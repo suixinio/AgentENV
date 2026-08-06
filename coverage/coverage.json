@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "72.15%",
+    "missed": 1375,
+    "total": 4937
+  },
+  "generated_at": "2026-08-06T15:39:34Z",
+  "lines": {
+    "coverage": "76.27%",
+    "missed": 9663,
+    "total": 40720
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "75.38%",
+    "missed": 14018,
+    "total": 56931
+  },
+  "run_url": "https://github.com/suixinio/AgentENV/actions/runs/31115340632"
+}

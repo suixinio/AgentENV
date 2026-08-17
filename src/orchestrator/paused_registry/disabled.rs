@@ -55,6 +55,10 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(())
     }
 
+    async fn renew_lease(&self, _node_id: &str, _sandbox_ids: &[SandboxId]) -> RegistryResult<u64> {
+        Ok(0)
+    }
+
     async fn mark_running(&self, _sandbox_id: &SandboxId, _node_id: &str) -> RegistryResult<()> {
         Ok(())
     }

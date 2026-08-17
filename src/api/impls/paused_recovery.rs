@@ -23,19 +23,40 @@ use crate::orchestrator::{
 };
 use crate::types::SandboxId;
 
-/// Outcome of trying to resume a sandbox this node has never seen.
+/// Outcome of rebuilding a sandbox from a claim this node already holds.
 pub(super) enum CrossNodeResume {
     /// The sandbox is running here again, under its original ID.
     Restored(Box<SandboxMetadata>),
-    /// The cluster has no paused record for it.
+    /// The registry named a snapshot the repository no longer has, so there is
+    /// nothing left to rebuild from.
     NotFound,
-    /// The snapshot has not landed in the repository yet, so only the origin
-    /// node can serve this resume.
-    NotReady { origin_node_id: String },
-    /// Another node is already resuming it, or still holds it.
-    Conflict { origin_node_id: String },
-    /// The record exists and was claimed, but rebuilding failed.
+    /// Rebuilding failed.
     Failed(String),
+}
+
+/// Who the cluster says may resume a sandbox.
+///
+/// Both resume paths — off this node's own disk, and from the shared snapshot
+/// repository — pass through this one decision. They have to: each ends with a
+/// live sandbox, so arbitrating them separately is what lets two nodes bring the
+/// same sandbox up at once. Routing cannot substitute for it, because the
+/// gateway hands a resume to an arbitrary node whenever the scheduler holds no
+/// binding, and bindings live in memory with a short TTL and are lost outright
+/// when the scheduler restarts.
+pub(super) enum ResumeArbitration {
+    /// The registry has no say: it is not cluster-backed, or it does not track
+    /// this sandbox. Whatever is on local disk is the whole truth.
+    Proceed,
+    /// This node holds the claim, and must release it if the resume fails. The
+    /// row travels with it so a rebuild never has to claim a second time —
+    /// claiming twice would deadlock against this node's own claim.
+    Held(Box<PausedSandboxEntry>),
+    /// The newest snapshot is still being published by another node, which is
+    /// therefore the only node that can serve this resume.
+    NotReady { origin_node_id: String },
+    /// Another node holds the sandbox, so resuming here would make a second
+    /// live copy of it.
+    Blocked { origin_node_id: String },
 }
 
 /// Why a node's local paused record is no longer the truth.
@@ -59,39 +80,55 @@ impl Superseded {
 }
 
 impl ApiImpl {
-    /// Rebuilds a sandbox this node has never run, from the cluster registry.
+    /// Asks the cluster who may resume this sandbox, taking the claim when the
+    /// answer is "this node".
     ///
-    /// Called only after the local resume reported the sandbox unknown, so a
-    /// node that holds the sandbox locally never reaches this path.
-    pub(super) async fn resume_from_registry(
-        &self,
-        sandbox_id: SandboxId,
-        timeout: NewTimeout,
-    ) -> CrossNodeResume {
+    /// Fails open on anything that is not a clear "someone else has it": a
+    /// registry that cannot answer must not be able to stop a node from
+    /// resuming a sandbox sitting on its own disk.
+    pub(super) async fn arbitrate_resume(&self, sandbox_id: SandboxId) -> ResumeArbitration {
+        if !self.paused.registry().is_cluster_backed() {
+            return ResumeArbitration::Proceed;
+        }
+
+        let node_id = self.paused.node_id();
         let claim = match self
             .paused
             .registry()
-            .claim_for_resume(&sandbox_id, self.paused.node_id())
+            .claim_for_resume(&sandbox_id, node_id)
             .await
         {
             Ok(claim) => claim,
             Err(err) => {
-                warn!(error = %err, %sandbox_id, "failed to claim paused sandbox for resume");
+                warn!(
+                    error = %err,
+                    %sandbox_id,
+                    "could not reach the registry to arbitrate a resume; proceeding locally"
+                );
 
-                return CrossNodeResume::Failed(err.to_string());
+                return ResumeArbitration::Proceed;
             }
         };
 
-        let entry = match claim {
-            ResumeClaim::Claimed(entry) => *entry,
-            ResumeClaim::NotFound => return CrossNodeResume::NotFound,
-            ResumeClaim::NotReady { origin_node_id } => {
-                return CrossNodeResume::NotReady { origin_node_id }
-            }
-            ResumeClaim::Conflict { origin_node_id } => {
-                return CrossNodeResume::Conflict { origin_node_id }
-            }
-        };
+        arbitration(claim, node_id)
+    }
+
+    /// Returns a claim after the resume it was taken for failed.
+    pub(super) async fn abandon_claim(&self, sandbox_id: SandboxId, generation: i64) {
+        self.release_claim(&sandbox_id, generation).await;
+    }
+
+    /// Rebuilds a sandbox from the claim this node already holds.
+    ///
+    /// Reached when the local resume reported the sandbox unknown — this node
+    /// has never run it, or has already discarded its copy — while the cluster
+    /// still has a snapshot to rebuild it from.
+    pub(super) async fn restore_claimed_sandbox(
+        &self,
+        entry: PausedSandboxEntry,
+        timeout: NewTimeout,
+    ) -> CrossNodeResume {
+        let sandbox_id = entry.sandbox_id;
 
         // The claim only matches rows that name a snapshot, so this cannot be
         // None here; treat it as a failed claim rather than panicking.
@@ -150,6 +187,49 @@ impl ApiImpl {
 
                 CrossNodeResume::Failed(err.to_string())
             }
+        }
+    }
+
+    /// Renews this node's lease on every registry row it is the holder of.
+    ///
+    /// The registry has no other way to tell a node that is still running its
+    /// sandboxes from one that has died: a lease that keeps being renewed is
+    /// the whole of the evidence. Skipping a renewal is therefore not a missed
+    /// optimisation, it is this node telling the cluster its sandboxes are up
+    /// for grabs.
+    ///
+    /// The whole local roster goes in, whatever state each sandbox is in — the
+    /// registry decides which rows this node actually holds, so nothing here
+    /// has to duplicate that judgement.
+    pub async fn renew_paused_leases(&self) {
+        if !self.paused.registry().is_cluster_backed() {
+            return;
+        }
+
+        let sandboxes = match self
+            .orchestrator
+            .list_sandboxes_filtered(SandboxListFilter::default())
+            .await
+        {
+            Ok(sandboxes) => sandboxes,
+            Err(err) => {
+                warn!(error = ?err, "failed to list local sandboxes for lease renewal");
+
+                return;
+            }
+        };
+
+        let ids: Vec<SandboxId> = sandboxes.into_iter().map(|metadata| metadata.id).collect();
+        if let Err(err) = self
+            .paused
+            .registry()
+            .renew_lease(self.paused.node_id(), &ids)
+            .await
+        {
+            warn!(
+                error = %err,
+                "failed to renew paused registry leases; another node may take these sandboxes over"
+            );
         }
     }
 
@@ -323,6 +403,32 @@ impl ApiImpl {
                 "failed to release the resume claim; the sandbox stays marked as resuming"
             );
         }
+    }
+}
+
+/// Turns the registry's answer into a decision about this node.
+///
+/// Split out from the call that produces it because whether a node may bring a
+/// sandbox up is the judgement that decides how many copies of it exist. The
+/// one case worth stating twice: an answer naming *this* node is not a refusal.
+/// A node is regularly told "not ready, held by X" or "conflict, held by X"
+/// where X is itself — its own in-flight publish, its own pause that never
+/// published, its own already-running sandbox — and reading those as refusals
+/// would make a node unable to resume its own sandboxes.
+fn arbitration(claim: ResumeClaim, node_id: &str) -> ResumeArbitration {
+    match claim {
+        ResumeClaim::Claimed(entry) => ResumeArbitration::Held(entry),
+        // The cluster does not track this sandbox, so there is nobody to
+        // arbitrate with and a local copy, if any, is the whole truth.
+        ResumeClaim::NotFound => ResumeArbitration::Proceed,
+        ResumeClaim::NotReady { origin_node_id } if origin_node_id == node_id => {
+            ResumeArbitration::Proceed
+        }
+        ResumeClaim::Conflict { origin_node_id } if origin_node_id == node_id => {
+            ResumeArbitration::Proceed
+        }
+        ResumeClaim::NotReady { origin_node_id } => ResumeArbitration::NotReady { origin_node_id },
+        ResumeClaim::Conflict { origin_node_id } => ResumeArbitration::Blocked { origin_node_id },
     }
 }
 
@@ -530,6 +636,79 @@ mod tests {
             &ClusterRegistration::Anonymous
         )
         .is_none());
+    }
+
+    /// 🔴 The regression that would break every ordinary resume. A node that
+    /// holds a sandbox is routinely told "held by X" where X is itself, and
+    /// treating that as a refusal would leave it unable to resume its own
+    /// sandboxes while another node, seeing no local copy, could not resume
+    /// them either.
+    #[test]
+    fn an_answer_naming_this_node_is_not_a_refusal() {
+        for claim in [
+            ResumeClaim::NotReady {
+                origin_node_id: SELF.to_string(),
+            },
+            ResumeClaim::Conflict {
+                origin_node_id: SELF.to_string(),
+            },
+        ] {
+            assert!(
+                matches!(arbitration(claim, SELF), ResumeArbitration::Proceed),
+                "a node must not be blocked from resuming by its own hold"
+            );
+        }
+    }
+
+    /// The second-copy case. Another node holding the sandbox is the one answer
+    /// that must stop a local resume dead, however resumable the local copy
+    /// looks.
+    #[test]
+    fn another_node_holding_the_sandbox_blocks_a_local_resume() {
+        assert!(matches!(
+            arbitration(
+                ResumeClaim::Conflict {
+                    origin_node_id: OTHER.to_string()
+                },
+                SELF
+            ),
+            ResumeArbitration::Blocked { .. }
+        ));
+        assert!(matches!(
+            arbitration(
+                ResumeClaim::NotReady {
+                    origin_node_id: OTHER.to_string()
+                },
+                SELF
+            ),
+            ResumeArbitration::NotReady { .. }
+        ));
+    }
+
+    /// A sandbox the cluster does not track is nobody's business but this
+    /// node's, so the registry must not stand in the way of resuming it.
+    #[test]
+    fn an_untracked_sandbox_resumes_without_arbitration() {
+        assert!(matches!(
+            arbitration(ResumeClaim::NotFound, SELF),
+            ResumeArbitration::Proceed
+        ));
+    }
+
+    /// The claim carries the row so the rebuild can use it directly. Claiming
+    /// again would find this node's own fresh claim in the way and deadlock the
+    /// resume against itself.
+    #[test]
+    fn a_granted_claim_carries_the_row_for_the_rebuild() {
+        let row = entry(PausedRegistryState::Paused, SELF, None);
+        let snapshot = row.snapshot_id.clone();
+
+        let ResumeArbitration::Held(held) = arbitration(ResumeClaim::Claimed(Box::new(row)), SELF)
+        else {
+            panic!("a granted claim must be held");
+        };
+
+        assert_eq!(held.snapshot_id, snapshot);
     }
 
     /// A claim always wins over a local paused copy, whoever took it.

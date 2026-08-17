@@ -163,12 +163,15 @@ async fn main() -> anyhow::Result<()> {
         paused_wiring,
         config.sandbox_proxy.domains.clone(),
     ));
-    // Runs before the listener opens: a resume that arrives first must not find
-    // a paused record the cluster has already moved past.
+    // Both run before the listener opens. Renewing first is what stops this
+    // node's own sandboxes from looking abandoned during startup; reconciling
+    // then makes sure a resume arriving first does not find a paused record the
+    // cluster has already moved past.
+    api_impl.renew_paused_leases().await;
     api_impl.reconcile_local_paused_records().await;
     let paused_reconcile = spawn_paused_record_reconciler(
         Arc::clone(&api_impl),
-        Duration::from_secs(config.orchestrator.paused_registry.reconcile_interval_secs),
+        config.orchestrator.paused_registry.reconcile_interval(),
     );
 
     let app = server::new(api_impl);
@@ -233,14 +236,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keeps this node's paused records in step with the cluster.
+/// Keeps this node's standing in the cluster registry current, in both
+/// directions.
 ///
-/// A node that loses a sandbox to another node is never told about it: the
-/// resume happens elsewhere, against a registry row this node does not watch.
-/// Until it notices, it keeps the sandbox in its heartbeat roster and the
-/// scheduler's binding for that sandbox flaps between the two nodes. Only
-/// re-checking on a timer closes that, so this runs for as long as the server
-/// does.
+/// Outward, it renews the lease on every sandbox this node holds. That lease is
+/// the only evidence the registry has that the node is still there, and letting
+/// it lapse is what invites another node to take the sandbox over — so this
+/// loop stopping is itself the signal that the node has gone.
+///
+/// Inward, a node that loses a sandbox to another node is never told about it:
+/// the resume happens elsewhere, against a registry row this node does not
+/// watch. Until it notices, it keeps the sandbox in its heartbeat roster and the
+/// scheduler's binding for that sandbox flaps between the two nodes.
+///
+/// Both only work on a timer, so this runs for as long as the server does.
 fn spawn_paused_record_reconciler(
     api_impl: Arc<ApiImpl>,
     interval: Duration,
@@ -251,6 +260,7 @@ fn spawn_paused_record_reconciler(
         ticker.tick().await;
         loop {
             ticker.tick().await;
+            api_impl.renew_paused_leases().await;
             api_impl.reconcile_local_paused_records().await;
         }
     })

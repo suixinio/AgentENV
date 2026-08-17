@@ -28,7 +28,7 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
-use super::paused_recovery::CrossNodeResume;
+use super::paused_recovery::{CrossNodeResume, ResumeArbitration};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -1249,6 +1249,32 @@ impl Sandboxes<()> for ApiImpl {
         // resume below cannot start a second copy alongside the live one.
         self.discard_if_superseded(sandbox_id).await;
 
+        // Then ask the cluster who may resume it. Discarding above closes the
+        // case where this node is behind by a whole reconciliation; this closes
+        // the one where it is behind by a moment, which is the case that
+        // actually produces two live copies of one sandbox. Both resume paths
+        // below run under this single decision.
+        let arbitration = self.arbitrate_resume(sandbox_id).await;
+        let held = match &arbitration {
+            ResumeArbitration::Blocked { origin_node_id } => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                    Self::error(409, format!("sandbox is held by node '{origin_node_id}'")),
+                ));
+            }
+            ResumeArbitration::NotReady { origin_node_id } => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                    Self::error(
+                        409,
+                        format!(
+                            "sandbox snapshot is still being published by node '{origin_node_id}'"
+                        ),
+                    ),
+                ));
+            }
+            ResumeArbitration::Held(entry) => Some(entry.generation),
+            ResumeArbitration::Proceed => None,
+        };
+
         let timer = SandboxStageTimer::new("resume");
         match timer
             .time(
@@ -1258,9 +1284,17 @@ impl Sandboxes<()> for ApiImpl {
             )
             .await
         {
-            // Resumed from local artifacts. The orchestrator repoints the
-            // cluster record at this node as part of the resume.
+            // Resumed from local artifacts.
             Ok(metadata) => {
+                // The orchestrator repoints the cluster record as part of a
+                // resume it actually performed, but not on the already-running
+                // path, which returns without touching the registry. Saying it
+                // again here is idempotent and keeps a claim from sitting in
+                // `resuming` until its lease lapses.
+                if held.is_some() {
+                    self.paused.mark_sandbox_running(sandbox_id).await;
+                }
+
                 return Ok(
                     SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
                         self.sandbox_model(metadata),
@@ -1268,11 +1302,17 @@ impl Sandboxes<()> for ApiImpl {
                 );
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
-                // This node has never run the sandbox. It may still be paused
-                // somewhere in the cluster, with its snapshot in the shared
-                // repository — rebuild it here under the same ID.
+                // Nothing local to resume. If the claim above came with a row,
+                // the cluster still has a snapshot to rebuild it from — under
+                // the same ID, on this node.
+                let ResumeArbitration::Held(entry) = arbitration else {
+                    return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                        sandbox_not_found(id),
+                    ));
+                };
+
                 return Ok(match self
-                    .resume_from_registry(sandbox_id, NewTimeout::Set(timeout))
+                    .restore_claimed_sandbox(*entry, NewTimeout::Set(timeout))
                     .await
                 {
                     CrossNodeResume::Restored(metadata) => {
@@ -1285,20 +1325,6 @@ impl Sandboxes<()> for ApiImpl {
                             sandbox_not_found(id),
                         )
                     }
-                    CrossNodeResume::NotReady { origin_node_id } => {
-                        SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
-                            409,
-                            format!(
-                                "sandbox snapshot is still being published by node '{origin_node_id}'"
-                            ),
-                        ))
-                    }
-                    CrossNodeResume::Conflict { origin_node_id } => {
-                        SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
-                            409,
-                            format!("sandbox is already being resumed by node '{origin_node_id}'"),
-                        ))
-                    }
                     CrossNodeResume::Failed(reason) => {
                         SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
                             500,
@@ -1308,6 +1334,10 @@ impl Sandboxes<()> for ApiImpl {
                 });
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                if let Some(generation) = held {
+                    self.abandon_claim(sandbox_id, generation).await;
+                }
+
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
                     Self::error(
                         409,
@@ -1316,6 +1346,10 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
+                if let Some(generation) = held {
+                    self.abandon_claim(sandbox_id, generation).await;
+                }
+
                 return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
                     err.into(),
                 ));

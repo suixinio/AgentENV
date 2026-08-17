@@ -399,14 +399,99 @@ pub struct PausedRegistryConfig {
     pub dsn: Option<String>,
     #[config(default = 8u32)]
     pub max_connections: u32,
-    /// How often to re-check local paused records against the registry.
+    /// How often to renew this node's registry leases and re-check its local
+    /// paused records against the registry.
     ///
     /// This is how a node finds out that a sandbox it still holds as paused was
     /// resumed somewhere else — nothing tells it, so the only bound on how long
-    /// it keeps advertising a sandbox it no longer owns is this interval. Ignored
-    /// with the `local` backend, where there is nothing to reconcile against.
-    #[config(default = 60u64)]
+    /// it keeps advertising a sandbox it no longer owns is this interval. It is
+    /// also the renewal cadence for `lease_ttl_secs`. Ignored with the `local`
+    /// backend, where there is nothing to reconcile against.
+    #[config(default = 30u64)]
     pub reconcile_interval_secs: u64,
+    /// How long a node's claim on a sandbox stays valid without renewal.
+    ///
+    /// A row that names a node as running, publishing or resuming a sandbox is
+    /// only honoured while that node keeps renewing it. Once the lease lapses
+    /// the sandbox becomes recoverable elsewhere, so this is the delay between
+    /// losing a node and being able to bring its sandboxes back — traded
+    /// against how long a node may be unresponsive before the cluster starts
+    /// treating its sandboxes as abandoned.
+    #[config(default = 90u64)]
+    pub lease_ttl_secs: u64,
+}
+
+impl PausedRegistryConfig {
+    /// Reconciliation cadence, floored at one second.
+    ///
+    /// Zero is not merely useless here, it is fatal: a zero-period
+    /// `tokio::time::interval` panics, so an operator could take the node down
+    /// at startup with a config value.
+    pub fn reconcile_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.reconcile_interval_secs.max(1))
+    }
+
+    /// Lease length, held to at least three renewal intervals.
+    ///
+    /// A lease shorter than the cadence that renews it expires on a healthy
+    /// node, which invites exactly the takeover of a live sandbox the lease
+    /// exists to prevent. Three intervals leaves room for two missed renewals
+    /// before the cluster concludes a node is gone.
+    pub fn lease_ttl_secs(&self) -> u64 {
+        self.lease_ttl_secs
+            .max(self.reconcile_interval_secs.max(1).saturating_mul(3))
+    }
+}
+
+#[cfg(test)]
+mod paused_registry_config_tests {
+    use super::*;
+
+    fn config(reconcile_interval_secs: u64, lease_ttl_secs: u64) -> PausedRegistryConfig {
+        PausedRegistryConfig {
+            backend: PausedRegistryBackendKind::Postgres,
+            dsn: None,
+            max_connections: 8,
+            reconcile_interval_secs,
+            lease_ttl_secs,
+        }
+    }
+
+    /// `tokio::time::interval` panics on a zero period, so an unclamped value
+    /// here is a config field that takes the node down at startup.
+    #[test]
+    fn a_zero_interval_never_reaches_the_timer() {
+        assert_eq!(
+            config(0, 90).reconcile_interval(),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    /// A lease shorter than the cadence renewing it expires on a perfectly
+    /// healthy node — which is an invitation to take over a live sandbox, the
+    /// exact thing the lease exists to prevent.
+    #[test]
+    fn a_lease_can_never_be_shorter_than_the_renewal_cadence() {
+        assert_eq!(config(60, 10).lease_ttl_secs(), 180);
+        assert_eq!(config(0, 0).lease_ttl_secs(), 3);
+    }
+
+    /// A lease longer than the floor is the operator's call: it only trades
+    /// slower recovery for more tolerance of an unresponsive node.
+    #[test]
+    fn a_generous_lease_is_left_alone() {
+        assert_eq!(config(30, 600).lease_ttl_secs(), 600);
+    }
+
+    /// The shipped defaults have to satisfy the same rule, or every deployment
+    /// that touches nothing starts out broken.
+    #[test]
+    fn the_defaults_leave_room_for_two_missed_renewals() {
+        let defaults = config(30, 90);
+
+        assert_eq!(defaults.lease_ttl_secs(), 90);
+        assert!(defaults.lease_ttl_secs() >= defaults.reconcile_interval().as_secs() * 3);
+    }
 }
 
 #[derive(Debug, Config, Clone)]

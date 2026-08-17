@@ -113,6 +113,20 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// Returns a claimed sandbox to the paused state after a failed resume.
     async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()>;
 
+    /// Refreshes the liveness lease on every row among `sandbox_ids` that
+    /// `node_id` is the holder of, and reports how many that was.
+    ///
+    /// This is the only evidence the registry has that a node still holds what
+    /// its rows claim. A row whose lease runs out becomes claimable by any
+    /// node — that is how a sandbox survives losing the node it was on — so a
+    /// node that stops renewing is, by definition, one that has let its
+    /// sandboxes go.
+    ///
+    /// Callers pass their whole local roster and let the implementation decide
+    /// which entries they have standing to renew; a node must not be able to
+    /// extend a lease on a sandbox it does not hold.
+    async fn renew_lease(&self, node_id: &str, sandbox_ids: &[SandboxId]) -> RegistryResult<u64>;
+
     /// Records that the sandbox is live on `node_id` again.
     ///
     /// The row survives the resume rather than being deleted, still naming the
@@ -206,6 +220,7 @@ pub async fn build_paused_registry(
                     dsn,
                     identity.cluster_id,
                     config.max_connections,
+                    config.lease_ttl_secs() as f64,
                 )
                 .await?,
             ))

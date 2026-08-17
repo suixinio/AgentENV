@@ -399,6 +399,14 @@ pub struct PausedRegistryConfig {
     pub dsn: Option<String>,
     #[config(default = 8u32)]
     pub max_connections: u32,
+    /// How often to re-check local paused records against the registry.
+    ///
+    /// This is how a node finds out that a sandbox it still holds as paused was
+    /// resumed somewhere else — nothing tells it, so the only bound on how long
+    /// it keeps advertising a sandbox it no longer owns is this interval. Ignored
+    /// with the `local` backend, where there is nothing to reconcile against.
+    #[config(default = 60u64)]
+    pub reconcile_interval_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]

@@ -118,6 +118,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        paused_publisher: tokio::sync::OnceCell::new(),
     })
 }
 
@@ -4810,4 +4811,140 @@ fn disabled_registry_is_not_cluster_backed() {
     use crate::orchestrator::{DisabledPausedSandboxRegistry, PausedSandboxRegistry};
 
     assert!(!DisabledPausedSandboxRegistry.is_cluster_backed());
+}
+
+/// Records what the orchestrator asks of the cluster, so tests can assert that
+/// a pause reached it without standing up a registry.
+#[derive(Default)]
+struct RecordingPublisher {
+    published: StdMutex<Vec<SandboxId>>,
+    marked_running: StdMutex<Vec<SandboxId>>,
+    forgotten: StdMutex<Vec<SandboxId>>,
+}
+
+impl RecordingPublisher {
+    fn published(&self) -> Vec<SandboxId> {
+        self.published.lock().unwrap().clone()
+    }
+
+    fn marked_running(&self) -> Vec<SandboxId> {
+        self.marked_running.lock().unwrap().clone()
+    }
+
+    fn forgotten(&self) -> Vec<SandboxId> {
+        self.forgotten.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
+    async fn publish_paused(&self, outcome: crate::orchestrator::PauseOutcome) -> Option<String> {
+        self.published.lock().unwrap().push(outcome.metadata.id);
+
+        Some("test-node".to_string())
+    }
+
+    async fn mark_running(&self, sandbox_id: SandboxId) {
+        self.marked_running.lock().unwrap().push(sandbox_id);
+    }
+
+    async fn forget(&self, sandbox_id: SandboxId) {
+        self.forgotten.lock().unwrap().push(sandbox_id);
+    }
+}
+
+async fn orchestrator_with_recording_publisher() -> (Arc<TestOrchestrator>, Arc<RecordingPublisher>)
+{
+    let orchestrator = make_orchestrator().await;
+    let publisher = Arc::new(RecordingPublisher::default());
+    orchestrator.set_paused_publisher(
+        Arc::clone(&publisher) as Arc<dyn crate::orchestrator::PausedSandboxPublisher>
+    );
+
+    (orchestrator, publisher)
+}
+
+#[tokio::test]
+async fn an_api_pause_is_published_to_the_cluster() -> Result<()> {
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    orchestrator.pause_sandbox(created.id).await?;
+
+    assert_eq!(publisher.published(), vec![created.id]);
+
+    Ok(())
+}
+
+/// The path that actually pauses most sandboxes. It used to drop the capture on
+/// the floor, so an expired sandbox was resumable only on the node it happened
+/// to expire on — and nobody is watching when that node is later lost.
+#[tokio::test]
+async fn an_expiry_auto_pause_is_published_to_the_cluster() -> Result<()> {
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(0), &[]))
+        .await?;
+
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+
+    assert_eq!(evicted, vec![created.id], "the sandbox should have expired");
+    assert_eq!(publisher.published(), vec![created.id]);
+
+    Ok(())
+}
+
+/// Shutdown pauses everything still running, and is the one case where the node
+/// may genuinely never come back. Publishing here is the difference between a
+/// decommissioned node's sandboxes surviving and evaporating.
+#[tokio::test]
+async fn a_shutdown_pause_is_published_to_the_cluster() -> Result<()> {
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(600), &[]))
+        .await?;
+
+    orchestrator.shutdown().await?;
+
+    assert_eq!(publisher.published(), vec![created.id]);
+
+    Ok(())
+}
+
+/// A resume repoints the cluster record at this node. Without it the node that
+/// paused the sandbox keeps advertising a copy it no longer owns.
+#[tokio::test]
+async fn a_resume_marks_the_sandbox_running_in_the_cluster() -> Result<()> {
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+
+    assert_eq!(publisher.marked_running(), vec![created.id]);
+
+    Ok(())
+}
+
+/// The row and its snapshot outlive the paused period on purpose, so the delete
+/// is the only thing that collects them. An expiry-driven delete has no API
+/// call behind it and must clean up just as thoroughly.
+#[tokio::test]
+async fn a_delete_forgets_the_sandbox_in_the_cluster() -> Result<()> {
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    orchestrator.delete_sandbox(created.id).await?;
+
+    assert_eq!(publisher.forgotten(), vec![created.id]);
+
+    Ok(())
 }

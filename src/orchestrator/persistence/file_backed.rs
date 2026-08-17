@@ -9,7 +9,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{ClusterRegistration, PersistenceResult, SandboxPersistenceError, SandboxPersister};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
@@ -44,6 +44,16 @@ struct PersistedPausedRecord {
     /// the node-local backend to a cluster one safe.
     #[serde(default)]
     cluster_registered: bool,
+    /// The node identity this record was announced under.
+    ///
+    /// Separate from `cluster_registered` because a node's ID is not
+    /// necessarily stable across restarts — under Kubernetes it is commonly the
+    /// pod name — and the registry row must be compared against the identity
+    /// that wrote it, never against whatever this process happens to be called
+    /// now. Records from before this field existed deserialize to `None`, which
+    /// reconciliation treats as "compare nothing about identity".
+    #[serde(default)]
+    registered_as: Option<String>,
 }
 
 impl PersistedPausedRecord {
@@ -373,6 +383,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             metadata: metadata.clone(),
             artifact_root: artifact_root.to_path_buf(),
             cluster_registered: false,
+            registered_as: None,
             state,
         };
         let result = self.put_record(&record).await;
@@ -389,15 +400,28 @@ impl SandboxPersister for FileBackedSandboxPersister {
         self.put_record(&record).await
     }
 
-    async fn mark_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
-        debug!(sandbox_id = %sandbox_id, "marking paused sandbox as cluster-registered");
+    async fn mark_cluster_registered(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+    ) -> PersistenceResult<()> {
+        debug!(sandbox_id = %sandbox_id, node_id, "marking paused sandbox as cluster-registered");
         let mut record = self.get_record(sandbox_id).await?;
         record.cluster_registered = true;
+        record.registered_as = Some(node_id.to_string());
         self.put_record(&record).await
     }
 
-    async fn is_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<bool> {
-        Ok(self.get_record(sandbox_id).await?.cluster_registered)
+    async fn cluster_registration(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<ClusterRegistration> {
+        let record = self.get_record(sandbox_id).await?;
+        Ok(match (record.cluster_registered, record.registered_as) {
+            (false, _) => ClusterRegistration::Never,
+            (true, Some(node_id)) => ClusterRegistration::As(node_id),
+            (true, None) => ClusterRegistration::Anonymous,
+        })
     }
 
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -724,10 +748,46 @@ mod tests {
         // A freshly persisted record has not been announced anywhere, so
         // reconciliation must not be able to reason about its absence from a
         // registry.
-        assert!(!persister.is_cluster_registered(&sandbox_id).await?);
+        assert_eq!(
+            persister.cluster_registration(&sandbox_id).await?,
+            ClusterRegistration::Never
+        );
 
-        persister.mark_cluster_registered(&sandbox_id).await?;
-        assert!(persister.is_cluster_registered(&sandbox_id).await?);
+        persister
+            .mark_cluster_registered(&sandbox_id, "node-a")
+            .await?;
+
+        // The identity matters as much as the fact: reconciliation compares the
+        // registry row against the name this record was announced under, never
+        // against whatever this process is called when it later reads it back.
+        assert_eq!(
+            persister.cluster_registration(&sandbox_id).await?,
+            ClusterRegistration::As("node-a".to_string())
+        );
+
+        Ok(())
+    }
+
+    /// A record announced by a build that did not yet store the identity must
+    /// not be mistaken for one belonging to another node — a node's ID is
+    /// commonly its pod name, so "not ours" would be the reading after any pod
+    /// recreation, and the whole node's paused sandboxes would be discarded.
+    #[tokio::test]
+    async fn records_registered_before_the_identity_was_stored_load_as_anonymous(
+    ) -> anyhow::Result<()> {
+        let legacy = serde_json::json!({
+            "version": RECORD_VERSION,
+            "lifecycle": "paused",
+            "metadata": SandboxMetadata::default(),
+            "artifactRoot": "/tmp/does-not-matter",
+            "state": {},
+            "clusterRegistered": true,
+        });
+
+        let record = decode_record(&serde_json::to_vec(&legacy)?)?;
+
+        assert!(record.cluster_registered);
+        assert_eq!(record.registered_as, None);
 
         Ok(())
     }

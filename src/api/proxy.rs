@@ -1717,12 +1717,13 @@ mod tests {
         let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
         Arc::new(ApiImpl::new(
             orchestrator,
-            snapshot_manager,
+            Arc::clone(&snapshot_manager),
             template_builder,
             image_resolver,
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),
+                snapshot_manager,
                 &crate::identity::NodeIdentity::from_config(&Default::default()),
             ),
             domains,

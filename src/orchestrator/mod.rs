@@ -12,12 +12,12 @@ use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
 pub use paused_registry::{
-    build_paused_registry, DisabledPausedSandboxRegistry, PausedRegistryError, PausedRegistryState,
-    PausedSandboxEntry, PausedSandboxRegistry, PostgresPausedSandboxRegistry, RegistryResult,
-    ResumeClaim,
+    build_paused_registry, BeganPause, DisabledPausedSandboxRegistry, PausedRegistryError,
+    PausedRegistryState, PausedSandboxEntry, PausedSandboxPublisher, PausedSandboxRegistry,
+    PostgresPausedSandboxRegistry, RegistryResult, ResumeClaim,
 };
 pub use persistence::{
-    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
+    ClusterRegistration, DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};

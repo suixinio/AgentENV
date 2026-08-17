@@ -2,6 +2,7 @@ mod admin;
 mod attached_drives;
 mod auth;
 mod pagination;
+mod paused_coordinator;
 mod paused_recovery;
 mod sandbox;
 mod snapshots;
@@ -17,29 +18,43 @@ use super::proxy::{build_proxy_client, ProxyClient};
 use crate::identity::NodeIdentity;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
-use crate::orchestrator::{Orchestrator, PausedSandboxRegistry};
+use crate::orchestrator::{Orchestrator, PausedSandboxPublisher, PausedSandboxRegistry};
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 use agentenv_http_server::{apis, models};
+pub use paused_coordinator::PausedSandboxCoordinator;
 
 #[derive(Clone, Debug)]
 pub struct Claims;
 
-/// Everything the API layer needs to make a paused sandbox recoverable beyond
-/// the node that paused it. Passed as one value so enabling cross-node recovery
-/// stays a single wiring decision at startup.
+/// Everything needed to make a paused sandbox recoverable beyond the node that
+/// paused it, built once at startup and shared by the two sides that need it:
+/// the API, for resumes that arrive on a node which has never run the sandbox,
+/// and the orchestrator, which drives publishing for every pause regardless of
+/// what started it.
 pub struct PausedSandboxWiring {
-    pub registry: Arc<dyn PausedSandboxRegistry>,
-    pub node_id: String,
+    pub coordinator: Arc<PausedSandboxCoordinator>,
 }
 
 impl PausedSandboxWiring {
-    pub fn new(registry: Arc<dyn PausedSandboxRegistry>, identity: &NodeIdentity) -> Self {
+    pub fn new(
+        registry: Arc<dyn PausedSandboxRegistry>,
+        snapshot_manager: Arc<SnapshotManager>,
+        identity: &NodeIdentity,
+    ) -> Self {
         Self {
-            registry,
-            node_id: identity.id.clone(),
+            coordinator: Arc::new(PausedSandboxCoordinator::new(
+                registry,
+                snapshot_manager,
+                identity.id.clone(),
+            )),
         }
+    }
+
+    /// The orchestrator's side of the wiring.
+    pub fn publisher(&self) -> Arc<dyn PausedSandboxPublisher> {
+        Arc::clone(&self.coordinator) as Arc<dyn PausedSandboxPublisher>
     }
 }
 
@@ -47,11 +62,9 @@ impl PausedSandboxWiring {
 pub struct ApiImpl {
     orchestrator: Arc<Orchestrator>,
     snapshot_manager: Arc<SnapshotManager>,
-    /// Cluster-wide index of paused sandboxes. With the default `local`
-    /// backend every call is a no-op and pause/resume stay node-local.
-    paused_registry: Arc<dyn PausedSandboxRegistry>,
-    /// This node's ID, recorded as the origin of the snapshots it publishes.
-    node_id: String,
+    /// Cluster-wide bookkeeping for paused sandboxes. With the default `local`
+    /// registry backend every call is a no-op and pause/resume stay node-local.
+    paused: Arc<PausedSandboxCoordinator>,
     template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
     observability: Option<Arc<ObservabilityService>>,
@@ -72,8 +85,7 @@ impl ApiImpl {
         Self {
             orchestrator,
             snapshot_manager,
-            paused_registry: paused.registry,
-            node_id: paused.node_id,
+            paused: paused.coordinator,
             template_builder,
             image_resolver,
             observability,

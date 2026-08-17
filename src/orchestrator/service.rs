@@ -27,6 +27,8 @@ use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
+use super::paused_registry::PausedSandboxPublisher;
+use super::persistence::ClusterRegistration;
 use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
@@ -107,6 +109,11 @@ pub struct Orchestrator<
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    /// Cluster-wide bookkeeping for paused sandboxes, wired in after
+    /// construction because it is built from the snapshot repository, which the
+    /// orchestrator otherwise has no reason to know about. Unset means every
+    /// pause stays node-local, which is the default.
+    paused_publisher: OnceCell<Arc<dyn PausedSandboxPublisher>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -197,6 +204,7 @@ where
             shutdown_outcome: OnceCell::new(),
             image_refs,
             access_tokens,
+            paused_publisher: OnceCell::new(),
         });
 
         // Start the auto-evict task.
@@ -1023,26 +1031,71 @@ where
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
+        // The sandbox is gone, so its cluster row and the snapshot behind it are
+        // garbage. Done here rather than at the API so an expiry-driven delete
+        // cleans up as thoroughly as a requested one.
+        if let Some(publisher) = self.paused_publisher() {
+            publisher.forget(sandbox_id).await;
+        }
         info!("sandbox deleted");
 
         Ok(())
     }
 
-    /// Records that a paused sandbox has been announced to a cluster registry.
-    ///
-    /// Only announced records may later be discarded by reconciliation, so this
-    /// is what makes "the registry has no row for it" mean anything at all.
-    pub async fn mark_paused_record_cluster_registered(&self, sandbox_id: SandboxId) -> Result<()> {
-        self.persister
-            .mark_cluster_registered(&sandbox_id)
-            .await
-            .map_err(|err| OrchestratorError::InternalError(err.to_string()))
+    /// Wires in cluster-wide pause bookkeeping. Idempotent; later calls are
+    /// ignored, so the first wiring wins.
+    pub fn set_paused_publisher(&self, publisher: Arc<dyn PausedSandboxPublisher>) {
+        if self.paused_publisher.set(publisher).is_err() {
+            warn!("paused sandbox publisher was already wired; ignoring");
+        }
     }
 
-    /// Whether a paused record was ever announced to a cluster registry.
-    pub async fn paused_record_is_cluster_registered(&self, sandbox_id: SandboxId) -> Result<bool> {
+    fn paused_publisher(&self) -> Option<&Arc<dyn PausedSandboxPublisher>> {
+        self.paused_publisher.get()
+    }
+
+    /// Publishes a just-paused sandbox to the cluster and records the outcome
+    /// on the local record.
+    ///
+    /// Called from `pause_sandbox_inner` rather than from its callers, so that
+    /// an API pause, an expiry auto-pause and a shutdown pause all reach the
+    /// cluster identically. Doing it per call site is what left the latter two
+    /// unpublished, and those are the two whose sandboxes most need to survive
+    /// losing the node.
+    async fn publish_paused_sandbox(&self, sandbox_id: SandboxId, outcome: PauseOutcome) {
+        let Some(publisher) = self.paused_publisher() else {
+            return;
+        };
+
+        let Some(registered_as) = publisher.publish_paused(outcome).await else {
+            return;
+        };
+
+        // From here on the cluster knows about this sandbox, so a later
+        // reconciliation is allowed to act on what the registry says about it.
+        // Recording that on the local record is what keeps reconciliation off
+        // records that predate the registry.
+        if let Err(err) = self
+            .persister
+            .mark_cluster_registered(&sandbox_id, &registered_as)
+            .await
+        {
+            warn!(error = ?err, %sandbox_id, "failed to mark the local record as registered");
+        }
+    }
+
+    /// Whether a paused record was ever announced to a cluster registry, and
+    /// under which node identity.
+    ///
+    /// Only announced records may be discarded by reconciliation, and only
+    /// against the identity they were announced under — which is what makes
+    /// what the registry says about them mean anything at all.
+    pub async fn paused_record_cluster_registration(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<ClusterRegistration> {
         self.persister
-            .is_cluster_registered(&sandbox_id)
+            .cluster_registration(&sandbox_id)
             .await
             .map_err(|err| OrchestratorError::InternalError(err.to_string()))
     }
@@ -1132,7 +1185,7 @@ where
     /// If another `pause_sandbox` call is already in progress for the same
     /// sandbox (`Pausing` state), this call waits for it to complete and then
     /// returns the outcome rather than duplicating the work.
-    pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<PauseOutcome> {
+    pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("pause", sandbox_id, async move {
             this.pause_sandbox_inner(sandbox_id).await
@@ -1145,7 +1198,10 @@ where
         skip(self),
         fields(sandbox_id = %sandbox_id)
     )]
-    async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<PauseOutcome> {
+    async fn pause_sandbox_inner(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxMetadata> {
         info!("pausing sandbox");
         match self
             .store
@@ -1158,14 +1214,11 @@ where
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
                     SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
-                    // Already paused: idempotent success. The capture belongs
-                    // to the pause that produced it and is long gone, so this
-                    // caller gets the record without a publishable snapshot.
+                    // Already paused: idempotent success. The capture belongs to
+                    // the pause that produced it and is long gone, so there is
+                    // nothing left to publish here.
                     SandboxState::Paused => match self.store.get(&sandbox_id).await? {
-                        Some(metadata) => Ok(PauseOutcome {
-                            metadata,
-                            publishable: None,
-                        }),
+                        Some(metadata) => Ok(metadata),
                         None => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
                     },
                     SandboxState::Killing => {
@@ -1364,10 +1417,19 @@ where
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
 
-        Ok(PauseOutcome {
-            metadata: paused_metadata,
-            publishable,
-        })
+        // The sandbox is already paused and locally resumable, so this runs
+        // after the point of no return on purpose: it can only add cross-node
+        // recovery, never take the pause away.
+        self.publish_paused_sandbox(
+            sandbox_id,
+            PauseOutcome {
+                metadata: paused_metadata.clone(),
+                publishable,
+            },
+        )
+        .await;
+
+        Ok(paused_metadata)
     }
 
     /// Resumes a paused sandbox from its snapshot.
@@ -1507,6 +1569,12 @@ where
                 metadata.id,
                 metadata.resources,
             );
+            // Tell the cluster the sandbox is live here. Its snapshot stays
+            // behind as the sandbox's durable fallback until the next pause
+            // replaces it.
+            if let Some(publisher) = self.paused_publisher() {
+                publisher.mark_running(sandbox_id).await;
+            }
         }
         resumed
     }
@@ -1898,7 +1966,7 @@ where
     /// The joined outcome never carries a publishable capture: the capture
     /// belongs to the pause that produced it, and only that caller can publish
     /// it. A joiner learns the pause succeeded, nothing more.
-    async fn join_concurrent_pause(&self, sandbox_id: SandboxId) -> Result<PauseOutcome> {
+    async fn join_concurrent_pause(&self, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
         debug!("concurrent pause in progress, waiting for completion");
         let m = self
             .wait_for_transition(sandbox_id, SandboxState::Pausing)
@@ -1906,10 +1974,10 @@ where
         match m.state {
             SandboxState::Paused => {
                 debug!("concurrent pause succeeded");
-                Ok(PauseOutcome {
-                    metadata: m,
-                    publishable: None,
-                })
+
+                // Publishing belongs to the pause that produced the capture;
+                // the winner has already done it.
+                Ok(m)
             }
             SandboxState::Running => {
                 info!("concurrent pause failed; sandbox returned to running state");
@@ -1979,6 +2047,9 @@ where
                 continue;
             }
             if let Err(err) = match metadata.timeout_action {
+                // Publishing happens inside the pause, so an expired sandbox is
+                // just as recoverable from another node as an explicitly paused
+                // one — which matters more here, not less: nobody is watching.
                 SandboxTimeoutAction::Pause => {
                     self.pause_sandbox_inner(metadata.id).await.map(|_| ())
                 }

@@ -7,8 +7,11 @@ use crate::types::SandboxId;
 
 /// Lifecycle of a registry row.
 ///
-/// The row exists only while the sandbox is not running anywhere. It is created
-/// by the node that pauses the sandbox and removed by whichever node resumes it.
+/// The row is created by the node that pauses the sandbox and lives until the
+/// sandbox is deleted. It deliberately outlives the paused period: once a
+/// sandbox is resumed the row stays behind as `Running`, still naming the last
+/// durable snapshot, so losing the node that resumed it does not lose the
+/// sandbox — the next resume rebuilds it from that snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausedRegistryState {
     /// The sandbox is paused locally but its snapshot has not landed in the
@@ -23,6 +26,10 @@ pub enum PausedRegistryState {
     /// cluster can tell "this sandbox is still parked on its node" apart from
     /// "this sandbox is gone" — a distinction reconciliation depends on.
     LocalOnly,
+    /// The sandbox is live on `origin_node_id`. `snapshot_id` still names the
+    /// snapshot it was last resumed from, which is what makes it recoverable if
+    /// that node is lost before the sandbox is paused again.
+    Running,
 }
 
 impl PausedRegistryState {
@@ -35,6 +42,7 @@ impl PausedRegistryState {
             "paused" => Some(Self::Paused),
             "resuming" => Some(Self::Resuming),
             "local_only" => Some(Self::LocalOnly),
+            "running" => Some(Self::Running),
             _ => None,
         }
     }
@@ -56,14 +64,34 @@ pub struct PausedSandboxEntry {
     /// newer decision (for example a pause completing after another node has
     /// already claimed the sandbox for resume).
     pub generation: i64,
-    /// The node that produced the snapshot. A scheduling hint, never a binding:
-    /// resume prefers it and falls back to any node when it cannot serve.
+    /// The node that currently holds the sandbox: the one that paused it, or
+    /// the one it was last resumed on. A scheduling hint, never a binding —
+    /// but also the answer to "whose local copy is authoritative", which is
+    /// what lets every other node recognise its own copy as superseded.
     pub origin_node_id: String,
+    /// The node that took the sandbox for a resume. Only set while
+    /// `state == Resuming`; distinct from `origin_node_id`, which still names
+    /// the node whose disk holds the local artifacts.
+    pub claimed_by_node_id: Option<String>,
     /// `None` while `state == Publishing`.
     pub snapshot_id: Option<SnapshotId>,
     pub metadata: SandboxMetadata,
     pub paused_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// What [`PausedSandboxRegistry::begin_pause`](super::PausedSandboxRegistry::begin_pause) hands back.
+#[derive(Debug, Clone)]
+pub struct BeganPause {
+    /// The generation the caller must quote when completing or aborting.
+    pub generation: i64,
+    /// The snapshot the row pointed at before this pause replaced it, if any.
+    ///
+    /// Nothing references it once the new pause completes, so the caller is
+    /// responsible for deleting it — that deletion is deliberately deferred to
+    /// here rather than done at resume time, so a sandbox always has one
+    /// durable snapshot behind it while it runs.
+    pub previous_snapshot_id: Option<SnapshotId>,
 }
 
 /// Outcome of trying to take ownership of a paused sandbox for a resume.

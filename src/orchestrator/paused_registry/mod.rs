@@ -28,12 +28,13 @@ use async_trait::async_trait;
 
 use crate::cfg::{PausedRegistryBackendKind, PausedRegistryConfig};
 use crate::identity::NodeIdentity;
+use crate::orchestrator::PauseOutcome;
 use crate::snapshot::SnapshotId;
 use crate::types::SandboxId;
 
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use postgres::PostgresPausedSandboxRegistry;
-pub use types::{PausedRegistryState, PausedSandboxEntry, ResumeClaim};
+pub use types::{BeganPause, PausedRegistryState, PausedSandboxEntry, ResumeClaim};
 
 pub type RegistryResult<T> = std::result::Result<T, PausedRegistryError>;
 
@@ -76,9 +77,11 @@ impl PausedRegistryError {
 #[async_trait]
 pub trait PausedSandboxRegistry: Send + Sync {
     /// Records that a sandbox has been paused locally but its snapshot is not
-    /// durable yet. Returns the generation the caller must pass to
-    /// [`complete_pause`](Self::complete_pause) or [`mark_local_only`](Self::mark_local_only).
-    async fn begin_pause(&self, entry: &PausedSandboxEntry) -> RegistryResult<i64>;
+    /// durable yet. The returned [`BeganPause`] carries the generation the
+    /// caller must pass to [`complete_pause`](Self::complete_pause) or
+    /// [`mark_local_only`](Self::mark_local_only), plus the snapshot this pause
+    /// supersedes so the caller can retire it once the new one lands.
+    async fn begin_pause(&self, entry: &PausedSandboxEntry) -> RegistryResult<BeganPause>;
 
     /// Marks the snapshot durable, making the sandbox resumable on any node.
     async fn complete_pause(
@@ -110,7 +113,20 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// Returns a claimed sandbox to the paused state after a failed resume.
     async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()>;
 
-    /// Removes the row once the sandbox is running again, or has been deleted.
+    /// Records that the sandbox is live on `node_id` again.
+    ///
+    /// The row survives the resume rather than being deleted, still naming the
+    /// snapshot it came back from. Two things depend on that: losing `node_id`
+    /// before the next pause no longer loses the sandbox, and every other node
+    /// holding a stale local copy can see from `origin_node_id` that its copy
+    /// has been superseded.
+    ///
+    /// Never creates a row — a sandbox the cluster does not already track stays
+    /// untracked.
+    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<()>;
+
+    /// Removes the row, and with it the cluster's memory of the sandbox.
+    /// Only correct once the sandbox itself is gone.
     async fn remove(&self, sandbox_id: &SandboxId) -> RegistryResult<()>;
 
     /// Whether this registry actually tracks sandboxes cluster-wide.
@@ -122,6 +138,44 @@ pub trait PausedSandboxRegistry: Send + Sync {
     fn is_cluster_backed(&self) -> bool {
         false
     }
+}
+
+/// The orchestrator's hook into cluster-wide pause bookkeeping.
+///
+/// The orchestrator pauses, resumes and deletes sandboxes from three places —
+/// the API, the expiry evictor, and graceful shutdown — and every one of them
+/// has to reach the registry. Rather than repeat that at each call site (which
+/// is exactly how the evictor and shutdown paths came to be the two that did
+/// not), the orchestrator calls this hook itself and every path inherits it.
+///
+/// Implemented outside the orchestrator because publishing needs the snapshot
+/// repository, which the orchestrator has no other reason to know about. The
+/// implementation must not hold the orchestrator back, or the wiring becomes a
+/// cycle.
+///
+/// Every method is best-effort by contract: the sandbox operation has already
+/// succeeded locally by the time these run, and failing one of them must cost
+/// cross-node recovery and nothing else.
+#[async_trait]
+pub trait PausedSandboxPublisher: Send + Sync {
+    /// Publishes a just-paused sandbox's snapshot and records it cluster-wide.
+    ///
+    /// Returns the node identity the row was written under, which the
+    /// orchestrator stamps onto the local record; `None` when nothing was
+    /// recorded. Only a record carrying that stamp may later be discarded for
+    /// disagreeing with the registry, so a `None` here is what keeps
+    /// reconciliation off records that predate the registry.
+    ///
+    /// The identity is returned rather than read back later because it is the
+    /// thing reconciliation compares the registry row against, and a node's ID
+    /// can change between the pause and the comparison.
+    async fn publish_paused(&self, outcome: PauseOutcome) -> Option<String>;
+
+    /// Records that the sandbox is live on this node again.
+    async fn mark_running(&self, sandbox_id: SandboxId);
+
+    /// Drops the cluster's record of the sandbox and the snapshot behind it.
+    async fn forget(&self, sandbox_id: SandboxId);
 }
 
 /// Builds the configured registry.

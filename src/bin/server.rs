@@ -1,4 +1,5 @@
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use agentenv::api::{server, ApiImpl, PausedSandboxWiring};
 use agentenv::identity::NodeIdentity;
@@ -145,18 +146,30 @@ async fn main() -> anyhow::Result<()> {
 
     let paused_registry =
         build_paused_registry(&config.orchestrator.paused_registry, &identity_for_registry).await?;
+    let paused_wiring = PausedSandboxWiring::new(
+        paused_registry,
+        Arc::clone(&snapshot_manager),
+        &identity_for_registry,
+    );
+    // The orchestrator publishes every pause it performs, including the ones no
+    // API request asked for (expiry, shutdown).
+    orchestrator.set_paused_publisher(paused_wiring.publisher());
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
         snapshot_manager,
         template_builder,
         image_resolver,
         observability,
-        PausedSandboxWiring::new(paused_registry, &identity_for_registry),
+        paused_wiring,
         config.sandbox_proxy.domains.clone(),
     ));
     // Runs before the listener opens: a resume that arrives first must not find
     // a paused record the cluster has already moved past.
     api_impl.reconcile_local_paused_records().await;
+    let paused_reconcile = spawn_paused_record_reconciler(
+        Arc::clone(&api_impl),
+        Duration::from_secs(config.orchestrator.paused_registry.reconcile_interval_secs),
+    );
 
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);
@@ -180,6 +193,9 @@ async fn main() -> anyhow::Result<()> {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
                 }
             }
+            // Stop reconciling before the shutdown pauses start: those write
+            // paused records this task would otherwise be racing to inspect.
+            paused_reconcile.abort();
             info!(target: "agentenv", "stopping sandboxes before process exit");
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
@@ -215,6 +231,29 @@ async fn main() -> anyhow::Result<()> {
     shutdown_cleanup.await?;
 
     Ok(())
+}
+
+/// Keeps this node's paused records in step with the cluster.
+///
+/// A node that loses a sandbox to another node is never told about it: the
+/// resume happens elsewhere, against a registry row this node does not watch.
+/// Until it notices, it keeps the sandbox in its heartbeat roster and the
+/// scheduler's binding for that sandbox flaps between the two nodes. Only
+/// re-checking on a timer closes that, so this runs for as long as the server
+/// does.
+fn spawn_paused_record_reconciler(
+    api_impl: Arc<ApiImpl>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The startup pass already ran; skip the immediate first tick.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            api_impl.reconcile_local_paused_records().await;
+        }
+    })
 }
 
 async fn shutdown_signal() {

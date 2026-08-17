@@ -782,13 +782,15 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
-        match self.orchestrator.delete_sandbox(sandbox_id).await {
-            Ok(_) => {
-                // Drop the cluster record too. Without this a deleted sandbox
-                // leaves a row pointing at a snapshot nobody will ever resume,
-                // and the snapshot's layers stay in the repository forever.
-                self.forget_paused_sandbox(sandbox_id).await;
+        // A leftover paused record here is not the sandbox — it may well be
+        // running on another node. Drop it first so the delete below acts on
+        // something this node actually owns.
+        self.discard_if_superseded(sandbox_id).await;
 
+        match self.orchestrator.delete_sandbox(sandbox_id).await {
+            // The orchestrator drops the cluster record and its snapshot as
+            // part of the delete.
+            Ok(_) => {
                 Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
@@ -1066,15 +1068,11 @@ impl Sandboxes<()> for ApiImpl {
             .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
             .await
         {
-            Ok(outcome) => {
-                // Publish + register so the sandbox survives losing this node.
-                // A no-op with the default node-local registry.
-                self.register_paused_sandbox(sandbox_id, outcome).await;
-
-                Ok(
-                    SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
-                )
-            }
+            // The orchestrator publishes and registers the pause itself, so
+            // every pause path gets it — this one, expiry, and shutdown alike.
+            Ok(_) => Ok(
+                SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
+            ),
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
@@ -1260,11 +1258,9 @@ impl Sandboxes<()> for ApiImpl {
             )
             .await
         {
+            // Resumed from local artifacts. The orchestrator repoints the
+            // cluster record at this node as part of the resume.
             Ok(metadata) => {
-                // Resumed from local artifacts; any cluster record for it is
-                // now stale.
-                self.forget_paused_sandbox(sandbox_id).await;
-
                 return Ok(
                     SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
                         self.sandbox_model(metadata),

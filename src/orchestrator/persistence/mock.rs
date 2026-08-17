@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tonic::async_trait;
 
 use super::super::store::SandboxMetadata;
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{ClusterRegistration, PersistenceResult, SandboxPersistenceError, SandboxPersister};
 use crate::sandbox::PausedSandboxState;
 use crate::types::SandboxId;
 
@@ -122,14 +122,21 @@ impl SandboxPersister for RecordingPersister {
         Ok(())
     }
 
-    async fn mark_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+    async fn mark_cluster_registered(
+        &self,
+        _sandbox_id: &SandboxId,
+        _node_id: &str,
+    ) -> PersistenceResult<()> {
         self.record(RecordingCall::MarkClusterRegistered);
 
         Ok(())
     }
 
-    async fn is_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<bool> {
-        Ok(false)
+    async fn cluster_registration(
+        &self,
+        _sandbox_id: &SandboxId,
+    ) -> PersistenceResult<ClusterRegistration> {
+        Ok(ClusterRegistration::Never)
     }
 
     async fn mark_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {

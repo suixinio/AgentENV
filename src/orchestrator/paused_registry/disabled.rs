@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::{PausedSandboxEntry, PausedSandboxRegistry, RegistryResult, ResumeClaim};
+use super::{BeganPause, PausedSandboxEntry, PausedSandboxRegistry, RegistryResult, ResumeClaim};
 use crate::snapshot::SnapshotId;
 use crate::types::SandboxId;
 
@@ -15,8 +15,11 @@ pub struct DisabledPausedSandboxRegistry;
 
 #[async_trait]
 impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
-    async fn begin_pause(&self, _entry: &PausedSandboxEntry) -> RegistryResult<i64> {
-        Ok(0)
+    async fn begin_pause(&self, _entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
+        Ok(BeganPause {
+            generation: 0,
+            previous_snapshot_id: None,
+        })
     }
 
     async fn complete_pause(
@@ -49,6 +52,10 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
     }
 
     async fn release_claim(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<()> {
+        Ok(())
+    }
+
+    async fn mark_running(&self, _sandbox_id: &SandboxId, _node_id: &str) -> RegistryResult<()> {
         Ok(())
     }
 

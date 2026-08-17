@@ -7,8 +7,8 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::{
-    PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
-    RegistryResult, ResumeClaim,
+    BeganPause, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
+    PausedSandboxRegistry, RegistryResult, ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
@@ -17,7 +17,7 @@ use crate::types::SandboxId;
 /// Columns every read path selects, in one place so the row decoder stays in
 /// sync with the queries.
 const ENTRY_COLUMNS: &str = "sandbox_id, cluster_id, state, generation, origin_node_id, \
-                             snapshot_id, metadata, paused_at, updated_at";
+                             claimed_by_node_id, snapshot_id, metadata, paused_at, updated_at";
 
 /// Idempotent schema bootstrap.
 ///
@@ -25,11 +25,19 @@ const ENTRY_COLUMNS: &str = "sandbox_id, cluster_id, state, generation, origin_n
 /// registry is a single-purpose index whose shape is owned by this module, and a
 /// node must be able to come up against a fresh database without an out-of-band
 /// migration step.
+///
+/// Everything after the `CREATE TABLE` brings an already-deployed table up to
+/// the current shape, because `CREATE TABLE IF NOT EXISTS` silently does
+/// nothing when the table exists — including when its columns and constraints
+/// are a version behind. Each statement is written to be a no-op on a table
+/// that is already current, so this runs unchanged on both a fresh database and
+/// one seeded by an earlier build. The whole script is one implicit
+/// transaction, so a node either sees the old shape or the new one.
 const SCHEMA_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS paused_sandboxes (
     sandbox_id     UUID        PRIMARY KEY,
     cluster_id     UUID        NOT NULL,
-    state          TEXT        NOT NULL CHECK (state IN ('publishing', 'paused', 'resuming', 'local_only')),
+    state          TEXT        NOT NULL,
     generation     BIGINT      NOT NULL,
     origin_node_id TEXT        NOT NULL,
     snapshot_id    UUID,
@@ -37,6 +45,10 @@ CREATE TABLE IF NOT EXISTS paused_sandboxes (
     paused_at      TIMESTAMPTZ NOT NULL,
     updated_at     TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS claimed_by_node_id TEXT;
+ALTER TABLE paused_sandboxes DROP CONSTRAINT IF EXISTS paused_sandboxes_state_check;
+ALTER TABLE paused_sandboxes ADD CONSTRAINT paused_sandboxes_state_check
+    CHECK (state IN ('publishing', 'paused', 'resuming', 'local_only', 'running'));
 CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
 CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
 "#;
@@ -171,6 +183,9 @@ impl PostgresPausedSandboxRegistry {
             origin_node_id: row
                 .try_get("origin_node_id")
                 .map_err(|e| PausedRegistryError::backend("decode origin_node_id", anyhow!(e)))?,
+            claimed_by_node_id: row.try_get("claimed_by_node_id").map_err(|e| {
+                PausedRegistryError::backend("decode claimed_by_node_id", anyhow!(e))
+            })?,
             snapshot_id: snapshot_uuid.map(SnapshotId::from_uuid),
             metadata,
             paused_at: row
@@ -196,7 +211,7 @@ impl PostgresPausedSandboxRegistry {
 
 #[async_trait]
 impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
-    async fn begin_pause(&self, entry: &PausedSandboxEntry) -> RegistryResult<i64> {
+    async fn begin_pause(&self, entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
         let metadata = serde_json::to_value(&entry.metadata).map_err(|e| {
             PausedRegistryError::InvalidRecord {
                 sandbox_id: entry.sandbox_id.to_string(),
@@ -209,22 +224,38 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         // A re-pause of a sandbox that already has a row (paused -> resumed ->
         // paused) reuses the row and bumps the generation, so any in-flight
         // writer holding the previous generation is fenced out.
+        //
+        // The `previous` CTE reads the row as it stood before the upsert (every
+        // CTE sees the same statement-start snapshot), which is the only way to
+        // learn the snapshot this pause is about to orphan — `RETURNING` would
+        // hand back the new row. A sandbox is only ever paused from the one node
+        // running it, so nothing else can be rewriting this row concurrently.
         let row = sqlx::query(
             r#"
-            INSERT INTO paused_sandboxes (
-                sandbox_id, cluster_id, state, generation, origin_node_id,
-                snapshot_id, metadata, paused_at, updated_at
+            WITH previous AS (
+                SELECT snapshot_id FROM paused_sandboxes WHERE sandbox_id = $1
+            ),
+            upserted AS (
+                INSERT INTO paused_sandboxes (
+                    sandbox_id, cluster_id, state, generation, origin_node_id,
+                    claimed_by_node_id, snapshot_id, metadata, paused_at, updated_at
+                )
+                VALUES ($1, $2, 'publishing', 1, $3, NULL, NULL, $4, $5, $5)
+                ON CONFLICT (sandbox_id) DO UPDATE SET
+                    state              = 'publishing',
+                    generation         = paused_sandboxes.generation + 1,
+                    origin_node_id     = EXCLUDED.origin_node_id,
+                    claimed_by_node_id = NULL,
+                    snapshot_id        = NULL,
+                    metadata           = EXCLUDED.metadata,
+                    paused_at          = EXCLUDED.paused_at,
+                    updated_at         = EXCLUDED.updated_at
+                RETURNING generation
             )
-            VALUES ($1, $2, 'publishing', 1, $3, NULL, $4, $5, $5)
-            ON CONFLICT (sandbox_id) DO UPDATE SET
-                state          = 'publishing',
-                generation     = paused_sandboxes.generation + 1,
-                origin_node_id = EXCLUDED.origin_node_id,
-                snapshot_id    = NULL,
-                metadata       = EXCLUDED.metadata,
-                paused_at      = EXCLUDED.paused_at,
-                updated_at     = EXCLUDED.updated_at
-            RETURNING generation
+            SELECT upserted.generation AS generation,
+                   previous.snapshot_id AS previous_snapshot_id
+              FROM upserted
+              LEFT JOIN previous ON TRUE
             "#,
         )
         .bind(entry.sandbox_id.into_inner())
@@ -239,10 +270,16 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         let generation: i64 = row
             .try_get("generation")
             .map_err(|e| PausedRegistryError::backend("begin_pause generation", anyhow!(e)))?;
+        let previous_snapshot: Option<Uuid> = row.try_get("previous_snapshot_id").map_err(|e| {
+            PausedRegistryError::backend("begin_pause previous_snapshot_id", anyhow!(e))
+        })?;
 
         debug!(sandbox_id = %entry.sandbox_id, generation, "registered paused sandbox");
 
-        Ok(generation)
+        Ok(BeganPause {
+            generation,
+            previous_snapshot_id: previous_snapshot.map(SnapshotId::from_uuid),
+        })
     }
 
     async fn complete_pause(
@@ -306,18 +343,31 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         node_id: &str,
     ) -> RegistryResult<ResumeClaim> {
         // `origin_node_id` deliberately stays untouched: it still names the node
-        // holding the local fast-path artifacts, and it only becomes wrong once
-        // this resume succeeds — at which point the row is removed entirely.
+        // holding the local fast-path artifacts, and it only becomes right again
+        // once this resume succeeds and `mark_running` repoints it here.
+        // `claimed_by_node_id` is what says who is doing the work meanwhile —
+        // without it the origin node cannot tell a resume happening elsewhere
+        // from its own row and would happily start a second copy.
+        //
+        // `running` is claimable too, and on purpose: the row only reads
+        // `running` while some node holds the sandbox, and a resume reaches this
+        // path only when no node is bound to it — i.e. the holder is gone. The
+        // last durable snapshot is then the best truth left, exactly as it is
+        // for a paused sandbox.
         let sql = format!(
             r#"
             UPDATE paused_sandboxes
-               SET state = 'resuming', generation = generation + 1, updated_at = $2
-             WHERE sandbox_id = $1 AND state = 'paused'
+               SET state = 'resuming', claimed_by_node_id = $2,
+                   generation = generation + 1, updated_at = $3
+             WHERE sandbox_id = $1
+               AND state IN ('paused', 'running')
+               AND snapshot_id IS NOT NULL
             RETURNING {ENTRY_COLUMNS}
             "#
         );
         let claimed = sqlx::query(&sql)
             .bind(sandbox_id.into_inner())
+            .bind(node_id)
             .bind(Utc::now())
             .fetch_optional(&self.pool)
             .await
@@ -330,8 +380,8 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
             return Ok(ResumeClaim::Claimed(Box::new(entry)));
         }
 
-        // The claim did not match. Re-read to tell the three reasons apart, so
-        // the caller can redirect instead of reporting a bare "not found".
+        // The claim did not match. Re-read to tell the reasons apart, so the
+        // caller can redirect instead of reporting a bare "not found".
         match self.fetch(sandbox_id).await? {
             None => Ok(ResumeClaim::NotFound),
             Some(entry) => match entry.state {
@@ -342,9 +392,13 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
                         origin_node_id: entry.origin_node_id,
                     })
                 }
-                PausedRegistryState::Resuming => Ok(ResumeClaim::Conflict {
-                    origin_node_id: entry.origin_node_id,
-                }),
+                // Someone else is bringing it up, or it is live somewhere with
+                // no snapshot behind it yet. Either way this node must not.
+                PausedRegistryState::Resuming | PausedRegistryState::Running => {
+                    Ok(ResumeClaim::Conflict {
+                        origin_node_id: entry.claimed_by_node_id.unwrap_or(entry.origin_node_id),
+                    })
+                }
                 // Lost a race with another claimer that has since released it.
                 PausedRegistryState::Paused => Ok(ResumeClaim::Conflict {
                     origin_node_id: entry.origin_node_id,
@@ -354,10 +408,13 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
     }
 
     async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()> {
+        // Back to `paused` even when the claim was taken over a `running` row:
+        // the claim is only ever handed out when no node holds the sandbox, so
+        // its snapshot is the whole truth and `paused` is what describes that.
         sqlx::query(
             r#"
             UPDATE paused_sandboxes
-               SET state = 'paused', updated_at = $3
+               SET state = 'paused', claimed_by_node_id = NULL, updated_at = $3
              WHERE sandbox_id = $1 AND generation = $2 AND state = 'resuming'
             "#,
         )
@@ -367,6 +424,31 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         .execute(&self.pool)
         .await
         .map_err(|e| PausedRegistryError::backend("release_claim", anyhow!(e)))?;
+
+        Ok(())
+    }
+
+    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<()> {
+        // No generation guard and no insert. A sandbox runs on exactly one node,
+        // and that node is the one calling this, so there is no competing writer
+        // to fence out. The missing insert is the important half: a sandbox the
+        // cluster was never told about must stay that way, otherwise every
+        // resume on a node with a node-local history would start publishing
+        // rows for sandboxes that have no snapshot behind them.
+        sqlx::query(
+            r#"
+            UPDATE paused_sandboxes
+               SET state = 'running', origin_node_id = $2, claimed_by_node_id = NULL,
+                   generation = generation + 1, updated_at = $3
+             WHERE sandbox_id = $1
+            "#,
+        )
+        .bind(sandbox_id.into_inner())
+        .bind(node_id)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PausedRegistryError::backend("mark_running", anyhow!(e)))?;
 
         Ok(())
     }

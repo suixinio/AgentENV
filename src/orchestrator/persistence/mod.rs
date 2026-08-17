@@ -58,6 +58,26 @@ impl SandboxPersistenceError {
     }
 }
 
+/// Whether a paused record was ever announced to a cluster registry, and under
+/// which node identity.
+///
+/// The identity matters because it, not the node's *current* identity, is what
+/// a registry row must be compared against. A node's ID is only as stable as
+/// whatever supplies it — under Kubernetes it is commonly the pod name, which
+/// changes every time the pod is recreated — and a node that mistook its own
+/// rows for another node's would discard every paused sandbox it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterRegistration {
+    /// Never announced. The local copy is the only copy, so nothing the
+    /// registry says (including saying nothing) may be acted on.
+    Never,
+    /// Announced by a build that did not record the identity it used. Only
+    /// facts that hold regardless of identity may be acted on.
+    Anonymous,
+    /// Announced under this identity.
+    As(String),
+}
+
 #[async_trait]
 /// Persistence interface for sandbox records and artifacts.
 pub trait SandboxPersister: Send + Sync {
@@ -86,15 +106,23 @@ pub trait SandboxPersister: Send + Sync {
     /// Mark a paused sandbox as resuming.
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
-    /// Record that this paused sandbox has been announced to a cluster registry.
-    async fn mark_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+    /// Record that this paused sandbox has been announced to a cluster registry
+    /// under `node_id`.
+    async fn mark_cluster_registered(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+    ) -> PersistenceResult<()>;
 
     /// Whether this paused sandbox was ever announced to a cluster registry.
     ///
     /// Records that never were must be left alone by reconciliation: for them
     /// the local copy is the only copy, so "absent from the registry" carries
     /// no information at all.
-    async fn is_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<bool>;
+    async fn cluster_registration(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<ClusterRegistration>;
 
     /// Roll back a resuming mark after a failed resume attempt.
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
@@ -134,12 +162,19 @@ impl SandboxPersister for DisabledSandboxPersister {
         Ok(())
     }
 
-    async fn mark_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+    async fn mark_cluster_registered(
+        &self,
+        _sandbox_id: &SandboxId,
+        _node_id: &str,
+    ) -> PersistenceResult<()> {
         Ok(())
     }
 
-    async fn is_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<bool> {
-        Ok(false)
+    async fn cluster_registration(
+        &self,
+        _sandbox_id: &SandboxId,
+    ) -> PersistenceResult<ClusterRegistration> {
+        Ok(ClusterRegistration::Never)
     }
 
     async fn mark_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {

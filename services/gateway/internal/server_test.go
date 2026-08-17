@@ -20,6 +20,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type stubSchedulerClient struct {
@@ -2196,5 +2198,105 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 	getReq := httptest.NewRequest(http.MethodGet, "/process.Process/StreamInput", nil)
 	if isStreamInputProxyRequest(getReq) {
 		t.Fatalf("GET StreamInput should not be classified as stream input")
+	}
+}
+
+func TestIsPausedSandboxRecoveryRequest(t *testing.T) {
+	cases := []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodPost, "/sandboxes/sbx-1/resume", true},
+		{http.MethodPost, "/sandboxes/sbx-1/resume/", true},
+		// Every other endpoint addresses a sandbox the caller believes is live,
+		// so it must never be handed to a node that does not hold it.
+		{http.MethodPost, "/sandboxes/sbx-1/pause", false},
+		{http.MethodPost, "/sandboxes/sbx-1/fork", false},
+		{http.MethodPost, "/sandboxes/sbx-1/connect", false},
+		{http.MethodGet, "/sandboxes/sbx-1", false},
+		{http.MethodGet, "/sandboxes/sbx-1/resume", false},
+		{http.MethodPost, "/sandboxes", false},
+	}
+
+	for _, tc := range cases {
+		request := httptest.NewRequest(tc.method, tc.path, nil)
+		if got := isPausedSandboxRecoveryRequest(request); got != tc.want {
+			t.Fatalf("%s %s: expected %v, got %v", tc.method, tc.path, tc.want, got)
+		}
+	}
+}
+
+// A resume for a sandbox no node currently holds must reach a scheduled node,
+// which then tries to claim it from the paused registry, rather than failing at
+// the gateway. This is what lets a sandbox outlive the node that paused it.
+func TestResumeOfUnassignedSandboxRoutesToScheduledNode(t *testing.T) {
+	forwarded := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded <- r.URL.Path
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer upstream.Close()
+
+	scheduleCalled := 0
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			return nil, status.Error(codes.NotFound, "sandbox assignment not found")
+		},
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalled++
+			return &schedulerv1.ScheduleResponse{
+				Node: &schedulerv1.Node{NodeId: "node-b", Endpoint: upstream.URL},
+			}, nil
+		},
+		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, 5*time.Second, 4<<20)
+
+	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader("{}"))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", response.Code)
+	}
+	if scheduleCalled != 1 {
+		t.Fatalf("expected exactly one Schedule call, got %d", scheduleCalled)
+	}
+	select {
+	case path := <-forwarded:
+		if path != "/sandboxes/sbx-1/resume" {
+			t.Fatalf("unexpected upstream path: %s", path)
+		}
+	default:
+		t.Fatal("request was not forwarded to the scheduled node")
+	}
+}
+
+// The control: the same missing assignment on a non-resume endpoint must still
+// fail at the gateway. Without this, the test above would pass even if the
+// fallback fired for every sandbox request.
+func TestPauseOfUnassignedSandboxDoesNotReschedule(t *testing.T) {
+	scheduleCalled := 0
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			return nil, status.Error(codes.NotFound, "sandbox assignment not found")
+		},
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalled++
+			return nil, status.Error(codes.Internal, "should not be called")
+		},
+	}, 5*time.Second, 4<<20)
+
+	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", response.Code)
+	}
+	if scheduleCalled != 0 {
+		t.Fatalf("expected no Schedule call, got %d", scheduleCalled)
 	}
 }

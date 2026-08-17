@@ -196,16 +196,37 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
+	// Set when a resume was routed to a node that does not hold the sandbox, so
+	// the assignment gets recorded as soon as that node brings it back up.
+	recoveredSandbox := false
 
 	if hasSandbox {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
-		if err != nil {
+		switch {
+		case err == nil:
+			node = resp.GetNode()
+		case status.Code(err) == codes.NotFound && isPausedSandboxRecoveryRequest(r):
+			// No node holds this sandbox. It may still be paused elsewhere in
+			// the cluster with its snapshot in shared storage, and the node that
+			// paused it may be gone for good — so instead of answering "not
+			// found" from the gateway, hand the resume to a scheduled node and
+			// let it claim the sandbox from the paused registry. A sandbox that
+			// genuinely does not exist still comes back 404, from that node.
+			recovery, recoveryErr := s.scheduleRecoveryNode(routingCtx, sandboxID)
+			if recoveryErr != nil {
+				// Report the original lookup failure: the sandbox not being
+				// assigned anywhere is the more useful error here.
+				s.writeSchedulerError(w, err)
+				return
+			}
+			node = recovery
+			recoveredSandbox = true
+		default:
 			s.writeSchedulerError(w, err)
 			return
 		}
-		node = resp.GetNode()
 	} else {
 		hint, err := buildScheduleHint(r)
 		if err != nil {
@@ -257,7 +278,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upstreamURL,
 		node,
 		proxyRequestOptions{
-			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
+			recordAssignment: recoveredSandbox || shouldRecordAssignment(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 		},
@@ -560,6 +581,49 @@ func sandboxIDFromPath(path string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+// isPausedSandboxRecoveryRequest reports whether a request may be served by a
+// node that has never run the sandbox.
+//
+// Only resume qualifies. Every other sandbox endpoint addresses a sandbox the
+// caller believes is live somewhere, and sending those to an arbitrary node
+// would turn a stale routing entry into a confusing 404 against the wrong node.
+// Resume is different: it is the one operation whose whole purpose is to bring
+// a sandbox back from a snapshot, and the node-side handler already falls back
+// to the paused registry when it does not hold the sandbox locally.
+func isPausedSandboxRecoveryRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+
+	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" &&
+		parts[2] == "resume"
+}
+
+// scheduleRecoveryNode picks the node that will attempt to rebuild a paused
+// sandbox nobody currently holds.
+func (s *Server) scheduleRecoveryNode(ctx context.Context, sandboxID string) (*schedulerv1.Node, error) {
+	rpcStart := time.Now()
+	resp, err := s.scheduler.Schedule(ctx, &schedulerv1.ScheduleRequest{})
+	recordGatewaySchedulerRPC("Schedule", rpcStart, err)
+	if err != nil {
+		s.logger.Warn("no node available to recover an unassigned sandbox",
+			zap.String("sandbox_id", sandboxID),
+			zap.Error(err),
+		)
+
+		return nil, err
+	}
+
+	node := resp.GetNode()
+	s.logger.Info("routing resume of an unassigned sandbox to a scheduled node",
+		zap.String("sandbox_id", sandboxID),
+		zap.String("node_id", node.GetNodeId()),
+	)
+
+	return node, nil
 }
 
 func isSandboxControlPlaneRequest(r *http.Request) bool {

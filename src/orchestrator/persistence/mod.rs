@@ -86,6 +86,16 @@ pub trait SandboxPersister: Send + Sync {
     /// Mark a paused sandbox as resuming.
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
+    /// Record that this paused sandbox has been announced to a cluster registry.
+    async fn mark_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+
+    /// Whether this paused sandbox was ever announced to a cluster registry.
+    ///
+    /// Records that never were must be left alone by reconciliation: for them
+    /// the local copy is the only copy, so "absent from the registry" carries
+    /// no information at all.
+    async fn is_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<bool>;
+
     /// Roll back a resuming mark after a failed resume attempt.
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
@@ -122,6 +132,14 @@ impl SandboxPersister for DisabledSandboxPersister {
         _paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
         Ok(())
+    }
+
+    async fn mark_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Ok(())
+    }
+
+    async fn is_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<bool> {
+        Ok(false)
     }
 
     async fn mark_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {

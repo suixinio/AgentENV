@@ -17,9 +17,9 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -275,8 +275,8 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn pause(
         &mut self,
-        _artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        artifact_root: Option<&Path>,
+    ) -> SandboxCaptureResult<PausedSandboxCapture> {
         let pause_result = self
             .behavior
             .apply_capture_result(MockOperation::Pause)
@@ -292,7 +292,12 @@ impl SandboxBackend for MockSandboxBackend {
             }
             return Err(pause_err);
         }
-        Ok(Arc::new(MockSnapshot))
+        // Mirrors the real backend: a pause into a caller-owned artifact root
+        // can also be published, a pause into managed temporaries cannot.
+        Ok(PausedSandboxCapture {
+            state: Arc::new(MockSnapshot),
+            publishable: artifact_root.map(|_| CapturedSandboxSnapshot::new(MockCapturedSnapshot)),
+        })
     }
 
     async fn resume(&mut self) -> Result<()> {

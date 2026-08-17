@@ -1,10 +1,10 @@
 use std::sync::{Arc, RwLock};
 
-use agentenv::api::{server, ApiImpl};
+use agentenv::api::{server, ApiImpl, PausedSandboxWiring};
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
-use agentenv::orchestrator::Orchestrator;
+use agentenv::orchestrator::{build_paused_registry, Orchestrator};
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
@@ -81,6 +81,9 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
+    // `identity` is moved into the observability service below; the registry
+    // wiring needs the same node/cluster identity afterwards.
+    let identity_for_registry = identity.clone();
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
     let overlaybd_p2p =
@@ -140,14 +143,21 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let paused_registry =
+        build_paused_registry(&config.orchestrator.paused_registry, &identity_for_registry).await?;
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
         snapshot_manager,
         template_builder,
         image_resolver,
         observability,
+        PausedSandboxWiring::new(paused_registry, &identity_for_registry),
         config.sandbox_proxy.domains.clone(),
     ));
+    // Runs before the listener opens: a resume that arrives first must not find
+    // a paused record the cluster has already moved past.
+    api_impl.reconcile_local_paused_records().await;
+
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

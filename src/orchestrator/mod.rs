@@ -1,5 +1,6 @@
 mod launch_plan;
 mod metrics;
+mod paused_registry;
 mod persistence;
 mod proxy;
 mod service;
@@ -10,6 +11,11 @@ use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
+pub use paused_registry::{
+    build_paused_registry, DisabledPausedSandboxRegistry, PausedRegistryError, PausedRegistryState,
+    PausedSandboxEntry, PausedSandboxRegistry, PostgresPausedSandboxRegistry, RegistryResult,
+    ResumeClaim,
+};
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,
@@ -21,8 +27,8 @@ pub use store::{
     SandboxTimeoutAction,
 };
 pub use types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, PauseOutcome, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

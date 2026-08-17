@@ -31,9 +31,9 @@ use crate::sandbox::custom_extension::{
 use crate::cfg::ConfigManager;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
+    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
@@ -201,7 +201,10 @@ pub struct FirecrackerSandbox {
 #[derive(Debug)]
 pub struct FirecrackerCapturedSnapshot {
     manifest: FirecrackerSnapshotManifest,
-    _snapshot_root: Arc<PersistentSnapshotRootGuard>,
+    /// Keeps a backend-managed snapshot directory alive until the repository
+    /// has published it. `None` when the artifacts sit in a caller-owned
+    /// directory that outlives this value on its own.
+    _snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,7 +250,17 @@ impl FirecrackerCapturedSnapshot {
     ) -> Self {
         Self {
             manifest,
-            _snapshot_root: snapshot_root,
+            _snapshot_root: Some(snapshot_root),
+        }
+    }
+
+    /// A capture whose artifacts live in a directory the caller owns (the
+    /// persister's artifact root), so nothing needs to keep a managed snapshot
+    /// root alive on its behalf.
+    pub(crate) fn in_caller_owned_dir(manifest: FirecrackerSnapshotManifest) -> Self {
+        Self {
+            manifest,
+            _snapshot_root: None,
         }
     }
 
@@ -274,15 +287,23 @@ impl SandboxBackend for FirecrackerSandbox {
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+    ) -> SandboxCaptureResult<PausedSandboxCapture> {
+        // Both arms capture the sandbox exactly once. The caller-managed arm
+        // also keeps the manifest: its artifacts live in a directory that
+        // outlives this runtime, so the very same capture can be published to
+        // the snapshot repository and resumed on another node. The managed arm
+        // captures into a temporary root that is reclaimed with the paused
+        // state, which nothing outside this node may reference.
         let pause_result = match artifact_root {
             Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
                 .await
-                .map(|(snapshot_config, _)| snapshot_config),
-            None => FirecrackerSandbox::pause(self).await,
+                .map(|(snapshot_config, manifest)| (snapshot_config, Some(manifest))),
+            None => FirecrackerSandbox::pause(self)
+                .await
+                .map(|snapshot_config| (snapshot_config, None)),
         };
-        let snapshot_config = match pause_result {
-            Ok(snapshot_config) => snapshot_config,
+        let (snapshot_config, manifest) = match pause_result {
+            Ok(captured) => captured,
             Err(err) => {
                 let pause_err = SandboxCaptureError::from(err);
                 if pause_err.is_terminal() {
@@ -296,7 +317,14 @@ impl SandboxBackend for FirecrackerSandbox {
                 return Err(pause_err);
             }
         };
-        Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
+        Ok(PausedSandboxCapture {
+            state: Arc::new(FirecrackerPausedState::new(snapshot_config)),
+            publishable: manifest.map(|manifest| {
+                CapturedSandboxSnapshot::new(FirecrackerCapturedSnapshot::in_caller_owned_dir(
+                    manifest,
+                ))
+            }),
+        })
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {

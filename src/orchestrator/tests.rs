@@ -4746,3 +4746,68 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
     orchestrator.delete_sandbox(source.id).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn discard_local_paused_record_drops_a_paused_sandbox() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let discarded = orchestrator.discard_local_paused_record(created.id).await?;
+
+    assert!(discarded, "a paused record should be discardable");
+    assert!(
+        orchestrator.store.get(&created.id).await?.is_none(),
+        "the local record should be gone"
+    );
+
+    Ok(())
+}
+
+/// The dangerous direction: reconciliation runs against whatever the registry
+/// reports, so a wrong answer must never be able to take down a live sandbox.
+#[tokio::test]
+async fn discard_local_paused_record_refuses_a_running_sandbox() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    let discarded = orchestrator.discard_local_paused_record(created.id).await?;
+
+    assert!(!discarded, "a running sandbox must never be discarded");
+    let metadata = orchestrator
+        .store
+        .get(&created.id)
+        .await?
+        .expect("running sandbox should still be tracked");
+    assert_eq!(metadata.state, SandboxState::Running);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_local_paused_record_is_a_noop_for_unknown_sandboxes() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+
+    assert!(
+        !orchestrator
+            .discard_local_paused_record(SandboxId::new())
+            .await?
+    );
+
+    Ok(())
+}
+
+/// Reconciliation reads "no row" as "this sandbox moved on". A registry that
+/// tracks nothing answers that for every sandbox, so it must never be treated
+/// as cluster-backed — otherwise the first reconciliation pass would discard
+/// every paused sandbox on the node.
+#[test]
+fn disabled_registry_is_not_cluster_backed() {
+    use crate::orchestrator::{DisabledPausedSandboxRegistry, PausedSandboxRegistry};
+
+    assert!(!DisabledPausedSandboxRegistry.is_cluster_backed());
+}

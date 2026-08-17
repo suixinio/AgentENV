@@ -134,6 +134,33 @@ pub struct CapturedSandboxSnapshot {
     inner: Box<dyn Any + Send>,
 }
 
+/// Everything a single pause produced.
+///
+/// A pause captures the sandbox once and can express that capture two ways: the
+/// backend-specific state the *same* node reopens on resume, and — when the
+/// capture landed in a caller-managed artifact directory that outlives the
+/// runtime — the publishable form a snapshot repository can commit so *any*
+/// node can rebuild the sandbox. Both come out of the same capture, so offering
+/// the publishable form costs no second snapshot.
+pub struct PausedSandboxCapture {
+    /// Reopened by the origin node on a local resume.
+    pub state: Arc<dyn PausedSandboxState>,
+    /// `None` when the backend cannot hand out a publishable capture — for
+    /// example a pause into backend-managed temporary artifacts, which are
+    /// reclaimed as soon as the paused state is dropped.
+    pub publishable: Option<CapturedSandboxSnapshot>,
+}
+
+impl PausedSandboxCapture {
+    /// A capture that only the pausing node can reopen.
+    pub fn local_only(state: Arc<dyn PausedSandboxState>) -> Self {
+        Self {
+            state,
+            publishable: None,
+        }
+    }
+}
+
 impl CapturedSandboxSnapshot {
     pub fn new<T>(snapshot: T) -> Self
     where
@@ -204,7 +231,7 @@ pub trait SandboxBackend: Send + 'static {
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
+    ) -> SandboxCaptureResult<PausedSandboxCapture>;
 
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.
     ///

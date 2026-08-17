@@ -2,6 +2,7 @@ mod admin;
 mod attached_drives;
 mod auth;
 mod pagination;
+mod paused_recovery;
 mod sandbox;
 mod snapshots;
 mod template;
@@ -13,9 +14,10 @@ use anyhow::Error as AnyhowError;
 use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
+use crate::identity::NodeIdentity;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{Orchestrator, PausedSandboxRegistry};
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
@@ -24,10 +26,32 @@ use agentenv_http_server::{apis, models};
 #[derive(Clone, Debug)]
 pub struct Claims;
 
+/// Everything the API layer needs to make a paused sandbox recoverable beyond
+/// the node that paused it. Passed as one value so enabling cross-node recovery
+/// stays a single wiring decision at startup.
+pub struct PausedSandboxWiring {
+    pub registry: Arc<dyn PausedSandboxRegistry>,
+    pub node_id: String,
+}
+
+impl PausedSandboxWiring {
+    pub fn new(registry: Arc<dyn PausedSandboxRegistry>, identity: &NodeIdentity) -> Self {
+        Self {
+            registry,
+            node_id: identity.id.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiImpl {
     orchestrator: Arc<Orchestrator>,
     snapshot_manager: Arc<SnapshotManager>,
+    /// Cluster-wide index of paused sandboxes. With the default `local`
+    /// backend every call is a no-op and pause/resume stay node-local.
+    paused_registry: Arc<dyn PausedSandboxRegistry>,
+    /// This node's ID, recorded as the origin of the snapshots it publishes.
+    node_id: String,
     template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
     observability: Option<Arc<ObservabilityService>>,
@@ -42,11 +66,14 @@ impl ApiImpl {
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
         observability: Option<Arc<ObservabilityService>>,
+        paused: PausedSandboxWiring,
         sandbox_proxy_domains: Vec<String>,
     ) -> Self {
         Self {
             orchestrator,
             snapshot_manager,
+            paused_registry: paused.registry,
+            node_id: paused.node_id,
             template_builder,
             image_resolver,
             observability,

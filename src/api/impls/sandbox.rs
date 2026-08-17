@@ -28,6 +28,7 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
+use super::paused_recovery::CrossNodeResume;
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -783,11 +784,23 @@ impl Sandboxes<()> for ApiImpl {
         };
         match self.orchestrator.delete_sandbox(sandbox_id).await {
             Ok(_) => {
+                // Drop the cluster record too. Without this a deleted sandbox
+                // leaves a row pointing at a snapshot nobody will ever resume,
+                // and the snapshot's layers stay in the repository forever.
+                self.forget_paused_sandbox(sandbox_id).await;
+
                 Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)
             }
-            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
-                SandboxesSandboxIdDeleteResponse::Status404_NotFound(sandbox_not_found(id)),
-            ),
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                // The local node does not have it, but the cluster may still
+                // hold a paused record — deleting a sandbox that lives only as
+                // a published snapshot must still remove it.
+                self.forget_paused_sandbox(sandbox_id).await;
+
+                Ok(SandboxesSandboxIdDeleteResponse::Status404_NotFound(
+                    sandbox_not_found(id),
+                ))
+            }
             Err(err) => Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
                 err.into(),
             )),
@@ -1053,18 +1066,23 @@ impl Sandboxes<()> for ApiImpl {
             .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
             .await
         {
-            Ok(_) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
-            ),
+            Ok(outcome) => {
+                // Publish + register so the sandbox survives losing this node.
+                // A no-op with the default node-local registry.
+                self.register_paused_sandbox(sandbox_id, outcome).await;
+
+                Ok(
+                    SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
+                )
+            }
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ),
+                SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status409_Conflict(
-                    Self::error(409, format!("sandbox cannot be paused from {} state", state)),
-                ),
+                SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(
+                    409,
+                    format!("sandbox cannot be paused from {} state", state),
+                )),
             ),
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                 err.into(),
@@ -1228,6 +1246,11 @@ impl Sandboxes<()> for ApiImpl {
         };
         let timeout = duration_from_secs(body.timeout).unwrap_or(default_sandbox_timeout());
 
+        // If the cluster has moved past this sandbox — another node resumed it
+        // while this one was away — drop the leftover local record first, so the
+        // resume below cannot start a second copy alongside the live one.
+        self.discard_if_superseded(sandbox_id).await;
+
         let timer = SandboxStageTimer::new("resume");
         match timer
             .time(
@@ -1238,6 +1261,10 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(metadata) => {
+                // Resumed from local artifacts; any cluster record for it is
+                // now stale.
+                self.forget_paused_sandbox(sandbox_id).await;
+
                 return Ok(
                     SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
                         self.sandbox_model(metadata),
@@ -1245,9 +1272,44 @@ impl Sandboxes<()> for ApiImpl {
                 );
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ));
+                // This node has never run the sandbox. It may still be paused
+                // somewhere in the cluster, with its snapshot in the shared
+                // repository — rebuild it here under the same ID.
+                return Ok(match self
+                    .resume_from_registry(sandbox_id, NewTimeout::Set(timeout))
+                    .await
+                {
+                    CrossNodeResume::Restored(metadata) => {
+                        SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
+                            self.sandbox_model(*metadata),
+                        )
+                    }
+                    CrossNodeResume::NotFound => {
+                        SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                            sandbox_not_found(id),
+                        )
+                    }
+                    CrossNodeResume::NotReady { origin_node_id } => {
+                        SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
+                            409,
+                            format!(
+                                "sandbox snapshot is still being published by node '{origin_node_id}'"
+                            ),
+                        ))
+                    }
+                    CrossNodeResume::Conflict { origin_node_id } => {
+                        SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
+                            409,
+                            format!("sandbox is already being resumed by node '{origin_node_id}'"),
+                        ))
+                    }
+                    CrossNodeResume::Failed(reason) => {
+                        SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
+                            500,
+                            format!("failed to restore paused sandbox: {reason}"),
+                        ))
+                    }
+                });
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(

@@ -16,9 +16,9 @@ use crate::image::cache::{
 };
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
-    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
-    SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxNetworkPolicy, SandboxRuntimeInfo,
+    FreshSandboxBuildSpec, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
+    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
+    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -31,8 +31,8 @@ use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, S
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, PauseOutcome, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -334,6 +334,29 @@ where
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
+            this.create_sandbox_inner(sandbox_id, request).await
+        })
+        .await
+    }
+
+    /// Rebuilds a sandbox from a published snapshot under an ID it already had.
+    ///
+    /// This is the cross-node half of resume. The sandbox was paused on another
+    /// node and its snapshot committed to the shared repository; this node
+    /// brings it back under the *same* ID, so clients keep addressing it exactly
+    /// as before and the envd access token — derived from the sandbox ID —
+    /// stays valid.
+    ///
+    /// The caller owns the decision that this node may take the sandbox over.
+    /// Nothing here checks whether another node still holds it, so this must
+    /// only be called after winning a claim in the paused-sandbox registry.
+    pub async fn restore_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("restore", sandbox_id, async move {
             this.create_sandbox_inner(sandbox_id, request).await
         })
         .await
@@ -1005,6 +1028,77 @@ where
         Ok(())
     }
 
+    /// Records that a paused sandbox has been announced to a cluster registry.
+    ///
+    /// Only announced records may later be discarded by reconciliation, so this
+    /// is what makes "the registry has no row for it" mean anything at all.
+    pub async fn mark_paused_record_cluster_registered(&self, sandbox_id: SandboxId) -> Result<()> {
+        self.persister
+            .mark_cluster_registered(&sandbox_id)
+            .await
+            .map_err(|err| OrchestratorError::InternalError(err.to_string()))
+    }
+
+    /// Whether a paused record was ever announced to a cluster registry.
+    pub async fn paused_record_is_cluster_registered(&self, sandbox_id: SandboxId) -> Result<bool> {
+        self.persister
+            .is_cluster_registered(&sandbox_id)
+            .await
+            .map_err(|err| OrchestratorError::InternalError(err.to_string()))
+    }
+
+    /// Drops this node's local copy of a paused sandbox, leaving the sandbox
+    /// itself alone.
+    ///
+    /// Used when the cluster registry says the sandbox has moved on — another
+    /// node resumed it, or it was destroyed — so the local paused record is a
+    /// leftover from before. This is deliberately **not** a delete: the sandbox
+    /// may well be running on another node right now, so no `Delete` lifecycle
+    /// event is published and nothing is reported as killed.
+    ///
+    /// Returns whether a record was actually discarded. Anything other than
+    /// `Paused` is left untouched, so a stale reconciliation decision can never
+    /// take down a live sandbox, and a resume that started in the meantime wins
+    /// the state CAS.
+    #[tracing::instrument(
+        name = "discard_local_paused_record",
+        skip(self),
+        fields(sandbox_id = %sandbox_id)
+    )]
+    pub async fn discard_local_paused_record(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<bool> {
+        match self
+            .store
+            .update_state_if_state(&sandbox_id, SandboxState::Killing, &[SandboxState::Paused])
+            .await
+        {
+            Ok(_) => {}
+            Err(StoreError::StateConflict { actual_state, .. }) => {
+                debug!(state = ?actual_state, "not discarding: sandbox is not paused here");
+
+                return Ok(false);
+            }
+            Err(StoreError::SandboxNotFound { .. }) => return Ok(false),
+            Err(err) => return Err(OrchestratorError::from(err)),
+        }
+
+        self.store.remove(&sandbox_id).await?;
+        if let Err(err) = self
+            .persister
+            .delete_record_and_artifacts(&sandbox_id)
+            .await
+        {
+            warn!(error = ?err, "failed to delete stranded paused sandbox artifacts");
+        }
+        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            .await;
+        info!("discarded stranded local paused record");
+
+        Ok(true)
+    }
+
     /// Stops every known sandbox and tears down in-memory runtime state.
     ///
     /// This is single-flight: the first caller performs cleanup and subsequent
@@ -1038,7 +1132,7 @@ where
     /// If another `pause_sandbox` call is already in progress for the same
     /// sandbox (`Pausing` state), this call waits for it to complete and then
     /// returns the outcome rather than duplicating the work.
-    pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<PauseOutcome> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("pause", sandbox_id, async move {
             this.pause_sandbox_inner(sandbox_id).await
@@ -1051,7 +1145,7 @@ where
         skip(self),
         fields(sandbox_id = %sandbox_id)
     )]
-    async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<PauseOutcome> {
         info!("pausing sandbox");
         match self
             .store
@@ -1064,7 +1158,16 @@ where
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
                     SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
-                    SandboxState::Paused => Ok(()),
+                    // Already paused: idempotent success. The capture belongs
+                    // to the pause that produced it and is long gone, so this
+                    // caller gets the record without a publishable snapshot.
+                    SandboxState::Paused => match self.store.get(&sandbox_id).await? {
+                        Some(metadata) => Ok(PauseOutcome {
+                            metadata,
+                            publishable: None,
+                        }),
+                        None => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
+                    },
                     SandboxState::Killing => {
                         info!("sandbox is being deleted while pausing");
                         Err(OrchestratorError::SandboxNotFound(sandbox_id))
@@ -1146,8 +1249,8 @@ where
         };
 
         // If pausing failed, attempt to put the sandbox back and return an error.
-        let paused_state = match paused_state_result {
-            Ok(s) => s,
+        let capture = match paused_state_result {
+            Ok(capture) => capture,
             Err(err) => {
                 warn!(error = ?err, "failed to pause sandbox");
                 if err.is_terminal() {
@@ -1185,6 +1288,11 @@ where
                 });
             }
         };
+
+        let PausedSandboxCapture {
+            state: paused_state,
+            publishable,
+        } = capture;
 
         let persisted_metadata = {
             let mut metadata = self
@@ -1242,6 +1350,7 @@ where
             )));
         }
         let resources = persisted_metadata.resources;
+        let paused_metadata = persisted_metadata.clone();
         self.store.update(persisted_metadata).await?;
 
         // Stop the sandbox to free up resources.
@@ -1255,7 +1364,10 @@ where
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
 
-        Ok(())
+        Ok(PauseOutcome {
+            metadata: paused_metadata,
+            publishable,
+        })
     }
 
     /// Resumes a paused sandbox from its snapshot.
@@ -1781,8 +1893,12 @@ where
 
     /// Joins a concurrent pause already in progress for the same sandbox.
     /// Waits for the `Pausing` state to resolve and maps the final state to
-    /// the appropriate `Ok(())` / `Err(...)` result.
-    async fn join_concurrent_pause(&self, sandbox_id: SandboxId) -> Result<()> {
+    /// the appropriate `Ok(...)` / `Err(...)` result.
+    ///
+    /// The joined outcome never carries a publishable capture: the capture
+    /// belongs to the pause that produced it, and only that caller can publish
+    /// it. A joiner learns the pause succeeded, nothing more.
+    async fn join_concurrent_pause(&self, sandbox_id: SandboxId) -> Result<PauseOutcome> {
         debug!("concurrent pause in progress, waiting for completion");
         let m = self
             .wait_for_transition(sandbox_id, SandboxState::Pausing)
@@ -1790,7 +1906,10 @@ where
         match m.state {
             SandboxState::Paused => {
                 debug!("concurrent pause succeeded");
-                Ok(())
+                Ok(PauseOutcome {
+                    metadata: m,
+                    publishable: None,
+                })
             }
             SandboxState::Running => {
                 info!("concurrent pause failed; sandbox returned to running state");
@@ -1860,7 +1979,9 @@ where
                 continue;
             }
             if let Err(err) = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => self.pause_sandbox_inner(metadata.id).await,
+                SandboxTimeoutAction::Pause => {
+                    self.pause_sandbox_inner(metadata.id).await.map(|_| ())
+                }
                 SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
             } {
                 warn!(

@@ -16,6 +16,17 @@ impl SnapshotId {
         Self(Uuid::now_v7())
     }
 
+    /// Wraps a raw UUID as a snapshot ID.
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    /// Returns the underlying UUID, for callers that store snapshot IDs in a
+    /// UUID-typed column or field rather than as text.
+    pub fn to_uuid(&self) -> Uuid {
+        self.0
+    }
+
     /// Parses a UUID string as a snapshot ID.
     pub fn parse(input: &str) -> Result<Self> {
         let uuid = Uuid::parse_str(input)

@@ -1721,6 +1721,10 @@ mod tests {
             template_builder,
             image_resolver,
             None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),
+                &crate::identity::NodeIdentity::from_config(&Default::default()),
+            ),
             domains,
         ))
     }

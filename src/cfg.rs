@@ -377,6 +377,30 @@ pub enum SnapshotRepositoryBackendKind {
     Oss,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedRegistryBackendKind {
+    /// Node-local only. A paused sandbox is resumable on the node that paused
+    /// it and invisible to the rest of the cluster.
+    Local,
+    /// Cluster-wide registry in PostgreSQL. Pausing also publishes the snapshot
+    /// to the shared repository, so any node can resume the sandbox under its
+    /// original ID.
+    Postgres,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct PausedRegistryConfig {
+    #[config(default = "local")]
+    pub backend: PausedRegistryBackendKind,
+    /// Required when `backend = "postgres"`. Prefer the environment variable:
+    /// the DSN carries credentials and should not sit in a config file.
+    #[config(env = "AENV_PAUSED_REGISTRY_DSN", parse_env = parse_trimmed_string)]
+    pub dsn: Option<String>,
+    #[config(default = 8u32)]
+    pub max_connections: u32,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct UblkTomlConfig {
     /// Path to the `uvm-ublk-daemon` binary.
@@ -545,6 +569,8 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+    #[config(nested)]
+    pub paused_registry: PausedRegistryConfig,
 }
 
 /// Custom extension service integration.

@@ -87,3 +87,16 @@ pub struct SnapshotCaptureResult {
     pub metadata: super::store::SandboxMetadata,
     pub captured_snapshot: crate::sandbox::CapturedSandboxSnapshot,
 }
+
+/// What a completed pause leaves for the caller to act on.
+///
+/// The sandbox is already paused, persisted and stopped by the time this is
+/// returned; `publishable` is the same capture in a form a snapshot repository
+/// can commit, offered so the caller can make the paused sandbox resumable
+/// beyond this node. It is `None` when the backend captured into managed
+/// temporaries, and callers that only care about the pause itself may drop it.
+#[derive(Debug)]
+pub struct PauseOutcome {
+    pub metadata: super::store::SandboxMetadata,
+    pub publishable: Option<crate::sandbox::CapturedSandboxSnapshot>,
+}

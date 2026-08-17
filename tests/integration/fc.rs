@@ -254,7 +254,7 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     let paused_state = SandboxBackend::pause(&mut sandbox, Some(&artifact_root)).await?;
     sandbox.stop().await?;
 
-    let encoded = paused_state.encode()?;
+    let encoded = paused_state.state.encode()?;
     drop(paused_state);
 
     let decoded =

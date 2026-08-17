@@ -16,6 +16,7 @@ pub(crate) enum RecordingCall {
     AllocateArtifactRoot,
     PersistPaused,
     MarkResuming,
+    MarkClusterRegistered,
     RollbackResuming,
     DeleteRecord,
     DeleteRecordAndArtifacts,
@@ -28,6 +29,7 @@ impl RecordingCall {
             Self::AllocateArtifactRoot => "allocate_artifact_root",
             Self::PersistPaused => "persist_paused",
             Self::MarkResuming => "mark_resuming",
+            Self::MarkClusterRegistered => "mark_cluster_registered",
             Self::RollbackResuming => "rollback_resuming",
             Self::DeleteRecord => "delete_record",
             Self::DeleteRecordAndArtifacts => "delete_record_and_artifacts",
@@ -118,6 +120,16 @@ impl SandboxPersister for RecordingPersister {
         self.record(RecordingCall::PersistPaused);
         self.maybe_fail(RecordingCall::PersistPaused)?;
         Ok(())
+    }
+
+    async fn mark_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.record(RecordingCall::MarkClusterRegistered);
+
+        Ok(())
+    }
+
+    async fn is_cluster_registered(&self, _sandbox_id: &SandboxId) -> PersistenceResult<bool> {
+        Ok(false)
     }
 
     async fn mark_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {

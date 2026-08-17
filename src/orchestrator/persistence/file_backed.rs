@@ -34,6 +34,16 @@ struct PersistedPausedRecord {
     metadata: SandboxMetadata,
     artifact_root: PathBuf,
     state: Value,
+    /// Whether this paused sandbox was ever announced to a cluster registry.
+    ///
+    /// Reconciliation treats "the registry has no row for this sandbox" as
+    /// "the sandbox moved on", which is only a safe reading for records that
+    /// were announced in the first place. Records written before a cluster
+    /// registry was configured deserialize to `false` and are therefore never
+    /// discarded — which is exactly what makes switching a running node from
+    /// the node-local backend to a cluster one safe.
+    #[serde(default)]
+    cluster_registered: bool,
 }
 
 impl PersistedPausedRecord {
@@ -362,6 +372,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             lifecycle: PersistedPausedLifecycle::Paused,
             metadata: metadata.clone(),
             artifact_root: artifact_root.to_path_buf(),
+            cluster_registered: false,
             state,
         };
         let result = self.put_record(&record).await;
@@ -376,6 +387,17 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Resuming;
         self.put_record(&record).await
+    }
+
+    async fn mark_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        debug!(sandbox_id = %sandbox_id, "marking paused sandbox as cluster-registered");
+        let mut record = self.get_record(sandbox_id).await?;
+        record.cluster_registered = true;
+        self.put_record(&record).await
+    }
+
+    async fn is_cluster_registered(&self, sandbox_id: &SandboxId) -> PersistenceResult<bool> {
+        Ok(self.get_record(sandbox_id).await?.cluster_registered)
     }
 
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -689,6 +711,45 @@ mod tests {
 
         assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
         assert!(!snapshot_root.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_are_not_cluster_registered_until_marked() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("artifacts");
+        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+
+        // A freshly persisted record has not been announced anywhere, so
+        // reconciliation must not be able to reason about its absence from a
+        // registry.
+        assert!(!persister.is_cluster_registered(&sandbox_id).await?);
+
+        persister.mark_cluster_registered(&sandbox_id).await?;
+        assert!(persister.is_cluster_registered(&sandbox_id).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_written_before_the_flag_existed_load_as_unregistered() -> anyhow::Result<()> {
+        // Simulates upgrading a node that already holds paused sandboxes: the
+        // stored JSON has no `clusterRegistered` field at all. Reading it as
+        // "registered" would let the first reconciliation pass delete every
+        // sandbox paused before the cluster registry was configured.
+        let legacy = serde_json::json!({
+            "version": RECORD_VERSION,
+            "lifecycle": "paused",
+            "metadata": SandboxMetadata::default(),
+            "artifactRoot": "/tmp/does-not-matter",
+            "state": {},
+        });
+
+        let record = decode_record(&serde_json::to_vec(&legacy)?)?;
+
+        assert!(!record.cluster_registered);
+
         Ok(())
     }
 

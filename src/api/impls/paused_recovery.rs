@@ -317,26 +317,35 @@ impl ApiImpl {
             }
         };
 
-        for metadata in running {
-            let sandbox_id = metadata.id;
-            // Never registered by this process: the cluster has said nothing
-            // about this sandbox, and an absent row is not evidence of anything.
-            let Some(registered_as) = self.paused.running_registration(&sandbox_id) else {
-                continue;
-            };
+        // Only sandboxes this process registered can be judged at all, so the
+        // roster is narrowed before the registry is asked anything.
+        let registered: Vec<(SandboxId, String)> = running
+            .into_iter()
+            .filter_map(|metadata| {
+                self.paused
+                    .running_registration(&metadata.id)
+                    .map(|registered_as| (metadata.id, registered_as))
+            })
+            .collect();
+        if registered.is_empty() {
+            return;
+        }
 
-            let entry = match self.paused.registry().get(&sandbox_id).await {
-                Ok(entry) => entry,
-                Err(err) => {
-                    // One unreadable answer must not cascade into tearing down
-                    // the rest of the node's sandboxes.
-                    warn!(error = %err, %sandbox_id, "registry unreadable; stopping running-sandbox reconciliation");
+        let ids: Vec<SandboxId> = registered.iter().map(|(id, _)| *id).collect();
+        let rows = match self.paused.registry().get_many(&ids).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                // One unreadable answer must not cascade into tearing down the
+                // node's sandboxes.
+                warn!(error = %err, "registry unreadable; stopping running-sandbox reconciliation");
 
-                    return;
-                }
-            };
+                return;
+            }
+        };
 
-            let Some(superseded) = running_supersession(entry.as_ref(), &registered_as) else {
+        for (sandbox_id, registered_as) in registered {
+            let Some(superseded) = running_supersession(rows.get(&sandbox_id), &registered_as)
+            else {
                 continue;
             };
 
@@ -351,8 +360,12 @@ impl ApiImpl {
                 .discard_superseded_sandbox(sandbox_id)
                 .await
             {
-                Ok(()) => info!(%sandbox_id, "discarded superseded running sandbox"),
+                Ok(()) => {
+                    record_supersession("running", "discarded");
+                    info!(%sandbox_id, "discarded superseded running sandbox");
+                }
                 Err(err) => {
+                    record_supersession("running", "failed");
                     warn!(error = ?err, %sandbox_id, "failed to discard superseded running sandbox")
                 }
             }
@@ -385,21 +398,49 @@ impl ApiImpl {
             }
         };
 
-        let mut discarded = 0usize;
+        // Records that predate the registry, or that were written while it was
+        // node-local, carry no cluster registration — for those the local copy
+        // is the only copy and the registry's silence says nothing. Dropping
+        // them here also keeps them out of the query below.
+        let mut registered = Vec::with_capacity(paused.len());
         for metadata in paused {
-            let sandbox_id = metadata.id;
-
-            let superseded = match self.superseded_by_cluster(sandbox_id).await {
-                Ok(Some(superseded)) => superseded,
-                Ok(None) => continue,
-                Err(()) => {
-                    // Never guess when the registry cannot answer: one
-                    // unreadable response must not cascade into deleting local
-                    // records.
-                    warn!(%sandbox_id, "registry unreadable; stopping paused-record reconciliation");
-
-                    return;
+            match self
+                .orchestrator
+                .paused_record_cluster_registration(metadata.id)
+                .await
+            {
+                Ok(ClusterRegistration::Never) => continue,
+                Ok(registration) => registered.push((metadata.id, registration)),
+                Err(err) => {
+                    warn!(error = ?err, sandbox_id = %metadata.id, "failed to read local registration marker")
                 }
+            }
+        }
+        if registered.is_empty() {
+            return;
+        }
+
+        let ids: Vec<SandboxId> = registered.iter().map(|(id, _)| *id).collect();
+        let rows = match self.paused.registry().get_many(&ids).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                // Never guess when the registry cannot answer: one unreadable
+                // response must not cascade into deleting local records.
+                warn!(error = %err, "registry unreadable; stopping paused-record reconciliation");
+
+                return;
+            }
+        };
+
+        let mut discarded = 0usize;
+        for (sandbox_id, registration) in registered {
+            // Registered once, no row now: resumed elsewhere, or deleted.
+            let superseded = match rows.get(&sandbox_id) {
+                None => Superseded::Gone,
+                Some(entry) => match supersession(entry, &registration) {
+                    Some(superseded) => superseded,
+                    None => continue,
+                },
             };
 
             match self
@@ -408,11 +449,13 @@ impl ApiImpl {
                 .await
             {
                 Ok(true) => {
+                    record_supersession("paused", "discarded");
                     info!(%sandbox_id, reason = %superseded.reason(), "discarded superseded paused record");
                     discarded += 1;
                 }
                 Ok(false) => {}
                 Err(err) => {
+                    record_supersession("paused", "failed");
                     warn!(error = ?err, %sandbox_id, "failed to discard stranded paused record")
                 }
             }
@@ -585,6 +628,21 @@ fn supersession(
         }
         _ => None,
     }
+}
+
+/// Counts what reconciliation found the cluster had moved past.
+///
+/// Worth a metric rather than only a log line: every increment here is a copy of
+/// a sandbox that this node believed it held and did not, so a rate that is
+/// anything but near-zero means nodes are routinely losing sandboxes to each
+/// other — a lease or partition problem, not a reconciliation one.
+fn record_supersession(kind: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        "agentenv_paused_registry_superseded_total",
+        "kind" => kind,
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 /// Decides whether a running copy on this node has been superseded, judged

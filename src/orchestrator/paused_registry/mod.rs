@@ -21,6 +21,7 @@ mod disabled;
 mod postgres;
 mod types;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -102,6 +103,23 @@ pub trait PausedSandboxRegistry: Send + Sync {
 
     /// Reads a row without taking ownership.
     async fn get(&self, sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>>;
+
+    /// Reads every row among `sandbox_ids` that exists, in as few round trips as
+    /// the backend can manage.
+    ///
+    /// Reconciliation compares a node's whole roster against the registry, and
+    /// doing that one [`get`](Self::get) at a time costs a round trip per
+    /// sandbox on every pass, from every node. Worse, the rows then come from
+    /// different instants: a sandbox read early can be judged against a cluster
+    /// state that a sandbox read late already contradicts. One query answers
+    /// both.
+    ///
+    /// A sandbox missing from the returned map has no row — the same answer
+    /// `get` gives as `None`, and never "we did not look".
+    async fn get_many(
+        &self,
+        sandbox_ids: &[SandboxId],
+    ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>>;
 
     /// Takes ownership of a paused sandbox so this node can resume it.
     async fn claim_for_resume(

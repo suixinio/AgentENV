@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 
 use super::{BeganPause, PausedSandboxEntry, PausedSandboxRegistry, RegistryResult, ResumeClaim};
@@ -41,6 +43,13 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
 
     async fn get(&self, _sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
         Ok(None)
+    }
+
+    async fn get_many(
+        &self,
+        _sandbox_ids: &[SandboxId],
+    ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+        Ok(HashMap::new())
     }
 
     async fn claim_for_resume(

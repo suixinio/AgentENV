@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -53,6 +55,9 @@ ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP
 CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
 CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
 "#;
+
+/// Largest number of sandbox IDs bound into a single `get_many` statement.
+const GET_MANY_CHUNK: usize = 1_000;
 
 /// How a row proves its holder is still alive.
 ///
@@ -418,6 +423,36 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
 
     async fn get(&self, sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
         self.fetch(sandbox_id).await
+    }
+
+    async fn get_many(
+        &self,
+        sandbox_ids: &[SandboxId],
+    ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+        let mut rows = HashMap::with_capacity(sandbox_ids.len());
+        // Chunked so a node with a very large roster cannot build a parameter
+        // array big enough to be refused; the chunk size is well under any
+        // server limit and keeps each statement's plan trivial.
+        for chunk in sandbox_ids.chunks(GET_MANY_CHUNK) {
+            let ids: Vec<Uuid> = chunk.iter().map(|id| id.into_inner()).collect();
+            let sql = format!(
+                "SELECT {ENTRY_COLUMNS} FROM paused_sandboxes \
+                 WHERE cluster_id = $1 AND sandbox_id = ANY($2)"
+            );
+            let fetched = sqlx::query(&sql)
+                .bind(self.cluster_id)
+                .bind(&ids)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| PausedRegistryError::backend("get_many", anyhow!(e)))?;
+
+            for row in &fetched {
+                let entry = Self::decode(row)?;
+                rows.insert(entry.sandbox_id, entry);
+            }
+        }
+
+        Ok(rows)
     }
 
     async fn claim_for_resume(

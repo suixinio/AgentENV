@@ -514,3 +514,69 @@ async fn marking_running_reports_a_refusal_when_another_node_holds_the_claim() {
         "another node holds the claim, so this node is not the holder"
     );
 }
+
+/// Reconciliation asks about a node's whole roster at once. The batch has to
+/// answer exactly what a row-at-a-time read would: present means present,
+/// absent means "no row" — never "not looked at".
+#[tokio::test]
+async fn a_batch_read_reports_only_the_sandboxes_that_have_rows() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let tracked = SandboxId::new();
+    let also_tracked = SandboxId::new();
+    let untracked = SandboxId::new();
+    pause_and_publish(&registry, tracked, NODE_A).await;
+    pause_and_publish(&registry, also_tracked, NODE_B).await;
+
+    let rows = registry
+        .get_many(&[tracked, untracked, also_tracked])
+        .await
+        .expect("batch read");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.get(&tracked)
+            .map(|entry| entry.origin_node_id.as_str()),
+        Some(NODE_A)
+    );
+    assert_eq!(
+        rows.get(&also_tracked)
+            .map(|entry| entry.origin_node_id.as_str()),
+        Some(NODE_B)
+    );
+    assert!(
+        !rows.contains_key(&untracked),
+        "a sandbox with no row must be absent, which is how the caller reads 'the cluster does not track it'"
+    );
+}
+
+/// 🔴 The batch is what reconciliation tears sandboxes down on, so it must be
+/// scoped to this cluster just as tightly as every other read. Without the
+/// filter, one cluster's reconciliation reads another cluster's rows and
+/// concludes its own sandboxes have moved on.
+#[tokio::test]
+async fn a_batch_read_cannot_see_another_clusters_sandboxes() {
+    let dsn = require_db!();
+    let ours = registry(&dsn, Uuid::new_v4()).await;
+    let theirs = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+    pause_and_publish(&theirs, sandbox_id, NODE_A).await;
+
+    let rows = ours.get_many(&[sandbox_id]).await.expect("batch read");
+
+    assert!(rows.is_empty(), "another cluster's row must be invisible");
+    assert!(
+        theirs.get(&sandbox_id).await.expect("read").is_some(),
+        "and untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_read_of_nothing_asks_nothing() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+
+    let rows = registry.get_many(&[]).await.expect("batch read");
+
+    assert!(rows.is_empty());
+}

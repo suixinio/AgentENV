@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
     // cluster has already moved past.
     api_impl.renew_paused_leases().await;
     api_impl.reconcile_local_records().await;
-    let paused_reconcile = spawn_paused_record_reconciler(
+    let paused_upkeep = spawn_paused_record_upkeep(
         Arc::clone(&api_impl),
         config.orchestrator.paused_registry.reconcile_interval(),
     );
@@ -197,8 +197,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             // Stop reconciling before the shutdown pauses start: those write
-            // paused records this task would otherwise be racing to inspect.
-            paused_reconcile.abort();
+            // paused records these tasks would otherwise be racing to inspect.
+            for task in &paused_upkeep {
+                task.abort();
+            }
             info!(target: "agentenv", "stopping sandboxes before process exit");
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
@@ -246,24 +248,42 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Inward, a node that loses a sandbox to another node is never told about it:
 /// the resume happens elsewhere, against a registry row this node does not
-/// watch. Until it notices, it keeps the sandbox in its heartbeat roster and the
-/// scheduler's binding for that sandbox flaps between the two nodes.
+/// watch. Until it notices, it keeps the sandbox in its heartbeat roster, the
+/// scheduler's binding for that sandbox flaps between the two nodes, and — if
+/// the sandbox is still running here — two live copies of it write to their own
+/// rootfs layers.
 ///
-/// Both only work on a timer, so this runs for as long as the server does.
-fn spawn_paused_record_reconciler(
+/// 🔴 **Two tasks, not one.** Reconciliation tears sandboxes down, and a
+/// teardown waits on whatever operation currently holds the sandbox; one that
+/// drags on would, in a shared loop, stop the renewals as well. The node would
+/// then declare *all* of its own sandboxes abandoned while it was busy standing
+/// one of them down, and other nodes would take them over. Renewal must not be
+/// able to starve behind anything.
+fn spawn_paused_record_upkeep(
     api_impl: Arc<ApiImpl>,
     interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let renewer = Arc::clone(&api_impl);
+    let renew = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // The startup pass already ran; skip the immediate first tick.
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            api_impl.renew_paused_leases().await;
+            renewer.renew_paused_leases().await;
+        }
+    });
+
+    let reconcile = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
             api_impl.reconcile_local_records().await;
         }
-    })
+    });
+
+    vec![renew, reconcile]
 }
 
 async fn shutdown_signal() {

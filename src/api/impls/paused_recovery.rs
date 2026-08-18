@@ -14,12 +14,13 @@
 //! Everything here is inert unless the paused-sandbox registry is configured
 //! with a cluster backend.
 
+use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
 use super::ApiImpl;
 use crate::orchestrator::{
-    ClusterRegistration, CreateSandboxRequest, NewTimeout, PausedRegistryState, PausedSandboxEntry,
-    ResumeClaim, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
+    ClusterRegistration, CreateSandboxRequest, HeldSandbox, NewTimeout, PausedRegistryState,
+    PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
 };
 use crate::types::SandboxId;
 
@@ -192,11 +193,13 @@ impl ApiImpl {
 
     /// Renews this node's lease on every registry row it is the holder of.
     ///
-    /// The registry has no other way to tell a node that is still running its
-    /// sandboxes from one that has died: a lease that keeps being renewed is
-    /// the whole of the evidence. Skipping a renewal is therefore not a missed
-    /// optimisation, it is this node telling the cluster its sandboxes are up
-    /// for grabs.
+    /// What lapsing costs is narrower than it looks. For a sandbox that is
+    /// live, nothing: no lease state makes another node willing to rebuild it,
+    /// because reaching the database and being alive are not the same thing.
+    /// For one that is parked with an unpublished snapshot, it is the signal
+    /// that this node has given up on it, and the cluster will bring the
+    /// sandbox back elsewhere from the previous snapshot — losing the last
+    /// pause's work. Renewal is what buys the time not to do that.
     ///
     /// The whole local roster goes in, whatever state each sandbox is in — the
     /// registry decides which rows this node actually holds, so nothing here
@@ -219,17 +222,128 @@ impl ApiImpl {
             }
         };
 
-        let ids: Vec<SandboxId> = sandboxes.into_iter().map(|metadata| metadata.id).collect();
+        // The deadline comes from the live sandbox, not from the row: the row's
+        // metadata is a snapshot of what the sandbox looked like when it was
+        // paused, and a timeout set or extended since then only exists here.
+        // Reclamation compares against this, so a stale value would retire a
+        // sandbox that still had time left.
+        let held: Vec<HeldSandbox> = sandboxes
+            .into_iter()
+            .map(|metadata| HeldSandbox {
+                sandbox_id: metadata.id,
+                expires_at: metadata.expires_at.map(DateTime::<Utc>::from),
+            })
+            .collect();
         if let Err(err) = self
             .paused
             .registry()
-            .renew_lease(self.paused.node_id(), &ids)
+            .renew_lease(self.paused.node_id(), &held)
             .await
         {
             warn!(
                 error = %err,
-                "failed to renew paused registry leases; another node may take these sandboxes over"
+                "failed to renew paused registry leases; sandboxes parked here with an \
+                 unpublished snapshot may be rebuilt elsewhere from an older one"
             );
+        }
+    }
+
+    /// Hands back the sandboxes the previous process on this node died holding.
+    ///
+    /// 🔴 **Startup only, and before the listener opens.** It releases rows by
+    /// node identity, and this node's identity is the machine's — so once this
+    /// process is actually running sandboxes, the very rows it would release
+    /// are its own. Call it while it holds nothing and it is exact; call it a
+    /// second later and it hands live sandboxes to whoever resumes them next.
+    ///
+    /// Why this exists at all. A row saying "running on this node" can be stale
+    /// for two reasons that look identical from the database: the process that
+    /// wrote it died, or it is merely cut off from PostgreSQL. Only the first
+    /// makes the sandbox safe to rebuild elsewhere, and no timeout can tell
+    /// them apart — which is why `claim_for_resume` refuses live rows outright
+    /// and why the decision is made here instead. Being the successor process
+    /// on that machine *is* the proof: the previous process's VMs were its
+    /// children in its PID namespace and went with it.
+    ///
+    /// e2b reaches the same end from its control plane, which has the one thing
+    /// we do not: a single authority that knows which nodes exist. It never
+    /// rebuilds a live sandbox somewhere else either — a resume that finds the
+    /// sandbox in its store is refused (`sandbox_resume.go`, StateRunning ⇒
+    /// 409), and its orphan sweep only kills what the store has no record of.
+    pub async fn release_stale_node_holdings(&self) {
+        if !self.paused.registry().is_cluster_backed() {
+            return;
+        }
+
+        let node_id = self.paused.node_id().to_string();
+        match self.paused.registry().release_node_holdings(&node_id).await {
+            Ok(released) if released.is_empty() => {}
+            Ok(released) => {
+                metrics::counter!("agentenv_paused_registry_node_holdings_released_total")
+                    .increment(released.released);
+                metrics::counter!("agentenv_paused_registry_node_holdings_discarded_total")
+                    .increment(released.discarded);
+                info!(
+                    node_id,
+                    released = released.released,
+                    discarded = released.discarded,
+                    "took over the sandboxes a previous process on this node was holding"
+                );
+            }
+            Err(err) => {
+                // Nothing else releases these rows, so the sandboxes stay
+                // stranded until a later start succeeds. That is the safe
+                // direction — the alternative is a timeout deciding it, which
+                // is the thing this replaced.
+                warn!(
+                    error = %err,
+                    node_id,
+                    "could not release the previous process's holdings; \
+                     sandboxes it was running stay unclaimable until a later start"
+                );
+            }
+        }
+    }
+
+    /// Reclaims sandboxes that outlived their deadline on a node nobody has
+    /// heard from since.
+    ///
+    /// Unlike everything else in this module, this pass is not about *this*
+    /// node — any node runs it against the whole cluster, and running it from
+    /// several at once is harmless because the statement is a single
+    /// conditional `UPDATE`. That is deliberate: it exists for the case where a
+    /// machine never comes back, so it cannot depend on that machine doing
+    /// anything.
+    ///
+    /// It is the counterpart to the node-local eviction task. A reachable node
+    /// evicts its own expired sandboxes — pausing them properly, publishing a
+    /// fresh snapshot — which is the outcome we want and the reason this waits
+    /// for a lapsed lease before touching anything. e2b does not need the
+    /// distinction because its eviction was never on the node to begin with:
+    /// it runs in the control plane off a cluster-wide expiry index, and drops
+    /// the sandbox from its store even when the node cannot be reached to be
+    /// told (`e2b/packages/api/internal/orchestrator/delete_instance.go:104`).
+    pub async fn reclaim_expired_sandboxes(&self) {
+        if !self.paused.registry().is_cluster_backed() {
+            return;
+        }
+
+        match self.paused.registry().reclaim_expired_holdings().await {
+            Ok(reclaimed) if reclaimed.is_empty() => {}
+            Ok(reclaimed) => {
+                metrics::counter!("agentenv_paused_registry_expired_reclaimed_total")
+                    .increment(reclaimed.released);
+                metrics::counter!("agentenv_paused_registry_expired_discarded_total")
+                    .increment(reclaimed.discarded);
+                info!(
+                    released = reclaimed.released,
+                    discarded = reclaimed.discarded,
+                    "reclaimed expired sandboxes from nodes that stopped reporting"
+                );
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to reclaim expired sandboxes");
+            }
         }
     }
 

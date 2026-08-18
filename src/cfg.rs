@@ -409,14 +409,28 @@ pub struct PausedRegistryConfig {
     /// backend, where there is nothing to reconcile against.
     #[config(default = 30u64)]
     pub reconcile_interval_secs: u64,
-    /// How long a node's claim on a sandbox stays valid without renewal.
+    /// How long a node's hold on a *parked* sandbox stays valid without
+    /// renewal.
     ///
-    /// A row that names a node as running, publishing or resuming a sandbox is
-    /// only honoured while that node keeps renewing it. Once the lease lapses
-    /// the sandbox becomes recoverable elsewhere, so this is the delay between
-    /// losing a node and being able to bring its sandboxes back — traded
-    /// against how long a node may be unresponsive before the cluster starts
-    /// treating its sandboxes as abandoned.
+    /// A sandbox that was paused but whose snapshot never reached the
+    /// repository can only be brought back by the node holding its local
+    /// artifacts. Once that node stops renewing, the cluster gives up waiting
+    /// and rebuilds the sandbox elsewhere from the previous snapshot instead —
+    /// losing the last pause's work, which is why it waits at all. This is that
+    /// wait.
+    ///
+    /// 🔴 A live sandbox is never handed to another node on this alone. A lapsed
+    /// lease only proves the holder cannot reach the database, and a
+    /// partitioned node goes on running every sandbox it has; rebuilding one of
+    /// those elsewhere would produce two live copies. Live rows are released by
+    /// the next process to start on the holder's own machine — the only party
+    /// that can prove the previous one is gone — or, for a machine that never
+    /// comes back, reclaimed once the sandbox has *also* outlived its own
+    /// deadline.
+    ///
+    /// So this value is a floor on how long the cluster waits before either of
+    /// those, never the thing that decides them. Lowering it does not bring a
+    /// dead node's sandboxes back sooner than their own timeouts allow.
     #[config(default = 90u64)]
     pub lease_ttl_secs: u64,
 }
@@ -434,9 +448,10 @@ impl PausedRegistryConfig {
     /// Lease length, held to at least three renewal intervals.
     ///
     /// A lease shorter than the cadence that renews it expires on a healthy
-    /// node, which invites exactly the takeover of a live sandbox the lease
-    /// exists to prevent. Three intervals leaves room for two missed renewals
-    /// before the cluster concludes a node is gone.
+    /// node, so a sandbox parked on a node that is doing fine would be rebuilt
+    /// elsewhere from an older snapshot for no reason. Three intervals leaves
+    /// room for two missed renewals before the cluster concludes a node is
+    /// gone.
     pub fn lease_ttl_secs(&self) -> u64 {
         self.lease_ttl_secs
             .max(self.reconcile_interval_secs.max(1).saturating_mul(3))

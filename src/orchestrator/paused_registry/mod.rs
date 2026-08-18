@@ -35,7 +35,10 @@ use crate::types::SandboxId;
 
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use postgres::PostgresPausedSandboxRegistry;
-pub use types::{BeganPause, PausedRegistryState, PausedSandboxEntry, ResumeClaim};
+pub use types::{
+    BeganPause, HeldSandbox, PausedRegistryState, PausedSandboxEntry, ReclaimedHoldings,
+    ReleasedHoldings, ResumeClaim,
+};
 
 pub type RegistryResult<T> = std::result::Result<T, PausedRegistryError>;
 
@@ -134,16 +137,61 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// Refreshes the liveness lease on every row among `sandbox_ids` that
     /// `node_id` is the holder of, and reports how many that was.
     ///
-    /// This is the only evidence the registry has that a node still holds what
-    /// its rows claim. A row whose lease runs out becomes claimable by any
-    /// node — that is how a sandbox survives losing the node it was on — so a
-    /// node that stops renewing is, by definition, one that has let its
-    /// sandboxes go.
+    /// This is the only evidence the registry has that a node is still attached
+    /// to the cluster. A **parked** row whose lease runs out becomes claimable
+    /// by any node — that is how a sandbox whose snapshot never published
+    /// survives losing the node it was parked on.
+    ///
+    /// It does not work that way for rows whose sandbox is live. Renewals stop
+    /// for two very different reasons — the process died, or it merely cannot
+    /// reach the database — and only the first makes rebuilding the sandbox
+    /// elsewhere safe. Those rows are released by the node's own successor
+    /// process instead; see
+    /// [`release_node_holdings`](Self::release_node_holdings).
     ///
     /// Callers pass their whole local roster and let the implementation decide
     /// which entries they have standing to renew; a node must not be able to
     /// extend a lease on a sandbox it does not hold.
-    async fn renew_lease(&self, node_id: &str, sandbox_ids: &[SandboxId]) -> RegistryResult<u64>;
+    ///
+    /// Each entry also carries the sandbox's current deadline, which the
+    /// registry stores alongside the lease. That is what makes
+    /// [`reclaim_expired_holdings`](Self::reclaim_expired_holdings) possible at
+    /// all: the deadline has to come from the holder, because only the holder
+    /// knows about the timeout extensions that happened since the sandbox was
+    /// paused.
+    async fn renew_lease(&self, node_id: &str, held: &[HeldSandbox]) -> RegistryResult<u64>;
+
+    /// Reclaims live rows whose holder stopped renewing *and* whose sandbox has
+    /// since outlived its own deadline.
+    ///
+    /// The last resort for a machine that is never coming back. Nothing else
+    /// releases its rows: `release_node_holdings` needs a successor process on
+    /// that machine, and `claim_for_resume` refuses live rows outright — so
+    /// without this a decommissioned node's sandboxes would stay unrecoverable
+    /// and their rows unremovable, forever.
+    ///
+    /// 🔴 The deadline, not the lease, is what makes this safe. A lapsed lease
+    /// alone says only that the holder cannot reach the database; acting on it
+    /// is the mistake `claim_for_resume` exists to avoid. But a sandbox that is
+    /// *also* past the deadline its own user gave it has no claim on being kept
+    /// alive: it should already have been evicted, and would have been if
+    /// anyone could still reach the node. Reclaiming it is enforcing the
+    /// timeout, not guessing at the node's health.
+    ///
+    /// This is where e2b puts the same decision. Its eviction runs in the
+    /// control plane off a cluster-wide expiry index, entirely independent of
+    /// node state (`e2b/packages/api/internal/orchestrator/evictor/evict.go`),
+    /// and it drops the sandbox from its store even when the node cannot be
+    /// reached to be told (`delete_instance.go:104`, the unconditional
+    /// `defer o.sandboxStore.Remove(...)`). Our eviction lives on the node
+    /// instead, which is why losing the node used to mean losing the eviction
+    /// with it.
+    ///
+    /// Both conditions are required, and the lease one is what keeps this out
+    /// of the way of the normal path: a reachable node evicts its own expired
+    /// sandboxes itself, pausing them properly and publishing a fresh snapshot.
+    /// Only when nobody has renewed for a full lease does the cluster step in.
+    async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings>;
 
     /// Records that the sandbox is live on `node_id` again.
     ///
@@ -163,6 +211,30 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// an absent row as "the cluster has moved past this sandbox", which for an
     /// untracked one would be a freshly created sandbox being torn down.
     async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<bool>;
+
+    /// Hands back every live sandbox this node was holding when its previous
+    /// process died, and reports what was found.
+    ///
+    /// 🔴 **Only ever correct at process startup, before this node can hold
+    /// anything.** It releases rows by node identity alone, so running it once
+    /// the node is serving would hand this node's own live sandboxes to
+    /// whoever resumes them next — the exact duplication the rest of this
+    /// module exists to prevent.
+    ///
+    /// Why startup is nevertheless the strongest evidence in the system: a
+    /// node's ID names the machine, not the process, so a row saying
+    /// "`running` on this node" that is being read by a process which has just
+    /// started and holds nothing can only have been written by a previous
+    /// process on this same machine. That process is gone, and its sandboxes
+    /// went with it — the VMs are its children, in its PID namespace. No
+    /// timeout can establish that; only being the successor can.
+    ///
+    /// Rows naming a snapshot go back to `paused` and can be resumed anywhere.
+    /// Rows without one are deleted: the sandbox was live, its local artifacts
+    /// were consumed by the resume that started it, and nothing was ever
+    /// published — there is nothing left to bring back, and a row that can
+    /// never be claimed would just accumulate.
+    async fn release_node_holdings(&self, node_id: &str) -> RegistryResult<ReleasedHoldings>;
 
     /// Removes the row, and with it the cluster's memory of the sandbox.
     /// Only correct once the sandbox itself is gone.

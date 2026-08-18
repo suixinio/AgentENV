@@ -94,6 +94,57 @@ pub struct BeganPause {
     pub previous_snapshot_id: Option<SnapshotId>,
 }
 
+/// One sandbox a node is reporting itself the holder of, and when that sandbox
+/// is currently due to end.
+///
+/// The deadline travels with the renewal rather than being derived from the
+/// stored `metadata` because the two disagree in exactly the case that matters.
+/// `metadata` is whatever the sandbox looked like when it was paused; a resume
+/// may set a different timeout, and callers extend timeouts on live sandboxes
+/// all the time. Reading the deadline out of the row would therefore reclaim
+/// sandboxes that still had hours to run.
+///
+/// `None` means the sandbox has no deadline at all, which is not the same as
+/// "unknown": it is a sandbox that was asked never to expire, and reclamation
+/// leaves it alone forever.
+#[derive(Clone, Copy, Debug)]
+pub struct HeldSandbox {
+    pub sandbox_id: SandboxId,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// What a node's successor process found waiting for it in the registry.
+///
+/// Both numbers describe sandboxes the previous process on this machine was
+/// holding when it died. They are reported separately because they mean
+/// different things to an operator: `released` sandboxes are recoverable and
+/// will come back on the next resume, `discarded` ones are gone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReleasedHoldings {
+    /// Rows handed back to the cluster as `paused`, recoverable from the
+    /// snapshot they name.
+    pub released: u64,
+    /// Rows deleted because no snapshot was ever published for them, so nothing
+    /// remains to rebuild the sandbox from.
+    pub discarded: u64,
+}
+
+/// What a reclamation pass did to the rows of nodes that stopped reporting.
+///
+/// Same two outcomes as [`ReleasedHoldings`], for the same reason — the
+/// difference is only in what established that the holder is gone: there, being
+/// its successor; here, the sandbox outliving its own deadline while nobody
+/// renewed for it.
+pub type ReclaimedHoldings = ReleasedHoldings;
+
+impl ReleasedHoldings {
+    /// Whether anything at all was found, i.e. whether the previous process
+    /// died holding sandboxes rather than shutting down cleanly.
+    pub fn is_empty(&self) -> bool {
+        self.released == 0 && self.discarded == 0
+    }
+}
+
 /// Outcome of trying to take ownership of a paused sandbox for a resume.
 #[derive(Debug)]
 pub enum ResumeClaim {

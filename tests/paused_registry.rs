@@ -14,12 +14,12 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use uuid::Uuid;
 
 use agentenv::orchestrator::{
-    PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
-    PostgresPausedSandboxRegistry, ResumeClaim, SandboxMetadata,
+    HeldSandbox, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
+    PausedSandboxRegistry, PostgresPausedSandboxRegistry, ResumeClaim, SandboxMetadata,
 };
 use agentenv::snapshot::SnapshotId;
 use agentenv::types::SandboxId;
@@ -66,6 +66,24 @@ async fn registry(dsn: &str, cluster_id: Uuid) -> PostgresPausedSandboxRegistry 
     PostgresPausedSandboxRegistry::connect(dsn, cluster_id, 4, TEST_LEASE_SECS)
         .await
         .expect("connect to the test registry")
+}
+
+/// A renewal for a sandbox with no deadline — the shape most of these tests
+/// want, since they exercise the lease rather than reclamation.
+fn held(sandbox_id: SandboxId) -> HeldSandbox {
+    HeldSandbox {
+        sandbox_id,
+        expires_at: None,
+    }
+}
+
+/// A renewal reporting a deadline `offset` from now. Negative means the sandbox
+/// has already outlived it.
+fn held_due(sandbox_id: SandboxId, offset: TimeDelta) -> HeldSandbox {
+    HeldSandbox {
+        sandbox_id,
+        expires_at: Some(Utc::now() + offset),
+    }
 }
 
 fn entry(sandbox_id: SandboxId, origin: &str) -> PausedSandboxEntry {
@@ -183,11 +201,20 @@ async fn a_live_holder_cannot_have_its_sandbox_taken_away() {
     }
 }
 
-/// The other half: the lease has to actually expire, or losing a node would
-/// strand its sandboxes forever. This is the whole point of the mechanism —
-/// a node that stops renewing has, by definition, let its sandboxes go.
+/// 🔴 The duplication this design exists to make impossible.
+///
+/// A lapsed lease proves the holder cannot reach this database. It does not
+/// prove the holder is dead — a partitioned node keeps running every sandbox it
+/// has, keeps being routed traffic, and keeps writing to its rootfs layers,
+/// while its rows expire on schedule. Rebuilding one of those sandboxes on
+/// another node produces two live copies diverging from the same snapshot, and
+/// nothing downstream can merge them again.
+///
+/// So a live row stays with its holder however long the lease has been lapsed.
+/// e2b refuses the same move from the other side of the same fact: a resume
+/// that finds the sandbox in its store is a 409, not a placement.
 #[tokio::test]
-async fn a_holder_that_stops_renewing_loses_the_sandbox() {
+async fn a_live_sandbox_is_never_taken_over_on_a_lapsed_lease() {
     let dsn = require_db!();
     let registry = registry(&dsn, Uuid::new_v4()).await;
     let sandbox_id = SandboxId::new();
@@ -200,13 +227,224 @@ async fn a_holder_that_stops_renewing_loses_the_sandbox() {
 
     tokio::time::sleep(PAST_LEASE).await;
 
+    match registry.claim_for_resume(&sandbox_id, NODE_B).await {
+        Ok(ResumeClaim::Conflict { origin_node_id }) => assert_eq!(origin_node_id, NODE_A),
+        other => panic!("a live sandbox must never be rebuilt elsewhere on a timer, got {other:?}"),
+    }
+}
+
+/// The parked half, which is what the lease is still for. `publishing` and
+/// `local_only` name a node that already stopped the VM, so taking the sandbox
+/// over cannot duplicate it — it only rewinds to the snapshot the previous
+/// pause left behind. That loss is worth accepting to avoid stranding the
+/// sandbox on a node that may never come back, so here the lease does decide.
+#[tokio::test]
+async fn a_parked_sandbox_moves_on_once_its_holder_stops_renewing() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    // A first pause that published, then a second that did not: the row is
+    // `publishing` while still naming the older, durable snapshot.
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .begin_pause(&entry(sandbox_id, NODE_A))
+        .await
+        .expect("second pause");
+
+    match registry.claim_for_resume(&sandbox_id, NODE_B).await {
+        Ok(ResumeClaim::NotReady { origin_node_id }) => assert_eq!(origin_node_id, NODE_A),
+        other => panic!("a live lease must keep the upload on its own node, got {other:?}"),
+    }
+
+    tokio::time::sleep(PAST_LEASE).await;
+
     let claim = registry
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim");
     assert!(
         matches!(claim, ResumeClaim::Claimed(_)),
-        "a lapsed lease must let another node recover the sandbox"
+        "a parked sandbox whose holder went quiet must be recoverable elsewhere"
+    );
+}
+
+/// How a live row is *actually* released: by the next process on the machine
+/// that was holding it.
+///
+/// Being the successor is the proof no timeout can supply — the previous
+/// process's VMs were its children, so a process that has just started on that
+/// machine and holds nothing is looking at rows whose sandboxes are certainly
+/// gone. The sandbox goes back to `paused` and its snapshot stays, so the next
+/// resume rebuilds it anywhere.
+#[tokio::test]
+async fn a_successor_process_releases_what_the_previous_one_was_running() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    let snapshot = pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+
+    let released = registry
+        .release_node_holdings(NODE_A)
+        .await
+        .expect("release holdings");
+    assert_eq!(released.released, 1);
+    assert_eq!(released.discarded, 0);
+
+    let entry = registry
+        .get(&sandbox_id)
+        .await
+        .expect("read back")
+        .expect("row survives the release");
+    assert_eq!(entry.state, PausedRegistryState::Paused);
+    assert_eq!(
+        entry.snapshot_id.as_ref(),
+        Some(&snapshot),
+        "the snapshot is the whole reason the sandbox survives the node"
+    );
+
+    let claim = registry
+        .claim_for_resume(&sandbox_id, NODE_B)
+        .await
+        .expect("claim");
+    assert!(
+        matches!(claim, ResumeClaim::Claimed(_)),
+        "a released sandbox must be recoverable on any node"
+    );
+}
+
+/// A live sandbox whose snapshot never published has its only artifacts on the
+/// disk of the process that just died, and the resume that started it consumed
+/// the paused record they belonged to. Keeping the row would leave something no
+/// node can claim (a claim requires a snapshot) and no node will ever clear.
+#[tokio::test]
+async fn a_successor_process_discards_live_rows_that_never_published() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    let began = registry
+        .begin_pause(&entry(sandbox_id, NODE_A))
+        .await
+        .expect("begin pause");
+    registry
+        .mark_local_only(&sandbox_id, began.generation)
+        .await
+        .expect("publish never landed");
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("resumed locally");
+
+    let released = registry
+        .release_node_holdings(NODE_A)
+        .await
+        .expect("release holdings");
+    assert_eq!(released.released, 0);
+    assert_eq!(released.discarded, 1);
+    assert!(
+        registry
+            .get(&sandbox_id)
+            .await
+            .expect("read back")
+            .is_none(),
+        "a sandbox with nothing to rebuild from must not leave a row behind"
+    );
+}
+
+/// The release is scoped to one node's own holdings twice over: another node's
+/// live sandboxes are untouchable, and this node's parked rows are left exactly
+/// as they were. Widening either would turn a routine restart into a cluster
+/// event.
+#[tokio::test]
+async fn releasing_holdings_touches_nothing_but_this_nodes_live_rows() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+
+    let live_elsewhere = SandboxId::new();
+    pause_and_publish(&registry, live_elsewhere, NODE_B).await;
+    registry
+        .mark_running(&live_elsewhere, NODE_B)
+        .await
+        .expect("mark running on the other node");
+
+    let parked_here = SandboxId::new();
+    pause_and_publish(&registry, parked_here, NODE_A).await;
+
+    let released = registry
+        .release_node_holdings(NODE_A)
+        .await
+        .expect("release holdings");
+    assert!(
+        released.is_empty(),
+        "a node with nothing live of its own must release nothing, got {released:?}"
+    );
+
+    assert_eq!(
+        registry
+            .get(&live_elsewhere)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::Running,
+        "another node's live sandbox must be untouched"
+    );
+    assert_eq!(
+        registry
+            .get(&parked_here)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::Paused,
+    );
+}
+
+/// A resume that was in flight when the process died is released by the node
+/// that claimed it, not by the one whose disk holds the artifacts — the claim
+/// deliberately leaves `origin_node_id` alone, so judging by it would let the
+/// origin release a rebuild another node is midway through.
+#[tokio::test]
+async fn an_interrupted_resume_is_released_by_the_node_that_claimed_it() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    let claim = registry
+        .claim_for_resume(&sandbox_id, NODE_B)
+        .await
+        .expect("claim");
+    assert!(matches!(claim, ResumeClaim::Claimed(_)));
+
+    let by_origin = registry
+        .release_node_holdings(NODE_A)
+        .await
+        .expect("release as the origin");
+    assert!(
+        by_origin.is_empty(),
+        "the origin must not release a resume another node is running, got {by_origin:?}"
+    );
+
+    let by_claimer = registry
+        .release_node_holdings(NODE_B)
+        .await
+        .expect("release as the claimer");
+    assert_eq!(by_claimer.released, 1);
+    assert_eq!(
+        registry
+            .get(&sandbox_id)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::Paused,
     );
 }
 
@@ -227,7 +465,7 @@ async fn only_the_holder_can_renew_its_lease() {
 
     assert_eq!(
         registry
-            .renew_lease(NODE_B, &[sandbox_id])
+            .renew_lease(NODE_B, &[held(sandbox_id)])
             .await
             .expect("renew as a stranger"),
         0,
@@ -235,7 +473,7 @@ async fn only_the_holder_can_renew_its_lease() {
     );
     assert_eq!(
         registry
-            .renew_lease(NODE_A, &[sandbox_id])
+            .renew_lease(NODE_A, &[held(sandbox_id)])
             .await
             .expect("renew as the holder"),
         1
@@ -244,7 +482,7 @@ async fn only_the_holder_can_renew_its_lease() {
     // Renewed, so the takeover that would otherwise succeed by now does not.
     tokio::time::sleep(Duration::from_millis(600)).await;
     registry
-        .renew_lease(NODE_A, &[sandbox_id])
+        .renew_lease(NODE_A, &[held(sandbox_id)])
         .await
         .expect("renew again");
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -579,4 +817,319 @@ async fn a_batch_read_of_nothing_asks_nothing() {
     let rows = registry.get_many(&[]).await.expect("batch read");
 
     assert!(rows.is_empty());
+}
+
+/// 🔴 The one thing that keeps a decommissioned machine's sandboxes from being
+/// stranded forever.
+///
+/// Nothing else can release them: `release_node_holdings` needs a successor
+/// process on that machine, and `claim_for_resume` refuses live rows outright.
+/// So the cluster steps in when the sandbox has outlived the deadline its own
+/// user gave it *and* nobody has renewed for it since — which is enforcing the
+/// timeout, not guessing whether the node is dead.
+///
+/// e2b puts the same decision in its control-plane evictor, which runs off a
+/// cluster-wide expiry index and drops the sandbox from its store even when the
+/// node cannot be reached to be told.
+#[tokio::test]
+async fn a_sandbox_that_outlived_its_deadline_on_a_silent_node_is_reclaimed() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    let snapshot = pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+    registry
+        .renew_lease(NODE_A, &[held_due(sandbox_id, TimeDelta::seconds(-1))])
+        .await
+        .expect("report a deadline that has already passed");
+
+    tokio::time::sleep(PAST_LEASE).await;
+
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert_eq!(reclaimed.released, 1);
+    assert_eq!(reclaimed.discarded, 0);
+
+    let entry = registry
+        .get(&sandbox_id)
+        .await
+        .expect("read back")
+        .expect("row survives");
+    assert_eq!(entry.state, PausedRegistryState::Paused);
+    assert_eq!(entry.snapshot_id.as_ref(), Some(&snapshot));
+}
+
+/// The lease is only half the condition. A node can go silent while its
+/// sandboxes still have hours to run — that is a partition, and taking those
+/// sandboxes would duplicate them.
+#[tokio::test]
+async fn a_sandbox_still_within_its_deadline_survives_a_silent_node() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+    registry
+        .renew_lease(NODE_A, &[held_due(sandbox_id, TimeDelta::hours(1))])
+        .await
+        .expect("report a deadline an hour out");
+
+    tokio::time::sleep(PAST_LEASE).await;
+
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert!(
+        reclaimed.is_empty(),
+        "a sandbox with time left must not be taken from a node that is merely quiet, got {reclaimed:?}"
+    );
+    assert_eq!(
+        registry
+            .get(&sandbox_id)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::Running,
+    );
+}
+
+/// The other half. A node that is still renewing evicts its own expired
+/// sandboxes — pausing them properly and publishing a fresh snapshot, which is
+/// strictly the better outcome. Stepping in front of that would rewind the
+/// sandbox to an older snapshot for no reason.
+#[tokio::test]
+async fn an_expired_sandbox_stays_with_a_node_that_is_still_reporting() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+    registry
+        .renew_lease(NODE_A, &[held_due(sandbox_id, TimeDelta::seconds(-1))])
+        .await
+        .expect("renew with a deadline that has passed");
+
+    // No sleep: the lease this renewal just issued is still live.
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert!(
+        reclaimed.is_empty(),
+        "a reporting node must get to evict its own sandbox, got {reclaimed:?}"
+    );
+}
+
+/// A sandbox asked never to expire has no deadline to outlive, so no amount of
+/// silence makes it reclaimable. Same for a row whose holder has not renewed
+/// since the deadline column existed — an unknown deadline reads as no deadline,
+/// which is the safe direction.
+#[tokio::test]
+async fn a_sandbox_with_no_deadline_is_never_reclaimed() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+    registry
+        .renew_lease(NODE_A, &[held(sandbox_id)])
+        .await
+        .expect("renew without a deadline");
+
+    tokio::time::sleep(PAST_LEASE).await;
+
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert!(
+        reclaimed.is_empty(),
+        "a sandbox with no deadline must never be reclaimed, got {reclaimed:?}"
+    );
+}
+
+/// Reclamation is scoped to live rows. Parked ones already have a mechanism —
+/// the lease lets another node take them over — and rewriting them here would
+/// bypass the `NotReady` redirect that keeps a still-publishing snapshot on its
+/// own node.
+#[tokio::test]
+async fn reclamation_leaves_parked_rows_alone() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+
+    let paused = SandboxId::new();
+    pause_and_publish(&registry, paused, NODE_A).await;
+    registry
+        .renew_lease(NODE_A, &[held_due(paused, TimeDelta::seconds(-1))])
+        .await
+        .expect("renew");
+
+    let publishing = SandboxId::new();
+    registry
+        .begin_pause(&entry(publishing, NODE_A))
+        .await
+        .expect("begin pause");
+    registry
+        .renew_lease(NODE_A, &[held_due(publishing, TimeDelta::seconds(-1))])
+        .await
+        .expect("renew");
+
+    // The shape that actually tempts the predicate: parked, but *with* a
+    // snapshot behind it. A pause that published once and then failed to
+    // publish again leaves exactly this. Reclaiming it would mark it `paused`,
+    // another node would claim it and rebuild from the older snapshot, and the
+    // newer artifacts still sitting on the origin node would be thrown away —
+    // all while the `NotReady` redirect that exists to prevent precisely that
+    // is bypassed.
+    let local_only = SandboxId::new();
+    pause_and_publish(&registry, local_only, NODE_A).await;
+    let second = registry
+        .begin_pause(&entry(local_only, NODE_A))
+        .await
+        .expect("second pause");
+    registry
+        .mark_local_only(&local_only, second.generation)
+        .await
+        .expect("second publish never landed");
+    registry
+        .renew_lease(NODE_A, &[held_due(local_only, TimeDelta::seconds(-1))])
+        .await
+        .expect("renew");
+
+    tokio::time::sleep(PAST_LEASE).await;
+
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert!(
+        reclaimed.is_empty(),
+        "parked rows are the lease's business, not reclamation's, got {reclaimed:?}"
+    );
+    assert_eq!(
+        registry
+            .get(&publishing)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::Publishing,
+    );
+    assert_eq!(
+        registry
+            .get(&local_only)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::LocalOnly,
+        "a parked row with a snapshot must not be handed to the cluster behind its origin's back"
+    );
+    assert_eq!(
+        registry
+            .get(&paused)
+            .await
+            .expect("read back")
+            .expect("row")
+            .state,
+        PausedRegistryState::Paused,
+    );
+}
+
+/// An expired live row with nothing published behind it leaves nothing to
+/// rebuild, so it is deleted rather than parked — the same call reclamation's
+/// sibling makes, for the same reason.
+#[tokio::test]
+async fn reclamation_discards_expired_rows_with_nothing_to_rebuild_from() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    let began = registry
+        .begin_pause(&entry(sandbox_id, NODE_A))
+        .await
+        .expect("begin pause");
+    registry
+        .mark_local_only(&sandbox_id, began.generation)
+        .await
+        .expect("publish never landed");
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("resumed locally");
+    registry
+        .renew_lease(NODE_A, &[held_due(sandbox_id, TimeDelta::seconds(-1))])
+        .await
+        .expect("renew");
+
+    tokio::time::sleep(PAST_LEASE).await;
+
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert_eq!(reclaimed.released, 0);
+    assert_eq!(reclaimed.discarded, 1);
+    assert!(registry
+        .get(&sandbox_id)
+        .await
+        .expect("read back")
+        .is_none());
+}
+
+/// The deadline has to come from the holder, not from the row: `metadata` is
+/// whatever the sandbox looked like when it was paused, and a resume that set a
+/// longer timeout only exists in what the holder reports. Deriving it from the
+/// row would retire a sandbox that still had hours left.
+#[tokio::test]
+async fn a_renewal_moves_the_deadline_the_row_is_judged_against() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+    registry
+        .renew_lease(NODE_A, &[held_due(sandbox_id, TimeDelta::seconds(-1))])
+        .await
+        .expect("first renewal: already past");
+    // The sandbox's timeout is extended while it runs.
+    registry
+        .renew_lease(NODE_A, &[held_due(sandbox_id, TimeDelta::hours(1))])
+        .await
+        .expect("second renewal: an hour out");
+
+    tokio::time::sleep(PAST_LEASE).await;
+
+    let reclaimed = registry
+        .reclaim_expired_holdings()
+        .await
+        .expect("reclaim expired");
+    assert!(
+        reclaimed.is_empty(),
+        "an extended deadline must be what counts, got {reclaimed:?}"
+    );
 }

@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use super::{BeganPause, PausedSandboxEntry, PausedSandboxRegistry, RegistryResult, ResumeClaim};
+use super::{
+    BeganPause, HeldSandbox, PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings,
+    RegistryResult, ReleasedHoldings, ResumeClaim,
+};
 use crate::snapshot::SnapshotId;
 use crate::types::SandboxId;
 
@@ -64,12 +67,20 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(())
     }
 
-    async fn renew_lease(&self, _node_id: &str, _sandbox_ids: &[SandboxId]) -> RegistryResult<u64> {
+    async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
         Ok(0)
+    }
+
+    async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
+        Ok(ReclaimedHoldings::default())
     }
 
     async fn mark_running(&self, _sandbox_id: &SandboxId, _node_id: &str) -> RegistryResult<bool> {
         Ok(false)
+    }
+
+    async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
+        Ok(ReleasedHoldings::default())
     }
 
     async fn remove(&self, _sandbox_id: &SandboxId) -> RegistryResult<()> {

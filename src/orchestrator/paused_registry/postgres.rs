@@ -9,8 +9,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
-    BeganPause, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
-    PausedSandboxRegistry, RegistryResult, ResumeClaim,
+    BeganPause, HeldSandbox, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
+    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
@@ -52,6 +52,7 @@ ALTER TABLE paused_sandboxes DROP CONSTRAINT IF EXISTS paused_sandboxes_state_ch
 ALTER TABLE paused_sandboxes ADD CONSTRAINT paused_sandboxes_state_check
     CHECK (state IN ('publishing', 'paused', 'resuming', 'local_only', 'running'));
 ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS sandbox_expires_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
 CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
 "#;
@@ -59,25 +60,39 @@ CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (
 /// Largest number of sandbox IDs bound into a single `get_many` statement.
 const GET_MANY_CHUNK: usize = 1_000;
 
-/// How a row proves its holder is still alive.
+/// How a row proves its holder is still attached to the cluster.
 ///
 /// Every state except `paused` names a node that is doing something the row
 /// describes — running the sandbox, uploading its snapshot, bringing it back
-/// up — and that node refreshes `lease_expires_at` on a timer. Another node may
-/// only take the sandbox over once the lease has run out.
+/// up — and that node refreshes `lease_expires_at` on a timer.
 ///
-/// Without this the registry has no liveness signal at all, and the only thing
-/// left to infer "the holder is gone" from is the scheduler having no binding
-/// for the sandbox. That inference is wrong: bindings are held in memory with a
-/// 30s TTL and are lost outright when the scheduler restarts, so a perfectly
-/// healthy sandbox reads as unheld for as long as it takes the next heartbeat
-/// to re-seed the binding — and a resume arriving in that window would start a
-/// second live copy of it on another node.
+/// 🔴 What a lapsed lease proves, and what it does not. It proves the holder
+/// cannot reach PostgreSQL. It does **not** prove the holder's process is dead,
+/// and the two are only the same thing on a machine that has actually gone
+/// away: a node partitioned from the database keeps running every sandbox it
+/// has, keeps serving traffic through the gateway, and keeps writing to its
+/// rootfs layers, all while its rows quietly expire. Rebuilding one of those
+/// sandboxes elsewhere on that evidence produces two live copies of it, both
+/// diverging from the same snapshot, with the gateway flapping between them.
+///
+/// So this predicate only ever gates states whose VM is already stopped —
+/// `publishing` and `local_only` — where taking over costs the work since the
+/// last durable snapshot and nothing more. Live states (`running`, `resuming`)
+/// are never claimable on a timer; they are released by the only party that can
+/// prove the previous process is gone, which is the next process on that same
+/// machine (see `release_node_holdings`).
 ///
 /// `COALESCE(lease_expires_at, updated_at)` treats a row written before this
 /// column existed as already expired, which is the safe direction: a live
 /// holder refreshes it within one interval, a dead one never does.
 const LEASE_EXPIRED: &str = "COALESCE(lease_expires_at, updated_at) < now()";
+
+/// Rows a node is the holder of *and* whose sandbox is live: the ones only that
+/// node's own successor may release. `running` names the node in
+/// `origin_node_id`, `resuming` in `claimed_by_node_id` — the claim leaves
+/// `origin_node_id` pointing at whoever holds the local artifacts.
+const LIVE_HOLDINGS_OF_NODE: &str = "((state = 'running'  AND origin_node_id     = $2)
+              OR (state = 'resuming' AND claimed_by_node_id = $2))";
 
 /// PostgreSQL-backed [`PausedSandboxRegistry`].
 ///
@@ -467,19 +482,31 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         // without it the origin node cannot tell a resume happening elsewhere
         // from its own row and would happily start a second copy.
         //
-        // Two ways to qualify. A `paused` row is free for the taking: nobody is
-        // holding the sandbox and its snapshot is durable, which is the ordinary
-        // cross-node resume. Every other state names a node that is mid-flight,
-        // so taking it over requires that node's lease to have run out — the
-        // only evidence in this system that it is actually gone. Claiming a
-        // `running` row on any weaker signal starts a second live copy of a
-        // healthy sandbox.
+        // Two ways to qualify, and one state that never does.
         //
-        // Taking over `publishing` or `local_only` restores from the snapshot
-        // the *previous* pause left behind, since the newest one never reached
-        // the repository. That loses the last pause's work, so it happens only
-        // after a full lease has gone unrenewed, and it is logged as the
-        // degradation it is.
+        // A `paused` row is free for the taking: nobody is holding the sandbox
+        // and its snapshot is durable, which is the ordinary cross-node resume.
+        //
+        // `publishing` and `local_only` name a node that paused the sandbox but
+        // never got its snapshot into the repository. The VM is already stopped,
+        // so rebuilding elsewhere cannot duplicate it — it only rewinds to the
+        // snapshot the *previous* pause left behind. That is a real loss, so it
+        // waits for a full lease to go unrenewed and is logged as the
+        // degradation it is, but it is strictly better than the alternative of
+        // leaving the sandbox stranded on a node that may never return.
+        //
+        // 🔴 `running` and `resuming` are never claimable here, however long the
+        // lease has been lapsed. Their VM may still be up: a lapsed lease says
+        // the holder cannot reach this database, which a partitioned node —
+        // still running every sandbox it has, still being routed traffic —
+        // satisfies exactly as well as a dead one. e2b makes the same call from
+        // the other side of the same fact: a resume that finds the sandbox in
+        // its store is refused outright rather than placed somewhere else
+        // (`e2b/packages/api/internal/handlers/sandbox_resume.go`, StateRunning
+        // ⇒ 409), and its orphan sweep only ever kills sandboxes the store has
+        // no record of at all. Live rows are released instead by the successor
+        // process on the holder's own machine — see `release_node_holdings`,
+        // the only place in this system that can prove a VM is gone.
         let sql = format!(
             r#"
             UPDATE paused_sandboxes
@@ -489,7 +516,8 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
              WHERE sandbox_id = $1
                AND cluster_id = $4
                AND snapshot_id IS NOT NULL
-               AND (state = 'paused' OR {LEASE_EXPIRED})
+               AND (state = 'paused'
+                 OR (state IN ('publishing', 'local_only') AND {LEASE_EXPIRED}))
             RETURNING {ENTRY_COLUMNS}
             "#
         );
@@ -522,9 +550,9 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         }
 
         // The claim did not match. Re-read to tell the reasons apart, so the
-        // caller can redirect instead of reporting a bare "not found". Every
-        // answer below describes a live holder, because a dead one's row would
-        // have been claimed above.
+        // caller can redirect instead of reporting a bare "not found". A parked
+        // row that got here still has a live lease; a live row gets here
+        // whatever its lease says, and stays with its holder either way.
         match self.fetch(sandbox_id).await? {
             None => Ok(ResumeClaim::NotFound),
             Some(entry) => match entry.state {
@@ -535,8 +563,10 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
                         origin_node_id: entry.origin_node_id,
                     })
                 }
-                // Someone else is bringing it up, or it is live somewhere with
-                // no snapshot behind it yet. Either way this node must not.
+                // Live somewhere else, or being brought up somewhere else. The
+                // lease is not consulted: no timeout makes a live sandbox safe
+                // to rebuild here, so this stays a conflict until the holder's
+                // own successor releases the row.
                 PausedRegistryState::Resuming | PausedRegistryState::Running => {
                     Ok(ResumeClaim::Conflict {
                         origin_node_id: entry.claimed_by_node_id.unwrap_or(entry.origin_node_id),
@@ -550,12 +580,13 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         }
     }
 
-    async fn renew_lease(&self, node_id: &str, sandbox_ids: &[SandboxId]) -> RegistryResult<u64> {
-        if sandbox_ids.is_empty() {
+    async fn renew_lease(&self, node_id: &str, held: &[HeldSandbox]) -> RegistryResult<u64> {
+        if held.is_empty() {
             return Ok(0);
         }
 
-        let ids: Vec<Uuid> = sandbox_ids.iter().map(|id| id.into_inner()).collect();
+        let ids: Vec<Uuid> = held.iter().map(|h| h.sandbox_id.into_inner()).collect();
+        let deadlines: Vec<Option<DateTime<Utc>>> = held.iter().map(|h| h.expires_at).collect();
 
         // Only rows this node is actually the holder of. Passing the whole local
         // roster is deliberate — the predicate, not the caller, decides which of
@@ -565,20 +596,31 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         // `paused` is absent on purpose: that state means nobody holds the
         // sandbox, so there is nothing to keep alive and renewing it would only
         // be noise.
+        //
+        // The deadline rides along on the same statement rather than being
+        // written anywhere else, because these two facts are only useful
+        // together: "when did the holder last check in" and "how long was this
+        // sandbox supposed to live" are what reclamation compares. Writing them
+        // at different moments would let a row claim a deadline from one instant
+        // and a lease from another.
         let renewed = sqlx::query(
             r#"
-            UPDATE paused_sandboxes
-               SET lease_expires_at = now() + make_interval(secs => $1::double precision),
-                   updated_at = now()
-             WHERE cluster_id = $2
-               AND sandbox_id = ANY($3)
-               AND ((state IN ('running', 'publishing', 'local_only') AND origin_node_id = $4)
-                 OR (state = 'resuming' AND claimed_by_node_id = $4))
+            UPDATE paused_sandboxes AS p
+               SET lease_expires_at   = now() + make_interval(secs => $1::double precision),
+                   sandbox_expires_at = v.expires_at,
+                   updated_at         = now()
+              FROM (SELECT unnest($3::uuid[])        AS sandbox_id,
+                           unnest($4::timestamptz[]) AS expires_at) AS v
+             WHERE p.sandbox_id = v.sandbox_id
+               AND p.cluster_id = $2
+               AND ((p.state IN ('running', 'publishing', 'local_only') AND p.origin_node_id = $5)
+                 OR (p.state = 'resuming' AND p.claimed_by_node_id = $5))
             "#,
         )
         .bind(self.lease_ttl_secs)
         .bind(self.cluster_id)
         .bind(&ids)
+        .bind(&deadlines)
         .bind(node_id)
         .execute(&self.pool)
         .await
@@ -588,6 +630,89 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         debug!(node_id, renewed, "renewed paused registry leases");
 
         Ok(renewed)
+    }
+
+    async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
+        // Both conditions, and neither alone would do.
+        //
+        // `{LEASE_EXPIRED}` alone is what `claim_for_resume` refuses to act on:
+        // it cannot tell a dead node from a partitioned one, and acting on it
+        // duplicates live sandboxes.
+        //
+        // `sandbox_expires_at < now()` alone would race the node's own eviction.
+        // A reachable node evicts its expired sandboxes itself — pausing them
+        // properly and publishing a fresh snapshot — and that is by far the
+        // better outcome, so the cluster only steps in once nobody has renewed
+        // for a full lease.
+        //
+        // Together they describe a sandbox that has outlived the deadline its
+        // own user set, on a node that has not been heard from since before it
+        // did. Reclaiming that is enforcing the timeout, not guessing at the
+        // node's health — and it is the one thing that keeps a decommissioned
+        // machine's sandboxes from being stranded forever.
+        //
+        // A NULL `sandbox_expires_at` never matches, which covers both a
+        // sandbox asked never to expire and a row whose holder has not renewed
+        // since this column existed. Both are the safe answer: leave it alone.
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                PausedRegistryError::backend("reclaim_expired_holdings", anyhow!(e))
+            })?;
+
+        let released = sqlx::query(&format!(
+            r#"
+            UPDATE paused_sandboxes
+               SET state = 'paused', claimed_by_node_id = NULL,
+                   generation = generation + 1, updated_at = now(),
+                   lease_expires_at = now()
+             WHERE cluster_id = $1
+               AND snapshot_id IS NOT NULL
+               AND state IN ('running', 'resuming')
+               AND {LEASE_EXPIRED}
+               AND sandbox_expires_at < now()
+            "#
+        ))
+        .bind(self.cluster_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PausedRegistryError::backend("reclaim_expired_holdings", anyhow!(e)))?
+        .rows_affected();
+
+        // Same reasoning as `release_node_holdings`: no snapshot means nothing
+        // to rebuild from, so the row is only ever going to sit there.
+        let discarded = sqlx::query(&format!(
+            r#"
+            DELETE FROM paused_sandboxes
+             WHERE cluster_id = $1
+               AND snapshot_id IS NULL
+               AND state IN ('running', 'resuming')
+               AND {LEASE_EXPIRED}
+               AND sandbox_expires_at < now()
+            "#
+        ))
+        .bind(self.cluster_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PausedRegistryError::backend("reclaim_expired_holdings", anyhow!(e)))?
+        .rows_affected();
+
+        tx.commit()
+            .await
+            .map_err(|e| PausedRegistryError::backend("reclaim_expired_holdings", anyhow!(e)))?;
+
+        if released > 0 || discarded > 0 {
+            warn!(
+                released,
+                discarded,
+                "reclaimed sandboxes that outlived their deadline on a node that stopped \
+                 reporting; released ones resume from their last published snapshot"
+            );
+        }
+
+        Ok(ReclaimedHoldings {
+            released,
+            discarded,
+        })
     }
 
     async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()> {
@@ -661,6 +786,80 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         }
 
         Ok(updated > 0)
+    }
+
+    async fn release_node_holdings(&self, node_id: &str) -> RegistryResult<ReleasedHoldings> {
+        // One transaction, so a resume arriving between the two statements
+        // cannot see a sandbox that is neither released nor discarded.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PausedRegistryError::backend("release_node_holdings", anyhow!(e)))?;
+
+        // Recoverable: the snapshot outlives the process that was running the
+        // sandbox, so the row goes back to being claimable by anyone —
+        // including this node, which is usually the one that picks it up again.
+        // `lease_expires_at = now()` rather than a fresh lease: `paused` means
+        // nobody holds it, and leaving a live-looking lease behind would only
+        // confuse the next reader.
+        let released = sqlx::query(&format!(
+            r#"
+            UPDATE paused_sandboxes
+               SET state = 'paused', claimed_by_node_id = NULL,
+                   generation = generation + 1, updated_at = now(),
+                   lease_expires_at = now()
+             WHERE cluster_id = $1
+               AND snapshot_id IS NOT NULL
+               AND {LIVE_HOLDINGS_OF_NODE}
+            "#
+        ))
+        .bind(self.cluster_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PausedRegistryError::backend("release_node_holdings", anyhow!(e)))?
+        .rows_affected();
+
+        // Unrecoverable: a live sandbox with no published snapshot has its only
+        // artifacts on the local disk of the process that just died, and the
+        // resume that started it consumed the paused record they belonged to.
+        // Keeping the row would leave something no node can ever claim
+        // (`claim_for_resume` requires a snapshot) and no node can ever clear.
+        let discarded = sqlx::query(&format!(
+            r#"
+            DELETE FROM paused_sandboxes
+             WHERE cluster_id = $1
+               AND snapshot_id IS NULL
+               AND {LIVE_HOLDINGS_OF_NODE}
+            "#
+        ))
+        .bind(self.cluster_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PausedRegistryError::backend("release_node_holdings", anyhow!(e)))?
+        .rows_affected();
+
+        tx.commit()
+            .await
+            .map_err(|e| PausedRegistryError::backend("release_node_holdings", anyhow!(e)))?;
+
+        if released > 0 || discarded > 0 {
+            warn!(
+                node_id,
+                released,
+                discarded,
+                "released sandboxes the previous process on this node was holding; \
+                 released ones resume from their last published snapshot, \
+                 discarded ones never had one"
+            );
+        }
+
+        Ok(ReleasedHoldings {
+            released,
+            discarded,
+        })
     }
 
     async fn remove(&self, sandbox_id: &SandboxId) -> RegistryResult<()> {

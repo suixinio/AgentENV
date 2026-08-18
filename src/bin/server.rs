@@ -163,10 +163,17 @@ async fn main() -> anyhow::Result<()> {
         paused_wiring,
         config.sandbox_proxy.domains.clone(),
     ));
-    // Both run before the listener opens. Renewing first is what stops this
-    // node's own sandboxes from looking abandoned during startup; reconciling
-    // then makes sure a resume arriving first does not find a paused record the
-    // cluster has already moved past.
+    // All three run before the listener opens, and the order is load-bearing.
+    //
+    // Releasing goes first, and only here: it hands back every sandbox a
+    // previous process on this machine died holding, which is sound precisely
+    // because this process holds nothing yet. Once the listener is open that
+    // stops being true and the same call would be giving away live sandboxes.
+    //
+    // Renewing then stops this node's own remaining records from looking
+    // abandoned during startup, and reconciling makes sure a resume arriving
+    // first does not find a paused record the cluster has already moved past.
+    api_impl.release_stale_node_holdings().await;
     api_impl.renew_paused_leases().await;
     api_impl.reconcile_local_records().await;
     let paused_upkeep = spawn_paused_record_upkeep(
@@ -280,6 +287,11 @@ fn spawn_paused_record_upkeep(
         loop {
             ticker.tick().await;
             api_impl.reconcile_local_records().await;
+            // Cluster-wide rather than node-local, and deliberately not on the
+            // startup path: the rows it collects have been stranded for at
+            // least a sandbox lifetime already, so nothing is gained by making
+            // the listener wait for it.
+            api_impl.reclaim_expired_sandboxes().await;
         }
     });
 

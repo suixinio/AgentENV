@@ -8,6 +8,19 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: agentenv-node
+  # 🔴 maxSurge must stay 0 (the DaemonSet default, made explicit here because
+  # correctness depends on it). A node releases the sandboxes its previous
+  # process died holding by node identity, at startup, on the premise that the
+  # previous process on this machine is gone — which is exactly what "old pod
+  # fully terminated before the new one starts" guarantees. Surging the two
+  # pods together breaks that premise: the new pod would hand the old pod's
+  # still-running sandboxes to whoever resumes them next, and both copies would
+  # then diverge from the same snapshot.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   template:
     metadata:
       labels:

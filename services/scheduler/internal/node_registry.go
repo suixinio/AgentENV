@@ -42,8 +42,17 @@ type observedNodeRecord struct {
 }
 
 type AtomicNodeRegistry struct {
-	mu               sync.RWMutex
-	nodesByID        map[string]Node
+	mu        sync.RWMutex
+	nodesByID map[string]Node
+	// Maps a node's previous identity (its pod name) to its current one, so a
+	// heartbeat sent under the old name during a fleet upgrade is still
+	// recognised instead of being rejected as an unknown node. Without it the
+	// scheduler stops accepting a node's heartbeats the moment discovery starts
+	// naming nodes after the machine, and keeps rejecting them until that
+	// node's pod restarts — which, behind a drain that waits for every sandbox
+	// to be parked, can be hours. The node's bindings expire meanwhile and
+	// every sandbox on it answers 404.
+	aliasToID        map[string]string
 	lingeringIDs     map[string]bool
 	observedTTL      time.Duration
 	observed         map[string]observedNodeRecord
@@ -59,6 +68,7 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 
 	registry := &AtomicNodeRegistry{
 		nodesByID:        make(map[string]Node),
+		aliasToID:        make(map[string]string),
 		lingeringIDs:     make(map[string]bool),
 		observedTTL:      ttl,
 		observed:         make(map[string]observedNodeRecord),
@@ -90,15 +100,33 @@ func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 func (r *AtomicNodeRegistry) Contains(node Node) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	known, ok := r.nodesByID[node.ID]
+	known, ok := r.nodesByID[r.canonicalIDLocked(node.ID)]
 	return ok && known.Endpoint == node.Endpoint
 }
 
 func (r *AtomicNodeRegistry) Resolve(nodeID string) (Node, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	node, ok := r.nodesByID[nodeID]
+	node, ok := r.nodesByID[r.canonicalIDLocked(nodeID)]
 	return node, ok
+}
+
+// canonicalIDLocked maps whatever identity a caller used onto the one discovery
+// currently uses for that node. Unknown identities are returned unchanged, so
+// the caller still gets its "not in the registry" answer.
+//
+// The order is the guarantee, not an optimisation: a real node is always
+// resolved as itself, so an alias can never shadow one and attribute one
+// machine's heartbeat to another.
+func (r *AtomicNodeRegistry) canonicalIDLocked(nodeID string) string {
+	if _, ok := r.nodesByID[nodeID]; ok {
+		return nodeID
+	}
+	if canonical, ok := r.aliasToID[nodeID]; ok {
+		return canonical
+	}
+
+	return nodeID
 }
 
 // Set replaces the discovered node list. active nodes are serving and not
@@ -117,9 +145,18 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 		lIDs[node.ID] = true
 	}
 
+	aliases := make(map[string]string)
+	for _, node := range byID {
+		if node.PodName == "" || node.PodName == node.ID {
+			continue
+		}
+		aliases[node.PodName] = node.ID
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.nodesByID = byID
+	r.aliasToID = aliases
 	r.lingeringIDs = lIDs
 	affectedClusters := make(map[string]struct{})
 	for nodeID, record := range r.observed {
@@ -144,13 +181,17 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	node, ok := r.nodesByID[req.GetNodeId()]
+	// Everything below keys off the canonical ID, never the one the node sent:
+	// a node mid-upgrade still reports its pod name, and recording it under
+	// that would give the same machine two observed identities.
+	nodeID := r.canonicalIDLocked(req.GetNodeId())
+	node, ok := r.nodesByID[nodeID]
 	if !ok {
 		return Node{}, "", ErrNodeNotInRegistry
 	}
 
 	prevCPU, existed := "", false
-	if prev, ok := r.observed[req.GetNodeId()]; ok {
+	if prev, ok := r.observed[nodeID]; ok {
 		existed = true
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
 		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
@@ -160,7 +201,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 
 	record := observedNodeRecord{
 		node: &schedulerv1.ObservedNode{
-			NodeId:            req.GetNodeId(),
+			NodeId:            nodeID,
 			Endpoint:          node.Endpoint,
 			ClusterId:         req.GetClusterId(),
 			ServiceInstanceId: req.GetServiceInstanceId(),
@@ -180,7 +221,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		record.node.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
 	}
 
-	r.observed[req.GetNodeId()] = record
+	r.observed[nodeID] = record
 
 	clusterID := req.GetClusterId()
 	if !existed || (machineInfo != nil && machineInfo.GetCpuConfigJson() != prevCPU) {
@@ -194,8 +235,8 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		}
 	}
 
-	if intersection, ok := r.cpuIntersection[clusterID]; ok && !r.intersectionSent[req.GetNodeId()] {
-		r.intersectionSent[req.GetNodeId()] = true
+	if intersection, ok := r.cpuIntersection[clusterID]; ok && !r.intersectionSent[nodeID] {
+		r.intersectionSent[nodeID] = true
 		return node, intersection, nil
 	}
 	return node, "", nil

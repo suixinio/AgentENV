@@ -5,6 +5,11 @@ import schedulerv1 "agentenv/services/api/proto"
 type Node struct {
 	ID       string `json:"node_id"`
 	Endpoint string `json:"endpoint"`
+	// PodName is the identity this node reported itself under before node
+	// identity became the machine's name rather than the pod's. Carried purely
+	// so a heartbeat arriving under the old name is still recognised while a
+	// fleet is mid-upgrade; empty once every node reports the stable ID.
+	PodName string `json:"pod_name,omitempty"`
 }
 
 // RichNode combines discovery identity with observed runtime state.

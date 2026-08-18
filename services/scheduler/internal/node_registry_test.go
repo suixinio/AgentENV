@@ -487,3 +487,96 @@ func TestMultiClusterCpuIntersectionsAreIndependent(t *testing.T) {
 		t.Errorf("cluster-y y1: got unexpected second delivery %v", c)
 	}
 }
+
+// 🔴 The upgrade window. Discovery starts naming nodes after the machine as
+// soon as the scheduler rolls, but a node keeps reporting its pod name until
+// its own pod restarts — and behind a drain that waits for every sandbox to be
+// parked, that can be hours. Rejecting those heartbeats would expire the node's
+// bindings and 404 every sandbox on it in the meantime.
+func TestHeartbeatUnderThePreviousPodNameIsStillRecognised(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, 30*time.Second)
+	registry.Set([]Node{{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000", PodName: "agentenv-node-xk29f"}}, nil)
+
+	node, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "agentenv-node-xk29f",
+		ClusterId:         "cluster-a",
+		ServiceInstanceId: "svc-a",
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}, time.Unix(100, 0))
+	if err != nil {
+		t.Fatalf("expected the old identity to be accepted, got %v", err)
+	}
+	if node.ID != "aenv-worker-01" {
+		t.Fatalf("expected the canonical node, got %q", node.ID)
+	}
+
+	// And it must be recorded once, under the canonical ID — not twice.
+	observed := registry.ListObserved("cluster-a", time.Unix(100, 0))
+	if len(observed) != 1 || observed[0].GetNodeId() != "aenv-worker-01" {
+		t.Fatalf("expected one observation under the canonical ID, got %+v", observed)
+	}
+	if registry.PeekObserved("agentenv-node-xk29f") != nil {
+		t.Fatal("the old identity must not become a second observed node")
+	}
+}
+
+// The same machine before and after its pod restarts is one node, with one
+// observation — not a stale entry plus a live one.
+func TestHeartbeatsUnderOldAndNewIdentityCollapseToOneNode(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, 30*time.Second)
+	registry.Set([]Node{{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000", PodName: "agentenv-node-xk29f"}}, nil)
+	now := time.Unix(100, 0)
+
+	for _, id := range []string{"agentenv-node-xk29f", "aenv-worker-01"} {
+		if _, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            id,
+			ClusterId:         "cluster-a",
+			ServiceInstanceId: "svc-a",
+			Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+		}, now); err != nil {
+			t.Fatalf("heartbeat as %q: %v", id, err)
+		}
+	}
+
+	if observed := registry.ListObserved("cluster-a", now); len(observed) != 1 {
+		t.Fatalf("expected one node, got %d", len(observed))
+	}
+}
+
+// An alias must never shadow a real node, or one machine's heartbeat would be
+// attributed to another.
+func TestAnAliasThatCollidesWithARealNodeIsIgnored(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, 30*time.Second)
+	registry.Set([]Node{
+		{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000", PodName: "aenv-worker-02"},
+		{ID: "aenv-worker-02", Endpoint: "http://10.0.0.2:8000"},
+	}, nil)
+
+	node, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "aenv-worker-02",
+		ClusterId:         "cluster-a",
+		ServiceInstanceId: "svc-b",
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}, time.Unix(100, 0))
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if node.ID != "aenv-worker-02" || node.Endpoint != "http://10.0.0.2:8000" {
+		t.Fatalf("a real node must win over an alias, got %+v", node)
+	}
+}
+
+// A genuinely unknown node still has to be refused.
+func TestHeartbeatFromAnUnknownIdentityIsStillRejected(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, 30*time.Second)
+	registry.Set([]Node{{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000", PodName: "agentenv-node-xk29f"}}, nil)
+
+	_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "agentenv-node-somewhere-else",
+		ClusterId:         "cluster-a",
+		ServiceInstanceId: "svc-a",
+	}, time.Unix(100, 0))
+	if !errors.Is(err, ErrNodeNotInRegistry) {
+		t.Fatalf("expected ErrNodeNotInRegistry, got %v", err)
+	}
+}

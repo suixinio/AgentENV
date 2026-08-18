@@ -328,9 +328,15 @@ func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) 
 	terminating := endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating
 
 	hostPort := net.JoinHostPort(address, strconv.Itoa(int(port)))
+	podName := ""
+	if id != endpoint.TargetRef.Name {
+		podName = endpoint.TargetRef.Name
+	}
+
 	return Node{
 		ID:       id,
 		Endpoint: fmt.Sprintf("%s://%s", scheme, hostPort),
+		PodName:  podName,
 	}, terminating, true
 }
 

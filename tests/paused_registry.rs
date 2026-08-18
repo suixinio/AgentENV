@@ -171,7 +171,7 @@ async fn a_failed_publish_keeps_the_snapshot_the_sandbox_already_had() {
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim");
-    let ResumeClaim::Claimed(claimed) = claim else {
+    let ResumeClaim::Claimed { entry: claimed, .. } = claim else {
         panic!("a lapsed local-only row must be recoverable from its last snapshot");
     };
     assert_eq!(claimed.snapshot_id.as_ref(), Some(&first));
@@ -263,9 +263,14 @@ async fn a_parked_sandbox_moves_on_once_its_holder_stops_renewing() {
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim");
-    assert!(
-        matches!(claim, ResumeClaim::Claimed(_)),
-        "a parked sandbox whose holder went quiet must be recoverable elsewhere"
+    let ResumeClaim::Claimed { previous_state, .. } = claim else {
+        panic!("a parked sandbox whose holder went quiet must be recoverable elsewhere, got {claim:?}");
+    };
+    assert_eq!(
+        previous_state,
+        PausedRegistryState::Publishing,
+        "the claim has to name the state it overrode: this one cost its holder an \
+         unpublished pause, which is the whole reason the event is worth logging"
     );
 }
 
@@ -313,7 +318,7 @@ async fn a_successor_process_releases_what_the_previous_one_was_running() {
         .await
         .expect("claim");
     assert!(
-        matches!(claim, ResumeClaim::Claimed(_)),
+        matches!(claim, ResumeClaim::Claimed { .. }),
         "a released sandbox must be recoverable on any node"
     );
 }
@@ -421,7 +426,7 @@ async fn an_interrupted_resume_is_released_by_the_node_that_claimed_it() {
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim");
-    assert!(matches!(claim, ResumeClaim::Claimed(_)));
+    assert!(matches!(claim, ResumeClaim::Claimed { .. }));
 
     let by_origin = registry
         .release_node_holdings(NODE_A)
@@ -509,7 +514,41 @@ async fn a_paused_sandbox_is_claimable_immediately() {
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim");
-    assert!(matches!(claim, ResumeClaim::Claimed(_)));
+    assert!(matches!(claim, ResumeClaim::Claimed { .. }));
+}
+
+/// 🔴 An ordinary resume must not report itself as a takeover.
+///
+/// The claim is one conditional `UPDATE` that sets `state = 'resuming'`, and
+/// `RETURNING` describes the row it produced — so the returned `state` reads
+/// `Resuming` for every claim, whatever the row said a moment earlier. Deciding
+/// the outcome from it labelled every routine resume "holder stopped renewing
+/// its lease", which buried the rare claim that really does cost someone an
+/// unpublished pause under the common one that costs nothing.
+///
+/// Nothing caught it, because every assertion in this file looked only at the
+/// variant and the snapshot — never at what the claim said it replaced. This is
+/// that assertion.
+#[tokio::test]
+async fn an_ordinary_claim_reports_no_takeover() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+
+    let claim = registry
+        .claim_for_resume(&sandbox_id, NODE_B)
+        .await
+        .expect("claim");
+    let ResumeClaim::Claimed { previous_state, .. } = claim else {
+        panic!("a durably paused sandbox is claimable, got {claim:?}");
+    };
+    assert_eq!(
+        previous_state,
+        PausedRegistryState::Paused,
+        "no lease was in question here: the row was published and idle"
+    );
 }
 
 /// 🔴 One node's resume must not erase another's in-flight one. A blind write
@@ -522,7 +561,7 @@ async fn marking_a_sandbox_running_cannot_erase_another_nodes_claim() {
     let sandbox_id = SandboxId::new();
 
     pause_and_publish(&registry, sandbox_id, NODE_A).await;
-    let ResumeClaim::Claimed(_) = registry
+    let ResumeClaim::Claimed { .. } = registry
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim")
@@ -671,7 +710,7 @@ async fn releasing_a_claim_puts_the_sandbox_back() {
     let sandbox_id = SandboxId::new();
 
     pause_and_publish(&registry, sandbox_id, NODE_A).await;
-    let ResumeClaim::Claimed(claimed) = registry
+    let ResumeClaim::Claimed { entry: claimed, .. } = registry
         .claim_for_resume(&sandbox_id, NODE_B)
         .await
         .expect("claim")

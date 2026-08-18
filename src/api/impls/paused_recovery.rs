@@ -681,7 +681,7 @@ impl ApiImpl {
 /// would make a node unable to resume its own sandboxes.
 fn arbitration(claim: ResumeClaim, node_id: &str) -> ResumeArbitration {
     match claim {
-        ResumeClaim::Claimed(entry) => ResumeArbitration::Held(entry),
+        ResumeClaim::Claimed { entry, .. } => ResumeArbitration::Held(entry),
         // The cluster does not track this sandbox, so there is nobody to
         // arbitrate with and a local copy, if any, is the whole truth.
         ResumeClaim::NotFound => ResumeArbitration::Proceed,
@@ -1104,8 +1104,11 @@ mod tests {
         let row = entry(PausedRegistryState::Paused, SELF, None);
         let snapshot = row.snapshot_id.clone();
 
-        let ResumeArbitration::Held(held) = arbitration(ResumeClaim::Claimed(Box::new(row)), SELF)
-        else {
+        let claim = ResumeClaim::Claimed {
+            entry: Box::new(row),
+            previous_state: PausedRegistryState::Paused,
+        };
+        let ResumeArbitration::Held(held) = arbitration(claim, SELF) else {
             panic!("a granted claim must be held");
         };
 

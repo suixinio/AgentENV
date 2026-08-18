@@ -149,7 +149,24 @@ impl ReleasedHoldings {
 #[derive(Debug)]
 pub enum ResumeClaim {
     /// The caller owns the sandbox and must either resume it or release the claim.
-    Claimed(Box<PausedSandboxEntry>),
+    Claimed {
+        entry: Box<PausedSandboxEntry>,
+        /// What the row said *before* the claim moved it to `Resuming`.
+        ///
+        /// 🔴 It cannot be read off `entry`: the claim is a single conditional
+        /// `UPDATE`, and `RETURNING` hands back the row as the statement left
+        /// it — `state` is therefore always `Resuming` there, whatever it was
+        /// a moment earlier. Reading it from `entry` is how this claim came to
+        /// report every ordinary resume as a lease takeover for months.
+        ///
+        /// The distinction it carries is not cosmetic. `Paused` means the
+        /// snapshot was durable and nothing was lost. `Publishing` /
+        /// `LocalOnly` mean the claim overrode a node that never finished
+        /// uploading, so the sandbox comes back one snapshot behind and the
+        /// work since that snapshot is gone — the one event on this path an
+        /// operator has to be able to find.
+        previous_state: PausedRegistryState,
+    },
     /// No registry row: the sandbox is unknown to the cluster.
     NotFound,
     /// The snapshot is still uploading, so only the origin node can serve this

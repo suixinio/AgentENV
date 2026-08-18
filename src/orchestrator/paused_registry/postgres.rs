@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -180,6 +180,28 @@ impl PostgresPausedSandboxRegistry {
         Ok(())
     }
 
+    /// Decodes one state column by name.
+    ///
+    /// Taken as a parameter because `claim_for_resume` reads two of them out of
+    /// the same row — the state the claim produced and the one it replaced —
+    /// and both have to be rejected the same way when the text is not a state
+    /// this build knows.
+    fn decode_state(
+        row: &PgRow,
+        column: &str,
+        sandbox_id: &SandboxId,
+    ) -> RegistryResult<PausedRegistryState> {
+        let text: String = row.try_get(column).map_err(|e| {
+            PausedRegistryError::backend("decode state", anyhow!(e).context(format!("column {column}")))
+        })?;
+
+        PausedRegistryState::parse(&text).ok_or_else(|| PausedRegistryError::InvalidRecord {
+            sandbox_id: sandbox_id.to_string(),
+            reason: format!("unknown state '{text}' in column '{column}'"),
+            source: None,
+        })
+    }
+
     fn decode(row: &PgRow) -> RegistryResult<PausedSandboxEntry> {
         let sandbox_uuid: Uuid = row
             .try_get("sandbox_id")
@@ -193,11 +215,7 @@ impl PostgresPausedSandboxRegistry {
                 source,
             };
 
-        let state_text: String = row
-            .try_get("state")
-            .map_err(|e| PausedRegistryError::backend("decode state", anyhow!(e)))?;
-        let state = PausedRegistryState::parse(&state_text)
-            .ok_or_else(|| invalid(format!("unknown state '{state_text}'"), None))?;
+        let state = Self::decode_state(row, "state", &sandbox_id)?;
 
         let metadata_json: serde_json::Value = row
             .try_get("metadata")
@@ -507,18 +525,35 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         // no record of at all. Live rows are released instead by the successor
         // process on the holder's own machine — see `release_node_holdings`,
         // the only place in this system that can prove a VM is gone.
+        //
+        // The `previous` CTE is what makes the outcome knowable at all. Both
+        // CTEs read the same statement-start snapshot, so it sees the row as
+        // the `UPDATE` found it, while `RETURNING` can only describe the row
+        // the `UPDATE` left behind — where `state` is unconditionally
+        // `Resuming`. Judging the outcome from the returned row therefore
+        // reports every claim as the rarest one, which is exactly what this
+        // used to do. Same reasoning, and the same shape, as `begin_pause`.
         let sql = format!(
             r#"
-            UPDATE paused_sandboxes
-               SET state = 'resuming', claimed_by_node_id = $2,
-                   generation = generation + 1, updated_at = now(),
-                   lease_expires_at = now() + make_interval(secs => $3::double precision)
-             WHERE sandbox_id = $1
-               AND cluster_id = $4
-               AND snapshot_id IS NOT NULL
-               AND (state = 'paused'
-                 OR (state IN ('publishing', 'local_only') AND {LEASE_EXPIRED}))
-            RETURNING {ENTRY_COLUMNS}
+            WITH previous AS (
+                SELECT state AS previous_state
+                  FROM paused_sandboxes
+                 WHERE sandbox_id = $1 AND cluster_id = $4
+            ),
+            claimed AS (
+                UPDATE paused_sandboxes
+                   SET state = 'resuming', claimed_by_node_id = $2,
+                       generation = generation + 1, updated_at = now(),
+                       lease_expires_at = now() + make_interval(secs => $3::double precision)
+                 WHERE sandbox_id = $1
+                   AND cluster_id = $4
+                   AND snapshot_id IS NOT NULL
+                   AND (state = 'paused'
+                     OR (state IN ('publishing', 'local_only') AND {LEASE_EXPIRED}))
+                RETURNING {ENTRY_COLUMNS}
+            )
+            SELECT claimed.*, previous.previous_state
+              FROM claimed JOIN previous ON TRUE
             "#
         );
         let claimed = sqlx::query(&sql)
@@ -532,21 +567,49 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
 
         if let Some(row) = claimed {
             let entry = Self::decode(&row)?;
-            match entry.state {
-                PausedRegistryState::Paused => {
-                    debug!(%sandbox_id, node_id, generation = entry.generation, "claimed paused sandbox")
-                }
-                stale => warn!(
+            let previous_state = Self::decode_state(&row, "previous_state", &entry.sandbox_id)?;
+
+            // One arm per thing that actually happened, decided here rather
+            // than left for a reader to infer from the row: an ordinary resume
+            // and a claim that cost someone their last unpublished pause are
+            // not the same event, and only the second one is worth waking
+            // anybody for.
+            match previous_state {
+                PausedRegistryState::Paused => debug!(
                     %sandbox_id,
                     node_id,
-                    previous_state = ?stale,
+                    generation = entry.generation,
+                    claim_outcome = "durable",
+                    "claimed a sandbox from its published snapshot"
+                ),
+                PausedRegistryState::Publishing | PausedRegistryState::LocalOnly => warn!(
+                    %sandbox_id,
+                    node_id,
+                    claim_outcome = "rewound",
+                    previous_state = ?previous_state,
                     previous_holder = %entry.origin_node_id,
-                    "took over a sandbox whose holder stopped renewing its lease; \
-                     restoring from the last snapshot that reached the repository"
+                    "took over a sandbox parked on a node that stopped renewing its lease; \
+                     restoring from the last snapshot that reached the repository, so any \
+                     work since that snapshot is lost"
+                ),
+                // Unreachable through the `WHERE` above, which is precisely why
+                // it is loud: reaching it means the predicate and this match
+                // have drifted apart, and the claim just duplicated a sandbox
+                // that was live somewhere else.
+                live => error!(
+                    %sandbox_id,
+                    node_id,
+                    claim_outcome = "invariant_violation",
+                    previous_state = ?live,
+                    previous_holder = %entry.origin_node_id,
+                    "claimed a sandbox that was not parked; a live sandbox may now exist twice"
                 ),
             }
 
-            return Ok(ResumeClaim::Claimed(Box::new(entry)));
+            return Ok(ResumeClaim::Claimed {
+                entry: Box::new(entry),
+                previous_state,
+            });
         }
 
         // The claim did not match. Re-read to tell the reasons apart, so the

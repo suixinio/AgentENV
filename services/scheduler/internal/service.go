@@ -212,6 +212,12 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 	if strings.TrimSpace(node.ID) == "" || strings.TrimSpace(node.Endpoint) == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and endpoint are required")
 	}
+	if known, ok := s.nodes.Resolve(node.ID); ok {
+		// Heartbeats reconcile bindings under the node's current identity; a
+		// binding written under a previous one would be dropped by the next
+		// heartbeat as belonging to nobody.
+		node.ID = known.ID
+	}
 	if !s.isKnownNode(node) {
 		s.logger.Warn("scheduler rejected assignment for unknown node",
 			zap.String("sandbox_id", req.GetSandboxId()),
@@ -319,16 +325,21 @@ func (s *Service) RecordP2PArtifact(_ context.Context, req *schedulerv1.RecordP2
 	if strings.TrimSpace(req.GetClusterId()) == "" || strings.TrimSpace(req.GetBackend()) == "" || strings.TrimSpace(req.GetKey()) == "" || strings.TrimSpace(req.GetNodeId()) == "" {
 		return nil, status.Error(codes.InvalidArgument, "cluster_id, backend, key, and node_id are required")
 	}
-	if _, ok := s.nodes.Resolve(req.GetNodeId()); !ok {
+	// Index under the node's current identity, not the one it reported itself
+	// under: peers are listed by the identity heartbeats are recorded against,
+	// so a node mid-upgrade would otherwise file its artifacts under a name no
+	// lookup ever matches, and the index would quietly stop accelerating.
+	node, ok := s.nodes.Resolve(req.GetNodeId())
+	if !ok {
 		return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
 	}
 
-	s.artifacts.Record(req.GetClusterId(), req.GetBackend(), req.GetKey(), req.GetNodeId())
+	s.artifacts.Record(req.GetClusterId(), req.GetBackend(), req.GetKey(), node.ID)
 	s.logger.Debug("scheduler recorded P2P artifact",
 		zap.String("cluster_id", req.GetClusterId()),
 		zap.String("backend", req.GetBackend()),
 		zap.String("key", req.GetKey()),
-		zap.String("node_id", req.GetNodeId()),
+		zap.String("node_id", node.ID),
 	)
 	return &schedulerv1.RecordP2PArtifactResponse{}, nil
 }
@@ -338,12 +349,19 @@ func (s *Service) ForgetP2PArtifact(_ context.Context, req *schedulerv1.ForgetP2
 		return nil, status.Error(codes.InvalidArgument, "cluster_id, backend, key, and node_id are required")
 	}
 
-	s.artifacts.Forget(req.GetClusterId(), req.GetBackend(), req.GetKey(), req.GetNodeId())
+	// Must resolve exactly as Record did, or a node that filed an artifact under
+	// one identity could never withdraw it under the other.
+	nodeID := req.GetNodeId()
+	if node, ok := s.nodes.Resolve(nodeID); ok {
+		nodeID = node.ID
+	}
+
+	s.artifacts.Forget(req.GetClusterId(), req.GetBackend(), req.GetKey(), nodeID)
 	s.logger.Debug("scheduler forgot P2P artifact",
 		zap.String("cluster_id", req.GetClusterId()),
 		zap.String("backend", req.GetBackend()),
 		zap.String("key", req.GetKey()),
-		zap.String("node_id", req.GetNodeId()),
+		zap.String("node_id", nodeID),
 	)
 	return &schedulerv1.ForgetP2PArtifactResponse{}, nil
 }
@@ -383,6 +401,13 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	serviceInstanceID := strings.TrimSpace(req.GetServiceInstanceId())
 	if nodeID == "" || serviceInstanceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
+	}
+
+	if node, ok := s.nodes.Resolve(nodeID); ok {
+		// Bindings and observations are held under the node's current identity,
+		// so an unregister sent under the previous one has to be resolved or it
+		// clears nothing.
+		nodeID = node.ID
 	}
 
 	unregisterErr := s.nodes.UnregisterObserved(nodeID, serviceInstanceID)

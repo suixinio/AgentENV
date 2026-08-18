@@ -710,3 +710,78 @@ func TestHeartbeatRejectsEmptyServiceInstanceID(t *testing.T) {
 		t.Fatalf("expected invalid argument, got %v", err)
 	}
 }
+
+// Every RPC that takes a node ID has to resolve it the same way, or a node
+// mid-upgrade files things under one identity and the rest of the scheduler
+// looks for them under the other.
+func TestNodeIdentifyingRPCsResolveThePreviousPodName(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
+	registry.Set([]Node{{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000", PodName: "agentenv-node-xk29f"}}, nil)
+	artifacts := NewInMemoryArtifactStore(1000, 0)
+	service := NewService(zap.NewNop(), registry, NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL), WithArtifactStore(artifacts))
+	heartbeatVia(t, service, "agentenv-node-xk29f")
+
+	// A binding recorded under the old identity must survive the next
+	// heartbeat, which reconciles under the current one.
+	if _, err := service.RecordAssignment(context.Background(), &schedulerv1.RecordAssignmentRequest{
+		SandboxId: "sbx-1",
+		Node:      (&Node{ID: "agentenv-node-xk29f", Endpoint: "http://10.0.0.1:8000"}).ToProto(),
+	}); err != nil {
+		t.Fatalf("record assignment: %v", err)
+	}
+	resp, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "sbx-1"})
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if got := resp.GetNode().GetNodeId(); got != "aenv-worker-01" {
+		t.Fatalf("expected the binding under the canonical ID, got %q", got)
+	}
+
+	// An artifact filed under the old identity must be findable by peers listed
+	// under the current one.
+	if _, err := service.RecordP2PArtifact(context.Background(), &schedulerv1.RecordP2PArtifactRequest{
+		ClusterId: "cluster-a", Backend: "iroh", Key: "layer-1", NodeId: "agentenv-node-xk29f",
+	}); err != nil {
+		t.Fatalf("record artifact: %v", err)
+	}
+	if got := artifacts.Lookup("cluster-a", "iroh", "layer-1"); len(got) != 1 || got[0] != "aenv-worker-01" {
+		t.Fatalf("expected the artifact indexed under the canonical ID, got %v", got)
+	}
+
+	// And withdrawn under either.
+	if _, err := service.ForgetP2PArtifact(context.Background(), &schedulerv1.ForgetP2PArtifactRequest{
+		ClusterId: "cluster-a", Backend: "iroh", Key: "layer-1", NodeId: "agentenv-node-xk29f",
+	}); err != nil {
+		t.Fatalf("forget artifact: %v", err)
+	}
+	if got := artifacts.Lookup("cluster-a", "iroh", "layer-1"); len(got) != 0 {
+		t.Fatalf("expected the artifact withdrawn, got %v", got)
+	}
+}
+
+// Unregistering under the previous identity must still clear the bindings the
+// node actually holds.
+func TestUnregisterUnderThePreviousPodNameClearsBindings(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
+	registry.Set([]Node{{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000", PodName: "agentenv-node-xk29f"}}, nil)
+	service := NewService(zap.NewNop(), registry, NewStrategy("round_robin"), NewInMemoryBindingStore(defaultObservedReportTTL))
+	heartbeatVia(t, service, "agentenv-node-xk29f")
+	if _, err := service.RecordAssignment(context.Background(), &schedulerv1.RecordAssignmentRequest{
+		SandboxId: "sbx-1",
+		Node:      (&Node{ID: "aenv-worker-01", Endpoint: "http://10.0.0.1:8000"}).ToProto(),
+	}); err != nil {
+		t.Fatalf("record assignment: %v", err)
+	}
+
+	if _, err := service.UnregisterNode(context.Background(), &schedulerv1.UnregisterNodeRequest{
+		NodeId:            "agentenv-node-xk29f",
+		ServiceInstanceId: "svc-agentenv-node-xk29f",
+	}); err != nil {
+		t.Fatalf("unregister: %v", err)
+	}
+
+	if _, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "sbx-1"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected the binding cleared, got %v", err)
+	}
+}

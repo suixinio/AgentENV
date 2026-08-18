@@ -37,10 +37,17 @@ spec:
               value: /usr/local/bin/uvm-ublk-daemon
             - name: AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR
               value: "0.0.0.0:9103"
+            # The cluster's name for the machine, not the pod's. This ID is
+            # what a paused sandbox's registry row records as its holder and
+            # what the node must still match to renew that row's lease; a pod
+            # name changes on every pod recreation, so a restarted node would
+            # stop matching its own rows and the leases on every sandbox parked
+            # on it would lapse for good. Must stay in step with the scheduler's
+            # discovery, which names nodes the same way.
             - name: AENV_NODE_ID
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.name
+                  fieldPath: spec.nodeName
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "true"
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT

@@ -318,6 +318,7 @@ func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) 
 	if endpoint.TargetRef == nil || endpoint.TargetRef.Name == "" {
 		return Node{}, false, false
 	}
+	id := nodeIDForEndpoint(endpoint)
 
 	address, addrOK := selectRoutableEndpointAddress(endpoint.Addresses)
 	if !addrOK {
@@ -328,9 +329,33 @@ func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) 
 
 	hostPort := net.JoinHostPort(address, strconv.Itoa(int(port)))
 	return Node{
-		ID:       endpoint.TargetRef.Name,
+		ID:       id,
 		Endpoint: fmt.Sprintf("%s://%s", scheme, hostPort),
 	}, terminating, true
+}
+
+// nodeIDForEndpoint names the node an endpoint belongs to.
+//
+// The cluster's name for the machine, not the pod's, because this ID is what a
+// sandbox's registry row records as its holder and what a node must still match
+// to renew that row's lease. A pod name changes on every pod recreation, so a
+// node that restarts stops matching its own rows: the leases on every sandbox
+// parked on it lapse permanently, and any other node may take them over even
+// though the artifacts are still sitting on the original node's disk. Observed
+// on a live cluster — a paused sandbox whose lease had been expired for 50
+// minutes while its record sat, intact, on the node that owned it.
+//
+// Falls back to the pod name when the endpoint carries no node name, which is
+// the only shape older or non-Kubernetes discovery can produce; that is exactly
+// the previous behaviour, so the fallback never makes anything worse.
+func nodeIDForEndpoint(endpoint discoveryv1.Endpoint) string {
+	if endpoint.NodeName != nil {
+		if name := strings.TrimSpace(*endpoint.NodeName); name != "" {
+			return name
+		}
+	}
+
+	return endpoint.TargetRef.Name
 }
 
 func selectRoutableEndpointAddress(addresses []string) (string, bool) {

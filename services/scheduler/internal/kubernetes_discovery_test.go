@@ -440,3 +440,66 @@ func int32Ptr(v int32) *int32 {
 func boolPtr(v bool) *bool {
 	return &v
 }
+
+// 🔴 A node's identity has to survive its pod being recreated. It is what a
+// paused sandbox's registry row names as its holder, and what the node must
+// still match to renew that row's lease — so a pod-name identity means a
+// restarted node can never renew the leases on the sandboxes parked on it.
+func TestNodesFromEndpointSlicesIdentifiesNodesByClusterNodeName(t *testing.T) {
+	ep := servingEndpoint("agentenv-node-xk29f", "10.0.0.1")
+	ep.NodeName = stringPtr("aenv-worker-01")
+
+	active, _ := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
+		newEndpointSlice(8000, ep),
+	}, defaultDiscoveryCfg)
+
+	if len(active) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(active))
+	}
+	if got := active[0].ID; got != "aenv-worker-01" {
+		t.Fatalf("expected the cluster node name, got %q", got)
+	}
+}
+
+// The same node, one pod recreation later: same identity, new address.
+func TestNodesFromEndpointSlicesKeepsIdentityAcrossPodRecreation(t *testing.T) {
+	before := servingEndpoint("agentenv-node-xk29f", "10.0.0.1")
+	before.NodeName = stringPtr("aenv-worker-01")
+	after := servingEndpoint("agentenv-node-p4t7z", "10.0.0.9")
+	after.NodeName = stringPtr("aenv-worker-01")
+
+	first, _ := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{newEndpointSlice(8000, before)}, defaultDiscoveryCfg)
+	second, _ := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{newEndpointSlice(8000, after)}, defaultDiscoveryCfg)
+
+	if first[0].ID != second[0].ID {
+		t.Fatalf("identity changed across pod recreation: %q -> %q", first[0].ID, second[0].ID)
+	}
+	if second[0].Endpoint != "http://10.0.0.9:8000" {
+		t.Fatalf("expected the new address, got %q", second[0].Endpoint)
+	}
+}
+
+// Discovery shapes that carry no node name must behave exactly as before, so
+// enabling this cannot break a cluster whose endpoints do not populate it.
+func TestNodesFromEndpointSlicesFallsBackToPodNameWithoutNodeName(t *testing.T) {
+	for _, ep := range []discoveryv1.Endpoint{
+		servingEndpoint("agentenv-node-xk29f", "10.0.0.1"),
+		func() discoveryv1.Endpoint {
+			e := servingEndpoint("agentenv-node-xk29f", "10.0.0.1")
+			e.NodeName = stringPtr("   ")
+			return e
+		}(),
+	} {
+		active, _ := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
+			newEndpointSlice(8000, ep),
+		}, defaultDiscoveryCfg)
+
+		if len(active) != 1 || active[0].ID != "agentenv-node-xk29f" {
+			t.Fatalf("expected the pod name as fallback, got %+v", active)
+		}
+	}
+}
+
+func stringPtr(v string) *string {
+	return &v
+}

@@ -94,6 +94,15 @@ spec:
                   - /bin/sh
                   - "-c"
                   - |
+                    # Stop taking new sandboxes first. The pod is already
+                    # Terminating, so the scheduler's discovery will drop it
+                    # too, but that is an outside signal on its own clock —
+                    # this one is immediate, and it is the one the node itself
+                    # acts on when deciding whether to serve a resume.
+                    curl -sf -X PUT -H 'X-API-Key: preStop' \
+                      "http://localhost:8000/nodes/${AENV_NODE_ID}/isolation" \
+                      && echo "preStop: node isolated" \
+                      || echo "preStop: failed to isolate node, continuing"
                     echo "preStop: waiting for sandboxes to drain..."
                     while true; do
                       count=$(curl -sf -H 'X-API-Key: preStop' http://localhost:8000/sandboxes | jq 'length') || count=""

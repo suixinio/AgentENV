@@ -380,7 +380,14 @@ impl ObservabilityReporter {
                 cpu_config_json: snapshot.machine_info.cpu_config_json.unwrap_or_default(),
             }),
             snapshot: Some(scheduler::NodeSnapshot {
-                status: scheduler::NodeStatus::Ready.into(),
+                // An isolated node keeps heartbeating — it is healthy and still
+                // serving sandboxes — and says so here, which is what takes it
+                // out of scheduling without taking it out of the cluster.
+                status: if snapshot.draining {
+                    scheduler::NodeStatus::Draining.into()
+                } else {
+                    scheduler::NodeStatus::Ready.into()
+                },
                 allocated_cpu: snapshot.metrics.allocated_cpu,
                 allocated_memory_bytes: snapshot.metrics.allocated_memory_bytes,
                 cpu_percent: snapshot.metrics.cpu_percent,

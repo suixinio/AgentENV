@@ -30,6 +30,12 @@ const (
 //	lingering + heartbeat OK    → LINGERING     — terminating, draining existing work
 //	lingering + no heartbeat    → CONNECTING    — terminating, never confirmed
 //	lingering + heartbeat timeout → UNHEALTHY   — terminating, heartbeat lost
+//
+// DRAINING is different in kind from the rows above: it is not derived, it is
+// what the node itself reports after being isolated through its own admin API.
+// A node reports it while it is still perfectly healthy, so it never overrides
+// a derived status — LINGERING and UNHEALTHY both win over it, because a pod
+// that is going away, or a node that stopped answering, is the stronger fact.
 type NodeStatus int32
 
 const (
@@ -38,6 +44,8 @@ const (
 	NodeStatus_NODE_STATUS_CONNECTING  NodeStatus = 2
 	NodeStatus_NODE_STATUS_UNHEALTHY   NodeStatus = 3
 	NodeStatus_NODE_STATUS_LINGERING   NodeStatus = 4
+	// Node-reported isolation: serving existing sandboxes, refusing new work.
+	NodeStatus_NODE_STATUS_DRAINING NodeStatus = 5
 )
 
 // Enum value maps for NodeStatus.
@@ -48,6 +56,7 @@ var (
 		2: "NODE_STATUS_CONNECTING",
 		3: "NODE_STATUS_UNHEALTHY",
 		4: "NODE_STATUS_LINGERING",
+		5: "NODE_STATUS_DRAINING",
 	}
 	NodeStatus_value = map[string]int32{
 		"NODE_STATUS_UNSPECIFIED": 0,
@@ -55,6 +64,7 @@ var (
 		"NODE_STATUS_CONNECTING":  2,
 		"NODE_STATUS_UNHEALTHY":   3,
 		"NODE_STATUS_LINGERING":   4,
+		"NODE_STATUS_DRAINING":    5,
 	}
 )
 
@@ -2475,14 +2485,15 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x15UnregisterNodeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
 	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x18\n" +
-	"\x16UnregisterNodeResponse*\x92\x01\n" +
+	"\x16UnregisterNodeResponse*\xac\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11NODE_STATUS_READY\x10\x01\x12\x1a\n" +
 	"\x16NODE_STATUS_CONNECTING\x10\x02\x12\x19\n" +
 	"\x15NODE_STATUS_UNHEALTHY\x10\x03\x12\x19\n" +
-	"\x15NODE_STATUS_LINGERING\x10\x04*\xce\x01\n" +
+	"\x15NODE_STATUS_LINGERING\x10\x04\x12\x18\n" +
+	"\x14NODE_STATUS_DRAINING\x10\x05*\xce\x01\n" +
 	"\x10SandboxEventType\x12\"\n" +
 	"\x1eSANDBOX_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_CREATE\x10\x01\x12\x1d\n" +

@@ -210,3 +210,54 @@ func TestFilterIncludingPausedExcludesNodeWithinActiveLimits(t *testing.T) {
 		t.Fatalf("expected [ok], got %v", result)
 	}
 }
+
+func TestFilterUnschedulableDropsSelfReportedDraining(t *testing.T) {
+	nodes := []RichNode{
+		{Node: Node{ID: "ready"}, Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY}},
+		{Node: Node{ID: "isolated"}, Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_DRAINING}},
+	}
+
+	result := FilterUnschedulable(nodes)
+	if len(result) != 1 || result[0].Node.ID != "ready" {
+		t.Fatalf("expected only the ready node to survive, got %v", nodeIDsOf(result))
+	}
+}
+
+// A node that has registered but not yet reported must stay schedulable —
+// otherwise a freshly started cluster has nothing to place sandboxes on until
+// the first heartbeat lands.
+func TestFilterUnschedulableKeepsNodesThatHaveNotReported(t *testing.T) {
+	nodes := []RichNode{
+		{Node: Node{ID: "no-snapshot"}, Snapshot: nil},
+		{Node: Node{ID: "unspecified"}, Snapshot: &schedulerv1.NodeSnapshot{}},
+	}
+
+	result := FilterUnschedulable(nodes)
+	if len(result) != 2 {
+		t.Fatalf("expected both unreported nodes to be kept, got %v", nodeIDsOf(result))
+	}
+}
+
+func TestNodeStatusCanAcceptNewRequests(t *testing.T) {
+	accepting := map[schedulerv1.NodeStatus]bool{
+		schedulerv1.NodeStatus_NODE_STATUS_READY:       true,
+		schedulerv1.NodeStatus_NODE_STATUS_DRAINING:    false,
+		schedulerv1.NodeStatus_NODE_STATUS_LINGERING:   false,
+		schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY:   false,
+		schedulerv1.NodeStatus_NODE_STATUS_CONNECTING:  false,
+		schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED: false,
+	}
+	for status, want := range accepting {
+		if got := status.CanAcceptNewRequests(); got != want {
+			t.Errorf("%s: CanAcceptNewRequests() = %v, want %v", status, got, want)
+		}
+	}
+}
+
+func nodeIDsOf(nodes []RichNode) []string {
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.Node.ID)
+	}
+	return ids
+}

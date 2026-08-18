@@ -1,6 +1,36 @@
 package scheduler
 
-import "agentenv/services/shared/config"
+import (
+	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
+)
+
+// FilterUnschedulable removes nodes whose own last heartbeat says they are not
+// taking new work — today that means a node isolated through its admin API,
+// which reports DRAINING.
+//
+// Only a status the node actually reported is acted on. A node with no snapshot
+// yet, or one reporting UNSPECIFIED, is kept: it has just registered and has
+// not had a chance to say anything about itself, and dropping it would leave a
+// freshly started cluster with nothing to schedule onto until the first
+// heartbeat lands. Fail open on what we do not know, fail closed on what a node
+// told us.
+//
+// Statuses the scheduler derives rather than receives — LINGERING from pod
+// termination, UNHEALTHY from a lost heartbeat — are not handled here. Those
+// come from discovery and heartbeat expiry, and are filtered upstream of this
+// call.
+func FilterUnschedulable(nodes []RichNode) []RichNode {
+	result := make([]RichNode, 0, len(nodes))
+	for _, n := range nodes {
+		status := n.Snapshot.GetStatus()
+		if status != schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED && !status.CanAcceptNewRequests() {
+			continue
+		}
+		result = append(result, n)
+	}
+	return result
+}
 
 // FilterByResourceLimit removes nodes that exceed any configured resource
 // threshold. Nodes without a heartbeat snapshot are always kept (they have no

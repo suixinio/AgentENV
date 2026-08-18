@@ -114,6 +114,8 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+        scheduling_disabled: std::sync::atomic::AtomicBool::new(false),
+        scheduling_disabled_changed_at_ms: std::sync::atomic::AtomicI64::new(0),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
@@ -4971,6 +4973,87 @@ async fn discarding_a_superseded_copy_leaves_the_cluster_record_alone() -> Resul
         orchestrator.get_sandbox(&created.id).await?.is_none(),
         "the local copy must be gone"
     );
+
+    Ok(())
+}
+
+/// Isolation is about what arrives next. A node that has been taken out of
+/// rotation must refuse work that would put another sandbox on it, and must
+/// carry on serving everything it already holds — otherwise isolating a node
+/// would be indistinguishable from breaking it.
+#[tokio::test]
+async fn an_isolated_node_refuses_new_sandboxes_and_keeps_serving_its_own() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(90), &[("case_id", case_id.as_str())]))
+        .await?;
+
+    assert!(
+        orchestrator.set_scheduling_disabled(true),
+        "isolating a node in rotation is a change"
+    );
+    assert!(
+        !orchestrator.set_scheduling_disabled(true),
+        "isolating an already isolated node changes nothing"
+    );
+    assert!(orchestrator.scheduling_disabled_changed_at_ms().is_some());
+
+    let create_err = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await
+        .expect_err("an isolated node must not take a new sandbox");
+    assert!(matches!(create_err, OrchestratorError::NotAcceptingNewWork));
+
+    let fork_err = Arc::clone(&orchestrator)
+        .fork_sandbox(created.id, 1, NewTimeout::UseExisting)
+        .await
+        .expect_err("a fork puts another sandbox on this node, so it is new work");
+    assert!(matches!(fork_err, OrchestratorError::NotAcceptingNewWork));
+
+    // Existing sandboxes are untouched: keeping one alive and putting it to
+    // sleep are both things this node still owns.
+    orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(300)), false)
+        .await?
+        .expect("keep-alive must survive isolation");
+    orchestrator.pause_sandbox(created.id).await?;
+
+    assert!(
+        orchestrator.set_scheduling_disabled(false),
+        "clearing isolation is a change"
+    );
+    orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await
+        .expect("clearing isolation puts the node back in rotation");
+
+    Ok(())
+}
+
+/// The orchestrator itself never refuses a resume: a paused sandbox that only
+/// this node can rebuild has nowhere else to go, and refusing it here would
+/// turn "this node is busy leaving" into "your sandbox is gone". Declining a
+/// resume somebody else can serve is a routing decision, and lives in the API
+/// layer where the registry can be consulted.
+#[tokio::test]
+async fn an_isolated_node_still_resumes_a_sandbox_it_alone_holds() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(90), &[("case_id", case_id.as_str())]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    orchestrator.set_scheduling_disabled(true);
+
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect("an isolated node must still resume what only it can recover");
+    assert_eq!(resumed.state, SandboxState::Running);
 
     Ok(())
 }

@@ -108,7 +108,9 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		})
 	}
 
-	eligible := FilterByResourceLimit(rich, s.resourceLimit)
+	// Discovery already dropped lingering nodes; this drops the ones that
+	// reported themselves isolated in their own heartbeat.
+	eligible := FilterByResourceLimit(FilterUnschedulable(rich), s.resourceLimit)
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {

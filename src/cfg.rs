@@ -677,6 +677,16 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+    /// How long shutdown waits, after isolating the node, before it starts
+    /// tearing sandboxes down.
+    ///
+    /// The pause exists so the scheduler learns this node is out of rotation
+    /// while the node can still serve — otherwise a sandbox placed in the last
+    /// moments before shutdown is created only to be paused again. Two
+    /// heartbeat intervals is enough for the report to land and be applied.
+    /// Zero disables the wait, which is what tests and local runs want.
+    #[config(default = 10u64, env = "AENV_SHUTDOWN_DRAIN_PROPAGATION_SECS")]
+    pub shutdown_drain_propagation_secs: u64,
     #[config(nested)]
     pub paused_registry: PausedRegistryConfig,
 }

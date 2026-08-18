@@ -66,6 +66,9 @@ pub enum OrchestratorError {
     #[error("orchestrator is shutting down")]
     ShuttingDown,
 
+    #[error("node is isolated and is not taking new sandboxes")]
+    NotAcceptingNewWork,
+
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),
 

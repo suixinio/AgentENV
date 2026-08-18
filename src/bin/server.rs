@@ -183,6 +183,9 @@ async fn main() -> anyhow::Result<()> {
 
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);
+    let drain_orchestrator = Arc::clone(&orchestrator);
+    let drain_propagation =
+        Duration::from_secs(config.orchestrator.shutdown_drain_propagation_secs);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
@@ -236,6 +239,26 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+
+            // Take the node out of rotation before tearing anything down, and
+            // give the scheduler time to hear about it. Without this pause a
+            // sandbox can be placed here in the moments after the signal and be
+            // paused again before the caller has finished starting it.
+            //
+            // Isolation set through the admin API is left alone: it is already
+            // the state we want, and re-announcing it would reset the timestamp
+            // an operator is watching.
+            if drain_orchestrator.set_scheduling_disabled(true) {
+                info!(
+                    target: "agentenv",
+                    wait_secs = drain_propagation.as_secs(),
+                    "isolated the node for shutdown; waiting for the scheduler to notice"
+                );
+                if !drain_propagation.is_zero() {
+                    tokio::time::sleep(drain_propagation).await;
+                }
+            }
+
             let _ = shutdown_tx.send(());
         })
         .await?;

@@ -108,12 +108,20 @@ message DiskMetric {
 //   lingering + heartbeat OK    → LINGERING     — terminating, draining existing work
 //   lingering + no heartbeat    → CONNECTING    — terminating, never confirmed
 //   lingering + heartbeat timeout → UNHEALTHY   — terminating, heartbeat lost
+//
+// DRAINING is different in kind from the rows above: it is not derived, it is
+// what the node itself reports after being isolated through its own admin API.
+// A node reports it while it is still perfectly healthy, so it never overrides
+// a derived status — LINGERING and UNHEALTHY both win over it, because a pod
+// that is going away, or a node that stopped answering, is the stronger fact.
 enum NodeStatus {
   NODE_STATUS_UNSPECIFIED = 0;
   NODE_STATUS_READY = 1;
   NODE_STATUS_CONNECTING = 2;
   NODE_STATUS_UNHEALTHY = 3;
   NODE_STATUS_LINGERING = 4;
+  // Node-reported isolation: serving existing sandboxes, refusing new work.
+  NODE_STATUS_DRAINING = 5;
 }
 
 message NodeSnapshot {

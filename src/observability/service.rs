@@ -80,6 +80,7 @@ impl ObservabilityService {
             machine_info: self.machine_info.clone(),
             sandbox_count: runtime.running_sandbox_count,
             sandbox_ids: self.orchestrator.list_sandbox_ids().await?,
+            draining: self.orchestrator.scheduling_disabled(),
             metrics: NodeMetricsSnapshot {
                 allocated_cpu: runtime.allocated_cpu,
                 allocated_memory_bytes: runtime.allocated_memory_bytes,

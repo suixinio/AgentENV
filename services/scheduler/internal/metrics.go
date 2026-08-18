@@ -79,6 +79,7 @@ func recordObservedNodes(nodes []*schedulerv1.ObservedNode) {
 		"connecting":  0,
 		"unhealthy":   0,
 		"lingering":   0,
+		"draining":    0,
 		"unspecified": 0,
 	}
 	for _, node := range nodes {
@@ -135,6 +136,8 @@ func schedulerNodeStatusLabel(status schedulerv1.NodeStatus) string {
 		return "unhealthy"
 	case schedulerv1.NodeStatus_NODE_STATUS_LINGERING:
 		return "lingering"
+	case schedulerv1.NodeStatus_NODE_STATUS_DRAINING:
+		return "draining"
 	default:
 		return "unspecified"
 	}

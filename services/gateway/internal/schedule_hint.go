@@ -152,3 +152,44 @@ func parseNewSandboxHint(body []byte) *schedulerv1.NewSandboxHint {
 	hint.Metadata = parsed.Metadata
 	return hint
 }
+
+// maxReplayBodyBytes bounds how much of a request body the gateway holds so the
+// request can be sent to a second node. Sized for control-plane calls like
+// resume, whose bodies are a handful of fields.
+const maxReplayBodyBytes = 64 << 10
+
+// captureReplayBody buffers a request body so the request can be forwarded
+// twice. It reports whether a replay is possible: a body larger than the bound
+// is left as an intact stream and must not be replayed, since only a truncated
+// prefix was ever held.
+func captureReplayBody(r *http.Request) ([]byte, bool, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, true, nil
+	}
+
+	orig := r.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, maxReplayBodyBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(buf)) > maxReplayBodyBytes {
+		r.Body = &prefixedBody{Reader: io.MultiReader(bytes.NewReader(buf), orig), closer: orig}
+		return nil, false, nil
+	}
+	_ = orig.Close()
+	restoreReplayBody(r, buf)
+
+	return buf, true, nil
+}
+
+// restoreReplayBody re-presents a buffered body as a fresh readable stream, so
+// a request whose body was already consumed by one forward can be sent again.
+func restoreReplayBody(r *http.Request, body []byte) {
+	if len(body) == 0 {
+		r.Body = http.NoBody
+		r.ContentLength = 0
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+}

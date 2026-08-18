@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, SystemTime};
@@ -105,6 +105,19 @@ pub struct Orchestrator<
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
+    /// Node-level isolation. While set, this node refuses work that would put a
+    /// *new* sandbox on it and reports itself draining in its heartbeat, but
+    /// keeps serving everything it already holds: isolation is about what
+    /// arrives next, not about what is already here.
+    ///
+    /// Deliberately separate from `is_shutting_down`. A shutting-down node is
+    /// on its way out and refuses lifecycle work outright; an isolated node is
+    /// perfectly healthy and may be un-isolated again.
+    scheduling_disabled: std::sync::atomic::AtomicBool,
+    /// When isolation last changed, in unix milliseconds; zero means never.
+    /// Reported by the admin API so an operator can see how long a node has
+    /// been out of rotation.
+    scheduling_disabled_changed_at_ms: AtomicI64,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
@@ -211,6 +224,8 @@ where
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            scheduling_disabled: std::sync::atomic::AtomicBool::new(false),
+            scheduling_disabled_changed_at_ms: AtomicI64::new(0),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
             image_refs,
@@ -391,7 +406,7 @@ where
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
-        if let Err(err) = self.ensure_accepting_lifecycle_operations() {
+        if let Err(err) = self.ensure_accepting_new_work() {
             self.counters.record_create_fail(1);
             return Err(err);
         }
@@ -578,7 +593,7 @@ where
         count: u32,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
-        self.ensure_accepting_lifecycle_operations()?;
+        self.ensure_accepting_new_work()?;
 
         info!("forking sandboxes");
 
@@ -2676,6 +2691,62 @@ where
         if self.is_shutting_down() {
             info!("rejecting lifecycle operation because orchestrator is shutting down");
             return Err(OrchestratorError::ShuttingDown);
+        }
+
+        Ok(())
+    }
+
+    /// Whether this node currently refuses to take on new sandboxes.
+    pub fn scheduling_disabled(&self) -> bool {
+        self.scheduling_disabled.load(Ordering::Acquire)
+    }
+
+    /// Isolates this node, or puts it back in rotation. Reports whether the
+    /// call changed anything, so callers can stay idempotent without having to
+    /// read first.
+    pub fn set_scheduling_disabled(&self, disabled: bool) -> bool {
+        if self.scheduling_disabled.swap(disabled, Ordering::AcqRel) == disabled {
+            return false;
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since| since.as_millis() as i64)
+            .unwrap_or_default();
+        self.scheduling_disabled_changed_at_ms
+            .store(now_ms, Ordering::Release);
+        info!(
+            scheduling_disabled = disabled,
+            "node scheduling availability changed"
+        );
+
+        true
+    }
+
+    /// When isolation last changed, or `None` if it never has.
+    pub fn scheduling_disabled_changed_at_ms(&self) -> Option<i64> {
+        match self
+            .scheduling_disabled_changed_at_ms
+            .load(Ordering::Acquire)
+        {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Guards the paths that would put a new sandbox on this node.
+    ///
+    /// Deliberately *not* used by paths that act on sandboxes already here —
+    /// keep-alive, snapshot, pause, delete — nor by `launch_sandbox`, which
+    /// resume shares: a node that is merely isolated must still be able to
+    /// bring back a sandbox it alone can recover (see the resume gate in the
+    /// API layer, which decides that question where the answer is known).
+    fn ensure_accepting_new_work(&self) -> Result<()> {
+        self.ensure_accepting_lifecycle_operations()?;
+
+        if self.scheduling_disabled() {
+            info!("rejecting new work because the node is isolated");
+            return Err(OrchestratorError::NotAcceptingNewWork);
         }
 
         Ok(())

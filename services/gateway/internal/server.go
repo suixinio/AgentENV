@@ -28,7 +28,18 @@ const (
 	headerE2BTargetPort        = "e2b-sandbox-port"
 	headerNodeID               = "x-agentenv-node-id"
 	maxRecordAssignmentTimeout = 5 * time.Second
+
+	// headerReroute is how an isolated node asks the gateway to hand a request
+	// to somebody else instead. Only a node that has established the work can
+	// be picked up elsewhere sets it — see the resume path in the node's API.
+	headerReroute         = "x-agentenv-reroute"
+	rerouteReasonSchedule = "schedule"
 )
+
+// errRerouteRequested aborts a proxied response before any of it reaches the
+// client, so the request can be sent to a different node. It never surfaces to
+// a caller: the error handler swallows it and the caller retries.
+var errRerouteRequested = errors.New("upstream asked for the request to be rerouted")
 
 type routeSource string
 
@@ -175,6 +186,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			setGatewayRouteSource(w, routeSourcePath)
 			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
 			return
+		} else if nodeID, ok := isNodeIsolationRequest(r); ok {
+			setGatewayRouteSource(w, routeSourcePath)
+			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
+			return
 		}
 	}
 
@@ -268,10 +283,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A resume sent to a node by an existing binding can come back declined:
+	// that node is isolated and has established the sandbox can be rebuilt
+	// elsewhere. Buffer the body up front so the request can be replayed; a
+	// body too large to buffer simply forfeits the reroute rather than being
+	// truncated.
+	replayBody, canReplay := []byte(nil), false
+	if !recoveredSandbox && isPausedSandboxRecoveryRequest(r) {
+		var err error
+		replayBody, canReplay, err = captureReplayBody(r)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+	}
+
 	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
 	defer cancelUpstream()
 
-	s.proxyRequest(
+	rerouted := s.proxyRequest(
 		w,
 		r.Clone(upstreamCtx),
 		r.Context(),
@@ -280,6 +310,67 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		proxyRequestOptions{
 			recordAssignment: recoveredSandbox || shouldRecordAssignment(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
+			flushImmediately: longLived,
+			allowReroute:     canReplay,
+		},
+	)
+	if !rerouted {
+		return
+	}
+
+	s.rerouteToScheduledNode(w, r, routingCtx, sandboxID, replayBody, longLived)
+}
+
+// rerouteToScheduledNode re-sends a request that its bound node declined, to a
+// node the scheduler picks instead. Nothing has been written to w yet.
+//
+// The assignment is recorded on the way out: the sandbox is moving to a node
+// that never held it, and the binding has to follow it there rather than wait
+// for the next heartbeat to notice.
+func (s *Server) rerouteToScheduledNode(
+	w http.ResponseWriter,
+	r *http.Request,
+	routingCtx context.Context,
+	sandboxID string,
+	body []byte,
+	longLived bool,
+) {
+	recovery, err := s.scheduleRecoveryNode(routingCtx, sandboxID)
+	if err != nil {
+		s.writeSchedulerError(w, err)
+		return
+	}
+
+	upstreamURL, err := joinUpstream(
+		recovery.GetEndpoint(),
+		upstreamTargetPath(routeSourcePath, r.URL.Path),
+		upstreamTargetEscapedPath(routeSourcePath, requestEscapedPath(r)),
+		r.URL.RawQuery,
+	)
+	if err != nil {
+		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		return
+	}
+
+	setGatewayRouteSource(w, routeSourceSchedule)
+	s.logger.Info("rerouting declined resume to a scheduled node",
+		zap.String("sandbox_id", sandboxID),
+		zap.String("node_id", recovery.GetNodeId()),
+		zap.String("upstream_endpoint", recovery.GetEndpoint()),
+	)
+
+	restoreReplayBody(r, body)
+	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
+	defer cancelUpstream()
+
+	s.proxyRequest(
+		w,
+		r.Clone(upstreamCtx),
+		r.Context(),
+		upstreamURL,
+		recovery,
+		proxyRequestOptions{
+			recordAssignment: true,
 			flushImmediately: longLived,
 		},
 	)
@@ -307,8 +398,15 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	// allowReroute lets the upstream node decline the request in a way the
+	// gateway acts on rather than forwards. Only set it where the caller is
+	// prepared to send the request somewhere else.
+	allowReroute bool
 }
 
+// proxyRequest forwards the request to one node. It reports whether that node
+// declined it and asked for a different node to be tried; nothing has been
+// written to w in that case, so the caller may forward it again.
 func (s *Server) proxyRequest(
 	w http.ResponseWriter,
 	proxyReq *http.Request,
@@ -316,12 +414,14 @@ func (s *Server) proxyRequest(
 	target string,
 	node *schedulerv1.Node,
 	options proxyRequestOptions,
-) {
+) bool {
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
-		return
+		return false
 	}
+
+	rerouteRequested := false
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
@@ -339,6 +439,17 @@ func (s *Server) proxyRequest(
 		},
 		FlushInterval: flushInterval(options.flushImmediately),
 		ModifyResponse: func(resp *http.Response) error {
+			// An isolated node answers a resume it does not want to serve with
+			// this marker instead of starting the sandbox. Drop the response
+			// before any of it is copied to the client so the request can go to
+			// another node; the client never learns this happened.
+			if options.allowReroute &&
+				resp.StatusCode == http.StatusServiceUnavailable &&
+				strings.EqualFold(resp.Header.Get(headerReroute), rerouteReasonSchedule) {
+				_ = resp.Body.Close()
+				rerouteRequested = true
+				return errRerouteRequested
+			}
 			// In debug mode, expose the upstream node id on the response so
 			// operators can tell which backend node served a given request.
 			// This is purely for debugging/observability and is not consumed
@@ -354,6 +465,16 @@ func (s *Server) proxyRequest(
 			return s.recordAssignmentFromResponse(originalCtx, resp, node)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			if errors.Is(err, errRerouteRequested) {
+				// Deliberately writes nothing: the caller retries on another
+				// node and owns the response.
+				s.logger.Debug("upstream asked for reroute",
+					zap.String("node", node.GetNodeId()),
+					zap.String("path", proxyReq.URL.Path),
+				)
+				return
+			}
+
 			if errors.Is(err, context.Canceled) {
 				logLevel := zap.WarnLevel
 				if isStreamInputProxyRequest(proxyReq) {
@@ -398,7 +519,11 @@ func (s *Server) proxyRequest(
 	proxyStart := time.Now()
 	route := gatewayRouteLabel(proxyReq.URL.Path)
 	proxy.ServeHTTP(w, proxyReq)
+	if rerouteRequested {
+		return true
+	}
 	recordGatewayUpstreamProxy(route, proxyStart, w, proxyReq.Context())
+	return false
 }
 
 func isStreamInputProxyRequest(r *http.Request) bool {

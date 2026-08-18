@@ -17,6 +17,10 @@ func nodeStatusToString(status schedulerv1.NodeStatus) string {
 		return "connecting"
 	case schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY:
 		return "unhealthy"
+	case schedulerv1.NodeStatus_NODE_STATUS_LINGERING:
+		return "lingering"
+	case schedulerv1.NodeStatus_NODE_STATUS_DRAINING:
+		return "draining"
 	default:
 		return "unspecified"
 	}
@@ -94,6 +98,28 @@ func isNodeDetailRequest(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return nodeIDFromPath(r.URL.Path)
+}
+
+// isNodeIsolationRequest reports whether this is a node isolation call —
+// reading, setting, or clearing the flag that stops a node from being given new
+// sandboxes. It is proxied to the node itself, like node detail: the node owns
+// the flag, the gateway only routes to it.
+func isNodeIsolationRequest(r *http.Request) (string, bool) {
+	switch r.Method {
+	case http.MethodGet, http.MethodPut, http.MethodDelete:
+	default:
+		return "", false
+	}
+
+	trimmed := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 3 || parts[0] != "nodes" || parts[2] != "isolation" {
+		return "", false
+	}
+	if strings.TrimSpace(parts[1]) == "" {
+		return "", false
+	}
+	return parts[1], true
 }
 
 func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingCtx context.Context) {

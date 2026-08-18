@@ -43,6 +43,10 @@ pub struct NodeSnapshot {
     pub sandbox_count: u32,
     pub sandbox_ids: Vec<SandboxId>,
     pub metrics: NodeMetricsSnapshot,
+    /// Whether this node is isolated: still serving what it holds, refusing new
+    /// sandboxes. Reported so the scheduler stops picking it without having to
+    /// wait for the node to disappear.
+    pub draining: bool,
     pub create_successes: u64,
     pub create_fails: u64,
     pub sandbox_starting_count: u32,

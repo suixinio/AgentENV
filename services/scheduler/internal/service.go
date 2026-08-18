@@ -23,6 +23,7 @@ type Service struct {
 	store         BindingStore
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
+	warmup        *warmupGate
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -42,7 +43,19 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.warmup == nil {
+		s.warmup = newWarmupGate(nodes, defaultWarmupTimeout, time.Now())
+	}
 	return s
+}
+
+// WithWarmupTimeout bounds how long a freshly started scheduler withholds
+// "sandbox assignment not found" while its bindings are still being seeded by
+// node heartbeats.
+func WithWarmupTimeout(timeout time.Duration) ServiceOption {
+	return func(s *Service) {
+		s.warmup = newWarmupGate(s.nodes, timeout, time.Now())
+	}
 }
 
 // ServiceOption configures optional Service behaviour.
@@ -75,7 +88,9 @@ func NewQueryOnlyService(logger *zap.Logger, store BindingStore) *QueryOnlyServi
 }
 
 func (s *QueryOnlyService) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req)
+	// No gate: this mode requires Redis, so its bindings outlive the replica's
+	// own restart and a miss is a real miss rather than a cold cache.
+	return lookupNode(s.logger, s.store, req, nil)
 }
 
 func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) (resp *schedulerv1.ScheduleResponse, err error) {
@@ -149,19 +164,35 @@ func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) 
 }
 
 func (s *Service) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req)
+	return lookupNode(s.logger, s.store, req, s.warmup)
 }
 
-func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
+// lookupNode answers a binding lookup, and — when `warmup` is present and still
+// cold — refuses to turn a miss into "not assigned anywhere".
+//
+// A nil gate means the caller has a binding store that survives its own restart
+// (the query-only replica requires Redis), so a miss there really is a miss.
+func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupNodeRequest, warmup *warmupGate) (*schedulerv1.LookupNodeResponse, error) {
 	if strings.TrimSpace(req.GetSandboxId()) == "" {
 		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
 	}
-	node, ok, getErr := store.Get(req.GetSandboxId(), time.Now())
+	now := time.Now()
+	node, ok, getErr := store.Get(req.GetSandboxId(), now)
 	if getErr != nil {
 		logger.Warn("scheduler lookup binding store failed", zap.String("sandbox_id", req.GetSandboxId()), zap.Error(getErr))
 		return nil, status.Error(codes.Unavailable, "binding store unavailable")
 	}
 	if !ok {
+		if warmup != nil && !warmup.warmedUp(now) {
+			// Retryable on purpose. The gateway maps Unavailable to 503 and
+			// only hijacks a resume onto an arbitrary node when it sees
+			// NotFound, so this both keeps live sandboxes from 404ing and keeps
+			// a resume from being handed to a node that does not hold it.
+			logger.Info("scheduler lookup withheld while bindings are still being seeded",
+				zap.String("sandbox_id", req.GetSandboxId()),
+			)
+			return nil, status.Error(codes.Unavailable, "scheduler is still seeding sandbox assignments")
+		}
 		logger.Debug("scheduler lookup missed sandbox assignment", zap.String("sandbox_id", req.GetSandboxId()))
 		return nil, status.Error(codes.NotFound, "sandbox assignment not found")
 	}
@@ -230,6 +261,9 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		)
 		return nil, status.Error(codes.Unavailable, "binding store unavailable")
 	}
+	// Only now, with the roster actually applied to the store: warm-up is about
+	// the bindings being seeded, not about the node having said hello.
+	s.warmup.reportedIn(now)
 	return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
 }
 

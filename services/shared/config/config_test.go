@@ -603,3 +603,28 @@ func TestLoadRejectsIncompleteKubernetesSchedulerDiscoveryConfig(t *testing.T) {
 		t.Fatal("expected load to fail for incomplete kubernetes discovery config")
 	}
 }
+
+func TestSchedulerWarmupTimeoutDefaultsAndParses(t *testing.T) {
+	if got := defaultConfig("scheduler").Scheduler.WarmupTimeout; got != 15*time.Second {
+		t.Fatalf("expected a 15s default warmup timeout, got %v", got)
+	}
+
+	cfg := defaultConfig("scheduler")
+	if err := cfg.Scheduler.UnmarshalJSON([]byte(`{"warmup_timeout":"3s"}`)); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Scheduler.WarmupTimeout != 3*time.Second {
+		t.Fatalf("expected 3s, got %v", cfg.Scheduler.WarmupTimeout)
+	}
+}
+
+func TestSchedulerWarmupTimeoutEnvOverride(t *testing.T) {
+	t.Setenv("SCHEDULER_WARMUP_TIMEOUT", "7s")
+	cfg := defaultConfig("scheduler")
+	if err := overrideWithEnv(&cfg); err != nil {
+		t.Fatalf("override: %v", err)
+	}
+	if cfg.Scheduler.WarmupTimeout != 7*time.Second {
+		t.Fatalf("expected 7s from the environment, got %v", cfg.Scheduler.WarmupTimeout)
+	}
+}

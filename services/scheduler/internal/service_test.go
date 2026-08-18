@@ -144,12 +144,16 @@ func TestLookupNodeReturnsUnavailableWhenBindingStoreFails(t *testing.T) {
 }
 
 func TestLookupNodeReturnsNotFoundWhenAssignmentMissing(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
 	service := NewService(
 		zap.NewNop(),
-		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
+		registry,
 		NewStrategy("round_robin"),
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
+	// The bindings only mean anything once the nodes have reported them; a
+	// miss before that is withheld rather than answered (see warmup_test.go).
+	heartbeatVia(t, service, "node-a")
 
 	_, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "missing"})
 	if status.Code(err) != codes.NotFound {

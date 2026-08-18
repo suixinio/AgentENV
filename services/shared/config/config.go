@@ -63,6 +63,7 @@ type SchedulerConfig struct {
 	Strategy                string                   `json:"strategy"`
 	ReportTTL               time.Duration            `json:"report_ttl"`
 	BindingTTL              time.Duration            `json:"binding_ttl"`
+	WarmupTimeout           time.Duration            `json:"warmup_timeout"`
 	RedisAddr               string                   `json:"redis_addr"`
 	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
 	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
@@ -78,6 +79,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Strategy                *string                   `json:"strategy"`
 		ReportTTL               json.RawMessage           `json:"report_ttl"`
 		BindingTTL              json.RawMessage           `json:"binding_ttl"`
+		WarmupTimeout           json.RawMessage           `json:"warmup_timeout"`
 		RedisAddr               *string                   `json:"redis_addr"`
 		ArtifactStoreCapacity   *int                      `json:"artifact_store_capacity"`
 		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
@@ -132,6 +134,13 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.BindingTTL = d
+	}
+	if len(bytes.TrimSpace(parsed.WarmupTimeout)) > 0 {
+		d, err := parseSchedulerDuration(parsed.WarmupTimeout, "scheduler.warmup_timeout")
+		if err != nil {
+			return err
+		}
+		s.WarmupTimeout = d
 	}
 
 	return nil
@@ -285,6 +294,7 @@ func defaultConfig(service string) Config {
 			Strategy:                "round_robin",
 			ReportTTL:               30 * time.Second,
 			BindingTTL:              30 * time.Second,
+			WarmupTimeout:           15 * time.Second,
 			ArtifactStoreCapacity:   defaultSchedulerArtifactStoreCapacity,
 			ArtifactLookupNodeLimit: 0,
 			Nodes: []Node{
@@ -335,6 +345,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_BINDING_TTL %q: %w", v, err)
 		}
 		cfg.Scheduler.BindingTTL = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_WARMUP_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_WARMUP_TIMEOUT %q: %w", v, err)
+		}
+		cfg.Scheduler.WarmupTimeout = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ARTIFACT_STORE_CAPACITY")); v != "" {

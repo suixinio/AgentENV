@@ -90,11 +90,13 @@ General config notes:
 - `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
 - `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
+- `scheduler.warmup_timeout` bounds how long a freshly started scheduler withholds `NotFound` for an unknown sandbox while its bindings are still being seeded by node heartbeats; defaults to `"15s"`. During that window a binding miss is reported as `Unavailable` (the gateway turns it into a 503) instead of `NotFound`, so traffic to live sandboxes does not 404 and a resume is not handed to a node that does not hold the sandbox. The window ends early as soon as every discovered node has delivered a heartbeat.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
 - `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
 - `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
 - `SCHEDULER_BINDING_TTL=<duration>` overrides `scheduler.binding_ttl` from the environment.
+- `SCHEDULER_WARMUP_TIMEOUT=<duration>` overrides `scheduler.warmup_timeout` from the environment.
 - `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.

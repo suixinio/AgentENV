@@ -76,6 +76,7 @@ func main() {
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+			scheduler.WithWarmupTimeout(cfg.Scheduler.WarmupTimeout),
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)

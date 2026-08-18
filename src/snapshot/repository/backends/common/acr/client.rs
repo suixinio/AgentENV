@@ -1201,26 +1201,11 @@ pub(super) mod tests {
     #[test]
     #[cfg(unix)]
     fn loads_credentials_from_docker_credential_helper_binary() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let helper = temp.path().join("docker-credential-test");
-        let staged_helper = temp.path().join("docker-credential-test.tmp");
-        {
-            let mut file = std::fs::File::create(&staged_helper).unwrap();
-            file.write_all(
-                br#"#!/bin/sh
-read _server
-printf '{"Username":"helper-user","Secret":"helper-secret"}'
-"#,
-            )
-            .unwrap();
-            file.sync_all().unwrap();
-        }
-        let mut permissions = std::fs::metadata(&staged_helper).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged_helper, permissions).unwrap();
-        std::fs::rename(&staged_helper, &helper).unwrap();
+        // 用仓内 fixture，不在测试里现写一个可执行文件：写文件的线程持有写 fd
+        // 期间，同进程任何线程的 fork 都会把这个 fd 复制进子进程，紧随其后的
+        // execve 就被内核以 ETXTBSY 拒绝。fixture 谁也不写，窗口不存在。
+        let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/docker-credential-helper.sh");
 
         let credentials =
             load_docker_credential_helper_binary(helper.to_str().unwrap(), "registry.example")

@@ -518,7 +518,6 @@ mod tests {
     use super::*;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
@@ -808,17 +807,32 @@ mod tests {
         );
     }
 
+    /// 把可执行文件的落盘交给子进程：本进程若持有它的写 fd，同进程任何线程在
+    /// 这期间 fork 都会复制到这个 fd，紧随其后的 execve 会被内核以 ETXTBSY
+    /// 拒绝。子进程的 fd 表不共享给我们的线程，窗口不存在。
+    /// `rm -f` 先行则是另一个方向：覆盖一个仍在被执行的文件同样是 ETXTBSY，
+    /// 换掉 inode 就绕开了它。
     fn write_script(path: &Path, contents: &str) {
-        fs::write(path, contents).unwrap();
-        set_executable(path);
-    }
+        use std::io::Write as _;
 
-    fn set_executable(path: &Path) {
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(path).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(path, perms).unwrap();
-        }
+        let mut writer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"rm -f "$1" && cat > "$1" && chmod 755 "$1""#)
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn script writer");
+        writer
+            .stdin
+            .take()
+            .expect("script writer stdin")
+            .write_all(contents.as_bytes())
+            .expect("write script body");
+        assert!(
+            writer.wait().expect("wait script writer").success(),
+            "write executable {}",
+            path.display()
+        );
     }
 }

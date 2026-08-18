@@ -279,32 +279,19 @@ pub(crate) mod fixture {
     //! `{dir}/state`. No registry HTTP server runs.
 
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use crate::digest;
     use crate::snapshot::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
 
-    const FAKE_REGCTL_SCRIPT: &str = r#"#!/usr/bin/env bash
-dir="$(cd "$(dirname "$0")" && pwd)"; state="$dir/state"
-printf 'argv:%s\n' "$*" >>"$dir/log"
-nf() { echo "regctl: $* [http 404]: not found" >&2; exit 1; }
-mkey() { printf '%s' "$1" | tr '/:@' '___'; }
-case "$1 $2" in
-"blob head") [ -f "$state/blobs/$3/$4" ] || nf "blob $3 $4" ;;
-"blob get") [ -f "$state/blobs/$3/$4" ] || nf "blob $3 $4"; cat "$state/blobs/$3/$4" ;;
-"blob put") mkdir -p "$state/blobs/$3"; cat >"$state/blobs/$3/$5" ;;
-"blob copy") [ -f "$state/blobs/$3/$5" ] || nf "blob $3 $5"; mkdir -p "$state/blobs/$4"; cp "$state/blobs/$3/$5" "$state/blobs/$4/$5" ;;
-"manifest head") m="$state/manifests/$(mkey "$3")"; [ -f "$m/digest" ] || nf "manifest $3"; cat "$m/digest" ;;
-"manifest put") m="$state/manifests/$(mkey "$5")"; mkdir -p "$m"; cat >"$m/body"; printf 'sha256:%s\n' "$(sha256sum "$m/body" | cut -d' ' -f1)" >"$m/digest" ;;
-*) echo "unexpected regctl invocation: $*" >&2; exit 2 ;;
-esac
-"#;
-
+    /// 把仓内 fixture 链进 `dir`，而不是在这里现写一个可执行文件：写文件的线程
+    /// 持有写 fd 期间，同进程任何线程的 fork 都会复制到这个 fd，紧随其后的
+    /// execve 就被内核以 ETXTBSY 拒绝。symlink 不碰目标 inode，窗口不存在。
+    /// 链接（而非直接返回 fixture 路径）是因为脚本靠 `$0` 定位 `{dir}/state`。
     pub(crate) fn install_fake_regctl(dir: &Path) -> PathBuf {
         let binary = dir.join("regctl");
-        fs::write(&binary, FAKE_REGCTL_SCRIPT).expect("write fake regctl");
-        fs::set_permissions(&binary, PermissionsExt::from_mode(0o755)).expect("chmod fake regctl");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/regctl.sh");
+        std::os::unix::fs::symlink(&fixture, &binary).expect("link fake regctl");
         binary
     }
 

@@ -59,6 +59,8 @@ sudo -E cargo test -p agentenv --test orchestrator_integration orchestrator::tes
 
 Integration tests require root (network namespaces), `/dev/kvm`, host modules matching `AENV_VIRTUALIZATION_MODE`, and `AENV_CONFIG_PATH` pointing to a valid config.
 
+Tests must never write out an executable they then `execve` themselves. While any thread holds a write fd on that file, every concurrent `fork` in the process inherits the fd and the exec is rejected with `ETXTBSY` (writing to a temp name and renaming does not help — `rename` keeps the inode). Ship the script under `tests/fixtures/` instead, symlinking it into the per-test directory when it has to resolve `$0` to that directory, or let a child process write it.
+
 ## Architecture
 
 See `docs/src/internals/architecture.md` for detailed design with data flow diagrams.

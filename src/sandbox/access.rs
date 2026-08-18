@@ -217,15 +217,8 @@ fn create_managed_seed(path: &Path) -> Result<String> {
     let parent = path
         .parent()
         .context("managed envd access-token seed path has no parent")?;
-    fs::create_dir_all(parent)
+    create_private_directory(parent)
         .with_context(|| format!("create managed secret directory {}", parent.display()))?;
-    validate_managed_seed_directory_identity(parent).with_context(|| {
-        format!(
-            "validate managed secret directory ownership {}",
-            parent.display()
-        )
-    })?;
-    set_permissions(parent, 0o700)?;
     validate_managed_seed_directory(parent)
         .with_context(|| format!("validate managed secret directory {}", parent.display()))?;
 
@@ -269,6 +262,50 @@ fn is_valid_managed_seed(seed: &str) -> bool {
         && seed
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Creates the secret directory already private, in one step.
+///
+/// 🔴 Creating it and then tightening it are two steps, and between them the
+/// directory exists at whatever the umask allowed — 0755 under the usual 022.
+/// That is not a harmless intermediate state: [`resolve_seed`] starts by
+/// validating this directory and treats anything other than 0700 as a hard
+/// error, with no retry. So a second caller arriving inside that window fails
+/// outright, on a directory this process was in the middle of securing. Worse
+/// than the failure is what it would mean if the window ever widened: a secret
+/// written into a world-readable directory.
+///
+/// `mkdir(2)` takes the mode with the directory, so there is no window to land
+/// in. Only the leaf is created this way; ancestors keep ordinary permissions,
+/// since making `$AENV_HOME` itself 0700 would lock out everything else that
+/// legitimately reads from it.
+///
+/// `AlreadyExists` is success: either a previous run created it, or a
+/// concurrent caller won the race. Both leave the caller's own validation to
+/// decide whether what is there is acceptable.
+///
+/// An unusual umask (one masking bits inside 0700) yields a *stricter*
+/// directory, which validation then rejects with the mode it found. Left to
+/// fail deliberately: forcing the mode afterwards would restore the very window
+/// this removes, and an operator running such a umask needs to know.
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    if let Some(ancestors) = path.parent() {
+        fs::create_dir_all(ancestors)?;
+    }
+
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_managed_seed_directory(path: &Path) -> io::Result<()> {
@@ -345,8 +382,44 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_private_managed_seed_directory(path: &Path) -> Result<()> {
-        fs::create_dir_all(path)?;
-        set_permissions(path, 0o700)
+        Ok(create_private_directory(path)?)
+    }
+
+    /// The directory has to be private the instant it exists, not a moment
+    /// after. Anything that creates it first and tightens it second leaves a
+    /// window in which it is 0755 — and `resolve_seed` rejects that outright,
+    /// so a concurrent caller landing in the window fails on a directory this
+    /// process is in the middle of securing.
+    ///
+    /// Asserted against the mode on disk rather than through `resolve_seed`,
+    /// because the window is invisible to any test that only looks at the end
+    /// state.
+    #[test]
+    #[cfg(unix)]
+    fn the_secret_directory_is_private_from_the_moment_it_exists() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let secrets = temp.path().join("nested").join("secrets");
+
+        create_private_directory(&secrets)?;
+
+        let mode = fs::symlink_metadata(&secrets)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "found {mode:04o}");
+
+        // The ancestor it had to create on the way keeps ordinary permissions:
+        // making $AENV_HOME itself 0700 would lock out everything else that
+        // legitimately reads from it.
+        let ancestor = fs::symlink_metadata(temp.path().join("nested"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_ne!(ancestor, 0o700, "only the leaf should be locked down");
+
+        // Idempotent: a second run finds it already there and says so quietly.
+        create_private_directory(&secrets)?;
+
+        Ok(())
     }
 
     #[test]

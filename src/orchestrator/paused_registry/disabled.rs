@@ -59,8 +59,8 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(0)
     }
 
-    async fn mark_running(&self, _sandbox_id: &SandboxId, _node_id: &str) -> RegistryResult<()> {
-        Ok(())
+    async fn mark_running(&self, _sandbox_id: &SandboxId, _node_id: &str) -> RegistryResult<bool> {
+        Ok(false)
     }
 
     async fn remove(&self, _sandbox_id: &SandboxId) -> RegistryResult<()> {

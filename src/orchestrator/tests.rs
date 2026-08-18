@@ -4948,3 +4948,29 @@ async fn a_delete_forgets_the_sandbox_in_the_cluster() -> Result<()> {
 
     Ok(())
 }
+
+/// 🔴 The mirror of the test above, and the reason the two teardown paths are
+/// distinct at all. Discarding a superseded copy means the sandbox is alive on
+/// another node; `forget_sandbox` would happily clear a row in any parked state
+/// from any node, taking that node's snapshot — the sandbox's only recovery
+/// point — with it.
+#[tokio::test]
+async fn discarding_a_superseded_copy_leaves_the_cluster_record_alone() -> Result<()> {
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    orchestrator.discard_superseded_sandbox(created.id).await?;
+
+    assert!(
+        publisher.forgotten().is_empty(),
+        "a superseded copy must not clear the cluster record"
+    );
+    assert!(
+        orchestrator.get_sandbox(&created.id).await?.is_none(),
+        "the local copy must be gone"
+    );
+
+    Ok(())
+}

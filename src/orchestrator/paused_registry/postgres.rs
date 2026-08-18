@@ -579,7 +579,7 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         Ok(())
     }
 
-    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<()> {
+    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<bool> {
         // No insert, and that is the important half: a sandbox the cluster was
         // never told about must stay that way, otherwise every resume on a node
         // with a node-local history would start publishing rows for sandboxes
@@ -625,7 +625,7 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
             }
         }
 
-        Ok(())
+        Ok(updated > 0)
     }
 
     async fn remove(&self, sandbox_id: &SandboxId) -> RegistryResult<()> {

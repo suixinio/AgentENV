@@ -10,7 +10,8 @@
 //! Everything here is inert unless the registry is configured with a cluster
 //! backend.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -25,11 +26,68 @@ use crate::snapshot::{
 };
 use crate::types::SandboxId;
 
+/// Which sandboxes running on this node the registry has confirmed this node as
+/// the holder of, and the identity it confirmed each of them under.
+///
+/// The paused half of this bookkeeping is durable (`registered_as` on the
+/// persisted record) because a paused sandbox outlives the process. A running
+/// one does not: it is never persisted, and a restart leaves its VM behind as a
+/// process nobody tracks. So this in-process map is not a weaker version of the
+/// durable marker, it is the matching one — and it answers exactly what
+/// reconciliation must know before acting on a registry row: *this* process put
+/// that row there.
+///
+/// Without it an absent row is ambiguous, and ambiguous in the expensive
+/// direction: a sandbox created here a second ago has no row either, and
+/// reading that as "the cluster has moved past it" would tear down a live
+/// sandbox nobody asked to remove.
+#[derive(Default)]
+struct RunningRegistrations(Mutex<HashMap<SandboxId, String>>);
+
+impl RunningRegistrations {
+    /// Applies the registry's answer to a `mark_running`.
+    ///
+    /// Only a confirmed write enrols the sandbox: an unacknowledged one is no
+    /// evidence that the row says what this node believes it says, and
+    /// reconciliation acts on that evidence.
+    ///
+    /// A refusal leaves any earlier confirmation standing rather than clearing
+    /// it. That is the point, not laziness — a refusal means another node holds
+    /// the claim, which is precisely the situation the earlier confirmation
+    /// makes recognisable.
+    fn observe(&self, sandbox_id: SandboxId, node_id: &str, confirmed: bool) {
+        if !confirmed {
+            return;
+        }
+        self.lock().insert(sandbox_id, node_id.to_string());
+    }
+
+    fn get(&self, sandbox_id: &SandboxId) -> Option<String> {
+        self.lock().get(sandbox_id).cloned()
+    }
+
+    fn forget(&self, sandbox_id: &SandboxId) {
+        self.lock().remove(sandbox_id);
+    }
+
+    fn retain(&self, live: &HashSet<SandboxId>) {
+        self.lock()
+            .retain(|sandbox_id, _| live.contains(sandbox_id));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SandboxId, String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Owns the cluster's view of this node's paused sandboxes.
 pub struct PausedSandboxCoordinator {
     registry: Arc<dyn PausedSandboxRegistry>,
     snapshot_manager: Arc<SnapshotManager>,
     node_id: String,
+    running_registrations: RunningRegistrations,
 }
 
 impl PausedSandboxCoordinator {
@@ -42,6 +100,7 @@ impl PausedSandboxCoordinator {
             registry,
             snapshot_manager,
             node_id,
+            running_registrations: RunningRegistrations::default(),
         }
     }
 
@@ -169,14 +228,48 @@ impl PausedSandboxCoordinator {
     /// Called on both resume paths — the local fast path and a cross-node
     /// restore — because both end with this node holding a sandbox the registry
     /// still describes as parked somewhere else.
+    ///
+    /// A confirmed write is also what enrols the sandbox in
+    /// [`running_registration`](Self::running_registration), and only a
+    /// confirmed one: an unacknowledged write is no evidence that the row says
+    /// what this node thinks it says, and reconciliation acts on that evidence.
+    /// A refusal or an error leaves any earlier confirmation standing — it
+    /// remains true that the cluster once named this node the holder, which is
+    /// precisely the premise reconciliation needs to notice that it no longer
+    /// does.
     pub async fn mark_sandbox_running(&self, sandbox_id: SandboxId) {
-        if let Err(err) = self.registry.mark_running(&sandbox_id, &self.node_id).await {
-            warn!(
-                error = %err,
-                %sandbox_id,
-                "failed to record the sandbox as running here; another node may keep a stale copy"
-            );
-        }
+        let confirmed = match self.registry.mark_running(&sandbox_id, &self.node_id).await {
+            Ok(confirmed) => confirmed,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    %sandbox_id,
+                    "failed to record the sandbox as running here; another node may keep a stale copy"
+                );
+
+                false
+            }
+        };
+
+        self.running_registrations
+            .observe(sandbox_id, &self.node_id, confirmed);
+    }
+
+    /// The identity this node was confirmed as the holder of `sandbox_id`
+    /// under, if the registry ever confirmed it.
+    ///
+    /// `None` means the cluster has never been told this node runs the sandbox,
+    /// and therefore that nothing the registry says (or fails to say) about it
+    /// is about this node's copy.
+    pub fn running_registration(&self, sandbox_id: &SandboxId) -> Option<String> {
+        self.running_registrations.get(sandbox_id)
+    }
+
+    /// Drops registrations for sandboxes this node no longer has, so the map
+    /// tracks the node's roster rather than growing with every resume it has
+    /// ever served.
+    pub fn retain_running_registrations(&self, live: &HashSet<SandboxId>) {
+        self.running_registrations.retain(live);
     }
 
     /// Drops a sandbox's registry row and the snapshot behind it.
@@ -185,6 +278,8 @@ impl PausedSandboxCoordinator {
     /// the sandbox recoverable, so removing it while the sandbox still exists
     /// somewhere would quietly strip its last durable copy.
     pub async fn forget_sandbox(&self, sandbox_id: SandboxId) {
+        self.running_registrations.forget(&sandbox_id);
+
         let entry = match self.registry.get(&sandbox_id).await {
             Ok(Some(entry)) => entry,
             // Nothing recorded (the common case with a node-local registry).
@@ -389,6 +484,59 @@ mod tests {
     fn unreadable_registry_never_deletes() {
         assert_eq!(orphan_verdict(false, false), OrphanVerdict::Unknown);
         assert_eq!(orphan_verdict(false, true), OrphanVerdict::Unknown);
+    }
+
+    /// 🔴 The one that decides whether reconciliation may act at all. A
+    /// sandbox created on this node and never resumed from the cluster has no
+    /// registry row, and neither does one the cluster has genuinely forgotten —
+    /// only this map tells them apart, and only a confirmed write may put an
+    /// entry in it.
+    #[test]
+    fn an_unconfirmed_mark_leaves_the_sandbox_unregistered() {
+        let registrations = RunningRegistrations::default();
+        let sandbox_id = SandboxId::new();
+
+        registrations.observe(sandbox_id, "node-a", false);
+
+        assert_eq!(registrations.get(&sandbox_id), None);
+    }
+
+    #[test]
+    fn a_confirmed_mark_records_the_identity_it_was_confirmed_under() {
+        let registrations = RunningRegistrations::default();
+        let sandbox_id = SandboxId::new();
+
+        registrations.observe(sandbox_id, "node-a", true);
+
+        assert_eq!(registrations.get(&sandbox_id), Some("node-a".to_string()));
+    }
+
+    /// A later refusal means another node took the claim — the very case the
+    /// earlier confirmation exists to make recognisable. Clearing it here would
+    /// silently disarm the reaper for exactly the sandbox it is meant to catch.
+    #[test]
+    fn a_refusal_does_not_clear_an_earlier_confirmation() {
+        let registrations = RunningRegistrations::default();
+        let sandbox_id = SandboxId::new();
+
+        registrations.observe(sandbox_id, "node-a", true);
+        registrations.observe(sandbox_id, "node-a", false);
+
+        assert_eq!(registrations.get(&sandbox_id), Some("node-a".to_string()));
+    }
+
+    #[test]
+    fn retain_drops_sandboxes_this_node_no_longer_has() {
+        let registrations = RunningRegistrations::default();
+        let kept = SandboxId::new();
+        let dropped = SandboxId::new();
+        registrations.observe(kept, "node-a", true);
+        registrations.observe(dropped, "node-a", true);
+
+        registrations.retain(&HashSet::from([kept]));
+
+        assert_eq!(registrations.get(&kept), Some("node-a".to_string()));
+        assert_eq!(registrations.get(&dropped), None);
     }
 
     fn entry(

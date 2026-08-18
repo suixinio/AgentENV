@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     // then makes sure a resume arriving first does not find a paused record the
     // cluster has already moved past.
     api_impl.renew_paused_leases().await;
-    api_impl.reconcile_local_paused_records().await;
+    api_impl.reconcile_local_records().await;
     let paused_reconcile = spawn_paused_record_reconciler(
         Arc::clone(&api_impl),
         config.orchestrator.paused_registry.reconcile_interval(),
@@ -261,7 +261,7 @@ fn spawn_paused_record_reconciler(
         loop {
             ticker.tick().await;
             api_impl.renew_paused_leases().await;
-            api_impl.reconcile_local_paused_records().await;
+            api_impl.reconcile_local_records().await;
         }
     })
 }

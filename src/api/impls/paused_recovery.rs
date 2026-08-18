@@ -242,26 +242,133 @@ impl ApiImpl {
         self.paused.forget_sandbox(sandbox_id).await;
     }
 
-    /// Drops local paused records the cluster has moved past.
+    /// Brings this node's copies of sandboxes back in line with the cluster.
     ///
-    /// Runs at startup and then on a timer. A node that keeps a paused record
-    /// for a sandbox another node has since resumed does more than waste disk:
-    /// it keeps reporting that sandbox in its heartbeat roster, so the
-    /// scheduler's binding for it flaps between the two nodes and traffic for a
-    /// perfectly healthy sandbox lands half the time on the node that only has
-    /// a corpse of it. Left long enough, a resume aimed here would start a
-    /// second copy, and the two would write to their own rootfs layers from the
-    /// same starting point.
+    /// Runs at startup and then on a timer, over both halves of the node's
+    /// roster, because a node can be out of step in two different ways and only
+    /// one of them used to be checked:
     ///
-    /// Being periodic is what makes it work: the node that lost the sandbox
-    /// gets no notification, so noticing is entirely on it.
-    pub async fn reconcile_local_paused_records(&self) {
+    /// - a **paused** record for a sandbox another node has since resumed —
+    ///   dead weight that still gets advertised in the heartbeat roster, so the
+    ///   scheduler's binding flaps between the two nodes;
+    /// - a **running** copy of a sandbox another node has taken over — two live
+    ///   VMs writing to their own rootfs layers from the same starting point.
+    ///
+    /// The second is the expensive one and the one the lease cannot prevent:
+    /// the lease decides *who may take over*, and a node whose lease lapsed
+    /// because it was partitioned rather than dead comes back still running its
+    /// copy. Nothing tells it. Noticing is entirely on it, which is why this is
+    /// periodic and why it covers running sandboxes too.
+    pub async fn reconcile_local_records(&self) {
         // A disabled registry reports every sandbox as missing, which this
         // would read as "all of them moved on".
         if !self.paused.registry().is_cluster_backed() {
             return;
         }
 
+        self.retain_running_registrations().await;
+        self.reconcile_local_paused_records().await;
+        self.reap_superseded_running_sandboxes().await;
+    }
+
+    /// Forgets registrations for sandboxes this node no longer has, so the map
+    /// tracks the current roster instead of every resume the process ever
+    /// served.
+    async fn retain_running_registrations(&self) {
+        match self.orchestrator.list_sandbox_ids().await {
+            Ok(ids) => self
+                .paused
+                .retain_running_registrations(&ids.into_iter().collect()),
+            Err(err) => {
+                warn!(error = ?err, "failed to list local sandboxes to prune registrations")
+            }
+        }
+    }
+
+    /// Tears down running copies of sandboxes the cluster says are held
+    /// elsewhere.
+    ///
+    /// The mirror image of e2b's orphan sweep, which reconciles each node's
+    /// reported sandbox list against the store and kills whatever the store
+    /// does not account for (`e2b/packages/api/internal/sandbox/store.go:141`,
+    /// *"Redis is the source of truth — divergent sandboxes are orphans …
+    /// Kill them"*). Same invariant, opposite direction: e2b's control plane
+    /// pulls and kills, and here the node that has fallen out of step is the
+    /// one that notices and stands down.
+    ///
+    /// Only sandboxes this process registered are considered, and the registry
+    /// row is judged against the identity it was registered under rather than
+    /// this node's current ID — the same rule the paused half follows, for the
+    /// same reason (§8.4: the ID is a pod name and changes under the node).
+    async fn reap_superseded_running_sandboxes(&self) {
+        let running = match self
+            .orchestrator
+            .list_sandboxes_filtered(SandboxListFilter {
+                states: Some(vec![crate::orchestrator::SandboxState::Running]),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(running) => running,
+            Err(err) => {
+                warn!(error = ?err, "failed to list local running sandboxes for reconciliation");
+
+                return;
+            }
+        };
+
+        for metadata in running {
+            let sandbox_id = metadata.id;
+            // Never registered by this process: the cluster has said nothing
+            // about this sandbox, and an absent row is not evidence of anything.
+            let Some(registered_as) = self.paused.running_registration(&sandbox_id) else {
+                continue;
+            };
+
+            let entry = match self.paused.registry().get(&sandbox_id).await {
+                Ok(entry) => entry,
+                Err(err) => {
+                    // One unreadable answer must not cascade into tearing down
+                    // the rest of the node's sandboxes.
+                    warn!(error = %err, %sandbox_id, "registry unreadable; stopping running-sandbox reconciliation");
+
+                    return;
+                }
+            };
+
+            let Some(superseded) = running_supersession(entry.as_ref(), &registered_as) else {
+                continue;
+            };
+
+            warn!(
+                %sandbox_id,
+                reason = %superseded.reason(),
+                "tearing down a running sandbox the cluster holds elsewhere"
+            );
+
+            match self
+                .orchestrator
+                .discard_superseded_sandbox(sandbox_id)
+                .await
+            {
+                Ok(()) => info!(%sandbox_id, "discarded superseded running sandbox"),
+                Err(err) => {
+                    warn!(error = ?err, %sandbox_id, "failed to discard superseded running sandbox")
+                }
+            }
+        }
+    }
+
+    /// Drops local paused records the cluster has moved past.
+    ///
+    /// A node that keeps a paused record for a sandbox another node has since
+    /// resumed does more than waste disk: it keeps reporting that sandbox in
+    /// its heartbeat roster, so the scheduler's binding for it flaps between
+    /// the two nodes and traffic for a perfectly healthy sandbox lands half the
+    /// time on the node that only has a corpse of it. Left long enough, a
+    /// resume aimed here would start a second copy, and the two would write to
+    /// their own rootfs layers from the same starting point.
+    async fn reconcile_local_paused_records(&self) {
         let paused = match self
             .orchestrator
             .list_sandboxes_filtered(SandboxListFilter {
@@ -480,6 +587,50 @@ fn supersession(
     }
 }
 
+/// Decides whether a running copy on this node has been superseded, judged
+/// against the identity the registry confirmed this node as holder under.
+///
+/// Deliberately narrower than [`supersession`]: that one decides the fate of a
+/// *paused* record, whose artifacts are the sandbox. This one decides the fate
+/// of a live VM, so it only ever fires when the row positively names someone
+/// else — or has ceased to exist, which for a row this node was confirmed the
+/// holder of means the sandbox was removed cluster-wide while this node was
+/// away.
+///
+/// `entry: None` is only reachable for a sandbox this process registered, which
+/// is the whole reason the caller must not invoke this without one. For an
+/// unregistered sandbox — anything created here and never resumed from the
+/// cluster — `None` means nothing at all, and reading it as "gone" would tear
+/// down a sandbox seconds after it was created.
+fn running_supersession(
+    entry: Option<&PausedSandboxEntry>,
+    registered_as: &str,
+) -> Option<Superseded> {
+    let Some(entry) = entry else {
+        return Some(Superseded::Gone);
+    };
+
+    match entry.state {
+        // Held by whoever the row names, and it is not us.
+        PausedRegistryState::Running
+        | PausedRegistryState::Paused
+        | PausedRegistryState::Publishing
+        | PausedRegistryState::LocalOnly => (entry.origin_node_id != registered_as)
+            .then(|| Superseded::HeldBy(entry.origin_node_id.clone())),
+        // Someone is bringing it up. `origin_node_id` still names the node
+        // whose disk holds the artifacts — which during a takeover is us — so
+        // only the claimer answers the question.
+        PausedRegistryState::Resuming => {
+            let claimer = entry
+                .claimed_by_node_id
+                .clone()
+                .unwrap_or_else(|| entry.origin_node_id.clone());
+
+            (claimer != registered_as).then_some(Superseded::ClaimedBy(claimer))
+        }
+    }
+}
+
 /// Builds the launch request that brings a paused sandbox back.
 ///
 /// Every field is carried over from the record the pausing node wrote, so the
@@ -590,6 +741,84 @@ mod tests {
             &registered_as(SELF)
         )
         .is_none());
+    }
+
+    /// The case the running pass exists for: this node was partitioned, its
+    /// lease lapsed, another node legitimately took the sandbox over, and the
+    /// partition then healed with the original VM still running. Two live
+    /// copies of one sandbox until this fires.
+    #[test]
+    fn a_running_row_naming_another_node_supersedes_our_live_copy() {
+        let superseded = running_supersession(
+            Some(&entry(PausedRegistryState::Running, OTHER, None)),
+            SELF,
+        );
+
+        assert!(matches!(superseded, Some(Superseded::HeldBy(node)) if node == OTHER));
+    }
+
+    /// The takeover ran on and paused the sandbox before this node noticed.
+    /// Every parked state answers the same way — whoever the row names owns it.
+    #[test]
+    fn a_parked_row_naming_another_node_supersedes_our_live_copy() {
+        for state in [
+            PausedRegistryState::Paused,
+            PausedRegistryState::Publishing,
+            PausedRegistryState::LocalOnly,
+        ] {
+            assert!(
+                matches!(
+                    running_supersession(Some(&entry(state, OTHER, None)), SELF),
+                    Some(Superseded::HeldBy(_))
+                ),
+                "{state:?} on another node should supersede our running copy"
+            );
+        }
+    }
+
+    /// Mid-takeover. `origin_node_id` still points here because the artifacts
+    /// are here, so only the claimer can answer — exactly as in the paused half.
+    #[test]
+    fn a_claim_by_another_node_supersedes_our_live_copy() {
+        let superseded = running_supersession(
+            Some(&entry(PausedRegistryState::Resuming, SELF, Some(OTHER))),
+            SELF,
+        );
+
+        assert!(matches!(superseded, Some(Superseded::ClaimedBy(node)) if node == OTHER));
+    }
+
+    /// The ordinary case, and by far the most common: our row, our sandbox.
+    /// Firing here would tear down a healthy sandbox on every reconcile.
+    #[test]
+    fn our_own_running_row_is_not_superseded() {
+        assert!(
+            running_supersession(Some(&entry(PausedRegistryState::Running, SELF, None)), SELF)
+                .is_none()
+        );
+    }
+
+    /// This node claimed it and is bringing it back up. `origin_node_id` may
+    /// still name the node the artifacts came from, so judging by origin alone
+    /// would have this node tear down the sandbox it is in the middle of
+    /// resuming.
+    #[test]
+    fn our_own_claim_is_not_superseded() {
+        assert!(running_supersession(
+            Some(&entry(PausedRegistryState::Resuming, OTHER, Some(SELF))),
+            SELF
+        )
+        .is_none());
+    }
+
+    /// A row this node was confirmed the holder of, now absent: the sandbox was
+    /// removed cluster-wide while this node could not see it.
+    #[test]
+    fn a_vanished_row_supersedes_our_live_copy() {
+        assert!(matches!(
+            running_supersession(None, SELF),
+            Some(Superseded::Gone)
+        ));
     }
 
     /// A pause whose publish failed keeps a `local_only` row naming this node.

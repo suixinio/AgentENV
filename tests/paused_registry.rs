@@ -454,3 +454,63 @@ async fn releasing_a_claim_puts_the_sandbox_back() {
     assert_eq!(row.state, PausedRegistryState::Paused);
     assert_eq!(row.claimed_by_node_id, None);
 }
+
+/// 🔴 The signal the running-sandbox reaper is built on. A node may only judge
+/// its live copy against a registry row once the registry has confirmed the row
+/// is about that copy; without a confirmation an absent row means nothing, and
+/// reading it as "the cluster moved on" tears down sandboxes that were simply
+/// created here and never announced.
+#[tokio::test]
+async fn marking_an_untracked_sandbox_running_reports_that_it_is_untracked() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+
+    let confirmed = registry
+        .mark_running(&SandboxId::new(), NODE_A)
+        .await
+        .expect("mark running");
+
+    assert!(
+        !confirmed,
+        "a sandbox with no row must not be reported as tracked"
+    );
+}
+
+#[tokio::test]
+async fn marking_a_tracked_sandbox_running_reports_the_node_as_holder() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+
+    let confirmed = registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+
+    assert!(confirmed, "the row now names this node as the holder");
+}
+
+/// A refusal has to be distinguishable from a success, or the node would enrol
+/// a sandbox it does not hold and then reconcile the wrong copy away.
+#[tokio::test]
+async fn marking_running_reports_a_refusal_when_another_node_holds_the_claim() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    registry
+        .claim_for_resume(&sandbox_id, NODE_B)
+        .await
+        .expect("claim");
+
+    let confirmed = registry
+        .mark_running(&sandbox_id, NODE_A)
+        .await
+        .expect("mark running");
+
+    assert!(
+        !confirmed,
+        "another node holds the claim, so this node is not the holder"
+    );
+}

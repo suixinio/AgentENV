@@ -137,7 +137,14 @@ pub trait PausedSandboxRegistry: Send + Sync {
     ///
     /// Never creates a row — a sandbox the cluster does not already track stays
     /// untracked.
-    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<()>;
+    ///
+    /// Returns whether a row now names `node_id` as the holder. `false` covers
+    /// both "the cluster does not track this sandbox" and "someone else holds
+    /// the claim", and the caller must not treat the registry as having
+    /// anything to say about the sandbox in either case: reconciliation reads
+    /// an absent row as "the cluster has moved past this sandbox", which for an
+    /// untracked one would be a freshly created sandbox being torn down.
+    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<bool>;
 
     /// Removes the row, and with it the cluster's memory of the sandbox.
     /// Only correct once the sandbox itself is gone.

@@ -116,6 +116,17 @@ pub struct Orchestrator<
     paused_publisher: OnceCell<Arc<dyn PausedSandboxPublisher>>,
 }
 
+/// What a teardown should do with the sandbox's cluster-wide record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClusterDisposition {
+    /// The sandbox is gone for good: clear its row and the snapshot behind it.
+    Forget,
+    /// Only this node's copy is going: the row describes a sandbox that is
+    /// alive elsewhere, and the snapshot it names is that sandbox's recovery
+    /// point.
+    KeepClusterRecord,
+}
+
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
     pub async fn with_in_memory_store() -> Arc<Self> {
         Self::new(
@@ -904,7 +915,27 @@ where
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("delete", sandbox_id, async move {
-            this.delete_sandbox_inner(sandbox_id).await
+            this.delete_sandbox_inner(sandbox_id, ClusterDisposition::Forget)
+                .await
+        })
+        .await
+    }
+
+    /// Tears down a local copy of a sandbox the cluster says belongs elsewhere.
+    ///
+    /// Identical to [`delete_sandbox`](Self::delete_sandbox) except that it
+    /// leaves the cluster record and the snapshot behind it completely alone,
+    /// and that difference is the whole point. The sandbox is not being
+    /// deleted — it is alive on another node, under the row this node is about
+    /// to stop disagreeing with. Routing a discard through the ordinary delete
+    /// would hand `forget_sandbox` a row in a parked state, which it is
+    /// entitled to clear from any node, and the other node's snapshot would go
+    /// with it.
+    pub async fn discard_superseded_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("discard_superseded", sandbox_id, async move {
+            this.delete_sandbox_inner(sandbox_id, ClusterDisposition::KeepClusterRecord)
+                .await
         })
         .await
     }
@@ -912,9 +943,13 @@ where
     #[tracing::instrument(
         name = "delete_sandbox",
         skip(self),
-        fields(sandbox_id = %sandbox_id)
+        fields(sandbox_id = %sandbox_id, disposition = ?disposition)
     )]
-    async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    async fn delete_sandbox_inner(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        disposition: ClusterDisposition,
+    ) -> Result<()> {
         info!("deleting sandbox");
 
         // Attempt to transition to Killing, retrying after waiting whenever we
@@ -1034,8 +1069,10 @@ where
         // The sandbox is gone, so its cluster row and the snapshot behind it are
         // garbage. Done here rather than at the API so an expiry-driven delete
         // cleans up as thoroughly as a requested one.
-        if let Some(publisher) = self.paused_publisher() {
-            publisher.forget(sandbox_id).await;
+        if disposition == ClusterDisposition::Forget {
+            if let Some(publisher) = self.paused_publisher() {
+                publisher.forget(sandbox_id).await;
+            }
         }
         info!("sandbox deleted");
 
@@ -2053,7 +2090,10 @@ where
                 SandboxTimeoutAction::Pause => {
                     self.pause_sandbox_inner(metadata.id).await.map(|_| ())
                 }
-                SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
+                SandboxTimeoutAction::Delete => {
+                    self.delete_sandbox_inner(metadata.id, ClusterDisposition::Forget)
+                        .await
+                }
             } {
                 warn!(
                     sandbox_id = %metadata.id,

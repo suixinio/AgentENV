@@ -93,33 +93,23 @@ func nodeIDFromPath(path string) (string, bool) {
 	return parts[1], true
 }
 
-func isNodeDetailRequest(r *http.Request) (string, bool) {
-	if r.Method != http.MethodGet {
-		return "", false
-	}
-	return nodeIDFromPath(r.URL.Path)
-}
-
-// isNodeIsolationRequest reports whether this is a node isolation call —
-// reading, setting, or clearing the flag that stops a node from being given new
-// sandboxes. It is proxied to the node itself, like node detail: the node owns
-// the flag, the gateway only routes to it.
-func isNodeIsolationRequest(r *http.Request) (string, bool) {
+// isNodeAdminRequest reports whether this addresses one node's admin surface —
+// reading it, or changing its status. Both are answered by the node itself, so
+// the gateway resolves the id to an endpoint and proxies the request through
+// unchanged.
+//
+// POST matters as much as GET. Taking a node out of rotation and putting it
+// back are the same URL, and a POST that fell through to the sandbox path would
+// be handed to whichever node the scheduler picked — which, once a node is
+// draining, is never the node the operator is trying to reach. Isolation would
+// become a one-way door.
+func isNodeAdminRequest(r *http.Request) (string, bool) {
 	switch r.Method {
-	case http.MethodGet, http.MethodPut, http.MethodDelete:
+	case http.MethodGet, http.MethodPost:
 	default:
 		return "", false
 	}
-
-	trimmed := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) != 3 || parts[0] != "nodes" || parts[2] != "isolation" {
-		return "", false
-	}
-	if strings.TrimSpace(parts[1]) == "" {
-		return "", false
-	}
-	return parts[1], true
+	return nodeIDFromPath(r.URL.Path)
 }
 
 func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingCtx context.Context) {

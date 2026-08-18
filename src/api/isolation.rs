@@ -1,33 +1,26 @@
-//! Node isolation: the switch that stops a healthy node from being given new
-//! sandboxes, without taking away the ones it already runs.
+//! What node isolation means for resume.
 //!
-//! Hand-written rather than generated, for the same reason `proxy` is: it is an
-//! operator-facing control that does not belong in the sandbox API contract.
+//! Setting and reading the flag itself belongs to the generated admin API
+//! (`POST /nodes/{nodeID}`, see `impls::admin`). What lives here is the one
+//! consequence that cannot be expressed as a status field: an isolated node is
+//! on its way out, so a paused sandbox that somebody else could rebuild should
+//! be resumed by somebody else.
 //!
-//! Two pieces live here.
-//!
-//! * `router` serves `/nodes/{node_id}/isolation` — read, set, clear. The
-//!   distributed gateway proxies the identical path through to the node that
-//!   owns the flag, so the cluster-wide entrypoint and the node-local one are
-//!   the same URL.
-//! * `resume_isolation_gate` turns isolation into a routing decision for
-//!   resume. An isolated node is about to go away, so a sandbox it can hand to
-//!   somebody else should be resumed by somebody else — but only one that the
-//!   cluster can actually rebuild elsewhere. A paused sandbox that was never
-//!   announced to the registry exists on this node alone, and refusing it here
-//!   would turn a slow resume into a lost sandbox.
+//! `resume_isolation_gate` runs ahead of the generated resume handler and turns
+//! that into a routing decision the gateway can act on. It only declines a
+//! sandbox the cluster actually knows about — one that was never announced to
+//! the registry exists on this node alone, and refusing it here would turn a
+//! slow resume into a lost sandbox.
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Request, State},
-    http::{header::HeaderMap, StatusCode},
+    extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
+    Json,
 };
-use serde::Serialize;
 use tracing::{info, warn};
 
 use super::ApiImpl;
@@ -38,127 +31,6 @@ use crate::types::SandboxId;
 /// with 503, and only for work another node can pick up.
 pub(crate) const REROUTE_HEADER: &str = "x-agentenv-reroute";
 pub(crate) const REROUTE_SCHEDULE: &str = "schedule";
-
-/// camelCase to match the rest of the node API, which the generated surface
-/// serialises that way.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IsolationState {
-    node_id: String,
-    scheduling_disabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    changed_at_unix_ms: Option<i64>,
-}
-
-pub(crate) fn router<I>(api_impl: I) -> Router
-where
-    I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
-{
-    Router::new()
-        .route(
-            "/nodes/{node_id}/isolation",
-            get(read_isolation::<I>)
-                .put(set_isolation::<I>)
-                .delete(clear_isolation::<I>),
-        )
-        .with_state(api_impl)
-}
-
-/// Mirrors the generated API's key check. That check only asserts a credential
-/// is present (see `impls::auth`), and this endpoint must not be the one place
-/// that looks stricter than the rest of the surface while being no stricter.
-fn authorized(headers: &HeaderMap) -> bool {
-    ["X-API-Key", "X-Team-ID", "X-Admin-Token"]
-        .iter()
-        .any(|name| {
-            headers
-                .get(*name)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| !value.is_empty())
-        })
-}
-
-/// Rejects a call aimed at some other node.
-///
-/// The gateway resolves the node id to an endpoint before proxying, so a
-/// mismatch here means the request reached the wrong node — answering it would
-/// isolate a node nobody asked about. Nodes that do not report to a scheduler
-/// have no identity to compare against and accept the call as addressed to
-/// them.
-fn addresses_this_node(api: &ApiImpl, node_id: &str) -> bool {
-    match api.observability() {
-        Some(observability) => observability.node_id() == node_id,
-        None => true,
-    }
-}
-
-async fn read_isolation<I>(
-    State(api_impl): State<I>,
-    Path(node_id): Path<String>,
-    headers: HeaderMap,
-) -> Response
-where
-    I: AsRef<ApiImpl>,
-{
-    respond_with_state(api_impl.as_ref(), &node_id, &headers, None)
-}
-
-async fn set_isolation<I>(
-    State(api_impl): State<I>,
-    Path(node_id): Path<String>,
-    headers: HeaderMap,
-) -> Response
-where
-    I: AsRef<ApiImpl>,
-{
-    respond_with_state(api_impl.as_ref(), &node_id, &headers, Some(true))
-}
-
-async fn clear_isolation<I>(
-    State(api_impl): State<I>,
-    Path(node_id): Path<String>,
-    headers: HeaderMap,
-) -> Response
-where
-    I: AsRef<ApiImpl>,
-{
-    respond_with_state(api_impl.as_ref(), &node_id, &headers, Some(false))
-}
-
-/// One shape for all three verbs: apply the change if there is one, then report
-/// the resulting state. Setting a flag that already holds is a success, so
-/// retries and concurrent operators converge instead of colliding.
-fn respond_with_state(
-    api: &ApiImpl,
-    node_id: &str,
-    headers: &HeaderMap,
-    desired: Option<bool>,
-) -> Response {
-    if !authorized(headers) {
-        return (StatusCode::UNAUTHORIZED, "missing credentials").into_response();
-    }
-    if !addresses_this_node(api, node_id) {
-        return (StatusCode::NOT_FOUND, "node not found on this host").into_response();
-    }
-
-    let orchestrator = api.orchestrator();
-    if let Some(disabled) = desired {
-        if orchestrator.set_scheduling_disabled(disabled) {
-            info!(
-                node_id,
-                scheduling_disabled = disabled,
-                "node isolation set"
-            );
-        }
-    }
-
-    Json(IsolationState {
-        node_id: node_id.to_string(),
-        scheduling_disabled: orchestrator.scheduling_disabled(),
-        changed_at_unix_ms: orchestrator.scheduling_disabled_changed_at_ms(),
-    })
-    .into_response()
-}
 
 /// Declines a resume that another node could serve, while this node is
 /// isolated.
@@ -246,7 +118,6 @@ async fn recoverable_elsewhere(orchestrator: &Arc<Orchestrator>, sandbox_id: San
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     #[test]
     fn resume_target_reads_the_sandbox_out_of_a_resume_path() {
@@ -277,23 +148,5 @@ mod tests {
     #[test]
     fn resume_target_ignores_an_unparseable_sandbox_id() {
         assert_eq!(resume_target("/sandboxes/not-a-uuid/resume"), None);
-    }
-
-    #[test]
-    fn authorization_accepts_any_of_the_credentials_the_generated_api_takes() {
-        for name in ["X-API-Key", "X-Team-ID", "X-Admin-Token"] {
-            let mut headers = HeaderMap::new();
-            headers.insert(name, HeaderValue::from_static("something"));
-            assert!(authorized(&headers), "{name} should be accepted");
-        }
-    }
-
-    #[test]
-    fn authorization_rejects_missing_and_empty_credentials() {
-        assert!(!authorized(&HeaderMap::new()));
-
-        let mut empty = HeaderMap::new();
-        empty.insert("X-API-Key", HeaderValue::from_static(""));
-        assert!(!authorized(&empty));
     }
 }

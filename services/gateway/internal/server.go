@@ -182,11 +182,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleNodeList(w, r, routingCtx)
 			return
-		} else if nodeID, ok := isNodeDetailRequest(r); ok {
-			setGatewayRouteSource(w, routeSourcePath)
-			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
-			return
-		} else if nodeID, ok := isNodeIsolationRequest(r); ok {
+		} else if nodeID, ok := isNodeAdminRequest(r); ok {
 			setGatewayRouteSource(w, routeSourcePath)
 			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
 			return

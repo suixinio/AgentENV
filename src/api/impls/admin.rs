@@ -51,8 +51,24 @@ impl From<NodeMetricsSnapshot> for models::NodeMetrics {
     }
 }
 
+/// What a node reports about itself.
+///
+/// Only two of the statuses are the node's to claim: it knows whether it has
+/// been taken out of rotation, and otherwise it is serving. CONNECTING and
+/// UNHEALTHY describe how the *scheduler* is getting on with this node, and a
+/// node claiming either would be describing something it cannot observe.
+fn node_status(node: &NodeSnapshot) -> models::NodeStatus {
+    if node.draining {
+        models::NodeStatus::NodeStatusDraining
+    } else {
+        models::NodeStatus::NodeStatusReady
+    }
+}
+
 impl From<NodeSnapshot> for models::Node {
     fn from(node: NodeSnapshot) -> Self {
+        // Read the status before the fields below move out of `node`.
+        let status = node_status(&node);
         models::Node::new(
             node.version,
             node.commit,
@@ -60,7 +76,7 @@ impl From<NodeSnapshot> for models::Node {
             node.service_instance_id,
             node.cluster_id.to_string(),
             node.machine_info.into(),
-            models::NodeStatus::NodeStatusReady,
+            status,
             node.sandbox_count,
             node.metrics.into(),
             node.create_successes,
@@ -150,6 +166,7 @@ impl Admin<()> for ApiImpl {
             }
         };
 
+        let status = node_status(&node);
         let detail = models::NodeDetail::new(
             node.cluster_id.to_string(),
             node.version,
@@ -157,7 +174,7 @@ impl Admin<()> for ApiImpl {
             node.node_id,
             node.service_instance_id,
             node.machine_info.into(),
-            models::NodeStatus::NodeStatusReady,
+            status,
             node.sandbox_count,
             node.metrics.into(),
             vec![],
@@ -166,5 +183,61 @@ impl Admin<()> for ApiImpl {
             node.paused_sandbox_count,
         );
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
+    }
+
+    /// Takes this node out of rotation, or puts it back.
+    ///
+    /// Only `ready` and `draining` are settable — see `node_status`. Asking for
+    /// one of the derived statuses is answered with 409 rather than quietly
+    /// ignored, so a caller that believes it parked a node never gets that
+    /// belief for free.
+    async fn nodes_node_id_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::NodesNodeIdPostPathParams,
+        query_params: &models::NodesNodeIdPostQueryParams,
+        body: &models::NodeStatusChange,
+    ) -> Result<NodesNodeIdPostResponse, ()> {
+        let Some(observability) = self.observability() else {
+            return Ok(NodesNodeIdPostResponse::Status404_NotFound(Self::error(
+                404,
+                "observability is disabled on this node",
+            )));
+        };
+
+        // Same check as the GET above, and it matters more here: this request
+        // reached us through a gateway that resolved the node id to an
+        // endpoint, and a routing mistake must not be allowed to park a node
+        // nobody asked about. The cluster may be named in either place; both
+        // have to agree with us.
+        let cluster_mismatch = query_params
+            .cluster_id
+            .or(body.cluster_id)
+            .map(|cluster_id| cluster_id != observability.cluster_id())
+            .unwrap_or(false);
+        if path_params.node_id != observability.node_id() || cluster_mismatch {
+            return Ok(NodesNodeIdPostResponse::Status404_NotFound(Self::error(
+                404,
+                format!("node {} not found", path_params.node_id),
+            )));
+        }
+
+        let disabled = match body.status {
+            models::NodeStatus::NodeStatusDraining => true,
+            models::NodeStatus::NodeStatusReady => false,
+            status => {
+                return Ok(NodesNodeIdPostResponse::Status409_Conflict(Self::error(
+                    409,
+                    format!("node status {status} is derived by the scheduler and cannot be set",),
+                )));
+            }
+        };
+
+        self.orchestrator().set_scheduling_disabled(disabled);
+
+        Ok(NodesNodeIdPostResponse::Status204_TheNodeStatusWasChangedSuccessfully)
     }
 }

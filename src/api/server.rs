@@ -25,7 +25,6 @@ where
     // the hand-written `/proxy/*` entrypoints needed for the temporary reverse
     // proxy contract.
     agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
-        .merge(isolation::router(api_impl.clone()))
         .merge(proxy::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         // Runs ahead of the generated resume handler: an isolated node answers

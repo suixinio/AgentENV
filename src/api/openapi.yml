@@ -1034,6 +1034,17 @@ components:
         reason:
           $ref: "#/components/schemas/BuildStatusReason"
 
+    NodeStatusChange:
+      required:
+        - status
+      properties:
+        clusterID:
+          type: string
+          format: uuid
+          description: Identifier of the cluster
+        status:
+          $ref: "#/components/schemas/NodeStatus"
+
     NodeStatus:
       type: string
       description: |
@@ -2240,5 +2251,46 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+    post:
+      summary: Change node status
+      description: |
+        Change status of a node.
+
+        Only `ready` and `draining` may be set. The others are states the
+        scheduler derives from discovery and heartbeats, and claiming one of
+        them here would describe the node as something it is not.
+
+        Setting `draining` takes the node out of rotation: it stops accepting
+        new sandboxes while continuing to serve the ones it already runs.
+        Setting `ready` puts it back. Both are idempotent.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/nodeID"
+        - in: query
+          name: clusterID
+          description: Identifier of the cluster
+          required: false
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeStatusChange"
+      responses:
+        "204":
+          description: The node status was changed successfully
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"

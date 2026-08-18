@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	schedulerv1 "agentenv/services/api/proto"
 )
@@ -157,16 +159,18 @@ func TestDeclineMarkerOnNonResumeIsNotRerouted(t *testing.T) {
 	}
 }
 
-// Isolation is owned by the node; the gateway resolves the node and proxies the
-// call through unchanged.
-func TestNodeIsolationIsProxiedToTheNode(t *testing.T) {
+// Changing a node's status is owned by the node; the gateway resolves the id
+// and proxies the call through unchanged, body and all.
+func TestNodeStatusChangeIsProxiedToTheNode(t *testing.T) {
 	type call struct {
 		method string
 		path   string
+		body   string
 	}
 	calls := make(chan call, 1)
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls <- call{method: r.Method, path: r.URL.Path}
+		body, _ := io.ReadAll(r.Body)
+		calls <- call{method: r.Method, path: r.URL.Path, body: string(body)}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer node.Close()
@@ -182,21 +186,57 @@ func TestNodeIsolationIsProxiedToTheNode(t *testing.T) {
 		},
 	}, 5*time.Second, 4<<20)
 
-	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
-		request := httptest.NewRequest(method, "/nodes/node-a/isolation", nil)
+	// Draining and back again travel the same route; a node on its way out has
+	// to stay reachable or isolation could never be undone.
+	for _, status := range []string{"draining", "ready"} {
+		payload := `{"status":"` + status + `"}`
+		request := httptest.NewRequest(http.MethodPost, "/nodes/node-a", strings.NewReader(payload))
 		response := httptest.NewRecorder()
 		server.Handler().ServeHTTP(response, request)
 
 		if response.Code != http.StatusNoContent {
-			t.Fatalf("%s: expected status 204, got %d", method, response.Code)
+			t.Fatalf("%s: expected status 204, got %d", status, response.Code)
 		}
 		select {
 		case got := <-calls:
-			if got.method != method || got.path != "/nodes/node-a/isolation" {
-				t.Fatalf("%s: node saw %s %s", method, got.method, got.path)
+			if got.method != http.MethodPost || got.path != "/nodes/node-a" {
+				t.Fatalf("%s: node saw %s %s", status, got.method, got.path)
+			}
+			if got.body != payload {
+				t.Fatalf("%s: node saw body %q, want %q", status, got.body, payload)
 			}
 		default:
-			t.Fatalf("%s: request never reached the node", method)
+			t.Fatalf("%s: request never reached the node", status)
+		}
+	}
+}
+
+// The control: only the methods the node admin surface actually has are routed
+// to a node. Everything else has to keep falling through to sandbox routing,
+// or an unrelated request to a /nodes-shaped path would be answered by a node
+// that was never asked.
+func TestOtherMethodsOnNodePathAreNotProxiedToTheNode(t *testing.T) {
+	getNodeCalled := 0
+	server := newTestServer(t, stubSchedulerClient{
+		getNodeFunc: func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
+			getNodeCalled++
+			return nil, nil
+		},
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return nil, status.Error(codes.Unavailable, "no nodes available")
+		},
+	}, 5*time.Second, 4<<20)
+
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		request := httptest.NewRequest(method, "/nodes/node-a", nil)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+
+		if getNodeCalled != 0 {
+			t.Fatalf("%s: resolved a node it should not have", method)
+		}
+		if response.Code == http.StatusNoContent {
+			t.Fatalf("%s: was served as a node admin call", method)
 		}
 	}
 }

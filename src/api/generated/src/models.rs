@@ -94,6 +94,21 @@ pub struct NodesNodeIdGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct NodesNodeIdPostPathParams {
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct NodesNodeIdPostQueryParams {
+    /// Identifier of the cluster
+    #[serde(rename = "clusterID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesGetQueryParams {
     /// Metadata query used to filter the sandboxes (e.g. \"user=abc&app=prod\"). Each key and values must be URL encoded.
     #[serde(rename = "metadata")]
@@ -3336,9 +3351,7 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err(
-                        "Missing value while parsing Node".to_string(),
-                    );
+                    return std::result::Result::Err("Missing value while parsing Node".to_string());
                 }
             };
 
@@ -4229,6 +4242,159 @@ impl std::str::FromStr for NodeStatus {
             "connecting" => std::result::Result::Ok(NodeStatus::NodeStatusConnecting),
             "unhealthy" => std::result::Result::Ok(NodeStatus::NodeStatusUnhealthy),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct NodeStatusChange {
+    /// Identifier of the cluster
+    #[serde(rename = "clusterID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<uuid::Uuid>,
+
+    #[serde(rename = "status")]
+    #[validate(nested)]
+    pub status: models::NodeStatus,
+}
+
+impl NodeStatusChange {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(status: models::NodeStatus) -> NodeStatusChange {
+        NodeStatusChange {
+            cluster_id: None,
+            status,
+        }
+    }
+}
+
+/// Converts the NodeStatusChange value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for NodeStatusChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping clusterID in query parameter serialization
+
+            // Skipping status in query parameter serialization
+
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a NodeStatusChange value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for NodeStatusChange {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub cluster_id: Vec<uuid::Uuid>,
+            pub status: Vec<models::NodeStatus>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing NodeStatusChange".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "clusterID" => intermediate_rep.cluster_id.push(
+                        <uuid::Uuid as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "status" => intermediate_rep.status.push(
+                        <models::NodeStatus as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing NodeStatusChange".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(NodeStatusChange {
+            cluster_id: intermediate_rep.cluster_id.into_iter().next(),
+            status: intermediate_rep
+                .status
+                .into_iter()
+                .next()
+                .ok_or_else(|| "status missing in NodeStatusChange".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<NodeStatusChange> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<NodeStatusChange>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<NodeStatusChange>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for NodeStatusChange - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NodeStatusChange> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <NodeStatusChange as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into NodeStatusChange - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
         }
     }
 }

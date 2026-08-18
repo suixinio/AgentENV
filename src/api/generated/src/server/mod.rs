@@ -44,7 +44,10 @@ where
     Router::new()
         .route("/health", get(health_get::<I, A, E>))
         .route("/nodes", get(nodes_get::<I, A, E, C>))
-        .route("/nodes/{node_id}", get(nodes_node_id_get::<I, A, E, C>))
+        .route(
+            "/nodes/{node_id}",
+            get(nodes_node_id_get::<I, A, E, C>).post(nodes_node_id_post::<I, A, E, C>),
+        )
         .route(
             "/sandboxes",
             get(sandboxes_get::<I, A, E, C>).post(sandboxes_post::<I, A, E, C>),
@@ -373,6 +376,184 @@ where
                 response.body(Body::from(body_content))
             }
             apis::admin::NodesNodeIdGetResponse::Status500_ServerError(body) => {
+                let mut response = response.status(500);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+        },
+        Err(why) => {
+            // Application code returned an error. This should not happen, as the implementation should
+            // return a valid response.
+            return api_impl
+                .as_ref()
+                .handle_error(&method, &host, &cookies, why)
+                .await;
+        }
+    };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(validator::Validate)]
+#[allow(dead_code)]
+struct NodesNodeIdPostBodyValidator<'a> {
+    #[validate(nested)]
+    body: &'a models::NodeStatusChange,
+}
+
+#[tracing::instrument(skip_all)]
+fn nodes_node_id_post_validation(
+    path_params: models::NodesNodeIdPostPathParams,
+    query_params: models::NodesNodeIdPostQueryParams,
+    body: models::NodeStatusChange,
+) -> std::result::Result<
+    (
+        models::NodesNodeIdPostPathParams,
+        models::NodesNodeIdPostQueryParams,
+        models::NodeStatusChange,
+    ),
+    ValidationErrors,
+> {
+    path_params.validate()?;
+    query_params.validate()?;
+    let b = NodesNodeIdPostBodyValidator { body: &body };
+    b.validate()?;
+
+    Ok((path_params, query_params, body))
+}
+/// NodesNodeIdPost - POST /nodes/{nodeID}
+#[tracing::instrument(skip_all)]
+async fn nodes_node_id_post<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::NodesNodeIdPostPathParams>,
+    QueryExtra(query_params): QueryExtra<models::NodesNodeIdPostQueryParams>,
+    State(api_impl): State<I>,
+    Json(body): Json<models::NodeStatusChange>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::admin::Admin<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-Admin-Token")
+        .await;
+    let claims = None.or(claims_in_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        nodes_node_id_post_validation(path_params, query_params, body)
+    })
+    .await
+    .unwrap();
+
+    let Ok((path_params, query_params, body)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .nodes_node_id_post(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &query_params,
+            &body,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+        Ok(rsp) => match rsp {
+            apis::admin::NodesNodeIdPostResponse::Status204_TheNodeStatusWasChangedSuccessfully => {
+                let mut response = response.status(204);
+                response.body(Body::empty())
+            }
+            apis::admin::NodesNodeIdPostResponse::Status401_AuthenticationError(body) => {
+                let mut response = response.status(401);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::admin::NodesNodeIdPostResponse::Status404_NotFound(body) => {
+                let mut response = response.status(404);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::admin::NodesNodeIdPostResponse::Status409_Conflict(body) => {
+                let mut response = response.status(409);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::admin::NodesNodeIdPostResponse::Status500_ServerError(body) => {
                 let mut response = response.status(500);
                 {
                     let mut response_headers = response.headers_mut().unwrap();

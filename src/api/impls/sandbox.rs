@@ -28,7 +28,7 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
-use super::paused_recovery::{CrossNodeResume, ResumeArbitration};
+use super::paused_recovery::{CrossNodeResume, MissingLocalResume, ResumeArbitration};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -1310,9 +1310,36 @@ impl Sandboxes<()> for ApiImpl {
                 // the cluster still has a snapshot to rebuild it from — under
                 // the same ID, on this node.
                 let ResumeArbitration::Held(entry) = arbitration else {
-                    return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                        sandbox_not_found(id),
-                    ));
+                    // 既没有本地副本、也没拿到认领权。单发请求下这确实是"沙箱没了"，
+                    // 但并发下不是 —— 输家会走到这里，而赢家正把同一台拉起来。
+                    // 🔴 回 404 之前必须先问清集群：404 的下游契约是"可以重建"，
+                    // 而重建等于把用户工作区退回模板初始态。
+                    return Ok(match self.resolve_missing_local_resume(sandbox_id).await {
+                        MissingLocalResume::Unknown => {
+                            SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                                sandbox_not_found(id),
+                            )
+                        }
+                        MissingLocalResume::Resumed(metadata) => {
+                            SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
+                                self.sandbox_model(*metadata),
+                            )
+                        }
+                        MissingLocalResume::Busy { holder } => {
+                            SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
+                                409,
+                                format!("sandbox is being resumed by node '{holder}'"),
+                            ))
+                        }
+                        MissingLocalResume::Undecided(reason) => {
+                            SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
+                                500,
+                                format!(
+                                    "cannot determine whether the sandbox still exists: {reason}"
+                                ),
+                            ))
+                        }
+                    });
                 };
 
                 return Ok(match self

@@ -14,6 +14,8 @@
 //! Everything here is inert unless the paused-sandbox registry is configured
 //! with a cluster backend.
 
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
@@ -21,8 +23,76 @@ use super::ApiImpl;
 use crate::orchestrator::{
     ClusterRegistration, CreateSandboxRequest, HeldSandbox, NewTimeout, PausedRegistryState,
     PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
+    SandboxState,
 };
 use crate::types::SandboxId;
+
+/// 本节点既没有本地副本、又没拿到认领权时，一次 resume 该怎么收场。
+///
+/// 🔴 这个枚举存在的唯一理由：**404 的下游契约是「沙箱没了，可以重建」**。
+/// 平台侧收到 resume 的 404 会把 `externalID` 清空并从模板重建沙箱
+/// （`apps/agent-platform/internal/sandbox/aenv/service.go`，注释自己写着
+/// 「工作区回到模板初始态」）。所以「另一发 resume 正在把它拉起来」
+/// 绝不能落成 404 —— 那会把一次良性竞态变成用户工作区被重置。
+///
+/// e2b 在同一处竞态上的答案是让输家**拿到赢家的结果**：`Reserve` 命中 pending
+/// 就订阅赢家的完成通知（`e2b/packages/api/internal/sandbox/reservations/redis/reservation.go`），
+/// 命中 storage index 就直接读回既有沙箱（`.../sandbox/store.go`）。它从不把
+/// 输家答成「不存在」。这里对齐的是那个保证，不是它的 Redis 形状。
+pub(super) enum MissingLocalResume {
+    /// 集群也不认识它。**唯一**允许回 404 的情形。
+    Unknown,
+    /// 另一发 resume 已经把它拉起来了，而且赢家就在本节点 —— 直接返回成品。
+    Resumed(Box<SandboxMetadata>),
+    /// 有人正在处理它，或它属于别的节点。可重试，但不是「不存在」。
+    Busy { holder: String },
+    /// 登记表答不上来。宁可报错，也不许说「不存在」。
+    Undecided(String),
+}
+
+/// [`missing_local_verdict`] 的结论。抽成纯函数是为了能穷举测试：
+/// 这里判错一次的代价是用户工作区，而它的输入只有三样事实。
+enum MissingLocalVerdict {
+    /// 集群没有这一行。
+    Unknown,
+    /// 本地已经有一台跑着的同 ID 沙箱 —— 赢家落定了。
+    Ready,
+    /// 赢家在本节点且仍在进行中，它的成品会出现在本地 store，值得等。
+    Wait { holder: String },
+    /// 别人管着它。等不出结果，交给调用方重试。
+    Busy { holder: String },
+}
+
+/// 据三样事实判定：集群怎么说、本地 store 怎么说、本节点是谁。
+///
+/// `paused` 也归入 [`MissingLocalVerdict::Busy`]：走到这里说明我们刚在
+/// `claim_for_resume` 上输掉一次认领而赢家又已经释放，重试一次就能拿到 ——
+/// 那是「稍后再来」，同样不是「不存在」。
+fn missing_local_verdict(
+    entry: Option<&PausedSandboxEntry>,
+    local: Option<&SandboxMetadata>,
+    node_id: &str,
+) -> MissingLocalVerdict {
+    let Some(entry) = entry else {
+        return MissingLocalVerdict::Unknown;
+    };
+
+    // 赢家把沙箱加进本地 store 之后，这里就能看到成品 —— 与 e2b 输家
+    // 从 storage 读回赢家那台是同一件事。
+    if local.is_some_and(|m| m.state == SandboxState::Running) {
+        return MissingLocalVerdict::Ready;
+    }
+
+    let holder = entry
+        .claimed_by_node_id
+        .clone()
+        .unwrap_or_else(|| entry.origin_node_id.clone());
+
+    match entry.state {
+        PausedRegistryState::Resuming if holder == node_id => MissingLocalVerdict::Wait { holder },
+        _ => MissingLocalVerdict::Busy { holder },
+    }
+}
 
 /// Outcome of rebuilding a sandbox from a claim this node already holds.
 pub(super) enum CrossNodeResume {
@@ -115,6 +185,74 @@ impl ApiImpl {
     }
 
     /// Returns a claim after the resume it was taken for failed.
+    /// 有界地等「本节点上另一发 resume」落定，然后据实回答本节点该回什么。
+    ///
+    /// 只在 resume 已经确认**本地没有副本**、且仲裁**没有给出认领权**之后调用。
+    /// 这两个条件合起来在单发请求下意味着"沙箱真没了"，但在并发下不是：
+    /// 同一台沙箱的两发 resume 会被网关派到同一个非 origin 节点，赢家拿到认领权、
+    /// 输家的 `claim_for_resume` 撞上自己节点的 `resuming` 行 —— 而
+    /// `Conflict{origin == 本节点}` 被 [`arbitration`] 判为 `Proceed`（那条判断
+    /// 对赢家是对的：它确实持有认领权）。输家于是既无本地副本又无 entry。
+    ///
+    /// 🧪 实测（pve-sg dev，2026-08-18，隔离 origin 后两发并发，2/2 复现）：
+    /// 修复前输家稳定拿到 404 / ~0.19s，而沙箱正在另一节点上健康运行。
+    const MISSING_LOCAL_WAIT: Duration = Duration::from_secs(5);
+    const MISSING_LOCAL_POLL: Duration = Duration::from_millis(200);
+
+    pub(super) async fn resolve_missing_local_resume(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> MissingLocalResume {
+        // 单机形态：登记表没有话语权，本地没有就是真没有 —— 保持原语义。
+        if !self.paused.registry().is_cluster_backed() {
+            return MissingLocalResume::Unknown;
+        }
+
+        let node_id = self.paused.node_id().to_string();
+        let deadline = Instant::now() + Self::MISSING_LOCAL_WAIT;
+        let mut holder = node_id.clone();
+
+        loop {
+            let entry = match self.paused.registry().get(&sandbox_id).await {
+                Ok(entry) => entry,
+                // 读不到就不下结论。这是本方法的全部意义：说错成"不存在"
+                // 会让调用方重建，而重建是不可逆的。
+                Err(err) => return MissingLocalResume::Undecided(err.to_string()),
+            };
+            let local = match self.orchestrator.get_sandbox(&sandbox_id).await {
+                Ok(local) => local,
+                Err(err) => return MissingLocalResume::Undecided(err.to_string()),
+            };
+
+            match missing_local_verdict(entry.as_ref(), local.as_ref(), &node_id) {
+                MissingLocalVerdict::Unknown => return MissingLocalResume::Unknown,
+                MissingLocalVerdict::Ready => {
+                    return match local {
+                        Some(metadata) => MissingLocalResume::Resumed(Box::new(metadata)),
+                        // 判定说 Ready 就一定有 local；这条只为不写 unwrap。
+                        None => MissingLocalResume::Busy { holder },
+                    };
+                }
+                MissingLocalVerdict::Busy { holder } => return MissingLocalResume::Busy { holder },
+                MissingLocalVerdict::Wait { holder: who } => {
+                    holder = who;
+                    if Instant::now() >= deadline {
+                        // 等不到不等于没有。超时同样回 Busy（可重试），不回 404。
+                        warn!(
+                            %sandbox_id,
+                            holder,
+                            "another resume on this node has not landed within the wait window; \
+                             reporting it as busy rather than missing"
+                        );
+
+                        return MissingLocalResume::Busy { holder };
+                    }
+                    tokio::time::sleep(Self::MISSING_LOCAL_POLL).await;
+                }
+            }
+        }
+    }
+
     pub(super) async fn abandon_claim(&self, sandbox_id: SandboxId, generation: i64) {
         self.release_claim(&sandbox_id, generation).await;
     }
@@ -1134,5 +1272,68 @@ mod tests {
                 "a resuming row must never leave a local paused copy resumable"
             );
         }
+    }
+
+    /// 唯一允许回 404 的输入：集群也没有这一行。
+    #[test]
+    fn no_registry_row_is_the_only_missing_verdict() {
+        assert!(matches!(
+            missing_local_verdict(None, None, "self"),
+            MissingLocalVerdict::Unknown
+        ));
+    }
+
+    /// 并发 resume 的输家：本节点持有认领权（是赢家那一发拿的），本地还没成品。
+    /// 必须等，不能答"不存在" —— 这是 2026-08-18 实测那个 404 的正解。
+    #[test]
+    fn a_resume_in_flight_on_this_node_is_waited_for_not_reported_missing() {
+        let row = entry(PausedRegistryState::Resuming, "other", Some("self"));
+        assert!(matches!(
+            missing_local_verdict(Some(&row), None, "self"),
+            MissingLocalVerdict::Wait { .. }
+        ));
+    }
+
+    /// 赢家落定之后，输家从本地 store 读回同一台 —— 与 e2b 输家读回赢家结果同义。
+    #[test]
+    fn a_running_local_copy_settles_the_wait() {
+        let row = entry(PausedRegistryState::Resuming, "other", Some("self"));
+        let local = SandboxMetadata {
+            state: SandboxState::Running,
+            ..Default::default()
+        };
+        assert!(matches!(
+            missing_local_verdict(Some(&row), Some(&local), "self"),
+            MissingLocalVerdict::Ready
+        ));
+    }
+
+    /// 任何"别人管着它"的行都不是 404：等在本节点等不到，交给调用方重试。
+    #[test]
+    fn rows_held_elsewhere_are_busy_never_missing() {
+        for row in [
+            entry(PausedRegistryState::Resuming, "other", Some("other")),
+            entry(PausedRegistryState::Running, "other", None),
+            entry(PausedRegistryState::Paused, "other", None),
+            entry(PausedRegistryState::Publishing, "other", None),
+            entry(PausedRegistryState::LocalOnly, "other", None),
+        ] {
+            let verdict = missing_local_verdict(Some(&row), None, "self");
+            assert!(
+                matches!(verdict, MissingLocalVerdict::Busy { .. }),
+                "state {:?} must not be reported as missing",
+                row.state
+            );
+        }
+    }
+
+    /// 我们自己的 paused 行同样不是 404：说明刚输掉一次认领而赢家已释放，重试即可。
+    #[test]
+    fn our_own_paused_row_is_busy_not_missing() {
+        let row = entry(PausedRegistryState::Paused, "self", None);
+        assert!(matches!(
+            missing_local_verdict(Some(&row), None, "self"),
+            MissingLocalVerdict::Busy { .. }
+        ));
     }
 }

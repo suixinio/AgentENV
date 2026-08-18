@@ -5,10 +5,16 @@ import schedulerv1 "agentenv/services/api/proto"
 type Node struct {
 	ID       string `json:"node_id"`
 	Endpoint string `json:"endpoint"`
-	// PodName is the identity this node reported itself under before node
-	// identity became the machine's name rather than the pod's. Carried purely
-	// so a heartbeat arriving under the old name is still recognised while a
-	// fleet is mid-upgrade; empty once every node reports the stable ID.
+	// PodName is the name of the pod currently serving this node, which is the
+	// identity a node still reports itself under until its own pod restarts
+	// onto the build that reports the machine's name instead. Carrying it lets
+	// the registry recognise such a heartbeat rather than rejecting it as an
+	// unknown node.
+	//
+	// Only the *current* pod is aliased — a stale process reporting some
+	// earlier pod's name is still refused — and the alias never shadows a real
+	// node, so keeping it once the fleet is upgraded costs nothing and leaves
+	// the next upgrade equally seamless.
 	PodName string `json:"pod_name,omitempty"`
 }
 

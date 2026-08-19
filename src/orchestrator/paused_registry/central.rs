@@ -1,10 +1,10 @@
 //! The cluster registry, reached through whoever owns the database.
 //!
-//! Same registry and same semantics as [`PostgresPausedSandboxRegistry`](super::PostgresPausedSandboxRegistry);
-//! the difference is who holds the connection. Here the node states what it
-//! wants over gRPC and the controller runs the statement, so the DSN, the
-//! connection budget and the schema stop being the business of every machine
-//! that runs user code.
+//! The node states what it wants over gRPC and the controller runs the
+//! statement, so the DSN, the connection budget and the schema stop being the
+//! business of every machine that runs user code. This is the only backend that
+//! reaches a cluster registry at all — the one where each node connected to the
+//! database itself was removed once this one had the semantics to replace it.
 //!
 //! 🔴 **A failure is never an answer.** Everything below turns any transport
 //! failure into [`PausedRegistryError::Backend`] and never into an empty

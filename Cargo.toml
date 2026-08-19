@@ -54,14 +54,6 @@ http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 rocksdb = "0.24.0"
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio",
-    "tls-rustls",
-    "postgres",
-    "uuid",
-    "chrono",
-    "json",
-] }
 tower = "0.5.2"
 anyhow = "1.0.100"
 tempfile = "3.22.0"

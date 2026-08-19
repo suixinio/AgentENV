@@ -19,13 +19,12 @@
 
 mod central;
 mod disabled;
-mod postgres;
 mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
@@ -37,7 +36,6 @@ use crate::types::SandboxId;
 
 pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
-pub use postgres::PostgresPausedSandboxRegistry;
 pub use types::{
     BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome, PausedRegistryState,
     PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
@@ -378,6 +376,23 @@ pub async fn build_paused_registry(
     let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
         match config.backend {
             PausedRegistryBackendKind::Local => (Arc::new(DisabledPausedSandboxRegistry), ""),
+            // 🔴 Refused, not reinterpreted. A node reaching the registry
+            // database itself is the shape this whole change removed: the
+            // credentials, the connection budget and the schema stopped being
+            // every node's business, and putting them back on a machine that
+            // runs user code is not something a stale config value gets to do
+            // quietly.
+            //
+            // Nor is it silently upgraded to `central`, which needs a scheduler
+            // endpoint this node may not have been given.
+            PausedRegistryBackendKind::Postgres => {
+                bail!(
+                    "paused_registry.backend = \"postgres\" has been removed: the node no longer \
+                     connects to the registry database. Set AENV_PAUSED_REGISTRY_BACKEND=central \
+                     and point AENV_OBSERVABILITY_SCHEDULER_ENDPOINT at the scheduler, which owns \
+                     the database now; the node's own DSN secret can then be dropped"
+                )
+            }
             PausedRegistryBackendKind::Central => {
                 let endpoint = cluster
                     .scheduler_endpoint
@@ -405,43 +420,18 @@ pub async fn build_paused_registry(
                     endpoint,
                 )
             }
-            PausedRegistryBackendKind::Postgres => {
-                let dsn = config
-                    .dsn
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|dsn| !dsn.is_empty())
-                    .context(
-                        "paused_registry.backend = \"postgres\" requires a DSN; \
-                         set AENV_PAUSED_REGISTRY_DSN",
-                    )?;
-
-                (
-                    Arc::new(
-                        PostgresPausedSandboxRegistry::connect(
-                            dsn,
-                            identity.cluster_id,
-                            config.max_connections,
-                            config.lease_ttl_secs() as f64,
-                        )
-                        .await?,
-                    ),
-                    "",
-                )
-            }
         };
 
-    // 🔴 One statement for all three backends, after the match rather than
-    // inside each arm. A per-arm line is a line an arm can be missing, and the
-    // arm that was missing it was `central`: a node switched over to it said
+    // 🔴 One statement for both backends, after the match rather than inside
+    // each arm. A per-arm line is a line an arm can be missing, and the arm
+    // that was missing it was `central`: a node switched over to it said
     // nothing at all, so "the switch took" and "the value never reached the
     // node and it stayed on `local`" read identically in the log — while the
     // difference between them only surfaces later, when a node is lost and its
     // sandboxes turn out to have gone with it. Which backend this node ended
     // up on is the one fact this path has to state out loud.
     //
-    // `scheduler_endpoint` is empty for the two backends that do not have one;
-    // the DSN is deliberately not here, since it carries credentials.
+    // `scheduler_endpoint` is empty for `local`, which does not have one.
     info!(
         backend = config.backend.as_str(),
         cluster_id = %identity.cluster_id,
@@ -549,8 +539,6 @@ mod build_tests {
     fn config(backend: PausedRegistryBackendKind) -> PausedRegistryConfig {
         PausedRegistryConfig {
             backend,
-            dsn: None,
-            max_connections: 8,
             reconcile_interval_secs: 30,
             lease_ttl_secs: 90,
         }
@@ -612,17 +600,34 @@ mod build_tests {
         }
     }
 
-    /// The same rule for the direct backend, which is what the central one was
-    /// modelled on.
+    /// 🔴 A deployment still asking for the removed backend is stopped, not
+    /// reinterpreted.
+    ///
+    /// Both of the plausible reinterpretations are wrong. Treating it as
+    /// `local` puts the node back to node-local pauses, which is the silent
+    /// failure `AENV_PAUSED_REGISTRY_BACKEND` exists to prevent. Treating it as
+    /// `central` points the node at whatever endpoint happens to be configured
+    /// — including none. Refusing to start is the only answer an operator
+    /// cannot miss.
     #[tokio::test]
-    async fn the_postgres_backend_without_a_dsn_is_a_startup_failure() {
-        assert!(build_paused_registry(
+    async fn the_removed_postgres_backend_refuses_to_start() {
+        let failure = build_paused_registry(
             &config(PausedRegistryBackendKind::Postgres),
+            // A perfectly usable endpoint, so nothing about *this* is what
+            // makes it fail.
             &cluster(Some("http://scheduler.invalid:9090")),
             &identity(),
         )
-        .await
-        .is_err());
+        .await;
+
+        let Err(failure) = failure else {
+            panic!("the removed backend must not build a registry");
+        };
+        let message = failure.to_string();
+        assert!(
+            message.contains("central"),
+            "the refusal has to say what to set instead, got {message:?}"
+        );
     }
 
     /// 🔴 Every backend says which one it is, out loud, at assembly.

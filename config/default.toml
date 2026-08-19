@@ -214,27 +214,21 @@ auto_resume_min_sandbox_timeout_secs = 300
 # sandboxes turn out to have gone with it.
 [orchestrator.paused_registry]
 # - "local": a paused sandbox is resumable only on the node that paused it.
-# - "postgres": the pause also publishes its snapshot to the shared repository
-#   and records the sandbox in PostgreSQL, so any node can resume it under its
-#   original ID.
-# - "central": the same registry and the same semantics as "postgres", reached
-#   over gRPC through the service that owns the database instead of by
-#   connecting to it. Requires [cluster].scheduler_endpoint and no DSN; a
-#   "central" backend with no endpoint fails startup rather than falling back.
+# - "central": the pause also publishes its snapshot to the shared repository
+#   and records the sandbox cluster-wide, so any node can resume it under its
+#   original ID. The registry is reached over gRPC through the scheduler, which
+#   owns the database. Requires [cluster].scheduler_endpoint; a "central"
+#   backend with no endpoint fails startup rather than falling back.
+#
+# The former "postgres" backend, where each node connected to the registry
+# database itself, has been removed. A node still configured with it refuses to
+# start and says what to set instead — the credentials, the connection budget
+# and the schema are no longer every node's business.
 #
 # 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
 # editing the copy of this file that lands in the cluster ConfigMap — see
 # above. The environment wins over this value.
 backend = "local"
-
-# Required by the "postgres" backend, and deliberately absent here: the DSN
-# carries credentials. Set AENV_PAUSED_REGISTRY_DSN instead, from a Secret.
-# A "postgres" backend with no DSN fails startup rather than falling back.
-# dsn = ""
-
-# Connections per node held open against the registry database.
-# Unused by the "central" backend, which holds none.
-max_connections = 8
 
 # How often a node renews its registry leases and re-checks its local paused
 # records against the registry. Ignored by the "local" backend.

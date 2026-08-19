@@ -80,7 +80,7 @@ The make targets build a temporary Kustomize context so runtime Pods mount the r
 The runtime DaemonSet injects scheduler-report wiring for each node Pod:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon` so the Pod uses the `uvm-ublk-daemon` binary included in the runtime image
-- `AENV_NODE_ID` from Pod metadata name (`metadata.name`)
+- `AENV_NODE_ID` from the node the Pod is on (`fieldRef: spec.nodeName`), not the Pod's own name — a paused sandbox's registry row records it as the holder, and it has to survive the Pod being replaced
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true`
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-scheduler:9090`
 - `AENV_SANDBOX_PROXY_DOMAINS` from the shared sandbox proxy ConfigMap
@@ -89,27 +89,25 @@ The P2P listen address must be reachable Pod-to-Pod; use a concrete container po
 
 ## Cluster-wide Paused Sandboxes
 
-By default a paused sandbox is resumable only on the node that paused it. Pointing the nodes at a shared PostgreSQL registry makes a pause publish its snapshot to the shared repository as well, so any node can resume the sandbox under its original ID.
+By default a paused sandbox is resumable only on the node that paused it. Pointing the nodes at the cluster-wide registry makes a pause publish its snapshot to the shared repository as well, so any node can resume the sandbox under its original ID.
 
-Both settings reach the DaemonSet through optional references, so a cluster without them starts normally on the node-local default. Enabling it takes two objects:
+The registry lives in PostgreSQL and the **scheduler** owns it. Nodes reach it over gRPC; no node holds database credentials, a connection, or any say over the schema. Enabling it takes one object:
 
 ```bash
 kubectl -n agentenv-system create configmap paused-registry-config \
-  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=postgres
-
-kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
-  --from-literal=paused-registry-dsn='postgres://user:password@host:5432/agentenv' \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=central
 ```
+
+The setting reaches the DaemonSet through an optional reference, so a cluster without it starts normally on the node-local default.
 
 🔴 **Do not select the backend by editing the `agentenv-k8s-config` ConfigMap.** The make targets rebuild that ConfigMap from `config/default.toml` on every apply, so an edit there is undone by the next `make k8s-apply` — quietly, and in the direction that loses cross-node recovery: pauses go back to being node-local and nothing reports an error until a node is lost and its sandboxes turn out to have gone with it. `AENV_PAUSED_REGISTRY_BACKEND` exists so the choice lives somewhere the file cannot overwrite it.
 
-The `postgres` backend refuses to start without a DSN rather than falling back, so the two objects above belong together. The node creates its own schema on first start.
+`central` needs `[cluster].scheduler_endpoint` (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, already set on the DaemonSet) and refuses to start without one rather than falling back. Reclaiming holdings from nodes that never came back is the scheduler's own timer, not something a node asks for.
 
 Each node reports the backend it assembled, once, at startup:
 
 ```
-INFO paused sandbox registry ready backend=postgres cluster_id=… lease_ttl_secs=90 scheduler_endpoint=
+INFO paused sandbox registry ready backend=central cluster_id=… lease_ttl_secs=90 scheduler_endpoint=http://agentenv-scheduler:9090
 ```
 
 That line is how a rollout is confirmed. A value `AENV_PAUSED_REGISTRY_BACKEND` does not recognise stops the node rather than falling back, but a value that never reached the Pod at all — a ConfigMap that was not created, a key spelled differently — leaves it on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
@@ -129,18 +127,40 @@ curl -s localhost:9101/healthz | jq .registry_write
 
 An empty `cluster_id` there means the write surface is registered and cold, answering every registry RPC `UNAVAILABLE` until one is supplied.
 
-### Through the scheduler instead of the database
+### Migrating from the removed `postgres` backend
 
-`AENV_PAUSED_REGISTRY_BACKEND=central` reaches the same registry over gRPC through the scheduler, which owns the database. The semantics are identical; what changes is that the DSN, the connection budget and the schema stop being every node's business — the credentials are held in one place instead of on every machine that runs user code, and the connection count stops growing with the fleet.
+Nodes used to connect to the registry database themselves, under `AENV_PAUSED_REGISTRY_BACKEND=postgres`. That backend has been **removed**, and a node still configured with it refuses to start rather than guessing:
 
-```bash
-kubectl -n agentenv-system create configmap paused-registry-config \
-  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=central
+```
+paused_registry.backend = "postgres" has been removed: the node no longer connects to the
+registry database. Set AENV_PAUSED_REGISTRY_BACKEND=central and point
+AENV_OBSERVABILITY_SCHEDULER_ENDPOINT at the scheduler, which owns the database now;
+the node's own DSN secret can then be dropped
 ```
 
-It needs `[cluster].scheduler_endpoint` (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, already set on the DaemonSet) and no DSN, and refuses to start without an endpoint rather than falling back. Reclamation of holdings from nodes that never came back is the scheduler's own timer under this backend, not something a node asks for.
+Refusing is deliberate. Reading it as `local` would put the fleet back to node-local pauses — the silent failure this setting exists to prevent — and reading it as `central` would point the node at whatever endpoint happened to be configured, including none.
 
-🔴 **Switch every node at once, and not while sandboxes are live.** A node on the `postgres` backend re-asserts the table's constraints on every start, so a mixed fleet has two writers with different ideas of the schema. Both backends arbitrate through the same generation column, so a mixed fleet is not corrupt — but it is a fleet whose schema owner is whichever node started last.
+To migrate:
+
+```bash
+# 1. The scheduler must already own the table: SCHEDULER_REGISTRY_DSN set,
+#    SCHEDULER_REGISTRY_WRITE_ENABLED=true, and a cluster id supplied.
+curl -s localhost:9101/healthz | jq .registry_write   # phase must be "serving"
+
+# 2. Switch the nodes.
+kubectl -n agentenv-system create configmap paused-registry-config \
+  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=central \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n agentenv-system rollout restart daemonset/agentenv-node
+
+# 3. Drop the credentials the nodes no longer need.
+kubectl -n agentenv-system patch secret agentenv-runtime-secrets \
+  --type=json -p '[{"op":"remove","path":"/data/paused-registry-dsn"}]'
+```
+
+The table itself does not change: both backends wrote the same schema and arbitrate through the same generation column, so the rows a `postgres` fleet left behind are the rows a `central` fleet reads. What changes is who may write them.
+
+🔴 **Verify the switch on each node** with the assembly line above — `backend=central` with a non-empty `scheduler_endpoint`. A value that never reached the Pod at all (a ConfigMap that was not created, a key spelled differently) leaves the node on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
 
 ## Operations
 

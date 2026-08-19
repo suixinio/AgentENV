@@ -383,9 +383,15 @@ pub enum PausedRegistryBackendKind {
     /// Node-local only. A paused sandbox is resumable on the node that paused
     /// it and invisible to the rest of the cluster.
     Local,
-    /// Cluster-wide registry in PostgreSQL. Pausing also publishes the snapshot
-    /// to the shared repository, so any node can resume the sandbox under its
-    /// original ID.
+    /// Removed. Kept as a name so a deployment still carrying it is told what
+    /// to do instead of being told the word is unknown.
+    ///
+    /// 🔴 It fails startup rather than being treated as `central`. The two are
+    /// not interchangeable at the moment of the switch: `central` needs a
+    /// scheduler endpoint this node may not have been given, and a node that
+    /// silently reinterpreted the value would either start with no registry at
+    /// all or start against an endpoint nobody meant it to use. Neither
+    /// reports anything until a node is lost.
     Postgres,
     /// Same registry, reached over gRPC through whoever owns the database
     /// instead of by connecting to it. Identical semantics to `postgres` — the
@@ -422,12 +428,6 @@ pub struct PausedRegistryConfig {
     /// selects the backend here instead, where the file cannot overwrite it.
     #[config(default = "local", env = "AENV_PAUSED_REGISTRY_BACKEND")]
     pub backend: PausedRegistryBackendKind,
-    /// Required when `backend = "postgres"`. Prefer the environment variable:
-    /// the DSN carries credentials and should not sit in a config file.
-    #[config(env = "AENV_PAUSED_REGISTRY_DSN", parse_env = parse_trimmed_string)]
-    pub dsn: Option<String>,
-    #[config(default = 8u32)]
-    pub max_connections: u32,
     /// How often to renew this node's registry leases and re-check its local
     /// paused records against the registry.
     ///
@@ -493,9 +493,7 @@ mod paused_registry_config_tests {
 
     fn config(reconcile_interval_secs: u64, lease_ttl_secs: u64) -> PausedRegistryConfig {
         PausedRegistryConfig {
-            backend: PausedRegistryBackendKind::Postgres,
-            dsn: None,
-            max_connections: 8,
+            backend: PausedRegistryBackendKind::Central,
             reconcile_interval_secs,
             lease_ttl_secs,
         }
@@ -1515,24 +1513,25 @@ mod tests {
             .and_then(toml::Value::as_table)
             .expect("config/default.toml must carry an [orchestrator.paused_registry] section");
 
-        for key in [
-            "backend",
-            "max_connections",
-            "reconcile_interval_secs",
-            "lease_ttl_secs",
-        ] {
+        for key in ["backend", "reconcile_interval_secs", "lease_ttl_secs"] {
             assert!(
                 section.contains_key(key),
                 "[orchestrator.paused_registry] is missing {key}"
             );
         }
 
-        // The DSN carries credentials and belongs in a Secret, not in a file
-        // that is copied wholesale into a ConfigMap.
-        assert!(
-            !section.contains_key("dsn"),
-            "the registry DSN must not be committed to config/default.toml"
-        );
+        // 🔴 Neither key may come back. The node does not connect to the
+        // registry database at all any more, and a config that still offers a
+        // DSN and a connection budget is a config that reads as though it
+        // could — on the machines that run user code, which is the whole
+        // reason the connection moved.
+        for key in ["dsn", "max_connections"] {
+            assert!(
+                !section.contains_key(key),
+                "[orchestrator.paused_registry] still carries {key}: the node holds no database \
+                 connection of its own"
+            );
+        }
     }
 
     /// The backend a deployment actually runs has to be settable from outside

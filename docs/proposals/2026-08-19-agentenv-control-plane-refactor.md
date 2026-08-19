@@ -15,12 +15,22 @@
 > | §4 阶段 1 | 「查 roster 兜底」当时**没有数据源** | 同上 §1.2 |
 > | §4 阶段 2 | 13 → 5 个 RPC **已实施**，实际形状见订正块 | `_impl-plan-control-plane-phase2.md` §3.3 |
 > | §7 | 🚦 **闸门 A 已通过**（2026-08-19 用户裁决） | `_impl-plan-control-plane-phase2.md` 抬头 |
+> | §4 阶段 3-C | fencing 三候选的判断要改，**且主次对调**（写路径 fencing 才是本体）| 2026-08-19 e2b / Cube 源码考古 |
+> | §4 阶段 3 | **不需要向后兼容** ⇒ schema 重画、RPC 直接重写、execution 内部必填 | 用户裁决 2026-08-19 |
+> | §4 阶段 4 | **并入阶段 3**，不再"拖到最后" | 同上考古（fencing 从"检查"降级成"拓扑"）|
+> | §5.3 | ExecutionID 是**内部** token；跨仓契约**退出阶段 3 关键路径** | 范围裁决 2026-08-19 |
+> | §7 | 🚦 **闸门 B 已通过**（2026-08-19 用户裁决）⇒ 阶段 3 可开工 | 见 outcome §3.4 |
 >
 > 🔴 **本文 §5 重估该文 §4.1 的 G 列表**（G1 的性质、G3 的可达性、G5/G6 的归属四条已变），
 > 以本文为准。
 >
 > **裁决前提**：改造在 AgentENV 内部完成，agent-platform 是消费方，不代持任何沙箱状态。
 > 但见 §5.3 —— **阶段 3 会破这个前提**，那是一个必须提前知道的跨仓契约变更，不是意外。
+>
+> 🔧 **实施订正（2026-08-19 范围裁决）：上面那句"阶段 3 会破这个前提"作废 —— 前提不会被破。**
+> 本轮设计**只做 AgentENV**，agent-platform 后期再改。ExecutionID 被重新定位成**内部** fencing
+> token（e2b 的原始形态就是这样，见 §5.3 订正），阶段 3 因此**不需要任何跨仓协同**。
+> 另一条前提也变了：**AgentENV 尚未上生产，无向后兼容包袱**，允许按最优架构直接重画。
 
 ---
 
@@ -470,6 +480,24 @@ e2b 把 `indexHealed` 当首要告警信号（"healthy steady state is zero"）�
 
 ### 阶段 3：语义上收（真正的重构）
 
+> 🔧 **实施订正（2026-08-19）：两条前提变了，阶段 3 的做法比原文激进。**
+>
+> **前提一：AgentENV 尚未上生产，不需要向后兼容。**
+>
+> | 原文受兼容约束的做法 | 修订后 |
+> |---|---|
+> | ExecutionID 作附加**可选**字段 | **内部必填**。可选的 fencing token 是 fencing 剧场 —— "字段缺失"必然要留一条 fail-open 分支，而那条分支就是全部攻击面 |
+> | 登记表 schema 走兼容迁移 | **直接重画**（dev 存量行可丢）。`execution_id` NOT NULL；并定清**身份轴与版本轴的分工** —— `generation` 今天只服务 3 处 CAS（`complete_pause` / `mark_local_only` / `release_claim`），要么被 execution 吸收成一条轴，要么明确拆成「execution = 化身身份 / version = 行版本」。**现在是唯一能改的窗口**；且 agent-platform 侧对 `generation` **零消费**（grep `apps/agent-platform/internal/sandbox/aenv/*.go` 无命中），怎么改都不外溢 |
+> | 阶段 2 的 5 个 RPC 形状在其上演进 | **直接删掉重写成中央语义**。本文下方已写明这份翻译"全部寿命只有观察期" —— 现在寿命可以归零：node→controller 收敛成「上报事实」，controller→node 收敛成「下发命令」 |
+>
+> **前提二：范围只做 AgentENV**（§5.3 订正）⇒ ExecutionID 内部化，跨仓契约退出关键路径。
+>
+> **建议与「暂停必然落 OSS」(v3) 并批**（主仓 `docs/proposals/2026-08-19-aenv-pause-publish-durability.md`，
+> 不在本 submodule 内，勿加相对链接）：
+> 那份方案把 `publishing` 从瞬时态改成长驻重试态、`local_only` 只在预算耗尽才写。
+> 它落地后，placement 里"硬钉 origin"的分支基本消失，**中央 placement 才真正自由**。
+> 两者动的是同一批状态流转，分开做等于把同一处代码改两遍。
+
 | 现有机制（node 视角） | 改造后（中央视角） | 参照 |
 |---|---|---|
 | `renew_lease` 节点自己续租 | **controller 每 N 秒主动 poll node**，`answered` 与 `sync_ok` 分开判 | e2b `nodemanager/sync.go` |
@@ -531,6 +559,62 @@ e2b 敢直接裁决，是因为它接受泄漏（孤儿等节点回来再杀）+
 **倾向**：先做「路由层拒旧 execution」（与 ExecutionID 同一批工作，几乎零额外成本），
 把「存储层写锁」列为长期项。**在选定之前，`running`/`resuming` 永不可抢这条不许放宽。**
 
+> 🔧 **实施订正（2026-08-19 源码考古）：三个候选的判断要改，而且主次对调。**
+> 证据来自对 e2b（`/home/debian/e2b-infra` @ `6938cbb`）与 CubeSandbox
+> （`/home/debian/CubeSandbox-latest` @ `50d9a3e7`，比另一份检出新 660 commits）的逐调用点考古。
+> **结论：两家都没有"解决"这个问题 —— 它们各自靠一条我们不具备的业务前提把问题消解掉了。**
+>
+> **e2b 的四条硬事实**
+>
+> 1. **存储层零排他**：GCS / S3 / Azure 三个后端 grep `IfGenerationMatch` / `precondition` /
+>    `IfNoneMatch` **零命中**，对象全是无条件 Put。唯一的"锁"
+>    （`shared/pkg/storage/lock/file_lock.go:47-49`）是**节点本地** `O_EXCL` + 10s TTL 的
+>    NFS 读缓存去重锁，注释自认 `The worst that can happen is more than one node will acquire the lock`
+>    —— 它保护的是**不可变、内容逐字相同**的缓存 chunk（temp 文件 + rename 原子落位），
+>    锁坏了只是重复下载一次。**⇒ 候选 1 在 e2b 零先例。**
+> 2. **envd token 不绑 execution**：`api/internal/sandbox/sandbox_envd_secret.go:27-35`
+>    token = `HMAC(sandboxID)`，新旧化身完全相同。**⇒ 候选 2 在 e2b 也零先例。**
+> 3. **`ExpectExecutionID` 基建完整，但生产调用点为零**：enforcement 刻意放进 Redis Lua
+>    （`storage/redis/scripts.go:33-39`：`Add is lockless, so a resume can install a new incarnation
+>    between a Go-side comparison and this write`），而全仓只有 `execution_pin_test.go` 在设它，
+>    evictor 不带 pin。⚠️ **但这不是"没做完"，是刻意划范围**：`states.go:82-92` 注释写死
+>    「陈旧快照决策方（background scan / queued batch）才需要 pin；`Empty means "remove whatever
+>    is stored", which is correct for callers acting on a fresh read or on user intent`」，
+>    `errors.go:47` 复述为 "caller **opted in**"。引入提交 `c29ee2622`（2026-08-10，带
+>    `GitOrigin-RevId` ⇒ 内部 monorepo 导出，**裁决理由只存在于注释**）。
+>    ⇒ **pin 是 opt-in 的补充手段，不是 e2b 防双活的主闸。**
+> 4. **真正防双活的主闸是别的东西**：resume 入口查到 Running 记录直接 409
+>    （`handlers/sandbox_resume.go:96-106`），而**那条记录没有租约、不会自动过期释放**
+>    （`UnreachableSince` 全仓零生产消费者）⇒ e2b 在分区期间对 resume 是**彻底 fail-closed 的：
+>    等，不接管**。⚠️ 对照我们：reclaim 是「租约过期 + deadline 过期」双条件**自动接管** ——
+>    **我们在接管上比 e2b 激进，这正是我们比 e2b 更需要 fencing 的原因。**
+>
+> **e2b 的写路径 fencing 本体 = 发布权集中**（不是 ExecutionID、更不是存储锁）：
+> 节点无自主 pause 权（`orchestrator.proto:56-59`：`the orchestrator itself does not act on it —
+> the API evictor does`）+ 每次 pause 造**全新 build UUID**（写目标天然不相交）+ build 翻 `ready`
+> **只由 API 在 RPC 成功返回后做**（`pause_instance.go:71-77`），而 resume 只选
+> `status_group = 'ready'` 的最新 build。⇒ **分区旧节点就算把快照字节传完，没有中央翻牌，
+> 这份数据永远进不了快照链。**
+>
+> **CubeSandbox**：**根本没有跨节点 resume**（roadmap 未来项，`docs/zh/guide/lifecycle.md:259`
+> 逐字「后续版本将支持跨节点恢复」），沙箱身份终身钉死单节点、快照落本地 cubecow reflink 盘
+> ⇒ fencing 降维成 cubelet **进程内** per-sandbox 互斥锁（`services/cubebox/update.go:77`）——
+> 因为一个沙箱的全部生命周期操作都汇聚到唯一节点，**这把进程锁就是全局锁**。
+> 全仓 grep `fencing|fence|epoch` **零命中**。
+>
+> **⇒ 修订后的三候选判断**
+>
+> | 候选 | 修订判断 |
+> |---|---|
+> | 1 存储层写锁 | **两家零先例** —— 连把快照放中央对象存储的 e2b 都没做条件写。维持长期项的结论更有底气 |
+> | 2 envd token 绑 execution | **e2b 也没做**。维持「`secure` 沙箱加强项、seed 统一后再补」 |
+> | 3 路由层拒旧 execution | 方向被 e2b **半**验证：它把路由缓存刻意删成每请求实时查 catalog（PR #2636 / #2315），买的就是收敛速度 —— 但它只做**收敛**，不做**拒绝** |
+>
+> **🔴 主次对调（本订正最重要的一条）**：原文把「旧 execution 禁 pause/publish」当作候选 3 的
+> *配套措施* —— 考古证明**它才是 fencing 本体**。路由拒绝保护的是分区期间的交互流量（**可恢复**），
+> 快照链保护的是用户工作区（**不可逆**）。
+> ⇒ 闸门 B 的答案应表述为：**写路径 fencing 为主 + node API 收窄同批（原阶段 4）+ 路由层拒旧 execution 为辅。**
+
 **兑现**：G2（孤儿回收）、G4（并发 resume 天然串行）、G1 的**一半**（见上）；末尾引 Redis 后控制面可无状态多副本
 
 ### 阶段 4：API 收窄（边界闭合）
@@ -542,6 +626,27 @@ node 的用户级 REST（`/sandboxes` POST/DELETE、`/pause`、`/resume`、`/for
 外部 e2b SDK 兼容面不受影响 —— 外部本来就只经 gateway。
 
 **兑现**：绕过 controller 变得不可能；controller 的"唯一裁判"身份才真正成立
+
+> 🔧 **实施订正（2026-08-19）：阶段 4 并入阶段 3，不再"拖到最后"。**
+>
+> 理由来自考古：e2b 的 fencing 本体是「发布权集中」，而它成立的前提是**节点没有自主发起路径**
+> （`orchestrator.proto:56-59`）。node 的用户级 REST 只要还开着，"旧化身自己发起 pause/publish"
+> 这条路径就**在物理上存在**，我们只能靠一道道 `expect_execution_id` 检查去堵；
+> 同批收窄则让这条路径**根本不存在** —— fencing 从"检查"降级成"拓扑"，是同一件事的更强形态。
+>
+> 分两阶段做反而更贵：阶段 3 要为"node 仍可被直接调用"写一整套校验，阶段 4 再把这套校验证明为多余。
+> 顺带关掉 [`_impl-D11-pg-removal.md`](_impl-D11-pg-removal.md) §5 的 **L1**
+> （节点面鉴权只查 header 存在、不查值）与原 A2/A3。
+>
+> 🔍 **侦察项（动手前必须确认，否则收窄边界画错）**：agent-platform 今天打的是
+> `http://<node-ip>:30800`（主仓 `apps/agent-platform/internal/sandbox/aenv/client.go:91-100`，
+> 单一 `baseURL`），**要先确认它落在 gateway 还是 node 自身 API**。
+> 这正是 §2.1 教训（"写方案时引用的每一个数据源，动手前都要确认它真的存在"）的适用场景。
+>
+> ⚠️ **另一个 in-house 消费方：Agent-Console**（主仓 `apps/Agent-Console`）。它**直连 PG**
+> 读登记表（`internal/aenv/pausedregistry/reader.go`），而阶段 0 产出的只读 API
+> `GET /registry/sandboxes` 本来就是为了让它不再直连。**schema 重画会打掉这条直连路径**
+> ⇒ 把 Console 切 API 排进同批发布（它不在本 submodule 内，但属于本轮的下游收尾）。
 
 ---
 
@@ -590,6 +695,37 @@ node 的用户级 REST（`/sandboxes` POST/DELETE、`/pause`、`/resume`、`/for
 
 **G9（两套真相无人对账）**：阶段 0 就能开始对账，但"平台库 ↔ aenv 库"的对账天然是跨仓的。
 
+> 🔧 **实施订正（2026-08-19，两条裁决叠加）：G3 的跨仓部分退出阶段 3 的关键路径。**
+>
+> **① 范围裁决（用户 2026-08-19）**：本轮设计**只做 AgentENV**，agent-platform 后期再改。
+> **② ExecutionID 是内部 fencing token，不是跨仓契约。** 这不是妥协 —— 这恰是 e2b 的原始形态：
+> 上面已核过"公开 API 零处暴露 execution id"，外部调用方只说"pause 沙箱 X"，
+> 由 **API 层自己**把 X 解析成当前化身，再把下游每一步钉死在这次化身上。
+>
+> 改造后的边界：
+>
+> ```text
+> 外部（gateway，e2b 兼容面）   不要求传 execution ⇒ agent-platform 一行不用改
+>          ↓ controller 在每个破坏性操作入口解析 sandbox_id → 当前 execution
+> 内部（controller → node → 登记表 → 发布）   全链路钉死该 execution
+>          ↓ node 拒绝任何 execution ≠ 自己活着的化身的命令
+> ```
+>
+> **能力边界（诚实说明，别高估单侧能拿到什么）**
+>
+> | 威胁 | AgentENV 单侧 |
+> |---|---|
+> | 分区旧节点发布快照 → 第二条快照分支（**不可逆，用户工作区**）| ✅ 完全能解决 |
+> | 旧化身继续收流量 | ✅ 完全能解决 |
+> | 操作执行期间被 resume 插队（内部竞态）| ✅ —— 正是 e2b `ExpectExecutionID` 注释描述的原场景 |
+> | 平台重试队列里的陈旧 delete 落到新化身（= **G3 本体**）| ❌ 需平台传 execution，**后期做** |
+>
+> 最后一条推迟**有先例**：e2b 的 `ExpectExecutionID` 生产调用点为零，它自己也还没做。
+> 而在外部**只读**暴露 execution 字段（`GET /sandboxes/{id}` 与 resume 响应）是 additive、
+> 无人依赖、成本近乎为零 ⇒ **阶段 3 顺手加上**，平台哪天要用就有。
+>
+> ⇒ **闸门 B 的前置二（跨仓 ExecutionID 契约）从阻塞项里移除。闸门 B 只剩一个决定：选定 fencing 方案。**
+
 ### 5.4 改造**不能**解决的（别抱幻想）
 
 | 问题 | 为什么改控制面没用 |
@@ -618,7 +754,7 @@ Cube 为此有 `artifact_node_placement` / `template_replica` 两张表；
 | **SQL 翻译风险** | 942 行 Rust → Go，generation CAS / lease / 三分法边界必须逐条对齐。**先把 Rust 侧现有单测移植成 Go 契约测试**，作为阶段 2/3 的安全绳 —— 这件事在阶段 1 的观察期内就可以并行做 |
 | **单点** | 今天 gateway 与 scheduler 都已是 `replicas: 1`。但阶段 2 之后 controller 停机会**同时**打掉路由与租约时钟（§3.2）—— 这是新出现的相关性故障，靠 §3.2 的 grace 期兜住，阶段 3 末尾引 Redis 后可多副本 |
 | **切换窗口** | 阶段 2 切 backend 需所有 node 同时切，建议在无活沙箱窗口 |
-| **跨仓协同** | 阶段 3 的 ExecutionID 需要 agent-platform 配合（§5.3）|
+| **跨仓协同** | ~~阶段 3 的 ExecutionID 需要 agent-platform 配合（§5.3）~~ 🔧 **已消除**：ExecutionID 内部化 + 范围只做 AgentENV ⇒ 阶段 3 零跨仓依赖（§5.3 订正）。仅剩下游收尾：Agent-Console 从 PG 直连切只读 API |
 
 ---
 
@@ -631,12 +767,57 @@ Cube 为此有 `artifact_node_placement` / `template_replica` 两张表；
    ⇒ 上游追平成本不再是约束，允许改动 Rust 主干。
    （原文："决定 fork 长期维护策略 —— 业务决策，不是技术决策。不过闸不进阶段 2"）
 5. **阶段 2**（写路径）—— §3.1/§3.2/§3.3 **以及实施中新增的 §3.5** 是验收条件
-6. 🚦 **闸门 B**（**当前卡在这里**）：选定 fencing 方案（「阶段 3-C」）+ 与 agent-platform 敲定
-   ExecutionID 契约（§5.3）。**不过闸不进阶段 3** —— 在此之前 `running`/`resuming` 永不可抢这条不许放宽。
-   ⇒ 完整决策材料（三个候选的取舍 + 跨仓契约要 agent-platform 配合什么）见
-   [`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md) §3
-7. **阶段 3**（语义 + 裁决权）
-8. **阶段 4**（API 收窄）—— 可以拖到最后，只影响边界严密性
+6. 🚦 **闸门 B** ✅ **已通过（2026-08-19，用户裁决）**：
+   **写路径 fencing 为主 + node API 收窄同批 + 路由层拒旧 execution 为辅。**
+   前置二（跨仓 ExecutionID 契约）随 ExecutionID 内部化 + 范围裁决**已移出阻塞项**（§5.3 订正）。
+   ⇒ 决策材料与依据见 [`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md) §3 / §3.4
+   ⇒ 🔴 **闸门放行的是"开工"，不是"提前放宽不变式"**：在 A3 落地并验证前，
+   `running`/`resuming` 永不可抢这条不许放宽
+7. **阶段 3**（语义 + 裁决权）+ **原阶段 4**（API 收窄）—— 🔧 **同批做**，理由见阶段 4 订正
+8. ~~阶段 4~~ —— 已并入第 7 步
+
+---
+
+## 8. 🔧 阶段 3 开发清单（2026-08-19 订正后的完整形态）
+
+> 本节是上面各订正块的汇总视图，供任务书直接展开。**批次 A 是闸门 B 的解锁工程本身。**
+
+### 批次 A：身份轴 + 边界闭合
+
+| # | 事 | 关键约束 |
+|---|---|---|
+| A1 | **ExecutionID 一等公民（内部）** | start / resume 换代，快照 / checkpoint **不**换代（抄 e2b 边界，`checkpoint_instance.go:22-23`）。把现有 `SandboxInstanceId`（今天只私有流向 custom extension hook，`src/sandbox/custom_extension/client.rs`）升格进 orchestrator 元数据、登记表、node Runtime |
+| A2 | **登记表 schema 重画** | `execution_id` NOT NULL；定清身份轴与版本轴分工（见阶段 3 前提块）。dev 存量行可丢 |
+| A3 | **写路径 fencing（主角）** | 所有破坏性转换内部必带 execution，旧化身 pause / publish / remove 一律拒。🔴 **校验必须在 controller 的 SQL 事务内原子完成** —— 抄 e2b 把 enforcement 放进 Lua 的教训：Go 侧"先查后写"之间正是 resume 插队的窗口。同时关掉 §4.2 的 **S1**（全接口唯一无条件破坏性写）|
+| A4 | **node API 收窄**（原阶段 4）| node 用户级 REST 只接受 controller 调用；数据面 `{port}-{sandboxID}` 反代保持直连。先做侦察项（平台的 `:30800` 落在哪一面）|
+| A5 | **路由层拒旧 execution（配角）** | `LookupNode` 答案携带 execution 身份，gateway / proxy 对旧化身流量归零 |
+| A6 | **外部只读暴露 execution** | additive、无人依赖，为平台后期留口 |
+
+### 批次 B：语义上收本体（**批次 A 落地后**才许放宽"永不可抢"）
+
+| # | 事 | 关键约束 |
+|---|---|---|
+| B1 | 中央 poll 取代节点自续租 | `answered` 与 `sync_ok` 分开判；`RenewNodeLease` RPC 退役 |
+| B2 | evictor 与 reclaim **分离** | 见「阶段 3-A」：两个都要、不能合并；reclaim 双条件不许放宽成单条件 |
+| B3 | 孤儿回收 | `Reconcile(roster) → KillOrphan` + grace period + §3.3 熔断。🔴 **按 execution 身份判孤儿，不按 sandboxID 存在性判** —— e2b 的现成缺口：`storage/redis/main.go:205-217` 只看 `raw != nil`，同 ID 异节点重建后旧化身查库会命中**新化身的记录**，不判 orphan、永远杀不掉 |
+| B4 | 中央 placement | resume 改「controller 选节点 + 下发 Create with snapshot」；`AcquireSandbox` 变内部调用；三分法（§3.4）在中央显式建模 |
+| B5 | 显式状态机 | `AllowedTransitions` + `TransitionEffect` + 结构化 `KillReason` |
+| B6 | RPC 面重写 | node→controller = 上报事实；controller→node = 下发命令。阶段 2 的 5 RPC 形状直接丢 |
+| B7 | `release_node_holdings` **保留** | 见「阶段 3-B」：除非能论证 node id 永不复用且无重叠窗口 —— 它是系统里唯一能**证明**而非推断 VM 已死的证据 |
+
+### 批次 C：随行收口
+
+- T3 **F6** 永久孤儿行（`sandbox_expires_at` 为 NULL 永不匹配 reclaim）—— 随中央 poll 一并消掉
+- **S 系列**接口语义缺口（随 RPC 重写消化）：**S4** 响应带实际覆盖的 id 集合（护栏 §3.1 目前唯一无机械保证的一环，而缺行的下游反应是**删用户工作区**）、**S2** release 0 行静默成功要可计数、**S5** 读路径带 DB 时钟、**S7** `MarkRunning` 的 bool 拆成两个事实、**S3** 节点 `reconcile_interval` 校验归属
+- **D8**：`Code::Aborted ⇒ GenerationConflict`（一行，Go 侧已备好）
+
+### 🔴 写进任务书的两条反面教材
+
+1. **绝不"跳过 RPC 直删元数据"** —— Cube 的 `sandbox_remove.go:180-204`：节点不在内存缓存里就跳过
+   Destroy RPC、直接抹掉 Redis 元数据 ⇒ 中央认为已删、分区节点上 VM 还在跑还在写盘，
+   且 cubelet 无本地 TTL 自杀，孤儿跑到人工干预为止。这正是我们护栏哲学（"我不知道"≠"不存在"）要防的。
+2. **分区期间 fail-closed 等待，不抄 e2b 的"清库不等 ack"**（`delete_instance.go:104-105`
+   无条件 `defer Remove`）—— e2b 敢这么做是因为沙箱可弃，我们的是用户工作区。
 
 ---
 

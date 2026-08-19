@@ -19,17 +19,28 @@ node 退回纯执行器。**顺序是反的**：先建观测面，再收读路�
 | **0** 中央影子对账 | controller 加只读 PG，产出差异指标 + 只读 API | ✅ 实施 + 集群验证 | `central-control-plane-phase01`：`7e6f790` `c35f5ec` |
 | **1** 读路径上收 | `LookupNode` 回落读登记表，gateway 删掉三段补丁 | ✅ 实施 + 集群验证 | 同上（两阶段同批交付） |
 | **2** PG 写权上收 | node 不再直连 PG，登记表读写全经 gRPC 打到 controller | ✅ 实施 + 集群验证 | `central-control-plane-phase2`：`4a5e3ef` `339d1f2` `40a4526` `224b70d` |
-| **3** 语义 + 裁决权 | 中央 poll / 孤儿回收 / ExecutionID / 中央 placement | ⛔ **卡在闸门 B** | 见 §3 |
-| **4** API 收窄 | node 的用户级 REST 只接受 controller 调用 | ⛔ 未开始 | 可拖到最后 |
+| **3** 语义 + 裁决权 | 中央 poll / 孤儿回收 / ExecutionID / 中央 placement | 🟢 **闸门 B 已过，待开工** | 见 §3.4 |
+| **4** API 收窄 | node 的用户级 REST 只接受 controller 调用 | ⛔ **并入阶段 3**（2026-08-19 订正）| 见 §3.3 |
 
 **🚦 闸门 A 已通过**（2026-08-19 用户裁决）：长期自维护 fork，手动从上游拉取检查合并。
 ⇒ 上游追平成本不再是约束，允许改动 Rust 主干。
 
-**🚦 闸门 B 未过**，它是阶段 3 的硬前置：选定 fencing 方案 + 与 agent-platform 敲定
-ExecutionID 跨仓契约。**在此之前 `running` / `resuming` 永不可抢这条不许放宽。**
+**🚦 闸门 B ✅ 已通过（2026-08-19 用户裁决）**。~~两件前置：选定 fencing 方案 + 与 agent-platform
+敲定 ExecutionID 跨仓契约。~~ 前置二随「ExecutionID 内部化 + 范围只做 AgentENV」两条裁决移出阻塞项
+（§3.2）；前置一按 §3.4 裁定：
+
+> **写路径 fencing 为主 + node API 收窄同批（原阶段 4）+ 路由层拒旧 execution 为辅。**
+
+⇒ **阶段 3 可以开工。** 🔴 但铁律仍在：**在 A3（写路径 fencing）真正落地并验证之前，
+`running` / `resuming` 永不可抢这条不许放宽** —— 闸门放行的是"开工"，不是"提前放宽不变式"。
 完整决策材料见 §3。
 
-**🔴 三件事现在就要有人决定**，见 §4.1 的 A0 / A1 / A6。
+**✅ §4.1 的 A0 / A1 / A6 已全部处置**（阶段 2.5，见 §4.0）—— 原先那句"三件事现在就要有人决定"已作废。
+
+**🔧 两条改变阶段 3 做法的新前提**（2026-08-19 用户裁决）：
+1. **AgentENV 尚未上生产，无向后兼容包袱** ⇒ schema 可直接重画、阶段 2 的 RPC 面可直接删掉重写、
+   execution 可做成**内部必填**而不是可选附加字段；
+2. **本轮只做 AgentENV**，agent-platform 后期再改 ⇒ 阶段 3 零跨仓依赖。
 
 ---
 
@@ -133,8 +144,10 @@ T3 交付时那 4 项"未复原的未合并代码"随合并一起消失了——
 | **F4 指标分来源** | `grace_refusals_total` | ✅ `{source="reclaim"} 3`，`rpc` 一次都没有——正是 T3 F4 预测的"健康重启的自噪声"，现在可以和真实拒绝分开告警 |
 | **存量行不受伤** | 老行 `01a01853` | ✅ `local_only` / gen 3 / origin 不变 |
 
-> `01a01853` 仍是 `local_only`——那是 [`aenv-pause-publish-durability`](2026-08-19-aenv-pause-publish-durability.md)
-> 要修的东西，不在本轮范围内。
+> `01a01853` 仍是 `local_only`——那是「暂停必然落 OSS」（**主仓**
+> `docs/proposals/2026-08-19-aenv-pause-publish-durability.md`，不在本 submodule 内，故不加相对链接）
+> 要修的东西，不在本轮范围内。**建议与阶段 3 并批做**：它把 `publishing` 改成长驻重试态后，
+> placement 的"硬钉 origin"分支基本消失，中央 placement 才真正自由。
 
 ---
 
@@ -184,7 +197,17 @@ T3 交付时那 4 项"未复原的未合并代码"随合并一起消失了——
 
 ## 3. 🚦 闸门 B 的决策材料
 
-阶段 3 有两件前置，缺一件都不能开工。
+> 🔧 **2026-08-19 更新**：本节原文写于源码考古之前。考古（e2b `/home/debian/e2b-infra` @ `6938cbb`；
+> CubeSandbox `/home/debian/CubeSandbox-latest` @ `50d9a3e7`）**改写了三处**：
+> ① 三个候选的判断（§3.1 订正）；② 前置二不再是阻塞项（§3.2 订正）；
+> ③ 多出一件必须同批做的事（§3.3）。**推荐答案见 §3.4。**
+>
+> **一句话总结考古**：两家都没有"解决"闸门 B —— 各自靠一条我们不具备的业务前提把问题**消解**掉了。
+> e2b 靠「沙箱可弃 + 运行态在节点本地盘 + 节点无自主快照权」，Cube 靠「**根本没有跨节点 resume**」。
+> 三家里**只有我们同时具备"持久用户工作区 + 快照在共享存储 + 跨节点 resume 既有能力"** ——
+> 闸门 B 对我们是真问题，**没有作业可抄**。
+
+~~阶段 3 有两件前置，缺一件都不能开工。~~ 🔧 **现在只剩一件（§3.1）。**
 
 ### 3.1 前置一：选定 fencing 方案
 
@@ -254,6 +277,36 @@ seed 来自 `[sandbox].access_token_hash_seed`，没配就用节点本地
 候选 2 作为 `secure` 沙箱的加强项，在 seed 统一之后再补；
 候选 1 列长期项，不阻塞阶段 3。
 
+> 🔧 **考古订正（2026-08-19）：结论方向不变，但主次要对调，且两个候选的"成本"判断要改。**
+>
+> | 候选 | 考古发现 | 修订判断 |
+> |---|---|---|
+> | 1 存储层写锁 | e2b 的 GCS / S3 / Azure 后端 grep `IfGenerationMatch` / `precondition` / `IfNoneMatch` **零命中**，全是无条件 Put；唯一的"锁"是**节点本地** `O_EXCL` + 10s TTL 的 NFS 读缓存去重锁，注释自认 `The worst that can happen is more than one node will acquire the lock`（`shared/pkg/storage/lock/file_lock.go:47-49`）—— 它保护的是**不可变、内容逐字相同**的缓存 chunk，坏了只是重复下载 | **两家零先例**。维持长期项 |
+> | 2 envd token 绑 execution | e2b 的 token = `HMAC(sandboxID)`（`sandbox_envd_secret.go:27-35`），新旧化身**完全相同** | **e2b 也没做**。维持加强项 |
+> | 3 路由层拒旧 execution | e2b 把路由缓存**刻意删成**每请求实时查 catalog（PR #2636 / #2315），买的就是收敛速度 | 方向被**半**验证：它只做**收敛**，不做**拒绝** |
+>
+> **🔴 主次对调**：原文把「旧 execution 不许 pause/publish」写成候选 3 的*配套措施*，
+> 考古证明**它才是 fencing 本体**：
+> - e2b 的 `ExpectExecutionID` **生产调用点为零，且这是刻意的**：enforcement 在 Redis Lua 内
+>   （`storage/redis/scripts.go:33-39`），但注释把适用范围写死为"从陈旧快照做决定的调用方"
+>   （`states.go:82-92`），并明言 `Empty means "remove whatever is stored", which is correct
+>   for callers acting on a fresh read or on user intent`。⇒ **pin 是 opt-in 补充手段，
+>   不是 e2b 防双活的主闸**；
+> - 主闸是「Running 记录在库即 409」（`handlers/sandbox_resume.go:96-106`）+ **那条记录没有租约、
+>   永不自动释放**（`UnreachableSince` 零生产消费者）⇒ e2b 分区期间**彻底 fail-closed：等，不接管**；
+> - 而保护**快照链**（= 用户数据真相）的，是**发布权集中**：节点无自主 pause 权
+>   （`orchestrator.proto:56-59`）+ 每次 pause 造**全新 build UUID** + build 翻 `ready` 只由 API
+>   在 RPC 成功后做（`pause_instance.go:71-77`）+ resume 只选 `status_group='ready'`。
+>   ⇒ 分区旧节点即使把字节传完，**没有中央翻牌就永远进不了快照链**。
+>
+> ⚠️ **一条必须正视的对照**：e2b 分区期间对 resume 是 fail-closed 的（永不自动释放记录），
+> 而**我们的 reclaim 是「租约过期 + deadline 过期」双条件自动接管** ——
+> **我们在接管上比 e2b 激进，这正是我们比 e2b 更需要 fencing 的原因**，
+> 也反过来确认了"fencing 没选定前 `running`/`resuming` 永不可抢"这条铁律的分量。
+>
+> **📌 路由拒绝 vs 写路径 fencing 的分工，一句话**：
+> 路由拒绝保护**分区期间的交互流量（可恢复）**；写路径 fencing 保护**用户工作区（不可逆）**。
+
 ### 3.2 前置二：跨仓 ExecutionID 契约
 
 🔴 **"改造只在 AgentENV 内部完成"这个裁决前提，从阶段 3 起就不成立了**（方案 §5.3）。
@@ -276,6 +329,74 @@ seed 来自 `[sandbox].access_token_hash_seed`，没配就用节点本地
 
 **时序**：aenv 先出字段（向后兼容，平台不读也不坏），平台再消费。
 **不要**等平台改完再发 aenv —— 那会把一次单向兼容变更变成一次双向同步发布。
+
+> 🔧 **实施订正（2026-08-19，两条裁决叠加）：本节整体从"闸门 B 前置"降级为"后期增强项"。**
+>
+> **① 范围裁决**：本轮只做 AgentENV，agent-platform 后期再改。
+> **② ExecutionID 是内部 fencing token，不是跨仓契约** —— 这不是妥协，**这恰是 e2b 的原始形态**：
+> 它的公开 API 零处暴露 execution id，外部只说"pause 沙箱 X"，由 **API 层自己**把 X 解析成当前化身，
+> 再把下游每一步钉死在这次化身上。
+>
+> ```text
+> 外部（gateway，e2b 兼容面）   不要求传 execution ⇒ agent-platform 一行不用改
+>          ↓ controller 在每个破坏性操作入口解析 sandbox_id → 当前 execution
+> 内部（controller → node → 登记表 → 发布）   全链路钉死该 execution
+>          ↓ node 拒绝任何 execution ≠ 自己活着的化身的命令
+> ```
+>
+> **AgentENV 单侧能拿到什么、拿不到什么**
+>
+> | 威胁 | 单侧 |
+> |---|---|
+> | 分区旧节点发布快照 → 第二条快照分支（**不可逆，用户工作区**）| ✅ |
+> | 旧化身继续收流量 | ✅ |
+> | 操作执行期间被 resume 插队（内部竞态）| ✅ —— 正是 e2b `ExpectExecutionID` 注释描述的原场景 |
+> | 平台重试队列里的陈旧 delete 落到新化身（= **本节 G3 本体**）| ❌ 需平台传 execution，后期做 |
+>
+> 最后一条推迟**有先例**：e2b 的 `ExpectExecutionID` 生产调用点为零。
+> 而外部**只读**暴露 execution 字段是 additive、无人依赖 ⇒ **阶段 3 顺手加上**，平台哪天要用就有。
+>
+> ⇒ **闸门 B 只剩「选定 fencing 方案」一个决定。**
+
+### 3.3 🔧（新增）第三件事：node API 收窄必须与阶段 3 同批
+
+原阶段 4「node 的用户级 REST 只接受 controller 调用」被定为"可拖到最后，只影响边界严密性" ——
+考古推翻了这个定性。
+
+e2b 的 fencing 本体是「发布权集中」，而它成立的前提是**节点没有自主发起路径**
+（`orchestrator.proto:56-59` 逐字：`the orchestrator itself does not act on it — the API evictor does`）。
+node 的用户级 REST 只要还开着，"旧化身自己发起 pause/publish"这条路径就**在物理上存在**，
+我们只能靠一道道 `expect_execution_id` 检查去堵；**同批收窄则让这条路径根本不存在** ——
+fencing 从"检查"降级成"拓扑"，是同一件事的更强形态。
+
+分两阶段做反而更贵：阶段 3 要为"node 仍可被直接调用"写一整套校验，阶段 4 再证明这套校验多余。
+顺带关掉 [`_impl-D11-pg-removal.md`](_impl-D11-pg-removal.md) §5 的 **L1**（节点面鉴权只查 header 存在不查值）。
+
+🔍 **两个动手前必须确认的下游**：
+1. agent-platform 今天打的 `http://<node-ip>:30800`（主仓 `internal/sandbox/aenv/client.go:91-100`）
+   **落在 gateway 还是 node 自身 API** —— 决定收窄边界画在哪；
+2. **Agent-Console 直连 PG 读登记表**（主仓 `apps/Agent-Console/internal/aenv/pausedregistry/reader.go`），
+   而阶段 0 的只读 API `GET /registry/sandboxes` 本就是为让它不再直连。
+   **schema 重画会打掉这条直连** ⇒ Console 切 API 排进同批发布。
+
+### 3.4 🔧（新增）闸门 B 的答案 —— ✅ **2026-08-19 用户裁决通过**
+
+**写路径 fencing 为主 + node API 收窄同批 + 路由层拒旧 execution 为辅。**
+
+> **裁决依据（三家对照后的取舍）**：候选 1（存储层写锁）两家零先例、且踩在已知最不稳的 rustfs 上；
+> 候选 2（envd token 绑 execution）e2b 同样没做、且只覆盖 `secure` 沙箱是"有一半没锁"；
+> 候选 3 方向被 e2b 半验证但它只做收敛不做拒绝。**真正被实证有效的是 e2b 的「发布权集中」**——
+> 它保护的恰是我们唯一不可逆的东西：用户工作区的快照链。
+
+具体到实现：`TransitionSandbox` 带 `expect_execution_id`，旧化身的 pause / publish / remove 一律拒；
+🔴 **校验必须在 controller 的 SQL 事务内原子完成** —— 抄 e2b 把 enforcement 放进 Redis Lua 的教训
+（`scripts.go:33-39`：Go 侧"先查后写"之间正是 resume 插队的窗口）。
+候选 2 留作 `secure` 沙箱加强项（seed 统一后），候选 1 留长期项。
+
+**另一条随之而来的实现约束**：阶段 3 的 `KillOrphan` **必须按 execution 身份判孤儿，不能按
+sandboxID 存在性判** —— e2b 的现成缺口（`storage/redis/main.go:205-217` 只看 `raw != nil`）：
+同 ID 在 B 节点重建后，A 节点回来的旧化身查库会命中**新化身的记录**，不判 orphan、永远杀不掉，
+成为无路由僵尸。我们的 `Reconcile(roster) → KillOrphan` 正是照它抄的，别把缺口一起抄过来。
 
 **一条现在就该重新取样的事**：阶段 1 已经**部分**改善了那三个 404 来源
 ——「registry 不可达」现在答 **503 而不是 404**（T1 V1-1 实测），
@@ -317,7 +438,7 @@ seed 来自 `[sandbox].access_token_hash_seed`，没配就用节点本地
 | **A2** | `POST /nodes/{id}` 是**写操作**，却只查 header 存在不查值 | T2 §N2 | 实测坐实：用临时编的 `X-Admin-Token`、经对宿主机开放的 NodePort **两次**把节点置成 DRAINING，全程 204。根因在 `src/api/impls/auth.rs:19` 的 `TODO: Validate configured authentication credentials instead of only checking that they are present.`。**既有问题，非本轮引入**，但优先级高于 A3 |
 | **A3** | `/registry/sandboxes` 的 `X-API-Key` 只是**一道门**不是一把锁 | T1 §6 F1 / T2 §N1 | 任意非空值放行。本轮新增端点把「全集群沙箱 ID + 归属节点 + 租约时间」加进了这个面。要么给这组补真凭据校验，要么确认 gateway 只在内网可达 |
 | **A4** | **scheduler 是单点，阶段 2 把它从"读侧降级"提升成"写侧硬依赖"** | T3 §8 | `replicas: 1`、无 PDB、无 `maxSurge`。实测：它一停机，节点侧的续租、对账、`begin_pause`、**以及所有已登记沙箱的 resume**（按 §3.5 设计如此）全部停摆。护栏做对了它该做的事（失败可重试、不双活），但**故障窗口的宽度现在由滚动升级策略决定，而没有任何清单约束住它** |
-| **A5** | 生产的 `agentenv-postgres` Secret 有没有 `cluster_id` | T3 §7 F1 | 缺了 ⇒ 写面永远 `PhaseCold` ⇒ 每个 RPC `UNAVAILABLE`，**现象与"scheduler 挂了"完全一样**，而进程健康、`/healthz` 200、探针也通过。`224b70d` 已把值搬进 base 层 `configMapGenerator`，但生产集群的实际状态要单独确认 |
+| **A5** 🔧 | ~~生产的~~ **未来上生产时**的 `agentenv-postgres` Secret 有没有 `cluster_id`（**AgentENV 至今未上生产**，本条是清单核对项，不是待办确认项；`224b70d` 已把值搬进 base 层 `configMapGenerator`，用当前清单全新部署不会踩到 —— 真正的风险面只剩"从旧清单演化来的集群"，dev 是唯一一个且已补）| T3 §7 F1 | 缺了 ⇒ 写面永远 `PhaseCold` ⇒ 每个 RPC `UNAVAILABLE`，**现象与"scheduler 挂了"完全一样**，而进程健康、`/healthz` 200、探针也通过。`224b70d` 已把值搬进 base 层 `configMapGenerator`，但生产集群的实际状态要单独确认 |
 | **A6** | 熔断阈值（10 行 / 10%）对生产表规模是否合理 | T3 §8 | dev 上 **2/8 就跳闸**。如果生产登记表长期只有个位数行，这个熔断会把**任何**一次正常回收都拦掉。`max_rows` 臂只有单测覆盖，没在集群上单独取样过 |
 
 ### 4.2 🟡 建议做
@@ -461,6 +582,8 @@ agent-platform 是"授权重建工作区"的意思。
 **计划（裁决产物）**
 - `_impl-plan-control-plane-phase01.md` — 阶段 0/1 任务书（§1 是四处侦察推翻）
 - `_impl-plan-control-plane-phase2.md` — 阶段 2 任务书（§1 第五条护栏、§3 RPC 面）
+- [`_impl-plan-control-plane-phase3.md`](_impl-plan-control-plane-phase3.md) — **阶段 3 + 原阶段 4 任务书**
+  （闸门 B 裁决后产出：§1 五条侦察项、§2 新增两条护栏、§3 批次 A 含变异验证、§7 已知陷阱）
 
 **实现记录**
 - `_impl-D3-harden.md` / `_impl-D4-fixes.md` — 阶段 0/1 加固与缺陷修复

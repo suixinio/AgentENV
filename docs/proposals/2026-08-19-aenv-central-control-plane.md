@@ -129,6 +129,44 @@ sandbox ID 是稳定的，但**每次启动/恢复是一次新的 execution**。
 
 我们的 `paused_sandboxes.generation` 是同一个思路的弱化版 —— 但它只在 aenv 内部有效，**平台侧（agent-platform）完全看不到它**，所以平台的判断只能退化成"HTTP 状态码猜"。
 
+> 🔧 **深挖订正（2026-08-19 逐调用点考古 @ `6938cbb`）：ExecutionID 不是 e2b 防双活的主闸。**
+>
+> 1. **`ExpectExecutionID` 生产调用点为零** —— enforcement 写得很讲究（刻意放进 Redis Lua 而不是
+>    Go 侧，`storage/redis/scripts.go:33-39` 逐字：`Add is lockless, so a resume can install a new
+>    incarnation between a Go-side comparison and this write`），但全仓只有 `execution_pin_test.go`
+>    在设它，evictor（`evictor/evict.go:158`）只传 `{Action, Eviction: true}`。
+>    ⚠️ **但"未上膛"是误读**：`states.go:82-92` 的注释把范围写死了 ——
+>    「`For callers that decide from a snapshot taken earlier — a background scan, a queued batch`」
+>    才需要 pin，而「`Empty means "remove whatever is stored", which is correct for callers
+>    acting on a fresh read or on user intent`」。`errors.go:47` 复述为 "caller **opted in**"。
+>    ⇒ **pin 是刻意设计成 opt-in 的**，只对"从陈旧快照做决定"的调用方上膛；
+>    那类调用方在 e2b 生产代码里还不存在，所以调用点为零。**不是没做完，是故意划了范围。**
+>    引入它的提交是 `c29ee2622`（2026-08-10，"let a removal pin the sandbox incarnation it
+>    meant to remove"，带 `GitOrigin-RevId` ⇒ 从内部 monorepo 导出，**无公开设计讨论，
+>    裁决理由全在注释里**）。
+>    📌 对我们的含义：**agent-platform 的重试队列正是注释点名的 "queued batch" 类别** ——
+>    这从反面确认了 G3（平台传 execution）该在平台侧改造时做，阶段 3 不必。
+> 2. **主闸是「Running 记录在库即 409」**（`handlers/sandbox_resume.go:96-106`），且**那条记录没有租约、
+>    不会自动过期释放** —— `UnreachableSince`（`nodemanager/status.go:118-135`）**全仓零生产消费者**。
+>    ⇒ e2b 在节点分区期间对 resume 是**彻底 fail-closed 的：等，不接管**。
+>    ⚠️ 对照我们：reclaim 是「租约过期 + deadline 过期」双条件**自动接管** ——
+>    **我们比 e2b 激进，因此比 e2b 更需要 fencing。**
+> 3. **保护快照链的是"发布权集中"，不是 ExecutionID**：节点无自主 pause 权
+>    （`orchestrator.proto:56-59`：`the orchestrator itself does not act on it — the API evictor does`）
+>    + 每次 pause 造**全新 build UUID** + build 翻 `ready` 只由 API 在 RPC 成功后做
+>    （`pause_instance.go:71-77`）+ resume 只选 `status_group='ready'`（`get_last_snapshot.sql:8`）。
+>    ⇒ **分区旧节点即使把快照字节传完，没有中央翻牌就永远进不了快照链。**
+> 4. **存储层零排他**：GCS / S3 / Azure 后端 grep `IfGenerationMatch` / `precondition` / `IfNoneMatch`
+>    **零命中**；唯一的"锁"是节点本地 `O_EXCL` + 10s TTL 的 NFS 读缓存去重锁，
+>    自认可多持有（`storage/lock/file_lock.go:47-49`）。
+> 5. **envd token 不绑 execution**：`sandbox_envd_secret.go:27-35` token = `HMAC(sandboxID)`，
+>    新旧化身相同。数据面路由则是**每请求实时查 catalog、无缓存**
+>    （缓存曾存在、被 PR #2636 / #2315 刻意删掉）—— 是**收敛**不是**拒绝**。
+> 6. 🔴 **e2b 自己的一个现成缺口**：`Reconcile` 判 orphan **只比对 sandboxID 存在性、不比对
+>    ExecutionID / NodeID**（`storage/redis/main.go:205-217` 只看 `raw != nil`）。
+>    同 ID 在 B 节点重建后，A 节点回来的旧化身查库会命中**新化身的记录** ⇒ 不判 orphan、不杀，
+>    成为无路由僵尸。**我们的阶段 3 `Reconcile → KillOrphan` 正是照它抄的，别把缺口一起抄过来。**
+
 ### 2.5 显式状态机
 
 ```go
@@ -185,6 +223,34 @@ claimed_by_node_id / lease_expires_at / sandbox_expires_at
 ```
 
 **字段几乎一一对应**（`generation` ↔ `SandboxGen`，`lease_expires_at` ↔ `LastSeenAt`）。同样的状态模型，**唯一的差别是谁写**：Cube 是 CubeMaster 一个进程写，AgentENV 是 N 台 KVM 节点抢着写。
+
+> 🔧 **深挖订正（2026-08-19 考古 @ `CubeSandbox-latest` `50d9a3e7`）：上面这个类比形似而神不似，要打折。**
+>
+> **最重要的一条：Cube 根本没有跨节点 resume。** pause/resume 严格同节点（VM 快照落**本地**
+> cubecow reflink 卷），沙箱一生 HostIP 不变。跨机暂停恢复在 roadmap「即将上线」里
+> （`docs/zh/guide/lifecycle.md:259` 逐字：「后续版本将支持跨节点恢复」）。
+> 全仓 grep `fencing|fence|epoch` **零命中** —— 不是没找到，是真的没有。
+>
+> 由此，上面几处对应关系全部要重新理解：
+>
+> | 原表述 | 考古事实 |
+> |---|---|
+> | `generation` ↔ `SandboxGen` | **不对等**。`SandboxGen` 只在 **rollback** 时递增（`snapshot_ops.go:469`），编进卷名 `sb-{id}-rootfs-gen{N}`，cubelet 拒 `new_gen <= current`（`rollback.go:104-107`）。它防的是**同节点内迟到的 rollback 重放**，不是跨节点化身 fencing。create 时固定 gen=0，pause / resume **根本不碰它** |
+> | `lease_expires_at` ↔ `LastSeenAt` | **不对等**。`LastSeenAt` **只被写、从没有任何代码读它做过期判定**（全部读取点只是 DTO 透传到视图）。Cube 没有租约判死这回事 |
+> | `snapshot_runtime_ref` ≈ 我们的登记表 | 它其实是**快照删除保护的引用计数账本**（谁的内存卷还被哪个运行中沙箱当 backing），不是化身注册表。`BindingType` 全仓只有一个取值 `memory_backing` |
+>
+> **Cube 真正的互斥在哪**：cubelet **进程内** per-sandbox 锁（`services/cubebox/update.go:77`）——
+> 因为一个沙箱的全部生命周期操作都汇聚到唯一节点，**这把进程锁就是全局锁**。
+> 控制侧的 Redis SETNX 只是防重复 RPC 的礼貌锁，注释自认
+> `This is intentionally racy... CubeMaster handles idempotently`（`resumer.go:266-271`）。
+>
+> **节点失联后 Cube 什么都不做**：判死只影响调度准入与快照操作，其上运行中 / paused 沙箱 =
+> **等节点回来**，无接管、无 orphan kill、无回归对账。代价写在文档里：节点死 ⇒ 其上 paused 沙箱不可恢复。
+>
+> 🔴 **一条要抄进我们任务书的反面教材**：`sandbox_remove.go:180-204` —— 删除沙箱时若节点不在内存缓存里，
+> **直接跳过 Destroy RPC、抹掉 Redis 元数据**。结果是"中央认为已删、分区节点上 VM 还在跑还在写盘"，
+> 且 cubelet 无本地 TTL 自杀逻辑，孤儿会一直跑到人工干预。
+> **这正是我们护栏哲学（"我不知道"≠"不存在"）要防的那类事。**
 
 ---
 
@@ -246,3 +312,13 @@ e2b 把 `indexHealed` 这类指标当**首要告警信号**（"healthy steady st
 - e2b：`packages/api/internal/sandbox/{store.go,sandboxtypes/states.go,storage/redis/,reservations/redis/}`、`packages/api/internal/orchestrator/{cache.go,pause_instance.go,create_instance.go,placement/,nodemanager/sync.go}`、`packages/shared/pkg/sandbox-catalog/`、`packages/orchestrator/{orchestrator.proto,go.mod,pkg/factories/run.go}`、`packages/client-proxy/internal/proxy/proxy.go`
 - CubeSandbox：`docs/zh/architecture/overview.md`、`CubeDB/go.mod`、`CubeMaster/pkg/base/db/models/{snapshot_runtime_ref.go,nodemeta.go}`、`Cubelet/{go.mod,pkg/utils/localstorage.go,network/event/doc.go}`
 - AgentENV：`src/orchestrator/paused_registry/postgres.rs`、`src/cfg.rs`、`src/api/generated/src/server/mod.rs`、`services/{go.mod,shared/config/config.go,api/proto/scheduler.proto}`、`docs/src/internals/architecture.md`
+
+> 🔧 **2026-08-19 补充**：本文 §2 / §3 的两处深挖订正来自一次**专门针对闸门 B**（分区双活 fencing）
+> 的逐调用点考古，检出版本：e2b `/home/debian/e2b-infra` @ `6938cbb`、
+> CubeSandbox `/home/debian/CubeSandbox-latest` @ `50d9a3e7`（比 `/home/debian/CubeSandbox` 新 660 commits，
+> **以 latest 为准**）。
+> **考古的总结论**：两家都没有"解决"闸门 B，而是各自靠一条我们不具备的业务前提把它**消解**掉了 ——
+> e2b 靠「沙箱可弃 + 运行态在节点本地盘 + 节点无自主快照权」，Cube 靠「没有跨节点 resume」。
+> 三家里**只有我们同时具备"持久用户工作区 + 快照在共享存储 + 跨节点 resume 既有能力"**，
+> ⇒ **闸门 B 对我们是真问题，没有作业可抄；最硬的可抄项是 e2b 的「发布权集中」写路径 fencing。**
+> 决策落点见 [`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md) §3。

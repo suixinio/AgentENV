@@ -912,6 +912,12 @@ mod tests {
     ///
     /// This covers the half of discovery that fixture-only tests cannot: the
     /// argv actually handed to `regctl`.
+    ///
+    /// 三样可变的东西都落成 `$0` 旁边的数据文件，脚本本身只是仓内 fixture 的
+    /// 符号链接：测试不能自己写出随后要 execve 的可执行文件——写 fd 存活期间
+    /// 同进程任何线程的 fork 都会复制到它，紧随其后的 execve 被内核以 ETXTBSY
+    /// 拒绝（先写临时名再 rename 也救不了，rename 保留 inode）。symlink 不碰
+    /// 目标 inode，这个窗口就不存在。
     #[cfg(unix)]
     fn fake_regctl(
         dir: &std::path::Path,
@@ -919,36 +925,15 @@ mod tests {
         stderr: &str,
         exit_code: i32,
     ) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("stdout"), stdout).expect("write stdout fixture");
+        std::fs::write(dir.join("stderr"), stderr).expect("write stderr fixture");
+        std::fs::write(dir.join("exit_code"), format!("{exit_code}\n"))
+            .expect("write exit code fixture");
 
-        let stdout_path = dir.join("stdout");
-        let stderr_path = dir.join("stderr");
-        std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
-        std::fs::write(&stderr_path, stderr).expect("write stderr fixture");
-
-        // The script locates its fixtures relative to `$0` rather than
-        // embedding absolute paths, so a TMPDIR containing shell
-        // metacharacters cannot break or inject into the generated script.
-        //
-        // Staged write + rename so the binary is never observed half-written or
-        // non-executable, matching how the real dependency installer stages
-        // downloads.
         let binary = dir.join("regctl");
-        let staged = dir.join("regctl.staged");
-        {
-            let mut file = std::fs::File::create(&staged).expect("create fake regctl");
-            write!(
-                file,
-                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
-            )
-            .expect("write fake regctl");
-            file.sync_all().expect("sync fake regctl");
-        }
-        let mut permissions = std::fs::metadata(&staged).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged, permissions).expect("chmod fake regctl");
-        std::fs::rename(&staged, &binary).expect("publish fake regctl");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/regctl-recorder.sh");
+        std::os::unix::fs::symlink(&fixture, &binary).expect("link fake regctl");
         binary
     }
 

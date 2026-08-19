@@ -160,6 +160,15 @@ kubectl -n agentenv-system patch secret agentenv-runtime-secrets \
 
 The table itself does not change: both backends wrote the same schema and arbitrate through the same generation column, so the rows a `postgres` fleet left behind are the rows a `central` fleet reads. What changes is who may write them.
 
+🔴 **The nodes and the scheduler in this release go out together.** Deleting a
+registry row is a conditional write now, and the two sides disagree about it in
+both directions: a node from before this release asks for the unconditional
+delete, which the scheduler refuses outright, and a node from after it asks for
+a kind an older scheduler does not serve. Neither direction corrupts anything —
+a refused delete leaves the row and its snapshot in place, which is the safe
+side — but during a mixed window `DELETE /sandboxes/{id}` will not clear the
+cluster record. Roll the DaemonSet and the Deployment in the same change.
+
 🔴 **Verify the switch on each node** with the assembly line above — `backend=central` with a non-empty `scheduler_endpoint`. A value that never reached the Pod at all (a ConfigMap that was not created, a key spelled differently) leaves the node on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
 
 ## The node API is protected by the network, not by its headers

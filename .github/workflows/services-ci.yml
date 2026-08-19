@@ -6,11 +6,13 @@ on:
     paths:
       - "services/**"
       - "deploy/**"
+      - "tests/fixtures/**"
       - ".github/workflows/services-ci.yml"
   push:
     paths:
       - "services/**"
       - "deploy/**"
+      - "tests/fixtures/**"
       - ".github/workflows/services-ci.yml"
 
 jobs:
@@ -19,6 +21,23 @@ jobs:
     defaults:
       run:
         working-directory: services
+    # The scheduler reads the paused-sandbox registry out of PostgreSQL, and
+    # those tests were skipping in CI because nothing here provided one. They
+    # are the semantic baseline the control plane is measured against, so a
+    # baseline nobody runs is worse than none.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: verify
+          POSTGRES_DB: aenv_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -34,6 +53,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y redis-server
       - name: Test services
+        env:
+          SCHEDULER_REGISTRY_TEST_DSN: postgres://postgres:verify@127.0.0.1:5432/aenv_registry
+          # A DSN that goes missing must fail this job rather than turn the
+          # registry tests into green skips.
+          SCHEDULER_REGISTRY_TEST_REQUIRED: "1"
         run: make test
       - name: Go format check
         run: make fmt-check

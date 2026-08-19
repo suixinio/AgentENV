@@ -75,11 +75,84 @@ impl RunningRegistrations {
             .retain(|sandbox_id, _| live.contains(sandbox_id));
     }
 
+    fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SandboxId, String>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The one window in which this node may hand back the sandboxes a previous
+/// process on the same machine died holding.
+///
+/// 🔴 The window is not a period of time, it is a state of this process:
+/// it stays open exactly as long as this process has done nothing that could
+/// put this node's name on a `running` or `resuming` row. Once it has, the
+/// rows [`release_node_holdings`](PausedSandboxRegistry::release_node_holdings)
+/// selects — by node identity alone — stop being only the dead process's and
+/// start including this one's own live sandboxes.
+///
+/// It closes on the *attempt*, not on the confirmation, and that difference is
+/// the whole reason this exists as its own latch rather than as
+/// `running_registrations.is_empty()`. The case a retry exists for is a
+/// registry that was unreachable at startup; in that same outage a resume
+/// fails open and runs the sandbox here anyway, while its `mark_running` goes
+/// unconfirmed and enrols nothing. Fencing on confirmations alone would read
+/// that node as holding nothing and release the rows of the sandboxes it is
+/// actually running — the duplication this whole module exists to prevent.
+/// `retain_running_registrations` can empty the map again for the same reason.
+///
+/// The mutex is held across the release itself, so a resume arriving mid-flight
+/// waits rather than slipping past a fence that has already been read.
+struct TakeoverWindow(tokio::sync::Mutex<bool>);
+
+impl TakeoverWindow {
+    fn new() -> Self {
+        Self(tokio::sync::Mutex::new(true))
+    }
+
+    /// Takes the window for one release attempt, or `None` once it has closed.
+    async fn enter(&self) -> Option<TakeoverAttempt<'_>> {
+        let guard = self.0.lock().await;
+        if !*guard {
+            return None;
+        }
+
+        Some(TakeoverAttempt(guard))
+    }
+
+    /// Closes the window for good. Monotonic: nothing reopens it.
+    async fn close(&self) {
+        *self.0.lock().await = false;
+    }
+}
+
+/// A held-open [`TakeoverWindow`]. Dropping it without
+/// [`settle`](TakeoverAttempt::settle) leaves the window open for a retry.
+struct TakeoverAttempt<'a>(tokio::sync::MutexGuard<'a, bool>);
+
+impl TakeoverAttempt<'_> {
+    fn settle(mut self) {
+        *self.0 = false;
+    }
+}
+
+/// How an attempt to release a previous process's holdings settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleReleaseOutcome {
+    /// The rows were handed back, or there were none. Nothing more to do.
+    Released,
+    /// The takeover window has closed — this process has taken a sandbox live,
+    /// so releasing by node identity would now give away one of its own.
+    /// Whatever was still stranded stays stranded until the next start.
+    Fenced,
+    /// The registry could not be reached. Worth retrying while the window is
+    /// still open.
+    Failed,
 }
 
 /// Owns the cluster's view of this node's paused sandboxes.
@@ -88,6 +161,7 @@ pub struct PausedSandboxCoordinator {
     snapshot_manager: Arc<SnapshotManager>,
     node_id: String,
     running_registrations: RunningRegistrations,
+    takeover_window: TakeoverWindow,
 }
 
 impl PausedSandboxCoordinator {
@@ -101,6 +175,7 @@ impl PausedSandboxCoordinator {
             snapshot_manager,
             node_id,
             running_registrations: RunningRegistrations::default(),
+            takeover_window: TakeoverWindow::new(),
         }
     }
 
@@ -110,6 +185,34 @@ impl PausedSandboxCoordinator {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Records that this process is about to try to make a sandbox live here,
+    /// closing the window in which releasing rows by node identity is exact.
+    ///
+    /// Called before the write, not after it: a claim whose response was lost
+    /// still wrote `resuming` with this node's name on it, and a `mark_running`
+    /// that went unacknowledged still wrote `running`. Either is enough to make
+    /// a later release by node identity give away a sandbox this process holds.
+    pub async fn note_taking_sandbox_live(&self) {
+        self.takeover_window.close().await;
+    }
+
+    /// Takes the takeover window for one attempt at releasing what a previous
+    /// process on this machine left behind, or `None` once it has closed.
+    ///
+    /// The returned guard keeps the window shut to everything else for as long
+    /// as it is held, so the release either happens entirely before this
+    /// process takes on a sandbox or does not happen at all.
+    async fn enter_takeover_window(&self) -> Option<TakeoverAttempt<'_>> {
+        // Belt and braces: a confirmed registration is by construction preceded
+        // by `note_taking_sandbox_live`, so this can only fire if some future
+        // caller enrols a sandbox without going through `mark_sandbox_running`.
+        if !self.running_registrations.is_empty() {
+            return None;
+        }
+
+        self.takeover_window.enter().await
     }
 
     /// Publishes a just-paused sandbox and records it cluster-wide.
@@ -194,7 +297,8 @@ impl PausedSandboxCoordinator {
                             %snapshot_id,
                             "published paused snapshot but could not mark it durable"
                         );
-                        self.discard_unreferenced_snapshot(&sandbox_id, &snapshot_id)
+                        let _ = self
+                            .discard_unreferenced_snapshot(&sandbox_id, &snapshot_id)
                             .await;
                     }
                 }
@@ -223,6 +327,53 @@ impl PausedSandboxCoordinator {
         Some(self.node_id.clone())
     }
 
+    /// Hands back the rows a previous process on this machine died holding.
+    ///
+    /// Idempotent by construction: the first success closes the takeover
+    /// window, and so does the first sandbox this process takes live, so this
+    /// can be called repeatedly and will act at most once.
+    pub(super) async fn release_stale_holdings(&self) -> StaleReleaseOutcome {
+        let Some(attempt) = self.enter_takeover_window().await else {
+            return StaleReleaseOutcome::Fenced;
+        };
+
+        match self.registry.release_node_holdings(&self.node_id).await {
+            Ok(released) => {
+                attempt.settle();
+                if !released.is_empty() {
+                    metrics::counter!("agentenv_paused_registry_node_holdings_released_total")
+                        .increment(released.released);
+                    metrics::counter!("agentenv_paused_registry_node_holdings_discarded_total")
+                        .increment(released.discarded);
+                    info!(
+                        node_id = %self.node_id,
+                        released = released.released,
+                        discarded = released.discarded,
+                        "took over the sandboxes a previous process on this node was holding"
+                    );
+                }
+
+                StaleReleaseOutcome::Released
+            }
+            Err(err) => {
+                // Nothing else releases these rows, so the sandboxes stay
+                // stranded until either a retry lands or a later start
+                // succeeds. That is the safe direction — the alternative is a
+                // timeout deciding it, which is the thing this replaced.
+                metrics::counter!("agentenv_paused_registry_stale_release_failed_total")
+                    .increment(1);
+                warn!(
+                    error = %err,
+                    node_id = %self.node_id,
+                    "could not release the previous process's holdings; \
+                     sandboxes it was running stay unclaimable until a retry lands"
+                );
+
+                StaleReleaseOutcome::Failed
+            }
+        }
+    }
+
     /// Records that the sandbox is live on this node.
     ///
     /// Called on both resume paths — the local fast path and a cross-node
@@ -238,6 +389,9 @@ impl PausedSandboxCoordinator {
     /// precisely the premise reconciliation needs to notice that it no longer
     /// does.
     pub async fn mark_sandbox_running(&self, sandbox_id: SandboxId) {
+        // Before the write: see `note_taking_sandbox_live`.
+        self.note_taking_sandbox_live().await;
+
         let confirmed = match self.registry.mark_running(&sandbox_id, &self.node_id).await {
             Ok(confirmed) => confirmed,
             Err(err) => {
@@ -327,11 +481,16 @@ impl PausedSandboxCoordinator {
     /// enough to delete; when the registry cannot answer at all the snapshot is
     /// left behind and named in the log, because an operator can collect
     /// garbage but cannot un-delete a referenced snapshot.
+    ///
+    /// Returns the verdict it acted on, so a test can tell "read the row and
+    /// concluded nothing references it" apart from "deleted without looking" —
+    /// two behaviours that are indistinguishable from the repository's side and
+    /// differ only in whether they can destroy a sandbox's one durable copy.
     async fn discard_unreferenced_snapshot(
         &self,
         sandbox_id: &SandboxId,
         snapshot_id: &SnapshotId,
-    ) {
+    ) -> OrphanVerdict {
         let reread = self.registry.get(sandbox_id).await;
         let readable = reread.is_ok();
         let referenced = reread
@@ -339,7 +498,8 @@ impl PausedSandboxCoordinator {
             .ok()
             .map(|entry| snapshot_is_referenced(entry.as_ref(), snapshot_id));
 
-        match orphan_verdict(readable, referenced.unwrap_or(false)) {
+        let verdict = orphan_verdict(readable, referenced.unwrap_or(false));
+        match verdict {
             OrphanVerdict::Delete => {
                 self.delete_snapshot(sandbox_id, snapshot_id, "never referenced by the registry")
                     .await
@@ -356,6 +516,8 @@ impl PausedSandboxCoordinator {
                  leaving it in the repository for manual collection"
             ),
         }
+
+        verdict
     }
 
     async fn delete_snapshot(
@@ -460,6 +622,7 @@ fn publish_metadata(metadata: &SandboxMetadata) -> SnapshotPublishMetadata {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{CountingRegistry, GetAnswer};
     use super::*;
 
     /// The failure that motivated all this: `complete_pause` fails, nothing
@@ -608,6 +771,362 @@ mod tests {
                 live_elsewhere(&entry(state, "node-b", None), "node-a").is_none(),
                 "{state:?} should be clearable from another node"
             );
+        }
+    }
+
+    /// 🔴 The re-read is the whole safety property, and it is invisible from
+    /// the repository's side: "read the row, nothing references this snapshot,
+    /// delete it" and "delete it without looking" produce the same repository
+    /// afterwards on the happy path and differ only when the write landed and
+    /// its response was lost — which is exactly the case that costs a sandbox
+    /// its one durable copy. So the test asserts the read happened, not just
+    /// that the verdict was right.
+    #[tokio::test]
+    async fn a_failed_complete_pause_rereads_the_row_before_touching_the_snapshot() {
+        let snapshot_id = SnapshotId::generate();
+        let registry = Arc::new(CountingRegistry::answering(GetAnswer::Referencing(
+            snapshot_id.clone(),
+        )));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        let verdict = coordinator
+            .discard_unreferenced_snapshot(&SandboxId::new(), &snapshot_id)
+            .await;
+
+        assert_eq!(registry.get_calls(), 1, "the row must be re-read");
+        assert_eq!(
+            verdict,
+            OrphanVerdict::Referenced,
+            "a complete_pause whose response was lost still applied the write"
+        );
+    }
+
+    /// The registry being unreachable is exactly when both calls fail together,
+    /// so this is the common case rather than a corner one. Leaking a snapshot
+    /// is recoverable by hand; deleting a referenced one is not.
+    #[tokio::test]
+    async fn an_unreadable_registry_leaves_the_snapshot_alone() {
+        let registry = Arc::new(CountingRegistry::answering(GetAnswer::Unreachable));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        let verdict = coordinator
+            .discard_unreferenced_snapshot(&SandboxId::new(), &SnapshotId::generate())
+            .await;
+
+        assert_eq!(registry.get_calls(), 1);
+        assert_eq!(verdict, OrphanVerdict::Unknown);
+    }
+
+    /// And the case the re-read exists to permit: the write really was
+    /// rejected, nothing points at the upload, so it is collected.
+    #[tokio::test]
+    async fn a_snapshot_no_row_points_at_is_collected() {
+        let registry = Arc::new(CountingRegistry::answering(GetAnswer::Missing));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        let verdict = coordinator
+            .discard_unreferenced_snapshot(&SandboxId::new(), &SnapshotId::generate())
+            .await;
+
+        assert_eq!(registry.get_calls(), 1);
+        assert_eq!(verdict, OrphanVerdict::Delete);
+    }
+
+    fn coordinator(registry: Arc<CountingRegistry>) -> PausedSandboxCoordinator {
+        PausedSandboxCoordinator::new(
+            registry,
+            Arc::new(crate::snapshot::mock::mock_snapshot_manager()),
+            "node-a".to_string(),
+        )
+    }
+
+    /// The failure this whole retry exists for. Nothing else releases these
+    /// rows and `claim_for_resume` refuses them outright, so a single failed
+    /// attempt used to strand every sandbox the previous process was running
+    /// until somebody restarted the node again.
+    #[tokio::test]
+    async fn a_registry_failure_leaves_the_window_open_for_another_attempt() {
+        let registry = Arc::new(CountingRegistry::new(1, false));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Failed
+        );
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Released
+        );
+        assert_eq!(registry.release_calls(), 2);
+    }
+
+    /// Once the rows are back there is nothing left to release, and asking
+    /// again on a node that has since started serving would be the dangerous
+    /// call. The window shuts on success as firmly as it does on a takeover.
+    #[tokio::test]
+    async fn a_successful_release_closes_the_window() {
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Released
+        );
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Fenced
+        );
+        assert_eq!(registry.release_calls(), 1);
+    }
+
+    /// 🔴 The fence itself. Releasing by node identity is only exact while this
+    /// process holds nothing; a claim taken since then names this node on a
+    /// `resuming` row, and releasing it would hand a live sandbox to whoever
+    /// resumes it next.
+    #[tokio::test]
+    async fn taking_a_sandbox_live_fences_the_release() {
+        let registry = Arc::new(CountingRegistry::always_failing());
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        coordinator.note_taking_sandbox_live().await;
+
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Fenced
+        );
+        assert_eq!(
+            registry.release_calls(),
+            0,
+            "a fenced release must not reach the registry at all"
+        );
+    }
+
+    /// 🔴 The case the retry was added for, and the reason the fence is not
+    /// `running_registrations.is_empty()`. During a registry outage a resume
+    /// fails open and runs the sandbox here, while its `mark_running` goes
+    /// unacknowledged and enrols nothing. A fence that only counted confirmed
+    /// registrations would read this node as holding nothing, and the retry
+    /// that fires when the registry comes back would release the rows of the
+    /// sandboxes it is actually running.
+    #[tokio::test]
+    async fn an_unconfirmed_mark_running_still_fences_the_release() {
+        let registry = Arc::new(CountingRegistry::new(usize::MAX, true));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        coordinator.mark_sandbox_running(SandboxId::new()).await;
+
+        assert_eq!(
+            coordinator.running_registration(&SandboxId::new()),
+            None,
+            "an unacknowledged mark must not enrol anything"
+        );
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Fenced
+        );
+        assert_eq!(registry.release_calls(), 0);
+    }
+
+    /// Reconciliation prunes the registration map down to the node's live
+    /// roster, so it empties again as soon as the sandbox goes away. The window
+    /// is monotonic precisely so that cannot reopen it.
+    #[tokio::test]
+    async fn pruning_the_registrations_does_not_reopen_the_window() {
+        let registry = Arc::new(CountingRegistry::always_failing());
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        coordinator.mark_sandbox_running(SandboxId::new()).await;
+        coordinator.retain_running_registrations(&HashSet::new());
+
+        assert_eq!(
+            coordinator.release_stale_holdings().await,
+            StaleReleaseOutcome::Fenced
+        );
+        assert_eq!(registry.release_calls(), 0);
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use crate::orchestrator::{
+        BeganPause, HeldSandbox, PausedRegistryError, PausedSandboxEntry, PausedSandboxRegistry,
+        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    };
+    use crate::snapshot::SnapshotId;
+    use crate::types::SandboxId;
+
+    /// A cluster-backed registry that counts what it is asked to do and can be
+    /// told to fail a fixed number of times first.
+    ///
+    /// Only the two calls the takeover window turns on are interesting here;
+    /// everything else answers the way the disabled registry does.
+    pub(crate) struct CountingRegistry {
+        release_calls: AtomicUsize,
+        releases_to_fail: usize,
+        mark_running_fails: bool,
+        get_calls: AtomicUsize,
+        get_answer: GetAnswer,
+    }
+
+    /// What a programmed `get` should answer.
+    pub(crate) enum GetAnswer {
+        /// No row at all.
+        Missing,
+        /// A row naming this snapshot.
+        Referencing(SnapshotId),
+        /// The registry could not answer.
+        Unreachable,
+    }
+
+    impl CountingRegistry {
+        pub(crate) fn new(releases_to_fail: usize, mark_running_fails: bool) -> Self {
+            Self {
+                release_calls: AtomicUsize::new(0),
+                releases_to_fail,
+                mark_running_fails,
+                get_calls: AtomicUsize::new(0),
+                get_answer: GetAnswer::Missing,
+            }
+        }
+
+        /// Fails every release, forever.
+        pub(crate) fn always_failing() -> Self {
+            Self::new(usize::MAX, false)
+        }
+
+        pub(crate) fn answering(get_answer: GetAnswer) -> Self {
+            Self {
+                get_answer,
+                ..Self::new(0, false)
+            }
+        }
+
+        pub(crate) fn release_calls(&self) -> usize {
+            self.release_calls.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    fn unreachable_backend(operation: &'static str) -> PausedRegistryError {
+        PausedRegistryError::Backend {
+            operation,
+            source: anyhow::anyhow!("registry is unreachable"),
+        }
+    }
+
+    #[async_trait]
+    impl PausedSandboxRegistry for CountingRegistry {
+        async fn begin_pause(&self, _entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
+            Ok(BeganPause {
+                generation: 0,
+                previous_snapshot_id: None,
+            })
+        }
+
+        async fn complete_pause(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+            _snapshot_id: &SnapshotId,
+        ) -> RegistryResult<()> {
+            Ok(())
+        }
+
+        async fn mark_local_only(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> RegistryResult<()> {
+            Ok(())
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+
+            match &self.get_answer {
+                GetAnswer::Missing => Ok(None),
+                GetAnswer::Unreachable => Err(unreachable_backend("get")),
+                GetAnswer::Referencing(snapshot_id) => Ok(Some(PausedSandboxEntry {
+                    sandbox_id: *sandbox_id,
+                    cluster_id: uuid::Uuid::nil(),
+                    state: crate::orchestrator::PausedRegistryState::Paused,
+                    generation: 1,
+                    origin_node_id: "node-a".to_string(),
+                    claimed_by_node_id: None,
+                    snapshot_id: Some(snapshot_id.clone()),
+                    metadata: crate::orchestrator::SandboxMetadata::default(),
+                    paused_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })),
+            }
+        }
+
+        async fn get_many(
+            &self,
+            _sandbox_ids: &[SandboxId],
+        ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+            Ok(HashMap::new())
+        }
+
+        async fn claim_for_resume(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+        ) -> RegistryResult<ResumeClaim> {
+            Ok(ResumeClaim::NotFound)
+        }
+
+        async fn release_claim(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> RegistryResult<()> {
+            Ok(())
+        }
+
+        async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
+            Ok(0)
+        }
+
+        async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
+            Ok(ReclaimedHoldings::default())
+        }
+
+        async fn mark_running(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+        ) -> RegistryResult<bool> {
+            if self.mark_running_fails {
+                return Err(unreachable_backend("mark_running"));
+            }
+
+            Ok(true)
+        }
+
+        async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
+            let seen = self.release_calls.fetch_add(1, Ordering::SeqCst);
+            if seen < self.releases_to_fail {
+                return Err(unreachable_backend("release_node_holdings"));
+            }
+
+            Ok(ReleasedHoldings::default())
+        }
+
+        async fn remove(&self, _sandbox_id: &SandboxId) -> RegistryResult<()> {
+            Ok(())
+        }
+
+        fn is_cluster_backed(&self) -> bool {
+            true
         }
     }
 }

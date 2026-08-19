@@ -23,7 +23,7 @@ use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 use agentenv_http_server::{apis, models};
-pub use paused_coordinator::PausedSandboxCoordinator;
+pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
 
 #[derive(Clone, Debug)]
 pub struct Claims;

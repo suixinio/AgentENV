@@ -42,6 +42,32 @@ spec:
                   name: agentenv-runtime-secrets
                   key: sandbox-access-token-hash-seed
                   optional: true
+            # Both halves of the cluster-wide paused-sandbox registry are
+            # optional so a cluster that has not set it up still starts: with
+            # neither of them the node keeps the `local` backend from
+            # config/default.toml and pauses stay node-local.
+            #
+            # 🔴 The backend is selected here rather than in the ConfigMap.
+            # `deploy/k8s/run.sh` overwrites config/agentenv.toml from
+            # config/default.toml on every apply, so a ConfigMap edit would be
+            # undone by the next `make k8s-apply` — silently, and in the
+            # direction that loses cross-node recovery. Set this key to
+            # "postgres" in an overlay patch, together with the Secret below.
+            - name: AENV_PAUSED_REGISTRY_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: paused-registry-config
+                  key: AENV_PAUSED_REGISTRY_BACKEND
+                  optional: true
+            # The DSN carries credentials, so it never travels in the ConfigMap.
+            # A "postgres" backend with no DSN fails startup rather than falling
+            # back to local, which is why the two are configured together.
+            - name: AENV_PAUSED_REGISTRY_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-runtime-secrets
+                  key: paused-registry-dsn
+                  optional: true
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
             - name: API_ADDR

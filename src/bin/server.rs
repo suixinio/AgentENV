@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use agentenv::api::{server, ApiImpl, PausedSandboxWiring};
+use agentenv::api::{server, ApiImpl, PausedSandboxWiring, StaleReleaseOutcome};
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
@@ -173,13 +173,22 @@ async fn main() -> anyhow::Result<()> {
     // Renewing then stops this node's own remaining records from looking
     // abandoned during startup, and reconciling makes sure a resume arriving
     // first does not find a paused record the cluster has already moved past.
-    api_impl.release_stale_node_holdings().await;
+    let stale_release = api_impl.release_stale_node_holdings().await;
     api_impl.renew_paused_leases().await;
     api_impl.reconcile_local_records().await;
-    let paused_upkeep = spawn_paused_record_upkeep(
+    let mut paused_upkeep = spawn_paused_record_upkeep(
         Arc::clone(&api_impl),
         config.orchestrator.paused_registry.reconcile_interval(),
     );
+    // Only a registry that could not be reached is worth retrying, and only
+    // from here: the retry is bounded by the same fence the startup call is,
+    // and that fence closes the moment this node takes a sandbox live.
+    if stale_release == StaleReleaseOutcome::Failed {
+        let retrier = Arc::clone(&api_impl);
+        paused_upkeep.push(tokio::spawn(async move {
+            retrier.retry_stale_node_holdings_release().await;
+        }));
+    }
 
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);

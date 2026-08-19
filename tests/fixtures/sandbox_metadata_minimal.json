@@ -1,0 +1,41 @@
+{
+  "auto_resume": false,
+  "context": {
+    "env_vars": {},
+    "workdir": "/"
+  },
+  "created_at": {
+    "nanos_since_epoch": 0,
+    "secs_since_epoch": 1755561600
+  },
+  "expires_at": null,
+  "id": "0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08",
+  "network_policy": {
+    "base_policy": "Default",
+    "egress": {
+      "allowed_cidrs": [],
+      "allowed_domains": [],
+      "denied_cidrs": []
+    }
+  },
+  "resources": {
+    "cpu_count": 1,
+    "disk_size_mib": 1024,
+    "memory_mib": 128
+  },
+  "runtime_versions": {
+    "envd_version": "unknown",
+    "firecracker_version": "unknown",
+    "kernel_version": "unknown",
+    "tools_drive_version": "unknown"
+  },
+  "secure": false,
+  "snapshot_alias": null,
+  "snapshot_id": "unknown",
+  "startup": null,
+  "state": "Creating",
+  "timeout": null,
+  "timeout_action": "Pause",
+  "user_metadata": null,
+  "virtualization_mode": "kvm"
+}

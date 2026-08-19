@@ -1,0 +1,107 @@
+{
+  "auto_resume": true,
+  "context": {
+    "cmd": [
+      "npm run dev"
+    ],
+    "entrypoint": [
+      "/bin/sh",
+      "-lc"
+    ],
+    "env_vars": {
+      "LANG": "C.UTF-8",
+      "PATH": "/usr/local/bin:/usr/bin"
+    },
+    "exposed_ports": [
+      "5173/tcp"
+    ],
+    "labels": {
+      "owner": "agentenv"
+    },
+    "user": "user",
+    "volumes": [
+      "/data"
+    ],
+    "workdir": "/home/user"
+  },
+  "created_at": {
+    "nanos_since_epoch": 123456789,
+    "secs_since_epoch": 1755561600
+  },
+  "custom_extension_params": {
+    "retries": 3,
+    "tenant": "workspace-42"
+  },
+  "expires_at": {
+    "nanos_since_epoch": 0,
+    "secs_since_epoch": 1755562500
+  },
+  "id": "0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07",
+  "image_configs": [
+    {
+      "config": {
+        "Cmd": [
+          "/bin/sh"
+        ],
+        "Env": [
+          "PATH=/usr/local/bin:/usr/bin"
+        ]
+      },
+      "mountPath": "/"
+    },
+    {
+      "config": {},
+      "driveId": "drive-1",
+      "mountPath": "/data"
+    }
+  ],
+  "network_policy": {
+    "base_policy": "Deny",
+    "egress": {
+      "allowed_cidrs": [
+        "10.20.0.0/16"
+      ],
+      "allowed_domains": [
+        "registry.npmjs.org"
+      ],
+      "denied_cidrs": [
+        "10.20.30.0/24"
+      ]
+    }
+  },
+  "resources": {
+    "cpu_count": 2,
+    "disk_size_mib": 20480,
+    "memory_mib": 4096
+  },
+  "runtime_versions": {
+    "envd_version": "0.5.15",
+    "firecracker_version": "1.13.1",
+    "kernel_version": "6.1.102",
+    "tools_drive_version": "2026.08.01"
+  },
+  "secure": true,
+  "snapshot_alias": "tpl-node22",
+  "snapshot_id": "0199c8ff-1122-7000-8000-aabbccddeeff",
+  "startup": {
+    "context": {
+      "env_vars": {
+        "NODE_ENV": "development"
+      },
+      "workdir": "/home/user/app"
+    },
+    "ready_cmd": "curl -sf http://127.0.0.1:5173",
+    "start_cmd": "npm run dev"
+  },
+  "state": "Paused",
+  "timeout": {
+    "nanos": 0,
+    "secs": 900
+  },
+  "timeout_action": "Delete",
+  "user_metadata": {
+    "sandboxId": "sbx-42",
+    "workspaceId": "42"
+  },
+  "virtualization_mode": "pvm"
+}

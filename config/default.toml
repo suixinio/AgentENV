@@ -203,6 +203,44 @@ auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
+# Cluster-wide registry of paused sandboxes.
+#
+# 🔴 This section must stay in this file even when every value is a default.
+# `deploy/k8s/run.sh` copies this file verbatim over the cluster's
+# `agentenv-k8s-config` ConfigMap on every apply, so a section that lives only
+# in the cluster disappears on the next `make k8s-apply` — and disappears
+# quietly: the backend falls back to `local`, pauses stop reaching the shared
+# repository, and nothing reports an error until a node is lost and its
+# sandboxes turn out to have gone with it.
+[orchestrator.paused_registry]
+# - "local": a paused sandbox is resumable only on the node that paused it.
+# - "postgres": the pause also publishes its snapshot to the shared repository
+#   and records the sandbox in PostgreSQL, so any node can resume it under its
+#   original ID.
+#
+# 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
+# editing the copy of this file that lands in the cluster ConfigMap — see
+# above. The environment wins over this value.
+backend = "local"
+
+# Required by the "postgres" backend, and deliberately absent here: the DSN
+# carries credentials. Set AENV_PAUSED_REGISTRY_DSN instead, from a Secret.
+# A "postgres" backend with no DSN fails startup rather than falling back.
+# dsn = ""
+
+# Connections per node held open against the registry database.
+max_connections = 8
+
+# How often a node renews its registry leases and re-checks its local paused
+# records against the registry. Ignored by the "local" backend.
+reconcile_interval_secs = 30
+
+# How long a node's hold on a *parked* sandbox stays valid without renewal.
+# Held to at least three reconcile intervals whatever is configured here, since
+# a lease shorter than the cadence that renews it expires on a healthy node.
+# A live sandbox is never handed to another node on this alone.
+lease_ttl_secs = 90
+
 [snapshot]
 # Node-local cache for snapshot artifacts.
 # local_cache_path = "$AENV_HOME/snapshot-local-cache"

@@ -87,6 +87,25 @@ The runtime DaemonSet injects scheduler-report wiring for each node Pod:
 
 The P2P listen address must be reachable Pod-to-Pod; use a concrete container port or a Pod-reachable address if your cluster policy does not allow dialing ephemeral ports.
 
+## Cluster-wide Paused Sandboxes
+
+By default a paused sandbox is resumable only on the node that paused it. Pointing the nodes at a shared PostgreSQL registry makes a pause publish its snapshot to the shared repository as well, so any node can resume the sandbox under its original ID.
+
+Both settings reach the DaemonSet through optional references, so a cluster without them starts normally on the node-local default. Enabling it takes two objects:
+
+```bash
+kubectl -n agentenv-system create configmap paused-registry-config \
+  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=postgres
+
+kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
+  --from-literal=paused-registry-dsn='postgres://user:password@host:5432/agentenv' \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+🔴 **Do not select the backend by editing the `agentenv-k8s-config` ConfigMap.** The make targets rebuild that ConfigMap from `config/default.toml` on every apply, so an edit there is undone by the next `make k8s-apply` — quietly, and in the direction that loses cross-node recovery: pauses go back to being node-local and nothing reports an error until a node is lost and its sandboxes turn out to have gone with it. `AENV_PAUSED_REGISTRY_BACKEND` exists so the choice lives somewhere the file cannot overwrite it.
+
+The `postgres` backend refuses to start without a DSN rather than falling back, so the two objects above belong together. The node creates its own schema on first start.
+
 ## Operations
 
 ```bash

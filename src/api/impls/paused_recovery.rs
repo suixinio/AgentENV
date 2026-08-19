@@ -17,9 +17,9 @@
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use super::ApiImpl;
+use super::{ApiImpl, StaleReleaseOutcome};
 use crate::orchestrator::{
     ClusterRegistration, CreateSandboxRequest, HeldSandbox, NewTimeout, PausedRegistryState,
     PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
@@ -162,6 +162,12 @@ impl ApiImpl {
             return ResumeArbitration::Proceed;
         }
 
+        // A claim that lands writes `resuming` with this node's name on it, and
+        // a claim whose response is lost writes it just the same — so this node
+        // stops being able to release rows by identity from here on, not from
+        // whenever the answer comes back.
+        self.paused.note_taking_sandbox_live().await;
+
         let node_id = self.paused.node_id();
         let claim = match self
             .paused
@@ -198,6 +204,16 @@ impl ApiImpl {
     /// 修复前输家稳定拿到 404 / ~0.19s，而沙箱正在另一节点上健康运行。
     const MISSING_LOCAL_WAIT: Duration = Duration::from_secs(5);
     const MISSING_LOCAL_POLL: Duration = Duration::from_millis(200);
+
+    /// How often to retry a failed release of the previous process's holdings.
+    ///
+    /// Short on purpose, and not configurable: the whole point is to land
+    /// inside the window between this process starting and it taking its first
+    /// sandbox live, which on a busy node is seconds. A missed window costs a
+    /// node restart, while an extra query every five seconds costs nothing —
+    /// the retry stops at the first success, and only runs at all after a
+    /// failure.
+    const STALE_RELEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
     pub(super) async fn resolve_missing_local_resume(
         &self,
@@ -408,37 +424,63 @@ impl ApiImpl {
     /// rebuilds a live sandbox somewhere else either — a resume that finds the
     /// sandbox in its store is refused (`sandbox_resume.go`, StateRunning ⇒
     /// 409), and its orphan sweep only kills what the store has no record of.
-    pub async fn release_stale_node_holdings(&self) {
+    pub async fn release_stale_node_holdings(&self) -> StaleReleaseOutcome {
         if !self.paused.registry().is_cluster_backed() {
-            return;
+            return StaleReleaseOutcome::Released;
         }
 
-        let node_id = self.paused.node_id().to_string();
-        match self.paused.registry().release_node_holdings(&node_id).await {
-            Ok(released) if released.is_empty() => {}
-            Ok(released) => {
-                metrics::counter!("agentenv_paused_registry_node_holdings_released_total")
-                    .increment(released.released);
-                metrics::counter!("agentenv_paused_registry_node_holdings_discarded_total")
-                    .increment(released.discarded);
-                info!(
-                    node_id,
-                    released = released.released,
-                    discarded = released.discarded,
-                    "took over the sandboxes a previous process on this node was holding"
-                );
-            }
-            Err(err) => {
-                // Nothing else releases these rows, so the sandboxes stay
-                // stranded until a later start succeeds. That is the safe
-                // direction — the alternative is a timeout deciding it, which
-                // is the thing this replaced.
-                warn!(
-                    error = %err,
-                    node_id,
-                    "could not release the previous process's holdings; \
-                     sandboxes it was running stay unclaimable until a later start"
-                );
+        self.paused.release_stale_holdings().await
+    }
+
+    /// Keeps trying to release what the previous process left behind, for as
+    /// long as doing so is still exact.
+    ///
+    /// 🔴 Why a failed release used to be permanent, and why that is the wrong
+    /// shape. `claim_for_resume` refuses `running` and `resuming` rows outright
+    /// — no lease, no timeout, nothing else in the system releases them — so a
+    /// single failed attempt at startup left every sandbox the previous process
+    /// was running unresumable until somebody restarted the node again. The
+    /// only evidence in the failure was one `warn!` that does not survive the
+    /// next restart.
+    ///
+    /// Retrying is safe for the same reason the startup call is: the fence is
+    /// not a deadline but the state of this process, and it stays open exactly
+    /// while this process has done nothing that could put its node's name on a
+    /// live row. A retry that lands inside that window is indistinguishable
+    /// from the startup call landing late; one that arrives after it is refused
+    /// outright, not merely deprioritised.
+    ///
+    /// It gives up only when the window closes, and says so loudly when it
+    /// does: at that point rows really are stranded until the next start, and
+    /// that is worth an operator's attention rather than a debug line.
+    pub async fn retry_stale_node_holdings_release(&self) {
+        loop {
+            tokio::time::sleep(Self::STALE_RELEASE_RETRY_INTERVAL).await;
+
+            match self.release_stale_node_holdings().await {
+                StaleReleaseOutcome::Released => {
+                    info!(
+                        node_id = self.paused.node_id(),
+                        "released the previous process's holdings on a retry"
+                    );
+
+                    return;
+                }
+                StaleReleaseOutcome::Fenced => {
+                    metrics::counter!("agentenv_paused_registry_stale_release_abandoned_total")
+                        .increment(1);
+                    error!(
+                        node_id = self.paused.node_id(),
+                        "gave up releasing the previous process's holdings: this node now runs \
+                         sandboxes of its own, so releasing by node identity would give one of \
+                         them away. Any sandbox the previous process was running stays \
+                         unclaimable until this node restarts"
+                    );
+
+                    return;
+                }
+                // Logged and counted at the point of failure.
+                StaleReleaseOutcome::Failed => {}
             }
         }
     }
@@ -973,13 +1015,124 @@ fn restore_request(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::Utc;
 
+    use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
+    use crate::cfg::AppConfig;
+    use crate::identity::NodeIdentity;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{
+        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
+        Orchestrator, PausedSandboxRegistry,
+    };
+    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::snapshot::mock::mock_snapshot_manager;
     use crate::snapshot::SnapshotId;
+    use crate::template::TemplateBuilder;
 
     const SELF: &str = "node-a";
     const OTHER: &str = "node-b";
+
+    /// An API built over the given registry and nothing else that touches the
+    /// host: enough to drive the startup-time release and its retry.
+    async fn api_over(registry: Arc<dyn PausedSandboxRegistry>) -> Arc<ApiImpl> {
+        let root = tempfile::tempdir().unwrap();
+        let orchestrator = Orchestrator::new(
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let snapshot_manager = Arc::new(mock_snapshot_manager());
+
+        Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                registry,
+                snapshot_manager,
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+        ))
+    }
+
+    /// The single-node default. There is no cluster to hand anything back to,
+    /// so this must settle without a retry task ever being spawned.
+    #[tokio::test]
+    async fn a_node_local_registry_has_nothing_to_release() {
+        let api = api_over(Arc::new(DisabledPausedSandboxRegistry)).await;
+
+        assert_eq!(
+            api.release_stale_node_holdings().await,
+            StaleReleaseOutcome::Released
+        );
+    }
+
+    /// Runs a retry loop that is supposed to finish, and fails the test rather
+    /// than hanging the suite if it does not.
+    ///
+    /// Under `start_paused` the clock advances whenever the runtime idles, so a
+    /// loop that never settles burns virtual time as fast as the CPU allows and
+    /// would otherwise spin until somebody killed the run. That is precisely
+    /// what removing the fence produces, so the bound is what turns it into a
+    /// readable failure.
+    async fn run_bounded(work: impl std::future::Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(600), work)
+            .await
+            .expect("the retry loop should settle rather than run forever");
+    }
+
+    /// The scheduler-is-rolling case: the release fails at startup and lands on
+    /// a later attempt, without anyone having restarted the node.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_keeps_going_until_the_release_lands() {
+        let registry = Arc::new(CountingRegistry::new(3, false));
+        let api = api_over(Arc::clone(&registry) as Arc<dyn PausedSandboxRegistry>).await;
+
+        assert_eq!(
+            api.release_stale_node_holdings().await,
+            StaleReleaseOutcome::Failed
+        );
+
+        run_bounded(api.retry_stale_node_holdings_release()).await;
+
+        assert_eq!(
+            registry.release_calls(),
+            4,
+            "three failures then the one that landed"
+        );
+    }
+
+    /// 🔴 The retry is bounded by the fence, not by a count or a clock. A node
+    /// that has taken a sandbox live must never release rows by node identity
+    /// again, however badly the earlier attempt failed.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_stops_once_this_node_holds_a_sandbox() {
+        let registry = Arc::new(CountingRegistry::always_failing());
+        let api = api_over(Arc::clone(&registry) as Arc<dyn PausedSandboxRegistry>).await;
+
+        assert_eq!(
+            api.release_stale_node_holdings().await,
+            StaleReleaseOutcome::Failed
+        );
+        api.paused.note_taking_sandbox_live().await;
+
+        run_bounded(api.retry_stale_node_holdings_release()).await;
+
+        assert_eq!(
+            registry.release_calls(),
+            1,
+            "only the startup attempt; the retry must not reach the registry"
+        );
+    }
 
     fn registered_as(node_id: &str) -> ClusterRegistration {
         ClusterRegistration::As(node_id.to_string())

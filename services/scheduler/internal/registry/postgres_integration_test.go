@@ -52,6 +52,28 @@ const (
 	snapshotOtherClus = "cccccccc-0000-0000-0000-000000000009"
 )
 
+// requireTestDSN returns the test database DSN, or skips the calling test when
+// none is configured.
+//
+// A skipped test reports as passing, so a runner that is *supposed* to have a
+// database — CI, or a verification run — sets SCHEDULER_REGISTRY_TEST_REQUIRED
+// and gets a loud failure instead of a file full of green no-ops. Without it
+// these tests can be silently skipped by the one thing that is meant to be
+// enforcing them.
+func requireTestDSN(t *testing.T) string {
+	t.Helper()
+
+	dsn := os.Getenv("SCHEDULER_REGISTRY_TEST_DSN")
+	if dsn == "" {
+		if os.Getenv("SCHEDULER_REGISTRY_TEST_REQUIRED") != "" {
+			t.Fatal("SCHEDULER_REGISTRY_TEST_REQUIRED is set but SCHEDULER_REGISTRY_TEST_DSN is not: these tests would have been skipped")
+		}
+		t.Skip("SCHEDULER_REGISTRY_TEST_DSN is not set; skipping the real PostgreSQL test")
+	}
+
+	return dsn
+}
+
 // setupRegistryDatabase creates the node-shaped table in the database named by
 // SCHEDULER_REGISTRY_TEST_DSN, seeds one row per state, and drops the table
 // again when the test finishes.
@@ -62,10 +84,7 @@ const (
 func setupRegistryDatabase(t *testing.T) string {
 	t.Helper()
 
-	dsn := os.Getenv("SCHEDULER_REGISTRY_TEST_DSN")
-	if dsn == "" {
-		t.Skip("SCHEDULER_REGISTRY_TEST_DSN is not set; skipping the real PostgreSQL test")
-	}
+	dsn := requireTestDSN(t)
 
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, dsn)

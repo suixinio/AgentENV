@@ -391,7 +391,13 @@ pub enum PausedRegistryBackendKind {
 
 #[derive(Debug, Config, Clone)]
 pub struct PausedRegistryConfig {
-    #[config(default = "local")]
+    /// 🔴 Settable from the environment on purpose. `deploy/k8s/run.sh` copies
+    /// `config/default.toml` over the cluster's ConfigMap on every apply, so a
+    /// cluster that expressed its choice of backend by editing that ConfigMap
+    /// would silently lose it — and lose it in the quiet direction, falling
+    /// back to node-local pauses that report no error at all. A deployment
+    /// selects the backend here instead, where the file cannot overwrite it.
+    #[config(default = "local", env = "AENV_PAUSED_REGISTRY_BACKEND")]
     pub backend: PausedRegistryBackendKind,
     /// Required when `backend = "postgres"`. Prefer the environment variable:
     /// the DSN carries credentials and should not sit in a config file.
@@ -1463,6 +1469,82 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
+    }
+
+    /// 🔴 The section has to be in the file, not merely in the code defaults.
+    /// `deploy/k8s/run.sh` copies this file over the cluster ConfigMap on every
+    /// apply, so a cluster whose registry settings live only in that ConfigMap
+    /// loses them on the next `make k8s-apply` — falling back to node-local
+    /// pauses without reporting anything.
+    #[test]
+    fn the_bundled_default_config_documents_the_paused_registry() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml"),
+        )
+        .expect("read the bundled config");
+        let parsed: toml::Value = toml::from_str(&text)
+            .map_err(|err| err.message().to_string())
+            .expect("parse the bundled config");
+
+        let section = parsed
+            .get("orchestrator")
+            .and_then(|orchestrator| orchestrator.get("paused_registry"))
+            .and_then(toml::Value::as_table)
+            .expect("config/default.toml must carry an [orchestrator.paused_registry] section");
+
+        for key in [
+            "backend",
+            "max_connections",
+            "reconcile_interval_secs",
+            "lease_ttl_secs",
+        ] {
+            assert!(
+                section.contains_key(key),
+                "[orchestrator.paused_registry] is missing {key}"
+            );
+        }
+
+        // The DSN carries credentials and belongs in a Secret, not in a file
+        // that is copied wholesale into a ConfigMap.
+        assert!(
+            !section.contains_key("dsn"),
+            "the registry DSN must not be committed to config/default.toml"
+        );
+    }
+
+    /// The backend a deployment actually runs has to be settable from outside
+    /// the file, for the same reason: the file is overwritten on every apply.
+    ///
+    /// Touches a process-global environment variable, which nothing else in
+    /// this crate reads or writes.
+    #[test]
+    fn the_paused_registry_backend_is_settable_from_the_environment() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", "postgres");
+        let overridden = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
+        std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");
+
+        assert_eq!(
+            overridden
+                .expect("load with the backend overridden")
+                .config()
+                .orchestrator
+                .paused_registry
+                .backend,
+            PausedRegistryBackendKind::Postgres
+        );
+
+        assert_eq!(
+            ConfigManager::new_from_path(&workspace.join("config/default.toml"))
+                .expect("load without the override")
+                .config()
+                .orchestrator
+                .paused_registry
+                .backend,
+            PausedRegistryBackendKind::Local,
+            "the file's value must stand when the environment says nothing"
+        );
     }
 
     #[test]

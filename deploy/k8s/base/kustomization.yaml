@@ -10,6 +10,7 @@ resources:
   - rolebinding.yaml
   - scheduler-service.yaml
   - scheduler-deployment.yaml
+  - scheduler-pdb.yaml
   - gateway-service.yaml
   - gateway-deployment.yaml
   - agentenv-headless-service.yaml

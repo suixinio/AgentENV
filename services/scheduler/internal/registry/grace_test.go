@@ -343,7 +343,16 @@ func TestTheDiscardBreakerTakesTheStricterOfItsTwoLimits(t *testing.T) {
 		{name: "under both", maxRows: 10, maxRatio: 0.5, candidates: 3, total: 100},
 		{name: "at both limits exactly", maxRows: 10, maxRatio: 0.1, candidates: 10, total: 100},
 		{name: "over the count on a large cluster", maxRows: 10, maxRatio: 0.9, candidates: 11, total: 1000, wantTrip: true},
-		{name: "over the ratio on a small cluster", maxRows: 100, maxRatio: 0.1, candidates: 3, total: 10, wantTrip: true},
+		// 🔴 A percentage of a small table says nothing about whether the pass
+		// is sane. Two rows out of eight is 25% and is also just two sandboxes
+		// that outlived their deadlines on a node that went away — the exact
+		// pass the dev cluster tripped on. The ratio arm has a floor now; the
+		// absolute limit still covers what the ratio is there for.
+		{name: "over the ratio but under the floor", maxRows: 100, maxRatio: 0.1, candidates: 3, total: 10},
+		{name: "the measured false positive: two of eight", maxRows: 100, maxRatio: 0.1, candidates: 2, total: 8},
+		// Past the floor it means something again.
+		{name: "over the ratio and past the floor", maxRows: 100, maxRatio: 0.1, candidates: 4, total: 10, wantTrip: true},
+		{name: "past the floor but well under the ratio", maxRows: 100, maxRatio: 0.1, candidates: 9, total: 1000},
 		// A ratio needs a denominator; with no rows at all the absolute limit is
 		// the only one that means anything.
 		{name: "no denominator, under the count", maxRows: 10, maxRatio: 0.1, candidates: 5, total: 0},
@@ -375,7 +384,9 @@ func TestANilBreakerAllowsEverything(t *testing.T) {
 func TestTheDiscardBreakerFillsInWhateverWasLeftAtZero(t *testing.T) {
 	breaker := NewDiscardBreaker(0, 0, nil)
 
-	if breaker.MaxRows != defaultDiscardMaxRows || breaker.MaxRatio != defaultDiscardMaxRatio {
+	if breaker.MaxRows != defaultDiscardMaxRows ||
+		breaker.MaxRatio != defaultDiscardMaxRatio ||
+		breaker.MinRatioRows != defaultDiscardMinRatioRows {
 		t.Fatalf("defaults were not applied: %+v", breaker)
 	}
 	// A zero-valued breaker built by hand must behave the same way rather than

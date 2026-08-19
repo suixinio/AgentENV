@@ -1,0 +1,22 @@
+# Keeps a voluntary disruption from taking the scheduler away entirely.
+#
+# 🔴 With one replica this blocks `kubectl drain` on the scheduler's node until
+# somebody decides what to do, and that is the intent. Since the registry write
+# surface moved here, this process is a hard dependency of every node in the
+# cluster: while it is gone, no node renews a lease, completes a pause, or
+# resumes a sandbox the registry knows about. That is a decision for an operator
+# to take deliberately, not a side effect of draining a node for an unrelated
+# reason.
+#
+# To drain anyway, delete this object, drain, and re-apply it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agentenv-scheduler
+  labels:
+    app.kubernetes.io/name: agentenv-scheduler
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentenv-scheduler

@@ -162,6 +162,31 @@ The table itself does not change: both backends wrote the same schema and arbitr
 
 🔴 **Verify the switch on each node** with the assembly line above — `backend=central` with a non-empty `scheduler_endpoint`. A value that never reached the Pod at all (a ConfigMap that was not created, a key spelled differently) leaves the node on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
 
+## The node API is protected by the network, not by its headers
+
+🔴 **Port 8000 on a node Pod is an unauthenticated admin surface.** The API
+declares `X-Admin-Token` and `X-API-Key`, and the node accepts *any* non-empty
+value for either — presence is checked, validity is not. A made-up token is
+enough to put a node into `DRAINING` through `POST /nodes/{id}`.
+
+This matches where e2b puts the same boundary: its orchestrator's gRPC server
+has no authentication interceptor, because only the control plane is supposed to
+be able to reach it. The consequence is the same for us — **whatever can reach
+port 8000 can administer the node**, and the headers will not tell you
+otherwise.
+
+So the check belongs on the boundary:
+
+```bash
+# Nothing should expose the node API beyond the cluster.
+kubectl -n agentenv-system get svc -o wide | grep -i nodeport
+# And the node's port should be reachable only from the gateway and scheduler.
+kubectl -n agentenv-system get networkpolicy
+```
+
+A NodePort on the node service, or a cluster without a NetworkPolicy in front of
+it, is what turns this from a design choice into an exposure.
+
 ## Operations
 
 ```bash

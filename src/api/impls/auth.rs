@@ -16,8 +16,23 @@ fn non_empty_header(headers: &HeaderMap, name: &str) -> bool {
 impl apis::ApiKeyAuthHeader for ApiImpl {
     type Claims = Claims;
 
-    // TODO: Validate configured authentication credentials instead of only
-    // checking that they are present.
+    // 🔴 Presence, not validity. Any non-empty value is accepted, including one
+    // a caller invented — measured, not inferred: a made-up `X-Admin-Token`
+    // sent through the NodePort put a node into DRAINING twice, 204 both times.
+    //
+    // This is not an oversight to be fixed by comparing strings here. The node
+    // API's protection is the network boundary, the same place e2b puts it —
+    // its orchestrator's gRPC server has no authentication interceptor at all
+    // (`packages/shared/pkg/grpc/server.go` chains recovery and logging and
+    // nothing else), because only the control plane is meant to reach it. Our
+    // headers exist to carry a caller's identity for the API contract, and
+    // giving them real credentials would mean issuing, distributing and
+    // rotating a secret for every caller across two repositories.
+    //
+    // 🔴 So the thing to check is the boundary, not this function. A cluster
+    // that exposes port 8000 beyond the control plane — a NodePort, a
+    // permissive NetworkPolicy — has an unauthenticated admin surface, and this
+    // header will not tell it so. See docs/src/deployment/kubernetes.md.
     async fn extract_claims_from_header(
         &self,
         headers: &HeaderMap,

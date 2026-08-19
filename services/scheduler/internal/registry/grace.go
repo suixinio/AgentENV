@@ -70,19 +70,38 @@ var (
 	})
 	registryGraceDowntimeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "agentenv_scheduler_registry_write_grace_downtime_seconds",
-		Help: "Downtime this process inferred from max(updated_at) at start-up.",
+		// 🔴 Inferred, and an over-estimate by design. It is now() minus the
+		// newest updated_at, and nodes only write that once per reconcile
+		// interval — so a healthy 14-second restart reports around 20. The
+		// direction is the safe one (a longer grace window, not a shorter) but
+		// the number is not how long this process was gone, and reading it as
+		// that turns every ordinary restart into an apparent control-plane
+		// outage.
+		Help: "Downtime inferred at start-up from now() - max(updated_at). Over-estimates by up to one node reconcile interval; not process downtime.",
 	})
 	registryGraceLeasesExtended = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "agentenv_scheduler_registry_write_grace_leases_extended",
 		Help: "Rows whose lease the restart grace pass extended.",
 	})
-	registryGraceRefusals = promauto.NewCounter(prometheus.CounterOpts{
+	// Split by who was refused. A client RPC being turned away and this
+	// process's own reclaim timer being held back are different events: the
+	// first is a node that has to retry, the second is entirely internal and
+	// happens two or three times on every completely healthy restart. Summed
+	// into one counter, an alert on it has a permanent floor of self-inflicted
+	// noise.
+	registryGraceRefusals = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "agentenv_scheduler_registry_write_grace_refusals_total",
-		Help: "Requests refused because the write surface was cold or in its grace period.",
-	})
-	registryGraceTakeoversWithheld = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "agentenv_scheduler_registry_write_grace_takeovers_withheld_total",
-		Help: "Claims served during the grace period without the lapsed-lease takeover arm.",
+		Help: "Requests refused because the write surface was cold or in its grace period, by source.",
+	}, []string{"source"})
+	// 🔴 Named for what it counts. It is claims *served* in the grace window
+	// while the lapsed-lease arm was withheld — not takeovers that were
+	// actually prevented. Most of those claims are on `paused` rows, which
+	// never consult the lease at all, so nothing was withheld from them; a
+	// counter called "takeovers withheld" would report a restart's cost as many
+	// times larger than it was.
+	registryGraceClaimsWithoutTakeoverArm = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agentenv_scheduler_registry_write_grace_claims_without_takeover_arm_total",
+		Help: "Claims served during the grace period without the lapsed-lease takeover arm. Not all of them would have used it.",
 	})
 	registryClaimRewound = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "agentenv_scheduler_registry_write_claim_rewound_total",
@@ -248,7 +267,7 @@ func (g *Grace) Require() error {
 	if g.Ready() {
 		return nil
 	}
-	registryGraceRefusals.Inc()
+	registryGraceRefusals.WithLabelValues(refusalSourceRPC).Inc()
 	return ErrNotReady
 }
 
@@ -260,13 +279,20 @@ func (g *Grace) RequireServing() error {
 	case PhaseServing:
 		return nil
 	case PhaseGrace:
-		registryGraceRefusals.Inc()
+		registryGraceRefusals.WithLabelValues(refusalSourceReclaim).Inc()
 		return ErrGracePeriod
 	default:
-		registryGraceRefusals.Inc()
+		registryGraceRefusals.WithLabelValues(refusalSourceReclaim).Inc()
 		return ErrNotReady
 	}
 }
+
+// The two callers of the refusal counter. Require serves the RPC surface;
+// RequireServing is only ever reached by this process's own reclaim timer.
+const (
+	refusalSourceRPC     = "rpc"
+	refusalSourceReclaim = "reclaim"
+)
 
 // allowsLeaseTakeover reports whether a claim may use its lapsed-lease arm.
 //
@@ -283,7 +309,7 @@ func (g *Grace) allowsLeaseTakeover() bool {
 	if g.Phase() == PhaseServing {
 		return true
 	}
-	registryGraceTakeoversWithheld.Inc()
+	registryGraceClaimsWithoutTakeoverArm.Inc()
 	return false
 }
 
@@ -383,27 +409,51 @@ type DiscardBreaker struct {
 	MaxRows int64
 	// MaxRatio is a fraction of the cluster's rows. Zero takes the default.
 	MaxRatio float64
+	// MinRatioRows is the fewest discards the ratio arm may act on. Zero takes
+	// the default.
+	//
+	// 🔴 Without it the ratio arm is unusable on a small table. A cluster with
+	// eight rows discarding two is at 25% and trips a 10% limit — while two
+	// rows is an entirely ordinary reclamation, two sandboxes that outlived
+	// their deadlines on a node that went away. Measured on the dev cluster,
+	// where exactly that happened. A breaker that fires on every normal pass is
+	// a breaker somebody turns off.
+	MinRatioRows int64
 	// Log receives the refusal.
 	Log *zap.Logger
 }
 
 const (
-	defaultDiscardMaxRows  int64   = 10
-	defaultDiscardMaxRatio float64 = 0.10
+	defaultDiscardMaxRows      int64   = 10
+	defaultDiscardMaxRatio     float64 = 0.10
+	defaultDiscardMinRatioRows int64   = 3
 )
 
 // NewDiscardBreaker fills in whatever the caller left at zero.
 func NewDiscardBreaker(maxRows int64, maxRatio float64, log *zap.Logger) *DiscardBreaker {
+	return NewDiscardBreakerWithFloor(maxRows, maxRatio, 0, log)
+}
+
+// NewDiscardBreakerWithFloor is NewDiscardBreaker with the ratio arm's floor.
+func NewDiscardBreakerWithFloor(maxRows int64, maxRatio float64, minRatioRows int64, log *zap.Logger) *DiscardBreaker {
 	if maxRows <= 0 {
 		maxRows = defaultDiscardMaxRows
 	}
 	if maxRatio <= 0 {
 		maxRatio = defaultDiscardMaxRatio
 	}
+	if minRatioRows <= 0 {
+		minRatioRows = defaultDiscardMinRatioRows
+	}
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &DiscardBreaker{MaxRows: maxRows, MaxRatio: maxRatio, Log: log}
+	return &DiscardBreaker{
+		MaxRows:      maxRows,
+		MaxRatio:     maxRatio,
+		MinRatioRows: minRatioRows,
+		Log:          log,
+	}
 }
 
 // Allow reports whether a pass that would discard `candidates` rows out of
@@ -421,11 +471,21 @@ func (b *DiscardBreaker) Allow(candidates, total int64) error {
 	if maxRatio <= 0 {
 		maxRatio = defaultDiscardMaxRatio
 	}
+	minRatioRows := b.MinRatioRows
+	if minRatioRows <= 0 {
+		minRatioRows = defaultDiscardMinRatioRows
+	}
 
 	overCount := candidates > maxRows
 	// A ratio needs a denominator. With no rows at all there is nothing to be a
 	// fraction of, and the absolute limit is the only one that means anything.
-	overRatio := total > 0 && float64(candidates)/float64(total) > maxRatio
+	//
+	// The floor is the other half: below it, a percentage of a small table
+	// says nothing about whether the pass is sane. The absolute limit still
+	// covers the case the ratio is there for.
+	overRatio := total > 0 &&
+		candidates > minRatioRows &&
+		float64(candidates)/float64(total) > maxRatio
 
 	if !overCount && !overRatio {
 		return nil
@@ -442,7 +502,8 @@ func (b *DiscardBreaker) Allow(candidates, total int64) error {
 		zap.Int64("cluster_rows", total),
 		zap.Int64("max_rows", maxRows),
 		zap.Float64("max_ratio", maxRatio),
+		zap.Int64("min_ratio_rows", minRatioRows),
 	)
-	return fmt.Errorf("%w: %d of %d rows exceeds the limit of %d or %.0f%%",
-		ErrDiscardBreakerTripped, candidates, total, maxRows, maxRatio*100)
+	return fmt.Errorf("%w: %d of %d rows exceeds the limit of %d, or %.0f%% above %d rows",
+		ErrDiscardBreakerTripped, candidates, total, maxRows, maxRatio*100, minRatioRows)
 }

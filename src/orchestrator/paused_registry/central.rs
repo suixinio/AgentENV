@@ -375,9 +375,39 @@ impl CentralPausedSandboxRegistry {
                 snapshot_id,
             }))
             .await
-            .map_err(|status| Self::unreachable(operation, status))?;
+            .map_err(|status| {
+                Self::transition_failure(operation, sandbox_id, expect_generation, status)
+            })?;
 
         Ok(response.into_inner())
+    }
+
+    /// A failed transition, classified.
+    ///
+    /// 🔴 `Aborted` is the one status that is not a transport failure: the
+    /// controller reached the database, ran the statement, and it matched
+    /// nothing because the generation quoted is not the row's any more. That is
+    /// a distinct fact from "the write did not happen" — one says the caller's
+    /// view is stale and a re-read would fix it, the other says nothing is
+    /// known — and until now the node flattened both into `Backend`.
+    ///
+    /// The controller has always sent it (`registryErrorCode` maps
+    /// `ErrGenerationConflict` to `Aborted`, and deliberately not to
+    /// `FailedPrecondition`, which it reserves for a row no node can repair).
+    /// This is the other half of that contract finally being read.
+    fn transition_failure(
+        operation: &'static str,
+        sandbox_id: &SandboxId,
+        expect_generation: Option<i64>,
+        status: tonic::Status,
+    ) -> PausedRegistryError {
+        match (status.code(), expect_generation) {
+            (tonic::Code::Aborted, Some(expected)) => PausedRegistryError::GenerationConflict {
+                sandbox_id: sandbox_id.to_string(),
+                expected,
+            },
+            _ => Self::unreachable(operation, status),
+        }
     }
 }
 
@@ -1966,6 +1996,49 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// A conditional write that lost the race is not the same fact as a write
+    /// that never reached the database.
+    ///
+    /// The controller distinguishes them — `Aborted` for a stale generation,
+    /// everything else for a failure — and the node used to flatten both into
+    /// `Backend`. Nothing keys off the difference yet; carrying it is what makes
+    /// keying off it possible, and what stops a re-read loop over a row that
+    /// will never change from looking like a database outage.
+    #[tokio::test]
+    async fn a_stale_generation_is_a_conflict_not_an_outage() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+
+        *harness.fake.transition.lock().unwrap() =
+            Some(Err(Status::aborted("registry generation conflict")));
+
+        let failure = harness
+            .registry
+            .complete_pause(&sandbox_id, 7, &SnapshotId::generate())
+            .await
+            .expect_err("an aborted transition is a failure");
+
+        match failure {
+            PausedRegistryError::GenerationConflict { expected, .. } => assert_eq!(expected, 7),
+            other => panic!("a stale generation must not arrive as a transport failure: {other:?}"),
+        }
+
+        // 🔴 And only for the conditional writes. mark_running quotes no
+        // generation, so an Aborted there is the controller misbehaving rather
+        // than a race this caller lost — reading it as a conflict would invent
+        // a generation nobody supplied.
+        *harness.fake.transition.lock().unwrap() = Some(Err(Status::aborted("unexpected")));
+        let failure = harness
+            .registry
+            .mark_running(&sandbox_id, NODE)
+            .await
+            .expect_err("an aborted transition is a failure");
+        assert!(
+            matches!(failure, PausedRegistryError::Backend { .. }),
+            "an unconditional write cannot report a generation conflict, got {failure:?}"
+        );
     }
 
     /// The two conflicts are not interchangeable on the way in either.

@@ -5,7 +5,30 @@ metadata:
   labels:
     app.kubernetes.io/name: agentenv-scheduler
 spec:
+  # 🔴 One replica, and it stays one. The registry write surface would be safe
+  # with more — every statement it runs is a single conditional write, so two
+  # writers cannot corrupt each other — but this process is more than that
+  # surface. Bindings, observed-node state and the P2P artifact index all live
+  # in its memory, and a second replica would serve half the cluster from an
+  # empty copy of each. Sharing them needs `scheduler.redis_addr` and
+  # `--query-only` replicas, which is a different change from this one.
+  #
+  # What is fixed here is the window, not the count: since phase 2 this process
+  # is a hard dependency of every node's renewals, pauses and resumes, and how
+  # long it is absent during an upgrade was left entirely to the default
+  # rolling-update behaviour — which takes the only Pod down first.
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Start the replacement before retiring the incumbent. The two overlap for
+      # a few seconds and that is fine for the registry: both run the same
+      # single-statement conditional writes, and the new one's restart grace
+      # window withholds exactly the decisions a just-started process must not
+      # make. Taking the old one down first instead leaves a gap in which every
+      # node's registry call fails.
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: agentenv-scheduler

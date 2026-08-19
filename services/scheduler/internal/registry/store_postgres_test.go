@@ -265,35 +265,22 @@ func snapshotUUID(n int) string {
 // Migration
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMigrationIsTheNodesScriptVerbatim is the guard the whole switchover rests
-// on.
+// TestMigrateIsIdempotentOverATableTheNodeCreated is what the switchover rests
+// on, and it outlived the switchover.
 //
-// Every node configured with the `postgres` backend runs its own copy of this
-// script on every start, and two of its statements drop and re-add the state
-// CHECK unconditionally. The moment the two copies disagree about the set of
-// states — and one row exists carrying a state only this side knows — the next
-// node to start cannot add its constraint back and never comes up, with the
-// cause in a different process on a different machine.
-func TestMigrationIsTheNodesScriptVerbatim(t *testing.T) {
-	if SchemaDDL != schemaDDL {
-		t.Fatalf("the controller's migration has drifted from the node's SCHEMA_DDL.\ncontroller:\n%s\nnode:\n%s", SchemaDDL, schemaDDL)
-	}
-}
-
-// TestMigrateIsIdempotentOverATableTheNodeCreated is the switchover's hard
-// gate, made executable.
+// It used to have a companion asserting this migration was the node's own
+// script byte for byte, because during the changeover both processes ran it and
+// both dropped and re-added the state CHECK unconditionally. That companion is
+// gone with the node's copy: this process is the only writer now and may extend
+// the schema — the reclamation index below the original statements is the first
+// thing it added.
 //
-// During the changeover both a node and this controller bootstrap the same
-// table, and the node's script is unconditional about the state constraint:
-// every `postgres`-backend node runs `DROP CONSTRAINT IF EXISTS` +
-// `ADD CONSTRAINT` on every start. So this migration has to be a no-op over a
-// table the node built — and, since the node will run its own script again
-// afterwards, the shape this leaves behind has to be one the node's script
-// still applies cleanly to.
-//
-// The table here is created from a copy of the node's DDL rather than from
-// Migrate, which is the whole point: a paraphrase would pass against a table
-// this side built and fail against a real one.
+// What survives is the harder half. Every cluster that has ever run the old
+// backend has a table an old node built, and this migration has to be a no-op
+// over it — including the parts this side has since grown. So the table here is
+// created from a verbatim copy of that node's DDL rather than from Migrate,
+// which is the whole point: a paraphrase would pass against a table this side
+// built and fail against a real one.
 func TestMigrateIsIdempotentOverATableTheNodeCreated(t *testing.T) {
 	f := newStoreFixtureWithoutMigration(t)
 	ctx := context.Background()

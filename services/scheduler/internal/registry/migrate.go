@@ -26,8 +26,10 @@ import (
 // touched, which is the worst combination a schema owner can hand somebody.
 //
 // A column is the same story one step removed: a new NOT NULL column without a
-// default makes every insert the node still issues fail. Extending this belongs
-// to the release that removes the `postgres` backend, not to this one.
+// default makes every insert the node still issues fail. That constraint is
+// lifted now — the `postgres` backend is gone and this process is the only
+// writer — but only for additions no earlier writer could trip over. Indexes
+// qualify; a NOT NULL column still would not.
 //
 // Everything after the CREATE TABLE brings an already-deployed table up to the
 // current shape, because CREATE TABLE IF NOT EXISTS silently does nothing when
@@ -54,6 +56,18 @@ ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP
 ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS sandbox_expires_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
 CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
+-- Serves the two reclamation statements, which run on a timer against the whole
+-- cluster and until now had no index to stand on: they filter by cluster, by
+-- two live states, by a lapsed lease and by a deadline that has passed, and
+-- PostgreSQL answered that with a sequential scan. Affordable on a small table
+-- and not what this table will be.
+--
+-- Partial, because the rows reclamation must never miss are a minority of a
+-- large table: it only ever acts on live rows carrying a deadline. Indexing the
+-- rest would cost a write on every pause for entries these statements skip.
+CREATE INDEX IF NOT EXISTS paused_sandboxes_reclaim_idx
+    ON paused_sandboxes (cluster_id, sandbox_expires_at)
+    WHERE state IN ('running', 'resuming') AND sandbox_expires_at IS NOT NULL;
 `
 
 // schemaLockKey is the advisory lock the node takes around its own bootstrap,

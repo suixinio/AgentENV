@@ -318,7 +318,7 @@ func (e *contractEnv) markRunning(t *testing.T, cluster, sandboxID, node string)
 func (e *contractEnv) markRunningOutcome(t *testing.T, cluster, sandboxID, node string) MarkRunningOutcome {
 	t.Helper()
 
-	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node)
+	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node, nil)
 	if err != nil {
 		t.Fatalf("mark %s running on %s: %v", sandboxID, node, err)
 	}

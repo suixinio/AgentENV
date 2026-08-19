@@ -444,7 +444,7 @@ func TestAFailedPublishKeepsTheSnapshotTheSandboxAlreadyHad(t *testing.T) {
 
 	// Resume it, then pause it again — and let that second pause fail before it
 	// publishes anything.
-	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA); err != nil {
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, nil); err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
 	second := f.beginPause(id, stNodeA)
@@ -1190,7 +1190,7 @@ func TestMarkingAnUntrackedSandboxRunningReportsThatItIsUntracked(t *testing.T) 
 	f := newStoreFixture(t)
 	id := sandboxUUID(43)
 
-	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA)
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA, nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1216,7 +1216,7 @@ func TestMarkingRunningCannotEraseAnotherNodesClaim(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(44),
 	})
 
-	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c")
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1246,7 +1246,7 @@ func TestMarkingATrackedSandboxRunningReportsTheNodeAsHolder(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(45),
 	})
 
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1259,6 +1259,61 @@ func TestMarkingATrackedSandboxRunningReportsTheNodeAsHolder(t *testing.T) {
 	}
 	if row.generation != 5 {
 		t.Fatalf("mark_running bumps the generation, got %d", row.generation)
+	}
+}
+
+// 🔴 The permanent-orphan window.
+//
+// Reclamation requires a lapsed lease *and* a deadline that has passed, and
+// NULL is not a deadline that has passed — it never matches, at any point in
+// the future. Until D11 only renew_lease wrote the column, so every row spent
+// its first reconcile interval carrying none. A node lost inside that window
+// left a row that nothing could ever act on: not claimable (it is live), not
+// reclaimable (no deadline), not removable (nobody owns it).
+func TestMarkRunningStampsTheDeadlineReclamationNeeds(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(47)
+
+	f.seed(seedRow{
+		sandboxID: id, state: "resuming", generation: 4, originNode: stNodeA,
+		claimedBy: stNodeB, snapshotID: snapshotUUID(47),
+	})
+	if before := f.raw(id); before.sandboxExpiry != nil {
+		t.Fatalf("the fixture already carries a deadline, so this proves nothing: %+v", before)
+	}
+
+	deadline := f.dbNow().Add(2 * time.Hour)
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, &deadline); err != nil || outcome != MarkRunningAdopted {
+		t.Fatalf("mark_running failed: %v (%s)", err, outcome)
+	}
+
+	row := f.raw(id)
+	if row.sandboxExpiry == nil {
+		t.Fatal("a row marked running with a deadline must carry it before the first renewal")
+	}
+	if got := row.sandboxExpiry.Sub(deadline).Abs(); got > time.Second {
+		t.Fatalf("the deadline drifted by %s", got)
+	}
+}
+
+// A sandbox asked never to expire has to stay that way. Absent is not zero:
+// zero is a deadline in 1970, which reclamation acts on immediately.
+func TestMarkRunningLeavesAnAbsentDeadlineAbsent(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(48)
+
+	f.seed(seedRow{
+		sandboxID: id, state: "resuming", generation: 4, originNode: stNodeA,
+		claimedBy: stNodeB, snapshotID: snapshotUUID(48),
+	})
+
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, nil); err != nil {
+		t.Fatalf("mark_running failed: %v", err)
+	}
+	if row := f.raw(id); row.sandboxExpiry != nil {
+		t.Fatalf("a sandbox with no deadline was given one: %v", row.sandboxExpiry)
 	}
 }
 
@@ -1276,7 +1331,7 @@ func TestMarkRunningPropagatesARowItCannotDecode(t *testing.T) {
 	// re-read that follows has something to complain about.
 	f.seed(seedRow{sandboxID: id, state: "paused", originNode: stNodeA, claimedBy: stNodeB})
 
-	_, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c")
+	_, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", nil)
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
 	}
@@ -1877,7 +1932,7 @@ func TestOneClusterCannotReachAnothersSandboxes(t *testing.T) {
 	if matched, err := f.store.ReleaseClaim(ctx, f.cluster, id, 3); err != nil || matched {
 		t.Fatalf("release_claim reached another cluster: %v, %v", matched, err)
 	}
-	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA); err != nil || outcome != MarkRunningUntracked {
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, nil); err != nil || outcome != MarkRunningUntracked {
 		t.Fatalf("mark_running reached another cluster: %v, %v", outcome, err)
 	}
 	if renewed, err := f.store.RenewLease(ctx, f.cluster, "node-z", []HeldSandbox{{SandboxID: id}}); err != nil || renewed != 0 {

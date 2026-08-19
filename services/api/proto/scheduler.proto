@@ -516,6 +516,19 @@ message TransitionSandboxRequest {
   int64 lease_ttl_millis = 7;
   // complete_pause only.
   string snapshot_id = 8;
+  // mark_running only: when the sandbox this node just brought up is due to
+  // end.
+  //
+  // 🔴 The column it writes is half of what reclamation requires, and until now
+  // only renew_lease ever wrote it. A row therefore carried no deadline between
+  // being marked running and the node's first renewal — up to one reconcile
+  // interval — and reclamation's predicate needs `sandbox_expires_at < now()`,
+  // which NULL never satisfies. A node lost inside that window left a row
+  // nothing would ever reclaim: not claimable, not removable, forever.
+  //
+  // Absent means the sandbox was asked never to expire, which is a different
+  // fact from unknown and is why this is optional rather than a zero.
+  optional int64 sandbox_expires_at_unix_micros = 9;
 }
 
 message TransitionSandboxResponse {

@@ -4846,7 +4846,11 @@ impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
         Some("test-node".to_string())
     }
 
-    async fn mark_running(&self, sandbox_id: SandboxId) {
+    async fn mark_running(
+        &self,
+        sandbox_id: SandboxId,
+        _expires_at: Option<std::time::SystemTime>,
+    ) {
         self.marked_running.lock().unwrap().push(sandbox_id);
     }
 

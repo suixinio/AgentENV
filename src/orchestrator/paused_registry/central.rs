@@ -21,7 +21,7 @@
 //! and the sandbox record only on the two calls that need it.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -352,6 +352,32 @@ impl CentralPausedSandboxRegistry {
         metadata_json: Vec<u8>,
         snapshot_id: String,
     ) -> RegistryResult<pb::TransitionSandboxResponse> {
+        self.transition_with_deadline(
+            operation,
+            kind,
+            sandbox_id,
+            node_id,
+            expect_generation,
+            metadata_json,
+            snapshot_id,
+            None,
+        )
+        .await
+    }
+
+    /// `transition` for the one kind that also carries the sandbox's deadline.
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_with_deadline(
+        &self,
+        operation: &'static str,
+        kind: pb::TransitionKind,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+        expect_generation: Option<i64>,
+        metadata_json: Vec<u8>,
+        snapshot_id: String,
+        sandbox_expires_at_unix_micros: Option<i64>,
+    ) -> RegistryResult<pb::TransitionSandboxResponse> {
         // 🔴 The lease travels with every transition that stamps one, which is
         // all of them but `remove`: a row that is being deleted has no lease
         // left to stamp, and sending a TTL to a statement that does not write
@@ -373,6 +399,7 @@ impl CentralPausedSandboxRegistry {
                 metadata_json,
                 lease_ttl_millis,
                 snapshot_id,
+                sandbox_expires_at_unix_micros,
             }))
             .await
             .map_err(|status| {
@@ -408,6 +435,20 @@ impl CentralPausedSandboxRegistry {
             },
             _ => Self::unreachable(operation, status),
         }
+    }
+}
+
+/// Encodes a deadline for the wire.
+///
+/// 🔴 Microseconds, matching every other timestamp on this interface: the
+/// database stores `timestamptz` to the microsecond, so anything finer would
+/// round-trip a write as a silently truncated read. Times before the epoch
+/// saturate rather than wrap — a deadline that far in the past is already
+/// expired by any reading, and wrapping it would make it far in the future.
+fn micros_since_epoch(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_micros()).unwrap_or(i64::MAX),
+        Err(_) => i64::MIN,
     }
 }
 
@@ -699,9 +740,10 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {
         let response = self
-            .transition(
+            .transition_with_deadline(
                 "mark_running",
                 pb::TransitionKind::MarkRunning,
                 sandbox_id,
@@ -709,6 +751,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 None,
                 Vec::new(),
                 String::new(),
+                expires_at.map(micros_since_epoch),
             )
             .await?;
 
@@ -1627,7 +1670,7 @@ mod tests {
             .unwrap();
         harness
             .registry
-            .mark_running(&sandbox_id, OTHER)
+            .mark_running(&sandbox_id, OTHER, None)
             .await
             .unwrap();
         harness
@@ -1698,7 +1741,7 @@ mod tests {
             .unwrap();
         harness
             .registry
-            .mark_running(&sandbox_id, NODE)
+            .mark_running(&sandbox_id, NODE, None)
             .await
             .unwrap();
         harness
@@ -1990,12 +2033,55 @@ mod tests {
             assert_eq!(
                 harness
                     .registry
-                    .mark_running(&sandbox_id, NODE)
+                    .mark_running(&sandbox_id, NODE, None)
                     .await
                     .unwrap(),
                 expected
             );
         }
+    }
+
+    /// A resume carries the sandbox's deadline with it.
+    ///
+    /// 🔴 Not because anything reads it back, but because the column it writes
+    /// is half of what reclamation requires and NULL satisfies that half at no
+    /// point ever. Until this travelled with mark_running, only the first lease
+    /// renewal wrote it — and a node lost before that renewal left a row that
+    /// could not be reclaimed, claimed or removed by anything, permanently.
+    #[tokio::test]
+    async fn a_resume_reports_when_the_sandbox_is_due_to_end() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+        let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+
+        harness
+            .registry
+            .mark_running(&sandbox_id, NODE, Some(deadline))
+            .await
+            .expect("mark running");
+
+        let seen = harness.fake.seen_transition.lock().unwrap().clone();
+        let request = seen.last().expect("a transition was sent");
+        assert_eq!(
+            request.sandbox_expires_at_unix_micros,
+            Some(1_800_000_000_000_000)
+        );
+
+        // Absent stays absent: a sandbox asked never to expire is a different
+        // fact from one whose deadline is unknown, and reclamation leaves the
+        // first alone forever. A zero here would be a deadline in 1970.
+        harness
+            .registry
+            .mark_running(&sandbox_id, NODE, None)
+            .await
+            .expect("mark running");
+        let seen = harness.fake.seen_transition.lock().unwrap().clone();
+        assert_eq!(
+            seen.last()
+                .expect("a transition was sent")
+                .sandbox_expires_at_unix_micros,
+            None
+        );
     }
 
     /// A conditional write that lost the race is not the same fact as a write
@@ -2032,7 +2118,7 @@ mod tests {
         *harness.fake.transition.lock().unwrap() = Some(Err(Status::aborted("unexpected")));
         let failure = harness
             .registry
-            .mark_running(&sandbox_id, NODE)
+            .mark_running(&sandbox_id, NODE, None)
             .await
             .expect_err("an aborted transition is a failure");
         assert!(
@@ -2158,7 +2244,7 @@ mod tests {
             assert_eq!(
                 harness
                     .registry
-                    .mark_running(&sandbox_id, NODE)
+                    .mark_running(&sandbox_id, NODE, None)
                     .await
                     .unwrap(),
                 expected

@@ -1320,7 +1320,9 @@ impl Sandboxes<()> for ApiImpl {
                 // again here is idempotent and keeps a claim from sitting in
                 // `resuming` until its lease lapses.
                 if held.is_some() {
-                    self.paused.mark_sandbox_running(sandbox_id).await;
+                    self.paused
+                        .mark_sandbox_running(sandbox_id, metadata.expires_at)
+                        .await;
                 }
 
                 return Ok(

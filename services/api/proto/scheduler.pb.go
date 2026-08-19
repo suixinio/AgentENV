@@ -3178,9 +3178,22 @@ type TransitionSandboxRequest struct {
 	// remove.
 	LeaseTtlMillis int64 `protobuf:"varint,7,opt,name=lease_ttl_millis,json=leaseTtlMillis,proto3" json:"lease_ttl_millis,omitempty"`
 	// complete_pause only.
-	SnapshotId    string `protobuf:"bytes,8,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SnapshotId string `protobuf:"bytes,8,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// mark_running only: when the sandbox this node just brought up is due to
+	// end.
+	//
+	// 🔴 The column it writes is half of what reclamation requires, and until now
+	// only renew_lease ever wrote it. A row therefore carried no deadline between
+	// being marked running and the node's first renewal — up to one reconcile
+	// interval — and reclamation's predicate needs `sandbox_expires_at < now()`,
+	// which NULL never satisfies. A node lost inside that window left a row
+	// nothing would ever reclaim: not claimable, not removable, forever.
+	//
+	// Absent means the sandbox was asked never to expire, which is a different
+	// fact from unknown and is why this is optional rather than a zero.
+	SandboxExpiresAtUnixMicros *int64 `protobuf:"varint,9,opt,name=sandbox_expires_at_unix_micros,json=sandboxExpiresAtUnixMicros,proto3,oneof" json:"sandbox_expires_at_unix_micros,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *TransitionSandboxRequest) Reset() {
@@ -3267,6 +3280,13 @@ func (x *TransitionSandboxRequest) GetSnapshotId() string {
 		return x.SnapshotId
 	}
 	return ""
+}
+
+func (x *TransitionSandboxRequest) GetSandboxExpiresAtUnixMicros() int64 {
+	if x != nil && x.SandboxExpiresAtUnixMicros != nil {
+		return *x.SandboxExpiresAtUnixMicros
+	}
+	return 0
 }
 
 type TransitionSandboxResponse struct {
@@ -4237,7 +4257,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x14GetSandboxesResponse\x129\n" +
 	"\tsandboxes\x18\x01 \x03(\v2\x1b.scheduler.v1.RegistryEntryR\tsandboxes\x12.\n" +
 	"\x13covered_sandbox_ids\x18\x02 \x03(\tR\x11coveredSandboxIds\x12&\n" +
-	"\x0fnow_unix_micros\x18\x03 \x01(\x03R\rnowUnixMicros\"\xdb\x02\n" +
+	"\x0fnow_unix_micros\x18\x03 \x01(\x03R\rnowUnixMicros\"\xc7\x03\n" +
 	"\x18TransitionSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1d\n" +
@@ -4249,8 +4269,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\rmetadata_json\x18\x06 \x01(\fR\fmetadataJson\x12(\n" +
 	"\x10lease_ttl_millis\x18\a \x01(\x03R\x0eleaseTtlMillis\x12\x1f\n" +
 	"\vsnapshot_id\x18\b \x01(\tR\n" +
-	"snapshotIdB\x14\n" +
-	"\x12_expect_generation\"\x8f\x02\n" +
+	"snapshotId\x12G\n" +
+	"\x1esandbox_expires_at_unix_micros\x18\t \x01(\x03H\x01R\x1asandboxExpiresAtUnixMicros\x88\x01\x01B\x14\n" +
+	"\x12_expect_generationB!\n" +
+	"\x1f_sandbox_expires_at_unix_micros\"\x8f\x02\n" +
 	"\x19TransitionSandboxResponse\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x03R\n" +

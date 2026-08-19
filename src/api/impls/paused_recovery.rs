@@ -367,7 +367,9 @@ impl ApiImpl {
                 // The sandbox lives here now. Repointing the row is what tells
                 // its former node that its copy is stale, and keeps the
                 // snapshot around as this sandbox's durable fallback.
-                self.paused.mark_sandbox_running(sandbox_id).await;
+                self.paused
+                    .mark_sandbox_running(sandbox_id, metadata.expires_at)
+                    .await;
 
                 CrossNodeResume::Restored(Box::new(metadata))
             }

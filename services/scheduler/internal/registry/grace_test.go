@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 )
 
@@ -51,6 +52,42 @@ func TestNothingIsServedBeforeTheGateOpens(t *testing.T) {
 	}
 	if grace.allowsLeaseTakeover() {
 		t.Fatal("a cold gate allowed a lapsed-lease takeover")
+	}
+}
+
+// 🔴 A refused client RPC and this process holding back its own reclaim timer
+// are different events, and summing them made the counter useless.
+//
+// Measured: a completely healthy restart produces two or three reclaim
+// refusals, because the timer keeps firing through the grace window and is
+// supposed to be held back. Anything alerting on the total therefore has a
+// permanent floor of self-inflicted noise, and the one signal worth paging on —
+// nodes being turned away — is buried in it.
+func TestRefusalsSayWhoWasRefused(t *testing.T) {
+	grace := NewGrace(time.Hour, zap.NewNop())
+	if _, err := grace.Enter(context.Background(), &fakeExtender{}, stCluster); err != nil {
+		t.Fatalf("enter failed: %v", err)
+	}
+
+	rpcBefore := testutil.ToFloat64(registryGraceRefusals.WithLabelValues(refusalSourceRPC))
+	reclaimBefore := testutil.ToFloat64(registryGraceRefusals.WithLabelValues(refusalSourceReclaim))
+
+	// The RPC surface is open in the grace window; only reclamation is not.
+	if err := grace.Require(); err != nil {
+		t.Fatalf("the RPC surface must be open during the grace window: %v", err)
+	}
+	if err := grace.RequireServing(); !errors.Is(err, ErrGracePeriod) {
+		t.Fatalf("reclamation must be held back during the grace window, got %v", err)
+	}
+
+	rpcAfter := testutil.ToFloat64(registryGraceRefusals.WithLabelValues(refusalSourceRPC))
+	reclaimAfter := testutil.ToFloat64(registryGraceRefusals.WithLabelValues(refusalSourceReclaim))
+
+	if reclaimAfter-reclaimBefore != 1 {
+		t.Fatalf("the reclaim timer's refusal was not counted as one: %v -> %v", reclaimBefore, reclaimAfter)
+	}
+	if rpcAfter != rpcBefore {
+		t.Fatalf("an internal refusal was counted against the RPC surface: %v -> %v", rpcBefore, rpcAfter)
 	}
 }
 

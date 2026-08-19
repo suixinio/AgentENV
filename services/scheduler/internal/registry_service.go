@@ -267,7 +267,15 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		if err := rejectFields(req, fieldGeneration|fieldMetadata|fieldSnapshot); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId())
+		var expiresAt *time.Time
+		if req.SandboxExpiresAtUnixMicros != nil {
+			// Absent is not zero. Absent means the sandbox was asked never to
+			// expire and reclamation leaves it alone forever; zero would be a
+			// deadline in 1970, which reclamation acts on.
+			deadline := time.UnixMicro(req.GetSandboxExpiresAtUnixMicros()).UTC()
+			expiresAt = &deadline
+		}
+		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId(), expiresAt)
 		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}

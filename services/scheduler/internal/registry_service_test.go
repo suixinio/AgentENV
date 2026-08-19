@@ -46,9 +46,11 @@ type fakeStore struct {
 	released bool
 	removed  bool
 	// now is the database clock GetMany reports.
-	now   time.Time
-	began pausedregistry.BeganPause
-	err   error
+	now time.Time
+	// lastExpiresAt is the deadline the last MarkRunning carried.
+	lastExpiresAt *time.Time
+	began         pausedregistry.BeganPause
+	err           error
 
 	leaseTTL time.Duration
 
@@ -131,8 +133,9 @@ func (f *fakeStore) RenewLease(_ context.Context, _, _ string, held []pausedregi
 	return f.renewed, nil
 }
 
-func (f *fakeStore) MarkRunning(_ context.Context, _, _, _ string) (pausedregistry.MarkRunningOutcome, error) {
+func (f *fakeStore) MarkRunning(_ context.Context, _, _, _ string, expiresAt *time.Time) (pausedregistry.MarkRunningOutcome, error) {
 	f.record("MarkRunning")
+	f.lastExpiresAt = expiresAt
 	if f.err != nil {
 		return pausedregistry.MarkRunningUntracked, f.err
 	}

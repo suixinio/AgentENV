@@ -86,6 +86,7 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         &self,
         _sandbox_id: &SandboxId,
         _node_id: &str,
+        _expires_at: Option<std::time::SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {
         // Untracked, not held-elsewhere: this backend has no cluster to hold a
         // sandbox anywhere else.

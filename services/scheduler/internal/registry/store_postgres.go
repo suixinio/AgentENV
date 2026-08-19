@@ -820,11 +820,20 @@ func (s *PostgresStore) ReleaseClaim(ctx context.Context, clusterID, sandboxID s
 	return tag.RowsAffected() > 0, nil
 }
 
+// 🔴 sandbox_expires_at is written here, not left to the first renewal.
+//
+// Reclamation needs a lapsed lease *and* a passed deadline, and NULL is not a
+// passed deadline — it never matches, at any point in the future. Until D11 the
+// column was written only by renew_lease, so every row spent its first
+// reconcile interval carrying none, and a node lost inside that window left a
+// row that could not be reclaimed, claimed or removed by anything. e2b has no
+// equivalent gap because its catalog carries the expiry on every write.
 const markRunningSQL = `
 UPDATE paused_sandboxes
    SET state = 'running', origin_node_id = $2, claimed_by_node_id = NULL,
        generation = generation + 1, updated_at = now(),
-       lease_expires_at = now() + make_interval(secs => $3::double precision)
+       lease_expires_at = now() + make_interval(secs => $3::double precision),
+       sandbox_expires_at = $5
  WHERE sandbox_id = $1::uuid
    AND cluster_id = $4::uuid
    AND (claimed_by_node_id IS NULL OR claimed_by_node_id = $2)`
@@ -840,7 +849,7 @@ UPDATE paused_sandboxes
 // in-flight one. Without it a blind write here would clear claimed_by_node_id
 // mid-claim, and both nodes would go on to bring the same sandbox up believing
 // they held it.
-func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string) (MarkRunningOutcome, error) {
+func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string, expiresAt *time.Time) (MarkRunningOutcome, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
 		return MarkRunningUntracked, err
@@ -856,7 +865,7 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 
-	tag, err := s.pool.Exec(ctx, markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster)
+	tag, err := s.pool.Exec(ctx, markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster, expiresAt)
 	if err != nil {
 		return MarkRunningUntracked, fmt.Errorf("registry mark_running: %w", err)
 	}

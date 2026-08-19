@@ -23,6 +23,7 @@ mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -220,6 +221,7 @@ pub trait PausedSandboxRegistry: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome>;
 
     /// Hands back every live sandbox this node was holding when its previous
@@ -305,7 +307,15 @@ pub trait PausedSandboxPublisher: Send + Sync {
     async fn publish_paused(&self, outcome: PauseOutcome) -> Option<String>;
 
     /// Records that the sandbox is live on this node again.
-    async fn mark_running(&self, sandbox_id: SandboxId);
+    ///
+    /// `expires_at` is when the sandbox is due to end, and it travels with the
+    /// write rather than waiting for the first lease renewal. Reclamation needs
+    /// a lapsed lease *and* a passed deadline, and a row with no deadline
+    /// satisfies the second condition at no point ever — so a node lost in the
+    /// interval before its first renewal used to leave a row nothing could
+    /// reclaim, claim or remove again. `None` means the sandbox was asked never
+    /// to expire, which is a different fact and stays one.
+    async fn mark_running(&self, sandbox_id: SandboxId, expires_at: Option<SystemTime>);
 
     /// Drops the cluster's record of the sandbox and the snapshot behind it.
     async fn forget(&self, sandbox_id: SandboxId);

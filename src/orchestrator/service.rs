@@ -1625,7 +1625,13 @@ where
             // behind as the sandbox's durable fallback until the next pause
             // replaces it.
             if let Some(publisher) = self.paused_publisher() {
-                publisher.mark_running(sandbox_id).await;
+                // The deadline goes with the write. Reclamation needs one, and
+                // until the first lease renewal the row would otherwise carry
+                // none — a window in which losing this node strands the row
+                // permanently.
+                publisher
+                    .mark_running(sandbox_id, metadata.expires_at)
+                    .await;
             }
         }
         resumed

@@ -99,7 +99,15 @@ type Store interface {
 	// Those two were a single false until D11. The node used to re-read the row
 	// to tell them apart; once this moved behind an RPC that re-read happened
 	// here, and the distinction stopped crossing the wire at all.
-	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string) (MarkRunningOutcome, error)
+	//
+	// expiresAt is when the sandbox is due to end, and it is written here for
+	// the same reason RenewLease writes it: reclamation requires both a lapsed
+	// lease *and* a passed deadline, and a NULL deadline satisfies neither now
+	// nor ever. Before D11 only RenewLease wrote the column, so a row spent its
+	// first reconcile interval with no deadline at all — and a node lost inside
+	// that window left a row nothing could reclaim, claim or remove again.
+	// A nil expiresAt means the sandbox was asked never to expire.
+	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string, expiresAt *time.Time) (MarkRunningOutcome, error)
 
 	// ReleaseNodeHoldings frees the rows a previous process on this same
 	// machine was holding when it died.

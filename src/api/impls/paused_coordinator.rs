@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -425,11 +426,19 @@ impl PausedSandboxCoordinator {
     /// remains true that the cluster once named this node the holder, which is
     /// precisely the premise reconciliation needs to notice that it no longer
     /// does.
-    pub async fn mark_sandbox_running(&self, sandbox_id: SandboxId) {
+    pub async fn mark_sandbox_running(
+        &self,
+        sandbox_id: SandboxId,
+        expires_at: Option<SystemTime>,
+    ) {
         // Before the write: see `note_taking_sandbox_live`.
         self.note_taking_sandbox_live().await;
 
-        let confirmed = match self.registry.mark_running(&sandbox_id, &self.node_id).await {
+        let confirmed = match self
+            .registry
+            .mark_running(&sandbox_id, &self.node_id, expires_at)
+            .await
+        {
             Ok(MarkRunningOutcome::HeldElsewhere) => {
                 // 🔴 The cluster says another node holds the resume claim on a
                 // sandbox this one has just brought up. Both are about to run
@@ -613,8 +622,8 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
         self.publish(outcome).await
     }
 
-    async fn mark_running(&self, sandbox_id: SandboxId) {
-        self.mark_sandbox_running(sandbox_id).await;
+    async fn mark_running(&self, sandbox_id: SandboxId, expires_at: Option<SystemTime>) {
+        self.mark_sandbox_running(sandbox_id, expires_at).await;
     }
 
     async fn forget(&self, sandbox_id: SandboxId) {
@@ -985,7 +994,9 @@ mod tests {
         let registry = Arc::new(CountingRegistry::new(usize::MAX, true));
         let coordinator = coordinator(Arc::clone(&registry));
 
-        coordinator.mark_sandbox_running(SandboxId::new()).await;
+        coordinator
+            .mark_sandbox_running(SandboxId::new(), None)
+            .await;
 
         assert_eq!(
             coordinator.running_registration(&SandboxId::new()),
@@ -1007,7 +1018,9 @@ mod tests {
         let registry = Arc::new(CountingRegistry::always_failing());
         let coordinator = coordinator(Arc::clone(&registry));
 
-        coordinator.mark_sandbox_running(SandboxId::new()).await;
+        coordinator
+            .mark_sandbox_running(SandboxId::new(), None)
+            .await;
         coordinator.retain_running_registrations(&HashSet::new());
 
         assert_eq!(
@@ -1206,6 +1219,7 @@ pub(super) mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _node_id: &str,
+            _expires_at: Option<std::time::SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {
             if self.mark_running_fails {
                 return Err(unreachable_backend("mark_running"));

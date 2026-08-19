@@ -613,3 +613,311 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "api/proto/scheduler.proto",
 }
+
+const (
+	PausedRegistry_GetSandboxes_FullMethodName        = "/scheduler.v1.PausedRegistry/GetSandboxes"
+	PausedRegistry_TransitionSandbox_FullMethodName   = "/scheduler.v1.PausedRegistry/TransitionSandbox"
+	PausedRegistry_AcquireSandbox_FullMethodName      = "/scheduler.v1.PausedRegistry/AcquireSandbox"
+	PausedRegistry_RenewNodeLease_FullMethodName      = "/scheduler.v1.PausedRegistry/RenewNodeLease"
+	PausedRegistry_ReleaseNodeHoldings_FullMethodName = "/scheduler.v1.PausedRegistry/ReleaseNodeHoldings"
+)
+
+// PausedRegistryClient is the client API for PausedRegistry service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// PausedRegistry: the paused-sandbox registry, served by whoever owns the
+// database instead of by every node against it directly.
+//
+// The five methods here cover thirteen operations on the node side. The
+// narrowing is deliberate: a wire contract shaped like the node's own trait
+// would make "the node decides" a cross-process contract, and the next stage
+// begins by deleting that. What survives the next stage is shaped like this.
+//
+// Every request carries cluster_id and node_id. The node scopes each statement
+// rather than the connection, and one cluster reaching another's sandboxes is a
+// case its tests cover; making the scope implicit here is how that property
+// gets lost.
+//
+// 🔴 No method may answer a failure with an empty result. A sandbox missing
+// from GetSandboxes means the row does not exist, and the caller deletes local
+// artifacts on the strength of that. Anything that went wrong is an RPC error.
+// ─────────────────────────────────────────────────────────────────────────────
+type PausedRegistryClient interface {
+	// Reads rows in bulk. All-or-nothing: any backend failure is an error, never
+	// a shorter map. Carries no metadata — no bulk consumer reads it.
+	GetSandboxes(ctx context.Context, in *GetSandboxesRequest, opts ...grpc.CallOption) (*GetSandboxesResponse, error)
+	// Moves a sandbox between states. Covers begin_pause, complete_pause,
+	// mark_local_only, mark_running, release_claim and remove.
+	TransitionSandbox(ctx context.Context, in *TransitionSandboxRequest, opts ...grpc.CallOption) (*TransitionSandboxResponse, error)
+	// Takes a sandbox for a resume, deciding on the server which of the three
+	// cases applies. Carries metadata, for the one row it answers with.
+	AcquireSandbox(ctx context.Context, in *AcquireSandboxRequest, opts ...grpc.CallOption) (*AcquireSandboxResponse, error)
+	// Extends the lease on everything a node reports holding.
+	RenewNodeLease(ctx context.Context, in *RenewNodeLeaseRequest, opts ...grpc.CallOption) (*RenewNodeLeaseResponse, error)
+	// Frees what a previous process on the same machine was holding.
+	ReleaseNodeHoldings(ctx context.Context, in *ReleaseNodeHoldingsRequest, opts ...grpc.CallOption) (*ReleaseNodeHoldingsResponse, error)
+}
+
+type pausedRegistryClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewPausedRegistryClient(cc grpc.ClientConnInterface) PausedRegistryClient {
+	return &pausedRegistryClient{cc}
+}
+
+func (c *pausedRegistryClient) GetSandboxes(ctx context.Context, in *GetSandboxesRequest, opts ...grpc.CallOption) (*GetSandboxesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxesResponse)
+	err := c.cc.Invoke(ctx, PausedRegistry_GetSandboxes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pausedRegistryClient) TransitionSandbox(ctx context.Context, in *TransitionSandboxRequest, opts ...grpc.CallOption) (*TransitionSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TransitionSandboxResponse)
+	err := c.cc.Invoke(ctx, PausedRegistry_TransitionSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pausedRegistryClient) AcquireSandbox(ctx context.Context, in *AcquireSandboxRequest, opts ...grpc.CallOption) (*AcquireSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcquireSandboxResponse)
+	err := c.cc.Invoke(ctx, PausedRegistry_AcquireSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pausedRegistryClient) RenewNodeLease(ctx context.Context, in *RenewNodeLeaseRequest, opts ...grpc.CallOption) (*RenewNodeLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewNodeLeaseResponse)
+	err := c.cc.Invoke(ctx, PausedRegistry_RenewNodeLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pausedRegistryClient) ReleaseNodeHoldings(ctx context.Context, in *ReleaseNodeHoldingsRequest, opts ...grpc.CallOption) (*ReleaseNodeHoldingsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseNodeHoldingsResponse)
+	err := c.cc.Invoke(ctx, PausedRegistry_ReleaseNodeHoldings_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PausedRegistryServer is the server API for PausedRegistry service.
+// All implementations must embed UnimplementedPausedRegistryServer
+// for forward compatibility.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// PausedRegistry: the paused-sandbox registry, served by whoever owns the
+// database instead of by every node against it directly.
+//
+// The five methods here cover thirteen operations on the node side. The
+// narrowing is deliberate: a wire contract shaped like the node's own trait
+// would make "the node decides" a cross-process contract, and the next stage
+// begins by deleting that. What survives the next stage is shaped like this.
+//
+// Every request carries cluster_id and node_id. The node scopes each statement
+// rather than the connection, and one cluster reaching another's sandboxes is a
+// case its tests cover; making the scope implicit here is how that property
+// gets lost.
+//
+// 🔴 No method may answer a failure with an empty result. A sandbox missing
+// from GetSandboxes means the row does not exist, and the caller deletes local
+// artifacts on the strength of that. Anything that went wrong is an RPC error.
+// ─────────────────────────────────────────────────────────────────────────────
+type PausedRegistryServer interface {
+	// Reads rows in bulk. All-or-nothing: any backend failure is an error, never
+	// a shorter map. Carries no metadata — no bulk consumer reads it.
+	GetSandboxes(context.Context, *GetSandboxesRequest) (*GetSandboxesResponse, error)
+	// Moves a sandbox between states. Covers begin_pause, complete_pause,
+	// mark_local_only, mark_running, release_claim and remove.
+	TransitionSandbox(context.Context, *TransitionSandboxRequest) (*TransitionSandboxResponse, error)
+	// Takes a sandbox for a resume, deciding on the server which of the three
+	// cases applies. Carries metadata, for the one row it answers with.
+	AcquireSandbox(context.Context, *AcquireSandboxRequest) (*AcquireSandboxResponse, error)
+	// Extends the lease on everything a node reports holding.
+	RenewNodeLease(context.Context, *RenewNodeLeaseRequest) (*RenewNodeLeaseResponse, error)
+	// Frees what a previous process on the same machine was holding.
+	ReleaseNodeHoldings(context.Context, *ReleaseNodeHoldingsRequest) (*ReleaseNodeHoldingsResponse, error)
+	mustEmbedUnimplementedPausedRegistryServer()
+}
+
+// UnimplementedPausedRegistryServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedPausedRegistryServer struct{}
+
+func (UnimplementedPausedRegistryServer) GetSandboxes(context.Context, *GetSandboxesRequest) (*GetSandboxesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxes not implemented")
+}
+func (UnimplementedPausedRegistryServer) TransitionSandbox(context.Context, *TransitionSandboxRequest) (*TransitionSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TransitionSandbox not implemented")
+}
+func (UnimplementedPausedRegistryServer) AcquireSandbox(context.Context, *AcquireSandboxRequest) (*AcquireSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcquireSandbox not implemented")
+}
+func (UnimplementedPausedRegistryServer) RenewNodeLease(context.Context, *RenewNodeLeaseRequest) (*RenewNodeLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewNodeLease not implemented")
+}
+func (UnimplementedPausedRegistryServer) ReleaseNodeHoldings(context.Context, *ReleaseNodeHoldingsRequest) (*ReleaseNodeHoldingsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseNodeHoldings not implemented")
+}
+func (UnimplementedPausedRegistryServer) mustEmbedUnimplementedPausedRegistryServer() {}
+func (UnimplementedPausedRegistryServer) testEmbeddedByValue()                        {}
+
+// UnsafePausedRegistryServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to PausedRegistryServer will
+// result in compilation errors.
+type UnsafePausedRegistryServer interface {
+	mustEmbedUnimplementedPausedRegistryServer()
+}
+
+func RegisterPausedRegistryServer(s grpc.ServiceRegistrar, srv PausedRegistryServer) {
+	// If the following call panics, it indicates UnimplementedPausedRegistryServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&PausedRegistry_ServiceDesc, srv)
+}
+
+func _PausedRegistry_GetSandboxes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PausedRegistryServer).GetSandboxes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PausedRegistry_GetSandboxes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PausedRegistryServer).GetSandboxes(ctx, req.(*GetSandboxesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PausedRegistry_TransitionSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TransitionSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PausedRegistryServer).TransitionSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PausedRegistry_TransitionSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PausedRegistryServer).TransitionSandbox(ctx, req.(*TransitionSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PausedRegistry_AcquireSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcquireSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PausedRegistryServer).AcquireSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PausedRegistry_AcquireSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PausedRegistryServer).AcquireSandbox(ctx, req.(*AcquireSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PausedRegistry_RenewNodeLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewNodeLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PausedRegistryServer).RenewNodeLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PausedRegistry_RenewNodeLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PausedRegistryServer).RenewNodeLease(ctx, req.(*RenewNodeLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PausedRegistry_ReleaseNodeHoldings_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseNodeHoldingsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PausedRegistryServer).ReleaseNodeHoldings(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PausedRegistry_ReleaseNodeHoldings_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PausedRegistryServer).ReleaseNodeHoldings(ctx, req.(*ReleaseNodeHoldingsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// PausedRegistry_ServiceDesc is the grpc.ServiceDesc for PausedRegistry service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var PausedRegistry_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "scheduler.v1.PausedRegistry",
+	HandlerType: (*PausedRegistryServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetSandboxes",
+			Handler:    _PausedRegistry_GetSandboxes_Handler,
+		},
+		{
+			MethodName: "TransitionSandbox",
+			Handler:    _PausedRegistry_TransitionSandbox_Handler,
+		},
+		{
+			MethodName: "AcquireSandbox",
+			Handler:    _PausedRegistry_AcquireSandbox_Handler,
+		},
+		{
+			MethodName: "RenewNodeLease",
+			Handler:    _PausedRegistry_RenewNodeLease_Handler,
+		},
+		{
+			MethodName: "ReleaseNodeHoldings",
+			Handler:    _PausedRegistry_ReleaseNodeHoldings_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "api/proto/scheduler.proto",
+}

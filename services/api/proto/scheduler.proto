@@ -362,3 +362,216 @@ message ListRegistrySandboxesResponse {
   // only meaningful relative to this, never to the reader's own clock.
   int64 database_now_unix_ms = 3;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PausedRegistry: the paused-sandbox registry, served by whoever owns the
+// database instead of by every node against it directly.
+//
+// The five methods here cover thirteen operations on the node side. The
+// narrowing is deliberate: a wire contract shaped like the node's own trait
+// would make "the node decides" a cross-process contract, and the next stage
+// begins by deleting that. What survives the next stage is shaped like this.
+//
+// Every request carries cluster_id and node_id. The node scopes each statement
+// rather than the connection, and one cluster reaching another's sandboxes is a
+// case its tests cover; making the scope implicit here is how that property
+// gets lost.
+//
+// 🔴 No method may answer a failure with an empty result. A sandbox missing
+// from GetSandboxes means the row does not exist, and the caller deletes local
+// artifacts on the strength of that. Anything that went wrong is an RPC error.
+// ─────────────────────────────────────────────────────────────────────────────
+service PausedRegistry {
+  // Reads rows in bulk. All-or-nothing: any backend failure is an error, never
+  // a shorter map. Carries no metadata — no bulk consumer reads it.
+  rpc GetSandboxes(GetSandboxesRequest) returns (GetSandboxesResponse);
+
+  // Moves a sandbox between states. Covers begin_pause, complete_pause,
+  // mark_local_only, mark_running, release_claim and remove.
+  rpc TransitionSandbox(TransitionSandboxRequest) returns (TransitionSandboxResponse);
+
+  // Takes a sandbox for a resume, deciding on the server which of the three
+  // cases applies. Carries metadata, for the one row it answers with.
+  rpc AcquireSandbox(AcquireSandboxRequest) returns (AcquireSandboxResponse);
+
+  // Extends the lease on everything a node reports holding.
+  rpc RenewNodeLease(RenewNodeLeaseRequest) returns (RenewNodeLeaseResponse);
+
+  // Frees what a previous process on the same machine was holding.
+  rpc ReleaseNodeHoldings(ReleaseNodeHoldingsRequest) returns (ReleaseNodeHoldingsResponse);
+}
+
+// RegistryEntry is one row, without metadata.
+message RegistryEntry {
+  string sandbox_id = 1;
+  string cluster_id = 2;
+  // One of publishing, paused, resuming, local_only, running.
+  //
+  // A string rather than an enum because the table's CHECK constraint is the
+  // source of truth and it belongs to whoever migrates the database. A value
+  // this build has not heard of has to reach an operator's screen intact
+  // rather than flatten into UNSPECIFIED alongside a genuinely absent one.
+  string state = 3;
+  int64 generation = 4;
+  // The node holding the local artifacts. A claim deliberately leaves this
+  // pointing at the previous holder, so it is not the answer to "who owns this
+  // row now" while state is resuming — claimed_by_node_id is.
+  string origin_node_id = 5;
+  // Set only while state is resuming.
+  string claimed_by_node_id = 6;
+  // Empty while publishing, and after a publish that failed.
+  string snapshot_id = 7;
+  // 🔴 Microseconds, not nanoseconds and not seconds. PostgreSQL stores
+  // timestamptz to the microsecond and the node's clock type is nanosecond, so
+  // nanoseconds would round-trip a write as a silently truncated read; seconds
+  // would make two transitions within the same second unorderable.
+  int64 paused_at_unix_micros = 8;
+  int64 updated_at_unix_micros = 9;
+}
+
+message GetSandboxesRequest {
+  string cluster_id = 1;
+  repeated string sandbox_ids = 2;
+}
+
+message GetSandboxesResponse {
+  // Only the sandboxes that have rows. An id that was asked for and is absent
+  // here has no row.
+  repeated RegistryEntry sandboxes = 1;
+}
+
+// TransitionKind is which of the node-side operations this is.
+enum TransitionKind {
+  TRANSITION_KIND_UNSPECIFIED = 0;
+  // Records that a pause has started. Carries metadata and the lease TTL;
+  // answers with the generation to quote and the snapshot this pause orphaned.
+  TRANSITION_KIND_BEGIN_PAUSE = 1;
+  // Publishes the snapshot a pause produced. Requires expect_generation.
+  TRANSITION_KIND_COMPLETE_PAUSE = 2;
+  // Records that the snapshot never reached the repository. Requires
+  // expect_generation.
+  TRANSITION_KIND_MARK_LOCAL_ONLY = 3;
+  // Records that a sandbox is live on this node. Never creates a row.
+  TRANSITION_KIND_MARK_RUNNING = 4;
+  // Hands a claimed sandbox back unresumed. Requires expect_generation.
+  TRANSITION_KIND_RELEASE_CLAIM = 5;
+  // Deletes the row.
+  TRANSITION_KIND_REMOVE = 6;
+}
+
+message TransitionSandboxRequest {
+  string cluster_id = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+  TransitionKind kind = 4;
+  // Required on the three transitions that are conditional — complete_pause,
+  // mark_local_only and release_claim — and refused on the other three.
+  //
+  // Three, not four: the node's SQL carries `AND generation = $n` in exactly
+  // those places. claim_for_resume and mark_running read as though they were
+  // conditional too, but their predicates are on state and holder, never on
+  // generation, so quoting one at them would suggest a guarantee they do not
+  // give.
+  optional int64 expect_generation = 5;
+  // 🔴 Raw JSON bytes, passed through untouched. Not google.protobuf.Struct:
+  // that reorders keys, collapses integers into doubles, and normalises what it
+  // does not recognise, and the type on the other side does not reject unknown
+  // fields — so a field lost in translation is lost silently.
+  bytes metadata_json = 6;
+  // 🔴 The lease TTL belongs to the node, not to this service. The node renews
+  // on its own cadence and its configuration enforces that the TTL leaves room
+  // for two missed renewals; a TTL chosen here instead would expire rows
+  // underneath a node that is renewing exactly as it was told to. So it travels
+  // with every transition that stamps a lease — which is all of them except
+  // remove.
+  int64 lease_ttl_millis = 7;
+  // complete_pause only.
+  string snapshot_id = 8;
+}
+
+message TransitionSandboxResponse {
+  // begin_pause only: the generation to quote when finishing.
+  int64 generation = 1;
+  // begin_pause only: the snapshot this pause replaced, empty when there was
+  // none. Nothing references it once the pause completes.
+  string previous_snapshot_id = 2;
+  // mark_running only: whether the cluster tracks this sandbox and now names
+  // this node as its holder. False means there is no row, which is what a
+  // sandbox that has never been paused looks like — not an error.
+  bool tracked = 3;
+}
+
+message AcquireSandboxRequest {
+  string cluster_id = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+  // A successful claim stamps a fresh lease; see TransitionSandboxRequest.
+  int64 lease_ttl_millis = 4;
+}
+
+message AcquiredSandbox {
+  RegistryEntry entry = 1;
+  // Raw JSON bytes; see TransitionSandboxRequest.metadata_json.
+  bytes metadata_json = 2;
+  // 🔴 What the row said *before* the claim moved it to resuming, read in the
+  // same statement rather than off the returned row — RETURNING hands back the
+  // row as the update left it, so reading state there always says resuming.
+  //
+  // publishing or local_only here means the claim overrode a node that never
+  // finished uploading: the sandbox comes back one snapshot behind and the work
+  // since then is gone. That is the one event on this path an operator has to
+  // be able to find, so it is carried explicitly rather than inferred.
+  string previous_state = 3;
+}
+
+message AcquireOriginRef {
+  string origin_node_id = 1;
+}
+
+message AcquireSandboxResponse {
+  oneof outcome {
+    // The caller owns it and must resume it or release the claim.
+    AcquiredSandbox claimed = 1;
+    // No row: unknown to the cluster.
+    AcquireNotFound not_found = 2;
+    // Still uploading, so only the origin node can serve this resume.
+    AcquireOriginRef not_ready = 3;
+    // Live elsewhere, or a claim this caller lost.
+    AcquireOriginRef conflict = 4;
+  }
+}
+
+message AcquireNotFound {}
+
+message HeldSandbox {
+  string sandbox_id = 1;
+  // When this sandbox is currently due to end. Absent means it was asked never
+  // to expire, which is not the same as unknown: reclamation leaves it alone
+  // forever.
+  optional int64 expires_at_unix_micros = 2;
+}
+
+message RenewNodeLeaseRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  repeated HeldSandbox held = 3;
+  int64 lease_ttl_millis = 4;
+}
+
+message RenewNodeLeaseResponse {
+  uint64 renewed = 1;
+}
+
+message ReleaseNodeHoldingsRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+}
+
+message ReleaseNodeHoldingsResponse {
+  // Handed back to the cluster as paused, recoverable from the snapshot they
+  // name.
+  uint64 released = 1;
+  // Deleted because no snapshot was ever published for them, so nothing remains
+  // to rebuild the sandbox from.
+  uint64 discarded = 2;
+}

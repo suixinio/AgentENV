@@ -93,20 +93,21 @@ func setupRegistryDatabase(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = conn.Close(context.Background()) })
 
-	var exists bool
-	if err := conn.QueryRow(ctx, "SELECT to_regclass('public.paused_sandboxes') IS NOT NULL").Scan(&exists); err != nil {
-		t.Fatalf("probe for an existing table failed: %v", err)
-	}
-	if exists {
-		t.Fatalf("paused_sandboxes already exists in the test database; refusing to run because this test drops it")
-	}
-
+	// The DDL is the node's own, verbatim and idempotent, so sharing the table
+	// with whatever else uses this database is fine. What is not fine is
+	// dropping it: this test used to, and guarded that by refusing to run when
+	// the table already existed — which made running the suite twice, or
+	// alongside any other test that needs the table, a failure rather than a
+	// pass. Each test owns its rows by cluster id and removes those instead.
 	if _, err := conn.Exec(ctx, schemaDDL); err != nil {
 		t.Fatalf("create schema failed: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := conn.Exec(context.Background(), "DROP TABLE IF EXISTS paused_sandboxes"); err != nil {
-			t.Logf("drop test table failed: %v", err)
+		if _, err := conn.Exec(context.Background(),
+			"DELETE FROM paused_sandboxes WHERE cluster_id = ANY($1::uuid[])",
+			[]string{clusterA, clusterB},
+		); err != nil {
+			t.Logf("clean up test rows failed: %v", err)
 		}
 	})
 

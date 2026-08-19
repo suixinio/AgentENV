@@ -227,6 +227,76 @@ func (SandboxEventType) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{2}
 }
 
+// TransitionKind is which of the node-side operations this is.
+type TransitionKind int32
+
+const (
+	TransitionKind_TRANSITION_KIND_UNSPECIFIED TransitionKind = 0
+	// Records that a pause has started. Carries metadata and the lease TTL;
+	// answers with the generation to quote and the snapshot this pause orphaned.
+	TransitionKind_TRANSITION_KIND_BEGIN_PAUSE TransitionKind = 1
+	// Publishes the snapshot a pause produced. Requires expect_generation.
+	TransitionKind_TRANSITION_KIND_COMPLETE_PAUSE TransitionKind = 2
+	// Records that the snapshot never reached the repository. Requires
+	// expect_generation.
+	TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY TransitionKind = 3
+	// Records that a sandbox is live on this node. Never creates a row.
+	TransitionKind_TRANSITION_KIND_MARK_RUNNING TransitionKind = 4
+	// Hands a claimed sandbox back unresumed. Requires expect_generation.
+	TransitionKind_TRANSITION_KIND_RELEASE_CLAIM TransitionKind = 5
+	// Deletes the row.
+	TransitionKind_TRANSITION_KIND_REMOVE TransitionKind = 6
+)
+
+// Enum value maps for TransitionKind.
+var (
+	TransitionKind_name = map[int32]string{
+		0: "TRANSITION_KIND_UNSPECIFIED",
+		1: "TRANSITION_KIND_BEGIN_PAUSE",
+		2: "TRANSITION_KIND_COMPLETE_PAUSE",
+		3: "TRANSITION_KIND_MARK_LOCAL_ONLY",
+		4: "TRANSITION_KIND_MARK_RUNNING",
+		5: "TRANSITION_KIND_RELEASE_CLAIM",
+		6: "TRANSITION_KIND_REMOVE",
+	}
+	TransitionKind_value = map[string]int32{
+		"TRANSITION_KIND_UNSPECIFIED":     0,
+		"TRANSITION_KIND_BEGIN_PAUSE":     1,
+		"TRANSITION_KIND_COMPLETE_PAUSE":  2,
+		"TRANSITION_KIND_MARK_LOCAL_ONLY": 3,
+		"TRANSITION_KIND_MARK_RUNNING":    4,
+		"TRANSITION_KIND_RELEASE_CLAIM":   5,
+		"TRANSITION_KIND_REMOVE":          6,
+	}
+)
+
+func (x TransitionKind) Enum() *TransitionKind {
+	p := new(TransitionKind)
+	*p = x
+	return p
+}
+
+func (x TransitionKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TransitionKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[3].Descriptor()
+}
+
+func (TransitionKind) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[3]
+}
+
+func (x TransitionKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TransitionKind.Descriptor instead.
+func (TransitionKind) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{3}
+}
+
 type Node struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -2692,6 +2762,1024 @@ func (x *ListRegistrySandboxesResponse) GetDatabaseNowUnixMs() int64 {
 	return 0
 }
 
+// RegistryEntry is one row, without metadata.
+type RegistryEntry struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	ClusterId string                 `protobuf:"bytes,2,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// One of publishing, paused, resuming, local_only, running.
+	//
+	// A string rather than an enum because the table's CHECK constraint is the
+	// source of truth and it belongs to whoever migrates the database. A value
+	// this build has not heard of has to reach an operator's screen intact
+	// rather than flatten into UNSPECIFIED alongside a genuinely absent one.
+	State      string `protobuf:"bytes,3,opt,name=state,proto3" json:"state,omitempty"`
+	Generation int64  `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
+	// The node holding the local artifacts. A claim deliberately leaves this
+	// pointing at the previous holder, so it is not the answer to "who owns this
+	// row now" while state is resuming — claimed_by_node_id is.
+	OriginNodeId string `protobuf:"bytes,5,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	// Set only while state is resuming.
+	ClaimedByNodeId string `protobuf:"bytes,6,opt,name=claimed_by_node_id,json=claimedByNodeId,proto3" json:"claimed_by_node_id,omitempty"`
+	// Empty while publishing, and after a publish that failed.
+	SnapshotId string `protobuf:"bytes,7,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// 🔴 Microseconds, not nanoseconds and not seconds. PostgreSQL stores
+	// timestamptz to the microsecond and the node's clock type is nanosecond, so
+	// nanoseconds would round-trip a write as a silently truncated read; seconds
+	// would make two transitions within the same second unorderable.
+	PausedAtUnixMicros  int64 `protobuf:"varint,8,opt,name=paused_at_unix_micros,json=pausedAtUnixMicros,proto3" json:"paused_at_unix_micros,omitempty"`
+	UpdatedAtUnixMicros int64 `protobuf:"varint,9,opt,name=updated_at_unix_micros,json=updatedAtUnixMicros,proto3" json:"updated_at_unix_micros,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *RegistryEntry) Reset() {
+	*x = RegistryEntry{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegistryEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegistryEntry) ProtoMessage() {}
+
+func (x *RegistryEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegistryEntry.ProtoReflect.Descriptor instead.
+func (*RegistryEntry) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *RegistryEntry) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *RegistryEntry) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *RegistryEntry) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *RegistryEntry) GetGeneration() int64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *RegistryEntry) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+func (x *RegistryEntry) GetClaimedByNodeId() string {
+	if x != nil {
+		return x.ClaimedByNodeId
+	}
+	return ""
+}
+
+func (x *RegistryEntry) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *RegistryEntry) GetPausedAtUnixMicros() int64 {
+	if x != nil {
+		return x.PausedAtUnixMicros
+	}
+	return 0
+}
+
+func (x *RegistryEntry) GetUpdatedAtUnixMicros() int64 {
+	if x != nil {
+		return x.UpdatedAtUnixMicros
+	}
+	return 0
+}
+
+type GetSandboxesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId     string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	SandboxIds    []string               `protobuf:"bytes,2,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSandboxesRequest) Reset() {
+	*x = GetSandboxesRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSandboxesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSandboxesRequest) ProtoMessage() {}
+
+func (x *GetSandboxesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSandboxesRequest.ProtoReflect.Descriptor instead.
+func (*GetSandboxesRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *GetSandboxesRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *GetSandboxesRequest) GetSandboxIds() []string {
+	if x != nil {
+		return x.SandboxIds
+	}
+	return nil
+}
+
+type GetSandboxesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Only the sandboxes that have rows. An id that was asked for and is absent
+	// here has no row.
+	Sandboxes     []*RegistryEntry `protobuf:"bytes,1,rep,name=sandboxes,proto3" json:"sandboxes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSandboxesResponse) Reset() {
+	*x = GetSandboxesResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSandboxesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSandboxesResponse) ProtoMessage() {}
+
+func (x *GetSandboxesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSandboxesResponse.ProtoReflect.Descriptor instead.
+func (*GetSandboxesResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *GetSandboxesResponse) GetSandboxes() []*RegistryEntry {
+	if x != nil {
+		return x.Sandboxes
+	}
+	return nil
+}
+
+type TransitionSandboxRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	SandboxId string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	NodeId    string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Kind      TransitionKind         `protobuf:"varint,4,opt,name=kind,proto3,enum=scheduler.v1.TransitionKind" json:"kind,omitempty"`
+	// Required on the three transitions that are conditional — complete_pause,
+	// mark_local_only and release_claim — and refused on the other three.
+	//
+	// Three, not four: the node's SQL carries `AND generation = $n` in exactly
+	// those places. claim_for_resume and mark_running read as though they were
+	// conditional too, but their predicates are on state and holder, never on
+	// generation, so quoting one at them would suggest a guarantee they do not
+	// give.
+	ExpectGeneration *int64 `protobuf:"varint,5,opt,name=expect_generation,json=expectGeneration,proto3,oneof" json:"expect_generation,omitempty"`
+	// 🔴 Raw JSON bytes, passed through untouched. Not google.protobuf.Struct:
+	// that reorders keys, collapses integers into doubles, and normalises what it
+	// does not recognise, and the type on the other side does not reject unknown
+	// fields — so a field lost in translation is lost silently.
+	MetadataJson []byte `protobuf:"bytes,6,opt,name=metadata_json,json=metadataJson,proto3" json:"metadata_json,omitempty"`
+	// 🔴 The lease TTL belongs to the node, not to this service. The node renews
+	// on its own cadence and its configuration enforces that the TTL leaves room
+	// for two missed renewals; a TTL chosen here instead would expire rows
+	// underneath a node that is renewing exactly as it was told to. So it travels
+	// with every transition that stamps a lease — which is all of them except
+	// remove.
+	LeaseTtlMillis int64 `protobuf:"varint,7,opt,name=lease_ttl_millis,json=leaseTtlMillis,proto3" json:"lease_ttl_millis,omitempty"`
+	// complete_pause only.
+	SnapshotId    string `protobuf:"bytes,8,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransitionSandboxRequest) Reset() {
+	*x = TransitionSandboxRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransitionSandboxRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransitionSandboxRequest) ProtoMessage() {}
+
+func (x *TransitionSandboxRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransitionSandboxRequest.ProtoReflect.Descriptor instead.
+func (*TransitionSandboxRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *TransitionSandboxRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *TransitionSandboxRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *TransitionSandboxRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *TransitionSandboxRequest) GetKind() TransitionKind {
+	if x != nil {
+		return x.Kind
+	}
+	return TransitionKind_TRANSITION_KIND_UNSPECIFIED
+}
+
+func (x *TransitionSandboxRequest) GetExpectGeneration() int64 {
+	if x != nil && x.ExpectGeneration != nil {
+		return *x.ExpectGeneration
+	}
+	return 0
+}
+
+func (x *TransitionSandboxRequest) GetMetadataJson() []byte {
+	if x != nil {
+		return x.MetadataJson
+	}
+	return nil
+}
+
+func (x *TransitionSandboxRequest) GetLeaseTtlMillis() int64 {
+	if x != nil {
+		return x.LeaseTtlMillis
+	}
+	return 0
+}
+
+func (x *TransitionSandboxRequest) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+type TransitionSandboxResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// begin_pause only: the generation to quote when finishing.
+	Generation int64 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	// begin_pause only: the snapshot this pause replaced, empty when there was
+	// none. Nothing references it once the pause completes.
+	PreviousSnapshotId string `protobuf:"bytes,2,opt,name=previous_snapshot_id,json=previousSnapshotId,proto3" json:"previous_snapshot_id,omitempty"`
+	// mark_running only: whether the cluster tracks this sandbox and now names
+	// this node as its holder. False means there is no row, which is what a
+	// sandbox that has never been paused looks like — not an error.
+	Tracked       bool `protobuf:"varint,3,opt,name=tracked,proto3" json:"tracked,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransitionSandboxResponse) Reset() {
+	*x = TransitionSandboxResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransitionSandboxResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransitionSandboxResponse) ProtoMessage() {}
+
+func (x *TransitionSandboxResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransitionSandboxResponse.ProtoReflect.Descriptor instead.
+func (*TransitionSandboxResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *TransitionSandboxResponse) GetGeneration() int64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *TransitionSandboxResponse) GetPreviousSnapshotId() string {
+	if x != nil {
+		return x.PreviousSnapshotId
+	}
+	return ""
+}
+
+func (x *TransitionSandboxResponse) GetTracked() bool {
+	if x != nil {
+		return x.Tracked
+	}
+	return false
+}
+
+type AcquireSandboxRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	SandboxId string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	NodeId    string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// A successful claim stamps a fresh lease; see TransitionSandboxRequest.
+	LeaseTtlMillis int64 `protobuf:"varint,4,opt,name=lease_ttl_millis,json=leaseTtlMillis,proto3" json:"lease_ttl_millis,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *AcquireSandboxRequest) Reset() {
+	*x = AcquireSandboxRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquireSandboxRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquireSandboxRequest) ProtoMessage() {}
+
+func (x *AcquireSandboxRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquireSandboxRequest.ProtoReflect.Descriptor instead.
+func (*AcquireSandboxRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *AcquireSandboxRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *AcquireSandboxRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *AcquireSandboxRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *AcquireSandboxRequest) GetLeaseTtlMillis() int64 {
+	if x != nil {
+		return x.LeaseTtlMillis
+	}
+	return 0
+}
+
+type AcquiredSandbox struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Entry *RegistryEntry         `protobuf:"bytes,1,opt,name=entry,proto3" json:"entry,omitempty"`
+	// Raw JSON bytes; see TransitionSandboxRequest.metadata_json.
+	MetadataJson []byte `protobuf:"bytes,2,opt,name=metadata_json,json=metadataJson,proto3" json:"metadata_json,omitempty"`
+	// 🔴 What the row said *before* the claim moved it to resuming, read in the
+	// same statement rather than off the returned row — RETURNING hands back the
+	// row as the update left it, so reading state there always says resuming.
+	//
+	// publishing or local_only here means the claim overrode a node that never
+	// finished uploading: the sandbox comes back one snapshot behind and the work
+	// since then is gone. That is the one event on this path an operator has to
+	// be able to find, so it is carried explicitly rather than inferred.
+	PreviousState string `protobuf:"bytes,3,opt,name=previous_state,json=previousState,proto3" json:"previous_state,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcquiredSandbox) Reset() {
+	*x = AcquiredSandbox{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquiredSandbox) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquiredSandbox) ProtoMessage() {}
+
+func (x *AcquiredSandbox) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquiredSandbox.ProtoReflect.Descriptor instead.
+func (*AcquiredSandbox) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *AcquiredSandbox) GetEntry() *RegistryEntry {
+	if x != nil {
+		return x.Entry
+	}
+	return nil
+}
+
+func (x *AcquiredSandbox) GetMetadataJson() []byte {
+	if x != nil {
+		return x.MetadataJson
+	}
+	return nil
+}
+
+func (x *AcquiredSandbox) GetPreviousState() string {
+	if x != nil {
+		return x.PreviousState
+	}
+	return ""
+}
+
+type AcquireOriginRef struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OriginNodeId  string                 `protobuf:"bytes,1,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcquireOriginRef) Reset() {
+	*x = AcquireOriginRef{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquireOriginRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquireOriginRef) ProtoMessage() {}
+
+func (x *AcquireOriginRef) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquireOriginRef.ProtoReflect.Descriptor instead.
+func (*AcquireOriginRef) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *AcquireOriginRef) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+type AcquireSandboxResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*AcquireSandboxResponse_Claimed
+	//	*AcquireSandboxResponse_NotFound
+	//	*AcquireSandboxResponse_NotReady
+	//	*AcquireSandboxResponse_Conflict
+	Outcome       isAcquireSandboxResponse_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcquireSandboxResponse) Reset() {
+	*x = AcquireSandboxResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquireSandboxResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquireSandboxResponse) ProtoMessage() {}
+
+func (x *AcquireSandboxResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquireSandboxResponse.ProtoReflect.Descriptor instead.
+func (*AcquireSandboxResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *AcquireSandboxResponse) GetOutcome() isAcquireSandboxResponse_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *AcquireSandboxResponse) GetClaimed() *AcquiredSandbox {
+	if x != nil {
+		if x, ok := x.Outcome.(*AcquireSandboxResponse_Claimed); ok {
+			return x.Claimed
+		}
+	}
+	return nil
+}
+
+func (x *AcquireSandboxResponse) GetNotFound() *AcquireNotFound {
+	if x != nil {
+		if x, ok := x.Outcome.(*AcquireSandboxResponse_NotFound); ok {
+			return x.NotFound
+		}
+	}
+	return nil
+}
+
+func (x *AcquireSandboxResponse) GetNotReady() *AcquireOriginRef {
+	if x != nil {
+		if x, ok := x.Outcome.(*AcquireSandboxResponse_NotReady); ok {
+			return x.NotReady
+		}
+	}
+	return nil
+}
+
+func (x *AcquireSandboxResponse) GetConflict() *AcquireOriginRef {
+	if x != nil {
+		if x, ok := x.Outcome.(*AcquireSandboxResponse_Conflict); ok {
+			return x.Conflict
+		}
+	}
+	return nil
+}
+
+type isAcquireSandboxResponse_Outcome interface {
+	isAcquireSandboxResponse_Outcome()
+}
+
+type AcquireSandboxResponse_Claimed struct {
+	// The caller owns it and must resume it or release the claim.
+	Claimed *AcquiredSandbox `protobuf:"bytes,1,opt,name=claimed,proto3,oneof"`
+}
+
+type AcquireSandboxResponse_NotFound struct {
+	// No row: unknown to the cluster.
+	NotFound *AcquireNotFound `protobuf:"bytes,2,opt,name=not_found,json=notFound,proto3,oneof"`
+}
+
+type AcquireSandboxResponse_NotReady struct {
+	// Still uploading, so only the origin node can serve this resume.
+	NotReady *AcquireOriginRef `protobuf:"bytes,3,opt,name=not_ready,json=notReady,proto3,oneof"`
+}
+
+type AcquireSandboxResponse_Conflict struct {
+	// Live elsewhere, or a claim this caller lost.
+	Conflict *AcquireOriginRef `protobuf:"bytes,4,opt,name=conflict,proto3,oneof"`
+}
+
+func (*AcquireSandboxResponse_Claimed) isAcquireSandboxResponse_Outcome() {}
+
+func (*AcquireSandboxResponse_NotFound) isAcquireSandboxResponse_Outcome() {}
+
+func (*AcquireSandboxResponse_NotReady) isAcquireSandboxResponse_Outcome() {}
+
+func (*AcquireSandboxResponse_Conflict) isAcquireSandboxResponse_Outcome() {}
+
+type AcquireNotFound struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcquireNotFound) Reset() {
+	*x = AcquireNotFound{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcquireNotFound) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcquireNotFound) ProtoMessage() {}
+
+func (x *AcquireNotFound) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcquireNotFound.ProtoReflect.Descriptor instead.
+func (*AcquireNotFound) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{49}
+}
+
+type HeldSandbox struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// When this sandbox is currently due to end. Absent means it was asked never
+	// to expire, which is not the same as unknown: reclamation leaves it alone
+	// forever.
+	ExpiresAtUnixMicros *int64 `protobuf:"varint,2,opt,name=expires_at_unix_micros,json=expiresAtUnixMicros,proto3,oneof" json:"expires_at_unix_micros,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *HeldSandbox) Reset() {
+	*x = HeldSandbox{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[50]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeldSandbox) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeldSandbox) ProtoMessage() {}
+
+func (x *HeldSandbox) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[50]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeldSandbox.ProtoReflect.Descriptor instead.
+func (*HeldSandbox) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{50}
+}
+
+func (x *HeldSandbox) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *HeldSandbox) GetExpiresAtUnixMicros() int64 {
+	if x != nil && x.ExpiresAtUnixMicros != nil {
+		return *x.ExpiresAtUnixMicros
+	}
+	return 0
+}
+
+type RenewNodeLeaseRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId      string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	NodeId         string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Held           []*HeldSandbox         `protobuf:"bytes,3,rep,name=held,proto3" json:"held,omitempty"`
+	LeaseTtlMillis int64                  `protobuf:"varint,4,opt,name=lease_ttl_millis,json=leaseTtlMillis,proto3" json:"lease_ttl_millis,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *RenewNodeLeaseRequest) Reset() {
+	*x = RenewNodeLeaseRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[51]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewNodeLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewNodeLeaseRequest) ProtoMessage() {}
+
+func (x *RenewNodeLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[51]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewNodeLeaseRequest.ProtoReflect.Descriptor instead.
+func (*RenewNodeLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{51}
+}
+
+func (x *RenewNodeLeaseRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *RenewNodeLeaseRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *RenewNodeLeaseRequest) GetHeld() []*HeldSandbox {
+	if x != nil {
+		return x.Held
+	}
+	return nil
+}
+
+func (x *RenewNodeLeaseRequest) GetLeaseTtlMillis() int64 {
+	if x != nil {
+		return x.LeaseTtlMillis
+	}
+	return 0
+}
+
+type RenewNodeLeaseResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Renewed       uint64                 `protobuf:"varint,1,opt,name=renewed,proto3" json:"renewed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RenewNodeLeaseResponse) Reset() {
+	*x = RenewNodeLeaseResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[52]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewNodeLeaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewNodeLeaseResponse) ProtoMessage() {}
+
+func (x *RenewNodeLeaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[52]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewNodeLeaseResponse.ProtoReflect.Descriptor instead.
+func (*RenewNodeLeaseResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{52}
+}
+
+func (x *RenewNodeLeaseResponse) GetRenewed() uint64 {
+	if x != nil {
+		return x.Renewed
+	}
+	return 0
+}
+
+type ReleaseNodeHoldingsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId     string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseNodeHoldingsRequest) Reset() {
+	*x = ReleaseNodeHoldingsRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[53]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseNodeHoldingsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseNodeHoldingsRequest) ProtoMessage() {}
+
+func (x *ReleaseNodeHoldingsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[53]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseNodeHoldingsRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseNodeHoldingsRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{53}
+}
+
+func (x *ReleaseNodeHoldingsRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *ReleaseNodeHoldingsRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+type ReleaseNodeHoldingsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Handed back to the cluster as paused, recoverable from the snapshot they
+	// name.
+	Released uint64 `protobuf:"varint,1,opt,name=released,proto3" json:"released,omitempty"`
+	// Deleted because no snapshot was ever published for them, so nothing remains
+	// to rebuild the sandbox from.
+	Discarded     uint64 `protobuf:"varint,2,opt,name=discarded,proto3" json:"discarded,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseNodeHoldingsResponse) Reset() {
+	*x = ReleaseNodeHoldingsResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[54]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseNodeHoldingsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseNodeHoldingsResponse) ProtoMessage() {}
+
+func (x *ReleaseNodeHoldingsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[54]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseNodeHoldingsResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseNodeHoldingsResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{54}
+}
+
+func (x *ReleaseNodeHoldingsResponse) GetReleased() uint64 {
+	if x != nil {
+		return x.Released
+	}
+	return 0
+}
+
+func (x *ReleaseNodeHoldingsResponse) GetDiscarded() uint64 {
+	if x != nil {
+		return x.Discarded
+	}
+	return 0
+}
+
 var File_api_proto_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_proto_scheduler_proto_rawDesc = "" +
@@ -2891,7 +3979,88 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x1dListRegistrySandboxesResponse\x12;\n" +
 	"\tsandboxes\x18\x01 \x03(\v2\x1d.scheduler.v1.RegistrySandboxR\tsandboxes\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\x12/\n" +
-	"\x14database_now_unix_ms\x18\x03 \x01(\x03R\x11databaseNowUnixMs*\x89\x01\n" +
+	"\x14database_now_unix_ms\x18\x03 \x01(\x03R\x11databaseNowUnixMs\"\xdf\x02\n" +
+	"\rRegistryEntry\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x02 \x01(\tR\tclusterId\x12\x14\n" +
+	"\x05state\x18\x03 \x01(\tR\x05state\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x04 \x01(\x03R\n" +
+	"generation\x12$\n" +
+	"\x0eorigin_node_id\x18\x05 \x01(\tR\foriginNodeId\x12+\n" +
+	"\x12claimed_by_node_id\x18\x06 \x01(\tR\x0fclaimedByNodeId\x12\x1f\n" +
+	"\vsnapshot_id\x18\a \x01(\tR\n" +
+	"snapshotId\x121\n" +
+	"\x15paused_at_unix_micros\x18\b \x01(\x03R\x12pausedAtUnixMicros\x123\n" +
+	"\x16updated_at_unix_micros\x18\t \x01(\x03R\x13updatedAtUnixMicros\"U\n" +
+	"\x13GetSandboxesRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1f\n" +
+	"\vsandbox_ids\x18\x02 \x03(\tR\n" +
+	"sandboxIds\"Q\n" +
+	"\x14GetSandboxesResponse\x129\n" +
+	"\tsandboxes\x18\x01 \x03(\v2\x1b.scheduler.v1.RegistryEntryR\tsandboxes\"\xdb\x02\n" +
+	"\x18TransitionSandboxRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x17\n" +
+	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x120\n" +
+	"\x04kind\x18\x04 \x01(\x0e2\x1c.scheduler.v1.TransitionKindR\x04kind\x120\n" +
+	"\x11expect_generation\x18\x05 \x01(\x03H\x00R\x10expectGeneration\x88\x01\x01\x12#\n" +
+	"\rmetadata_json\x18\x06 \x01(\fR\fmetadataJson\x12(\n" +
+	"\x10lease_ttl_millis\x18\a \x01(\x03R\x0eleaseTtlMillis\x12\x1f\n" +
+	"\vsnapshot_id\x18\b \x01(\tR\n" +
+	"snapshotIdB\x14\n" +
+	"\x12_expect_generation\"\x87\x01\n" +
+	"\x19TransitionSandboxResponse\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x01 \x01(\x03R\n" +
+	"generation\x120\n" +
+	"\x14previous_snapshot_id\x18\x02 \x01(\tR\x12previousSnapshotId\x12\x18\n" +
+	"\atracked\x18\x03 \x01(\bR\atracked\"\x98\x01\n" +
+	"\x15AcquireSandboxRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x17\n" +
+	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12(\n" +
+	"\x10lease_ttl_millis\x18\x04 \x01(\x03R\x0eleaseTtlMillis\"\x90\x01\n" +
+	"\x0fAcquiredSandbox\x121\n" +
+	"\x05entry\x18\x01 \x01(\v2\x1b.scheduler.v1.RegistryEntryR\x05entry\x12#\n" +
+	"\rmetadata_json\x18\x02 \x01(\fR\fmetadataJson\x12%\n" +
+	"\x0eprevious_state\x18\x03 \x01(\tR\rpreviousState\"8\n" +
+	"\x10AcquireOriginRef\x12$\n" +
+	"\x0eorigin_node_id\x18\x01 \x01(\tR\foriginNodeId\"\x99\x02\n" +
+	"\x16AcquireSandboxResponse\x129\n" +
+	"\aclaimed\x18\x01 \x01(\v2\x1d.scheduler.v1.AcquiredSandboxH\x00R\aclaimed\x12<\n" +
+	"\tnot_found\x18\x02 \x01(\v2\x1d.scheduler.v1.AcquireNotFoundH\x00R\bnotFound\x12=\n" +
+	"\tnot_ready\x18\x03 \x01(\v2\x1e.scheduler.v1.AcquireOriginRefH\x00R\bnotReady\x12<\n" +
+	"\bconflict\x18\x04 \x01(\v2\x1e.scheduler.v1.AcquireOriginRefH\x00R\bconflictB\t\n" +
+	"\aoutcome\"\x11\n" +
+	"\x0fAcquireNotFound\"\x81\x01\n" +
+	"\vHeldSandbox\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x128\n" +
+	"\x16expires_at_unix_micros\x18\x02 \x01(\x03H\x00R\x13expiresAtUnixMicros\x88\x01\x01B\x19\n" +
+	"\x17_expires_at_unix_micros\"\xa8\x01\n" +
+	"\x15RenewNodeLeaseRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12-\n" +
+	"\x04held\x18\x03 \x03(\v2\x19.scheduler.v1.HeldSandboxR\x04held\x12(\n" +
+	"\x10lease_ttl_millis\x18\x04 \x01(\x03R\x0eleaseTtlMillis\"2\n" +
+	"\x16RenewNodeLeaseResponse\x12\x18\n" +
+	"\arenewed\x18\x01 \x01(\x04R\arenewed\"T\n" +
+	"\x1aReleaseNodeHoldingsRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"W\n" +
+	"\x1bReleaseNodeHoldingsResponse\x12\x1a\n" +
+	"\breleased\x18\x01 \x01(\x04R\breleased\x12\x1c\n" +
+	"\tdiscarded\x18\x02 \x01(\x04R\tdiscarded*\x89\x01\n" +
 	"\x0fSandboxLocation\x12 \n" +
 	"\x1cSANDBOX_LOCATION_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16SANDBOX_LOCATION_BOUND\x10\x01\x12\x1b\n" +
@@ -2911,7 +4080,15 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19SANDBOX_EVENT_TYPE_DELETE\x10\x02\x12\x1c\n" +
 	"\x18SANDBOX_EVENT_TYPE_PAUSE\x10\x03\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_RESUME\x10\x04\x12\x1b\n" +
-	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\x95\n" +
+	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x05*\xfc\x01\n" +
+	"\x0eTransitionKind\x12\x1f\n" +
+	"\x1bTRANSITION_KIND_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bTRANSITION_KIND_BEGIN_PAUSE\x10\x01\x12\"\n" +
+	"\x1eTRANSITION_KIND_COMPLETE_PAUSE\x10\x02\x12#\n" +
+	"\x1fTRANSITION_KIND_MARK_LOCAL_ONLY\x10\x03\x12 \n" +
+	"\x1cTRANSITION_KIND_MARK_RUNNING\x10\x04\x12!\n" +
+	"\x1dTRANSITION_KIND_RELEASE_CLAIM\x10\x05\x12\x1a\n" +
+	"\x16TRANSITION_KIND_REMOVE\x10\x062\x95\n" +
 	"\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
@@ -2928,7 +4105,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11LookupP2pArtifact\x12&.scheduler.v1.LookupP2pArtifactRequest\x1a'.scheduler.v1.LookupP2pArtifactResponse\x12F\n" +
 	"\aGetNode\x12\x1c.scheduler.v1.GetNodeRequest\x1a\x1d.scheduler.v1.GetNodeResponse\x12[\n" +
 	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponse\x12p\n" +
-	"\x15ListRegistrySandboxes\x12*.scheduler.v1.ListRegistrySandboxesRequest\x1a+.scheduler.v1.ListRegistrySandboxesResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
+	"\x15ListRegistrySandboxes\x12*.scheduler.v1.ListRegistrySandboxesRequest\x1a+.scheduler.v1.ListRegistrySandboxesResponse2\xf3\x03\n" +
+	"\x0ePausedRegistry\x12U\n" +
+	"\fGetSandboxes\x12!.scheduler.v1.GetSandboxesRequest\x1a\".scheduler.v1.GetSandboxesResponse\x12d\n" +
+	"\x11TransitionSandbox\x12&.scheduler.v1.TransitionSandboxRequest\x1a'.scheduler.v1.TransitionSandboxResponse\x12[\n" +
+	"\x0eAcquireSandbox\x12#.scheduler.v1.AcquireSandboxRequest\x1a$.scheduler.v1.AcquireSandboxResponse\x12[\n" +
+	"\x0eRenewNodeLease\x12#.scheduler.v1.RenewNodeLeaseRequest\x1a$.scheduler.v1.RenewNodeLeaseResponse\x12j\n" +
+	"\x13ReleaseNodeHoldings\x12(.scheduler.v1.ReleaseNodeHoldingsRequest\x1a).scheduler.v1.ReleaseNodeHoldingsResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
 
 var (
 	file_api_proto_scheduler_proto_rawDescOnce sync.Once
@@ -2942,114 +4125,148 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_proto_scheduler_proto_rawDescData
 }
 
-var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
+var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 57)
 var file_api_proto_scheduler_proto_goTypes = []any{
 	(SandboxLocation)(0),                  // 0: scheduler.v1.SandboxLocation
 	(NodeStatus)(0),                       // 1: scheduler.v1.NodeStatus
 	(SandboxEventType)(0),                 // 2: scheduler.v1.SandboxEventType
-	(*Node)(nil),                          // 3: scheduler.v1.Node
-	(*ScheduleRequestHint)(nil),           // 4: scheduler.v1.ScheduleRequestHint
-	(*NewColdSandboxHint)(nil),            // 5: scheduler.v1.NewColdSandboxHint
-	(*NewSandboxHint)(nil),                // 6: scheduler.v1.NewSandboxHint
-	(*ScheduleRequest)(nil),               // 7: scheduler.v1.ScheduleRequest
-	(*ScheduleResponse)(nil),              // 8: scheduler.v1.ScheduleResponse
-	(*ListNodesRequest)(nil),              // 9: scheduler.v1.ListNodesRequest
-	(*ListNodesResponse)(nil),             // 10: scheduler.v1.ListNodesResponse
-	(*LookupNodeRequest)(nil),             // 11: scheduler.v1.LookupNodeRequest
-	(*LookupNodeResponse)(nil),            // 12: scheduler.v1.LookupNodeResponse
-	(*RecordAssignmentRequest)(nil),       // 13: scheduler.v1.RecordAssignmentRequest
-	(*RecordAssignmentResponse)(nil),      // 14: scheduler.v1.RecordAssignmentResponse
-	(*MachineInfo)(nil),                   // 15: scheduler.v1.MachineInfo
-	(*DiskMetric)(nil),                    // 16: scheduler.v1.DiskMetric
-	(*NodeSnapshot)(nil),                  // 17: scheduler.v1.NodeSnapshot
-	(*P2PEndpoint)(nil),                   // 18: scheduler.v1.P2pEndpoint
-	(*ObservedNode)(nil),                  // 19: scheduler.v1.ObservedNode
-	(*HeartbeatRequest)(nil),              // 20: scheduler.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),             // 21: scheduler.v1.HeartbeatResponse
-	(*SandboxEvent)(nil),                  // 22: scheduler.v1.SandboxEvent
-	(*ReportSandboxEventRequest)(nil),     // 23: scheduler.v1.ReportSandboxEventRequest
-	(*ReportSandboxEventResponse)(nil),    // 24: scheduler.v1.ReportSandboxEventResponse
-	(*ListObservedNodesRequest)(nil),      // 25: scheduler.v1.ListObservedNodesRequest
-	(*ListObservedNodesResponse)(nil),     // 26: scheduler.v1.ListObservedNodesResponse
-	(*P2PPeer)(nil),                       // 27: scheduler.v1.P2pPeer
-	(*ListP2PPeersRequest)(nil),           // 28: scheduler.v1.ListP2pPeersRequest
-	(*ListP2PPeersResponse)(nil),          // 29: scheduler.v1.ListP2pPeersResponse
-	(*RecordP2PArtifactRequest)(nil),      // 30: scheduler.v1.RecordP2pArtifactRequest
-	(*RecordP2PArtifactResponse)(nil),     // 31: scheduler.v1.RecordP2pArtifactResponse
-	(*ForgetP2PArtifactRequest)(nil),      // 32: scheduler.v1.ForgetP2pArtifactRequest
-	(*ForgetP2PArtifactResponse)(nil),     // 33: scheduler.v1.ForgetP2pArtifactResponse
-	(*LookupP2PArtifactRequest)(nil),      // 34: scheduler.v1.LookupP2pArtifactRequest
-	(*LookupP2PArtifactResponse)(nil),     // 35: scheduler.v1.LookupP2pArtifactResponse
-	(*GetNodeRequest)(nil),                // 36: scheduler.v1.GetNodeRequest
-	(*GetNodeResponse)(nil),               // 37: scheduler.v1.GetNodeResponse
-	(*UnregisterNodeRequest)(nil),         // 38: scheduler.v1.UnregisterNodeRequest
-	(*UnregisterNodeResponse)(nil),        // 39: scheduler.v1.UnregisterNodeResponse
-	(*RegistrySandbox)(nil),               // 40: scheduler.v1.RegistrySandbox
-	(*ListRegistrySandboxesRequest)(nil),  // 41: scheduler.v1.ListRegistrySandboxesRequest
-	(*ListRegistrySandboxesResponse)(nil), // 42: scheduler.v1.ListRegistrySandboxesResponse
-	nil,                                   // 43: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                   // 44: scheduler.v1.NewSandboxHint.MetadataEntry
+	(TransitionKind)(0),                   // 3: scheduler.v1.TransitionKind
+	(*Node)(nil),                          // 4: scheduler.v1.Node
+	(*ScheduleRequestHint)(nil),           // 5: scheduler.v1.ScheduleRequestHint
+	(*NewColdSandboxHint)(nil),            // 6: scheduler.v1.NewColdSandboxHint
+	(*NewSandboxHint)(nil),                // 7: scheduler.v1.NewSandboxHint
+	(*ScheduleRequest)(nil),               // 8: scheduler.v1.ScheduleRequest
+	(*ScheduleResponse)(nil),              // 9: scheduler.v1.ScheduleResponse
+	(*ListNodesRequest)(nil),              // 10: scheduler.v1.ListNodesRequest
+	(*ListNodesResponse)(nil),             // 11: scheduler.v1.ListNodesResponse
+	(*LookupNodeRequest)(nil),             // 12: scheduler.v1.LookupNodeRequest
+	(*LookupNodeResponse)(nil),            // 13: scheduler.v1.LookupNodeResponse
+	(*RecordAssignmentRequest)(nil),       // 14: scheduler.v1.RecordAssignmentRequest
+	(*RecordAssignmentResponse)(nil),      // 15: scheduler.v1.RecordAssignmentResponse
+	(*MachineInfo)(nil),                   // 16: scheduler.v1.MachineInfo
+	(*DiskMetric)(nil),                    // 17: scheduler.v1.DiskMetric
+	(*NodeSnapshot)(nil),                  // 18: scheduler.v1.NodeSnapshot
+	(*P2PEndpoint)(nil),                   // 19: scheduler.v1.P2pEndpoint
+	(*ObservedNode)(nil),                  // 20: scheduler.v1.ObservedNode
+	(*HeartbeatRequest)(nil),              // 21: scheduler.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),             // 22: scheduler.v1.HeartbeatResponse
+	(*SandboxEvent)(nil),                  // 23: scheduler.v1.SandboxEvent
+	(*ReportSandboxEventRequest)(nil),     // 24: scheduler.v1.ReportSandboxEventRequest
+	(*ReportSandboxEventResponse)(nil),    // 25: scheduler.v1.ReportSandboxEventResponse
+	(*ListObservedNodesRequest)(nil),      // 26: scheduler.v1.ListObservedNodesRequest
+	(*ListObservedNodesResponse)(nil),     // 27: scheduler.v1.ListObservedNodesResponse
+	(*P2PPeer)(nil),                       // 28: scheduler.v1.P2pPeer
+	(*ListP2PPeersRequest)(nil),           // 29: scheduler.v1.ListP2pPeersRequest
+	(*ListP2PPeersResponse)(nil),          // 30: scheduler.v1.ListP2pPeersResponse
+	(*RecordP2PArtifactRequest)(nil),      // 31: scheduler.v1.RecordP2pArtifactRequest
+	(*RecordP2PArtifactResponse)(nil),     // 32: scheduler.v1.RecordP2pArtifactResponse
+	(*ForgetP2PArtifactRequest)(nil),      // 33: scheduler.v1.ForgetP2pArtifactRequest
+	(*ForgetP2PArtifactResponse)(nil),     // 34: scheduler.v1.ForgetP2pArtifactResponse
+	(*LookupP2PArtifactRequest)(nil),      // 35: scheduler.v1.LookupP2pArtifactRequest
+	(*LookupP2PArtifactResponse)(nil),     // 36: scheduler.v1.LookupP2pArtifactResponse
+	(*GetNodeRequest)(nil),                // 37: scheduler.v1.GetNodeRequest
+	(*GetNodeResponse)(nil),               // 38: scheduler.v1.GetNodeResponse
+	(*UnregisterNodeRequest)(nil),         // 39: scheduler.v1.UnregisterNodeRequest
+	(*UnregisterNodeResponse)(nil),        // 40: scheduler.v1.UnregisterNodeResponse
+	(*RegistrySandbox)(nil),               // 41: scheduler.v1.RegistrySandbox
+	(*ListRegistrySandboxesRequest)(nil),  // 42: scheduler.v1.ListRegistrySandboxesRequest
+	(*ListRegistrySandboxesResponse)(nil), // 43: scheduler.v1.ListRegistrySandboxesResponse
+	(*RegistryEntry)(nil),                 // 44: scheduler.v1.RegistryEntry
+	(*GetSandboxesRequest)(nil),           // 45: scheduler.v1.GetSandboxesRequest
+	(*GetSandboxesResponse)(nil),          // 46: scheduler.v1.GetSandboxesResponse
+	(*TransitionSandboxRequest)(nil),      // 47: scheduler.v1.TransitionSandboxRequest
+	(*TransitionSandboxResponse)(nil),     // 48: scheduler.v1.TransitionSandboxResponse
+	(*AcquireSandboxRequest)(nil),         // 49: scheduler.v1.AcquireSandboxRequest
+	(*AcquiredSandbox)(nil),               // 50: scheduler.v1.AcquiredSandbox
+	(*AcquireOriginRef)(nil),              // 51: scheduler.v1.AcquireOriginRef
+	(*AcquireSandboxResponse)(nil),        // 52: scheduler.v1.AcquireSandboxResponse
+	(*AcquireNotFound)(nil),               // 53: scheduler.v1.AcquireNotFound
+	(*HeldSandbox)(nil),                   // 54: scheduler.v1.HeldSandbox
+	(*RenewNodeLeaseRequest)(nil),         // 55: scheduler.v1.RenewNodeLeaseRequest
+	(*RenewNodeLeaseResponse)(nil),        // 56: scheduler.v1.RenewNodeLeaseResponse
+	(*ReleaseNodeHoldingsRequest)(nil),    // 57: scheduler.v1.ReleaseNodeHoldingsRequest
+	(*ReleaseNodeHoldingsResponse)(nil),   // 58: scheduler.v1.ReleaseNodeHoldingsResponse
+	nil,                                   // 59: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                   // 60: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
-	5,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
-	6,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	43, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	44, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
-	4,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
-	3,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
-	3,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
-	3,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
+	6,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
+	7,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
+	59, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	60, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	5,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
+	4,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
+	4,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
+	4,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
 	0,  // 8: scheduler.v1.LookupNodeResponse.location:type_name -> scheduler.v1.SandboxLocation
-	3,  // 9: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
+	4,  // 9: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
 	1,  // 10: scheduler.v1.NodeSnapshot.status:type_name -> scheduler.v1.NodeStatus
-	16, // 11: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
-	15, // 12: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
-	17, // 13: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	15, // 14: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
-	17, // 15: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	18, // 16: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
+	17, // 11: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
+	16, // 12: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
+	18, // 13: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	16, // 14: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
+	18, // 15: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	19, // 16: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
 	2,  // 17: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
-	22, // 18: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
-	19, // 19: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
-	18, // 20: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
-	27, // 21: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
-	27, // 22: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
-	19, // 23: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	40, // 24: scheduler.v1.ListRegistrySandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistrySandbox
-	7,  // 25: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	9,  // 26: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
-	11, // 27: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
-	13, // 28: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
-	20, // 29: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	23, // 30: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	25, // 31: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
-	28, // 32: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	30, // 33: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	32, // 34: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	34, // 35: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	36, // 36: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	38, // 37: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	41, // 38: scheduler.v1.Scheduler.ListRegistrySandboxes:input_type -> scheduler.v1.ListRegistrySandboxesRequest
-	8,  // 39: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	10, // 40: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	12, // 41: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	14, // 42: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	21, // 43: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	24, // 44: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	26, // 45: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	29, // 46: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	31, // 47: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	33, // 48: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	35, // 49: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	37, // 50: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	39, // 51: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	42, // 52: scheduler.v1.Scheduler.ListRegistrySandboxes:output_type -> scheduler.v1.ListRegistrySandboxesResponse
-	39, // [39:53] is the sub-list for method output_type
-	25, // [25:39] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	23, // 18: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
+	20, // 19: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
+	19, // 20: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
+	28, // 21: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
+	28, // 22: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
+	20, // 23: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
+	41, // 24: scheduler.v1.ListRegistrySandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistrySandbox
+	44, // 25: scheduler.v1.GetSandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistryEntry
+	3,  // 26: scheduler.v1.TransitionSandboxRequest.kind:type_name -> scheduler.v1.TransitionKind
+	44, // 27: scheduler.v1.AcquiredSandbox.entry:type_name -> scheduler.v1.RegistryEntry
+	50, // 28: scheduler.v1.AcquireSandboxResponse.claimed:type_name -> scheduler.v1.AcquiredSandbox
+	53, // 29: scheduler.v1.AcquireSandboxResponse.not_found:type_name -> scheduler.v1.AcquireNotFound
+	51, // 30: scheduler.v1.AcquireSandboxResponse.not_ready:type_name -> scheduler.v1.AcquireOriginRef
+	51, // 31: scheduler.v1.AcquireSandboxResponse.conflict:type_name -> scheduler.v1.AcquireOriginRef
+	54, // 32: scheduler.v1.RenewNodeLeaseRequest.held:type_name -> scheduler.v1.HeldSandbox
+	8,  // 33: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	10, // 34: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
+	12, // 35: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
+	14, // 36: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
+	21, // 37: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	24, // 38: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	26, // 39: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
+	29, // 40: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	31, // 41: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	33, // 42: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	35, // 43: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	37, // 44: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	39, // 45: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	42, // 46: scheduler.v1.Scheduler.ListRegistrySandboxes:input_type -> scheduler.v1.ListRegistrySandboxesRequest
+	45, // 47: scheduler.v1.PausedRegistry.GetSandboxes:input_type -> scheduler.v1.GetSandboxesRequest
+	47, // 48: scheduler.v1.PausedRegistry.TransitionSandbox:input_type -> scheduler.v1.TransitionSandboxRequest
+	49, // 49: scheduler.v1.PausedRegistry.AcquireSandbox:input_type -> scheduler.v1.AcquireSandboxRequest
+	55, // 50: scheduler.v1.PausedRegistry.RenewNodeLease:input_type -> scheduler.v1.RenewNodeLeaseRequest
+	57, // 51: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:input_type -> scheduler.v1.ReleaseNodeHoldingsRequest
+	9,  // 52: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	11, // 53: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	13, // 54: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	15, // 55: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	22, // 56: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	25, // 57: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	27, // 58: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	30, // 59: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	32, // 60: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	34, // 61: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	36, // 62: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	38, // 63: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	40, // 64: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	43, // 65: scheduler.v1.Scheduler.ListRegistrySandboxes:output_type -> scheduler.v1.ListRegistrySandboxesResponse
+	46, // 66: scheduler.v1.PausedRegistry.GetSandboxes:output_type -> scheduler.v1.GetSandboxesResponse
+	48, // 67: scheduler.v1.PausedRegistry.TransitionSandbox:output_type -> scheduler.v1.TransitionSandboxResponse
+	52, // 68: scheduler.v1.PausedRegistry.AcquireSandbox:output_type -> scheduler.v1.AcquireSandboxResponse
+	56, // 69: scheduler.v1.PausedRegistry.RenewNodeLease:output_type -> scheduler.v1.RenewNodeLeaseResponse
+	58, // 70: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:output_type -> scheduler.v1.ReleaseNodeHoldingsResponse
+	52, // [52:71] is the sub-list for method output_type
+	33, // [33:52] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -3061,15 +4278,23 @@ func file_api_proto_scheduler_proto_init() {
 		(*ScheduleRequestHint_NewColdSandbox)(nil),
 		(*ScheduleRequestHint_NewSandbox)(nil),
 	}
+	file_api_proto_scheduler_proto_msgTypes[43].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[48].OneofWrappers = []any{
+		(*AcquireSandboxResponse_Claimed)(nil),
+		(*AcquireSandboxResponse_NotFound)(nil),
+		(*AcquireSandboxResponse_NotReady)(nil),
+		(*AcquireSandboxResponse_Conflict)(nil),
+	}
+	file_api_proto_scheduler_proto_msgTypes[50].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   42,
+			NumEnums:      4,
+			NumMessages:   57,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_api_proto_scheduler_proto_goTypes,
 		DependencyIndexes: file_api_proto_scheduler_proto_depIdxs,

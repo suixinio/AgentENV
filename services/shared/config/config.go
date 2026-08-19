@@ -18,6 +18,21 @@ const (
 	defaultSchedulerRegistryReconcileInterval = 30 * time.Second
 	defaultSchedulerRegistryQueryTimeout      = 5 * time.Second
 	defaultSchedulerRegistryLeaseWarnWindow   = 30 * time.Second
+
+	// The node's own lease default (`lease_ttl_secs`, src/cfg.rs). Matching it
+	// means a fleet that configures neither side still agrees.
+	defaultSchedulerRegistryLeaseTTL = 90 * time.Second
+	// Far below any real lease, on purpose: it is there to catch a reported
+	// zero or a milliseconds/seconds mix-up, not to second-guess a node whose
+	// own configuration already checks its lease against its renewal cadence.
+	defaultSchedulerRegistryLeaseTTLFloor = 30 * time.Second
+	// The node ran this pass on its reconcile cadence; keeping the same one
+	// means the changeover does not also change how quickly a decommissioned
+	// machine's rows are collected.
+	defaultSchedulerRegistryReclaimInterval     = 30 * time.Second
+	defaultSchedulerRegistryWriteMaxConnections = 8
+	defaultSchedulerRegistryDiscardMaxRows      = 10
+	defaultSchedulerRegistryDiscardMaxRatio     = 0.10
 )
 
 type Node struct {
@@ -84,6 +99,43 @@ type SchedulerRegistryConfig struct {
 	// LeaseWarnWindow is how far ahead a parked row's lease is looked at
 	// before it is counted as expiring.
 	LeaseWarnWindow time.Duration `json:"lease_warn_window"`
+
+	// WriteEnabled turns on the write surface: the migration, the
+	// PausedRegistry gRPC service, and the reclamation timer.
+	//
+	// Off by default, and it has to stay that way. Switching it on makes this
+	// process the owner of a table the nodes are still writing themselves; the
+	// two are only safe together in the changeover window the rollout notes
+	// describe, and defaulting to on would put every existing deployment into
+	// that window on an upgrade nobody asked for.
+	WriteEnabled bool `json:"write_enabled"`
+	// WriteMaxConnections caps the writable pool. This is the number the whole
+	// fleet's writes now share, where each node used to hold its own.
+	WriteMaxConnections int32 `json:"write_max_connections"`
+	// LeaseTTL is the lease length stamped for callers that report none of
+	// their own, and the length of the restart grace window.
+	//
+	// It is the node's configuration that governs a real lease — see
+	// registry.Store.WithLeaseTTL — so this value is a fallback and a yardstick
+	// rather than a policy. It defaults to the node's own default for that
+	// reason.
+	LeaseTTL time.Duration `json:"lease_ttl"`
+	// ReclaimInterval is how often the cluster's backstop pass runs.
+	ReclaimInterval time.Duration `json:"reclaim_interval"`
+	// LeaseTTLFloor is the shortest lease this process will stamp, however
+	// short a value a node reports.
+	//
+	// It is a guard against an unset field or a unit confused for another, not
+	// a policy: the invariant that a lease outlives the cadence renewing it is
+	// checked on the node, which is the only place that knows both numbers.
+	// Values below it are raised, never refused — a longer lease is harder to
+	// take over, and failing a pause over an advisory number is not a trade
+	// worth making.
+	LeaseTTLFloor time.Duration `json:"lease_ttl_floor"`
+	// DiscardMaxRows and DiscardMaxRatio bound how much one reclamation pass
+	// may delete before it is refused outright. Both apply; the stricter wins.
+	DiscardMaxRows  int64   `json:"discard_max_rows"`
+	DiscardMaxRatio float64 `json:"discard_max_ratio"`
 }
 
 func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
@@ -94,6 +146,14 @@ func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
 		ReconcileInterval json.RawMessage `json:"reconcile_interval"`
 		QueryTimeout      json.RawMessage `json:"query_timeout"`
 		LeaseWarnWindow   json.RawMessage `json:"lease_warn_window"`
+
+		WriteEnabled        *bool           `json:"write_enabled"`
+		WriteMaxConnections *int32          `json:"write_max_connections"`
+		LeaseTTL            json.RawMessage `json:"lease_ttl"`
+		LeaseTTLFloor       json.RawMessage `json:"lease_ttl_floor"`
+		ReclaimInterval     json.RawMessage `json:"reclaim_interval"`
+		DiscardMaxRows      *int64          `json:"discard_max_rows"`
+		DiscardMaxRatio     *float64        `json:"discard_max_ratio"`
 	}
 
 	parsed := wire{}
@@ -131,6 +191,40 @@ func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.LeaseWarnWindow = d
+	}
+
+	if parsed.WriteEnabled != nil {
+		s.WriteEnabled = *parsed.WriteEnabled
+	}
+	if parsed.WriteMaxConnections != nil {
+		s.WriteMaxConnections = *parsed.WriteMaxConnections
+	}
+	if len(bytes.TrimSpace(parsed.LeaseTTL)) > 0 {
+		d, err := parseSchedulerDuration(parsed.LeaseTTL, "scheduler.registry.lease_ttl")
+		if err != nil {
+			return err
+		}
+		s.LeaseTTL = d
+	}
+	if len(bytes.TrimSpace(parsed.LeaseTTLFloor)) > 0 {
+		d, err := parseSchedulerDuration(parsed.LeaseTTLFloor, "scheduler.registry.lease_ttl_floor")
+		if err != nil {
+			return err
+		}
+		s.LeaseTTLFloor = d
+	}
+	if len(bytes.TrimSpace(parsed.ReclaimInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.ReclaimInterval, "scheduler.registry.reclaim_interval")
+		if err != nil {
+			return err
+		}
+		s.ReclaimInterval = d
+	}
+	if parsed.DiscardMaxRows != nil {
+		s.DiscardMaxRows = *parsed.DiscardMaxRows
+	}
+	if parsed.DiscardMaxRatio != nil {
+		s.DiscardMaxRatio = *parsed.DiscardMaxRatio
 	}
 
 	return nil
@@ -397,10 +491,16 @@ func defaultConfig(service string) Config {
 				},
 			},
 			Registry: SchedulerRegistryConfig{
-				MaxConnections:    defaultSchedulerRegistryMaxConnections,
-				ReconcileInterval: defaultSchedulerRegistryReconcileInterval,
-				QueryTimeout:      defaultSchedulerRegistryQueryTimeout,
-				LeaseWarnWindow:   defaultSchedulerRegistryLeaseWarnWindow,
+				MaxConnections:      defaultSchedulerRegistryMaxConnections,
+				ReconcileInterval:   defaultSchedulerRegistryReconcileInterval,
+				QueryTimeout:        defaultSchedulerRegistryQueryTimeout,
+				LeaseWarnWindow:     defaultSchedulerRegistryLeaseWarnWindow,
+				WriteMaxConnections: defaultSchedulerRegistryWriteMaxConnections,
+				LeaseTTL:            defaultSchedulerRegistryLeaseTTL,
+				LeaseTTLFloor:       defaultSchedulerRegistryLeaseTTLFloor,
+				ReclaimInterval:     defaultSchedulerRegistryReclaimInterval,
+				DiscardMaxRows:      defaultSchedulerRegistryDiscardMaxRows,
+				DiscardMaxRatio:     defaultSchedulerRegistryDiscardMaxRatio,
 			},
 		},
 		Gateway: GatewayConfig{
@@ -434,6 +534,38 @@ func overrideWithEnv(cfg *Config) error {
 	// through the config file, which is a ConfigMap.
 	set("SCHEDULER_REGISTRY_DSN", &cfg.Scheduler.Registry.DSN)
 	set("SCHEDULER_REGISTRY_CLUSTER_ID", &cfg.Scheduler.Registry.ClusterID)
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_WRITE_ENABLED")); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_WRITE_ENABLED %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.WriteEnabled = enabled
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_LEASE_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_LEASE_TTL %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.LeaseTTL = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_LEASE_TTL_FLOOR")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_LEASE_TTL_FLOOR %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.LeaseTTLFloor = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_RECLAIM_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_RECLAIM_INTERVAL %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.ReclaimInterval = d
+	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_SANDBOX_PROXY_DOMAINS")); v != "" {
 		cfg.Gateway.SandboxProxyDomains = splitCommaSeparated(v)
@@ -532,6 +664,24 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.Registry.LeaseWarnWindow <= 0 {
 		c.Scheduler.Registry.LeaseWarnWindow = defaultSchedulerRegistryLeaseWarnWindow
 	}
+	if c.Scheduler.Registry.WriteMaxConnections <= 0 {
+		c.Scheduler.Registry.WriteMaxConnections = defaultSchedulerRegistryWriteMaxConnections
+	}
+	if c.Scheduler.Registry.LeaseTTL <= 0 {
+		c.Scheduler.Registry.LeaseTTL = defaultSchedulerRegistryLeaseTTL
+	}
+	if c.Scheduler.Registry.LeaseTTLFloor <= 0 {
+		c.Scheduler.Registry.LeaseTTLFloor = defaultSchedulerRegistryLeaseTTLFloor
+	}
+	if c.Scheduler.Registry.ReclaimInterval <= 0 {
+		c.Scheduler.Registry.ReclaimInterval = defaultSchedulerRegistryReclaimInterval
+	}
+	if c.Scheduler.Registry.DiscardMaxRows <= 0 {
+		c.Scheduler.Registry.DiscardMaxRows = defaultSchedulerRegistryDiscardMaxRows
+	}
+	if c.Scheduler.Registry.DiscardMaxRatio <= 0 {
+		c.Scheduler.Registry.DiscardMaxRatio = defaultSchedulerRegistryDiscardMaxRatio
+	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
 	}
@@ -567,6 +717,45 @@ func validateSchedulerRegistry(registry SchedulerRegistryConfig) error {
 	// into a start-up error.
 	if clusterID := strings.TrimSpace(registry.ClusterID); clusterID != "" && !looksLikeUUID(clusterID) {
 		return fmt.Errorf("scheduler.registry.cluster_id must be a uuid, got %q", clusterID)
+	}
+
+	if !registry.WriteEnabled {
+		return nil
+	}
+
+	// 🔴 A missing cluster id is *not* rejected here, and the asymmetry is
+	// deliberate.
+	//
+	// The write surface does need one — reclaiming every cluster in a shared
+	// database deletes rows this controller was never given, and the restart
+	// grace pass would extend one cluster's leases while serving another's
+	// writes with none of theirs extended. But the cluster id arrives from an
+	// optional Secret key, so "missing" is a thing that happens on a rollout,
+	// and rejecting it here means the scheduler will not start at all: routing,
+	// discovery and bindings would all stop over a registry that was switched
+	// on last week. The write surface is left cold instead, loudly, and the
+	// rest of the process carries on (see openRegistryWriteSurface).
+	//
+	// The checks below are different in kind: every one of them has a default,
+	// so reaching an invalid value takes somebody explicitly writing one, and
+	// no absent Secret can produce it.
+	if registry.WriteMaxConnections <= 0 {
+		return errors.New("scheduler.registry.write_max_connections must be greater than zero")
+	}
+	if registry.LeaseTTL <= 0 {
+		return errors.New("scheduler.registry.lease_ttl must be greater than zero")
+	}
+	if registry.LeaseTTLFloor <= 0 {
+		return errors.New("scheduler.registry.lease_ttl_floor must be greater than zero")
+	}
+	if registry.ReclaimInterval <= 0 {
+		return errors.New("scheduler.registry.reclaim_interval must be greater than zero")
+	}
+	if registry.DiscardMaxRows <= 0 {
+		return errors.New("scheduler.registry.discard_max_rows must be greater than zero")
+	}
+	if registry.DiscardMaxRatio <= 0 || registry.DiscardMaxRatio > 1 {
+		return fmt.Errorf("scheduler.registry.discard_max_ratio must be in (0, 1], got %v", registry.DiscardMaxRatio)
 	}
 	return nil
 }

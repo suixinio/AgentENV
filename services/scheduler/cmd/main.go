@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -52,6 +53,16 @@ func main() {
 	registryReader, closeRegistry := createRegistryReader(logger, cfg)
 	defer closeRegistry()
 
+	// 🔴 Never on a query-only replica. Those exist so sandbox lookups survive a
+	// primary restart; there is exactly one owner of this table's shape and of
+	// the reclamation timer that deletes rows from it, and a replica that
+	// migrated and reclaimed alongside the primary would be a second one.
+	registryWriter, registryGrace, closeRegistryWriter := createRegistryStore(logger, cfg, *queryOnly)
+	defer closeRegistryWriter()
+
+	// nil until the write surface is switched on; /healthz reports "off" then.
+	var registryPhase func() (string, time.Duration, time.Duration)
+
 	g := grpc.NewServer(grpc.UnaryInterceptor(scheduler.MetricsUnaryInterceptor()))
 	if *queryOnly {
 		// The registry goes to this replica too: a gateway pointed at a
@@ -94,6 +105,45 @@ func main() {
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		go svc.RunRegistryReconcile(sigCtx, cfg.Scheduler.Registry.ReconcileInterval)
 		schedulerv1.RegisterSchedulerServer(g, svc)
+
+		if registryWriter != nil {
+			// Registered before the migration has run, on purpose. The service
+			// answers UNAVAILABLE until the gate opens, which is the one thing
+			// it must do — a registry that is not ready has to say so, because
+			// the alternative shape of "not ready" is an empty answer, and the
+			// node deletes a workspace on the strength of one of those.
+			registrySvc := scheduler.NewPausedRegistryService(
+				logger, registryWriter, registryGrace,
+				cfg.Scheduler.Registry.ClusterID,
+				cfg.Scheduler.Registry.LeaseTTL,
+				cfg.Scheduler.Registry.LeaseTTLFloor,
+			)
+			schedulerv1.RegisterPausedRegistryServer(g, registrySvc)
+			registryPhase = registrySvc.Phase
+
+			// 🔴 Registered either way, and left cold when there is no cluster
+			// scope. Not registering would answer Unimplemented, which reads as
+			// "this build does not have the feature" rather than "it is
+			// configured and not usable"; and the phase this leaves behind is
+			// what /healthz and the metric report, so the operator sees one
+			// story instead of two.
+			if !registryWriteScoped(cfg) {
+				logger.Error("scheduler paused registry write surface is configured but has no cluster id, "+
+					"so it will stay cold: the restart grace pass and the reclamation timer will not run, "+
+					"and every registry RPC will be answered UNAVAILABLE until a cluster id is set",
+					zap.String("env", "SCHEDULER_REGISTRY_CLUSTER_ID"),
+				)
+			} else {
+				go openRegistryWriteSurface(sigCtx, logger, cfg, registryWriter, registryGrace, registryWriter)
+				go registrySvc.RunReclaim(sigCtx, cfg.Scheduler.Registry.ReclaimInterval)
+				logger.Info("scheduler paused registry write surface enabled",
+					zap.String("cluster_id", cfg.Scheduler.Registry.ClusterID),
+					zap.Duration("lease_ttl", cfg.Scheduler.Registry.LeaseTTL),
+					zap.Duration("lease_ttl_floor", cfg.Scheduler.Registry.LeaseTTLFloor),
+					zap.Duration("reclaim_interval", cfg.Scheduler.Registry.ReclaimInterval),
+				)
+			}
+		}
 	}
 
 	hs := health.NewServer()
@@ -113,9 +163,12 @@ func main() {
 		zap.Bool("paused_registry", registryEnabled(cfg)),
 	)
 
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", registryHealthHandler(registryPhase))
 	metricsServer := &http.Server{
 		Addr:    cfg.Scheduler.MetricsListenAddr,
-		Handler: promhttp.Handler(),
+		Handler: mux,
 	}
 	go func() {
 		logger.Info("scheduler metrics server listening", zap.String("addr", metricsServer.Addr))
@@ -234,6 +287,153 @@ func createRegistryReader(logger *zap.Logger, cfg config.Config) (pausedregistry
 		zap.Duration("reconcile_interval", cfg.Scheduler.Registry.ReconcileInterval),
 	)
 	return reader, reader.Close
+}
+
+// createRegistryStore builds the writable store, or nothing when the write
+// surface is switched off.
+//
+// It does not connect and it does not migrate: see openRegistryWriteSurface.
+//
+// The concrete type is returned rather than the Store interface because the
+// restart grace pass is not part of that interface: it is this process's own
+// repair of its own absence, not an operation any node can ask for.
+func createRegistryStore(logger *zap.Logger, cfg config.Config, queryOnly bool) (*pausedregistry.PostgresStore, *pausedregistry.Grace, func()) {
+	if queryOnly && registryWriteEnabled(cfg) {
+		logger.Info("scheduler paused registry write surface stays off on a query-only replica")
+	}
+	if queryOnly || !registryWriteEnabled(cfg) {
+		return nil, nil, func() {}
+	}
+
+	grace := pausedregistry.NewGrace(cfg.Scheduler.Registry.LeaseTTL, logger)
+	breaker := pausedregistry.NewDiscardBreaker(
+		cfg.Scheduler.Registry.DiscardMaxRows,
+		cfg.Scheduler.Registry.DiscardMaxRatio,
+		logger,
+	)
+
+	built, err := pausedregistry.NewStore(context.Background(), pausedregistry.StoreConfig{
+		DSN:            cfg.Scheduler.Registry.DSN,
+		Logger:         logger,
+		LeaseTTL:       cfg.Scheduler.Registry.LeaseTTL,
+		MaxConnections: cfg.Scheduler.Registry.WriteMaxConnections,
+		QueryTimeout:   cfg.Scheduler.Registry.QueryTimeout,
+	})
+	if err != nil {
+		// A DSN that will not parse is a configuration error that does not fix
+		// itself, and this one is the credentials for the table this process is
+		// being asked to own.
+		logger.Fatal("create paused registry store failed", zap.Error(err))
+	}
+
+	// The restart gate and the discard breaker are this process's own, not part
+	// of the Store seam the nodes see, so they are attached to the concrete
+	// type. NewStore only ever returns this one.
+	store, ok := built.(*pausedregistry.PostgresStore)
+	if !ok {
+		logger.Fatal("paused registry store is not the postgres implementation; the restart gate cannot be attached")
+	}
+	store.WithGuards(grace, breaker)
+
+	return store, grace, store.Close
+}
+
+// openRegistryWriteSurface migrates, runs the restart grace pass, and opens the
+// gate — retrying until it succeeds or the process is shutting down.
+//
+// 🔴 Retried rather than fatal. This process routes traffic, discovers nodes
+// and serves bindings, all of which work with the registry database on fire;
+// exiting because it is would turn one subsystem's outage into the cluster's.
+// The gate is what makes that safe: until this returns, every registry request
+// is answered UNAVAILABLE rather than with an empty result.
+func openRegistryWriteSurface(
+	ctx context.Context,
+	logger *zap.Logger,
+	cfg config.Config,
+	store pausedregistry.Store,
+	grace *pausedregistry.Grace,
+	extender pausedregistry.LeaseExtender,
+) {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 30 * time.Second
+	)
+
+	backoff := initialBackoff
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+
+		err := store.Migrate(ctx)
+		if err == nil {
+			var observed pausedregistry.GraceObservation
+			observed, err = grace.Enter(ctx, extender, cfg.Scheduler.Registry.ClusterID)
+			if err == nil {
+				logger.Info("paused registry write surface open",
+					zap.Duration("inferred_downtime", observed.Downtime),
+					zap.Int64("leases_extended", observed.Extended),
+					zap.Time("grace_until", observed.Until),
+				)
+				return
+			}
+		}
+
+		logger.Error("paused registry write surface is not open; every registry request is refused until it is",
+			zap.Error(err),
+			zap.Duration("retry_in", backoff),
+		)
+		if !sleepWithContext(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff, maxBackoff)
+	}
+}
+
+// registryHealthHandler reports the write surface's phase.
+//
+// 🔴 Always 200, deliberately. This says something about one subsystem, and a
+// probe wired to it that took the pod out of rotation would answer a registry
+// database outage by also stopping the routing and discovery that had nothing
+// to do with it. The phase is in the body for whoever is looking; nothing here
+// gates the process.
+func registryHealthHandler(phase func() (string, time.Duration, time.Duration)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{"status": "ok"}
+		if phase == nil {
+			body["registry_write"] = map[string]any{"phase": "off"}
+		} else {
+			name, remaining, downtime := phase()
+			body["registry_write"] = map[string]any{
+				"phase":                     name,
+				"ready":                     name != "cold",
+				"serving":                   name == "serving",
+				"grace_remaining_seconds":   remaining.Seconds(),
+				"inferred_downtime_seconds": downtime.Seconds(),
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(body)
+	}
+}
+
+func registryWriteEnabled(cfg config.Config) bool {
+	return registryEnabled(cfg) && cfg.Scheduler.Registry.WriteEnabled
+}
+
+// registryWriteScoped reports whether the write surface has everything it needs
+// to actually open.
+//
+// 🔴 Separate from registryWriteEnabled because a missing cluster id leaves the
+// surface *registered and cold* rather than absent: it was configured on, so
+// reporting it as "off" would be a lie, and answering Unimplemented would read
+// as "this build does not have the feature". Cold answers UNAVAILABLE, which is
+// both true and the one shape a node must never mistake for "the cluster knows
+// of no such sandbox".
+func registryWriteScoped(cfg config.Config) bool {
+	return registryWriteEnabled(cfg) && strings.TrimSpace(cfg.Scheduler.Registry.ClusterID) != ""
 }
 
 func registryEnabled(cfg config.Config) bool {

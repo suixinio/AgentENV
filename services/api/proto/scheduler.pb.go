@@ -244,8 +244,20 @@ const (
 	TransitionKind_TRANSITION_KIND_MARK_RUNNING TransitionKind = 4
 	// Hands a claimed sandbox back unresumed. Requires expect_generation.
 	TransitionKind_TRANSITION_KIND_RELEASE_CLAIM TransitionKind = 5
-	// Deletes the row.
-	TransitionKind_TRANSITION_KIND_REMOVE TransitionKind = 6
+	// Deletes the row. Requires expect_generation.
+	TransitionKind_TRANSITION_KIND_REMOVE TransitionKind = 7
+	// Deprecated: the unconditional delete. Refused by this build.
+	//
+	// It was the whole interface's one unguarded destructive write: the caller
+	// read the row, decided it was not live elsewhere, and then deleted it, with
+	// the decision and the delete in two statements. A node that had just come
+	// back from a partition and had not reconciled yet would take that path
+	// against a sandbox already resumed somewhere else, and the delete would
+	// succeed, silently, taking the snapshot with it. Guarding it in the caller
+	// was exactly the "the node decides" shape phase 2 exists to remove.
+	//
+	// Deprecated: Marked as deprecated in api/proto/scheduler.proto.
+	TransitionKind_TRANSITION_KIND_REMOVE_UNCONDITIONAL TransitionKind = 6
 )
 
 // Enum value maps for TransitionKind.
@@ -257,16 +269,18 @@ var (
 		3: "TRANSITION_KIND_MARK_LOCAL_ONLY",
 		4: "TRANSITION_KIND_MARK_RUNNING",
 		5: "TRANSITION_KIND_RELEASE_CLAIM",
-		6: "TRANSITION_KIND_REMOVE",
+		7: "TRANSITION_KIND_REMOVE",
+		6: "TRANSITION_KIND_REMOVE_UNCONDITIONAL",
 	}
 	TransitionKind_value = map[string]int32{
-		"TRANSITION_KIND_UNSPECIFIED":     0,
-		"TRANSITION_KIND_BEGIN_PAUSE":     1,
-		"TRANSITION_KIND_COMPLETE_PAUSE":  2,
-		"TRANSITION_KIND_MARK_LOCAL_ONLY": 3,
-		"TRANSITION_KIND_MARK_RUNNING":    4,
-		"TRANSITION_KIND_RELEASE_CLAIM":   5,
-		"TRANSITION_KIND_REMOVE":          6,
+		"TRANSITION_KIND_UNSPECIFIED":          0,
+		"TRANSITION_KIND_BEGIN_PAUSE":          1,
+		"TRANSITION_KIND_COMPLETE_PAUSE":       2,
+		"TRANSITION_KIND_MARK_LOCAL_ONLY":      3,
+		"TRANSITION_KIND_MARK_RUNNING":         4,
+		"TRANSITION_KIND_RELEASE_CLAIM":        5,
+		"TRANSITION_KIND_REMOVE":               7,
+		"TRANSITION_KIND_REMOVE_UNCONDITIONAL": 6,
 	}
 )
 
@@ -295,6 +309,125 @@ func (x TransitionKind) Number() protoreflect.EnumNumber {
 // Deprecated: Use TransitionKind.Descriptor instead.
 func (TransitionKind) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{3}
+}
+
+// MarkRunningOutcome splits the two facts the `tracked` bool ran together.
+//
+// store.go says it plainly: "the difference between 'not tracked' and
+// 'somebody else's' — and the caller needs both". Before phase 2 the node read
+// the row back to tell them apart; centrally that re-read happens on the
+// server, so the distinction has to cross the wire or it is lost.
+type MarkRunningOutcome int32
+
+const (
+	MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNSPECIFIED MarkRunningOutcome = 0
+	// No row. What a sandbox that has never been paused looks like.
+	MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNTRACKED MarkRunningOutcome = 1
+	// There was a row, and it now names this node as the holder.
+	MarkRunningOutcome_MARK_RUNNING_OUTCOME_ADOPTED MarkRunningOutcome = 2
+	// There was a row and it belongs to another node, which is still holding it.
+	// The caller is running a sandbox the cluster says is somewhere else.
+	MarkRunningOutcome_MARK_RUNNING_OUTCOME_HELD_ELSEWHERE MarkRunningOutcome = 3
+)
+
+// Enum value maps for MarkRunningOutcome.
+var (
+	MarkRunningOutcome_name = map[int32]string{
+		0: "MARK_RUNNING_OUTCOME_UNSPECIFIED",
+		1: "MARK_RUNNING_OUTCOME_UNTRACKED",
+		2: "MARK_RUNNING_OUTCOME_ADOPTED",
+		3: "MARK_RUNNING_OUTCOME_HELD_ELSEWHERE",
+	}
+	MarkRunningOutcome_value = map[string]int32{
+		"MARK_RUNNING_OUTCOME_UNSPECIFIED":    0,
+		"MARK_RUNNING_OUTCOME_UNTRACKED":      1,
+		"MARK_RUNNING_OUTCOME_ADOPTED":        2,
+		"MARK_RUNNING_OUTCOME_HELD_ELSEWHERE": 3,
+	}
+)
+
+func (x MarkRunningOutcome) Enum() *MarkRunningOutcome {
+	p := new(MarkRunningOutcome)
+	*p = x
+	return p
+}
+
+func (x MarkRunningOutcome) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MarkRunningOutcome) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[4].Descriptor()
+}
+
+func (MarkRunningOutcome) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[4]
+}
+
+func (x MarkRunningOutcome) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MarkRunningOutcome.Descriptor instead.
+func (MarkRunningOutcome) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{4}
+}
+
+// ConflictReason splits the two situations a bare conflict ran together.
+//
+// They call for opposite responses — one means "route the resume to that node",
+// the other means "this caller lost a race and must not touch the sandbox" —
+// and the central placement decision in phase 3 has to make the same
+// distinction from the same field.
+type ConflictReason int32
+
+const (
+	ConflictReason_CONFLICT_REASON_UNSPECIFIED ConflictReason = 0
+	// The sandbox is live on origin_node_id. Nobody may take it.
+	ConflictReason_CONFLICT_REASON_LIVE_ELSEWHERE ConflictReason = 1
+	// This caller held the claim and no longer does.
+	ConflictReason_CONFLICT_REASON_CLAIM_LOST ConflictReason = 2
+)
+
+// Enum value maps for ConflictReason.
+var (
+	ConflictReason_name = map[int32]string{
+		0: "CONFLICT_REASON_UNSPECIFIED",
+		1: "CONFLICT_REASON_LIVE_ELSEWHERE",
+		2: "CONFLICT_REASON_CLAIM_LOST",
+	}
+	ConflictReason_value = map[string]int32{
+		"CONFLICT_REASON_UNSPECIFIED":    0,
+		"CONFLICT_REASON_LIVE_ELSEWHERE": 1,
+		"CONFLICT_REASON_CLAIM_LOST":     2,
+	}
+)
+
+func (x ConflictReason) Enum() *ConflictReason {
+	p := new(ConflictReason)
+	*p = x
+	return p
+}
+
+func (x ConflictReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ConflictReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[5].Descriptor()
+}
+
+func (ConflictReason) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[5]
+}
+
+func (x ConflictReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ConflictReason.Descriptor instead.
+func (ConflictReason) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{5}
 }
 
 type Node struct {
@@ -2941,8 +3074,27 @@ func (x *GetSandboxesRequest) GetSandboxIds() []string {
 type GetSandboxesResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Only the sandboxes that have rows. An id that was asked for and is absent
-	// here has no row.
-	Sandboxes     []*RegistryEntry `protobuf:"bytes,1,rep,name=sandboxes,proto3" json:"sandboxes,omitempty"`
+	// from `sandboxes` *and present in* `covered_sandbox_ids` has no row.
+	Sandboxes []*RegistryEntry `protobuf:"bytes,1,rep,name=sandboxes,proto3" json:"sandboxes,omitempty"`
+	// 🔴 The ids this answer actually covers — every id the server looked up,
+	// whether or not it found a row.
+	//
+	// "All-or-nothing" is the contract, but the caller could not check it: a
+	// truncated page, a partial stream or a chunk loop that dropped its tail all
+	// look exactly like "those ids have no rows", and the caller's response to
+	// "no row" is to tear down a running sandbox and delete its local artifacts.
+	// So the coverage travels explicitly and the caller asserts it before
+	// treating any absence as authority to delete.
+	//
+	// An older server leaves this empty; a caller that wants the assertion must
+	// treat empty as "not asserted" rather than as "covered nothing".
+	CoveredSandboxIds []string `protobuf:"bytes,2,rep,name=covered_sandbox_ids,json=coveredSandboxIds,proto3" json:"covered_sandbox_ids,omitempty"`
+	// The database's own clock, from the same statement that read the rows.
+	//
+	// Lease arithmetic on a row must not use the reading process's wall clock —
+	// that is the mistake `Listing` already carries `now` to avoid. Zero from an
+	// older server means "not supplied", not "the epoch".
+	NowUnixMicros int64 `protobuf:"varint,3,opt,name=now_unix_micros,json=nowUnixMicros,proto3" json:"now_unix_micros,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2984,20 +3136,34 @@ func (x *GetSandboxesResponse) GetSandboxes() []*RegistryEntry {
 	return nil
 }
 
+func (x *GetSandboxesResponse) GetCoveredSandboxIds() []string {
+	if x != nil {
+		return x.CoveredSandboxIds
+	}
+	return nil
+}
+
+func (x *GetSandboxesResponse) GetNowUnixMicros() int64 {
+	if x != nil {
+		return x.NowUnixMicros
+	}
+	return 0
+}
+
 type TransitionSandboxRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
 	SandboxId string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	NodeId    string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	Kind      TransitionKind         `protobuf:"varint,4,opt,name=kind,proto3,enum=scheduler.v1.TransitionKind" json:"kind,omitempty"`
-	// Required on the three transitions that are conditional — complete_pause,
-	// mark_local_only and release_claim — and refused on the other three.
+	// Required on the four conditional transitions — complete_pause,
+	// mark_local_only, release_claim and remove — and refused on the rest.
 	//
-	// Three, not four: the node's SQL carries `AND generation = $n` in exactly
-	// those places. claim_for_resume and mark_running read as though they were
-	// conditional too, but their predicates are on state and holder, never on
-	// generation, so quoting one at them would suggest a guarantee they do not
-	// give.
+	// Four, not five: mark_running's predicate is on state and holder, never on
+	// generation, so quoting one at it would suggest a guarantee it does not
+	// give. (begin_pause creates or takes over a row and has nothing to quote.)
+	//
+	// remove joined this list in D11. See TRANSITION_KIND_REMOVE_UNCONDITIONAL.
 	ExpectGeneration *int64 `protobuf:"varint,5,opt,name=expect_generation,json=expectGeneration,proto3,oneof" json:"expect_generation,omitempty"`
 	// 🔴 Raw JSON bytes, passed through untouched. Not google.protobuf.Struct:
 	// that reorders keys, collapses integers into doubles, and normalises what it
@@ -3113,7 +3279,24 @@ type TransitionSandboxResponse struct {
 	// mark_running only: whether the cluster tracks this sandbox and now names
 	// this node as its holder. False means there is no row, which is what a
 	// sandbox that has never been paused looks like — not an error.
-	Tracked       bool `protobuf:"varint,3,opt,name=tracked,proto3" json:"tracked,omitempty"`
+	//
+	// Kept for rollout compatibility; mark_running_outcome says which of the two
+	// false cases this is. Equal to (outcome == MARK_RUNNING_OUTCOME_ADOPTED).
+	Tracked bool `protobuf:"varint,3,opt,name=tracked,proto3" json:"tracked,omitempty"`
+	// remove only: whether the delete matched. False means the generation quoted
+	// was not the row's any more — somebody else has moved it since this caller
+	// last read it — which is not an error: the row this caller meant to delete
+	// is already gone.
+	Removed bool `protobuf:"varint,4,opt,name=removed,proto3" json:"removed,omitempty"`
+	// mark_running only. See MarkRunningOutcome.
+	MarkRunningOutcome MarkRunningOutcome `protobuf:"varint,5,opt,name=mark_running_outcome,json=markRunningOutcome,proto3,enum=scheduler.v1.MarkRunningOutcome" json:"mark_running_outcome,omitempty"`
+	// release_claim only: whether the release matched a row.
+	//
+	// False means the generation quoted was stale, and centrally that is the
+	// *only* remaining signal of it — the node used to see the zero-row update
+	// itself. Not an error: the claim this caller meant to release is no longer
+	// this caller's.
+	Matched       bool `protobuf:"varint,6,opt,name=matched,proto3" json:"matched,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3165,6 +3348,27 @@ func (x *TransitionSandboxResponse) GetPreviousSnapshotId() string {
 func (x *TransitionSandboxResponse) GetTracked() bool {
 	if x != nil {
 		return x.Tracked
+	}
+	return false
+}
+
+func (x *TransitionSandboxResponse) GetRemoved() bool {
+	if x != nil {
+		return x.Removed
+	}
+	return false
+}
+
+func (x *TransitionSandboxResponse) GetMarkRunningOutcome() MarkRunningOutcome {
+	if x != nil {
+		return x.MarkRunningOutcome
+	}
+	return MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNSPECIFIED
+}
+
+func (x *TransitionSandboxResponse) GetMatched() bool {
+	if x != nil {
+		return x.Matched
 	}
 	return false
 }
@@ -3308,8 +3512,13 @@ func (x *AcquiredSandbox) GetPreviousState() string {
 }
 
 type AcquireOriginRef struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	OriginNodeId  string                 `protobuf:"bytes,1,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Under not_ready: the node whose local artifacts are the only copy.
+	// Under conflict + LIVE_ELSEWHERE: the node holding the live sandbox.
+	// Under conflict + CLAIM_LOST: the node that took the claim from this caller.
+	OriginNodeId string `protobuf:"bytes,1,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	// Set on conflict only; UNSPECIFIED under not_ready and from older servers.
+	Reason        ConflictReason `protobuf:"varint,2,opt,name=reason,proto3,enum=scheduler.v1.ConflictReason" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3349,6 +3558,13 @@ func (x *AcquireOriginRef) GetOriginNodeId() string {
 		return x.OriginNodeId
 	}
 	return ""
+}
+
+func (x *AcquireOriginRef) GetReason() ConflictReason {
+	if x != nil {
+		return x.Reason
+	}
+	return ConflictReason_CONFLICT_REASON_UNSPECIFIED
 }
 
 type AcquireSandboxResponse struct {
@@ -3566,8 +3782,19 @@ type RenewNodeLeaseRequest struct {
 	NodeId         string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	Held           []*HeldSandbox         `protobuf:"bytes,3,rep,name=held,proto3" json:"held,omitempty"`
 	LeaseTtlMillis int64                  `protobuf:"varint,4,opt,name=lease_ttl_millis,json=leaseTtlMillis,proto3" json:"lease_ttl_millis,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// How often this node renews. Reported so the invariant that owns both
+	// numbers — a TTL must survive two missed renewals, i.e. ttl >= 3*interval —
+	// can be checked somewhere. The node enforces it locally on its own config,
+	// but a node built against a different default, or a config that drifted
+	// between the two knobs, produces a TTL nothing here could question.
+	//
+	// 🔴 Reported, not enforced: a disagreement is logged and counted, never
+	// refused. Refusing would turn one node's config drift into that node's
+	// sandboxes silently expiring — the exact outcome the invariant protects
+	// against. Zero means an older node that does not report it.
+	ReconcileIntervalMillis int64 `protobuf:"varint,5,opt,name=reconcile_interval_millis,json=reconcileIntervalMillis,proto3" json:"reconcile_interval_millis,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *RenewNodeLeaseRequest) Reset() {
@@ -3624,6 +3851,13 @@ func (x *RenewNodeLeaseRequest) GetHeld() []*HeldSandbox {
 func (x *RenewNodeLeaseRequest) GetLeaseTtlMillis() int64 {
 	if x != nil {
 		return x.LeaseTtlMillis
+	}
+	return 0
+}
+
+func (x *RenewNodeLeaseRequest) GetReconcileIntervalMillis() int64 {
+	if x != nil {
+		return x.ReconcileIntervalMillis
 	}
 	return 0
 }
@@ -3999,9 +4233,11 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1f\n" +
 	"\vsandbox_ids\x18\x02 \x03(\tR\n" +
-	"sandboxIds\"Q\n" +
+	"sandboxIds\"\xa9\x01\n" +
 	"\x14GetSandboxesResponse\x129\n" +
-	"\tsandboxes\x18\x01 \x03(\v2\x1b.scheduler.v1.RegistryEntryR\tsandboxes\"\xdb\x02\n" +
+	"\tsandboxes\x18\x01 \x03(\v2\x1b.scheduler.v1.RegistryEntryR\tsandboxes\x12.\n" +
+	"\x13covered_sandbox_ids\x18\x02 \x03(\tR\x11coveredSandboxIds\x12&\n" +
+	"\x0fnow_unix_micros\x18\x03 \x01(\x03R\rnowUnixMicros\"\xdb\x02\n" +
 	"\x18TransitionSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1d\n" +
@@ -4014,13 +4250,16 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x10lease_ttl_millis\x18\a \x01(\x03R\x0eleaseTtlMillis\x12\x1f\n" +
 	"\vsnapshot_id\x18\b \x01(\tR\n" +
 	"snapshotIdB\x14\n" +
-	"\x12_expect_generation\"\x87\x01\n" +
+	"\x12_expect_generation\"\x8f\x02\n" +
 	"\x19TransitionSandboxResponse\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x03R\n" +
 	"generation\x120\n" +
 	"\x14previous_snapshot_id\x18\x02 \x01(\tR\x12previousSnapshotId\x12\x18\n" +
-	"\atracked\x18\x03 \x01(\bR\atracked\"\x98\x01\n" +
+	"\atracked\x18\x03 \x01(\bR\atracked\x12\x18\n" +
+	"\aremoved\x18\x04 \x01(\bR\aremoved\x12R\n" +
+	"\x14mark_running_outcome\x18\x05 \x01(\x0e2 .scheduler.v1.MarkRunningOutcomeR\x12markRunningOutcome\x12\x18\n" +
+	"\amatched\x18\x06 \x01(\bR\amatched\"\x98\x01\n" +
 	"\x15AcquireSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1d\n" +
@@ -4031,9 +4270,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x0fAcquiredSandbox\x121\n" +
 	"\x05entry\x18\x01 \x01(\v2\x1b.scheduler.v1.RegistryEntryR\x05entry\x12#\n" +
 	"\rmetadata_json\x18\x02 \x01(\fR\fmetadataJson\x12%\n" +
-	"\x0eprevious_state\x18\x03 \x01(\tR\rpreviousState\"8\n" +
+	"\x0eprevious_state\x18\x03 \x01(\tR\rpreviousState\"n\n" +
 	"\x10AcquireOriginRef\x12$\n" +
-	"\x0eorigin_node_id\x18\x01 \x01(\tR\foriginNodeId\"\x99\x02\n" +
+	"\x0eorigin_node_id\x18\x01 \x01(\tR\foriginNodeId\x124\n" +
+	"\x06reason\x18\x02 \x01(\x0e2\x1c.scheduler.v1.ConflictReasonR\x06reason\"\x99\x02\n" +
 	"\x16AcquireSandboxResponse\x129\n" +
 	"\aclaimed\x18\x01 \x01(\v2\x1d.scheduler.v1.AcquiredSandboxH\x00R\aclaimed\x12<\n" +
 	"\tnot_found\x18\x02 \x01(\v2\x1d.scheduler.v1.AcquireNotFoundH\x00R\bnotFound\x12=\n" +
@@ -4045,13 +4285,14 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x128\n" +
 	"\x16expires_at_unix_micros\x18\x02 \x01(\x03H\x00R\x13expiresAtUnixMicros\x88\x01\x01B\x19\n" +
-	"\x17_expires_at_unix_micros\"\xa8\x01\n" +
+	"\x17_expires_at_unix_micros\"\xe4\x01\n" +
 	"\x15RenewNodeLeaseRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12-\n" +
 	"\x04held\x18\x03 \x03(\v2\x19.scheduler.v1.HeldSandboxR\x04held\x12(\n" +
-	"\x10lease_ttl_millis\x18\x04 \x01(\x03R\x0eleaseTtlMillis\"2\n" +
+	"\x10lease_ttl_millis\x18\x04 \x01(\x03R\x0eleaseTtlMillis\x12:\n" +
+	"\x19reconcile_interval_millis\x18\x05 \x01(\x03R\x17reconcileIntervalMillis\"2\n" +
 	"\x16RenewNodeLeaseResponse\x12\x18\n" +
 	"\arenewed\x18\x01 \x01(\x04R\arenewed\"T\n" +
 	"\x1aReleaseNodeHoldingsRequest\x12\x1d\n" +
@@ -4080,7 +4321,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19SANDBOX_EVENT_TYPE_DELETE\x10\x02\x12\x1c\n" +
 	"\x18SANDBOX_EVENT_TYPE_PAUSE\x10\x03\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_RESUME\x10\x04\x12\x1b\n" +
-	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x05*\xfc\x01\n" +
+	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x05*\xaa\x02\n" +
 	"\x0eTransitionKind\x12\x1f\n" +
 	"\x1bTRANSITION_KIND_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bTRANSITION_KIND_BEGIN_PAUSE\x10\x01\x12\"\n" +
@@ -4088,7 +4329,17 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x1fTRANSITION_KIND_MARK_LOCAL_ONLY\x10\x03\x12 \n" +
 	"\x1cTRANSITION_KIND_MARK_RUNNING\x10\x04\x12!\n" +
 	"\x1dTRANSITION_KIND_RELEASE_CLAIM\x10\x05\x12\x1a\n" +
-	"\x16TRANSITION_KIND_REMOVE\x10\x062\x95\n" +
+	"\x16TRANSITION_KIND_REMOVE\x10\a\x12,\n" +
+	"$TRANSITION_KIND_REMOVE_UNCONDITIONAL\x10\x06\x1a\x02\b\x01*\xa9\x01\n" +
+	"\x12MarkRunningOutcome\x12$\n" +
+	" MARK_RUNNING_OUTCOME_UNSPECIFIED\x10\x00\x12\"\n" +
+	"\x1eMARK_RUNNING_OUTCOME_UNTRACKED\x10\x01\x12 \n" +
+	"\x1cMARK_RUNNING_OUTCOME_ADOPTED\x10\x02\x12'\n" +
+	"#MARK_RUNNING_OUTCOME_HELD_ELSEWHERE\x10\x03*u\n" +
+	"\x0eConflictReason\x12\x1f\n" +
+	"\x1bCONFLICT_REASON_UNSPECIFIED\x10\x00\x12\"\n" +
+	"\x1eCONFLICT_REASON_LIVE_ELSEWHERE\x10\x01\x12\x1e\n" +
+	"\x1aCONFLICT_REASON_CLAIM_LOST\x10\x022\x95\n" +
 	"\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
@@ -4125,148 +4376,152 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_proto_scheduler_proto_rawDescData
 }
 
-var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
 var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 57)
 var file_api_proto_scheduler_proto_goTypes = []any{
 	(SandboxLocation)(0),                  // 0: scheduler.v1.SandboxLocation
 	(NodeStatus)(0),                       // 1: scheduler.v1.NodeStatus
 	(SandboxEventType)(0),                 // 2: scheduler.v1.SandboxEventType
 	(TransitionKind)(0),                   // 3: scheduler.v1.TransitionKind
-	(*Node)(nil),                          // 4: scheduler.v1.Node
-	(*ScheduleRequestHint)(nil),           // 5: scheduler.v1.ScheduleRequestHint
-	(*NewColdSandboxHint)(nil),            // 6: scheduler.v1.NewColdSandboxHint
-	(*NewSandboxHint)(nil),                // 7: scheduler.v1.NewSandboxHint
-	(*ScheduleRequest)(nil),               // 8: scheduler.v1.ScheduleRequest
-	(*ScheduleResponse)(nil),              // 9: scheduler.v1.ScheduleResponse
-	(*ListNodesRequest)(nil),              // 10: scheduler.v1.ListNodesRequest
-	(*ListNodesResponse)(nil),             // 11: scheduler.v1.ListNodesResponse
-	(*LookupNodeRequest)(nil),             // 12: scheduler.v1.LookupNodeRequest
-	(*LookupNodeResponse)(nil),            // 13: scheduler.v1.LookupNodeResponse
-	(*RecordAssignmentRequest)(nil),       // 14: scheduler.v1.RecordAssignmentRequest
-	(*RecordAssignmentResponse)(nil),      // 15: scheduler.v1.RecordAssignmentResponse
-	(*MachineInfo)(nil),                   // 16: scheduler.v1.MachineInfo
-	(*DiskMetric)(nil),                    // 17: scheduler.v1.DiskMetric
-	(*NodeSnapshot)(nil),                  // 18: scheduler.v1.NodeSnapshot
-	(*P2PEndpoint)(nil),                   // 19: scheduler.v1.P2pEndpoint
-	(*ObservedNode)(nil),                  // 20: scheduler.v1.ObservedNode
-	(*HeartbeatRequest)(nil),              // 21: scheduler.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),             // 22: scheduler.v1.HeartbeatResponse
-	(*SandboxEvent)(nil),                  // 23: scheduler.v1.SandboxEvent
-	(*ReportSandboxEventRequest)(nil),     // 24: scheduler.v1.ReportSandboxEventRequest
-	(*ReportSandboxEventResponse)(nil),    // 25: scheduler.v1.ReportSandboxEventResponse
-	(*ListObservedNodesRequest)(nil),      // 26: scheduler.v1.ListObservedNodesRequest
-	(*ListObservedNodesResponse)(nil),     // 27: scheduler.v1.ListObservedNodesResponse
-	(*P2PPeer)(nil),                       // 28: scheduler.v1.P2pPeer
-	(*ListP2PPeersRequest)(nil),           // 29: scheduler.v1.ListP2pPeersRequest
-	(*ListP2PPeersResponse)(nil),          // 30: scheduler.v1.ListP2pPeersResponse
-	(*RecordP2PArtifactRequest)(nil),      // 31: scheduler.v1.RecordP2pArtifactRequest
-	(*RecordP2PArtifactResponse)(nil),     // 32: scheduler.v1.RecordP2pArtifactResponse
-	(*ForgetP2PArtifactRequest)(nil),      // 33: scheduler.v1.ForgetP2pArtifactRequest
-	(*ForgetP2PArtifactResponse)(nil),     // 34: scheduler.v1.ForgetP2pArtifactResponse
-	(*LookupP2PArtifactRequest)(nil),      // 35: scheduler.v1.LookupP2pArtifactRequest
-	(*LookupP2PArtifactResponse)(nil),     // 36: scheduler.v1.LookupP2pArtifactResponse
-	(*GetNodeRequest)(nil),                // 37: scheduler.v1.GetNodeRequest
-	(*GetNodeResponse)(nil),               // 38: scheduler.v1.GetNodeResponse
-	(*UnregisterNodeRequest)(nil),         // 39: scheduler.v1.UnregisterNodeRequest
-	(*UnregisterNodeResponse)(nil),        // 40: scheduler.v1.UnregisterNodeResponse
-	(*RegistrySandbox)(nil),               // 41: scheduler.v1.RegistrySandbox
-	(*ListRegistrySandboxesRequest)(nil),  // 42: scheduler.v1.ListRegistrySandboxesRequest
-	(*ListRegistrySandboxesResponse)(nil), // 43: scheduler.v1.ListRegistrySandboxesResponse
-	(*RegistryEntry)(nil),                 // 44: scheduler.v1.RegistryEntry
-	(*GetSandboxesRequest)(nil),           // 45: scheduler.v1.GetSandboxesRequest
-	(*GetSandboxesResponse)(nil),          // 46: scheduler.v1.GetSandboxesResponse
-	(*TransitionSandboxRequest)(nil),      // 47: scheduler.v1.TransitionSandboxRequest
-	(*TransitionSandboxResponse)(nil),     // 48: scheduler.v1.TransitionSandboxResponse
-	(*AcquireSandboxRequest)(nil),         // 49: scheduler.v1.AcquireSandboxRequest
-	(*AcquiredSandbox)(nil),               // 50: scheduler.v1.AcquiredSandbox
-	(*AcquireOriginRef)(nil),              // 51: scheduler.v1.AcquireOriginRef
-	(*AcquireSandboxResponse)(nil),        // 52: scheduler.v1.AcquireSandboxResponse
-	(*AcquireNotFound)(nil),               // 53: scheduler.v1.AcquireNotFound
-	(*HeldSandbox)(nil),                   // 54: scheduler.v1.HeldSandbox
-	(*RenewNodeLeaseRequest)(nil),         // 55: scheduler.v1.RenewNodeLeaseRequest
-	(*RenewNodeLeaseResponse)(nil),        // 56: scheduler.v1.RenewNodeLeaseResponse
-	(*ReleaseNodeHoldingsRequest)(nil),    // 57: scheduler.v1.ReleaseNodeHoldingsRequest
-	(*ReleaseNodeHoldingsResponse)(nil),   // 58: scheduler.v1.ReleaseNodeHoldingsResponse
-	nil,                                   // 59: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                   // 60: scheduler.v1.NewSandboxHint.MetadataEntry
+	(MarkRunningOutcome)(0),               // 4: scheduler.v1.MarkRunningOutcome
+	(ConflictReason)(0),                   // 5: scheduler.v1.ConflictReason
+	(*Node)(nil),                          // 6: scheduler.v1.Node
+	(*ScheduleRequestHint)(nil),           // 7: scheduler.v1.ScheduleRequestHint
+	(*NewColdSandboxHint)(nil),            // 8: scheduler.v1.NewColdSandboxHint
+	(*NewSandboxHint)(nil),                // 9: scheduler.v1.NewSandboxHint
+	(*ScheduleRequest)(nil),               // 10: scheduler.v1.ScheduleRequest
+	(*ScheduleResponse)(nil),              // 11: scheduler.v1.ScheduleResponse
+	(*ListNodesRequest)(nil),              // 12: scheduler.v1.ListNodesRequest
+	(*ListNodesResponse)(nil),             // 13: scheduler.v1.ListNodesResponse
+	(*LookupNodeRequest)(nil),             // 14: scheduler.v1.LookupNodeRequest
+	(*LookupNodeResponse)(nil),            // 15: scheduler.v1.LookupNodeResponse
+	(*RecordAssignmentRequest)(nil),       // 16: scheduler.v1.RecordAssignmentRequest
+	(*RecordAssignmentResponse)(nil),      // 17: scheduler.v1.RecordAssignmentResponse
+	(*MachineInfo)(nil),                   // 18: scheduler.v1.MachineInfo
+	(*DiskMetric)(nil),                    // 19: scheduler.v1.DiskMetric
+	(*NodeSnapshot)(nil),                  // 20: scheduler.v1.NodeSnapshot
+	(*P2PEndpoint)(nil),                   // 21: scheduler.v1.P2pEndpoint
+	(*ObservedNode)(nil),                  // 22: scheduler.v1.ObservedNode
+	(*HeartbeatRequest)(nil),              // 23: scheduler.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),             // 24: scheduler.v1.HeartbeatResponse
+	(*SandboxEvent)(nil),                  // 25: scheduler.v1.SandboxEvent
+	(*ReportSandboxEventRequest)(nil),     // 26: scheduler.v1.ReportSandboxEventRequest
+	(*ReportSandboxEventResponse)(nil),    // 27: scheduler.v1.ReportSandboxEventResponse
+	(*ListObservedNodesRequest)(nil),      // 28: scheduler.v1.ListObservedNodesRequest
+	(*ListObservedNodesResponse)(nil),     // 29: scheduler.v1.ListObservedNodesResponse
+	(*P2PPeer)(nil),                       // 30: scheduler.v1.P2pPeer
+	(*ListP2PPeersRequest)(nil),           // 31: scheduler.v1.ListP2pPeersRequest
+	(*ListP2PPeersResponse)(nil),          // 32: scheduler.v1.ListP2pPeersResponse
+	(*RecordP2PArtifactRequest)(nil),      // 33: scheduler.v1.RecordP2pArtifactRequest
+	(*RecordP2PArtifactResponse)(nil),     // 34: scheduler.v1.RecordP2pArtifactResponse
+	(*ForgetP2PArtifactRequest)(nil),      // 35: scheduler.v1.ForgetP2pArtifactRequest
+	(*ForgetP2PArtifactResponse)(nil),     // 36: scheduler.v1.ForgetP2pArtifactResponse
+	(*LookupP2PArtifactRequest)(nil),      // 37: scheduler.v1.LookupP2pArtifactRequest
+	(*LookupP2PArtifactResponse)(nil),     // 38: scheduler.v1.LookupP2pArtifactResponse
+	(*GetNodeRequest)(nil),                // 39: scheduler.v1.GetNodeRequest
+	(*GetNodeResponse)(nil),               // 40: scheduler.v1.GetNodeResponse
+	(*UnregisterNodeRequest)(nil),         // 41: scheduler.v1.UnregisterNodeRequest
+	(*UnregisterNodeResponse)(nil),        // 42: scheduler.v1.UnregisterNodeResponse
+	(*RegistrySandbox)(nil),               // 43: scheduler.v1.RegistrySandbox
+	(*ListRegistrySandboxesRequest)(nil),  // 44: scheduler.v1.ListRegistrySandboxesRequest
+	(*ListRegistrySandboxesResponse)(nil), // 45: scheduler.v1.ListRegistrySandboxesResponse
+	(*RegistryEntry)(nil),                 // 46: scheduler.v1.RegistryEntry
+	(*GetSandboxesRequest)(nil),           // 47: scheduler.v1.GetSandboxesRequest
+	(*GetSandboxesResponse)(nil),          // 48: scheduler.v1.GetSandboxesResponse
+	(*TransitionSandboxRequest)(nil),      // 49: scheduler.v1.TransitionSandboxRequest
+	(*TransitionSandboxResponse)(nil),     // 50: scheduler.v1.TransitionSandboxResponse
+	(*AcquireSandboxRequest)(nil),         // 51: scheduler.v1.AcquireSandboxRequest
+	(*AcquiredSandbox)(nil),               // 52: scheduler.v1.AcquiredSandbox
+	(*AcquireOriginRef)(nil),              // 53: scheduler.v1.AcquireOriginRef
+	(*AcquireSandboxResponse)(nil),        // 54: scheduler.v1.AcquireSandboxResponse
+	(*AcquireNotFound)(nil),               // 55: scheduler.v1.AcquireNotFound
+	(*HeldSandbox)(nil),                   // 56: scheduler.v1.HeldSandbox
+	(*RenewNodeLeaseRequest)(nil),         // 57: scheduler.v1.RenewNodeLeaseRequest
+	(*RenewNodeLeaseResponse)(nil),        // 58: scheduler.v1.RenewNodeLeaseResponse
+	(*ReleaseNodeHoldingsRequest)(nil),    // 59: scheduler.v1.ReleaseNodeHoldingsRequest
+	(*ReleaseNodeHoldingsResponse)(nil),   // 60: scheduler.v1.ReleaseNodeHoldingsResponse
+	nil,                                   // 61: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                   // 62: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
-	6,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
-	7,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	59, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	60, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
-	5,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
-	4,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
-	4,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
-	4,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
+	8,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
+	9,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
+	61, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	62, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	7,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
+	6,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
+	6,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
+	6,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
 	0,  // 8: scheduler.v1.LookupNodeResponse.location:type_name -> scheduler.v1.SandboxLocation
-	4,  // 9: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
+	6,  // 9: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
 	1,  // 10: scheduler.v1.NodeSnapshot.status:type_name -> scheduler.v1.NodeStatus
-	17, // 11: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
-	16, // 12: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
-	18, // 13: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	16, // 14: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
-	18, // 15: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	19, // 16: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
+	19, // 11: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
+	18, // 12: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
+	20, // 13: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	18, // 14: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
+	20, // 15: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	21, // 16: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
 	2,  // 17: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
-	23, // 18: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
-	20, // 19: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
-	19, // 20: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
-	28, // 21: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
-	28, // 22: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
-	20, // 23: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	41, // 24: scheduler.v1.ListRegistrySandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistrySandbox
-	44, // 25: scheduler.v1.GetSandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistryEntry
+	25, // 18: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
+	22, // 19: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
+	21, // 20: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
+	30, // 21: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
+	30, // 22: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
+	22, // 23: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
+	43, // 24: scheduler.v1.ListRegistrySandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistrySandbox
+	46, // 25: scheduler.v1.GetSandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistryEntry
 	3,  // 26: scheduler.v1.TransitionSandboxRequest.kind:type_name -> scheduler.v1.TransitionKind
-	44, // 27: scheduler.v1.AcquiredSandbox.entry:type_name -> scheduler.v1.RegistryEntry
-	50, // 28: scheduler.v1.AcquireSandboxResponse.claimed:type_name -> scheduler.v1.AcquiredSandbox
-	53, // 29: scheduler.v1.AcquireSandboxResponse.not_found:type_name -> scheduler.v1.AcquireNotFound
-	51, // 30: scheduler.v1.AcquireSandboxResponse.not_ready:type_name -> scheduler.v1.AcquireOriginRef
-	51, // 31: scheduler.v1.AcquireSandboxResponse.conflict:type_name -> scheduler.v1.AcquireOriginRef
-	54, // 32: scheduler.v1.RenewNodeLeaseRequest.held:type_name -> scheduler.v1.HeldSandbox
-	8,  // 33: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	10, // 34: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
-	12, // 35: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
-	14, // 36: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
-	21, // 37: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	24, // 38: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	26, // 39: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
-	29, // 40: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	31, // 41: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	33, // 42: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	35, // 43: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	37, // 44: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	39, // 45: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	42, // 46: scheduler.v1.Scheduler.ListRegistrySandboxes:input_type -> scheduler.v1.ListRegistrySandboxesRequest
-	45, // 47: scheduler.v1.PausedRegistry.GetSandboxes:input_type -> scheduler.v1.GetSandboxesRequest
-	47, // 48: scheduler.v1.PausedRegistry.TransitionSandbox:input_type -> scheduler.v1.TransitionSandboxRequest
-	49, // 49: scheduler.v1.PausedRegistry.AcquireSandbox:input_type -> scheduler.v1.AcquireSandboxRequest
-	55, // 50: scheduler.v1.PausedRegistry.RenewNodeLease:input_type -> scheduler.v1.RenewNodeLeaseRequest
-	57, // 51: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:input_type -> scheduler.v1.ReleaseNodeHoldingsRequest
-	9,  // 52: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	11, // 53: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	13, // 54: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	15, // 55: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	22, // 56: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	25, // 57: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	27, // 58: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	30, // 59: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	32, // 60: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	34, // 61: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	36, // 62: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	38, // 63: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	40, // 64: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	43, // 65: scheduler.v1.Scheduler.ListRegistrySandboxes:output_type -> scheduler.v1.ListRegistrySandboxesResponse
-	46, // 66: scheduler.v1.PausedRegistry.GetSandboxes:output_type -> scheduler.v1.GetSandboxesResponse
-	48, // 67: scheduler.v1.PausedRegistry.TransitionSandbox:output_type -> scheduler.v1.TransitionSandboxResponse
-	52, // 68: scheduler.v1.PausedRegistry.AcquireSandbox:output_type -> scheduler.v1.AcquireSandboxResponse
-	56, // 69: scheduler.v1.PausedRegistry.RenewNodeLease:output_type -> scheduler.v1.RenewNodeLeaseResponse
-	58, // 70: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:output_type -> scheduler.v1.ReleaseNodeHoldingsResponse
-	52, // [52:71] is the sub-list for method output_type
-	33, // [33:52] is the sub-list for method input_type
-	33, // [33:33] is the sub-list for extension type_name
-	33, // [33:33] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	4,  // 27: scheduler.v1.TransitionSandboxResponse.mark_running_outcome:type_name -> scheduler.v1.MarkRunningOutcome
+	46, // 28: scheduler.v1.AcquiredSandbox.entry:type_name -> scheduler.v1.RegistryEntry
+	5,  // 29: scheduler.v1.AcquireOriginRef.reason:type_name -> scheduler.v1.ConflictReason
+	52, // 30: scheduler.v1.AcquireSandboxResponse.claimed:type_name -> scheduler.v1.AcquiredSandbox
+	55, // 31: scheduler.v1.AcquireSandboxResponse.not_found:type_name -> scheduler.v1.AcquireNotFound
+	53, // 32: scheduler.v1.AcquireSandboxResponse.not_ready:type_name -> scheduler.v1.AcquireOriginRef
+	53, // 33: scheduler.v1.AcquireSandboxResponse.conflict:type_name -> scheduler.v1.AcquireOriginRef
+	56, // 34: scheduler.v1.RenewNodeLeaseRequest.held:type_name -> scheduler.v1.HeldSandbox
+	10, // 35: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	12, // 36: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
+	14, // 37: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
+	16, // 38: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
+	23, // 39: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	26, // 40: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	28, // 41: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
+	31, // 42: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	33, // 43: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	35, // 44: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	37, // 45: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	39, // 46: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	41, // 47: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	44, // 48: scheduler.v1.Scheduler.ListRegistrySandboxes:input_type -> scheduler.v1.ListRegistrySandboxesRequest
+	47, // 49: scheduler.v1.PausedRegistry.GetSandboxes:input_type -> scheduler.v1.GetSandboxesRequest
+	49, // 50: scheduler.v1.PausedRegistry.TransitionSandbox:input_type -> scheduler.v1.TransitionSandboxRequest
+	51, // 51: scheduler.v1.PausedRegistry.AcquireSandbox:input_type -> scheduler.v1.AcquireSandboxRequest
+	57, // 52: scheduler.v1.PausedRegistry.RenewNodeLease:input_type -> scheduler.v1.RenewNodeLeaseRequest
+	59, // 53: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:input_type -> scheduler.v1.ReleaseNodeHoldingsRequest
+	11, // 54: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	13, // 55: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	15, // 56: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	17, // 57: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	24, // 58: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	27, // 59: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	29, // 60: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	32, // 61: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	34, // 62: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	36, // 63: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	38, // 64: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	40, // 65: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	42, // 66: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	45, // 67: scheduler.v1.Scheduler.ListRegistrySandboxes:output_type -> scheduler.v1.ListRegistrySandboxesResponse
+	48, // 68: scheduler.v1.PausedRegistry.GetSandboxes:output_type -> scheduler.v1.GetSandboxesResponse
+	50, // 69: scheduler.v1.PausedRegistry.TransitionSandbox:output_type -> scheduler.v1.TransitionSandboxResponse
+	54, // 70: scheduler.v1.PausedRegistry.AcquireSandbox:output_type -> scheduler.v1.AcquireSandboxResponse
+	58, // 71: scheduler.v1.PausedRegistry.RenewNodeLease:output_type -> scheduler.v1.RenewNodeLeaseResponse
+	60, // 72: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:output_type -> scheduler.v1.ReleaseNodeHoldingsResponse
+	54, // [54:73] is the sub-list for method output_type
+	35, // [35:54] is the sub-list for method input_type
+	35, // [35:35] is the sub-list for extension type_name
+	35, // [35:35] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -4291,7 +4546,7 @@ func file_api_proto_scheduler_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
-			NumEnums:      4,
+			NumEnums:      6,
 			NumMessages:   57,
 			NumExtensions: 0,
 			NumServices:   2,

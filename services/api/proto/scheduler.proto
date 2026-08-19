@@ -436,8 +436,27 @@ message GetSandboxesRequest {
 
 message GetSandboxesResponse {
   // Only the sandboxes that have rows. An id that was asked for and is absent
-  // here has no row.
+  // from `sandboxes` *and present in* `covered_sandbox_ids` has no row.
   repeated RegistryEntry sandboxes = 1;
+  // 🔴 The ids this answer actually covers — every id the server looked up,
+  // whether or not it found a row.
+  //
+  // "All-or-nothing" is the contract, but the caller could not check it: a
+  // truncated page, a partial stream or a chunk loop that dropped its tail all
+  // look exactly like "those ids have no rows", and the caller's response to
+  // "no row" is to tear down a running sandbox and delete its local artifacts.
+  // So the coverage travels explicitly and the caller asserts it before
+  // treating any absence as authority to delete.
+  //
+  // An older server leaves this empty; a caller that wants the assertion must
+  // treat empty as "not asserted" rather than as "covered nothing".
+  repeated string covered_sandbox_ids = 2;
+  // The database's own clock, from the same statement that read the rows.
+  //
+  // Lease arithmetic on a row must not use the reading process's wall clock —
+  // that is the mistake `Listing` already carries `now` to avoid. Zero from an
+  // older server means "not supplied", not "the epoch".
+  int64 now_unix_micros = 3;
 }
 
 // TransitionKind is which of the node-side operations this is.
@@ -455,8 +474,18 @@ enum TransitionKind {
   TRANSITION_KIND_MARK_RUNNING = 4;
   // Hands a claimed sandbox back unresumed. Requires expect_generation.
   TRANSITION_KIND_RELEASE_CLAIM = 5;
-  // Deletes the row.
-  TRANSITION_KIND_REMOVE = 6;
+  // Deletes the row. Requires expect_generation.
+  TRANSITION_KIND_REMOVE = 7;
+  // Deprecated: the unconditional delete. Refused by this build.
+  //
+  // It was the whole interface's one unguarded destructive write: the caller
+  // read the row, decided it was not live elsewhere, and then deleted it, with
+  // the decision and the delete in two statements. A node that had just come
+  // back from a partition and had not reconciled yet would take that path
+  // against a sandbox already resumed somewhere else, and the delete would
+  // succeed, silently, taking the snapshot with it. Guarding it in the caller
+  // was exactly the "the node decides" shape phase 2 exists to remove.
+  TRANSITION_KIND_REMOVE_UNCONDITIONAL = 6 [deprecated = true];
 }
 
 message TransitionSandboxRequest {
@@ -464,14 +493,14 @@ message TransitionSandboxRequest {
   string sandbox_id = 2;
   string node_id = 3;
   TransitionKind kind = 4;
-  // Required on the three transitions that are conditional — complete_pause,
-  // mark_local_only and release_claim — and refused on the other three.
+  // Required on the four conditional transitions — complete_pause,
+  // mark_local_only, release_claim and remove — and refused on the rest.
   //
-  // Three, not four: the node's SQL carries `AND generation = $n` in exactly
-  // those places. claim_for_resume and mark_running read as though they were
-  // conditional too, but their predicates are on state and holder, never on
-  // generation, so quoting one at them would suggest a guarantee they do not
-  // give.
+  // Four, not five: mark_running's predicate is on state and holder, never on
+  // generation, so quoting one at it would suggest a guarantee it does not
+  // give. (begin_pause creates or takes over a row and has nothing to quote.)
+  //
+  // remove joined this list in D11. See TRANSITION_KIND_REMOVE_UNCONDITIONAL.
   optional int64 expect_generation = 5;
   // 🔴 Raw JSON bytes, passed through untouched. Not google.protobuf.Struct:
   // that reorders keys, collapses integers into doubles, and normalises what it
@@ -498,7 +527,41 @@ message TransitionSandboxResponse {
   // mark_running only: whether the cluster tracks this sandbox and now names
   // this node as its holder. False means there is no row, which is what a
   // sandbox that has never been paused looks like — not an error.
+  //
+  // Kept for rollout compatibility; mark_running_outcome says which of the two
+  // false cases this is. Equal to (outcome == MARK_RUNNING_OUTCOME_ADOPTED).
   bool tracked = 3;
+  // remove only: whether the delete matched. False means the generation quoted
+  // was not the row's any more — somebody else has moved it since this caller
+  // last read it — which is not an error: the row this caller meant to delete
+  // is already gone.
+  bool removed = 4;
+  // mark_running only. See MarkRunningOutcome.
+  MarkRunningOutcome mark_running_outcome = 5;
+  // release_claim only: whether the release matched a row.
+  //
+  // False means the generation quoted was stale, and centrally that is the
+  // *only* remaining signal of it — the node used to see the zero-row update
+  // itself. Not an error: the claim this caller meant to release is no longer
+  // this caller's.
+  bool matched = 6;
+}
+
+// MarkRunningOutcome splits the two facts the `tracked` bool ran together.
+//
+// store.go says it plainly: "the difference between 'not tracked' and
+// 'somebody else's' — and the caller needs both". Before phase 2 the node read
+// the row back to tell them apart; centrally that re-read happens on the
+// server, so the distinction has to cross the wire or it is lost.
+enum MarkRunningOutcome {
+  MARK_RUNNING_OUTCOME_UNSPECIFIED = 0;
+  // No row. What a sandbox that has never been paused looks like.
+  MARK_RUNNING_OUTCOME_UNTRACKED = 1;
+  // There was a row, and it now names this node as the holder.
+  MARK_RUNNING_OUTCOME_ADOPTED = 2;
+  // There was a row and it belongs to another node, which is still holding it.
+  // The caller is running a sandbox the cluster says is somewhere else.
+  MARK_RUNNING_OUTCOME_HELD_ELSEWHERE = 3;
 }
 
 message AcquireSandboxRequest {
@@ -525,7 +588,26 @@ message AcquiredSandbox {
 }
 
 message AcquireOriginRef {
+  // Under not_ready: the node whose local artifacts are the only copy.
+  // Under conflict + LIVE_ELSEWHERE: the node holding the live sandbox.
+  // Under conflict + CLAIM_LOST: the node that took the claim from this caller.
   string origin_node_id = 1;
+  // Set on conflict only; UNSPECIFIED under not_ready and from older servers.
+  ConflictReason reason = 2;
+}
+
+// ConflictReason splits the two situations a bare conflict ran together.
+//
+// They call for opposite responses — one means "route the resume to that node",
+// the other means "this caller lost a race and must not touch the sandbox" —
+// and the central placement decision in phase 3 has to make the same
+// distinction from the same field.
+enum ConflictReason {
+  CONFLICT_REASON_UNSPECIFIED = 0;
+  // The sandbox is live on origin_node_id. Nobody may take it.
+  CONFLICT_REASON_LIVE_ELSEWHERE = 1;
+  // This caller held the claim and no longer does.
+  CONFLICT_REASON_CLAIM_LOST = 2;
 }
 
 message AcquireSandboxResponse {
@@ -556,6 +638,17 @@ message RenewNodeLeaseRequest {
   string node_id = 2;
   repeated HeldSandbox held = 3;
   int64 lease_ttl_millis = 4;
+  // How often this node renews. Reported so the invariant that owns both
+  // numbers — a TTL must survive two missed renewals, i.e. ttl >= 3*interval —
+  // can be checked somewhere. The node enforces it locally on its own config,
+  // but a node built against a different default, or a config that drifted
+  // between the two knobs, produces a TTL nothing here could question.
+  //
+  // 🔴 Reported, not enforced: a disagreement is logged and counted, never
+  // refused. Refusing would turn one node's config drift into that node's
+  // sandboxes silently expiring — the exact outcome the invariant protects
+  // against. Zero means an older node that does not report it.
+  int64 reconcile_interval_millis = 5;
 }
 
 message RenewNodeLeaseResponse {

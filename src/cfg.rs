@@ -396,6 +396,22 @@ pub enum PausedRegistryBackendKind {
     Central,
 }
 
+impl PausedRegistryBackendKind {
+    /// The name a deployment writes into `AENV_PAUSED_REGISTRY_BACKEND`.
+    ///
+    /// Used by the registry's assembly log, so what an operator reads back is
+    /// the same word they set — a log that named the backends differently
+    /// would be one more thing to translate at the moment somebody is checking
+    /// whether the switch they just made took effect.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Postgres => "postgres",
+            Self::Central => "central",
+        }
+    }
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct PausedRegistryConfig {
     /// 🔴 Settable from the environment on purpose. `deploy/k8s/run.sh` copies
@@ -1521,9 +1537,14 @@ mod tests {
 
     /// The backend a deployment actually runs has to be settable from outside
     /// the file, for the same reason: the file is overwritten on every apply.
+    /// And what is settable has to be exactly what is accepted — a value that
+    /// is neither accepted nor refused is the silent fallback this override
+    /// exists to remove.
     ///
     /// Touches a process-global environment variable, which nothing else in
-    /// this crate reads or writes.
+    /// this crate reads or writes. Both halves live in one test so that stays
+    /// true: two tests setting it would race each other under the default
+    /// parallel runner.
     #[test]
     fn the_paused_registry_backend_is_settable_from_the_environment() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1548,6 +1569,35 @@ mod tests {
                     .paused_registry
                     .backend,
                 expected
+            );
+
+            // The assembly log names the backend with `as_str`, and it is read
+            // by whoever just set this variable and wants to know whether it
+            // took. A name the log prints but the environment will not accept
+            // is a name that cannot be checked against anything.
+            assert_eq!(
+                expected.as_str(),
+                value,
+                "the logged name and the accepted value must be the same word"
+            );
+        }
+
+        // 🔴 A value nothing recognises stops the node instead of leaving it on
+        // `local`. This override exists because the backend cannot be chosen in
+        // the ConfigMap the next apply overwrites — and that is worth nothing
+        // if a typo in the replacement is answered by node-local pauses and no
+        // error at all. Startup is where the mistake is still cheap; past it,
+        // it surfaces when a node is lost and its sandboxes turn out to have
+        // gone with it.
+        for typo in ["postgress", "Central", "postgres ", "node-local"] {
+            std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", typo);
+            let loaded = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
+            std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");
+
+            assert!(
+                loaded.is_err(),
+                "backend={typo:?} was accepted; a misspelled backend must not \
+                 silently leave the node on `local`"
             );
         }
 

@@ -165,7 +165,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", registryHealthHandler(registryPhase))
+	mux.HandleFunc("/healthz", registryHealthHandler(cfg.Scheduler.Registry.ClusterID, registryPhase))
 	metricsServer := &http.Server{
 		Addr:    cfg.Scheduler.MetricsListenAddr,
 		Handler: mux,
@@ -390,14 +390,22 @@ func openRegistryWriteSurface(
 	}
 }
 
-// registryHealthHandler reports the write surface's phase.
+// registryHealthHandler reports the write surface's phase, and the cluster it
+// is scoped to.
 //
 // 🔴 Always 200, deliberately. This says something about one subsystem, and a
 // probe wired to it that took the pod out of rotation would answer a registry
 // database outage by also stopping the routing and discovery that had nothing
 // to do with it. The phase is in the body for whoever is looking; nothing here
 // gates the process.
-func registryHealthHandler(phase func() (string, time.Duration, time.Duration)) http.HandlerFunc {
+//
+// 🔴 The cluster id is here because "cold" has two causes that look identical
+// from outside — the database is unreachable, or nothing ever supplied a
+// cluster scope — and the second one leaves a process that is healthy by every
+// other measure: /healthz 200, gRPC probe passing, one error line at startup
+// that has long since scrolled away. An operator who can read the id back can
+// tell "configured" from "assumed" without redeploying anything.
+func registryHealthHandler(clusterID string, phase func() (string, time.Duration, time.Duration)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body := map[string]any{"status": "ok"}
 		if phase == nil {
@@ -408,6 +416,7 @@ func registryHealthHandler(phase func() (string, time.Duration, time.Duration)) 
 				"phase":                     name,
 				"ready":                     name != "cold",
 				"serving":                   name == "serving",
+				"cluster_id":                strings.TrimSpace(clusterID),
 				"grace_remaining_seconds":   remaining.Seconds(),
 				"inferred_downtime_seconds": downtime.Seconds(),
 			}

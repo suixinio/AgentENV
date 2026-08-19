@@ -91,25 +91,38 @@ func setupRegistryDatabase(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("connect to test database failed: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close(context.Background()) })
 
-	// The DDL is the node's own, verbatim and idempotent, so sharing the table
-	// with whatever else uses this database is fine. What is not fine is
-	// dropping it: this test used to, and guarded that by refusing to run when
-	// the table already existed — which made running the suite twice, or
-	// alongside any other test that needs the table, a failure rather than a
-	// pass. Each test owns its rows by cluster id and removes those instead.
+	// A private schema, for the same reason the contract tests use one, plus a
+	// stronger one of its own: this suite asserts on what an *unfiltered* read
+	// returns, so it is not enough for its rows to be distinguishable from
+	// everybody else's — it has to be the only thing in the table. Partitioning
+	// by cluster id cannot give it that, and sharing `public` with any other
+	// suite makes its central assertion count whatever they left behind.
+	//
+	// The table name in the node's DDL is unqualified and copied verbatim, so
+	// `search_path` is the only seam available.
+	schema := contractSchemaName(t)
+	quoted := pgx.Identifier{schema}.Sanitize()
+	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
+		_ = conn.Close(ctx)
+		t.Fatalf("create the private schema %s: %v", schema, err)
+	}
+	t.Cleanup(func() {
+		cleanup := context.Background()
+		if _, err := conn.Exec(cleanup, "DROP SCHEMA "+quoted+" CASCADE"); err != nil {
+			t.Logf("drop the private schema %s: %v", schema, err)
+		}
+		_ = conn.Close(cleanup)
+	})
+	if _, err := conn.Exec(ctx, "SET search_path TO "+quoted); err != nil {
+		t.Fatalf("point the test connection at %s: %v", schema, err)
+	}
+
 	if _, err := conn.Exec(ctx, schemaDDL); err != nil {
 		t.Fatalf("create schema failed: %v", err)
 	}
-	t.Cleanup(func() {
-		if _, err := conn.Exec(context.Background(),
-			"DELETE FROM paused_sandboxes WHERE cluster_id = ANY($1::uuid[])",
-			[]string{clusterA, clusterB},
-		); err != nil {
-			t.Logf("clean up test rows failed: %v", err)
-		}
-	})
+
+	dsn = contractDSNInSchema(t, dsn, schema)
 
 	seed := `
 INSERT INTO paused_sandboxes (

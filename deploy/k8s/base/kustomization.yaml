@@ -17,6 +17,23 @@ resources:
   - agentenv-daemonset.yaml
 
 configMapGenerator:
+  # 🔴 The cluster's own name, in one place because two sides have to agree on
+  # it and neither can tell that they do not. The node stamps this id on every
+  # paused-sandbox row it writes; the scheduler scopes every registry read,
+  # every registry write and the reclamation timer to it. Set them apart and
+  # nothing fails: the scheduler simply serves a cluster that has no rows, and
+  # the rows the nodes are writing are reclaimed by nobody.
+  #
+  # It is not a credential — it is a name — so it belongs here rather than in
+  # the Secret it used to be read from, where nothing created it and the write
+  # surface came up cold on every fresh cluster with one error line to say so.
+  #
+  # Keep it in step with `[node_identity].cluster_id` in config/default.toml,
+  # which is what a node falls back to if this ConfigMap is ever missing.
+  # `services/shared/config` has a test that fails if the two drift apart.
+  - name: cluster-identity-config
+    literals:
+      - CLUSTER_ID=00000000-0000-0000-0000-000000000000
   - name: agentenv-k8s-config
     files:
       - config/agentenv.toml

@@ -87,6 +87,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # The cluster this node's registry rows belong to, read from the
+            # same ConfigMap key the scheduler scopes its registry to. A node
+            # stamping one cluster id while the scheduler serves and reclaims
+            # another is not an error anywhere: the rows are written, and then
+            # nobody the node talks to can see them.
+            #
+            # Optional because a node falls back to `[node_identity].cluster_id`
+            # in config/default.toml, which carries the same value — the
+            # ConfigMap is where a deployment changes it, the file is what it
+            # changes from.
+            - name: AENV_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-identity-config
+                  key: CLUSTER_ID
+                  optional: true
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "true"
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT

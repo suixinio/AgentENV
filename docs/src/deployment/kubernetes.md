@@ -106,6 +106,29 @@ kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
 
 The `postgres` backend refuses to start without a DSN rather than falling back, so the two objects above belong together. The node creates its own schema on first start.
 
+Each node reports the backend it assembled, once, at startup:
+
+```
+INFO paused sandbox registry ready backend=postgres cluster_id=… lease_ttl_secs=90 scheduler_endpoint=
+```
+
+That line is how a rollout is confirmed. A value `AENV_PAUSED_REGISTRY_BACKEND` does not recognise stops the node rather than falling back, but a value that never reached the Pod at all — a ConfigMap that was not created, a key spelled differently — leaves it on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
+
+### Cluster identity
+
+Both sides of the registry are scoped to one cluster id, and both read it from the same generated key, `cluster-identity-config/CLUSTER_ID`: the node as `AENV_CLUSTER_ID`, the scheduler as `SCHEDULER_REGISTRY_CLUSTER_ID`. Change it in the one place it is written, the `configMapGenerator` literal in `deploy/k8s/base/kustomization.yaml`, and keep `[node_identity].cluster_id` in `config/default.toml` in step with it — that is what a node falls back to if the ConfigMap is ever absent.
+
+Two different values are not an error anywhere: rows are written, RPCs succeed, and the scheduler serves a cluster that has no rows while nobody reclaims the ones the nodes leave behind. A cluster id is a name rather than a credential, which is why it is not in a Secret — it used to be, on a key nothing ever created, and the result was a scheduler whose registry write surface was permanently cold on every fresh cluster while `/healthz` and the gRPC probe both said it was fine.
+
+The scheduler reports the scope it is running with on its metrics listener:
+
+```bash
+curl -s localhost:9101/healthz | jq .registry_write
+# { "phase": "serving", "ready": true, "serving": true, "cluster_id": "…", … }
+```
+
+An empty `cluster_id` there means the write surface is registered and cold, answering every registry RPC `UNAVAILABLE` until one is supplied.
+
 ### Through the scheduler instead of the database
 
 `AENV_PAUSED_REGISTRY_BACKEND=central` reaches the same registry over gRPC through the scheduler, which owns the database. The semantics are identical; what changes is that the DSN, the connection budget and the schema stop being every node's business — the credentials are held in one place instead of on every machine that runs user code, and the connection count stops growing with the fleet.

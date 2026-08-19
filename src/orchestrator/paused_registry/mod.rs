@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cfg::{ClusterConfig, PausedRegistryBackendKind, PausedRegistryConfig};
 use crate::identity::NodeIdentity;
@@ -339,60 +339,91 @@ pub(super) fn log_claim_outcome(
     }
 }
 
-/// Builds the configured registry.
+/// Builds the configured registry, and says which one it built.
 ///
 /// A cluster backend that is missing what it needs to reach the cluster is a
 /// startup failure rather than a silent fallback to `local`: the operator asked
 /// for cluster-wide recovery, and a node that quietly serves node-local
 /// semantics instead would only reveal the difference when a node is lost and
 /// the sandboxes turn out to be gone.
+///
+/// The backends that *are* reachable this way — `local` because the override
+/// never arrived — are told apart by the one info line at the end.
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
     cluster: &ClusterConfig,
     identity: &NodeIdentity,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
-    match config.backend {
-        PausedRegistryBackendKind::Local => Ok(Arc::new(DisabledPausedSandboxRegistry)),
-        PausedRegistryBackendKind::Central => {
-            let endpoint = cluster
-                .scheduler_endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|endpoint| !endpoint.is_empty())
-                .context(
-                    "paused_registry.backend = \"central\" requires a scheduler endpoint; \
-                     set AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
-                )?;
+    let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
+        match config.backend {
+            PausedRegistryBackendKind::Local => (Arc::new(DisabledPausedSandboxRegistry), ""),
+            PausedRegistryBackendKind::Central => {
+                let endpoint = cluster
+                    .scheduler_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .context(
+                        "paused_registry.backend = \"central\" requires a scheduler endpoint; \
+                         set AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
+                    )?;
 
-            Ok(Arc::new(CentralPausedSandboxRegistry::connect_lazy(
-                endpoint,
-                identity.cluster_id,
-                identity.id.clone(),
-                config.lease_ttl_secs(),
-            )?))
-        }
-        PausedRegistryBackendKind::Postgres => {
-            let dsn = config
-                .dsn
-                .as_deref()
-                .map(str::trim)
-                .filter(|dsn| !dsn.is_empty())
-                .context(
-                    "paused_registry.backend = \"postgres\" requires a DSN; \
-                     set AENV_PAUSED_REGISTRY_DSN",
-                )?;
-
-            Ok(Arc::new(
-                PostgresPausedSandboxRegistry::connect(
-                    dsn,
-                    identity.cluster_id,
-                    config.max_connections,
-                    config.lease_ttl_secs() as f64,
+                (
+                    Arc::new(CentralPausedSandboxRegistry::connect_lazy(
+                        endpoint,
+                        identity.cluster_id,
+                        identity.id.clone(),
+                        config.lease_ttl_secs(),
+                    )?),
+                    endpoint,
                 )
-                .await?,
-            ))
-        }
-    }
+            }
+            PausedRegistryBackendKind::Postgres => {
+                let dsn = config
+                    .dsn
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|dsn| !dsn.is_empty())
+                    .context(
+                        "paused_registry.backend = \"postgres\" requires a DSN; \
+                         set AENV_PAUSED_REGISTRY_DSN",
+                    )?;
+
+                (
+                    Arc::new(
+                        PostgresPausedSandboxRegistry::connect(
+                            dsn,
+                            identity.cluster_id,
+                            config.max_connections,
+                            config.lease_ttl_secs() as f64,
+                        )
+                        .await?,
+                    ),
+                    "",
+                )
+            }
+        };
+
+    // 🔴 One statement for all three backends, after the match rather than
+    // inside each arm. A per-arm line is a line an arm can be missing, and the
+    // arm that was missing it was `central`: a node switched over to it said
+    // nothing at all, so "the switch took" and "the value never reached the
+    // node and it stayed on `local`" read identically in the log — while the
+    // difference between them only surfaces later, when a node is lost and its
+    // sandboxes turn out to have gone with it. Which backend this node ended
+    // up on is the one fact this path has to state out loud.
+    //
+    // `scheduler_endpoint` is empty for the two backends that do not have one;
+    // the DSN is deliberately not here, since it carries credentials.
+    info!(
+        backend = config.backend.as_str(),
+        cluster_id = %identity.cluster_id,
+        lease_ttl_secs = config.lease_ttl_secs(),
+        scheduler_endpoint,
+        "paused sandbox registry ready"
+    );
+
+    Ok(registry)
 }
 
 #[cfg(test)]
@@ -486,6 +517,7 @@ mod claim_outcome_tests {
 mod build_tests {
     use super::*;
     use crate::cfg::PausedRegistryConfig;
+    use crate::logging::capture::Recorder;
 
     fn config(backend: PausedRegistryBackendKind) -> PausedRegistryConfig {
         PausedRegistryConfig {
@@ -564,5 +596,62 @@ mod build_tests {
         )
         .await
         .is_err());
+    }
+
+    /// 🔴 Every backend says which one it is, out loud, at assembly.
+    ///
+    /// The one that did not was `central`, and the cost was that a node
+    /// switched over to it produced no line at all — indistinguishable in the
+    /// log from a node whose override never arrived and that quietly stayed on
+    /// `local`, which is the failure `AENV_PAUSED_REGISTRY_BACKEND` was
+    /// introduced to prevent in the first place. The two arms reachable
+    /// without a database are checked here; the third shares the single
+    /// statement they all reach.
+    #[tokio::test]
+    async fn every_backend_reports_which_one_it_is() {
+        for (backend, endpoint) in [
+            (PausedRegistryBackendKind::Local, None),
+            (
+                PausedRegistryBackendKind::Central,
+                Some("http://scheduler.invalid:9090"),
+            ),
+        ] {
+            let recorder = Recorder::default();
+            let guard = recorder.install();
+            build_paused_registry(&config(backend), &cluster(endpoint), &identity())
+                .await
+                .expect("neither backend dials anything here");
+            drop(guard);
+
+            // The backend, so "the switch took" is readable on its own; the
+            // cluster id and the lease, because a registry scoped to the wrong
+            // cluster or holding leases for the wrong length looks healthy
+            // from every other angle.
+            for field in [
+                &format!("backend={}", backend.as_str()),
+                "cluster_id=00000000-0000-0000-0000-000000000000",
+                "lease_ttl_secs=90",
+                "paused sandbox registry ready",
+            ] {
+                assert!(
+                    recorder.saw(tracing::Level::INFO, field),
+                    "{backend:?} did not report {field:?}: {:?}",
+                    recorder.events()
+                );
+            }
+
+            // And where it is reaching, for the backend that reaches anywhere:
+            // an endpoint pointing at the wrong scheduler is the other way a
+            // node can be configured on and useless.
+            assert_eq!(
+                recorder.saw(
+                    tracing::Level::INFO,
+                    "scheduler_endpoint=http://scheduler.invalid:9090"
+                ),
+                endpoint.is_some(),
+                "{backend:?} reported the wrong endpoint: {:?}",
+                recorder.events()
+            );
+        }
     }
 }

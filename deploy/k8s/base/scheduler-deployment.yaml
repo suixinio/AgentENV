@@ -38,14 +38,30 @@ spec:
                   name: agentenv-postgres
                   key: dsn
                   optional: true
-            # Scopes every registry read to one cluster. Absent means "every row
-            # in the database", which is only right when the database serves a
-            # single cluster.
+            # Scopes every registry read to one cluster, and — once the write
+            # surface is on — every write and the reclamation timer with it.
+            #
+            # 🔴 The same ConfigMap key the DaemonSet reads `AENV_CLUSTER_ID`
+            # from, on purpose: this value only means anything if both sides
+            # hold the same one, and neither can detect that they do not. It
+            # used to come from a key on the `agentenv-postgres` Secret that
+            # nothing ever created, which is how a fresh cluster got a write
+            # surface that was permanently cold with a single error line to
+            # explain it. A cluster id is a name, not a credential, so it has
+            # no business being in a Secret in the first place.
+            #
+            # Left optional: absent, the read surface widens to every row in
+            # the database and the write surface stays registered and cold
+            # answering UNAVAILABLE. Both are deliberate — a missing value must
+            # not take routing, discovery and bindings down with it — which is
+            # exactly why the value is carried by the base layer rather than by
+            # an object somebody has to remember to create. `/healthz` reports
+            # the id in use, so "configured" can be told from "assumed".
             - name: SCHEDULER_REGISTRY_CLUSTER_ID
               valueFrom:
-                secretKeyRef:
-                  name: agentenv-postgres
-                  key: cluster_id
+                configMapKeyRef:
+                  name: cluster-identity-config
+                  key: CLUSTER_ID
                   optional: true
           ports:
             - name: grpc

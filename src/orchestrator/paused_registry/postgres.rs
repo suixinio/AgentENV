@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
@@ -127,7 +127,9 @@ impl PostgresPausedSandboxRegistry {
 
         Self::ensure_schema(&pool).await?;
 
-        info!(%cluster_id, lease_ttl_secs, "paused sandbox registry ready");
+        // The "registry ready" line lives in `build_paused_registry`, one
+        // statement shared by all three backends, so that the backend a node
+        // actually ended up on is reported the same way whichever one it is.
 
         Ok(Self {
             pool,

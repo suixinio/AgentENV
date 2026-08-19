@@ -22,6 +22,7 @@ import (
 func TestHealthReportsThePhaseWithoutGatingTheProcess(t *testing.T) {
 	cases := map[string]struct {
 		phase     func() (string, time.Duration, time.Duration)
+		clusterID string
 		want      string
 		ready     bool
 		serving   bool
@@ -39,17 +40,18 @@ func TestHealthReportsThePhaseWithoutGatingTheProcess(t *testing.T) {
 			remaining: 42,
 		},
 		"serving": {
-			phase:   func() (string, time.Duration, time.Duration) { return "serving", 0, 3 * time.Minute },
-			want:    "serving",
-			ready:   true,
-			serving: true,
+			phase:     func() (string, time.Duration, time.Duration) { return "serving", 0, 3 * time.Minute },
+			clusterID: "11111111-aaaa-4aaa-8aaa-111111111111",
+			want:      "serving",
+			ready:     true,
+			serving:   true,
 		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			registryHealthHandler(tc.phase)(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			registryHealthHandler(tc.clusterID, tc.phase)(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status: got %d, want 200 — this endpoint must not gate the process", rec.Code)
@@ -61,6 +63,7 @@ func TestHealthReportsThePhaseWithoutGatingTheProcess(t *testing.T) {
 					Phase     string  `json:"phase"`
 					Ready     bool    `json:"ready"`
 					Serving   bool    `json:"serving"`
+					ClusterID string  `json:"cluster_id"`
 					Remaining float64 `json:"grace_remaining_seconds"`
 					Downtime  float64 `json:"inferred_downtime_seconds"`
 				} `json:"registry_write"`
@@ -86,6 +89,16 @@ func TestHealthReportsThePhaseWithoutGatingTheProcess(t *testing.T) {
 				}
 				if body.RegistryWrite.Remaining != tc.remaining {
 					t.Fatalf("grace_remaining_seconds: got %v, want %v", body.RegistryWrite.Remaining, tc.remaining)
+				}
+				// 🔴 The scope the surface is actually running with, reported
+				// whether or not there is one. A write surface with no cluster
+				// id is cold forever while every other health signal says the
+				// process is fine, and the startup error that explains it has
+				// scrolled away by the time anyone looks; an empty cluster_id
+				// here is the difference between "the database is down" and
+				// "nothing ever told it which cluster it serves".
+				if body.RegistryWrite.ClusterID != tc.clusterID {
+					t.Fatalf("cluster_id: got %q, want %q", body.RegistryWrite.ClusterID, tc.clusterID)
 				}
 			}
 		})

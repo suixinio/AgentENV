@@ -395,6 +395,15 @@ interval_secs = 5
 # Stable node identifier returned by node APIs and scheduler heartbeats.
 node_id = "node-a"
 # Logical cluster UUID.
+#
+# 🔴 Also the scope of every paused-sandbox registry row this node writes, and
+# it has to be the same id the scheduler scopes its registry to — set them
+# apart and nothing fails, the rows are simply written into a cluster the
+# scheduler never looks at. A deployment sets both from one place: the
+# `cluster-identity-config` ConfigMap in deploy/k8s/base/kustomization.yaml,
+# reaching this value through AENV_CLUSTER_ID. This line is what a node falls
+# back to when that ConfigMap is absent, so the two must carry the same value;
+# `services/shared/config` has a test that fails if they drift apart.
 cluster_id = "00000000-0000-0000-0000-000000000000"
 # Identifier for this service instance.
 service_instance_id = "service-instance-a"

@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
-    BeganPause, HeldSandbox, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
-    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    log_claim_outcome, BeganPause, HeldSandbox, PausedRegistryError, PausedRegistryState,
+    PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
+    ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
@@ -192,7 +193,10 @@ impl PostgresPausedSandboxRegistry {
         sandbox_id: &SandboxId,
     ) -> RegistryResult<PausedRegistryState> {
         let text: String = row.try_get(column).map_err(|e| {
-            PausedRegistryError::backend("decode state", anyhow!(e).context(format!("column {column}")))
+            PausedRegistryError::backend(
+                "decode state",
+                anyhow!(e).context(format!("column {column}")),
+            )
         })?;
 
         PausedRegistryState::parse(&text).ok_or_else(|| PausedRegistryError::InvalidRecord {
@@ -256,7 +260,7 @@ impl PostgresPausedSandboxRegistry {
                 PausedRegistryError::backend("decode claimed_by_node_id", anyhow!(e))
             })?,
             snapshot_id: snapshot_uuid.map(SnapshotId::from_uuid),
-            metadata,
+            metadata: Some(metadata),
             paused_at: row
                 .try_get("paused_at")
                 .map_err(|e| PausedRegistryError::backend("decode paused_at", anyhow!(e)))?,
@@ -292,13 +296,22 @@ impl PostgresPausedSandboxRegistry {
 #[async_trait]
 impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
     async fn begin_pause(&self, entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
-        let metadata = serde_json::to_value(&entry.metadata).map_err(|e| {
-            PausedRegistryError::InvalidRecord {
+        // The write path always has the record; refusing here rather than
+        // writing an empty one keeps a row from promising a rebuild it cannot
+        // deliver.
+        let Some(metadata) = entry.metadata.as_ref() else {
+            return Err(PausedRegistryError::InvalidRecord {
+                sandbox_id: entry.sandbox_id.to_string(),
+                reason: "sandbox metadata is missing".to_string(),
+                source: None,
+            });
+        };
+        let metadata =
+            serde_json::to_value(metadata).map_err(|e| PausedRegistryError::InvalidRecord {
                 sandbox_id: entry.sandbox_id.to_string(),
                 reason: "sandbox metadata is not serializable".to_string(),
                 source: Some(e.into()),
-            }
-        })?;
+            })?;
         let now: DateTime<Utc> = Utc::now();
 
         // A re-pause of a sandbox that already has a row (paused -> resumed ->
@@ -569,42 +582,7 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
             let entry = Self::decode(&row)?;
             let previous_state = Self::decode_state(&row, "previous_state", &entry.sandbox_id)?;
 
-            // One arm per thing that actually happened, decided here rather
-            // than left for a reader to infer from the row: an ordinary resume
-            // and a claim that cost someone their last unpublished pause are
-            // not the same event, and only the second one is worth waking
-            // anybody for.
-            match previous_state {
-                PausedRegistryState::Paused => debug!(
-                    %sandbox_id,
-                    node_id,
-                    generation = entry.generation,
-                    claim_outcome = "durable",
-                    "claimed a sandbox from its published snapshot"
-                ),
-                PausedRegistryState::Publishing | PausedRegistryState::LocalOnly => warn!(
-                    %sandbox_id,
-                    node_id,
-                    claim_outcome = "rewound",
-                    previous_state = ?previous_state,
-                    previous_holder = %entry.origin_node_id,
-                    "took over a sandbox parked on a node that stopped renewing its lease; \
-                     restoring from the last snapshot that reached the repository, so any \
-                     work since that snapshot is lost"
-                ),
-                // Unreachable through the `WHERE` above, which is precisely why
-                // it is loud: reaching it means the predicate and this match
-                // have drifted apart, and the claim just duplicated a sandbox
-                // that was live somewhere else.
-                live => error!(
-                    %sandbox_id,
-                    node_id,
-                    claim_outcome = "invariant_violation",
-                    previous_state = ?live,
-                    previous_holder = %entry.origin_node_id,
-                    "claimed a sandbox that was not parked; a live sandbox may now exist twice"
-                ),
-            }
+            log_claim_outcome(sandbox_id, node_id, &entry, previous_state);
 
             return Ok(ResumeClaim::Claimed {
                 entry: Box::new(entry),

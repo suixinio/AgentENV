@@ -106,6 +106,19 @@ kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
 
 The `postgres` backend refuses to start without a DSN rather than falling back, so the two objects above belong together. The node creates its own schema on first start.
 
+### Through the scheduler instead of the database
+
+`AENV_PAUSED_REGISTRY_BACKEND=central` reaches the same registry over gRPC through the scheduler, which owns the database. The semantics are identical; what changes is that the DSN, the connection budget and the schema stop being every node's business — the credentials are held in one place instead of on every machine that runs user code, and the connection count stops growing with the fleet.
+
+```bash
+kubectl -n agentenv-system create configmap paused-registry-config \
+  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=central
+```
+
+It needs `[cluster].scheduler_endpoint` (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, already set on the DaemonSet) and no DSN, and refuses to start without an endpoint rather than falling back. Reclamation of holdings from nodes that never came back is the scheduler's own timer under this backend, not something a node asks for.
+
+🔴 **Switch every node at once, and not while sandboxes are live.** A node on the `postgres` backend re-asserts the table's constraints on every start, so a mixed fleet has two writers with different ideas of the schema. Both backends arbitrate through the same generation column, so a mixed fleet is not corrupt — but it is a fleet whose schema owner is whichever node started last.
+
 ## Operations
 
 ```bash

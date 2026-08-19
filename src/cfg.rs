@@ -387,6 +387,13 @@ pub enum PausedRegistryBackendKind {
     /// to the shared repository, so any node can resume the sandbox under its
     /// original ID.
     Postgres,
+    /// Same registry, reached over gRPC through whoever owns the database
+    /// instead of by connecting to it. Identical semantics to `postgres` — the
+    /// difference is that the database credentials, the connection budget and
+    /// the schema stop being every node's business.
+    ///
+    /// Requires `[cluster].scheduler_endpoint`.
+    Central,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1521,19 +1528,28 @@ mod tests {
     fn the_paused_registry_backend_is_settable_from_the_environment() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-        std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", "postgres");
-        let overridden = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
-        std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");
+        // Every backend has to be reachable this way, or the one that is not
+        // can only be selected by editing a file that the next apply
+        // overwrites — which is the failure this override exists to remove.
+        for (value, expected) in [
+            ("postgres", PausedRegistryBackendKind::Postgres),
+            ("central", PausedRegistryBackendKind::Central),
+            ("local", PausedRegistryBackendKind::Local),
+        ] {
+            std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", value);
+            let overridden = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
+            std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");
 
-        assert_eq!(
-            overridden
-                .expect("load with the backend overridden")
-                .config()
-                .orchestrator
-                .paused_registry
-                .backend,
-            PausedRegistryBackendKind::Postgres
-        );
+            assert_eq!(
+                overridden
+                    .unwrap_or_else(|err| panic!("load with backend={value}: {err}"))
+                    .config()
+                    .orchestrator
+                    .paused_registry
+                    .backend,
+                expected
+            );
+        }
 
         assert_eq!(
             ConfigManager::new_from_path(&workspace.join("config/default.toml"))

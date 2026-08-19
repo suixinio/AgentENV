@@ -95,7 +95,7 @@ fn entry(sandbox_id: SandboxId, origin: &str) -> PausedSandboxEntry {
         origin_node_id: origin.to_string(),
         claimed_by_node_id: None,
         snapshot_id: None,
-        metadata: SandboxMetadata::default(),
+        metadata: Some(SandboxMetadata::default()),
         paused_at: Utc::now(),
         updated_at: Utc::now(),
     }

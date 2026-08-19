@@ -11,6 +11,7 @@
 //! backend.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -162,6 +163,17 @@ pub struct PausedSandboxCoordinator {
     node_id: String,
     running_registrations: RunningRegistrations,
     takeover_window: TakeoverWindow,
+    /// How many lease renewals in a row have failed.
+    ///
+    /// 🔴 A single missed renewal is nothing — the configured TTL is held to
+    /// three renewal intervals precisely so that two may be missed. It is the
+    /// *run* that matters, and no single failure can report one: each one is
+    /// logged and forgotten, so the third in a row looks exactly like the
+    /// first, while it is the third that hands this node's parked sandboxes to
+    /// whoever claims them next. Against a database on a permanently open pool
+    /// three in a row was close to unreachable; against a service that rolls it
+    /// is a normal deployment.
+    consecutive_renew_failures: AtomicU64,
 }
 
 impl PausedSandboxCoordinator {
@@ -176,7 +188,32 @@ impl PausedSandboxCoordinator {
             node_id,
             running_registrations: RunningRegistrations::default(),
             takeover_window: TakeoverWindow::new(),
+            consecutive_renew_failures: AtomicU64::new(0),
         }
+    }
+
+    /// Records how a lease renewal went and publishes the current run of
+    /// failures.
+    ///
+    /// A gauge rather than a counter: what an operator has to see is the run
+    /// standing right now against the number of misses the TTL allows, and a
+    /// total of renewals that ever failed does not answer that.
+    pub fn observe_lease_renewal(&self, renewed: bool) {
+        let failures = if renewed {
+            self.consecutive_renew_failures.store(0, Ordering::SeqCst);
+            0
+        } else {
+            self.consecutive_renew_failures
+                .fetch_add(1, Ordering::SeqCst)
+                + 1
+        };
+
+        metrics::gauge!("agentenv_paused_registry_renew_consecutive_failures").set(failures as f64);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consecutive_renew_failures(&self) -> u64 {
+        self.consecutive_renew_failures.load(Ordering::SeqCst)
     }
 
     pub fn registry(&self) -> &Arc<dyn PausedSandboxRegistry> {
@@ -238,7 +275,7 @@ impl PausedSandboxCoordinator {
             origin_node_id: self.node_id.clone(),
             claimed_by_node_id: None,
             snapshot_id: None,
-            metadata: outcome.metadata.clone(),
+            metadata: Some(outcome.metadata.clone()),
             paused_at: DateTime::<Utc>::from(outcome.metadata.created_at),
             updated_at: Utc::now(),
         };
@@ -715,7 +752,7 @@ mod tests {
             origin_node_id: origin.to_string(),
             claimed_by_node_id: claimed_by.map(str::to_string),
             snapshot_id: Some(SnapshotId::generate()),
-            metadata: SandboxMetadata::default(),
+            metadata: Some(SandboxMetadata::default()),
             paused_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -971,6 +1008,9 @@ pub(super) mod test_support {
         mark_running_fails: bool,
         get_calls: AtomicUsize,
         get_answer: GetAnswer,
+        claim_fails: bool,
+        renew_calls: AtomicUsize,
+        renewals_to_fail: usize,
     }
 
     /// What a programmed `get` should answer.
@@ -991,6 +1031,24 @@ pub(super) mod test_support {
                 mark_running_fails,
                 get_calls: AtomicUsize::new(0),
                 get_answer: GetAnswer::Missing,
+                claim_fails: false,
+                renew_calls: AtomicUsize::new(0),
+                renewals_to_fail: 0,
+            }
+        }
+
+        /// A registry nobody can reach: the shape of a controller mid-rollout.
+        pub(crate) fn unreachable() -> Self {
+            Self::unreachable_for(usize::MAX)
+        }
+
+        /// Unreachable for the first `renewals_to_fail` renewals, then back.
+        pub(crate) fn unreachable_for(renewals_to_fail: usize) -> Self {
+            Self {
+                claim_fails: true,
+                renewals_to_fail,
+                get_answer: GetAnswer::Unreachable,
+                ..Self::new(usize::MAX, true)
             }
         }
 
@@ -1062,7 +1120,7 @@ pub(super) mod test_support {
                     origin_node_id: "node-a".to_string(),
                     claimed_by_node_id: None,
                     snapshot_id: Some(snapshot_id.clone()),
-                    metadata: crate::orchestrator::SandboxMetadata::default(),
+                    metadata: Some(crate::orchestrator::SandboxMetadata::default()),
                     paused_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 })),
@@ -1081,6 +1139,10 @@ pub(super) mod test_support {
             _sandbox_id: &SandboxId,
             _node_id: &str,
         ) -> RegistryResult<ResumeClaim> {
+            if self.claim_fails {
+                return Err(unreachable_backend("claim_for_resume"));
+            }
+
             Ok(ResumeClaim::NotFound)
         }
 
@@ -1093,6 +1155,11 @@ pub(super) mod test_support {
         }
 
         async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
+            let seen = self.renew_calls.fetch_add(1, Ordering::SeqCst);
+            if seen < self.renewals_to_fail {
+                return Err(unreachable_backend("renew_lease"));
+            }
+
             Ok(0)
         }
 

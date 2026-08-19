@@ -1275,6 +1275,30 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
+            // 🔴 Not a 404. The downstream contract for a 404 on this route is
+            // "the sandbox is gone, rebuild it", which resets the user's
+            // workspace to its template — and what actually happened is that
+            // nobody could be asked. This says "ask again", which is the only
+            // honest answer and the only retryable one.
+            //
+            // 🔴 And 500 rather than the 503 this obviously is, on purpose.
+            // `src/api/openapi.yml` has no 503 anywhere, so introducing one
+            // means regenerating the whole server crate for a code that buys
+            // nothing: the only consumer of this route maps both onto the same
+            // "the sandbox's state is unknown" branch, so 500 and 503 are
+            // literally indistinguishable to it. The wording below is what
+            // carries the meaning, and it is deliberately unique to this
+            // branch so an operator grepping for it lands here and nowhere
+            // else. Revisit if a 503 ever exists in the spec for its own
+            // reasons — not for this.
+            ResumeArbitration::Unavailable { reason } => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                    Self::error(
+                        500,
+                        format!("cannot determine whether the sandbox is live elsewhere: {reason}"),
+                    ),
+                ));
+            }
             ResumeArbitration::Held(entry) => Some(entry.generation),
             ResumeArbitration::Proceed => None,
         };

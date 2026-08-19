@@ -17,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{ApiImpl, StaleReleaseOutcome};
 use crate::orchestrator::{
@@ -128,6 +128,11 @@ pub(super) enum ResumeArbitration {
     /// Another node holds the sandbox, so resuming here would make a second
     /// live copy of it.
     Blocked { origin_node_id: String },
+    /// The registry could not be reached about a sandbox it is known to have a
+    /// say over, so nobody can tell whether resuming here would make a second
+    /// live copy. Retryable, and never an answer about whether the sandbox
+    /// exists.
+    Unavailable { reason: String },
 }
 
 /// Why a node's local paused record is no longer the truth.
@@ -154,9 +159,10 @@ impl ApiImpl {
     /// Asks the cluster who may resume this sandbox, taking the claim when the
     /// answer is "this node".
     ///
-    /// Fails open on anything that is not a clear "someone else has it": a
-    /// registry that cannot answer must not be able to stop a node from
-    /// resuming a sandbox sitting on its own disk.
+    /// Fails open on anything that is not a clear "someone else has it", with
+    /// one exception: a registry that cannot answer about a sandbox it was
+    /// told about. See [`unreachable_arbitration`] for why that one is
+    /// different.
     pub(super) async fn arbitrate_resume(&self, sandbox_id: SandboxId) -> ResumeArbitration {
         if !self.paused.registry().is_cluster_backed() {
             return ResumeArbitration::Proceed;
@@ -177,13 +183,15 @@ impl ApiImpl {
         {
             Ok(claim) => claim,
             Err(err) => {
-                warn!(
-                    error = %err,
-                    %sandbox_id,
-                    "could not reach the registry to arbitrate a resume; proceeding locally"
-                );
+                // What this node's own copy remembers is the only thing left to
+                // decide on, so read it before answering.
+                let registration = self
+                    .orchestrator
+                    .paused_record_cluster_registration(sandbox_id)
+                    .await
+                    .ok();
 
-                return ResumeArbitration::Proceed;
+                return unreachable_arbitration(registration, sandbox_id, &err.to_string());
             }
         };
 
@@ -293,6 +301,18 @@ impl ApiImpl {
             return CrossNodeResume::Failed("paused sandbox has no published snapshot".to_string());
         };
 
+        // A granted claim carries the record; rebuilding from a default one
+        // would produce a sandbox with a different identity and configuration
+        // from the one the user paused, and say nothing about it. Hand the
+        // claim back instead so the sandbox stays claimable.
+        let Some(metadata) = entry.metadata.clone() else {
+            self.release_claim(&sandbox_id, entry.generation).await;
+
+            return CrossNodeResume::Failed(
+                "paused sandbox claim carries no sandbox record".to_string(),
+            );
+        };
+
         info!(
             %sandbox_id,
             %snapshot_id,
@@ -325,7 +345,7 @@ impl ApiImpl {
             }
         };
 
-        let request = restore_request(&entry.metadata, snapshot, timeout);
+        let request = restore_request(&metadata, snapshot, timeout);
 
         match self.orchestrator.restore_sandbox(sandbox_id, request).await {
             Ok(metadata) => {
@@ -388,17 +408,21 @@ impl ApiImpl {
                 expires_at: metadata.expires_at.map(DateTime::<Utc>::from),
             })
             .collect();
-        if let Err(err) = self
+        match self
             .paused
             .registry()
             .renew_lease(self.paused.node_id(), &held)
             .await
         {
-            warn!(
-                error = %err,
-                "failed to renew paused registry leases; sandboxes parked here with an \
-                 unpublished snapshot may be rebuilt elsewhere from an older one"
-            );
+            Ok(_) => self.paused.observe_lease_renewal(true),
+            Err(err) => {
+                self.paused.observe_lease_renewal(false);
+                warn!(
+                    error = %err,
+                    "failed to renew paused registry leases; sandboxes parked here with an \
+                     unpublished snapshot may be rebuilt elsewhere from an older one"
+                );
+            }
         }
     }
 
@@ -775,8 +799,24 @@ impl ApiImpl {
             return false;
         }
 
-        let Ok(Some(superseded)) = self.superseded_by_cluster(sandbox_id).await else {
-            return false;
+        let superseded = match self.superseded_by_cluster(sandbox_id).await {
+            Ok(Some(superseded)) => superseded,
+            Ok(None) => return false,
+            // 🔴 Worth a line of its own. Keeping the copy is right, but the
+            // reason is not "the row is still ours" — it is that nobody could
+            // be asked, and the resume that follows this call is about to lose
+            // its other defence to the same outage. Once the registry is
+            // another service rather than a database connection this stops
+            // being rare, and without this it is invisible.
+            Err(()) => {
+                debug!(
+                    %sandbox_id,
+                    "the registry could not say whether this node's paused copy has been \
+                     superseded; leaving it in place"
+                );
+
+                return false;
+            }
         };
 
         match self
@@ -847,6 +887,73 @@ impl ApiImpl {
                 "failed to release the resume claim; the sandbox stays marked as resuming"
             );
         }
+    }
+}
+
+/// Decides a resume the registry could not arbitrate, from what this node's own
+/// copy remembers.
+///
+/// 🔴 This is the one direction the rest of this module's caution does not
+/// cover. Everywhere else a registry that cannot answer means *stop*; here it
+/// used to mean *go*, unconditionally — and the two failures are the same
+/// failure. `running` and `resuming` are never claimable, and the last thing
+/// enforcing that is the claim coming back as a conflict; when the registry is
+/// unreachable that check is simply absent. The same outage also makes
+/// `discard_if_superseded` keep a stale local copy instead of dropping it, so
+/// the two defences against bringing a sandbox up twice go together, and what
+/// is left is a node resuming a sandbox from a copy it has no reason to still
+/// believe in. Two VMs then diverge from one snapshot, each writing its own
+/// rootfs layers, with the gateway alternating between them.
+///
+/// That was survivable while the registry was a database in the same cluster
+/// with a permanently open pool. It is not once reaching it means reaching
+/// another service, whose ordinary rolling restart opens the window on purpose.
+///
+/// **Narrow, not blanket.** Only a local record that was announced *under a
+/// known identity* changes the answer. The alternatives carry no information:
+/// a record the cluster was never told about has its only copy right here, and
+/// one announced by a build that did not store the identity it used cannot be
+/// judged against the row either — which is exactly how [`supersession`] treats
+/// the same three cases. Refusing those would fail resumes that were never at
+/// risk.
+///
+/// The cost is a retryable failure while the registry is unreachable. Two live
+/// copies of one sandbox is not retryable.
+fn unreachable_arbitration(
+    registration: Option<ClusterRegistration>,
+    sandbox_id: SandboxId,
+    reason: &str,
+) -> ResumeArbitration {
+    if !matches!(registration, Some(ClusterRegistration::As(_))) {
+        metrics::counter!(
+            "agentenv_paused_registry_resume_unarbitrated_total",
+            "outcome" => "proceeded",
+        )
+        .increment(1);
+        warn!(
+            error = %reason,
+            %sandbox_id,
+            "could not reach the registry to arbitrate a resume; proceeding locally because \
+             this node holds no copy the cluster was told about"
+        );
+
+        return ResumeArbitration::Proceed;
+    }
+
+    metrics::counter!(
+        "agentenv_paused_registry_resume_unarbitrated_total",
+        "outcome" => "refused",
+    )
+    .increment(1);
+    warn!(
+        error = %reason,
+        %sandbox_id,
+        "could not reach the registry to arbitrate a resume for a sandbox this node announced \
+         to the cluster; refusing rather than risking a second live copy"
+    );
+
+    ResumeArbitration::Unavailable {
+        reason: reason.to_string(),
     }
 }
 
@@ -1040,10 +1147,24 @@ mod tests {
     /// host: enough to drive the startup-time release and its retry.
     async fn api_over(registry: Arc<dyn PausedSandboxRegistry>) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().unwrap();
+
+        api_rooted(root.path(), registry).await
+    }
+
+    /// The same, over a record store the caller owns — so a test can seed a
+    /// paused record into it first.
+    ///
+    /// The store is opened here and stays open, which is why seeding has to
+    /// happen before this is called: it is a RocksDB directory and only one
+    /// handle at a time may hold it.
+    async fn api_rooted(
+        root: &std::path::Path,
+        registry: Arc<dyn PausedSandboxRegistry>,
+    ) -> Arc<ApiImpl> {
         let orchestrator = Orchestrator::new(
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            FileBackedSandboxPersister::new_for_test(root.to_path_buf()),
         )
         .await
         .unwrap();
@@ -1062,6 +1183,249 @@ mod tests {
             ),
             Vec::new(),
         ))
+    }
+
+    /// Writes a paused record into the store at `root` and reports its id.
+    ///
+    /// 🔴 The record names the other virtualization mode on purpose. A store
+    /// opened afterwards keeps a record it cannot rebuild a VM from, but
+    /// discards one it *should* be able to and then cannot — and this test
+    /// wants the record, not a resumable sandbox. Seeded the obvious way, the
+    /// record is gone by the time the assertion runs and every one of these
+    /// tests passes for the wrong reason.
+    async fn seed_paused_record(
+        root: &std::path::Path,
+        registered_as: Option<&str>,
+    ) -> crate::types::SandboxId {
+        use crate::orchestrator::SandboxPersister;
+
+        let persister = FileBackedSandboxPersister::new_for_test(root.to_path_buf());
+        let sandbox_id = crate::types::SandboxId::new();
+        let artifacts = root.join("artifacts").join(sandbox_id.to_string());
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let paused_state: Arc<dyn crate::sandbox::PausedSandboxState> =
+            Arc::new(crate::sandbox::mock::MockSnapshot);
+
+        persister
+            .persist_paused(
+                &SandboxMetadata {
+                    id: sandbox_id,
+                    virtualization_mode: crate::virtualization::VirtualizationMode::Pvm,
+                    ..Default::default()
+                },
+                Some(&artifacts),
+                paused_state.as_ref(),
+            )
+            .await
+            .unwrap();
+        if let Some(node_id) = registered_as {
+            persister
+                .mark_cluster_registered(&sandbox_id, node_id)
+                .await
+                .unwrap();
+        }
+
+        sandbox_id
+    }
+
+    /// 🔴 The narrow case, and the only one that changes. A copy this node
+    /// announced to the cluster is one the cluster has a say over, and with the
+    /// registry unreachable nothing is left to enforce that `running` and
+    /// `resuming` are never claimable. Proceeding here is how one sandbox comes
+    /// to be live twice.
+    #[tokio::test]
+    async fn an_unreachable_registry_refuses_a_resume_for_a_copy_the_cluster_knows_about() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox_id = seed_paused_record(root.path(), Some(SELF)).await;
+        let api = api_rooted(root.path(), Arc::new(CountingRegistry::unreachable())).await;
+        let recorder = crate::logging::capture::Recorder::default();
+        let _guard = recorder.install();
+
+        assert!(matches!(
+            api.arbitrate_resume(sandbox_id).await,
+            ResumeArbitration::Unavailable { .. }
+        ));
+        assert!(
+            recorder.saw(tracing::Level::WARN, "refusing rather than risking"),
+            "the refusal has to be findable: {:?}",
+            recorder.events()
+        );
+    }
+
+    /// 🔴 What the refusal actually looks like to the only thing that reads it.
+    ///
+    /// The guardrail is worth nothing if the refusal reaches the caller as a
+    /// 404: the downstream contract for a 404 on this route is "the sandbox is
+    /// gone, rebuild it", which resets the user's workspace to its template —
+    /// exactly the outcome the guardrail exists to prevent, arrived at by a
+    /// different road. So the status is pinned here, along with the wording,
+    /// which is deliberately unique to this branch.
+    ///
+    /// 500 rather than 503 is on purpose; see the branch's own comment. The
+    /// assertion is that it is *not a 404 and not a success*, not that it is
+    /// the number 500 for its own sake.
+    #[tokio::test]
+    async fn a_resume_nobody_could_arbitrate_is_retryable_not_a_missing_sandbox() {
+        use agentenv_http_server::apis::sandboxes::{
+            Sandboxes, SandboxesSandboxIdResumePostResponse,
+        };
+        use agentenv_http_server::models;
+
+        let root = tempfile::tempdir().unwrap();
+        let sandbox_id = seed_paused_record(root.path(), Some(SELF)).await;
+        let api = api_rooted(root.path(), Arc::new(CountingRegistry::unreachable())).await;
+
+        let answer = api
+            .sandboxes_sandbox_id_resume_post(
+                &http::Method::POST,
+                &headers::Host::from(http::uri::Authority::from_static("localhost")),
+                &axum_extra::extract::CookieJar::new(),
+                &super::super::Claims,
+                &models::SandboxesSandboxIdResumePostPathParams {
+                    sandbox_id: sandbox_id.to_string(),
+                },
+                &models::ResumedSandbox::new(),
+            )
+            .await
+            .expect("the handler answers rather than failing the request");
+
+        let SandboxesSandboxIdResumePostResponse::Status500_ServerError(error) = answer else {
+            panic!("an unarbitrated resume must be retryable, got {answer:?}");
+        };
+        assert!(
+            error
+                .message
+                .contains("cannot determine whether the sandbox is live elsewhere"),
+            "the refusal has to say what happened: {error:?}"
+        );
+    }
+
+    /// The other side of the narrowing. A copy the cluster was never told about
+    /// is the only copy there is, so the registry's silence about it carries no
+    /// information and refusing would fail a resume that was never at risk.
+    #[tokio::test]
+    async fn an_unreachable_registry_still_proceeds_for_a_copy_the_cluster_never_saw() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox_id = seed_paused_record(root.path(), None).await;
+        let api = api_rooted(root.path(), Arc::new(CountingRegistry::unreachable())).await;
+
+        // The record has to still be there, or this passes for the wrong
+        // reason — a store that discarded it answers the same way.
+        assert_eq!(
+            api.orchestrator()
+                .paused_record_cluster_registration(sandbox_id)
+                .await
+                .expect("the seeded record should have survived startup"),
+            ClusterRegistration::Never
+        );
+        assert!(matches!(
+            api.arbitrate_resume(sandbox_id).await,
+            ResumeArbitration::Proceed
+        ));
+    }
+
+    /// Nothing local at all: there is no copy here to duplicate, so the resume
+    /// goes on to discover that for itself.
+    #[tokio::test]
+    async fn an_unreachable_registry_still_proceeds_when_this_node_holds_nothing() {
+        let api = api_over(Arc::new(CountingRegistry::unreachable())).await;
+
+        assert!(matches!(
+            api.arbitrate_resume(crate::types::SandboxId::new()).await,
+            ResumeArbitration::Proceed
+        ));
+    }
+
+    /// A node-local registry has no say at all, so an unreachable one cannot
+    /// arise and the resume never asks.
+    #[tokio::test]
+    async fn a_node_local_registry_never_refuses_a_resume() {
+        let api = api_over(Arc::new(DisabledPausedSandboxRegistry)).await;
+
+        assert!(matches!(
+            api.arbitrate_resume(crate::types::SandboxId::new()).await,
+            ResumeArbitration::Proceed
+        ));
+    }
+
+    /// The four things a local record can say, and what each is worth when the
+    /// registry cannot be reached.
+    #[test]
+    fn only_a_copy_announced_under_a_known_identity_refuses_a_resume() {
+        let sandbox_id = crate::types::SandboxId::new();
+
+        assert!(matches!(
+            unreachable_arbitration(
+                Some(ClusterRegistration::As(SELF.to_string())),
+                sandbox_id,
+                "no route to host"
+            ),
+            ResumeArbitration::Unavailable { .. }
+        ));
+        // Never announced: the local copy is the only copy.
+        assert!(matches!(
+            unreachable_arbitration(Some(ClusterRegistration::Never), sandbox_id, "no route"),
+            ResumeArbitration::Proceed
+        ));
+        // Announced by a build that did not store the identity: the row cannot
+        // be judged against it either, which is how `supersession` treats it.
+        assert!(matches!(
+            unreachable_arbitration(Some(ClusterRegistration::Anonymous), sandbox_id, "no route"),
+            ResumeArbitration::Proceed
+        ));
+        // No local record at all: nothing here to duplicate.
+        assert!(matches!(
+            unreachable_arbitration(None, sandbox_id, "no route"),
+            ResumeArbitration::Proceed
+        ));
+    }
+
+    /// 🔴 The second defence, failing in the same outage as the first. Keeping
+    /// the copy is right — but "the row is still ours" and "nobody could be
+    /// asked" are different reasons for the same silence, and only one of them
+    /// means a resume is about to run unarbitrated.
+    #[tokio::test]
+    async fn a_registry_that_cannot_be_asked_says_so_before_keeping_the_local_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox_id = seed_paused_record(root.path(), Some(SELF)).await;
+        let api = api_rooted(root.path(), Arc::new(CountingRegistry::unreachable())).await;
+        let recorder = crate::logging::capture::Recorder::default();
+        let _guard = recorder.install();
+
+        assert!(!api.discard_if_superseded(sandbox_id).await);
+        assert!(
+            recorder.saw(tracing::Level::DEBUG, "leaving it in place"),
+            "the non-deletion has to be findable: {:?}",
+            recorder.events()
+        );
+    }
+
+    /// 🔴 One missed renewal is nothing; the configured TTL is held to three
+    /// renewal intervals so that two may be missed. It is the run that matters,
+    /// and no single failure can report one.
+    #[tokio::test]
+    async fn consecutive_failed_renewals_are_counted() {
+        let api = api_over(Arc::new(CountingRegistry::unreachable())).await;
+
+        api.renew_paused_leases().await;
+        assert_eq!(api.paused.consecutive_renew_failures(), 1);
+        api.renew_paused_leases().await;
+        api.renew_paused_leases().await;
+        assert_eq!(api.paused.consecutive_renew_failures(), 3);
+    }
+
+    /// A run that has ended is not a run: the count is of failures *in a row*,
+    /// so one renewal landing clears whatever came before it.
+    #[tokio::test]
+    async fn a_renewal_that_lands_ends_the_run() {
+        let api = api_over(Arc::new(CountingRegistry::unreachable_for(2))).await;
+
+        api.renew_paused_leases().await;
+        api.renew_paused_leases().await;
+        assert_eq!(api.paused.consecutive_renew_failures(), 2);
+
+        api.renew_paused_leases().await;
+        assert_eq!(api.paused.consecutive_renew_failures(), 0);
     }
 
     /// The single-node default. There is no cluster to hand anything back to,
@@ -1151,7 +1515,7 @@ mod tests {
             origin_node_id: origin.to_string(),
             claimed_by_node_id: claimed_by.map(str::to_string),
             snapshot_id: Some(SnapshotId::generate()),
-            metadata: SandboxMetadata::default(),
+            metadata: Some(SandboxMetadata::default()),
             paused_at: Utc::now(),
             updated_at: Utc::now(),
         }

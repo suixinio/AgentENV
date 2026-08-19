@@ -75,7 +75,31 @@ pub struct PausedSandboxEntry {
     pub claimed_by_node_id: Option<String>,
     /// `None` while `state == Publishing`.
     pub snapshot_id: Option<SnapshotId>,
-    pub metadata: SandboxMetadata,
+    /// The sandbox's identity and configuration, as it looked when it was
+    /// paused. Present on the write path and on a granted claim; `None` on a
+    /// bulk read.
+    ///
+    /// 🔴 `None` says *this answer did not carry the record*, never *this
+    /// sandbox has no record*. Every row in the table has one — the write that
+    /// creates the row is refused without it — so there is no such thing as a
+    /// sandbox whose record is absent, and code that reads `None` as an empty
+    /// or default record would rebuild a sandbox that is not the one that was
+    /// asked for.
+    ///
+    /// 🔴 Optional because one backend genuinely cannot supply it, not because
+    /// it is unimportant. Exactly one caller reads it — the cross-node rebuild,
+    /// whose entry comes from [`ResumeClaim::Claimed`] — while the two bulk
+    /// consumers look only at `state`, `origin_node_id`, `claimed_by_node_id`
+    /// and `generation`. A backend that fetches rows over the network therefore
+    /// leaves it out of the batch read, which keeps a node's whole roster well
+    /// under any message size limit and confines the byte-for-byte round trip
+    /// of this record to the two calls that actually carry it.
+    ///
+    /// Absent, not defaulted: a default `SandboxMetadata` carries a freshly
+    /// generated id that matches no sandbox, so it would rebuild something that
+    /// is not the sandbox that was asked for, and nothing would report an
+    /// error.
+    pub metadata: Option<SandboxMetadata>,
     pub paused_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

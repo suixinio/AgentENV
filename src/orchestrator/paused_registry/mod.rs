@@ -17,6 +17,7 @@
 //! makes every operation a no-op, which leaves pause/resume behaving exactly as
 //! it did before this module existed.
 
+mod central;
 mod disabled;
 mod postgres;
 mod types;
@@ -26,13 +27,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use tracing::{debug, error, warn};
 
-use crate::cfg::{PausedRegistryBackendKind, PausedRegistryConfig};
+use crate::cfg::{ClusterConfig, PausedRegistryBackendKind, PausedRegistryConfig};
 use crate::identity::NodeIdentity;
 use crate::orchestrator::PauseOutcome;
 use crate::snapshot::SnapshotId;
 use crate::types::SandboxId;
 
+pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use postgres::PostgresPausedSandboxRegistry;
 pub use types::{
@@ -289,18 +292,85 @@ pub trait PausedSandboxPublisher: Send + Sync {
     async fn forget(&self, sandbox_id: SandboxId);
 }
 
+/// Says what a granted claim cost, once, wherever the claim came from.
+///
+/// Kept here rather than in each backend because the middle arm is an
+/// acceptance condition, not a log line: a claim that overrode a node which
+/// never finished uploading brings the sandbox back one snapshot behind, and
+/// the work since that snapshot is gone. That event has to be findable, and a
+/// second copy of this decision in another backend is how one of them would
+/// come to be missing it.
+pub(super) fn log_claim_outcome(
+    sandbox_id: &SandboxId,
+    node_id: &str,
+    entry: &PausedSandboxEntry,
+    previous_state: PausedRegistryState,
+) {
+    match previous_state {
+        PausedRegistryState::Paused => debug!(
+            %sandbox_id,
+            node_id,
+            generation = entry.generation,
+            claim_outcome = "durable",
+            "claimed a sandbox from its published snapshot"
+        ),
+        PausedRegistryState::Publishing | PausedRegistryState::LocalOnly => warn!(
+            %sandbox_id,
+            node_id,
+            claim_outcome = "rewound",
+            previous_state = ?previous_state,
+            previous_holder = %entry.origin_node_id,
+            "took over a sandbox parked on a node that stopped renewing its lease; \
+             restoring from the last snapshot that reached the repository, so any \
+             work since that snapshot is lost"
+        ),
+        // Unreachable through the claim's own predicate, which is precisely why
+        // it is loud: reaching it means the predicate and this match have
+        // drifted apart, and the claim just duplicated a sandbox that was live
+        // somewhere else.
+        live => error!(
+            %sandbox_id,
+            node_id,
+            claim_outcome = "invariant_violation",
+            previous_state = ?live,
+            previous_holder = %entry.origin_node_id,
+            "claimed a sandbox that was not parked; a live sandbox may now exist twice"
+        ),
+    }
+}
+
 /// Builds the configured registry.
 ///
-/// A `postgres` backend without a DSN is a startup failure rather than a silent
-/// fallback to `local`: the operator asked for cluster-wide recovery, and a node
-/// that quietly serves node-local semantics instead would only reveal the
-/// difference when a node is lost and the sandboxes turn out to be gone.
+/// A cluster backend that is missing what it needs to reach the cluster is a
+/// startup failure rather than a silent fallback to `local`: the operator asked
+/// for cluster-wide recovery, and a node that quietly serves node-local
+/// semantics instead would only reveal the difference when a node is lost and
+/// the sandboxes turn out to be gone.
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
+    cluster: &ClusterConfig,
     identity: &NodeIdentity,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
     match config.backend {
         PausedRegistryBackendKind::Local => Ok(Arc::new(DisabledPausedSandboxRegistry)),
+        PausedRegistryBackendKind::Central => {
+            let endpoint = cluster
+                .scheduler_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .context(
+                    "paused_registry.backend = \"central\" requires a scheduler endpoint; \
+                     set AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
+                )?;
+
+            Ok(Arc::new(CentralPausedSandboxRegistry::connect_lazy(
+                endpoint,
+                identity.cluster_id,
+                identity.id.clone(),
+                config.lease_ttl_secs(),
+            )?))
+        }
         PausedRegistryBackendKind::Postgres => {
             let dsn = config
                 .dsn
@@ -322,5 +392,177 @@ pub async fn build_paused_registry(
                 .await?,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_outcome_tests {
+    use super::*;
+    use crate::logging::capture::Recorder;
+    use crate::orchestrator::store::SandboxMetadata;
+
+    fn entry(state: PausedRegistryState) -> PausedSandboxEntry {
+        PausedSandboxEntry {
+            sandbox_id: SandboxId::new(),
+            cluster_id: uuid::Uuid::nil(),
+            state,
+            generation: 3,
+            origin_node_id: "node-b".to_string(),
+            claimed_by_node_id: None,
+            snapshot_id: Some(SnapshotId::generate()),
+            metadata: Some(SandboxMetadata::default()),
+            paused_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// 🔴 The one event on this path an operator has to be able to find: the
+    /// claim overrode a node that never finished uploading, so the sandbox
+    /// comes back one snapshot behind and everything since it is gone. It is a
+    /// warning because somebody lost work, not because something failed.
+    #[test]
+    fn a_claim_that_cost_somebody_their_last_pause_is_a_warning() {
+        for state in [
+            PausedRegistryState::Publishing,
+            PausedRegistryState::LocalOnly,
+        ] {
+            let recorder = Recorder::default();
+            let guard = recorder.install();
+            let entry = entry(state);
+
+            log_claim_outcome(&entry.sandbox_id, "node-a", &entry, state);
+            drop(guard);
+
+            assert!(
+                recorder.saw(tracing::Level::WARN, "work since that snapshot is lost"),
+                "{state:?} must warn: {:?}",
+                recorder.events()
+            );
+        }
+    }
+
+    /// An ordinary cross-node resume costs nothing and must not read as a
+    /// takeover — reporting every one of them as a lease takeover is a bug this
+    /// path has already had once.
+    #[test]
+    fn an_ordinary_claim_is_not_a_warning() {
+        let recorder = Recorder::default();
+        let guard = recorder.install();
+        let entry = entry(PausedRegistryState::Paused);
+
+        log_claim_outcome(
+            &entry.sandbox_id,
+            "node-a",
+            &entry,
+            PausedRegistryState::Paused,
+        );
+        drop(guard);
+
+        assert!(recorder.saw(tracing::Level::DEBUG, "durable"));
+        assert!(!recorder.saw(tracing::Level::WARN, "lost"));
+    }
+
+    /// A state the claim's own predicate cannot produce means the predicate and
+    /// this match have drifted apart, and a live sandbox may now exist twice.
+    #[test]
+    fn claiming_a_sandbox_that_was_not_parked_is_an_error() {
+        let recorder = Recorder::default();
+        let guard = recorder.install();
+        let entry = entry(PausedRegistryState::Running);
+
+        log_claim_outcome(
+            &entry.sandbox_id,
+            "node-a",
+            &entry,
+            PausedRegistryState::Running,
+        );
+        drop(guard);
+
+        assert!(recorder.saw(tracing::Level::ERROR, "may now exist twice"));
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use crate::cfg::PausedRegistryConfig;
+
+    fn config(backend: PausedRegistryBackendKind) -> PausedRegistryConfig {
+        PausedRegistryConfig {
+            backend,
+            dsn: None,
+            max_connections: 8,
+            reconcile_interval_secs: 30,
+            lease_ttl_secs: 90,
+        }
+    }
+
+    fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
+        ClusterConfig {
+            scheduler_endpoint: scheduler_endpoint.map(str::to_string),
+        }
+    }
+
+    fn identity() -> NodeIdentity {
+        NodeIdentity::from_config(&Default::default())
+    }
+
+    #[tokio::test]
+    async fn the_default_backend_is_node_local() {
+        let registry = build_paused_registry(
+            &config(PausedRegistryBackendKind::Local),
+            &cluster(None),
+            &identity(),
+        )
+        .await
+        .expect("the local backend needs nothing");
+
+        assert!(!registry.is_cluster_backed());
+    }
+
+    #[tokio::test]
+    async fn the_central_backend_comes_up_against_an_endpoint() {
+        let registry = build_paused_registry(
+            &config(PausedRegistryBackendKind::Central),
+            &cluster(Some("http://scheduler.invalid:9090")),
+            &identity(),
+        )
+        .await
+        .expect("the endpoint is dialled on first use, not here");
+
+        assert!(registry.is_cluster_backed());
+    }
+
+    /// 🔴 A cluster backend that cannot reach the cluster must stop the node,
+    /// not quietly serve node-local semantics. The difference between the two
+    /// only shows up when a node is lost and its sandboxes turn out to have
+    /// gone with it.
+    #[tokio::test]
+    async fn the_central_backend_without_an_endpoint_is_a_startup_failure() {
+        for endpoint in [None, Some(""), Some("   ")] {
+            assert!(
+                build_paused_registry(
+                    &config(PausedRegistryBackendKind::Central),
+                    &cluster(endpoint),
+                    &identity(),
+                )
+                .await
+                .is_err(),
+                "endpoint {endpoint:?} must not build a registry"
+            );
+        }
+    }
+
+    /// The same rule for the direct backend, which is what the central one was
+    /// modelled on.
+    #[tokio::test]
+    async fn the_postgres_backend_without_a_dsn_is_a_startup_failure() {
+        assert!(build_paused_registry(
+            &config(PausedRegistryBackendKind::Postgres),
+            &cluster(Some("http://scheduler.invalid:9090")),
+            &identity(),
+        )
+        .await
+        .is_err());
     }
 }

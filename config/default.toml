@@ -217,6 +217,10 @@ auto_resume_min_sandbox_timeout_secs = 300
 # - "postgres": the pause also publishes its snapshot to the shared repository
 #   and records the sandbox in PostgreSQL, so any node can resume it under its
 #   original ID.
+# - "central": the same registry and the same semantics as "postgres", reached
+#   over gRPC through the service that owns the database instead of by
+#   connecting to it. Requires [cluster].scheduler_endpoint and no DSN; a
+#   "central" backend with no endpoint fails startup rather than falling back.
 #
 # 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
 # editing the copy of this file that lands in the cluster ConfigMap — see
@@ -229,6 +233,7 @@ backend = "local"
 # dsn = ""
 
 # Connections per node held open against the registry database.
+# Unused by the "central" backend, which holds none.
 max_connections = 8
 
 # How often a node renews its registry leases and re-checks its local paused

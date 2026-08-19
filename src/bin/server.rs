@@ -144,8 +144,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let paused_registry =
-        build_paused_registry(&config.orchestrator.paused_registry, &identity_for_registry).await?;
+    let paused_registry = build_paused_registry(
+        &config.orchestrator.paused_registry,
+        &config.cluster,
+        &identity_for_registry,
+    )
+    .await?;
     let paused_wiring = PausedSandboxWiring::new(
         paused_registry,
         Arc::clone(&snapshot_manager),

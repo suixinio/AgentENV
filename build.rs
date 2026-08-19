@@ -5,8 +5,13 @@ fn main() {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
     emit_git_rerun_inputs();
 
+    // The server stubs exist for the in-process fake controller the registry
+    // client's transport tests run against. That client's whole job is turning
+    // gRPC outcomes into the right kind of failure, and the outcomes worth
+    // testing — a deadline, a refused connection, a status that sounds like an
+    // answer — can only be produced by something on the other end of a socket.
     tonic_prost_build::configure()
-        .build_server(false)
+        .build_server(true)
         .build_client(true)
         .compile_protos(
             &["services/api/proto/scheduler.proto"],

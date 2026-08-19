@@ -312,12 +312,18 @@ func (e *contractEnv) pauseAndPublish(t *testing.T, cluster, sandboxID, origin s
 func (e *contractEnv) markRunning(t *testing.T, cluster, sandboxID, node string) bool {
 	t.Helper()
 
-	confirmed, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node)
+	return e.markRunningOutcome(t, cluster, sandboxID, node) == MarkRunningAdopted
+}
+
+func (e *contractEnv) markRunningOutcome(t *testing.T, cluster, sandboxID, node string) MarkRunningOutcome {
+	t.Helper()
+
+	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node)
 	if err != nil {
 		t.Fatalf("mark %s running on %s: %v", sandboxID, node, err)
 	}
 
-	return confirmed
+	return outcome
 }
 
 func (e *contractEnv) claim(t *testing.T, cluster, sandboxID, node string) ResumeClaim {
@@ -555,17 +561,34 @@ func TestContractABatchReadReportsOnlyTheSandboxesThatHaveRows(t *testing.T) {
 		t.Fatalf("batch read: %v", err)
 	}
 
-	if len(rows) != 2 {
-		t.Fatalf("expected exactly the two rows that exist, got %d", len(rows))
+	if len(rows.Entries) != 2 {
+		t.Fatalf("expected exactly the two rows that exist, got %d", len(rows.Entries))
 	}
-	if got := rows[tracked].OriginNodeID; got != contractNodeA {
+	if got := rows.Entries[tracked].OriginNodeID; got != contractNodeA {
 		t.Fatalf("unexpected origin for the first row: got %q, want %q", got, contractNodeA)
 	}
-	if got := rows[alsoTracked].OriginNodeID; got != contractNodeB {
+	if got := rows.Entries[alsoTracked].OriginNodeID; got != contractNodeB {
 		t.Fatalf("unexpected origin for the second row: got %q, want %q", got, contractNodeB)
 	}
-	if _, ok := rows[untracked]; ok {
+	if _, ok := rows.Entries[untracked]; ok {
 		t.Fatal("a sandbox with no row must be absent, which is how the caller reads 'the cluster does not track it'")
+	}
+
+	// 🔴 The absence above is only usable as "no row" because the answer says
+	// it looked. Without this the caller cannot tell that reading from a
+	// response that lost rows on the way, and its response to "no row" is to
+	// delete the sandbox.
+	covered := make(map[string]bool, len(rows.Covered))
+	for _, id := range rows.Covered {
+		covered[id] = true
+	}
+	for _, id := range []string{tracked, untracked, alsoTracked} {
+		if !covered[id] {
+			t.Fatalf("the answer does not claim to have looked up %s, so its absence proves nothing", id)
+		}
+	}
+	if rows.Now.IsZero() {
+		t.Fatal("a batch read must carry the database's clock: lease arithmetic on these rows must not use the reader's own")
 	}
 }
 
@@ -586,8 +609,14 @@ func TestContractABatchReadCannotSeeAnotherClustersSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("batch read: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("another cluster's row must be invisible, got %d rows", len(rows))
+	if len(rows.Entries) != 0 {
+		t.Fatalf("another cluster's row must be invisible, got %d rows", len(rows.Entries))
+	}
+	// Covered still names the id: it was looked up, in this cluster, and has no
+	// row here. That is a different statement from "not looked at", and it is
+	// the one the caller is entitled to act on.
+	if len(rows.Covered) != 1 || rows.Covered[0] != sandboxID {
+		t.Fatalf("a scoped miss must still report what it looked up: got %v", rows.Covered)
 	}
 
 	env.requireRow(t, theirs, sandboxID)
@@ -601,8 +630,11 @@ func TestContractABatchReadOfNothingAsksNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("batch read of nothing: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("expected an empty map, got %d rows", len(rows))
+	if len(rows.Entries) != 0 {
+		t.Fatalf("expected an empty map, got %d rows", len(rows.Entries))
+	}
+	if len(rows.Covered) != 0 {
+		t.Fatalf("a batch that asked for nothing looked up nothing: got %v", rows.Covered)
 	}
 }
 
@@ -625,8 +657,15 @@ func TestContractOneClusterCannotReachAnothersSandboxes(t *testing.T) {
 		t.Fatalf("another cluster's sandbox must not be claimable: got %q, want %q", claim.Outcome, ClaimOutcomeNotFound)
 	}
 
-	if err := env.store.Remove(context.Background(), theirs, sandboxID); err != nil {
+	// The generation quoted is our row's, so a cluster filter that failed open
+	// would match and delete it. That is what makes this assertion have teeth.
+	ours := env.requireRow(t, env.cluster, sandboxID)
+	removed, err := env.store.Remove(context.Background(), theirs, sandboxID, ours.Generation)
+	if err != nil {
 		t.Fatalf("remove from the other cluster: %v", err)
+	}
+	if removed {
+		t.Fatal("a delete scoped to another cluster must not match our row")
 	}
 	if row := env.requireRow(t, env.cluster, sandboxID); row.OriginNodeID != contractNodeA {
 		t.Fatalf("another cluster's delete must not touch our row: got origin %q", row.OriginNodeID)
@@ -702,12 +741,12 @@ INSERT INTO paused_sandboxes (
 
 	rows, err := env.store.GetMany(context.Background(), env.cluster, []string{healthy, broken})
 	if !errors.Is(err, ErrInvalidRecord) {
-		t.Fatalf("one unreadable row must fail the whole batch: got %v (%d rows), want %v", err, len(rows), ErrInvalidRecord)
+		t.Fatalf("one unreadable row must fail the whole batch: got %v (%d rows), want %v", err, len(rows.Entries), ErrInvalidRecord)
 	}
 }
 
-// Remove is the one unconditional destructive write, so what it does has to be
-// exactly what it says: this row, this cluster, gone.
+// Remove is destructive and conditional, so what it does has to be exactly
+// what it says: this row, this cluster, this generation, gone.
 func TestContractRemoveDeletesOnlyTheRowItNames(t *testing.T) {
 	env := contractSetup(t)
 	doomed := contractUUID(t)
@@ -716,8 +755,13 @@ func TestContractRemoveDeletesOnlyTheRowItNames(t *testing.T) {
 	env.pauseAndPublish(t, env.cluster, doomed, contractNodeA)
 	env.pauseAndPublish(t, env.cluster, bystander, contractNodeA)
 
-	if err := env.store.Remove(context.Background(), env.cluster, doomed); err != nil {
+	row := env.requireRow(t, env.cluster, doomed)
+	removed, err := env.store.Remove(context.Background(), env.cluster, doomed, row.Generation)
+	if err != nil {
 		t.Fatalf("remove: %v", err)
+	}
+	if !removed {
+		t.Fatal("a delete quoting the row's own generation must match it")
 	}
 
 	env.requireNoRow(t, env.cluster, doomed)
@@ -725,10 +769,41 @@ func TestContractRemoveDeletesOnlyTheRowItNames(t *testing.T) {
 
 	// Removing a row that is already gone is not an error: the contract is
 	// "only correct once the sandbox itself is gone", and a retry after a
-	// timeout has to be able to say so twice.
-	if err := env.store.Remove(context.Background(), env.cluster, doomed); err != nil {
+	// timeout has to be able to say so twice. It reports that it matched
+	// nothing, which is how a retry tells itself apart from a first attempt.
+	removed, err = env.store.Remove(context.Background(), env.cluster, doomed, row.Generation)
+	if err != nil {
 		t.Fatalf("removing an absent row must not be an error: %v", err)
 	}
+	if removed {
+		t.Fatal("removing an absent row cannot have matched anything")
+	}
+}
+
+// 🔴 The window this closes: a node reads a row, decides the sandbox is not
+// live elsewhere, and deletes it — while somebody else resumes it in between.
+// The delete used to succeed and take the snapshot the other node is running
+// from with it, silently, from both sides.
+func TestContractRemoveRefusesAStaleGeneration(t *testing.T) {
+	env := contractSetup(t)
+	sandboxID := contractUUID(t)
+
+	env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	stale := env.requireRow(t, env.cluster, sandboxID).Generation
+
+	// Somebody else moves the row on — exactly what a resume elsewhere does.
+	if claim := env.claim(t, env.cluster, sandboxID, contractNodeB); claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("seed the race: got %q, want %q", claim.Outcome, ClaimOutcomeClaimed)
+	}
+
+	removed, err := env.store.Remove(context.Background(), env.cluster, sandboxID, stale)
+	if err != nil {
+		t.Fatalf("a stale delete is not an error, it is a no-op: %v", err)
+	}
+	if removed {
+		t.Fatal("a delete quoting a generation the row has moved past must match nothing")
+	}
+	env.requireRow(t, env.cluster, sandboxID)
 }
 
 // The Go read model carries the two lease columns the Rust ENTRY_COLUMNS

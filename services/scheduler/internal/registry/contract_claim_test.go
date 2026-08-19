@@ -246,8 +246,12 @@ func TestContractReleasingAClaimPutsTheSandboxBack(t *testing.T) {
 		t.Fatalf("the claim should have been granted: got %q", claim.Outcome)
 	}
 
-	if err := env.store.ReleaseClaim(context.Background(), env.cluster, sandboxID, claim.Entry.Generation); err != nil {
+	matched, err := env.store.ReleaseClaim(context.Background(), env.cluster, sandboxID, claim.Entry.Generation)
+	if err != nil {
 		t.Fatalf("release the claim: %v", err)
+	}
+	if !matched {
+		t.Fatal("a release quoting the claim's own generation must match the row it holds")
 	}
 
 	row := env.requireRow(t, env.cluster, sandboxID)

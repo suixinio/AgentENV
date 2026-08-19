@@ -752,14 +752,19 @@ func TestABatchReadReportsOnlyTheSandboxesThatHaveRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_many failed: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("expected exactly the one sandbox with a row, got %d", len(rows))
+	if len(rows.Entries) != 1 {
+		t.Fatalf("expected exactly the one sandbox with a row, got %d", len(rows.Entries))
 	}
-	if _, ok := rows[present]; !ok {
+	if _, ok := rows.Entries[present]; !ok {
 		t.Fatal("the sandbox with a row is missing from the batch")
 	}
-	if _, ok := rows[absent]; ok {
+	if _, ok := rows.Entries[absent]; ok {
 		t.Fatal("a sandbox with no row appeared in the batch")
+	}
+	// The absent one is only readable as "no row" because the answer says it
+	// was looked up.
+	if len(rows.Covered) != 2 {
+		t.Fatalf("both ids were looked up, so both must be covered: got %v", rows.Covered)
 	}
 }
 
@@ -773,8 +778,8 @@ func TestABatchReadCannotSeeAnotherClustersSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_many failed: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("one cluster read another's row: %+v", rows)
+	if len(rows.Entries) != 0 {
+		t.Fatalf("one cluster read another's row: %+v", rows.Entries)
 	}
 }
 
@@ -797,8 +802,8 @@ func TestABatchReadFailsWholeOnARowItCannotDecode(t *testing.T) {
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
 	}
-	if rows != nil {
-		t.Fatalf("a failed batch must return no map at all, got %+v", rows)
+	if rows.Entries != nil || rows.Covered != nil {
+		t.Fatalf("a failed batch must return nothing at all, got %+v", rows)
 	}
 }
 
@@ -815,8 +820,8 @@ func TestABatchReadFailsRatherThanShorteningOnAMalformedID(t *testing.T) {
 		if !errors.Is(err, ErrInvalidArgument) {
 			t.Fatalf("id %q: expected ErrInvalidArgument, got %v", malformed, err)
 		}
-		if rows != nil {
-			t.Fatalf("id %q: expected no map at all, got %+v", malformed, rows)
+		if rows.Entries != nil || rows.Covered != nil {
+			t.Fatalf("id %q: expected nothing at all, got %+v", malformed, rows)
 		}
 	}
 }
@@ -828,8 +833,11 @@ func TestABatchReadOfNothingAsksNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_many of nothing failed: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("expected an empty map, got %+v", rows)
+	if len(rows.Entries) != 0 {
+		t.Fatalf("expected an empty map, got %+v", rows.Entries)
+	}
+	if len(rows.Covered) != 0 {
+		t.Fatalf("a batch that asked for nothing looked up nothing: got %v", rows.Covered)
 	}
 }
 
@@ -1132,8 +1140,12 @@ func TestReleasingAClaimPutsTheSandboxBack(t *testing.T) {
 		t.Fatalf("claim failed: %v (%s)", err, claim.Outcome)
 	}
 
-	if err := f.store.ReleaseClaim(ctx, f.cluster, id, claim.Entry.Generation); err != nil {
+	matched, err := f.store.ReleaseClaim(ctx, f.cluster, id, claim.Entry.Generation)
+	if err != nil {
 		t.Fatalf("release_claim failed: %v", err)
+	}
+	if !matched {
+		t.Fatal("a release quoting the claim's own generation must match")
 	}
 	row := f.raw(id)
 	if row.state != "paused" || row.claimedBy != nil {
@@ -1144,25 +1156,39 @@ func TestReleasingAClaimPutsTheSandboxBack(t *testing.T) {
 	}
 }
 
-// TestAReleaseThatMatchesNothingIsSilent is the one conditional write whose
-// no-op is a success, and it is the node's behaviour.
+// TestAReleaseThatMatchesNothingSucceedsAndSaysSo is the one conditional write
+// whose no-op is a success, and it is the node's behaviour.
 //
 // A release that matches nothing means somebody else already moved the row on,
-// which is the outcome the release was trying to produce. Reporting it would
-// give its caller — an error path that is already unwinding a failed resume —
-// a second failure it has no way to act on.
-func TestAReleaseThatMatchesNothingIsSilent(t *testing.T) {
+// which is the outcome the release was trying to produce. Reporting it as a
+// failure would give its caller — an error path already unwinding a failed
+// resume — a second failure it has no way to act on.
+//
+// 🔴 Success, but it must not be silent. The node used to run this statement
+// itself and could see the zero-row tag; once it moved behind an RPC, that
+// evidence stops at the controller unless it is carried back, and it is the
+// only thing that says a node is quoting generations it has already lost.
+func TestAReleaseThatMatchesNothingSucceedsAndSaysSo(t *testing.T) {
 	f := newStoreFixture(t)
 	ctx := context.Background()
 	id := sandboxUUID(41)
 
 	f.seed(seedRow{sandboxID: id, state: "paused", generation: 9, originNode: stNodeA, snapshotID: snapshotUUID(41)})
 
-	if err := f.store.ReleaseClaim(ctx, f.cluster, id, 3); err != nil {
+	matched, err := f.store.ReleaseClaim(ctx, f.cluster, id, 3)
+	if err != nil {
 		t.Fatalf("a release that matches nothing must not be an error, got %v", err)
 	}
-	if err := f.store.ReleaseClaim(ctx, f.cluster, sandboxUUID(42), 1); err != nil {
+	if matched {
+		t.Fatal("a stale generation cannot have matched the row")
+	}
+
+	matched, err = f.store.ReleaseClaim(ctx, f.cluster, sandboxUUID(42), 1)
+	if err != nil {
 		t.Fatalf("releasing a sandbox with no row must not be an error, got %v", err)
+	}
+	if matched {
+		t.Fatal("a sandbox with no row cannot have matched anything")
 	}
 }
 
@@ -1177,12 +1203,12 @@ func TestMarkingAnUntrackedSandboxRunningReportsThatItIsUntracked(t *testing.T) 
 	f := newStoreFixture(t)
 	id := sandboxUUID(43)
 
-	tracked, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA)
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
-	if tracked {
-		t.Fatal("the cluster does not track this sandbox, and said it did")
+	if outcome != MarkRunningUntracked {
+		t.Fatalf("the cluster does not track this sandbox, and said otherwise: got %q", outcome)
 	}
 	if row := f.raw(id); row.found {
 		t.Fatalf("mark_running created a row: %+v", row)
@@ -1203,12 +1229,19 @@ func TestMarkingRunningCannotEraseAnotherNodesClaim(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(44),
 	})
 
-	tracked, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c")
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c")
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
-	if tracked {
+	if outcome == MarkRunningAdopted {
 		t.Fatal("a node claimed a sandbox another node holds the claim on")
+	}
+	// 🔴 And it says *which* refusal this is. Untracked means the cluster has
+	// no opinion and the caller carries on; held-elsewhere means two nodes are
+	// bringing the same sandbox up. They arrived as the same `false` until the
+	// re-read that tells them apart moved to the server.
+	if outcome != MarkRunningHeldElsewhere {
+		t.Fatalf("a refusal caused by another node's claim must say so: got %q", outcome)
 	}
 	row := f.raw(id)
 	if row.state != "resuming" || row.claimedBy == nil || *row.claimedBy != stNodeB {
@@ -1226,12 +1259,12 @@ func TestMarkingATrackedSandboxRunningReportsTheNodeAsHolder(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(45),
 	})
 
-	tracked, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
-	if !tracked {
-		t.Fatal("the claimer must be able to mark its own claim running")
+	if outcome != MarkRunningAdopted {
+		t.Fatalf("the claimer must be able to mark its own claim running: got %q", outcome)
 	}
 	row := f.raw(id)
 	if row.state != "running" || row.originNode != stNodeB || row.claimedBy != nil {
@@ -1242,9 +1275,10 @@ func TestMarkingATrackedSandboxRunningReportsTheNodeAsHolder(t *testing.T) {
 	}
 }
 
-// TestMarkRunningPropagatesARowItCannotDecode keeps `false` meaning one thing.
+// TestMarkRunningPropagatesARowItCannotDecode keeps "untracked" meaning one
+// thing.
 //
-// False tells the caller the registry has no say over this sandbox, and its
+// Untracked tells the caller the registry has no say over this sandbox, and its
 // reconciliation is built on that. A row that exists but cannot be decoded is
 // not that, so it has to arrive as an error.
 func TestMarkRunningPropagatesARowItCannotDecode(t *testing.T) {
@@ -1752,10 +1786,19 @@ func TestRemoveIsScopedToItsCluster(t *testing.T) {
 	f := newStoreFixture(t)
 	id := sandboxUUID(96)
 
-	f.seed(seedRow{sandboxID: id, cluster: f.other, state: "paused", originNode: "node-z", snapshotID: snapshotUUID(96)})
+	f.seed(seedRow{
+		sandboxID: id, cluster: f.other, state: "paused", generation: 5,
+		originNode: "node-z", snapshotID: snapshotUUID(96),
+	})
 
-	if err := f.store.Remove(context.Background(), f.cluster, id); err != nil {
+	// The generation quoted is the other cluster's own, so only the cluster
+	// filter can be what stops this.
+	removed, err := f.store.Remove(context.Background(), f.cluster, id, 5)
+	if err != nil {
 		t.Fatalf("remove failed: %v", err)
+	}
+	if removed {
+		t.Fatal("a delete scoped to this cluster matched another cluster's row")
 	}
 	if !f.raw(id).found {
 		t.Fatal("one cluster deleted another's row")
@@ -1765,8 +1808,55 @@ func TestRemoveIsScopedToItsCluster(t *testing.T) {
 func TestRemoveOfSomethingThatIsNotThereIsNotAnError(t *testing.T) {
 	f := newStoreFixture(t)
 
-	if err := f.store.Remove(context.Background(), f.cluster, sandboxUUID(97)); err != nil {
+	removed, err := f.store.Remove(context.Background(), f.cluster, sandboxUUID(97), 1)
+	if err != nil {
 		t.Fatalf("remove of an absent row failed: %v", err)
+	}
+	if removed {
+		t.Fatal("an absent row cannot have been deleted")
+	}
+}
+
+// TestRemoveRefusesAGenerationTheRowHasMovedPast is the window the caller-side
+// guard could not close.
+//
+// The old shape was: read the row, decide the sandbox is not live elsewhere,
+// delete it. A node returning from a partition holds a view from before it
+// left, and takes exactly that path against a sandbox somebody else has since
+// resumed. The delete matched, and the snapshot the other node is running from
+// went with it — no error on either side.
+func TestRemoveRefusesAGenerationTheRowHasMovedPast(t *testing.T) {
+	f := newStoreFixture(t)
+	id := sandboxUUID(99)
+
+	f.seed(seedRow{
+		sandboxID: id, state: "running", generation: 7,
+		originNode: stNodeB, snapshotID: snapshotUUID(99),
+	})
+
+	removed, err := f.store.Remove(context.Background(), f.cluster, id, 6)
+	if err != nil {
+		t.Fatalf("a stale delete is a no-op, not an error: %v", err)
+	}
+	if removed {
+		t.Fatal("a delete quoting a generation the row has moved past must match nothing")
+	}
+	if !f.raw(id).found {
+		t.Fatal("a stale delete destroyed a row somebody else is holding")
+	}
+
+	// The same call with the row's actual generation does delete it, so the
+	// refusal above is the condition working rather than the statement being
+	// broken.
+	removed, err = f.store.Remove(context.Background(), f.cluster, id, 7)
+	if err != nil {
+		t.Fatalf("remove failed: %v", err)
+	}
+	if !removed {
+		t.Fatal("a delete quoting the row's own generation must match it")
+	}
+	if f.raw(id).found {
+		t.Fatal("the row survived a delete that reported it matched")
 	}
 }
 
@@ -1797,11 +1887,11 @@ func TestOneClusterCannotReachAnothersSandboxes(t *testing.T) {
 	if err := f.store.MarkLocalOnly(ctx, f.cluster, id, 3); !errors.Is(err, ErrGenerationConflict) {
 		t.Fatalf("mark_local_only reached another cluster: %v", err)
 	}
-	if err := f.store.ReleaseClaim(ctx, f.cluster, id, 3); err != nil {
-		t.Fatalf("release_claim failed: %v", err)
+	if matched, err := f.store.ReleaseClaim(ctx, f.cluster, id, 3); err != nil || matched {
+		t.Fatalf("release_claim reached another cluster: %v, %v", matched, err)
 	}
-	if tracked, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA); err != nil || tracked {
-		t.Fatalf("mark_running reached another cluster: %v, %v", tracked, err)
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA); err != nil || outcome != MarkRunningUntracked {
+		t.Fatalf("mark_running reached another cluster: %v, %v", outcome, err)
 	}
 	if renewed, err := f.store.RenewLease(ctx, f.cluster, "node-z", []HeldSandbox{{SandboxID: id}}); err != nil || renewed != 0 {
 		t.Fatalf("renew_lease reached another cluster: %d, %v", renewed, err)
@@ -1873,8 +1963,8 @@ func TestAStateThisBuildDoesNotKnowIsRefusedRatherThanSkipped(t *testing.T) {
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("get_many: expected ErrInvalidRecord, got %v", err)
 	}
-	if rows != nil {
-		t.Fatalf("get_many returned a map alongside its error: %+v", rows)
+	if rows.Entries != nil || rows.Covered != nil {
+		t.Fatalf("get_many returned rows alongside its error: %+v", rows)
 	}
 	if _, err := f.store.ClaimForResume(ctx, f.cluster, unknown, stNodeB); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("claim: expected ErrInvalidRecord, got %v", err)

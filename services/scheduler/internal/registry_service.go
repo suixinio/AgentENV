@@ -23,6 +23,40 @@ var registryLeaseTTLClamped = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Requests whose reported lease TTL was below the floor and was raised to it.",
 })
 
+// registryReleaseClaimUnmatched and registryRemoveUnmatched count the
+// conditional writes that matched nothing.
+//
+// Both are successes: the row the caller meant to act on has already moved on,
+// which is the state it was trying to reach. They are counted because the node
+// used to run these statements itself and could see the zero-row tag; once they
+// moved behind an RPC, a node quoting generations it has already lost became
+// invisible from both sides.
+var registryReleaseClaimUnmatched = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "agentenv_scheduler_registry_write_release_claim_unmatched_total",
+	Help: "release_claim requests whose quoted generation matched no row.",
+})
+
+var registryRemoveUnmatched = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "agentenv_scheduler_registry_write_remove_unmatched_total",
+	Help: "remove requests whose quoted generation matched no row.",
+})
+
+// registryLeaseTTLTooShort counts nodes reporting a lease TTL that leaves no
+// room for two missed renewals.
+//
+// 🔴 Counted and logged, never refused. The invariant is ttl >= 3*interval, and
+// a node that gets it wrong will have its own rows expire underneath it — but
+// refusing the renewal is how that becomes certain instead of merely likely.
+// The node enforces this locally against its own config; this is the only place
+// that can see both numbers when those two knobs have drifted apart.
+var registryLeaseTTLTooShort = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_registry_write_lease_ttl_too_short_total",
+		Help: "Lease renewals whose reported TTL leaves no room for two missed renewals.",
+	},
+	[]string{"node"},
+)
+
 var registryWriteRPCs = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "agentenv_scheduler_registry_write_rpc_total",
@@ -111,17 +145,28 @@ func (s *PausedRegistryService) GetSandboxes(ctx context.Context, req *scheduler
 		return nil, s.fail("GetSandboxes", err)
 	}
 
-	entries, err := s.store.GetMany(ctx, req.GetClusterId(), req.GetSandboxIds())
+	rows, err := s.store.GetMany(ctx, req.GetClusterId(), req.GetSandboxIds())
 	if err != nil {
 		return nil, s.fail("GetSandboxes", err)
 	}
 
-	out := make([]*schedulerv1.RegistryEntry, 0, len(entries))
-	for _, entry := range entries {
+	out := make([]*schedulerv1.RegistryEntry, 0, len(rows.Entries))
+	for _, entry := range rows.Entries {
 		out = append(out, registryEntryToProto(entry))
 	}
 	registryWriteRPCs.WithLabelValues("GetSandboxes", codes.OK.String()).Inc()
-	return &schedulerv1.GetSandboxesResponse{Sandboxes: out}, nil
+	resp := &schedulerv1.GetSandboxesResponse{
+		Sandboxes: out,
+		// 🔴 Say which ids this answer covers. The caller treats an id's
+		// absence from Sandboxes as authority to tear down a running VM and
+		// delete its artifacts, and it has no other way to tell that apart from
+		// a response that lost rows on the way here.
+		CoveredSandboxIds: rows.Covered,
+	}
+	if !rows.Now.IsZero() {
+		resp.NowUnixMicros = rows.Now.UnixMicro()
+	}
+	return resp, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,40 +244,151 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		if err := store.ReleaseClaim(ctx, req.GetClusterId(), req.GetSandboxId(), generation); err != nil {
+		matched, err := store.ReleaseClaim(ctx, req.GetClusterId(), req.GetSandboxId(), generation)
+		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		return s.ok("TransitionSandbox")
+		if !matched {
+			// Still a success — the claim this caller meant to release is no
+			// longer its own, which is the state it was trying to reach. But
+			// the node cannot see the zero-row tag from here, and a node that
+			// keeps quoting generations it has already lost is worth finding.
+			registryReleaseClaimUnmatched.Inc()
+			s.log.Info("release_claim matched no row: the caller's generation is stale",
+				zap.String("sandbox_id", req.GetSandboxId()),
+				zap.String("node_id", req.GetNodeId()),
+				zap.Int64("expect_generation", generation),
+			)
+		}
+		registryWriteRPCs.WithLabelValues("TransitionSandbox", codes.OK.String()).Inc()
+		return &schedulerv1.TransitionSandboxResponse{Matched: matched}, nil
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING:
 		if err := rejectFields(req, fieldGeneration|fieldMetadata|fieldSnapshot); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		tracked, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId())
+		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId())
 		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		// 🔴 tracked == false is a successful answer, not a failure. It says
-		// the cluster does not track this sandbox — which is what a sandbox
-		// that has never been paused looks like, and by far the common case.
-		// Reporting it as an error would make the node treat its own healthy
-		// sandboxes as an outage.
+		// 🔴 Not being adopted is a successful answer, not a failure. Untracked
+		// says the cluster does not track this sandbox — which is what a
+		// sandbox that has never been paused looks like, and by far the common
+		// case. Reporting it as an error would make the node treat its own
+		// healthy sandboxes as an outage.
+		//
+		// Held-elsewhere is also a success on the wire and something else
+		// entirely in meaning: two nodes believe they are bringing the same
+		// sandbox up. It used to be indistinguishable from untracked because
+		// both arrived as `tracked: false`.
 		registryWriteRPCs.WithLabelValues("TransitionSandbox", codes.OK.String()).Inc()
-		return &schedulerv1.TransitionSandboxResponse{Tracked: tracked}, nil
+		return &schedulerv1.TransitionSandboxResponse{
+			Tracked:            outcome == pausedregistry.MarkRunningAdopted,
+			MarkRunningOutcome: markRunningOutcomeToProto(outcome),
+		}, nil
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE:
-		if err := rejectFields(req, fieldGeneration|fieldMetadata|fieldSnapshot); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		if err := s.store.Remove(ctx, req.GetClusterId(), req.GetSandboxId()); err != nil {
+		generation, err := requireGeneration(req)
+		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
-		return s.ok("TransitionSandbox")
+		removed, err := s.store.Remove(ctx, req.GetClusterId(), req.GetSandboxId(), generation)
+		if err != nil {
+			return nil, s.fail("TransitionSandbox", err)
+		}
+		if !removed {
+			// The row moved since the caller read it, so this deleted nothing —
+			// which is what the caller wanted, since the row it meant to delete
+			// is already gone. Counted because the alternative reading is that
+			// a node is operating on a view from before a partition.
+			registryRemoveUnmatched.Inc()
+			s.log.Info("remove matched no row: the caller's generation is stale",
+				zap.String("sandbox_id", req.GetSandboxId()),
+				zap.String("node_id", req.GetNodeId()),
+				zap.Int64("expect_generation", generation),
+			)
+		}
+		registryWriteRPCs.WithLabelValues("TransitionSandbox", codes.OK.String()).Inc()
+		return &schedulerv1.TransitionSandboxResponse{Removed: removed}, nil
+
+	case schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE_UNCONDITIONAL:
+		// 🔴 Refused, not served. This build has no unconditional delete: the
+		// guard used to be the caller reading the row first, and a node that
+		// still asks for this one is a node still deciding for itself whether
+		// somebody else's sandbox may be destroyed.
+		return nil, s.fail("TransitionSandbox",
+			fmt.Errorf("%w: the unconditional remove is no longer served; quote a generation",
+				pausedregistry.ErrInvalidArgument))
 
 	default:
 		return nil, s.fail("TransitionSandbox",
 			fmt.Errorf("%w: transition kind %q is not one this build serves", pausedregistry.ErrInvalidArgument, req.GetKind()))
 	}
+}
+
+// markRunningOutcomeToProto maps the store's answer onto the wire enum.
+//
+// An outcome this build does not know maps to UNSPECIFIED rather than to a
+// plausible neighbour: the caller's response to "untracked" is to carry on and
+// its response to "held elsewhere" is to tear a sandbox down, and guessing
+// between them is worse than saying nothing.
+func markRunningOutcomeToProto(outcome pausedregistry.MarkRunningOutcome) schedulerv1.MarkRunningOutcome {
+	switch outcome {
+	case pausedregistry.MarkRunningUntracked:
+		return schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNTRACKED
+	case pausedregistry.MarkRunningAdopted:
+		return schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_ADOPTED
+	case pausedregistry.MarkRunningHeldElsewhere:
+		return schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_HELD_ELSEWHERE
+	default:
+		return schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNSPECIFIED
+	}
+}
+
+// conflictReasonToProto maps the store's conflict classification onto the wire.
+func conflictReasonToProto(reason pausedregistry.ConflictReason) schedulerv1.ConflictReason {
+	switch reason {
+	case pausedregistry.ConflictReasonLiveElsewhere:
+		return schedulerv1.ConflictReason_CONFLICT_REASON_LIVE_ELSEWHERE
+	case pausedregistry.ConflictReasonClaimLost:
+		return schedulerv1.ConflictReason_CONFLICT_REASON_CLAIM_LOST
+	default:
+		return schedulerv1.ConflictReason_CONFLICT_REASON_UNSPECIFIED
+	}
+}
+
+// renewalsPerLease is how many renewals a lease must outlive: a TTL has to
+// survive two missed ones, so it must be at least three intervals long.
+const renewalsPerLease = 3
+
+// checkRenewalCadence notices a node whose lease TTL and renewal interval
+// disagree, and does nothing about it beyond saying so.
+//
+// 🔴 The reason it can only observe: the TTL belongs to the node (see
+// Store.WithLeaseTTL) and so does the interval, and this process sees them only
+// because the node reports them. Refusing a renewal on the strength of that
+// would expire the rows of the one node already at risk of exactly that — it
+// would convert a configuration smell into the outage the invariant exists to
+// prevent. A node that does not report its interval at all (an older build)
+// is not judged.
+func (s *PausedRegistryService) checkRenewalCadence(nodeID string, leaseTTLMillis, intervalMillis int64) {
+	if leaseTTLMillis <= 0 || intervalMillis <= 0 {
+		return
+	}
+	if leaseTTLMillis >= renewalsPerLease*intervalMillis {
+		return
+	}
+
+	registryLeaseTTLTooShort.WithLabelValues(nodeID).Inc()
+	s.log.Warn("node reports a lease TTL that leaves no room for two missed renewals",
+		zap.String("node_id", nodeID),
+		zap.Duration("lease_ttl", time.Duration(leaseTTLMillis)*time.Millisecond),
+		zap.Duration("reconcile_interval", time.Duration(intervalMillis)*time.Millisecond),
+		zap.Duration("minimum_ttl", time.Duration(renewalsPerLease*intervalMillis)*time.Millisecond),
+	)
 }
 
 // requestField names one optional field of a transition request.
@@ -322,7 +478,10 @@ func (s *PausedRegistryService) AcquireSandbox(ctx context.Context, req *schedul
 		}
 	case pausedregistry.ClaimOutcomeConflict:
 		resp.Outcome = &schedulerv1.AcquireSandboxResponse_Conflict{
-			Conflict: &schedulerv1.AcquireOriginRef{OriginNodeId: claim.OriginNodeID},
+			Conflict: &schedulerv1.AcquireOriginRef{
+				OriginNodeId: claim.OriginNodeID,
+				Reason:       conflictReasonToProto(claim.ConflictReason),
+			},
 		}
 	default:
 		return nil, s.fail("AcquireSandbox",
@@ -360,6 +519,8 @@ func (s *PausedRegistryService) RenewNodeLease(ctx context.Context, req *schedul
 		}
 		held = append(held, entry)
 	}
+
+	s.checkRenewalCadence(req.GetNodeId(), req.GetLeaseTtlMillis(), req.GetReconcileIntervalMillis())
 
 	store := s.leaseStore(req.GetLeaseTtlMillis())
 	renewed, err := store.RenewLease(ctx, req.GetClusterId(), req.GetNodeId(), held)

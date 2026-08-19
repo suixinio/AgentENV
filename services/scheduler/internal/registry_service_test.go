@@ -39,9 +39,16 @@ type fakeStore struct {
 	claim   pausedregistry.ResumeClaim
 	freed   pausedregistry.ReleasedHoldings
 	renewed uint64
-	tracked bool
-	began   pausedregistry.BeganPause
-	err     error
+	// markRunning is what MarkRunning answers. The zero value is untracked,
+	// which is the common case.
+	markRunning pausedregistry.MarkRunningOutcome
+	// released and removed are whether the two conditional writes matched.
+	released bool
+	removed  bool
+	// now is the database clock GetMany reports.
+	now   time.Time
+	began pausedregistry.BeganPause
+	err   error
 
 	leaseTTL time.Duration
 
@@ -93,12 +100,12 @@ func (f *fakeStore) Get(_ context.Context, _, id string) (pausedregistry.Entry, 
 	return entry, ok, f.err
 }
 
-func (f *fakeStore) GetMany(_ context.Context, _ string, _ []string) (map[string]pausedregistry.Entry, error) {
+func (f *fakeStore) GetMany(_ context.Context, _ string, ids []string) (pausedregistry.Rows, error) {
 	f.record("GetMany")
 	if f.err != nil {
-		return nil, f.err
+		return pausedregistry.Rows{}, f.err
 	}
-	return f.entries, nil
+	return pausedregistry.Rows{Entries: f.entries, Covered: ids, Now: f.now}, nil
 }
 
 func (f *fakeStore) ClaimForResume(_ context.Context, _, _, _ string) (pausedregistry.ResumeClaim, error) {
@@ -109,10 +116,10 @@ func (f *fakeStore) ClaimForResume(_ context.Context, _, _, _ string) (pausedreg
 	return f.claim, nil
 }
 
-func (f *fakeStore) ReleaseClaim(_ context.Context, _, _ string, gen int64) error {
+func (f *fakeStore) ReleaseClaim(_ context.Context, _, _ string, gen int64) (bool, error) {
 	f.record("ReleaseClaim")
 	f.lastGen = gen
-	return f.err
+	return f.released, f.err
 }
 
 func (f *fakeStore) RenewLease(_ context.Context, _, _ string, held []pausedregistry.HeldSandbox) (uint64, error) {
@@ -124,12 +131,12 @@ func (f *fakeStore) RenewLease(_ context.Context, _, _ string, held []pausedregi
 	return f.renewed, nil
 }
 
-func (f *fakeStore) MarkRunning(_ context.Context, _, _, _ string) (bool, error) {
+func (f *fakeStore) MarkRunning(_ context.Context, _, _, _ string) (pausedregistry.MarkRunningOutcome, error) {
 	f.record("MarkRunning")
 	if f.err != nil {
-		return false, f.err
+		return pausedregistry.MarkRunningUntracked, f.err
 	}
-	return f.tracked, nil
+	return f.markRunning, nil
 }
 
 func (f *fakeStore) ReleaseNodeHoldings(_ context.Context, _, _ string) (pausedregistry.ReleasedHoldings, error) {
@@ -140,9 +147,10 @@ func (f *fakeStore) ReleaseNodeHoldings(_ context.Context, _, _ string) (pausedr
 	return f.freed, nil
 }
 
-func (f *fakeStore) Remove(_ context.Context, _, _ string) error {
+func (f *fakeStore) Remove(_ context.Context, _, _ string, gen int64) (bool, error) {
 	f.record("Remove")
-	return f.err
+	f.lastGen = gen
+	return f.removed, f.err
 }
 
 func (f *fakeStore) ReclaimExpiredHoldings(_ context.Context, _ string) (pausedregistry.ReleasedHoldings, error) {
@@ -424,8 +432,16 @@ func TestATransitionRefusesFieldsItsKindNeverWrites(t *testing.T) {
 		name string
 		req  *schedulerv1.TransitionSandboxRequest
 	}{
-		{"remove with a generation", &schedulerv1.TransitionSandboxRequest{
-			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE, ExpectGeneration: &gen}},
+		{"remove with metadata", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE, ExpectGeneration: &gen,
+			MetadataJson: metadata}},
+		{"remove without a generation", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE}},
+		// 🔴 The unconditional delete is refused outright rather than served as
+		// a compatibility case. A node still asking for it is a node still
+		// deciding for itself whether somebody else's sandbox may be destroyed.
+		{"the unconditional remove", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE_UNCONDITIONAL}},
 		{"mark_running with a generation", &schedulerv1.TransitionSandboxRequest{
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExpectGeneration: &gen}},
 		{"complete_pause with metadata", &schedulerv1.TransitionSandboxRequest{
@@ -533,32 +549,52 @@ func TestBeginPauseWithoutMetadataIsRefused(t *testing.T) {
 
 // TestAnUntrackedSandboxIsASuccessfulAnswer.
 //
-// 🔴 False here says the cluster does not track this sandbox — which is what a
+// 🔴 Untracked says the cluster does not track this sandbox — which is what a
 // sandbox that has never been paused looks like, and by far the common case.
 // Reporting it as an error would make a node treat its own healthy sandboxes as
 // an outage.
 func TestAnUntrackedSandboxIsASuccessfulAnswer(t *testing.T) {
-	store := &fakeStore{tracked: false}
+	store := &fakeStore{markRunning: pausedregistry.MarkRunningUntracked}
 	svc := newTestRegistryService(t, store)
 
-	resp, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
-		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
-		Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING,
-	})
-	if err != nil {
-		t.Fatalf("an untracked sandbox was reported as a failure: %v", err)
+	markRunning := func(t *testing.T) *schedulerv1.TransitionSandboxResponse {
+		t.Helper()
+		resp, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING,
+		})
+		if err != nil {
+			t.Fatalf("mark_running was reported as a failure: %v", err)
+		}
+		return resp
 	}
+
+	resp := markRunning(t)
 	if resp.GetTracked() {
 		t.Fatal("the response says the cluster tracks a sandbox it does not")
 	}
+	if got := resp.GetMarkRunningOutcome(); got != schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNTRACKED {
+		t.Fatalf("an untracked sandbox must say so on the wire: got %v", got)
+	}
 
-	store.tracked = true
-	resp, err = svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
-		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
-		Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING,
-	})
-	if err != nil || !resp.GetTracked() {
-		t.Fatalf("a tracked sandbox was not reported as tracked: %+v, %v", resp, err)
+	store.markRunning = pausedregistry.MarkRunningAdopted
+	resp = markRunning(t)
+	if !resp.GetTracked() {
+		t.Fatalf("a tracked sandbox was not reported as tracked: %+v", resp)
+	}
+	if got := resp.GetMarkRunningOutcome(); got != schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_ADOPTED {
+		t.Fatalf("an adopted sandbox must say so on the wire: got %v", got)
+	}
+
+	// 🔴 The case the bool could not carry. Both of these are `tracked: false`,
+	// and one of them means two nodes are bringing the same sandbox up.
+	store.markRunning = pausedregistry.MarkRunningHeldElsewhere
+	resp = markRunning(t)
+	if resp.GetTracked() {
+		t.Fatal("a sandbox held by another node must not be reported as adopted")
+	}
+	if got := resp.GetMarkRunningOutcome(); got != schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_HELD_ELSEWHERE {
+		t.Fatalf("held-elsewhere must be distinguishable from untracked on the wire: got %v", got)
 	}
 }
 

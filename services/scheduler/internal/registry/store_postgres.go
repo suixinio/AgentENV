@@ -291,10 +291,10 @@ const getManySQL = `SELECT ` + entryColumns + `
 // one id that is not a uuid — each of them fails the whole call. A shorter map
 // is indistinguishable from "those sandboxes have no rows", and the caller
 // answers that by deleting local artifacts and tearing down running VMs.
-func (s *PostgresStore) GetMany(ctx context.Context, clusterID string, sandboxIDs []string) (map[string]Entry, error) {
+func (s *PostgresStore) GetMany(ctx context.Context, clusterID string, sandboxIDs []string) (Rows, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
-		return nil, err
+		return Rows{}, err
 	}
 
 	// Validated up front rather than left to PostgreSQL, so one malformed id
@@ -304,7 +304,7 @@ func (s *PostgresStore) GetMany(ctx context.Context, clusterID string, sandboxID
 	for _, raw := range sandboxIDs {
 		id, err := requireUUID("sandbox_id", raw)
 		if err != nil {
-			return nil, err
+			return Rows{}, err
 		}
 		ids = append(ids, id)
 	}
@@ -312,12 +312,28 @@ func (s *PostgresStore) GetMany(ctx context.Context, clusterID string, sandboxID
 	entries := make(map[string]Entry, len(ids))
 	if len(ids) == 0 {
 		// No statement at all: an empty batch has nothing to ask about, and
-		// asking anyway is a round trip that can only fail.
-		return entries, nil
+		// asking anyway is a round trip that can only fail. Covered is the
+		// empty set rather than nil for the same reason the rest of this
+		// answers precisely — "I looked up nothing" is a fact, and the caller
+		// checks it against a request that asked for nothing.
+		return Rows{Entries: entries, Covered: []string{}, Now: time.Time{}}, nil
 	}
 
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+
+	// Read the clock before the rows, not after.
+	//
+	// The chunks below are separate statements, so no single snapshot covers
+	// them anyway and pretending otherwise would be the lie. Taking `now` first
+	// makes every lease look *less* expired than it is by up to the duration of
+	// this call, and every decision downstream — who may take a sandbox over,
+	// what may be reclaimed — errs toward leaving somebody else's holding
+	// alone.
+	var now time.Time
+	if err := s.pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		return Rows{}, fmt.Errorf("registry get_many clock: %w", err)
+	}
 
 	for start := 0; start < len(ids); start += getManyChunk {
 		end := start + getManyChunk
@@ -327,18 +343,23 @@ func (s *PostgresStore) GetMany(ctx context.Context, clusterID string, sandboxID
 
 		rows, err := s.pool.Query(ctx, getManySQL, cluster, ids[start:end])
 		if err != nil {
-			return nil, fmt.Errorf("registry get_many: %w", err)
+			return Rows{}, fmt.Errorf("registry get_many: %w", err)
 		}
 		chunk, err := collectEntries(rows)
 		if err != nil {
-			return nil, err
+			return Rows{}, err
 		}
 		for _, entry := range chunk {
 			entries[entry.SandboxID] = entry
 		}
 	}
 
-	return entries, nil
+	// Every id reached a WHERE clause: the loop above returns on the first
+	// failure, so arriving here means all of them were looked up. That is the
+	// all-or-nothing guarantee, stated rather than assumed — it is the caller
+	// one process away who cannot see it and who deletes things when a row is
+	// absent.
+	return Rows{Entries: entries, Covered: ids, Now: now}, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -696,10 +717,21 @@ func (s *PostgresStore) ClaimForResume(ctx context.Context, clusterID, sandboxID
 		if origin == "" {
 			origin = current.OriginNodeID
 		}
-		return ResumeClaim{Outcome: ClaimOutcomeConflict, OriginNodeID: origin}, nil
+		return ResumeClaim{
+			Outcome:        ClaimOutcomeConflict,
+			OriginNodeID:   origin,
+			ConflictReason: ConflictReasonLiveElsewhere,
+		}, nil
 	case StatePaused:
-		// Lost a race with another claimer that has since released it.
-		return ResumeClaim{Outcome: ClaimOutcomeConflict, OriginNodeID: current.OriginNodeID}, nil
+		// Lost a race with another claimer that has since released it. The row
+		// is claimable again, so this is not "the sandbox is somewhere else" —
+		// it is "try again", and a caller that cannot tell the two apart either
+		// retries something it must not or gives up on something it could have.
+		return ResumeClaim{
+			Outcome:        ClaimOutcomeConflict,
+			OriginNodeID:   current.OriginNodeID,
+			ConflictReason: ConflictReasonClaimLost,
+		}, nil
 	default:
 		// scanEntry rejects any state outside the five, so this is unreachable
 		// unless that decoder and this switch have drifted apart.
@@ -763,23 +795,29 @@ UPDATE paused_sandboxes
 // treats it that way and its caller only warns on a transport error. A release
 // that matches nothing means somebody else already moved the row on, which is
 // the outcome this was trying to produce.
-func (s *PostgresStore) ReleaseClaim(ctx context.Context, clusterID, sandboxID string, expectGeneration int64) error {
+//
+// Success, but no longer silent. The node used to run this statement itself and
+// could see the zero-row tag; behind an RPC that evidence stops at this process
+// unless it is carried back, and it is the only thing that says a node is
+// quoting a generation it lost.
+func (s *PostgresStore) ReleaseClaim(ctx context.Context, clusterID, sandboxID string, expectGeneration int64) (bool, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	sandbox, err := requireUUID("sandbox_id", sandboxID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 
-	if _, err := s.pool.Exec(ctx, releaseClaimSQL, sandbox, expectGeneration, s.ttlSeconds(), cluster); err != nil {
-		return fmt.Errorf("registry release_claim: %w", err)
+	tag, err := s.pool.Exec(ctx, releaseClaimSQL, sandbox, expectGeneration, s.ttlSeconds(), cluster)
+	if err != nil {
+		return false, fmt.Errorf("registry release_claim: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 const markRunningSQL = `
@@ -802,17 +840,17 @@ UPDATE paused_sandboxes
 // in-flight one. Without it a blind write here would clear claimed_by_node_id
 // mid-claim, and both nodes would go on to bring the same sandbox up believing
 // they held it.
-func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string) (bool, error) {
+func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string) (MarkRunningOutcome, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
-		return false, err
+		return MarkRunningUntracked, err
 	}
 	sandbox, err := requireUUID("sandbox_id", sandboxID)
 	if err != nil {
-		return false, err
+		return MarkRunningUntracked, err
 	}
 	if strings.TrimSpace(nodeID) == "" {
-		return false, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
+		return MarkRunningUntracked, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
 	}
 
 	ctx, cancel := s.withTimeout(ctx)
@@ -820,22 +858,26 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 
 	tag, err := s.pool.Exec(ctx, markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster)
 	if err != nil {
-		return false, fmt.Errorf("registry mark_running: %w", err)
+		return MarkRunningUntracked, fmt.Errorf("registry mark_running: %w", err)
 	}
 	if tag.RowsAffected() > 0 {
-		return true, nil
+		return MarkRunningAdopted, nil
 	}
 
 	// Nothing matched: either the cluster does not track this sandbox (by far
 	// the common case, and correct), or somebody else holds the claim — which
 	// means two nodes believe they are resuming it and is worth saying out loud.
 	//
-	// The re-read's error is propagated rather than folded into `false`: false
-	// tells the caller the registry has no say over this sandbox, and a row
-	// that exists but could not be decoded is not that.
+	// The re-read's error is propagated rather than folded into an outcome:
+	// "untracked" tells the caller the registry has no say over this sandbox,
+	// and a row that exists but could not be decoded is not that.
+	//
+	// 🔴 The re-read is also the whole reason this returns three answers rather
+	// than two. It happens here now, so a caller across the wire never sees it;
+	// before phase 2 the node did it itself and could act on what it found.
 	entry, found, err := s.fetch(ctx, cluster, sandbox)
 	if err != nil {
-		return false, err
+		return MarkRunningUntracked, err
 	}
 	if found {
 		registryMarkRunningRefused.Inc()
@@ -844,8 +886,9 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 			zap.String("node_id", nodeID),
 			zap.String("claimed_by", entry.ClaimedByNodeID),
 		)
+		return MarkRunningHeldElsewhere, nil
 	}
-	return false, nil
+	return MarkRunningUntracked, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1123,30 +1166,43 @@ func (s *PostgresStore) ReleaseNodeHoldings(ctx context.Context, clusterID, node
 	return out, nil
 }
 
-const removeSQL = `DELETE FROM paused_sandboxes WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid`
+const removeSQL = `DELETE FROM paused_sandboxes
+ WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid AND generation = $3`
 
-// Remove deletes a row outright.
+// Remove deletes a row whose generation is still the one the caller quoted.
 //
-// No generation check and no state precondition, matching the node: the caller
-// guarantees the sandbox itself is gone, and its own guard is a read of the row
-// beforehand rather than a condition on the write.
-func (s *PostgresStore) Remove(ctx context.Context, clusterID, sandboxID string) error {
+// 🔴 Conditional, and the condition is the point. The caller's guard used to be
+// a read of the row beforehand — decide it is not live elsewhere, then delete —
+// which is two statements with a window between them and the caller deciding.
+// A node coming back from a partition, holding a view from before it left,
+// takes exactly that path against a sandbox somebody else has since resumed;
+// the delete matches, and the snapshot the other node is running from goes with
+// it. Neither node reports anything.
+//
+// Quoting the generation closes the window without needing the caller to be
+// right about anything: if the row moved since it was read, this matches
+// nothing. A non-match is not an error — the row this caller meant to delete is
+// already gone, which is what it wanted. e2b's catalog delete answers the same
+// situation the same way, returning nil when the stored execution id is not the
+// caller's.
+func (s *PostgresStore) Remove(ctx context.Context, clusterID, sandboxID string, expectGeneration int64) (bool, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	sandbox, err := requireUUID("sandbox_id", sandboxID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 
-	if _, err := s.pool.Exec(ctx, removeSQL, sandbox, cluster); err != nil {
-		return fmt.Errorf("registry remove: %w", err)
+	tag, err := s.pool.Exec(ctx, removeSQL, sandbox, cluster, expectGeneration)
+	if err != nil {
+		return false, fmt.Errorf("registry remove: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -47,13 +47,20 @@ type Store interface {
 	// matched nothing.
 	Get(ctx context.Context, clusterID, sandboxID string) (Entry, bool, error)
 
-	// GetMany returns the rows that exist among the requested ids.
+	// GetMany returns the rows that exist among the requested ids, the ids it
+	// actually looked up, and the database's clock.
 	//
 	// 🔴 A sandbox missing from the returned map has no row — the same answer
 	// Get gives as false, and never "we did not look". The caller deletes local
 	// artifacts on the strength of that absence, so any failure at all must be
 	// an error rather than a shorter map.
-	GetMany(ctx context.Context, clusterID string, sandboxIDs []string) (map[string]Entry, error)
+	//
+	// Rows.Covered is that guarantee made checkable. All-or-nothing is a
+	// property of this implementation, and a caller one process away cannot see
+	// it: a truncated page, a dropped chunk or a middlebox that shortened the
+	// response all arrive as "those ids have no rows". Naming the coverage lets
+	// the caller assert it instead of trusting it.
+	GetMany(ctx context.Context, clusterID string, sandboxIDs []string) (Rows, error)
 
 	// ClaimForResume takes ownership of a sandbox so nodeID can bring it back.
 	//
@@ -62,8 +69,15 @@ type Store interface {
 	// holder's lease lapses, and a live sandbox never.
 	ClaimForResume(ctx context.Context, clusterID, sandboxID, nodeID string) (ResumeClaim, error)
 
-	// ReleaseClaim hands a claimed sandbox back without resuming it.
-	ReleaseClaim(ctx context.Context, clusterID, sandboxID string, expectGeneration int64) error
+	// ReleaseClaim hands a claimed sandbox back without resuming it. The bool
+	// is whether the statement matched a row.
+	//
+	// Zero rows stays a success — somebody else already moved the row on, which
+	// is the outcome this was trying to produce — but it is no longer silent.
+	// Before phase 2 the node saw the zero-row update itself; centrally, this
+	// bool is the only remaining evidence that a node is quoting a generation
+	// it has already lost.
+	ReleaseClaim(ctx context.Context, clusterID, sandboxID string, expectGeneration int64) (bool, error)
 
 	// RenewLease extends the lease on every sandbox nodeID reports holding, and
 	// records each one's current deadline. Returns how many rows it renewed.
@@ -77,11 +91,15 @@ type Store interface {
 	// MarkRunning records that a sandbox is live on nodeID.
 	//
 	// 🔴 Never creates a row. A sandbox that has never been paused has no row
-	// by design, and the false return says exactly that: this node holds it,
-	// but the cluster is not tracking it. It also refuses when another node
+	// by design, and MarkRunningUntracked says exactly that: this node holds
+	// it, but the cluster is not tracking it. It also refuses when another node
 	// holds the claim, which is the difference between "not tracked" and
 	// "somebody else's" — and the caller needs both.
-	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string) (bool, error)
+	//
+	// Those two were a single false until D11. The node used to re-read the row
+	// to tell them apart; once this moved behind an RPC that re-read happened
+	// here, and the distinction stopped crossing the wire at all.
+	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string) (MarkRunningOutcome, error)
 
 	// ReleaseNodeHoldings frees the rows a previous process on this same
 	// machine was holding when it died.
@@ -92,8 +110,20 @@ type Store interface {
 	// and its sandboxes were its children.
 	ReleaseNodeHoldings(ctx context.Context, clusterID, nodeID string) (ReleasedHoldings, error)
 
-	// Remove deletes a row outright.
-	Remove(ctx context.Context, clusterID, sandboxID string) error
+	// Remove deletes a row whose generation is still the one the caller quoted.
+	// The bool is whether the statement matched.
+	//
+	// 🔴 Conditional since D11, and it is the last unguarded destructive write
+	// on this interface. It used to be unconditional, guarded by the caller
+	// reading the row first and deciding the sandbox was not live elsewhere —
+	// two statements with a window between them, and a node that had just come
+	// back from a partition takes that path against a sandbox already resumed
+	// somewhere else. The delete would succeed and take the snapshot with it.
+	//
+	// A non-match is not an error, the same way e2b's catalog delete returns
+	// nil when the execution id has moved on: the row this caller meant to
+	// delete is already gone, and that is what it wanted.
+	Remove(ctx context.Context, clusterID, sandboxID string, expectGeneration int64) (bool, error)
 
 	// ReclaimExpiredHoldings frees rows whose holder has stopped renewing *and*
 	// whose sandbox has outlived its own deadline.
@@ -134,6 +164,54 @@ type Store interface {
 	// Close releases the underlying resources.
 	Close()
 }
+
+// Rows is a bulk read: the rows that exist, what was looked up, and when.
+type Rows struct {
+	// Entries is keyed by sandbox id and holds only the ids that have rows.
+	Entries map[string]Entry
+
+	// Covered is every id this read looked up, present or absent. A caller may
+	// treat an id's absence from Entries as authority to delete only when that
+	// id is in here.
+	Covered []string
+
+	// Now is the database's clock, read on the same connection just before the
+	// rows.
+	//
+	// Before rather than after, deliberately: an earlier `now` makes leases look
+	// less expired than they are, and every decision downstream of this — who
+	// may take a sandbox over, what may be reclaimed — errs toward leaving
+	// somebody else's holding alone.
+	Now time.Time
+}
+
+// MarkRunningOutcome is which of the three answers MarkRunning gave.
+type MarkRunningOutcome string
+
+const (
+	// MarkRunningUntracked means there is no row. What a sandbox that has never
+	// been paused looks like, and by far the common case.
+	MarkRunningUntracked MarkRunningOutcome = "untracked"
+	// MarkRunningAdopted means the row now names this node as its holder.
+	MarkRunningAdopted MarkRunningOutcome = "adopted"
+	// MarkRunningHeldElsewhere means a row exists and another node holds the
+	// claim on it: two nodes believe they are bringing the same sandbox up.
+	MarkRunningHeldElsewhere MarkRunningOutcome = "held_elsewhere"
+)
+
+// ConflictReason splits the two situations ClaimOutcomeConflict ran together.
+type ConflictReason string
+
+const (
+	// ConflictReasonUnspecified is the zero value, for outcomes that are not
+	// conflicts.
+	ConflictReasonUnspecified ConflictReason = ""
+	// ConflictReasonLiveElsewhere means the sandbox is live on OriginNodeID.
+	ConflictReasonLiveElsewhere ConflictReason = "live_elsewhere"
+	// ConflictReasonClaimLost means this caller held the claim and no longer
+	// does.
+	ConflictReasonClaimLost ConflictReason = "claim_lost"
+)
 
 // Entry is a registry row as the write path sees it: every column the read
 // model carries, plus the opaque metadata blob.
@@ -238,8 +316,18 @@ type ResumeClaim struct {
 	PreviousState State
 
 	// OriginNodeID is set for ClaimOutcomeNotReady and ClaimOutcomeConflict, so
-	// the caller can say where the sandbox actually is.
+	// the caller can say where the sandbox actually is. What it names differs
+	// by outcome — see ConflictReason.
 	OriginNodeID string
+
+	// ConflictReason is set only for ClaimOutcomeConflict.
+	//
+	// The two call for opposite responses: one says "the sandbox lives on that
+	// node, route the resume there", the other says "you lost a race, do not
+	// touch it". Flattened into one outcome they are indistinguishable, and the
+	// central placement decision in phase 3 has to make the same call from the
+	// same field.
+	ConflictReason ConflictReason
 }
 
 var (

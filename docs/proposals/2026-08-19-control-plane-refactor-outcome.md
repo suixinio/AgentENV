@@ -99,36 +99,42 @@ controller 重启不丢 registry。
 
 ### 1.4 代码在哪、验证到什么程度、有没有合并
 
-| | 阶段 0 + 1 | 阶段 2 |
-|---|---|---|
-| 分支 | `central-control-plane-phase01`（已 push） | `central-control-plane-phase2`（已 push，HEAD `224b70d`） |
-| 提交 | `7e6f790`（主体）+ `c35f5ec`（缺陷修复） | `4a5e3ef` `339d1f2` `40a4526` `224b70d` |
-| 集群验证 | `_verify-T1-results.md`（首轮）+ `_verify-T2-final.md`（复验） | `_verify-T3-phase2.md` |
-| **合并状态** | 🔴 **未合并**。已 fast-forward 到本地 `dev`，但 **`origin/dev` 与 `main` 都没有它** | 🔴 **未合并**，基线是本地 `dev`（即含阶段 0/1） |
+| | 阶段 0 + 1 | 阶段 2 | 阶段 2.5（摘除）|
+|---|---|---|---|
+| 提交 | `7e6f790` + `c35f5ec` | `4a5e3ef` `339d1f2` `40a4526` `224b70d` | `82abc95` … `c7797ff` |
+| 集群验证 | `_verify-T1-results.md` + `_verify-T2-final.md` | `_verify-T3-phase2.md` | 见 §1.5 |
+| **合并状态** | 🟢 **已并入 `origin/dev`**（HEAD `c7797ff`）| 🟢 同上 | 🟢 同上 |
 
-🔴 **两处必须知道的落差**：
+**T3 交付时那两处落差都已消解**：
 
-1. **`224b70d` 没有经过集群验证。** T3 验的是 `40a4526`；`224b70d`（D10 修 T3 的 F1/F2
-   两条静默失败缺口）是验证之后才写的，只跑过本地门槛与变异验证。
-2. **过程文档没有进版本库。** `apps/AgentENV/docs/proposals/` 整个目录在 submodule 里是
-   untracked 状态。要留档就得单独提交一次。
+1. ~~`224b70d` 没有经过集群验证~~ —— D11 的集群验证跑的是含它在内的完整分支镜像
+   （`d11-9a8fd88`）。
+2. ~~过程文档没有进版本库~~ —— `18c3571` 已把整个 `docs/proposals/` 提交。
 
-三份验证报告的合并结论都是「能合并」，判据分别见 T1 §8 / T2 §6 / T3 §8。
+三份验证报告的合并结论都是「能合并」，判据分别见 T1 §8 / T2 §6 / T3 §8；
+摘除那一轮的判据见 §1.5。
 
 ### 1.5 集群现状（pve-sg dev，203/204）
 
-T3 交付时**没有全部复原**，保留了 4 项：
+**跑的是已合并的 `dev`**（镜像 `d11-9a8fd88`，两台 node + scheduler 同批）。
+T3 交付时那 4 项"未复原的未合并代码"随合并一起消失了——A0 不再存在。
 
-| 项 | 现状 |
-|---|---|
-| `deploy/agentenv-scheduler` 镜像 | `…/agentenv-scheduler:cp2-40a4526`（**不是** `224b70d`） |
-| scheduler env `SCHEDULER_REGISTRY_WRITE_ENABLED` | `true`（写面开着） |
-| Secret `agentenv-postgres` 新增 key `cluster_id` | 全零 UUID |
-| `ds/agentenv-node` 镜像 + `AENV_PAUSED_REGISTRY_BACKEND` | 镜像是 `cp2-40a4526`，**backend 已回退成 `postgres`** |
+摘除那一轮在这个集群上验的九件事：
 
-⚠️ **保留现状不是零成本**：controller 的 reclaim 定时器每 30s 跑一次、**会 DELETE 行**，
-node 侧的 reclaim 也在跑。两侧谓词相同、都是单条条件写，互相不会写坏，
-但这是"未合并代码在无人值守下持有删除权"。复原命令在 `_verify-T3-phase2.md` §6.1。
+| 探针 | 判据 | 结果 |
+|---|---|---|
+| **迁移拒绝**（对照探针）| 新 node 镜像配 `backend=postgres` | ✅ 拒绝启动，exit 1，日志逐字给出 `central` 的迁移指引 |
+| **G7 兑现**（否定证据）| `pg_stat_activity` 按 `client_addr` 分组 | ✅ 4 条连接**全部**来自 scheduler 的 Pod IP，两台 node **各 0 条** |
+| **没有静默回落 local**（正面反证）| 装配日志 + RPC 计数 | ✅ 两台都打 `backend="central"` + endpoint；`GetSandboxes` 7 / `TransitionSandbox` 5 / `AcquireSandbox` 1 / `RenewNodeLease` 4 / `ReleaseNodeHoldings` 2 全在涨 |
+| **migration 扩展生效** | `pg_indexes` | ✅ `paused_sandboxes_reclaim_idx` 已建，`WHERE state IN (…) AND sandbox_expires_at IS NOT NULL` 部分索引 |
+| **端到端** | 建 → pause → resume → 删 | ✅ 全通（201 / 204 / 201 / 204）|
+| **J10 deadline** | resume 后立刻查行 | ✅ `running` 行带 `sandbox_expires_at`（第一次续租之前），`paused` 态为 NULL——与设计精确对应 |
+| **J2 覆盖断言无误伤** | node 日志 `off contract` 计数 | ✅ 两台各 0 |
+| **F4 指标分来源** | `grace_refusals_total` | ✅ `{source="reclaim"} 3`，`rpc` 一次都没有——正是 T3 F4 预测的"健康重启的自噪声"，现在可以和真实拒绝分开告警 |
+| **存量行不受伤** | 老行 `01a01853` | ✅ `local_only` / gen 3 / origin 不变 |
+
+> `01a01853` 仍是 `local_only`——那是 [`aenv-pause-publish-durability`](2026-08-19-aenv-pause-publish-durability.md)
+> 要修的东西，不在本轮范围内。
 
 ---
 
@@ -281,7 +287,28 @@ seed 来自 `[sandbox].access_token_hash_seed`，没配就用节点本地
 
 ## 4. 遗留项清单
 
+### 4.0 ✅ 已处置（阶段 2.5，见 [`_impl-D11-pg-removal.md`](_impl-D11-pg-removal.md)）
+
+| # | 结局 |
+|---|---|
+| **A0** dev 集群上未合并代码持有 DELETE 权 | **消失**：分支已合并进 `origin/dev`，集群跑的就是它 |
+| **A1** `224b70d` 从未在集群上跑过 | **已跑**：D11 的集群验证用的是含它的完整分支 |
+| **A2/A3** 鉴权只查 header 存在不查值 | **不改代码**，改为写清边界模型 + 给出该查的部署项。理由：两家参考都把节点面的保护放在网络边界（e2b 的 orchestrator gRPC 服务端零鉴权拦截器），改成真凭据是一次跨仓的签发/分发/轮换工程。**遗留登记见 D11 §5 的 L1** |
+| **A4** scheduler 单点 | **更正后处置**：不加副本（bindings / observed-node / P2P 索引都在进程内存里），改为 `maxSurge:1 / maxUnavailable:0` + PDB，把"缺席窗口"从滚动升级的默认行为里拿掉 |
+| **A5** 生产 Secret 有没有 `cluster_id` | `224b70d` 已把值搬进 base 层 `configMapGenerator`；**生产集群的实际状态仍需单独确认** |
+| **A6** 熔断阈值对小表不合理 | **已修**：比例臂加了绝对下限，小表不再因百分比跳闸 |
+| S1 / S2 / S4 / S5 / S7 / S8 | **已修**（D11 的 J1–J6），每条配变异验证 |
+| S3 | **已修**：节点上报 `reconcile_interval`，controller 校验但不拒绝 |
+| D6 §6.2 reclaim 全表扫 | **已修**：部分索引，随摘除同 release |
+| D8 §6.1 `GenerationConflict` 表达不出来 | **已修**：`Aborted` ⇒ `GenerationConflict` |
+| T3 F3 / F4 / F5 | **已修**：指标改名 / 加 `source` 标签 / HELP 说清它不是进程停机时长 |
+| T3 F6 `sandbox_expires_at` 永久孤儿行 | **已修**：`mark_running` 写 deadline（落点比原方案收窄，理由见 D11 §2.1）|
+| D10 §5.1 共享测试库致必红 | **早已修**：私有 schema。用注入 175 行的对照探针确认过 |
+| T2 N3 `invalid_rows` 没有分辨力 | 仍未造出非零样本 |
+
 ### 4.1 🔴 上生产前必须有结论
+
+> 以下为**原始清单**，现状见 §4.0。
 
 | # | 事 | 出处 | 说明 |
 |---|---|---|---|

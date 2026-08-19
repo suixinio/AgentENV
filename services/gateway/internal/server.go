@@ -29,17 +29,15 @@ const (
 	headerNodeID               = "x-agentenv-node-id"
 	maxRecordAssignmentTimeout = 5 * time.Second
 
-	// headerReroute is how an isolated node asks the gateway to hand a request
-	// to somebody else instead. Only a node that has established the work can
-	// be picked up elsewhere sets it — see the resume path in the node's API.
+	// headerReroute is how an isolated node asks for a request to be handed to
+	// somebody else instead. The gateway does not act on it: since the
+	// scheduler resolves a sandbox against the paused registry before anything
+	// is forwarded, an isolated node is either excluded from the decision or is
+	// the only node that could have served the request at all. The marker is
+	// forwarded verbatim, so an operator still sees why a node refused.
 	headerReroute         = "x-agentenv-reroute"
 	rerouteReasonSchedule = "schedule"
 )
-
-// errRerouteRequested aborts a proxied response before any of it reaches the
-// client, so the request can be sent to a different node. It never surfaces to
-// a caller: the error handler swallows it and the caller retries.
-var errRerouteRequested = errors.New("upstream asked for the request to be rerouted")
 
 type routeSource string
 
@@ -185,6 +183,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleNodeList(w, r, routingCtx)
 			return
+		} else if isRegistryListRequest(r) {
+			setGatewayRouteSource(w, routeSourceGateway)
+			s.handleRegistryList(w, r, routingCtx)
+			return
 		} else if nodeID, ok := isNodeAdminRequest(r); ok {
 			setGatewayRouteSource(w, routeSourcePath)
 			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
@@ -210,36 +212,33 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
-	// Set when a resume was routed to a node that does not hold the sandbox, so
-	// the assignment gets recorded as soon as that node brings it back up.
-	recoveredSandbox := false
+	// How the scheduler arrived at that node. Anything other than BOUND means
+	// the node does not hold the sandbox yet, which is what decides whether the
+	// binding has to be written on the way back.
+	location := schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED
 
 	if hasSandbox {
+		// One call, one answer. The scheduler owns the whole decision — which
+		// node holds the sandbox, which node should rebuild it, and whether it
+		// exists at all — so there is nothing here to second-guess or retry
+		// against a different node.
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
-		switch {
-		case err == nil:
-			node = resp.GetNode()
-		case status.Code(err) == codes.NotFound && isPausedSandboxRecoveryRequest(r):
-			// No node holds this sandbox. It may still be paused elsewhere in
-			// the cluster with its snapshot in shared storage, and the node that
-			// paused it may be gone for good — so instead of answering "not
-			// found" from the gateway, hand the resume to a scheduled node and
-			// let it claim the sandbox from the paused registry. A sandbox that
-			// genuinely does not exist still comes back 404, from that node.
-			recovery, recoveryErr := s.scheduleRecoveryNode(routingCtx, sandboxID)
-			if recoveryErr != nil {
-				// Report the original lookup failure: the sandbox not being
-				// assigned anywhere is the more useful error here.
-				s.writeSchedulerError(w, err)
-				return
-			}
-			node = recovery
-			recoveredSandbox = true
-		default:
+		if err != nil {
 			s.writeSchedulerError(w, err)
 			return
+		}
+		node = resp.GetNode()
+		location = resp.GetLocation()
+		recordGatewaySandboxLocation(location)
+		if locationNeedsAssignment(location) {
+			s.logger.Info("routing a sandbox the scheduler resolved from the paused registry",
+				zap.String("sandbox_id", sandboxID),
+				zap.String("location", gatewaySandboxLocationLabel(location)),
+				zap.String("node_id", node.GetNodeId()),
+				zap.String("origin_node_id", resp.GetOriginNodeId()),
+			)
 		}
 	} else {
 		hint, err := buildScheduleHint(r)
@@ -269,6 +268,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("method", r.Method),
 		zap.String("path", r.URL.Path),
 		zap.String("route_source", string(routeSource)),
+		zap.String("location", gatewaySandboxLocationLabel(location)),
 		zap.String("sandbox_id", sandboxID),
 		zap.String("node_id", node.GetNodeId()),
 		zap.String("upstream_endpoint", node.GetEndpoint()),
@@ -282,83 +282,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A resume sent to a node by an existing binding can come back declined:
-	// that node is isolated and has established the sandbox can be rebuilt
-	// elsewhere. Buffer the body up front so the request can be replayed; a
-	// body too large to buffer simply forfeits the reroute rather than being
-	// truncated.
-	replayBody, canReplay := []byte(nil), false
-	if !recoveredSandbox && isPausedSandboxRecoveryRequest(r) {
-		var err error
-		replayBody, canReplay, err = captureReplayBody(r)
-		if err != nil {
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
-			return
-		}
-	}
-
-	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
-	defer cancelUpstream()
-
-	rerouted := s.proxyRequest(
-		w,
-		r.Clone(upstreamCtx),
-		r.Context(),
-		upstreamURL,
-		node,
-		proxyRequestOptions{
-			recordAssignment: recoveredSandbox || shouldRecordAssignment(r, routeSource, hasSandbox),
-			hostRoute:        hostRoute,
-			flushImmediately: longLived,
-			allowReroute:     canReplay,
-		},
-	)
-	if !rerouted {
-		return
-	}
-
-	s.rerouteToScheduledNode(w, r, routingCtx, sandboxID, replayBody, longLived)
-}
-
-// rerouteToScheduledNode re-sends a request that its bound node declined, to a
-// node the scheduler picks instead. Nothing has been written to w yet.
-//
-// The assignment is recorded on the way out: the sandbox is moving to a node
-// that never held it, and the binding has to follow it there rather than wait
-// for the next heartbeat to notice.
-func (s *Server) rerouteToScheduledNode(
-	w http.ResponseWriter,
-	r *http.Request,
-	routingCtx context.Context,
-	sandboxID string,
-	body []byte,
-	longLived bool,
-) {
-	recovery, err := s.scheduleRecoveryNode(routingCtx, sandboxID)
-	if err != nil {
-		s.writeSchedulerError(w, err)
-		return
-	}
-
-	upstreamURL, err := joinUpstream(
-		recovery.GetEndpoint(),
-		upstreamTargetPath(routeSourcePath, r.URL.Path),
-		upstreamTargetEscapedPath(routeSourcePath, requestEscapedPath(r)),
-		r.URL.RawQuery,
-	)
-	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
-		return
-	}
-
-	setGatewayRouteSource(w, routeSourceSchedule)
-	s.logger.Info("rerouting declined resume to a scheduled node",
-		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", recovery.GetNodeId()),
-		zap.String("upstream_endpoint", recovery.GetEndpoint()),
-	)
-
-	restoreReplayBody(r, body)
 	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
 	defer cancelUpstream()
 
@@ -367,14 +290,41 @@ func (s *Server) rerouteToScheduledNode(
 		r.Clone(upstreamCtx),
 		r.Context(),
 		upstreamURL,
-		recovery,
+		node,
 		proxyRequestOptions{
-			recordAssignment: true,
+			recordAssignment: locationNeedsAssignment(location) || shouldRecordAssignment(r, routeSource, hasSandbox),
+			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 		},
 	)
 }
 
+// locationNeedsAssignment reports whether the binding has to be written against
+// the node the scheduler named, as soon as that node answers.
+//
+// PLACED and PINNED both come from a registry row rather than from a binding,
+// so the node is about to hold a sandbox nothing has recorded against it.
+// Waiting for its next heartbeat to notice would leave every request for that
+// sandbox unroutable until then.
+func locationNeedsAssignment(location schedulerv1.SandboxLocation) bool {
+	switch location {
+	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED,
+		schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED:
+		return true
+	default:
+		return false
+	}
+}
+
+// writeSchedulerError turns the scheduler's answer into a status code.
+//
+// 🔴 The three failure codes must stay distinct. NotFound is the scheduler
+// saying the sandbox exists nowhere, and a 404 on a resume is the end of that
+// sandbox as far as any client is concerned. Unavailable is the scheduler
+// saying it could not look, and FailedPrecondition is it saying the one node
+// that could serve this sandbox will not — both are 503s, because both are
+// states the caller may find changed a moment later. Collapsing any of them
+// into another is the bug this whole path exists to avoid.
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 	st, ok := status.FromError(err)
 	if !ok {
@@ -386,7 +336,7 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 		http.Error(w, st.Message(), http.StatusBadRequest)
 	case codes.NotFound:
 		http.Error(w, st.Message(), http.StatusNotFound)
-	case codes.Unavailable:
+	case codes.Unavailable, codes.FailedPrecondition:
 		http.Error(w, st.Message(), http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "scheduler error", http.StatusBadGateway)
@@ -397,15 +347,9 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
-	// allowReroute lets the upstream node decline the request in a way the
-	// gateway acts on rather than forwards. Only set it where the caller is
-	// prepared to send the request somewhere else.
-	allowReroute bool
 }
 
-// proxyRequest forwards the request to one node. It reports whether that node
-// declined it and asked for a different node to be tried; nothing has been
-// written to w in that case, so the caller may forward it again.
+// proxyRequest forwards the request to one node.
 func (s *Server) proxyRequest(
 	w http.ResponseWriter,
 	proxyReq *http.Request,
@@ -413,14 +357,12 @@ func (s *Server) proxyRequest(
 	target string,
 	node *schedulerv1.Node,
 	options proxyRequestOptions,
-) bool {
+) {
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
-		return false
+		return
 	}
-
-	rerouteRequested := false
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
@@ -438,17 +380,6 @@ func (s *Server) proxyRequest(
 		},
 		FlushInterval: flushInterval(options.flushImmediately),
 		ModifyResponse: func(resp *http.Response) error {
-			// An isolated node answers a resume it does not want to serve with
-			// this marker instead of starting the sandbox. Drop the response
-			// before any of it is copied to the client so the request can go to
-			// another node; the client never learns this happened.
-			if options.allowReroute &&
-				resp.StatusCode == http.StatusServiceUnavailable &&
-				strings.EqualFold(resp.Header.Get(headerReroute), rerouteReasonSchedule) {
-				_ = resp.Body.Close()
-				rerouteRequested = true
-				return errRerouteRequested
-			}
 			// In debug mode, expose the upstream node id on the response so
 			// operators can tell which backend node served a given request.
 			// This is purely for debugging/observability and is not consumed
@@ -464,16 +395,6 @@ func (s *Server) proxyRequest(
 			return s.recordAssignmentFromResponse(originalCtx, resp, node)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
-			if errors.Is(err, errRerouteRequested) {
-				// Deliberately writes nothing: the caller retries on another
-				// node and owns the response.
-				s.logger.Debug("upstream asked for reroute",
-					zap.String("node", node.GetNodeId()),
-					zap.String("path", proxyReq.URL.Path),
-				)
-				return
-			}
-
 			if errors.Is(err, context.Canceled) {
 				logLevel := zap.WarnLevel
 				if isStreamInputProxyRequest(proxyReq) {
@@ -518,11 +439,7 @@ func (s *Server) proxyRequest(
 	proxyStart := time.Now()
 	route := gatewayRouteLabel(proxyReq.URL.Path)
 	proxy.ServeHTTP(w, proxyReq)
-	if rerouteRequested {
-		return true
-	}
 	recordGatewayUpstreamProxy(route, proxyStart, w, proxyReq.Context())
-	return false
 }
 
 func isStreamInputProxyRequest(r *http.Request) bool {
@@ -705,49 +622,6 @@ func sandboxIDFromPath(path string) (string, bool) {
 		return "", false
 	}
 	return rest, true
-}
-
-// isPausedSandboxRecoveryRequest reports whether a request may be served by a
-// node that has never run the sandbox.
-//
-// Only resume qualifies. Every other sandbox endpoint addresses a sandbox the
-// caller believes is live somewhere, and sending those to an arbitrary node
-// would turn a stale routing entry into a confusing 404 against the wrong node.
-// Resume is different: it is the one operation whose whole purpose is to bring
-// a sandbox back from a snapshot, and the node-side handler already falls back
-// to the paused registry when it does not hold the sandbox locally.
-func isPausedSandboxRecoveryRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost {
-		return false
-	}
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-
-	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" &&
-		parts[2] == "resume"
-}
-
-// scheduleRecoveryNode picks the node that will attempt to rebuild a paused
-// sandbox nobody currently holds.
-func (s *Server) scheduleRecoveryNode(ctx context.Context, sandboxID string) (*schedulerv1.Node, error) {
-	rpcStart := time.Now()
-	resp, err := s.scheduler.Schedule(ctx, &schedulerv1.ScheduleRequest{})
-	recordGatewaySchedulerRPC("Schedule", rpcStart, err)
-	if err != nil {
-		s.logger.Warn("no node available to recover an unassigned sandbox",
-			zap.String("sandbox_id", sandboxID),
-			zap.Error(err),
-		)
-
-		return nil, err
-	}
-
-	node := resp.GetNode()
-	s.logger.Info("routing resume of an unassigned sandbox to a scheduled node",
-		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", node.GetNodeId()),
-	)
-
-	return node, nil
 }
 
 func isSandboxControlPlaneRequest(r *http.Request) bool {

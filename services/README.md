@@ -8,12 +8,12 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway aggregates `GET /sandboxes` and `GET /v2/sandboxes` across all scheduler nodes.
 - Gateway aggregates `GET /nodes` across all observed nodes in the scheduler.
 - Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
-- Gateway routes sandbox requests by existing sandbox-to-node binding.
+- Gateway routes sandbox requests to whichever node the scheduler names, in a single `LookupNode` call. The scheduler answers from the sandbox-to-node binding, from the heartbeat roster that seeded it, or — when neither knows the sandbox — from the paused registry the nodes maintain among themselves, and says which of the three it used.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
 - Built-in strategies in v1: round_robin and random.
 - Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
-- Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
+- Scheduler can run as a primary read/write service or as query-only replicas that serve sandbox data-plane lookups from Redis.
 - Scheduler observes node health and sandbox roster from heartbeats, and drops expired sandbox-to-node bindings on heartbeat, node unregistration, or lookup.
 - HTTP and WebSocket forwarding.
 
@@ -90,9 +90,9 @@ General config notes:
 - `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
 - `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
-- `scheduler.warmup_timeout` bounds how long a freshly started scheduler withholds `NotFound` for an unknown sandbox while its bindings are still being seeded by node heartbeats; defaults to `"15s"`. During that window a binding miss is reported as `Unavailable` (the gateway turns it into a 503) instead of `NotFound`, so traffic to live sandboxes does not 404 and a resume is not handed to a node that does not hold the sandbox. The window ends early as soon as every discovered node has delivered a heartbeat.
+- `scheduler.warmup_timeout` bounds how long a freshly started scheduler withholds `NotFound` for an unknown sandbox while its bindings are still being seeded by node heartbeats; defaults to `"15s"`. During that window a miss is reported as `Unavailable` (the gateway turns it into a 503) instead of `NotFound`, so traffic to live sandboxes does not 404. A sandbox that has never been paused has no paused-registry row by design, so it can only ever be found through a binding or a roster, which is what makes this window matter. The window ends early as soon as every discovered node has delivered a heartbeat.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
-- `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
+- `--query-only` starts a read-only scheduler that serves `LookupNode` and `ListRegistrySandboxes`; it requires `scheduler.redis_addr` and does not need node discovery config. It runs no discovery and receives no heartbeats, so it answers from bindings and reports `Unavailable` for a sandbox that only the paused registry knows about — never `NotFound`.
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
 - `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
 - `SCHEDULER_BINDING_TTL=<duration>` overrides `scheduler.binding_ttl` from the environment.
@@ -300,3 +300,4 @@ Methods:
 - ReportSandboxEvent
 - GetNode
 - UnregisterNode
+- ListRegistrySandboxes

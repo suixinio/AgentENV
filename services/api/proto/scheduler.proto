@@ -18,6 +18,7 @@ service Scheduler {
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
+  rpc ListRegistrySandboxes(ListRegistrySandboxesRequest) returns (ListRegistrySandboxesResponse);
 }
 
 message Node {
@@ -72,8 +73,41 @@ message LookupNodeRequest {
   string sandbox_id = 1;
 }
 
+// SandboxLocation says how the scheduler arrived at the node it names, which is
+// what decides whether that node is known to hold the sandbox or has merely
+// been chosen to rebuild it.
+//
+// The distinction matters to the caller: a node that already holds the sandbox
+// also holds its binding, while a node that was picked or pinned holds neither
+// and has to have the assignment recorded against it as soon as it answers.
+enum SandboxLocation {
+  // The scheduler did not classify this answer. Only an older scheduler
+  // produces it; it is equivalent to BOUND, since that is all a scheduler
+  // without the registry could ever answer.
+  SANDBOX_LOCATION_UNSPECIFIED = 0;
+  // A node is known to hold the sandbox — from its binding, from the roster it
+  // reported in its last heartbeat, or from a registry row that names it as
+  // the holder.
+  SANDBOX_LOCATION_BOUND = 1;
+  // The registry has the sandbox paused with its snapshot published, so any
+  // node can rebuild it. The node named here is a placement decision, taken
+  // with origin_node_id as a soft preference so the layers already on that
+  // machine get reused when it can still take work.
+  SANDBOX_LOCATION_PLACED = 2;
+  // The registry has the sandbox parked on origin_node_id with no snapshot in
+  // shared storage (publishing, or local_only after a failed upload). The only
+  // copy is on that machine's disk, so the answer is that node or nothing.
+  SANDBOX_LOCATION_PINNED = 3;
+}
+
 message LookupNodeResponse {
   Node node = 1;
+  SandboxLocation location = 2;
+  // The node that holds the sandbox's local artifacts, as the registry records
+  // it. Carried whenever the answer came from a registry row — for PLACED it is
+  // the preference the placement was taken against, which may or may not be the
+  // node above.
+  string origin_node_id = 3;
 }
 
 message RecordAssignmentRequest {
@@ -277,3 +311,54 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
+
+// RegistrySandbox is one row of the node-owned `paused_sandboxes` table, read
+// only. The scheduler never writes this table; every value here is what the
+// nodes agreed on among themselves.
+message RegistrySandbox {
+  string sandbox_id = 1;
+  string cluster_id = 2;
+  // One of publishing, paused, resuming, local_only, running. Carried as a
+  // string rather than an enum because the set is pinned by a CHECK constraint
+  // the nodes own: a value this build has not heard of has to survive the trip
+  // to an operator's screen, not be flattened to UNSPECIFIED.
+  string state = 3;
+  int64 generation = 4;
+  // The node holding the local artifacts. A claim deliberately leaves this
+  // pointing at the previous holder, so it is not the answer to "who owns this
+  // row now" — holder_node_id is.
+  string origin_node_id = 5;
+  // The node bringing the sandbox back up. Only set while state is resuming.
+  string claimed_by_node_id = 6;
+  // Empty while publishing, and while local_only after a failed upload.
+  string snapshot_id = 7;
+  int64 paused_at_unix_ms = 8;
+  int64 updated_at_unix_ms = 9;
+  // 0 means the column is NULL, which the nodes treat as already expired.
+  int64 lease_expires_at_unix_ms = 10;
+  // 0 means the column is NULL, which never matches a reclaim condition.
+  int64 sandbox_expires_at_unix_ms = 11;
+  // The node this row makes authoritative: claimed_by_node_id when resuming,
+  // origin_node_id otherwise. Derived, not stored.
+  string holder_node_id = 12;
+}
+
+message ListRegistrySandboxesRequest {
+  // Optional exact-match filter on state.
+  string state = 1;
+  // Optional filter on holder_node_id.
+  string node_id = 2;
+  // 0 means no limit.
+  int32 page_size = 3;
+  // The next_page_token of the previous response.
+  string page_token = 4;
+}
+
+message ListRegistrySandboxesResponse {
+  repeated RegistrySandbox sandboxes = 1;
+  // Empty when the last page has been returned.
+  string next_page_token = 2;
+  // The database clock the rows were read against. Every lease field above is
+  // only meaningful relative to this, never to the reader's own clock.
+  int64 database_now_unix_ms = 3;
+}

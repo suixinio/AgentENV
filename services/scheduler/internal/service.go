@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	pausedregistry "agentenv/services/scheduler/internal/registry"
 	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
@@ -24,6 +26,17 @@ type Service struct {
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
 	warmup        *warmupGate
+	// registry is the read-only view of the node-owned paused registry. Never
+	// nil: an unconfigured scheduler gets the disabled reader, which answers
+	// ErrDisabled rather than an empty result, so "switched off" can never be
+	// mistaken for "the table is empty".
+	registry pausedregistry.Reader
+	// reportTTL is how long a heartbeat stays current. It decides both the
+	// roster freshness the shadow reconciliation judges against and the
+	// freshness a lookup requires before routing to a node the registry names,
+	// which is why it is one value rather than two.
+	reportTTL               time.Duration
+	registryLeaseWarnWindow time.Duration
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -34,11 +47,14 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		nodes = NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
 	}
 	s := &Service{
-		logger:    logger,
-		nodes:     nodes,
-		strategy:  strategy,
-		store:     store,
-		artifacts: NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		logger:                  logger,
+		nodes:                   nodes,
+		strategy:                strategy,
+		store:                   store,
+		artifacts:               NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		registry:                pausedregistry.Disabled(),
+		reportTTL:               defaultObservedReportTTL,
+		registryLeaseWarnWindow: defaultRegistryLeaseWarnWindow,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -74,23 +90,80 @@ func WithArtifactStore(store ArtifactStore) ServiceOption {
 	}
 }
 
-type QueryOnlyService struct {
-	schedulerv1.UnimplementedSchedulerServer
-	logger *zap.Logger
-	store  BindingStore
+// WithPausedRegistry installs the read-only paused-registry reader, together
+// with the two intervals the shadow reconciliation judges rosters and leases
+// against.
+func WithPausedRegistry(reader pausedregistry.Reader, reportTTL time.Duration, leaseWarnWindow time.Duration) ServiceOption {
+	return func(s *Service) {
+		if reader == nil {
+			reader = pausedregistry.Disabled()
+		}
+		s.registry = reader
+		if reportTTL > 0 {
+			s.reportTTL = reportTTL
+		}
+		if leaseWarnWindow > 0 {
+			s.registryLeaseWarnWindow = leaseWarnWindow
+		}
+	}
 }
 
-func NewQueryOnlyService(logger *zap.Logger, store BindingStore) *QueryOnlyService {
+type QueryOnlyService struct {
+	schedulerv1.UnimplementedSchedulerServer
+	logger   *zap.Logger
+	store    BindingStore
+	registry pausedregistry.Reader
+}
+
+// QueryOnlyServiceOption configures optional QueryOnlyService behaviour.
+type QueryOnlyServiceOption func(*QueryOnlyService)
+
+// WithQueryOnlyPausedRegistry gives a query-only replica the same read-only
+// registry reader as the primary.
+//
+// 🔴 This is not optional in practice. A gateway configured with
+// gateway.query_only_scheduler_addr sends every sandbox data-plane lookup to
+// this replica, so a registry wired only into the primary would be consulted by
+// nothing that matters — and the deployment where that shows up is not the one
+// this is developed against.
+func WithQueryOnlyPausedRegistry(reader pausedregistry.Reader) QueryOnlyServiceOption {
+	return func(s *QueryOnlyService) {
+		if reader == nil {
+			reader = pausedregistry.Disabled()
+		}
+		s.registry = reader
+	}
+}
+
+func NewQueryOnlyService(logger *zap.Logger, store BindingStore, opts ...QueryOnlyServiceOption) *QueryOnlyService {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &QueryOnlyService{logger: logger, store: store}
+	s := &QueryOnlyService{logger: logger, store: store, registry: pausedregistry.Disabled()}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
-func (s *QueryOnlyService) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	// No gate: this mode requires Redis, so its bindings outlive the replica's
-	// own restart and a miss is a real miss rather than a cold cache.
-	return lookupNode(s.logger, s.store, req, nil)
+func (s *QueryOnlyService) ListRegistrySandboxes(ctx context.Context, req *schedulerv1.ListRegistrySandboxesRequest) (*schedulerv1.ListRegistrySandboxesResponse, error) {
+	return listRegistrySandboxes(ctx, s.logger, s.registry, nil, req)
+}
+
+func (s *QueryOnlyService) LookupNode(ctx context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
+	// No warm-up gate: this mode requires Redis, so its bindings outlive the
+	// replica's own restart and a miss is a real miss rather than a cold cache.
+	//
+	// No placer either. This replica runs no discovery and receives no
+	// heartbeats, so it cannot tell a draining node from a healthy one and has
+	// no way to resolve a node id to an endpoint. It still consults the
+	// registry, because the answer that matters most here — "unreadable, so
+	// this is not a 404" — needs nothing but the reader.
+	return lookupNode(ctx, lookupDeps{
+		logger:   s.logger,
+		store:    s.store,
+		registry: s.registry,
+	}, req)
 }
 
 func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) (resp *schedulerv1.ScheduleResponse, err error) {
@@ -99,6 +172,41 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		recordSchedulerSchedule(s.strategy.Name(), start, err)
 	}()
 
+	// A Schedule call is for a sandbox that does not exist yet, so there is no
+	// node it would rather be on.
+	result, selectErr := s.selectNode(req.GetHint(), "")
+	if selectErr != nil {
+		if errors.Is(selectErr, ErrNoNodes) {
+			err = status.Error(codes.Unavailable, "no nodes available")
+			return nil, err
+		}
+		err = status.Error(codes.Internal, selectErr.Error())
+		return nil, err
+	}
+	return &schedulerv1.ScheduleResponse{Node: result.node.Node.ToProto()}, nil
+}
+
+// placement is one selection, together with the candidate counts the decision
+// was taken over. The counts travel with the node because they are the only
+// thing that explains a selection after the fact.
+type placement struct {
+	node       RichNode
+	candidates int
+	eligible   int
+}
+
+// selectNode runs the placement pipeline.
+//
+// preferNodeID is a soft affinity, not a constraint: a node that survives every
+// filter is taken as-is, and one that does not is simply forgotten. It exists
+// for the sandbox that is being rebuilt from a snapshot — the machine that
+// paused it still has the layers on disk, and pulling them again from object
+// storage instead is the single largest avoidable cost in a cross-node resume.
+//
+// It is applied after filtering, never before: a preference that could bring
+// back a node the filters removed would let an isolated or overloaded node be
+// selected by the one path that never asked the strategy.
+func (s *Service) selectNode(hint *schedulerv1.ScheduleRequestHint, preferNodeID string) (placement, error) {
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
@@ -112,31 +220,50 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	// reported themselves isolated in their own heartbeat.
 	eligible := FilterByResourceLimit(FilterUnschedulable(rich), s.resourceLimit)
 
-	node, selectErr := s.strategy.Select(eligible, req.GetHint())
-	if selectErr != nil {
+	// Resolve the preference the way every other node identity is resolved: a
+	// registry row was written by the node itself and may name the identity it
+	// reported under before a fleet upgrade renamed it.
+	preferNodeID = strings.TrimSpace(preferNodeID)
+	if preferNodeID != "" {
+		if resolved, ok := s.nodes.Resolve(preferNodeID); ok {
+			preferNodeID = resolved.ID
+		}
+		for _, candidate := range eligible {
+			if candidate.ID != preferNodeID {
+				continue
+			}
+			s.logger.Debug("scheduler selected the preferred node",
+				zap.String("node_id", candidate.ID),
+				zap.String("endpoint", candidate.Endpoint),
+				zap.Int("candidate_nodes", len(rich)),
+				zap.Int("eligible_nodes", len(eligible)),
+			)
+			return placement{node: candidate, candidates: len(rich), eligible: len(eligible)}, nil
+		}
+	}
+
+	node, err := s.strategy.Select(eligible, hint)
+	if err != nil {
 		s.logger.Debug("scheduler selection failed",
 			zap.String("strategy", s.strategy.Name()),
-			zap.String("hint", summarizeScheduleHint(req.GetHint())),
+			zap.String("hint", summarizeScheduleHint(hint)),
+			zap.String("prefer_node_id", preferNodeID),
 			zap.Int("candidate_nodes", len(rich)),
 			zap.Int("eligible_nodes", len(eligible)),
-			zap.Error(selectErr),
+			zap.Error(err),
 		)
-		if errors.Is(selectErr, ErrNoNodes) {
-			err = status.Error(codes.Unavailable, "no nodes available")
-			return nil, err
-		}
-		err = status.Error(codes.Internal, selectErr.Error())
-		return nil, err
+		return placement{}, err
 	}
 	s.logger.Debug("scheduler selected node",
 		zap.String("strategy", s.strategy.Name()),
-		zap.String("hint", summarizeScheduleHint(req.GetHint())),
+		zap.String("hint", summarizeScheduleHint(hint)),
+		zap.String("prefer_node_id", preferNodeID),
 		zap.String("node_id", node.ID),
 		zap.String("endpoint", node.Endpoint),
 		zap.Int("candidate_nodes", len(rich)),
 		zap.Int("eligible_nodes", len(eligible)),
 	)
-	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
+	return placement{node: node, candidates: len(rich), eligible: len(eligible)}, nil
 }
 
 // summarizeScheduleHint renders a compact, log-friendly description of a
@@ -165,45 +292,14 @@ func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) 
 	return &schedulerv1.ListNodesResponse{Nodes: nodes}, nil
 }
 
-func (s *Service) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req, s.warmup)
-}
-
-// lookupNode answers a binding lookup, and — when `warmup` is present and still
-// cold — refuses to turn a miss into "not assigned anywhere".
-//
-// A nil gate means the caller has a binding store that survives its own restart
-// (the query-only replica requires Redis), so a miss there really is a miss.
-func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupNodeRequest, warmup *warmupGate) (*schedulerv1.LookupNodeResponse, error) {
-	if strings.TrimSpace(req.GetSandboxId()) == "" {
-		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
-	}
-	now := time.Now()
-	node, ok, getErr := store.Get(req.GetSandboxId(), now)
-	if getErr != nil {
-		logger.Warn("scheduler lookup binding store failed", zap.String("sandbox_id", req.GetSandboxId()), zap.Error(getErr))
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
-	}
-	if !ok {
-		if warmup != nil && !warmup.warmedUp(now) {
-			// Retryable on purpose. The gateway maps Unavailable to 503 and
-			// only hijacks a resume onto an arbitrary node when it sees
-			// NotFound, so this both keeps live sandboxes from 404ing and keeps
-			// a resume from being handed to a node that does not hold it.
-			logger.Info("scheduler lookup withheld while bindings are still being seeded",
-				zap.String("sandbox_id", req.GetSandboxId()),
-			)
-			return nil, status.Error(codes.Unavailable, "scheduler is still seeding sandbox assignments")
-		}
-		logger.Debug("scheduler lookup missed sandbox assignment", zap.String("sandbox_id", req.GetSandboxId()))
-		return nil, status.Error(codes.NotFound, "sandbox assignment not found")
-	}
-	logger.Debug("scheduler lookup resolved sandbox assignment",
-		zap.String("sandbox_id", req.GetSandboxId()),
-		zap.String("node_id", node.ID),
-		zap.String("endpoint", node.Endpoint),
-	)
-	return &schedulerv1.LookupNodeResponse{Node: node.ToProto()}, nil
+func (s *Service) LookupNode(ctx context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
+	return lookupNode(ctx, lookupDeps{
+		logger:   s.logger,
+		store:    s.store,
+		registry: s.registry,
+		warmup:   s.warmup,
+		placer:   s,
+	}, req)
 }
 
 func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAssignmentRequest) (*schedulerv1.RecordAssignmentResponse, error) {
@@ -431,6 +527,119 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	s.artifacts.ForgetNode(nodeID)
 
 	return &schedulerv1.UnregisterNodeResponse{}, nil
+}
+
+func (s *Service) ListRegistrySandboxes(ctx context.Context, req *schedulerv1.ListRegistrySandboxesRequest) (*schedulerv1.ListRegistrySandboxesResponse, error) {
+	return listRegistrySandboxes(ctx, s.logger, s.registry, s.canonicalNodeID, req)
+}
+
+// listRegistrySandboxes serves the read-only view of the paused registry.
+//
+// The two failure answers are deliberately different codes. FailedPrecondition
+// means this scheduler was never pointed at a registry, so there is nothing to
+// read and never will be until it is reconfigured. Unavailable means there is
+// one and it could not be read — retryable, and above all *not* an empty list:
+// an empty answer from this call reads as "the registry holds nothing", which
+// is the one conclusion an unreadable registry must never produce.
+//
+// resolveNodeID canonicalises the node_id filter and each row's holder the same
+// way the reconciliation does. A node that reports itself under a new identity
+// keeps writing rows under the old one for as long as the alias lives, so
+// comparing the two raw would answer "no rows on that node" for a node that has
+// plenty. Nil means no aliases are known, which is the query-only replica.
+func listRegistrySandboxes(
+	ctx context.Context,
+	logger *zap.Logger,
+	reader pausedregistry.Reader,
+	resolveNodeID func(string) string,
+	req *schedulerv1.ListRegistrySandboxesRequest,
+) (*schedulerv1.ListRegistrySandboxesResponse, error) {
+	if req.GetPageSize() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "page_size must not be negative")
+	}
+	if reader == nil {
+		return nil, status.Error(codes.FailedPrecondition, "paused registry is not configured")
+	}
+
+	listing, err := reader.List(ctx)
+	if err != nil {
+		if errors.Is(err, pausedregistry.ErrDisabled) {
+			return nil, status.Error(codes.FailedPrecondition, "paused registry is not configured")
+		}
+		logger.Warn("scheduler registry list failed", zap.Error(err))
+		return nil, status.Error(codes.Unavailable, "paused registry unavailable")
+	}
+
+	stateFilter := strings.TrimSpace(req.GetState())
+	nodeFilter := strings.TrimSpace(req.GetNodeId())
+	if resolveNodeID == nil {
+		resolveNodeID = func(nodeID string) string { return nodeID }
+	}
+	nodeFilter = resolveNodeID(nodeFilter)
+	pageToken := strings.TrimSpace(req.GetPageToken())
+
+	matched := make([]pausedregistry.Sandbox, 0, len(listing.Sandboxes))
+	for _, sandbox := range listing.Sandboxes {
+		if stateFilter != "" && !strings.EqualFold(string(sandbox.State), stateFilter) {
+			continue
+		}
+		if nodeFilter != "" && resolveNodeID(sandbox.Holder()) != nodeFilter {
+			continue
+		}
+		if pageToken != "" && sandbox.SandboxID <= pageToken {
+			continue
+		}
+		matched = append(matched, sandbox)
+	}
+	// The reader promises no ordering; paging over an unordered list would
+	// silently skip rows.
+	sort.Slice(matched, func(i, j int) bool {
+		return matched[i].SandboxID < matched[j].SandboxID
+	})
+
+	nextPageToken := ""
+	if pageSize := int(req.GetPageSize()); pageSize > 0 && pageSize < len(matched) {
+		matched = matched[:pageSize]
+		nextPageToken = matched[len(matched)-1].SandboxID
+	}
+
+	sandboxes := make([]*schedulerv1.RegistrySandbox, 0, len(matched))
+	for _, sandbox := range matched {
+		sandboxes = append(sandboxes, registrySandboxToProto(sandbox))
+	}
+
+	return &schedulerv1.ListRegistrySandboxesResponse{
+		Sandboxes:         sandboxes,
+		NextPageToken:     nextPageToken,
+		DatabaseNowUnixMs: listing.Now.UTC().UnixMilli(),
+	}, nil
+}
+
+func registrySandboxToProto(sandbox pausedregistry.Sandbox) *schedulerv1.RegistrySandbox {
+	return &schedulerv1.RegistrySandbox{
+		SandboxId:              sandbox.SandboxID,
+		ClusterId:              sandbox.ClusterID,
+		State:                  string(sandbox.State),
+		Generation:             sandbox.Generation,
+		OriginNodeId:           sandbox.OriginNodeID,
+		ClaimedByNodeId:        sandbox.ClaimedByNodeID,
+		SnapshotId:             sandbox.SnapshotID,
+		PausedAtUnixMs:         sandbox.PausedAt.UTC().UnixMilli(),
+		UpdatedAtUnixMs:        sandbox.UpdatedAt.UTC().UnixMilli(),
+		LeaseExpiresAtUnixMs:   optionalUnixMilli(sandbox.LeaseExpiresAt),
+		SandboxExpiresAtUnixMs: optionalUnixMilli(sandbox.SandboxExpiresAt),
+		HolderNodeId:           sandbox.Holder(),
+	}
+}
+
+// optionalUnixMilli renders a nullable timestamp. Zero stands for NULL, which
+// each of the two lease columns gives its own meaning to — see the field
+// comments in scheduler.proto.
+func optionalUnixMilli(t *time.Time) int64 {
+	if t == nil {
+		return 0
+	}
+	return t.UTC().UnixMilli()
 }
 
 func (s *Service) isKnownNode(node Node) bool {

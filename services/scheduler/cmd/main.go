@@ -15,6 +15,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 	scheduler "agentenv/services/scheduler/internal"
+	pausedregistry "agentenv/services/scheduler/internal/registry"
 	"agentenv/services/shared/config"
 	"agentenv/services/shared/logging"
 
@@ -48,9 +49,16 @@ func main() {
 	store, closeStore := createBindingStore(logger, cfg)
 	defer closeStore()
 
+	registryReader, closeRegistry := createRegistryReader(logger, cfg)
+	defer closeRegistry()
+
 	g := grpc.NewServer(grpc.UnaryInterceptor(scheduler.MetricsUnaryInterceptor()))
 	if *queryOnly {
-		svc := scheduler.NewQueryOnlyService(logger, store)
+		// The registry goes to this replica too: a gateway pointed at a
+		// query-only scheduler sends it every sandbox data-plane lookup, so a
+		// registry wired only into the primary would never be consulted on the
+		// path that needs it.
+		svc := scheduler.NewQueryOnlyService(logger, store, scheduler.WithQueryOnlyPausedRegistry(registryReader))
 		schedulerv1.RegisterSchedulerServer(g, svc)
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
@@ -77,8 +85,14 @@ func main() {
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
 			scheduler.WithWarmupTimeout(cfg.Scheduler.WarmupTimeout),
+			scheduler.WithPausedRegistry(
+				registryReader,
+				cfg.Scheduler.ReportTTL,
+				cfg.Scheduler.Registry.LeaseWarnWindow,
+			),
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
+		go svc.RunRegistryReconcile(sigCtx, cfg.Scheduler.Registry.ReconcileInterval)
 		schedulerv1.RegisterSchedulerServer(g, svc)
 	}
 
@@ -96,6 +110,7 @@ func main() {
 		zap.String("strategy", cfg.Scheduler.Strategy),
 		zap.String("binding_store", bindingStoreName(cfg)),
 		zap.Bool("query_only", *queryOnly),
+		zap.Bool("paused_registry", registryEnabled(cfg)),
 	)
 
 	metricsServer := &http.Server{
@@ -175,6 +190,54 @@ func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.Bindin
 			logger.Warn("close redis binding store failed", zap.Error(err))
 		}
 	}
+}
+
+// createRegistryReader builds the read-only paused-registry reader, or the
+// disabled one when no DSN is configured.
+//
+// It does not connect. A registry database that is down must not stop the
+// scheduler from starting: routing, discovery, and bindings all work without
+// it, and refusing to start would turn an observability outage into a cluster
+// outage. Only a DSN that cannot be parsed is fatal, and that is a
+// configuration error that will not fix itself.
+func createRegistryReader(logger *zap.Logger, cfg config.Config) (pausedregistry.Reader, func()) {
+	scheduler.SetRegistryEnabled(registryEnabled(cfg))
+	if !registryEnabled(cfg) {
+		return pausedregistry.Disabled(), func() {}
+	}
+
+	if strings.TrimSpace(cfg.Scheduler.Registry.ClusterID) == "" {
+		// Fail-open, and loudly. The cluster id arrives from an optional Secret
+		// key, so a missing key or a typo in its name leaves it empty and every
+		// read silently widens to the whole database — which is the accident
+		// where one cluster reconciles another's rows. Reading nothing would be
+		// worse for a single-cluster database, which is the common case, so the
+		// scheduler carries on and says so.
+		logger.Warn("scheduler paused registry has no cluster id; every read covers every cluster in the database",
+			zap.String("env", "SCHEDULER_REGISTRY_CLUSTER_ID"),
+		)
+	}
+
+	reader, err := pausedregistry.New(context.Background(), pausedregistry.Config{
+		DSN:            cfg.Scheduler.Registry.DSN,
+		ClusterID:      cfg.Scheduler.Registry.ClusterID,
+		MaxConnections: cfg.Scheduler.Registry.MaxConnections,
+		QueryTimeout:   cfg.Scheduler.Registry.QueryTimeout,
+	})
+	if err != nil {
+		logger.Fatal("create paused registry reader failed", zap.Error(err))
+	}
+
+	logger.Info("scheduler paused registry enabled",
+		zap.String("cluster_id", cfg.Scheduler.Registry.ClusterID),
+		zap.Int32("max_connections", cfg.Scheduler.Registry.MaxConnections),
+		zap.Duration("reconcile_interval", cfg.Scheduler.Registry.ReconcileInterval),
+	)
+	return reader, reader.Close
+}
+
+func registryEnabled(cfg config.Config) bool {
+	return strings.TrimSpace(cfg.Scheduler.Registry.DSN) != ""
 }
 
 func bindingStoreName(cfg config.Config) string {

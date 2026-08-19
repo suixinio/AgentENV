@@ -11,3 +11,8 @@ spec:
     - name: grpc
       port: 9090
       targetPort: grpc
+    # The scheduler has always served Prometheus metrics on its own listener;
+    # without a Service port nothing could scrape them.
+    - name: metrics
+      port: 9101
+      targetPort: metrics

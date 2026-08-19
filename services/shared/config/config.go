@@ -13,6 +13,13 @@ import (
 
 const defaultSchedulerArtifactStoreCapacity = 1_000_000
 
+const (
+	defaultSchedulerRegistryMaxConnections    = 4
+	defaultSchedulerRegistryReconcileInterval = 30 * time.Second
+	defaultSchedulerRegistryQueryTimeout      = 5 * time.Second
+	defaultSchedulerRegistryLeaseWarnWindow   = 30 * time.Second
+)
+
 type Node struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
@@ -57,6 +64,78 @@ type NodeResourceLimit struct {
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
 }
 
+// SchedulerRegistryConfig points the scheduler at the node-owned
+// `paused_sandboxes` table, read-only.
+//
+// An empty DSN switches the whole thing off: no pool, no reconciliation, and
+// the read-only registry API answers FailedPrecondition. That is the default,
+// and it must stay a supported configuration — a cluster that never sets this
+// behaves exactly as it did before this existed.
+type SchedulerRegistryConfig struct {
+	// DSN is supplied through the environment or a Secret, never through the
+	// config file: it carries credentials and the config file is a ConfigMap.
+	DSN string `json:"dsn"`
+	// ClusterID scopes every query. Empty means "read every row in the
+	// database", which is only correct when this database serves one cluster.
+	ClusterID         string        `json:"cluster_id"`
+	MaxConnections    int32         `json:"max_connections"`
+	ReconcileInterval time.Duration `json:"reconcile_interval"`
+	QueryTimeout      time.Duration `json:"query_timeout"`
+	// LeaseWarnWindow is how far ahead a parked row's lease is looked at
+	// before it is counted as expiring.
+	LeaseWarnWindow time.Duration `json:"lease_warn_window"`
+}
+
+func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		DSN               *string         `json:"dsn"`
+		ClusterID         *string         `json:"cluster_id"`
+		MaxConnections    *int32          `json:"max_connections"`
+		ReconcileInterval json.RawMessage `json:"reconcile_interval"`
+		QueryTimeout      json.RawMessage `json:"query_timeout"`
+		LeaseWarnWindow   json.RawMessage `json:"lease_warn_window"`
+	}
+
+	parsed := wire{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+
+	if parsed.DSN != nil {
+		s.DSN = *parsed.DSN
+	}
+	if parsed.ClusterID != nil {
+		s.ClusterID = *parsed.ClusterID
+	}
+	if parsed.MaxConnections != nil {
+		s.MaxConnections = *parsed.MaxConnections
+	}
+
+	if len(bytes.TrimSpace(parsed.ReconcileInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.ReconcileInterval, "scheduler.registry.reconcile_interval")
+		if err != nil {
+			return err
+		}
+		s.ReconcileInterval = d
+	}
+	if len(bytes.TrimSpace(parsed.QueryTimeout)) > 0 {
+		d, err := parseSchedulerDuration(parsed.QueryTimeout, "scheduler.registry.query_timeout")
+		if err != nil {
+			return err
+		}
+		s.QueryTimeout = d
+	}
+	if len(bytes.TrimSpace(parsed.LeaseWarnWindow)) > 0 {
+		d, err := parseSchedulerDuration(parsed.LeaseWarnWindow, "scheduler.registry.lease_warn_window")
+		if err != nil {
+			return err
+		}
+		s.LeaseWarnWindow = d
+	}
+
+	return nil
+}
+
 type SchedulerConfig struct {
 	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
 	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
@@ -70,6 +149,7 @@ type SchedulerConfig struct {
 	Nodes                   []Node                   `json:"nodes"`
 	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
 	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	Registry                SchedulerRegistryConfig  `json:"registry"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -86,6 +166,10 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		// Decoded into the existing value rather than through a pointer,
+		// so a config that names only one registry key keeps the defaults
+		// for the others instead of zeroing them.
+		Registry json.RawMessage `json:"registry"`
 	}
 
 	parsed := wire{}
@@ -119,6 +203,12 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.ArtifactLookupNodeLimit != nil {
 		s.ArtifactLookupNodeLimit = *parsed.ArtifactLookupNodeLimit
+	}
+
+	if len(bytes.TrimSpace(parsed.Registry)) > 0 {
+		if err := json.Unmarshal(parsed.Registry, &s.Registry); err != nil {
+			return err
+		}
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
@@ -306,6 +396,12 @@ func defaultConfig(service string) Config {
 					Scheme: "http",
 				},
 			},
+			Registry: SchedulerRegistryConfig{
+				MaxConnections:    defaultSchedulerRegistryMaxConnections,
+				ReconcileInterval: defaultSchedulerRegistryReconcileInterval,
+				QueryTimeout:      defaultSchedulerRegistryQueryTimeout,
+				LeaseWarnWindow:   defaultSchedulerRegistryLeaseWarnWindow,
+			},
 		},
 		Gateway: GatewayConfig{
 			HTTPListenAddr:      ":8080",
@@ -334,6 +430,10 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
 	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
+	// The DSN carries credentials, so it only ever arrives this way — never
+	// through the config file, which is a ConfigMap.
+	set("SCHEDULER_REGISTRY_DSN", &cfg.Scheduler.Registry.DSN)
+	set("SCHEDULER_REGISTRY_CLUSTER_ID", &cfg.Scheduler.Registry.ClusterID)
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_SANDBOX_PROXY_DOMAINS")); v != "" {
 		cfg.Gateway.SandboxProxyDomains = splitCommaSeparated(v)
@@ -353,6 +453,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_WARMUP_TIMEOUT %q: %w", v, err)
 		}
 		cfg.Scheduler.WarmupTimeout = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_RECONCILE_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_RECONCILE_INTERVAL %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.ReconcileInterval = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ARTIFACT_STORE_CAPACITY")); v != "" {
@@ -412,6 +520,18 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.BindingTTL <= 0 {
 		c.Scheduler.BindingTTL = 30 * time.Second
 	}
+	if c.Scheduler.Registry.MaxConnections <= 0 {
+		c.Scheduler.Registry.MaxConnections = defaultSchedulerRegistryMaxConnections
+	}
+	if c.Scheduler.Registry.ReconcileInterval <= 0 {
+		c.Scheduler.Registry.ReconcileInterval = defaultSchedulerRegistryReconcileInterval
+	}
+	if c.Scheduler.Registry.QueryTimeout <= 0 {
+		c.Scheduler.Registry.QueryTimeout = defaultSchedulerRegistryQueryTimeout
+	}
+	if c.Scheduler.Registry.LeaseWarnWindow <= 0 {
+		c.Scheduler.Registry.LeaseWarnWindow = defaultSchedulerRegistryLeaseWarnWindow
+	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
 	}
@@ -421,6 +541,59 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Gateway.MetricsListenAddr) == "" {
 		c.Gateway.MetricsListenAddr = ":9102"
 	}
+}
+
+// validateSchedulerRegistry checks the registry block only when it is switched
+// on. An empty DSN is the default and always valid: the feature is off and
+// every other field is irrelevant.
+func validateSchedulerRegistry(registry SchedulerRegistryConfig) error {
+	if strings.TrimSpace(registry.DSN) == "" {
+		return nil
+	}
+	if registry.MaxConnections <= 0 {
+		return errors.New("scheduler.registry.max_connections must be greater than zero")
+	}
+	if registry.ReconcileInterval <= 0 {
+		return errors.New("scheduler.registry.reconcile_interval must be greater than zero")
+	}
+	if registry.QueryTimeout <= 0 {
+		return errors.New("scheduler.registry.query_timeout must be greater than zero")
+	}
+	if registry.LeaseWarnWindow <= 0 {
+		return errors.New("scheduler.registry.lease_warn_window must be greater than zero")
+	}
+	// The column is a uuid, so a cluster id that is not one makes every query
+	// fail forever. Catching it here turns a permanently silent read failure
+	// into a start-up error.
+	if clusterID := strings.TrimSpace(registry.ClusterID); clusterID != "" && !looksLikeUUID(clusterID) {
+		return fmt.Errorf("scheduler.registry.cluster_id must be a uuid, got %q", clusterID)
+	}
+	return nil
+}
+
+// looksLikeUUID reports whether s has the canonical 8-4-4-4-12 hexadecimal
+// shape. It is a shape check, not a version check: the registry only needs the
+// value to survive a cast to uuid.
+func looksLikeUUID(s string) bool {
+	groups := strings.Split(s, "-")
+	if len(groups) != 5 {
+		return false
+	}
+	for i, want := range []int{8, 4, 4, 4, 12} {
+		if len(groups[i]) != want {
+			return false
+		}
+		for _, r := range groups[i] {
+			switch {
+			case r >= '0' && r <= '9':
+			case r >= 'a' && r <= 'f':
+			case r >= 'A' && r <= 'F':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (c Config) Validate() error {
@@ -454,6 +627,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.BindingTTL <= 0 {
 			return errors.New("scheduler.binding_ttl must be greater than zero")
+		}
+		// Checked before the query-only early return: a query-only replica is
+		// given the same registry reader, so a bad registry config has to fail
+		// there too rather than only on the primary.
+		if err := validateSchedulerRegistry(c.Scheduler.Registry); err != nil {
+			return err
 		}
 		if schedulerQueryOnly {
 			if strings.TrimSpace(c.Scheduler.RedisAddr) == "" {

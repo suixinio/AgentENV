@@ -16,146 +16,64 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 )
 
-// An isolated node declines a resume it does not want to serve. The gateway
-// must hand the request to a scheduled node instead, and the client must never
-// see the decline.
-func TestDeclinedResumeIsReroutedToScheduledNode(t *testing.T) {
-	declined := 0
-	isolated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		declined++
-		w.Header().Set(headerReroute, rerouteReasonSchedule)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("node is isolated"))
-	}))
-	defer isolated.Close()
+// An isolated node still marks the resumes it refuses, and the gateway
+// forwards that answer to the client untouched.
+//
+// 🔴 This replaces a reroute the gateway used to perform on its own: buffer the
+// body, drop the first node's response, pick a second node, replay. That only
+// existed because nothing else could decide where a paused sandbox belonged.
+// The scheduler decides now — it excludes isolated nodes from a placement, and
+// refuses up front when an isolated node is the only one that could serve the
+// sandbox — so a marker arriving here means the node refused work that was
+// legitimately its own, and hiding it would hide a real fault.
+func TestDeclinedResumeIsForwardedToTheClient(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		marker bool
+	}{
+		{name: "with the reroute marker", marker: true},
+		// The control: a plain 503 was never rerouted, and must still not be.
+		{name: "without the reroute marker", marker: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			served := 0
+			isolated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				served++
+				if tc.marker {
+					w.Header().Set(headerReroute, rerouteReasonSchedule)
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("node is isolated"))
+			}))
+			defer isolated.Close()
 
-	receivedBody := make(chan string, 1)
-	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		receivedBody <- string(body)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"state":"running"}`))
-	}))
-	defer healthy.Close()
+			// scheduleFunc is unset: the stub fails the test if the gateway
+			// tries to pick a second node.
+			server := newTestServer(t, stubSchedulerClient{
+				lookupNodeFunc: lookupNodeReturning(
+					&schedulerv1.Node{NodeId: "node-a", Endpoint: isolated.URL},
+					schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
+					"",
+				),
+			}, 5*time.Second, 4<<20)
 
-	scheduleCalled := 0
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: isolated.URL},
-			}, nil
-		},
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			scheduleCalled++
-			return &schedulerv1.ScheduleResponse{
-				Node: &schedulerv1.Node{NodeId: "node-b", Endpoint: healthy.URL},
-			}, nil
-		},
-		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}, 5*time.Second, 4<<20)
+			request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader(`{"timeout":600}`))
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
 
-	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader(`{"timeout":600}`))
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected the reroute target's status 200, got %d (body %q)", response.Code, response.Body.String())
-	}
-	if strings.Contains(response.Body.String(), "isolated") {
-		t.Fatalf("the declining node's body leaked to the client: %q", response.Body.String())
-	}
-	if response.Header().Get(headerReroute) != "" {
-		t.Fatalf("the reroute marker leaked to the client")
-	}
-	if declined != 1 {
-		t.Fatalf("expected the bound node to be tried exactly once, got %d", declined)
-	}
-	if scheduleCalled != 1 {
-		t.Fatalf("expected exactly one Schedule call, got %d", scheduleCalled)
-	}
-
-	select {
-	case body := <-receivedBody:
-		if body != `{"timeout":600}` {
-			t.Fatalf("request body was not replayed intact: %q", body)
-		}
-	default:
-		t.Fatal("request never reached the scheduled node")
-	}
-}
-
-// The control for the test above: a plain 503 is an upstream failure, not an
-// invitation to try somebody else. Without this, any failing node would have
-// its work silently sprayed across the cluster.
-func TestPlainServiceUnavailableIsNotRerouted(t *testing.T) {
-	server503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("busy"))
-	}))
-	defer server503.Close()
-
-	scheduleCalled := 0
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: server503.URL},
-			}, nil
-		},
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			scheduleCalled++
-			return nil, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader("{}"))
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected the upstream 503 to pass through, got %d", response.Code)
-	}
-	if !strings.Contains(response.Body.String(), "busy") {
-		t.Fatalf("upstream body did not pass through: %q", response.Body.String())
-	}
-	if scheduleCalled != 0 {
-		t.Fatalf("expected no Schedule call, got %d", scheduleCalled)
-	}
-}
-
-// Only resume may be rebuilt on a node that never held the sandbox. Every other
-// endpoint addresses a sandbox that lives on one specific node, so a marker on
-// those must be forwarded rather than acted on.
-func TestDeclineMarkerOnNonResumeIsNotRerouted(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerReroute, rerouteReasonSchedule)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer upstream.Close()
-
-	scheduleCalled := 0
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-			}, nil
-		},
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			scheduleCalled++
-			return nil, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil)
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected the marker to be forwarded as a plain 503, got %d", response.Code)
-	}
-	if scheduleCalled != 0 {
-		t.Fatalf("expected no Schedule call, got %d", scheduleCalled)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected the upstream 503 to pass through, got %d", response.Code)
+			}
+			if !strings.Contains(response.Body.String(), "isolated") {
+				t.Fatalf("upstream body did not pass through: %q", response.Body.String())
+			}
+			if got := response.Header().Get(headerReroute); tc.marker && got != rerouteReasonSchedule {
+				t.Fatalf("the node's reroute marker was swallowed, got %q", got)
+			}
+			if served != 1 {
+				t.Fatalf("expected the bound node to be tried exactly once, got %d", served)
+			}
+		})
 	}
 }
 

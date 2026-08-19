@@ -628,3 +628,239 @@ func TestSchedulerWarmupTimeoutEnvOverride(t *testing.T) {
 		t.Fatalf("expected 7s from the environment, got %v", cfg.Scheduler.WarmupTimeout)
 	}
 }
+
+func TestDefaultSchedulerRegistryIsOff(t *testing.T) {
+	cfg := defaultConfig("scheduler")
+	registry := cfg.Scheduler.Registry
+	if registry.DSN != "" {
+		t.Fatalf("expected registry to default to off, got dsn %q", registry.DSN)
+	}
+	if registry.ClusterID != "" {
+		t.Fatalf("expected empty default cluster id, got %q", registry.ClusterID)
+	}
+	if registry.MaxConnections != defaultSchedulerRegistryMaxConnections {
+		t.Fatalf("expected max connections %d, got %d", defaultSchedulerRegistryMaxConnections, registry.MaxConnections)
+	}
+	if registry.ReconcileInterval != defaultSchedulerRegistryReconcileInterval {
+		t.Fatalf("expected reconcile interval %s, got %s", defaultSchedulerRegistryReconcileInterval, registry.ReconcileInterval)
+	}
+	if registry.QueryTimeout != defaultSchedulerRegistryQueryTimeout {
+		t.Fatalf("expected query timeout %s, got %s", defaultSchedulerRegistryQueryTimeout, registry.QueryTimeout)
+	}
+	if registry.LeaseWarnWindow != defaultSchedulerRegistryLeaseWarnWindow {
+		t.Fatalf("expected lease warn window %s, got %s", defaultSchedulerRegistryLeaseWarnWindow, registry.LeaseWarnWindow)
+	}
+}
+
+func TestLoadParsesSchedulerRegistryBlock(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"registry": {
+				"dsn": "postgres://reader@127.0.0.1:5432/agentenv",
+				"cluster_id": "00000000-0000-0000-0000-000000000000",
+				"max_connections": 7,
+				"reconcile_interval": "45s",
+				"query_timeout": "2s",
+				"lease_warn_window": "1m"
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := LoadScheduler(path, false)
+	if err != nil {
+		t.Fatalf("load scheduler config failed: %v", err)
+	}
+	registry := cfg.Scheduler.Registry
+	if registry.DSN != "postgres://reader@127.0.0.1:5432/agentenv" {
+		t.Fatalf("unexpected dsn %q", registry.DSN)
+	}
+	if registry.ClusterID != "00000000-0000-0000-0000-000000000000" {
+		t.Fatalf("unexpected cluster id %q", registry.ClusterID)
+	}
+	if registry.MaxConnections != 7 {
+		t.Fatalf("unexpected max connections %d", registry.MaxConnections)
+	}
+	if registry.ReconcileInterval != 45*time.Second {
+		t.Fatalf("unexpected reconcile interval %s", registry.ReconcileInterval)
+	}
+	if registry.QueryTimeout != 2*time.Second {
+		t.Fatalf("unexpected query timeout %s", registry.QueryTimeout)
+	}
+	if registry.LeaseWarnWindow != time.Minute {
+		t.Fatalf("unexpected lease warn window %s", registry.LeaseWarnWindow)
+	}
+}
+
+// A config naming one registry key must not zero the rest of the block; the
+// whole point of the pointer/RawMessage decoding is that an absent key keeps
+// its default.
+func TestLoadKeepsSchedulerRegistryDefaultsForAbsentKeys(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"registry": {
+				"reconcile_interval": "10s"
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := LoadScheduler(path, false)
+	if err != nil {
+		t.Fatalf("load scheduler config failed: %v", err)
+	}
+	registry := cfg.Scheduler.Registry
+	if registry.ReconcileInterval != 10*time.Second {
+		t.Fatalf("unexpected reconcile interval %s", registry.ReconcileInterval)
+	}
+	if registry.MaxConnections != defaultSchedulerRegistryMaxConnections {
+		t.Fatalf("expected max connections to keep its default, got %d", registry.MaxConnections)
+	}
+	if registry.QueryTimeout != defaultSchedulerRegistryQueryTimeout {
+		t.Fatalf("expected query timeout to keep its default, got %s", registry.QueryTimeout)
+	}
+	if registry.LeaseWarnWindow != defaultSchedulerRegistryLeaseWarnWindow {
+		t.Fatalf("expected lease warn window to keep its default, got %s", registry.LeaseWarnWindow)
+	}
+}
+
+func TestLoadRejectsNumericSchedulerRegistryReconcileInterval(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"registry": {
+				"reconcile_interval": 45
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	if _, err := LoadScheduler(path, false); err == nil {
+		t.Fatal("expected numeric reconcile_interval to be rejected")
+	}
+}
+
+func TestLoadAppliesSchedulerRegistryEnvOverrides(t *testing.T) {
+	t.Setenv("SCHEDULER_REGISTRY_DSN", "postgres://reader@db:5432/agentenv")
+	t.Setenv("SCHEDULER_REGISTRY_CLUSTER_ID", "11111111-2222-3333-4444-555555555555")
+	t.Setenv("SCHEDULER_REGISTRY_RECONCILE_INTERVAL", "17s")
+
+	cfg, err := Load("", "scheduler")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	registry := cfg.Scheduler.Registry
+	if registry.DSN != "postgres://reader@db:5432/agentenv" {
+		t.Fatalf("unexpected dsn %q", registry.DSN)
+	}
+	if registry.ClusterID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("unexpected cluster id %q", registry.ClusterID)
+	}
+	if registry.ReconcileInterval != 17*time.Second {
+		t.Fatalf("unexpected reconcile interval %s", registry.ReconcileInterval)
+	}
+}
+
+func TestLoadRejectsInvalidSchedulerRegistryReconcileIntervalEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_REGISTRY_RECONCILE_INTERVAL", "soon")
+
+	if _, err := Load("", "scheduler"); err == nil {
+		t.Fatal("expected invalid SCHEDULER_REGISTRY_RECONCILE_INTERVAL to fail")
+	}
+}
+
+// An unset DSN is the default, and every other field is then irrelevant: a
+// cluster that never configures a registry must keep starting.
+func TestValidateSchedulerRegistryIgnoresEverythingWhenDSNEmpty(t *testing.T) {
+	registry := SchedulerRegistryConfig{
+		ClusterID:         "not-a-uuid",
+		MaxConnections:    -1,
+		ReconcileInterval: -time.Second,
+		QueryTimeout:      0,
+		LeaseWarnWindow:   -time.Minute,
+	}
+	if err := validateSchedulerRegistry(registry); err != nil {
+		t.Fatalf("expected a disabled registry to validate, got %v", err)
+	}
+}
+
+func TestValidateSchedulerRegistryRejectsBadValuesWhenEnabled(t *testing.T) {
+	base := SchedulerRegistryConfig{
+		DSN:               "postgres://reader@db:5432/agentenv",
+		MaxConnections:    4,
+		ReconcileInterval: 30 * time.Second,
+		QueryTimeout:      5 * time.Second,
+		LeaseWarnWindow:   30 * time.Second,
+	}
+	if err := validateSchedulerRegistry(base); err != nil {
+		t.Fatalf("expected a well formed registry config to validate, got %v", err)
+	}
+
+	cases := map[string]func(*SchedulerRegistryConfig){
+		"max_connections":    func(c *SchedulerRegistryConfig) { c.MaxConnections = 0 },
+		"reconcile_interval": func(c *SchedulerRegistryConfig) { c.ReconcileInterval = 0 },
+		"query_timeout":      func(c *SchedulerRegistryConfig) { c.QueryTimeout = 0 },
+		"lease_warn_window":  func(c *SchedulerRegistryConfig) { c.LeaseWarnWindow = 0 },
+		"cluster_id":         func(c *SchedulerRegistryConfig) { c.ClusterID = "dev-cluster" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			mutate(&cfg)
+			if err := validateSchedulerRegistry(cfg); err == nil {
+				t.Fatalf("expected %s to be rejected", name)
+			}
+		})
+	}
+}
+
+// A query-only replica gets the same reader, so it has to reject the same bad
+// config rather than skipping the check with the rest of the query-only branch.
+func TestLoadSchedulerValidatesRegistryInQueryOnlyMode(t *testing.T) {
+	t.Setenv("SCHEDULER_REGISTRY_DSN", "postgres://reader@db:5432/agentenv")
+	t.Setenv("SCHEDULER_REGISTRY_CLUSTER_ID", "dev-cluster")
+	t.Setenv("SCHEDULER_REDIS_ADDR", "127.0.0.1:6379")
+
+	if _, err := LoadScheduler("", true); err == nil {
+		t.Fatal("expected query-only scheduler to reject a non-uuid registry cluster id")
+	}
+}
+
+func TestLooksLikeUUID(t *testing.T) {
+	valid := []string{
+		"00000000-0000-0000-0000-000000000000",
+		"11111111-2222-3333-4444-555555555555",
+		"AABBCCDD-EEFF-0011-2233-445566778899",
+	}
+	for _, value := range valid {
+		if !looksLikeUUID(value) {
+			t.Fatalf("expected %q to look like a uuid", value)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"dev-cluster",
+		"00000000-0000-0000-0000-00000000000",
+		"00000000-0000-0000-0000-0000000000000",
+		"00000000_0000_0000_0000_000000000000",
+		"0000000g-0000-0000-0000-000000000000",
+		"00000000-0000-0000-000000000000-0000",
+	}
+	for _, value := range invalid {
+		if looksLikeUUID(value) {
+			t.Fatalf("expected %q not to look like a uuid", value)
+		}
+	}
+}

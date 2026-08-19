@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/observability"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,6 +40,19 @@ var (
 			Buckets: observability.DurationBuckets,
 		},
 		[]string{"rpc", "status"},
+	)
+	// How each resolved sandbox request was located. This is deliberately its
+	// own series rather than another route_source value: route_source answers
+	// "where did the sandbox id come from", which is orthogonal and still
+	// needed. Before this existed, a resume served from a binding and one
+	// rebuilt on a node that had never held the sandbox were indistinguishable
+	// in every metric the gateway published.
+	gatewaySandboxLocations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_sandbox_location_total",
+			Help: "Resolved sandbox requests by how the scheduler located the sandbox.",
+		},
+		[]string{"location"},
 	)
 )
 
@@ -143,6 +157,29 @@ func (s *Server) isLocalGatewayEndpointRequest(r *http.Request) bool {
 func recordGatewaySchedulerRPC(rpc string, start time.Time, err error) {
 	status := observability.GRPCStatusLabel(err)
 	gatewaySchedulerRPCDuration.WithLabelValues(rpc, status).Observe(time.Since(start).Seconds())
+}
+
+func recordGatewaySandboxLocation(location schedulerv1.SandboxLocation) {
+	gatewaySandboxLocations.WithLabelValues(gatewaySandboxLocationLabel(location)).Inc()
+}
+
+// gatewaySandboxLocationLabel keeps the label set closed. An enum value this
+// build does not know is reported as "other" rather than as its number, so a
+// newer scheduler cannot grow the cardinality of this series.
+func gatewaySandboxLocationLabel(location schedulerv1.SandboxLocation) string {
+	switch location {
+	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND:
+		return "bound"
+	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED:
+		return "placed"
+	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED:
+		return "pinned"
+	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED:
+		// An older scheduler, which could only ever answer from a binding.
+		return "unspecified"
+	default:
+		return "other"
+	}
 }
 
 func recordGatewayUpstreamProxy(route string, start time.Time, w http.ResponseWriter, ctx context.Context) {

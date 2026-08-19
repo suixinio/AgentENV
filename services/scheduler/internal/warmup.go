@@ -17,18 +17,17 @@ const defaultWarmupTimeout = 15 * time.Second
 // Bindings are a cache: they are held in memory, expire on a TTL, and are
 // re-seeded entirely from node heartbeats. A scheduler that has just started
 // therefore knows nothing — and answering NotFound from that state is not a
-// cache miss, it is the cache asserting something it cannot know. Three things
-// downstream take that assertion at face value:
+// cache miss, it is the cache asserting something it cannot know.
 //
-//   - the gateway turns it into a 404, so traffic to perfectly healthy
-//     sandboxes fails for as long as the window lasts;
-//   - the gateway treats NotFound on a resume as "nobody holds this sandbox"
-//     and hands the resume to a scheduled node, which claims the sandbox from
-//     the paused registry and rebuilds it from object storage — while the node
-//     that has it sits idle with the artifacts on local disk;
-//   - a sandbox whose snapshot never published (`local_only`) cannot be
-//     rebuilt anywhere else at all, so that resume comes back 409 instead of
-//     succeeding on its own node in a second.
+// The gateway turns NotFound into a 404 and does nothing else with it, so a
+// premature one fails traffic to perfectly healthy sandboxes for as long as the
+// window lasts, and tells a client its sandbox no longer exists. That is the
+// whole of it now: the gateway used to answer a NotFound resume by picking a
+// node itself and letting it claim the sandbox from the paused registry, which
+// this gate also existed to prevent. That path is gone — the lookup consults
+// the registry itself — but the gate is no less necessary, because a sandbox
+// that has never been paused has no registry row by design and can only ever be
+// found through a binding or a roster.
 //
 // e2b closes the same window by running a full node sync before serving rather
 // than waiting for the first tick (`e2b/packages/api/internal/orchestrator/cache.go:34`,

@@ -24,9 +24,34 @@ spec:
           args:
             - -config
             - /config/scheduler.json
+          env:
+            # Read-only DSN for the node-owned `paused_sandboxes` table. It
+            # carries credentials, so it never goes near the ConfigMap.
+            #
+            # `optional: true` is not decoration: a cluster that does not run a
+            # registry database has no such Secret, and the scheduler has to
+            # come up there exactly as it always did. An empty DSN switches the
+            # whole feature off.
+            - name: SCHEDULER_REGISTRY_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-postgres
+                  key: dsn
+                  optional: true
+            # Scopes every registry read to one cluster. Absent means "every row
+            # in the database", which is only right when the database serves a
+            # single cluster.
+            - name: SCHEDULER_REGISTRY_CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-postgres
+                  key: cluster_id
+                  optional: true
           ports:
             - name: grpc
               containerPort: 9090
+            - name: metrics
+              containerPort: 9101
           readinessProbe:
             exec:
               command:

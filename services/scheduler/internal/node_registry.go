@@ -26,7 +26,35 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// RosterOf returns the sandbox roster a node reported in its last
+	// heartbeat, and when it reported it.
+	RosterOf(nodeID string) ([]string, time.Time, bool)
+	// NodesHolding returns every node whose last heartbeat listed this
+	// sandbox. More than one is normal during a cross-node takeover: the
+	// origin keeps its paused record until its own reconciliation drops it.
+	NodesHolding(sandboxID string) []string
+	// RostersInCluster returns one roster per node this scheduler answers for
+	// in a cluster, sorted by node id.
+	RostersInCluster(clusterID string) []Roster
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
+}
+
+// Roster is one node's heartbeat-reported sandbox list.
+//
+// Heartbeats have always carried this list, and until now its only consumer was
+// BindingStore.ReconcileNode, which folded it into sandbox-to-node bindings and
+// dropped the rest. Keeping it means the scheduler can answer "what does this
+// node say it holds" — which is the other half of every reconciliation against
+// the paused registry, and the only thing that can cover a binding whose TTL
+// lapsed between heartbeats.
+//
+// A zero LastSeen means the node is known to discovery but has never sent a
+// heartbeat. That is a real and reportable state, not a placeholder: a machine
+// that came up and never checked in is exactly the one an operator needs to see.
+type Roster struct {
+	NodeID     string
+	SandboxIDs []string
+	LastSeen   time.Time
 }
 
 var (
@@ -39,6 +67,11 @@ type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
+	// sandboxIDs is the roster from this node's last heartbeat, normalised.
+	sandboxIDs []string
+	// lastSeen duplicates node.LastSeenUnixMs as a time.Time so roster
+	// freshness is decided without a millisecond round trip.
+	lastSeen time.Time
 }
 
 type AtomicNodeRegistry struct {
@@ -58,6 +91,10 @@ type AtomicNodeRegistry struct {
 	observed         map[string]observedNodeRecord
 	cpuIntersection  map[string]string
 	intersectionSent map[string]bool
+	// sandboxHolders is the reverse of the rosters: sandbox id -> the nodes
+	// that reported holding it. Maintained on every roster change so a lookup
+	// costs one map hit rather than a scan of every node's roster.
+	sandboxHolders map[string]map[string]struct{}
 }
 
 func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeRegistry {
@@ -74,6 +111,7 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 		observed:         make(map[string]observedNodeRecord),
 		cpuIntersection:  make(map[string]string),
 		intersectionSent: make(map[string]bool),
+		sandboxHolders:   make(map[string]map[string]struct{}),
 	}
 	registry.Set(nodes, nil)
 	return registry
@@ -166,6 +204,7 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 		if clusterID := record.node.GetClusterId(); clusterID != "" {
 			affectedClusters[clusterID] = struct{}{}
 		}
+		r.clearRosterLocked(nodeID)
 		delete(r.observed, nodeID)
 		delete(r.intersectionSent, nodeID)
 	}
@@ -213,7 +252,10 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		},
 		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
 		reportTTL:   r.observedTTL,
+		sandboxIDs:  normalizeRoster(req.GetSandboxIds()),
+		lastSeen:    now,
 	}
+	r.applyRosterLocked(nodeID, record.sandboxIDs)
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
 	}
@@ -399,9 +441,166 @@ func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID
 	}
 
 	clusterID := record.node.GetClusterId()
+	r.clearRosterLocked(nodeID)
 	delete(r.observed, nodeID)
 	r.invalidateIntersectionLocked(clusterID)
 	return nil
+}
+
+// RosterOf returns a copy of a node's last reported roster.
+func (r *AtomicNodeRegistry) RosterOf(nodeID string) ([]string, time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	record, ok := r.observed[nodeID]
+	if !ok {
+		return nil, time.Time{}, false
+	}
+	return append([]string(nil), record.sandboxIDs...), record.lastSeen, true
+}
+
+// NodesHolding returns the nodes whose last heartbeat listed this sandbox,
+// sorted by node id.
+func (r *AtomicNodeRegistry) NodesHolding(sandboxID string) []string {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	holders, ok := r.sandboxHolders[sandboxID]
+	if !ok {
+		return nil
+	}
+	nodeIDs := make([]string, 0, len(holders))
+	for nodeID := range holders {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+	return nodeIDs
+}
+
+// RostersInCluster returns one roster per node this scheduler answers for in
+// the given cluster, sorted by node id. An empty clusterID means no filter,
+// which is the right answer for a database that serves a single cluster — and
+// the same condition the registry reader applies to its own SQL.
+//
+// Two things it deliberately does that a plain "list what we observed" would
+// not:
+//
+// A node discovery knows about but that has never sent a heartbeat is included,
+// with a zero LastSeen and no sandboxes. Reporting nothing for it would hide
+// the one node an operator most needs to see, and it would make the "never
+// reported" branch of every consumer unreachable in production.
+//
+// A node whose heartbeat named another cluster is excluded even though
+// discovery knows it, because it has answered — just not to us.
+func (r *AtomicNodeRegistry) RostersInCluster(clusterID string) []Roster {
+	wanted := normalizeClusterID(clusterID)
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	rosters := make([]Roster, 0, len(r.observed)+len(r.nodesByID))
+	for nodeID, record := range r.observed {
+		if wanted != "" && normalizeClusterID(record.node.GetClusterId()) != wanted {
+			continue
+		}
+		rosters = append(rosters, Roster{
+			NodeID:     nodeID,
+			SandboxIDs: append([]string(nil), record.sandboxIDs...),
+			LastSeen:   record.lastSeen,
+		})
+	}
+	for nodeID := range r.nodesByID {
+		if _, reported := r.observed[nodeID]; reported {
+			continue
+		}
+		rosters = append(rosters, Roster{NodeID: nodeID})
+	}
+	sort.Slice(rosters, func(i, j int) bool {
+		return rosters[i].NodeID < rosters[j].NodeID
+	})
+	return rosters
+}
+
+// normalizeClusterID puts two cluster ids in a comparable form. Both sides are
+// UUID text that travelled through a config file and an environment variable,
+// and a difference in case or padding between them would silently empty the
+// roster side of every comparison.
+func normalizeClusterID(clusterID string) string {
+	return strings.ToLower(strings.TrimSpace(clusterID))
+}
+
+// applyRosterLocked moves a node from its previous roster to a new one,
+// keeping the reverse index in step. r.mu must be held by the caller.
+func (r *AtomicNodeRegistry) applyRosterLocked(nodeID string, roster []string) {
+	next := make(map[string]struct{}, len(roster))
+	for _, sandboxID := range roster {
+		next[sandboxID] = struct{}{}
+	}
+
+	for _, sandboxID := range r.observed[nodeID].sandboxIDs {
+		if _, ok := next[sandboxID]; ok {
+			continue
+		}
+		r.removeHolderLocked(sandboxID, nodeID)
+	}
+
+	for sandboxID := range next {
+		holders, ok := r.sandboxHolders[sandboxID]
+		if !ok {
+			holders = make(map[string]struct{}, 1)
+			r.sandboxHolders[sandboxID] = holders
+		}
+		holders[nodeID] = struct{}{}
+	}
+}
+
+// clearRosterLocked drops a node from the reverse index entirely. r.mu must be
+// held by the caller.
+func (r *AtomicNodeRegistry) clearRosterLocked(nodeID string) {
+	for _, sandboxID := range r.observed[nodeID].sandboxIDs {
+		r.removeHolderLocked(sandboxID, nodeID)
+	}
+}
+
+func (r *AtomicNodeRegistry) removeHolderLocked(sandboxID string, nodeID string) {
+	holders, ok := r.sandboxHolders[sandboxID]
+	if !ok {
+		return
+	}
+	delete(holders, nodeID)
+	if len(holders) == 0 {
+		delete(r.sandboxHolders, sandboxID)
+	}
+}
+
+// normalizeRoster trims, drops blanks, and de-duplicates a reported roster so
+// the reverse index never carries an id the node did not really name.
+func normalizeRoster(sandboxIDs []string) []string {
+	if len(sandboxIDs) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(sandboxIDs))
+	normalized := make([]string, 0, len(sandboxIDs))
+	for _, sandboxID := range sandboxIDs {
+		sandboxID = strings.TrimSpace(sandboxID)
+		if sandboxID == "" {
+			continue
+		}
+		if _, ok := seen[sandboxID]; ok {
+			continue
+		}
+		seen[sandboxID] = struct{}{}
+		normalized = append(normalized, sandboxID)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }
 
 // deriveObservedNodeViewLocked builds the external ObservedNode view for a

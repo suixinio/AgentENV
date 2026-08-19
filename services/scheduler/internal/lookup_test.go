@@ -3,14 +3,17 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
 	pausedregistry "agentenv/services/scheduler/internal/registry"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // missingBindingStore always misses. Every test below is about what happens
@@ -97,6 +100,18 @@ func allNodesReady(t *testing.T, svc *Service) {
 	for _, node := range lookupTestNodes {
 		lookupHeartbeat(t, svc, node.ID, schedulerv1.NodeStatus_NODE_STATUS_READY)
 	}
+}
+
+// lookupResultCounts reads the lookup result counter back through a registry of
+// this test's own. It is how a test sees which branch answered: the two
+// refusals below share a gRPC code and a response shape, and differ only in
+// this label and in the log line.
+func lookupResultCounts(t *testing.T) map[string]float64 {
+	t.Helper()
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(schedulerLookupResults)
+	return gaugeSeries(t, reg, "agentenv_scheduler_lookup_node_total")
 }
 
 func registryRow(sandboxID string, state pausedregistry.State, originNodeID string, claimedByNodeID string) pausedregistry.Listing {
@@ -261,10 +276,21 @@ func TestLookupPinsAParkedSandboxToItsOrigin(t *testing.T) {
 // else, since no snapshot ever reached shared storage. Forwarding would earn
 // the caller a 503 whose stated reason is the opposite of the truth, so the
 // refusal is made here where the reason can be said correctly.
+//
+// 🔴 The two reasons are reported apart. They share a gRPC code because the
+// caller does the same thing either way — retry — but an operator does not:
+// "not accepting work" is a node that said so and is answered at the admin API,
+// while "not reporting" is a node that said nothing and is answered at its
+// heartbeat. Reporting the second as the first sends whoever is on the incident
+// to look at a subsystem that is behaving perfectly, and the cluster run of
+// this change did exactly that seven times.
 func TestLookupRefusesToPinToANodeThatWillNotServe(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		register func(*testing.T, *Service)
+		name        string
+		register    func(*testing.T, *Service)
+		wantResult  lookupResult
+		wantMessage string
+		otherResult lookupResult
 	}{
 		{
 			name: "origin is draining",
@@ -272,6 +298,9 @@ func TestLookupRefusesToPinToANodeThatWillNotServe(t *testing.T) {
 				lookupHeartbeat(t, svc, "node-a", schedulerv1.NodeStatus_NODE_STATUS_DRAINING)
 				lookupHeartbeat(t, svc, "node-b", schedulerv1.NodeStatus_NODE_STATUS_READY)
 			},
+			wantResult:  lookupResultOriginUnschedulable,
+			wantMessage: "which is not accepting work",
+			otherResult: lookupResultOriginNotReporting,
 		},
 		{
 			// A node nobody has heard from is not somewhere to send a sandbox
@@ -280,6 +309,9 @@ func TestLookupRefusesToPinToANodeThatWillNotServe(t *testing.T) {
 			register: func(t *testing.T, svc *Service) {
 				lookupHeartbeat(t, svc, "node-b", schedulerv1.NodeStatus_NODE_STATUS_READY)
 			},
+			wantResult:  lookupResultOriginNotReporting,
+			wantMessage: "which is not reporting",
+			otherResult: lookupResultOriginUnschedulable,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -287,11 +319,26 @@ func TestLookupRefusesToPinToANodeThatWillNotServe(t *testing.T) {
 			svc := newLookupTestService(t, missingBindingStore{}, reader, testReportTTL)
 			tc.register(t, svc)
 
+			before := lookupResultCounts(t)
 			resp, err := lookup(t, svc, "sbx-1")
 			if resp != nil {
 				t.Fatalf("expected no node, got %q", resp.GetNode().GetNodeId())
 			}
 			requireCode(t, err, codes.FailedPrecondition)
+
+			if got := status.Convert(err).Message(); !strings.Contains(got, tc.wantMessage) {
+				t.Fatalf("expected the message to say %q, got %q", tc.wantMessage, got)
+			}
+
+			after := lookupResultCounts(t)
+			if got := after[string(tc.wantResult)] - before[string(tc.wantResult)]; got != 1 {
+				t.Fatalf("expected one %s, got %v", tc.wantResult, got)
+			}
+			// And the other reason did not move. Collapsing the two back into
+			// one label is exactly what this pins.
+			if got := after[string(tc.otherResult)] - before[string(tc.otherResult)]; got != 0 {
+				t.Fatalf("expected %s not to be counted, got %v", tc.otherResult, got)
+			}
 		})
 	}
 }

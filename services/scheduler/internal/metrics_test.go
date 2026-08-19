@@ -28,6 +28,7 @@ const (
 	metricRegistryInvalid           = "agentenv_scheduler_registry_invalid_rows"
 	metricRegistryLastSuccess       = "agentenv_scheduler_registry_last_success_timestamp_seconds"
 	metricRegistryReadFailures      = "agentenv_scheduler_registry_read_failures_total"
+	metricRegistryReconcileDuration = "agentenv_scheduler_registry_reconcile_duration_seconds"
 	metricRegistryEnabled           = "agentenv_scheduler_registry_enabled"
 )
 
@@ -52,6 +53,7 @@ func newRegistryGatherer(t *testing.T) prometheus.Gatherer {
 		schedulerRegistryInvalidRows,
 		schedulerRegistryLastSuccess,
 		schedulerRegistryReadFailures,
+		schedulerRegistryReconcileDuration,
 		schedulerRegistryEnabled,
 	} {
 		reg.MustRegister(collector)
@@ -102,6 +104,32 @@ func gaugeValue(t *testing.T, gatherer prometheus.Gatherer, name string) float64
 		t.Fatalf("expected an unlabelled series for %q, got %v", name, series)
 	}
 	return value
+}
+
+// histogramCount reads back how many observations a histogram holds. Only the
+// count matters here: the subject is which rounds are sampled at all, not how
+// long any of them took.
+func histogramCount(t *testing.T, gatherer prometheus.Gatherer, name string) uint64 {
+	t.Helper()
+
+	families, err := gatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather failed: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			histogram := metric.GetHistogram()
+			if histogram == nil {
+				t.Fatalf("metric %q is not a histogram", name)
+			}
+			return histogram.GetSampleCount()
+		}
+	}
+	t.Fatalf("no series for %q", name)
+	return 0
 }
 
 // newMetricsTestService wires a scheduler over a real node registry, so the
@@ -323,5 +351,87 @@ func TestRegistryEnabledGaugeSeparatesOffFromBroken(t *testing.T) {
 	SetRegistryEnabled(true)
 	if got := gaugeValue(t, gatherer, metricRegistryEnabled); got != 1 {
 		t.Fatalf("expected 1 with a registry configured, got %v", got)
+	}
+}
+
+// 🔴 A round that could not read is not a sample of how long a round takes.
+//
+// Its "duration" is how long it took to give up — a connection refused in a
+// millisecond, or a query that ran until the context deadline — and neither
+// belongs in the distribution the histogram exists to report. On the cluster
+// three failed reads moved the count from 19 to 22, which is three data points
+// about the database being down sitting in a percentile about the work.
+// The failure is not lost: it has its own counter.
+func TestRegistryReconcileDurationOnlyTimesSuccessfulRounds(t *testing.T) {
+	gatherer := newRegistryGatherer(t)
+	now := time.Now()
+	reader := &stubRegistryReader{listing: pausedregistry.Listing{
+		Now: now,
+		Sandboxes: []pausedregistry.Sandbox{
+			{SandboxID: "s1", State: pausedregistry.StateRunning, OriginNodeID: "node-a", UpdatedAt: now, LeaseExpiresAt: at(now, time.Hour)},
+		},
+	}}
+	nodes := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	svc := newMetricsTestService(t, nodes, reader)
+	metricsHeartbeat(t, svc, "node-a", "s1")
+
+	// A successful round is timed, or this test is asserting nothing.
+	before := histogramCount(t, gatherer, metricRegistryReconcileDuration)
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the round to leave the loop running")
+	}
+	afterSuccess := histogramCount(t, gatherer, metricRegistryReconcileDuration)
+	if afterSuccess != before+1 {
+		t.Fatalf("expected a successful round to be timed once, got %d after %d", afterSuccess, before)
+	}
+
+	failuresBefore := gaugeSeries(t, gatherer, metricRegistryReadFailures)[""]
+	reader.err = errors.New("connection refused")
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected a read failure to leave the loop running")
+	}
+
+	if got := histogramCount(t, gatherer, metricRegistryReconcileDuration); got != afterSuccess {
+		t.Fatalf("expected a failed round not to be timed, got %d after %d", got, afterSuccess)
+	}
+	// It is counted, just somewhere else.
+	if got := gaugeSeries(t, gatherer, metricRegistryReadFailures)[""]; got != failuresBefore+1 {
+		t.Fatalf("expected the read failure to be counted once, got %v after %v", got, failuresBefore)
+	}
+
+	// And timing resumes the moment the database does.
+	reader.err = nil
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the recovered round to leave the loop running")
+	}
+	if got := histogramCount(t, gatherer, metricRegistryReconcileDuration); got != afterSuccess+1 {
+		t.Fatalf("expected the recovered round to be timed, got %d after %d", got, afterSuccess)
+	}
+}
+
+// A round the context cancelled is not timed either, and is not counted as a
+// read failure: nothing was learned about the database, the process is going
+// away. Without this the shutdown path could quietly become the loudest
+// contributor to both series.
+func TestRegistryReconcileIgnoresACancelledRound(t *testing.T) {
+	gatherer := newRegistryGatherer(t)
+	reader := &stubRegistryReader{err: context.Canceled}
+	nodes := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	svc := newMetricsTestService(t, nodes, reader)
+
+	durationBefore := histogramCount(t, gatherer, metricRegistryReconcileDuration)
+	failuresBefore := gaugeSeries(t, gatherer, metricRegistryReadFailures)[""]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if stop := svc.reconcileRegistryOnce(ctx); !stop {
+		t.Fatal("expected a cancelled round to stop the loop")
+	}
+
+	if got := histogramCount(t, gatherer, metricRegistryReconcileDuration); got != durationBefore {
+		t.Fatalf("expected a cancelled round not to be timed, got %d after %d", got, durationBefore)
+	}
+	if got := gaugeSeries(t, gatherer, metricRegistryReadFailures)[""]; got != failuresBefore {
+		t.Fatalf("expected a cancelled round not to count as a read failure, got %v after %v", got, failuresBefore)
 	}
 }

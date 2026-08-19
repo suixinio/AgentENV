@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,22 @@ type registryListResponse struct {
 	DatabaseTimeUnixMs int64 `json:"databaseTimeUnixMs"`
 }
 
+// headerRegistryAPIKey is the credential this endpoint requires. The name is
+// the one the nodes already check on their own API (`src/api/impls/auth.rs`),
+// so an operator holding a key for the fleet does not need a second one to read
+// this.
+const headerRegistryAPIKey = "X-API-Key"
+
+// registryListQueryParams is the closed set of query parameters this endpoint
+// understands. Anything else is refused rather than ignored — see
+// rejectUnknownRegistryListParams.
+var registryListQueryParams = map[string]struct{}{
+	"state":     {},
+	"nodeID":    {},
+	"limit":     {},
+	"nextToken": {},
+}
+
 func isRegistryListRequest(r *http.Request) bool {
 	if r.Method != http.MethodGet {
 		return false
@@ -53,7 +70,58 @@ func isRegistryListRequest(r *http.Request) bool {
 	return strings.TrimRight(strings.TrimSpace(r.URL.Path), "/") == "/registry/sandboxes"
 }
 
+// rejectUnknownRegistryListParams refuses any query parameter outside the four
+// this endpoint documents.
+//
+// 🔴 The alternative is what this replaces: `?nodeId=` (lower-case d) was
+// dropped on the floor and the caller got every row in the cluster back with a
+// 200, which reads exactly like "the filter matched everything". A filter that
+// silently does not apply is worse than no filter, because the answer still
+// looks like an answer.
+func rejectUnknownRegistryListParams(r *http.Request) error {
+	unknown := make([]string, 0, 1)
+	for name := range r.URL.Query() {
+		if _, ok := registryListQueryParams[name]; !ok {
+			unknown = append(unknown, name)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	supported := make([]string, 0, len(registryListQueryParams))
+	for name := range registryListQueryParams {
+		supported = append(supported, name)
+	}
+	// Both sorted, so the message does not depend on map iteration order — and
+	// the supported list is read off the same map the check uses, so it cannot
+	// advertise a parameter that would be refused.
+	sort.Strings(unknown)
+	sort.Strings(supported)
+	return fmt.Errorf("unknown query parameter(s) %s; supported: %s",
+		strings.Join(unknown, ", "), strings.Join(supported, ", "))
+}
+
 func (s *Server) handleRegistryList(w http.ResponseWriter, r *http.Request, routingCtx context.Context) {
+	// 🔴 The gateway has no authentication middleware: /nodes and this endpoint
+	// are both served by the gateway itself, and only the paths proxied to a
+	// node are checked at all — by that node. This one listing carries every
+	// sandbox id in the cluster along with which machine holds it, so it does
+	// not go out unauthenticated while that is being sorted out.
+	//
+	// Presence of a non-empty key is the whole check, which is the same bar the
+	// nodes apply today. It is a door, not a lock: it keeps the listing off an
+	// unauthenticated fetch, and it is not a substitute for the gateway
+	// growing real credential validation.
+	if strings.TrimSpace(r.Header.Get(headerRegistryAPIKey)) == "" {
+		http.Error(w, headerRegistryAPIKey+" is required", http.StatusUnauthorized)
+		return
+	}
+
+	if err := rejectUnknownRegistryListParams(r); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	pageSize, err := parseRegistryListLimit(r)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("invalid limit: %v", err), http.StatusBadRequest)

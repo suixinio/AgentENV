@@ -12,6 +12,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,31 @@ const (
 	// StateRunning means the sandbox is live on origin_node_id.
 	StateRunning State = "running"
 )
+
+// KnownStates lists the five states the table's CHECK constraint pins, in the
+// order a reader is expected to see them explained. It exists so that anything
+// validating a state against the set names the same five values this package
+// defines, rather than repeating a list that can fall behind.
+func KnownStates() []State {
+	return []State{StatePublishing, StatePaused, StateResuming, StateLocalOnly, StateRunning}
+}
+
+// ParseState resolves user input to one of the five known states, case
+// insensitively. The bool is false for anything else.
+//
+// 🔴 Callers must not fall back to filtering on the raw input when this fails.
+// A filter on a state no row can hold matches nothing, and an empty list reads
+// as "the registry holds no such rows" — which is how a mistyped state becomes
+// a confident wrong answer instead of an error.
+func ParseState(raw string) (State, bool) {
+	trimmed := strings.TrimSpace(raw)
+	for _, state := range KnownStates() {
+		if strings.EqualFold(string(state), trimmed) {
+			return state, true
+		}
+	}
+	return "", false
+}
 
 // Sandbox is one registry row.
 //

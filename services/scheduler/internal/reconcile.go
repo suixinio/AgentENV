@@ -361,7 +361,12 @@ func (s *Service) reconcileRegistryOnce(ctx context.Context) bool {
 			s.logger.Debug("scheduler registry reconciliation is disabled")
 			return true
 		}
-		recordRegistryReconcileDuration(start)
+		// 🔴 Deliberately not timed. A failed round's "duration" is how long it
+		// took to give up — a connection refused in a millisecond, or a query
+		// that hit the context deadline — and neither is a sample of how long
+		// reconciling the cluster takes. Mixing them in moves the percentiles
+		// the histogram exists to report. The failure is already counted, with
+		// its own series.
 		if ctx.Err() != nil {
 			return true
 		}

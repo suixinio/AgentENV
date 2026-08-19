@@ -160,7 +160,7 @@ var (
 	schedulerRegistryReconcileDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "agentenv_scheduler_registry_reconcile_duration_seconds",
-			Help:    "Duration of one paused-registry reconciliation round.",
+			Help:    "Duration of one successful paused-registry reconciliation round, read included. Failed rounds are not observed here — their duration is how long it took to give up, not how long the work takes — see registry_read_failures_total.",
 			Buckets: observability.DurationBuckets,
 		},
 	)
@@ -191,6 +191,9 @@ func recordRegistryReadFailure() {
 	schedulerRegistryReadFailures.Inc()
 }
 
+// recordRegistryReconcileDuration times one round that completed. Only
+// successful rounds are observed — see the Help above and the failure branch in
+// reconcileRegistryOnce.
 func recordRegistryReconcileDuration(start time.Time) {
 	schedulerRegistryReconcileDuration.Observe(time.Since(start).Seconds())
 }

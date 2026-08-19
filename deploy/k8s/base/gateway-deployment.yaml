@@ -26,6 +26,11 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            # The gateway has always served Prometheus metrics on its own
+            # listener; without this and the matching Service port nothing
+            # could scrape them.
+            - name: metrics
+              containerPort: 9102
           env:
             - name: GATEWAY_SANDBOX_PROXY_DOMAINS
               valueFrom:

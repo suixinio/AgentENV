@@ -557,6 +557,16 @@ func listRegistrySandboxes(
 	if req.GetPageSize() < 0 {
 		return nil, status.Error(codes.InvalidArgument, "page_size must not be negative")
 	}
+	// 🔴 Rejected here rather than filtered on, and rejected before the reader
+	// is consulted at all. A state outside the five matches no row, so filtering
+	// on it would answer a typo with an empty list — which reads as "the
+	// registry holds none of those" rather than as "there is no such state".
+	// Argument validation comes first so that answer is the same whether or not
+	// this deployment happens to run a registry.
+	stateFilter, err := parseRegistryStateFilter(req.GetState())
+	if err != nil {
+		return nil, err
+	}
 	if reader == nil {
 		return nil, status.Error(codes.FailedPrecondition, "paused registry is not configured")
 	}
@@ -570,7 +580,6 @@ func listRegistrySandboxes(
 		return nil, status.Error(codes.Unavailable, "paused registry unavailable")
 	}
 
-	stateFilter := strings.TrimSpace(req.GetState())
 	nodeFilter := strings.TrimSpace(req.GetNodeId())
 	if resolveNodeID == nil {
 		resolveNodeID = func(nodeID string) string { return nodeID }
@@ -580,7 +589,7 @@ func listRegistrySandboxes(
 
 	matched := make([]pausedregistry.Sandbox, 0, len(listing.Sandboxes))
 	for _, sandbox := range listing.Sandboxes {
-		if stateFilter != "" && !strings.EqualFold(string(sandbox.State), stateFilter) {
+		if stateFilter != "" && sandbox.State != stateFilter {
 			continue
 		}
 		if nodeFilter != "" && resolveNodeID(sandbox.Holder()) != nodeFilter {
@@ -613,6 +622,27 @@ func listRegistrySandboxes(
 		NextPageToken:     nextPageToken,
 		DatabaseNowUnixMs: listing.Now.UTC().UnixMilli(),
 	}, nil
+}
+
+// parseRegistryStateFilter resolves the optional state filter. An empty filter
+// means every state; anything the table cannot hold is an error naming the five
+// values that it can, so the caller is told what to type rather than handed an
+// empty page.
+func parseRegistryStateFilter(raw string) (pausedregistry.State, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	state, ok := pausedregistry.ParseState(trimmed)
+	if !ok {
+		known := make([]string, 0, len(pausedregistry.KnownStates()))
+		for _, candidate := range pausedregistry.KnownStates() {
+			known = append(known, string(candidate))
+		}
+		return "", status.Errorf(codes.InvalidArgument,
+			"unknown state %q, must be one of %s", trimmed, strings.Join(known, ", "))
+	}
+	return state, nil
 }
 
 func registrySandboxToProto(sandbox pausedregistry.Sandbox) *schedulerv1.RegistrySandbox {

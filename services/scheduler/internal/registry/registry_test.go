@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,5 +168,56 @@ func TestNewRejectsMissingAndMalformedDSN(t *testing.T) {
 	}
 	if _, err := New(context.Background(), Config{DSN: "://not a dsn"}); err == nil {
 		t.Fatal("expected a malformed dsn to be rejected")
+	}
+}
+
+// ParseState is the only place a caller-supplied state is turned into one of
+// the five. It answers false rather than passing the input through, so a filter
+// built on it cannot end up matching nothing and calling that an answer.
+func TestParseStateAcceptsOnlyTheFiveKnownStates(t *testing.T) {
+	for _, state := range KnownStates() {
+		for _, spelling := range []string{string(state), strings.ToUpper(string(state)), "  " + string(state) + "\t"} {
+			got, ok := ParseState(spelling)
+			if !ok {
+				t.Fatalf("expected %q to parse", spelling)
+			}
+			if got != state {
+				t.Fatalf("expected %q to parse to %q, got %q", spelling, state, got)
+			}
+		}
+	}
+
+	for _, raw := range []string{"", "bogus", "pause", "paused ish", "local-only", "hibernating"} {
+		if got, ok := ParseState(raw); ok {
+			t.Fatalf("expected %q to be rejected, got %q", raw, got)
+		}
+	}
+}
+
+// The five are the ones the table's CHECK constraint pins. A build that grows a
+// sixth state without adding it here would filter it out of every listing while
+// still counting it in the metrics, so the two lists are held together.
+func TestKnownStatesCoversEveryDeclaredState(t *testing.T) {
+	want := map[State]bool{
+		StatePublishing: false,
+		StatePaused:     false,
+		StateResuming:   false,
+		StateLocalOnly:  false,
+		StateRunning:    false,
+	}
+	for _, state := range KnownStates() {
+		seen, declared := want[state]
+		if !declared {
+			t.Fatalf("KnownStates lists %q, which is not one of the declared states", state)
+		}
+		if seen {
+			t.Fatalf("KnownStates lists %q twice", state)
+		}
+		want[state] = true
+	}
+	for state, seen := range want {
+		if !seen {
+			t.Fatalf("KnownStates is missing %q", state)
+		}
 	}
 }

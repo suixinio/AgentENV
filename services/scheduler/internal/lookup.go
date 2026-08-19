@@ -38,10 +38,36 @@ const (
 	lookupResultNoNodes             lookupResult = "unavailable_no_nodes"
 	lookupResultNoPlacer            lookupResult = "unavailable_no_placer"
 	lookupResultPlacementFailed     lookupResult = "internal_placement_failed"
-	// The two ways the registry names a node that cannot serve the request.
+	// The three ways the registry names a node that cannot serve the request.
+	//
+	// 🔴 The first two are the same refusal for opposite reasons and are kept
+	// apart on purpose. "Not accepting work" sends an operator to the admin API
+	// to look at the node's DRAINING status; "not reporting" sends them to the
+	// node's heartbeat. Reporting the second as the first is a signpost pointing
+	// at a healthy subsystem, and it costs however long it takes to stop
+	// believing it.
 	lookupResultOriginUnschedulable lookupResult = "origin_unschedulable"
+	lookupResultOriginNotReporting  lookupResult = "origin_not_reporting"
 	lookupResultHolderUnreachable   lookupResult = "holder_unreachable"
 	lookupResultUnknownState        lookupResult = "unknown_state"
+)
+
+// nodeSchedulability is why a node may not be pinned to. The two failures are
+// reached through the same call and mean entirely different things, so they are
+// never collapsed into a bool.
+type nodeSchedulability int
+
+const (
+	// nodeSchedulable: discovery knows the node, its heartbeat is fresh, and it
+	// has not said it is going away.
+	nodeSchedulable nodeSchedulability = iota
+	// nodeNotReporting: discovery does not know the node, or its last heartbeat
+	// is older than the report TTL. Nothing is known about it either way — this
+	// is the fail-closed answer, not an observation.
+	nodeNotReporting
+	// nodeNotAcceptingWork: the node is reporting, and what it reported is that
+	// it will not take new work (DRAINING).
+	nodeNotAcceptingWork
 )
 
 // nodePlacer is the half of a lookup that has to know about nodes: which of
@@ -61,8 +87,9 @@ type nodePlacer interface {
 	// It says nothing about whether that node accepts new work.
 	liveNode(nodeID string, now time.Time) (Node, bool)
 	// schedulableNode is liveNode plus the node not having reported itself
-	// unable to take new work.
-	schedulableNode(nodeID string, now time.Time) (Node, bool)
+	// unable to take new work. It says which of the two it failed on, because
+	// the caller reports them as different faults.
+	schedulableNode(nodeID string, now time.Time) (Node, nodeSchedulability)
 	// place picks a node for a sandbox any node could rebuild, preferring
 	// preferNodeID when it survives filtering.
 	place(preferNodeID string) (Node, error)
@@ -233,10 +260,24 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 		// asking for the request to go somewhere else, and there is nowhere else
 		// for these two states — so sending it would earn the caller a 503 whose
 		// message says the opposite of what happened.
-		origin, schedulable := deps.placer.schedulableNode(entry.OriginNodeID, now)
-		if !schedulable {
+		origin, schedulability := deps.placer.schedulableNode(entry.OriginNodeID, now)
+		switch schedulability {
+		case nodeNotReporting:
+			// The node has not been heard from. Nothing is known about whether
+			// it would serve this — it is being refused because it is silent,
+			// which is a heartbeat problem and not a scheduling decision the
+			// node made.
+			result = lookupResultOriginNotReporting
+			logger.Warn("scheduler cannot pin a sandbox to an origin node that is not reporting",
+				zap.String("sandbox_id", sandboxID),
+				zap.String("state", string(entry.State)),
+				zap.String("origin_node_id", entry.OriginNodeID),
+			)
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"sandbox is %s on node %q, which is not reporting", entry.State, entry.OriginNodeID)
+		case nodeNotAcceptingWork:
 			result = lookupResultOriginUnschedulable
-			logger.Warn("scheduler cannot pin a sandbox to its origin node",
+			logger.Warn("scheduler cannot pin a sandbox to an origin node that is not accepting work",
 				zap.String("sandbox_id", sandboxID),
 				zap.String("state", string(entry.State)),
 				zap.String("origin_node_id", entry.OriginNodeID),
@@ -377,16 +418,32 @@ func (s *Service) liveNode(nodeID string, now time.Time) (Node, bool) {
 // cluster. Requiring a fresh roster on top of it turns that around here: a node
 // nobody has heard from is not somewhere to pin a sandbox whose only copy is on
 // its disk.
-func (s *Service) schedulableNode(nodeID string, now time.Time) (Node, bool) {
+//
+// 🔴 That fail-closed half has a cost worth knowing before anybody calls it a
+// bug. Every scheduler restart begins with no rosters at all, so for the gap
+// until each node's next heartbeat lands, a publishing/local_only sandbox on a
+// perfectly healthy node is refused. The gap is one node report interval —
+// 5s by default (AENV_OBSERVABILITY_REPORT_INTERVAL_SECS) — and up to 60s
+// (MAX_REPORT_BACKOFF) if the scheduler was down long enough for the nodes'
+// report backoff to have grown. The refusal is FailedPrecondition, which the
+// gateway renders as a retryable 503, so the window costs a retry rather than a
+// sandbox. Failing open instead would mean pinning to a machine that may have
+// been gone for hours, which costs the sandbox.
+//
+// Note this is not symmetric with a `paused` row, which is placed rather than
+// pinned and so stays serviceable in the same window. That asymmetry is the
+// design: a paused sandbox has a published snapshot and any node can rebuild
+// it, while these two states have one copy in the world.
+func (s *Service) schedulableNode(nodeID string, now time.Time) (Node, nodeSchedulability) {
 	node, ok := s.liveNode(nodeID, now)
 	if !ok {
-		return Node{}, false
+		return Node{}, nodeNotReporting
 	}
 	rich := RichNode{Node: node, Snapshot: s.nodes.PeekObserved(node.ID)}
 	if len(FilterUnschedulable([]RichNode{rich})) == 0 {
-		return Node{}, false
+		return Node{}, nodeNotAcceptingWork
 	}
-	return node, true
+	return node, nodeSchedulable
 }
 
 // place implements nodePlacer.

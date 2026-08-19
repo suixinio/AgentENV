@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -251,4 +252,77 @@ func TestQueryOnlyServiceCarriesTheRegistry(t *testing.T) {
 		WithQueryOnlyPausedRegistry(&stubRegistryReader{err: errors.New("connection refused")}))
 	_, err = failing.ListRegistrySandboxes(ctx, &schedulerv1.ListRegistrySandboxesRequest{})
 	requireCode(t, err, codes.Unavailable)
+}
+
+// 🔴 A state outside the five is refused, not filtered on.
+//
+// Filtering on it matches nothing, and nothing is what a 200 with an empty list
+// says the registry holds. That turns one mistyped letter into a confident
+// wrong answer about the fleet, which is the failure mode this whole endpoint
+// exists to prevent on the read path. The message names the five values so the
+// caller does not have to go and read the CHECK constraint.
+func TestListRegistrySandboxesRejectsAnUnknownState(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	reader := &stubRegistryReader{listing: registryTestListing(now)}
+	svc := newRegistryTestService(t, reader)
+
+	resp, err := svc.ListRegistrySandboxes(context.Background(), &schedulerv1.ListRegistrySandboxesRequest{State: "bogus"})
+	if resp != nil {
+		t.Fatalf("expected no response, got %d rows", len(resp.GetSandboxes()))
+	}
+	requireCode(t, err, codes.InvalidArgument)
+
+	message := status.Convert(err).Message()
+	if !strings.Contains(message, "bogus") {
+		t.Fatalf("expected the message to quote what was sent, got %q", message)
+	}
+	for _, state := range pausedregistry.KnownStates() {
+		if !strings.Contains(message, string(state)) {
+			t.Fatalf("expected the message to list %q, got %q", state, message)
+		}
+	}
+	// Settled before the database: a bad argument is not a reason to make the
+	// registry answer for it.
+	if reader.calls != 0 {
+		t.Fatalf("expected the registry not to be read, got %d reads", reader.calls)
+	}
+}
+
+// The same refusal on a scheduler that runs no registry at all. Argument
+// validation comes first, so what the caller typed is judged the same way
+// everywhere rather than depending on how this particular deployment is
+// configured.
+func TestListRegistrySandboxesJudgesTheStateBeforeTheConfiguration(t *testing.T) {
+	svc := newRegistryTestService(t, nil)
+
+	_, err := svc.ListRegistrySandboxes(context.Background(), &schedulerv1.ListRegistrySandboxesRequest{State: "bogus"})
+	requireCode(t, err, codes.InvalidArgument)
+}
+
+// The five known states keep working, in any case, and each selects its own
+// rows. Without this the rejection above could be satisfied by refusing every
+// filter.
+func TestListRegistrySandboxesAcceptsEveryKnownState(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	svc := newRegistryTestService(t, &stubRegistryReader{listing: registryTestListing(now)})
+	ctx := context.Background()
+
+	wantRows := map[pausedregistry.State]int{
+		pausedregistry.StatePublishing: 0,
+		pausedregistry.StatePaused:     1,
+		pausedregistry.StateResuming:   1,
+		pausedregistry.StateLocalOnly:  1,
+		pausedregistry.StateRunning:    0,
+	}
+	for _, state := range pausedregistry.KnownStates() {
+		for _, spelling := range []string{string(state), strings.ToUpper(string(state)), " " + string(state) + " "} {
+			resp, err := svc.ListRegistrySandboxes(ctx, &schedulerv1.ListRegistrySandboxesRequest{State: spelling})
+			if err != nil {
+				t.Fatalf("state %q: %v", spelling, err)
+			}
+			if got := len(resp.GetSandboxes()); got != wantRows[state] {
+				t.Fatalf("state %q: expected %d rows, got %d", spelling, wantRows[state], got)
+			}
+		}
+	}
 }

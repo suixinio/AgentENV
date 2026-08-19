@@ -11,3 +11,8 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+    # Same reason as the scheduler's: the metrics listener is separate from the
+    # proxied HTTP port, so it needs a Service port of its own to be scraped.
+    - name: metrics
+      port: 9102
+      targetPort: metrics

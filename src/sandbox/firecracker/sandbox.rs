@@ -709,7 +709,7 @@ impl FirecrackerSandbox {
         let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
             &ConfigManager::global_config().memory_snapshot,
         );
-        let (mem_layer_path, mem_virtual_size) = self
+        let (mem_layer_path, mem_virtual_size, mem_layer_descriptor) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
 
@@ -725,6 +725,7 @@ impl FirecrackerSandbox {
         let mem_image_config = build_mem_snapshot_image_config(
             resume_mem_image_config_path,
             &mem_layer_path,
+            mem_layer_descriptor.as_ref(),
             snapshot_dir,
             memory_output,
         )
@@ -848,7 +849,7 @@ impl FirecrackerSandbox {
         vm_state_path: &Path,
         snapshot_dir: &Path,
         memory_output: OverlaybdCompactOutput,
-    ) -> Result<(PathBuf, u64)> {
+    ) -> Result<(PathBuf, u64, Option<overlaybd::LayerDescriptor>)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
         let firecracker_pid = self.fc_instance.pid()?;
         self.fc_instance
@@ -1843,6 +1844,7 @@ impl FirecrackerSandbox {
                 drive.read_only(),
                 &runtime.image_config_path,
                 &snapshot_dir.join("drives").join(drive.drive_id()),
+                "drive",
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;

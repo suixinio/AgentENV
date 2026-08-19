@@ -331,8 +331,23 @@ impl ApiImpl {
                 // Releasing the claim would just make the next resume fail the
                 // same way, so drop the record and report it as unknown.
                 warn!(%sandbox_id, %snapshot_id, "paused snapshot is missing from the repository");
-                if let Err(err) = self.paused.registry().remove(&sandbox_id).await {
-                    warn!(error = %err, %sandbox_id, "failed to drop the dangling registry row");
+                // Conditional on the row this resume claimed. If it has moved
+                // on since, the snapshot it names is not the one that was
+                // missing and the row is not this caller's to drop.
+                match self
+                    .paused
+                    .registry()
+                    .remove(&sandbox_id, entry.generation)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        %sandbox_id,
+                        "the dangling registry row changed hands before it could be dropped"
+                    ),
+                    Err(err) => {
+                        warn!(error = %err, %sandbox_id, "failed to drop the dangling registry row")
+                    }
                 }
 
                 return CrossNodeResume::NotFound;
@@ -975,11 +990,21 @@ fn arbitration(claim: ResumeClaim, node_id: &str) -> ResumeArbitration {
         ResumeClaim::NotReady { origin_node_id } if origin_node_id == node_id => {
             ResumeArbitration::Proceed
         }
-        ResumeClaim::Conflict { origin_node_id } if origin_node_id == node_id => {
-            ResumeArbitration::Proceed
-        }
+        ResumeClaim::Conflict {
+            origin_node_id,
+            reason: _,
+        } if origin_node_id == node_id => ResumeArbitration::Proceed,
         ResumeClaim::NotReady { origin_node_id } => ResumeArbitration::NotReady { origin_node_id },
-        ResumeClaim::Conflict { origin_node_id } => ResumeArbitration::Blocked { origin_node_id },
+        // 🔴 Both reasons block, and deliberately so. `ClaimLost` means the row
+        // is claimable again and a retry would be legitimate, but retrying is
+        // not this function's decision to make: it answers one question, and
+        // the caller that receives Blocked is the one that knows whether
+        // retrying is safe for the resume it is serving. The reason is carried
+        // this far so that caller can eventually see it.
+        ResumeClaim::Conflict {
+            origin_node_id,
+            reason: _,
+        } => ResumeArbitration::Blocked { origin_node_id },
     }
 }
 
@@ -1707,6 +1732,7 @@ mod tests {
             },
             ResumeClaim::Conflict {
                 origin_node_id: SELF.to_string(),
+                reason: crate::orchestrator::ConflictReason::LiveElsewhere,
             },
         ] {
             assert!(
@@ -1724,7 +1750,8 @@ mod tests {
         assert!(matches!(
             arbitration(
                 ResumeClaim::Conflict {
-                    origin_node_id: OTHER.to_string()
+                    origin_node_id: OTHER.to_string(),
+                    reason: crate::orchestrator::ConflictReason::LiveElsewhere,
                 },
                 SELF
             ),

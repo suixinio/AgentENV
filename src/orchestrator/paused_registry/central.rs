@@ -20,20 +20,20 @@
 //! `services/api/proto/scheduler.proto`: five methods for the thirteen here,
 //! and the sandbox record only on the two calls that need it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tonic::transport::{Channel, Endpoint};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    log_claim_outcome, BeganPause, HeldSandbox, PausedRegistryError, PausedRegistryState,
-    PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
-    ResumeClaim,
+    log_claim_outcome, BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome,
+    PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
+    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::proto::scheduler as pb;
@@ -71,6 +71,15 @@ pub struct CentralPausedSandboxRegistry {
     /// renewal intervals), so a TTL decided anywhere else would expire rows
     /// under a node that is renewing exactly as it was told to.
     lease_ttl_millis: i64,
+    /// How often this node renews, reported alongside every renewal.
+    ///
+    /// The invariant that owns both numbers — a lease must outlive two missed
+    /// renewals — is enforced locally by `lease_ttl_secs()`, which cannot see a
+    /// node built against a different default or a config whose two knobs have
+    /// drifted apart. The controller can see both and says so when they
+    /// disagree; it does not refuse, because refusing a renewal is how a
+    /// configuration smell becomes the outage the invariant exists to prevent.
+    reconcile_interval_millis: i64,
     call_timeout: Duration,
 }
 
@@ -87,6 +96,7 @@ impl CentralPausedSandboxRegistry {
         cluster_id: Uuid,
         node_id: String,
         lease_ttl_secs: u64,
+        reconcile_interval_secs: u64,
     ) -> anyhow::Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())
             .map_err(|e| anyhow!("invalid scheduler endpoint '{endpoint}': {e}"))?
@@ -97,6 +107,7 @@ impl CentralPausedSandboxRegistry {
             cluster_id,
             node_id,
             lease_ttl_secs,
+            reconcile_interval_secs,
         ))
     }
 
@@ -105,12 +116,15 @@ impl CentralPausedSandboxRegistry {
         cluster_id: Uuid,
         node_id: String,
         lease_ttl_secs: u64,
+        reconcile_interval_secs: u64,
     ) -> Self {
         Self {
             channel,
             cluster_id,
             node_id,
             lease_ttl_millis: i64::try_from(lease_ttl_secs.saturating_mul(1_000))
+                .unwrap_or(i64::MAX),
+            reconcile_interval_millis: i64::try_from(reconcile_interval_secs.saturating_mul(1_000))
                 .unwrap_or(i64::MAX),
             call_timeout: GRPC_CALL_TIMEOUT,
         }
@@ -262,6 +276,21 @@ impl CentralPausedSandboxRegistry {
                 .map_err(|status| Self::unreachable(operation, status))?
                 .into_inner();
 
+            // 🔴 Check the answer covers what was asked before reading it.
+            //
+            // Everything downstream treats an id's absence from `rows` as "the
+            // cluster has no row for it", and answers that by tearing down the
+            // running VM and deleting its local artifacts. All-or-nothing is
+            // the contract, but it is a property of the *controller's*
+            // implementation, and from here a response that lost rows on the
+            // way — a truncated page, a dropped chunk, a proxy that shortened
+            // the body — is indistinguishable from one that found none.
+            //
+            // So the coverage is asserted rather than assumed. Failing here
+            // costs one reconciliation pass, which the caller already knows how
+            // to skip; not failing here costs a workspace.
+            Self::require_full_coverage(operation, chunk, &response.covered_sandbox_ids)?;
+
             for row in response.sandboxes {
                 let entry = self.decode_entry(row, None)?;
                 rows.insert(entry.sandbox_id, entry);
@@ -269,6 +298,46 @@ impl CentralPausedSandboxRegistry {
         }
 
         Ok(rows)
+    }
+
+    /// Fails unless the controller says it looked up every id in `chunk`.
+    ///
+    /// An older controller reports nothing, and that is the one case this lets
+    /// through: it is a rollout, not a truncation, and the same node was
+    /// running against that controller without any coverage check at all a
+    /// moment ago. Refusing it would turn every mixed-version window into a
+    /// node-wide reconciliation stall.
+    fn require_full_coverage(
+        operation: &'static str,
+        requested: &[SandboxId],
+        covered: &[String],
+    ) -> RegistryResult<()> {
+        if covered.is_empty() {
+            return Ok(());
+        }
+
+        let covered: HashSet<&str> = covered.iter().map(String::as_str).collect();
+        let missing = requested
+            .iter()
+            .map(SandboxId::to_string)
+            .find(|id| !covered.contains(id.as_str()));
+
+        match missing {
+            None => Ok(()),
+            Some(id) => {
+                warn!(
+                    sandbox_id = %id,
+                    requested = requested.len(),
+                    covered = covered.len(),
+                    "the registry answered a batch it did not claim to have looked up in full"
+                );
+
+                Err(Self::malformed(
+                    operation,
+                    "a batch read that did not cover every id it was asked for",
+                ))
+            }
+        }
     }
 
     /// Sends one state transition and hands back what the controller said.
@@ -505,25 +574,39 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
             pb::acquire_sandbox_response::Outcome::NotReady(origin) => Ok(ResumeClaim::NotReady {
                 origin_node_id: origin.origin_node_id,
             }),
-            pb::acquire_sandbox_response::Outcome::Conflict(origin) => Ok(ResumeClaim::Conflict {
-                origin_node_id: origin.origin_node_id,
-            }),
+            pb::acquire_sandbox_response::Outcome::Conflict(origin) => {
+                // An unset reason is an older controller. It stays Unspecified
+                // rather than being guessed at: every consumer today blocks on
+                // any conflict, and inventing a reason here would be inventing
+                // the one fact this field exists to carry honestly.
+                let reason = match origin.reason() {
+                    pb::ConflictReason::LiveElsewhere => ConflictReason::LiveElsewhere,
+                    pb::ConflictReason::ClaimLost => ConflictReason::ClaimLost,
+                    pb::ConflictReason::Unspecified => ConflictReason::Unspecified,
+                };
+
+                Ok(ResumeClaim::Conflict {
+                    origin_node_id: origin.origin_node_id,
+                    reason,
+                })
+            }
         }
     }
 
-    async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()> {
-        self.transition(
-            "release_claim",
-            pb::TransitionKind::ReleaseClaim,
-            sandbox_id,
-            &self.node_id,
-            Some(generation),
-            Vec::new(),
-            String::new(),
-        )
-        .await?;
+    async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool> {
+        let response = self
+            .transition(
+                "release_claim",
+                pb::TransitionKind::ReleaseClaim,
+                sandbox_id,
+                &self.node_id,
+                Some(generation),
+                Vec::new(),
+                String::new(),
+            )
+            .await?;
 
-        Ok(())
+        Ok(response.matched)
     }
 
     async fn renew_lease(&self, node_id: &str, held: &[HeldSandbox]) -> RegistryResult<u64> {
@@ -537,6 +620,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 self.request(pb::RenewNodeLeaseRequest {
                     cluster_id: self.cluster_id.to_string(),
                     node_id: node_id.to_string(),
+                    reconcile_interval_millis: self.reconcile_interval_millis,
                     held: held
                         .iter()
                         .map(|sandbox| pb::HeldSandbox {
@@ -581,7 +665,11 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
         Ok(ReclaimedHoldings::default())
     }
 
-    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<bool> {
+    async fn mark_running(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+    ) -> RegistryResult<MarkRunningOutcome> {
         let response = self
             .transition(
                 "mark_running",
@@ -594,7 +682,16 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
             )
             .await?;
 
-        Ok(response.tracked)
+        // The enum is authoritative where it is set; `tracked` is what an older
+        // controller answers with, and it can only distinguish adopted from
+        // "one of the two others".
+        Ok(match response.mark_running_outcome() {
+            pb::MarkRunningOutcome::Adopted => MarkRunningOutcome::Adopted,
+            pb::MarkRunningOutcome::Untracked => MarkRunningOutcome::Untracked,
+            pb::MarkRunningOutcome::HeldElsewhere => MarkRunningOutcome::HeldElsewhere,
+            pb::MarkRunningOutcome::Unspecified if response.tracked => MarkRunningOutcome::Adopted,
+            pb::MarkRunningOutcome::Unspecified => MarkRunningOutcome::Untracked,
+        })
     }
 
     async fn release_node_holdings(&self, node_id: &str) -> RegistryResult<ReleasedHoldings> {
@@ -614,19 +711,20 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
         })
     }
 
-    async fn remove(&self, sandbox_id: &SandboxId) -> RegistryResult<()> {
-        self.transition(
-            "remove",
-            pb::TransitionKind::Remove,
-            sandbox_id,
-            &self.node_id,
-            None,
-            Vec::new(),
-            String::new(),
-        )
-        .await?;
+    async fn remove(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool> {
+        let response = self
+            .transition(
+                "remove",
+                pb::TransitionKind::Remove,
+                sandbox_id,
+                &self.node_id,
+                Some(generation),
+                Vec::new(),
+                String::new(),
+            )
+            .await?;
 
-        Ok(())
+        Ok(response.removed)
     }
 
     fn is_cluster_backed(&self) -> bool {
@@ -670,6 +768,11 @@ mod tests {
         seen_release: Mutex<Vec<pb::ReleaseNodeHoldingsRequest>>,
         /// Whether every call so far carried a deadline.
         deadlines: Mutex<Vec<bool>>,
+        /// Replaces the coverage a batch answer reports, so a test can produce
+        /// the one failure the coverage check exists for: an answer that looks
+        /// exactly like "those sandboxes have no rows" but is really "those
+        /// sandboxes were never looked up".
+        coverage: Mutex<Option<Vec<String>>>,
     }
 
     impl FakeController {
@@ -713,7 +816,29 @@ mod tests {
                 }
             };
 
-            answer.map(|sandboxes| Response::new(pb::GetSandboxesResponse { sandboxes }))
+            // The fake reports full coverage of whatever it was asked for.
+            // Tests that need the opposite build the response themselves — the
+            // point of the coverage check is that a *short* answer is caught,
+            // and a fake that quietly under-reports would make every other test
+            // here exercise the failure path instead.
+            let requested = match self.coverage.lock().unwrap().clone() {
+                Some(override_ids) => override_ids,
+                None => self
+                    .seen_get
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(|req: &pb::GetSandboxesRequest| req.sandbox_ids.clone())
+                    .unwrap_or_default(),
+            };
+
+            answer.map(|sandboxes| {
+                Response::new(pb::GetSandboxesResponse {
+                    sandboxes,
+                    covered_sandbox_ids: requested,
+                    now_unix_micros: 0,
+                })
+            })
         }
 
         async fn transition_sandbox(
@@ -816,6 +941,7 @@ mod tests {
             cluster_id,
             NODE.to_string(),
             90,
+            30,
         )
         .expect("build the registry")
         .with_call_timeout(Duration::from_secs(5));
@@ -838,6 +964,7 @@ mod tests {
             Uuid::new_v4(),
             NODE.to_string(),
             90,
+            30,
         )
         .expect("build the registry")
     }
@@ -866,6 +993,7 @@ mod tests {
             Uuid::new_v4(),
             NODE.to_string(),
             90,
+            30,
         )
         .expect("build the registry");
 
@@ -999,7 +1127,7 @@ mod tests {
             Err(PausedRegistryError::Backend { .. })
         ));
         assert!(matches!(
-            registry.remove(&sandbox_id).await,
+            registry.remove(&sandbox_id, 1).await,
             Err(PausedRegistryError::Backend { .. })
         ));
     }
@@ -1075,6 +1203,7 @@ mod tests {
             harness.cluster_id,
             NODE.to_string(),
             90,
+            30,
         )
         .with_call_timeout(Duration::from_millis(100));
         *harness.fake.stall.lock().unwrap() = Some(Duration::from_secs(30));
@@ -1096,7 +1225,7 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         let _ = harness.registry.get(&sandbox_id).await;
-        let _ = harness.registry.remove(&sandbox_id).await;
+        let _ = harness.registry.remove(&sandbox_id, 1).await;
         let _ = harness.registry.claim_for_resume(&sandbox_id, NODE).await;
         let _ = harness
             .registry
@@ -1177,6 +1306,7 @@ mod tests {
             outcome: Some(pb::acquire_sandbox_response::Outcome::NotReady(
                 pb::AcquireOriginRef {
                     origin_node_id: OTHER.to_string(),
+                    reason: pb::ConflictReason::Unspecified as i32,
                 },
             )),
         }));
@@ -1189,12 +1319,14 @@ mod tests {
             outcome: Some(pb::acquire_sandbox_response::Outcome::Conflict(
                 pb::AcquireOriginRef {
                     origin_node_id: OTHER.to_string(),
+                    reason: pb::ConflictReason::LiveElsewhere as i32,
                 },
             )),
         }));
         assert!(matches!(
             harness.registry.claim_for_resume(&sandbox_id, NODE).await,
-            Ok(ResumeClaim::Conflict { origin_node_id }) if origin_node_id == OTHER
+            Ok(ResumeClaim::Conflict { origin_node_id, reason })
+                if origin_node_id == OTHER && reason == ConflictReason::LiveElsewhere
         ));
     }
 
@@ -1473,7 +1605,7 @@ mod tests {
             .release_claim(&sandbox_id, 13)
             .await
             .unwrap();
-        harness.registry.remove(&sandbox_id).await.unwrap();
+        harness.registry.remove(&sandbox_id, 21).await.unwrap();
 
         let seen = harness.fake.seen_transition.lock().unwrap().clone();
         let kinds: Vec<(i32, Option<i64>)> = seen
@@ -1489,7 +1621,10 @@ mod tests {
                 (pb::TransitionKind::MarkLocalOnly as i32, Some(12)),
                 (pb::TransitionKind::MarkRunning as i32, None),
                 (pb::TransitionKind::ReleaseClaim as i32, Some(13)),
-                (pb::TransitionKind::Remove as i32, None),
+                // 🔴 Remove quotes one too, since D11. It was the interface's
+                // one unconditional destructive write; the guard used to be the
+                // caller reading the row first and deciding for itself.
+                (pb::TransitionKind::Remove as i32, Some(21)),
             ]
         );
         assert_eq!(seen[1].snapshot_id, snapshot_id.to_string());
@@ -1541,7 +1676,7 @@ mod tests {
             .release_claim(&sandbox_id, 3)
             .await
             .unwrap();
-        harness.registry.remove(&sandbox_id).await.unwrap();
+        harness.registry.remove(&sandbox_id, 21).await.unwrap();
         harness
             .registry
             .claim_for_resume(&sandbox_id, NODE)
@@ -1704,7 +1839,7 @@ mod tests {
         *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
             generation: 4,
             previous_snapshot_id: superseded.to_string(),
-            tracked: false,
+            ..Default::default()
         }));
 
         let began = harness
@@ -1725,7 +1860,7 @@ mod tests {
         *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
             generation: 1,
             previous_snapshot_id: String::new(),
-            tracked: false,
+            ..Default::default()
         }));
 
         let began = harness
@@ -1801,25 +1936,161 @@ mod tests {
         let harness = harness().await;
         let sandbox_id = SandboxId::new();
 
-        *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
-            tracked: true,
-            ..Default::default()
-        }));
-        assert!(harness
-            .registry
-            .mark_running(&sandbox_id, NODE)
-            .await
-            .unwrap());
+        for (outcome, expected) in [
+            (pb::MarkRunningOutcome::Adopted, MarkRunningOutcome::Adopted),
+            (
+                pb::MarkRunningOutcome::Untracked,
+                MarkRunningOutcome::Untracked,
+            ),
+            // 🔴 The one the bool could not carry: a row exists and another
+            // node holds the claim on it, which is two nodes bringing the same
+            // sandbox up — not the healthy "never paused" case it used to be
+            // indistinguishable from.
+            (
+                pb::MarkRunningOutcome::HeldElsewhere,
+                MarkRunningOutcome::HeldElsewhere,
+            ),
+        ] {
+            *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
+                tracked: outcome == pb::MarkRunningOutcome::Adopted,
+                mark_running_outcome: outcome as i32,
+                ..Default::default()
+            }));
 
-        *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
-            tracked: false,
-            ..Default::default()
-        }));
-        assert!(!harness
+            assert_eq!(
+                harness
+                    .registry
+                    .mark_running(&sandbox_id, NODE)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    /// The two conflicts are not interchangeable on the way in either.
+    ///
+    /// `ClaimLost` says the row is claimable again and a retry is legitimate;
+    /// `LiveElsewhere` says the sandbox is running somewhere and retrying is
+    /// how a second copy of it happens. Collapsing them here would hand every
+    /// caller the more alarming of the two, or the more dangerous one.
+    #[tokio::test]
+    async fn each_conflict_reason_survives_the_wire() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+
+        for (wire, expected) in [
+            (
+                pb::ConflictReason::LiveElsewhere,
+                ConflictReason::LiveElsewhere,
+            ),
+            (pb::ConflictReason::ClaimLost, ConflictReason::ClaimLost),
+            // An older controller says nothing, and nothing is what the node
+            // records — inventing a reason here would be inventing the one
+            // fact this field exists to carry honestly.
+            (pb::ConflictReason::Unspecified, ConflictReason::Unspecified),
+        ] {
+            *harness.fake.acquire.lock().unwrap() = Some(Ok(pb::AcquireSandboxResponse {
+                outcome: Some(pb::acquire_sandbox_response::Outcome::Conflict(
+                    pb::AcquireOriginRef {
+                        origin_node_id: OTHER.to_string(),
+                        reason: wire as i32,
+                    },
+                )),
+            }));
+
+            match harness.registry.claim_for_resume(&sandbox_id, NODE).await {
+                Ok(ResumeClaim::Conflict { reason, .. }) => assert_eq!(reason, expected),
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+    }
+
+    /// 🔴 The failure this check exists for.
+    ///
+    /// A batch answer that quietly covers fewer ids than it was asked about is
+    /// byte-for-byte what "those sandboxes have no rows" looks like, and the
+    /// node answers that by tearing down running VMs and deleting the artifacts
+    /// they came from. All-or-nothing is the controller's contract, but from
+    /// here it is unverifiable unless the coverage is stated — so a short answer
+    /// has to fail rather than be read.
+    #[tokio::test]
+    async fn a_batch_answer_that_covers_less_than_it_was_asked_is_a_failure() {
+        let harness = harness().await;
+        let present = SandboxId::new();
+        let dropped = SandboxId::new();
+
+        harness
+            .fake
+            .answer_get(vec![Ok(vec![row(harness.cluster_id, present, "paused")])]);
+        // The answer names only the sandbox it found. The other id is absent
+        // from both lists, which is the ambiguity the check refuses to resolve
+        // in the caller's favour.
+        *harness.fake.coverage.lock().unwrap() = Some(vec![present.to_string()]);
+
+        let answer = harness.registry.get_many(&[present, dropped]).await;
+
+        assert!(
+            matches!(answer, Err(PausedRegistryError::Backend { .. })),
+            "an answer that did not cover every id must not be read as rows that do not exist, got {answer:?}"
+        );
+    }
+
+    /// The same check must not fire on a controller that predates the field.
+    ///
+    /// It reports no coverage at all, and refusing that would stall every
+    /// node's reconciliation for the length of a rollout — against a controller
+    /// this node was already talking to without any coverage check a moment
+    /// earlier.
+    #[tokio::test]
+    async fn a_controller_that_reports_no_coverage_is_still_read() {
+        let harness = harness().await;
+        let present = SandboxId::new();
+        let absent = SandboxId::new();
+
+        harness
+            .fake
+            .answer_get(vec![Ok(vec![row(harness.cluster_id, present, "paused")])]);
+        *harness.fake.coverage.lock().unwrap() = Some(Vec::new());
+
+        let rows = harness
             .registry
-            .mark_running(&sandbox_id, NODE)
+            .get_many(&[present, absent])
             .await
-            .unwrap());
+            .expect("an older controller's answer is still an answer");
+
+        assert!(rows.contains_key(&present));
+        assert!(!rows.contains_key(&absent));
+    }
+
+    /// A controller that predates the enum answers with the bool alone, and a
+    /// node must still read it correctly rather than treating every answer as
+    /// "unspecified" — during a rollout that would mean every resume on this
+    /// node stops registering itself with the cluster.
+    #[tokio::test]
+    async fn an_older_controller_is_read_through_the_bool() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+
+        for (tracked, expected) in [
+            (true, MarkRunningOutcome::Adopted),
+            (false, MarkRunningOutcome::Untracked),
+        ] {
+            *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
+                tracked,
+                mark_running_outcome: pb::MarkRunningOutcome::Unspecified as i32,
+                ..Default::default()
+            }));
+
+            assert_eq!(
+                harness
+                    .registry
+                    .mark_running(&sandbox_id, NODE)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     /// The two numbers mean different things to an operator: released

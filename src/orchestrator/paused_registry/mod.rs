@@ -39,8 +39,8 @@ pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use postgres::PostgresPausedSandboxRegistry;
 pub use types::{
-    BeganPause, HeldSandbox, PausedRegistryState, PausedSandboxEntry, ReclaimedHoldings,
-    ReleasedHoldings, ResumeClaim,
+    BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome, PausedRegistryState,
+    PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
 };
 
 pub type RegistryResult<T> = std::result::Result<T, PausedRegistryError>;
@@ -135,7 +135,12 @@ pub trait PausedSandboxRegistry: Send + Sync {
     ) -> RegistryResult<ResumeClaim>;
 
     /// Returns a claimed sandbox to the paused state after a failed resume.
-    async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()>;
+    ///
+    /// The `bool` is whether the write matched a row. Matching nothing stays a
+    /// success — somebody else has already moved the row on, which is the
+    /// outcome this was trying to produce — but it is worth knowing: it is the
+    /// only signal that this node is quoting a generation it has already lost.
+    async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool>;
 
     /// Refreshes the liveness lease on every row among `sandbox_ids` that
     /// `node_id` is the holder of, and reports how many that was.
@@ -213,7 +218,11 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// anything to say about the sandbox in either case: reconciliation reads
     /// an absent row as "the cluster has moved past this sandbox", which for an
     /// untracked one would be a freshly created sandbox being torn down.
-    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<bool>;
+    async fn mark_running(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+    ) -> RegistryResult<MarkRunningOutcome>;
 
     /// Hands back every live sandbox this node was holding when its previous
     /// process died, and reports what was found.
@@ -239,9 +248,21 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// never be claimed would just accumulate.
     async fn release_node_holdings(&self, node_id: &str) -> RegistryResult<ReleasedHoldings>;
 
-    /// Removes the row, and with it the cluster's memory of the sandbox.
-    /// Only correct once the sandbox itself is gone.
-    async fn remove(&self, sandbox_id: &SandboxId) -> RegistryResult<()>;
+    /// Removes the row this node last read, and with it the cluster's memory
+    /// of the sandbox. Only correct once the sandbox itself is gone.
+    ///
+    /// 🔴 Conditional on `generation`, and that condition is the whole guard.
+    /// The caller's own check — read the row, decide the sandbox is not live
+    /// elsewhere, delete it — is two statements with a window between them, and
+    /// a node returning from a partition walks straight into it: it holds a
+    /// view from before it left, and the sandbox it is about to forget has
+    /// since been resumed somewhere else. The delete would match, taking the
+    /// snapshot that node is running from with it, and neither side would
+    /// report anything.
+    ///
+    /// The `bool` is whether it matched. Not matching is not an error: the row
+    /// this caller meant to delete is already gone, which is what it wanted.
+    async fn remove(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool>;
 
     /// Whether this registry actually tracks sandboxes cluster-wide.
     ///
@@ -374,6 +395,12 @@ pub async fn build_paused_registry(
                         identity.cluster_id,
                         identity.id.clone(),
                         config.lease_ttl_secs(),
+                        // The raw configured value, not the clamped one:
+                        // reporting `lease_ttl_secs()`'s own input back to the
+                        // controller is what lets it see the two knobs
+                        // disagreeing. Clamping first would make every node
+                        // look correctly configured by construction.
+                        config.reconcile_interval_secs,
                     )?),
                     endpoint,
                 )

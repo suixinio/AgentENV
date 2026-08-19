@@ -9,9 +9,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    log_claim_outcome, BeganPause, HeldSandbox, PausedRegistryError, PausedRegistryState,
-    PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
-    ResumeClaim,
+    log_claim_outcome, BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome,
+    PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
+    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
@@ -613,11 +613,15 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
                 PausedRegistryState::Resuming | PausedRegistryState::Running => {
                     Ok(ResumeClaim::Conflict {
                         origin_node_id: entry.claimed_by_node_id.unwrap_or(entry.origin_node_id),
+                        reason: ConflictReason::LiveElsewhere,
                     })
                 }
                 // Lost a race with another claimer that has since released it.
+                // The row is claimable again, which makes this a different
+                // answer from the one above even though both are conflicts.
                 PausedRegistryState::Paused => Ok(ResumeClaim::Conflict {
                     origin_node_id: entry.origin_node_id,
+                    reason: ConflictReason::ClaimLost,
                 }),
             },
         }
@@ -758,11 +762,11 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         })
     }
 
-    async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<()> {
+    async fn release_claim(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool> {
         // Back to `paused` even when the claim was taken over a `running` row:
         // the claim is only ever handed out when no node holds the sandbox, so
         // its snapshot is the whole truth and `paused` is what describes that.
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE paused_sandboxes
                SET state = 'paused', claimed_by_node_id = NULL, updated_at = now(),
@@ -777,12 +781,21 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         .bind(self.cluster_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| PausedRegistryError::backend("release_claim", anyhow!(e)))?;
+        .map_err(|e| PausedRegistryError::backend("release_claim", anyhow!(e)))?
+        .rows_affected();
 
-        Ok(())
+        // Zero rows stays a success — somebody else already moved the row on,
+        // which is the outcome this was trying to produce — but the caller is
+        // told, because it is the only signal that this node is quoting a
+        // generation it has already lost.
+        Ok(updated > 0)
     }
 
-    async fn mark_running(&self, sandbox_id: &SandboxId, node_id: &str) -> RegistryResult<bool> {
+    async fn mark_running(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+    ) -> RegistryResult<MarkRunningOutcome> {
         // No insert, and that is the important half: a sandbox the cluster was
         // never told about must stay that way, otherwise every resume on a node
         // with a node-local history would start publishing rows for sandboxes
@@ -817,7 +830,8 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
             // Nothing matched: either the cluster does not track this sandbox
             // (by far the common case, and correct), or someone else holds the
             // claim — which means two nodes believe they are resuming it and is
-            // worth saying out loud.
+            // worth saying out loud. The caller is told which, because those
+            // two call for entirely different things.
             if let Some(entry) = self.fetch(sandbox_id).await? {
                 warn!(
                     %sandbox_id,
@@ -825,10 +839,14 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
                     claimed_by = ?entry.claimed_by_node_id,
                     "refused to mark the sandbox running here: another node holds the resume claim"
                 );
+
+                return Ok(MarkRunningOutcome::HeldElsewhere);
             }
+
+            return Ok(MarkRunningOutcome::Untracked);
         }
 
-        Ok(updated > 0)
+        Ok(MarkRunningOutcome::Adopted)
     }
 
     async fn release_node_holdings(&self, node_id: &str) -> RegistryResult<ReleasedHoldings> {
@@ -905,15 +923,24 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         })
     }
 
-    async fn remove(&self, sandbox_id: &SandboxId) -> RegistryResult<()> {
-        sqlx::query("DELETE FROM paused_sandboxes WHERE sandbox_id = $1 AND cluster_id = $2")
-            .bind(sandbox_id.into_inner())
-            .bind(self.cluster_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| PausedRegistryError::backend("remove", anyhow!(e)))?;
+    async fn remove(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool> {
+        // 🔴 Conditional on the generation the caller last read. Without it the
+        // guard is the caller's own read-then-delete, and a node returning from
+        // a partition walks straight through that window against a sandbox
+        // somebody else has since resumed.
+        let deleted = sqlx::query(
+            "DELETE FROM paused_sandboxes
+              WHERE sandbox_id = $1 AND cluster_id = $2 AND generation = $3",
+        )
+        .bind(sandbox_id.into_inner())
+        .bind(self.cluster_id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PausedRegistryError::backend("remove", anyhow!(e)))?
+        .rows_affected();
 
-        Ok(())
+        Ok(deleted > 0)
     }
 
     fn is_cluster_backed(&self) -> bool {

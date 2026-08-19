@@ -18,8 +18,9 @@ use chrono::{TimeDelta, Utc};
 use uuid::Uuid;
 
 use agentenv::orchestrator::{
-    HeldSandbox, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
-    PausedSandboxRegistry, PostgresPausedSandboxRegistry, ResumeClaim, SandboxMetadata,
+    ConflictReason, HeldSandbox, MarkRunningOutcome, PausedRegistryError, PausedRegistryState,
+    PausedSandboxEntry, PausedSandboxRegistry, PostgresPausedSandboxRegistry, ResumeClaim,
+    SandboxMetadata,
 };
 use agentenv::snapshot::SnapshotId;
 use agentenv::types::SandboxId;
@@ -196,7 +197,16 @@ async fn a_live_holder_cannot_have_its_sandbox_taken_away() {
         .expect("mark running");
 
     match registry.claim_for_resume(&sandbox_id, NODE_B).await {
-        Ok(ResumeClaim::Conflict { origin_node_id }) => assert_eq!(origin_node_id, NODE_A),
+        Ok(ResumeClaim::Conflict {
+            origin_node_id,
+            reason,
+        }) => {
+            assert_eq!(origin_node_id, NODE_A);
+            // 🔴 Which conflict this is decides what the caller may do next.
+            // A lost race is retryable; a live sandbox is not, and retrying it
+            // is how a second copy happens.
+            assert_eq!(reason, ConflictReason::LiveElsewhere);
+        }
         other => panic!("a live holder must not be displaced, got {other:?}"),
     }
 }
@@ -228,7 +238,13 @@ async fn a_live_sandbox_is_never_taken_over_on_a_lapsed_lease() {
     tokio::time::sleep(PAST_LEASE).await;
 
     match registry.claim_for_resume(&sandbox_id, NODE_B).await {
-        Ok(ResumeClaim::Conflict { origin_node_id }) => assert_eq!(origin_node_id, NODE_A),
+        Ok(ResumeClaim::Conflict {
+            origin_node_id,
+            reason,
+        }) => {
+            assert_eq!(origin_node_id, NODE_A);
+            assert_eq!(reason, ConflictReason::LiveElsewhere);
+        }
         other => panic!("a live sandbox must never be rebuilt elsewhere on a timer, got {other:?}"),
     }
 }
@@ -264,7 +280,9 @@ async fn a_parked_sandbox_moves_on_once_its_holder_stops_renewing() {
         .await
         .expect("claim");
     let ResumeClaim::Claimed { previous_state, .. } = claim else {
-        panic!("a parked sandbox whose holder went quiet must be recoverable elsewhere, got {claim:?}");
+        panic!(
+            "a parked sandbox whose holder went quiet must be recoverable elsewhere, got {claim:?}"
+        );
     };
     assert_eq!(
         previous_state,
@@ -626,7 +644,21 @@ async fn one_cluster_cannot_reach_anothers_sandboxes() {
         "another cluster's sandbox must not be claimable"
     );
 
-    theirs.remove(&sandbox_id).await.expect("remove");
+    // The generation quoted is our row's own, so only the cluster scope can be
+    // what stops this delete from matching.
+    let ours_generation = ours
+        .get(&sandbox_id)
+        .await
+        .expect("read")
+        .expect("our row")
+        .generation;
+    assert!(
+        !theirs
+            .remove(&sandbox_id, ours_generation)
+            .await
+            .expect("remove"),
+        "a delete scoped to another cluster must not match our row"
+    );
     assert!(
         ours.get(&sandbox_id).await.expect("read").is_some(),
         "another cluster's delete must not remove our row"
@@ -737,6 +769,64 @@ async fn releasing_a_claim_puts_the_sandbox_back() {
 /// is about that copy; without a confirmation an absent row means nothing, and
 /// reading it as "the cluster moved on" tears down sandboxes that were simply
 /// created here and never announced.
+/// 🔴 The window the caller-side guard could not close.
+///
+/// `forget_sandbox` reads the row, decides the sandbox is not live elsewhere,
+/// and deletes it. A node returning from a partition holds a view from before
+/// it left and walks straight through that gap against a sandbox somebody else
+/// has since resumed — the delete matches, the snapshot that node is running
+/// from goes with it, and nothing reports anything.
+#[tokio::test]
+async fn a_delete_quoting_a_stale_generation_matches_nothing() {
+    let dsn = require_db!();
+    let registry = registry(&dsn, Uuid::new_v4()).await;
+    let sandbox_id = SandboxId::new();
+
+    pause_and_publish(&registry, sandbox_id, NODE_A).await;
+    let stale = registry
+        .get(&sandbox_id)
+        .await
+        .expect("read")
+        .expect("row")
+        .generation;
+
+    // Somebody else moves the row on, which is what a resume elsewhere does.
+    registry
+        .claim_for_resume(&sandbox_id, NODE_B)
+        .await
+        .expect("claim");
+
+    assert!(
+        !registry
+            .remove(&sandbox_id, stale)
+            .await
+            .expect("a stale delete is a no-op, not an error"),
+        "a delete quoting a generation the row has moved past must match nothing"
+    );
+    assert!(
+        registry.get(&sandbox_id).await.expect("read").is_some(),
+        "a stale delete destroyed a row somebody else holds"
+    );
+
+    // The same call with the row's current generation does delete it, so the
+    // refusal above is the condition working rather than the statement being
+    // broken.
+    let current = registry
+        .get(&sandbox_id)
+        .await
+        .expect("read")
+        .expect("row")
+        .generation;
+    assert!(
+        registry.remove(&sandbox_id, current).await.expect("remove"),
+        "a delete quoting the row's own generation must match it"
+    );
+    assert!(
+        registry.get(&sandbox_id).await.expect("read").is_none(),
+        "the row survived a delete that reported it matched"
+    );
+}
+
 #[tokio::test]
 async fn marking_an_untracked_sandbox_running_reports_that_it_is_untracked() {
     let dsn = require_db!();
@@ -747,8 +837,9 @@ async fn marking_an_untracked_sandbox_running_reports_that_it_is_untracked() {
         .await
         .expect("mark running");
 
-    assert!(
-        !confirmed,
+    assert_eq!(
+        confirmed,
+        MarkRunningOutcome::Untracked,
         "a sandbox with no row must not be reported as tracked"
     );
 }
@@ -765,7 +856,11 @@ async fn marking_a_tracked_sandbox_running_reports_the_node_as_holder() {
         .await
         .expect("mark running");
 
-    assert!(confirmed, "the row now names this node as the holder");
+    assert_eq!(
+        confirmed,
+        MarkRunningOutcome::Adopted,
+        "the row now names this node as the holder"
+    );
 }
 
 /// A refusal has to be distinguishable from a success, or the node would enrol
@@ -786,8 +881,12 @@ async fn marking_running_reports_a_refusal_when_another_node_holds_the_claim() {
         .await
         .expect("mark running");
 
-    assert!(
-        !confirmed,
+    // 🔴 And it is distinguishable from "untracked". Both refuse, but one is
+    // the healthy common case and the other means two nodes believe they are
+    // bringing the same sandbox up.
+    assert_eq!(
+        confirmed,
+        MarkRunningOutcome::HeldElsewhere,
         "another node holds the claim, so this node is not the holder"
     );
 }

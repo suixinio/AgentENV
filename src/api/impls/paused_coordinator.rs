@@ -19,8 +19,8 @@ use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 
 use crate::orchestrator::{
-    PauseOutcome, PausedRegistryState, PausedSandboxEntry, PausedSandboxPublisher,
-    PausedSandboxRegistry, SandboxMetadata,
+    MarkRunningOutcome, PauseOutcome, PausedRegistryState, PausedSandboxEntry,
+    PausedSandboxPublisher, PausedSandboxRegistry, SandboxMetadata,
 };
 use crate::snapshot::{
     SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
@@ -430,7 +430,24 @@ impl PausedSandboxCoordinator {
         self.note_taking_sandbox_live().await;
 
         let confirmed = match self.registry.mark_running(&sandbox_id, &self.node_id).await {
-            Ok(confirmed) => confirmed,
+            Ok(MarkRunningOutcome::HeldElsewhere) => {
+                // 🔴 The cluster says another node holds the resume claim on a
+                // sandbox this one has just brought up. Both are about to run
+                // it. Until D11 this arrived as the same `false` as the healthy
+                // "never paused, nothing to track" case and went unremarked.
+                //
+                // Not fatal here on purpose: the VM is already live, and the
+                // node that can safely stand down is decided by reconciliation
+                // with the whole row in front of it, not by this write's
+                // return value.
+                warn!(
+                    %sandbox_id,
+                    "the cluster holds this sandbox's resume claim elsewhere; two nodes may be running it"
+                );
+
+                false
+            }
+            Ok(outcome) => outcome.adopted(),
             Err(err) => {
                 warn!(
                     error = %err,
@@ -496,11 +513,29 @@ impl PausedSandboxCoordinator {
             return;
         }
 
-        if let Err(err) = self.registry.remove(&sandbox_id).await {
-            warn!(error = %err, %sandbox_id, "failed to clear the paused registry row");
+        // The generation is the one read above, so the delete is conditional on
+        // the row not having moved since. The check above — "is it live
+        // elsewhere?" — is a read, and between it and this write a resume
+        // somewhere else can start; quoting the generation is what makes the
+        // two behave as one decision.
+        match self.registry.remove(&sandbox_id, entry.generation).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // The row moved between the read and the delete, which means
+                // somebody else now owns it and its snapshot is theirs.
+                warn!(
+                    %sandbox_id,
+                    "not clearing the cluster record: it changed hands while this delete was being decided"
+                );
 
-            // Keep the snapshot: the row still points at it.
-            return;
+                return;
+            }
+            Err(err) => {
+                warn!(error = %err, %sandbox_id, "failed to clear the paused registry row");
+
+                // Keep the snapshot: the row still points at it.
+                return;
+            }
         }
 
         if let Some(snapshot_id) = entry.snapshot_id {
@@ -991,8 +1026,8 @@ pub(super) mod test_support {
     use async_trait::async_trait;
 
     use crate::orchestrator::{
-        BeganPause, HeldSandbox, PausedRegistryError, PausedSandboxEntry, PausedSandboxRegistry,
-        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+        BeganPause, HeldSandbox, MarkRunningOutcome, PausedRegistryError, PausedSandboxEntry,
+        PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::snapshot::SnapshotId;
     use crate::types::SandboxId;
@@ -1150,8 +1185,8 @@ pub(super) mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _generation: i64,
-        ) -> RegistryResult<()> {
-            Ok(())
+        ) -> RegistryResult<bool> {
+            Ok(true)
         }
 
         async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
@@ -1171,12 +1206,12 @@ pub(super) mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _node_id: &str,
-        ) -> RegistryResult<bool> {
+        ) -> RegistryResult<MarkRunningOutcome> {
             if self.mark_running_fails {
                 return Err(unreachable_backend("mark_running"));
             }
 
-            Ok(true)
+            Ok(MarkRunningOutcome::Adopted)
         }
 
         async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
@@ -1188,8 +1223,8 @@ pub(super) mod test_support {
             Ok(ReleasedHoldings::default())
         }
 
-        async fn remove(&self, _sandbox_id: &SandboxId) -> RegistryResult<()> {
-            Ok(())
+        async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
+            Ok(true)
         }
 
         fn is_cluster_backed(&self) -> bool {

@@ -197,5 +197,57 @@ pub enum ResumeClaim {
     /// resume. Carries the origin node so the caller can redirect.
     NotReady { origin_node_id: String },
     /// Another node claimed it first.
-    Conflict { origin_node_id: String },
+    Conflict {
+        origin_node_id: String,
+        reason: ConflictReason,
+    },
+}
+
+/// Which of the two situations a [`ResumeClaim::Conflict`] describes.
+///
+/// They call for opposite responses. `LiveElsewhere` means the sandbox is
+/// running on another node and this one must not touch it — retrying is how a
+/// second live copy happens. `ClaimLost` means the row is claimable again and
+/// this caller merely lost a race, so retrying is exactly right. Flattened into
+/// one variant, a caller either retries something it must not or gives up on
+/// something it could have had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictReason {
+    /// The sandbox is live on the node named alongside this. Nobody may take it.
+    LiveElsewhere,
+    /// This caller held the claim and no longer does; the row is claimable.
+    ClaimLost,
+    /// The backend did not say. Treated as `LiveElsewhere` wherever the two
+    /// differ, because that is the answer whose mistake is recoverable.
+    Unspecified,
+}
+
+/// Which of the three answers [`mark_running`] gave.
+///
+/// [`mark_running`]: super::PausedSandboxRegistry::mark_running
+///
+/// 🔴 `Untracked` and `HeldElsewhere` were one `false` until D11, and they mean
+/// opposite things. Untracked is the common, healthy case: a sandbox that has
+/// never been paused has no row, and the node carries on. HeldElsewhere means a
+/// row exists and another node holds the claim on it — two nodes believe they
+/// are bringing the same sandbox up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkRunningOutcome {
+    /// No row. What a sandbox that has never been paused looks like.
+    Untracked,
+    /// The row now names this node as its holder.
+    Adopted,
+    /// A row exists and another node holds the claim on it.
+    HeldElsewhere,
+}
+
+impl MarkRunningOutcome {
+    /// Whether the cluster tracks this sandbox and now names this node.
+    ///
+    /// Kept as a helper rather than left to callers comparing variants, so the
+    /// two non-adopted cases cannot quietly collapse back into one at a call
+    /// site that only wanted the boolean.
+    pub fn adopted(self) -> bool {
+        matches!(self, Self::Adopted)
+    }
 }

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use super::{
-    BeganPause, HeldSandbox, PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings,
-    RegistryResult, ReleasedHoldings, ResumeClaim,
+    BeganPause, HeldSandbox, MarkRunningOutcome, PausedSandboxEntry, PausedSandboxRegistry,
+    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::snapshot::SnapshotId;
 use crate::types::SandboxId;
@@ -63,8 +63,15 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(ResumeClaim::NotFound)
     }
 
-    async fn release_claim(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<()> {
-        Ok(())
+    async fn release_claim(
+        &self,
+        _sandbox_id: &SandboxId,
+        _generation: i64,
+    ) -> RegistryResult<bool> {
+        // Nothing was ever recorded, so nothing matched. `false` here is the
+        // truth rather than a stub: there is no row this release could have
+        // returned to the cluster.
+        Ok(false)
     }
 
     async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
@@ -75,15 +82,21 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(ReclaimedHoldings::default())
     }
 
-    async fn mark_running(&self, _sandbox_id: &SandboxId, _node_id: &str) -> RegistryResult<bool> {
-        Ok(false)
+    async fn mark_running(
+        &self,
+        _sandbox_id: &SandboxId,
+        _node_id: &str,
+    ) -> RegistryResult<MarkRunningOutcome> {
+        // Untracked, not held-elsewhere: this backend has no cluster to hold a
+        // sandbox anywhere else.
+        Ok(MarkRunningOutcome::Untracked)
     }
 
     async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
         Ok(ReleasedHoldings::default())
     }
 
-    async fn remove(&self, _sandbox_id: &SandboxId) -> RegistryResult<()> {
-        Ok(())
+    async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
+        Ok(false)
     }
 }

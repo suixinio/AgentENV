@@ -56,6 +56,24 @@
 
 ---
 
+## 2.1 🔧 实施推翻了四条裁决
+
+写方案时想当然、动手才发现不成立的四条。**就地勘误，不要照 §2 的原文行事。**
+
+| # | 裁决原文 | 实际 | 为什么 |
+|---|---|---|---|
+| **J3** | `GetSandboxesResponse` **与** `AcquireSandboxResponse` 都带 `now_unix_micros` | **只做前者** | Acquire 的租约判断整个发生在服务端，node 拿到的是「我已经拿到了 claim」这一结论，没有任何地方对它做租约算术。给它加一个永不被读的字段比不加更糟——一个字段的存在本身就是一句「这里需要它」的断言。 |
+| **J8** | scheduler `replicas: 2` + PDB，registry 写面单写者安全 | **保持 1 副本**，改为 `maxSurge: 1 / maxUnavailable: 0` + PDB | 「registry 写面安全」是对的，**但 scheduler 不只有这个写面**：bindings、observed-node 状态、P2P 索引全在进程内存里，第二个副本会用空副本服务半个集群（`CLAUDE.md` 明确 HA 模式是 data-plane only，且需要 `redis_addr` + `--query-only`）。真正要修的不是副本数是**窗口**——阶段 2 之后它是每个节点续租/暂停/恢复的硬依赖，而滚动升级默认先停唯一那个 Pod。 |
+| **J11** | 鉴权改成常量时间比对配置值；未配置则拒绝启动 | **不改代码**，改为把边界模型写进代码注释与部署文档 | 三条：① 超出「PG 摘除」的范围，且 A2/A3 都不是本轮引入的暴露面；② 爆炸半径是跨仓的——所有调用方（含 agent-platform）都要带上正确凭据，是一次凭据签发/分发/轮换工程；③ **两家参考都不在端点上做这件事**：e2b 的 orchestrator gRPC 服务端没有任何鉴权拦截器（`packages/shared/pkg/grpc/server.go` 只链了 recovery 和 logging），保护来自「只有控制面够得到它」。所以真正要收口的是 NetworkPolicy / NodePort，不是字符串比较。**遗留登记见 §5。** |
+| **J10** | `begin_pause` / `mark_running` / `claim_for_resume` **都**写 `sandbox_expires_at` | **只有 `mark_running`** | reclaim 的谓词是 `state IN ('running','resuming')`。`begin_pause` 产生的是 `publishing`，之后转 `paused`——两个状态 reclaim 都不碰，给它们写 deadline 不解决任何问题。`claim_for_resume` 产生的 `resuming` 确实在谓词里，但它是个极短的中间态，且 `begin_pause` 时行上已有的值会留着，后继进程的 `release_node_holdings` 也覆盖这条路。F6 描述的窗口——「首个续租 tick 之前失联」——精确落在 `mark_running` 之后。 |
+
+**另外一条自己消失了**：A7（D10 §5.1，共享测试库残留导致
+`TestPostgresReaderListWithoutClusterFilterSeesEveryCluster` 必红）在阶段 2 的某次提交里
+已经用私有 schema 修掉了。**用有分辨力的探针确认过**：往 `public.paused_sandboxes` 注入
+175 行再跑，该测试仍然 PASS——未隔离的断言在这个输入下必然失败。
+
+---
+
 ## 3. 任务分解与顺序
 
 🔴 **顺序不可换**：P 段补齐语义 → M 段摘除 → A 段收单点 → V 段验证。
@@ -117,9 +135,24 @@
 
 ---
 
-## 5. 明确不做
+## 5. 明确不做 / 遗留
+
+**不做，且理由在上面已经论证过**
 
 - **ExecutionID 跨仓契约**：属阶段 3 闸门 B，需 agent-platform 配合，不在本轮
 - **存储层写锁 / envd token 绑 execution**：同上
 - **EKS 搬迁**：用户已明确押后
 - **删 `local` 后端**：见 J12
+- **scheduler 多副本**：见 §2.1 的 J8。要做的前置是 `scheduler.redis_addr` +
+  `--query-only`，是另一件事
+
+**🔴 遗留一条，本轮只做了可见性**
+
+| # | 事 | 现状 |
+|---|---|---|
+| **L1** | 节点 API 端口 8000 是**无鉴权的管理面** | `X-Admin-Token` / `X-API-Key` 只校验非空，任何编造的值都放行；实测用临时编的 token 经 NodePort 两次把节点置成 `DRAINING`，全程 204。**本轮没有改这个行为**（理由见 §2.1 的 J11），改的是让它不再被误以为有保护：`src/api/impls/auth.rs` 的注释与 `docs/src/deployment/kubernetes.md` 新增一节都写明了「保护来自网络边界」，并给出该查什么（NodePort / NetworkPolicy）。**真正的收口是部署侧的**：确认 8000 端口只有 gateway 与 scheduler 够得到。 |
+
+**登记给阶段 3**
+
+- `claim_for_resume` 产生的 `resuming` 中间态仍可能不带 deadline（§2.1 的 J10）。
+  窗口极短且有 `release_node_holdings` 兜底，但 fencing 方案会重新处理这块归属。

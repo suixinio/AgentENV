@@ -7,6 +7,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -127,21 +128,80 @@ func TestReportSandboxEventRefusesAStaleIncarnation(t *testing.T) {
 // TestReportSandboxEventIgnoresAnUnnamedIncarnation: a reporter too old to name
 // one gets no unguarded delete. It also sends no long TTL, so its records
 // expire on their own within binding_ttl and nothing is leaked by waiting.
+//
+// 🔴 Two fixtures, and the second one is the test. Against a record that names
+// an incarnation, an unnamed event is refused by the *store* — its guard sees
+// "somebody else's" and answers rejected_stale — so a version of this with only
+// that fixture passes with the service's guard deleted, which is how it
+// shipped. The case the guard alone covers is an unnamed event against a record
+// whose incumbent is unknown too: there the store's rule is that an unknown
+// incumbent yields to a named challenger, and an empty challenger would match
+// it and take the record with it.
+//
+// 🔴 The outcome is asserted as well as the record, because the two stores
+// refuse this at different depths — the in-memory one now defends itself and
+// the Lua one always did — and "the record survived" cannot tell a guard that
+// fired from a store that quietly did nothing. `ignored_unknown_execution` is
+// the row §5.3 names, and only the service's guard can produce it.
 func TestReportSandboxEventIgnoresAnUnnamedIncarnation(t *testing.T) {
 	store := NewInMemoryBindingStore(30 * time.Second)
 	service := newProjectionService(t, store, authoritative(25*time.Hour))
 
+	// A record that names an incarnation, and one that does not — which is
+	// what a create recorded by a gateway that read no incarnation off the
+	// response looks like.
 	recordAssignment(t, service, "sbx-1", execA, 0)
-	for _, executionID := range []string{"", "   ", "not-a-uuid"} {
-		reportEvent(t, service, &schedulerv1.SandboxEvent{
-			SandboxId:   "sbx-1",
-			EventType:   schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_DELETE,
-			ExecutionId: executionID,
-		})
-		if !bound(t, store, "sbx-1") {
-			t.Fatalf("an event carrying %q deleted the record without a guard", executionID)
+	recordAssignment(t, service, "sbx-2", "", 0)
+	if !bound(t, store, "sbx-2") {
+		t.Fatal("precondition failed: nothing recorded for the unnamed-incumbent fixture")
+	}
+
+	for _, sandboxID := range []string{"sbx-1", "sbx-2"} {
+		for _, executionID := range []string{"", "   ", "not-a-uuid"} {
+			before := sandboxEventCount(t, "delete", sandboxEventIgnoredUnknownExecution)
+			reportEvent(t, service, &schedulerv1.SandboxEvent{
+				SandboxId:   sandboxID,
+				EventType:   schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_DELETE,
+				ExecutionId: executionID,
+			})
+			if !bound(t, store, sandboxID) {
+				t.Fatalf("%s: an event carrying %q deleted the record without a guard", sandboxID, executionID)
+			}
+			if after := sandboxEventCount(t, "delete", sandboxEventIgnoredUnknownExecution); after != before+1 {
+				t.Fatalf("%s: an event carrying %q was counted as something other than %s (%v -> %v)",
+					sandboxID, executionID, sandboxEventIgnoredUnknownExecution, before, after)
+			}
 		}
 	}
+}
+
+// sandboxEventCount reads one series of the sandbox-event counter, through a
+// private registry over the process-wide collector — the same shape
+// bindingDecisionCount uses.
+func sandboxEventCount(t *testing.T, eventType string, outcome string) float64 {
+	t.Helper()
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(schedulerSandboxEvent)
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather sandbox events: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != "agentenv_scheduler_sandbox_event_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["event_type"] == eventType && labels["outcome"] == outcome {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
 
 // TestReportSandboxEventLeavesTheOtherEventTypesAlone: create, resume and fork

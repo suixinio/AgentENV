@@ -104,6 +104,22 @@ func TestInMemoryDeleteGuardRules(t *testing.T) {
 			t.Fatalf("got (%v, %v), want noop_absent", outcome, err)
 		}
 	})
+
+	// The twin of the Redis case of the same name. A caller must never reach
+	// either store without an incarnation — that is the unguarded delete the
+	// guard exists to prevent — and neither store may rely on the other's
+	// caller to be the one that stops it.
+	t.Run("a blank incarnation is refused", func(t *testing.T) {
+		store := NewInMemoryBindingStore(30 * time.Second)
+		mustRecord(t, store, "sbx-1", Binding{Node: projectionTestNode()}, now)
+
+		if outcome, err := store.Delete("sbx-1", "  ", now); err != nil || outcome != BindingDeleteAbsent {
+			t.Fatalf("got (%v, %v), want a refused no-op", outcome, err)
+		}
+		if _, ok, _ := store.Get("sbx-1", now); !ok {
+			t.Fatal("a delete naming no incarnation removed a record anyway")
+		}
+	})
 }
 
 // TestInMemoryRecordUsesTheNodeBudget covers the create path's TTL: the node's

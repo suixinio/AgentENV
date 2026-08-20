@@ -282,7 +282,14 @@ func (s *InMemoryBindingStore) Record(sandboxID string, binding Binding, now tim
 // the default build runs and that is the one the tests exercise.
 func (s *InMemoryBindingStore) Delete(sandboxID string, executionID string, now time.Time) (BindingDeleteOutcome, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
-	if sandboxID == "" {
+	executionID = strings.TrimSpace(executionID)
+	// 🔴 A blank incarnation is refused here as well as at the caller, and as
+	// the Lua twin already refused it. It is the unguarded delete this whole
+	// path exists to prevent: an empty id matches a record that names none and
+	// would remove it, which is a delete nobody compared. The two stores have
+	// to answer this identically — one of them defending itself and the other
+	// trusting its caller is the shape a rule ends up implemented once.
+	if sandboxID == "" || executionID == "" {
 		return BindingDeleteAbsent, nil
 	}
 

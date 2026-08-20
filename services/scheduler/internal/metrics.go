@@ -258,6 +258,64 @@ var (
 		},
 		[]string{"source"},
 	)
+	// What the heartbeat-timeout sweep did to one node's routing records.
+	//
+	// 🔴 The vocabulary is the guarded delete's, word for word, and not a
+	// second set of names for the same four answers. The sweep drives
+	// BindingStore.Delete — the same call a pause event drives — so an operator
+	// comparing this against sandbox_event_total is comparing like with like,
+	// and a divergence between the two series means the two paths stopped
+	// obeying the same guard.
+	//
+	// 🔴 "rejected_stale" is the series that matters most, and it is the one
+	// worth alerting a *drop* to zero on rather than a rise. It is the guard
+	// refusing to retire a record that names a different incarnation from the
+	// one the silent node reported — which is exactly the sandbox that was
+	// rebuilt elsewhere while its old node was dying. A sweep that never
+	// refuses anything has never been asked the question that could kill a live
+	// sandbox's route.
+	schedulerBindingSweep = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_binding_sweep_total",
+			Help: "Routing records the heartbeat-timeout sweep acted on, by what the guarded delete decided. rejected_stale is the guard refusing to retire a record that names a live incarnation.",
+		},
+		[]string{"outcome"},
+	)
+	// The node half of the same pass, so "the sweep fired" and "the sweep
+	// declined to fire" are both provable.
+	//
+	// 🔴 suppressed_all_silent is not an error and is not rare enough to be
+	// left to a log line. It is the whole-fleet guard: when every node that has
+	// ever reported has gone quiet at once, the likelier fault is this
+	// scheduler's own network, and retiring the cluster's entire routing table
+	// on that reading would turn a scheduler-side blip into a fleet-wide
+	// outage.
+	schedulerBindingSweepNodes = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_binding_sweep_nodes_total",
+			Help: "Silent nodes the heartbeat-timeout sweep considered, by what it did with them.",
+		},
+		[]string{"outcome"},
+	)
+	// Resident for the same reason as the arbitration gauge below it: whether
+	// the sweep was running is asked months later, during an incident, about a
+	// process whose start-up logs are long gone.
+	schedulerBindingSweepEnabled = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_binding_sweep_enabled",
+			Help: "1 when the heartbeat-timeout binding sweep is on, 0 when it is off. With it off, a record installed by a node that dies hard survives its full projection TTL.",
+		},
+	)
+	// The silence threshold the sweep is actually running with, in seconds.
+	// Published beside the switch because "the sweep is on" and "the sweep
+	// fires after five minutes" are separate facts and only the first has ever
+	// been visible.
+	schedulerBindingSweepSilenceSeconds = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_binding_sweep_silence_seconds",
+			Help: "How long a node may say nothing before the sweep retires the routing records it installed. Reads 0 when the sweep is off.",
+		},
+	)
 	// Resident, because the question "is arbitration on" is asked months later,
 	// during an incident, about a process whose start-up logs are long gone.
 	schedulerRoutingExecutionArbitration = promauto.NewGauge(
@@ -376,6 +434,41 @@ const (
 
 func recordProjectionTTLSource(source string) {
 	schedulerProjectionTTLSource.WithLabelValues(source).Inc()
+}
+
+// The two node-level outcomes of one sweep round.
+const (
+	// bindingSweepNodeSwept: this node was silent past the threshold and its
+	// records were put through the guarded delete.
+	bindingSweepNodeSwept = "swept"
+	// bindingSweepNodeSuppressedAllSilent: this node was silent past the
+	// threshold, and so was every other node that has ever reported, so nothing
+	// was retired. See schedulerBindingSweepNodes.
+	bindingSweepNodeSuppressedAllSilent = "suppressed_all_silent"
+)
+
+func recordBindingSweep(outcome string) {
+	schedulerBindingSweep.WithLabelValues(outcome).Inc()
+}
+
+func recordBindingSweepNode(outcome string) {
+	schedulerBindingSweepNodes.WithLabelValues(outcome).Inc()
+}
+
+// SetBindingSweep publishes whether the sweep runs in this process, and the
+// threshold it runs with. Called once at start-up.
+//
+// 🔴 The threshold is published as zero when the sweep is off rather than as
+// the value that would have been used. A number on /metrics that no code path
+// reads is how an operator comes to believe a sweep is armed that is not.
+func SetBindingSweep(enabled bool, silence time.Duration) {
+	if !enabled {
+		schedulerBindingSweepEnabled.Set(0)
+		schedulerBindingSweepSilenceSeconds.Set(0)
+		return
+	}
+	schedulerBindingSweepEnabled.Set(1)
+	schedulerBindingSweepSilenceSeconds.Set(silence.Seconds())
 }
 
 // SetRoutingExecutionArbitration publishes the mode. Called once at start-up.

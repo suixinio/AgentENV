@@ -28,6 +28,37 @@ const defaultSchedulerArtifactStoreCapacity = 1_000_000
 // second copy would drift and the drift would look exactly like a cold cache.
 const defaultSchedulerMaxProjectionTTL = 25 * time.Hour
 
+// The heartbeat-timeout sweep's two cadences.
+//
+// 🔴 defaultSchedulerBindingSweepSilence is how long a node may say nothing
+// before the scheduler retires the routing records that node's last heartbeat
+// installed. Five minutes, and every term of that is measured rather than
+// guessed:
+//
+//   - The node reports every 5s (AENV_OBSERVABILITY_REPORT_INTERVAL_SECS), so
+//     this is sixty consecutive missed reports.
+//   - A node that cannot reach the scheduler backs off, doubling to a ceiling
+//     of 60s (MAX_REPORT_BACKOFF, src/observability/reporter.rs). Even pinned
+//     at the ceiling a live node reports five times inside this window.
+//   - A node missed a single heartbeat during the phase-1 rollout and backed
+//     off 5s. A rolling DaemonSet restart is a pod coming back in seconds, not
+//     minutes, so a routine rollout cannot reach this.
+//   - It is an order of magnitude above scheduler.report_ttl (30s), which is
+//     when a node reads UNHEALTHY and its roster stops being usable as a
+//     routing fallback. That ordering is load-bearing rather than tidy: retire
+//     a record while the roster is still fresh and the roster fallback simply
+//     re-answers with the same dead node, so the sweep has to be the *last*
+//     observer of silence, not the first.
+//
+// 🔴 It is deliberately not derived from report_ttl. The two answer different
+// questions — "may I still route to what this node said" versus "has this node
+// gone for good" — and tying them would move the second every time somebody
+// tuned the first.
+const (
+	defaultSchedulerBindingSweepSilence  = 5 * time.Minute
+	defaultSchedulerBindingSweepInterval = 30 * time.Second
+)
+
 const (
 	defaultSchedulerRegistryMaxConnections    = 4
 	defaultSchedulerRegistryReconcileInterval = 30 * time.Second
@@ -274,6 +305,8 @@ type SchedulerConfig struct {
 	WarmupTimeout           time.Duration            `json:"warmup_timeout"`
 	RedisAddr               string                   `json:"redis_addr"`
 	MaxProjectionTTL        time.Duration            `json:"max_projection_ttl"`
+	BindingSweepSilence     time.Duration            `json:"binding_sweep_silence"`
+	BindingSweepInterval    time.Duration            `json:"binding_sweep_interval"`
 	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
 	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
 	Nodes                   []Node                   `json:"nodes"`
@@ -293,6 +326,8 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		WarmupTimeout           json.RawMessage           `json:"warmup_timeout"`
 		RedisAddr               *string                   `json:"redis_addr"`
 		MaxProjectionTTL        json.RawMessage           `json:"max_projection_ttl"`
+		BindingSweepSilence     json.RawMessage           `json:"binding_sweep_silence"`
+		BindingSweepInterval    json.RawMessage           `json:"binding_sweep_interval"`
 		ArtifactStoreCapacity   *int                      `json:"artifact_store_capacity"`
 		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
 		Nodes                   *[]Node                   `json:"nodes"`
@@ -308,6 +343,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Routing *struct {
 			ExecutionArbitration    *string `json:"execution_arbitration"`
 			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
+			BindingSweep            *bool   `json:"binding_sweep"`
 		} `json:"routing"`
 	}
 
@@ -359,6 +395,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	if parsed.Routing != nil && parsed.Routing.ProjectionAuthoritative != nil {
 		s.Routing.ProjectionAuthoritative = *parsed.Routing.ProjectionAuthoritative
 	}
+	if parsed.Routing != nil && parsed.Routing.BindingSweep != nil {
+		s.Routing.BindingSweep = *parsed.Routing.BindingSweep
+	}
 
 	if len(bytes.TrimSpace(parsed.MaxProjectionTTL)) > 0 {
 		d, err := parseSchedulerDuration(parsed.MaxProjectionTTL, "scheduler.max_projection_ttl")
@@ -366,6 +405,21 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.MaxProjectionTTL = d
+	}
+
+	if len(bytes.TrimSpace(parsed.BindingSweepSilence)) > 0 {
+		d, err := parseSchedulerDuration(parsed.BindingSweepSilence, "scheduler.binding_sweep_silence")
+		if err != nil {
+			return err
+		}
+		s.BindingSweepSilence = d
+	}
+	if len(bytes.TrimSpace(parsed.BindingSweepInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.BindingSweepInterval, "scheduler.binding_sweep_interval")
+		if err != nil {
+			return err
+		}
+		s.BindingSweepInterval = d
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
@@ -478,6 +532,23 @@ type SchedulerRoutingConfig struct {
 	// for nothing. The switches above default to their end state because that
 	// release existed in order to turn them on.
 	ProjectionAuthoritative bool `json:"projection_authoritative"`
+	// BindingSweep lets the scheduler retire the routing records a node
+	// installed once that node has stopped heartbeating for longer than
+	// scheduler.binding_sweep_silence.
+	//
+	// 🔴 Off by default, for the same reason as the switch above it and not
+	// merely by imitation. Every node in the fleet is already heartbeating, so
+	// a scheduler that acquired this by being upgraded would start deleting
+	// routing records on a timer having been asked for nothing — and the one
+	// failure mode that matters here is deleting the record of a sandbox that
+	// is alive.
+	//
+	// 🔴 Independent of ProjectionAuthoritative rather than implied by it. The
+	// sweep only *matters* when records are long-lived, but a switch that is
+	// two switches cannot be turned on alone, and this one has to be
+	// exercisable — and revertible — without moving the write switch under a
+	// running cluster.
+	BindingSweep bool `json:"binding_sweep"`
 }
 
 // GatewayExecutionFencing is the three-state switch over the gateway's routing
@@ -786,8 +857,10 @@ func defaultConfig(service string) Config {
 			// state, and starting a release on observe is release discipline.
 			// A default of observe leaves clusters parked there with nobody
 			// aware they were never flipped.
-			Routing:          SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
-			MaxProjectionTTL: defaultSchedulerMaxProjectionTTL,
+			Routing:              SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
+			MaxProjectionTTL:     defaultSchedulerMaxProjectionTTL,
+			BindingSweepSilence:  defaultSchedulerBindingSweepSilence,
+			BindingSweepInterval: defaultSchedulerBindingSweepInterval,
 		},
 		Gateway: GatewayConfig{
 			HTTPListenAddr:      ":8080",
@@ -978,6 +1051,30 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE: %w", err)
 		}
 		cfg.Gateway.Routing.ProjectionAuthoritative = on
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ROUTING_BINDING_SWEEP")); v != "" {
+		on, err := ParseRoutingProjectionSwitch(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_ROUTING_BINDING_SWEEP: %w", err)
+		}
+		cfg.Scheduler.Routing.BindingSweep = on
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_BINDING_SWEEP_SILENCE")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_BINDING_SWEEP_SILENCE %q: %w", v, err)
+		}
+		cfg.Scheduler.BindingSweepSilence = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_BINDING_SWEEP_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_BINDING_SWEEP_INTERVAL %q: %w", v, err)
+		}
+		cfg.Scheduler.BindingSweepInterval = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_MAX_PROJECTION_TTL")); v != "" {

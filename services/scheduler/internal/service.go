@@ -59,6 +59,16 @@ type Service struct {
 	// of it in a ConfigMap would drift, and the drift would show up as records
 	// expiring before their sandboxes — indistinguishable from a cold cache.
 	maxProjectionTTL time.Duration
+	// bindingSweep is the switch over the heartbeat-timeout sweep: whether a
+	// node that stops heartbeating has the routing records it installed
+	// retired, or keeps them until their own TTL lapses.
+	//
+	// 🔴 Off by default and independent of projectionAuthoritative. See the
+	// argument on config.SchedulerRoutingConfig.BindingSweep, and the one at
+	// the top of sweep.go for what the sweep is and is not.
+	bindingSweep bool
+	// bindingSweepSilence is how long a node may say nothing first.
+	bindingSweepSilence time.Duration
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -78,6 +88,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		reportTTL:               defaultObservedReportTTL,
 		registryLeaseWarnWindow: defaultRegistryLeaseWarnWindow,
 		maxProjectionTTL:        defaultMaxProjectionTTL,
+		bindingSweepSilence:     defaultBindingSweepSilence,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -137,6 +148,22 @@ func WithAuthoritativeProjection(maxProjectionTTL time.Duration) ServiceOption {
 		s.projectionAuthoritative = true
 		if maxProjectionTTL > 0 {
 			s.maxProjectionTTL = maxProjectionTTL
+		}
+	}
+}
+
+// WithBindingSweep turns on the heartbeat-timeout sweep, with the silence a
+// node is allowed before the records it installed are retired.
+//
+// 🔴 A non-positive silence takes the default rather than meaning "immediately".
+// Zero arriving here is an unset config field, and the reading of it that costs
+// something is the one where every node that has not reported in this instant
+// loses its routing.
+func WithBindingSweep(silence time.Duration) ServiceOption {
+	return func(s *Service) {
+		s.bindingSweep = true
+		if silence > 0 {
+			s.bindingSweepSilence = silence
 		}
 	}
 }

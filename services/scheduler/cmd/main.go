@@ -110,6 +110,10 @@ func main() {
 		if cfg.Scheduler.Routing.ProjectionAuthoritative {
 			serviceOpts = append(serviceOpts, scheduler.WithAuthoritativeProjection(cfg.Scheduler.MaxProjectionTTL))
 		}
+		if cfg.Scheduler.Routing.BindingSweep {
+			serviceOpts = append(serviceOpts, scheduler.WithBindingSweep(cfg.Scheduler.BindingSweepSilence))
+		}
+		announceBindingSweep(logger, cfg)
 		svc := scheduler.NewService(
 			logger,
 			registry,
@@ -119,6 +123,10 @@ func main() {
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		go svc.RunRegistryReconcile(sigCtx, cfg.Scheduler.Registry.ReconcileInterval)
+		// Started unconditionally; the switch inside decides. See the note on
+		// Service.RunBindingSweep for why the condition lives there and not
+		// here.
+		go svc.RunBindingSweep(sigCtx, cfg.Scheduler.BindingSweepInterval)
 		schedulerv1.RegisterSchedulerServer(g, svc)
 
 		if registryWriter != nil {
@@ -271,6 +279,54 @@ func main() {
 	if err := <-serveErrCh; err != nil {
 		logger.Fatal("serve failed", zap.Error(err))
 	}
+}
+
+// announceBindingSweep publishes the sweep's position and says the two things
+// an operator cannot work out from the switch alone.
+//
+// 🔴 A query-only replica never reaches this. It has no node registry, no
+// heartbeats and no discovery, so it has no standing to decide any node has
+// gone — and the gauge stays at zero there, which is the truth about that
+// process rather than a copy of the primary's setting.
+func announceBindingSweep(logger *zap.Logger, cfg config.Config) {
+	enabled := cfg.Scheduler.Routing.BindingSweep
+	silence := cfg.Scheduler.BindingSweepSilence
+	scheduler.SetBindingSweep(enabled, silence)
+	if !enabled {
+		// 🔴 Warned about, not merely left at the default. With the write
+		// switch on and no sweep, a node that dies hard leaves every record it
+		// installed pointing at it for the record's full budget — up to
+		// max_projection_ttl — and nothing on either read path cross-checks it.
+		if cfg.Scheduler.Routing.ProjectionAuthoritative {
+			logger.Warn("scheduler binding sweep is OFF while the routing projection is authoritative: a node that dies without unregistering strands every record it installed for up to max_projection_ttl",
+				zap.String("setting", "scheduler.routing.binding_sweep"),
+				zap.String("env", "SCHEDULER_ROUTING_BINDING_SWEEP"),
+				zap.Duration("max_projection_ttl", cfg.Scheduler.MaxProjectionTTL),
+			)
+		}
+		return
+	}
+
+	// 🔴 The one ordering the sweep depends on. The roster fallback answers for
+	// any node whose last heartbeat is within report_ttl, so a threshold at or
+	// below it retires a record the fallback immediately re-answers with the
+	// same dead node: the sweep becomes a no-op that also costs a lookup.
+	if silence <= cfg.Scheduler.ReportTTL {
+		logger.Warn("scheduler binding sweep threshold is not above the report TTL, so the heartbeat roster will keep answering for nodes whose records it retires",
+			zap.Duration("binding_sweep_silence", silence),
+			zap.Duration("report_ttl", cfg.Scheduler.ReportTTL),
+			zap.String("env", "SCHEDULER_BINDING_SWEEP_SILENCE"),
+		)
+	}
+	if !cfg.Scheduler.Routing.ProjectionAuthoritative {
+		logger.Info("scheduler binding sweep is on while the routing projection is ephemeral: records expire on binding_ttl on their own, so the sweep will rarely find one left to retire",
+			zap.Duration("binding_ttl", cfg.Scheduler.BindingTTL),
+		)
+	}
+	logger.Info("scheduler binding sweep enabled",
+		zap.Duration("silence_threshold", silence),
+		zap.Duration("interval", cfg.Scheduler.BindingSweepInterval),
+	)
 }
 
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {

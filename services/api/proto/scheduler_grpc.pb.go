@@ -965,3 +965,561 @@ var PausedRegistry_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "api/proto/scheduler.proto",
 }
+
+const (
+	SnapshotCatalog_BeginSnapshot_FullMethodName   = "/scheduler.v1.SnapshotCatalog/BeginSnapshot"
+	SnapshotCatalog_CommitSnapshot_FullMethodName  = "/scheduler.v1.SnapshotCatalog/CommitSnapshot"
+	SnapshotCatalog_FailSnapshot_FullMethodName    = "/scheduler.v1.SnapshotCatalog/FailSnapshot"
+	SnapshotCatalog_GetSnapshot_FullMethodName     = "/scheduler.v1.SnapshotCatalog/GetSnapshot"
+	SnapshotCatalog_ListSnapshots_FullMethodName   = "/scheduler.v1.SnapshotCatalog/ListSnapshots"
+	SnapshotCatalog_DeleteSnapshot_FullMethodName  = "/scheduler.v1.SnapshotCatalog/DeleteSnapshot"
+	SnapshotCatalog_ResolveAlias_FullMethodName    = "/scheduler.v1.SnapshotCatalog/ResolveAlias"
+	SnapshotCatalog_StartBuild_FullMethodName      = "/scheduler.v1.SnapshotCatalog/StartBuild"
+	SnapshotCatalog_RenewBuildLease_FullMethodName = "/scheduler.v1.SnapshotCatalog/RenewBuildLease"
+	SnapshotCatalog_GetBuild_FullMethodName        = "/scheduler.v1.SnapshotCatalog/GetBuild"
+)
+
+// SnapshotCatalogClient is the client API for SnapshotCatalog service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SnapshotCatalog: the snapshot and template catalog, served by whoever owns
+// the database instead of by every node against it directly.
+//
+// Same shape and the same reason as PausedRegistry above. The reason worth
+// restating is the one that decided it: only a catalog that lives beside
+// `paused_sandboxes` can put a pause's registry transition and the catalog's
+// own row in *one* statement. A node holding its own connection would have two,
+// on two sockets, and "paused but absent from the catalog" would stay a window
+// that exists. Every write RPC below therefore carries an optional
+// CatalogPausedTransition, and that field is the whole point of the service.
+//
+// 🔴 The payload is opaque here and must stay opaque. `committed_payload` is a
+// CommittedSnapshot as the node serialised it; `build_error_json` is a
+// TemplateBuildErrorReason, which has a hand-written Deserialize with a legacy
+// string form. Neither has a Go type, neither may grow one. What this service
+// is allowed to know is the scalar columns — enough to index, filter, order and
+// fence, and nothing else. A Go struct mirroring CommittedSnapshot is the
+// failure this note exists to prevent: it makes the node's domain model a
+// cross-process contract, and the phase after this one begins by deleting the
+// process on the other end.
+//
+// 🔴 Milliseconds, not the microseconds PausedRegistry uses. The two services
+// disagree on purpose: `paused_sandboxes` stores timestamptz, whose resolution
+// is a microsecond, while the catalog's time columns are BIGINT milliseconds
+// because SnapshotRecord.created_at_unix_ms is an i64 of milliseconds and the
+// public pagination cursor is rendered from it. Passing microseconds here would
+// round-trip a cursor through a unit it does not have and land the boundary on
+// the wrong row. The one exception is inside CatalogPausedTransition, which
+// speaks to the other table and keeps that table's unit.
+//
+// 🔴 A refusal this service expects is an outcome, not a status code. A commit
+// that lost its fence, an alias somebody else holds, a template already
+// building — the caller branches on all three, and a gRPC code cannot carry
+// which row won or what the status is now. Status codes stay for the failures
+// nobody can act on: UNAVAILABLE until the migration has run, and the usual
+// transport faults. No method may report a failure as an empty success.
+// ─────────────────────────────────────────────────────────────────────────────
+type SnapshotCatalogClient interface {
+	// Creates the catalog row before any bytes exist: a template at `waiting`, or
+	// the `building` row a pause opens. Carries begin_pause when it is a pause.
+	BeginSnapshot(ctx context.Context, in *BeginSnapshotRequest, opts ...grpc.CallOption) (*BeginSnapshotResponse, error)
+	// Flips a row to `ready` — the only writer that does. Fenced on the row still
+	// being `building`. Carries complete_pause, or mark_local_only when the bytes
+	// reached the node but not the shared repository.
+	CommitSnapshot(ctx context.Context, in *CommitSnapshotRequest, opts ...grpc.CallOption) (*CommitSnapshotResponse, error)
+	// Moves a row to `error` with a reason. Covers a failed template build and a
+	// pause whose publish produced no payload at all.
+	FailSnapshot(ctx context.Context, in *FailSnapshotRequest, opts ...grpc.CallOption) (*FailSnapshotResponse, error)
+	// Reads one row by id or alias.
+	GetSnapshot(ctx context.Context, in *GetSnapshotRequest, opts ...grpc.CallOption) (*GetSnapshotResponse, error)
+	// Reads one keyset page.
+	ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error)
+	// Soft-deletes one row and drops the alias that pointed at it.
+	DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*DeleteSnapshotResponse, error)
+	// Resolves an alias to the snapshot id it currently names.
+	ResolveAlias(ctx context.Context, in *ResolveAliasRequest, opts ...grpc.CallOption) (*ResolveAliasResponse, error)
+	// Admits one build: the cluster-wide cap, the per-template exclusion and the
+	// waiting -> building transition, in one transaction.
+	StartBuild(ctx context.Context, in *StartBuildRequest, opts ...grpc.CallOption) (*StartBuildResponse, error)
+	// Says the builder is still alive. A build that stops saying so is reaped,
+	// and the answer tells the builder it was.
+	RenewBuildLease(ctx context.Context, in *RenewBuildLeaseRequest, opts ...grpc.CallOption) (*RenewBuildLeaseResponse, error)
+	// Reads one build row, deliberately without the `ready` predicate every
+	// resolving query carries: this endpoint exists to look at builds that are
+	// still running or have failed.
+	GetBuild(ctx context.Context, in *GetBuildRequest, opts ...grpc.CallOption) (*GetBuildResponse, error)
+}
+
+type snapshotCatalogClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSnapshotCatalogClient(cc grpc.ClientConnInterface) SnapshotCatalogClient {
+	return &snapshotCatalogClient{cc}
+}
+
+func (c *snapshotCatalogClient) BeginSnapshot(ctx context.Context, in *BeginSnapshotRequest, opts ...grpc.CallOption) (*BeginSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BeginSnapshotResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_BeginSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) CommitSnapshot(ctx context.Context, in *CommitSnapshotRequest, opts ...grpc.CallOption) (*CommitSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CommitSnapshotResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_CommitSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) FailSnapshot(ctx context.Context, in *FailSnapshotRequest, opts ...grpc.CallOption) (*FailSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FailSnapshotResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_FailSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) GetSnapshot(ctx context.Context, in *GetSnapshotRequest, opts ...grpc.CallOption) (*GetSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSnapshotResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_GetSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSnapshotsResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_ListSnapshots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) DeleteSnapshot(ctx context.Context, in *DeleteSnapshotRequest, opts ...grpc.CallOption) (*DeleteSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSnapshotResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_DeleteSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) ResolveAlias(ctx context.Context, in *ResolveAliasRequest, opts ...grpc.CallOption) (*ResolveAliasResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveAliasResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_ResolveAlias_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) StartBuild(ctx context.Context, in *StartBuildRequest, opts ...grpc.CallOption) (*StartBuildResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartBuildResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_StartBuild_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) RenewBuildLease(ctx context.Context, in *RenewBuildLeaseRequest, opts ...grpc.CallOption) (*RenewBuildLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewBuildLeaseResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_RenewBuildLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *snapshotCatalogClient) GetBuild(ctx context.Context, in *GetBuildRequest, opts ...grpc.CallOption) (*GetBuildResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetBuildResponse)
+	err := c.cc.Invoke(ctx, SnapshotCatalog_GetBuild_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SnapshotCatalogServer is the server API for SnapshotCatalog service.
+// All implementations must embed UnimplementedSnapshotCatalogServer
+// for forward compatibility.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SnapshotCatalog: the snapshot and template catalog, served by whoever owns
+// the database instead of by every node against it directly.
+//
+// Same shape and the same reason as PausedRegistry above. The reason worth
+// restating is the one that decided it: only a catalog that lives beside
+// `paused_sandboxes` can put a pause's registry transition and the catalog's
+// own row in *one* statement. A node holding its own connection would have two,
+// on two sockets, and "paused but absent from the catalog" would stay a window
+// that exists. Every write RPC below therefore carries an optional
+// CatalogPausedTransition, and that field is the whole point of the service.
+//
+// 🔴 The payload is opaque here and must stay opaque. `committed_payload` is a
+// CommittedSnapshot as the node serialised it; `build_error_json` is a
+// TemplateBuildErrorReason, which has a hand-written Deserialize with a legacy
+// string form. Neither has a Go type, neither may grow one. What this service
+// is allowed to know is the scalar columns — enough to index, filter, order and
+// fence, and nothing else. A Go struct mirroring CommittedSnapshot is the
+// failure this note exists to prevent: it makes the node's domain model a
+// cross-process contract, and the phase after this one begins by deleting the
+// process on the other end.
+//
+// 🔴 Milliseconds, not the microseconds PausedRegistry uses. The two services
+// disagree on purpose: `paused_sandboxes` stores timestamptz, whose resolution
+// is a microsecond, while the catalog's time columns are BIGINT milliseconds
+// because SnapshotRecord.created_at_unix_ms is an i64 of milliseconds and the
+// public pagination cursor is rendered from it. Passing microseconds here would
+// round-trip a cursor through a unit it does not have and land the boundary on
+// the wrong row. The one exception is inside CatalogPausedTransition, which
+// speaks to the other table and keeps that table's unit.
+//
+// 🔴 A refusal this service expects is an outcome, not a status code. A commit
+// that lost its fence, an alias somebody else holds, a template already
+// building — the caller branches on all three, and a gRPC code cannot carry
+// which row won or what the status is now. Status codes stay for the failures
+// nobody can act on: UNAVAILABLE until the migration has run, and the usual
+// transport faults. No method may report a failure as an empty success.
+// ─────────────────────────────────────────────────────────────────────────────
+type SnapshotCatalogServer interface {
+	// Creates the catalog row before any bytes exist: a template at `waiting`, or
+	// the `building` row a pause opens. Carries begin_pause when it is a pause.
+	BeginSnapshot(context.Context, *BeginSnapshotRequest) (*BeginSnapshotResponse, error)
+	// Flips a row to `ready` — the only writer that does. Fenced on the row still
+	// being `building`. Carries complete_pause, or mark_local_only when the bytes
+	// reached the node but not the shared repository.
+	CommitSnapshot(context.Context, *CommitSnapshotRequest) (*CommitSnapshotResponse, error)
+	// Moves a row to `error` with a reason. Covers a failed template build and a
+	// pause whose publish produced no payload at all.
+	FailSnapshot(context.Context, *FailSnapshotRequest) (*FailSnapshotResponse, error)
+	// Reads one row by id or alias.
+	GetSnapshot(context.Context, *GetSnapshotRequest) (*GetSnapshotResponse, error)
+	// Reads one keyset page.
+	ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error)
+	// Soft-deletes one row and drops the alias that pointed at it.
+	DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error)
+	// Resolves an alias to the snapshot id it currently names.
+	ResolveAlias(context.Context, *ResolveAliasRequest) (*ResolveAliasResponse, error)
+	// Admits one build: the cluster-wide cap, the per-template exclusion and the
+	// waiting -> building transition, in one transaction.
+	StartBuild(context.Context, *StartBuildRequest) (*StartBuildResponse, error)
+	// Says the builder is still alive. A build that stops saying so is reaped,
+	// and the answer tells the builder it was.
+	RenewBuildLease(context.Context, *RenewBuildLeaseRequest) (*RenewBuildLeaseResponse, error)
+	// Reads one build row, deliberately without the `ready` predicate every
+	// resolving query carries: this endpoint exists to look at builds that are
+	// still running or have failed.
+	GetBuild(context.Context, *GetBuildRequest) (*GetBuildResponse, error)
+	mustEmbedUnimplementedSnapshotCatalogServer()
+}
+
+// UnimplementedSnapshotCatalogServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSnapshotCatalogServer struct{}
+
+func (UnimplementedSnapshotCatalogServer) BeginSnapshot(context.Context, *BeginSnapshotRequest) (*BeginSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginSnapshot not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) CommitSnapshot(context.Context, *CommitSnapshotRequest) (*CommitSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CommitSnapshot not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) FailSnapshot(context.Context, *FailSnapshotRequest) (*FailSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FailSnapshot not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) GetSnapshot(context.Context, *GetSnapshotRequest) (*GetSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSnapshot not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSnapshots not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) DeleteSnapshot(context.Context, *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSnapshot not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) ResolveAlias(context.Context, *ResolveAliasRequest) (*ResolveAliasResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveAlias not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) StartBuild(context.Context, *StartBuildRequest) (*StartBuildResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartBuild not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) RenewBuildLease(context.Context, *RenewBuildLeaseRequest) (*RenewBuildLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewBuildLease not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) GetBuild(context.Context, *GetBuildRequest) (*GetBuildResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetBuild not implemented")
+}
+func (UnimplementedSnapshotCatalogServer) mustEmbedUnimplementedSnapshotCatalogServer() {}
+func (UnimplementedSnapshotCatalogServer) testEmbeddedByValue()                         {}
+
+// UnsafeSnapshotCatalogServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SnapshotCatalogServer will
+// result in compilation errors.
+type UnsafeSnapshotCatalogServer interface {
+	mustEmbedUnimplementedSnapshotCatalogServer()
+}
+
+func RegisterSnapshotCatalogServer(s grpc.ServiceRegistrar, srv SnapshotCatalogServer) {
+	// If the following call panics, it indicates UnimplementedSnapshotCatalogServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SnapshotCatalog_ServiceDesc, srv)
+}
+
+func _SnapshotCatalog_BeginSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).BeginSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_BeginSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).BeginSnapshot(ctx, req.(*BeginSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_CommitSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).CommitSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_CommitSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).CommitSnapshot(ctx, req.(*CommitSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_FailSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FailSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).FailSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_FailSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).FailSnapshot(ctx, req.(*FailSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_GetSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).GetSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_GetSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).GetSnapshot(ctx, req.(*GetSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_ListSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSnapshotsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).ListSnapshots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_ListSnapshots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).ListSnapshots(ctx, req.(*ListSnapshotsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_DeleteSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).DeleteSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_DeleteSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).DeleteSnapshot(ctx, req.(*DeleteSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_ResolveAlias_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveAliasRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).ResolveAlias(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_ResolveAlias_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).ResolveAlias(ctx, req.(*ResolveAliasRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_StartBuild_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartBuildRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).StartBuild(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_StartBuild_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).StartBuild(ctx, req.(*StartBuildRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_RenewBuildLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewBuildLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).RenewBuildLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_RenewBuildLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).RenewBuildLease(ctx, req.(*RenewBuildLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SnapshotCatalog_GetBuild_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetBuildRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SnapshotCatalogServer).GetBuild(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SnapshotCatalog_GetBuild_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SnapshotCatalogServer).GetBuild(ctx, req.(*GetBuildRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SnapshotCatalog_ServiceDesc is the grpc.ServiceDesc for SnapshotCatalog service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SnapshotCatalog_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "scheduler.v1.SnapshotCatalog",
+	HandlerType: (*SnapshotCatalogServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "BeginSnapshot",
+			Handler:    _SnapshotCatalog_BeginSnapshot_Handler,
+		},
+		{
+			MethodName: "CommitSnapshot",
+			Handler:    _SnapshotCatalog_CommitSnapshot_Handler,
+		},
+		{
+			MethodName: "FailSnapshot",
+			Handler:    _SnapshotCatalog_FailSnapshot_Handler,
+		},
+		{
+			MethodName: "GetSnapshot",
+			Handler:    _SnapshotCatalog_GetSnapshot_Handler,
+		},
+		{
+			MethodName: "ListSnapshots",
+			Handler:    _SnapshotCatalog_ListSnapshots_Handler,
+		},
+		{
+			MethodName: "DeleteSnapshot",
+			Handler:    _SnapshotCatalog_DeleteSnapshot_Handler,
+		},
+		{
+			MethodName: "ResolveAlias",
+			Handler:    _SnapshotCatalog_ResolveAlias_Handler,
+		},
+		{
+			MethodName: "StartBuild",
+			Handler:    _SnapshotCatalog_StartBuild_Handler,
+		},
+		{
+			MethodName: "RenewBuildLease",
+			Handler:    _SnapshotCatalog_RenewBuildLease_Handler,
+		},
+		{
+			MethodName: "GetBuild",
+			Handler:    _SnapshotCatalog_GetBuild_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "api/proto/scheduler.proto",
+}

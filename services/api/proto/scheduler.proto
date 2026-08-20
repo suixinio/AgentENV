@@ -856,3 +856,565 @@ message ReleaseNodeHoldingsResponse {
   // to rebuild the sandbox from.
   uint64 discarded = 2;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SnapshotCatalog: the snapshot and template catalog, served by whoever owns
+// the database instead of by every node against it directly.
+//
+// Same shape and the same reason as PausedRegistry above. The reason worth
+// restating is the one that decided it: only a catalog that lives beside
+// `paused_sandboxes` can put a pause's registry transition and the catalog's
+// own row in *one* statement. A node holding its own connection would have two,
+// on two sockets, and "paused but absent from the catalog" would stay a window
+// that exists. Every write RPC below therefore carries an optional
+// CatalogPausedTransition, and that field is the whole point of the service.
+//
+// 🔴 The payload is opaque here and must stay opaque. `committed_payload` is a
+// CommittedSnapshot as the node serialised it; `build_error_json` is a
+// TemplateBuildErrorReason, which has a hand-written Deserialize with a legacy
+// string form. Neither has a Go type, neither may grow one. What this service
+// is allowed to know is the scalar columns — enough to index, filter, order and
+// fence, and nothing else. A Go struct mirroring CommittedSnapshot is the
+// failure this note exists to prevent: it makes the node's domain model a
+// cross-process contract, and the phase after this one begins by deleting the
+// process on the other end.
+//
+// 🔴 Milliseconds, not the microseconds PausedRegistry uses. The two services
+// disagree on purpose: `paused_sandboxes` stores timestamptz, whose resolution
+// is a microsecond, while the catalog's time columns are BIGINT milliseconds
+// because SnapshotRecord.created_at_unix_ms is an i64 of milliseconds and the
+// public pagination cursor is rendered from it. Passing microseconds here would
+// round-trip a cursor through a unit it does not have and land the boundary on
+// the wrong row. The one exception is inside CatalogPausedTransition, which
+// speaks to the other table and keeps that table's unit.
+//
+// 🔴 A refusal this service expects is an outcome, not a status code. A commit
+// that lost its fence, an alias somebody else holds, a template already
+// building — the caller branches on all three, and a gRPC code cannot carry
+// which row won or what the status is now. Status codes stay for the failures
+// nobody can act on: UNAVAILABLE until the migration has run, and the usual
+// transport faults. No method may report a failure as an empty success.
+// ─────────────────────────────────────────────────────────────────────────────
+service SnapshotCatalog {
+  // Creates the catalog row before any bytes exist: a template at `waiting`, or
+  // the `building` row a pause opens. Carries begin_pause when it is a pause.
+  rpc BeginSnapshot(BeginSnapshotRequest) returns (BeginSnapshotResponse);
+
+  // Flips a row to `ready` — the only writer that does. Fenced on the row still
+  // being `building`. Carries complete_pause, or mark_local_only when the bytes
+  // reached the node but not the shared repository.
+  rpc CommitSnapshot(CommitSnapshotRequest) returns (CommitSnapshotResponse);
+
+  // Moves a row to `error` with a reason. Covers a failed template build and a
+  // pause whose publish produced no payload at all.
+  rpc FailSnapshot(FailSnapshotRequest) returns (FailSnapshotResponse);
+
+  // Reads one row by id or alias.
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+
+  // Reads one keyset page.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+  // Soft-deletes one row and drops the alias that pointed at it.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+
+  // Resolves an alias to the snapshot id it currently names.
+  rpc ResolveAlias(ResolveAliasRequest) returns (ResolveAliasResponse);
+
+  // Admits one build: the cluster-wide cap, the per-template exclusion and the
+  // waiting -> building transition, in one transaction.
+  rpc StartBuild(StartBuildRequest) returns (StartBuildResponse);
+
+  // Says the builder is still alive. A build that stops saying so is reaped,
+  // and the answer tells the builder it was.
+  rpc RenewBuildLease(RenewBuildLeaseRequest) returns (RenewBuildLeaseResponse);
+
+  // Reads one build row, deliberately without the `ready` predicate every
+  // resolving query carries: this endpoint exists to look at builds that are
+  // still running or have failed.
+  rpc GetBuild(GetBuildRequest) returns (GetBuildResponse);
+}
+
+// SnapshotRow is one catalog row, scalar columns plus two opaque blobs.
+message SnapshotRow {
+  string snapshot_id = 1;
+  string cluster_id = 2;
+
+  // One of `template`, `sandbox`. A string rather than an enum for the reason
+  // RegistryEntry.state gives: the table's CHECK constraint is the source of
+  // truth and it belongs to whoever migrates the database, so a value this
+  // build has not heard of must reach a screen intact rather than flatten into
+  // UNSPECIFIED beside a genuinely absent one.
+  string source_kind = 3;
+  // Set exactly when source_kind is `sandbox`; the table's CHECK pins the
+  // equivalence in both directions.
+  string source_sandbox_id = 4;
+
+  uint32 cpu_count = 5;
+  uint32 memory_mib = 6;
+  uint32 disk_size_mib = 7;
+
+  // One of `waiting`, `building`, `ready`, `error`. See source_kind on why it
+  // is a string.
+  string status = 8;
+  // One of `pending`, `in_progress`, `ready`, `failed`. Derived from `status`
+  // by a trigger and never written by a caller — it is here so a reader does
+  // not have to re-derive the mapping the partial indexes were built on.
+  string status_group = 9;
+
+  // Empty when no alias points here. At most one does; the catalog holds that
+  // to one with a unique index, because SnapshotRecord.alias is an Option and
+  // not a collection, and a second row would duplicate this snapshot inside a
+  // page that joins the two tables.
+  string alias = 10;
+
+  int64 created_at_unix_ms = 11;
+  int64 updated_at_unix_ms = 12;
+  // When the sandbox this snapshot was taken from first started. Absent for
+  // template rows and for older writers.
+  optional int64 sandbox_started_at_unix_ms = 13;
+
+  // 🔴 A CommittedSnapshot exactly as the node serialised it. Empty means the
+  // row has no payload — which the table states as `status <> 'ready' OR
+  // committed_payload IS NOT NULL`, so an empty payload here and a `ready`
+  // status cannot both be true. Empty is safe as "absent" because no
+  // serialisation of that type is zero bytes.
+  bytes committed_payload = 14;
+  // Which version of the payload encoding this is. Absent exactly when the
+  // payload is. The node refuses a version it does not know; nothing here
+  // interprets it.
+  optional uint32 committed_schema = 15;
+
+  // 🔴 A TemplateBuildErrorReason as JSON, passed through untouched. Empty when
+  // the row is not in error. Not google.protobuf.Struct, for the reason
+  // TransitionSandboxRequest.metadata_json gives.
+  bytes build_error_json = 16;
+
+  // Projected from the `builds` row when the caller asked for it, so a template
+  // row can be rendered as a TemplateBuildInfo without a second round trip.
+  // Both absent when no build has been started yet.
+  optional int64 build_started_at_unix_ms = 17;
+  optional int64 build_finished_at_unix_ms = 18;
+
+  // ── origin pinning ──────────────────────────────────────────────────────
+  //
+  // 🔴 These two are a block, and they are numbered away from everything else
+  // so that removing them is a removal. The day `local_only` stops happening,
+  // the catalog drops two columns, this service drops these two fields into
+  // `reserved`, and nothing above renumbers. Keeping them at 100 is what makes
+  // that true — appending them after field 18 would put the next field added
+  // on top of the hole they leave.
+  //
+  // published=false means the bytes never left the node named below, so only
+  // that node can start this snapshot. published=true leaves origin_node_id as
+  // a placement hint that may be empty and may be wrong; a hint that misses is
+  // not an error and must not send anything back to the named node.
+  //
+  // 🔴 Neither is a filter. A snapshot that failed to publish is a complete,
+  // runnable snapshot — it is `ready` — and listing hides it from nobody. The
+  // one consumer is the function that decides where a resume may run.
+  bool published = 100;
+  string origin_node_id = 101;
+}
+
+// BuildRow is one row of the build queue.
+message BuildRow {
+  string build_id = 1;
+  // Today the API forces this equal to build_id. The column is separate anyway:
+  // splitting a table later costs far more than carrying two ids that happen to
+  // match.
+  string template_id = 2;
+  string cluster_id = 3;
+  // See SnapshotRow.status / .status_group.
+  string status = 4;
+  string status_group = 5;
+  // The machine running this build. Empty for a queued build nobody has taken.
+  string node_id = 6;
+  // When the builder last said it was alive. Absent means it never has, which
+  // is why the reaper only acts on rows that carry one.
+  optional int64 heartbeat_at_unix_ms = 7;
+  int64 created_at_unix_ms = 8;
+  optional int64 started_at_unix_ms = 9;
+  optional int64 finished_at_unix_ms = 10;
+  // A TemplateBuildErrorReason as JSON. See SnapshotRow.build_error_json.
+  bytes error_reason_json = 11;
+}
+
+// CatalogPausedTransition is the `paused_sandboxes` half of a catalog write.
+//
+// 🔴 This is why the catalog is served here rather than read by the node. The
+// server puts this transition and the catalog row in one statement, so a pause
+// cannot end up recorded in one table and not the other. Absent means there is
+// no registry half — the template build path, which has no sandbox.
+//
+// The fields mirror TransitionSandboxRequest, including its units: this half
+// writes timestamptz columns and keeps microseconds while everything else on
+// this service is milliseconds.
+message CatalogPausedTransition {
+  // Which transition to apply. BEGIN_PAUSE on BeginSnapshot; COMPLETE_PAUSE or
+  // MARK_LOCAL_ONLY on CommitSnapshot; MARK_LOCAL_ONLY on FailSnapshot. Any
+  // other value is refused rather than ignored.
+  TransitionKind kind = 1;
+  string sandbox_id = 2;
+  // Required on COMPLETE_PAUSE and MARK_LOCAL_ONLY, refused on BEGIN_PAUSE,
+  // which creates or takes over a row and has nothing to quote.
+  optional int64 expect_generation = 3;
+  // Raw JSON, passed through untouched. BEGIN_PAUSE only.
+  bytes metadata_json = 4;
+  // The lease TTL belongs to the node; see TransitionSandboxRequest.
+  int64 lease_ttl_millis = 5;
+  // Which incarnation is writing. Required on BEGIN_PAUSE.
+  string execution_id = 6;
+  // 🔴 Microseconds, matching the column. See the note on this message.
+  optional int64 sandbox_expires_at_unix_micros = 7;
+}
+
+// CatalogRejection is a refusal the caller has to act on, as opposed to a
+// failure it can only report.
+enum CatalogRejection {
+  CATALOG_REJECTION_UNSPECIFIED = 0;
+  // No row with that id, or none that has not been soft-deleted.
+  CATALOG_REJECTION_NOT_FOUND = 1;
+  // The fencing predicate did not match: the row is no longer in the status
+  // this call acts from. observed_status says what it is now.
+  CATALOG_REJECTION_STATUS_MISMATCH = 2;
+  // The alias is bound to another live snapshot, named by
+  // alias_holder_snapshot_id. The whole write is refused rather than committed
+  // without the alias, which is what the object-store backend does today.
+  CATALOG_REJECTION_ALIAS_TAKEN = 3;
+  // The `paused_sandboxes` half moved since the caller last read it. Re-read
+  // and try again — this is the Aborted case, not the terminal one.
+  CATALOG_REJECTION_GENERATION_MISMATCH = 4;
+  // 🔴 Terminal. A superseded incarnation tried to write. The caller must not
+  // retry, must not publish behind it, and must not delete the snapshot it was
+  // about to replace. Named `sandbox_execution_superseded` wherever this has to
+  // be a string, exactly as on PausedRegistry.
+  CATALOG_REJECTION_EXECUTION_SUPERSEDED = 5;
+  // Another build for this template is already pending or in progress, named by
+  // active_build_id. The partial unique index is what decides this.
+  CATALOG_REJECTION_BUILD_IN_PROGRESS = 6;
+  // The cluster is at its concurrent-build ceiling. Retryable, unlike the one
+  // above: nothing about this template is wrong.
+  CATALOG_REJECTION_BUILD_QUEUE_FULL = 7;
+  // A row with this id already exists. BeginSnapshot only.
+  CATALOG_REJECTION_ALREADY_EXISTS = 8;
+}
+
+// CatalogRejected carries the refusal and whatever the caller needs to act on
+// it. Every field but `reason` is set only for the reasons that name it.
+message CatalogRejected {
+  CatalogRejection reason = 1;
+  // STATUS_MISMATCH: the status the row carries now.
+  string observed_status = 2;
+  // ALIAS_TAKEN: who holds it.
+  string alias_holder_snapshot_id = 3;
+  // BUILD_IN_PROGRESS: which build is holding the template.
+  string active_build_id = 4;
+  // GENERATION_MISMATCH: the generation the registry row carries now, so the
+  // caller can re-read against a number rather than blind.
+  optional int64 observed_generation = 5;
+}
+
+message BeginSnapshotRequest {
+  string cluster_id = 1;
+  // The node making the request. For a pause this is where the bytes are going
+  // to land, which is why it is also the origin below.
+  string node_id = 2;
+
+  string snapshot_id = 3;
+  // `template` or `sandbox`; see SnapshotRow.source_kind. Immutable once set —
+  // CommitSnapshot cannot change it.
+  string source_kind = 4;
+  string source_sandbox_id = 5;
+
+  uint32 cpu_count = 6;
+  uint32 memory_mib = 7;
+  uint32 disk_size_mib = 8;
+
+  // Bound in the same transaction as the row. Empty means no alias. An alias
+  // another live snapshot holds refuses the whole call — see ALIAS_TAKEN.
+  string alias = 9;
+
+  // The node's clock, not the database's. The catalog stores what the node
+  // recorded so a row and its object-store mirror carry the same instant during
+  // the double-write phase; a server-side now() would make every mirrored row
+  // differ by the RPC's latency.
+  int64 created_at_unix_ms = 10;
+  optional int64 sandbox_started_at_unix_ms = 11;
+
+  // 🔴 Written, never checked, in this phase. It is here so that the phase that
+  // runs several writers can add the predicate without a migration that has to
+  // backfill a column onto rows already in flight.
+  string publishing_execution_id = 12;
+
+  // The registry half; absent for a template build.
+  optional CatalogPausedTransition paused_transition = 13;
+
+  // Which status the new row starts in: `waiting` for a template nobody has
+  // built yet, `building` for a pause that is already writing bytes. Refused
+  // for any other value — a row cannot be born `ready`, because `ready`
+  // requires a payload and there is none yet.
+  string status = 14;
+
+  // See SnapshotRow. A pause opens its row unpublished and names itself; a
+  // template row is born published with no origin, because nothing is on any
+  // node yet.
+  bool published = 100;
+  string origin_node_id = 101;
+}
+
+message BeginSnapshotResponse {
+  oneof outcome {
+    BeganSnapshot began = 1;
+    CatalogRejected rejected = 2;
+  }
+}
+
+message BeganSnapshot {
+  SnapshotRow row = 1;
+  // BEGIN_PAUSE only: the generation to quote when finishing.
+  optional int64 generation = 2;
+  // BEGIN_PAUSE only: the snapshot this pause replaced, empty when there was
+  // none. Nothing references it once the pause completes.
+  string previous_snapshot_id = 3;
+}
+
+message CommitSnapshotRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  string snapshot_id = 3;
+
+  // 🔴 Required and non-empty. The table refuses a `ready` row without one, and
+  // this is the only call that produces a `ready` row.
+  bytes committed_payload = 4;
+  uint32 committed_schema = 5;
+
+  // Publish metadata may restate the resources; absent means leave the row's.
+  optional uint32 cpu_count = 6;
+  optional uint32 memory_mib = 7;
+  optional uint32 disk_size_mib = 8;
+
+  // Bound in the same transaction. Empty leaves whatever the row already has,
+  // which is not the same as unbinding it — there is no unbind on this call.
+  string alias = 9;
+  int64 updated_at_unix_ms = 10;
+
+  // The registry half; absent for a template build.
+  //
+  // COMPLETE_PAUSE with published=true is the ordinary path. MARK_LOCAL_ONLY
+  // with published=false is the publish that never reached shared storage: the
+  // row still goes `ready`, because the snapshot is complete and the origin can
+  // start it. Which of the two it was is a fact about the sandbox, and it stays
+  // in `paused_sandboxes` rather than being copied here.
+  optional CatalogPausedTransition paused_transition = 11;
+
+  // 🔴 Ignored in this phase, checked in the next. When the catalog has several
+  // writers, a commit whose incarnation is not the one the row was opened under
+  // is EXECUTION_SUPERSEDED. Until then the fence is the status predicate the
+  // server always applies, which the caller cannot turn off.
+  string publishing_execution_id = 12;
+
+  bool published = 100;
+  string origin_node_id = 101;
+}
+
+message CommitSnapshotResponse {
+  oneof outcome {
+    SnapshotRow committed = 1;
+    CatalogRejected rejected = 2;
+  }
+}
+
+message FailSnapshotRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  string snapshot_id = 3;
+  // A TemplateBuildErrorReason as JSON. Required: the table refuses an `error`
+  // row without one, so that "it failed" and "why" cannot come apart.
+  bytes build_error_json = 4;
+  int64 updated_at_unix_ms = 5;
+  // The registry half, when a pause is what failed. MARK_LOCAL_ONLY only.
+  optional CatalogPausedTransition paused_transition = 6;
+  // Ends the build row too, when this snapshot has one in flight. False leaves
+  // it alone, which is what a caller that is only recording a publish failure
+  // wants.
+  bool fail_active_build = 7;
+}
+
+message FailSnapshotResponse {
+  oneof outcome {
+    SnapshotRow failed = 1;
+    CatalogRejected rejected = 2;
+  }
+}
+
+message GetSnapshotRequest {
+  string cluster_id = 1;
+  // A snapshot id or an alias. Which one it is, the server decides — the node's
+  // own get() takes the same union and callers do not know which they hold.
+  string id_or_alias = 2;
+  // 🔴 Whether to apply the `status_group = 'ready'` predicate.
+  //
+  // True for everything that is about to *run* the snapshot, which is the
+  // predicate that stops a half-uploaded snapshot from starting a VM. False for
+  // the endpoint that reports build status, which exists precisely to see rows
+  // that are building or failed. There is no safe default, so it is required of
+  // the caller rather than assumed here.
+  bool only_ready = 3;
+  // Include the build row's timestamps in the answer.
+  bool with_build = 4;
+}
+
+message GetSnapshotResponse {
+  // Absent when there is no such row, or when only_ready excluded it. Not an
+  // error: "no such snapshot" is an answer.
+  optional SnapshotRow row = 1;
+}
+
+// SnapshotCursor is a keyset position: the last row of the previous page.
+//
+// 🔴 Not the public cursor. The public one is a base64url string with an
+// RFC3339 rendering inside it, and it is a response header on an OpenAPI
+// endpoint — changing its shape breaks in-flight clients and makes a rollback
+// lossy. It is parsed and rendered by the node; only the two values it decodes
+// to travel here.
+message SnapshotCursor {
+  int64 created_at_unix_ms = 1;
+  // Compared as text, not as a uuid. The public cursor orders by the id's
+  // string form, and a uuid's binary order is not its text order — comparing
+  // the wrong one skips rows at a page boundary without any error.
+  string snapshot_id = 2;
+}
+
+// SnapshotFilter mirrors the node's SnapshotListFilter field for field. Every
+// field is a conjunct; all empty matches everything the query's own predicates
+// allow.
+message SnapshotFilter {
+  // `template`, `sandbox`, or both. Empty means no restriction.
+  repeated string source_kinds = 1;
+  optional string alias_prefix = 2;
+  repeated string snapshot_ids = 3;
+  // A single id or an exact alias.
+  optional string snapshot_id_or_alias = 4;
+  // Matches sandbox rows only, by construction: template rows have no source
+  // sandbox and the table's CHECK enforces it.
+  optional string source_sandbox_id = 5;
+  // Template build statuses to keep. Matches template rows only.
+  //
+  // 🔴 Meaningful only when only_ready is false. Asking for `building` rows
+  // under the ready predicate is a filter that can never match, and a caller
+  // that does it is reading an empty page as "there are none".
+  repeated string template_statuses = 6;
+}
+
+message ListSnapshotsRequest {
+  string cluster_id = 1;
+  SnapshotFilter filter = 2;
+  // Absent starts at the newest row. The server does not need a sentinel for
+  // that case; the node's own open-ended cursor is one and it does not travel.
+  optional SnapshotCursor cursor = 3;
+  // 🔴 Capped by the server, and a request for none is not a request for all.
+  // The node's HTTP layer treats a missing limit as "every row", which is how a
+  // single request comes to pull ten thousand rows into memory. Here zero means
+  // "the server's default".
+  uint32 limit = 4;
+  // See GetSnapshotRequest.only_ready. The listing endpoints pass true.
+  bool only_ready = 5;
+  bool with_build = 6;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotRow rows = 1;
+  // Absent on the last page. Rendered into the public token by the node.
+  optional SnapshotCursor next_cursor = 2;
+}
+
+message DeleteSnapshotRequest {
+  string cluster_id = 1;
+  // Id or alias, as on GetSnapshotRequest.
+  string id_or_alias = 2;
+  int64 deleted_at_unix_ms = 3;
+}
+
+message DeleteSnapshotResponse {
+  // False when there was nothing to delete. Idempotent by contract, so that is
+  // a success and not a rejection.
+  bool deleted = 1;
+  // The row that was deleted, so the caller can find the artifacts to collect.
+  // Absent when `deleted` is false.
+  optional SnapshotRow row = 2;
+}
+
+message ResolveAliasRequest {
+  string cluster_id = 1;
+  string alias = 2;
+  // See GetSnapshotRequest.only_ready. Resolving in order to run means true.
+  bool only_ready = 3;
+}
+
+message ResolveAliasResponse {
+  // Empty when the alias names nothing — or names a row the ready predicate
+  // excluded, which is the same answer to the caller and deliberately so.
+  string snapshot_id = 1;
+  // 🔴 Projected, never filtered on. Present so a resume can be pinned without
+  // a second read; see the note on SnapshotRow's origin block.
+  bool published = 100;
+  string origin_node_id = 101;
+}
+
+message StartBuildRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  // Today the API forces these equal. Sent separately anyway; see BuildRow.
+  string build_id = 3;
+  string template_id = 4;
+  int64 started_at_unix_ms = 5;
+  // The first heartbeat, stamped by the same statement that admits the build.
+  //
+  // 🔴 Not optional in practice: the reaper only acts on rows carrying one, so
+  // a build admitted without a heartbeat is a build nothing can ever clean up —
+  // and the partial unique index would then block that template forever.
+  int64 heartbeat_at_unix_ms = 6;
+}
+
+message StartBuildResponse {
+  oneof outcome {
+    StartedBuild started = 1;
+    CatalogRejected rejected = 2;
+  }
+}
+
+message StartedBuild {
+  BuildRow build = 1;
+  // The template row as the transition left it: `building`.
+  SnapshotRow snapshot = 2;
+}
+
+message RenewBuildLeaseRequest {
+  string cluster_id = 1;
+  string node_id = 2;
+  string build_id = 3;
+  int64 heartbeat_at_unix_ms = 4;
+}
+
+message RenewBuildLeaseResponse {
+  // 🔴 False means this build is no longer the live one — reaped for a lapsed
+  // heartbeat, or finished by somebody else. The builder must stop, because the
+  // template it holds has already been handed to whoever asked next.
+  //
+  // Nothing else tells it. Without this the reaper frees the row, a second
+  // build starts, and two builders publish into the same template.
+  bool live = 1;
+}
+
+message GetBuildRequest {
+  string cluster_id = 1;
+  string build_id = 2;
+}
+
+message GetBuildResponse {
+  // Absent when there is no such build. 🔴 No ready predicate on this path: it
+  // is the one endpoint whose whole purpose is to see a build that is still
+  // running or has failed.
+  optional BuildRow build = 1;
+}

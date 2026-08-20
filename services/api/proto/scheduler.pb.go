@@ -497,6 +497,92 @@ func (ConflictReason) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{6}
 }
 
+// CatalogRejection is a refusal the caller has to act on, as opposed to a
+// failure it can only report.
+type CatalogRejection int32
+
+const (
+	CatalogRejection_CATALOG_REJECTION_UNSPECIFIED CatalogRejection = 0
+	// No row with that id, or none that has not been soft-deleted.
+	CatalogRejection_CATALOG_REJECTION_NOT_FOUND CatalogRejection = 1
+	// The fencing predicate did not match: the row is no longer in the status
+	// this call acts from. observed_status says what it is now.
+	CatalogRejection_CATALOG_REJECTION_STATUS_MISMATCH CatalogRejection = 2
+	// The alias is bound to another live snapshot, named by
+	// alias_holder_snapshot_id. The whole write is refused rather than committed
+	// without the alias, which is what the object-store backend does today.
+	CatalogRejection_CATALOG_REJECTION_ALIAS_TAKEN CatalogRejection = 3
+	// The `paused_sandboxes` half moved since the caller last read it. Re-read
+	// and try again — this is the Aborted case, not the terminal one.
+	CatalogRejection_CATALOG_REJECTION_GENERATION_MISMATCH CatalogRejection = 4
+	// 🔴 Terminal. A superseded incarnation tried to write. The caller must not
+	// retry, must not publish behind it, and must not delete the snapshot it was
+	// about to replace. Named `sandbox_execution_superseded` wherever this has to
+	// be a string, exactly as on PausedRegistry.
+	CatalogRejection_CATALOG_REJECTION_EXECUTION_SUPERSEDED CatalogRejection = 5
+	// Another build for this template is already pending or in progress, named by
+	// active_build_id. The partial unique index is what decides this.
+	CatalogRejection_CATALOG_REJECTION_BUILD_IN_PROGRESS CatalogRejection = 6
+	// The cluster is at its concurrent-build ceiling. Retryable, unlike the one
+	// above: nothing about this template is wrong.
+	CatalogRejection_CATALOG_REJECTION_BUILD_QUEUE_FULL CatalogRejection = 7
+	// A row with this id already exists. BeginSnapshot only.
+	CatalogRejection_CATALOG_REJECTION_ALREADY_EXISTS CatalogRejection = 8
+)
+
+// Enum value maps for CatalogRejection.
+var (
+	CatalogRejection_name = map[int32]string{
+		0: "CATALOG_REJECTION_UNSPECIFIED",
+		1: "CATALOG_REJECTION_NOT_FOUND",
+		2: "CATALOG_REJECTION_STATUS_MISMATCH",
+		3: "CATALOG_REJECTION_ALIAS_TAKEN",
+		4: "CATALOG_REJECTION_GENERATION_MISMATCH",
+		5: "CATALOG_REJECTION_EXECUTION_SUPERSEDED",
+		6: "CATALOG_REJECTION_BUILD_IN_PROGRESS",
+		7: "CATALOG_REJECTION_BUILD_QUEUE_FULL",
+		8: "CATALOG_REJECTION_ALREADY_EXISTS",
+	}
+	CatalogRejection_value = map[string]int32{
+		"CATALOG_REJECTION_UNSPECIFIED":          0,
+		"CATALOG_REJECTION_NOT_FOUND":            1,
+		"CATALOG_REJECTION_STATUS_MISMATCH":      2,
+		"CATALOG_REJECTION_ALIAS_TAKEN":          3,
+		"CATALOG_REJECTION_GENERATION_MISMATCH":  4,
+		"CATALOG_REJECTION_EXECUTION_SUPERSEDED": 5,
+		"CATALOG_REJECTION_BUILD_IN_PROGRESS":    6,
+		"CATALOG_REJECTION_BUILD_QUEUE_FULL":     7,
+		"CATALOG_REJECTION_ALREADY_EXISTS":       8,
+	}
+)
+
+func (x CatalogRejection) Enum() *CatalogRejection {
+	p := new(CatalogRejection)
+	*p = x
+	return p
+}
+
+func (x CatalogRejection) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CatalogRejection) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[7].Descriptor()
+}
+
+func (CatalogRejection) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[7]
+}
+
+func (x CatalogRejection) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CatalogRejection.Descriptor instead.
+func (CatalogRejection) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{7}
+}
+
 type Node struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -4341,6 +4427,2445 @@ func (x *ReleaseNodeHoldingsResponse) GetDiscarded() uint64 {
 	return 0
 }
 
+// SnapshotRow is one catalog row, scalar columns plus two opaque blobs.
+type SnapshotRow struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotId string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	ClusterId  string                 `protobuf:"bytes,2,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// One of `template`, `sandbox`. A string rather than an enum for the reason
+	// RegistryEntry.state gives: the table's CHECK constraint is the source of
+	// truth and it belongs to whoever migrates the database, so a value this
+	// build has not heard of must reach a screen intact rather than flatten into
+	// UNSPECIFIED beside a genuinely absent one.
+	SourceKind string `protobuf:"bytes,3,opt,name=source_kind,json=sourceKind,proto3" json:"source_kind,omitempty"`
+	// Set exactly when source_kind is `sandbox`; the table's CHECK pins the
+	// equivalence in both directions.
+	SourceSandboxId string `protobuf:"bytes,4,opt,name=source_sandbox_id,json=sourceSandboxId,proto3" json:"source_sandbox_id,omitempty"`
+	CpuCount        uint32 `protobuf:"varint,5,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
+	MemoryMib       uint32 `protobuf:"varint,6,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	DiskSizeMib     uint32 `protobuf:"varint,7,opt,name=disk_size_mib,json=diskSizeMib,proto3" json:"disk_size_mib,omitempty"`
+	// One of `waiting`, `building`, `ready`, `error`. See source_kind on why it
+	// is a string.
+	Status string `protobuf:"bytes,8,opt,name=status,proto3" json:"status,omitempty"`
+	// One of `pending`, `in_progress`, `ready`, `failed`. Derived from `status`
+	// by a trigger and never written by a caller — it is here so a reader does
+	// not have to re-derive the mapping the partial indexes were built on.
+	StatusGroup string `protobuf:"bytes,9,opt,name=status_group,json=statusGroup,proto3" json:"status_group,omitempty"`
+	// Empty when no alias points here. At most one does; the catalog holds that
+	// to one with a unique index, because SnapshotRecord.alias is an Option and
+	// not a collection, and a second row would duplicate this snapshot inside a
+	// page that joins the two tables.
+	Alias           string `protobuf:"bytes,10,opt,name=alias,proto3" json:"alias,omitempty"`
+	CreatedAtUnixMs int64  `protobuf:"varint,11,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
+	UpdatedAtUnixMs int64  `protobuf:"varint,12,opt,name=updated_at_unix_ms,json=updatedAtUnixMs,proto3" json:"updated_at_unix_ms,omitempty"`
+	// When the sandbox this snapshot was taken from first started. Absent for
+	// template rows and for older writers.
+	SandboxStartedAtUnixMs *int64 `protobuf:"varint,13,opt,name=sandbox_started_at_unix_ms,json=sandboxStartedAtUnixMs,proto3,oneof" json:"sandbox_started_at_unix_ms,omitempty"`
+	// 🔴 A CommittedSnapshot exactly as the node serialised it. Empty means the
+	// row has no payload — which the table states as `status <> 'ready' OR
+	// committed_payload IS NOT NULL`, so an empty payload here and a `ready`
+	// status cannot both be true. Empty is safe as "absent" because no
+	// serialisation of that type is zero bytes.
+	CommittedPayload []byte `protobuf:"bytes,14,opt,name=committed_payload,json=committedPayload,proto3" json:"committed_payload,omitempty"`
+	// Which version of the payload encoding this is. Absent exactly when the
+	// payload is. The node refuses a version it does not know; nothing here
+	// interprets it.
+	CommittedSchema *uint32 `protobuf:"varint,15,opt,name=committed_schema,json=committedSchema,proto3,oneof" json:"committed_schema,omitempty"`
+	// 🔴 A TemplateBuildErrorReason as JSON, passed through untouched. Empty when
+	// the row is not in error. Not google.protobuf.Struct, for the reason
+	// TransitionSandboxRequest.metadata_json gives.
+	BuildErrorJson []byte `protobuf:"bytes,16,opt,name=build_error_json,json=buildErrorJson,proto3" json:"build_error_json,omitempty"`
+	// Projected from the `builds` row when the caller asked for it, so a template
+	// row can be rendered as a TemplateBuildInfo without a second round trip.
+	// Both absent when no build has been started yet.
+	BuildStartedAtUnixMs  *int64 `protobuf:"varint,17,opt,name=build_started_at_unix_ms,json=buildStartedAtUnixMs,proto3,oneof" json:"build_started_at_unix_ms,omitempty"`
+	BuildFinishedAtUnixMs *int64 `protobuf:"varint,18,opt,name=build_finished_at_unix_ms,json=buildFinishedAtUnixMs,proto3,oneof" json:"build_finished_at_unix_ms,omitempty"`
+	// ── origin pinning ──────────────────────────────────────────────────────
+	//
+	// 🔴 These two are a block, and they are numbered away from everything else
+	// so that removing them is a removal. The day `local_only` stops happening,
+	// the catalog drops two columns, this service drops these two fields into
+	// `reserved`, and nothing above renumbers. Keeping them at 100 is what makes
+	// that true — appending them after field 18 would put the next field added
+	// on top of the hole they leave.
+	//
+	// published=false means the bytes never left the node named below, so only
+	// that node can start this snapshot. published=true leaves origin_node_id as
+	// a placement hint that may be empty and may be wrong; a hint that misses is
+	// not an error and must not send anything back to the named node.
+	//
+	// 🔴 Neither is a filter. A snapshot that failed to publish is a complete,
+	// runnable snapshot — it is `ready` — and listing hides it from nobody. The
+	// one consumer is the function that decides where a resume may run.
+	Published     bool   `protobuf:"varint,100,opt,name=published,proto3" json:"published,omitempty"`
+	OriginNodeId  string `protobuf:"bytes,101,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotRow) Reset() {
+	*x = SnapshotRow{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[56]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotRow) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotRow) ProtoMessage() {}
+
+func (x *SnapshotRow) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[56]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotRow.ProtoReflect.Descriptor instead.
+func (*SnapshotRow) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{56}
+}
+
+func (x *SnapshotRow) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetSourceKind() string {
+	if x != nil {
+		return x.SourceKind
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetSourceSandboxId() string {
+	if x != nil {
+		return x.SourceSandboxId
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetCpuCount() uint32 {
+	if x != nil {
+		return x.CpuCount
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetMemoryMib() uint32 {
+	if x != nil {
+		return x.MemoryMib
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetDiskSizeMib() uint32 {
+	if x != nil {
+		return x.DiskSizeMib
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetStatusGroup() string {
+	if x != nil {
+		return x.StatusGroup
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetAlias() string {
+	if x != nil {
+		return x.Alias
+	}
+	return ""
+}
+
+func (x *SnapshotRow) GetCreatedAtUnixMs() int64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetUpdatedAtUnixMs() int64 {
+	if x != nil {
+		return x.UpdatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetSandboxStartedAtUnixMs() int64 {
+	if x != nil && x.SandboxStartedAtUnixMs != nil {
+		return *x.SandboxStartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetCommittedPayload() []byte {
+	if x != nil {
+		return x.CommittedPayload
+	}
+	return nil
+}
+
+func (x *SnapshotRow) GetCommittedSchema() uint32 {
+	if x != nil && x.CommittedSchema != nil {
+		return *x.CommittedSchema
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetBuildErrorJson() []byte {
+	if x != nil {
+		return x.BuildErrorJson
+	}
+	return nil
+}
+
+func (x *SnapshotRow) GetBuildStartedAtUnixMs() int64 {
+	if x != nil && x.BuildStartedAtUnixMs != nil {
+		return *x.BuildStartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetBuildFinishedAtUnixMs() int64 {
+	if x != nil && x.BuildFinishedAtUnixMs != nil {
+		return *x.BuildFinishedAtUnixMs
+	}
+	return 0
+}
+
+func (x *SnapshotRow) GetPublished() bool {
+	if x != nil {
+		return x.Published
+	}
+	return false
+}
+
+func (x *SnapshotRow) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+// BuildRow is one row of the build queue.
+type BuildRow struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	BuildId string                 `protobuf:"bytes,1,opt,name=build_id,json=buildId,proto3" json:"build_id,omitempty"`
+	// Today the API forces this equal to build_id. The column is separate anyway:
+	// splitting a table later costs far more than carrying two ids that happen to
+	// match.
+	TemplateId string `protobuf:"bytes,2,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	ClusterId  string `protobuf:"bytes,3,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// See SnapshotRow.status / .status_group.
+	Status      string `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
+	StatusGroup string `protobuf:"bytes,5,opt,name=status_group,json=statusGroup,proto3" json:"status_group,omitempty"`
+	// The machine running this build. Empty for a queued build nobody has taken.
+	NodeId string `protobuf:"bytes,6,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// When the builder last said it was alive. Absent means it never has, which
+	// is why the reaper only acts on rows that carry one.
+	HeartbeatAtUnixMs *int64 `protobuf:"varint,7,opt,name=heartbeat_at_unix_ms,json=heartbeatAtUnixMs,proto3,oneof" json:"heartbeat_at_unix_ms,omitempty"`
+	CreatedAtUnixMs   int64  `protobuf:"varint,8,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
+	StartedAtUnixMs   *int64 `protobuf:"varint,9,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3,oneof" json:"started_at_unix_ms,omitempty"`
+	FinishedAtUnixMs  *int64 `protobuf:"varint,10,opt,name=finished_at_unix_ms,json=finishedAtUnixMs,proto3,oneof" json:"finished_at_unix_ms,omitempty"`
+	// A TemplateBuildErrorReason as JSON. See SnapshotRow.build_error_json.
+	ErrorReasonJson []byte `protobuf:"bytes,11,opt,name=error_reason_json,json=errorReasonJson,proto3" json:"error_reason_json,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *BuildRow) Reset() {
+	*x = BuildRow{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[57]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BuildRow) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BuildRow) ProtoMessage() {}
+
+func (x *BuildRow) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[57]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BuildRow.ProtoReflect.Descriptor instead.
+func (*BuildRow) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{57}
+}
+
+func (x *BuildRow) GetBuildId() string {
+	if x != nil {
+		return x.BuildId
+	}
+	return ""
+}
+
+func (x *BuildRow) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+func (x *BuildRow) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *BuildRow) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *BuildRow) GetStatusGroup() string {
+	if x != nil {
+		return x.StatusGroup
+	}
+	return ""
+}
+
+func (x *BuildRow) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *BuildRow) GetHeartbeatAtUnixMs() int64 {
+	if x != nil && x.HeartbeatAtUnixMs != nil {
+		return *x.HeartbeatAtUnixMs
+	}
+	return 0
+}
+
+func (x *BuildRow) GetCreatedAtUnixMs() int64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *BuildRow) GetStartedAtUnixMs() int64 {
+	if x != nil && x.StartedAtUnixMs != nil {
+		return *x.StartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *BuildRow) GetFinishedAtUnixMs() int64 {
+	if x != nil && x.FinishedAtUnixMs != nil {
+		return *x.FinishedAtUnixMs
+	}
+	return 0
+}
+
+func (x *BuildRow) GetErrorReasonJson() []byte {
+	if x != nil {
+		return x.ErrorReasonJson
+	}
+	return nil
+}
+
+// CatalogPausedTransition is the `paused_sandboxes` half of a catalog write.
+//
+// 🔴 This is why the catalog is served here rather than read by the node. The
+// server puts this transition and the catalog row in one statement, so a pause
+// cannot end up recorded in one table and not the other. Absent means there is
+// no registry half — the template build path, which has no sandbox.
+//
+// The fields mirror TransitionSandboxRequest, including its units: this half
+// writes timestamptz columns and keeps microseconds while everything else on
+// this service is milliseconds.
+type CatalogPausedTransition struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Which transition to apply. BEGIN_PAUSE on BeginSnapshot; COMPLETE_PAUSE or
+	// MARK_LOCAL_ONLY on CommitSnapshot; MARK_LOCAL_ONLY on FailSnapshot. Any
+	// other value is refused rather than ignored.
+	Kind      TransitionKind `protobuf:"varint,1,opt,name=kind,proto3,enum=scheduler.v1.TransitionKind" json:"kind,omitempty"`
+	SandboxId string         `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// Required on COMPLETE_PAUSE and MARK_LOCAL_ONLY, refused on BEGIN_PAUSE,
+	// which creates or takes over a row and has nothing to quote.
+	ExpectGeneration *int64 `protobuf:"varint,3,opt,name=expect_generation,json=expectGeneration,proto3,oneof" json:"expect_generation,omitempty"`
+	// Raw JSON, passed through untouched. BEGIN_PAUSE only.
+	MetadataJson []byte `protobuf:"bytes,4,opt,name=metadata_json,json=metadataJson,proto3" json:"metadata_json,omitempty"`
+	// The lease TTL belongs to the node; see TransitionSandboxRequest.
+	LeaseTtlMillis int64 `protobuf:"varint,5,opt,name=lease_ttl_millis,json=leaseTtlMillis,proto3" json:"lease_ttl_millis,omitempty"`
+	// Which incarnation is writing. Required on BEGIN_PAUSE.
+	ExecutionId string `protobuf:"bytes,6,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	// 🔴 Microseconds, matching the column. See the note on this message.
+	SandboxExpiresAtUnixMicros *int64 `protobuf:"varint,7,opt,name=sandbox_expires_at_unix_micros,json=sandboxExpiresAtUnixMicros,proto3,oneof" json:"sandbox_expires_at_unix_micros,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
+}
+
+func (x *CatalogPausedTransition) Reset() {
+	*x = CatalogPausedTransition{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[58]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CatalogPausedTransition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CatalogPausedTransition) ProtoMessage() {}
+
+func (x *CatalogPausedTransition) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[58]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CatalogPausedTransition.ProtoReflect.Descriptor instead.
+func (*CatalogPausedTransition) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{58}
+}
+
+func (x *CatalogPausedTransition) GetKind() TransitionKind {
+	if x != nil {
+		return x.Kind
+	}
+	return TransitionKind_TRANSITION_KIND_UNSPECIFIED
+}
+
+func (x *CatalogPausedTransition) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *CatalogPausedTransition) GetExpectGeneration() int64 {
+	if x != nil && x.ExpectGeneration != nil {
+		return *x.ExpectGeneration
+	}
+	return 0
+}
+
+func (x *CatalogPausedTransition) GetMetadataJson() []byte {
+	if x != nil {
+		return x.MetadataJson
+	}
+	return nil
+}
+
+func (x *CatalogPausedTransition) GetLeaseTtlMillis() int64 {
+	if x != nil {
+		return x.LeaseTtlMillis
+	}
+	return 0
+}
+
+func (x *CatalogPausedTransition) GetExecutionId() string {
+	if x != nil {
+		return x.ExecutionId
+	}
+	return ""
+}
+
+func (x *CatalogPausedTransition) GetSandboxExpiresAtUnixMicros() int64 {
+	if x != nil && x.SandboxExpiresAtUnixMicros != nil {
+		return *x.SandboxExpiresAtUnixMicros
+	}
+	return 0
+}
+
+// CatalogRejected carries the refusal and whatever the caller needs to act on
+// it. Every field but `reason` is set only for the reasons that name it.
+type CatalogRejected struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Reason CatalogRejection       `protobuf:"varint,1,opt,name=reason,proto3,enum=scheduler.v1.CatalogRejection" json:"reason,omitempty"`
+	// STATUS_MISMATCH: the status the row carries now.
+	ObservedStatus string `protobuf:"bytes,2,opt,name=observed_status,json=observedStatus,proto3" json:"observed_status,omitempty"`
+	// ALIAS_TAKEN: who holds it.
+	AliasHolderSnapshotId string `protobuf:"bytes,3,opt,name=alias_holder_snapshot_id,json=aliasHolderSnapshotId,proto3" json:"alias_holder_snapshot_id,omitempty"`
+	// BUILD_IN_PROGRESS: which build is holding the template.
+	ActiveBuildId string `protobuf:"bytes,4,opt,name=active_build_id,json=activeBuildId,proto3" json:"active_build_id,omitempty"`
+	// GENERATION_MISMATCH: the generation the registry row carries now, so the
+	// caller can re-read against a number rather than blind.
+	ObservedGeneration *int64 `protobuf:"varint,5,opt,name=observed_generation,json=observedGeneration,proto3,oneof" json:"observed_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *CatalogRejected) Reset() {
+	*x = CatalogRejected{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[59]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CatalogRejected) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CatalogRejected) ProtoMessage() {}
+
+func (x *CatalogRejected) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[59]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CatalogRejected.ProtoReflect.Descriptor instead.
+func (*CatalogRejected) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{59}
+}
+
+func (x *CatalogRejected) GetReason() CatalogRejection {
+	if x != nil {
+		return x.Reason
+	}
+	return CatalogRejection_CATALOG_REJECTION_UNSPECIFIED
+}
+
+func (x *CatalogRejected) GetObservedStatus() string {
+	if x != nil {
+		return x.ObservedStatus
+	}
+	return ""
+}
+
+func (x *CatalogRejected) GetAliasHolderSnapshotId() string {
+	if x != nil {
+		return x.AliasHolderSnapshotId
+	}
+	return ""
+}
+
+func (x *CatalogRejected) GetActiveBuildId() string {
+	if x != nil {
+		return x.ActiveBuildId
+	}
+	return ""
+}
+
+func (x *CatalogRejected) GetObservedGeneration() int64 {
+	if x != nil && x.ObservedGeneration != nil {
+		return *x.ObservedGeneration
+	}
+	return 0
+}
+
+type BeginSnapshotRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// The node making the request. For a pause this is where the bytes are going
+	// to land, which is why it is also the origin below.
+	NodeId     string `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	SnapshotId string `protobuf:"bytes,3,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// `template` or `sandbox`; see SnapshotRow.source_kind. Immutable once set —
+	// CommitSnapshot cannot change it.
+	SourceKind      string `protobuf:"bytes,4,opt,name=source_kind,json=sourceKind,proto3" json:"source_kind,omitempty"`
+	SourceSandboxId string `protobuf:"bytes,5,opt,name=source_sandbox_id,json=sourceSandboxId,proto3" json:"source_sandbox_id,omitempty"`
+	CpuCount        uint32 `protobuf:"varint,6,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
+	MemoryMib       uint32 `protobuf:"varint,7,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	DiskSizeMib     uint32 `protobuf:"varint,8,opt,name=disk_size_mib,json=diskSizeMib,proto3" json:"disk_size_mib,omitempty"`
+	// Bound in the same transaction as the row. Empty means no alias. An alias
+	// another live snapshot holds refuses the whole call — see ALIAS_TAKEN.
+	Alias string `protobuf:"bytes,9,opt,name=alias,proto3" json:"alias,omitempty"`
+	// The node's clock, not the database's. The catalog stores what the node
+	// recorded so a row and its object-store mirror carry the same instant during
+	// the double-write phase; a server-side now() would make every mirrored row
+	// differ by the RPC's latency.
+	CreatedAtUnixMs        int64  `protobuf:"varint,10,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
+	SandboxStartedAtUnixMs *int64 `protobuf:"varint,11,opt,name=sandbox_started_at_unix_ms,json=sandboxStartedAtUnixMs,proto3,oneof" json:"sandbox_started_at_unix_ms,omitempty"`
+	// 🔴 Written, never checked, in this phase. It is here so that the phase that
+	// runs several writers can add the predicate without a migration that has to
+	// backfill a column onto rows already in flight.
+	PublishingExecutionId string `protobuf:"bytes,12,opt,name=publishing_execution_id,json=publishingExecutionId,proto3" json:"publishing_execution_id,omitempty"`
+	// The registry half; absent for a template build.
+	PausedTransition *CatalogPausedTransition `protobuf:"bytes,13,opt,name=paused_transition,json=pausedTransition,proto3,oneof" json:"paused_transition,omitempty"`
+	// Which status the new row starts in: `waiting` for a template nobody has
+	// built yet, `building` for a pause that is already writing bytes. Refused
+	// for any other value — a row cannot be born `ready`, because `ready`
+	// requires a payload and there is none yet.
+	Status string `protobuf:"bytes,14,opt,name=status,proto3" json:"status,omitempty"`
+	// See SnapshotRow. A pause opens its row unpublished and names itself; a
+	// template row is born published with no origin, because nothing is on any
+	// node yet.
+	Published     bool   `protobuf:"varint,100,opt,name=published,proto3" json:"published,omitempty"`
+	OriginNodeId  string `protobuf:"bytes,101,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BeginSnapshotRequest) Reset() {
+	*x = BeginSnapshotRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[60]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BeginSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BeginSnapshotRequest) ProtoMessage() {}
+
+func (x *BeginSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[60]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BeginSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*BeginSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{60}
+}
+
+func (x *BeginSnapshotRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetSourceKind() string {
+	if x != nil {
+		return x.SourceKind
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetSourceSandboxId() string {
+	if x != nil {
+		return x.SourceSandboxId
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetCpuCount() uint32 {
+	if x != nil {
+		return x.CpuCount
+	}
+	return 0
+}
+
+func (x *BeginSnapshotRequest) GetMemoryMib() uint32 {
+	if x != nil {
+		return x.MemoryMib
+	}
+	return 0
+}
+
+func (x *BeginSnapshotRequest) GetDiskSizeMib() uint32 {
+	if x != nil {
+		return x.DiskSizeMib
+	}
+	return 0
+}
+
+func (x *BeginSnapshotRequest) GetAlias() string {
+	if x != nil {
+		return x.Alias
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetCreatedAtUnixMs() int64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *BeginSnapshotRequest) GetSandboxStartedAtUnixMs() int64 {
+	if x != nil && x.SandboxStartedAtUnixMs != nil {
+		return *x.SandboxStartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *BeginSnapshotRequest) GetPublishingExecutionId() string {
+	if x != nil {
+		return x.PublishingExecutionId
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetPausedTransition() *CatalogPausedTransition {
+	if x != nil {
+		return x.PausedTransition
+	}
+	return nil
+}
+
+func (x *BeginSnapshotRequest) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *BeginSnapshotRequest) GetPublished() bool {
+	if x != nil {
+		return x.Published
+	}
+	return false
+}
+
+func (x *BeginSnapshotRequest) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+type BeginSnapshotResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*BeginSnapshotResponse_Began
+	//	*BeginSnapshotResponse_Rejected
+	Outcome       isBeginSnapshotResponse_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BeginSnapshotResponse) Reset() {
+	*x = BeginSnapshotResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[61]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BeginSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BeginSnapshotResponse) ProtoMessage() {}
+
+func (x *BeginSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[61]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BeginSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*BeginSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{61}
+}
+
+func (x *BeginSnapshotResponse) GetOutcome() isBeginSnapshotResponse_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *BeginSnapshotResponse) GetBegan() *BeganSnapshot {
+	if x != nil {
+		if x, ok := x.Outcome.(*BeginSnapshotResponse_Began); ok {
+			return x.Began
+		}
+	}
+	return nil
+}
+
+func (x *BeginSnapshotResponse) GetRejected() *CatalogRejected {
+	if x != nil {
+		if x, ok := x.Outcome.(*BeginSnapshotResponse_Rejected); ok {
+			return x.Rejected
+		}
+	}
+	return nil
+}
+
+type isBeginSnapshotResponse_Outcome interface {
+	isBeginSnapshotResponse_Outcome()
+}
+
+type BeginSnapshotResponse_Began struct {
+	Began *BeganSnapshot `protobuf:"bytes,1,opt,name=began,proto3,oneof"`
+}
+
+type BeginSnapshotResponse_Rejected struct {
+	Rejected *CatalogRejected `protobuf:"bytes,2,opt,name=rejected,proto3,oneof"`
+}
+
+func (*BeginSnapshotResponse_Began) isBeginSnapshotResponse_Outcome() {}
+
+func (*BeginSnapshotResponse_Rejected) isBeginSnapshotResponse_Outcome() {}
+
+type BeganSnapshot struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Row   *SnapshotRow           `protobuf:"bytes,1,opt,name=row,proto3" json:"row,omitempty"`
+	// BEGIN_PAUSE only: the generation to quote when finishing.
+	Generation *int64 `protobuf:"varint,2,opt,name=generation,proto3,oneof" json:"generation,omitempty"`
+	// BEGIN_PAUSE only: the snapshot this pause replaced, empty when there was
+	// none. Nothing references it once the pause completes.
+	PreviousSnapshotId string `protobuf:"bytes,3,opt,name=previous_snapshot_id,json=previousSnapshotId,proto3" json:"previous_snapshot_id,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *BeganSnapshot) Reset() {
+	*x = BeganSnapshot{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[62]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BeganSnapshot) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BeganSnapshot) ProtoMessage() {}
+
+func (x *BeganSnapshot) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[62]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BeganSnapshot.ProtoReflect.Descriptor instead.
+func (*BeganSnapshot) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{62}
+}
+
+func (x *BeganSnapshot) GetRow() *SnapshotRow {
+	if x != nil {
+		return x.Row
+	}
+	return nil
+}
+
+func (x *BeganSnapshot) GetGeneration() int64 {
+	if x != nil && x.Generation != nil {
+		return *x.Generation
+	}
+	return 0
+}
+
+func (x *BeganSnapshot) GetPreviousSnapshotId() string {
+	if x != nil {
+		return x.PreviousSnapshotId
+	}
+	return ""
+}
+
+type CommitSnapshotRequest struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId  string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	NodeId     string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	SnapshotId string                 `protobuf:"bytes,3,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// 🔴 Required and non-empty. The table refuses a `ready` row without one, and
+	// this is the only call that produces a `ready` row.
+	CommittedPayload []byte `protobuf:"bytes,4,opt,name=committed_payload,json=committedPayload,proto3" json:"committed_payload,omitempty"`
+	CommittedSchema  uint32 `protobuf:"varint,5,opt,name=committed_schema,json=committedSchema,proto3" json:"committed_schema,omitempty"`
+	// Publish metadata may restate the resources; absent means leave the row's.
+	CpuCount    *uint32 `protobuf:"varint,6,opt,name=cpu_count,json=cpuCount,proto3,oneof" json:"cpu_count,omitempty"`
+	MemoryMib   *uint32 `protobuf:"varint,7,opt,name=memory_mib,json=memoryMib,proto3,oneof" json:"memory_mib,omitempty"`
+	DiskSizeMib *uint32 `protobuf:"varint,8,opt,name=disk_size_mib,json=diskSizeMib,proto3,oneof" json:"disk_size_mib,omitempty"`
+	// Bound in the same transaction. Empty leaves whatever the row already has,
+	// which is not the same as unbinding it — there is no unbind on this call.
+	Alias           string `protobuf:"bytes,9,opt,name=alias,proto3" json:"alias,omitempty"`
+	UpdatedAtUnixMs int64  `protobuf:"varint,10,opt,name=updated_at_unix_ms,json=updatedAtUnixMs,proto3" json:"updated_at_unix_ms,omitempty"`
+	// The registry half; absent for a template build.
+	//
+	// COMPLETE_PAUSE with published=true is the ordinary path. MARK_LOCAL_ONLY
+	// with published=false is the publish that never reached shared storage: the
+	// row still goes `ready`, because the snapshot is complete and the origin can
+	// start it. Which of the two it was is a fact about the sandbox, and it stays
+	// in `paused_sandboxes` rather than being copied here.
+	PausedTransition *CatalogPausedTransition `protobuf:"bytes,11,opt,name=paused_transition,json=pausedTransition,proto3,oneof" json:"paused_transition,omitempty"`
+	// 🔴 Ignored in this phase, checked in the next. When the catalog has several
+	// writers, a commit whose incarnation is not the one the row was opened under
+	// is EXECUTION_SUPERSEDED. Until then the fence is the status predicate the
+	// server always applies, which the caller cannot turn off.
+	PublishingExecutionId string `protobuf:"bytes,12,opt,name=publishing_execution_id,json=publishingExecutionId,proto3" json:"publishing_execution_id,omitempty"`
+	Published             bool   `protobuf:"varint,100,opt,name=published,proto3" json:"published,omitempty"`
+	OriginNodeId          string `protobuf:"bytes,101,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *CommitSnapshotRequest) Reset() {
+	*x = CommitSnapshotRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[63]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitSnapshotRequest) ProtoMessage() {}
+
+func (x *CommitSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[63]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*CommitSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{63}
+}
+
+func (x *CommitSnapshotRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *CommitSnapshotRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *CommitSnapshotRequest) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *CommitSnapshotRequest) GetCommittedPayload() []byte {
+	if x != nil {
+		return x.CommittedPayload
+	}
+	return nil
+}
+
+func (x *CommitSnapshotRequest) GetCommittedSchema() uint32 {
+	if x != nil {
+		return x.CommittedSchema
+	}
+	return 0
+}
+
+func (x *CommitSnapshotRequest) GetCpuCount() uint32 {
+	if x != nil && x.CpuCount != nil {
+		return *x.CpuCount
+	}
+	return 0
+}
+
+func (x *CommitSnapshotRequest) GetMemoryMib() uint32 {
+	if x != nil && x.MemoryMib != nil {
+		return *x.MemoryMib
+	}
+	return 0
+}
+
+func (x *CommitSnapshotRequest) GetDiskSizeMib() uint32 {
+	if x != nil && x.DiskSizeMib != nil {
+		return *x.DiskSizeMib
+	}
+	return 0
+}
+
+func (x *CommitSnapshotRequest) GetAlias() string {
+	if x != nil {
+		return x.Alias
+	}
+	return ""
+}
+
+func (x *CommitSnapshotRequest) GetUpdatedAtUnixMs() int64 {
+	if x != nil {
+		return x.UpdatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *CommitSnapshotRequest) GetPausedTransition() *CatalogPausedTransition {
+	if x != nil {
+		return x.PausedTransition
+	}
+	return nil
+}
+
+func (x *CommitSnapshotRequest) GetPublishingExecutionId() string {
+	if x != nil {
+		return x.PublishingExecutionId
+	}
+	return ""
+}
+
+func (x *CommitSnapshotRequest) GetPublished() bool {
+	if x != nil {
+		return x.Published
+	}
+	return false
+}
+
+func (x *CommitSnapshotRequest) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+type CommitSnapshotResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*CommitSnapshotResponse_Committed
+	//	*CommitSnapshotResponse_Rejected
+	Outcome       isCommitSnapshotResponse_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommitSnapshotResponse) Reset() {
+	*x = CommitSnapshotResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[64]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitSnapshotResponse) ProtoMessage() {}
+
+func (x *CommitSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[64]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*CommitSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{64}
+}
+
+func (x *CommitSnapshotResponse) GetOutcome() isCommitSnapshotResponse_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *CommitSnapshotResponse) GetCommitted() *SnapshotRow {
+	if x != nil {
+		if x, ok := x.Outcome.(*CommitSnapshotResponse_Committed); ok {
+			return x.Committed
+		}
+	}
+	return nil
+}
+
+func (x *CommitSnapshotResponse) GetRejected() *CatalogRejected {
+	if x != nil {
+		if x, ok := x.Outcome.(*CommitSnapshotResponse_Rejected); ok {
+			return x.Rejected
+		}
+	}
+	return nil
+}
+
+type isCommitSnapshotResponse_Outcome interface {
+	isCommitSnapshotResponse_Outcome()
+}
+
+type CommitSnapshotResponse_Committed struct {
+	Committed *SnapshotRow `protobuf:"bytes,1,opt,name=committed,proto3,oneof"`
+}
+
+type CommitSnapshotResponse_Rejected struct {
+	Rejected *CatalogRejected `protobuf:"bytes,2,opt,name=rejected,proto3,oneof"`
+}
+
+func (*CommitSnapshotResponse_Committed) isCommitSnapshotResponse_Outcome() {}
+
+func (*CommitSnapshotResponse_Rejected) isCommitSnapshotResponse_Outcome() {}
+
+type FailSnapshotRequest struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId  string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	NodeId     string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	SnapshotId string                 `protobuf:"bytes,3,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// A TemplateBuildErrorReason as JSON. Required: the table refuses an `error`
+	// row without one, so that "it failed" and "why" cannot come apart.
+	BuildErrorJson  []byte `protobuf:"bytes,4,opt,name=build_error_json,json=buildErrorJson,proto3" json:"build_error_json,omitempty"`
+	UpdatedAtUnixMs int64  `protobuf:"varint,5,opt,name=updated_at_unix_ms,json=updatedAtUnixMs,proto3" json:"updated_at_unix_ms,omitempty"`
+	// The registry half, when a pause is what failed. MARK_LOCAL_ONLY only.
+	PausedTransition *CatalogPausedTransition `protobuf:"bytes,6,opt,name=paused_transition,json=pausedTransition,proto3,oneof" json:"paused_transition,omitempty"`
+	// Ends the build row too, when this snapshot has one in flight. False leaves
+	// it alone, which is what a caller that is only recording a publish failure
+	// wants.
+	FailActiveBuild bool `protobuf:"varint,7,opt,name=fail_active_build,json=failActiveBuild,proto3" json:"fail_active_build,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *FailSnapshotRequest) Reset() {
+	*x = FailSnapshotRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[65]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FailSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FailSnapshotRequest) ProtoMessage() {}
+
+func (x *FailSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[65]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FailSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*FailSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{65}
+}
+
+func (x *FailSnapshotRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *FailSnapshotRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *FailSnapshotRequest) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *FailSnapshotRequest) GetBuildErrorJson() []byte {
+	if x != nil {
+		return x.BuildErrorJson
+	}
+	return nil
+}
+
+func (x *FailSnapshotRequest) GetUpdatedAtUnixMs() int64 {
+	if x != nil {
+		return x.UpdatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *FailSnapshotRequest) GetPausedTransition() *CatalogPausedTransition {
+	if x != nil {
+		return x.PausedTransition
+	}
+	return nil
+}
+
+func (x *FailSnapshotRequest) GetFailActiveBuild() bool {
+	if x != nil {
+		return x.FailActiveBuild
+	}
+	return false
+}
+
+type FailSnapshotResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*FailSnapshotResponse_Failed
+	//	*FailSnapshotResponse_Rejected
+	Outcome       isFailSnapshotResponse_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FailSnapshotResponse) Reset() {
+	*x = FailSnapshotResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[66]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FailSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FailSnapshotResponse) ProtoMessage() {}
+
+func (x *FailSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[66]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FailSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*FailSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{66}
+}
+
+func (x *FailSnapshotResponse) GetOutcome() isFailSnapshotResponse_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *FailSnapshotResponse) GetFailed() *SnapshotRow {
+	if x != nil {
+		if x, ok := x.Outcome.(*FailSnapshotResponse_Failed); ok {
+			return x.Failed
+		}
+	}
+	return nil
+}
+
+func (x *FailSnapshotResponse) GetRejected() *CatalogRejected {
+	if x != nil {
+		if x, ok := x.Outcome.(*FailSnapshotResponse_Rejected); ok {
+			return x.Rejected
+		}
+	}
+	return nil
+}
+
+type isFailSnapshotResponse_Outcome interface {
+	isFailSnapshotResponse_Outcome()
+}
+
+type FailSnapshotResponse_Failed struct {
+	Failed *SnapshotRow `protobuf:"bytes,1,opt,name=failed,proto3,oneof"`
+}
+
+type FailSnapshotResponse_Rejected struct {
+	Rejected *CatalogRejected `protobuf:"bytes,2,opt,name=rejected,proto3,oneof"`
+}
+
+func (*FailSnapshotResponse_Failed) isFailSnapshotResponse_Outcome() {}
+
+func (*FailSnapshotResponse_Rejected) isFailSnapshotResponse_Outcome() {}
+
+type GetSnapshotRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// A snapshot id or an alias. Which one it is, the server decides — the node's
+	// own get() takes the same union and callers do not know which they hold.
+	IdOrAlias string `protobuf:"bytes,2,opt,name=id_or_alias,json=idOrAlias,proto3" json:"id_or_alias,omitempty"`
+	// 🔴 Whether to apply the `status_group = 'ready'` predicate.
+	//
+	// True for everything that is about to *run* the snapshot, which is the
+	// predicate that stops a half-uploaded snapshot from starting a VM. False for
+	// the endpoint that reports build status, which exists precisely to see rows
+	// that are building or failed. There is no safe default, so it is required of
+	// the caller rather than assumed here.
+	OnlyReady bool `protobuf:"varint,3,opt,name=only_ready,json=onlyReady,proto3" json:"only_ready,omitempty"`
+	// Include the build row's timestamps in the answer.
+	WithBuild     bool `protobuf:"varint,4,opt,name=with_build,json=withBuild,proto3" json:"with_build,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSnapshotRequest) Reset() {
+	*x = GetSnapshotRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[67]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSnapshotRequest) ProtoMessage() {}
+
+func (x *GetSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[67]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*GetSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{67}
+}
+
+func (x *GetSnapshotRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *GetSnapshotRequest) GetIdOrAlias() string {
+	if x != nil {
+		return x.IdOrAlias
+	}
+	return ""
+}
+
+func (x *GetSnapshotRequest) GetOnlyReady() bool {
+	if x != nil {
+		return x.OnlyReady
+	}
+	return false
+}
+
+func (x *GetSnapshotRequest) GetWithBuild() bool {
+	if x != nil {
+		return x.WithBuild
+	}
+	return false
+}
+
+type GetSnapshotResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Absent when there is no such row, or when only_ready excluded it. Not an
+	// error: "no such snapshot" is an answer.
+	Row           *SnapshotRow `protobuf:"bytes,1,opt,name=row,proto3,oneof" json:"row,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSnapshotResponse) Reset() {
+	*x = GetSnapshotResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[68]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSnapshotResponse) ProtoMessage() {}
+
+func (x *GetSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[68]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*GetSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{68}
+}
+
+func (x *GetSnapshotResponse) GetRow() *SnapshotRow {
+	if x != nil {
+		return x.Row
+	}
+	return nil
+}
+
+// SnapshotCursor is a keyset position: the last row of the previous page.
+//
+// 🔴 Not the public cursor. The public one is a base64url string with an
+// RFC3339 rendering inside it, and it is a response header on an OpenAPI
+// endpoint — changing its shape breaks in-flight clients and makes a rollback
+// lossy. It is parsed and rendered by the node; only the two values it decodes
+// to travel here.
+type SnapshotCursor struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	CreatedAtUnixMs int64                  `protobuf:"varint,1,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
+	// Compared as text, not as a uuid. The public cursor orders by the id's
+	// string form, and a uuid's binary order is not its text order — comparing
+	// the wrong one skips rows at a page boundary without any error.
+	SnapshotId    string `protobuf:"bytes,2,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotCursor) Reset() {
+	*x = SnapshotCursor{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[69]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotCursor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotCursor) ProtoMessage() {}
+
+func (x *SnapshotCursor) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[69]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotCursor.ProtoReflect.Descriptor instead.
+func (*SnapshotCursor) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{69}
+}
+
+func (x *SnapshotCursor) GetCreatedAtUnixMs() int64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *SnapshotCursor) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+// SnapshotFilter mirrors the node's SnapshotListFilter field for field. Every
+// field is a conjunct; all empty matches everything the query's own predicates
+// allow.
+type SnapshotFilter struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// `template`, `sandbox`, or both. Empty means no restriction.
+	SourceKinds []string `protobuf:"bytes,1,rep,name=source_kinds,json=sourceKinds,proto3" json:"source_kinds,omitempty"`
+	AliasPrefix *string  `protobuf:"bytes,2,opt,name=alias_prefix,json=aliasPrefix,proto3,oneof" json:"alias_prefix,omitempty"`
+	SnapshotIds []string `protobuf:"bytes,3,rep,name=snapshot_ids,json=snapshotIds,proto3" json:"snapshot_ids,omitempty"`
+	// A single id or an exact alias.
+	SnapshotIdOrAlias *string `protobuf:"bytes,4,opt,name=snapshot_id_or_alias,json=snapshotIdOrAlias,proto3,oneof" json:"snapshot_id_or_alias,omitempty"`
+	// Matches sandbox rows only, by construction: template rows have no source
+	// sandbox and the table's CHECK enforces it.
+	SourceSandboxId *string `protobuf:"bytes,5,opt,name=source_sandbox_id,json=sourceSandboxId,proto3,oneof" json:"source_sandbox_id,omitempty"`
+	// Template build statuses to keep. Matches template rows only.
+	//
+	// 🔴 Meaningful only when only_ready is false. Asking for `building` rows
+	// under the ready predicate is a filter that can never match, and a caller
+	// that does it is reading an empty page as "there are none".
+	TemplateStatuses []string `protobuf:"bytes,6,rep,name=template_statuses,json=templateStatuses,proto3" json:"template_statuses,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *SnapshotFilter) Reset() {
+	*x = SnapshotFilter{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[70]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotFilter) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotFilter) ProtoMessage() {}
+
+func (x *SnapshotFilter) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[70]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotFilter.ProtoReflect.Descriptor instead.
+func (*SnapshotFilter) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{70}
+}
+
+func (x *SnapshotFilter) GetSourceKinds() []string {
+	if x != nil {
+		return x.SourceKinds
+	}
+	return nil
+}
+
+func (x *SnapshotFilter) GetAliasPrefix() string {
+	if x != nil && x.AliasPrefix != nil {
+		return *x.AliasPrefix
+	}
+	return ""
+}
+
+func (x *SnapshotFilter) GetSnapshotIds() []string {
+	if x != nil {
+		return x.SnapshotIds
+	}
+	return nil
+}
+
+func (x *SnapshotFilter) GetSnapshotIdOrAlias() string {
+	if x != nil && x.SnapshotIdOrAlias != nil {
+		return *x.SnapshotIdOrAlias
+	}
+	return ""
+}
+
+func (x *SnapshotFilter) GetSourceSandboxId() string {
+	if x != nil && x.SourceSandboxId != nil {
+		return *x.SourceSandboxId
+	}
+	return ""
+}
+
+func (x *SnapshotFilter) GetTemplateStatuses() []string {
+	if x != nil {
+		return x.TemplateStatuses
+	}
+	return nil
+}
+
+type ListSnapshotsRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	Filter    *SnapshotFilter        `protobuf:"bytes,2,opt,name=filter,proto3" json:"filter,omitempty"`
+	// Absent starts at the newest row. The server does not need a sentinel for
+	// that case; the node's own open-ended cursor is one and it does not travel.
+	Cursor *SnapshotCursor `protobuf:"bytes,3,opt,name=cursor,proto3,oneof" json:"cursor,omitempty"`
+	// 🔴 Capped by the server, and a request for none is not a request for all.
+	// The node's HTTP layer treats a missing limit as "every row", which is how a
+	// single request comes to pull ten thousand rows into memory. Here zero means
+	// "the server's default".
+	Limit uint32 `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`
+	// See GetSnapshotRequest.only_ready. The listing endpoints pass true.
+	OnlyReady     bool `protobuf:"varint,5,opt,name=only_ready,json=onlyReady,proto3" json:"only_ready,omitempty"`
+	WithBuild     bool `protobuf:"varint,6,opt,name=with_build,json=withBuild,proto3" json:"with_build,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListSnapshotsRequest) Reset() {
+	*x = ListSnapshotsRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[71]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListSnapshotsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListSnapshotsRequest) ProtoMessage() {}
+
+func (x *ListSnapshotsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[71]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListSnapshotsRequest.ProtoReflect.Descriptor instead.
+func (*ListSnapshotsRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{71}
+}
+
+func (x *ListSnapshotsRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *ListSnapshotsRequest) GetFilter() *SnapshotFilter {
+	if x != nil {
+		return x.Filter
+	}
+	return nil
+}
+
+func (x *ListSnapshotsRequest) GetCursor() *SnapshotCursor {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *ListSnapshotsRequest) GetLimit() uint32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListSnapshotsRequest) GetOnlyReady() bool {
+	if x != nil {
+		return x.OnlyReady
+	}
+	return false
+}
+
+func (x *ListSnapshotsRequest) GetWithBuild() bool {
+	if x != nil {
+		return x.WithBuild
+	}
+	return false
+}
+
+type ListSnapshotsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Rows  []*SnapshotRow         `protobuf:"bytes,1,rep,name=rows,proto3" json:"rows,omitempty"`
+	// Absent on the last page. Rendered into the public token by the node.
+	NextCursor    *SnapshotCursor `protobuf:"bytes,2,opt,name=next_cursor,json=nextCursor,proto3,oneof" json:"next_cursor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListSnapshotsResponse) Reset() {
+	*x = ListSnapshotsResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[72]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListSnapshotsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListSnapshotsResponse) ProtoMessage() {}
+
+func (x *ListSnapshotsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[72]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListSnapshotsResponse.ProtoReflect.Descriptor instead.
+func (*ListSnapshotsResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{72}
+}
+
+func (x *ListSnapshotsResponse) GetRows() []*SnapshotRow {
+	if x != nil {
+		return x.Rows
+	}
+	return nil
+}
+
+func (x *ListSnapshotsResponse) GetNextCursor() *SnapshotCursor {
+	if x != nil {
+		return x.NextCursor
+	}
+	return nil
+}
+
+type DeleteSnapshotRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// Id or alias, as on GetSnapshotRequest.
+	IdOrAlias       string `protobuf:"bytes,2,opt,name=id_or_alias,json=idOrAlias,proto3" json:"id_or_alias,omitempty"`
+	DeletedAtUnixMs int64  `protobuf:"varint,3,opt,name=deleted_at_unix_ms,json=deletedAtUnixMs,proto3" json:"deleted_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *DeleteSnapshotRequest) Reset() {
+	*x = DeleteSnapshotRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[73]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteSnapshotRequest) ProtoMessage() {}
+
+func (x *DeleteSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[73]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*DeleteSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{73}
+}
+
+func (x *DeleteSnapshotRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *DeleteSnapshotRequest) GetIdOrAlias() string {
+	if x != nil {
+		return x.IdOrAlias
+	}
+	return ""
+}
+
+func (x *DeleteSnapshotRequest) GetDeletedAtUnixMs() int64 {
+	if x != nil {
+		return x.DeletedAtUnixMs
+	}
+	return 0
+}
+
+type DeleteSnapshotResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// False when there was nothing to delete. Idempotent by contract, so that is
+	// a success and not a rejection.
+	Deleted bool `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	// The row that was deleted, so the caller can find the artifacts to collect.
+	// Absent when `deleted` is false.
+	Row           *SnapshotRow `protobuf:"bytes,2,opt,name=row,proto3,oneof" json:"row,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteSnapshotResponse) Reset() {
+	*x = DeleteSnapshotResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[74]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteSnapshotResponse) ProtoMessage() {}
+
+func (x *DeleteSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[74]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*DeleteSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{74}
+}
+
+func (x *DeleteSnapshotResponse) GetDeleted() bool {
+	if x != nil {
+		return x.Deleted
+	}
+	return false
+}
+
+func (x *DeleteSnapshotResponse) GetRow() *SnapshotRow {
+	if x != nil {
+		return x.Row
+	}
+	return nil
+}
+
+type ResolveAliasRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	Alias     string                 `protobuf:"bytes,2,opt,name=alias,proto3" json:"alias,omitempty"`
+	// See GetSnapshotRequest.only_ready. Resolving in order to run means true.
+	OnlyReady     bool `protobuf:"varint,3,opt,name=only_ready,json=onlyReady,proto3" json:"only_ready,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveAliasRequest) Reset() {
+	*x = ResolveAliasRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[75]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveAliasRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveAliasRequest) ProtoMessage() {}
+
+func (x *ResolveAliasRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[75]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveAliasRequest.ProtoReflect.Descriptor instead.
+func (*ResolveAliasRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{75}
+}
+
+func (x *ResolveAliasRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *ResolveAliasRequest) GetAlias() string {
+	if x != nil {
+		return x.Alias
+	}
+	return ""
+}
+
+func (x *ResolveAliasRequest) GetOnlyReady() bool {
+	if x != nil {
+		return x.OnlyReady
+	}
+	return false
+}
+
+type ResolveAliasResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty when the alias names nothing — or names a row the ready predicate
+	// excluded, which is the same answer to the caller and deliberately so.
+	SnapshotId string `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// 🔴 Projected, never filtered on. Present so a resume can be pinned without
+	// a second read; see the note on SnapshotRow's origin block.
+	Published     bool   `protobuf:"varint,100,opt,name=published,proto3" json:"published,omitempty"`
+	OriginNodeId  string `protobuf:"bytes,101,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveAliasResponse) Reset() {
+	*x = ResolveAliasResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[76]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveAliasResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveAliasResponse) ProtoMessage() {}
+
+func (x *ResolveAliasResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[76]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveAliasResponse.ProtoReflect.Descriptor instead.
+func (*ResolveAliasResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{76}
+}
+
+func (x *ResolveAliasResponse) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *ResolveAliasResponse) GetPublished() bool {
+	if x != nil {
+		return x.Published
+	}
+	return false
+}
+
+func (x *ResolveAliasResponse) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+type StartBuildRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	NodeId    string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// Today the API forces these equal. Sent separately anyway; see BuildRow.
+	BuildId         string `protobuf:"bytes,3,opt,name=build_id,json=buildId,proto3" json:"build_id,omitempty"`
+	TemplateId      string `protobuf:"bytes,4,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	StartedAtUnixMs int64  `protobuf:"varint,5,opt,name=started_at_unix_ms,json=startedAtUnixMs,proto3" json:"started_at_unix_ms,omitempty"`
+	// The first heartbeat, stamped by the same statement that admits the build.
+	//
+	// 🔴 Not optional in practice: the reaper only acts on rows carrying one, so
+	// a build admitted without a heartbeat is a build nothing can ever clean up —
+	// and the partial unique index would then block that template forever.
+	HeartbeatAtUnixMs int64 `protobuf:"varint,6,opt,name=heartbeat_at_unix_ms,json=heartbeatAtUnixMs,proto3" json:"heartbeat_at_unix_ms,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *StartBuildRequest) Reset() {
+	*x = StartBuildRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[77]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartBuildRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartBuildRequest) ProtoMessage() {}
+
+func (x *StartBuildRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[77]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartBuildRequest.ProtoReflect.Descriptor instead.
+func (*StartBuildRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{77}
+}
+
+func (x *StartBuildRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *StartBuildRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *StartBuildRequest) GetBuildId() string {
+	if x != nil {
+		return x.BuildId
+	}
+	return ""
+}
+
+func (x *StartBuildRequest) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+func (x *StartBuildRequest) GetStartedAtUnixMs() int64 {
+	if x != nil {
+		return x.StartedAtUnixMs
+	}
+	return 0
+}
+
+func (x *StartBuildRequest) GetHeartbeatAtUnixMs() int64 {
+	if x != nil {
+		return x.HeartbeatAtUnixMs
+	}
+	return 0
+}
+
+type StartBuildResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Outcome:
+	//
+	//	*StartBuildResponse_Started
+	//	*StartBuildResponse_Rejected
+	Outcome       isStartBuildResponse_Outcome `protobuf_oneof:"outcome"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartBuildResponse) Reset() {
+	*x = StartBuildResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[78]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartBuildResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartBuildResponse) ProtoMessage() {}
+
+func (x *StartBuildResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[78]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartBuildResponse.ProtoReflect.Descriptor instead.
+func (*StartBuildResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{78}
+}
+
+func (x *StartBuildResponse) GetOutcome() isStartBuildResponse_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
+func (x *StartBuildResponse) GetStarted() *StartedBuild {
+	if x != nil {
+		if x, ok := x.Outcome.(*StartBuildResponse_Started); ok {
+			return x.Started
+		}
+	}
+	return nil
+}
+
+func (x *StartBuildResponse) GetRejected() *CatalogRejected {
+	if x != nil {
+		if x, ok := x.Outcome.(*StartBuildResponse_Rejected); ok {
+			return x.Rejected
+		}
+	}
+	return nil
+}
+
+type isStartBuildResponse_Outcome interface {
+	isStartBuildResponse_Outcome()
+}
+
+type StartBuildResponse_Started struct {
+	Started *StartedBuild `protobuf:"bytes,1,opt,name=started,proto3,oneof"`
+}
+
+type StartBuildResponse_Rejected struct {
+	Rejected *CatalogRejected `protobuf:"bytes,2,opt,name=rejected,proto3,oneof"`
+}
+
+func (*StartBuildResponse_Started) isStartBuildResponse_Outcome() {}
+
+func (*StartBuildResponse_Rejected) isStartBuildResponse_Outcome() {}
+
+type StartedBuild struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Build *BuildRow              `protobuf:"bytes,1,opt,name=build,proto3" json:"build,omitempty"`
+	// The template row as the transition left it: `building`.
+	Snapshot      *SnapshotRow `protobuf:"bytes,2,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartedBuild) Reset() {
+	*x = StartedBuild{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[79]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartedBuild) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartedBuild) ProtoMessage() {}
+
+func (x *StartedBuild) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[79]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartedBuild.ProtoReflect.Descriptor instead.
+func (*StartedBuild) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{79}
+}
+
+func (x *StartedBuild) GetBuild() *BuildRow {
+	if x != nil {
+		return x.Build
+	}
+	return nil
+}
+
+func (x *StartedBuild) GetSnapshot() *SnapshotRow {
+	if x != nil {
+		return x.Snapshot
+	}
+	return nil
+}
+
+type RenewBuildLeaseRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId         string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	NodeId            string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	BuildId           string                 `protobuf:"bytes,3,opt,name=build_id,json=buildId,proto3" json:"build_id,omitempty"`
+	HeartbeatAtUnixMs int64                  `protobuf:"varint,4,opt,name=heartbeat_at_unix_ms,json=heartbeatAtUnixMs,proto3" json:"heartbeat_at_unix_ms,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *RenewBuildLeaseRequest) Reset() {
+	*x = RenewBuildLeaseRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[80]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewBuildLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewBuildLeaseRequest) ProtoMessage() {}
+
+func (x *RenewBuildLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[80]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewBuildLeaseRequest.ProtoReflect.Descriptor instead.
+func (*RenewBuildLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{80}
+}
+
+func (x *RenewBuildLeaseRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *RenewBuildLeaseRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *RenewBuildLeaseRequest) GetBuildId() string {
+	if x != nil {
+		return x.BuildId
+	}
+	return ""
+}
+
+func (x *RenewBuildLeaseRequest) GetHeartbeatAtUnixMs() int64 {
+	if x != nil {
+		return x.HeartbeatAtUnixMs
+	}
+	return 0
+}
+
+type RenewBuildLeaseResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 🔴 False means this build is no longer the live one — reaped for a lapsed
+	// heartbeat, or finished by somebody else. The builder must stop, because the
+	// template it holds has already been handed to whoever asked next.
+	//
+	// Nothing else tells it. Without this the reaper frees the row, a second
+	// build starts, and two builders publish into the same template.
+	Live          bool `protobuf:"varint,1,opt,name=live,proto3" json:"live,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RenewBuildLeaseResponse) Reset() {
+	*x = RenewBuildLeaseResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[81]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewBuildLeaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewBuildLeaseResponse) ProtoMessage() {}
+
+func (x *RenewBuildLeaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[81]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewBuildLeaseResponse.ProtoReflect.Descriptor instead.
+func (*RenewBuildLeaseResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{81}
+}
+
+func (x *RenewBuildLeaseResponse) GetLive() bool {
+	if x != nil {
+		return x.Live
+	}
+	return false
+}
+
+type GetBuildRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ClusterId     string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	BuildId       string                 `protobuf:"bytes,2,opt,name=build_id,json=buildId,proto3" json:"build_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetBuildRequest) Reset() {
+	*x = GetBuildRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[82]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetBuildRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetBuildRequest) ProtoMessage() {}
+
+func (x *GetBuildRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[82]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetBuildRequest.ProtoReflect.Descriptor instead.
+func (*GetBuildRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{82}
+}
+
+func (x *GetBuildRequest) GetClusterId() string {
+	if x != nil {
+		return x.ClusterId
+	}
+	return ""
+}
+
+func (x *GetBuildRequest) GetBuildId() string {
+	if x != nil {
+		return x.BuildId
+	}
+	return ""
+}
+
+type GetBuildResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Absent when there is no such build. 🔴 No ready predicate on this path: it
+	// is the one endpoint whose whole purpose is to see a build that is still
+	// running or has failed.
+	Build         *BuildRow `protobuf:"bytes,1,opt,name=build,proto3,oneof" json:"build,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetBuildResponse) Reset() {
+	*x = GetBuildResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[83]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetBuildResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetBuildResponse) ProtoMessage() {}
+
+func (x *GetBuildResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[83]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetBuildResponse.ProtoReflect.Descriptor instead.
+func (*GetBuildResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{83}
+}
+
+func (x *GetBuildResponse) GetBuild() *BuildRow {
+	if x != nil {
+		return x.Build
+	}
+	return nil
+}
+
 var File_api_proto_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_proto_scheduler_proto_rawDesc = "" +
@@ -4648,7 +7173,243 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"W\n" +
 	"\x1bReleaseNodeHoldingsResponse\x12\x1a\n" +
 	"\breleased\x18\x01 \x01(\x04R\breleased\x12\x1c\n" +
-	"\tdiscarded\x18\x02 \x01(\x04R\tdiscarded*\x89\x01\n" +
+	"\tdiscarded\x18\x02 \x01(\x04R\tdiscarded\"\x9c\a\n" +
+	"\vSnapshotRow\x12\x1f\n" +
+	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
+	"snapshotId\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x02 \x01(\tR\tclusterId\x12\x1f\n" +
+	"\vsource_kind\x18\x03 \x01(\tR\n" +
+	"sourceKind\x12*\n" +
+	"\x11source_sandbox_id\x18\x04 \x01(\tR\x0fsourceSandboxId\x12\x1b\n" +
+	"\tcpu_count\x18\x05 \x01(\rR\bcpuCount\x12\x1d\n" +
+	"\n" +
+	"memory_mib\x18\x06 \x01(\rR\tmemoryMib\x12\"\n" +
+	"\rdisk_size_mib\x18\a \x01(\rR\vdiskSizeMib\x12\x16\n" +
+	"\x06status\x18\b \x01(\tR\x06status\x12!\n" +
+	"\fstatus_group\x18\t \x01(\tR\vstatusGroup\x12\x14\n" +
+	"\x05alias\x18\n" +
+	" \x01(\tR\x05alias\x12+\n" +
+	"\x12created_at_unix_ms\x18\v \x01(\x03R\x0fcreatedAtUnixMs\x12+\n" +
+	"\x12updated_at_unix_ms\x18\f \x01(\x03R\x0fupdatedAtUnixMs\x12?\n" +
+	"\x1asandbox_started_at_unix_ms\x18\r \x01(\x03H\x00R\x16sandboxStartedAtUnixMs\x88\x01\x01\x12+\n" +
+	"\x11committed_payload\x18\x0e \x01(\fR\x10committedPayload\x12.\n" +
+	"\x10committed_schema\x18\x0f \x01(\rH\x01R\x0fcommittedSchema\x88\x01\x01\x12(\n" +
+	"\x10build_error_json\x18\x10 \x01(\fR\x0ebuildErrorJson\x12;\n" +
+	"\x18build_started_at_unix_ms\x18\x11 \x01(\x03H\x02R\x14buildStartedAtUnixMs\x88\x01\x01\x12=\n" +
+	"\x19build_finished_at_unix_ms\x18\x12 \x01(\x03H\x03R\x15buildFinishedAtUnixMs\x88\x01\x01\x12\x1c\n" +
+	"\tpublished\x18d \x01(\bR\tpublished\x12$\n" +
+	"\x0eorigin_node_id\x18e \x01(\tR\foriginNodeIdB\x1d\n" +
+	"\x1b_sandbox_started_at_unix_msB\x13\n" +
+	"\x11_committed_schemaB\x1b\n" +
+	"\x19_build_started_at_unix_msB\x1c\n" +
+	"\x1a_build_finished_at_unix_ms\"\xf6\x03\n" +
+	"\bBuildRow\x12\x19\n" +
+	"\bbuild_id\x18\x01 \x01(\tR\abuildId\x12\x1f\n" +
+	"\vtemplate_id\x18\x02 \x01(\tR\n" +
+	"templateId\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x03 \x01(\tR\tclusterId\x12\x16\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\x12!\n" +
+	"\fstatus_group\x18\x05 \x01(\tR\vstatusGroup\x12\x17\n" +
+	"\anode_id\x18\x06 \x01(\tR\x06nodeId\x124\n" +
+	"\x14heartbeat_at_unix_ms\x18\a \x01(\x03H\x00R\x11heartbeatAtUnixMs\x88\x01\x01\x12+\n" +
+	"\x12created_at_unix_ms\x18\b \x01(\x03R\x0fcreatedAtUnixMs\x120\n" +
+	"\x12started_at_unix_ms\x18\t \x01(\x03H\x01R\x0fstartedAtUnixMs\x88\x01\x01\x122\n" +
+	"\x13finished_at_unix_ms\x18\n" +
+	" \x01(\x03H\x02R\x10finishedAtUnixMs\x88\x01\x01\x12*\n" +
+	"\x11error_reason_json\x18\v \x01(\fR\x0ferrorReasonJsonB\x17\n" +
+	"\x15_heartbeat_at_unix_msB\x15\n" +
+	"\x13_started_at_unix_msB\x16\n" +
+	"\x14_finished_at_unix_ms\"\x90\x03\n" +
+	"\x17CatalogPausedTransition\x120\n" +
+	"\x04kind\x18\x01 \x01(\x0e2\x1c.scheduler.v1.TransitionKindR\x04kind\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x120\n" +
+	"\x11expect_generation\x18\x03 \x01(\x03H\x00R\x10expectGeneration\x88\x01\x01\x12#\n" +
+	"\rmetadata_json\x18\x04 \x01(\fR\fmetadataJson\x12(\n" +
+	"\x10lease_ttl_millis\x18\x05 \x01(\x03R\x0eleaseTtlMillis\x12!\n" +
+	"\fexecution_id\x18\x06 \x01(\tR\vexecutionId\x12G\n" +
+	"\x1esandbox_expires_at_unix_micros\x18\a \x01(\x03H\x01R\x1asandboxExpiresAtUnixMicros\x88\x01\x01B\x14\n" +
+	"\x12_expect_generationB!\n" +
+	"\x1f_sandbox_expires_at_unix_micros\"\xa1\x02\n" +
+	"\x0fCatalogRejected\x126\n" +
+	"\x06reason\x18\x01 \x01(\x0e2\x1e.scheduler.v1.CatalogRejectionR\x06reason\x12'\n" +
+	"\x0fobserved_status\x18\x02 \x01(\tR\x0eobservedStatus\x127\n" +
+	"\x18alias_holder_snapshot_id\x18\x03 \x01(\tR\x15aliasHolderSnapshotId\x12&\n" +
+	"\x0factive_build_id\x18\x04 \x01(\tR\ractiveBuildId\x124\n" +
+	"\x13observed_generation\x18\x05 \x01(\x03H\x00R\x12observedGeneration\x88\x01\x01B\x16\n" +
+	"\x14_observed_generation\"\xc2\x05\n" +
+	"\x14BeginSnapshotRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1f\n" +
+	"\vsnapshot_id\x18\x03 \x01(\tR\n" +
+	"snapshotId\x12\x1f\n" +
+	"\vsource_kind\x18\x04 \x01(\tR\n" +
+	"sourceKind\x12*\n" +
+	"\x11source_sandbox_id\x18\x05 \x01(\tR\x0fsourceSandboxId\x12\x1b\n" +
+	"\tcpu_count\x18\x06 \x01(\rR\bcpuCount\x12\x1d\n" +
+	"\n" +
+	"memory_mib\x18\a \x01(\rR\tmemoryMib\x12\"\n" +
+	"\rdisk_size_mib\x18\b \x01(\rR\vdiskSizeMib\x12\x14\n" +
+	"\x05alias\x18\t \x01(\tR\x05alias\x12+\n" +
+	"\x12created_at_unix_ms\x18\n" +
+	" \x01(\x03R\x0fcreatedAtUnixMs\x12?\n" +
+	"\x1asandbox_started_at_unix_ms\x18\v \x01(\x03H\x00R\x16sandboxStartedAtUnixMs\x88\x01\x01\x126\n" +
+	"\x17publishing_execution_id\x18\f \x01(\tR\x15publishingExecutionId\x12W\n" +
+	"\x11paused_transition\x18\r \x01(\v2%.scheduler.v1.CatalogPausedTransitionH\x01R\x10pausedTransition\x88\x01\x01\x12\x16\n" +
+	"\x06status\x18\x0e \x01(\tR\x06status\x12\x1c\n" +
+	"\tpublished\x18d \x01(\bR\tpublished\x12$\n" +
+	"\x0eorigin_node_id\x18e \x01(\tR\foriginNodeIdB\x1d\n" +
+	"\x1b_sandbox_started_at_unix_msB\x14\n" +
+	"\x12_paused_transition\"\x94\x01\n" +
+	"\x15BeginSnapshotResponse\x123\n" +
+	"\x05began\x18\x01 \x01(\v2\x1b.scheduler.v1.BeganSnapshotH\x00R\x05began\x12;\n" +
+	"\brejected\x18\x02 \x01(\v2\x1d.scheduler.v1.CatalogRejectedH\x00R\brejectedB\t\n" +
+	"\aoutcome\"\xa2\x01\n" +
+	"\rBeganSnapshot\x12+\n" +
+	"\x03row\x18\x01 \x01(\v2\x19.scheduler.v1.SnapshotRowR\x03row\x12#\n" +
+	"\n" +
+	"generation\x18\x02 \x01(\x03H\x00R\n" +
+	"generation\x88\x01\x01\x120\n" +
+	"\x14previous_snapshot_id\x18\x03 \x01(\tR\x12previousSnapshotIdB\r\n" +
+	"\v_generation\"\x94\x05\n" +
+	"\x15CommitSnapshotRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1f\n" +
+	"\vsnapshot_id\x18\x03 \x01(\tR\n" +
+	"snapshotId\x12+\n" +
+	"\x11committed_payload\x18\x04 \x01(\fR\x10committedPayload\x12)\n" +
+	"\x10committed_schema\x18\x05 \x01(\rR\x0fcommittedSchema\x12 \n" +
+	"\tcpu_count\x18\x06 \x01(\rH\x00R\bcpuCount\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"memory_mib\x18\a \x01(\rH\x01R\tmemoryMib\x88\x01\x01\x12'\n" +
+	"\rdisk_size_mib\x18\b \x01(\rH\x02R\vdiskSizeMib\x88\x01\x01\x12\x14\n" +
+	"\x05alias\x18\t \x01(\tR\x05alias\x12+\n" +
+	"\x12updated_at_unix_ms\x18\n" +
+	" \x01(\x03R\x0fupdatedAtUnixMs\x12W\n" +
+	"\x11paused_transition\x18\v \x01(\v2%.scheduler.v1.CatalogPausedTransitionH\x03R\x10pausedTransition\x88\x01\x01\x126\n" +
+	"\x17publishing_execution_id\x18\f \x01(\tR\x15publishingExecutionId\x12\x1c\n" +
+	"\tpublished\x18d \x01(\bR\tpublished\x12$\n" +
+	"\x0eorigin_node_id\x18e \x01(\tR\foriginNodeIdB\f\n" +
+	"\n" +
+	"_cpu_countB\r\n" +
+	"\v_memory_mibB\x10\n" +
+	"\x0e_disk_size_mibB\x14\n" +
+	"\x12_paused_transition\"\x9b\x01\n" +
+	"\x16CommitSnapshotResponse\x129\n" +
+	"\tcommitted\x18\x01 \x01(\v2\x19.scheduler.v1.SnapshotRowH\x00R\tcommitted\x12;\n" +
+	"\brejected\x18\x02 \x01(\v2\x1d.scheduler.v1.CatalogRejectedH\x00R\brejectedB\t\n" +
+	"\aoutcome\"\xe0\x02\n" +
+	"\x13FailSnapshotRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1f\n" +
+	"\vsnapshot_id\x18\x03 \x01(\tR\n" +
+	"snapshotId\x12(\n" +
+	"\x10build_error_json\x18\x04 \x01(\fR\x0ebuildErrorJson\x12+\n" +
+	"\x12updated_at_unix_ms\x18\x05 \x01(\x03R\x0fupdatedAtUnixMs\x12W\n" +
+	"\x11paused_transition\x18\x06 \x01(\v2%.scheduler.v1.CatalogPausedTransitionH\x00R\x10pausedTransition\x88\x01\x01\x12*\n" +
+	"\x11fail_active_build\x18\a \x01(\bR\x0ffailActiveBuildB\x14\n" +
+	"\x12_paused_transition\"\x93\x01\n" +
+	"\x14FailSnapshotResponse\x123\n" +
+	"\x06failed\x18\x01 \x01(\v2\x19.scheduler.v1.SnapshotRowH\x00R\x06failed\x12;\n" +
+	"\brejected\x18\x02 \x01(\v2\x1d.scheduler.v1.CatalogRejectedH\x00R\brejectedB\t\n" +
+	"\aoutcome\"\x91\x01\n" +
+	"\x12GetSnapshotRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1e\n" +
+	"\vid_or_alias\x18\x02 \x01(\tR\tidOrAlias\x12\x1d\n" +
+	"\n" +
+	"only_ready\x18\x03 \x01(\bR\tonlyReady\x12\x1d\n" +
+	"\n" +
+	"with_build\x18\x04 \x01(\bR\twithBuild\"O\n" +
+	"\x13GetSnapshotResponse\x120\n" +
+	"\x03row\x18\x01 \x01(\v2\x19.scheduler.v1.SnapshotRowH\x00R\x03row\x88\x01\x01B\x06\n" +
+	"\x04_row\"^\n" +
+	"\x0eSnapshotCursor\x12+\n" +
+	"\x12created_at_unix_ms\x18\x01 \x01(\x03R\x0fcreatedAtUnixMs\x12\x1f\n" +
+	"\vsnapshot_id\x18\x02 \x01(\tR\n" +
+	"snapshotId\"\xd2\x02\n" +
+	"\x0eSnapshotFilter\x12!\n" +
+	"\fsource_kinds\x18\x01 \x03(\tR\vsourceKinds\x12&\n" +
+	"\falias_prefix\x18\x02 \x01(\tH\x00R\valiasPrefix\x88\x01\x01\x12!\n" +
+	"\fsnapshot_ids\x18\x03 \x03(\tR\vsnapshotIds\x124\n" +
+	"\x14snapshot_id_or_alias\x18\x04 \x01(\tH\x01R\x11snapshotIdOrAlias\x88\x01\x01\x12/\n" +
+	"\x11source_sandbox_id\x18\x05 \x01(\tH\x02R\x0fsourceSandboxId\x88\x01\x01\x12+\n" +
+	"\x11template_statuses\x18\x06 \x03(\tR\x10templateStatusesB\x0f\n" +
+	"\r_alias_prefixB\x17\n" +
+	"\x15_snapshot_id_or_aliasB\x14\n" +
+	"\x12_source_sandbox_id\"\x85\x02\n" +
+	"\x14ListSnapshotsRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x124\n" +
+	"\x06filter\x18\x02 \x01(\v2\x1c.scheduler.v1.SnapshotFilterR\x06filter\x129\n" +
+	"\x06cursor\x18\x03 \x01(\v2\x1c.scheduler.v1.SnapshotCursorH\x00R\x06cursor\x88\x01\x01\x12\x14\n" +
+	"\x05limit\x18\x04 \x01(\rR\x05limit\x12\x1d\n" +
+	"\n" +
+	"only_ready\x18\x05 \x01(\bR\tonlyReady\x12\x1d\n" +
+	"\n" +
+	"with_build\x18\x06 \x01(\bR\twithBuildB\t\n" +
+	"\a_cursor\"\x9a\x01\n" +
+	"\x15ListSnapshotsResponse\x12-\n" +
+	"\x04rows\x18\x01 \x03(\v2\x19.scheduler.v1.SnapshotRowR\x04rows\x12B\n" +
+	"\vnext_cursor\x18\x02 \x01(\v2\x1c.scheduler.v1.SnapshotCursorH\x00R\n" +
+	"nextCursor\x88\x01\x01B\x0e\n" +
+	"\f_next_cursor\"\x83\x01\n" +
+	"\x15DeleteSnapshotRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1e\n" +
+	"\vid_or_alias\x18\x02 \x01(\tR\tidOrAlias\x12+\n" +
+	"\x12deleted_at_unix_ms\x18\x03 \x01(\x03R\x0fdeletedAtUnixMs\"l\n" +
+	"\x16DeleteSnapshotResponse\x12\x18\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\x120\n" +
+	"\x03row\x18\x02 \x01(\v2\x19.scheduler.v1.SnapshotRowH\x00R\x03row\x88\x01\x01B\x06\n" +
+	"\x04_row\"i\n" +
+	"\x13ResolveAliasRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x14\n" +
+	"\x05alias\x18\x02 \x01(\tR\x05alias\x12\x1d\n" +
+	"\n" +
+	"only_ready\x18\x03 \x01(\bR\tonlyReady\"{\n" +
+	"\x14ResolveAliasResponse\x12\x1f\n" +
+	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
+	"snapshotId\x12\x1c\n" +
+	"\tpublished\x18d \x01(\bR\tpublished\x12$\n" +
+	"\x0eorigin_node_id\x18e \x01(\tR\foriginNodeId\"\xe5\x01\n" +
+	"\x11StartBuildRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x19\n" +
+	"\bbuild_id\x18\x03 \x01(\tR\abuildId\x12\x1f\n" +
+	"\vtemplate_id\x18\x04 \x01(\tR\n" +
+	"templateId\x12+\n" +
+	"\x12started_at_unix_ms\x18\x05 \x01(\x03R\x0fstartedAtUnixMs\x12/\n" +
+	"\x14heartbeat_at_unix_ms\x18\x06 \x01(\x03R\x11heartbeatAtUnixMs\"\x94\x01\n" +
+	"\x12StartBuildResponse\x126\n" +
+	"\astarted\x18\x01 \x01(\v2\x1a.scheduler.v1.StartedBuildH\x00R\astarted\x12;\n" +
+	"\brejected\x18\x02 \x01(\v2\x1d.scheduler.v1.CatalogRejectedH\x00R\brejectedB\t\n" +
+	"\aoutcome\"s\n" +
+	"\fStartedBuild\x12,\n" +
+	"\x05build\x18\x01 \x01(\v2\x16.scheduler.v1.BuildRowR\x05build\x125\n" +
+	"\bsnapshot\x18\x02 \x01(\v2\x19.scheduler.v1.SnapshotRowR\bsnapshot\"\x9c\x01\n" +
+	"\x16RenewBuildLeaseRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x17\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x19\n" +
+	"\bbuild_id\x18\x03 \x01(\tR\abuildId\x12/\n" +
+	"\x14heartbeat_at_unix_ms\x18\x04 \x01(\x03R\x11heartbeatAtUnixMs\"-\n" +
+	"\x17RenewBuildLeaseResponse\x12\x12\n" +
+	"\x04live\x18\x01 \x01(\bR\x04live\"K\n" +
+	"\x0fGetBuildRequest\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x19\n" +
+	"\bbuild_id\x18\x02 \x01(\tR\abuildId\"O\n" +
+	"\x10GetBuildResponse\x121\n" +
+	"\x05build\x18\x01 \x01(\v2\x16.scheduler.v1.BuildRowH\x00R\x05build\x88\x01\x01B\b\n" +
+	"\x06_build*\x89\x01\n" +
 	"\x0fSandboxLocation\x12 \n" +
 	"\x1cSANDBOX_LOCATION_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16SANDBOX_LOCATION_BOUND\x10\x01\x12\x1b\n" +
@@ -4690,7 +7451,17 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x0eConflictReason\x12\x1f\n" +
 	"\x1bCONFLICT_REASON_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eCONFLICT_REASON_LIVE_ELSEWHERE\x10\x01\x12\x1e\n" +
-	"\x1aCONFLICT_REASON_CLAIM_LOST\x10\x022\x95\n" +
+	"\x1aCONFLICT_REASON_CLAIM_LOST\x10\x02*\xee\x02\n" +
+	"\x10CatalogRejection\x12!\n" +
+	"\x1dCATALOG_REJECTION_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bCATALOG_REJECTION_NOT_FOUND\x10\x01\x12%\n" +
+	"!CATALOG_REJECTION_STATUS_MISMATCH\x10\x02\x12!\n" +
+	"\x1dCATALOG_REJECTION_ALIAS_TAKEN\x10\x03\x12)\n" +
+	"%CATALOG_REJECTION_GENERATION_MISMATCH\x10\x04\x12*\n" +
+	"&CATALOG_REJECTION_EXECUTION_SUPERSEDED\x10\x05\x12'\n" +
+	"#CATALOG_REJECTION_BUILD_IN_PROGRESS\x10\x06\x12&\n" +
+	"\"CATALOG_REJECTION_BUILD_QUEUE_FULL\x10\a\x12$\n" +
+	" CATALOG_REJECTION_ALREADY_EXISTS\x10\b2\x95\n" +
 	"\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
@@ -4713,7 +7484,19 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11TransitionSandbox\x12&.scheduler.v1.TransitionSandboxRequest\x1a'.scheduler.v1.TransitionSandboxResponse\x12[\n" +
 	"\x0eAcquireSandbox\x12#.scheduler.v1.AcquireSandboxRequest\x1a$.scheduler.v1.AcquireSandboxResponse\x12[\n" +
 	"\x0eRenewNodeLease\x12#.scheduler.v1.RenewNodeLeaseRequest\x1a$.scheduler.v1.RenewNodeLeaseResponse\x12j\n" +
-	"\x13ReleaseNodeHoldings\x12(.scheduler.v1.ReleaseNodeHoldingsRequest\x1a).scheduler.v1.ReleaseNodeHoldingsResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
+	"\x13ReleaseNodeHoldings\x12(.scheduler.v1.ReleaseNodeHoldingsRequest\x1a).scheduler.v1.ReleaseNodeHoldingsResponse2\xfd\x06\n" +
+	"\x0fSnapshotCatalog\x12X\n" +
+	"\rBeginSnapshot\x12\".scheduler.v1.BeginSnapshotRequest\x1a#.scheduler.v1.BeginSnapshotResponse\x12[\n" +
+	"\x0eCommitSnapshot\x12#.scheduler.v1.CommitSnapshotRequest\x1a$.scheduler.v1.CommitSnapshotResponse\x12U\n" +
+	"\fFailSnapshot\x12!.scheduler.v1.FailSnapshotRequest\x1a\".scheduler.v1.FailSnapshotResponse\x12R\n" +
+	"\vGetSnapshot\x12 .scheduler.v1.GetSnapshotRequest\x1a!.scheduler.v1.GetSnapshotResponse\x12X\n" +
+	"\rListSnapshots\x12\".scheduler.v1.ListSnapshotsRequest\x1a#.scheduler.v1.ListSnapshotsResponse\x12[\n" +
+	"\x0eDeleteSnapshot\x12#.scheduler.v1.DeleteSnapshotRequest\x1a$.scheduler.v1.DeleteSnapshotResponse\x12U\n" +
+	"\fResolveAlias\x12!.scheduler.v1.ResolveAliasRequest\x1a\".scheduler.v1.ResolveAliasResponse\x12O\n" +
+	"\n" +
+	"StartBuild\x12\x1f.scheduler.v1.StartBuildRequest\x1a .scheduler.v1.StartBuildResponse\x12^\n" +
+	"\x0fRenewBuildLease\x12$.scheduler.v1.RenewBuildLeaseRequest\x1a%.scheduler.v1.RenewBuildLeaseResponse\x12I\n" +
+	"\bGetBuild\x12\x1d.scheduler.v1.GetBuildRequest\x1a\x1e.scheduler.v1.GetBuildResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
 
 var (
 	file_api_proto_scheduler_proto_rawDescOnce sync.Once
@@ -4727,8 +7510,8 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_proto_scheduler_proto_rawDescData
 }
 
-var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 58)
+var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 86)
 var file_api_proto_scheduler_proto_goTypes = []any{
 	(SandboxLocation)(0),                  // 0: scheduler.v1.SandboxLocation
 	(ExecutionAuthority)(0),               // 1: scheduler.v1.ExecutionAuthority
@@ -4737,146 +7520,218 @@ var file_api_proto_scheduler_proto_goTypes = []any{
 	(TransitionKind)(0),                   // 4: scheduler.v1.TransitionKind
 	(MarkRunningOutcome)(0),               // 5: scheduler.v1.MarkRunningOutcome
 	(ConflictReason)(0),                   // 6: scheduler.v1.ConflictReason
-	(*Node)(nil),                          // 7: scheduler.v1.Node
-	(*ScheduleRequestHint)(nil),           // 8: scheduler.v1.ScheduleRequestHint
-	(*NewColdSandboxHint)(nil),            // 9: scheduler.v1.NewColdSandboxHint
-	(*NewSandboxHint)(nil),                // 10: scheduler.v1.NewSandboxHint
-	(*ScheduleRequest)(nil),               // 11: scheduler.v1.ScheduleRequest
-	(*ScheduleResponse)(nil),              // 12: scheduler.v1.ScheduleResponse
-	(*ListNodesRequest)(nil),              // 13: scheduler.v1.ListNodesRequest
-	(*ListNodesResponse)(nil),             // 14: scheduler.v1.ListNodesResponse
-	(*LookupNodeRequest)(nil),             // 15: scheduler.v1.LookupNodeRequest
-	(*LookupNodeResponse)(nil),            // 16: scheduler.v1.LookupNodeResponse
-	(*RecordAssignmentRequest)(nil),       // 17: scheduler.v1.RecordAssignmentRequest
-	(*RecordAssignmentResponse)(nil),      // 18: scheduler.v1.RecordAssignmentResponse
-	(*MachineInfo)(nil),                   // 19: scheduler.v1.MachineInfo
-	(*DiskMetric)(nil),                    // 20: scheduler.v1.DiskMetric
-	(*NodeSnapshot)(nil),                  // 21: scheduler.v1.NodeSnapshot
-	(*P2PEndpoint)(nil),                   // 22: scheduler.v1.P2pEndpoint
-	(*ObservedNode)(nil),                  // 23: scheduler.v1.ObservedNode
-	(*HeartbeatRequest)(nil),              // 24: scheduler.v1.HeartbeatRequest
-	(*SandboxRosterEntry)(nil),            // 25: scheduler.v1.SandboxRosterEntry
-	(*HeartbeatResponse)(nil),             // 26: scheduler.v1.HeartbeatResponse
-	(*SandboxEvent)(nil),                  // 27: scheduler.v1.SandboxEvent
-	(*ReportSandboxEventRequest)(nil),     // 28: scheduler.v1.ReportSandboxEventRequest
-	(*ReportSandboxEventResponse)(nil),    // 29: scheduler.v1.ReportSandboxEventResponse
-	(*ListObservedNodesRequest)(nil),      // 30: scheduler.v1.ListObservedNodesRequest
-	(*ListObservedNodesResponse)(nil),     // 31: scheduler.v1.ListObservedNodesResponse
-	(*P2PPeer)(nil),                       // 32: scheduler.v1.P2pPeer
-	(*ListP2PPeersRequest)(nil),           // 33: scheduler.v1.ListP2pPeersRequest
-	(*ListP2PPeersResponse)(nil),          // 34: scheduler.v1.ListP2pPeersResponse
-	(*RecordP2PArtifactRequest)(nil),      // 35: scheduler.v1.RecordP2pArtifactRequest
-	(*RecordP2PArtifactResponse)(nil),     // 36: scheduler.v1.RecordP2pArtifactResponse
-	(*ForgetP2PArtifactRequest)(nil),      // 37: scheduler.v1.ForgetP2pArtifactRequest
-	(*ForgetP2PArtifactResponse)(nil),     // 38: scheduler.v1.ForgetP2pArtifactResponse
-	(*LookupP2PArtifactRequest)(nil),      // 39: scheduler.v1.LookupP2pArtifactRequest
-	(*LookupP2PArtifactResponse)(nil),     // 40: scheduler.v1.LookupP2pArtifactResponse
-	(*GetNodeRequest)(nil),                // 41: scheduler.v1.GetNodeRequest
-	(*GetNodeResponse)(nil),               // 42: scheduler.v1.GetNodeResponse
-	(*UnregisterNodeRequest)(nil),         // 43: scheduler.v1.UnregisterNodeRequest
-	(*UnregisterNodeResponse)(nil),        // 44: scheduler.v1.UnregisterNodeResponse
-	(*RegistrySandbox)(nil),               // 45: scheduler.v1.RegistrySandbox
-	(*ListRegistrySandboxesRequest)(nil),  // 46: scheduler.v1.ListRegistrySandboxesRequest
-	(*ListRegistrySandboxesResponse)(nil), // 47: scheduler.v1.ListRegistrySandboxesResponse
-	(*RegistryEntry)(nil),                 // 48: scheduler.v1.RegistryEntry
-	(*GetSandboxesRequest)(nil),           // 49: scheduler.v1.GetSandboxesRequest
-	(*GetSandboxesResponse)(nil),          // 50: scheduler.v1.GetSandboxesResponse
-	(*TransitionSandboxRequest)(nil),      // 51: scheduler.v1.TransitionSandboxRequest
-	(*TransitionSandboxResponse)(nil),     // 52: scheduler.v1.TransitionSandboxResponse
-	(*AcquireSandboxRequest)(nil),         // 53: scheduler.v1.AcquireSandboxRequest
-	(*AcquiredSandbox)(nil),               // 54: scheduler.v1.AcquiredSandbox
-	(*AcquireOriginRef)(nil),              // 55: scheduler.v1.AcquireOriginRef
-	(*AcquireSandboxResponse)(nil),        // 56: scheduler.v1.AcquireSandboxResponse
-	(*AcquireNotFound)(nil),               // 57: scheduler.v1.AcquireNotFound
-	(*HeldSandbox)(nil),                   // 58: scheduler.v1.HeldSandbox
-	(*RenewNodeLeaseRequest)(nil),         // 59: scheduler.v1.RenewNodeLeaseRequest
-	(*RenewNodeLeaseResponse)(nil),        // 60: scheduler.v1.RenewNodeLeaseResponse
-	(*ReleaseNodeHoldingsRequest)(nil),    // 61: scheduler.v1.ReleaseNodeHoldingsRequest
-	(*ReleaseNodeHoldingsResponse)(nil),   // 62: scheduler.v1.ReleaseNodeHoldingsResponse
-	nil,                                   // 63: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                   // 64: scheduler.v1.NewSandboxHint.MetadataEntry
+	(CatalogRejection)(0),                 // 7: scheduler.v1.CatalogRejection
+	(*Node)(nil),                          // 8: scheduler.v1.Node
+	(*ScheduleRequestHint)(nil),           // 9: scheduler.v1.ScheduleRequestHint
+	(*NewColdSandboxHint)(nil),            // 10: scheduler.v1.NewColdSandboxHint
+	(*NewSandboxHint)(nil),                // 11: scheduler.v1.NewSandboxHint
+	(*ScheduleRequest)(nil),               // 12: scheduler.v1.ScheduleRequest
+	(*ScheduleResponse)(nil),              // 13: scheduler.v1.ScheduleResponse
+	(*ListNodesRequest)(nil),              // 14: scheduler.v1.ListNodesRequest
+	(*ListNodesResponse)(nil),             // 15: scheduler.v1.ListNodesResponse
+	(*LookupNodeRequest)(nil),             // 16: scheduler.v1.LookupNodeRequest
+	(*LookupNodeResponse)(nil),            // 17: scheduler.v1.LookupNodeResponse
+	(*RecordAssignmentRequest)(nil),       // 18: scheduler.v1.RecordAssignmentRequest
+	(*RecordAssignmentResponse)(nil),      // 19: scheduler.v1.RecordAssignmentResponse
+	(*MachineInfo)(nil),                   // 20: scheduler.v1.MachineInfo
+	(*DiskMetric)(nil),                    // 21: scheduler.v1.DiskMetric
+	(*NodeSnapshot)(nil),                  // 22: scheduler.v1.NodeSnapshot
+	(*P2PEndpoint)(nil),                   // 23: scheduler.v1.P2pEndpoint
+	(*ObservedNode)(nil),                  // 24: scheduler.v1.ObservedNode
+	(*HeartbeatRequest)(nil),              // 25: scheduler.v1.HeartbeatRequest
+	(*SandboxRosterEntry)(nil),            // 26: scheduler.v1.SandboxRosterEntry
+	(*HeartbeatResponse)(nil),             // 27: scheduler.v1.HeartbeatResponse
+	(*SandboxEvent)(nil),                  // 28: scheduler.v1.SandboxEvent
+	(*ReportSandboxEventRequest)(nil),     // 29: scheduler.v1.ReportSandboxEventRequest
+	(*ReportSandboxEventResponse)(nil),    // 30: scheduler.v1.ReportSandboxEventResponse
+	(*ListObservedNodesRequest)(nil),      // 31: scheduler.v1.ListObservedNodesRequest
+	(*ListObservedNodesResponse)(nil),     // 32: scheduler.v1.ListObservedNodesResponse
+	(*P2PPeer)(nil),                       // 33: scheduler.v1.P2pPeer
+	(*ListP2PPeersRequest)(nil),           // 34: scheduler.v1.ListP2pPeersRequest
+	(*ListP2PPeersResponse)(nil),          // 35: scheduler.v1.ListP2pPeersResponse
+	(*RecordP2PArtifactRequest)(nil),      // 36: scheduler.v1.RecordP2pArtifactRequest
+	(*RecordP2PArtifactResponse)(nil),     // 37: scheduler.v1.RecordP2pArtifactResponse
+	(*ForgetP2PArtifactRequest)(nil),      // 38: scheduler.v1.ForgetP2pArtifactRequest
+	(*ForgetP2PArtifactResponse)(nil),     // 39: scheduler.v1.ForgetP2pArtifactResponse
+	(*LookupP2PArtifactRequest)(nil),      // 40: scheduler.v1.LookupP2pArtifactRequest
+	(*LookupP2PArtifactResponse)(nil),     // 41: scheduler.v1.LookupP2pArtifactResponse
+	(*GetNodeRequest)(nil),                // 42: scheduler.v1.GetNodeRequest
+	(*GetNodeResponse)(nil),               // 43: scheduler.v1.GetNodeResponse
+	(*UnregisterNodeRequest)(nil),         // 44: scheduler.v1.UnregisterNodeRequest
+	(*UnregisterNodeResponse)(nil),        // 45: scheduler.v1.UnregisterNodeResponse
+	(*RegistrySandbox)(nil),               // 46: scheduler.v1.RegistrySandbox
+	(*ListRegistrySandboxesRequest)(nil),  // 47: scheduler.v1.ListRegistrySandboxesRequest
+	(*ListRegistrySandboxesResponse)(nil), // 48: scheduler.v1.ListRegistrySandboxesResponse
+	(*RegistryEntry)(nil),                 // 49: scheduler.v1.RegistryEntry
+	(*GetSandboxesRequest)(nil),           // 50: scheduler.v1.GetSandboxesRequest
+	(*GetSandboxesResponse)(nil),          // 51: scheduler.v1.GetSandboxesResponse
+	(*TransitionSandboxRequest)(nil),      // 52: scheduler.v1.TransitionSandboxRequest
+	(*TransitionSandboxResponse)(nil),     // 53: scheduler.v1.TransitionSandboxResponse
+	(*AcquireSandboxRequest)(nil),         // 54: scheduler.v1.AcquireSandboxRequest
+	(*AcquiredSandbox)(nil),               // 55: scheduler.v1.AcquiredSandbox
+	(*AcquireOriginRef)(nil),              // 56: scheduler.v1.AcquireOriginRef
+	(*AcquireSandboxResponse)(nil),        // 57: scheduler.v1.AcquireSandboxResponse
+	(*AcquireNotFound)(nil),               // 58: scheduler.v1.AcquireNotFound
+	(*HeldSandbox)(nil),                   // 59: scheduler.v1.HeldSandbox
+	(*RenewNodeLeaseRequest)(nil),         // 60: scheduler.v1.RenewNodeLeaseRequest
+	(*RenewNodeLeaseResponse)(nil),        // 61: scheduler.v1.RenewNodeLeaseResponse
+	(*ReleaseNodeHoldingsRequest)(nil),    // 62: scheduler.v1.ReleaseNodeHoldingsRequest
+	(*ReleaseNodeHoldingsResponse)(nil),   // 63: scheduler.v1.ReleaseNodeHoldingsResponse
+	(*SnapshotRow)(nil),                   // 64: scheduler.v1.SnapshotRow
+	(*BuildRow)(nil),                      // 65: scheduler.v1.BuildRow
+	(*CatalogPausedTransition)(nil),       // 66: scheduler.v1.CatalogPausedTransition
+	(*CatalogRejected)(nil),               // 67: scheduler.v1.CatalogRejected
+	(*BeginSnapshotRequest)(nil),          // 68: scheduler.v1.BeginSnapshotRequest
+	(*BeginSnapshotResponse)(nil),         // 69: scheduler.v1.BeginSnapshotResponse
+	(*BeganSnapshot)(nil),                 // 70: scheduler.v1.BeganSnapshot
+	(*CommitSnapshotRequest)(nil),         // 71: scheduler.v1.CommitSnapshotRequest
+	(*CommitSnapshotResponse)(nil),        // 72: scheduler.v1.CommitSnapshotResponse
+	(*FailSnapshotRequest)(nil),           // 73: scheduler.v1.FailSnapshotRequest
+	(*FailSnapshotResponse)(nil),          // 74: scheduler.v1.FailSnapshotResponse
+	(*GetSnapshotRequest)(nil),            // 75: scheduler.v1.GetSnapshotRequest
+	(*GetSnapshotResponse)(nil),           // 76: scheduler.v1.GetSnapshotResponse
+	(*SnapshotCursor)(nil),                // 77: scheduler.v1.SnapshotCursor
+	(*SnapshotFilter)(nil),                // 78: scheduler.v1.SnapshotFilter
+	(*ListSnapshotsRequest)(nil),          // 79: scheduler.v1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),         // 80: scheduler.v1.ListSnapshotsResponse
+	(*DeleteSnapshotRequest)(nil),         // 81: scheduler.v1.DeleteSnapshotRequest
+	(*DeleteSnapshotResponse)(nil),        // 82: scheduler.v1.DeleteSnapshotResponse
+	(*ResolveAliasRequest)(nil),           // 83: scheduler.v1.ResolveAliasRequest
+	(*ResolveAliasResponse)(nil),          // 84: scheduler.v1.ResolveAliasResponse
+	(*StartBuildRequest)(nil),             // 85: scheduler.v1.StartBuildRequest
+	(*StartBuildResponse)(nil),            // 86: scheduler.v1.StartBuildResponse
+	(*StartedBuild)(nil),                  // 87: scheduler.v1.StartedBuild
+	(*RenewBuildLeaseRequest)(nil),        // 88: scheduler.v1.RenewBuildLeaseRequest
+	(*RenewBuildLeaseResponse)(nil),       // 89: scheduler.v1.RenewBuildLeaseResponse
+	(*GetBuildRequest)(nil),               // 90: scheduler.v1.GetBuildRequest
+	(*GetBuildResponse)(nil),              // 91: scheduler.v1.GetBuildResponse
+	nil,                                   // 92: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                   // 93: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
-	9,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
-	10, // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	63, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	64, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
-	8,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
-	7,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
-	7,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
-	7,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
+	10, // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
+	11, // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
+	92, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	93, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	9,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
+	8,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
+	8,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
+	8,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
 	0,  // 8: scheduler.v1.LookupNodeResponse.location:type_name -> scheduler.v1.SandboxLocation
 	1,  // 9: scheduler.v1.LookupNodeResponse.execution_authority:type_name -> scheduler.v1.ExecutionAuthority
-	7,  // 10: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
+	8,  // 10: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
 	2,  // 11: scheduler.v1.NodeSnapshot.status:type_name -> scheduler.v1.NodeStatus
-	20, // 12: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
-	19, // 13: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
-	21, // 14: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	19, // 15: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
-	21, // 16: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	22, // 17: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
-	25, // 18: scheduler.v1.HeartbeatRequest.roster:type_name -> scheduler.v1.SandboxRosterEntry
+	21, // 12: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
+	20, // 13: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
+	22, // 14: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	20, // 15: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
+	22, // 16: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	23, // 17: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
+	26, // 18: scheduler.v1.HeartbeatRequest.roster:type_name -> scheduler.v1.SandboxRosterEntry
 	3,  // 19: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
-	27, // 20: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
-	23, // 21: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
-	22, // 22: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
-	32, // 23: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
-	32, // 24: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
-	23, // 25: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	45, // 26: scheduler.v1.ListRegistrySandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistrySandbox
-	48, // 27: scheduler.v1.GetSandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistryEntry
+	28, // 20: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
+	24, // 21: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
+	23, // 22: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
+	33, // 23: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
+	33, // 24: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
+	24, // 25: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
+	46, // 26: scheduler.v1.ListRegistrySandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistrySandbox
+	49, // 27: scheduler.v1.GetSandboxesResponse.sandboxes:type_name -> scheduler.v1.RegistryEntry
 	4,  // 28: scheduler.v1.TransitionSandboxRequest.kind:type_name -> scheduler.v1.TransitionKind
 	5,  // 29: scheduler.v1.TransitionSandboxResponse.mark_running_outcome:type_name -> scheduler.v1.MarkRunningOutcome
-	48, // 30: scheduler.v1.AcquiredSandbox.entry:type_name -> scheduler.v1.RegistryEntry
+	49, // 30: scheduler.v1.AcquiredSandbox.entry:type_name -> scheduler.v1.RegistryEntry
 	6,  // 31: scheduler.v1.AcquireOriginRef.reason:type_name -> scheduler.v1.ConflictReason
-	54, // 32: scheduler.v1.AcquireSandboxResponse.claimed:type_name -> scheduler.v1.AcquiredSandbox
-	57, // 33: scheduler.v1.AcquireSandboxResponse.not_found:type_name -> scheduler.v1.AcquireNotFound
-	55, // 34: scheduler.v1.AcquireSandboxResponse.not_ready:type_name -> scheduler.v1.AcquireOriginRef
-	55, // 35: scheduler.v1.AcquireSandboxResponse.conflict:type_name -> scheduler.v1.AcquireOriginRef
-	58, // 36: scheduler.v1.RenewNodeLeaseRequest.held:type_name -> scheduler.v1.HeldSandbox
-	11, // 37: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	13, // 38: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
-	15, // 39: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
-	17, // 40: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
-	24, // 41: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	28, // 42: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	30, // 43: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
-	33, // 44: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	35, // 45: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	37, // 46: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	39, // 47: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	41, // 48: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	43, // 49: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	46, // 50: scheduler.v1.Scheduler.ListRegistrySandboxes:input_type -> scheduler.v1.ListRegistrySandboxesRequest
-	49, // 51: scheduler.v1.PausedRegistry.GetSandboxes:input_type -> scheduler.v1.GetSandboxesRequest
-	51, // 52: scheduler.v1.PausedRegistry.TransitionSandbox:input_type -> scheduler.v1.TransitionSandboxRequest
-	53, // 53: scheduler.v1.PausedRegistry.AcquireSandbox:input_type -> scheduler.v1.AcquireSandboxRequest
-	59, // 54: scheduler.v1.PausedRegistry.RenewNodeLease:input_type -> scheduler.v1.RenewNodeLeaseRequest
-	61, // 55: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:input_type -> scheduler.v1.ReleaseNodeHoldingsRequest
-	12, // 56: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	14, // 57: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	16, // 58: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	18, // 59: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	26, // 60: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	29, // 61: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	31, // 62: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	34, // 63: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	36, // 64: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	38, // 65: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	40, // 66: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	42, // 67: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	44, // 68: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	47, // 69: scheduler.v1.Scheduler.ListRegistrySandboxes:output_type -> scheduler.v1.ListRegistrySandboxesResponse
-	50, // 70: scheduler.v1.PausedRegistry.GetSandboxes:output_type -> scheduler.v1.GetSandboxesResponse
-	52, // 71: scheduler.v1.PausedRegistry.TransitionSandbox:output_type -> scheduler.v1.TransitionSandboxResponse
-	56, // 72: scheduler.v1.PausedRegistry.AcquireSandbox:output_type -> scheduler.v1.AcquireSandboxResponse
-	60, // 73: scheduler.v1.PausedRegistry.RenewNodeLease:output_type -> scheduler.v1.RenewNodeLeaseResponse
-	62, // 74: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:output_type -> scheduler.v1.ReleaseNodeHoldingsResponse
-	56, // [56:75] is the sub-list for method output_type
-	37, // [37:56] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	55, // 32: scheduler.v1.AcquireSandboxResponse.claimed:type_name -> scheduler.v1.AcquiredSandbox
+	58, // 33: scheduler.v1.AcquireSandboxResponse.not_found:type_name -> scheduler.v1.AcquireNotFound
+	56, // 34: scheduler.v1.AcquireSandboxResponse.not_ready:type_name -> scheduler.v1.AcquireOriginRef
+	56, // 35: scheduler.v1.AcquireSandboxResponse.conflict:type_name -> scheduler.v1.AcquireOriginRef
+	59, // 36: scheduler.v1.RenewNodeLeaseRequest.held:type_name -> scheduler.v1.HeldSandbox
+	4,  // 37: scheduler.v1.CatalogPausedTransition.kind:type_name -> scheduler.v1.TransitionKind
+	7,  // 38: scheduler.v1.CatalogRejected.reason:type_name -> scheduler.v1.CatalogRejection
+	66, // 39: scheduler.v1.BeginSnapshotRequest.paused_transition:type_name -> scheduler.v1.CatalogPausedTransition
+	70, // 40: scheduler.v1.BeginSnapshotResponse.began:type_name -> scheduler.v1.BeganSnapshot
+	67, // 41: scheduler.v1.BeginSnapshotResponse.rejected:type_name -> scheduler.v1.CatalogRejected
+	64, // 42: scheduler.v1.BeganSnapshot.row:type_name -> scheduler.v1.SnapshotRow
+	66, // 43: scheduler.v1.CommitSnapshotRequest.paused_transition:type_name -> scheduler.v1.CatalogPausedTransition
+	64, // 44: scheduler.v1.CommitSnapshotResponse.committed:type_name -> scheduler.v1.SnapshotRow
+	67, // 45: scheduler.v1.CommitSnapshotResponse.rejected:type_name -> scheduler.v1.CatalogRejected
+	66, // 46: scheduler.v1.FailSnapshotRequest.paused_transition:type_name -> scheduler.v1.CatalogPausedTransition
+	64, // 47: scheduler.v1.FailSnapshotResponse.failed:type_name -> scheduler.v1.SnapshotRow
+	67, // 48: scheduler.v1.FailSnapshotResponse.rejected:type_name -> scheduler.v1.CatalogRejected
+	64, // 49: scheduler.v1.GetSnapshotResponse.row:type_name -> scheduler.v1.SnapshotRow
+	78, // 50: scheduler.v1.ListSnapshotsRequest.filter:type_name -> scheduler.v1.SnapshotFilter
+	77, // 51: scheduler.v1.ListSnapshotsRequest.cursor:type_name -> scheduler.v1.SnapshotCursor
+	64, // 52: scheduler.v1.ListSnapshotsResponse.rows:type_name -> scheduler.v1.SnapshotRow
+	77, // 53: scheduler.v1.ListSnapshotsResponse.next_cursor:type_name -> scheduler.v1.SnapshotCursor
+	64, // 54: scheduler.v1.DeleteSnapshotResponse.row:type_name -> scheduler.v1.SnapshotRow
+	87, // 55: scheduler.v1.StartBuildResponse.started:type_name -> scheduler.v1.StartedBuild
+	67, // 56: scheduler.v1.StartBuildResponse.rejected:type_name -> scheduler.v1.CatalogRejected
+	65, // 57: scheduler.v1.StartedBuild.build:type_name -> scheduler.v1.BuildRow
+	64, // 58: scheduler.v1.StartedBuild.snapshot:type_name -> scheduler.v1.SnapshotRow
+	65, // 59: scheduler.v1.GetBuildResponse.build:type_name -> scheduler.v1.BuildRow
+	12, // 60: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	14, // 61: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
+	16, // 62: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
+	18, // 63: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
+	25, // 64: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	29, // 65: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	31, // 66: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
+	34, // 67: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	36, // 68: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	38, // 69: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	40, // 70: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	42, // 71: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	44, // 72: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	47, // 73: scheduler.v1.Scheduler.ListRegistrySandboxes:input_type -> scheduler.v1.ListRegistrySandboxesRequest
+	50, // 74: scheduler.v1.PausedRegistry.GetSandboxes:input_type -> scheduler.v1.GetSandboxesRequest
+	52, // 75: scheduler.v1.PausedRegistry.TransitionSandbox:input_type -> scheduler.v1.TransitionSandboxRequest
+	54, // 76: scheduler.v1.PausedRegistry.AcquireSandbox:input_type -> scheduler.v1.AcquireSandboxRequest
+	60, // 77: scheduler.v1.PausedRegistry.RenewNodeLease:input_type -> scheduler.v1.RenewNodeLeaseRequest
+	62, // 78: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:input_type -> scheduler.v1.ReleaseNodeHoldingsRequest
+	68, // 79: scheduler.v1.SnapshotCatalog.BeginSnapshot:input_type -> scheduler.v1.BeginSnapshotRequest
+	71, // 80: scheduler.v1.SnapshotCatalog.CommitSnapshot:input_type -> scheduler.v1.CommitSnapshotRequest
+	73, // 81: scheduler.v1.SnapshotCatalog.FailSnapshot:input_type -> scheduler.v1.FailSnapshotRequest
+	75, // 82: scheduler.v1.SnapshotCatalog.GetSnapshot:input_type -> scheduler.v1.GetSnapshotRequest
+	79, // 83: scheduler.v1.SnapshotCatalog.ListSnapshots:input_type -> scheduler.v1.ListSnapshotsRequest
+	81, // 84: scheduler.v1.SnapshotCatalog.DeleteSnapshot:input_type -> scheduler.v1.DeleteSnapshotRequest
+	83, // 85: scheduler.v1.SnapshotCatalog.ResolveAlias:input_type -> scheduler.v1.ResolveAliasRequest
+	85, // 86: scheduler.v1.SnapshotCatalog.StartBuild:input_type -> scheduler.v1.StartBuildRequest
+	88, // 87: scheduler.v1.SnapshotCatalog.RenewBuildLease:input_type -> scheduler.v1.RenewBuildLeaseRequest
+	90, // 88: scheduler.v1.SnapshotCatalog.GetBuild:input_type -> scheduler.v1.GetBuildRequest
+	13, // 89: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	15, // 90: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	17, // 91: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	19, // 92: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	27, // 93: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	30, // 94: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	32, // 95: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	35, // 96: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	37, // 97: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	39, // 98: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	41, // 99: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	43, // 100: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	45, // 101: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	48, // 102: scheduler.v1.Scheduler.ListRegistrySandboxes:output_type -> scheduler.v1.ListRegistrySandboxesResponse
+	51, // 103: scheduler.v1.PausedRegistry.GetSandboxes:output_type -> scheduler.v1.GetSandboxesResponse
+	53, // 104: scheduler.v1.PausedRegistry.TransitionSandbox:output_type -> scheduler.v1.TransitionSandboxResponse
+	57, // 105: scheduler.v1.PausedRegistry.AcquireSandbox:output_type -> scheduler.v1.AcquireSandboxResponse
+	61, // 106: scheduler.v1.PausedRegistry.RenewNodeLease:output_type -> scheduler.v1.RenewNodeLeaseResponse
+	63, // 107: scheduler.v1.PausedRegistry.ReleaseNodeHoldings:output_type -> scheduler.v1.ReleaseNodeHoldingsResponse
+	69, // 108: scheduler.v1.SnapshotCatalog.BeginSnapshot:output_type -> scheduler.v1.BeginSnapshotResponse
+	72, // 109: scheduler.v1.SnapshotCatalog.CommitSnapshot:output_type -> scheduler.v1.CommitSnapshotResponse
+	74, // 110: scheduler.v1.SnapshotCatalog.FailSnapshot:output_type -> scheduler.v1.FailSnapshotResponse
+	76, // 111: scheduler.v1.SnapshotCatalog.GetSnapshot:output_type -> scheduler.v1.GetSnapshotResponse
+	80, // 112: scheduler.v1.SnapshotCatalog.ListSnapshots:output_type -> scheduler.v1.ListSnapshotsResponse
+	82, // 113: scheduler.v1.SnapshotCatalog.DeleteSnapshot:output_type -> scheduler.v1.DeleteSnapshotResponse
+	84, // 114: scheduler.v1.SnapshotCatalog.ResolveAlias:output_type -> scheduler.v1.ResolveAliasResponse
+	86, // 115: scheduler.v1.SnapshotCatalog.StartBuild:output_type -> scheduler.v1.StartBuildResponse
+	89, // 116: scheduler.v1.SnapshotCatalog.RenewBuildLease:output_type -> scheduler.v1.RenewBuildLeaseResponse
+	91, // 117: scheduler.v1.SnapshotCatalog.GetBuild:output_type -> scheduler.v1.GetBuildResponse
+	89, // [89:118] is the sub-list for method output_type
+	60, // [60:89] is the sub-list for method input_type
+	60, // [60:60] is the sub-list for extension type_name
+	60, // [60:60] is the sub-list for extension extendee
+	0,  // [0:60] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -4896,15 +7751,45 @@ func file_api_proto_scheduler_proto_init() {
 		(*AcquireSandboxResponse_Conflict)(nil),
 	}
 	file_api_proto_scheduler_proto_msgTypes[51].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[56].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[57].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[58].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[59].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[60].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[61].OneofWrappers = []any{
+		(*BeginSnapshotResponse_Began)(nil),
+		(*BeginSnapshotResponse_Rejected)(nil),
+	}
+	file_api_proto_scheduler_proto_msgTypes[62].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[63].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[64].OneofWrappers = []any{
+		(*CommitSnapshotResponse_Committed)(nil),
+		(*CommitSnapshotResponse_Rejected)(nil),
+	}
+	file_api_proto_scheduler_proto_msgTypes[65].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[66].OneofWrappers = []any{
+		(*FailSnapshotResponse_Failed)(nil),
+		(*FailSnapshotResponse_Rejected)(nil),
+	}
+	file_api_proto_scheduler_proto_msgTypes[68].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[70].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[71].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[72].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[74].OneofWrappers = []any{}
+	file_api_proto_scheduler_proto_msgTypes[78].OneofWrappers = []any{
+		(*StartBuildResponse_Started)(nil),
+		(*StartBuildResponse_Rejected)(nil),
+	}
+	file_api_proto_scheduler_proto_msgTypes[83].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
-			NumEnums:      7,
-			NumMessages:   58,
+			NumEnums:      8,
+			NumMessages:   86,
 			NumExtensions: 0,
-			NumServices:   2,
+			NumServices:   3,
 		},
 		GoTypes:           file_api_proto_scheduler_proto_goTypes,
 		DependencyIndexes: file_api_proto_scheduler_proto_depIdxs,

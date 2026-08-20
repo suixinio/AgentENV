@@ -271,13 +271,25 @@ func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.Bindin
 		)
 	}
 
+	// 🔴 The same setting the Service reads, handed to the store as well. The
+	// Service decides whether a node's budget is honoured; the store decides
+	// whether a heartbeat may leave an existing deadline alone. Wiring only the
+	// first is how the switch shipped able to lengthen records but not to
+	// shorten them again.
+	projectionAuthoritative := cfg.Scheduler.Routing.ProjectionAuthoritative
+
 	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
-		return scheduler.NewInMemoryBindingStoreWithArbitration(
-			cfg.Scheduler.BindingTTL, scheduler.InMemoryArbitrationFor(string(mode))), func() {}
+		return scheduler.NewInMemoryBindingStoreWithModes(
+			cfg.Scheduler.BindingTTL,
+			scheduler.InMemoryArbitrationFor(string(mode)),
+			projectionAuthoritative), func() {}
 	}
 
-	store, err := scheduler.NewRedisBindingStoreWithArbitration(
-		cfg.Scheduler.RedisAddr, cfg.Scheduler.BindingTTL, scheduler.RedisArbitrationFor(string(mode)))
+	store, err := scheduler.NewRedisBindingStoreWithModes(
+		cfg.Scheduler.RedisAddr,
+		cfg.Scheduler.BindingTTL,
+		scheduler.RedisArbitrationFor(string(mode)),
+		projectionAuthoritative)
 	if err != nil {
 		logger.Fatal("create redis binding store failed", zap.Error(err), zap.String("addr", cfg.Scheduler.RedisAddr))
 	}

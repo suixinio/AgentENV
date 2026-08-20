@@ -16,6 +16,15 @@ func projectionTestNode() Node {
 	return Node{ID: "node-a", Endpoint: "http://node-a"}
 }
 
+// newAuthoritativeInMemoryBindingStore is the in-memory store as a scheduler
+// running with SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=on builds it. Its
+// Redis twin is newAuthoritativeRedisBindingStoreForTest, and anything
+// asserting on a deadline a heartbeat left alone has to use one of the two:
+// with the switch off there is no branch that could leave one alone.
+func newAuthoritativeInMemoryBindingStore(bindingTTL time.Duration) *InMemoryBindingStore {
+	return NewInMemoryBindingStoreWithModes(bindingTTL, arbitrateFenced, true)
+}
+
 // TestInMemoryDeleteGuardRules walks the four outcomes. Two of them are
 // deliberately not what a delete-by-id would do, and those are the two the
 // comments on BindingDeleteOutcome argue for.
@@ -126,7 +135,7 @@ func TestInMemoryRecordUsesTheNodeBudget(t *testing.T) {
 // data plane outlive a stopped scheduler.
 func TestInMemoryHeartbeatRefreshDoesNotExtendTheDeadline(t *testing.T) {
 	start := time.Now()
-	store := NewInMemoryBindingStore(30 * time.Second)
+	store := newAuthoritativeInMemoryBindingStore(30 * time.Second)
 	node := projectionTestNode()
 
 	roster := []RosterEntry{{SandboxID: "sbx-1", ExecutionID: execA, ProjectionTTL: time.Hour}}
@@ -150,7 +159,7 @@ func TestInMemoryHeartbeatRefreshDoesNotExtendTheDeadline(t *testing.T) {
 // deadline.
 func TestInMemoryHeartbeatRepairSetsTheDeadline(t *testing.T) {
 	start := time.Now()
-	store := NewInMemoryBindingStore(30 * time.Second)
+	store := newAuthoritativeInMemoryBindingStore(30 * time.Second)
 	node := projectionTestNode()
 
 	// Installed from nothing.
@@ -173,7 +182,7 @@ func TestInMemoryHeartbeatRepairSetsTheDeadline(t *testing.T) {
 // has to land in the record.
 func TestInMemoryHeartbeatRefreshStillRewritesTheRecord(t *testing.T) {
 	start := time.Now()
-	store := NewInMemoryBindingStore(30 * time.Second)
+	store := newAuthoritativeInMemoryBindingStore(30 * time.Second)
 
 	roster := []RosterEntry{{SandboxID: "sbx-1", ExecutionID: execA, ProjectionTTL: time.Hour}}
 	if err := store.ReconcileNode(Node{ID: "node-a", Endpoint: "http://old"}, roster, start); err != nil {

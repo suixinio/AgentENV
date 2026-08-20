@@ -152,8 +152,22 @@ func rosterOf(sandboxIDs ...string) []RosterEntry {
 
 func newRedisBindingStoreForTest(t *testing.T, ttl time.Duration) *RedisBindingStore {
 	t.Helper()
+	return newRedisBindingStoreWithModesForTest(t, ttl, redisArbitrationFenced, false)
+}
+
+// newAuthoritativeRedisBindingStoreForTest is the store a scheduler running
+// with SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=on builds. Anything asserting
+// on a deadline a heartbeat left alone has to say so: with the switch off there
+// is no such branch, which is the whole point of the switch.
+func newAuthoritativeRedisBindingStoreForTest(t *testing.T, ttl time.Duration) *RedisBindingStore {
+	t.Helper()
+	return newRedisBindingStoreWithModesForTest(t, ttl, redisArbitrationFenced, true)
+}
+
+func newRedisBindingStoreWithModesForTest(t *testing.T, ttl time.Duration, arbitration string, projectionAuthoritative bool) *RedisBindingStore {
+	t.Helper()
 	addr := startRedisServerForTest(t)
-	store, err := NewRedisBindingStore(addr, ttl)
+	store, err := NewRedisBindingStoreWithModes(addr, ttl, arbitration, projectionAuthoritative)
 	if err != nil {
 		t.Fatalf("create redis binding store failed: %v", err)
 	}

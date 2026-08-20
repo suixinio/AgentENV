@@ -34,6 +34,11 @@ type RedisBindingStore struct {
 	// The two scripts are chosen once, at construction, from three variants
 	// each. 🔴 Not one script with a mode argument: a script covering all
 	// three can never be exercised in any one of them.
+	//
+	// The reconciliation script is assembled from two preludes rather than
+	// one — the arbitration rule and the deadline rule — because they are two
+	// independent settings and neither may be inferred from the other. See
+	// redisKeepsDeadlineAuthoritative.
 	recordScript    *redis.Script
 	reconcileScript *redis.Script
 	// 🔴 The third script takes no arbitration prelude. Deleting is not the
@@ -44,13 +49,22 @@ type RedisBindingStore struct {
 	deleteScript *redis.Script
 }
 
+// NewRedisBindingStore builds the store the way an unconfigured scheduler runs
+// it: arbitration enforcing, projection ephemeral.
 func NewRedisBindingStore(addr string, bindingTTL time.Duration) (*RedisBindingStore, error) {
-	return NewRedisBindingStoreWithArbitration(addr, bindingTTL, redisArbitrationFenced)
+	return NewRedisBindingStoreWithModes(addr, bindingTTL, redisArbitrationFenced, false)
 }
 
-// NewRedisBindingStoreWithArbitration builds the store around one of the three
-// Lua arbitration preludes.
-func NewRedisBindingStoreWithArbitration(addr string, bindingTTL time.Duration, arbitration string) (*RedisBindingStore, error) {
+// NewRedisBindingStoreWithModes builds the store with its two construction-time
+// decisions stated together: which of the three Lua arbitration preludes judges
+// a write, and whether the projection is authoritative.
+//
+// 🔴 The deadline rule is a second prelude and not a branch inside one script,
+// for the same reason the arbitration is three constants rather than one with a
+// mode argument — and for one more: the version of this that shipped gated the
+// TTL *value* in Go and left `KEEPTTL` unconditional, so the store went on
+// preserving deadlines in a mode whose whole promise is that it does not.
+func NewRedisBindingStoreWithModes(addr string, bindingTTL time.Duration, arbitration string, projectionAuthoritative bool) (*RedisBindingStore, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return nil, fmt.Errorf("redis address is required")
@@ -76,8 +90,9 @@ func NewRedisBindingStoreWithArbitration(addr string, bindingTTL time.Duration, 
 		keyPrefix:        defaultRedisBindingKeyPrefix,
 		operationTimeout: defaultRedisOperationTimeout,
 		recordScript:     redis.NewScript(arbitration + redisRecordBindingScriptBody),
-		reconcileScript:  redis.NewScript(arbitration + redisReconcileNodeScriptBody),
-		deleteScript:     redis.NewScript(redisLuaHelpers + redisDeleteBindingScriptBody),
+		reconcileScript: redis.NewScript(
+			arbitration + redisKeepsDeadlineFor(projectionAuthoritative) + redisReconcileNodeScriptBody),
+		deleteScript: redis.NewScript(redisLuaHelpers + redisDeleteBindingScriptBody),
 	}
 	ctx, cancel := store.context()
 	defer cancel()
@@ -406,6 +421,50 @@ end
 `
 )
 
+// The two deadline preludes. Each defines `keeps_deadline`, and one of them is
+// prepended to the reconciliation body when a store is built.
+//
+// 🔴 `keeps_deadline` asks about the writer and the record, never about the
+// arbiter's decision. Under `execution_arbitration=off` the arbiter returns no
+// decision at all — it made none — so a rule spelled `decision == "refreshed"`
+// is a rule that silently stops running in that mode, and what stops running is
+// §6.5's guarantee that a heartbeat cannot extend a record.
+//
+// The three conditions are argued in full on InMemoryBindingStore.keepsDeadline;
+// this is the same rule, in the language the HA deployments run.
+const (
+	redisKeepsDeadlineAuthoritative = `
+local function keeps_deadline(incumbent, challenger, budget_ms)
+  if challenger == "" or budget_ms <= 0 then
+    return false
+  end
+  return incumbent == challenger
+end
+`
+
+	// redisKeepsDeadlineEphemeral is the write-side switch in its off position:
+	// every accepted write sets a deadline, which is what this store did before
+	// a projection had a lifetime of its own. 🔴 It is what makes the rollback
+	// work — a record installed under a 24-hour budget is back to binding_ttl
+	// one heartbeat after the switch is flipped, because there is no branch
+	// left that could preserve it.
+	redisKeepsDeadlineEphemeral = `
+local function keeps_deadline(incumbent, challenger, budget_ms)
+  return false
+end
+`
+)
+
+// redisKeepsDeadlineFor maps the setting onto the prelude, in one place, beside
+// the rule — as InMemoryArbitrationFor and RedisArbitrationFor do for the other
+// axis.
+func redisKeepsDeadlineFor(projectionAuthoritative bool) string {
+	if projectionAuthoritative {
+		return redisKeepsDeadlineAuthoritative
+	}
+	return redisKeepsDeadlineEphemeral
+}
+
 // redisRecordBindingScriptBody is the assignment write.
 //
 // ARGV[7] is the challenger's incarnation, and the reverse-index fix that used
@@ -508,7 +567,7 @@ for i = 1, desired_count do
   local accept, decision = accepts(raw, execution_id)
   decisions[i] = { sandbox_id, decision }
   if accept then
-    local old_node_id = parse_binding(raw)
+    local old_node_id, incumbent = parse_binding(raw)
     if old_node_id and old_node_id ~= node_id then
       redis.call("SREM", node_key_for(old_node_id), sandbox_id)
     end
@@ -516,25 +575,34 @@ for i = 1, desired_count do
     -- a canonical uuid or an empty string, so it needs no escaping, and the
     -- node object travels through untouched.
     local value = '{"node":' .. node_json .. ',"execution_id":"' .. execution_id .. '"}'
-    if raw and decision == "refreshed" then
-      -- 🔴 The same incarnation reporting again. This is the periodic tick, and
-      -- it must not extend the record: a heartbeat every five seconds rewriting
-      -- the deadline would put the projection's survival back on a periodic
-      -- write path, which is the whole thing the long TTL exists to get it off.
-      -- The record's contents are still rewritten — the node's endpoint or pod
-      -- name may have changed — but its deadline is left exactly as it was.
-      redis.call("SET", binding_key(sandbox_id), value, "KEEPTTL")
+    local key = binding_key(sandbox_id)
+    -- <= 0 is "the writer had no budget to give", which is the store's own
+    -- default. It is never "no expiry".
+    local entry_ttl_ms = entry_ttls[sandbox_id]
+    local entry_ttl_n = tonumber(entry_ttl_ms)
+    if not entry_ttl_n or entry_ttl_n <= 0 then
+      entry_ttl_ms = ttl_ms
+      entry_ttl_n = 0
+    end
+    -- 🔴 The same incarnation reporting again, with a budget, in a process
+    -- whose projection is authoritative. This is the periodic tick, and it must
+    -- not extend the record: a heartbeat every five seconds rewriting the
+    -- deadline would put the projection's survival back on a periodic write
+    -- path, which is the whole thing the long TTL exists to get it off. The
+    -- record's contents are still rewritten — the node's endpoint or pod name
+    -- may have changed — but its deadline is left exactly as it was.
+    --
+    -- 🔴 And only when there *is* a deadline to keep. KEEPTTL on a key that
+    -- somehow has none keeps it having none, and every later tick keeps it
+    -- again: one such key is a route nothing can retire. Anything else —
+    -- installed / installed_unknown (repairing a write that was lost),
+    -- superseded (a new incarnation, arriving with a new budget), or a writer
+    -- that named no budget — is a real lifecycle event rather than a tick, and
+    -- sets the deadline from what it came with.
+    if keeps_deadline(incumbent, execution_id, entry_ttl_n) and redis.call("PTTL", key) > 0 then
+      redis.call("SET", key, value, "KEEPTTL")
     else
-      -- installed / installed_unknown (repairing a write that was lost) and
-      -- superseded (a new incarnation, arriving with a new budget). All three
-      -- are real lifecycle events rather than ticks, so all three set the
-      -- deadline from the budget they came with.
-      local entry_ttl_ms = entry_ttls[sandbox_id]
-      local entry_ttl_n = tonumber(entry_ttl_ms)
-      if not entry_ttl_n or entry_ttl_n <= 0 then
-        entry_ttl_ms = ttl_ms
-      end
-      redis.call("SET", binding_key(sandbox_id), value, "PX", entry_ttl_ms)
+      redis.call("SET", key, value, "PX", entry_ttl_ms)
     end
     redis.call("SADD", node_key, sandbox_id)
   end

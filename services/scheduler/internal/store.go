@@ -201,15 +201,35 @@ type InMemoryBindingStore struct {
 	// runs under s.mu, which is the whole point: a comparison made outside the
 	// lock is a window a resume can install a new incarnation in.
 	arbitrate arbiter
+	// projectionAuthoritative is the write-side switch, as this store sees it:
+	// whether a record has a lifetime of its own or is the thirty-second cache
+	// it has always been. It decides one thing — whether a heartbeat may leave
+	// an existing deadline alone — and it is the *only* thing that decides it.
+	//
+	// 🔴 Construction-time, like the arbiter beside it, and set from the same
+	// setting the Service reads. With it off this store has to be
+	// indistinguishable from the build before the projection existed, and that
+	// includes the deadline every heartbeat writes: a switch that changed only
+	// the TTL *value* and not the branch would leave a rollback unable to
+	// shorten a record already installed with a long one.
+	projectionAuthoritative bool
 }
 
+// NewInMemoryBindingStore builds the store the way an unconfigured scheduler
+// runs it: arbitration enforcing, projection ephemeral.
 func NewInMemoryBindingStore(bindingTTL time.Duration) *InMemoryBindingStore {
-	return NewInMemoryBindingStoreWithArbitration(bindingTTL, arbitrateFenced)
+	return NewInMemoryBindingStoreWithModes(bindingTTL, arbitrateFenced, false)
 }
 
-// NewInMemoryBindingStoreWithArbitration builds the store with one of the three
-// arbiters. The mode is a construction-time decision, never a per-call one.
-func NewInMemoryBindingStoreWithArbitration(bindingTTL time.Duration, arbitrate arbiter) *InMemoryBindingStore {
+// NewInMemoryBindingStoreWithModes builds the store with its two
+// construction-time decisions stated together: which of the three arbiters
+// judges a write, and whether the projection is authoritative.
+//
+// 🔴 Both are construction-time and neither is a per-call argument. They are
+// also named in one signature on purpose: the second of them shipped as a value
+// the Service clamped rather than a branch this store took, which is precisely
+// the shape a caller cannot see.
+func NewInMemoryBindingStoreWithModes(bindingTTL time.Duration, arbitrate arbiter, projectionAuthoritative bool) *InMemoryBindingStore {
 	if bindingTTL <= 0 {
 		bindingTTL = defaultBindingTTL
 	}
@@ -217,10 +237,11 @@ func NewInMemoryBindingStoreWithArbitration(bindingTTL time.Duration, arbitrate 
 		arbitrate = arbitrateFenced
 	}
 	return &InMemoryBindingStore{
-		bindingTTL:  bindingTTL,
-		bindings:    make(map[string]bindingRecord),
-		nodeBinding: make(map[string]map[string]struct{}),
-		arbitrate:   arbitrate,
+		bindingTTL:              bindingTTL,
+		bindings:                make(map[string]bindingRecord),
+		nodeBinding:             make(map[string]map[string]struct{}),
+		arbitrate:               arbitrate,
+		projectionAuthoritative: projectionAuthoritative,
 	}
 }
 
@@ -375,7 +396,7 @@ func (s *InMemoryBindingStore) upsertLocked(sandboxID string, binding Binding, n
 	s.bindings[sandboxID] = bindingRecord{
 		node:        binding.Node,
 		executionID: binding.ExecutionID,
-		expiresAt:   s.expiryFor(existing, held, decision, binding.ProjectionTTL, now, source),
+		expiresAt:   s.expiryFor(existing, held, incumbent, binding, now, source),
 	}
 	return decision
 }
@@ -397,21 +418,58 @@ func (s *InMemoryBindingStore) upsertLocked(sandboxID string, binding Binding, n
 func (s *InMemoryBindingStore) expiryFor(
 	existing bindingRecord,
 	held bool,
-	decision bindingDecision,
-	projectionTTL time.Duration,
+	incumbent string,
+	binding Binding,
 	now time.Time,
 	source string,
 ) time.Time {
-	if held && source == bindingSourceHeartbeat && decision == bindingRefreshed {
+	if s.keepsDeadline(held, incumbent, binding, source) {
 		return existing.expiresAt
 	}
-	ttl := projectionTTL
+	ttl := binding.ProjectionTTL
 	if ttl <= 0 {
 		// 🔴 Not "forever". A non-positive budget means the writer had none to
 		// give, and the store's own default is what it had before any of this.
 		ttl = s.bindingTTL
 	}
 	return now.Add(ttl)
+}
+
+// keepsDeadline answers the one question expiryFor branches on: is this write a
+// periodic tick whose deadline the record already owns?
+//
+// Three conditions, and each is load-bearing on its own:
+//
+//   - 🔴 The switch. With the projection ephemeral this must always be false,
+//     or a rollback cannot shorten a record already installed with a long
+//     budget: every heartbeat would preserve the deadline it is trying to
+//     replace, and the promised "back to binding_ttl within one heartbeat"
+//     never arrives.
+//
+//   - 🔴 The same incarnation, compared here rather than read off the
+//     arbiter's decision. Under `execution_arbitration=off` the arbiter names
+//     no decision at all — it made none — so a rule keyed on "refreshed" is a
+//     rule that silently stops running in that mode. The question this asks
+//     is about the writer and the record, and it does not depend on who is
+//     judging them.
+//
+//   - 🔴 A budget. A writer that offered none gets the store's default, and
+//     keeping a deadline it never set would leave a record installed at
+//     binding_ttl expiring thirty seconds later while its node is still
+//     reporting it, reinstalled only by the heartbeat after that. The record
+//     blinks out on a healthy cluster, which is worse than the periodic write
+//     this branch exists to avoid.
+func (s *InMemoryBindingStore) keepsDeadline(held bool, incumbent string, binding Binding, source string) bool {
+	if !s.projectionAuthoritative {
+		return false
+	}
+	if !held || source != bindingSourceHeartbeat {
+		return false
+	}
+	if binding.ProjectionTTL <= 0 {
+		return false
+	}
+	return binding.ExecutionID != "" && binding.ExecutionID == incumbent
 }
 
 func (s *InMemoryBindingStore) deleteLocked(sandboxID string) {

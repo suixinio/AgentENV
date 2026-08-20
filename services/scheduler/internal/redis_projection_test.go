@@ -102,7 +102,7 @@ func TestRedisRecordHonoursTheNodeBudget(t *testing.T) {
 // leaving the record's survival dependent on the scheduler still running — the
 // exact dependency the long TTL is meant to remove.
 func TestRedisHeartbeatRefreshKeepsTheDeadline(t *testing.T) {
-	store := newRedisBindingStoreForTest(t, 30*time.Second)
+	store := newAuthoritativeRedisBindingStoreForTest(t, 30*time.Second)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 	roster := []RosterEntry{{SandboxID: "sbx-1", ExecutionID: execA, ProjectionTTL: time.Hour}}
 
@@ -131,7 +131,7 @@ func TestRedisHeartbeatRefreshKeepsTheDeadline(t *testing.T) {
 // TestRedisHeartbeatRepairSetsTheDeadline is the else branch: a record being
 // installed or superseded is a real lifecycle event and carries a new budget.
 func TestRedisHeartbeatRepairSetsTheDeadline(t *testing.T) {
-	store := newRedisBindingStoreForTest(t, 30*time.Second)
+	store := newAuthoritativeRedisBindingStoreForTest(t, 30*time.Second)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 
 	// Installed from nothing, with a budget.
@@ -156,7 +156,7 @@ func TestRedisHeartbeatRepairSetsTheDeadline(t *testing.T) {
 // TestRedisHeartbeatRefreshStillRewritesTheRecord: KEEPTTL keeps the deadline,
 // not the contents.
 func TestRedisHeartbeatRefreshStillRewritesTheRecord(t *testing.T) {
-	store := newRedisBindingStoreForTest(t, 30*time.Second)
+	store := newAuthoritativeRedisBindingStoreForTest(t, 30*time.Second)
 	roster := []RosterEntry{{SandboxID: "sbx-1", ExecutionID: execA, ProjectionTTL: time.Hour}}
 
 	if err := store.ReconcileNode(Node{ID: "node-a", Endpoint: "http://old"}, roster, time.Now()); err != nil {
@@ -173,7 +173,7 @@ func TestRedisHeartbeatRefreshStillRewritesTheRecord(t *testing.T) {
 // a third parallel run of arguments rather than as triples: the failure mode of
 // a flat list is every sandbox silently getting its neighbour's number.
 func TestRedisRosterBudgetsStayAlignedWithTheirSandboxes(t *testing.T) {
-	store := newRedisBindingStoreForTest(t, 30*time.Second)
+	store := newAuthoritativeRedisBindingStoreForTest(t, 30*time.Second)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 
 	roster := []RosterEntry{

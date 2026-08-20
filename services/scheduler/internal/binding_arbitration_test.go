@@ -318,7 +318,7 @@ func TestRedisRecordTakesOneRoundTrip(t *testing.T) {
 // that it restores a behaviour somebody is depending on.
 func TestExecutionArbitrationOffMatchesLegacyBehaviour(t *testing.T) {
 	t.Run("in-memory", func(t *testing.T) {
-		store := NewInMemoryBindingStoreWithArbitration(time.Minute, InMemoryArbitrationFor("off"))
+		store := NewInMemoryBindingStoreWithModes(time.Minute, InMemoryArbitrationFor("off"), false)
 		now := time.Now()
 		mustReconcile(t, store, arbNodeB, []RosterEntry{{SandboxID: "sbx", ExecutionID: execNew}}, now)
 		mustReconcile(t, store, arbNodeA, []RosterEntry{{SandboxID: "sbx", ExecutionID: execOld}}, now)
@@ -327,7 +327,7 @@ func TestExecutionArbitrationOffMatchesLegacyBehaviour(t *testing.T) {
 
 	t.Run("redis", func(t *testing.T) {
 		addr := startRedisServerForTest(t)
-		store, err := NewRedisBindingStoreWithArbitration(addr, time.Minute, RedisArbitrationFor("off"))
+		store, err := NewRedisBindingStoreWithModes(addr, time.Minute, RedisArbitrationFor("off"), false)
 		if err != nil {
 			t.Fatalf("create redis binding store: %v", err)
 		}
@@ -344,7 +344,7 @@ func TestExecutionArbitrationOffMatchesLegacyBehaviour(t *testing.T) {
 // step. Same routing as off, so nothing moves; the decisions become visible.
 func TestExecutionArbitrationObserveKeepsRoutingButCounts(t *testing.T) {
 	t.Run("in-memory", func(t *testing.T) {
-		store := NewInMemoryBindingStoreWithArbitration(time.Minute, InMemoryArbitrationFor("observe"))
+		store := NewInMemoryBindingStoreWithModes(time.Minute, InMemoryArbitrationFor("observe"), false)
 		now := time.Now()
 		mustReconcile(t, store, arbNodeB, []RosterEntry{{SandboxID: "sbx", ExecutionID: execNew}}, now)
 
@@ -360,7 +360,7 @@ func TestExecutionArbitrationObserveKeepsRoutingButCounts(t *testing.T) {
 
 	t.Run("redis", func(t *testing.T) {
 		addr := startRedisServerForTest(t)
-		store, err := NewRedisBindingStoreWithArbitration(addr, time.Minute, RedisArbitrationFor("observe"))
+		store, err := NewRedisBindingStoreWithModes(addr, time.Minute, RedisArbitrationFor("observe"), false)
 		if err != nil {
 			t.Fatalf("create redis binding store: %v", err)
 		}

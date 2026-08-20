@@ -341,7 +341,7 @@ func TestSchedulerServiceNeverReturnsPermissionDenied(t *testing.T) {
 // caller acting on an incarnation this scheduler did not arbitrate is worse
 // than one acting on none.
 func TestArbitrationOffLeavesTheLookupAnswerUnchanged(t *testing.T) {
-	store := NewInMemoryBindingStoreWithArbitration(time.Minute, InMemoryArbitrationFor("off"))
+	store := NewInMemoryBindingStoreWithModes(time.Minute, InMemoryArbitrationFor("off"), false)
 	if err := store.Record("sbx-1", Binding{Node: lookupTestNodes[0], ExecutionID: lookupExecution}, time.Now()); err != nil {
 		t.Fatalf("record: %v", err)
 	}

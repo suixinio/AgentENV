@@ -302,42 +302,88 @@ VALUES ($1, '11111111-1111-1111-1111-111111111111', 'template', 0, 128, 1024,
 	})
 }
 
-// TestOriginColumnsStayRemovable pins the six rules that make the origin block
-// droppable in one migration file. Each assertion below is one of them, checked
-// against the catalogs rather than against the DDL text, so a later change that
-// breaks one fails here rather than three phases from now.
+// TestOriginColumnsStayRemovable pins the rules that make the origin block
+// droppable in one migration file, checked against the catalogs rather than
+// against the DDL text, so a later change that breaks one fails here rather
+// than three phases from now.
+//
+// Five of the six are here. V5 — neither column ever appears in a WHERE clause
+// — is a rule about the statements this package sends rather than about the
+// schema, and nothing in the database can see it; it is pinned by
+// TestPinIsTheOnlyPlaceTheOriginBlockDecidesAnything in pin_test.go.
 func TestOriginColumnsStayRemovable(t *testing.T) {
 	pool := migratedPool(t)
 	ctx := context.Background()
 
-	// V1: not in any primary key, unique constraint or foreign key.
-	// V3: in exactly one index, and that index is the dedicated partial one.
+	// V1, for indexes, and V3: the origin block appears in exactly one index,
+	// that index is the dedicated partial one, and it is neither unique nor
+	// primary — so dropping the columns drops one whole index and rebuilds
+	// nothing.
+	//
+	// 🔴 The predicate is read as well as the key columns, and that is the
+	// whole of this check rather than a refinement of it. `a.attnum = ANY
+	// (ix.indkey)` covers key and INCLUDE columns; a partial index's predicate
+	// lives in indpred and matches none of them. Our one index over the block
+	// is `(cluster_id, origin_node_id) WHERE NOT published`, so `published`
+	// contributed no rows at all — this block was testing origin_node_id and
+	// nothing else, and `AND published` bolted onto any other index's predicate
+	// passed it. Which is exactly the thing V3 exists to prevent: a partial
+	// predicate is where a column gets tangled into an index without appearing
+	// to be part of it, and DROP COLUMN takes the whole index with it.
 	rows, err := pool.Query(ctx, `
-SELECT i.relname, ix.indisunique, ix.indisprimary
+SELECT i.relname,
+       ix.indisunique,
+       ix.indisprimary,
+       COALESCE(pg_get_expr(ix.indpred, ix.indrelid), ''),
+       COALESCE((SELECT string_agg(a.attname, ',')
+                   FROM pg_attribute a
+                  WHERE a.attrelid = t.oid
+                    AND a.attnum = ANY (ix.indkey)), '')
   FROM pg_index ix
   JOIN pg_class  i ON i.oid = ix.indexrelid
   JOIN pg_class  t ON t.oid = ix.indrelid
   JOIN pg_namespace n ON n.oid = t.relnamespace
-  JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (ix.indkey)
  WHERE t.relname = 'snapshots'
-   AND n.nspname = current_schema()
-   AND a.attname IN ('published', 'origin_node_id')`)
+   AND n.nspname = current_schema()`)
 	if err != nil {
 		t.Fatalf("inspect indexes: %v", err)
 	}
 	defer rows.Close()
 
 	var names []string
+	scanned := 0
 	for rows.Next() {
-		var name string
+		var name, predicate, keyColumns string
 		var unique, primary bool
-		if err := rows.Scan(&name, &unique, &primary); err != nil {
+		if err := rows.Scan(&name, &unique, &primary, &predicate, &keyColumns); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
+		scanned++
+
+		var where []string
+		for _, column := range originBlockColumns {
+			if columnListHas(keyColumns, column) {
+				where = append(where, "key column "+column)
+			}
+			if mentionsIdentifier(predicate, column) {
+				where = append(where, "predicate column "+column)
+			}
+		}
+		if len(where) == 0 {
+			continue
+		}
 		if unique || primary {
-			t.Fatalf("index %s over the origin block is unique or primary: dropping the columns would rebuild it", name)
+			t.Fatalf("index %s over the origin block (%s) is unique or primary: dropping the columns would rebuild it",
+				name, strings.Join(where, ", "))
 		}
 		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read indexes: %v", err)
+	}
+	// A query that returned nothing would pass every assertion above it.
+	if scanned == 0 {
+		t.Fatal("no indexes on snapshots came back: this check was inspecting nothing")
 	}
 	for _, name := range names {
 		if name != "snapshots_unpublished_idx" {
@@ -345,12 +391,48 @@ SELECT i.relname, ix.indisunique, ix.indisprimary
 				"dropping the columns would have to rebuild that index too", name)
 		}
 	}
-	if len(names) == 0 {
-		t.Fatal("snapshots_unpublished_idx does not cover the origin block")
+	if len(names) != 1 {
+		t.Fatalf("the origin block is covered by %d indexes (%v), want exactly snapshots_unpublished_idx",
+			len(names), names)
 	}
 
-	// The key columns only: `published` appears in that index's predicate, and
-	// origin_node_id in its key, so exactly one index name may come back.
+	// V2: `published` is never merged into status_group. They answer different
+	// questions — "did the capture finish" and "did the bytes reach shared
+	// storage" — and folding them turns the drop into a backfill.
+	//
+	// The trigger that derives status_group is the only place the merge could
+	// be written, so the assertion is that its body does not mention either
+	// column. The behavioural half is next door: a failed publish is `ready`
+	// and unpublished, which is the pair a merge would make impossible.
+	var triggerBody string
+	if err := pool.QueryRow(ctx, `
+SELECT p.prosrc
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE p.proname = 'catalog_status_group_trg' AND n.nspname = current_schema()`).Scan(&triggerBody); err != nil {
+		t.Fatalf("read the status_group trigger: %v", err)
+	}
+	for _, column := range originBlockColumns {
+		if mentionsIdentifier(triggerBody, column) {
+			t.Fatalf("the status_group trigger reads %s:\n%s\n\n"+
+				"status_group is derived from `status` alone. Folding the origin block into it "+
+				"makes dropping those columns a backfill of every row rather than one DDL file.",
+				column, triggerBody)
+		}
+	}
+	// And the other way it could be merged: a generated column, whose
+	// expression is a second place a dependency can hide.
+	var generated string
+	if err := pool.QueryRow(ctx, `
+SELECT is_generated FROM information_schema.columns
+ WHERE table_schema = current_schema() AND table_name = 'snapshots'
+   AND column_name = 'status_group'`).Scan(&generated); err != nil {
+		t.Fatalf("read status_group: %v", err)
+	}
+	if generated != "NEVER" {
+		t.Fatalf("status_group became a generated column (%s): its expression is a dependency "+
+			"the origin block can be pulled into without appearing in any index", generated)
+	}
 
 	// V4: the constraint tying them together is named, so the drop script can
 	// use DROP CONSTRAINT IF EXISTS and stay idempotent.
@@ -368,16 +450,30 @@ SELECT EXISTS (
 		t.Fatal("snapshots_origin_axis is not there under that name")
 	}
 
-	// No foreign key touches either column, from either side.
+	// V1, for foreign keys: none touches either column, from either side.
+	//
+	// 🔴 Both sides, and the second half was missing. conkey is the referencing
+	// side — an FK on `snapshots` whose column is one of these. confkey is the
+	// referenced side: another table pointing *at* one of these columns, which
+	// needs a unique index over it to exist at all and would therefore break
+	// V1's first half too — but by way of an error message about a constraint
+	// on a table this test never looks at.
 	var fkCount int
 	if err := pool.QueryRow(ctx, `
-SELECT count(*)
-  FROM pg_constraint c
-  JOIN pg_class t ON t.oid = c.conrelid
-  JOIN pg_namespace n ON n.oid = t.relnamespace
-  JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
- WHERE c.contype = 'f' AND t.relname = 'snapshots' AND n.nspname = current_schema()
-   AND a.attname IN ('published', 'origin_node_id')`).Scan(&fkCount); err != nil {
+SELECT (SELECT count(*)
+          FROM pg_constraint c
+          JOIN pg_class t ON t.oid = c.conrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
+         WHERE c.contype = 'f' AND t.relname = 'snapshots' AND n.nspname = current_schema()
+           AND a.attname IN ('published', 'origin_node_id'))
+     + (SELECT count(*)
+          FROM pg_constraint c
+          JOIN pg_class ft ON ft.oid = c.confrelid
+          JOIN pg_namespace fn ON fn.oid = ft.relnamespace
+          JOIN pg_attribute a ON a.attrelid = ft.oid AND a.attnum = ANY (c.confkey)
+         WHERE c.contype = 'f' AND ft.relname = 'snapshots' AND fn.nspname = current_schema()
+           AND a.attname IN ('published', 'origin_node_id'))`).Scan(&fkCount); err != nil {
 		t.Fatalf("inspect foreign keys: %v", err)
 	}
 	if fkCount != 0 {
@@ -399,10 +495,27 @@ SELECT is_nullable FROM information_schema.columns
 
 	// And the whole point: the drop really is one file. Run it here, on a
 	// database that has the schema, and check nothing else needed touching.
+	//
+	// 🔴 Everything else, not one named index. The rehearsal used to re-check
+	// `snapshots_list_idx` alone, which pinned the one index somebody happened
+	// to name in 2026-08 and let a botched removal take any of the others. What
+	// makes the rehearsal worth running is that it does not need to know which
+	// index a future rule-breaker will have tangled the columns into: it takes
+	// the whole inventory before the drop and requires all of it back after,
+	// minus the two objects the drop is supposed to remove.
 	seedSnapshot(t, pool, snapshotSeed{published: false, originNodeID: "node-a"})
 	if _, err := pool.Exec(ctx, `DELETE FROM snapshots WHERE NOT published`); err != nil {
 		t.Fatalf("clear unpublished rows: %v", err)
 	}
+
+	indexesBefore := snapshotIndexNames(t, ctx, pool)
+	constraintsBefore := snapshotConstraintNames(t, ctx, pool)
+	// A rehearsal over an empty inventory would pass whatever the drop did.
+	if len(indexesBefore) < 3 || len(constraintsBefore) < 3 {
+		t.Fatalf("only %d indexes and %d constraints to check: this rehearsal is inspecting almost nothing",
+			len(indexesBefore), len(constraintsBefore))
+	}
+
 	for _, statement := range []string{
 		`DROP INDEX IF EXISTS snapshots_unpublished_idx`,
 		`ALTER TABLE snapshots DROP CONSTRAINT IF EXISTS snapshots_origin_axis`,
@@ -413,17 +526,31 @@ SELECT is_nullable FROM information_schema.columns
 			t.Fatalf("%s: %v", statement, err)
 		}
 	}
-	// The listing index — the one thing a botched removal would take with it —
-	// is still there, and the table still writes.
-	var listIdx bool
-	if err := pool.QueryRow(ctx, `
-SELECT EXISTS (SELECT 1 FROM pg_indexes
-                WHERE schemaname = current_schema() AND indexname = 'snapshots_list_idx')`).Scan(&listIdx); err != nil {
-		t.Fatalf("look for snapshots_list_idx: %v", err)
+
+	indexesAfter := snapshotIndexNames(t, ctx, pool)
+	for name := range indexesBefore {
+		if name == "snapshots_unpublished_idx" {
+			continue
+		}
+		if !indexesAfter[name] {
+			t.Fatalf("dropping the origin block took index %s with it", name)
+		}
 	}
-	if !listIdx {
-		t.Fatal("dropping the origin block took snapshots_list_idx with it")
+	if indexesAfter["snapshots_unpublished_idx"] {
+		t.Fatal("snapshots_unpublished_idx survived the drop: it is the one index that should have gone")
 	}
+
+	constraintsAfter := snapshotConstraintNames(t, ctx, pool)
+	for name := range constraintsBefore {
+		if name == "snapshots_origin_axis" {
+			continue
+		}
+		if !constraintsAfter[name] {
+			t.Fatalf("dropping the origin block took constraint %s with it", name)
+		}
+	}
+
+	// And the table still writes.
 	if _, err := pool.Exec(ctx, `
 INSERT INTO snapshots (id, cluster_id, source_kind, cpu_count, memory_mib, disk_size_mib,
                        status, status_group, created_at_ms, updated_at_ms)
@@ -431,6 +558,89 @@ VALUES ($1, '11111111-1111-1111-1111-111111111111', 'template', 1, 128, 1024,
         'waiting', 'pending', 1, 1)`, newUUID(t)); err != nil {
 		t.Fatalf("the table stopped accepting rows after the drop: %v", err)
 	}
+}
+
+// originBlockColumns are the two columns the rules above keep untangled.
+var originBlockColumns = []string{"published", "origin_node_id"}
+
+// columnListHas answers whether a comma-separated column list contains a name.
+// Compared whole, so `published` does not match `unpublished_at`.
+func columnListHas(list, column string) bool {
+	for _, name := range strings.Split(list, ",") {
+		if name == column {
+			return true
+		}
+	}
+	return false
+}
+
+// mentionsIdentifier answers whether an expression names a column, as a word.
+//
+// pg_get_expr renders a partial index's predicate as SQL text — `(NOT
+// published)` — so this is a text search over a normalised rendering rather
+// than over anything anybody typed.
+func mentionsIdentifier(expr, identifier string) bool {
+	rest := expr
+	for {
+		idx := strings.Index(rest, identifier)
+		if idx < 0 {
+			return false
+		}
+		before := idx == 0 || !isSQLIdentifierByte(rest[idx-1])
+		end := idx + len(identifier)
+		after := end == len(rest) || !isSQLIdentifierByte(rest[end])
+		if before && after {
+			return true
+		}
+		rest = rest[idx+len(identifier):]
+	}
+}
+
+func isSQLIdentifierByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		(b >= '0' && b <= '9') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z')
+}
+
+func snapshotIndexNames(t *testing.T, ctx context.Context, pool *pgxpool.Pool) map[string]bool {
+	t.Helper()
+	return namesOf(t, ctx, pool, `
+SELECT indexname FROM pg_indexes
+ WHERE schemaname = current_schema() AND tablename = 'snapshots'`)
+}
+
+func snapshotConstraintNames(t *testing.T, ctx context.Context, pool *pgxpool.Pool) map[string]bool {
+	t.Helper()
+	return namesOf(t, ctx, pool, `
+SELECT c.conname
+  FROM pg_constraint c
+  JOIN pg_class t ON t.oid = c.conrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+ WHERE t.relname = 'snapshots' AND n.nspname = current_schema()`)
+}
+
+func namesOf(t *testing.T, ctx context.Context, pool *pgxpool.Pool, query string) map[string]bool {
+	t.Helper()
+
+	rows, err := pool.Query(ctx, query)
+	if err != nil {
+		t.Fatalf("read names: %v", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan a name: %v", err)
+		}
+		out[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read names: %v", err)
+	}
+	return out
 }
 
 func TestBuildsHoldOneLiveBuildPerTemplate(t *testing.T) {

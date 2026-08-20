@@ -5,37 +5,37 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::repository::{
-    RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
-    SnapshotRuntimeResolver,
+    ImportedSnapshotArtifacts, RepositoryError, RepositoryResult, SnapshotArtifactStore,
+    SnapshotCatalog, SnapshotListFilter, SnapshotRepository, SnapshotRuntimeResolver,
 };
 use super::{
-    RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedSnapshot, PersistedDiskImagePublication, RunnableSnapshot, SnapshotId,
+    SnapshotManager, SnapshotPublishMetadata, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::sandbox::FirecrackerSnapshotManifest;
 
-/// Test double for snapshot repository interactions that should stay unreachable.
+/// Test double for catalog interactions that should stay unreachable.
 #[derive(Clone, Debug, Default)]
-pub struct MockSnapshotRepository;
+pub struct MockSnapshotCatalog;
 
-impl MockSnapshotRepository {
+impl MockSnapshotCatalog {
     fn unsupported() -> RepositoryError {
         RepositoryError::Unsupported {
-            feature: "mock snapshot repository should not be called in this test".to_string(),
+            feature: "mock snapshot catalog should not be called in this test".to_string(),
         }
     }
 }
 
 #[async_trait]
-impl SnapshotRepository for MockSnapshotRepository {
+impl SnapshotCatalog for MockSnapshotCatalog {
     async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         Err(Self::unsupported())
     }
 
-    async fn publish(
+    async fn publish_commit(
         &self,
         _metadata: SnapshotPublishMetadata,
-        _manifest: FirecrackerSnapshotManifest,
+        _committed: CommittedSnapshot,
     ) -> RepositoryResult<SnapshotRecord> {
         Err(Self::unsupported())
     }
@@ -48,7 +48,7 @@ impl SnapshotRepository for MockSnapshotRepository {
         Err(Self::unsupported())
     }
 
-    async fn delete(&self, _id_or_alias: &str) -> RepositoryResult<()> {
+    async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
         Err(Self::unsupported())
     }
 
@@ -66,6 +66,31 @@ impl SnapshotRepository for MockSnapshotRepository {
         _reason: crate::snapshot::TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
         Err(Self::unsupported())
+    }
+}
+
+/// Test double for artifact-store interactions that should stay unreachable.
+#[derive(Clone, Debug, Default)]
+pub struct MockSnapshotArtifactStore;
+
+#[async_trait]
+impl SnapshotArtifactStore for MockSnapshotArtifactStore {
+    async fn import_built_artifacts(
+        &self,
+        _metadata: &SnapshotPublishMetadata,
+        _manifest: &FirecrackerSnapshotManifest,
+        _publications: &mut Vec<PersistedDiskImagePublication>,
+    ) -> RepositoryResult<ImportedSnapshotArtifacts> {
+        Err(RepositoryError::Unsupported {
+            feature: "mock snapshot artifact store should not be called in this test".to_string(),
+        })
+    }
+
+    async fn delete_artifacts(
+        &self,
+        _id: &SnapshotId,
+        _publications: &[PersistedDiskImagePublication],
+    ) {
     }
 }
 
@@ -91,7 +116,10 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
 /// Builds a snapshot manager backed by snapshot test doubles.
 pub fn mock_snapshot_manager() -> SnapshotManager {
     SnapshotManager::from_parts(
-        Arc::new(MockSnapshotRepository),
+        Arc::new(SnapshotRepository::new(
+            Arc::new(MockSnapshotCatalog),
+            Arc::new(MockSnapshotArtifactStore),
+        )),
         Arc::new(MockSnapshotRuntimeResolver),
         None,
     )

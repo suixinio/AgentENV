@@ -1,8 +1,11 @@
+mod artifacts;
+mod catalog;
 mod client;
 mod config;
 mod layout;
-mod repository;
 mod resolver;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,12 +16,14 @@ use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
+use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::SnapshotRepository;
 
+pub(crate) use self::artifacts::OssSnapshotArtifactStore;
+pub(crate) use self::catalog::OssSnapshotCatalog;
 pub(crate) use self::client::OssClient;
 pub(crate) use self::config::NormalizedOssConfig;
 pub(crate) use self::layout::OssSnapshotArtifactLayout;
-pub(crate) use self::repository::OssSnapshotRepository;
 use self::resolver::OssRuntimeResolver;
 
 /// OSS-backed snapshot backend.
@@ -26,7 +31,7 @@ use self::resolver::OssRuntimeResolver;
 /// Combines the durable committed-state repository (stored in OSS) with a
 /// node-local runtime resolver that materializes runnable overlaybd configs.
 pub struct OssBackend {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<SnapshotRepository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
 
@@ -67,9 +72,12 @@ impl OssBackend {
             config.credential_source(),
         )?);
 
-        let repository: Arc<dyn SnapshotRepository> = Arc::new(OssSnapshotRepository::new(
-            Arc::clone(&client),
-            config.snapshot_image_storage(),
+        let repository = Arc::new(SnapshotRepository::new(
+            Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
+            Arc::new(OssSnapshotArtifactStore::new(
+                Arc::clone(&client),
+                config.snapshot_image_storage(),
+            )),
         ));
 
         std::fs::create_dir_all(&runtime_root)
@@ -90,12 +98,7 @@ impl OssBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Arc<dyn SnapshotRepository>,
-        Arc<dyn SnapshotRuntimeResolver>,
-    ) {
+    pub fn into_parts(self) -> (Arc<SnapshotRepository>, Arc<dyn SnapshotRuntimeResolver>) {
         (self.repository, self.runtime_resolver)
     }
 }

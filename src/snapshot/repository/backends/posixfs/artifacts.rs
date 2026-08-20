@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
@@ -5,17 +6,25 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
+use tokio::task;
+use tracing::warn;
 
 use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
 use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::snapshot::repository::interfaces::{ImportedSnapshotArtifacts, SnapshotArtifactStore};
 use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
+    RepositoryError, RepositoryResult, SnapshotId, SnapshotPublishMetadata,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
+///
+/// Never publishes to an external registry, so the publications it reports and
+/// the ones it is asked to roll back are always empty.
+#[derive(Clone)]
 pub struct PosixFsArtifactStore {
     root: PathBuf,
 }
@@ -41,7 +50,7 @@ impl PosixFsArtifactStore {
     /// Note that committed snapshot metadata intentionally does not persist the
     /// build-time `image.json` files. Runtime resolvers regenerate those files
     /// from the committed manifest plus backend layout conventions.
-    pub(crate) fn import_built_artifacts(
+    fn import_built_artifacts_sync(
         &self,
         snapshot_id: &SnapshotId,
         manifest: &FirecrackerSnapshotManifest,
@@ -90,6 +99,20 @@ impl PosixFsArtifactStore {
             memory_layers,
             attached_drives,
         })
+    }
+
+    /// Removes one snapshot's artifact directory. Idempotent; the commit
+    /// marker inside it goes with it.
+    fn remove_snapshot_dir(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
+        let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
+        match fs::remove_dir_all(&snapshot_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RepositoryError::backend(
+                format!("remove snapshot dir '{}'", snapshot_dir.display()),
+                error,
+            )),
+        }
     }
 
     fn persist_firecracker_manifest(
@@ -694,6 +717,60 @@ fn copy_file_with_sha256(source: &Path, destination: &Path) -> RepositoryResult<
     Ok(())
 }
 
+#[async_trait]
+impl SnapshotArtifactStore for PosixFsArtifactStore {
+    async fn import_built_artifacts(
+        &self,
+        metadata: &SnapshotPublishMetadata,
+        manifest: &FirecrackerSnapshotManifest,
+        _publications: &mut Vec<PersistedDiskImagePublication>,
+    ) -> RepositoryResult<ImportedSnapshotArtifacts> {
+        let store = self.clone();
+        let snapshot_id = metadata.id.clone();
+        let manifest = manifest.clone();
+        run_artifact_blocking("import snapshot artifacts", move || {
+            store.import_built_artifacts_sync(&snapshot_id, &manifest)
+        })
+        .await
+        .map(|built| ImportedSnapshotArtifacts {
+            rootfs_layers: built.rootfs_layers,
+            memory_layers: built.memory_layers,
+            attached_drives: built.attached_drives,
+            // This backend keeps every layer in its own store.
+            disk_publications: Vec::new(),
+        })
+    }
+
+    async fn delete_artifacts(
+        &self,
+        id: &SnapshotId,
+        _publications: &[PersistedDiskImagePublication],
+    ) {
+        let store = self.clone();
+        let owned_id = id.clone();
+        let removed = run_artifact_blocking("delete snapshot artifacts", move || {
+            store.remove_snapshot_dir(&owned_id)
+        })
+        .await;
+        if let Err(error) = removed {
+            warn!(snapshot_id = %id, error = %error, "failed to delete posixfs snapshot artifacts");
+        }
+    }
+}
+
+async fn run_artifact_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> RepositoryResult<T> + Send + 'static,
+{
+    task::spawn_blocking(work)
+        .await
+        .map_err(|error| RepositoryError::Backend {
+            message: format!("artifact blocking task panicked while trying to {operation}"),
+            source: Some(anyhow::Error::from(error)),
+        })?
+}
+
 #[derive(Debug)]
 pub(crate) struct CollectedBuiltArtifacts {
     pub(crate) rootfs_layers: Vec<OverlaybdLayerRef>,
@@ -834,7 +911,7 @@ mod tests {
             .expect("attached drive manifest should include virtual size");
 
         let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+            .import_built_artifacts_sync(&snapshot_id, &manifest)
             .expect("import built artifacts");
 
         let path = match &built.attached_drives[0] {
@@ -866,7 +943,7 @@ mod tests {
         let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
             .expect("mock built artifacts should write");
         let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+            .import_built_artifacts_sync(&snapshot_id, &manifest)
             .expect("collect built artifacts");
 
         assert_eq!(built.rootfs_layers.len(), 1);
@@ -894,7 +971,7 @@ mod tests {
                 .expect("mock built artifacts should write");
 
         let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+            .import_built_artifacts_sync(&snapshot_id, &manifest)
             .expect("collect built artifacts");
 
         let committed_layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
@@ -953,7 +1030,7 @@ mod tests {
         .expect("write descriptor rootfs image config");
 
         let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+            .import_built_artifacts_sync(&snapshot_id, &manifest)
             .expect("collect built artifacts");
 
         match &built.rootfs_layers[0] {
@@ -979,7 +1056,7 @@ mod tests {
         let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
             .expect("mock built artifacts should write");
         let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+            .import_built_artifacts_sync(&snapshot_id, &manifest)
             .expect("collect built artifacts");
 
         assert_eq!(built.memory_layers.len(), 1);
@@ -1073,7 +1150,7 @@ mod tests {
         .expect("write zfile memory image config");
 
         let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+            .import_built_artifacts_sync(&snapshot_id, &manifest)
             .expect("import built artifacts");
 
         assert_eq!(built.memory_layers.len(), 1);

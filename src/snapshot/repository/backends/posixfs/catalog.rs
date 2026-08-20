@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tokio::task;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
+use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::metrics::{
     record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
@@ -21,13 +24,17 @@ const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 const ALIAS_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
 const RECORD_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
 
+/// Snapshot rows as one JSON file per record under `catalog/`, with an alias
+/// directory beside it and a commit marker in each snapshot's artifact
+/// directory.
+///
+/// The marker is the one place this store writes outside `catalog/`: it is what
+/// makes "committed" mean "the row says so *and* the directory was sealed", and
+/// it is what `retains_artifacts_on_publish_failure` reads to keep a failed
+/// re-publish from deleting a live snapshot's bytes.
+#[derive(Clone)]
 pub struct PosixFsCatalogStore {
     root: PathBuf,
-}
-
-#[derive(Debug)]
-pub(crate) struct PublishSession {
-    pub(crate) snapshot_id: SnapshotId,
 }
 
 #[derive(Debug)]
@@ -60,24 +67,6 @@ impl PosixFsCatalogStore {
         PosixFsSnapshotArtifactLayout::record_path(&self.root, snapshot_id)
     }
 
-    /// Starts a publish session by creating the snapshot directory under the durable catalog root.
-    pub(crate) fn begin_publish(
-        &self,
-        snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<PublishSession> {
-        self.ensure_layout()?;
-        let snapshot_dir = self.layout(snapshot_id).snapshot_dir();
-        fs::create_dir_all(&snapshot_dir).map_err(|error| {
-            RepositoryError::backend(
-                format!("create snapshot dir '{}'", snapshot_dir.display()),
-                error,
-            )
-        })?;
-        Ok(PublishSession {
-            snapshot_id: snapshot_id.clone(),
-        })
-    }
-
     /// Commits one imported snapshot into the catalog and makes it visible via the commit marker.
     ///
     /// Flow:
@@ -85,12 +74,12 @@ impl PosixFsCatalogStore {
     /// 2. bind the alias
     /// 3. write the commit marker
     /// 4. write the committed snapshot record
-    pub(crate) fn commit_publish(
+    fn publish_commit_sync(
         &self,
-        session: &PublishSession,
         metadata: SnapshotPublishMetadata,
         committed: CommittedSnapshot,
     ) -> RepositoryResult<SnapshotRecord> {
+        self.ensure_layout()?;
         let now = now_unix_ms();
         let snapshot_id = metadata.id.clone();
         let write_result = if let Some(alias) = metadata.alias.as_ref() {
@@ -110,14 +99,14 @@ impl PosixFsCatalogStore {
                     }
                 }
                 store.write_json(&alias_path, &snapshot_id)?;
-                store.write_commit_marker(&session.snapshot_id)?;
+                store.write_commit_marker(&snapshot_id)?;
                 store.write_committed_record_unlocked(&record)?;
                 Ok(record)
             })
         } else {
             (|| {
                 let record = self.committed_record_unlocked(&metadata, committed.clone(), now)?;
-                self.write_commit_marker(&session.snapshot_id)?;
+                self.write_commit_marker(&snapshot_id)?;
                 self.write_committed_record_unlocked(&record)?;
                 Ok(record)
             })()
@@ -136,18 +125,15 @@ impl PosixFsCatalogStore {
                         Ok(())
                     });
                 }
-                let _ = self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id);
+                // The snapshot directory is not removed here: rolling back
+                // bytes belongs to the artifact store, and the composite calls
+                // it after asking `retains_artifacts_on_publish_failure`.
                 Err(error)
             }
         }
     }
 
-    /// Cleans up an unfinished publish session that never reached the committed marker.
-    pub(crate) fn abort_publish(&self, session: &PublishSession) -> RepositoryResult<()> {
-        self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id)
-    }
-
-    pub(crate) fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+    fn create_sync(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.ensure_layout()?;
         if !matches!(record.source, SnapshotSource::Template { .. }) {
             return Err(RepositoryError::InvalidRequest {
@@ -180,7 +166,7 @@ impl PosixFsCatalogStore {
         Ok(record)
     }
 
-    pub(crate) fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+    fn get_sync(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         self.ensure_layout()?;
         if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
             if let Some(record) = self.load_record_by_id_unlocked(&direct_id)? {
@@ -209,7 +195,7 @@ impl PosixFsCatalogStore {
         })
     }
 
-    pub(crate) fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+    fn list_sync(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
         self.ensure_layout()?;
         let records_dir = self.records_dir();
         let mut records = Vec::new();
@@ -260,39 +246,32 @@ impl PosixFsCatalogStore {
         Ok(records)
     }
 
-    pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let Some(record) = self.load_record_by_id_unlocked(id)? else {
-            // Idempotent: already doesn't exist
-            return Ok(());
-        };
+    /// Removes the commit marker, the alias binding, and the row.
+    ///
+    /// The snapshot's artifact directory is *not* removed here; that is the
+    /// artifact store's, and the composite calls it once this returns. Clearing
+    /// the marker first still means a crash mid-delete leaves the snapshot
+    /// uncommitted rather than half-committed.
+    fn delete_record_sync(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+        let id = &record.id;
         if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
-                let snapshot_layout = PosixFsSnapshotArtifactLayout::new(&store.root, id);
                 let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
-                store.remove_file_if_exists(
-                    &snapshot_layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER),
-                )?;
+                store.remove_file_if_exists(&store.commit_marker_path(id))?;
                 if store.load_alias_target(alias)?.as_ref() == Some(id) {
                     store.remove_file_if_exists(&alias_path)?;
-                }
-                if record.committed.is_some() {
-                    store.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
                 }
                 store.remove_file_if_exists(&store.record_path(id))
             })?;
             return Ok(());
         }
-        let snapshot_layout = self.layout(id);
         self.remove_file_if_exists(&self.commit_marker_path(id))?;
-        if record.committed.is_some() {
-            self.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
-        }
         self.remove_file_if_exists(&self.record_path(id))?;
         Ok(())
     }
 
     /// Resolves one alias to a committed snapshot id and drops stale alias entries on the way.
-    pub(crate) fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+    fn resolve_alias_sync(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         let alias =
             SnapshotAlias::parse(alias).map_err(|error| RepositoryError::InvalidRequest {
                 reason: error.to_string(),
@@ -335,7 +314,7 @@ impl PosixFsCatalogStore {
         Ok(())
     }
 
-    pub(crate) fn try_start(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+    fn try_start_sync(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
         let _guard = self.acquire_record_lock(id)?;
         let mut record = self.load_record_by_id_unlocked(id)?.ok_or_else(|| {
             RepositoryError::SnapshotNotFound {
@@ -361,7 +340,7 @@ impl PosixFsCatalogStore {
         Ok(record)
     }
 
-    pub(crate) fn mark_error(
+    fn mark_error_sync(
         &self,
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
@@ -535,17 +514,12 @@ impl PosixFsCatalogStore {
         }
     }
 
-    fn remove_dir_if_exists(&self, path: &Path) -> RepositoryResult<()> {
-        match fs::remove_dir_all(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(RepositoryError::backend(
-                format!("remove '{}'", path.display()),
-                error,
-            )),
-        }
-    }
-
+    /// Whether a completed publish still owns this snapshot's artifacts.
+    ///
+    /// Both halves matter: the marker alone can survive a crash between writing
+    /// it and writing the row, and a committed row alone can predate a
+    /// directory that was since removed. Read errors resolve to "not
+    /// committed", which is what the pre-split rollback did.
     fn is_committed(&self, id: &SnapshotId) -> bool {
         self.commit_marker_path(id).exists()
             && self
@@ -553,14 +527,6 @@ impl PosixFsCatalogStore {
                 .ok()
                 .flatten()
                 .is_some_and(|record| record.committed.is_some())
-    }
-
-    fn cleanup_uncommitted_snapshot_dir(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        if self.is_committed(id) {
-            return Ok(());
-        }
-        let snapshot_layout = self.layout(id);
-        self.remove_dir_if_exists(&snapshot_layout.snapshot_dir())
     }
 
     fn load_record_by_id_unlocked(
@@ -819,6 +785,105 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Every method here is one `spawn_blocking` around the synchronous body above.
+/// The POSIX catalog is file I/O and file locks; keeping the blocking work off
+/// the reactor is the whole of what this layer does.
+#[async_trait]
+impl SnapshotCatalog for PosixFsCatalogStore {
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        let store = self.clone();
+        run_catalog_blocking("create snapshot record", move || store.create_sync(record)).await
+    }
+
+    async fn publish_commit(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        committed: CommittedSnapshot,
+    ) -> RepositoryResult<SnapshotRecord> {
+        let store = self.clone();
+        run_catalog_blocking("commit snapshot record", move || {
+            store.publish_commit_sync(metadata, committed)
+        })
+        .await
+    }
+
+    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        let store = self.clone();
+        let id_or_alias = id_or_alias.to_string();
+        run_catalog_blocking("load snapshot", move || store.get_sync(&id_or_alias)).await
+    }
+
+    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+        let store = self.clone();
+        run_catalog_blocking("list snapshots", move || store.list_sync(filter)).await
+    }
+
+    async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+        let store = self.clone();
+        let record = record.clone();
+        run_catalog_blocking("delete snapshot record", move || {
+            store.delete_record_sync(&record)
+        })
+        .await
+    }
+
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        let store = self.clone();
+        let alias = alias.to_string();
+        run_catalog_blocking("resolve snapshot alias", move || {
+            store.resolve_alias_sync(&alias)
+        })
+        .await
+    }
+
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        let store = self.clone();
+        let id = id.clone();
+        run_catalog_blocking("start template build", move || store.try_start_sync(&id)).await
+    }
+
+    async fn mark_build_error(
+        &self,
+        id: &SnapshotId,
+        reason: TemplateBuildErrorReason,
+    ) -> RepositoryResult<()> {
+        let store = self.clone();
+        let id = id.clone();
+        run_catalog_blocking("mark template build error", move || {
+            store.mark_error_sync(&id, reason)
+        })
+        .await
+    }
+
+    /// Unlike the OSS backend, this one refuses to delete artifacts a completed
+    /// publish still owns, so a failed re-publish of an existing id cannot take
+    /// the live snapshot's bytes with it.
+    async fn retains_artifacts_on_publish_failure(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<bool> {
+        let store = self.clone();
+        let id = id.clone();
+        run_catalog_blocking("check snapshot commit state", move || {
+            Ok(store.is_committed(&id))
+        })
+        .await
+    }
+}
+
+async fn run_catalog_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> RepositoryResult<T> + Send + 'static,
+{
+    task::spawn_blocking(work)
+        .await
+        .map_err(|error| RepositoryError::Backend {
+            message: format!("catalog blocking task panicked while trying to {operation}"),
+            source: Some(anyhow::Error::from(error)),
+        })?
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -848,7 +913,7 @@ mod tests {
         let record_count = 3_u64;
         for index in 0..record_count {
             store
-                .create(SnapshotRecord::template_waiting(
+                .create_sync(SnapshotRecord::template_waiting(
                     SnapshotId::generate(),
                     Some(SnapshotAlias::parse(&format!("template-{index}")).expect("alias parses")),
                     SandboxResources::default(),
@@ -858,8 +923,13 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
+        // Deliberately the synchronous body rather than the `SnapshotCatalog`
+        // method: `with_local_recorder` installs a *thread-local* recorder, and
+        // the trait method runs the same work on a `spawn_blocking` thread that
+        // would not see it. In production the recorder is global, so the two
+        // paths record identically.
         let listed = metrics::with_local_recorder(&recorder, || {
-            store.list(SnapshotListFilter::matches_all())
+            store.list_sync(SnapshotListFilter::matches_all())
         })
         .expect("list should work");
         assert_eq!(listed.len(), record_count as usize);
@@ -877,17 +947,13 @@ mod tests {
     }
 
     #[test]
-    fn begin_and_commit_make_snapshot_visible() {
+    fn commit_makes_snapshot_visible_and_seals_its_directory() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
         let snapshot_id = SnapshotId::generate();
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("begin should work");
 
         store
-            .commit_publish(
-                &session,
+            .publish_commit_sync(
                 SnapshotPublishMetadata {
                     id: snapshot_id.clone(),
                     source: SnapshotPublishSource::Template,
@@ -898,7 +964,7 @@ mod tests {
             .expect("commit should work");
 
         assert!(store
-            .get(&snapshot_id.to_string())
+            .get_sync(&snapshot_id.to_string())
             .expect("get should work")
             .expect("snapshot should exist")
             .committed
@@ -925,18 +991,15 @@ mod tests {
 
     fn commit_record(store: &PosixFsCatalogStore, metadata: SnapshotPublishMetadata) -> SnapshotId {
         let snapshot_id = metadata.id.clone();
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("begin should work");
         store
-            .commit_publish(&session, metadata, CommittedSnapshot::mock())
+            .publish_commit_sync(metadata, CommittedSnapshot::mock())
             .expect("commit should work");
         snapshot_id
     }
 
     fn listed_ids(store: &PosixFsCatalogStore, filter: SnapshotListFilter) -> Vec<SnapshotId> {
         store
-            .list(filter)
+            .list_sync(filter)
             .expect("list should work")
             .into_iter()
             .map(|record| record.id)
@@ -985,14 +1048,14 @@ mod tests {
         );
         let errored_template = SnapshotId::generate();
         store
-            .create(SnapshotRecord::template_waiting(
+            .create_sync(SnapshotRecord::template_waiting(
                 errored_template.clone(),
                 Some(SnapshotAlias::parse("template-error").expect("alias should parse")),
                 Default::default(),
             ))
             .expect("create template should work");
         store
-            .mark_error(
+            .mark_error_sync(
                 &errored_template,
                 crate::snapshot::TemplateBuildErrorReason::new("boom"),
             )
@@ -1080,7 +1143,7 @@ mod tests {
         // "../../etc/passwd" is not a valid alias (nor a UUID), so alias parsing
         // validation rejects it as InvalidRequest.
         let err = store
-            .get("../../etc/passwd")
+            .get_sync("../../etc/passwd")
             .expect_err("path traversal should be rejected");
         assert!(
             matches!(err, crate::snapshot::RepositoryError::InvalidRequest { .. }),
@@ -1094,7 +1157,7 @@ mod tests {
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
         let unknown = SnapshotId::generate();
         let result = store
-            .get(&unknown.to_string())
+            .get_sync(&unknown.to_string())
             .expect("valid UUID lookup should not error");
         assert!(result.is_none(), "non-existent snapshot should return None");
     }

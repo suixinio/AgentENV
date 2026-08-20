@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use super::errors::RepositoryResult;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
-    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef,
+    PersistedDiskImagePublication, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
+    SnapshotRecord, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildStatus,
 };
 
 /// Snapshot record list filter.
@@ -77,68 +78,64 @@ impl SnapshotListFilter {
     }
 }
 
-#[async_trait]
-/// Durable snapshot repository.
+/// The facts a [`SnapshotArtifactStore`] establishes by writing one snapshot's
+/// bytes into durable storage.
 ///
-/// This trait owns the repository truth for [`SnapshotRecord`] values and committed snapshot
-/// artifacts. A record is the catalog identity and lifecycle state for a snapshot:
+/// This is the whole of what the byte side tells the row side. Everything here
+/// is a *logical* reference — a digest, a size, a registry coordinate — never a
+/// local path, a temp directory, or a handle. That is what lets the two halves
+/// end up in different processes: `SnapshotCatalog::publish_commit` can be
+/// answered by something that has never seen the bytes.
+#[derive(Clone, Debug, Default)]
+pub struct ImportedSnapshotArtifacts {
+    pub rootfs_layers: Vec<OverlaybdLayerRef>,
+    /// Managed overlaybd layers for the memory snapshot image, ordered bottom-up.
+    pub memory_layers: Vec<ManagedLayer>,
+    pub attached_drives: Vec<CommittedAttachedDrive>,
+    /// External registry publications produced by the source-registry policy.
+    /// Empty for backends that keep every layer in their own store.
+    pub disk_publications: Vec<PersistedDiskImagePublication>,
+}
+
+#[async_trait]
+/// The rows: snapshot records, template build state, and alias bindings.
+///
+/// A record is the catalog identity and lifecycle state for a snapshot:
 ///
 /// - template records may exist before build artifacts are committed
 /// - sandbox records are created by publishing an already captured runtime snapshot
-/// - committed records carry a [`crate::snapshot::CommittedSnapshot`] payload with artifact
-///   references
+/// - committed records carry a [`CommittedSnapshot`] payload of artifact references
 ///
-/// Implementations are responsible for durable state that may be shared across processes or nodes:
+/// Nothing in this trait reads or writes a snapshot byte. That separation is
+/// load-bearing rather than cosmetic: an implementation of this trait can live
+/// behind an RPC, in a database, or in front of both, without the byte path
+/// knowing. The counterpart is [`SnapshotArtifactStore`], and
+/// [`SnapshotRepository`] is the only thing that sequences the two.
 ///
-/// - snapshot records and template build state
-/// - alias-to-snapshot bindings
-/// - committed artifacts such as Firecracker snapshots and managed layers
-/// - publish / delete visibility rules
-///
-/// Callers may assume returned records describe durable repository state rather than process-local
-/// working directories or node-local runtime cache files.
-///
-/// The repository boundary intentionally excludes node-local derived state. In particular:
-///
-/// - local build-artifact allocation is owned by the manager rather than the repository
-/// - runtime-ready `image.json` files should be materialized by [`SnapshotRuntimeResolver`]
-/// - node-local cache directories should not leak back into snapshot records
-/// - repository implementations should not require sandbox launch code to understand backend-specific
-///   local build layouts
-///
-/// Backend guidance for shared POSIX or distributed filesystems:
+/// Backend guidance:
 ///
 /// - alias claim / release should be concurrency-safe
-/// - publish should only make aliases visible after the snapshot record and committed artifact
-///   payload are durable enough for subsequent readers to resolve
-/// - delete should avoid exposing partially removed records or committed artifacts
-/// - shared artifact imports should use atomic protocols so concurrent writers do not expose
-///   half-written managed layers
-pub trait SnapshotRepository: Send + Sync {
+/// - a commit should only make an alias visible once the record it points at is
+///   durable enough for subsequent readers to resolve
+/// - delete should avoid exposing partially removed records
+pub trait SnapshotCatalog: Send + Sync {
     /// Creates a durable template snapshot record before build artifacts exist.
     ///
-    /// Backends should reject records that already contain a committed artifact payload and should
-    /// only accept records whose source kind is template.
+    /// Backends should reject records that already contain a committed artifact
+    /// payload and should only accept records whose source kind is template.
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
 
-    /// Publishes manager-owned local artifacts into committed repository state.
+    /// Commits one snapshot's row, given a payload whose artifacts are already
+    /// durable.
     ///
-    /// Implementations are responsible for:
-    ///
-    /// - reading build artifacts from the provided local artifact description
-    /// - validating publish metadata
-    /// - importing any repository-owned managed layers
-    /// - committing a durable snapshot record with a committed artifact payload
-    /// - binding aliases only after the record is durable
-    /// - cleaning up or rolling back partially committed state on failure
-    ///
-    /// On success, the returned [`SnapshotRecord`] must contain committed artifact state.
-    /// On failure, callers may assume the backend attempted best-effort cleanup of partially published
-    /// state, but durable shared artifacts may still be retained when doing so is safe and intentional.
-    async fn publish(
+    /// This is the flip: before it the snapshot is bytes nobody can find, after
+    /// it the snapshot is resolvable. It must bind the alias and mark the
+    /// record committed, and it must not assume the artifacts are reachable
+    /// from this process — `committed` is the only description of them it gets.
+    async fn publish_commit(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        committed: CommittedSnapshot,
     ) -> RepositoryResult<SnapshotRecord>;
 
     /// Loads one snapshot record by repository id or alias.
@@ -147,32 +144,88 @@ pub trait SnapshotRepository: Send + Sync {
     /// Lists snapshot records matching the provided filter.
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
 
-    /// Deletes one snapshot record by repository id or alias.
+    /// Deletes one snapshot's row and any alias binding that still points at
+    /// it. Idempotent. Leaves the artifacts to [`SnapshotArtifactStore`].
     ///
-    /// Returns `Ok(())` on success. The operation is idempotent:
-    /// if the snapshot does not exist, it is still considered success.
-    ///
-    /// For committed records, implementations should also remove per-snapshot committed artifacts and
-    /// any alias binding that still points at the deleted id.
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
+    /// Takes the record rather than the id because unbinding the alias needs
+    /// it, and the caller has just read it: asking for the id alone would make
+    /// every backend re-read the row it was handed.
+    async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()>;
 
     /// Resolves a human-readable alias to the current snapshot id.
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
 
     /// Atomically transitions one template build from waiting to building.
     ///
-    /// Backends should reject non-template records and template records that are no longer waiting.
+    /// Backends should reject non-template records and template records that are
+    /// no longer waiting.
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
 
     /// Marks one template build as failed.
     ///
-    /// Backends should preserve the existing record identity, alias, resources, and source while
-    /// recording the failure state and reason.
+    /// Backends should preserve the existing record identity, alias, resources,
+    /// and source while recording the failure state and reason.
     async fn mark_build_error(
         &self,
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
+
+    /// Whether an earlier commit still owns `id`'s artifacts, so a publish that
+    /// failed now must not delete them.
+    ///
+    /// Only the catalog can answer this: it is the half that knows whether a
+    /// previous publish of the same id ever committed. The default is "no",
+    /// which rolls back unconditionally — the behaviour the OSS backend has
+    /// always had.
+    async fn retains_artifacts_on_publish_failure(
+        &self,
+        _id: &SnapshotId,
+    ) -> RepositoryResult<bool> {
+        Ok(false)
+    }
+}
+
+#[async_trait]
+/// The bytes: snapshot artifacts and managed layers.
+///
+/// Implementations move a captured or built snapshot's local files into durable
+/// shared storage and report back what they stored, as
+/// [`ImportedSnapshotArtifacts`]. They never touch a catalog row, and they are
+/// never the thing that makes a snapshot visible — a snapshot whose bytes are
+/// all present but whose row was never committed is unresolvable, by design.
+///
+/// Backend guidance:
+///
+/// - shared artifact imports should use atomic protocols so concurrent writers
+///   never expose half-written managed layers
+/// - content-addressed layers are shared between snapshots; they are not part
+///   of any one snapshot's rollback and need separate GC
+pub trait SnapshotArtifactStore: Send + Sync {
+    /// Writes one snapshot's bytes into durable storage.
+    ///
+    /// `publications` accumulates external registry publications *as they are
+    /// made*, rather than only on success, because rolling back a partial
+    /// import needs the ones that already landed. It is the caller's, so the
+    /// caller still holds them when this returns `Err`.
+    async fn import_built_artifacts(
+        &self,
+        metadata: &SnapshotPublishMetadata,
+        manifest: &FirecrackerSnapshotManifest,
+        publications: &mut Vec<PersistedDiskImagePublication>,
+    ) -> RepositoryResult<ImportedSnapshotArtifacts>;
+
+    /// Removes everything stored for `id`, plus the listed external
+    /// publications. Best effort: failures are logged, not returned, because
+    /// every caller is already on an error path or has already removed the row.
+    ///
+    /// Content-addressed managed layers are deliberately out of scope — they
+    /// are shared across snapshots.
+    async fn delete_artifacts(
+        &self,
+        id: &SnapshotId,
+        publications: &[PersistedDiskImagePublication],
+    );
 }
 
 #[async_trait]

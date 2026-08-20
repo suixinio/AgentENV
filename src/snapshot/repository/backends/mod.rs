@@ -11,17 +11,15 @@ use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBa
 use crate::image::cache::local_image_services_from_app_config;
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
+use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::SnapshotRepository;
 pub use oss::OssBackend;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 
 /// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
 pub fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<(
-    Arc<dyn SnapshotRepository>,
-    Arc<dyn SnapshotRuntimeResolver>,
-)> {
+) -> Result<(Arc<SnapshotRepository>, Arc<dyn SnapshotRuntimeResolver>)> {
     let config = ConfigManager::global_config();
     let shared_cache_root = shared_runtime_cache_root();
     let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;

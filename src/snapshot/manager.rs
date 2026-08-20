@@ -12,7 +12,8 @@ use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
+use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::SnapshotRepository;
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
@@ -48,7 +49,7 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
 /// is reclaimable - committed snapshots never pin it - so this manager records no
 /// local image ref pins.
 pub struct SnapshotManager {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<SnapshotRepository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 }
@@ -66,7 +67,7 @@ impl SnapshotManager {
 
     /// Builds a manager from the given components.
     pub fn from_parts(
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<SnapshotRepository>,
         runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {

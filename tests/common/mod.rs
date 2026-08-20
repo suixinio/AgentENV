@@ -86,11 +86,7 @@ pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
 #[allow(dead_code)]
 pub fn snapshot_test_parts(
     root: &Path,
-) -> (
-    TemplateBuilder,
-    SnapshotManager,
-    Arc<dyn SnapshotRepository>,
-) {
+) -> (TemplateBuilder, SnapshotManager, Arc<SnapshotRepository>) {
     let backend = PosixFsBackend::new(PosixFsBackendConfig {
         root: root.join("repository"),
         cache_root: Some(root.join("runtime-cache")),

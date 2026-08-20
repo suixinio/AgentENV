@@ -1,22 +1,15 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use tokio::task;
 
 use super::super::shared_runtime_cache_root;
-use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
+use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
-use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
-use crate::snapshot::types::{
-    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
-};
+use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::SnapshotRepository;
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -33,7 +26,7 @@ pub struct PosixFsBackendConfig {
 }
 
 pub struct PosixFsBackend {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<SnapshotRepository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
 
@@ -70,12 +63,7 @@ impl PosixFsBackend {
         } = config;
         let cache_root = cache_root.unwrap_or_else(shared_runtime_cache_root);
         let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
-        let catalog_store = Arc::new(PosixFsCatalogStore::new(root.clone()));
-        let artifact_store = Arc::new(PosixFsArtifactStore::new(root.clone()));
-        let repository: Arc<dyn SnapshotRepository> = Arc::new(PosixFsSnapshotRepository::new(
-            catalog_store,
-            artifact_store,
-        ));
+        let repository = Arc::new(posixfs_repository(&root));
         let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
             PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
         );
@@ -87,7 +75,7 @@ impl PosixFsBackend {
     }
 
     /// Returns the committed-state repository for publish/get/list/delete operations.
-    pub fn repository(&self) -> Arc<dyn SnapshotRepository> {
+    pub fn repository(&self) -> Arc<SnapshotRepository> {
         Arc::clone(&self.repository)
     }
 
@@ -97,222 +85,17 @@ impl PosixFsBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Arc<dyn SnapshotRepository>,
-        Arc<dyn SnapshotRuntimeResolver>,
-    ) {
+    pub fn into_parts(self) -> (Arc<SnapshotRepository>, Arc<dyn SnapshotRuntimeResolver>) {
         (self.repository, self.runtime_resolver)
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct PosixFsSnapshotRepository {
-    catalog_store: Arc<PosixFsCatalogStore>,
-    artifact_store: Arc<PosixFsArtifactStore>,
-}
-
-impl PosixFsSnapshotRepository {
-    pub(crate) fn new(
-        catalog_store: Arc<PosixFsCatalogStore>,
-        artifact_store: Arc<PosixFsArtifactStore>,
-    ) -> Self {
-        Self {
-            catalog_store,
-            artifact_store,
-        }
-    }
-
-    fn committed_snapshot(
-        metadata: &SnapshotPublishMetadata,
-        built: CollectedBuiltArtifacts,
-    ) -> CommittedSnapshot {
-        CommittedSnapshot {
-            context: metadata.context.clone(),
-            startup: metadata.startup.clone(),
-            runtime_versions: metadata.runtime_versions.clone(),
-            virtualization_mode: metadata.virtualization_mode,
-            image_configs: metadata.image_configs.clone(),
-            custom_extension_params: metadata.custom_extension_params.clone(),
-            rootfs_layers: built.rootfs_layers,
-            attached_drives: built.attached_drives,
-            memory_layers: built.memory_layers,
-            disk_publications: Vec::new(),
-        }
-    }
-
-    fn create_sync(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        self.catalog_store.create(record)
-    }
-
-    fn publish_sync(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
-    ) -> RepositoryResult<SnapshotRecord> {
-        let mut drive_ids = HashSet::new();
-        for drive in &manifest.attached_drives {
-            if !drive_ids.insert(drive.drive_id.clone()) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "duplicate attached drive id in publish request: {}",
-                        drive.drive_id
-                    ),
-                });
-            }
-            if drive.virtual_size == 0 {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "attached drive '{}' virtual_size must be non-zero",
-                        drive.drive_id
-                    ),
-                });
-            }
-        }
-
-        let session = self.catalog_store.begin_publish(&metadata.id)?;
-        let built = match self
-            .artifact_store
-            .import_built_artifacts(&metadata.id, &manifest)
-        {
-            Ok(built) => built,
-            Err(error) => {
-                let _ = self.catalog_store.abort_publish(&session);
-                return Err(error);
-            }
-        };
-
-        let committed = Self::committed_snapshot(&metadata, built);
-        match self
-            .catalog_store
-            .commit_publish(&session, metadata, committed)
-        {
-            Ok(stored) => Ok(stored),
-            Err(error) => {
-                let _ = self.catalog_store.abort_publish(&session);
-                Err(error)
-            }
-        }
-    }
-
-    fn get_sync(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.catalog_store.get(id_or_alias)
-    }
-
-    fn list_sync(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.catalog_store.list(filter)
-    }
-
-    fn delete_sync(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let Some(record) = self.catalog_store.get(id_or_alias)? else {
-            return Ok(());
-        };
-        self.catalog_store.delete_record(&record.id)
-    }
-
-    fn resolve_alias_sync(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        self.catalog_store.resolve_alias(alias)
-    }
-
-    fn try_start_sync(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        self.catalog_store.try_start(id)
-    }
-
-    fn mark_error_sync(
-        &self,
-        id: &SnapshotId,
-        reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        self.catalog_store.mark_error(id, reason)
-    }
-}
-
-#[async_trait]
-impl SnapshotRepository for PosixFsSnapshotRepository {
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        let repository = self.clone();
-        run_repository_blocking("create snapshot record", move || {
-            repository.create_sync(record)
-        })
-        .await
-    }
-
-    async fn publish(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
-    ) -> RepositoryResult<SnapshotRecord> {
-        let repository = self.clone();
-        run_repository_blocking("publish snapshot", move || {
-            repository.publish_sync(metadata, manifest)
-        })
-        .await
-    }
-
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        let repository = self.clone();
-        let id_or_alias = id_or_alias.to_string();
-        run_repository_blocking("load snapshot", move || repository.get_sync(&id_or_alias)).await
-    }
-
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let repository = self.clone();
-        run_repository_blocking("list snapshots", move || repository.list_sync(filter)).await
-    }
-
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let repository = self.clone();
-        let id_or_alias = id_or_alias.to_string();
-        run_repository_blocking("delete snapshot", move || {
-            repository.delete_sync(&id_or_alias)
-        })
-        .await
-    }
-
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        let repository = self.clone();
-        let alias = alias.to_string();
-        run_repository_blocking("resolve snapshot alias", move || {
-            repository.resolve_alias_sync(&alias)
-        })
-        .await
-    }
-
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        let repository = self.clone();
-        let id = id.clone();
-        run_repository_blocking("start template build", move || {
-            repository.try_start_sync(&id)
-        })
-        .await
-    }
-
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        let repository = self.clone();
-        let id = id.clone();
-        run_repository_blocking("mark template build error", move || {
-            repository.mark_error_sync(&id, reason)
-        })
-        .await
-    }
-}
-
-async fn run_repository_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> RepositoryResult<T> + Send + 'static,
-{
-    task::spawn_blocking(work)
-        .await
-        .map_err(|error| RepositoryError::Backend {
-            message: format!("repository blocking task panicked while trying to {operation}"),
-            source: Some(anyhow::Error::from(error)),
-        })?
+/// Composes a POSIX repository out of its two halves, both rooted at `root`.
+pub(crate) fn posixfs_repository(root: &std::path::Path) -> SnapshotRepository {
+    SnapshotRepository::new(
+        Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
+        Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
+    )
 }
 
 #[cfg(test)]
@@ -325,7 +108,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::runtime::PosixFsRuntimeResolver;
-    use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
+    use super::{posixfs_repository, PosixFsBackend, PosixFsBackendConfig};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
     use crate::sandbox::{ExtraDrive, FirecrackerSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
@@ -338,9 +121,6 @@ mod tests {
         SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
     };
-
-    use super::super::artifacts::PosixFsArtifactStore;
-    use super::super::catalog::PosixFsCatalogStore;
 
     #[derive(Debug)]
     struct TestOverlaybdLayerStore;
@@ -396,11 +176,8 @@ mod tests {
         PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
     }
 
-    fn test_repository(root: &Path) -> PosixFsSnapshotRepository {
-        PosixFsSnapshotRepository::new(
-            Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
-            Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
-        )
+    fn test_repository(root: &Path) -> SnapshotRepository {
+        posixfs_repository(root)
     }
 
     fn seed_built_snapshot(root: &Path) -> FirecrackerSnapshotManifest {
@@ -505,6 +282,66 @@ mod tests {
                 .join(second_id.to_string())
                 .exists(),
             "failed publish should not leave a committed revision directory"
+        );
+    }
+
+    /// The pre-split `abort_publish` refused to delete a snapshot directory a
+    /// committed record still owned; after the split that decision is the
+    /// catalog's `retains_artifacts_on_publish_failure`, and the artifact store
+    /// only obeys. Re-publishing over a committed id and failing must still
+    /// leave that id's bytes alone — otherwise a rejected rebuild destroys a
+    /// live snapshot.
+    #[tokio::test]
+    async fn failed_republish_keeps_the_committed_snapshot_it_was_overwriting() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+
+        let committed_id = SnapshotId::generate();
+        repository
+            .publish(
+                sample_metadata(committed_id.clone(), Some("keeper")),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect("first publish should work");
+        repository
+            .publish(
+                sample_metadata(SnapshotId::generate(), Some("taken")),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect("second publish should work");
+
+        // Re-publish the already-committed id onto an alias someone else
+        // holds. It fails during the import, because committed artifacts are
+        // read-only — which is the same rollback path a failed commit takes.
+        repository
+            .publish(
+                sample_metadata(committed_id.clone(), Some("taken")),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect_err("re-publish over a committed snapshot should fail");
+
+        assert!(
+            tempdir
+                .path()
+                .join("snapshots")
+                .join(committed_id.to_string())
+                .join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state)
+                .exists(),
+            "a failed re-publish must not delete the artifacts of the snapshot it \
+             was overwriting"
+        );
+        assert!(
+            repository
+                .get(&committed_id.to_string())
+                .await
+                .expect("get should work")
+                .expect("the committed snapshot should still exist")
+                .committed
+                .is_some(),
+            "the original commit must survive the failed re-publish"
         );
     }
 

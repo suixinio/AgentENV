@@ -29,6 +29,10 @@ func (missingBindingStore) Record(string, Binding, time.Time) error { return nil
 
 func (missingBindingStore) ReconcileNode(Node, []RosterEntry, time.Time) error { return nil }
 
+func (missingBindingStore) Delete(string, string, time.Time) (BindingDeleteOutcome, error) {
+	return BindingDeleteAbsent, nil
+}
+
 // forbiddenRegistryReader fails the test on any read. It pins the two answers
 // that must be reachable without a database round trip: a binding hit, which
 // every proxied request goes through, and a roster hit, which covers the window

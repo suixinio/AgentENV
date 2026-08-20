@@ -105,6 +105,9 @@ func main() {
 		if cfg.Scheduler.Routing.ExecutionArbitration == config.SchedulerExecutionArbitrationOff {
 			serviceOpts = append(serviceOpts, scheduler.WithSilentExecutionAxis())
 		}
+		if cfg.Scheduler.Routing.ProjectionAuthoritative {
+			serviceOpts = append(serviceOpts, scheduler.WithAuthoritativeProjection(cfg.Scheduler.MaxProjectionTTL))
+		}
 		svc := scheduler.NewService(
 			logger,
 			registry,
@@ -171,6 +174,11 @@ func main() {
 		zap.String("binding_store", bindingStoreName(cfg)),
 		zap.Bool("query_only", *queryOnly),
 		zap.Bool("paused_registry", registryEnabled(cfg)),
+		// Both, together: "the projection is authoritative" is only true of a
+		// store the other replicas can see, and an operator reading one of
+		// these lines without the other would have half the answer.
+		zap.Bool("projection_authoritative", cfg.Scheduler.Routing.ProjectionAuthoritative),
+		zap.Duration("max_projection_ttl", cfg.Scheduler.MaxProjectionTTL),
 	)
 
 	mux := http.NewServeMux()

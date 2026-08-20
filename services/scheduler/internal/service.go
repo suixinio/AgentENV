@@ -41,6 +41,24 @@ type Service struct {
 	// answer. Set only in the rollback mode, where a response from this build
 	// has to be indistinguishable from one before it.
 	silentExecution bool
+	// projectionAuthoritative is the write-side switch: whether the routing
+	// projection is a record with its own lifetime, or the 30-second cache it
+	// has always been.
+	//
+	// 🔴 It defaults to false, unlike the three incarnation switches next to
+	// it, and the difference is not timidity. Turning it on makes
+	// ReportSandboxEvent — an RPC every node in the fleet is already sending —
+	// stop being a guaranteed no-op and start deleting records. A cluster that
+	// upgrades this binary without setting anything would acquire that
+	// behaviour at the moment a pod restarted, having asked for nothing.
+	projectionAuthoritative bool
+	// maxProjectionTTL caps what a node may ask this scheduler to store.
+	//
+	// 🔴 A storage owner's limit on writers, not a second source of truth for
+	// how long a sandbox lives. The definition stays on the node; a second copy
+	// of it in a ConfigMap would drift, and the drift would show up as records
+	// expiring before their sandboxes — indistinguishable from a cold cache.
+	maxProjectionTTL time.Duration
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -59,6 +77,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		registry:                pausedregistry.Disabled(),
 		reportTTL:               defaultObservedReportTTL,
 		registryLeaseWarnWindow: defaultRegistryLeaseWarnWindow,
+		maxProjectionTTL:        defaultMaxProjectionTTL,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -104,6 +123,21 @@ func WithArtifactStore(store ArtifactStore) ServiceOption {
 func WithSilentExecutionAxis() ServiceOption {
 	return func(s *Service) {
 		s.silentExecution = true
+	}
+}
+
+// WithAuthoritativeProjection turns on the write side of the routing
+// projection: node-supplied TTLs are honoured, and pause/delete events remove
+// records instead of being logged and dropped.
+//
+// 🔴 Opt-in. See the note on Service.projectionAuthoritative for why this one
+// switch defaults the other way from the three beside it.
+func WithAuthoritativeProjection(maxProjectionTTL time.Duration) ServiceOption {
+	return func(s *Service) {
+		s.projectionAuthoritative = true
+		if maxProjectionTTL > 0 {
+			s.maxProjectionTTL = maxProjectionTTL
+		}
 	}
 }
 
@@ -362,7 +396,10 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 	// What is not optional is going through the same rule: a write that skipped
 	// it would be the way around everything the heartbeat path enforces.
 	execution := normalizeExecutionID(req.GetExecutionId())
-	if err := s.store.Record(req.GetSandboxId(), Binding{Node: node, ExecutionID: execution}, time.Now()); err != nil {
+	projectionTTL, ttlSource := s.resolveProjectionTTL(projectionTTLFromSecs(req.GetProjectionTtlSecs()))
+	recordProjectionTTLSource(ttlSource)
+	binding := Binding{Node: node, ExecutionID: execution, ProjectionTTL: projectionTTL}
+	if err := s.store.Record(req.GetSandboxId(), binding, time.Now()); err != nil {
 		s.logger.Warn("scheduler record assignment binding store failed",
 			zap.String("sandbox_id", req.GetSandboxId()),
 			zap.String("node_id", node.ID),
@@ -375,6 +412,8 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 		zap.String("node_id", node.ID),
 		zap.String("endpoint", node.Endpoint),
 		zap.String("execution_id", execution),
+		zap.Duration("projection_ttl", projectionTTL),
+		zap.String("projection_ttl_source", ttlSource),
 	)
 	return &schedulerv1.RecordAssignmentResponse{}, nil
 }
@@ -409,6 +448,7 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 			zap.Int("sandboxes", len(roster)),
 		)
 	}
+	roster = s.resolveRosterProjectionTTLs(roster)
 	if err := s.store.ReconcileNode(node, roster, now); err != nil {
 		s.logger.Warn("scheduler heartbeat binding reconcile failed",
 			zap.String("node_id", nodeID),
@@ -422,13 +462,146 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
 }
 
+// ReportSandboxEvent applies the two event types that end a sandbox's presence
+// on a node, and watches the rest go by.
+//
+// 🔴 Never an error to the caller, whatever happens inside. Events are best
+// effort from the node's side — the reporter drops them on a lagging channel
+// and only warns on a failed send — and the heartbeat reconciliation is the
+// repair path for every one that is lost. Failing this RPC would put a retry
+// obligation on a caller that has no queue to retry from.
+//
+// 🔴 What PAUSE actually buys here is small, and it is worth being honest about
+// it: a node's heartbeat roster is derived from every sandbox it holds
+// regardless of state, so a paused sandbox is still in the roster and the next
+// reconciliation reinstalls the record this deleted. It is not harmful — the
+// record names the node that holds the paused sandbox, which is where the data
+// plane wants to go — but the load-bearing half is DELETE, where the sandbox
+// leaves the roster for good and the event buys both the five seconds until the
+// next heartbeat and the case where that heartbeat never comes because the node
+// died.
 func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportSandboxEventRequest) (*schedulerv1.ReportSandboxEventResponse, error) {
-	s.logger.Debug("scheduler ignored sandbox event batch",
+	now := time.Now()
+	applied := 0
+	for _, event := range req.GetEvents() {
+		switch event.GetEventType() {
+		case schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_PAUSE,
+			schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_DELETE:
+			if s.applyProjectionDelete(event, now) {
+				applied++
+			}
+		default:
+			recordSandboxEvent(sandboxEventTypeLabel(event.GetEventType()), sandboxEventObservedOnly)
+		}
+	}
+	s.logger.Debug("scheduler handled sandbox event batch",
 		zap.String("node_id", req.GetNodeId()),
 		zap.String("service_instance_id", req.GetServiceInstanceId()),
 		zap.Int("event_count", len(req.GetEvents())),
+		zap.Int("projection_deletes", applied),
+		zap.Bool("projection_authoritative", s.projectionAuthoritative),
 	)
 	return &schedulerv1.ReportSandboxEventResponse{}, nil
+}
+
+// applyProjectionDelete runs one pause or delete event against the projection,
+// and says whether a record went away.
+func (s *Service) applyProjectionDelete(event *schedulerv1.SandboxEvent, now time.Time) bool {
+	label := sandboxEventTypeLabel(event.GetEventType())
+	if !s.projectionAuthoritative {
+		recordSandboxEvent(label, sandboxEventIgnoredSwitchOff)
+		return false
+	}
+	sandboxID := strings.TrimSpace(event.GetSandboxId())
+	if sandboxID == "" {
+		recordSandboxEvent(label, sandboxEventIgnoredNoSandbox)
+		return false
+	}
+	// 🔴 The quiet normaliser, not the roster one. The roster's counts a drop
+	// into a series whose name and help both say "roster"; an event path
+	// incrementing it would put two unrelated facts into one number.
+	execution, _ := normalizeExecutionIDReason(event.GetExecutionId())
+	if execution == "" {
+		recordSandboxEvent(label, sandboxEventIgnoredUnknownExecution)
+		return false
+	}
+	outcome, err := s.store.Delete(sandboxID, execution, now)
+	if err != nil {
+		recordSandboxEvent(label, sandboxEventStoreError)
+		s.logger.Warn("scheduler sandbox event binding delete failed",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("event_type", label),
+			zap.Error(err),
+		)
+		return false
+	}
+	recordSandboxEvent(label, string(outcome))
+	if outcome == BindingDeleteRejectedStale {
+		// Worth a line: it means an event arrived for an incarnation that is no
+		// longer the one running, which is the guard doing its job and also the
+		// only visible sign of out-of-order delivery.
+		s.logger.Debug("scheduler refused a stale sandbox event delete",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("event_type", label),
+			zap.String("event_execution_id", execution),
+		)
+	}
+	return outcome == BindingDeleteDeleted || outcome == BindingDeleteUnknownIncumbent
+}
+
+// defaultMaxProjectionTTL is the ceiling a scheduler stores a projection under
+// when nothing configures one.
+//
+// 🔴 25 hours, not 24, and the extra hour is load-bearing. A node's own default
+// ceiling is 24 hours and it adds a grace period on top so the record outlives
+// the sandbox rather than dying just before it. A 24-hour cap here would clamp
+// every single record by exactly that grace — cancelling the thing the grace is
+// for, and pinning the "clamped" counter at 100% so it can never signal
+// anything.
+const defaultMaxProjectionTTL = 25 * time.Hour
+
+// resolveProjectionTTL turns a node-reported budget into what the store should
+// write, and says where the number came from.
+//
+// 🔴 Zero — which is what an absent field and an older node both produce — is
+// "use the store's binding_ttl". It is never "no expiry". The wire type is
+// unsigned so nothing below zero can arrive here, but the same rule is enforced
+// at every place a signed value is parsed, because the one implementation of
+// this that got it wrong did so by dividing to zero and then handing that
+// straight to a Redis SET with no expiry.
+func (s *Service) resolveProjectionTTL(raw time.Duration) (time.Duration, string) {
+	if !s.projectionAuthoritative || raw <= 0 {
+		return 0, projectionTTLSourceDefault
+	}
+	if s.maxProjectionTTL > 0 && raw > s.maxProjectionTTL {
+		return s.maxProjectionTTL, projectionTTLSourceClamped
+	}
+	return raw, projectionTTLSourceNode
+}
+
+// projectionTTLFromSecs is the one conversion from the wire's whole seconds.
+// A non-positive value becomes zero, which every reader of this treats as
+// "no budget offered" and never as "no expiry".
+func projectionTTLFromSecs(secs uint32) time.Duration {
+	if secs == 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// resolveRosterProjectionTTLs applies the same rule across a heartbeat roster.
+// It does not count: the store writes a TTL for only some of these entries — the
+// refreshes keep the deadline they already have — and counting all of them would
+// report a decision that was not made, once per sandbox every five seconds.
+func (s *Service) resolveRosterProjectionTTLs(roster []RosterEntry) []RosterEntry {
+	if len(roster) == 0 {
+		return roster
+	}
+	for i := range roster {
+		ttl, _ := s.resolveProjectionTTL(roster[i].ProjectionTTL)
+		roster[i].ProjectionTTL = ttl
+	}
+	return roster
 }
 
 func (s *Service) RunObservedNodesMetrics(ctx context.Context, interval time.Duration) {

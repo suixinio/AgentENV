@@ -225,6 +225,39 @@ var (
 		},
 		[]string{"node"},
 	)
+	// What a sandbox lifecycle event did to the routing projection.
+	//
+	// 🔴 The outcome axis is the point, not the event count. "deleted" and
+	// "rejected_stale" are both the guard working; "deleted_unknown_incumbent"
+	// is a record that was written without an incarnation and is the number to
+	// watch while any node is still on a build that does not report one. A
+	// non-zero "rejected_stale" on a quiet cluster means events are arriving
+	// out of order, which is expected and is why the guard exists.
+	schedulerSandboxEvent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_sandbox_event_total",
+			Help: "Sandbox lifecycle events by type and by what they did to the routing projection. Only pause and delete act; everything else is counted as observed_only.",
+		},
+		[]string{"event_type", "outcome"},
+	)
+	// Where the projection's TTL came from on a projection write.
+	//
+	// 🔴 Counted on the assignment path only. A heartbeat that finds the same
+	// incarnation already recorded writes no TTL at all — that is the KEEPTTL
+	// branch — so counting there would fill the series with a decision that was
+	// not made, at five-second intervals, per sandbox.
+	//
+	// A permanently non-zero "clamped" means scheduler.max_projection_ttl is
+	// below what the nodes are asking for, and every record is expiring before
+	// its sandbox does. That degrades to a lookup miss and a roster fallback
+	// rather than to an outage, which is why it is a counter and not an alert.
+	schedulerProjectionTTLSource = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_projection_ttl_source_total",
+			Help: "Routing projection writes by where the record's TTL came from: the node's own budget, the scheduler's binding_ttl default, or the scheduler's ceiling.",
+		},
+		[]string{"source"},
+	)
 	// Resident, because the question "is arbitration on" is asked months later,
 	// during an incident, about a process whose start-up logs are long gone.
 	schedulerRoutingExecutionArbitration = promauto.NewGauge(
@@ -277,6 +310,72 @@ func recordLegacyRoster(nodeID string) {
 
 func recordRosterDropped(reason string) {
 	schedulerHeartbeatRosterDropped.WithLabelValues(reason).Inc()
+}
+
+// The outcomes a sandbox event can have that the binding store did not decide.
+// The rest come straight from BindingDeleteOutcome, so the two sets together
+// are closed over every path through ReportSandboxEvent.
+const (
+	// sandboxEventObservedOnly: create, resume and fork. Their projection
+	// write is the gateway's, on the response, and it is synchronous — which
+	// is why this path only watches them go by.
+	sandboxEventObservedOnly = "observed_only"
+	// sandboxEventIgnoredSwitchOff: the write-side switch is off, so this RPC
+	// is the no-op it was before.
+	sandboxEventIgnoredSwitchOff = "ignored_switch_off"
+	// sandboxEventIgnoredUnknownExecution: the reporter named no incarnation,
+	// so there is nothing to guard the delete with. 🔴 Ignored rather than
+	// deleted: an unguarded delete reintroduces exactly the race the guard
+	// exists for, and a reporter too old to name an incarnation is also too
+	// old to send a long TTL, so its records expire on their own in 30s.
+	sandboxEventIgnoredUnknownExecution = "ignored_unknown_execution"
+	// sandboxEventIgnoredNoSandbox: a malformed event.
+	sandboxEventIgnoredNoSandbox = "ignored_no_sandbox"
+	// sandboxEventStoreError: the store could not be reached. The heartbeat
+	// reconciliation is the repair path; events are best effort by design.
+	sandboxEventStoreError = "store_error"
+)
+
+func recordSandboxEvent(eventType string, outcome string) {
+	schedulerSandboxEvent.WithLabelValues(eventType, outcome).Inc()
+}
+
+// sandboxEventTypeLabel closes the event type over a small set of labels.
+// An unrecognised type is one a newer node grew, and lands under "other" rather
+// than opening the series up to whatever an unknown build sends.
+func sandboxEventTypeLabel(eventType schedulerv1.SandboxEventType) string {
+	switch eventType {
+	case schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_CREATE:
+		return "create"
+	case schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_DELETE:
+		return "delete"
+	case schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_PAUSE:
+		return "pause"
+	case schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_RESUME:
+		return "resume"
+	case schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_FORK:
+		return "fork"
+	default:
+		return "other"
+	}
+}
+
+// The three places a projection TTL can come from.
+const (
+	// projectionTTLSourceNode: the node named a budget and it was used as sent.
+	projectionTTLSourceNode = "event"
+	// projectionTTLSourceDefault: no budget, or the switch is off. The store's
+	// binding_ttl, which is what every record had before any of this.
+	projectionTTLSourceDefault = "default"
+	// projectionTTLSourceClamped: the node asked for longer than this
+	// scheduler will store. 🔴 A limit the store owner puts on writers, not a
+	// second definition of a sandbox's lifetime — the definition stays on the
+	// node.
+	projectionTTLSourceClamped = "clamped"
+)
+
+func recordProjectionTTLSource(source string) {
+	schedulerProjectionTTLSource.WithLabelValues(source).Inc()
 }
 
 // SetRoutingExecutionArbitration publishes the mode. Called once at start-up.

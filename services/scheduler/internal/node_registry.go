@@ -635,6 +635,11 @@ func rosterFromHeartbeat(req *schedulerv1.HeartbeatRequest) (entries []RosterEnt
 			out = append(out, RosterEntry{
 				SandboxID:   sandboxID,
 				ExecutionID: normalizeExecutionID(item.GetExecutionId()),
+				// Raw as reported. The clamp and the switch are the service's
+				// to apply, not this decoder's — a node's budget and a
+				// scheduler's ceiling on it are two different facts and the
+				// place they meet has to be the place both are visible.
+				ProjectionTTL: projectionTTLFromSecs(item.GetProjectionTtlSecs()),
 			})
 		}
 		if len(out) == 0 {
@@ -679,16 +684,30 @@ func rosterFromHeartbeat(req *schedulerv1.HeartbeatRequest) (entries []RosterEnt
 // '0'-'9' < 'A'-'F' < 'a'-'f', so one upper-case id reverses the comparison and
 // the older incarnation wins.
 func normalizeExecutionID(raw string) string {
+	normalized, reason := normalizeExecutionIDReason(raw)
+	if reason != "" {
+		recordRosterDropped(reason)
+	}
+	return normalized
+}
+
+// normalizeExecutionIDReason is the same rule without the counter, and returns
+// why it dropped a value instead of counting it.
+//
+// 🔴 It exists because the counter is named for rosters and documented as being
+// about rosters. Sandbox events run the same normalisation and are not rosters;
+// incrementing that series from here would merge two unrelated facts into one
+// number, and the number is one somebody reads to decide whether the fleet has
+// finished upgrading.
+func normalizeExecutionIDReason(raw string) (normalized string, dropReason string) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		recordRosterDropped("no_execution")
-		return ""
+		return "", "no_execution"
 	}
 	if !isCanonicalUUIDText(trimmed) {
-		recordRosterDropped("bad_uuid")
-		return ""
+		return "", "bad_uuid"
 	}
-	return strings.ToLower(trimmed)
+	return strings.ToLower(trimmed), ""
 }
 
 // isCanonicalUUIDText is the shape check, deliberately narrow: the ids come

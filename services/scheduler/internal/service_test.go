@@ -27,6 +27,10 @@ func (failingBindingStore) ReconcileNode(Node, []RosterEntry, time.Time) error {
 	return errors.New("binding store failed")
 }
 
+func (failingBindingStore) Delete(string, string, time.Time) (BindingDeleteOutcome, error) {
+	return BindingDeleteAbsent, errors.New("binding store failed")
+}
+
 func registerObservedNodeForTest(t *testing.T, service *Service, nodeID string, serviceInstanceID string) {
 	t.Helper()
 	_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{

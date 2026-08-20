@@ -8,6 +8,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 	pausedregistry "agentenv/services/scheduler/internal/registry"
+	"agentenv/services/shared/routing"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -421,17 +422,15 @@ func (deps lookupDeps) answer(
 	}
 }
 
-// authorityFor is the one place an incarnation becomes an authority.
+// authorityFor is routing.AuthorityFor, and nothing else.
 //
-// 🔴 REGISTRY is never reported with an empty value. "Authoritatively, no
-// incarnation" is a sentence the caller would have to compare an empty string
-// against; when this side cannot name one, the honest answer is that it does
-// not know.
+// 🔴 The rule moved to services/shared/routing when the gateway started reading
+// the projection directly: both sides derive the same authority from the same
+// field, and a second copy of three lines drifts silently into a gateway that
+// refuses what this would have allowed. What is left here is a name the rest of
+// this file already reads well with — not a second implementation.
 func authorityFor(executionID string) schedulerv1.ExecutionAuthority {
-	if strings.TrimSpace(executionID) == "" {
-		return schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN
-	}
-	return schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY
+	return routing.AuthorityFor(executionID)
 }
 
 // rosterHolder implements nodePlacer.

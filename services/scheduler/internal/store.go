@@ -15,7 +15,47 @@ type BindingStore interface {
 	Get(sandboxID string, now time.Time) (Binding, bool, error)
 	Record(sandboxID string, binding Binding, now time.Time) error
 	ReconcileNode(node Node, roster []RosterEntry, now time.Time) error
+	// Delete removes a sandbox's routing projection, but only if the record
+	// still names the incarnation the event came from.
+	//
+	// 🔴 The guard is the whole point. A pause event that arrives late, for a
+	// sandbox id that has since been resumed elsewhere under a new
+	// incarnation, would otherwise tear down the live record and leave the
+	// running sandbox unroutable until the next heartbeat reinstalls it.
+	//
+	// 🔴 executionID is required and must already be normalised. An empty one
+	// is refused by the caller rather than being treated as "delete anything",
+	// which would be the unguarded delete this exists to prevent.
+	Delete(sandboxID string, executionID string, now time.Time) (BindingDeleteOutcome, error)
 }
+
+// BindingDeleteOutcome is what a guarded delete did. Closed set: every return
+// below maps onto exactly one, so the metric's series sum to the call count.
+type BindingDeleteOutcome string
+
+const (
+	// BindingDeleteAbsent: nothing held this sandbox. Ordinary — a delete
+	// event can arrive after the heartbeat reconciliation already dropped the
+	// record.
+	BindingDeleteAbsent BindingDeleteOutcome = "noop_absent"
+	// BindingDeleteDeleted: the record named the same incarnation the event
+	// did, and is gone.
+	BindingDeleteDeleted BindingDeleteOutcome = "deleted"
+	// BindingDeleteUnknownIncumbent: the record named no incarnation at all,
+	// and is gone.
+	//
+	// 🔴 Deleted, not refused — and this is deliberately the opposite of what
+	// the write path does with an empty incumbent. An empty incumbent means
+	// "unknown", not "somebody else's": the write path lets any named
+	// challenger take it for exactly that reason. Refusing here instead would
+	// mean a create that recorded no incarnation, followed by a delete two
+	// seconds later, leaves a long-lived record pointing at a sandbox that no
+	// longer exists.
+	BindingDeleteUnknownIncumbent BindingDeleteOutcome = "deleted_unknown_incumbent"
+	// BindingDeleteRejectedStale: the record names a different incarnation.
+	// The guard fired; the live record survives.
+	BindingDeleteRejectedStale BindingDeleteOutcome = "rejected_stale"
+)
 
 // Binding is where a sandbox is and which incarnation of it is there.
 //
@@ -33,6 +73,14 @@ type Binding struct {
 	// below treats it as a record that may be replaced by anything but may
 	// itself replace nothing that names an incarnation.
 	ExecutionID string
+	// ProjectionTTL is how long this record should live, as the node that owns
+	// the sandbox computed it from its own lifetime ceiling.
+	//
+	// 🔴 Zero means "use the store's binding_ttl". It never means "never
+	// expires": a record that outlives every path able to delete it is a route
+	// pointing at a sandbox nobody can reach, and the failure looks exactly
+	// like a cold cache from the outside.
+	ProjectionTTL time.Duration
 }
 
 // RosterEntry is one sandbox in a node's heartbeat roster.
@@ -41,6 +89,11 @@ type RosterEntry struct {
 	// ExecutionID is normalised on the way in: trimmed, checked for shape, and
 	// lower-cased. Empty where the node did not report one.
 	ExecutionID string
+	// ProjectionTTL is the same budget Binding.ProjectionTTL carries, on the
+	// repair path rather than the create path: a projection write that was
+	// lost has to be reinstalled with the sandbox's real budget, not with the
+	// receiver's default. Zero means "use the store's binding_ttl".
+	ProjectionTTL time.Duration
 }
 
 // bindingDecision is what the arbitration did, as a closed set of metric
@@ -198,19 +251,53 @@ func (s *InMemoryBindingStore) Record(sandboxID string, binding Binding, now tim
 	// response that landed on a node whose sandbox has since moved would
 	// otherwise be a way in behind the rule — the one write left unguarded is
 	// the one that undoes the others.
-	decision := s.upsertLocked(sandboxID, binding, now)
+	decision := s.upsertLocked(sandboxID, binding, now, bindingSourceAssignment)
 	recordBindingArbitration(bindingSourceAssignment, decision)
 	return nil
 }
 
+// Delete is the guarded delete. See BindingStore.Delete for the rules; they are
+// implemented identically here and in the Lua script, because this is the store
+// the default build runs and that is the one the tests exercise.
+func (s *InMemoryBindingStore) Delete(sandboxID string, executionID string, now time.Time) (BindingDeleteOutcome, error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return BindingDeleteAbsent, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record, ok := s.bindings[sandboxID]
+	if !ok {
+		return BindingDeleteAbsent, nil
+	}
+	if !record.expiresAt.After(now) {
+		// Expired is absent everywhere else in this store, and it is absent
+		// here too. Tidying it up on the way past costs nothing.
+		s.deleteLocked(sandboxID)
+		return BindingDeleteAbsent, nil
+	}
+	if record.executionID != "" && record.executionID != executionID {
+		return BindingDeleteRejectedStale, nil
+	}
+	outcome := BindingDeleteDeleted
+	if record.executionID == "" {
+		outcome = BindingDeleteUnknownIncumbent
+	}
+	s.deleteLocked(sandboxID)
+	return outcome, nil
+}
+
 func (s *InMemoryBindingStore) ReconcileNode(node Node, roster []RosterEntry, now time.Time) error {
-	normalized := make(map[string]string, len(roster))
+	normalized := make(map[string]RosterEntry, len(roster))
 	for _, entry := range roster {
 		sandboxID := strings.TrimSpace(entry.SandboxID)
 		if sandboxID == "" {
 			continue
 		}
-		normalized[sandboxID] = entry.ExecutionID
+		entry.SandboxID = sandboxID
+		normalized[sandboxID] = entry
 	}
 
 	s.mu.Lock()
@@ -225,8 +312,9 @@ func (s *InMemoryBindingStore) ReconcileNode(node Node, roster []RosterEntry, no
 		return nil
 	}
 
-	for sandboxID, executionID := range normalized {
-		decision := s.upsertLocked(sandboxID, Binding{Node: node, ExecutionID: executionID}, now)
+	for sandboxID, entry := range normalized {
+		binding := Binding{Node: node, ExecutionID: entry.ExecutionID, ProjectionTTL: entry.ProjectionTTL}
+		decision := s.upsertLocked(sandboxID, binding, now, bindingSourceHeartbeat)
 		recordBindingArbitration(bindingSourceHeartbeat, decision)
 	}
 
@@ -256,7 +344,7 @@ func (s *InMemoryBindingStore) ReconcileNode(node Node, roster []RosterEntry, no
 // reverse index. Putting it in the index alone would leave a node listing a
 // sandbox it does not own, and the next heartbeat in which it reports an empty
 // roster would delete somebody else's binding on the way past.
-func (s *InMemoryBindingStore) upsertLocked(sandboxID string, binding Binding, now time.Time) bindingDecision {
+func (s *InMemoryBindingStore) upsertLocked(sandboxID string, binding Binding, now time.Time, source string) bindingDecision {
 	existing, held := s.bindings[sandboxID]
 	if held && !existing.expiresAt.After(now) {
 		// Expired is the same as absent: nothing holds this any more, so
@@ -287,9 +375,43 @@ func (s *InMemoryBindingStore) upsertLocked(sandboxID string, binding Binding, n
 	s.bindings[sandboxID] = bindingRecord{
 		node:        binding.Node,
 		executionID: binding.ExecutionID,
-		expiresAt:   now.Add(s.bindingTTL),
+		expiresAt:   s.expiryFor(existing, held, decision, binding.ProjectionTTL, now, source),
 	}
 	return decision
+}
+
+// expiryFor decides the record's new deadline, and is where a heartbeat stops
+// being able to extend one.
+//
+// 🔴 A heartbeat that finds the same incarnation already recorded keeps the
+// deadline the record already has. It is a periodic tick, not a lifecycle
+// event, and letting it rewrite the deadline every five seconds would put the
+// projection's survival back on a periodic write path — which is exactly what
+// the long TTL exists to get it off. The Lua reconciliation says the same thing
+// with KEEPTTL, and the two have to agree: the default build runs this one and
+// every HA deployment runs that one.
+//
+// Everything else is a real lifecycle event — a record being installed, a
+// missing one being repaired, a new incarnation arriving with a new budget —
+// and each of those sets the deadline from the budget it came with.
+func (s *InMemoryBindingStore) expiryFor(
+	existing bindingRecord,
+	held bool,
+	decision bindingDecision,
+	projectionTTL time.Duration,
+	now time.Time,
+	source string,
+) time.Time {
+	if held && source == bindingSourceHeartbeat && decision == bindingRefreshed {
+		return existing.expiresAt
+	}
+	ttl := projectionTTL
+	if ttl <= 0 {
+		// 🔴 Not "forever". A non-positive budget means the writer had none to
+		// give, and the store's own default is what it had before any of this.
+		ttl = s.bindingTTL
+	}
+	return now.Add(ttl)
 }
 
 func (s *InMemoryBindingStore) deleteLocked(sandboxID string) {

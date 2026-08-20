@@ -21,12 +21,14 @@ use tracing::{debug, warn};
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
-use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotListFilter};
+use crate::snapshot::repository::interfaces::{
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::{
-    CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotRecord, SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus,
+    CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotPublishSource, SnapshotRecord,
+    SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo,
+    TemplateBuildStatus,
 };
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
@@ -98,28 +100,24 @@ impl SnapshotCatalog for OssSnapshotCatalog {
         Ok(record)
     }
 
-    async fn publish_commit(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
-    ) -> RepositoryResult<SnapshotRecord> {
-        let id = metadata.id.clone();
+    async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+        let id = commit.id.clone();
         // Alias first, then the record. That order predates the split and is a
         // known defect — `interfaces.rs` asks for the opposite, and the read
         // path's stale-alias cleanup can delete the alias of a snapshot that is
         // mid-publish. It is preserved verbatim here because fixing it belongs
         // with the move to a catalog that can write both in one transaction,
         // not with a refactor that is supposed to change nothing.
-        if let Some(alias) = metadata.alias.as_ref() {
+        if let Some(alias) = commit.alias.as_ref() {
             self.bind_alias(alias.as_ref(), &id).await?;
         }
         let record = self
             .write_committed_record(
                 id.clone(),
-                metadata.alias.clone(),
-                metadata.resources,
-                committed,
-                metadata.source.clone(),
+                commit.alias,
+                commit.resources,
+                commit.committed,
+                commit.source,
             )
             .await?;
         debug!(snapshot_id = %id, "published snapshot to oss");
@@ -546,6 +544,17 @@ mod tests {
     use crate::snapshot::repository::metrics::test_support::object_store_requests;
     use crate::types::SandboxResources;
 
+    /// A commit for a fresh snapshot, with an optional alias to bind.
+    fn commit(alias: Option<&str>) -> SnapshotCommit {
+        SnapshotCommit {
+            id: SnapshotId::generate(),
+            alias: alias.map(|value| SnapshotAlias::parse(value).expect("alias parses")),
+            source: SnapshotPublishSource::Template,
+            resources: SandboxResources::default(),
+            committed: CommittedSnapshot::mock(),
+        }
+    }
+
     /// Today a single `GET /snapshots` costs one LIST of `catalog/records/`
     /// plus one GET per record. Pin that `1 + N` down now, while it is still
     /// non-zero: a counter that reads zero both before and after the catalog
@@ -719,14 +728,11 @@ mod tests {
     async fn publish_commit_marks_the_record_committed_and_binds_its_alias() {
         let addr = spawn_fake_s3(BTreeMap::new()).await;
         let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
-        let metadata = SnapshotPublishMetadata {
-            alias: Some(SnapshotAlias::parse("published").expect("alias parses")),
-            ..SnapshotPublishMetadata::mock()
-        };
-        let id = metadata.id.clone();
+        let published = commit(Some("published"));
+        let id = published.id.clone();
 
         let record = catalog
-            .publish_commit(metadata, CommittedSnapshot::mock())
+            .publish_commit(published)
             .await
             .expect("commit should work");
 
@@ -757,24 +763,15 @@ mod tests {
     async fn publish_commit_refuses_an_alias_a_live_snapshot_holds() {
         let addr = spawn_fake_s3(BTreeMap::new()).await;
         let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
-        let held = SnapshotPublishMetadata {
-            alias: Some(SnapshotAlias::parse("held").expect("alias parses")),
-            ..SnapshotPublishMetadata::mock()
-        };
+        let held = commit(Some("held"));
         let first_id = held.id.clone();
         catalog
-            .publish_commit(held, CommittedSnapshot::mock())
+            .publish_commit(held)
             .await
             .expect("first commit should work");
 
         let error = catalog
-            .publish_commit(
-                SnapshotPublishMetadata {
-                    alias: Some(SnapshotAlias::parse("held").expect("alias parses")),
-                    ..SnapshotPublishMetadata::mock()
-                },
-                CommittedSnapshot::mock(),
-            )
+            .publish_commit(commit(Some("held")))
             .await
             .expect_err("a second commit must not steal the alias");
 
@@ -812,15 +809,11 @@ mod tests {
             .expect("pre-create should work");
 
         let committed = catalog
-            .publish_commit(
-                SnapshotPublishMetadata {
-                    id: pending.id.clone(),
-                    alias: pending.alias.clone(),
-                    source: SnapshotPublishSource::Template,
-                    ..SnapshotPublishMetadata::mock()
-                },
-                CommittedSnapshot::mock(),
-            )
+            .publish_commit(SnapshotCommit {
+                id: pending.id.clone(),
+                alias: pending.alias.clone(),
+                ..commit(None)
+            })
             .await
             .expect("commit should work");
 

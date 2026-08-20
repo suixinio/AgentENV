@@ -10,15 +10,15 @@ use serde::Serialize;
 use tokio::task;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
-use crate::snapshot::repository::interfaces::SnapshotCatalog;
+use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
 use crate::snapshot::repository::metrics::{
     record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
 use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
-    CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId, SnapshotPublishSource,
+    SnapshotRecord, SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason,
+    TemplateBuildInfo, TemplateBuildStatus,
 };
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 const ALIAS_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
@@ -74,17 +74,14 @@ impl PosixFsCatalogStore {
     /// 2. bind the alias
     /// 3. write the commit marker
     /// 4. write the committed snapshot record
-    fn publish_commit_sync(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
-    ) -> RepositoryResult<SnapshotRecord> {
+    fn publish_commit_sync(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
         self.ensure_layout()?;
         let now = now_unix_ms();
-        let snapshot_id = metadata.id.clone();
-        let write_result = if let Some(alias) = metadata.alias.as_ref() {
+        let snapshot_id = commit.id.clone();
+        let write_result = if let Some(alias) = commit.alias.clone() {
+            let alias = &alias;
             self.with_alias_lock(alias, |store| {
-                let record = store.committed_record_unlocked(&metadata, committed.clone(), now)?;
+                let record = store.committed_record_unlocked(&commit, now)?;
                 let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
                 if let Some(existing) = store.load_alias_target(alias)? {
                     if existing != snapshot_id {
@@ -105,7 +102,7 @@ impl PosixFsCatalogStore {
             })
         } else {
             (|| {
-                let record = self.committed_record_unlocked(&metadata, committed.clone(), now)?;
+                let record = self.committed_record_unlocked(&commit, now)?;
                 self.write_commit_marker(&snapshot_id)?;
                 self.write_committed_record_unlocked(&record)?;
                 Ok(record)
@@ -115,7 +112,7 @@ impl PosixFsCatalogStore {
         match write_result {
             Ok(record) => Ok(record),
             Err(error) => {
-                if let Some(alias) = metadata.alias.as_ref() {
+                if let Some(alias) = commit.alias.as_ref() {
                     let _ = self.with_alias_lock(alias, |store| {
                         let alias_path =
                             PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
@@ -679,14 +676,14 @@ impl PosixFsCatalogStore {
 
     fn committed_record_unlocked(
         &self,
-        metadata: &SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
+        commit: &SnapshotCommit,
         now_unix_ms: i64,
     ) -> RepositoryResult<SnapshotRecord> {
-        let id = metadata.id.clone();
-        let alias = metadata.alias.clone();
-        let resources = metadata.resources;
-        let source = metadata.source.clone();
+        let id = commit.id.clone();
+        let alias = commit.alias.clone();
+        let resources = commit.resources;
+        let source = commit.source.clone();
+        let committed = commit.committed.clone();
         if let Some(mut record) = self.load_record_by_id_unlocked(&id)? {
             record.mark_committed(alias, resources, committed, source, now_unix_ms);
             return Ok(record);
@@ -795,14 +792,10 @@ impl SnapshotCatalog for PosixFsCatalogStore {
         run_catalog_blocking("create snapshot record", move || store.create_sync(record)).await
     }
 
-    async fn publish_commit(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
-    ) -> RepositoryResult<SnapshotRecord> {
+    async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
         let store = self.clone();
         run_catalog_blocking("commit snapshot record", move || {
-            store.publish_commit_sync(metadata, committed)
+            store.publish_commit_sync(commit)
         })
         .await
     }
@@ -894,9 +887,10 @@ mod tests {
     use super::super::layout::PosixFsSnapshotArtifactLayout;
     use super::PosixFsCatalogStore;
     use crate::snapshot::repository::metrics::test_support::object_store_requests;
+    use crate::snapshot::repository::SnapshotCommit;
     use crate::snapshot::{
-        CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
-        SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
+        CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishSource,
+        SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
     };
     use crate::types::SandboxResources;
 
@@ -953,14 +947,13 @@ mod tests {
         let snapshot_id = SnapshotId::generate();
 
         store
-            .publish_commit_sync(
-                SnapshotPublishMetadata {
-                    id: snapshot_id.clone(),
-                    source: SnapshotPublishSource::Template,
-                    ..SnapshotPublishMetadata::mock()
-                },
-                CommittedSnapshot::mock(),
-            )
+            .publish_commit_sync(SnapshotCommit {
+                id: snapshot_id.clone(),
+                alias: None,
+                source: SnapshotPublishSource::Template,
+                resources: SandboxResources::default(),
+                committed: CommittedSnapshot::mock(),
+            })
             .expect("commit should work");
 
         assert!(store
@@ -980,19 +973,20 @@ mod tests {
         id: SnapshotId,
         alias: &str,
         source: SnapshotPublishSource,
-    ) -> SnapshotPublishMetadata {
-        SnapshotPublishMetadata {
+    ) -> SnapshotCommit {
+        SnapshotCommit {
             id,
             alias: Some(SnapshotAlias::parse(alias).expect("alias should parse")),
             source,
-            ..SnapshotPublishMetadata::mock()
+            resources: SandboxResources::default(),
+            committed: CommittedSnapshot::mock(),
         }
     }
 
-    fn commit_record(store: &PosixFsCatalogStore, metadata: SnapshotPublishMetadata) -> SnapshotId {
-        let snapshot_id = metadata.id.clone();
+    fn commit_record(store: &PosixFsCatalogStore, commit: SnapshotCommit) -> SnapshotId {
+        let snapshot_id = commit.id.clone();
         store
-            .publish_commit_sync(metadata, CommittedSnapshot::mock())
+            .publish_commit_sync(commit)
             .expect("commit should work");
         snapshot_id
     }

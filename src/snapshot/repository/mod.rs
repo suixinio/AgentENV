@@ -7,6 +7,6 @@ pub(crate) mod metrics;
 pub use composite::SnapshotRepository;
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
-    ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotListFilter,
-    SnapshotRuntimeResolver,
+    ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
+    SnapshotListFilter, SnapshotRuntimeResolver,
 };

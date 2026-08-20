@@ -25,12 +25,12 @@ use std::sync::Arc;
 
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
-    ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotListFilter,
+    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
-    CommittedSnapshot, PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord, TemplateBuildErrorReason,
+    PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
+    TemplateBuildErrorReason,
 };
 
 /// Durable snapshot repository: a [`SnapshotCatalog`] and a
@@ -95,9 +95,8 @@ impl SnapshotRepository {
                 .artifacts
                 .import_built_artifacts(&metadata, &manifest, &mut publications)
                 .await?;
-            let committed = committed_snapshot(&metadata, imported);
             self.catalog
-                .publish_commit(metadata.clone(), committed)
+                .publish_commit(SnapshotCommit::new(&metadata, imported))
                 .await
         }
         .await;
@@ -207,28 +206,6 @@ fn validate_attached_drives(manifest: &FirecrackerSnapshotManifest) -> Repositor
     Ok(())
 }
 
-/// Joins the publish request with what the artifact store actually stored.
-///
-/// Pure: no I/O, no backend knowledge. This is the value that crosses from the
-/// byte half to the row half, and the reason the row half can be remote.
-fn committed_snapshot(
-    metadata: &SnapshotPublishMetadata,
-    imported: ImportedSnapshotArtifacts,
-) -> CommittedSnapshot {
-    CommittedSnapshot {
-        context: metadata.context.clone(),
-        startup: metadata.startup.clone(),
-        runtime_versions: metadata.runtime_versions.clone(),
-        virtualization_mode: metadata.virtualization_mode,
-        image_configs: metadata.image_configs.clone(),
-        custom_extension_params: metadata.custom_extension_params.clone(),
-        rootfs_layers: imported.rootfs_layers,
-        attached_drives: imported.attached_drives,
-        memory_layers: imported.memory_layers,
-        disk_publications: imported.disk_publications,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -237,9 +214,10 @@ mod tests {
 
     use super::*;
     use crate::sandbox::ExtraDrive;
-    use crate::snapshot::repository::interfaces::SnapshotCatalog;
+    use crate::snapshot::repository::interfaces::{ImportedSnapshotArtifacts, SnapshotCatalog};
     use crate::snapshot::types::{
-        PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishSource, TemplateBuildStatus,
+        CommittedSnapshot, PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishSource,
+        TemplateBuildStatus,
     };
 
     /// Every call either half receives, in order, so a test can assert that the
@@ -280,11 +258,7 @@ mod tests {
             Ok(record)
         }
 
-        async fn publish_commit(
-            &self,
-            metadata: SnapshotPublishMetadata,
-            committed: CommittedSnapshot,
-        ) -> RepositoryResult<SnapshotRecord> {
+        async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
             self.journal.record("catalog.publish_commit");
             if self.commit_fails {
                 return Err(RepositoryError::Backend {
@@ -292,16 +266,13 @@ mod tests {
                     source: None,
                 });
             }
-            let mut record = SnapshotRecord::template_waiting(
-                metadata.id,
-                metadata.alias.clone(),
-                metadata.resources,
-            );
+            let mut record =
+                SnapshotRecord::template_waiting(commit.id, commit.alias.clone(), commit.resources);
             record.mark_committed(
-                metadata.alias,
-                metadata.resources,
-                committed,
-                metadata.source,
+                commit.alias,
+                commit.resources,
+                commit.committed,
+                commit.source,
                 0,
             );
             Ok(record)

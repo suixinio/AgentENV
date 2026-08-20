@@ -6,11 +6,12 @@ use async_trait::async_trait;
 
 use super::repository::{
     ImportedSnapshotArtifacts, RepositoryError, RepositoryResult, SnapshotArtifactStore,
-    SnapshotCatalog, SnapshotListFilter, SnapshotRepository, SnapshotRuntimeResolver,
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotRepository,
+    SnapshotRuntimeResolver,
 };
 use super::{
-    CommittedSnapshot, PersistedDiskImagePublication, RunnableSnapshot, SnapshotId,
-    SnapshotManager, SnapshotPublishMetadata, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
+    PersistedDiskImagePublication, RunnableSnapshot, SnapshotId, SnapshotManager,
+    SnapshotPublishMetadata, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::sandbox::FirecrackerSnapshotManifest;
 
@@ -32,11 +33,7 @@ impl SnapshotCatalog for MockSnapshotCatalog {
         Err(Self::unsupported())
     }
 
-    async fn publish_commit(
-        &self,
-        _metadata: SnapshotPublishMetadata,
-        _committed: CommittedSnapshot,
-    ) -> RepositoryResult<SnapshotRecord> {
+    async fn publish_commit(&self, _commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
         Err(Self::unsupported())
     }
 

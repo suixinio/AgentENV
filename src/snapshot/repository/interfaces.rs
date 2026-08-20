@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use super::errors::RepositoryResult;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
     CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildStatus,
+    PersistedDiskImagePublication, RunnableSnapshot, SnapshotAlias, SnapshotId,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
+    TemplateBuildErrorReason, TemplateBuildStatus,
 };
+use crate::types::SandboxResources;
 
 /// Snapshot record list filter.
 ///
@@ -97,6 +100,57 @@ pub struct ImportedSnapshotArtifacts {
     pub disk_publications: Vec<PersistedDiskImagePublication>,
 }
 
+/// One snapshot ready to be committed: its identity, and the payload describing
+/// artifacts that are already durable.
+///
+/// 🔴 Every field is a plain value — no `PathBuf`, no `Arc`, no temp-directory
+/// guard — and the whole struct is `Serialize`/`Deserialize`. That is what makes
+/// [`SnapshotCatalog::publish_commit`] answerable by a process that never saw
+/// the bytes.
+///
+/// It is deliberately *narrower* than [`SnapshotPublishMetadata`]: the six
+/// fields it drops (context, startup, runtime versions, virtualization mode,
+/// image configs, custom extension params) are already inside `committed`, so
+/// carrying the whole request here would ask the row half to hold six values it
+/// has no use for and cannot serialize.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotCommit {
+    pub id: SnapshotId,
+    /// At most one alias per snapshot, bound as part of the commit.
+    pub alias: Option<SnapshotAlias>,
+    pub source: SnapshotPublishSource,
+    pub resources: SandboxResources,
+    pub committed: CommittedSnapshot,
+}
+
+impl SnapshotCommit {
+    /// Joins a publish request with what the artifact store stored.
+    ///
+    /// Pure: no I/O, no backend knowledge. This is the value that crosses from
+    /// the byte half to the row half, and the reason the row half can be
+    /// remote.
+    pub fn new(metadata: &SnapshotPublishMetadata, imported: ImportedSnapshotArtifacts) -> Self {
+        Self {
+            id: metadata.id.clone(),
+            alias: metadata.alias.clone(),
+            source: metadata.source.clone(),
+            resources: metadata.resources,
+            committed: CommittedSnapshot {
+                context: metadata.context.clone(),
+                startup: metadata.startup.clone(),
+                runtime_versions: metadata.runtime_versions.clone(),
+                virtualization_mode: metadata.virtualization_mode,
+                image_configs: metadata.image_configs.clone(),
+                custom_extension_params: metadata.custom_extension_params.clone(),
+                rootfs_layers: imported.rootfs_layers,
+                attached_drives: imported.attached_drives,
+                memory_layers: imported.memory_layers,
+                disk_publications: imported.disk_publications,
+            },
+        }
+    }
+}
+
 #[async_trait]
 /// The rows: snapshot records, template build state, and alias bindings.
 ///
@@ -131,12 +185,9 @@ pub trait SnapshotCatalog: Send + Sync {
     /// This is the flip: before it the snapshot is bytes nobody can find, after
     /// it the snapshot is resolvable. It must bind the alias and mark the
     /// record committed, and it must not assume the artifacts are reachable
-    /// from this process — `committed` is the only description of them it gets.
-    async fn publish_commit(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
-    ) -> RepositoryResult<SnapshotRecord>;
+    /// from this process — [`SnapshotCommit`] is the only description of them
+    /// it gets.
+    async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord>;
 
     /// Loads one snapshot record by repository id or alias.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;

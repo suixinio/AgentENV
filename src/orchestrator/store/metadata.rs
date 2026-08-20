@@ -190,7 +190,9 @@ impl SandboxMetadata {
         // how a projection comes to expire before the sandbox it points at;
         // flooring at 1 is how a sub-unit remainder avoids collapsing into a
         // zero that the receiver would have to interpret.
-        let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        let secs = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0));
         secs.saturating_add(grace_secs)
             .clamp(1, u64::from(u32::MAX)) as u32
     }

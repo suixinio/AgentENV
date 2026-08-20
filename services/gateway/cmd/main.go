@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -68,6 +69,8 @@ func main() {
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,
+		ExecutionFencing:         string(cfg.Gateway.Routing.ExecutionFencing),
+		ControlPlaneToken:        cfg.Gateway.ControlPlaneToken,
 	})
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))
@@ -79,6 +82,10 @@ func main() {
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
+		zap.String("execution_fencing", string(cfg.Gateway.Routing.ExecutionFencing)),
+		// Whether the token is set, never the token. An operator needs to know
+		// which of the two states the gate is in, and that is the whole of it.
+		zap.Bool("control_plane_token_configured", strings.TrimSpace(cfg.Gateway.ControlPlaneToken) != ""),
 	)
 	httpServer := &http.Server{
 		Addr:    cfg.Gateway.HTTPListenAddr,

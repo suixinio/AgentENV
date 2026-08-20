@@ -54,6 +54,35 @@ var (
 		},
 		[]string{"location"},
 	)
+	// What the routing layer did about the incarnation, per resolved request.
+	//
+	// The refused_* decisions should read zero on a healthy cluster, which makes
+	// them alertable as they are. The unfenced_* ones are the more useful half:
+	// their absolute value is the size of the coverage gap, and each names a
+	// different reason for it — no authority from the centre, or a node that does
+	// not answer with one. Before this existed there was no way to tell a gateway
+	// that was fencing everything from one that was fencing nothing.
+	gatewayExecutionFencing = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_execution_fencing_total",
+			Help: "Resolved sandbox requests by plane and by what the routing layer decided about the sandbox incarnation.",
+		},
+		[]string{"plane", "decision"},
+	)
+	// Duplicate sandbox rows seen while merging the cluster listing, by how the
+	// winner was chosen.
+	//
+	// A duplicate means one sandbox answered from two nodes, which is the most
+	// direct signal there is that a sandbox is live in two places. It used to be
+	// swallowed by the deduplication, so the endpoint most likely to be used to
+	// find a split brain was the one that hid it.
+	gatewayClusterListDuplicates = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_cluster_list_duplicate_total",
+			Help: "Duplicate sandbox rows merged in the cluster listing, by how the surviving row was chosen.",
+		},
+		[]string{"resolution"},
+	)
 )
 
 type statusRecorder struct {
@@ -161,6 +190,20 @@ func recordGatewaySchedulerRPC(rpc string, start time.Time, err error) {
 
 func recordGatewaySandboxLocation(location schedulerv1.SandboxLocation) {
 	gatewaySandboxLocations.WithLabelValues(gatewaySandboxLocationLabel(location)).Inc()
+}
+
+// recordExecutionFencing takes both labels from constants in
+// execution_fencing.go, which is what keeps the label set closed without a
+// mapping function: nothing a scheduler or a node sends reaches this call.
+func recordExecutionFencing(plane fencingPlane, decision string) {
+	if decision == "" {
+		return
+	}
+	gatewayExecutionFencing.WithLabelValues(string(plane), decision).Inc()
+}
+
+func recordClusterListDuplicate(resolution string) {
+	gatewayClusterListDuplicates.WithLabelValues(resolution).Inc()
 }
 
 // gatewaySandboxLocationLabel keeps the label set closed. An enum value this

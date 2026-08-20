@@ -15,6 +15,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -55,6 +56,15 @@ type ServerOptions struct {
 	DebugMode                bool
 	SandboxProxyDomains      []string
 	QueryOnlySchedulerClient schedulerv1.SchedulerClient
+	// ExecutionFencing is the raw configured mode. It is parsed in NewServer so
+	// an unrecognised value stops the process rather than becoming a silently
+	// chosen behaviour; the empty string is the absence of a setting and takes
+	// the default.
+	ExecutionFencing string
+	// ControlPlaneToken is stamped on every request the gateway forwards to a
+	// node. Empty means stamp nothing, which is the state the fleet runs in
+	// until the node-side gate is turned on.
+	ControlPlaneToken string
 }
 
 type Server struct {
@@ -69,10 +79,20 @@ type Server struct {
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
 	debugMode           bool
 	sandboxProxyDomains []string
+	// executionFencing is resolved once, at construction. Reading a string and
+	// branching on it at each call site is how one of these switches ends up
+	// meaning different things in different places.
+	executionFencing  fencingMode
+	controlPlaneToken string
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
+	if err != nil {
+		return nil, err
+	}
+
+	executionFencing, err := config.ParseGatewayExecutionFencing(options.ExecutionFencing)
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +111,8 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		maxRespSize:         options.MaxResponseSize,
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
+		executionFencing:    executionFencing,
+		controlPlaneToken:   strings.TrimSpace(options.ControlPlaneToken),
 	}, nil
 }
 
@@ -216,6 +238,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// the node does not hold the sandbox yet, which is what decides whether the
 	// binding has to be written on the way back.
 	location := schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED
+	// Decided once, from the one lookup answer, and carried to both ends of the
+	// proxied exchange. A request the scheduler never resolved has no incarnation
+	// to reason about, so it keeps the zero plan and stamps nothing.
+	fencing := fencingPlan{}
 
 	if hasSandbox {
 		// One call, one answer. The scheduler owns the whole decision — which
@@ -232,6 +258,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		node = resp.GetNode()
 		location = resp.GetLocation()
 		recordGatewaySandboxLocation(location)
+		plane := fencingPlaneFor(routeSource)
+		fencing = decideFencing(s.executionFencing, plane, resp)
+		recordExecutionFencing(plane, fencing.decision)
 		if locationNeedsAssignment(location) {
 			s.logger.Info("routing a sandbox the scheduler resolved from the paused registry",
 				zap.String("sandbox_id", sandboxID),
@@ -272,6 +301,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("sandbox_id", sandboxID),
 		zap.String("node_id", node.GetNodeId()),
 		zap.String("upstream_endpoint", node.GetEndpoint()),
+		// The control plane resolves an incarnation and never acts on it, so
+		// this line is the only place it is visible for those requests.
+		zap.String("expected_execution_id", fencing.expect),
+		zap.String("execution_authority", fencing.authority.String()),
+		zap.String("fencing_stage", fencingStageGatewayRoute),
 	)
 
 	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
@@ -295,6 +329,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			recordAssignment: locationNeedsAssignment(location) || shouldRecordAssignment(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
+			sandboxID:        sandboxID,
+			fencing:          fencing,
 		},
 	)
 }
@@ -347,6 +383,13 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	// sandboxID is the sandbox this exchange was routed for, empty when the
+	// request was scheduled rather than resolved. It appears in refusals.
+	sandboxID string
+	// fencing is the plan decided from the lookup answer. The zero value stamps
+	// nothing and reads nothing back, which is what the paths with no sandbox
+	// and the node admin surface both get.
+	fencing fencingPlan
 }
 
 // proxyRequest forwards the request to one node.
@@ -373,6 +416,12 @@ func (s *Server) proxyRequest(
 			req.Out.URL.RawQuery = upstreamURL.RawQuery
 			req.Out.Host = req.In.Host
 			injectForwardedHeaders(req.Out.Header, req.In)
+			// 🔴 After the client's own headers have been copied, and
+			// unconditionally: these two header names are the gateway's to
+			// assert, and leaving an inbound one in place would make the gateway
+			// a passthrough for a forged control-plane identity or a forged
+			// fencing token.
+			s.stampOutboundGatewayHeaders(req.Out.Header, options.fencing.stampedExecutionID())
 			if options.hostRoute != nil {
 				req.Out.Header.Set(headerSandboxID, options.hostRoute.sandboxID)
 				req.Out.Header.Set(headerTargetPort, strconv.Itoa(options.hostRoute.targetPort))
@@ -388,6 +437,11 @@ func (s *Server) proxyRequest(
 				if nodeID := node.GetNodeId(); nodeID != "" {
 					resp.Header.Set(headerNodeID, nodeID)
 				}
+			}
+			// Before the assignment record, on purpose: a refused exchange must
+			// not leave a binding behind naming the node that was refused.
+			if err := s.fenceProxyResponse(options.fencing, options.sandboxID, node, resp); err != nil {
+				return err
 			}
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
@@ -422,7 +476,7 @@ func (s *Server) proxyRequest(
 
 			var proxyErr *proxyResponseError
 			if errors.As(err, &proxyErr) {
-				http.Error(rw, proxyErr.message, proxyErr.statusCode)
+				proxyErr.write(rw)
 				return
 			}
 
@@ -446,10 +500,42 @@ func isStreamInputProxyRequest(r *http.Request) bool {
 	return r.Method == http.MethodPost && r.URL.Path == "/process.Process/StreamInput"
 }
 
+// proxyResponseError is how ModifyResponse ends a proxied exchange on its own
+// terms. Returning it makes the reverse proxy close the upstream body and hand
+// the error to ErrorHandler, so the upstream's own response never reaches the
+// client — including for a 101, which the upgrade path would otherwise have
+// taken over before anything written in place could matter.
 type proxyResponseError struct {
 	statusCode int
 	message    string
 	cause      error
+	// contentType, body and headers carry a structured refusal. When body is
+	// empty the error falls back to http.Error's plain text, which is what every
+	// pre-existing caller wants.
+	contentType string
+	body        []byte
+	headers     http.Header
+}
+
+// write emits the error as a response.
+func (e *proxyResponseError) write(rw http.ResponseWriter) {
+	if len(e.body) == 0 {
+		http.Error(rw, e.message, e.statusCode)
+		return
+	}
+	for name, values := range e.headers {
+		for _, value := range values {
+			rw.Header().Add(name, value)
+		}
+	}
+	if e.contentType != "" {
+		rw.Header().Set("Content-Type", e.contentType)
+	}
+	rw.Header().Set("Content-Length", strconv.Itoa(len(e.body)))
+	rw.WriteHeader(e.statusCode)
+	if _, err := rw.Write(e.body); err != nil {
+		return
+	}
 }
 
 func (e *proxyResponseError) Error() string {
@@ -463,8 +549,14 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
 
+	// The node names the incarnation it just started on the same response. It is
+	// optional on the way in: absent only costs authority for the window between
+	// the create and the node's first heartbeat, and inside that window the
+	// sandbox is new and has exactly one incarnation.
+	executionID := executionIDFromResponse(resp.Header)
+
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
-		s.recordAssignment(recordCtx, sandboxID, node, "response_header")
+		s.recordAssignment(recordCtx, sandboxID, node, executionID, "response_header")
 		return nil
 	}
 
@@ -497,14 +589,23 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
 	for _, sandboxID := range extractSandboxIDsFromResponse(body) {
-		s.recordAssignment(recordCtx, sandboxID, node, "response_body")
+		// 🔴 One echoed incarnation, several sandbox ids: a fork answers with the
+		// parent's echo and the children's ids, and stamping the parent's
+		// incarnation onto a child would name an incarnation that never ran
+		// there. The body path therefore records no incarnation at all and takes
+		// the same unauthoritative window a fresh create takes.
+		s.recordAssignment(recordCtx, sandboxID, node, "", "response_body")
 	}
 	return nil
 }
 
-func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) {
+func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, executionID string, source string) {
 	rpcStart := time.Now()
-	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{SandboxId: sandboxID, Node: node})
+	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
+		SandboxId:   sandboxID,
+		Node:        node,
+		ExecutionId: executionID,
+	})
 	recordGatewaySchedulerRPC("RecordAssignment", rpcStart, err)
 	if err != nil {
 		s.logger.Warn("record assignment failed", zap.Error(err), zap.String("sandbox_id", sandboxID), zap.String("node_id", node.GetNodeId()))
@@ -514,6 +615,7 @@ func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *s
 	s.logger.Debug("gateway recorded sandbox assignment",
 		zap.String("sandbox_id", sandboxID),
 		zap.String("node_id", node.GetNodeId()),
+		zap.String("observed_execution_id", executionID),
 		zap.String("source", source),
 	)
 }

@@ -33,6 +33,17 @@ type listedSandbox struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	State       string            `json:"state"`
 	EnvdVersion string            `json:"envdVersion"`
+	// ExecutionID names which run of this sandbox the row describes.
+	//
+	// 🔴 It has to be declared here even though the gateway only passes it
+	// through: this struct is decoded from the node's JSON, and a field it does
+	// not name is discarded without a word. The endpoint most likely to be used
+	// to find a sandbox live in two places would then be the one endpoint unable
+	// to show it apart.
+	//
+	// Read-only, and omitted when the node did not send one — which is what a
+	// node from before this field looks like.
+	ExecutionID string `json:"executionID,omitempty"`
 }
 
 type clusterListResult struct {
@@ -187,6 +198,14 @@ func (s *Server) fetchNodeClusterList(ctx context.Context, incoming *http.Reques
 	req.Header = incoming.Header.Clone()
 	req.Host = incoming.Host
 	injectForwardedHeaders(req.Header, incoming)
+	// 🔴 This fan-out does not go through the reverse proxy, so it does not get
+	// the Rewrite hook's headers. Two consequences, both silent if missed: the
+	// client's own copy of these headers would be forwarded verbatim, and the
+	// gateway would not identify itself — and this endpoint is all-or-nothing,
+	// so one node refusing takes the whole cluster listing with it rather than
+	// one node's rows. No incarnation is stamped: this is not a data-plane
+	// request against a single sandbox.
+	s.stampOutboundGatewayHeaders(req.Header, "")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -240,21 +259,65 @@ func sortListedSandboxes(items []listedSandbox) {
 	})
 }
 
+// Why a duplicate was resolved the way it was. Two values, closed.
+const (
+	// clusterListDuplicateByExecution — the rows named different incarnations
+	// and the newer one won.
+	clusterListDuplicateByExecution = "by_execution"
+	// clusterListDuplicateKeepFirst — the rows could not be told apart, so the
+	// sort order decided. This is the old behaviour, kept for the rows that
+	// still cannot supply an incarnation.
+	clusterListDuplicateKeepFirst = "keep_first"
+)
+
+// dedupListedSandboxes collapses rows for the same sandbox returned by more than
+// one node.
+//
+// 🔴 The two rows are indistinguishable by everything the sort orders on:
+// startedAt comes from the sandbox's creation time and is only reset by a fork,
+// so a resume carries the original one, and the sandbox id is the same by
+// definition. The comparison therefore answers false in both directions, and
+// sort.Slice is not stable — the surviving row was whichever one the sort
+// happened to leave in front, and two calls against the same cluster could
+// answer differently, with the state, the end time and the metadata all coming
+// from a run that is over.
+//
+// The incarnation is what settles it: a UUIDv7 sorts in the order it was minted,
+// so the larger one is the later one. When neither row can name one, the old
+// keep-first fallback stands — it is no worse than before, and it is counted.
+//
+// 🔴 The registry is not consulted, and must not be. It holds no row for a
+// sandbox that has never been paused, which is the most common kind, so using it
+// to decide who is authoritative would delete those sandboxes from the listing
+// outright. The tie-break has to be carried by the rows themselves.
 func dedupListedSandboxes(items []listedSandbox) []listedSandbox {
 	if len(items) < 2 {
 		return items
 	}
 
-	// TODO: When sandbox migration is supported, replace this "keep first" fallback
-	// with a deterministic winner based on authoritative ownership or versioning.
-	seen := make(map[string]struct{}, len(items))
+	// The winner replaces the loser in place rather than being appended, so the
+	// order established by the sort survives the deduplication.
+	at := make(map[string]int, len(items))
 	deduped := make([]listedSandbox, 0, len(items))
 	for _, item := range items {
-		if _, ok := seen[item.SandboxID]; ok {
+		index, seen := at[item.SandboxID]
+		if !seen {
+			at[item.SandboxID] = len(deduped)
+			deduped = append(deduped, item)
 			continue
 		}
-		seen[item.SandboxID] = struct{}{}
-		deduped = append(deduped, item)
+
+		kept := deduped[index]
+		incoming := normalizeExecutionID(item.ExecutionID)
+		existing := normalizeExecutionID(kept.ExecutionID)
+		if incoming == "" || existing == "" || incoming == existing {
+			recordClusterListDuplicate(clusterListDuplicateKeepFirst)
+			continue
+		}
+		recordClusterListDuplicate(clusterListDuplicateByExecution)
+		if incoming > existing {
+			deduped[index] = item
+		}
 	}
 	return deduped
 }

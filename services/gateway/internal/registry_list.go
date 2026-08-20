@@ -35,6 +35,14 @@ type registrySandboxItem struct {
 	UpdatedAtUnixMs        int64  `json:"updatedAtUnixMs"`
 	LeaseExpiresAtUnixMs   *int64 `json:"leaseExpiresAtUnixMs"`
 	SandboxExpiresAtUnixMs *int64 `json:"sandboxExpiresAtUnixMs"`
+	// ExecutionID is the incarnation this row is fenced against, empty when the
+	// row's state pins the column to NULL.
+	//
+	// Read-only, and deliberately not filterable: registryListQueryParams is a
+	// closed set and this is not in it. A parameter that selects by incarnation
+	// is one step from a caller supplying one, and an incarnation supplied by a
+	// caller is stale by construction.
+	ExecutionID string `json:"executionID"`
 }
 
 type registryListResponse struct {
@@ -156,6 +164,7 @@ func (s *Server) handleRegistryList(w http.ResponseWriter, r *http.Request, rout
 			UpdatedAtUnixMs:        sandbox.GetUpdatedAtUnixMs(),
 			LeaseExpiresAtUnixMs:   optionalUnixMs(sandbox.GetLeaseExpiresAtUnixMs()),
 			SandboxExpiresAtUnixMs: optionalUnixMs(sandbox.GetSandboxExpiresAtUnixMs()),
+			ExecutionID:            sandbox.GetExecutionId(),
 		})
 	}
 

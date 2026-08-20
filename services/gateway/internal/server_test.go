@@ -162,6 +162,23 @@ type testServerOption func(*ServerOptions)
 
 func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, timeout time.Duration, maxRespSize int64, opts ...testServerOption) *Server {
 	t.Helper()
+	return newTestServerWithLogger(t, zap.NewNop(), schedulerClient, timeout, maxRespSize, opts...)
+}
+
+// newTestServerWithLogger is newTestServer for the tests that assert on what the
+// gateway wrote down rather than only on what it answered. The distinction
+// matters for the modes that deliberately change nothing on the wire: with the
+// response identical either way, the log line and the counter are the entire
+// observable output.
+func newTestServerWithLogger(
+	t *testing.T,
+	logger *zap.Logger,
+	schedulerClient schedulerv1.SchedulerClient,
+	timeout time.Duration,
+	maxRespSize int64,
+	opts ...testServerOption,
+) *Server {
+	t.Helper()
 
 	options := ServerOptions{
 		RequestTimeout:  timeout,
@@ -171,7 +188,7 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 		opt(&options)
 	}
 
-	server, err := NewServer(zap.NewNop(), schedulerClient, options)
+	server, err := NewServer(logger, schedulerClient, options)
 	if err != nil {
 		t.Fatalf("new gateway server failed: %v", err)
 	}

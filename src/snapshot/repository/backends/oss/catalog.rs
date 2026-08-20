@@ -654,7 +654,8 @@ mod tests {
     #[tokio::test]
     async fn catalog_round_trips_a_record_without_an_artifact_store() {
         let addr = spawn_fake_s3(BTreeMap::new()).await;
-        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        let client = fake_s3_client(addr);
+        let catalog = OssSnapshotCatalog::new(Arc::clone(&client));
         let record = SnapshotRecord::template_waiting(
             SnapshotId::generate(),
             Some(SnapshotAlias::parse("standalone").expect("alias parses")),
@@ -696,11 +697,156 @@ mod tests {
             .await
             .expect("get after delete should work")
             .is_none());
-        assert!(catalog
-            .resolve_alias("standalone")
+        // Assert the binding object itself is gone rather than asking
+        // `resolve_alias`: that call cleans up aliases pointing at missing
+        // records, so it would answer `None` even if the delete had left the
+        // binding behind.
+        assert!(
+            !client
+                .exists("catalog/aliases/standalone.json")
+                .await
+                .expect("alias existence check should work"),
+            "deleting a record must remove the alias binding that pointed at it"
+        );
+    }
+
+    /// `publish_commit` is the flip: before it the bytes are unfindable, after
+    /// it they resolve. It has to do both halves of that — mark the record
+    /// committed *and* bind the alias — because a commit that only wrote the
+    /// record leaves the alias pointing nowhere, and one that only bound the
+    /// alias leaves it pointing at an uncommitted row.
+    #[tokio::test]
+    async fn publish_commit_marks_the_record_committed_and_binds_its_alias() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        let metadata = SnapshotPublishMetadata {
+            alias: Some(SnapshotAlias::parse("published").expect("alias parses")),
+            ..SnapshotPublishMetadata::mock()
+        };
+        let id = metadata.id.clone();
+
+        let record = catalog
+            .publish_commit(metadata, CommittedSnapshot::mock())
             .await
-            .expect("resolve after delete should work")
-            .is_none());
+            .expect("commit should work");
+
+        assert_eq!(record.id, id);
+        assert!(record.committed.is_some(), "the record must be committed");
+        assert_eq!(
+            catalog
+                .resolve_alias("published")
+                .await
+                .expect("resolve should work"),
+            Some(id.clone()),
+            "the alias must resolve to the snapshot the commit published"
+        );
+        assert!(
+            catalog
+                .get("published")
+                .await
+                .expect("get should work")
+                .expect("record should resolve through the alias")
+                .committed
+                .is_some(),
+            "resolving through the alias must reach the committed record"
+        );
+    }
+
+    /// A commit must not take an alias a live snapshot already holds.
+    #[tokio::test]
+    async fn publish_commit_refuses_an_alias_a_live_snapshot_holds() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        let held = SnapshotPublishMetadata {
+            alias: Some(SnapshotAlias::parse("held").expect("alias parses")),
+            ..SnapshotPublishMetadata::mock()
+        };
+        let first_id = held.id.clone();
+        catalog
+            .publish_commit(held, CommittedSnapshot::mock())
+            .await
+            .expect("first commit should work");
+
+        let error = catalog
+            .publish_commit(
+                SnapshotPublishMetadata {
+                    alias: Some(SnapshotAlias::parse("held").expect("alias parses")),
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .await
+            .expect_err("a second commit must not steal the alias");
+
+        assert!(
+            matches!(error, RepositoryError::AliasConflict { .. }),
+            "expected an alias conflict, got {error:?}"
+        );
+        assert_eq!(
+            catalog
+                .resolve_alias("held")
+                .await
+                .expect("resolve should work"),
+            Some(first_id),
+            "the alias must still point at the snapshot that won it"
+        );
+    }
+
+    /// Template builds pre-create a `Waiting` row and only later publish over
+    /// it, so `publish_commit` has a second branch: fold the commit into the
+    /// row that is already there rather than mint a new one. Folding is what
+    /// preserves the template's identity — its creation time and its build
+    /// reaching `Ready` rather than appearing from nowhere as a fresh record.
+    #[tokio::test]
+    async fn publish_commit_folds_into_a_pre_created_template_record() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        let pending = SnapshotRecord::template_waiting(
+            SnapshotId::generate(),
+            Some(SnapshotAlias::parse("built").expect("alias parses")),
+            SandboxResources::default(),
+        );
+        catalog
+            .create(pending.clone())
+            .await
+            .expect("pre-create should work");
+
+        let committed = catalog
+            .publish_commit(
+                SnapshotPublishMetadata {
+                    id: pending.id.clone(),
+                    alias: pending.alias.clone(),
+                    source: SnapshotPublishSource::Template,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .await
+            .expect("commit should work");
+
+        assert!(committed.committed.is_some());
+        assert_eq!(
+            committed.created_at_unix_ms, pending.created_at_unix_ms,
+            "committing must fold into the pre-created row, not replace it"
+        );
+        let SnapshotSource::Template { build } = &committed.source else {
+            panic!(
+                "a template build must stay a template, got {:?}",
+                committed.source
+            );
+        };
+        assert_eq!(build.status, TemplateBuildStatus::Ready);
+
+        let reloaded = catalog
+            .get(&pending.id.to_string())
+            .await
+            .expect("get should work")
+            .expect("record should exist");
+        assert!(
+            reloaded.committed.is_some(),
+            "the stored row must carry the commit, not just the returned value"
+        );
+        assert_eq!(reloaded.created_at_unix_ms, pending.created_at_unix_ms);
     }
 
     /// A second snapshot must not be able to steal a live alias. This is the

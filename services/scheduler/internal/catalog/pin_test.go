@@ -250,6 +250,32 @@ func everyStatement() map[string]string {
 		out[fmt.Sprintf("selectSnapshotByID/%v", opts)] = selectSnapshotSQL(byIDPredicate, opts)
 		out[fmt.Sprintf("selectSnapshotByAlias/%v", opts)] = selectSnapshotSQL(byAliasPredicate, opts)
 	}
+	// The listing in every shape it takes: the filters and the cursor each add
+	// their own predicates, and a rule about WHERE clauses that skipped the
+	// query with the most of them would be the one place worth checking.
+	prefix := "p"
+	sandbox := "sbx"
+	union := "0189ab00-0000-7000-8000-000000000002"
+	rich := Filter{
+		SourceKinds:       []string{SourceKindSandbox},
+		AliasPrefix:       &prefix,
+		SnapshotIDs:       []string{"0189ab00-0000-7000-8000-000000000003"},
+		SnapshotIDOrAlias: &union,
+		SourceSandboxID:   &sandbox,
+		TemplateStatuses:  []string{StatusBuilding},
+	}
+	for _, opts := range everyReadOption() {
+		for _, cursor := range []*Cursor{nil, {CreatedAtMs: 1, SnapshotID: "0189ab00-0000-7000-8000-000000000001"}} {
+			for label, filter := range map[string]Filter{"bare": {}, "filtered": rich} {
+				in := ListInput{ClusterID: anyCluster, Filter: filter, Cursor: cursor, ReadOptions: opts}
+				sql, _, err := listSnapshotsSQL(in, defaultListLimit)
+				if err != nil {
+					panic(err)
+				}
+				out[fmt.Sprintf("listSnapshots/%s/%v/cursor=%v", label, opts, cursor != nil)] = sql
+			}
+		}
+	}
 	return out
 }
 

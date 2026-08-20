@@ -56,6 +56,10 @@
       "mountPath": "/data"
     }
   ],
+  "max_lifetime": {
+    "nanos": 0,
+    "secs": 86400
+  },
   "network_policy": {
     "base_policy": "Deny",
     "egress": {

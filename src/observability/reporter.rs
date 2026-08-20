@@ -434,9 +434,10 @@ impl ObservabilityReporter {
             roster: snapshot
                 .sandbox_roster
                 .into_iter()
-                .map(|(sandbox_id, execution_id)| scheduler::SandboxRosterEntry {
-                    sandbox_id: sandbox_id.to_string(),
-                    execution_id: execution_id.to_string(),
+                .map(|entry| scheduler::SandboxRosterEntry {
+                    sandbox_id: entry.sandbox_id.to_string(),
+                    execution_id: entry.execution_id.to_string(),
+                    projection_ttl_secs: entry.projection_ttl_secs,
                 })
                 .collect(),
         }
@@ -455,6 +456,10 @@ impl ObservabilityReporter {
                 .map(|event| scheduler::SandboxEvent {
                     sandbox_id: event.sandbox_id.to_string(),
                     event_type: Self::map_sandbox_event_type(event.event_type).into(),
+                    // The guard the receiver deletes a projection under. An
+                    // empty value there means "no guard", so this is never
+                    // allowed to go out empty.
+                    execution_id: event.execution_id.to_string(),
                     requested_cpu: event.resources.cpu_count,
                     requested_memory_bytes: u64::from(event.resources.memory_mib) * 1024 * 1024,
                     requested_disk_bytes: u64::from(event.resources.disk_size_mib) * 1024 * 1024,

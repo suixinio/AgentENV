@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -17,6 +17,37 @@ use crate::virtualization::VirtualizationMode;
 pub enum SandboxTimeoutAction {
     Pause,
     Delete,
+}
+
+/// The configured slack added to a routing projection's TTL.
+///
+/// Read once: it is a deployment-wide constant, and every response header and
+/// heartbeat roster entry asks for it.
+fn configured_projection_ttl_grace_secs() -> u64 {
+    static GRACE_SECS: OnceLock<u64> = OnceLock::new();
+
+    *GRACE_SECS.get_or_init(|| {
+        crate::cfg::ConfigManager::global_config()
+            .orchestrator
+            .projection_ttl_grace_secs
+    })
+}
+
+/// The lifetime ceiling this node creates sandboxes under, or `None` when the
+/// ceiling is disabled.
+pub fn configured_max_sandbox_lifetime() -> Option<Duration> {
+    static MAX_LIFETIME: OnceLock<Option<Duration>> = OnceLock::new();
+
+    *MAX_LIFETIME.get_or_init(|| {
+        match crate::cfg::ConfigManager::global_config()
+            .orchestrator
+            .max_sandbox_lifetime_secs
+        {
+            // 🔴 0 is "no ceiling", not "expire immediately".
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +100,22 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
+    /// The lifetime ceiling this sandbox was created under, measured from
+    /// `created_at`, or `None` when the node had no ceiling configured.
+    ///
+    /// Stored as the budget rather than as an absolute deadline on purpose. A
+    /// fork resets `created_at` and so gets a whole fresh window; a resume
+    /// keeps it and so keeps shrinking the same one. Both are the right reading
+    /// of "maximum lifetime", and neither needs a line of clamping code at the
+    /// call site.
+    ///
+    /// 🔴 `#[serde(default)]` is load-bearing here, unlike on `execution_id`
+    /// above: `persister.load_all` runs inside `Orchestrator::new`, so a
+    /// required field would mean a node that cannot start after an upgrade,
+    /// because every paused record written by an earlier build is missing it.
+    /// Do not copy the neighbour.
+    #[serde(default)]
+    pub max_lifetime: Option<Duration>,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
@@ -106,6 +153,7 @@ impl Default for SandboxMetadata {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,
+            max_lifetime: None,
             paused_state: None,
         }
     }
@@ -116,9 +164,47 @@ impl SandboxMetadata {
         self._set_timeout(timeout, SystemTime::now());
     }
 
+    /// `created_at + max_lifetime`. `None` means this sandbox has no ceiling.
+    pub fn lifetime_deadline(&self) -> Option<SystemTime> {
+        self.max_lifetime
+            .and_then(|lifetime| self.created_at.checked_add(lifetime))
+    }
+
+    /// How long this sandbox's routing projection should live, in whole
+    /// seconds, or `0` when there is no ceiling to derive it from.
+    ///
+    /// 🔴 `0` is the only non-positive value that may ever leave here, and it
+    /// means "use the receiver's default TTL". It must never be read as "never
+    /// expires": a projection that outlives every path able to delete it is a
+    /// route pointing at a sandbox nobody can reach.
+    pub fn projection_ttl_secs(&self, now: SystemTime) -> u32 {
+        self._projection_ttl_secs(now, configured_projection_ttl_grace_secs())
+    }
+
+    fn _projection_ttl_secs(&self, now: SystemTime, grace_secs: u64) -> u32 {
+        let Some(cap) = self.lifetime_deadline() else {
+            return 0;
+        };
+        let remaining = cap.duration_since(now).unwrap_or(Duration::ZERO);
+        // 🔴 Ceil, not truncate, and floored at 1. Truncating whole units is
+        // how a projection comes to expire before the sandbox it points at;
+        // flooring at 1 is how a sub-unit remainder avoids collapsing into a
+        // zero that the receiver would have to interpret.
+        let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        secs.saturating_add(grace_secs).clamp(1, u64::from(u32::MAX)) as u32
+    }
+
     fn _set_timeout(&mut self, timeout: Option<Duration>, from: SystemTime) {
         self.timeout = timeout;
-        self.expires_at = timeout.and_then(|ttl| from.checked_add(ttl));
+        let deadline = timeout.and_then(|ttl| from.checked_add(ttl));
+        // Every path that sets an expiry — create, resume, fork, connect,
+        // auto-resume, keep-alive — funnels through here, which is why the
+        // ceiling is applied here and at no call site: there are six of them
+        // and clamping them one by one would miss one.
+        self.expires_at = match (deadline, self.lifetime_deadline()) {
+            (Some(deadline), Some(cap)) => Some(deadline.min(cap)),
+            (deadline, _) => deadline,
+        };
     }
 
     pub fn update_timeout(&mut self, new_timeout: NewTimeout) {
@@ -198,6 +284,230 @@ mod tests {
         metadata.update_timeout(NewTimeout::None);
         assert_eq!(metadata.timeout, None);
         assert_eq!(metadata.expires_at, None);
+    }
+
+    /// A record with no ceiling behaves exactly as it did before the ceiling
+    /// existed. This is the control for every test below it: without it,
+    /// "clamped to 300" could just as well be "the timeout was 300 all along".
+    fn uncapped(base: SystemTime) -> SandboxMetadata {
+        SandboxMetadata {
+            created_at: base,
+            max_lifetime: None,
+            ..Default::default()
+        }
+    }
+
+    fn capped(base: SystemTime, lifetime_secs: u64) -> SandboxMetadata {
+        SandboxMetadata {
+            created_at: base,
+            max_lifetime: Some(Duration::from_secs(lifetime_secs)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lifetime_deadline_is_created_at_plus_the_budget() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+
+        assert_eq!(uncapped(base).lifetime_deadline(), None);
+        assert_eq!(
+            capped(base, 300).lifetime_deadline(),
+            Some(base + Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn set_timeout_clamps_to_the_lifetime_ceiling() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut metadata = capped(base, 300);
+
+        metadata._set_timeout(Some(Duration::from_secs(3600)), base);
+        assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(300)));
+        // 🔴 The requested timeout is kept as requested; only the deadline is
+        // clamped. A caller that reads `timeout` back is told what it asked
+        // for, and the ceiling is a property of the deadline.
+        assert_eq!(metadata.timeout, Some(Duration::from_secs(3600)));
+    }
+
+    /// The control face for the test above.
+    #[test]
+    fn set_timeout_without_a_ceiling_is_not_clamped() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut metadata = uncapped(base);
+
+        metadata._set_timeout(Some(Duration::from_secs(3600)), base);
+        assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn set_timeout_leaves_a_deadline_inside_the_ceiling_alone() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut metadata = capped(base, 300);
+
+        metadata._set_timeout(Some(Duration::from_secs(60)), base);
+        assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(60)));
+    }
+
+    /// Renewal is where the ceiling earns its keep: a keep-alive issued halfway
+    /// through the window may not push the deadline past the end of it.
+    #[test]
+    fn a_later_renewal_cannot_push_the_deadline_past_the_ceiling() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut metadata = capped(base, 300);
+        metadata._set_timeout(Some(Duration::from_secs(60)), base);
+
+        let halfway = base + Duration::from_secs(150);
+        metadata._set_timeout(Some(Duration::from_secs(3600)), halfway);
+        assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn clearing_the_timeout_clears_the_deadline_even_under_a_ceiling() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut metadata = capped(base, 300);
+        metadata._set_timeout(Some(Duration::from_secs(60)), base);
+
+        metadata._set_timeout(None, base);
+        // No timeout means no expiry, and the ceiling does not invent one: the
+        // eviction loop reads `expires_at` and nothing else, so writing the cap
+        // in here would start deleting sandboxes that asked never to expire.
+        assert_eq!(metadata.expires_at, None);
+    }
+
+    #[test]
+    fn a_forked_child_gets_a_fresh_window_because_created_at_moved() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut parent = capped(base, 300);
+        parent._set_timeout(Some(Duration::from_secs(300)), base);
+
+        let mut child = parent.clone();
+        let later = base + Duration::from_secs(280);
+        child.created_at = later;
+        child._set_timeout(Some(Duration::from_secs(300)), later);
+
+        assert_eq!(child.expires_at, Some(later + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn projection_ttl_is_zero_without_a_ceiling() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+
+        // 🔴 0 is the handoff to the receiver's default, and the only
+        // non-positive value that may ever be emitted.
+        assert_eq!(uncapped(base)._projection_ttl_secs(base, 60), 0);
+    }
+
+    #[test]
+    fn projection_ttl_is_the_remaining_budget_plus_the_grace() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let metadata = capped(base, 300);
+
+        assert_eq!(metadata._projection_ttl_secs(base, 60), 360);
+        assert_eq!(
+            metadata._projection_ttl_secs(base + Duration::from_secs(100), 60),
+            260
+        );
+        assert_eq!(metadata._projection_ttl_secs(base, 0), 300);
+    }
+
+    /// 🔴 Ceil, not truncate. Truncation is the bug that makes a projection
+    /// expire before the sandbox it points at, and it only shows up on a
+    /// remainder — which a whole-numbered fixture would never produce.
+    #[test]
+    fn projection_ttl_rounds_a_partial_second_up() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let metadata = capped(base, 300);
+
+        // Exactly on a second boundary: ceil is not "+1".
+        assert_eq!(metadata._projection_ttl_secs(base, 0), 300);
+        // Half a second in, 299.5s left. Rounding up gives the sandbox's own
+        // last second back; truncating to 299 is what retires the projection
+        // while the sandbox it points at is still answering.
+        assert_eq!(
+            metadata._projection_ttl_secs(base + Duration::new(0, 500_000_000), 0),
+            300
+        );
+
+        // A budget that is not itself a whole number of seconds.
+        let ragged = SandboxMetadata {
+            created_at: base,
+            max_lifetime: Some(Duration::new(300, 1)),
+            ..Default::default()
+        };
+        assert_eq!(ragged._projection_ttl_secs(base, 0), 301);
+    }
+
+    /// 🔴 The second, worse half of the bug this formula replaces: a budget
+    /// smaller than one unit truncating to 0, and 0 being read downstream as
+    /// "no expiry at all". Nothing here may emit a non-positive value once a
+    /// ceiling exists.
+    #[test]
+    fn projection_ttl_floors_at_one_second_and_never_at_zero() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let metadata = SandboxMetadata {
+            created_at: base,
+            max_lifetime: Some(Duration::new(0, 1)),
+            ..Default::default()
+        };
+
+        assert_eq!(metadata._projection_ttl_secs(base, 0), 1);
+
+        // Already past the deadline: still 1, still not 0. An expired sandbox
+        // asks for a short-lived record, not for an immortal one.
+        let expired = capped(base, 300);
+        assert_eq!(
+            expired._projection_ttl_secs(base + Duration::from_secs(9_000), 0),
+            1
+        );
+    }
+
+    #[test]
+    fn projection_ttl_saturates_instead_of_wrapping() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let metadata = capped(base, u64::from(u32::MAX));
+
+        assert_eq!(metadata._projection_ttl_secs(base, 3600), u32::MAX);
+    }
+
+    /// 🔴 N2. `load_all` runs inside `Orchestrator::new`, so a record written
+    /// before this field existed has to decode or the node does not start.
+    #[test]
+    fn a_record_written_before_the_ceiling_existed_still_decodes() {
+        let mut document = serde_json::to_value(&SandboxMetadata {
+            created_at: UNIX_EPOCH + Duration::from_secs(100),
+            max_lifetime: Some(Duration::from_secs(300)),
+            ..Default::default()
+        })
+        .expect("serialize");
+        document
+            .as_object_mut()
+            .expect("an object")
+            .remove("max_lifetime")
+            .expect("the field is written");
+
+        let decoded: SandboxMetadata =
+            serde_json::from_value(document).expect("an older record must still load");
+
+        assert_eq!(decoded.max_lifetime, None);
+        assert_eq!(decoded.lifetime_deadline(), None);
+        // And an uncapped record keeps behaving as it did before the ceiling
+        // existed, rather than being retro-fitted with this node's ceiling.
+        assert_eq!(decoded.projection_ttl_secs(SystemTime::now()), 0);
+    }
+
+    #[test]
+    fn the_ceiling_survives_a_round_trip() {
+        let metadata = SandboxMetadata {
+            created_at: UNIX_EPOCH + Duration::from_secs(100),
+            max_lifetime: Some(Duration::from_secs(86_400)),
+            ..Default::default()
+        };
+
+        let decoded: SandboxMetadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).expect("serialize"))
+                .expect("deserialize");
+
+        assert_eq!(decoded.max_lifetime, Some(Duration::from_secs(86_400)));
     }
 }
 
@@ -375,6 +685,7 @@ mod golden {
             ),
             custom_extension_params: Some(custom_extension_params),
             secure: true,
+            max_lifetime: Some(Duration::new(86_400, 0)),
             paused_state: None,
         }
     }
@@ -543,7 +854,7 @@ mod golden {
         );
     }
 
-    /// The other half of the boundary. These five are genuinely optional, and a
+    /// The other half of the boundary. These are genuinely optional, and a
     /// document without them is valid — so a reader must not treat "fewer keys"
     /// as damage.
     #[test]
@@ -560,6 +871,11 @@ mod golden {
             "expires_at",
             "startup",
             "user_metadata",
+            // 🔴 The one whose absence a node actually meets in production:
+            // every paused record written before the lifetime ceiling existed
+            // is missing it, and `load_all` runs inside `Orchestrator::new`, so
+            // a decode failure here is a node that will not start.
+            "max_lifetime",
         ] {
             let mut trimmed = full.clone();
             trimmed

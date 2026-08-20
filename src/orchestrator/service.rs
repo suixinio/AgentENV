@@ -34,7 +34,7 @@ use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, PauseOutcome, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -476,6 +476,7 @@ where
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     secure,
+                    max_lifetime: configured_max_sandbox_lifetime(),
                     ..Default::default()
                 };
 
@@ -536,6 +537,7 @@ where
                     network_policy,
                     custom_extension_params,
                     secure,
+                    max_lifetime: configured_max_sandbox_lifetime(),
                     ..Default::default()
                 };
 
@@ -556,6 +558,7 @@ where
                 self.publish_sandbox_event(
                     SandboxLifecycleEventType::Create,
                     metadata.id,
+                    metadata.execution_id,
                     metadata.resources,
                 );
                 Ok(metadata)
@@ -743,6 +746,7 @@ where
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Fork,
                 metadata.id,
+                metadata.execution_id,
                 metadata.resources,
             );
             successes += 1;
@@ -787,18 +791,29 @@ where
     }
 
     /// Lists every sandbox this node tracks together with the incarnation it is
-    /// running under.
+    /// running under and the TTL its routing projection should carry.
     ///
     /// The same set [`list_sandbox_ids`](Self::list_sandbox_ids) reports, which
     /// is deliberate: the heartbeat sends both, and a receiver that finds them
     /// describing different sets could not tell which one to believe.
-    pub async fn list_sandbox_roster(&self) -> Result<Vec<(SandboxId, ExecutionId)>> {
+    pub async fn list_sandbox_roster(&self) -> Result<Vec<SandboxRosterEntry>> {
+        let now = SystemTime::now();
+
         Ok(self
             .store
             .list()
             .await?
             .into_iter()
-            .map(|metadata| (metadata.id, metadata.execution_id))
+            .map(|metadata| SandboxRosterEntry {
+                sandbox_id: metadata.id,
+                execution_id: metadata.execution_id,
+                // The repair path for a projection write that was lost: it has
+                // to reinstall the record with the sandbox's real remaining
+                // budget, not with the receiver's default, or a single dropped
+                // write silently downgrades that sandbox's routing record for
+                // good.
+                projection_ttl_secs: metadata.projection_ttl_secs(now),
+            })
             .collect())
     }
 
@@ -928,6 +943,22 @@ where
                 sandbox_id,
                 state: metadata.state,
             });
+        }
+
+        // 🔴 The ceiling refuses here and nowhere else. An over-long renewal is
+        // clamped by `_set_timeout` below and succeeds; only a sandbox that has
+        // already outlived its ceiling is refused, because there is no window
+        // left to clamp into. Reversing this — refusing anything that asks for
+        // more than the ceiling allows — would hand a new 400 to every client
+        // that passes a generous timeout.
+        if let Some(deadline) = metadata.lifetime_deadline() {
+            if SystemTime::now() >= deadline {
+                info!(?deadline, "sandbox has exceeded its maximum lifetime");
+                return Err(OrchestratorError::SandboxLifetimeExceeded {
+                    sandbox_id,
+                    deadline,
+                });
+            }
         }
 
         let mut timeout_updated = false;
@@ -1118,6 +1149,7 @@ where
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
                 metadata.id,
+                metadata.execution_id,
                 metadata.resources,
             );
         }
@@ -1504,6 +1536,7 @@ where
             )));
         }
         let resources = persisted_metadata.resources;
+        let paused_execution_id = persisted_metadata.execution_id;
         let paused_metadata = persisted_metadata.clone();
         self.store.update(persisted_metadata).await?;
 
@@ -1515,7 +1548,12 @@ where
         if let Err(err) = stop_result {
             warn!(error = ?err, "failed to stop sandbox after pausing");
         }
-        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
+        self.publish_sandbox_event(
+            SandboxLifecycleEventType::Pause,
+            sandbox_id,
+            paused_execution_id,
+            resources,
+        );
         info!("sandbox paused");
 
         // The sandbox is already paused and locally resumable, so this runs
@@ -1682,6 +1720,7 @@ where
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Resume,
                 metadata.id,
+                metadata.execution_id,
                 metadata.resources,
             );
             // Tell the cluster the sandbox is live here. Its snapshot stays
@@ -2017,11 +2056,13 @@ where
         &self,
         event_type: SandboxLifecycleEventType,
         sandbox_id: SandboxId,
+        execution_id: ExecutionId,
         resources: SandboxResources,
     ) {
         let event = SandboxLifecycleEvent {
             event_type,
             sandbox_id,
+            execution_id,
             resources,
         };
         let _ = self.sandbox_event_tx.send(event);

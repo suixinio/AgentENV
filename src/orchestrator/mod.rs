@@ -8,6 +8,8 @@ mod service;
 mod store;
 mod types;
 
+use std::time::SystemTime;
+
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
@@ -26,12 +28,12 @@ pub use persistence::{
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{
-    InMemoryMetadataStore, MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata,
-    SandboxTimeoutAction,
+    configured_max_sandbox_lifetime, InMemoryMetadataStore, MetadataStore, NewTimeout,
+    SandboxListFilter, SandboxMetadata, SandboxTimeoutAction,
 };
 pub use types::{
     CreateSandboxRequest, PauseOutcome, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -104,6 +106,18 @@ pub enum OrchestratorError {
     InvalidTimeout {
         sandbox_id: SandboxId,
         timeout: String,
+    },
+
+    /// The sandbox is already past the lifetime ceiling it was created under,
+    /// so there is no window left to extend into.
+    ///
+    /// 🔴 This is the *only* thing about the ceiling that refuses a request. A
+    /// keep-alive asking for more time than the ceiling leaves is clamped, not
+    /// rejected — see `SandboxMetadata::_set_timeout`.
+    #[error("sandbox {sandbox_id} has exceeded its maximum lifetime")]
+    SandboxLifetimeExceeded {
+        sandbox_id: SandboxId,
+        deadline: SystemTime,
     },
 
     #[error("internal error: {0}")]

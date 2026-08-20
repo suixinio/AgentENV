@@ -764,6 +764,20 @@ pub struct OrchestratorConfig {
     pub default_sandbox_timeout_secs: u64,
     #[config(default = 300u64)]
     pub auto_resume_min_sandbox_timeout_secs: u64,
+    /// Hard ceiling on a sandbox's total wall-clock life, measured from its
+    /// creation. A request asking for more is clamped, not refused, and a later
+    /// SetTimeout can never push the deadline past it.
+    ///
+    /// 🔴 `0` means "no ceiling", and with it no derivable routing-projection
+    /// TTL: the node then reports `projection_ttl_secs = 0` and the scheduler
+    /// falls back to its own `binding_ttl`, which is exactly the behaviour that
+    /// shipped before this knob existed.
+    #[config(default = 86400u64, env = "AENV_MAX_SANDBOX_LIFETIME_SECS")]
+    pub max_sandbox_lifetime_secs: u64,
+    /// Slack added to the routing projection's TTL so the record outlives the
+    /// sandbox it points at rather than expiring just before it.
+    #[config(default = 60u64, env = "AENV_PROJECTION_TTL_GRACE_SECS")]
+    pub projection_ttl_grace_secs: u64,
     #[config(
         default = "$AENV_HOME/persisted-sandboxes",
         env = "AENV_PERSISTED_SANDBOX_STORE_PATH",

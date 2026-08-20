@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::CommandContext;
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 
 #[derive(Clone)]
 pub enum SandboxLaunchSource {
@@ -38,6 +38,22 @@ pub struct CreateSandboxRequest {
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
+/// One sandbox as the heartbeat reports it: which sandbox, which incarnation,
+/// and how long its routing projection should live.
+///
+/// The TTL travels with the roster and not only on the create response because
+/// the roster is the *repair* path — the one that reinstalls a projection write
+/// that was lost. A repair that installs the receiver's default TTL instead of
+/// the sandbox's real budget turns one dropped write into a permanently
+/// short-lived record, which is exactly the failure the budget exists to avoid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxRosterEntry {
+    pub sandbox_id: SandboxId,
+    pub execution_id: ExecutionId,
+    /// 🔴 `0` means "use the receiver's default", never "never expires".
+    pub projection_ttl_secs: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxLifecycleEventType {
     Create,
@@ -51,6 +67,14 @@ pub enum SandboxLifecycleEventType {
 pub struct SandboxLifecycleEvent {
     pub event_type: SandboxLifecycleEventType,
     pub sandbox_id: SandboxId,
+    /// The incarnation this event belongs to.
+    ///
+    /// 🔴 Not an `Option`. Every one of the five publish points holds the
+    /// incarnation on the line that sends the event, so an absent value here
+    /// could only ever mean "somebody forgot", and a delete guarded by a value
+    /// that means that is not guarded at all. `ExecutionId` is a `Uuid`
+    /// newtype, so this stays `Copy`.
+    pub execution_id: ExecutionId,
     pub resources: SandboxResources,
 }
 

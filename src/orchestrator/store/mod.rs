@@ -10,7 +10,9 @@ use crate::orchestrator::SandboxState;
 use crate::types::SandboxId;
 
 pub use in_memory::InMemoryMetadataStore;
-pub use metadata::{NewTimeout, SandboxMetadata, SandboxTimeoutAction};
+pub use metadata::{
+    configured_max_sandbox_lifetime, NewTimeout, SandboxMetadata, SandboxTimeoutAction,
+};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 

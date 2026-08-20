@@ -8,8 +8,14 @@ build:
 
 # Tests the same package set `vet` checks: a target that stops at ./gateway/...
 # leaves everything under shared/ untested by the only command CI runs.
+# 🔴 -count=1, always. Go caches a package's test result and reports it as a
+# plain `ok … (cached)`, which is indistinguishable from a run — so a suite
+# whose whole point is proving that PostgreSQL and Redis were reachable this
+# time can report success without opening a connection. The environment those
+# tests read is not part of the cache key either, so `make test` with the DSN
+# set replays the result of the run that skipped them.
 test:
-	cd $(ROOT) && $(GO) test ./gateway/... ./shared/... ./api/...
+	cd $(ROOT) && $(GO) test -count=1 ./gateway/... ./shared/... ./api/...
 
 fmt:
 	cd $(ROOT) && gofmt -w $$(find gateway shared api -name '*.go' -type f)

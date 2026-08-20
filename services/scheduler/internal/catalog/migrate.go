@@ -34,6 +34,27 @@
 // statements that cannot run in a transaction. If catalog changes ever become
 // frequent — more than about one a month — this judgement should be revisited
 // and goose is the right answer then.
+//
+// # Rolling it back
+//
+// There is no down migration, and for this phase there does not need to be: a
+// rollback is dropping what was created, which is one command. It is written
+// once, as `rollbackCommand` below, and quoted verbatim by verifyApplied's
+// refusal, so that the process tells an operator the whole of it at the moment
+// they need it:
+//
+//	DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;
+//	DROP TABLE IF EXISTS catalog_schema_migrations;
+//
+// 🔴 Both lines, always. The second is the one that gets forgotten — it is not
+// one of the tables the change was about — and forgetting it is silent: a
+// later upgrade is told every version is applied, creates nothing, opens the
+// write gate, and leaves every catalog RPC failing on a missing relation with
+// no way forward. verifyApplied refuses that state at startup rather than
+// letting it become a schema nobody can repair by re-running anything.
+//
+// This does not touch `paused_sandboxes`, which is a different mechanism with
+// a different runbook — see the note above.
 package catalog
 
 import (
@@ -95,10 +116,39 @@ const schemaLockKey int64 = 0x0A6E_7653_4348_4D41
 // from the caller's.
 const unlockTimeout = 5 * time.Second
 
-// ownedRelations are the relations migration 0001 and 0002 create. The
-// preflight refuses to run when one of these already exists and this database
-// has no record of ever having created it.
-var ownedRelations = []string{"snapshots", "templates", "builds", "aliases"}
+// relationsByVersion is what each migration file creates, keyed by its version.
+//
+// It is read by both halves of the schema self-check, which are complementary:
+// preflight refuses a relation that exists with an empty ledger, and
+// verifyApplied refuses a ledger entry whose relations are gone. Between them,
+// "the ledger and the database agree" is checked in both directions before any
+// DDL runs.
+//
+// 🔴 When a later migration drops one of these, move it out of this map in the
+// same file — otherwise verifyApplied refuses every start after that migration
+// applies, on a database that is perfectly correct.
+var relationsByVersion = map[int][]string{
+	1: {"snapshots"},
+	2: {"templates", "builds", "aliases", "active_templates"},
+}
+
+// ownedRelations is relationsByVersion flattened in version order, which is
+// also creation order — so a message listing them reads the way the files run.
+var ownedRelations = flattenRelations()
+
+func flattenRelations() []string {
+	versions := make([]int, 0, len(relationsByVersion))
+	for version := range relationsByVersion {
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+
+	out := make([]string, 0, len(relationsByVersion))
+	for _, version := range versions {
+		out = append(out, relationsByVersion[version]...)
+	}
+	return out
+}
 
 // migration is one file.
 type migration struct {
@@ -279,6 +329,9 @@ func (a *applier) apply(ctx context.Context, conn *pgx.Conn) error {
 	if err := preflight(ctx, conn, applied); err != nil {
 		return err
 	}
+	if err := verifyApplied(ctx, conn, applied); err != nil {
+		return err
+	}
 
 	for _, m := range a.migrations {
 		if applied[m.version] {
@@ -332,14 +385,11 @@ func preflight(ctx context.Context, conn *pgx.Conn, applied map[int]bool) error 
 
 	existing := make([]string, 0, len(ownedRelations))
 	for _, relation := range ownedRelations {
-		var found *string
-		// to_regclass resolves through search_path and answers NULL rather than
-		// raising when the name is free, so this is one round trip per name and
-		// no error handling for the ordinary case.
-		if err := conn.QueryRow(ctx, "SELECT to_regclass($1)::text", relation).Scan(&found); err != nil {
-			return fmt.Errorf("inspect the catalog schema before migrating: %w", err)
+		found, err := relationExists(ctx, conn, relation)
+		if err != nil {
+			return err
 		}
-		if found != nil {
+		if found {
 			existing = append(existing, relation)
 		}
 	}
@@ -353,6 +403,106 @@ func preflight(ctx context.Context, conn *pgx.Conn, applied map[int]bool) error 
 			"继续下去会得到一个看着已迁移、却拒绝每一次写入的 schema）。"+
 			"按 runbook 处置：确认这些表的归属，dev/test 环境可 DROP TABLE 后重启本进程",
 		strings.Join(existing, ", "))
+}
+
+// verifyApplied is preflight's other half: it refuses a ledger that claims work
+// the database no longer has.
+//
+// 🔴 What it catches, and why nothing else can. Rolling 2a back means dropping
+// the four tables — and the ledger is a fifth table nobody thinks of, because
+// it is not one of the tables the change was about. Drop the four and leave it,
+// and this applier is told every version is applied: `applied[m.version]` skips
+// both files, apply() returns nil, the write gate opens, and every catalog RPC
+// then fails on a relation that is not there — permanently, because the next
+// start is told the same thing. The symptom is at the far end of the process
+// from the cause, the process reports a clean startup, and re-running the
+// upgrade is the one thing that cannot fix it.
+//
+// So the ledger is checked against the catalogs before any DDL runs. A rollback
+// that depends on somebody remembering a fifth table name is not a rollback;
+// this turns forgetting it into a refusal at startup, naming the command that
+// finishes the job.
+//
+// 🔴 Refused rather than repaired. Re-applying the missing files would be right
+// for the half-finished rollback and wrong for the two other ways to reach this
+// state — a dump restored without its tables, and a search_path that resolves
+// somewhere other than where the tables were created — where it would create a
+// second copy of the catalog in the wrong schema and start serving from it.
+//
+// Versions this build does not know are skipped: that is a database a newer
+// build migrated, and this one has no idea what those files created.
+func verifyApplied(ctx context.Context, conn *pgx.Conn, applied map[int]bool) error {
+	if len(applied) == 0 {
+		return nil
+	}
+
+	versions := make([]int, 0, len(applied))
+	for version := range applied {
+		if _, known := relationsByVersion[version]; known {
+			versions = append(versions, version)
+		}
+	}
+	sort.Ints(versions)
+
+	missing := make([]string, 0, len(ownedRelations))
+	claimed := make([]string, 0, len(versions))
+	for _, version := range versions {
+		gone := false
+		for _, relation := range relationsByVersion[version] {
+			found, err := relationExists(ctx, conn, relation)
+			if err != nil {
+				return err
+			}
+			if !found {
+				missing = append(missing, relation)
+				gone = true
+			}
+		}
+		if gone {
+			claimed = append(claimed, strconv.Itoa(version))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"catalog_schema_migrations 记录了版本 %s 已应用，但它建的关系 %s 不在库里 —— "+
+			"这两件事不可能同时为真。最常见的成因是回滚只删了表、没删版本表："+
+			"那样下一次升级会「成功」但什么也不建，闸门照常打开，之后每一个目录 RPC 都会永久性地"+
+			"栽在一张不存在的表上。本 build 拒绝在这种状态下继续（重建缺失的表在另外两种成因下是错的："+
+			"dump 没恢复全、search_path 指到了别处 —— 那会在错误的 schema 里再建一份目录并开始服务）。"+
+			"把回滚做完，再重启本进程：\n"+
+			"    %s",
+		strings.Join(claimed, ", "), strings.Join(missing, ", "), rollbackCommand)
+}
+
+// rollbackCommand is the whole of a 2a rollback, in one place, quoted by
+// verifyApplied's refusal.
+//
+// 🔴 Not quoted by preflight, deliberately. That one fires when these names
+// belong to somebody else, and this command would tell an operator to drop
+// their tables.
+//
+// 🔴 The ledger is on this line for the same reason the check above exists: it
+// is the table the four in front of it make people forget, and dropping the
+// four without it is the failure mode with no symptom at the time and no way
+// back afterwards. CASCADE is what takes `active_templates` and the foreign
+// keys with the tables.
+const rollbackCommand = "DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE; " +
+	"DROP TABLE IF EXISTS catalog_schema_migrations;"
+
+// relationExists asks whether a name resolves to a table or view in this
+// session's search_path.
+//
+// to_regclass answers NULL rather than raising when the name is free, so this
+// is one round trip per name and no error handling for the ordinary case.
+func relationExists(ctx context.Context, conn *pgx.Conn, relation string) (bool, error) {
+	var found *string
+	if err := conn.QueryRow(ctx, "SELECT to_regclass($1)::text", relation).Scan(&found); err != nil {
+		return false, fmt.Errorf("inspect the catalog schema: %w", err)
+	}
+	return found != nil, nil
 }
 
 // applyOne runs one migration and records it.

@@ -441,6 +441,96 @@ func TestMigrateRefusesATableItDidNotCreate(t *testing.T) {
 	}
 }
 
+// TestMigrateRefusesALedgerWhoseTablesAreGone is the rollback foot-gun, run.
+//
+// 🔴 Rolling 2a back means dropping four tables. The ledger is a fifth table
+// nobody thinks of, because it is not one of the tables the change was about —
+// so the plausible half-done rollback is `DROP TABLE aliases, builds,
+// templates, snapshots` with catalog_schema_migrations left behind. What makes
+// that dangerous is that it is silent: the next upgrade is told both versions
+// are applied, skips both files, returns success, and opens the write gate over
+// a database with no catalog in it. Every RPC then fails on a missing relation,
+// forever, and re-running the upgrade cannot fix it because re-running is what
+// is already happening.
+//
+// So the refusal has to come from the applier, and it has to name the command
+// that finishes the job.
+func TestMigrateRefusesALedgerWhoseTablesAreGone(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("first migration: %v", err)
+	}
+
+	// The half-done rollback, exactly as somebody would type it.
+	if _, err := pool.Exec(ctx,
+		`DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE`); err != nil {
+		t.Fatalf("drop the catalog tables: %v", err)
+	}
+
+	err := Migrate(ctx, pool)
+	if err == nil {
+		t.Fatal("a ledger with no tables under it migrated 'successfully': " +
+			"that is the silent no-op this check exists to stop")
+	}
+	// The message has to carry all three: which versions the ledger claims,
+	// which relations are missing, and the command that fixes it. An operator
+	// reading only the first two would repeat the same half-rollback.
+	for _, want := range []string{"1", "2", "snapshots", "aliases", "catalog_schema_migrations"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal does not mention %q: %v", want, err)
+		}
+	}
+	if !strings.Contains(err.Error(), rollbackCommand) {
+		t.Fatalf("the refusal does not quote the rollback command: %v", err)
+	}
+
+	// 🔴 And it is a refusal, not a repair: the tables are still absent. A
+	// re-apply would be right for this cause and wrong for the two that look
+	// identical from here — a partial restore, and a search_path pointing
+	// somewhere other than where the tables live.
+	for _, relation := range []string{"snapshots", "aliases"} {
+		var found *string
+		if err := pool.QueryRow(ctx, "SELECT to_regclass($1)::text", relation).Scan(&found); err != nil {
+			t.Fatalf("look for %s: %v", relation, err)
+		}
+		if found != nil {
+			t.Fatalf("%s was re-created: this check refuses, it does not repair", relation)
+		}
+	}
+
+	// The control, and the documented way out: finish the rollback, and the
+	// same call migrates from scratch.
+	if _, err := pool.Exec(ctx, rollbackCommand); err != nil {
+		t.Fatalf("run the rollback the error quotes: %v", err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate after a completed rollback: %v", err)
+	}
+	seedSnapshot(t, pool, snapshotSeed{status: "waiting"})
+}
+
+// TestMigrateAcceptsALedgerFromANewerBuild is the other side of the check
+// above: a version this build has never heard of names relations it cannot
+// know, so it is not evidence of anything and must not be refused.
+func TestMigrateAcceptsALedgerFromANewerBuild(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("first migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO catalog_schema_migrations (version, applied_at_ms) VALUES (99, 1)`); err != nil {
+		t.Fatalf("record a version from the future: %v", err)
+	}
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("a rolled-back build refused to start against a newer ledger: %v", err)
+	}
+}
+
 // TestNoTransactionDirectiveIsWhatMakesConcurrentIndexesWork carries its own
 // control: the same file without the directive must fail, or the directive is
 // not what the first half proved.

@@ -26,6 +26,15 @@
 > **沙箱寿命上界已定** —— 照抄，含它的三处强制（§7 阶段 1 第 4 点）。
 > **节点失联接管也定了，但答案是「两个形态都不选」** —— 折叠之后没有需要接管的东西（§4.2.1）。
 > 两条都不再阻塞阶段 3。
+>
+> **v6（2026-08-20）**：三份实施规格照着代码把本文核了一遍 —— 它们的作者被要求
+> **不信本文的散文、只信 `file:line`**，于是核出**十四条**，外加三处行号偏移。
+> 阶段 1 的 ①.1 有一半不成立（CREATE 的投影写**不带化身**，FORK 的投影写**从未发生过**）；
+> ①.4 漏了一条单独就能让它全部失效的路径（**心跳对账每 5 秒重写 TTL**）；
+> 规模低估约 3–4 倍。§3.3 的「已经可以独立装配」与「`S` 换个类型参数」**两句都不成立**。
+> §8 陷阱 4 的警报**响错了地方**。§5.1 的 bytes-then-commit 劈分**没有任何一个阶段认领**。
+> §4.2.1 挂的那条跨仓依赖被用户裁决**不予考虑**，⇒ 它自己写的退路转正为主路。
+> 逐条处置在 **§13**。
 
 ---
 
@@ -54,7 +63,7 @@ scheduler 手上，全在每台 node 的 Rust 二进制里。
 |---|---|---|---|
 | **1** | **路由投影**变成权威记录 ＋ gateway 直读 Redis | 控制面挂掉不再打死数据面 | 读/写两个开关分别回落 |
 | **2** | catalog 进 PG，对象存储降为纯字节 | 拿到可原子提交的地方；暂停态有地方落 | 双写保留到阶段 3 之后 |
-| **3** | 活跃态折叠进 Redis ＋ `--role` 拆 `api`/`node` ＋ `api` 直接 N 副本 | 三分变二分；−13,640 行；node 成纯执行器 | `--role all` |
+| **3** | 活跃态折叠进 Redis ＋ `--role` 拆 `api`/`node` ＋ `api` 直接 N 副本 | 三分变二分；node 成纯执行器（🔧 v6：**−13,640 行不在本阶段兑现**，见 §13 P7） | 🔧 v6：**不是一个 flag**，见 §7 阶段 3 的 3a／3b |
 | **4** | 折叠 `scheduler` 进 `api` | 消除双节点清册；进程表收敛到 e2b 的三个 | 保留 `scheduler` 二进制一个 release |
 
 > **阶段 1 与阶段 2 无相互依赖，可并行。** 阶段 1 排第一是因为它没有任何前置，
@@ -63,6 +72,9 @@ scheduler 手上，全在每台 node 的 Rust 二进制里。
 > 所说的东西 —— 理由与证据在 §7 阶段 1。
 > 🔧 **v4 又把它收窄了**：CREATE / FORK 的投影写**今天已经是同步的**，不需要改造，
 > 真正缺的只有 RESUME 与 PAUSE / DELETE。规模回到 400–500 行含测试。
+> 🔧 **v6 把这条收窄撤销了一半**：**同步成立，「不需要改造」不成立** ——
+> CREATE 的写不带化身，FORK 的写根本没发生过（§13 E1／E2）。
+> 规模是 **~1,570 非测试 ＋ ~1,820 测试 ＋ ~1,050 生成 ＋ ~185 YAML**，不是 400–500。
 
 > **术语**：本文用「**本文阶段 N**」指上表；用「**上一轮阶段 N**」指
 > [`控制面重构收口`](2026-08-19-control-plane-refactor-outcome.md) 的阶段 0/1/2/3。
@@ -205,9 +217,18 @@ pub struct Orchestrator<
 ```
 
 - `F` → `RemoteSandboxBackendFactory`（gRPC 打到 node）⇒ 从「本机编排器」变成「集群编排器」；
-- `S` → **Redis 后端，并且是唯一后端**（见 §4.2、模块文档 D7）⇒ 这是 `api` 能有 N 副本的
+- `S` → **Redis 后端，并且是唯一权威后端**（见 §4.2、模块文档 D7）⇒ 这是 `api` 能有 N 副本的
   **必要条件，不是充分条件** —— 换完 `S` 还要补齐四个原语（阶段 3 第 2 条）才谈得上多副本正确；
 - `P` 留在 node 侧。
+
+> 🔴 **v6 更正：「换 `S`」不是换一个类型参数，接缝比这一节想的高一层。**
+> `MetadataStore::update_if_state<F>`（`src/orchestrator/store/mod.rs:75`）、
+> `list_with_callback<F>`（`:86`）、`SandboxPersister::load_all<F>`
+> （`src/orchestrator/persistence/mod.rs:85`）**都是泛型方法** ⇒ 两个 trait 都**不是对象安全的**
+> ⇒ `Box<dyn MetadataStore>` / `Box<dyn SandboxPersister>` 编译不过。
+> 「换 `S`」只在**单态**世界里成立（写两个具体的 `Orchestrator<S,F,P>`）；
+> 在「一个 `ApiImpl` 装两种」的世界里不成立。
+> 落法见 [`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §2.3 的门面 trait。登记在 §13 P2。
 
 🔴 **`S` 今天只有一个生产实现**：`src/orchestrator/store/in_memory.rs:95`。
 其余四个 `impl MetadataStore` 全在 `src/orchestrator/tests.rs` 里，是测试替身。
@@ -221,7 +242,16 @@ e2b 的 `packages/api/internal/sandbox/storage/` 下**只有 `redis/` 一个子�
 落点见模块文档 §6 D7。
 
 `src/api/impls/mod.rs:65` 的 `ApiImpl` 八个字段里六个是 `Arc<...>`，另外两个是 HTTP 客户端与
-代理域名 —— **没有任何一个是对 Firecracker、netns 或 ublk 的直接引用**。这一层已经可以独立装配。
+代理域名 —— **字段名里没有任何一个提到 Firecracker、netns 或 ublk。**
+
+> 🔴 **v6 更正：字段数对，结论错 —— 这一层今天还不能独立装配。**
+> 第一个字段是 `orchestrator: Arc<Orchestrator>`（`src/api/impls/mod.rs:66`），
+> **裸 `Orchestrator` ＝ 默认类型参数**，展开含 `FirecrackerSandboxFactory`
+> （`src/orchestrator/service.rs:93-97`）。**这就是一处对 Firecracker 的直接、编译期引用**，
+> `ApiImpl` 今天无法与任何别的 factory 一起装配。
+> 这句话如果被当成「这一层不用改」，`--role api` 会在第一次 `cargo build` 时撞墙。
+> 门面 trait（[`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §2.3）的作用就是**把这句话变成真的**。
+> 登记在 §13 P1。
 
 ### 3.4 🔴 trait 本身还不能直接当 RPC 面
 
@@ -289,7 +319,7 @@ StateSnapshotting State = "snapshotting"
 **租约去哪了 —— 🔴 不是「折叠进 TTL」。** TTL 只负责「记录不会永久泄漏」。
 
 v2 写的是「节点死了 ⇒ 记录到期 ⇒ 不再被路由，这也是 e2b 的做法」。**归因错了**：
-e2b 的记录 expiration 是 `MaxLengthInHours`（`orchestrator/lifecycle.go:38`）——
+e2b 的记录 expiration 是 `MaxLengthInHours`（`orchestrator/lifecycle.go:36` `:39-40`）——
 **沙箱的最大寿命**。节点死了记录**不会**很快到期；清理靠
 `nodemanager.Sync` → `store.Reconcile(orphanCandidates, nodeID)`。
 
@@ -361,6 +391,21 @@ placed, err := placement.PlaceSandbox(ctx, algo, clusterNodes, node /* 可为 ni
    接管问题原样回来（退路仍是目录行带 `origin_node_id` ＋ `published` 两列，
    resume 时对未发布的行硬钉 origin）。
    ⇒ **阶段 3 的记录结构现在依赖一个本仓之外的交付物**，排期时要显式挂上去。
+
+   > 🔴 **v6：这个依赖已经被裁决了，答案是不予考虑（用户裁决，2026-08-20）。**
+   > 全部工作只落在 `/home/debian/AgentENV` 内。
+   > ⇒ **上面括号里的退路不再是「万一」，它是当前状态，是主路**：目录行带
+   > `origin_node_id` ＋ `published` 两列，未发布的行 resume **硬钉 origin**。
+   > 于是本节开头那句「问题被取消提问资格」**只对已发布的暂停沙箱成立**；
+   > 未发布的那一支，接管问题原样在，而回答是「不接管、显式失败」。
+   > 阶段 3 的 Redis 记录因此**不是只要 `execution_id` ＋ `node_id`**，
+   > 还要 `origin_node_id` ＋ `published`，而本文自己说过「记录结构一旦建起来改不动」。
+   >
+   > **代价比看起来小 —— 这套两档逻辑今天已经在生产路径上**：
+   > `services/scheduler/internal/lookup.go:261` 的 `origin_preferred`（prefer 档）与
+   > `:271-318` 的 pin 档（`:317` 的 `SANDBOX_LOCATION_PINNED` ＋ `:293` `:302` 两个 `FailedPrecondition`）。
+   > ⇒ 要做的**不是重写，是不假设它会消失**：`api` 的 resume 走 `LookupNode` 而不是
+   > `Schedule`，阶段 4 port `placement/` 时两档一起 port。登记在 §13 P6。
 
 3. **亲和性本身要保留，作为提示。** D5 已经写了我们有一半（P2P / 缓存亲和）。
    `maybeRemapResumeOriginNode` 那个模式值得抄：**提示落空时改写提示**，
@@ -456,6 +501,19 @@ node 侧   写字节（OSS / POSIX），路径带 build-unique 前缀，返回 s
    ↓
 api  侧   在 PG 里写目录行 —— 这一步才是「这个快照生效了」
 ```
+
+> 🔴 **v6：这张图是一条交付物，而它今天没有任何一个阶段认领。**
+> 今天这两步在**同一个调用里**：`SnapshotManager::publish_captured`
+> （`src/snapshot/manager.rs:101-119`）downcast 成 `FirecrackerCapturedSnapshot` 之后直接
+> `repository.publish(metadata, manifest)`，而 `SnapshotRepository::publish` 的契约
+> （`src/snapshot/repository/interfaces.rs:124-142`）**同时**要求
+> 「reading build artifacts from the provided local artifact description」（`:128`）和
+> 「committing a durable snapshot record」（`:131`），且 manifest 里全是**本机路径**。
+> 阶段 2 写的是「`SnapshotRepository` 的目录读写走 PG；对象存储只留字节」——
+> **这句话在不劈开这个调用的前提下就能满足**（同一个进程里先写 OSS 再写 PG）。
+> ⇒ **必须在阶段 2 的交付清单里显式加一条**：`publish` 拆成 `stage_artifacts`（node）
+> ＋ `commit_staged`（api）两个可分别调用的半。不加，阶段 3 的远程 pause 无处落地，
+> 而失败点会在 node proto 定稿之后才暴露。登记在 §13 P4。
 
 e2b `pause_instance.go:71-82`：orchestrator 的 `Pause` RPC 成功之后，API 才写
 `UpdateEnvBuildStatus(Success)`。**而未翻牌的 build 选不中** —— `status_group = 'ready'`
@@ -652,9 +710,10 @@ type redisBindingRecord struct {
 `SandboxInfo`**（`packages/shared/pkg/sandbox-catalog/catalog.go:11-18`）少两个字段。
 ⇒ 阶段 1 不是新建一个过渡结构，是**把已有结构补成 §4.2.2 的投影**。四件事：
 
-**1. CREATE / FORK：不动，它已经是同步的。**
-`services/gateway/internal/server.go:557-561` 在**响应路径上**写，还从响应头取到了化身
-（`bff4993` 落的）：
+**1. CREATE / FORK：🔧 v6 —— 触发条件不动，写入内容要动。**
+
+**同步这一半成立。** `services/gateway/internal/server.go:556-560`（v4 写的 `:557-561` 偏一行）
+在 `ModifyResponse` 内、对客户端**同步**地写：
 
 ```go
 executionID := executionIDFromResponse(resp.Header)
@@ -665,11 +724,47 @@ if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
 e2b 明确要求这条同步 —— `packages/api/internal/sandbox/store.go:43`：
 「`AddSandboxToRoutingTable` should be called **sync** to prevent race conditions where we
 would know where to route the sandbox」。把它挪到尽力而为的事件流上，等于自己造出
-「create 已返回、gateway 还查不到」的窗口。
+「create 已返回、gateway 还查不到」的窗口。**这条判断没变。**
+
+🔴 **但「已带化身」和「FORK 也一样」两句都是错的**（§13 E1／E2）：
+
+| 环节 | 现状 | 阶段 1 要改吗 |
+|---|---|---|
+| 何时触发写 | `shouldRecordAssignment` 命中 create / cold / fork（`server.go:655-670`） | ❌ 不改 |
+| 写是否同步 | 是（`server.go:431` `:449` 的 `ModifyResponse`） | ❌ 不改 |
+| 写的化身 | CREATE：**永远为空**；FORK：**根本没写过** | ✅ 必须改 |
+| 写的 TTL | 恒 `binding_ttl` ＝ 30s，且**下一个心跳会把它重置回去** | ✅ 必须改（见第 4 点） |
+
+- **E1（CREATE）**：`executionIDFromResponse` 读的 `x-agentenv-execution-id` 只由
+  `src/api/proxy.rs:352` 的 `echo_execution` 写出（常量在 `:95`），
+  而它的**三个调用点 `:449` `:462` `:473` 全在 `proxy_request` 内** ——
+  那是**数据面反代**路径。**控制面的 201 从不带这个头。**
+  `server.go:552-555` 的注释本身就写着它「optional on the way in」。
+  ⇒ 今天 CREATE 的 binding 永远以空化身写入，实际化身由 5 秒后的心跳补。
+- **E2（FORK）**：fork 的 201 响应体是**顶层 JSON 数组**
+  （`src/api/openapi.yml` 的 `/sandboxes/{sandboxID}/fork` 201 是 `type: array` of
+  `SandboxForkResult`），而 `extractSandboxIDsFromResponse`（`server.go:924`）
+  第一句就是 `json.Unmarshal(body, &map[string]any)`（`:925-928`）——
+  **顶层数组直接报错返回 `nil`**。它唯一的测试喂的是 `{"sandboxes":[…]}` 信封，
+  **本仓没有任何路由产出这种形状**。⇒ **fork 的投影写从未发生过**，
+  子沙箱的 binding 只能等心跳。
+- ⇒ 落法：control-plane 的 201 补 `x-agentenv-execution-id`（单沙箱走头）、
+  fork 走 body 的 `result.sandbox.executionID`（每个子元素自带自己的化身，
+  🔴 **禁止跨元素借用父的化身**）。逐字规格见
+  [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §3。
 
 **2. RESUME：补进同一个同步机制。**
 `shouldRecordAssignment`（`server.go:655-670`）只匹配 `POST /sandboxes`、`/sandboxes-cold`、
 `/{id}/fork` —— resume 不在其中。**这是投影今天真正缺的那条写。**
+
+> 🔴 **v6：它不是 Go 的一行改动，是三处，而且缺 Rust 那一处会静默失败。**
+> 在阶段 1 补上它们之前，resume 的 201 **既没有 `x-agentenv-sandbox-id` 也没有化身头**
+> （`src/api/openapi.yml` 里只有 create 与 cold 的 201 带前者）——
+> 所以这两个头是阶段 1 的**交付物**，不是它可以假定已经在的前提。
+> 而集群的化身仲裁在终态 `enforce`（[`_sd-recon-env.md`](_sd-recon-env.md) §3.3），
+> 此时 `redis_store.go:319` 逐字：`if challenger == "" then return false, "rejected_unknown"`
+> —— **一次不带化身的 resume 写，会被 Lua 静默拒绝**，日志里只有一个计数器。
+> ⇒ Go 侧匹配路由 ＋ Rust 侧补两个响应头，两件必须同批。
 
 **3. PAUSE / DELETE：这两条才需要事件通道。**
 DELETE 连方法都不匹配（`shouldRecordAssignment` 首行 `if r.Method != http.MethodPost`）。
@@ -717,7 +812,7 @@ ALTER TABLE "public"."tiers" ALTER COLUMN "max_length_hours" SET NOT NULL;
 | 位置 | 做什么 |
 |---|---|
 | `sandbox/store.go:82-83` | **入库时钳制** —— `if endTime.Sub(StartTime) > MaxInstanceLength { EndTime = StartTime + MaxInstanceLength }` |
-| `keep_alive.go:28` `:31-32` | **续期时拒绝** —— `getMaxAllowedTTL(now, StartTime, duration, MaxInstanceLength)`；越界 ⇒ `errMaxInstanceLengthExceeded` ⇒ **HTTP 400 "Max instance length exceeded"** |
+| `orchestrator/keep_alive.go:28` `:31-32` `:55` | 🔧 **v6 更正：续期时是钳制，不是拒绝。** `:28` 的 `getMaxAllowedTTL` ＝ `min(timeLeft, duration)`（`:73-80`）—— 请求一个过长的 timeout **不会被拒绝，会被截短**。`:31-32` 的 `errMaxInstanceLengthExceeded` 只在 `time.Since(StartTime) > MaxInstanceLength`（**沙箱已经越界**）时抛，`:55` 才映射成 HTTP 400。🔴 且这个文件在 `packages/api/internal/**orchestrator**/`，**不在 `handlers/`** |
 | `lifecycle.go:36` `:39` | 投影 TTL ＝ `MaxLengthInHours * time.Hour` |
 
 ⇒ **因为 `SetTimeout` 在前门就被钳住了，投影 TTL 才可以「写一次、永不续期」。**
@@ -726,11 +821,44 @@ ALTER TABLE "public"."tiers" ALTER COLUMN "max_length_hours" SET NOT NULL;
 **我们的落法**：`[orchestrator] max_sandbox_lifetime_secs` 一个 config 值即可 ——
 没有租户模型（§4.4）反而省掉了 tier 表。三处强制照搬，
 一处都不能省：只做 TTL 不做钳制，等于让投影在沙箱还活着时过期。
+🔧 **v6：「一个 config 值即可」也低估了** —— 实际是一个 metadata 字段
+＋ 一处 `_set_timeout` 钳制 ＋ 一个错误变体 ＋ 两个 OpenAPI 响应 ＋ 一轮 codegen。
+🔴 **照 e2b 的语义，我们的 400 也只给「已经越界」，不给「请求得太长」**，
+后者一律钳制 —— 否则每个传大 timeout 的客户端都会拿到一个它以前收不到的 400。
 
-🔴 **抄的时候有一个坑**：`lifecycle.go:36` 的 `int64(MaxInstanceLength / time.Hour)`
-是**整数除法**。它在 e2b 安全，只因为源头本来就是整小时。
-**我们的上界如果做成秒级，不能沿用这个截断** —— 90 分钟会被截成 1 小时，
-投影比沙箱先过期，路由在沙箱还活着的时候就查不到了。
+🔴 **抄的时候有一个坑 —— 🔧 v6：是两个，第二个更致命：**
+
+| 坑 | e2b 代码 | 后果 |
+|---|---|---|
+| 截断 | `int64(MaxInstanceLength / time.Hour)`（`lifecycle.go:36`） | 90 分钟 ⇒ `1` ⇒ 60 分钟：**投影比沙箱先过期**，沙箱还活着路由就查不到 |
+| 🔴 **归零** | 同上，**< 1 小时 ⇒ `0`** ⇒ `lifetime := Duration(0) * time.Hour = 0`（`:39`）⇒ `catalog_redis.go:71` 的 `redisClient.Set(ctx, key, value, 0)` = **永不过期** | **上界越短，泄漏越严重。** e2b 只因为默认就是整 1 小时才没踩到 |
+
+⇒ 三条硬规则，一条都不能省：
+1. **单位是整秒、向上取整**（`ceil`），不是截断；
+2. **下限钳到 1**，绝不出现 0；
+3. 🔴 **对端收到 `<= 0` 一律解释为「使用 `binding_ttl`」，永远不解释为「不过期」。**
+   Redis `PX 0` 是错误、`SET` 不带过期是永久 —— 两者都不能是默认行为。
+
+#### 🔴🔴 v6 新增第 5 点：心跳对账必须停止重置 TTL
+
+**这一条本文 v5 之前完全没有，而它单独就能让第 4 点全部失效。**
+
+`redisReconcileNodeScriptBody`（`services/scheduler/internal/redis_store.go`）的 accept 分支
+今天逐字是 `redis.call("SET", binding_key(sandbox_id), value, "PX", ttl_ms)`（`:448`），
+而 `ttl_ms`（`:400`，来自 `ARGV[3]`）**恒等于 `binding_ttl`**。
+心跳 5 秒一次（`src/cfg.rs:734-735`、`config/default.toml:427`）
+⇒ **建时写的 24 小时 TTL 在 5 秒后变回 30 秒。**
+
+⇒ accept 分支要按 decision 分岔：
+- `refreshed`（同一化身再次报到，**周期性 tick**）⇒ **`KEEPTTL`**，绝不给记录续命；
+- `installed` / `installed_unknown`（修复一条丢失的写）与 `superseded`（新化身、
+  携带新的寿命预算）⇒ 才用 `PX`，且用**该 roster 条目自带的** `projection_ttl_secs`，
+  缺席或 `<= 0` 落回 `binding_ttl`。
+
+🔴 **这条不是加分支，是改行为** —— 跑新脚本与跑旧脚本的两个 scheduler 对着同一个 Redis
+会互相打架（旧的每 5 秒把 TTL 打回 30 秒）。scheduler 今天 `replicas: 1`，
+滚动期间的 ≤30 秒降级窗口可以接受，**不要为它上 leader election**。
+逐字规格见 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §6.5。
 
 > 被否掉的另一条：TTL ＝ 当前 deadline ＋ 宽限、每次改 timeout 都 `EXPIRE` 续期。
 > 那正是 e2b 在 `operations.go:159-215` 里靠 `redis.KeepTTL` ＋ ZAdd 重打分处理的那类问题，
@@ -769,8 +897,20 @@ ALTER TABLE "public"."tiers" ALTER COLUMN "max_length_hours" SET NOT NULL;
 ⇒ 只做②买到的是**30 秒宽限**，不是「控制面挂掉不再打死数据面」。
 而①之后 binding 的存活不再依赖 scheduler 在线，标题才成立。
 
-**规模**：400–500 行含测试。
-（v2 写的 300–400 只覆盖②；v3 写的 600–800 假设 CREATE / FORK 也要改造，而它们不用。）
+**规模**：🔧 **v6 实测 ~1,570 行非测试 ＋ ~1,820 行测试 ＋ ~1,050 行生成 ＋ ~185 行 YAML。**
+
+（历史估值：v2 的 300–400 只覆盖②；v3 的 600–800 假设 CREATE / FORK 也要改造；
+v4 的 400–500 假设它们**不用**改。v4 那个假设是错的，逐文件清点在
+[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §10。）
+
+**被低估的四处，按贡献排序**：
+1. 假定 create / fork 已带化身（E1／E2）⇒ **给 Rust API 层记了 0 行**，实际约 675 行 ＋ 一轮 codegen；
+2. 心跳对账的 `KEEPTTL` 问题（①.4 第 5 点）完全没进视野 —— 它单独带来 Lua ＋ 两条 proto 参数串 ＋ 一发探针；
+3. 寿命上界被写成「一个 config 值即可」；
+4. Redis 本身没有部署对象，提案里不算成本但它是硬前置
+   （🟢 已解：`deploy/k8s/base/redis.yaml`，提交 `77aa98f`）。
+
+即使只算②那一半，实测也是 **~600 非测试 ＋ ~700 测试**，而不是 v2 估的 300–400。
 
 **兑现**：控制面挂掉不再打死数据面 —— 今天
 `services/gateway/cmd/main.go:27` 的 `grpc.NewClient` 没有 retry policy、没有 `WaitForReady`，
@@ -794,12 +934,20 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 `packages/api/internal/cache/` 三个子包全部是 Redis ＋ DB 回落，所以它压根没有
 「跨副本失效」这个问题。目录在哪，目录缓存就在哪，两件事一起做才不用做两次。
 
+🔴 **v6 新增的第三件「做」：把 `publish` 劈成 bytes-then-commit 两半。**
+`SnapshotRepository::publish` 拆成 `stage_artifacts`（node 写字节，返回「字节在哪」）
+＋ `commit_staged`（`api` 写目录行）两个可分别调用的方法。
+**这是阶段 3 远程 pause 的硬前置，而阶段 2 与阶段 3 的任务清单今天都没有认领它**
+—— 论证在 §5.1 的 v6 注。放在阶段 2 是因为它和建表是同一次接口改动；
+拖到阶段 3 会在 node proto 定稿之后才暴露。
+
 🔴 **建表时就要定的两件**：
-1. **暂停态的落点**（§4.2.1）：**目标是消掉 `local_only`** —— 它是唯一让原节点从
-   「偏好」变成「必需」的东西，消掉之后阶段 3 的接管问题跟着消失。
-   🔴 但它依赖主仓的 pause-publish-durability。**建表时必须同时确认那一项的排期**：
-   若不能同期完成，退路是目录行带 `origin_node_id` ＋ `published` 两列，
-   resume 时对未发布的行硬钉 origin。拖到阶段 3 会变成一次 schema 重做。
+1. **暂停态的落点**（§4.2.1）：v5 的目标是消掉 `local_only` —— 它是唯一让原节点从
+   「偏好」变成「必需」的东西。
+   🔴 **v6：它依赖的主仓 pause-publish-durability 已被裁决不予考虑（2026-08-20）**
+   ⇒ **退路即主路，建表时直接按退路建**：目录行带 `origin_node_id` ＋ `published` 两列，
+   resume 时对未发布的行硬钉 origin。**这不再是「若不能同期完成」的分支，是唯一分支**，
+   而拖到阶段 3 才补仍然是一次 schema 重做。
 2. **`builds` 表的形状要能承载构建队列** —— e2b 有
    `get_concurrent_template_builds` / `active_template_builds` 做并发控制，我们今天没有。
 
@@ -816,10 +964,15 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 
 **前置**：阶段 2。
 
-🔴 **外加一条跨仓前置**：主仓的 pause-publish-durability。
-它决定 Redis 记录要不要带接管字段 —— 落地了就只要 `execution_id` ＋ `node_id`（§4.2.1），
-没落地就得回到「有条件接管」，多两个字段和一套仲裁。**记录结构一旦建起来改不动，
-所以这一项的状态要在本阶段开工前确认，不能开工后再问。**
+~~🔴 **外加一条跨仓前置**：主仓的 pause-publish-durability。~~
+✅ **v6：这一项的状态已确认 —— 不予考虑（用户裁决，2026-08-20），不再是前置。**
+它决定的是 Redis 记录要不要带接管字段。**答案现在是「要」**：
+记录**不是**只有 `execution_id` ＋ `node_id`，还要 `origin_node_id` ＋ `published`
+（§4.2.1 的 v6 注）。**记录结构一旦建起来改不动，所以这两个字段要在建结构时就在。**
+⇒ 本阶段按「有条件接管」排期，不要再留悬置。
+
+🔴 **外加一条本仓前置**：阶段 2 的 `stage_artifacts` / `commit_staged` 劈分（§5.1 的 v6 注）。
+不劈开，远程 pause 无处落地。
 
 🔴 **这三件事是同一批，不能拆。** 理由是 §0 的第二条硬约束：只有 `api` 持有 Redis 凭据。
 先搬活跃态、后拆 role，等于把 Redis 凭据发到每台跑用户代码的 KVM 机器上，
@@ -827,7 +980,8 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 而那期间它是一个比今天更集中的新单点。
 
 **它们本来也是同一件事**：store 后端是 role 的函数 —— `--role all` 用进程内 store，
-`--role api` 用 Redis store。所以回退是一个 flag。
+`--role api` 用 Redis store。**代码侧**的回退因此是一个 flag。
+🔧 **v6：部署侧不是** —— 见本阶段末尾的「回退」。
 
 **做**：
 
@@ -898,6 +1052,26 @@ orchestrator 与 template-manager 共用一个二进制）。
 
 **回退**：`--role all`。进程内 store 与 Redis store 两条代码路径在这一批期间**都保留**。
 
+> 🔴 **v6：这一行代码侧是对的，部署侧是被低估的。** 它是**三个部署对象的协同回退**：
+>
+> | 对象 | 改什么 | 代价 |
+> |---|---|---|
+> | `agentenv-node` DaemonSet | `--role node` → `--role all` | 🔴 **滚动重启**。`maxSurge: 0` ＋ `maxUnavailable: 1`（`deploy/k8s/base/agentenv-daemonset.yaml:21-23`）⇒ 逐台串行，每台 `terminationGracePeriodSeconds: 3600`（`:29`）|
+> | `gateway` | REST 上游从 `agentenv-api` 改回扇出到 node；resume 上游拆掉 | ConfigMap ＋ 一次滚动，秒级 |
+> | `agentenv-api` | `replicas: 0` | 秒级 |
+>
+> 而且**顺序是硬的**：node 必须先重新开始服务 REST，gateway 才能指回去。
+> ⇒ 关键路径是那次 DaemonSet 串行滚动。**在事故里这不是回退，是把故障时间乘以节点数。**
+>
+> ⇒ **落法：把本阶段的结构半劈成 3a／3b**，让真正的回退动作落在 gateway 的一个 ConfigMap 上：
+>
+> | | 做什么 | 回退动作 | 回退耗时 |
+> |---|---|---|---|
+> | **3a**（影子） | DaemonSet 保持 `--role all`；上线 `agentenv-api --role api` 副本 2；gateway 的 REST 与 resume 上游切到 `api` | gateway 一个 ConfigMap 切回去 ＋ gateway 滚动 | 秒级，**不碰 DaemonSet** |
+> | **3b**（收窄） | DaemonSet 切 `--role node`（关本机 REST、启用 node_reclaim） | 3a 的动作 ＋ DaemonSet 滚回 `all` | 分钟～小时 |
+>
+> 逐条在 [`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §11。登记在 §13 P5。
+
 **删除动作放下一个 release**（观察期之后）：
 
 ```
@@ -921,6 +1095,28 @@ src/orchestrator/paused_registry           3,564 行
 
 > **诚实对照**：e2b 的 Redis 沙箱 store 非测试约 2,100 行，和我们 Go 侧的 3,483 行同量级。
 > **省的不是行数，是那条跨语言接缝本身。**
+
+> 🔴 **v6 两条更正，都指向「别把 −13,640 当兑现」**：
+> 1. **`services/scheduler/internal/registry` 里承载 pin / prefer 的那部分不能只删不搬。**
+>    `services/scheduler/internal/lookup.go:261`（`origin_preferred`）与
+>    `:271-318`（`:317` 的 `SANDBOX_LOCATION_PINNED` ＋ `:293` `:302` 两个 `FailedPrecondition`）
+>    是这条语义今天**唯一的实现**，而 §4.2.1 的 v6 注刚把它从「即将消失」改回「必须保留」。
+> 2. **阶段 3 本身不减少任何行数** —— 结构半自己就是 ≈ 6,700 行新增
+>    （[`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §13.3），
+>    删除批在**下一个 release**，且大部分挂在 Redis 那一半上。
+>    ⇒ §0 那张表里阶段 3 的「−13,640 行」不是本阶段的兑现，**更不能当验收判据**。
+>
+> 🔴 **还有一条收窄（v6）**：`InMemoryMetadataStore` 的生产实现**不该在阶段 3 删**。
+> `--role node` 要执行 create / pause / resume / fork / snapshot，
+> 这五条路径的全部逻辑在 `Orchestrator` 里，而 `Orchestrator` 的每一步都建在
+> `MetadataStore` 上。「node 只有句柄表、没有 `MetadataStore`」等于**在 node 侧重写
+> `service.rs`**，不在任何一份清单里。
+> ⇒ 收窄成：**它不再是集群权威，但保留为 `node` 角色的本地账本**；
+> 集群唯一的权威活跃态 store 是 Redis 实现，`--role api` 只用它。
+> D7 的三条依据论证的是「**权威**状态不要有两个后端」，收窄后仍全部成立
+> —— `api` 用 `ListSandboxes` 去对 node 的账，**正是因为不信它**。
+> 代价要诚实登记：`update_if_state` 之类的语义会有两个实现
+> （详见 [`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §14.6）。
 
 **成本**：Redis 从可选变成硬依赖，且它现在承载活跃沙箱状态 —— 必须 HA，必须持久化策略明确。
 这一条要单独过一遍。
@@ -962,7 +1158,7 @@ src/orchestrator/paused_registry           3,564 行
 
 1. 🔴 **别把两把锁搞混。** 生命周期互斥**今天就不靠 `RwLock`** ——
    靠的是 `MetadataStore` 的 `update_state_if_state` / `update_if_state` /
-   `wait_while_in_states`（`src/orchestrator/store/mod.rs:61` `:73` `:96`）。
+   `wait_while_in_states`（`src/orchestrator/store/mod.rs:63` `:75` `:98` —— 🔧 v6 更正：v1 起写的 `:61` `:73` `:96` 整体偏 2 行）。
    它们是 trait 方法，换成 Redis 实现就自动跨副本了，**不需要新造锁**。
    而 `RwLock<HashMap<SandboxId, SandboxHandle>>`（`service.rs:101`）守的是活 VM 的
    进程内句柄，**不可序列化、留在 `node`**。真正要补的是
@@ -985,12 +1181,29 @@ src/orchestrator/paused_registry           3,564 行
    目录缓存进 Redis。留在 `node` 的只有块 / 层这类**内容寻址、天然可各自为政**的缓存
    （模块文档 D2）。
 
-4. 🔴 **构建沙箱必须被 `ListSandboxes` 排除，否则 `api` 会把它们当孤儿杀掉。**
+4. 🔴 **构建沙箱必须被排除，否则 `api` 会把它们当孤儿杀掉 —— 🔧 v6：警报响错了地方。**
    e2b 在 `packages/orchestrator/pkg/server/sandboxes.go:577-582` 逐字写了这条：
    「Build sandboxes are not owned by the API and must never show up here, or the API
    would treat them as orphans and kill them.」它用 `APIStoredConfig == nil` 做标记。
-   我们的 `src/template/runner.rs` 正是在节点上跑构建沙箱 —— 拆分之后必然撞上。
-   ⇒ `ListSandboxes` 必须只报**控制面拥有的**沙箱，所有权标记要显式，不能靠推断。
+
+   **但在 `ListSandboxes` 这一侧，我们这里是假警报。**
+   `src/template/runner.rs:165` 与 `:189` 直接构造 `FirecrackerSandbox`，
+   在一个自己起的线程 ＋ 自己的 runtime 里 `start` / `pause_to_dir` / `stop`，
+   **从头到尾不经过 `Orchestrator`** ⇒ 从来没进过句柄表（`src/orchestrator/service.rs:101`）。
+   e2b 的坑成立，是因为它两类沙箱共用同一张 `sandboxFactory.Sandboxes`
+   （`sandboxes.go:568`）—— **我们不共用**。只要 `ListSandboxes` 的数据源是句柄表，
+   构建沙箱结构上就进不来。
+
+   🔴 **真正会杀错人的消费者是 `node_reclaim`（启动残留回收），不是 `ListSandboxes`。**
+   它扫的是**宿主机残留** —— firecracker 进程、netns、ublk 设备、临时目录 ——
+   而构建沙箱的残留和用户沙箱的残留在宿主机上**长得一模一样**：
+   netns 名是 `{NETNS_PREFIX}{uuid_v7}`（`src/sandbox/network/slot.rs:93`），
+   不带沙箱 id、不带来源、不带所有权。**陷阱 4 的真身在这里。**
+
+   ⇒ 显式所有权标记**照做**（三条理由：规矩本身；`--role all` 回退期间本机 REST 建的沙箱
+   **会**进句柄表而 `api` 不拥有它们；以及上面那条真危险），
+   但**验收探针要按 `node_reclaim` 那一侧写**，不要只验 `ListSandboxes`。
+   登记在 §13 P3。
 
 5. **`RuntimeArtifactSet` / `PausedSandboxCapture` 的所有权。** 见 §3.4。
    建议把 `SandboxBackend` 拆成两个 trait —— 一个可远程（返回 id 与事实），
@@ -1108,6 +1321,62 @@ src/orchestrator/paused_registry           3,564 行
 
 ---
 
+## 13. 实施规格的对抗核查处置
+
+前三轮（§10 / §11 / §12）都是对着**文档**审的。这一轮不是：阶段 1、阶段 3 结构半
+两份实施规格的作者被要求**不信本文的散文、只信 `file:line`**，回到代码里逐条复核。
+于是这一轮的 findings 全部带着「我去看了，它不是这样」的形状。
+
+> ⚠️ **同上，这张表是历史记录，正文才是当前状态。** 每一行都已改进正文，
+> 表里只记「审查发现 / 位置 / 实际 / 处置」四栏。
+
+**来源**：[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §1 / §6.5 / §10、
+[`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §0 / §14。
+
+| # | 审查发现 | 位置 | 实际 | 处置 |
+|---|---|---|---|---|
+| **E1** | CREATE 的投影写「已经是同步的，**且带化身**」 | §7 阶段 1 ①.1、附证据索引 | **同步成立，带化身不成立。** `x-agentenv-execution-id`（常量 `src/api/proxy.rs:95`）只由 `:352` 的 `echo_execution` 写出，它的三个调用点 `:449` `:462` `:473` **全在 `proxy_request` 内** —— 那是数据面反代，**控制面响应从不带它**。`services/gateway/internal/server.go:552-555` 的注释本身就写着它「optional on the way in」 | ①.1 重写成「触发条件不动，**写入内容要动**」；control-plane 的 201 补化身头。证据索引拆成三行 |
+| **E2** | 同上，FORK 一并「不动」 | 同上 | **FORK 的投影写从未发生过。** fork 201 的响应体是**顶层 JSON 数组**（`src/api/openapi.yml` 的 `/sandboxes/{sandboxID}/fork` 201 是 `type: array` of `SandboxForkResult`），而 `extractSandboxIDsFromResponse`（`services/gateway/internal/server.go:924`）第一句就 `json.Unmarshal(body, &map[string]any)`（`:925-928`）—— 顶层数组直接报错返回 `nil`。它唯一的测试喂的 `{"sandboxes":[…]}` 信封，**本仓没有任何路由产出** | ①.1 同上；fork 走 body 的 `result.sandbox.executionID`，🔴 **禁止跨元素借用父的化身** |
+| **E3** | 「续期时**拒绝** —— 越界 ⇒ `errMaxInstanceLengthExceeded` ⇒ HTTP 400」 | §7 阶段 1 ①.4 表、模块文档 D10 | **半错。** e2b `keep_alive.go:28` 是 `getMaxAllowedTTL` ＝ `min(timeLeft, duration)`（`:73-80`），即**钳制** —— 请求一个过长的 timeout **不会被拒绝，会被截短**；`:31-32` 的 400 只在 `time.Since(StartTime) > MaxInstanceLength`（沙箱**已经**越界）时抛，`:55` 才映射。且该文件在 `packages/api/internal/**orchestrator**/`，**不在 `handlers/`** | ①.4 表改写为「续期时钳制」＋ 更正包路径；正文加一句「我们的 400 也只给已经越界」。照 E3 原样实现会给每个传大 timeout 的客户端一个新的 400 |
+| **E4** | **（本文完全没有的一条）** 心跳对账脚本每 5 秒用 `PX binding_ttl` 重写记录 | ①.4 全节 | `redisReconcileNodeScriptBody` 的 accept 分支逐字 `redis.call("SET", binding_key(sandbox_id), value, "PX", ttl_ms)`（`services/scheduler/internal/redis_store.go:448`），`ttl_ms`（`:400`）**恒等于 `binding_ttl`**；心跳 5 秒一次（`src/cfg.rs:734-735`、`config/default.toml:427`）⇒ **建时写的 24 小时 TTL 在 5 秒后变回 30 秒** | ①.4 新增第 5 点：`refreshed` 分支改 **`KEEPTTL`**，`installed`／`superseded` 才 `PX` 且用条目自带的 TTL。🔴 这是**改行为不是加分支**，新旧脚本对着同一个 Redis 会互相打架 —— 接受滚动期间 ≤30 秒的降级窗口，不上 leader election |
+| **E5** | 整数除法的坑只标了「截断」那一半 | ①.4 末尾 | **是两个坑，第二个更致命。** `int64(MaxInstanceLength / time.Hour)` 对 **< 1 小时**的值得到 **`0`** ⇒ `lifetime = 0`（`lifecycle.go:39`）⇒ `catalog_redis.go:71` 的 `Set(ctx, key, value, 0)` = **永不过期**。**上界越短，泄漏越严重**；e2b 只因为默认就是整 1 小时才没踩到 | ①.4 改成两行表 ＋ 三条硬规则：ceil 到整秒、下限钳到 1、🔴 **对端收到 `<= 0` 一律解释为「用 `binding_ttl`」，永远不解释为「不过期」** |
+| **E6** | 阶段 1「400–500 行含测试」 | §0 v4 注、§7 阶段 1「规模」 | **低估约 3–4 倍**：~1,570 非测试 ＋ ~1,820 测试 ＋ ~1,050 生成 ＋ ~185 YAML（逐文件在 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §10）。头号原因就是 E1／E2 —— 假定化身已经在，于是**给 Rust API 层记了 0 行**，实际约 675 行 ＋ 一轮 codegen | 两处数字都改；并列出被低估的四处，按贡献排序 |
+| **P1** | §3.3「`ApiImpl` 八个字段没有任何一个引用 Firecracker / netns / ublk，这一层已经可以独立装配」 | §3.3、附证据索引 | **字段数对（八个、六个 `Arc`），结论错。** 首字段 `orchestrator: Arc<Orchestrator>`（`src/api/impls/mod.rs:66`）用的是**默认类型参数**，展开含 `FirecrackerSandboxFactory`（`src/orchestrator/service.rs:93-97`）—— **这就是一处直接的、编译期的 Firecracker 引用**。当成「这一层不用改」的话，`--role api` 会在第一次 `cargo build` 时撞墙 | §3.3 改写 ＋ 证据索引那一行反转；门面 trait（[`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §2.3）的作用就是**把这句话变成真的** |
+| **P2** | §3.3「`S` → Redis 后端」写得像换个类型参数就行 | §3.3 | `MetadataStore::update_if_state<F>`（`src/orchestrator/store/mod.rs:75`）、`list_with_callback<F>`（`:86`）、`SandboxPersister::load_all<F>`（`src/orchestrator/persistence/mod.rs:85`）**都是泛型方法** ⇒ 两个 trait 都**不是对象安全的** ⇒ `Box<dyn …>` 编译不过。「换 `S`」只在**单态**世界里成立 | §3.3 加 v6 注：**接缝比这一节想的高一层**，落法是对象安全的门面 trait |
+| **P3** | §8 陷阱 4：构建沙箱会被 `ListSandboxes` 当孤儿杀掉 | §8 陷阱 4 | **警报响错了地方。** `src/template/runner.rs:165` `:189` 直接构造 `FirecrackerSandbox`，从不经过 `Orchestrator` ⇒ 从来没进过句柄表（`src/orchestrator/service.rs:101`）。e2b 的坑成立是因为它两类沙箱共用一张表（`sandboxes.go:568`），**我们不共用** ⇒ 这一侧是**假警报**。真危险在 **`node_reclaim`**：宿主机残留长得一模一样，netns 名 `{NETNS_PREFIX}{uuid_v7}`（`src/sandbox/network/slot.rs:93`）不带来源、不带所有权 | 陷阱 4 重写成「假警报 / 真警报」两段；**标记照做**（三条理由，含 `--role all` 期间的双记账），但**验收探针按 `node_reclaim` 那一侧写** |
+| **P4** | §5.1 的 bytes-then-commit 劈分**没有任何一个阶段认领** | §5.1、阶段 2「做」、阶段 3 必做清单 | `SnapshotManager::publish_captured`（`src/snapshot/manager.rs:101-119`）downcast 之后直接 `repository.publish`，而 `SnapshotRepository::publish` 的契约（`src/snapshot/repository/interfaces.rs:124-142`）**同时**要求「reading build artifacts from the provided local artifact description」（`:128`）与「committing a durable snapshot record」（`:131`），manifest 里全是本机路径。阶段 2 写的「目录读写走 PG」**在不劈开这个调用的前提下就能满足** | §5.1 加 v6 注；**阶段 2 的「做」显式加一条**：`publish` 拆成 `stage_artifacts`（node）＋ `commit_staged`（api）。阶段 3 把它列为本仓前置。不加，失败点会在 node proto 定稿之后才暴露 |
+| **P5** | 阶段 3「回退：`--role all`」 | §0 阶段表、§7 阶段 3 | **代码侧对，部署侧被低估。** 它是**三个部署对象的协同回退**，顺序还是硬的（node 必须先重新服务 REST，gateway 才能指回去），关键路径是一次 `maxSurge: 0` ＋ `terminationGracePeriodSeconds: 3600` 的 DaemonSet **串行**滚动（`deploy/k8s/base/agentenv-daemonset.yaml:21-23` `:29`）。**在事故里这不是回退，是把故障时间乘以节点数** | §0 表的「回退」栏改指 3a／3b；阶段 3 的回退段展开成两张表，把真正的回退动作落在 **gateway 的一个 ConfigMap** 上 |
+| **P6** | §4.2.1 的干净答案挂在一条**跨仓**依赖上 | §4.2.1、阶段 2 建表、阶段 3 前置、模块文档 D12 | **该依赖已裁决：不予考虑（用户裁决，2026-08-20）**，全部工作只落在本仓。⇒ §4.2.1 自己括号里的**退路转正为主路**：目录行带 `origin_node_id` ＋ `published`，未发布的行 resume **硬钉 origin**。⇒ 阶段 3 的 Redis 记录**不是**只要 `execution_id` ＋ `node_id`。代价比看起来小 —— 两档逻辑今天已经在生产路径上：`services/scheduler/internal/lookup.go:261`（`origin_preferred`）与 `:271-318`（`:317` 的 `SANDBOX_LOCATION_PINNED` ＋ `:293` `:302` 两个 `FailedPrecondition`） | §4.2.1 加裁决注；阶段 2 建表**直接按退路建**；阶段 3 的「跨仓前置」划掉、改成「状态已确认」；模块文档 D12 三条后果各加一个例外分支。⇒ **`api` 必须 pin / prefer 两档都会** |
+| **P7** | §0 阶段表把「−13,640 行」写成阶段 3 的兑现 | §0 阶段表、阶段 3 删除块 | **两条都站不住**：① `services/scheduler/internal/registry` 里承载 pin / prefer 的那部分**不能只删不搬**（P6 之后 `lookup.go` 的三个分支是这条语义今天唯一的实现）；② 阶段 3 结构半自己就是 ≈ 6,700 行**新增**（[`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §13.3），删除批在下一个 release 且大部分挂在 Redis 那一半上 | §0 表标注「不在本阶段兑现」；删除块加两条更正，并写明**−13,640 不能当验收判据** |
+| **P8** | D7「把 `InMemoryMetadataStore` 整个拿掉」与 `node` 角色冲突 | §3.3、阶段 3 删除块、模块文档 D7 | `--role node` 要执行 create / pause / resume / fork / snapshot，这五条路径的全部逻辑在 `Orchestrator` 里，而它每一步都建在 `MetadataStore` 上。「node 只有句柄表、没有 `MetadataStore`」等于**在 node 侧重写 `service.rs`** —— 不在任何一份清单里 | 收窄成：**不再是集群权威，但保留为 `node` 的本地账本**；集群唯一权威是 Redis 实现，`--role api` 只用它。D7 的三条依据论证的是「**权威**状态不要有两个后端」，收窄后仍全部成立。代价（两个实现）诚实登记 |
+
+**本轮顺带更正的行号**（不影响任何结论，但会 grep 不到）。
+🔴 **其中后三条是两份规格自己的引用偏了** —— 规格要求作者逐条自证，本文照做，
+偏了的就在这里更正，不往下传：
+
+| 位置 | 写的 | 实际 |
+|---|---|---|
+| 本文 §8 陷阱 1 的三个 `MetadataStore` 方法 | `src/orchestrator/store/mod.rs:61` `:73` `:96` | `:63` `:75` `:98`（整体偏 2 行） |
+| 本文 §4.2 的 e2b 投影 TTL 落点 | `orchestrator/lifecycle.go:38` | `:36`（`MaxLengthInHours`）＋ `:39-40`（`lifetime` ＋ `StoreSandbox`）；`:38` 是空行 |
+| 本文 §7 阶段 1 ①.1 / §11 G2 的同步投影写 | `server.go:557-561` | `:556-560` |
+| [`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §14.2 的两个泛型方法 | `store/mod.rs:73` `:84` | `:75` `:86`（同样偏 2） |
+| [`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §14.8 的 pin / prefer 落点 | `lookup.go:260`、`:270-317` | `:261`（`origin_preferred`）；pin 档是 `:271-318`，两个 `FailedPrecondition` 在 `:293` `:302`，`SANDBOX_LOCATION_PINNED` 在 `:317` |
+| [`_sd-impl-phase3-role.md`](_sd-impl-phase3-role.md) §14.4 的 `publish` 契约 | `interfaces.rs:138-142` | `:138-142` 是**函数签名**；那两句契约在 `:128` 与 `:131`，整段是 `:124-142` |
+| [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §1 E2 的抽取函数 | `server.go:924-926` | `:924` 是函数头，unmarshal 与早退是 `:925-928` |
+
+**这一轮经受住核查、可以照做的**：§4.2.2 与 D11（投影与活跃态 store 是两个结构）；
+**投影写必须同步**这条判断本身；PAUSE / DELETE 走事件通道并按化身守卫；
+roster 回落不能丢；阶段 1 ② 的两件不能省；§6.1–6.2 的全部论证；
+以及 §3.2「缺一个 `ListSandboxes`」—— 规格作者核到 e2b 的 `List` 数据源确实是**进程内句柄表**
+（`packages/orchestrator/pkg/server/sandboxes.go:568`），与本文的推断同形。
+
+🔴 **还有一条本文一直没写出来的中间态**：阶段 3 结束时进程表是**四个**，不是三个 ——
+`placement/` 要到阶段 4 才 port，所以 `api` 的 `RemoteSandboxBackendFactory` 仍要向
+`scheduler` 要节点。⇒ **gateway / api / scheduler / node**。这不是错误，
+但它影响容量规划、告警面与探针取样点，排期文档里要显式画出来。
+
+---
+
 ## 附：证据索引
 
 **AgentENV**
@@ -1126,12 +1395,21 @@ src/orchestrator/paused_registry           3,564 行
 | 拆分接缝：trait / 泛型 | `src/sandbox/backend.rs:215` `:313`、`src/orchestrator/service.rs:93` |
 | 🔴 生产 `MetadataStore` 只有一个实现 | `src/orchestrator/store/in_memory.rs:95` |
 | `KillOrphan` 尚不存在，仅在注释里作为待办 | `services/scheduler/internal/registry/store_postgres.go:1055` |
-| API 层已可独立装配 | `src/api/impls/mod.rs:65` |
+| 🔧 **v6 更正：API 层今天还不能独立装配** —— 首字段是裸 `Arc<Orchestrator>`，默认类型参数含 `FirecrackerSandboxFactory` | `src/api/impls/mod.rs:65` `:66`、`src/orchestrator/service.rs:93-97` |
+| 🔴 `MetadataStore` / `SandboxPersister` **不是对象安全的**（泛型方法） | `src/orchestrator/store/mod.rs:75` `:86`、`src/orchestrator/persistence/mod.rs:85` |
+| 🔴 构建沙箱不进句柄表 ⇒ 陷阱 4 在 `ListSandboxes` 侧是假警报 | `src/template/runner.rs:165` `:189`；`src/orchestrator/service.rs:101` |
+| 🔴 `publish` 一步同时读本机产物与提交目录行 ⇒ bytes-then-commit 尚未劈开 | `src/snapshot/manager.rs:101-119`、`src/snapshot/repository/interfaces.rs:124-142` |
+| 🔴 pin / prefer 两档落点**今天已经在生产路径上**，不能只删不搬 | `services/scheduler/internal/lookup.go:261`（prefer）、`:271-318`（pin：`:293` `:302` `:317`） |
+| 🔴 `--role all` 回退的关键路径是 DaemonSet 串行滚动 ＋ 3600 秒 grace | `deploy/k8s/base/agentenv-daemonset.yaml:21-23` `:29` |
 | 🔴 `ReportSandboxEvent` 收到就丢弃 | `services/scheduler/internal/service.go:425-432` |
 | 五种沙箱事件已定义、节点已在发 | `services/api/proto/scheduler.proto:316-324` |
 | 🔴 普通数据面流量不续 binding | `services/gateway/internal/server.go:655-670` |
 | execution fencing 批次 A 已合并 | `f7eef4c` `7851bb4` `04c5d37` `bff4993`；`store_postgres.go:462` `:501` |
-| 🔴 CREATE / FORK 的投影写**已经是同步的**，且带化身 | `services/gateway/internal/server.go:557-561` |
+| 🔴 CREATE / FORK 的投影写**已经是同步的**（🔧 v6 删去原「且带化身」—— 不成立，见下两行） | `services/gateway/internal/server.go:431` `:449` `:556-560` |
+| 🔴 **控制面响应从不带 `x-agentenv-execution-id`** ⇒ CREATE 的 binding 永远空化身 | 常量 `src/api/proxy.rs:95`；写出点 `:352`；三个调用点 `:449` `:462` `:473` **全在 `proxy_request` 内** |
+| 🔴 **FORK 的投影写从未发生过** —— 201 是顶层 JSON 数组，抽取函数第一句 unmarshal 成 map | `src/api/openapi.yml` 的 `/sandboxes/{sandboxID}/fork` 201（`type: array`）；`services/gateway/internal/server.go:924` `:925-928` |
+| 🔴 心跳对账每 5 秒用 `PX binding_ttl` 重写记录 ⇒ 建时写的长 TTL 活不过一个心跳 | `services/scheduler/internal/redis_store.go:400` `:448`；`src/cfg.rs:734-735`、`config/default.toml:427` |
+| 🔴 `enforce` 仲裁下空化身写入被静默拒绝（`rejected_unknown`） | `services/scheduler/internal/redis_store.go:319` |
 | 路由投影的记录结构已存在：扁平 key ＋ 节点 ＋ 化身 | `services/scheduler/internal/redis_store.go:17` |
 | 🔴 没有「沙箱最大寿命」这个量（✅ 已定：引入 `max_sandbox_lifetime_secs`） | `config/default.toml:215`；`grep max_instance_length` 全仓无匹配 |
 | 运行中沙箱的分区问题无解可抄，且只针对**运行中**的 | 提交 `14456f1` 的提交信息 |
@@ -1162,9 +1440,11 @@ src/orchestrator/paused_registry           3,564 行
 | 节点间供块 | `packages/orchestrator/chunks.proto` |
 | 🔴 跨副本的每沙箱分布式锁 | `packages/api/internal/sandbox/storage/redis/lock.go`、`state_change.go:41` `:190` |
 | 并发 create 去重：`ErrAlreadyExists` ⇒ `waitForStart` | `packages/api/internal/sandbox/store.go:157` |
-| 路由记录的 TTL 是沙箱寿命，不是租约 | `packages/api/internal/orchestrator/lifecycle.go:38` |
+| 路由记录的 TTL 是沙箱寿命，不是租约（🔧 v6 更正行号：`:38` 是空行） | `packages/api/internal/orchestrator/lifecycle.go:36` `:39-40` |
 | 寿命上界是**配额表的列**，默认 1 小时，可按项目覆盖 | `packages/db/migrations/20240219190940_add_max_length_hours.sql`、`20260728163016_add_project_limits.sql:56` |
-| 🔴 上界的三处强制：入库钳制 / 续期拒绝 / 投影 TTL | `sandbox/store.go:82-83`、`keep_alive.go:28` `:31-32`、`lifecycle.go:36` `:39` |
+| 🔴 上界的三处强制：入库钳制 / **续期钳制**（🔧 v6：不是拒绝）/ 投影 TTL | `sandbox/store.go:82-83`、`internal/orchestrator/keep_alive.go:28` `:73-80`、`lifecycle.go:36` `:39` |
+| 🔴 续期的 400 只给**已经越界**的沙箱，不给「请求得太长」 | `internal/orchestrator/keep_alive.go:31-32` `:55` |
+| 🔴 投影 TTL 的**归零**坑：< 1 小时 ⇒ `0` ⇒ go-redis `Set(…, 0)` = **永不过期** | `lifecycle.go:36` `:39`、`sandbox-catalog/catalog_redis.go:71` |
 | 🔴 resume 的节点亲和**落空即放弃**，无租约、无仲裁 | `packages/api/internal/orchestrator/create_instance.go:333-341` |
 | 亲和落空后**改写 DB 里的 origin**，提示自愈 | `create_instance.go:460-505`、`UpdateSnapshotOriginNode` |
 | 亲和成功与否是两个独立 telemetry 属性 ⇒ 落空是正常结果 | `create_instance.go:372-373` |

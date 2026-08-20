@@ -6,6 +6,16 @@
 > 考古基准：e2b `/home/debian/e2b-infra`。所有 `packages/...` 路径都指它。
 > 行数均为**非测试**代码。
 >
+> **v6（2026-08-20）**：随拆分方案的第四轮核查（对着代码，不是对着文档）同步更新。
+> **D10 的 CREATE / FORK 一行被推翻一半**（同步成立，「已带化身」不成立），
+> RESUME 一行补上它对 Rust 侧响应头的隐含依赖，TTL 段的「续期 400」改为「续期钳制」
+> 并补上心跳对账那条会让整件事失效的路径；
+> **D12 的前提被裁决为不可用**，三条模块级后果各加一个例外分支；
+> **D7 收窄**（拿掉的是「权威」，不是 `InMemoryMetadataStore` 这个类型）；
+> **D8 的警报响错了地方**（`ListSandboxes` 侧是假警报，`node_reclaim` 侧才是真的）；
+> §7 补一条今天**没有任何阶段认领**的 bytes-then-commit 劈分。
+> 逐条处置在拆分方案 §13。
+>
 > **v5（2026-08-20）**：两个悬置决策裁决完毕 ——
 > 沙箱寿命上界照抄 e2b（D10 末尾），节点失联接管**取消提问**（新增 **D12**）。
 >
@@ -309,6 +319,25 @@ e2b 的节点有一处 Redis（`pkg/sandbox/uploads.go` 的 upload-done pub/sub�
 用户裁决（2026-08-20）：**`InMemoryMetadataStore` 作为权威状态整个拿掉**，
 不保留「本地/dev 用内存、生产用 Redis」的双后端。
 
+> 🔧 **v6 收窄：拿掉的是「权威」，不是这个类型。**
+> `--role node` 要执行 create / pause / resume / fork / snapshot，
+> 而这五条路径的全部逻辑在 `Orchestrator` 里，`Orchestrator` 的每一步都建在
+> `MetadataStore` 上（状态机、超时、`execution_id`、`paused_state`、`image_refs` 引用计数）。
+> 「node 只有句柄表、没有 `MetadataStore`」等于**在 node 侧重写 `service.rs`** ——
+> 不是阶段 3 能装下的工作量，也不在任何一份清单里。
+> ⇒ **`InMemoryMetadataStore` 保留为 `node` 角色的本地账本，但不再是集群权威。**
+> 集群唯一的权威活跃态 store 是 Redis 实现，`--role api` 只用它。
+>
+> 下面三条依据全部仍然成立 —— **它们论证的是「权威状态不要有两个后端」**，
+> 而 node 的账本不是权威：`api` 用 `ListSandboxes` 去对它的账，**正是因为不信它**。
+> 第 3 条也仍然满足：`--role api` 只有 Redis 一条路径。
+>
+> 🔴 **代价要诚实登记**：`update_if_state` 之类的语义会有两个实现，正是上面第 2 条
+> 引的那句警告的形状。缓解是**两个实现服务两个不同的调用面** ——
+> node 的账本从不并发决策，`api` 的 store 是唯一的决策者 ——
+> 所以「改了一个忘了另一个」不会静默：node 侧不需要 CAS 正确性，
+> `api` 侧的测试跑真 Redis。**但这条要写在这里，不能不说。**
+
 **三条依据：**
 
 1. **e2b 就是单后端。** `packages/api/internal/sandbox/storage/` 下只有 `redis/` 一个子目录；
@@ -343,6 +372,22 @@ e2b `packages/orchestrator/pkg/server/sandboxes.go:577-582` 逐字：
 
 ⇒ **`ListSandboxes` 只报控制面拥有的沙箱**，所有权用**显式标记**表达
 （跟着那份不透明配置走：有配置 = 控制面的），不要靠「它长得像不像用户沙箱」去推断。
+
+> 🔧 **v6：结论照做，但危险的位置不是这里。**
+> `src/template/runner.rs:165` `:189` 直接构造 `FirecrackerSandbox`，
+> **从头到尾不经过 `Orchestrator`** ⇒ 从来没进过句柄表（`src/orchestrator/service.rs:101`）。
+> e2b 的坑成立是因为它两类沙箱**共用同一张 `sandboxFactory.Sandboxes`**
+> （`sandboxes.go:568`）—— **我们不共用** ⇒ `ListSandboxes` 这一侧是**假警报**。
+>
+> 🔴 **真正会杀错人的消费者是 `node_reclaim`**（§7 表里的 `src/node_reclaim/`）：
+> 它扫的是**宿主机残留** —— firecracker 进程、netns、ublk 设备、临时目录 ——
+> 而构建沙箱与用户沙箱的残留在宿主机上**长得一模一样**：
+> netns 名是 `{NETNS_PREFIX}{uuid_v7}`（`src/sandbox/network/slot.rs:93`），
+> 不带沙箱 id、不带来源、不带所有权。
+>
+> ⇒ 标记仍然要做（规矩本身；`--role all` 回退期间本机 REST 建的沙箱**会**进句柄表
+> 而 `api` 不拥有它们；以及上面那条真危险），
+> **但验收探针要按 `node_reclaim` 那一侧写，不要只验 `ListSandboxes`。**
 
 顺带：这个不透明配置还解决了 `api` 副本重启的重建问题 —— 节点原样回传控制面当初下发的东西，
 `api` 不需要把节点内部状态翻译回自己的模型。
@@ -400,8 +445,8 @@ sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
 
 | 事件 | 走哪 | 理由 |
 |---|---|---|
-| **CREATE / FORK** | **不改** —— gateway 响应路径上的同步写（`server.go:557-561`，已带化身） | e2b `sandbox/store.go:43` 明确要求投影写**同步**：「to prevent race conditions where we would know where to route the sandbox」。改走尽力而为的事件流是降级 |
-| **RESUME** | 补进同一个同步机制 | `shouldRecordAssignment`（`server.go:655-670`）今天不匹配它 —— **这是投影真正缺的那条写** |
+| **CREATE / FORK** | **触发条件不改**（🔧 v6 —— gateway 响应路径上的同步写，`server.go:556-560`），🔴 **但写入内容要改** | e2b `sandbox/store.go:43` 明确要求投影写**同步**：「to prevent race conditions where we would know where to route the sandbox」。改走尽力而为的事件流是降级。🔴 **v6 推翻「已带化身」**：`x-agentenv-execution-id` 只由 `src/api/proxy.rs:352` 的 `echo_execution` 写出，三个调用点全在 `proxy_request`（数据面反代）内 ⇒ **控制面 201 从不带它**，CREATE 的 binding 永远空化身。FORK 更甚 —— 201 是顶层 JSON 数组，`extractSandboxIDsFromResponse`（`server.go:924` `:925-928`）第一句 unmarshal 成 map，**这条写从未发生过** |
+| **RESUME** | 补进同一个同步机制 | `shouldRecordAssignment`（`server.go:655-670`）今天不匹配它 —— **这是投影真正缺的那条写**。🔴 **v6：它不是 Go 的一行改动。** 在阶段 1 补上它们之前，resume 的 201 既无 `x-agentenv-sandbox-id` 也无化身头 ⇒ **Rust 侧的这两个响应头是阶段 1 的交付物，不是前提**；否则在集群当前的 `enforce` 仲裁下，一次不带化身的写会被 Lua **静默拒绝**（`services/scheduler/internal/redis_store.go:319`：`if challenger == "" then return false, "rejected_unknown"`），只留下一个计数器 |
 | **PAUSE / DELETE** | 事件通道（`ReportSandboxEvent`），按 execution 守卫删除 | DELETE 连方法都不匹配那个同步路径；守卫对标 `catalog_redis.go` 的 `DeleteSandbox`：`if info.ExecutionID != executionID { return nil }` |
 
 ⇒ 与 D1 的关系：D1 说「推与拉都要，各管各的」，D10 把「推」再拆成
@@ -411,12 +456,32 @@ sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
 ✅ **TTL 写成什么，已定：引入沙箱寿命上界，照抄 e2b。**
 它的上界是**配额表的列**（`tiers.max_length_hours`，默认 1 小时），
 而真正让 TTL 得以「写一次、永不续期」的是**三处强制**：
-入库时钳制 `EndTime`（`sandbox/store.go:82-83`）、续期时越界拒绝并回 400
-（`keep_alive.go:31-32`）、投影 TTL 由它推导（`lifecycle.go:36` `:39`）。
+
+1. **入库时钳制 `EndTime`**（`sandbox/store.go:82-83`）；
+2. 🔧 **v6 更正：续期时也是钳制，不是拒绝。**
+   `internal/orchestrator/keep_alive.go:28` 的 `getMaxAllowedTTL` ＝ `min(timeLeft, duration)`
+   （`:73-80`）—— 请求一个过长的 timeout **会被截短，不会被拒绝**；
+   `:31-32` 的 400 只在沙箱**已经**越界时抛，`:55` 才映射成 HTTP 400。
+   🔴 且该文件在 `packages/api/internal/**orchestrator**/`，**不在 `handlers/`**；
+3. **投影 TTL 由它推导**（`lifecycle.go:36` `:39`）。
+
 **把会移动的量在源头锁死，TTL 才变成建时可推导的。**
 我们没有租户模型，一个 config 值即可，但三处强制一处不能省。
-🔴 抄的时候注意 `lifecycle.go:36` 是整数除法 —— 秒级上界不能沿用那个截断。
+🔴 抄的时候注意 `lifecycle.go:36` 是整数除法 —— 秒级上界不能沿用那个截断，
+🔴 **而且 < 1 小时会得到 `0`，go-redis `Set(…, 0)` ＝ 永不过期**
+（`sandbox-catalog/catalog_redis.go:71`）：上界越短泄漏越严重。
 详见拆分方案 §7 阶段 1 第 4 点。
+
+🔴🔴 **v6 补一条本节原本完全没有的路径：心跳对账必须停止重置 TTL。**
+`redisReconcileNodeScriptBody` 的 accept 分支今天是
+`redis.call("SET", binding_key(sandbox_id), value, "PX", ttl_ms)`
+（`services/scheduler/internal/redis_store.go:448`），`ttl_ms`（`:400`）**恒等于 `binding_ttl`**，
+而心跳 5 秒一次 ⇒ **建时写的长 TTL 活不过一个心跳，本条决策全部失效。**
+⇒ `refreshed`（同一化身的周期性 tick）必须走 **`KEEPTTL`**；
+只有 `installed` / `installed_unknown`（修复丢失的写）与 `superseded`（新化身、
+带新的寿命预算）才用 `PX`，且用该条目自带的 `projection_ttl_secs`。
+**这是本节与 D1 的分工在存储层的落点**：心跳是修复路径，修复路径**不许给记录续命**，
+否则投影的存活重新依赖一条周期性写路径 —— 正是它要消掉的东西。
 
 ---
 
@@ -463,20 +528,38 @@ if node != nil && !node.CanAcceptNewRequests() {
 没有租约、不等过期、没有仲裁。落空之后 `maybeRemapResumeOriginNode`
 还会**改写 DB 里的 origin**，让提示自愈。
 
-⇒ 三条模块级后果：
+> 🔴 **v6：这条决策的前提没了。** `local_only` 的消除依赖主仓的
+> pause-publish-durability，而**它已被裁决为不予考虑（用户裁决，2026-08-20）** ——
+> 全部工作只落在本仓。⇒ **下面三条不是「全部回退」，是各带一个例外分支**：
+> **已发布（`published = true`）的行走亲和提示这一档；未发布的行硬钉 origin。**
+> `api` 因此**必须 pin / prefer 两档都会**，不能只实现一档。
+
+⇒ 三条模块级后果（每条都是**两档**）：
 
 1. **`src/orchestrator/placement/` 要接受一个可空的 preferred node**，
    并在它不可用时静默降级 —— 不是报错，不是重试那台机器。
    这与 D4「试到有人接为止」是同一套控制流。
+   🔴 **例外分支（v6）**：目录行 `published = false` 时**不降级** ——
+   字节只在 origin 上，别处恢复不出来。落空即**显式失败**（`FailedPrecondition`），
+   不是换一台。两档今天已经在生产路径上：
+   `services/scheduler/internal/lookup.go:261` 的 `origin_preferred` 是 prefer 档，
+   `:271-318` 是 pin 档（`:317` 的 `SANDBOX_LOCATION_PINNED` ＋ `:293` `:302` 两个 `FailedPrecondition`）。
+   ⇒ **不是重写，是不假设 pin 档会消失**；阶段 4 port `placement/` 时两档一起 port。
 2. **`src/orchestrator/routing_projection.rs` 的记录只要 `execution_id` ＋ `node_id`**，
    不带 `lease_expires_at` / `sandbox_expires_at`。租约的两件事里，
    「原节点还在吗」消失，「并发恢复互斥」归 §8 的状态 CAS。
+   🔴 **例外分支（v6）**：目录行还要 `origin_node_id` ＋ `published` 两列 ——
+   这是给活跃态 store（Redis 那一半）的**接缝要求**，而拆分方案自己说过
+   「记录结构一旦建起来改不动」⇒ **建结构时这两个字段就要在**。
 3. **提示落空要改写提示**（对标 `UpdateSnapshotOriginNode`），
    这正好接上 D5 —— 我们已经有 P2P / 缓存亲和的一半，缺的是这个自愈回路。
+   🔴 **例外分支（v6）**：`published = false` 的行**不改写** ——
+   改写 origin 等于宣布字节搬走了，而它没有。自愈只对已发布的行开。
 
-🔴 **前提是 `local_only` 被消掉**，而那依赖主仓的 pause-publish-durability，
-**不在本 submodule 内**。它不落地，原节点就仍是「必需」而非「偏好」，
-上面三条全部回退。
+🔴 **顺带一条排期含义**：阶段 3 的删除批里 `services/scheduler/internal/registry`
+（10,076 行）**承载 pin / prefer 的那部分不能只删不搬** ——
+`lookup.go` 的三个分支是这条语义今天**唯一的实现**。
+拆分方案 §0 表里阶段 3 的「−13,640 行」因此不是本阶段的兑现。
 
 ---
 
@@ -488,10 +571,14 @@ if node != nil && !node.CanAcceptNewRequests() {
 | `scheduler` 的 `ReportSandboxEvent` 实现（今天丢弃） | **1** | D10，阶段 1 的① |
 | proto 加 `SandboxEvent.execution_id` | **1** | D10 的 execution 守卫删除需要它 |
 | `shouldRecordAssignment` 覆盖 RESUME | **1** | D10 —— 投影真正缺的那条同步写 |
-| ✅ `max_sandbox_lifetime_secs` ＋ **三处强制**（入库钳制 / 续期 400 / 投影 TTL） | **1** | D10 末尾；已定，照抄 e2b。三处一起做才有意义 |
-| `placement` 接受可空 preferred node ＋ 落空静默降级 | **4** | D12 第 1 条 |
-| 亲和提示落空后**改写提示**（对标 `UpdateSnapshotOriginNode`） | **4** | D12 第 3 条；接上 D5 缺的自愈回路 |
-| 🔴 跨仓前置：主仓 pause-publish-durability 消掉 `local_only` | **3 之前** | D12 的前提；不落地则 D12 三条全部回退 |
+| ✅ `max_sandbox_lifetime_secs` ＋ **三处强制**（入库钳制 / **续期钳制**，400 只给已越界 / 投影 TTL） | **1** | D10 末尾；已定，照抄 e2b。三处一起做才有意义。🔧 v6 更正「续期 400」 |
+| 🔴 心跳对账脚本的 `refreshed` 分支改 `KEEPTTL`（`redis_store.go:448`） | **1** | 🔧 **v6 新增，此前无人认领。** 不改，上一行的三处强制全部失效 —— 长 TTL 活不过一个心跳 |
+| 🔴 control-plane 的 201 补 `x-agentenv-execution-id`；fork 走 body 的 `result.sandbox.executionID` | **1** | 🔧 **v6 新增。** D10 的 CREATE / FORK 一行原以为「不用改」；实际 CREATE 空化身、FORK 从未写过 |
+| `placement` 接受可空 preferred node ＋ 落空静默降级，**外加 `published = false` 的硬钉分支** | **4** | D12 第 1 条（v6：两档，不是一档）。pin 档今天在 `services/scheduler/internal/lookup.go:271-318`（`:293` `:302` `:317`），**port 时一起搬** |
+| 亲和提示落空后**改写提示**（对标 `UpdateSnapshotOriginNode`），🔴 **只对 `published = true` 的行开** | **4** | D12 第 3 条（v6 加例外分支）；接上 D5 缺的自愈回路 |
+| ~~🔴 跨仓前置：主仓 pause-publish-durability 消掉 `local_only`~~ | ~~3 之前~~ | ✅ **v6：已裁决为不予考虑（2026-08-20），不再是前置。** ⇒ D12 三条各走例外分支，`api` pin / prefer 两档都要有 |
+| 🔴 **`SnapshotRepository::publish` 劈成 `stage_artifacts`（node）＋ `commit_staged`（api）** | **2** | 🔧 **v6 新增 —— 今天阶段 2 与阶段 3 的清单都没有认领它。** 拆分方案 §5.1 的 bytes-then-commit 图就是这条；`src/snapshot/manager.rs:101-119` 与 `src/snapshot/repository/interfaces.rs:124-142` 今天把两件事绑在一个调用里。不劈开，阶段 3 的远程 pause 无处落地，而失败点会在 node proto 定稿之后才暴露 |
+| 目录行加 `origin_node_id` ＋ `published` 两列 | **2** | D12 第 2 条的例外分支；🔴 建表时就要在，拖到阶段 3 是一次 schema 重做 |
 | `src/snapshot/repository/pg/` | **2** | 目录进 PG |
 | `src/template` 的并发上限 ＋ `builds` 表 | **2** | 建表时留形状，别等阶段 3 |
 | `src/orchestrator/store/redis.rs` | **3** | `api` N 副本的**必要条件**（不是充分 —— 还要 8.5 那六件） |
@@ -506,8 +593,8 @@ if node != nil && !node.CanAcceptNewRequests() {
 | `src/node_server/` ＋ `ListSandboxes` | **3** | D1 的拉侧 |
 | `src/node_server/admission.rs` | **3** | D4 的节点侧 |
 | `src/node_reclaim/` | **3** | node 角色一旦独立就必须有 |
-| 删除 `src/orchestrator/store/in_memory.rs` | **3** | D7，与 Redis store 同批 |
-| `ListSandboxes` 的所有权标记 | **3** | D8，漏了会被当孤儿杀掉 |
+| ~~删除 `src/orchestrator/store/in_memory.rs`~~ | **不删** | 🔧 **v6 收窄 D7**：`--role node` 的 create / pause / resume / fork / snapshot 全部建在 `MetadataStore` 上，删掉等于在 node 侧重写 `service.rs`。⇒ **不再是集群权威，但保留为 node 的本地账本**；集群唯一权威是 Redis 实现，`--role api` 只用它 |
+| `ListSandboxes` 的所有权标记 | **3** | D8。🔧 v6：`ListSandboxes` 这一侧是假警报（构建沙箱不进句柄表），**真危险在 `node_reclaim`** —— 探针按那一侧写 |
 | `src/orchestrator/placement/` | **4** | 从 Go port，D4 ＋ D5 |
 | `src/orchestrator/node_manager/` | **4** | 从 Go port |
 | `src/orchestrator/discovery/` | **4** | 从 Go port |

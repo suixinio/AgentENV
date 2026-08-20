@@ -55,7 +55,6 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	fmt clippy \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
-	test-paused-registry \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
@@ -121,16 +120,6 @@ test-unit:
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
-
-# The registry's behaviour lives in its SQL, so these need a real PostgreSQL
-# and are their own target: `test-unit` builds only the lib target and never
-# sees them, and `test-agent-integration` names its test targets explicitly.
-#
-# AENV_PAUSED_REGISTRY_TEST_REQUIRED turns a missing DSN into a failure rather
-# than a file of green skips, which is the only thing standing between this
-# target and passing while testing nothing.
-test-paused-registry:
-	AENV_PAUSED_REGISTRY_TEST_REQUIRED=1 $(CARGO) test -p agentenv --test paused_registry
 
 test-integration: test-agent-integration test-envd test-ublk
 

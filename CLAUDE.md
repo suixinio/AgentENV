@@ -38,14 +38,27 @@ Local RocksDB helper (`src/local_store.rs`) is the shared async-friendly wrapper
 
 Go control-plane services (`services/` module):
 ```bash
-make -C services build        # build gateway + scheduler
-make -C services test         # run gateway + scheduler tests
+make -C services build               # build gateway + scheduler
+make -C services test                # test the whole module (gateway, scheduler, shared, api)
+make -C services test-with-postgres  # the same, against a throwaway PostgreSQL: nothing skips
 make -C services run-scheduler
 make -C services run-gateway
 
 # from services/ directly
 go test ./...
 ```
+
+`make test` runs the paused-sandbox registry suite without a database, and every
+test in it that touches SQL skips — 125 of them, all reported as passes.
+`test-with-postgres` reproduces the coverage CI has: it starts a throwaway
+PostgreSQL, points `SCHEDULER_REGISTRY_TEST_DSN` at it, and sets
+`SCHEDULER_REGISTRY_TEST_REQUIRED=1`, which turns a missing database into a
+failure rather than back into green skips. It sets `REDIS_SERVER_BIN` and
+`SCHEDULER_REDIS_TEST_REQUIRED=1` for the same reason, on behalf of the
+binding-store tests — those are the only ones that exercise the Redis binding
+store, which is what every HA deployment runs, and a change made to the
+in-memory store and forgotten for Redis is invisible everywhere else. It needs
+Docker and a local `redis-server` binary.
 
 Run a single test:
 ```bash
@@ -93,7 +106,7 @@ Gateway (`services/gateway/`) is an HTTP reverse proxy that routes client traffi
 
 `services/` is a separate Go module containing the distributed control plane (gateway + scheduler). See `services/README.md` for build/run/deploy instructions.
 
-When changing code under `services/`, validate via `make -C services test` (or `go test ./...` inside `services/`) in addition to Rust workspace checks.
+When changing code under `services/`, validate via `make -C services test` (or `go test ./...` inside `services/`) in addition to Rust workspace checks. Anything touching `scheduler/internal/registry` needs `make -C services test-with-postgres` instead: without a database that package's tests skip rather than run.
 
 ### Per-Node Subsystems
 

@@ -25,6 +25,11 @@ jobs:
     # those tests were skipping in CI because nothing here provided one. They
     # are the semantic baseline the control plane is measured against, so a
     # baseline nobody runs is worse than none.
+    #
+    # Since PostgreSQL came off the node, that baseline lives here and nowhere
+    # else: the node's own `tests/paused_registry.rs` was deleted with it, and
+    # its thirty tests were ported into the registry package (each one named in
+    # a `Ported from` comment). This job is the only thing that runs them.
     services:
       postgres:
         image: postgres:16-alpine
@@ -58,6 +63,18 @@ jobs:
           # A DSN that goes missing must fail this job rather than turn the
           # registry tests into green skips.
           SCHEDULER_REGISTRY_TEST_REQUIRED: "1"
+          # Same reason for the binding-store tests: they fall back to looking
+          # `redis-server` up on PATH and skip when it is absent, so naming the
+          # binary is what makes a failed install fail the job instead.
+          REDIS_SERVER_BIN: /usr/bin/redis-server
+          # And the belt to that brace. Naming the binary only helps while the
+          # path is right; this turns a skip inside the suite into a failure
+          # however it was reached. It matters here more than the registry's
+          # equivalent does: the binding-store tests are the only ones that
+          # exercise the Redis implementation, which is what every HA
+          # deployment runs, and a change made to the in-memory store and
+          # forgotten for Redis passes every other test in the module.
+          SCHEDULER_REDIS_TEST_REQUIRED: "1"
         run: make test
       - name: Go format check
         run: make fmt-check

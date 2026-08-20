@@ -6,8 +6,10 @@ GO   ?= go
 build:
 	cd $(ROOT) && $(GO) build -o bin/scheduler ./scheduler/cmd
 
+# Tests the same package set `vet` checks: a target that stops at ./scheduler/...
+# leaves everything under shared/ untested by the only command CI runs.
 test:
-	cd $(ROOT) && $(GO) test ./scheduler/...
+	cd $(ROOT) && $(GO) test ./scheduler/... ./shared/... ./api/...
 
 fmt:
 	cd $(ROOT) && gofmt -w $$(find scheduler shared api -name '*.go' -type f)

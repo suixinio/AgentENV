@@ -50,8 +50,42 @@ Commands (from `services/`):
 ```bash
 make tidy
 make proto
-make build      # builds both gateway and scheduler
-make test       # tests both services
+make build              # builds both gateway and scheduler
+make test               # tests the whole module: gateway, scheduler, shared, api
+make test-with-postgres # the same, against a throwaway PostgreSQL: nothing skips
+```
+
+The paused-sandbox registry's behaviour is its SQL — which rows a predicate
+matches and which it deliberately does not — so none of it can be checked
+without a real database. `make test` on its own therefore skips 125 tests in
+`scheduler/internal/registry`, and a skip reports as a pass.
+
+`make test-with-postgres` is the coverage CI has. It starts a throwaway
+PostgreSQL in Docker, points `SCHEDULER_REGISTRY_TEST_DSN` at it, and sets
+`SCHEDULER_REGISTRY_TEST_REQUIRED=1` so that a database which fails to come up
+fails the run instead of quietly restoring the skips. `REDIS_SERVER_BIN` and
+`SCHEDULER_REDIS_TEST_REQUIRED=1` do the same for the `RedisBindingStore`
+tests, which otherwise skip when `redis-server` is not installed. Override
+`REGISTRY_TEST_PORT` if 15499 is taken.
+
+🔴 Both redis variables matter, and the second one more than it looks. The
+binding-store tests are the only ones that exercise the Redis implementation of
+sandbox-to-node bindings, and that implementation is what every HA deployment
+runs. A change made to the in-memory store and forgotten for Redis passes every
+other test in the module, on any machine, and shows up only in production — as
+routing that quietly stops arbitrating. A skip reports as a pass, so without
+`SCHEDULER_REDIS_TEST_REQUIRED` a missing `redis-server` and a healthy run look
+identical.
+
+To point the suite at a database you already have, set the same two variables
+by hand:
+
+```bash
+SCHEDULER_REGISTRY_TEST_DSN=postgres://postgres:verify@127.0.0.1:15499/aenv_registry \
+SCHEDULER_REGISTRY_TEST_REQUIRED=1 \
+SCHEDULER_REDIS_TEST_REQUIRED=1 \
+REDIS_SERVER_BIN="$(command -v redis-server)" \
+  go test ./scheduler/internal/registry/ ./scheduler/internal/
 ```
 
 Per-service (from `services/gateway/` or `services/scheduler/`):
@@ -60,6 +94,9 @@ Per-service (from `services/gateway/` or `services/scheduler/`):
 make build
 make test
 ```
+
+Each per-service `test` covers `shared/` and `api/` as well as its own tree,
+which is the package set its `vet` and `fmt-check` already check.
 
 ## Run locally
 

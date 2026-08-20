@@ -348,6 +348,32 @@ pub projection_ttl_grace_secs: u64,
 `0` 必须是「关闭」而不是「无上界」。🔴 关闭时节点发 `projection_ttl_secs = 0`，
 scheduler 落回 `binding_ttl` —— **这就是写侧回退路径，且它等于今天的行为**。
 
+#### 🔴 已订正（QA F3）：上界约束的是「运行时长」，不是「自创建起的墙钟」
+
+本节初稿把上界写成「自 `created_at` 起的墙钟寿命」，理由只列到「`/refreshes`
+单次上限 3600 秒，要撞到 24 小时得连续续期 24 次」——
+**这条推理只覆盖了一直在跑的沙箱，完全没算暂停期间流逝的墙钟。**
+实测后果：创建 → 暂停 → 25 小时后 resume，resume 返回 201，
+但 `_set_timeout` 算出的 `expires_at = min(now + timeout, created_at + 24h)`
+**已经是过去时刻**；`auto_evict_interval_ms`（默认 1000ms）内驱逐循环就会看到
+一台 Running 且已过期的沙箱，按 `timeout_action` 把它重新暂停（默认）
+或者直接删除。客户端看到的是「resume 成功，随即沙箱死亡」。
+
+**订正后的语义：上界约束的是沙箱的累计运行时长，暂停期间不计入。**
+
+判据不是口味问题，是本阶段的纪律问题：
+
+- 本阶段抄的 e2b **根本没有 paused 状态**（`sandboxtypes/states.go:108-113`
+  只有 running / pausing / killing / snapshotting，暂停的沙箱离开活动集合、
+  变成 catalog 行），所以它的 `MaxInstanceLength` 只可能约束运行时长 ——
+  这个问题在那边提不出来。
+- 「暂停也计入上界」是 AgentENV 多出一个状态之后**新造**出来的产品行为变更。
+  §7 的纪律（「删除动作一律不与切换动作同批」，以及每个阶段必须可独立回滚、
+  不得夹带行为变更）明确禁止把它塞进一次基础设施阶段。
+
+对外可见的规则因此表述为：**一台沙箱累计运行不得超过 `max_sandbox_lifetime_secs`**，
+而不是「创建 24 小时后不能再 resume」。
+
 ### 6.2 (a) 建时钳制 —— 一个字段管住所有入口
 
 🔴 **不要在 create 调用点钳制。** `expires_at` 的入口有六条
@@ -356,31 +382,61 @@ fork `:715`、connect、auto-resume `src/api/proxy.rs:1032`），
 逐个钳制必漏。所有六条最终都汇进 `SandboxMetadata::_set_timeout`
 （`src/orchestrator/store/metadata.rs:119-122`），钳制放那里。
 
-`SandboxMetadata` 加一个字段：
+`SandboxMetadata` 加三个字段 —— 一个预算，一个已花，一个本次运行的起点：
 
 ```rust
 /// The lifetime ceiling this sandbox was created under, or None when the node
-/// had no ceiling configured.
-///
-/// 🔴 `serde(default)` is load-bearing, unlike `execution_id` above: the
-/// persisted paused-sandbox store holds records written by earlier builds and
-/// `persister.load_all` runs inside `Orchestrator::new` (service.rs:195) — a
-/// required field here means the node fails to start after an upgrade.
+/// had no ceiling configured. A budget of *running* time.
 #[serde(default)]
 pub max_lifetime: Option<Duration>,
+/// Running time already spent, summed over the runs that have finished.
+#[serde(default)]
+pub running_elapsed: Duration,
+/// When the run in progress started, or None while the sandbox is paused.
+#[serde(skip)]
+pub running_since: Option<SystemTime>,
 ```
 
+🔴 `serde(default)` 在前两个字段上都是承重的，与 `execution_id` 相反：
+持久化的暂停沙箱记录里有早先构建写下的行，而 `persister.load_all` 跑在
+`Orchestrator::new`（`service.rs:195`）里面 —— 这里写成必填字段
+等于「升级之后节点起不来」。
+
+🔴 `running_since` 反过来**故意不持久化**。它描述的是「本进程这一次运行」的区间，
+而记录只在 pause 时离开本进程，那时 `pause_sandbox_inner` 已经把区间结算进
+`running_elapsed` 了。持久化它只会新增一种失败模式：一个跨越节点宕机的未闭合区间，
+把停机时间算成运行时间 —— 正是这套机制要消除的那个 bug。
+
 ```rust
+impl SandboxState {
+    /// 除 Paused 外全都在花预算：暂停的沙箱没有 VM、没有 vCPU、没有网络槽位。
+    pub fn spends_lifetime(self) -> bool { !matches!(self, SandboxState::Paused) }
+}
+
 impl SandboxMetadata {
-    /// created_at + max_lifetime. None means unbounded.
-    pub fn lifetime_deadline(&self) -> Option<SystemTime> {
-        self.max_lifetime.and_then(|l| self.created_at.checked_add(l))
+    /// 预算耗尽的时刻。None 表示没有上界。
+    pub fn lifetime_deadline(&self, now: SystemTime) -> Option<SystemTime> {
+        let remaining = self.max_lifetime?.saturating_sub(self.running_elapsed);
+        // 在跑：锚在本次运行的起点，所以整段运行期间答案固定，且**可以是过去时刻**
+        //       —— 这正是 §6.3 那条 400 报告的东西。
+        // 暂停：什么都没在花，锚随 now 后退 —— 暂停一周回来预算原封不动。
+        let anchor = match self.running_since {
+            Some(since) if self.state.spends_lifetime() => since,
+            _ => now,
+        };
+        anchor.checked_add(remaining)
     }
+
+    /// 幂等，且只由 state 驱动。
+    pub fn sync_running_clock(&mut self, now: SystemTime) { /* 开/结算本次区间 */ }
+
+    /// fork 子沙箱专用：预算清零重开（与 `created_at = now` 配对）。
+    pub fn restart_lifetime_clock(&mut self, now: SystemTime) { /* … */ }
 
     fn _set_timeout(&mut self, timeout: Option<Duration>, from: SystemTime) {
         self.timeout = timeout;
         let deadline = timeout.and_then(|ttl| from.checked_add(ttl));
-        self.expires_at = match (deadline, self.lifetime_deadline()) {
+        self.expires_at = match (deadline, self.lifetime_deadline(from)) {
             (Some(d), Some(cap)) => Some(d.min(cap)),
             (d, _) => d,
         };
@@ -388,16 +444,33 @@ impl SandboxMetadata {
 }
 ```
 
+**记账放在哪：`InMemoryMetadataStore` 的四个写入口**（`add`、`update`、
+`update_state_if_state`、`update_if_state`）在发布结果前各调一次
+`sync_running_clock`。理由与「`_set_timeout` 是唯一钳制点」完全同构：
+`metadata.state = …` 的赋值点有八九处，逐点挂钩必漏一处，而漏掉的症状是
+某台沙箱悄悄多花或少花预算。时钟是 state 的函数，所以放在写入口收敛最省事 ——
+`update_if_state` 的回调可以随便改 state，时钟自己跟上。
+
+两个例外要显式调用，且都因为幂等而无害：
+
+- `pause_sandbox_inner`（`service.rs:1489` 附近）在 `state = Paused` 之后、
+  `persist_paused` **之前**结算。持久化的那份才是重启后读回来的那份，
+  把结算留给 store 等于每次节点重启白送一段运行时间。
+- fork 子沙箱（`service.rs:715` 附近）在 `created_at = now` 旁边
+  `restart_lifetime_clock(now)`。克隆自带父的 `running_elapsed`，
+  不清零就等于「从跑了 23 小时的父沙箱 fork 出来的孩子只有 1 小时命」。
+
 **为什么是 `max_lifetime: Option<Duration>` 而不是存一个绝对 `lifetime_deadline`：**
-fork 在 `service.rs:713` 先 `metadata.created_at = now` 再 `:715` `update_timeout`，
-所以子沙箱自动拿到全新窗口；resume 保留 `created_at`，所以恢复后窗口继续收缩 ——
-两者都是「最大寿命」的正确读法，而且**不需要在任何调用点写一行钳制代码**。
+fork 清零时钟，所以子沙箱拿到全新窗口；resume 保留已花预算，
+所以恢复后接着花同一份 —— 两者都是「最大运行时长」的正确读法，
+而且**不需要在任何调用点写一行钳制代码**。
 
 写入 `max_lifetime` 的位置只有 `SandboxMetadata` 的构造点：
 `service.rs:463-480`（snapshot 分支）、`:524-540`（cold 分支）、
 `:706-715`（fork 子沙箱，克隆父的即可）。跨节点 restore
 （`src/api/impls/paused_recovery.rs:1167-1189` → `create_sandbox_inner`）
-走的是普通 create 路径，自动拿到新值。本地 restore 原样保留旧值（含 `None`）。
+走的是普通 create 路径，自动拿到新值（预算也随之清零）。
+本地 restore 原样保留旧值（含 `None`），`running_elapsed` 一并读回。
 
 ### 6.3 (b) 续期 —— 钳制为主，400 只给「已经越界」
 
@@ -410,8 +483,9 @@ fork 在 `service.rs:713` 先 `metadata.created_at = now` 再 `:715` `update_tim
   `metadata.state != Running` 检查之后（`service.rs:931` 之后）插入：
 
   ```rust
-  if let Some(cap) = metadata.lifetime_deadline() {
-      if SystemTime::now() >= cap {
+  let now = SystemTime::now();
+  if let Some(cap) = metadata.lifetime_deadline(now) {
+      if now >= cap {
           return Err(OrchestratorError::SandboxLifetimeExceeded { sandbox_id, cap });
       }
   }
@@ -439,7 +513,7 @@ fork 在 `service.rs:713` 先 `metadata.created_at = now` 再 `:715` `update_tim
 
 ```rust
 pub fn projection_ttl_secs(&self, now: SystemTime) -> u32 {
-    let Some(cap) = self.lifetime_deadline() else { return 0 };   // 0 = 交给对端默认
+    let Some(cap) = self.lifetime_deadline(now) else { return 0 };   // 0 = 交给对端默认
     let remaining = cap.duration_since(now).unwrap_or(Duration::ZERO);
     // ceil to whole seconds, then add the grace, then floor at 1.
     let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
@@ -770,8 +844,24 @@ A 相位从不未命中，所以它无法证明回落还在。补一发：
   （[`_sd-recon-env.md`](_sd-recon-env.md) §8 第 4 条）：
   它只在 `now >= lifetime_deadline` 且驱逐器尚未动手时可达，
   而 `auto_evict_interval_ms = 1000` ⇒ 窗口 ≤1 秒，端到端不可稳定复现。
-  **用 `keep_alive_for` 的单元测试证明**（构造一个 `created_at` 在过去的记录），
+  **用 `keep_alive_for` 的单元测试证明**（构造一个 `running_since` 在过去、
+  已经跑满预算的记录 —— 🔴 订正：不是 `created_at` 在过去，
+  见 §6.1「上界约束的是运行时长」），
   并在验收记录里写明「400 是单元测试覆盖，不是集群取证」。
+
+### P3-b —— 🔴 暂停久于上界的沙箱仍然能 resume（QA F3 的回归探针）
+
+- 探针：`AENV_MAX_SANDBOX_LIFETIME_SECS=300`；create（`timeout=60`）⇒ pause ⇒
+  等待 > 300 秒 ⇒ resume ⇒ **等待 ≥ 2 个 `auto_evict_interval_ms`** ⇒
+  `GET /sandboxes/{id}` 仍是 `running`，且 `endAt > now`。
+- 🔴 **必须等驱逐周期**，只看 resume 的 201 什么都证明不了：
+  这个缺陷的表现就是「201 之后一秒内被驱逐」。
+- 对照面（必须失败）：同一台沙箱累计**运行**满 300 秒之后 resume ⇒
+  一个驱逐周期内回到 `paused`（`timeout_action=Pause`）。
+  没有这一面，「没被驱逐」可能只是上界被整个关掉了。
+- 单元测试覆盖同一对判据：
+  `a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor`
+  与 `a_sandbox_that_has_spent_its_running_budget_is_still_evicted_after_a_resume`。
 
 ### P4 —— 事件删除是按化身守卫的
 
@@ -839,7 +929,7 @@ A 相位从不未命中，所以它无法证明回落还在。补一发：
 | 文件 | 动作 | 非测试 | 测试 |
 |---|---|---|---|
 | `config/default.toml` ＋ `src/cfg.rs` | 2 个配置项 | 20 | 0 |
-| `src/orchestrator/store/metadata.rs` | `max_lifetime` ＋ `lifetime_deadline()` ＋ `_set_timeout` 钳制 ＋ `projection_ttl_secs()` | 70 | 150 |
+| `src/orchestrator/store/metadata.rs` | `max_lifetime` ＋ `running_elapsed` / `running_since` ＋ `lifetime_deadline(now)` ＋ `sync_running_clock` / `restart_lifetime_clock` ＋ `_set_timeout` 钳制 ＋ `projection_ttl_secs()` | 70 | 150 |
 | `src/orchestrator/types.rs` | 事件加 `execution_id` | 10 | 0 |
 | `src/orchestrator/error.rs` | `SandboxLifetimeExceeded` | 10 | 0 |
 | `src/orchestrator/service.rs` | 3 处构造点写 `max_lifetime`；`keep_alive_for` 的 400 分支；`publish_sandbox_event` ＋ 5 个调用点 | 90 | 160 |
@@ -882,11 +972,12 @@ A 相位从不未命中，所以它无法证明回落还在。补一发：
 | # | 位置 | 为什么不是加法 | 处置 |
 |---|---|---|---|
 | **N1** | `redisReconcileNodeScriptBody` 的 TTL 语义（§6.5） | 这是**改行为**不是加分支。一个跑新脚本（`KEEPTTL`）的 scheduler 与一个跑旧脚本（`PX 30s`）的 scheduler 对着**同一个 Redis** 会互相打架：旧的每 5 秒把 TTL 打回 30 秒 | scheduler 今天 `replicas: 1`；滚动更新期间会短暂两个 primary。**接受这个 ≤30 秒的降级窗口**（只是 TTL 被重置，不是数据损坏），不要为它上 leader election。`--query-only` 副本不写，无影响 |
-| **N2** | `SandboxMetadata.max_lifetime` 的 serde | `persister.load_all` 在 `Orchestrator::new` 内（`service.rs:195`），旧记录缺字段 ⇒ **节点起不来** | 必须 `#[serde(default)]`。🔴 注意本文件的既有先例相反：`execution_id`（`metadata.rs:33-42`）**刻意不给** `serde(default)`。别照抄邻居 |
+| **N2** | `SandboxMetadata.max_lifetime` / `running_elapsed` 的 serde | `persister.load_all` 在 `Orchestrator::new` 内（`service.rs:195`），旧记录缺字段 ⇒ **节点起不来** | 必须 `#[serde(default)]`。🔴 注意本文件的既有先例相反：`execution_id`（`metadata.rs:33-42`）**刻意不给** `serde(default)`。别照抄邻居 |
 | **N3** | `ReportSandboxEvent` 从「保证 no-op」变成有副作用 | 所有在跑的节点**今天就在发**这些事件。scheduler 一升级就会开始改投影，而节点侧没有任何开关 | 写侧开关代码默认 `off`（§8）。这是它必须默认 `off` 的**主要**理由 |
 | **N4** | `publish_sandbox_event` 加参数 | 签名变更，5 个调用点必须同批改 | 单 crate 内，编译器兜底 |
 | **N5** | `authorityFor` 移到 `services/shared/routing` | 移动会删掉 `lookup.go` 现在拥有的符号 | 移动而非复制；两处不得并存；加跨包 golden 测试（§7.1） |
 | **N6** | `/timeout` `/refreshes` 新增 400 | 客户端会收到一个它以前收不到的状态码 | 可达窗口 ≤1 秒（§9 P3），风险可接受；写进 CHANGELOG |
+| **N6-b** | 寿命上界的单位（§6.1 订正） | 与 N6 同批进 CHANGELOG。对外规则是「累计**运行**不得超过 `max_sandbox_lifetime_secs`」；暂停时间不计入 | 只影响本阶段新引入的行为，没有更早的版本对它有依赖 |
 | **N7** | `extractSandboxIDsFromResponse` 的返回类型 | 从 `[]string` 变成三元组 | 包内私有函数，调用点只有 `server.go:596`；其唯一测试（`server_test.go:665`）用的信封形状本仓不产出，🔴 **顺手改成真实的 fork 数组形状** |
 | **N8** | proto 三个新字段 | 加法安全：消费者只有本仓 Go（`services/go.mod` 是唯一 module，`services/api/proto/` 未独立发布）与本仓 Rust（`build.rs:5,17`）。无外部消费者 | 直接加。`make -C services build` ＋ `cargo build` 各重生成一次 |
 
@@ -921,6 +1012,7 @@ A 相位从不未命中，所以它无法证明回落还在。补一发：
 | `2026-08-20-service-decomposition.md` §7 阶段 1 ①.1 | 「CREATE / FORK 不动」改为「触发条件不动，写入内容要改」，并写明 E1/E2 |
 | 同上 ①.4 表第二行 | 「续期时拒绝 ⇒ 400」改为「续期时**钳制**；400 只给已越界」，并更正 `keep_alive.go` 的包路径 |
 | 同上 ①.4 | 增补「心跳对账必须停止重置 TTL」一条（§6.5） |
+| 同上 ①.4 | 🔴 上界的单位改为**累计运行时长**（暂停不计入），见 §6.1 订正块。CHANGELOG 里对外的说法是「一台沙箱累计运行不得超过 `max_sandbox_lifetime_secs`」，**不是**「创建 24 小时后不能再 resume」 |
 | 同上「规模」 | 400–500 → ~1,570 非测试 ＋ ~1,820 测试 ＋ ~1,050 生成 |
 | 附证据索引 | 「CREATE / FORK 的投影写已经是同步的，**且带化身**」删去后半句，改指 `src/api/proxy.rs:95` `:352-364` |
 | `2026-08-20-module-responsibilities.md` D10 表 | RESUME 一行补「需要 Rust 侧响应头，否则在 `enforce` 仲裁下被静默拒绝」 |

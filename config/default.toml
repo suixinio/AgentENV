@@ -232,11 +232,11 @@ auto_evict_interval_ms = 1000
 default_sandbox_timeout_secs = 15
 # Minimum auto-resumed lifetime in seconds (300 = 5 minutes).
 auto_resume_min_sandbox_timeout_secs = 300
-# Hard ceiling on a sandbox's total wall-clock life, measured from creation.
-# A create/resume/fork request asking for more is clamped, not refused, and a
-# later SetTimeout can never push the deadline past it. 0 disables the ceiling
-# (and with it the long-lived routing projection: records fall back to
-# scheduler.binding_ttl).
+# Hard ceiling on how long a sandbox may run in total, summed across every
+# resume. Time spent paused does not count against it. A create/resume/fork
+# request asking for more is clamped, not refused, and a later SetTimeout can
+# never push the deadline past it. 0 disables the ceiling (and with it the
+# long-lived routing projection: records fall back to scheduler.binding_ttl).
 max_sandbox_lifetime_secs = 86400
 # Slack added to the routing projection's TTL so the record outlives the
 # sandbox rather than dying just before it.

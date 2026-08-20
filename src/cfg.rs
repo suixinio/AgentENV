@@ -764,9 +764,15 @@ pub struct OrchestratorConfig {
     pub default_sandbox_timeout_secs: u64,
     #[config(default = 300u64)]
     pub auto_resume_min_sandbox_timeout_secs: u64,
-    /// Hard ceiling on a sandbox's total wall-clock life, measured from its
-    /// creation. A request asking for more is clamped, not refused, and a later
-    /// SetTimeout can never push the deadline past it.
+    /// Hard ceiling on how long a sandbox may **run** in total, summed across
+    /// every resume. A request asking for more is clamped, not refused, and a
+    /// later SetTimeout can never push the deadline past it.
+    ///
+    /// 🔴 Running time, not wall-clock time since creation: a sandbox spends
+    /// this budget only while it is not paused. A sandbox paused for a week
+    /// comes back with the budget it went away with, which is what makes a
+    /// resume after the ceiling has elapsed a working sandbox instead of one
+    /// the eviction loop tears down within the second.
     ///
     /// 🔴 `0` means "no ceiling", and with it no derivable routing-projection
     /// TTL: the node then reports `projection_ttl_secs = 0` and the scheduler

@@ -191,7 +191,8 @@ impl SandboxMetadata {
         // flooring at 1 is how a sub-unit remainder avoids collapsing into a
         // zero that the receiver would have to interpret.
         let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
-        secs.saturating_add(grace_secs).clamp(1, u64::from(u32::MAX)) as u32
+        secs.saturating_add(grace_secs)
+            .clamp(1, u64::from(u32::MAX)) as u32
     }
 
     fn _set_timeout(&mut self, timeout: Option<Duration>, from: SystemTime) {

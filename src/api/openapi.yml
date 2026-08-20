@@ -714,6 +714,19 @@ components:
           $ref: "#/components/schemas/Sandbox"
         error:
           $ref: "#/components/schemas/Error"
+        projectionTtlSecs:
+          type: integer
+          format: int64
+          description: >-
+            How long this fork's routing projection should live, in whole
+            seconds, as derived from the node's sandbox lifetime ceiling. 0 or
+            absent means the receiver should use its own default TTL; it never
+            means the record should not expire.
+
+            Carried here rather than on Sandbox because fork answers with a
+            top-level array — one response, N children, N incarnations — so a
+            response header cannot say it per child, and Sandbox is the
+            user-facing model while this is a routing-infrastructure value.
 
     Template:
       required:
@@ -1389,6 +1402,23 @@ paths:
               description: Identifier of the created sandbox for proxy routing.
               schema:
                 type: string
+            x-agentenv-execution-id:
+              description: >-
+                The incarnation this sandbox is running under. The routing
+                projection is written under it, and a write that cannot name
+                one is refused by incarnation arbitration rather than
+                overwriting a record that names a different run.
+              schema:
+                type: string
+            x-agentenv-projection-ttl-secs:
+              description: >-
+                How long this sandbox's routing projection should live, in
+                whole seconds, as derived from the node's sandbox lifetime
+                ceiling. Absent or 0 means the receiver should use its own
+                default TTL; it never means the record should not expire.
+              schema:
+                type: integer
+                format: int64
           content:
             application/json:
               schema:
@@ -1428,6 +1458,23 @@ paths:
               description: Identifier of the created sandbox for proxy routing.
               schema:
                 type: string
+            x-agentenv-execution-id:
+              description: >-
+                The incarnation this sandbox is running under. The routing
+                projection is written under it, and a write that cannot name
+                one is refused by incarnation arbitration rather than
+                overwriting a record that names a different run.
+              schema:
+                type: string
+            x-agentenv-projection-ttl-secs:
+              description: >-
+                How long this sandbox's routing projection should live, in
+                whole seconds, as derived from the node's sandbox lifetime
+                ceiling. Absent or 0 means the receiver should use its own
+                default TTL; it never means the record should not expire.
+              schema:
+                type: integer
+                format: int64
           content:
             application/json:
               schema:
@@ -1588,6 +1635,28 @@ paths:
       responses:
         "201":
           description: The sandbox was resumed successfully
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the resumed sandbox for proxy routing.
+              schema:
+                type: string
+            x-agentenv-execution-id:
+              description: >-
+                The incarnation this sandbox is running under. The routing
+                projection is written under it, and a write that cannot name
+                one is refused by incarnation arbitration rather than
+                overwriting a record that names a different run.
+              schema:
+                type: string
+            x-agentenv-projection-ttl-secs:
+              description: >-
+                How long this sandbox's routing projection should live, in
+                whole seconds, as derived from the node's sandbox lifetime
+                ceiling. Absent or 0 means the receiver should use its own
+                default TTL; it never means the record should not expire.
+              schema:
+                type: integer
+                format: int64
           content:
             application/json:
               schema:
@@ -1671,12 +1740,56 @@ paths:
       responses:
         "200":
           description: The sandbox was already running
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the resumed sandbox for proxy routing.
+              schema:
+                type: string
+            x-agentenv-execution-id:
+              description: >-
+                The incarnation this sandbox is running under. The routing
+                projection is written under it, and a write that cannot name
+                one is refused by incarnation arbitration rather than
+                overwriting a record that names a different run.
+              schema:
+                type: string
+            x-agentenv-projection-ttl-secs:
+              description: >-
+                How long this sandbox's routing projection should live, in
+                whole seconds, as derived from the node's sandbox lifetime
+                ceiling. Absent or 0 means the receiver should use its own
+                default TTL; it never means the record should not expire.
+              schema:
+                type: integer
+                format: int64
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Sandbox"
         "201":
           description: The sandbox was resumed successfully
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the resumed sandbox for proxy routing.
+              schema:
+                type: string
+            x-agentenv-execution-id:
+              description: >-
+                The incarnation this sandbox is running under. The routing
+                projection is written under it, and a write that cannot name
+                one is refused by incarnation arbitration rather than
+                overwriting a record that names a different run.
+              schema:
+                type: string
+            x-agentenv-projection-ttl-secs:
+              description: >-
+                How long this sandbox's routing projection should live, in
+                whole seconds, as derived from the node's sandbox lifetime
+                ceiling. Absent or 0 means the receiver should use its own
+                default TTL; it never means the record should not expire.
+              schema:
+                type: integer
+                format: int64
           content:
             application/json:
               schema:
@@ -1711,6 +1824,8 @@ paths:
       responses:
         "204":
           description: Successfully set the sandbox timeout
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "404":
@@ -1847,6 +1962,8 @@ paths:
       responses:
         "204":
           description: Successfully refreshed the sandbox
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "404":

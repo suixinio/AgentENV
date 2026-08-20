@@ -16,6 +16,8 @@ pub enum SandboxesColdPostResponse {
     Status201_TheSandboxWasCreatedSuccessfully {
         body: models::Sandbox,
         x_agentenv_sandbox_id: Option<String>,
+        x_agentenv_execution_id: Option<String>,
+        x_agentenv_projection_ttl_secs: Option<i64>,
     },
     /// Authentication error
     Status401_AuthenticationError(models::Error),
@@ -47,6 +49,8 @@ pub enum SandboxesPostResponse {
     Status201_TheSandboxWasCreatedSuccessfully {
         body: models::Sandbox,
         x_agentenv_sandbox_id: Option<String>,
+        x_agentenv_execution_id: Option<String>,
+        x_agentenv_projection_ttl_secs: Option<i64>,
     },
     /// Authentication error
     Status401_AuthenticationError(models::Error),
@@ -61,9 +65,19 @@ pub enum SandboxesPostResponse {
 #[allow(clippy::large_enum_variant)]
 pub enum SandboxesSandboxIdConnectPostResponse {
     /// The sandbox was already running
-    Status200_TheSandboxWasAlreadyRunning(models::Sandbox),
+    Status200_TheSandboxWasAlreadyRunning {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+        x_agentenv_execution_id: Option<String>,
+        x_agentenv_projection_ttl_secs: Option<i64>,
+    },
     /// The sandbox was resumed successfully
-    Status201_TheSandboxWasResumedSuccessfully(models::Sandbox),
+    Status201_TheSandboxWasResumedSuccessfully {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+        x_agentenv_execution_id: Option<String>,
+        x_agentenv_projection_ttl_secs: Option<i64>,
+    },
     /// Bad request
     Status400_BadRequest(models::Error),
     /// Authentication error
@@ -196,6 +210,8 @@ pub enum SandboxesSandboxIdPausePostResponse {
 pub enum SandboxesSandboxIdRefreshesPostResponse {
     /// Successfully refreshed the sandbox
     Status204_SuccessfullyRefreshedTheSandbox,
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Not found
@@ -209,7 +225,12 @@ pub enum SandboxesSandboxIdRefreshesPostResponse {
 #[allow(clippy::large_enum_variant)]
 pub enum SandboxesSandboxIdResumePostResponse {
     /// The sandbox was resumed successfully
-    Status201_TheSandboxWasResumedSuccessfully(models::Sandbox),
+    Status201_TheSandboxWasResumedSuccessfully {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+        x_agentenv_execution_id: Option<String>,
+        x_agentenv_projection_ttl_secs: Option<i64>,
+    },
     /// Conflict
     Status409_Conflict(models::Error),
     /// Not found
@@ -242,6 +263,8 @@ pub enum SandboxesSandboxIdSnapshotsPostResponse {
 pub enum SandboxesSandboxIdTimeoutPostResponse {
     /// Successfully set the sandbox timeout
     Status204_SuccessfullySetTheSandboxTimeout,
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Not found

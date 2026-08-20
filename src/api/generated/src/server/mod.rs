@@ -735,7 +735,9 @@ where
                                                 apis::sandboxes::SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully
                                                     {
                                                         body,
-                                                        x_agentenv_sandbox_id
+                                                        x_agentenv_sandbox_id,
+                                                        x_agentenv_execution_id,
+                                                        x_agentenv_projection_ttl_secs
                                                     }
                                                 => {
                                                     if let Some(x_agentenv_sandbox_id) = x_agentenv_sandbox_id {
@@ -754,6 +756,44 @@ where
                                                       response_headers.insert(
                                                           HeaderName::from_static("x-agentenv-sandbox-id"),
                                                           x_agentenv_sandbox_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_execution_id) = x_agentenv_execution_id {
+                                                    let x_agentenv_execution_id = match header::IntoHeaderValue(x_agentenv_execution_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_execution_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-execution-id"),
+                                                          x_agentenv_execution_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_projection_ttl_secs) = x_agentenv_projection_ttl_secs {
+                                                    let x_agentenv_projection_ttl_secs = match header::IntoHeaderValue(x_agentenv_projection_ttl_secs).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_projection_ttl_secs header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-projection-ttl-secs"),
+                                                          x_agentenv_projection_ttl_secs
                                                       );
                                                     }
                                                     }
@@ -1061,7 +1101,9 @@ where
                                                 apis::sandboxes::SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully
                                                     {
                                                         body,
-                                                        x_agentenv_sandbox_id
+                                                        x_agentenv_sandbox_id,
+                                                        x_agentenv_execution_id,
+                                                        x_agentenv_projection_ttl_secs
                                                     }
                                                 => {
                                                     if let Some(x_agentenv_sandbox_id) = x_agentenv_sandbox_id {
@@ -1080,6 +1122,44 @@ where
                                                       response_headers.insert(
                                                           HeaderName::from_static("x-agentenv-sandbox-id"),
                                                           x_agentenv_sandbox_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_execution_id) = x_agentenv_execution_id {
+                                                    let x_agentenv_execution_id = match header::IntoHeaderValue(x_agentenv_execution_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_execution_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-execution-id"),
+                                                          x_agentenv_execution_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_projection_ttl_secs) = x_agentenv_projection_ttl_secs {
+                                                    let x_agentenv_projection_ttl_secs = match header::IntoHeaderValue(x_agentenv_projection_ttl_secs).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_projection_ttl_secs header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-projection-ttl-secs"),
+                                                          x_agentenv_projection_ttl_secs
                                                       );
                                                     }
                                                     }
@@ -1248,8 +1328,70 @@ where
     let resp = match result {
                                             Ok(rsp) => match rsp {
                                                 apis::sandboxes::SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning
-                                                    (body)
+                                                    {
+                                                        body,
+                                                        x_agentenv_sandbox_id,
+                                                        x_agentenv_execution_id,
+                                                        x_agentenv_projection_ttl_secs
+                                                    }
                                                 => {
+                                                    if let Some(x_agentenv_sandbox_id) = x_agentenv_sandbox_id {
+                                                    let x_agentenv_sandbox_id = match header::IntoHeaderValue(x_agentenv_sandbox_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_sandbox_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-sandbox-id"),
+                                                          x_agentenv_sandbox_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_execution_id) = x_agentenv_execution_id {
+                                                    let x_agentenv_execution_id = match header::IntoHeaderValue(x_agentenv_execution_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_execution_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-execution-id"),
+                                                          x_agentenv_execution_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_projection_ttl_secs) = x_agentenv_projection_ttl_secs {
+                                                    let x_agentenv_projection_ttl_secs = match header::IntoHeaderValue(x_agentenv_projection_ttl_secs).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_projection_ttl_secs header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-projection-ttl-secs"),
+                                                          x_agentenv_projection_ttl_secs
+                                                      );
+                                                    }
+                                                    }
                                                   let mut response = response.status(200);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
@@ -1266,8 +1408,70 @@ where
                                                   response.body(Body::from(body_content))
                                                 },
                                                 apis::sandboxes::SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully
-                                                    (body)
+                                                    {
+                                                        body,
+                                                        x_agentenv_sandbox_id,
+                                                        x_agentenv_execution_id,
+                                                        x_agentenv_projection_ttl_secs
+                                                    }
                                                 => {
+                                                    if let Some(x_agentenv_sandbox_id) = x_agentenv_sandbox_id {
+                                                    let x_agentenv_sandbox_id = match header::IntoHeaderValue(x_agentenv_sandbox_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_sandbox_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-sandbox-id"),
+                                                          x_agentenv_sandbox_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_execution_id) = x_agentenv_execution_id {
+                                                    let x_agentenv_execution_id = match header::IntoHeaderValue(x_agentenv_execution_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_execution_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-execution-id"),
+                                                          x_agentenv_execution_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_projection_ttl_secs) = x_agentenv_projection_ttl_secs {
+                                                    let x_agentenv_projection_ttl_secs = match header::IntoHeaderValue(x_agentenv_projection_ttl_secs).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_projection_ttl_secs header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-projection-ttl-secs"),
+                                                          x_agentenv_projection_ttl_secs
+                                                      );
+                                                    }
+                                                    }
                                                   let mut response = response.status(201);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
@@ -2661,6 +2865,24 @@ where
                                                   let mut response = response.status(204);
                                                   response.body(Body::empty())
                                                 },
+                                                apis::sandboxes::SandboxesSandboxIdRefreshesPostResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
                                                 apis::sandboxes::SandboxesSandboxIdRefreshesPostResponse::Status401_AuthenticationError
                                                     (body)
                                                 => {
@@ -2811,8 +3033,70 @@ where
     let resp = match result {
                                             Ok(rsp) => match rsp {
                                                 apis::sandboxes::SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully
-                                                    (body)
+                                                    {
+                                                        body,
+                                                        x_agentenv_sandbox_id,
+                                                        x_agentenv_execution_id,
+                                                        x_agentenv_projection_ttl_secs
+                                                    }
                                                 => {
+                                                    if let Some(x_agentenv_sandbox_id) = x_agentenv_sandbox_id {
+                                                    let x_agentenv_sandbox_id = match header::IntoHeaderValue(x_agentenv_sandbox_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_sandbox_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-sandbox-id"),
+                                                          x_agentenv_sandbox_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_execution_id) = x_agentenv_execution_id {
+                                                    let x_agentenv_execution_id = match header::IntoHeaderValue(x_agentenv_execution_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_execution_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-execution-id"),
+                                                          x_agentenv_execution_id
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_projection_ttl_secs) = x_agentenv_projection_ttl_secs {
+                                                    let x_agentenv_projection_ttl_secs = match header::IntoHeaderValue(x_agentenv_projection_ttl_secs).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_projection_ttl_secs header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-projection-ttl-secs"),
+                                                          x_agentenv_projection_ttl_secs
+                                                      );
+                                                    }
+                                                    }
                                                   let mut response = response.status(201);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
@@ -3186,6 +3470,24 @@ where
                                                 => {
                                                   let mut response = response.status(204);
                                                   response.body(Body::empty())
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdTimeoutPostResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
                                                 },
                                                 apis::sandboxes::SandboxesSandboxIdTimeoutPostResponse::Status401_AuthenticationError
                                                     (body)

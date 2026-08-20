@@ -3,6 +3,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -677,6 +678,47 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
         ProxyLookupResult::Paused { auto_resume: true }
     );
     assert_metrics_values(&orchestrator, 0, 0, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+/// 🔴 The startup ordering the routing projection's TTL now rests on.
+///
+/// Heartbeat reconciliation deletes every binding a node owns when that node
+/// reports an empty roster — that is what makes a node's disappearance clear
+/// its records instead of leaving them pointing at nothing. It also means a
+/// node that heartbeats *before* it has finished restoring its persisted
+/// sandboxes would wipe its own routing records on every restart, and would do
+/// it quietly: the records come back on the following heartbeat, so all anyone
+/// sees is a few seconds of 404s that look like a cold cache.
+///
+/// The ordering that prevents it is that `Orchestrator::new` finishes the
+/// restore before it returns, and `src/bin/server.rs` starts the reporter after
+/// that await. Nothing else pins it, so this does.
+#[tokio::test]
+async fn the_roster_is_complete_the_moment_new_returns() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let paused = paused_resume_metadata(sandbox_id);
+    let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
+
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister,
+    )
+    .await?;
+
+    // No await in between, and no background task to wait for: whatever the
+    // first heartbeat would carry is already here.
+    let roster = orchestrator.list_sandbox_roster().await?;
+
+    assert_eq!(
+        roster.len(),
+        1,
+        "a restored sandbox must be in the roster before anything can report an empty one"
+    );
+    assert_eq!(roster[0].sandbox_id, sandbox_id);
+    assert_eq!(roster[0].execution_id, paused.execution_id);
     Ok(())
 }
 
@@ -2737,6 +2779,114 @@ async fn keep_alive_uses_latest_metadata_when_deciding_whether_to_shorten() -> R
     assert_eq!(fetched.timeout, Some(Duration::from_secs(300)));
     assert_eq!(fetched.expires_at, updated.expires_at);
     Ok(())
+}
+
+/// The ceiling clamps a renewal; it does not refuse one.
+///
+/// 🔴 The direction matters. Refusing an over-long renewal would hand a new 400
+/// to every client that passes a generous timeout — and clients pass generous
+/// timeouts because that is what the API has always accepted.
+#[tokio::test]
+async fn keep_alive_clamps_an_over_long_renewal_to_the_ceiling() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let created_at = SystemTime::now() - Duration::from_secs(60);
+    let mut metadata = SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Running,
+        created_at,
+        max_lifetime: Some(Duration::from_secs(300)),
+        ..Default::default()
+    };
+    metadata.set_timeout(Some(Duration::from_secs(30)));
+
+    let store = InMemoryMetadataStore::new();
+    store.add(metadata).await?;
+    let orchestrator = make_orchestrator_without_background(store);
+
+    let updated = orchestrator
+        .keep_alive_for(sandbox_id, Some(Duration::from_secs(3_600)), true)
+        .await?
+        .expect("keep_alive_for should return updated metadata");
+
+    assert_eq!(
+        updated.expires_at,
+        Some(created_at + Duration::from_secs(300)),
+        "the deadline may not be pushed past the ceiling"
+    );
+    // The request itself succeeded and recorded what was asked for.
+    assert_eq!(updated.timeout, Some(Duration::from_secs(3_600)));
+    Ok(())
+}
+
+/// The control face for the test above: the same call on a node with no
+/// ceiling. Without this, "clamped to 300" could just as well be "the ceiling
+/// was never consulted and 300 came from somewhere else".
+#[tokio::test]
+async fn keep_alive_without_a_ceiling_is_not_clamped() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let mut metadata = SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Running,
+        created_at: SystemTime::now() - Duration::from_secs(60),
+        max_lifetime: None,
+        ..Default::default()
+    };
+    metadata.set_timeout(Some(Duration::from_secs(30)));
+
+    let store = InMemoryMetadataStore::new();
+    store.add(metadata).await?;
+    let orchestrator = make_orchestrator_without_background(store);
+
+    let updated = orchestrator
+        .keep_alive_for(sandbox_id, Some(Duration::from_secs(3_600)), true)
+        .await?
+        .expect("keep_alive_for should return updated metadata");
+
+    let deadline = updated.expires_at.expect("a deadline");
+    assert!(
+        deadline > SystemTime::now() + Duration::from_secs(3_000),
+        "an uncapped sandbox keeps the full hour it asked for"
+    );
+    Ok(())
+}
+
+/// The one refusal the ceiling produces, and the reason `/timeout` and
+/// `/refreshes` grew a 400 they never returned before.
+///
+/// 🔴 Only reachable as a unit test. End to end the window is under a second:
+/// the eviction loop runs every `auto_evict_interval_ms` and tears down a
+/// sandbox the moment it passes `expires_at`, which a clamped sandbox reaches
+/// at the same instant it passes its ceiling.
+#[tokio::test]
+async fn keep_alive_refuses_a_sandbox_that_is_already_past_its_ceiling() {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let created_at = SystemTime::now() - Duration::from_secs(3_600);
+    let metadata = SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Running,
+        created_at,
+        max_lifetime: Some(Duration::from_secs(300)),
+        ..Default::default()
+    };
+
+    let store = InMemoryMetadataStore::new();
+    store.add(metadata).await.expect("seed the store");
+    let orchestrator = make_orchestrator_without_background(store);
+
+    let err = orchestrator
+        .keep_alive_for(sandbox_id, Some(Duration::from_secs(60)), true)
+        .await
+        .expect_err("a sandbox past its ceiling has no window left to extend into");
+
+    match err {
+        OrchestratorError::SandboxLifetimeExceeded { deadline, .. } => {
+            assert_eq!(deadline, created_at + Duration::from_secs(300));
+        }
+        other => panic!("expected SandboxLifetimeExceeded, got {other:?}"),
+    }
 }
 
 #[tokio::test]

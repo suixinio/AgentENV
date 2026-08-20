@@ -136,6 +136,19 @@ async fn main() -> anyhow::Result<()> {
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
     let factory = FirecrackerSandboxFactory::with_cpu_config(applied_cpu_arc);
+    // 🔴 This await, and the `reporter.start()` below it, are in this order on
+    // purpose. `Orchestrator::new` restores the persisted paused sandboxes
+    // before it returns, so by the time the reporter sends its first heartbeat
+    // the roster is already complete.
+    //
+    // The scheduler deletes every routing binding a node owns when that node
+    // reports an empty roster — which is what makes a node's disappearance
+    // clear its records rather than leave them pointing at nothing. Start the
+    // reporter first and a restart would wipe this node's own records, and do
+    // it quietly: the next heartbeat puts them back, so all anyone sees is a
+    // few seconds of 404s indistinguishable from a cold cache. Pinned by
+    // `the_roster_is_complete_the_moment_new_returns` in
+    // `src/orchestrator/tests.rs`.
     let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {

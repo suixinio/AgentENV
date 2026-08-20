@@ -451,20 +451,22 @@ impl ObservabilityReporter {
             node_id: service.node_id().to_string(),
             cluster_id: service.cluster_id().to_string(),
             service_instance_id: service.service_instance_id().to_string(),
-            events: events
-                .into_iter()
-                .map(|event| scheduler::SandboxEvent {
-                    sandbox_id: event.sandbox_id.to_string(),
-                    event_type: Self::map_sandbox_event_type(event.event_type).into(),
-                    // The guard the receiver deletes a projection under. An
-                    // empty value there means "no guard", so this is never
-                    // allowed to go out empty.
-                    execution_id: event.execution_id.to_string(),
-                    requested_cpu: event.resources.cpu_count,
-                    requested_memory_bytes: u64::from(event.resources.memory_mib) * 1024 * 1024,
-                    requested_disk_bytes: u64::from(event.resources.disk_size_mib) * 1024 * 1024,
-                })
-                .collect(),
+            events: events.into_iter().map(Self::map_sandbox_event).collect(),
+        }
+    }
+
+    fn map_sandbox_event(event: SandboxLifecycleEvent) -> scheduler::SandboxEvent {
+        scheduler::SandboxEvent {
+            sandbox_id: event.sandbox_id.to_string(),
+            event_type: Self::map_sandbox_event_type(event.event_type).into(),
+            // The guard the receiver deletes a projection under. An empty value
+            // there means "no guard at all", and the receiver then declines to
+            // delete rather than deleting unguarded — so an event that goes out
+            // without this is an event that does nothing.
+            execution_id: event.execution_id.to_string(),
+            requested_cpu: event.resources.cpu_count,
+            requested_memory_bytes: u64::from(event.resources.memory_mib) * 1024 * 1024,
+            requested_disk_bytes: u64::from(event.resources.disk_size_mib) * 1024 * 1024,
         }
     }
 
@@ -527,6 +529,9 @@ impl ReporterConfig {
 mod tests {
     use super::*;
     use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
+    use crate::observability::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
+    use crate::orchestrator::SandboxRosterEntry;
+    use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
     fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
@@ -583,6 +588,122 @@ mod tests {
         let cfg = make_report_config(Some(true), Some(0));
         let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
         assert_eq!(result.interval, Duration::from_secs(1));
+    }
+
+    fn node_snapshot(roster: Vec<SandboxRosterEntry>) -> NodeSnapshot {
+        NodeSnapshot {
+            version: "test".to_string(),
+            commit: "test".to_string(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "instance-a".to_string(),
+            cluster_id: uuid::Uuid::nil(),
+            machine_info: MachineInfo {
+                cpu_family: String::new(),
+                cpu_model: String::new(),
+                cpu_model_name: String::new(),
+                cpu_architecture: String::new(),
+                cpu_config_json: None,
+            },
+            sandbox_count: roster.len() as u32,
+            sandbox_ids: roster.iter().map(|entry| entry.sandbox_id).collect(),
+            sandbox_roster: roster,
+            metrics: NodeMetricsSnapshot {
+                allocated_cpu: 0,
+                allocated_memory_bytes: 0,
+                cpu_percent: 0,
+                cpu_count: 0,
+                memory_used_bytes: 0,
+                memory_total_bytes: 0,
+                disks: Vec::new(),
+                paused_allocated_cpu: 0,
+                paused_allocated_memory_bytes: 0,
+            },
+            draining: false,
+            create_successes: 0,
+            create_fails: 0,
+            sandbox_starting_count: 0,
+            paused_sandbox_count: 0,
+        }
+    }
+
+    /// The heartbeat is the repair path for a projection write that was lost,
+    /// so it has to carry the sandbox's own budget. A repair that installs the
+    /// receiver's default instead turns one dropped write into a permanently
+    /// short-lived record — and nothing anywhere reports that it happened.
+    #[test]
+    fn the_heartbeat_roster_carries_each_sandbox_budget() {
+        let entry = SandboxRosterEntry {
+            sandbox_id: SandboxId::new(),
+            execution_id: ExecutionId::new(),
+            projection_ttl_secs: 86_460,
+        };
+
+        let request =
+            ObservabilityReporter::build_heartbeat_request(node_snapshot(vec![entry]), 0, None);
+
+        assert_eq!(request.roster.len(), 1);
+        assert_eq!(request.roster[0].sandbox_id, entry.sandbox_id.to_string());
+        assert_eq!(
+            request.roster[0].execution_id,
+            entry.execution_id.to_string()
+        );
+        assert_eq!(request.roster[0].projection_ttl_secs, 86_460);
+    }
+
+    /// 🔴 The control face: a node with no ceiling says 0, and 0 is the value
+    /// the receiver reads as "use your own default". It is never "do not
+    /// expire" — a record that outlives every path able to delete it is a route
+    /// pointing at a sandbox nobody can reach.
+    #[test]
+    fn a_roster_entry_without_a_budget_says_zero() {
+        let entry = SandboxRosterEntry {
+            sandbox_id: SandboxId::new(),
+            execution_id: ExecutionId::new(),
+            projection_ttl_secs: 0,
+        };
+
+        let request =
+            ObservabilityReporter::build_heartbeat_request(node_snapshot(vec![entry]), 0, None);
+
+        assert_eq!(request.roster[0].projection_ttl_secs, 0);
+    }
+
+    /// Every lifecycle event names the run it belongs to. The receiver guards a
+    /// projection delete with this value and declines to delete when it is
+    /// missing, so an event that goes out without one is an event that does
+    /// nothing at all.
+    #[test]
+    fn every_lifecycle_event_names_its_incarnation() {
+        for event_type in [
+            SandboxLifecycleEventType::Create,
+            SandboxLifecycleEventType::Delete,
+            SandboxLifecycleEventType::Pause,
+            SandboxLifecycleEventType::Resume,
+            SandboxLifecycleEventType::Fork,
+        ] {
+            let event = SandboxLifecycleEvent {
+                event_type,
+                sandbox_id: SandboxId::new(),
+                execution_id: ExecutionId::new(),
+                resources: SandboxResources {
+                    cpu_count: 2,
+                    memory_mib: 512,
+                    disk_size_mib: 1024,
+                },
+            };
+
+            let wire = ObservabilityReporter::map_sandbox_event(event);
+
+            assert_eq!(wire.sandbox_id, event.sandbox_id.to_string());
+            assert_eq!(
+                wire.execution_id,
+                event.execution_id.to_string(),
+                "{event_type:?} must name the run it belongs to"
+            );
+            assert!(!wire.execution_id.is_empty());
+            assert_eq!(wire.requested_memory_bytes, 512 * 1024 * 1024);
+            assert_eq!(wire.requested_disk_bytes, 1024 * 1024 * 1024);
+        }
     }
 
     #[test]

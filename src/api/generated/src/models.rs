@@ -5642,6 +5642,11 @@ pub struct SandboxForkResult {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<models::Error>,
+
+    /// How long this fork's routing projection should live, in whole seconds, as derived from the node's sandbox lifetime ceiling. 0 or absent means the receiver should use its own default TTL; it never means the record should not expire. Carried here rather than on Sandbox because fork answers with a top-level array — one response, N children, N incarnations — so a response header cannot say it per child, and Sandbox is the user-facing model while this is a routing-infrastructure value.
+    #[serde(rename = "projectionTtlSecs")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_ttl_secs: Option<i64>,
 }
 
 impl SandboxForkResult {
@@ -5650,6 +5655,7 @@ impl SandboxForkResult {
         SandboxForkResult {
             sandbox: None,
             error: None,
+            projection_ttl_secs: None,
         }
     }
 }
@@ -5663,7 +5669,15 @@ impl std::fmt::Display for SandboxForkResult {
             // Skipping sandbox in query parameter serialization
 
             // Skipping error in query parameter serialization
-
+            self.projection_ttl_secs
+                .as_ref()
+                .map(|projection_ttl_secs| {
+                    [
+                        "projectionTtlSecs".to_string(),
+                        projection_ttl_secs.to_string(),
+                    ]
+                    .join(",")
+                }),
         ];
 
         write!(
@@ -5687,6 +5701,7 @@ impl std::str::FromStr for SandboxForkResult {
         struct IntermediateRep {
             pub sandbox: Vec<models::Sandbox>,
             pub error: Vec<models::Error>,
+            pub projection_ttl_secs: Vec<i64>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -5718,6 +5733,10 @@ impl std::str::FromStr for SandboxForkResult {
                         <models::Error as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "projectionTtlSecs" => intermediate_rep.projection_ttl_secs.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxForkResult".to_string(),
@@ -5734,6 +5753,7 @@ impl std::str::FromStr for SandboxForkResult {
         std::result::Result::Ok(SandboxForkResult {
             sandbox: intermediate_rep.sandbox.into_iter().next(),
             error: intermediate_rep.error.into_iter().next(),
+            projection_ttl_secs: intermediate_rep.projection_ttl_secs.into_iter().next(),
         })
     }
 }

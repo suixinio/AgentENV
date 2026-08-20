@@ -35,6 +35,33 @@ fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
 
+/// The routing values a control-plane 2xx hands back to the gateway so it can
+/// write the sandbox's routing projection without asking the scheduler first.
+///
+/// 🔴 All three, not just the id. `x-agentenv-execution-id` used to be written
+/// only by the data-plane proxy's echo, so control-plane responses never
+/// carried one — which meant every projection write the gateway made was
+/// unincarnated, and under `enforce` arbitration an unincarnated write against
+/// an existing record is refused *silently*. On resume that is the whole point
+/// of the write: resume mints a fresh incarnation, so without this header the
+/// record keeps naming the run that ended.
+struct RoutingHeaders {
+    sandbox_id: String,
+    execution_id: String,
+    /// 🔴 0 means "use your own default TTL". It never means "do not expire".
+    projection_ttl_secs: i64,
+}
+
+impl RoutingHeaders {
+    fn of(metadata: &SandboxMetadata) -> Self {
+        Self {
+            sandbox_id: metadata.id.to_string(),
+            execution_id: metadata.execution_id.to_string(),
+            projection_ttl_secs: i64::from(metadata.projection_ttl_secs(SystemTime::now())),
+        }
+    }
+}
+
 fn default_sandbox_timeout() -> Duration {
     static DEFAULT_SANDBOX_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
@@ -59,6 +86,7 @@ impl From<OrchestratorError> for models::Error {
             ),
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
+            OrchestratorError::SandboxLifetimeExceeded { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation,
@@ -524,11 +552,13 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(metadata) => {
-                let sandbox_id = metadata.id.to_string();
+                let routing = RoutingHeaders::of(&metadata);
                 Ok(
                     SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
                         body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
+                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                        x_agentenv_execution_id: Some(routing.execution_id),
+                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
                     },
                 )
             }
@@ -657,11 +687,13 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(metadata) => {
-                let sandbox_id = metadata.id.to_string();
+                let routing = RoutingHeaders::of(&metadata);
                 Ok(
                     SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
                         body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
+                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                        x_agentenv_execution_id: Some(routing.execution_id),
+                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
                     },
                 )
             }
@@ -730,10 +762,18 @@ impl Sandboxes<()> for ApiImpl {
                         );
                     }
                 }
+                // The sandbox did not move, but the gateway still records a
+                // routing projection for this request, and a write without an
+                // incarnation is the one arbitration refuses without saying so.
+                let routing = RoutingHeaders::of(&metadata);
+
                 return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning(
-                        self.sandbox_model(metadata),
-                    ),
+                    SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                        x_agentenv_execution_id: Some(routing.execution_id),
+                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                    },
                 );
             }
             SandboxState::Killing => {
@@ -804,10 +844,15 @@ impl Sandboxes<()> for ApiImpl {
                         .await;
                 }
 
+                let routing = RoutingHeaders::of(&resumed_metadata);
+
                 return Ok(
-                SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully(
-                    self.sandbox_model(resumed_metadata),
-                ),
+                SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                    body: self.sandbox_model(resumed_metadata),
+                    x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                    x_agentenv_execution_id: Some(routing.execution_id),
+                    x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                },
             );
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
@@ -917,13 +962,23 @@ impl Sandboxes<()> for ApiImpl {
                 let results = outcomes
                     .into_iter()
                     .map(|outcome| match outcome {
-                        Ok(metadata) => models::SandboxForkResult {
-                            sandbox: Some(self.sandbox_model(metadata)),
-                            error: None,
-                        },
+                        Ok(metadata) => {
+                            // 🔴 On the body, not on a header: one response,
+                            // N children, N incarnations. The child's own
+                            // incarnation is already inside `sandbox`.
+                            let projection_ttl_secs =
+                                i64::from(metadata.projection_ttl_secs(SystemTime::now()));
+
+                            models::SandboxForkResult {
+                                sandbox: Some(self.sandbox_model(metadata)),
+                                error: None,
+                                projection_ttl_secs: Some(projection_ttl_secs),
+                            }
+                        }
                         Err(err) => models::SandboxForkResult {
                             sandbox: None,
                             error: Some(models::Error::from(err)),
+                            projection_ttl_secs: None,
                         },
                     })
                     .collect();
@@ -1293,6 +1348,16 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdRefreshesPostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
+            // 🔴 Matched explicitly. The catch-all below hands the error to
+            // `From<OrchestratorError>`, which builds a body whose `code` says
+            // 400 and then ships it inside an HTTP 500 — a mismatch a client
+            // cannot act on.
+            Err(err @ OrchestratorError::SandboxLifetimeExceeded { .. }) => Ok(
+                SandboxesSandboxIdRefreshesPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    err.to_string(),
+                )),
+            ),
             Err(err) => {
                 Ok(SandboxesSandboxIdRefreshesPostResponse::Status500_ServerError(err.into()))
             }
@@ -1408,10 +1473,15 @@ impl Sandboxes<()> for ApiImpl {
                         .await;
                 }
 
+                let routing = RoutingHeaders::of(&metadata);
+
                 return Ok(
-                    SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
-                        self.sandbox_model(metadata),
-                    ),
+                    SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                        x_agentenv_execution_id: Some(routing.execution_id),
+                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                    },
                 );
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
@@ -1430,9 +1500,14 @@ impl Sandboxes<()> for ApiImpl {
                             )
                         }
                         MissingLocalResume::Resumed(metadata) => {
-                            SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
-                                self.sandbox_model(*metadata),
-                            )
+                            let routing = RoutingHeaders::of(&metadata);
+
+                            SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                                body: self.sandbox_model(*metadata),
+                                x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                                x_agentenv_execution_id: Some(routing.execution_id),
+                                x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                            }
                         }
                         MissingLocalResume::Busy { holder } => {
                             SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
@@ -1441,37 +1516,48 @@ impl Sandboxes<()> for ApiImpl {
                             ))
                         }
                         MissingLocalResume::Undecided(reason) => {
-                            SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
-                                500,
-                                format!(
+                            SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                                Self::error(
+                                    500,
+                                    format!(
                                     "cannot determine whether the sandbox still exists: {reason}"
                                 ),
-                            ))
+                                ),
+                            )
                         }
                     });
                 };
 
-                return Ok(match self
-                    .restore_claimed_sandbox(*entry, NewTimeout::Set(timeout))
-                    .await
-                {
-                    CrossNodeResume::Restored(metadata) => {
-                        SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully(
-                            self.sandbox_model(*metadata),
-                        )
-                    }
-                    CrossNodeResume::NotFound => {
-                        SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                            sandbox_not_found(id),
-                        )
-                    }
-                    CrossNodeResume::Failed(reason) => {
-                        SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
-                            500,
-                            format!("failed to restore paused sandbox: {reason}"),
-                        ))
-                    }
-                });
+                return Ok(
+                    match self
+                        .restore_claimed_sandbox(*entry, NewTimeout::Set(timeout))
+                        .await
+                    {
+                        CrossNodeResume::Restored(metadata) => {
+                            let routing = RoutingHeaders::of(&metadata);
+
+                            SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                            body: self.sandbox_model(*metadata),
+                            x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                            x_agentenv_execution_id: Some(routing.execution_id),
+                            x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                        }
+                        }
+                        CrossNodeResume::NotFound => {
+                            SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                                sandbox_not_found(id),
+                            )
+                        }
+                        CrossNodeResume::Failed(reason) => {
+                            SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                                Self::error(
+                                    500,
+                                    format!("failed to restore paused sandbox: {reason}"),
+                                ),
+                            )
+                        }
+                    },
+                );
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 if let Some(generation) = held {
@@ -1525,6 +1611,12 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdTimeoutPostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
+            // Explicit for the same reason as on the refresh route above.
+            Err(err @ OrchestratorError::SandboxLifetimeExceeded { .. }) => {
+                Ok(SandboxesSandboxIdTimeoutPostResponse::Status400_BadRequest(
+                    Self::error(400, err.to_string()),
+                ))
+            }
             Err(err) => {
                 Ok(SandboxesSandboxIdTimeoutPostResponse::Status500_ServerError(err.into()))
             }
@@ -1741,6 +1833,194 @@ mod tests {
             .expect("empty update should be valid");
 
         assert_eq!(policy, SandboxNetworkPolicy::default());
+    }
+}
+
+#[cfg(test)]
+mod routing_header_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    /// The four operations whose success responses the gateway turns into a
+    /// routing projection write. All four are POSTs; the GET that shares two of
+    /// these paths is not one of them.
+    const ROUTING_OPERATIONS: [&str; 4] = [
+        "/sandboxes",
+        "/sandboxes-cold",
+        "/sandboxes/{sandboxID}/resume",
+        "/sandboxes/{sandboxID}/connect",
+    ];
+
+    const ROUTING_HEADERS: [&str; 3] = [
+        "x-agentenv-sandbox-id",
+        "x-agentenv-execution-id",
+        "x-agentenv-projection-ttl-secs",
+    ];
+
+    const SPEC: &str = include_str!("../openapi.yml");
+
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// The lines of one block, from the line after `header` up to the next line
+    /// indented no further than `header` was.
+    fn block_after(lines: &[&str], header_index: usize) -> Vec<String> {
+        let base = indent_of(lines[header_index]);
+
+        lines[header_index + 1..]
+            .iter()
+            .take_while(|line| line.trim().is_empty() || indent_of(line) > base)
+            .map(|line| (*line).to_string())
+            .collect()
+    }
+
+    fn schema_block(name: &str) -> Vec<String> {
+        let lines: Vec<&str> = SPEC.lines().collect();
+        let header = format!("    {name}:");
+        let index = lines
+            .iter()
+            .position(|line| *line == header)
+            .unwrap_or_else(|| panic!("{name} is not a schema in the spec"));
+
+        block_after(&lines, index)
+    }
+
+    #[test]
+    fn routing_headers_name_the_sandbox_the_run_and_the_budget() {
+        let created_at = UNIX_EPOCH + Duration::from_secs(1_000);
+        let metadata = SandboxMetadata {
+            created_at,
+            max_lifetime: Some(Duration::from_secs(86_400)),
+            ..Default::default()
+        };
+
+        let routing = RoutingHeaders::of(&metadata);
+
+        assert_eq!(routing.sandbox_id, metadata.id.to_string());
+        assert_eq!(routing.execution_id, metadata.execution_id.to_string());
+        // A sandbox created at the epoch is long past its ceiling. What comes
+        // out is still positive: the receiver has to be able to read every
+        // value here as a duration, and 0 is spoken for.
+        assert!(
+            routing.projection_ttl_secs > 0,
+            "a sandbox past its ceiling still asks for a short record, not an immortal one"
+        );
+    }
+
+    /// 🔴 The control face. Without a ceiling the node has nothing to derive a
+    /// TTL from and says so with 0 — which the receiver reads as "use your own
+    /// default", never as "this record should not expire".
+    #[test]
+    fn routing_headers_report_zero_when_the_node_has_no_ceiling() {
+        let metadata = SandboxMetadata {
+            max_lifetime: None,
+            ..Default::default()
+        };
+
+        assert_eq!(RoutingHeaders::of(&metadata).projection_ttl_secs, 0);
+    }
+
+    #[test]
+    fn a_live_sandbox_reports_a_budget_that_outlives_it() {
+        let metadata = SandboxMetadata {
+            created_at: SystemTime::now(),
+            max_lifetime: Some(Duration::from_secs(3_600)),
+            ..Default::default()
+        };
+
+        let ttl = RoutingHeaders::of(&metadata).projection_ttl_secs;
+
+        // At least the hour the sandbox has left. A projection that expires
+        // before the sandbox it points at is the failure this value exists to
+        // prevent, and it is invisible from the outside: the route simply
+        // misses, exactly as a cold cache would.
+        assert!(
+            ttl >= 3_600,
+            "expected at least the remaining hour, got {ttl}"
+        );
+    }
+
+    /// 🔴 Pinned against the spec rather than against the handlers, so it also
+    /// holds for a route added later. Dropping a header here does not break the
+    /// build anywhere a reader would look: it regenerates a response variant
+    /// with one fewer field, and what fails downstream is a projection write
+    /// that incarnation arbitration refuses without saying so.
+    #[test]
+    fn every_routing_response_declares_all_three_headers() {
+        let lines: Vec<&str> = SPEC.lines().collect();
+        let mut path: Option<&str> = None;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            if indent_of(line) == 2 && trimmed.starts_with('/') && trimmed.ends_with(':') {
+                path = Some(trimmed.trim_end_matches(':'));
+                continue;
+            }
+            // Only the POST on these paths creates or resumes a sandbox; the
+            // listing GET that shares one of them does not.
+            if indent_of(line) != 8 || !trimmed.starts_with("\"2") {
+                continue;
+            }
+            let Some(path) = path.filter(|path| ROUTING_OPERATIONS.contains(path)) else {
+                continue;
+            };
+            if !lines[..index]
+                .iter()
+                .rev()
+                .find(|line| indent_of(line) == 4 && line.trim().ends_with(':'))
+                .is_some_and(|line| line.trim() == "post:")
+            {
+                continue;
+            }
+
+            let status = trimmed.trim_end_matches(':');
+            let block = block_after(&lines, index);
+            checked += 1;
+
+            for header in ROUTING_HEADERS {
+                if !block.iter().any(|line| line.trim() == format!("{header}:")) {
+                    offenders.push(format!("{path} {status} does not return {header}"));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "every 2xx the gateway records a routing projection from must name the sandbox, \
+             the run, and the budget: {offenders:?}"
+        );
+        // Guards the parser itself: an expression that silently matches
+        // nothing would otherwise pass this test forever.
+        assert_eq!(
+            checked, 5,
+            "expected create, cold, resume, and both connect outcomes"
+        );
+    }
+
+    /// The other half of the carrier. Fork answers with a top-level array, so
+    /// its TTL rides in the body — and on the infrastructure wrapper rather
+    /// than on the user-facing model.
+    #[test]
+    fn the_fork_result_carries_the_budget_and_the_user_facing_model_does_not() {
+        let carries = |name: &str| {
+            schema_block(name)
+                .iter()
+                .any(|line| line.trim() == "projectionTtlSecs:")
+        };
+
+        assert!(
+            carries("SandboxForkResult"),
+            "fork's per-child budget has nowhere else to travel: one response, N children, \
+             N incarnations"
+        );
+        assert!(
+            !carries("Sandbox"),
+            "the user-facing model must not grow a routing-infrastructure field"
+        );
     }
 }
 

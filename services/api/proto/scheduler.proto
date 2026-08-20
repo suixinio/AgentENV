@@ -4,6 +4,15 @@ package scheduler.v1;
 
 option go_package = "agentenv/services/api/proto;schedulerv1";
 
+// Scheduler is the placement and observation surface: gateways and nodes ask
+// it where a sandbox is, tell it where one ended up, and report what they hold.
+//
+// 🔴 No method on this service may answer with codes.PermissionDenied. That
+// code belongs to PausedRegistry, where it means "a superseded incarnation
+// tried to write" (see ExecutionAuthority and TransitionSandboxRequest
+// .execution_id). The gateway's scheduler error mapping has no branch for it
+// and falls through to a 502, so returning it here turns a precise refusal
+// into a misdiagnosed server fault.
 service Scheduler {
   rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
@@ -100,6 +109,42 @@ enum SandboxLocation {
   SANDBOX_LOCATION_PINNED = 3;
 }
 
+// ExecutionAuthority says how strong the source of an execution_id is.
+//
+// 🔴 It is not a confidence level. It is the answer to "may this be used to
+// refuse traffic", and only REGISTRY answers yes.
+enum ExecutionAuthority {
+  // A scheduler from before this field existed. Equivalent to UNKNOWN, and
+  // that equivalence is hard: a caller that handles 0 separately gives two
+  // behaviours for one situation for the length of a rolling upgrade.
+  EXECUTION_AUTHORITY_UNSPECIFIED = 0;
+  // The scheduler cannot name the current incarnation — the sandbox has never
+  // entered the registry, or the binding or roster this answer came from was
+  // written before incarnations were recorded. The caller must let the request
+  // through and count the pass as unprotected.
+  EXECUTION_AUTHORITY_UNKNOWN = 1;
+  // execution_id comes from an authoritative source and names the incarnation
+  // that should be alive, right now, on the node the answer names. This is the
+  // only value that licenses a refusal, and it is never reported with an empty
+  // execution_id — an authoritative source that has no incarnation to name is
+  // UNKNOWN, not an authoritative claim that there is none.
+  EXECUTION_AUTHORITY_REGISTRY = 2;
+  // The node is about to mint a new incarnation, which is what PLACED and
+  // PINNED both mean. execution_id is left empty; a non-empty one would name
+  // the previous incarnation and must never be used to refuse.
+  //
+  // 🔴 Both of those locations report PENDING, and the branch says so
+  // explicitly rather than letting the row's value decide. Under PLACED, and
+  // under the local_only half of PINNED, the registry's CHECK constraint pins
+  // execution_id to NULL, so there is nothing to report. Under the publishing
+  // half of PINNED the column is non-empty — and it names a VM that is already
+  // stopped, because a pause stops the VM before it uploads. Inferring
+  // authority from "is the value empty" therefore gives one location two
+  // authority levels, and the stronger of them refuses every data-plane auto
+  // resume that branch exists to serve.
+  EXECUTION_AUTHORITY_PENDING = 3;
+}
+
 message LookupNodeResponse {
   Node node = 1;
   SandboxLocation location = 2;
@@ -108,11 +153,31 @@ message LookupNodeResponse {
   // the preference the placement was taken against, which may or may not be the
   // node above.
   string origin_node_id = 3;
+  // The incarnation this answer points at: the one the scheduler holds as the
+  // one that should be alive on the node named above, right now.
+  //
+  // Not "the value a client should send", and not "an incarnation that once
+  // existed". Empty says the scheduler cannot name one, which is what
+  // execution_authority = UNKNOWN says as well.
+  //
+  // Shape follows NodeIdentity.service_instance_id: the string form of a
+  // UUIDv7, lowercase canonical, validated server-side.
+  string execution_id = 4;
+  // What the caller is licensed to do with execution_id. Read this before
+  // reading the field above, never after: an empty execution_id is a different
+  // fact under UNKNOWN than under PENDING, and REGISTRY never carries one.
+  ExecutionAuthority execution_authority = 5;
 }
 
 message RecordAssignmentRequest {
   string sandbox_id = 1;
   Node node = 2;
+  // Optional: the incarnation the node reported for this sandbox, when the
+  // caller could read it off the node's response. Empty is an ordinary answer
+  // and only costs authority for the window between the create and the node's
+  // first heartbeat — during which the sandbox is brand new and has exactly
+  // one incarnation, so nothing can be confused with anything.
+  string execution_id = 3;
 }
 
 message RecordAssignmentResponse {}
@@ -208,8 +273,40 @@ message HeartbeatRequest {
   string commit = 5;
   MachineInfo machine_info = 6;
   NodeSnapshot snapshot = 7;
-  repeated string sandbox_ids = 8;
+  // Deprecated: the roster without incarnations, superseded by `roster` below.
+  //
+  // 🔴 Kept rather than reserved, for one release cycle. Nodes and the
+  // controller roll independently, so mixed versions are certain inside the
+  // window, and an empty roster does not read as a degraded report here — it
+  // reads as "this node holds no sandboxes at all" and deletes every binding
+  // the node owns. A new controller against an old node would therefore have
+  // the data plane answer 404 for every sandbox that has never been paused,
+  // for the whole rolling window.
+  //
+  // Removable once heartbeat_legacy_roster_total has been zero across the
+  // fleet — not before.
+  repeated string sandbox_ids = 8 [deprecated = true];
   P2pEndpoint p2p_endpoint = 9;
+  // The sandboxes alive on this node, and the incarnation each is running
+  // under. Supersedes sandbox_ids.
+  //
+  // A node that reports this reports it in full: empty still means "nothing
+  // here", exactly as it does above. The receiver distinguishes "this node
+  // sent an empty roster" from "this node is too old to send one" by the
+  // presence of sandbox_ids, not by this field being empty.
+  repeated SandboxRosterEntry roster = 10;
+}
+
+// SandboxRosterEntry is one sandbox on a node, as that node reports it.
+message SandboxRosterEntry {
+  string sandbox_id = 1;
+  // Lowercase canonical UUIDv7. Empty means this entry takes no part in
+  // binding arbitration — it is unknown, so it may install a binding where
+  // there is none but may never displace one that names an incarnation.
+  //
+  // 🔴 Empty does not mean "drop the entry": the entry still routes. Dropping
+  // it would trade away a working route to avoid an unprotected one.
+  string execution_id = 2;
 }
 
 message HeartbeatResponse {
@@ -341,6 +438,11 @@ message RegistrySandbox {
   // The node this row makes authoritative: claimed_by_node_id when resuming,
   // origin_node_id otherwise. Derived, not stored.
   string holder_node_id = 12;
+  // The incarnation this row is fenced against. Empty when the row's state
+  // pins the column to NULL. Read-only exposure: when one sandbox turns out to
+  // be live in two places, this is the only per-row thing to reconcile them
+  // against.
+  string execution_id = 13;
 }
 
 message ListRegistrySandboxesRequest {
@@ -380,6 +482,18 @@ message ListRegistrySandboxesResponse {
 // 🔴 No method may answer a failure with an empty result. A sandbox missing
 // from GetSandboxes means the row does not exist, and the caller deletes local
 // artifacts on the strength of that. Anything that went wrong is an RPC error.
+//
+// 🔴 Two refusals on this service look alike and are not interchangeable. A
+// write from a superseded incarnation is codes.PermissionDenied, and it is
+// terminal: the caller must not retry it, must not publish behind it, and must
+// not delete the snapshot it was about to replace. A write whose generation
+// moved is codes.Aborted, and the caller re-reads the row and tries again.
+//
+// Wherever the first one has to be named as a string — a header value, a JSON
+// body, a log field — the name is `sandbox_execution_superseded`.
+//
+// 🔴 PermissionDenied belongs to this service alone; see the note on the
+// Scheduler service for why it may never appear there.
 // ─────────────────────────────────────────────────────────────────────────────
 service PausedRegistry {
   // Reads rows in bulk. All-or-nothing: any backend failure is an error, never
@@ -427,6 +541,13 @@ message RegistryEntry {
   // would make two transitions within the same second unorderable.
   int64 paused_at_unix_micros = 8;
   int64 updated_at_unix_micros = 9;
+  // The incarnation this row is fenced against, empty when the row's state
+  // pins the column to NULL.
+  //
+  // 🔴 The value handed back on a successful claim is the one the claiming
+  // node must quote at mark_running. Minting a fresh one there instead does
+  // not match mark_running's predicate, and every cross-node resume fails.
+  string execution_id = 10;
 }
 
 message GetSandboxesRequest {
@@ -476,16 +597,21 @@ enum TransitionKind {
   TRANSITION_KIND_RELEASE_CLAIM = 5;
   // Deletes the row. Requires expect_generation.
   TRANSITION_KIND_REMOVE = 7;
-  // Deprecated: the unconditional delete. Refused by this build.
+
+  // 🔴 6 was TRANSITION_KIND_REMOVE_UNCONDITIONAL, the unconditional delete,
+  // and this interface's one unguarded destructive write: the caller read the
+  // row, decided it was not live elsewhere, and then deleted it, with the
+  // decision and the delete in two statements. A node that had just come back
+  // from a partition and had not reconciled yet would take that path against a
+  // sandbox already resumed somewhere else, and the delete would succeed,
+  // silently, taking the snapshot with it. Guarding it in the caller was
+  // exactly the "the node decides" shape phase 2 exists to remove.
   //
-  // It was the whole interface's one unguarded destructive write: the caller
-  // read the row, decided it was not live elsewhere, and then deleted it, with
-  // the decision and the delete in two statements. A node that had just come
-  // back from a partition and had not reconciled yet would take that path
-  // against a sandbox already resumed somewhere else, and the delete would
-  // succeed, silently, taking the snapshot with it. Guarding it in the caller
-  // was exactly the "the node decides" shape phase 2 exists to remove.
-  TRANSITION_KIND_REMOVE_UNCONDITIONAL = 6 [deprecated = true];
+  // Reserved rather than recycled: a node still sending 6 would have its
+  // unconditional delete silently become whatever took the number over.
+  // Holding it makes protoc refuse the reuse on our behalf.
+  reserved 6;
+  reserved "TRANSITION_KIND_REMOVE_UNCONDITIONAL";
 }
 
 message TransitionSandboxRequest {
@@ -500,7 +626,8 @@ message TransitionSandboxRequest {
   // generation, so quoting one at it would suggest a guarantee it does not
   // give. (begin_pause creates or takes over a row and has nothing to quote.)
   //
-  // remove joined this list in D11. See TRANSITION_KIND_REMOVE_UNCONDITIONAL.
+  // remove joined this list in D11. See the `reserved 6` note on
+  // TransitionKind for what it used to be guarded against.
   optional int64 expect_generation = 5;
   // 🔴 Raw JSON bytes, passed through untouched. Not google.protobuf.Struct:
   // that reorders keys, collapses integers into doubles, and normalises what it
@@ -529,6 +656,20 @@ message TransitionSandboxRequest {
   // Absent means the sandbox was asked never to expire, which is a different
   // fact from unknown and is why this is optional rather than a zero.
   optional int64 sandbox_expires_at_unix_micros = 9;
+  // Which incarnation of the sandbox is making this write. A UUIDv7 in the
+  // same string shape as sandbox_id and cluster_id, lowercase canonical.
+  //
+  // 🔴 Required on begin_pause and mark_running, refused on the other four —
+  // per-kind and explicit, the same way expect_generation is, so that "this
+  // field is required" never has a middle state of "validated when present".
+  //
+  // Deliberately not an opt-in fencing token. e2b's ExpectExecutionID is
+  // optional because a caller that has just read the row, or a human giving a
+  // direct order, is a legitimate case there; neither is a case here, where
+  // every internal caller is "the controller decided, the node executes". An
+  // optional fencing token has to keep an "absent means allow" branch, and
+  // that branch is the entire attack surface.
+  string execution_id = 10;
 }
 
 message TransitionSandboxResponse {
@@ -583,6 +724,12 @@ message AcquireSandboxRequest {
   string node_id = 3;
   // A successful claim stamps a fresh lease; see TransitionSandboxRequest.
   int64 lease_ttl_millis = 4;
+  // Required: the incarnation this node will run the sandbox under once the
+  // claim succeeds. Minted before the claim and written by the same statement
+  // that sets claimed_by_node_id, so a resuming row names its claimant's new
+  // incarnation rather than the stopped one it is replacing — which is what
+  // lets a resume window stay fenced instead of going open.
+  string execution_id = 5;
 }
 
 message AcquiredSandbox {

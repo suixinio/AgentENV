@@ -38,6 +38,16 @@ const (
 // SchedulerClient is the client API for Scheduler service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Scheduler is the placement and observation surface: gateways and nodes ask
+// it where a sandbox is, tell it where one ended up, and report what they hold.
+//
+// 🔴 No method on this service may answer with codes.PermissionDenied. That
+// code belongs to PausedRegistry, where it means "a superseded incarnation
+// tried to write" (see ExecutionAuthority and TransitionSandboxRequest
+// .execution_id). The gateway's scheduler error mapping has no branch for it
+// and falls through to a 502, so returning it here turns a precise refusal
+// into a misdiagnosed server fault.
 type SchedulerClient interface {
 	Schedule(ctx context.Context, in *ScheduleRequest, opts ...grpc.CallOption) (*ScheduleResponse, error)
 	ListNodes(ctx context.Context, in *ListNodesRequest, opts ...grpc.CallOption) (*ListNodesResponse, error)
@@ -206,6 +216,16 @@ func (c *schedulerClient) ListRegistrySandboxes(ctx context.Context, in *ListReg
 // SchedulerServer is the server API for Scheduler service.
 // All implementations must embed UnimplementedSchedulerServer
 // for forward compatibility.
+//
+// Scheduler is the placement and observation surface: gateways and nodes ask
+// it where a sandbox is, tell it where one ended up, and report what they hold.
+//
+// 🔴 No method on this service may answer with codes.PermissionDenied. That
+// code belongs to PausedRegistry, where it means "a superseded incarnation
+// tried to write" (see ExecutionAuthority and TransitionSandboxRequest
+// .execution_id). The gateway's scheduler error mapping has no branch for it
+// and falls through to a 502, so returning it here turns a precise refusal
+// into a misdiagnosed server fault.
 type SchedulerServer interface {
 	Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error)
 	ListNodes(context.Context, *ListNodesRequest) (*ListNodesResponse, error)
@@ -643,6 +663,18 @@ const (
 // 🔴 No method may answer a failure with an empty result. A sandbox missing
 // from GetSandboxes means the row does not exist, and the caller deletes local
 // artifacts on the strength of that. Anything that went wrong is an RPC error.
+//
+// 🔴 Two refusals on this service look alike and are not interchangeable. A
+// write from a superseded incarnation is codes.PermissionDenied, and it is
+// terminal: the caller must not retry it, must not publish behind it, and must
+// not delete the snapshot it was about to replace. A write whose generation
+// moved is codes.Aborted, and the caller re-reads the row and tries again.
+//
+// Wherever the first one has to be named as a string — a header value, a JSON
+// body, a log field — the name is `sandbox_execution_superseded`.
+//
+// 🔴 PermissionDenied belongs to this service alone; see the note on the
+// Scheduler service for why it may never appear there.
 // ─────────────────────────────────────────────────────────────────────────────
 type PausedRegistryClient interface {
 	// Reads rows in bulk. All-or-nothing: any backend failure is an error, never
@@ -739,6 +771,18 @@ func (c *pausedRegistryClient) ReleaseNodeHoldings(ctx context.Context, in *Rele
 // 🔴 No method may answer a failure with an empty result. A sandbox missing
 // from GetSandboxes means the row does not exist, and the caller deletes local
 // artifacts on the strength of that. Anything that went wrong is an RPC error.
+//
+// 🔴 Two refusals on this service look alike and are not interchangeable. A
+// write from a superseded incarnation is codes.PermissionDenied, and it is
+// terminal: the caller must not retry it, must not publish behind it, and must
+// not delete the snapshot it was about to replace. A write whose generation
+// moved is codes.Aborted, and the caller re-reads the row and tries again.
+//
+// Wherever the first one has to be named as a string — a header value, a JSON
+// body, a log field — the name is `sandbox_execution_superseded`.
+//
+// 🔴 PermissionDenied belongs to this service alone; see the note on the
+// Scheduler service for why it may never appear there.
 // ─────────────────────────────────────────────────────────────────────────────
 type PausedRegistryServer interface {
 	// Reads rows in bulk. All-or-nothing: any backend failure is an error, never

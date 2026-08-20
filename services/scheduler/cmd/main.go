@@ -16,10 +16,12 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 	scheduler "agentenv/services/scheduler/internal"
+	"agentenv/services/scheduler/internal/catalog"
 	pausedregistry "agentenv/services/scheduler/internal/registry"
 	"agentenv/services/shared/config"
 	"agentenv/services/shared/logging"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -466,6 +468,9 @@ func openRegistryWriteSurface(
 
 		err := store.Migrate(ctx)
 		if err == nil {
+			err = migrateCatalog(ctx, store)
+		}
+		if err == nil {
 			var observed pausedregistry.GraceObservation
 			observed, err = grace.Enter(ctx, extender, cfg.Scheduler.Registry.ClusterID)
 			if err == nil {
@@ -478,7 +483,7 @@ func openRegistryWriteSurface(
 			}
 		}
 
-		logger.Error("paused registry write surface is not open; every registry request is refused until it is",
+		logger.Error("paused registry and snapshot catalog write surfaces are not open; every request to either is refused until they are",
 			zap.Error(err),
 			zap.Duration("retry_in", backoff),
 		)
@@ -487,6 +492,27 @@ func openRegistryWriteSurface(
 		}
 		backoff = nextBackoff(backoff, maxBackoff)
 	}
+}
+
+// migrateCatalog applies the snapshot catalog's schema, on the same pool and in
+// the same retry loop as the registry's.
+//
+// 🔴 Same loop, and after the registry's migration rather than beside it. Both
+// take the same advisory lock, so running them concurrently from one process
+// would be a lock this process waits on itself for; running them in a fixed
+// order makes that impossible. And the retry loop's contract already covers
+// this case: a schema that cannot be applied refuses its RPCs and leaves
+// routing, discovery and bindings alone, rather than taking the process down.
+//
+// A store that is not the postgres one has no pool and no catalog to migrate.
+// NewStore only ever returns the postgres one today, so this is the shape of a
+// future in-memory store rather than a case that happens.
+func migrateCatalog(ctx context.Context, store pausedregistry.Store) error {
+	pooled, ok := store.(interface{ Pool() *pgxpool.Pool })
+	if !ok {
+		return nil
+	}
+	return catalog.Migrate(ctx, pooled.Pool())
 }
 
 // registryHealthHandler reports the write surface's phase, and the cluster it

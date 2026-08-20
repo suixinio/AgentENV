@@ -16,6 +16,7 @@ import (
 	gateway "agentenv/services/gateway/internal"
 	"agentenv/services/shared/config"
 	"agentenv/services/shared/logging"
+	"agentenv/services/shared/routing"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -63,7 +64,20 @@ func main() {
 		queryOnlySchedulerClient = schedulerv1.NewSchedulerClient(queryOnlyConn)
 	}
 
-	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
+	// 🔴 Built here and only when the read switch is on, so "the switch is off"
+	// is a nil reader rather than a live connection nothing uses. NewReader
+	// dials and pings, so a wrong address stops the process at start-up instead
+	// of becoming a per-request warning that reads exactly like a cache miss.
+	var projectionReader *routing.Reader
+	if cfg.Gateway.Routing.ProjectionRead {
+		projectionReader, err = routing.NewReader(cfg.Gateway.RedisAddr)
+		if err != nil {
+			logger.Fatal("connect routing projection redis failed", zap.Error(err), zap.String("addr", cfg.Gateway.RedisAddr))
+		}
+		defer projectionReader.Close()
+	}
+
+	serverOptions := gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
 		DebugMode:                cfg.Gateway.DebugMode,
@@ -71,7 +85,17 @@ func main() {
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,
 		ExecutionFencing:         string(cfg.Gateway.Routing.ExecutionFencing),
 		ControlPlaneToken:        cfg.Gateway.ControlPlaneToken,
-	})
+		ProjectionAuthoritative:  cfg.Gateway.Routing.ProjectionAuthoritative,
+	}
+	// 🔴 Assigned through the branch rather than passed inline: a typed nil
+	// pointer stored in an interface field is not a nil interface, and the read
+	// path checks the interface. Passing projectionReader unconditionally would
+	// turn the switch off into a reader that panics on first use.
+	if projectionReader != nil {
+		serverOptions.ProjectionReader = projectionReader
+	}
+
+	s, err := gateway.NewServer(logger, schedulerClient, serverOptions)
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))
 	}
@@ -83,6 +107,8 @@ func main() {
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 		zap.String("execution_fencing", string(cfg.Gateway.Routing.ExecutionFencing)),
+		zap.Bool("routing_projection_read", cfg.Gateway.Routing.ProjectionRead),
+		zap.Bool("routing_projection_authoritative", cfg.Gateway.Routing.ProjectionAuthoritative),
 		// Whether the token is set, never the token. An operator needs to know
 		// which of the two states the gate is in, and that is the whole of it.
 		zap.Bool("control_plane_token_configured", strings.TrimSpace(cfg.Gateway.ControlPlaneToken) != ""),

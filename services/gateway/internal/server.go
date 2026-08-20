@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -23,11 +24,18 @@ import (
 )
 
 const (
-	headerSandboxID            = "x-agentenv-sandbox-id"
-	headerE2BSandboxID         = "e2b-sandbox-id"
-	headerTargetPort           = "x-agentenv-target-port"
-	headerE2BTargetPort        = "e2b-sandbox-port"
-	headerNodeID               = "x-agentenv-node-id"
+	headerSandboxID     = "x-agentenv-sandbox-id"
+	headerE2BSandboxID  = "e2b-sandbox-id"
+	headerTargetPort    = "x-agentenv-target-port"
+	headerE2BTargetPort = "e2b-sandbox-port"
+	headerNodeID        = "x-agentenv-node-id"
+	// headerProjectionTTLSecs is the node's own budget for how long the routing
+	// projection of the sandbox it just started should live, in whole seconds.
+	//
+	// 🔴 Absent, unparseable and non-positive all mean the same thing here:
+	// nothing to forward, and the scheduler falls back to its binding_ttl. None
+	// of them may ever become "no expiry".
+	headerProjectionTTLSecs    = "x-agentenv-projection-ttl-secs"
 	maxRecordAssignmentTimeout = 5 * time.Second
 
 	// headerReroute is how an isolated node asks for a request to be handed to
@@ -65,6 +73,15 @@ type ServerOptions struct {
 	// node. Empty means stamp nothing, which is the state the fleet runs in
 	// until the node-side gate is turned on.
 	ControlPlaneToken string
+	// ProjectionReader lets a sandbox route be answered out of the routing
+	// projection instead of from a LookupNode call. Nil is the read switch in
+	// its off position, and is the behaviour that shipped before it existed.
+	ProjectionReader projectionReader
+	// ProjectionAuthoritative is the gateway's half of the write-side switch:
+	// resume and connect record an assignment, and the incarnation and TTL a
+	// node reports are forwarded to the scheduler. Off forwards neither, which
+	// is a projection write identical to today's.
+	ProjectionAuthoritative bool
 }
 
 type Server struct {
@@ -84,6 +101,11 @@ type Server struct {
 	// meaning different things in different places.
 	executionFencing  fencingMode
 	controlPlaneToken string
+	// projectionReader is nil when the read switch is off. Checked once per
+	// request rather than being wrapped in a no-op implementation, so "the
+	// switch is off" is a state a reader of this code can see.
+	projectionReader        projectionReader
+	projectionAuthoritative bool
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -103,16 +125,18 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	}
 
 	return &Server{
-		logger:              logger,
-		scheduler:           schedulerClient,
-		queryOnlyScheduler:  queryOnlyScheduler,
-		httpClient:          &http.Client{},
-		requestTimeout:      options.RequestTimeout,
-		maxRespSize:         options.MaxResponseSize,
-		debugMode:           options.DebugMode,
-		sandboxProxyDomains: sandboxProxyDomains,
-		executionFencing:    executionFencing,
-		controlPlaneToken:   strings.TrimSpace(options.ControlPlaneToken),
+		logger:                  logger,
+		scheduler:               schedulerClient,
+		queryOnlyScheduler:      queryOnlyScheduler,
+		httpClient:              &http.Client{},
+		requestTimeout:          options.RequestTimeout,
+		maxRespSize:             options.MaxResponseSize,
+		debugMode:               options.DebugMode,
+		sandboxProxyDomains:     sandboxProxyDomains,
+		executionFencing:        executionFencing,
+		controlPlaneToken:       strings.TrimSpace(options.ControlPlaneToken),
+		projectionReader:        options.ProjectionReader,
+		projectionAuthoritative: options.ProjectionAuthoritative,
 	}, nil
 }
 
@@ -242,19 +266,52 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// proxied exchange. A request the scheduler never resolved has no incarnation
 	// to reason about, so it keeps the zero plan and stamps nothing.
 	fencing := fencingPlan{}
+	// Empty for a scheduled request, which resolves no sandbox and so has no
+	// route to have resolved one way or the other.
+	routeResolution := ""
 
 	if hasSandbox {
-		// One call, one answer. The scheduler owns the whole decision — which
-		// node holds the sandbox, which node should rebuild it, and whether it
-		// exists at all — so there is nothing here to second-guess or retry
-		// against a different node.
-		rpcStart := time.Now()
-		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
-		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
-		if err != nil {
-			s.writeSchedulerError(w, err)
-			return
+		// The routing projection first, when the read switch is on. A hit is
+		// the same answer the scheduler's binding hit would have produced —
+		// routing.Synthesize and lookup.go's binding exit are held field-for-
+		// field identical by a golden test — so nothing below this block needs
+		// to know which of the two answered.
+		//
+		// source starts at "scheduler" and only a projection hit moves it. A
+		// miss or a read error counts itself where it happens and still leaves
+		// source alone, so the two series reconcile:
+		//
+		//	Δ{redis_miss} + Δ{redis_error} ≈ Δ{scheduler}
+		source := routeResolutionScheduler
+		resp := s.resolveFromProjection(routingCtx, sandboxID)
+		if resp != nil {
+			source = routeResolutionRedisHit
 		}
+
+		if resp == nil {
+			// 🔴 Everything the projection could not answer lands here, and
+			// that includes a read error. A miss is not an absence: the
+			// scheduler walks the binding, then the heartbeat roster, then the
+			// paused registry, and the last two are exactly what covers a
+			// projection that has expired or been deleted. Answering 404 from
+			// a miss would cut all of that out.
+			//
+			// One call, one answer. The scheduler owns the whole decision —
+			// which node holds the sandbox, which node should rebuild it, and
+			// whether it exists at all — so there is nothing here to
+			// second-guess or retry against a different node.
+			rpcStart := time.Now()
+			var err error
+			resp, err = s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
+			recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
+			if err != nil {
+				// 🔴 Still the only source of a 404 or a 503 in this package.
+				s.writeSchedulerError(w, err)
+				return
+			}
+		}
+		recordRouteResolution(source)
+		routeResolution = source
 		node = resp.GetNode()
 		location = resp.GetLocation()
 		recordGatewaySandboxLocation(location)
@@ -306,6 +363,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("expected_execution_id", fencing.expect),
 		zap.String("execution_authority", fencing.authority.String()),
 		zap.String("fencing_stage", fencingStageGatewayRoute),
+		zap.String("route_resolution", routeResolution),
 	)
 
 	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
@@ -326,7 +384,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upstreamURL,
 		node,
 		proxyRequestOptions{
-			recordAssignment: locationNeedsAssignment(location) || shouldRecordAssignment(r, routeSource, hasSandbox),
+			assignment:       s.assignmentRouteFor(r, routeSource, hasSandbox, location),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 			sandboxID:        sandboxID,
@@ -380,7 +438,7 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 }
 
 type proxyRequestOptions struct {
-	recordAssignment bool
+	assignment       assignmentRoute
 	hostRoute        *hostRoute
 	flushImmediately bool
 	// sandboxID is the sandbox this exchange was routed for, empty when the
@@ -443,10 +501,10 @@ func (s *Server) proxyRequest(
 			if err := s.fenceProxyResponse(options.fencing, options.sandboxID, node, resp); err != nil {
 				return err
 			}
-			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if options.assignment == assignmentRouteNone || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node)
+			return s.recordAssignmentFromResponse(originalCtx, resp, node, options)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -545,7 +603,7 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node) error {
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, options proxyRequestOptions) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
 
@@ -554,9 +612,22 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	// the create and the node's first heartbeat, and inside that window the
 	// sandbox is new and has exactly one incarnation.
 	executionID := executionIDFromResponse(resp.Header)
+	projectionTTLSecs := s.projectionTTLToRecord(resp.Header)
+
+	// 🔴 The routed sandbox is the answer for resume and connect, and it costs
+	// nothing to find: it came off the request path. Falling through to the
+	// body would buffer the whole response to rediscover an id already in hand,
+	// and — worse — resume's 201 carries no sandbox-id header at all, so the
+	// buffering would not be optional.
+	if options.assignment == assignmentRoutePath {
+		if sandboxID := strings.TrimSpace(options.sandboxID); sandboxID != "" {
+			s.recordAssignment(recordCtx, sandboxID, node, executionID, projectionTTLSecs, "routed_path")
+			return nil
+		}
+	}
 
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
-		s.recordAssignment(recordCtx, sandboxID, node, executionID, "response_header")
+		s.recordAssignment(recordCtx, sandboxID, node, executionID, projectionTTLSecs, "response_header")
 		return nil
 	}
 
@@ -588,23 +659,52 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	}
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
-	for _, sandboxID := range extractSandboxIDsFromResponse(body) {
-		// 🔴 One echoed incarnation, several sandbox ids: a fork answers with the
-		// parent's echo and the children's ids, and stamping the parent's
-		// incarnation onto a child would name an incarnation that never ran
-		// there. The body path therefore records no incarnation at all and takes
-		// the same unauthoritative window a fresh create takes.
-		s.recordAssignment(recordCtx, sandboxID, node, "", "response_body")
+	for _, assignment := range extractSandboxAssignmentsFromResponse(body) {
+		// 🔴 Each element's own incarnation, never the response's echoed one
+		// and never a neighbour's. A fork answers with several sandboxes and
+		// one echo; stamping that echo onto a child would name an incarnation
+		// that never ran there, which is why this path used to record none at
+		// all. Now that each element carries its own, an element that has one
+		// is recorded with it and an element that does not is recorded without
+		// — taking the same unauthoritative window a fresh create takes, until
+		// the node's first heartbeat.
+		s.recordAssignment(recordCtx, assignment.sandboxID, node,
+			assignment.executionID,
+			s.projectionTTLToRecordValue(assignment.projectionTTLSecs),
+			"response_body")
 	}
 	return nil
 }
 
-func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, executionID string, source string) {
+// projectionTTLToRecord is the gateway's half of the write-side switch, and it
+// is deliberately narrow.
+//
+// 🔴 It gates the TTL and nothing else. The incarnation is forwarded either
+// way: reading it off a response and passing it on is behaviour that already
+// shipped, and gating it here would be a rollback of something the switch was
+// never about. The TTL is the new fact, and with the switch off the gateway
+// sends zero — which the scheduler reads as "use binding_ttl", making the
+// projection write byte-identical to the one that shipped before this existed.
+// That is what lets the two halves of the switch be flipped in either order
+// without an intermediate state anybody has to reason about.
+func (s *Server) projectionTTLToRecord(h http.Header) uint32 {
+	return s.projectionTTLToRecordValue(projectionTTLSecsFromHeaders(h))
+}
+
+func (s *Server) projectionTTLToRecordValue(secs uint32) uint32 {
+	if !s.projectionAuthoritative {
+		return 0
+	}
+	return secs
+}
+
+func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, executionID string, projectionTTLSecs uint32, source string) {
 	rpcStart := time.Now()
 	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
-		SandboxId:   sandboxID,
-		Node:        node,
-		ExecutionId: executionID,
+		SandboxId:         sandboxID,
+		Node:              node,
+		ExecutionId:       executionID,
+		ProjectionTtlSecs: projectionTTLSecs,
 	})
 	recordGatewaySchedulerRPC("RecordAssignment", rpcStart, err)
 	if err != nil {
@@ -616,6 +716,7 @@ func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *s
 		zap.String("sandbox_id", sandboxID),
 		zap.String("node_id", node.GetNodeId()),
 		zap.String("observed_execution_id", executionID),
+		zap.Uint32("projection_ttl_secs", projectionTTLSecs),
 		zap.String("source", source),
 	)
 }
@@ -652,21 +753,95 @@ func flushInterval(flushImmediately bool) time.Duration {
 	return 0
 }
 
-func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
-	if r.Method != http.MethodPost {
+// assignmentRoute says how the sandbox an assignment is for should be found.
+//
+// 🔴 Not a bool, because the two ways are genuinely different work. One reads
+// the response — a header if the node put one there, otherwise the whole body,
+// buffered. The other already knows: the request was routed for that sandbox
+// and the id came out of the path. Collapsing them would mean either buffering
+// a body to rediscover an id we are holding, or using the routed id on the one
+// route where it is the wrong answer.
+type assignmentRoute int
+
+const (
+	// assignmentRouteNone: this exchange writes no assignment.
+	assignmentRouteNone assignmentRoute = iota
+	// assignmentRouteResponse: the sandboxes are named in the response.
+	// Creates, cold creates, and forks — a fork answers with several sandboxes
+	// and none of them is the one the request was routed for.
+	assignmentRouteResponse
+	// assignmentRoutePath: the assignment is for the sandbox this request was
+	// already routed for. Resume and connect, and any control-plane request the
+	// scheduler resolved off the paused registry.
+	assignmentRoutePath
+)
+
+// assignmentRouteFor decides whether this exchange writes a routing projection,
+// and how the sandbox is named.
+func (s *Server) assignmentRouteFor(r *http.Request, routeSource routeSource, hasSandbox bool, location schedulerv1.SandboxLocation) assignmentRoute {
+	if isForkRequest(r, routeSource, hasSandbox) {
+		return assignmentRouteResponse
+	}
+	if shouldRecordCreateAssignment(r, hasSandbox) {
+		return assignmentRouteResponse
+	}
+	// 🔴 resume and connect both, never resume alone. Connect is a resume
+	// entry point — the node routes both into the same resume path — so
+	// recording one and not the other leaves the identical hole under a
+	// different name.
+	if s.projectionAuthoritative && isResumeEntryPoint(r, routeSource, hasSandbox) {
+		return assignmentRoutePath
+	}
+	// A sandbox the scheduler resolved off the paused registry is about to be
+	// held by a node nothing has recorded against. That was already true before
+	// any of this and is unrelated to the switch.
+	if hasSandbox && locationNeedsAssignment(location) {
+		if routeSource == routeSourcePath {
+			return assignmentRoutePath
+		}
+		return assignmentRouteResponse
+	}
+	return assignmentRouteNone
+}
+
+func shouldRecordCreateAssignment(r *http.Request, hasSandbox bool) bool {
+	if r.Method != http.MethodPost || hasSandbox {
 		return false
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
-	if !hasSandbox {
-		return path == "/sandboxes" || path == "/sandboxes-cold"
-	}
-	if routeSource != routeSourcePath {
+	return path == "/sandboxes" || path == "/sandboxes-cold"
+}
+
+// isForkRequest: routed by the source sandbox, but it creates child sandbox
+// assignments, so the routed id is not the one to record.
+func isForkRequest(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+	parts, ok := sandboxSubResourcePath(r, routeSource, hasSandbox)
+	return ok && parts[2] == "fork"
+}
+
+func isResumeEntryPoint(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+	parts, ok := sandboxSubResourcePath(r, routeSource, hasSandbox)
+	if !ok {
 		return false
 	}
+	switch parts[2] {
+	case "resume", "connect":
+		return true
+	default:
+		return false
+	}
+}
 
-	// Fork is routed by the source sandbox but creates child sandbox assignments.
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" && parts[2] == "fork"
+func sandboxSubResourcePath(r *http.Request, routeSource routeSource, hasSandbox bool) ([]string, bool) {
+	if r.Method != http.MethodPost || !hasSandbox || routeSource != routeSourcePath {
+		return nil, false
+	}
+	path := strings.Trim(strings.TrimRight(r.URL.Path, "/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 3 || parts[0] != "sandboxes" || strings.TrimSpace(parts[1]) == "" {
+		return nil, false
+	}
+	return parts, true
 }
 
 func sandboxIDFromHeaders(h http.Header) (string, bool) {
@@ -913,34 +1088,62 @@ func headerContainsToken(h http.Header, name string, want string) bool {
 	return false
 }
 
-func extractSandboxIDFromResponse(body []byte) (string, bool) {
-	ids := extractSandboxIDsFromResponse(body)
-	if len(ids) == 0 {
-		return "", false
-	}
-	return ids[0], true
+// sandboxAssignment is one sandbox named by a response, with whatever that
+// response said about it alongside.
+type sandboxAssignment struct {
+	sandboxID   string
+	executionID string
+	// projectionTTLSecs is the node's budget for this sandbox's routing
+	// projection. 🔴 Zero means "not offered", which the scheduler reads as
+	// "use binding_ttl". It is never "no expiry".
+	projectionTTLSecs uint32
 }
 
-func extractSandboxIDsFromResponse(body []byte) []string {
+func extractSandboxIDFromResponse(body []byte) (string, bool) {
+	assignments := extractSandboxAssignmentsFromResponse(body)
+	if len(assignments) == 0 {
+		return "", false
+	}
+	return assignments[0].sandboxID, true
+}
+
+// extractSandboxAssignmentsFromResponse reads every sandbox a response names.
+//
+// 🔴 The top-level array comes first, and it is the whole reason this function
+// changed. Fork's 201 answers with a bare JSON array of per-fork results — no
+// envelope, no object — and this used to begin by unmarshalling into a
+// map[string]any, which fails outright on an array and returned nil. Fork's
+// projection write therefore never happened, in any build, and the only test
+// covering it fed a {"sandboxes":[…]} envelope that no route in this repo
+// produces.
+//
+// The object shapes below are kept because create and cold-create answer with
+// one, and because a caller may reach here with a body this function has always
+// been able to read.
+func extractSandboxAssignmentsFromResponse(body []byte) []sandboxAssignment {
+	var assignments []sandboxAssignment
+
+	var array []any
+	if err := json.Unmarshal(body, &array); err == nil {
+		for _, item := range array {
+			object, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			assignments = appendSandboxAssignment(assignments, object)
+		}
+		return dedupeSandboxAssignments(assignments)
+	}
+
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil
 	}
-	var ids []string
-	appendSandboxID := func(value any) {
-		if id, ok := value.(string); ok && strings.TrimSpace(id) != "" {
-			ids = append(ids, id)
-		}
-	}
-	for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-		appendSandboxID(payload[key])
-	}
+	assignments = appendSandboxAssignment(assignments, payload)
 	if data, ok := payload["data"].(map[string]any); ok {
-		for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-			appendSandboxID(data[key])
-		}
+		assignments = appendSandboxAssignment(assignments, data)
 	}
-	appendSandboxIDsFromArray := func(value any) {
+	appendFromArray := func(value any) {
 		items, ok := value.([]any)
 		if !ok {
 			return
@@ -950,26 +1153,115 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 			if !ok {
 				continue
 			}
-			for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-				appendSandboxID(object[key])
+			assignments = appendSandboxAssignment(assignments, object)
+		}
+	}
+	appendFromArray(payload["sandboxes"])
+	if data, ok := payload["data"].(map[string]any); ok {
+		appendFromArray(data["sandboxes"])
+	}
+	return dedupeSandboxAssignments(assignments)
+}
+
+// appendSandboxAssignment reads one object.
+//
+// A fork result wraps the sandbox one level down and carries the projection
+// budget beside it rather than inside it, because the budget is infrastructure
+// and the sandbox is the user-visible model. Every other shape carries both on
+// the object itself, so both levels are consulted, outer first for the budget.
+func appendSandboxAssignment(dst []sandboxAssignment, object map[string]any) []sandboxAssignment {
+	if object == nil {
+		return dst
+	}
+	inner := object
+	if nested, ok := object["sandbox"].(map[string]any); ok {
+		inner = nested
+	}
+	sandboxID := firstStringField(inner, "sandboxID", "sandboxId", "sandbox_id")
+	if sandboxID == "" {
+		return dst
+	}
+	ttl := firstTTLField(object)
+	if ttl == 0 && inner != nil {
+		ttl = firstTTLField(inner)
+	}
+	return append(dst, sandboxAssignment{
+		sandboxID:   sandboxID,
+		executionID: firstStringField(inner, "executionID", "executionId", "execution_id"),
+
+		projectionTTLSecs: ttl,
+	})
+}
+
+func firstStringField(object map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := object[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
 			}
 		}
 	}
-	appendSandboxIDsFromArray(payload["sandboxes"])
-	if data, ok := payload["data"].(map[string]any); ok {
-		appendSandboxIDsFromArray(data["sandboxes"])
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(ids))
-	unique := ids[:0]
-	for _, id := range ids {
-		if _, ok := seen[id]; ok {
+	return ""
+}
+
+// firstTTLField reads a projection budget out of a decoded JSON object.
+//
+// 🔴 Anything that is not a positive whole number of seconds becomes zero,
+// which the scheduler reads as "use binding_ttl". A negative value in
+// particular must never survive into something a store could read as "keep this
+// forever" — that is the exact shape of the bug this rule exists to avoid.
+func firstTTLField(object map[string]any) uint32 {
+	for _, key := range []string{"projectionTtlSecs", "projectionTTLSecs", "projection_ttl_secs"} {
+		value, ok := object[key].(float64)
+		if !ok {
 			continue
 		}
-		seen[id] = struct{}{}
-		unique = append(unique, id)
+		if value <= 0 {
+			return 0
+		}
+		if value > math.MaxUint32 {
+			return math.MaxUint32
+		}
+		return uint32(value)
+	}
+	return 0
+}
+
+// dedupeSandboxAssignments keeps the first spelling of each sandbox id, as this
+// has always done. A later element naming the same sandbox is a duplicate, not
+// a correction.
+func dedupeSandboxAssignments(assignments []sandboxAssignment) []sandboxAssignment {
+	if len(assignments) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(assignments))
+	unique := assignments[:0]
+	for _, assignment := range assignments {
+		if _, ok := seen[assignment.sandboxID]; ok {
+			continue
+		}
+		seen[assignment.sandboxID] = struct{}{}
+		unique = append(unique, assignment)
 	}
 	return unique
+}
+
+// projectionTTLSecsFromHeaders reads the node's budget off a response header.
+//
+// 🔴 Absent, unparseable, and non-positive all come back as zero — "not
+// offered" — and the scheduler falls back to its own binding_ttl. None of them
+// may become "no expiry", which is what a Redis SET with no TTL argument is.
+func projectionTTLSecsFromHeaders(h http.Header) uint32 {
+	raw := strings.TrimSpace(h.Get(headerProjectionTTLSecs))
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	if value > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(value)
 }

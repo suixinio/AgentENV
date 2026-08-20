@@ -69,6 +69,30 @@ var (
 		},
 		[]string{"plane", "decision"},
 	)
+	// How each resolved sandbox route was answered: out of the routing
+	// projection, or by asking the scheduler.
+	//
+	// 🔴 This exists because turning the direct read on drives the scheduler's
+	// own lookup counters towards zero, and those counters were half of a
+	// two-sided reconciliation. This is the other half restored on this side.
+	// In a window where nothing has changed:
+	//
+	//	Δ{redis_miss} + Δ{redis_error} ≈ Δ agentenv_scheduler_lookup_total
+	//
+	// A persistent disagreement means one of the two sides is counting
+	// something it is not doing.
+	//
+	// 🔴 redis_error is not a failure mode of the request. It is the count of
+	// times the fallback earned its place: the request still went to the
+	// scheduler and the client saw nothing. Alert on its rate, never on its
+	// existence.
+	gatewayRouteResolution = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_route_resolution_total",
+			Help: "Resolved sandbox routes by where the answer came from: a routing projection hit, a miss, a projection read error, or the scheduler.",
+		},
+		[]string{"source"},
+	)
 	// Duplicate sandbox rows seen while merging the cluster listing, by how the
 	// winner was chosen.
 	//
@@ -204,6 +228,19 @@ func recordExecutionFencing(plane fencingPlane, decision string) {
 
 func recordClusterListDuplicate(resolution string) {
 	gatewayClusterListDuplicates.WithLabelValues(resolution).Inc()
+}
+
+// The four ways a sandbox route gets answered. Closed set, and every path
+// through the read block lands on exactly one.
+const (
+	routeResolutionRedisHit   = "redis_hit"
+	routeResolutionRedisMiss  = "redis_miss"
+	routeResolutionRedisError = "redis_error"
+	routeResolutionScheduler  = "scheduler"
+)
+
+func recordRouteResolution(source string) {
+	gatewayRouteResolution.WithLabelValues(source).Inc()
 }
 
 // gatewaySandboxLocationLabel keeps the label set closed. An enum value this

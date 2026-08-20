@@ -612,26 +612,52 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 	}
 }
 
-func TestShouldRecordAssignment(t *testing.T) {
+func TestAssignmentRouteFor(t *testing.T) {
+	unspecified := schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED
+	placed := schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED
+
 	tests := []struct {
-		name       string
-		method     string
-		path       string
-		route      routeSource
-		hasSandbox bool
-		want       bool
+		name          string
+		method        string
+		path          string
+		route         routeSource
+		hasSandbox    bool
+		location      schedulerv1.SandboxLocation
+		authoritative bool
+		want          assignmentRoute
 	}{
-		{name: "create sandbox", method: http.MethodPost, path: "/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: true},
-		{name: "create sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes/", route: routeSourceSchedule, hasSandbox: false, want: true},
-		{name: "create cold sandbox", method: http.MethodPost, path: "/sandboxes-cold", route: routeSourceSchedule, hasSandbox: false, want: true},
-		{name: "create cold sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes-cold/", route: routeSourceSchedule, hasSandbox: false, want: true},
-		{name: "fork sandbox records child assignment", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourcePath, hasSandbox: true, want: true},
-		{name: "fork-shaped host route is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceHost, hasSandbox: true, want: false},
-		{name: "fork-shaped header route is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceHeader, hasSandbox: true, want: false},
-		{name: "list sandboxes", method: http.MethodGet, path: "/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: false},
-		{name: "get cold sandbox path", method: http.MethodGet, path: "/sandboxes-cold", route: routeSourceSchedule, hasSandbox: false, want: false},
-		{name: "control plane path", method: http.MethodPost, path: "/sandboxes/sbx-1/pause", route: routeSourcePath, hasSandbox: true, want: false},
-		{name: "other post path", method: http.MethodPost, path: "/templates", route: routeSourceSchedule, hasSandbox: false, want: false},
+		{name: "create sandbox", method: http.MethodPost, path: "/sandboxes", route: routeSourceSchedule, location: unspecified, want: assignmentRouteResponse},
+		{name: "create sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes/", route: routeSourceSchedule, location: unspecified, want: assignmentRouteResponse},
+		{name: "create cold sandbox", method: http.MethodPost, path: "/sandboxes-cold", route: routeSourceSchedule, location: unspecified, want: assignmentRouteResponse},
+		{name: "create cold sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes-cold/", route: routeSourceSchedule, location: unspecified, want: assignmentRouteResponse},
+		// 🔴 Fork stays on the response path whatever the switch says. Its
+		// children are named nowhere else, and the routed sandbox id is the
+		// parent's.
+		{name: "fork records child assignments from the response", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourcePath, hasSandbox: true, location: unspecified, want: assignmentRouteResponse},
+		{name: "fork-shaped host route is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceHost, hasSandbox: true, location: unspecified, want: assignmentRouteNone},
+		{name: "fork-shaped header route is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourceHeader, hasSandbox: true, location: unspecified, want: assignmentRouteNone},
+		{name: "list sandboxes", method: http.MethodGet, path: "/sandboxes", route: routeSourceSchedule, location: unspecified, want: assignmentRouteNone},
+		{name: "get cold sandbox path", method: http.MethodGet, path: "/sandboxes-cold", route: routeSourceSchedule, location: unspecified, want: assignmentRouteNone},
+		{name: "pause is not an assignment", method: http.MethodPost, path: "/sandboxes/sbx-1/pause", route: routeSourcePath, hasSandbox: true, location: unspecified, want: assignmentRouteNone},
+		{name: "other post path", method: http.MethodPost, path: "/templates", route: routeSourceSchedule, location: unspecified, want: assignmentRouteNone},
+
+		// The write switch, off: resume and connect record nothing, which is
+		// what shipped before it existed.
+		{name: "resume with the switch off", method: http.MethodPost, path: "/sandboxes/sbx-1/resume", route: routeSourcePath, hasSandbox: true, location: unspecified, want: assignmentRouteNone},
+		{name: "connect with the switch off", method: http.MethodPost, path: "/sandboxes/sbx-1/connect", route: routeSourcePath, hasSandbox: true, location: unspecified, want: assignmentRouteNone},
+
+		// 🔴 On: both, never resume alone. Connect is a resume entry point —
+		// the node routes both into the same resume path — so covering one and
+		// not the other leaves the identical hole under a different name.
+		{name: "resume with the switch on", method: http.MethodPost, path: "/sandboxes/sbx-1/resume", route: routeSourcePath, hasSandbox: true, location: unspecified, authoritative: true, want: assignmentRoutePath},
+		{name: "connect with the switch on", method: http.MethodPost, path: "/sandboxes/sbx-1/connect", route: routeSourcePath, hasSandbox: true, location: unspecified, authoritative: true, want: assignmentRoutePath},
+		{name: "resume routed by header is data plane", method: http.MethodPost, path: "/sandboxes/sbx-1/resume", route: routeSourceHeader, hasSandbox: true, location: unspecified, authoritative: true, want: assignmentRouteNone},
+		{name: "GET on a resume path is not a resume", method: http.MethodGet, path: "/sandboxes/sbx-1/resume", route: routeSourcePath, hasSandbox: true, location: unspecified, authoritative: true, want: assignmentRouteNone},
+
+		// A registry-resolved location has always needed an assignment, and is
+		// unrelated to the switch.
+		{name: "placed control-plane request uses the routed id", method: http.MethodPost, path: "/sandboxes/sbx-1/pause", route: routeSourcePath, hasSandbox: true, location: placed, want: assignmentRoutePath},
+		{name: "placed data-plane request still reads the response", method: http.MethodGet, path: "/anything", route: routeSourceHeader, hasSandbox: true, location: placed, want: assignmentRouteResponse},
 	}
 
 	for _, tc := range tests {
@@ -640,7 +666,8 @@ func TestShouldRecordAssignment(t *testing.T) {
 			if err != nil {
 				t.Fatalf("build request failed: %v", err)
 			}
-			got := shouldRecordAssignment(req, tc.route, tc.hasSandbox)
+			server := &Server{projectionAuthoritative: tc.authoritative}
+			got := server.assignmentRouteFor(req, tc.route, tc.hasSandbox, tc.location)
 			if got != tc.want {
 				t.Fatalf("expected %v, got %v", tc.want, got)
 			}
@@ -662,9 +689,17 @@ func TestExtractSandboxIDFromResponse(t *testing.T) {
 	if !ok || id != "sbx-123" {
 		t.Fatalf("expected sandbox id to be extracted, got %q (ok=%v)", id, ok)
 	}
-	ids := extractSandboxIDsFromResponse([]byte(`{"sandboxes":[{"sandboxID":"sbx-1"},{"sandboxID":"sbx-2"}]}`))
-	if !equalStrings(ids, []string{"sbx-1", "sbx-2"}) {
-		t.Fatalf("expected batch sandbox ids, got %#v", ids)
+
+	// 🔴 The real fork response: a bare top-level array of per-fork results,
+	// each wrapping a full sandbox. This test used to feed
+	// {"sandboxes":[…]} — an envelope no route in this repo produces — which
+	// is how the extraction shipped unable to read the one body it exists for.
+	assignments := extractSandboxAssignmentsFromResponse([]byte(`[
+		{"sandbox":{"sandboxID":"sbx-1","executionID":"exec-1"},"projectionTtlSecs":3600},
+		{"sandbox":{"sandboxID":"sbx-2","executionID":"exec-2"},"projectionTtlSecs":3600}
+	]`))
+	if !equalStrings(sandboxIDsOf(assignments), []string{"sbx-1", "sbx-2"}) {
+		t.Fatalf("expected the fork array's sandbox ids, got %#v", assignments)
 	}
 }
 
@@ -1327,7 +1362,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, proxyRequestOptions{assignment: assignmentRouteResponse}); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 

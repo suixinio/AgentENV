@@ -1066,9 +1066,18 @@ type RecordAssignmentRequest struct {
 	// and only costs authority for the window between the create and the node's
 	// first heartbeat — during which the sandbox is brand new and has exactly
 	// one incarnation, so nothing can be confused with anything.
-	ExecutionId   string `protobuf:"bytes,3,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ExecutionId string `protobuf:"bytes,3,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	// How long the routing projection for this sandbox should live, in whole
+	// seconds, as the node that owns the sandbox computed it from its own
+	// lifetime ceiling. The node is the only source of truth for this number;
+	// the scheduler stores it and never defines it.
+	//
+	// 🔴 <= 0 means "use the receiver's binding_ttl". It never means "never
+	// expires" — a projection that outlives every path that could delete it is
+	// a route pointing at a sandbox nobody can reach.
+	ProjectionTtlSecs uint32 `protobuf:"varint,4,opt,name=projection_ttl_secs,json=projectionTtlSecs,proto3" json:"projection_ttl_secs,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *RecordAssignmentRequest) Reset() {
@@ -1120,6 +1129,13 @@ func (x *RecordAssignmentRequest) GetExecutionId() string {
 		return x.ExecutionId
 	}
 	return ""
+}
+
+func (x *RecordAssignmentRequest) GetProjectionTtlSecs() uint32 {
+	if x != nil {
+		return x.ProjectionTtlSecs
+	}
+	return 0
 }
 
 type RecordAssignmentResponse struct {
@@ -1788,9 +1804,19 @@ type SandboxRosterEntry struct {
 	//
 	// 🔴 Empty does not mean "drop the entry": the entry still routes. Dropping
 	// it would trade away a working route to avoid an unprotected one.
-	ExecutionId   string `protobuf:"bytes,2,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ExecutionId string `protobuf:"bytes,2,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	// How long this sandbox's routing projection should live, in whole seconds,
+	// as computed by this node. This is the repair path for the same number
+	// RecordAssignmentRequest carries: a projection write that was lost gets
+	// reinstalled by heartbeat reconciliation, and it must be reinstalled with
+	// the sandbox's real budget rather than with the receiver's default.
+	//
+	// 🔴 <= 0 means "use the receiver's binding_ttl", never "never expires".
+	// Absent (an older node) lands on the same fallback, which is exactly the
+	// behaviour that shipped before this field existed.
+	ProjectionTtlSecs uint32 `protobuf:"varint,3,opt,name=projection_ttl_secs,json=projectionTtlSecs,proto3" json:"projection_ttl_secs,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *SandboxRosterEntry) Reset() {
@@ -1835,6 +1861,13 @@ func (x *SandboxRosterEntry) GetExecutionId() string {
 		return x.ExecutionId
 	}
 	return ""
+}
+
+func (x *SandboxRosterEntry) GetProjectionTtlSecs() uint32 {
+	if x != nil {
+		return x.ProjectionTtlSecs
+	}
+	return 0
 }
 
 type HeartbeatResponse struct {
@@ -1888,8 +1921,17 @@ type SandboxEvent struct {
 	RequestedCpu         uint32                 `protobuf:"varint,3,opt,name=requested_cpu,json=requestedCpu,proto3" json:"requested_cpu,omitempty"`
 	RequestedMemoryBytes uint64                 `protobuf:"varint,4,opt,name=requested_memory_bytes,json=requestedMemoryBytes,proto3" json:"requested_memory_bytes,omitempty"`
 	RequestedDiskBytes   uint64                 `protobuf:"varint,5,opt,name=requested_disk_bytes,json=requestedDiskBytes,proto3" json:"requested_disk_bytes,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// The incarnation this event belongs to. A projection delete must be guarded
+	// by it: a pause event that arrives late, for a sandbox id that has since
+	// been started again elsewhere under a new incarnation, would otherwise tear
+	// down the live record.
+	//
+	// Empty means the reporter is too old to name one, and the event therefore
+	// takes no part in the guard — the receiver ignores it for deletes rather
+	// than deleting without a guard.
+	ExecutionId   string `protobuf:"bytes,6,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SandboxEvent) Reset() {
@@ -1955,6 +1997,13 @@ func (x *SandboxEvent) GetRequestedDiskBytes() uint64 {
 		return x.RequestedDiskBytes
 	}
 	return 0
+}
+
+func (x *SandboxEvent) GetExecutionId() string {
+	if x != nil {
+		return x.ExecutionId
+	}
+	return ""
 }
 
 type ReportSandboxEventRequest struct {
@@ -4333,12 +4382,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\blocation\x18\x02 \x01(\x0e2\x1d.scheduler.v1.SandboxLocationR\blocation\x12$\n" +
 	"\x0eorigin_node_id\x18\x03 \x01(\tR\foriginNodeId\x12!\n" +
 	"\fexecution_id\x18\x04 \x01(\tR\vexecutionId\x12Q\n" +
-	"\x13execution_authority\x18\x05 \x01(\x0e2 .scheduler.v1.ExecutionAuthorityR\x12executionAuthority\"\x83\x01\n" +
+	"\x13execution_authority\x18\x05 \x01(\x0e2 .scheduler.v1.ExecutionAuthorityR\x12executionAuthority\"\xb3\x01\n" +
 	"\x17RecordAssignmentRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12&\n" +
 	"\x04node\x18\x02 \x01(\v2\x12.scheduler.v1.NodeR\x04node\x12!\n" +
-	"\fexecution_id\x18\x03 \x01(\tR\vexecutionId\"\x1a\n" +
+	"\fexecution_id\x18\x03 \x01(\tR\vexecutionId\x12.\n" +
+	"\x13projection_ttl_secs\x18\x04 \x01(\rR\x11projectionTtlSecs\"\x1a\n" +
 	"\x18RecordAssignmentResponse\"\xc2\x01\n" +
 	"\vMachineInfo\x12\x1d\n" +
 	"\n" +
@@ -4403,13 +4453,14 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"sandboxIds\x12<\n" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x128\n" +
 	"\x06roster\x18\n" +
-	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06roster\"V\n" +
+	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06roster\"\x86\x01\n" +
 	"\x12SandboxRosterEntry\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
-	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\";\n" +
+	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12.\n" +
+	"\x13projection_ttl_secs\x18\x03 \x01(\rR\x11projectionTtlSecs\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
-	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
+	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\x9c\x02\n" +
 	"\fSandboxEvent\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12=\n" +
@@ -4417,7 +4468,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"event_type\x18\x02 \x01(\x0e2\x1e.scheduler.v1.SandboxEventTypeR\teventType\x12#\n" +
 	"\rrequested_cpu\x18\x03 \x01(\rR\frequestedCpu\x124\n" +
 	"\x16requested_memory_bytes\x18\x04 \x01(\x04R\x14requestedMemoryBytes\x120\n" +
-	"\x14requested_disk_bytes\x18\x05 \x01(\x04R\x12requestedDiskBytes\"\xb7\x01\n" +
+	"\x14requested_disk_bytes\x18\x05 \x01(\x04R\x12requestedDiskBytes\x12!\n" +
+	"\fexecution_id\x18\x06 \x01(\tR\vexecutionId\"\xb7\x01\n" +
 	"\x19ReportSandboxEventRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +

@@ -178,6 +178,15 @@ message RecordAssignmentRequest {
   // first heartbeat — during which the sandbox is brand new and has exactly
   // one incarnation, so nothing can be confused with anything.
   string execution_id = 3;
+  // How long the routing projection for this sandbox should live, in whole
+  // seconds, as the node that owns the sandbox computed it from its own
+  // lifetime ceiling. The node is the only source of truth for this number;
+  // the scheduler stores it and never defines it.
+  //
+  // 🔴 <= 0 means "use the receiver's binding_ttl". It never means "never
+  // expires" — a projection that outlives every path that could delete it is
+  // a route pointing at a sandbox nobody can reach.
+  uint32 projection_ttl_secs = 4;
 }
 
 message RecordAssignmentResponse {}
@@ -307,6 +316,16 @@ message SandboxRosterEntry {
   // 🔴 Empty does not mean "drop the entry": the entry still routes. Dropping
   // it would trade away a working route to avoid an unprotected one.
   string execution_id = 2;
+  // How long this sandbox's routing projection should live, in whole seconds,
+  // as computed by this node. This is the repair path for the same number
+  // RecordAssignmentRequest carries: a projection write that was lost gets
+  // reinstalled by heartbeat reconciliation, and it must be reinstalled with
+  // the sandbox's real budget rather than with the receiver's default.
+  //
+  // 🔴 <= 0 means "use the receiver's binding_ttl", never "never expires".
+  // Absent (an older node) lands on the same fallback, which is exactly the
+  // behaviour that shipped before this field existed.
+  uint32 projection_ttl_secs = 3;
 }
 
 message HeartbeatResponse {
@@ -330,6 +349,15 @@ message SandboxEvent {
   uint32 requested_cpu = 3;
   uint64 requested_memory_bytes = 4;
   uint64 requested_disk_bytes = 5;
+  // The incarnation this event belongs to. A projection delete must be guarded
+  // by it: a pause event that arrives late, for a sandbox id that has since
+  // been started again elsewhere under a new incarnation, would otherwise tear
+  // down the live record.
+  //
+  // Empty means the reporter is too old to name one, and the event therefore
+  // takes no part in the guard — the receiver ignores it for deletes rather
+  // than deleting without a guard.
+  string execution_id = 6;
 }
 
 message ReportSandboxEventRequest {

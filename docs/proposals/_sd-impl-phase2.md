@@ -12,6 +12,14 @@
 > 最重的一条：父提案 §4.2.1 把「消掉 `local_only`」挂在一个**本仓之外的**交付物上。
 > **那条依赖出了范围**（用户裁决 2026-08-20，全部工作只在 `/home/debian/AgentENV` 内）。
 > ⇒ 父提案说的"退路"不是退路，是**唯一的设计，而且现在就建**。见 §3.1。
+>
+> 🔧 **更新（2026-08-20 夜）：2a 已在 dev 集群上线并通过验收，记录在 §13。**
+> 规格本体一字未改，但 §13 里有两件事会改变别的东西：
+> ① 🔴 **P0 的基线数字**（§13.1）—— `N = 32`，一发 `GET /snapshots` ＝ `1 + 32`，
+>    **`?limit=5` 也是 `1 + 32`**。这个数**只有 2b/2c 动手之前能取**；
+> ② 🔴 **2a 没有证明什么**（§13.3）—— 没有调过一次目录 RPC，P1 的对照面今天造不出来，
+>    迁移只对着空库跑过一次、回滚与失败迁移都没演练过。
+> 另有本文自己的三处就地订正（Redis 已部署、14s → 2.3–3.3s、§10.1 的八个行号），见 §13.5。
 
 ---
 
@@ -1126,10 +1134,16 @@ scheduler 启动日志坐实 `binding_store="memory"`。SD-B1 把它列为阻塞
 > （`kubectl get pods,svc -n agentenv-system | grep -i redis` 仍零命中）。
 > 它是阶段 1 的产出，落地即解掉 SD-B1。**动手前先复核它是否真在集群上**，
 > 别照着这一节的"没有"去做规划。
+>
+> 🔧 **已过时（2026-08-20 当日晚些）**：Redis **已经部署**，scheduler 与 gateway 都已接上，
+> SD-B1 **全解**（recon §4.5 🔧 / §9；[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.2）。
+> 上面两段作为「这条阻塞项当时挡住了什么」保留。🟢 **§7.2 的结论不受影响** ——
+> 「缓存与目录同侧、落在 Go 进程里」本来就不靠 Redis 在不在成立。见 §13.5 **C1**。
 
 **但这不是阶段 2 独有的成本**：阶段 1（gateway 直读 Redis）与阶段 3（活跃态折叠）
 都以它为前提。SD-B1 是三个阶段共享的一次性部署工作（Deployment ＋ Service ＋ 可选 PVC
-＋ 把 `redis_addr` 注进 scheduler），**顺带解掉滚 scheduler 的 14s 数据面 503 窗口**。
+＋ 把 `redis_addr` 注进 scheduler），**顺带解掉滚 scheduler 的数据面 503 窗口**
+（🔧 **2.3–3.3 秒**，不是原文写的 14s —— 那是上一轮自己那次测量，recon §4.5 已重测；§13.5 **C2**）。
 ⇒ 把它写成**阶段 2 的前置**，而不是阶段 2 的内容。
 
 ### 7.2 🔴 缓存的凭据问题和 PG 一模一样，父提案没注意到
@@ -1360,6 +1374,11 @@ I5 是让父提案「回退是把读侧开关切回对象存储，**零数据损
 
 ### 10.1 🔴 先补一个不存在的指标
 
+> 🔧 **已兑现（2026-08-20 夜，2a）**：这一节要求的埋点**已经上线**，
+> 现场读数与 `surface` 标签的正面证据在 §13.1。本节保留为**动手前的现状**，
+> 🔴 **但下面那八个 `client.rs` 行号已经全部漂了**（埋点本身把文件撑开了），
+> 现值见 §13.5 **C3**。
+
 头号判据是「`GET /snapshots?limit=10` 的对象存储请求数为 0」。**今天没法观测**：
 
 ```
@@ -1392,7 +1411,7 @@ metrics::counter!(
 
 | # | 判据 | 做法 | 🔴 对照面（必须给出相反结果） |
 |---|---|---|---|
-| **P1** | **头号：10k 条目录，`GET /snapshots?limit=10` 的对象存储请求数为 0** | 造 10k 行；记录 `…object_store_requests_total{surface="catalog"}` 基线；发 20 次请求；增量必须 **= 0** | 同一发请求在 `catalog_read = object_store` 下重跑：增量必须 **≥ 20 × (1 + 10000)**（1 次 LIST ＋ 10k 次 GET，`oss/repository.rs:369-397`）。两相同答 ⇒ 探针瞎了（recon §8 第 2 条） |
+| **P1** | **头号：10k 条目录，`GET /snapshots?limit=10` 的对象存储请求数为 0** | 造 10k 行；记录 `…object_store_requests_total{surface="catalog"}` 基线；发 20 次请求；增量必须 **= 0** | 同一发请求在 `catalog_read = object_store` 下重跑：增量必须 **≥ 20 × (1 + 10000)**（1 次 LIST ＋ 10k 次 GET，`oss/repository.rs:369-397`）。两相同答 ⇒ 探针瞎了（recon §8 第 2 条）<br>🔧 **2026-08-20 夜的现状**：对照面**今天造不出来**（`catalog_read = postgres` 这个取值还不存在，§13.3 第 2 条），但**它那一侧的数字已经实测到了**：`N = 32` 时每发 `1 + 32`（§13.1）。🔴 三条落地约束：① `limit` 今天不影响代价，`?limit=5` 同样是 `1 + 32`；② `limit` 上限是 **100**，`?limit=200` 直接 400；③ **两台节点的计数器分开**，探针必须相加 |
 | **P2** | keyset 翻页无重无漏 | 10k 行，`limit=10` 翻到底，收集 id 集合 | ① 集合大小恰为 10,000 且无重复；② 翻页中途插入一条 `created_at` 落在**已翻过**区间的行 ⇒ 它**不出现**；③ 插一条 `created_at` 最新的 ⇒ 也**不出现**。offset 分页在 ② 会漏一条、在 ③ 会重一条 |
 | **P3** | 别名唯一性 | 两个并发 publish 争同一别名 | PG 侧：恰好一个 2xx、一个 `AliasConflict`。**对照**：同一测试打 `catalog_write = object_store` ⇒ 必须能复现出**两个都成功**或丢失更新（`oss/repository.rs:590-682` 的读-改-写-回读）。复现不出来 ⇒ 并发度不够，加压 |
 | **P4** | 构建准入 | 对同一 template 并发发 N=20 次 `POST …/builds/{id}` | 恰好 1 次进入 `building`，19 次拿到明确冲突；`builds` 表里 `status_group IN ('pending','in_progress')` 的行数 = 1。**对照**：临时 drop `builds_one_active_per_template` 重跑 ⇒ 必须出现 >1（对应 `oss/repository.rs:469-493` 今天的行为） |
@@ -1471,6 +1490,10 @@ metrics::counter!(
 > **P0**（2a 专属）：埋点上线后，跑一次今天的 `GET /snapshots`，
 > `…object_store_requests_total{surface="catalog"}` 必须**长出 1 + N**。
 > 恒 0 说明埋点没生效 —— recon §8 第 2 条，"某指标恒 0 本身不是证据"。
+>
+> 🔧 **已通过（2026-08-20 夜）**：**`N = 32`**，实测 `list/catalog/ok` **+1**、
+> `get/catalog/ok` **+32**、其余 series **全 0**，六对前后抓取 ＋ 两个对照面 —— 全部数字在 §13.1。
+> 🔴 **那 30 条种子快照是 2c 的对照面，故意留在集群里，不要清理掉。**
 
 🔴 **Redis 不再是阶段 2 的前置。** §7.2 的结论把目录缓存降级成条件项之后，
 2a/2b/2c 三批都不依赖 Redis：目录读走 PG，缓存先不做。
@@ -1517,6 +1540,156 @@ metrics::counter!(
 | `POST …/builds/{id}` 的 `tokio::spawn` 脱管，进程死掉记录永卡 `Building`，全仓无收割器 | `src/api/impls/template.rs:652` | 🔴 **必须在阶段 2 修**，否则 `builds_one_active_per_template` 把泄漏升级成故障（§3.2、P6） |
 | `templates_get`（v1）完全没有分页，返回全量模板 | `src/api/impls/template.rs:322-346` | 阶段 2 同批补上，否则 10k 记录下它先炸而判据看不到 |
 | PG / RustFS 的 PVC 都是 `local-path`、钉死 204、无备份 | recon SD-B5 | 🔴 目录进 PG 之后 PG 成为不可逆用户数据的唯一真相源。**2a 上线前必须谈一次持久化**，这是 recon 自己提的 |
+
+---
+
+## 13. 🔧 2a 集群验收记录（2026-08-20 夜，`pve-sg dev` 203/204）
+
+> **2a 已上线并通过验收**，三个服务同 tag `sd2a-7cf9c30`（发布前的基线是 `sd1-1f79e8f`，
+> `$WD/baseline-images.txt`）。**规格本体一字未改。**
+>
+> 本节记三件事，重要性递增：
+> ① 2a 自己的验收清单（§13.2）；
+> ② 🔴 **P0 的基线数字**（§13.1）—— 它**只有今天能取**：2b/2c 把目录搬走之后这些计数器归零，
+>    届时一发「必须为 0」的探针，如果拿不出它是**从哪个数掉下来的**，就什么都没证明；
+> ③ 🔴 **2a 没有证明什么**（§13.3）—— 这一节比上面所有 PASS 都重要。
+>
+> 证据目录 `$WD = /tmp/claude-1000/…/6fffa6a8…/scratchpad/sd2a/`，
+> 🔴 **临时目录、会被清掉** ⇒ 关键数字全部抄进本节正文，不指望文件活着。
+> 集群手法与踩过的坑不在这里重复，在 [`_sd-recon-env.md`](_sd-recon-env.md) §7 / §11。
+
+### 13.1 🔴 P0 基线：`N = 32`，一发 `GET /snapshots` ＝ `1 + 32`
+
+**本轮最值钱的产物，而且不可重取。**
+
+目录规模 **N = 32** ＝ 2 个既有模板（`uns-sandbox-runtime-v3` / `uns-scaffold-v3`）
+＋ **30 条本轮特意播下的快照**（`p0-seed-001…030`，30 发全部 **201**，`$WD/seed-snapshots.txt`）。
+
+**一发请求的代价，逐 series：**
+
+| series | 增量 |
+|---|---|
+| `…object_store_requests_total{op="list",surface="catalog",outcome="ok"}` | **+1** |
+| `…{op="get",surface="catalog",outcome="ok"}` | **+32**（＝ N） |
+| 其余全部（`put/*`、`head/*`、`delete/*`、以及所有 `surface="artifact"`） | **0** |
+
+**逐发原始计数**（`$WD/p0.{before,after}.txt`、`p0.{b,a}{2,3,4,5}.txt`、`p0.final.{b,a}.txt`；
+只列发生变化的那台节点，另一台逐字节不动。🟡 口径提示：本轮口头报告说的是「5 次复现」，
+证据目录里是**六对**前后抓取，形状全部一致）：
+
+| 发次 | 落在哪台 | `get/catalog/ok` | `list/catalog/ok` |
+|---|---|---|---|
+| ① | node-B | 2 → **34** | 1 → **2** |
+| ② | node-A | 96 → **128** | 2 → **3** |
+| ③ | node-B | 34 → **66** | 2 → **3** |
+| ④ | node-A | 128 → **160** | 3 → **4** |
+| ⑤ | node-B | 70 → **102** | 3 → **4** |
+| ⑥（控制面已全部换成 `sd2a-7cf9c30` 之后重取）| node-B | 32 → **64** | 1 → **2** |
+
+⑥ 的绝对值比 ⑤ 小，是因为 node 进程换了镜像重启、计数器从零重新起算 ——
+**形状不变，仍然是 `1 + 32`**。
+
+这六对覆盖三种请求形状，**三种的增量完全一样**：
+
+- `GET /snapshots`
+- 🔴 **`GET /snapshots?limit=5`** —— **也是 `1 + 32`**
+- `GET /templates` —— **也是 `1 + 32`**
+
+🔴 **`limit` 今天买不到任何东西。** 目录读是**先全量取回**（一次 LIST ＋ 每条一次 GET
+＋ 内存过滤 ＋ 内存排序，`src/snapshot/repository/backends/oss/repository.rs:369-397`），
+分页在那之后、在 HTTP 层做（`src/api/impls/snapshots.rs:91` → `src/api/impls/pagination.rs:91-118`）。
+⇒ **P1 判据里那个 `limit=10` 与 `limit=100` 等价**，它省下的正是 2c 要拿走的东西。
+写 2c 的探针时把这句抄进去：`limit` 变小而增量不变，本身就是「分页还没下沉」的判据。
+
+🟡 **顺带一条会卡住探针的边界**：`limit` 的上限是 **100**
+（`src/api/openapi.yml:93-103`，`maximum: 100`）⇒ `?limit=200` 直接 **400**（range error）。
+P1 / P10 的脚本不要写 `limit=200`。
+
+**对照面一（空转控制）**：无流量情况下相隔 12 秒的两次抓取**逐字节相同**
+（`$WD/p0.t0.txt` / `p0.t1.txt`，`diff` 为空）⇒ 上面那些增量是请求打出来的，
+不是后台任务的自然漂移。
+
+**对照面二（`surface` 标签真的分得开）**：一次「从快照建沙箱」的增量是
+
+| series | 增量 |
+|---|---|
+| `get/catalog/ok` | **+1** |
+| `get/artifact/ok` | **+2** |
+| `head/artifact/ok` | **+3** |
+| 🔴 `list/catalog/ok` | **0** |
+
+（`$WD/art.{before,after}.txt`）⇒ **字节面与目录面确实是两条独立的 series**。
+§10.1 说 `surface` 标签是「判据能不能成立的关键」，现在它有正面证据了：
+2a 之后 `put/artifact` 会一直很高，而判据看的那一支不被它污染。
+
+🔴 **两台节点的计数器是分开的，请求落在谁身上谁涨。** 上表 ② ④ 落在 node-A，
+① ③ ⑤ ⑥ 落在 node-B —— gateway 把 `GET /snapshots` 代理给哪台是它自己的事。
+⇒ **探针必须把两台的同名 series 相加**（或先把请求钉死到一台）。
+只抓一台会**随机地**读到 0，而 0 在 2c 的判据里恰好长得像「通过」。
+这是 [`_sd-recon-env.md`](_sd-recon-env.md) §8 第 2 条在本轮的又一个形态。
+
+🔴 **那 30 条快照是故意留在集群里的。** 2c 的探针要对着一个**有意义的 N** 去比，
+而不是对着 `1 + 2`。清理集群的人**不要顺手删掉 `p0-seed-*`** —— 删了就等于把 P1 的
+基线一起删了，而它**重造一次要重新跑 30 次真实创建**（§10.3 已写明合成行不算数）。
+
+### 13.2 2a 的验收清单
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 迁移落库 | **4 张表**（`snapshots` / `templates` / `builds` / `aliases`）＋ **账本** `catalog_schema_migrations` ＋ **2 个函数** ＋ **3 个触发器** ＋ **1 个视图** `active_templates` ＋ **7 个索引** | `services/scheduler/internal/catalog/migrations/0001_snapshots.sql`、`0002_templates_builds_aliases.sql`；账本 DDL 在 `catalog/migrate.go:99` |
+| 🔴 `paused_sandboxes` **未被触碰** | 表 DDL 的 md5 **三次取样完全一致**（`fa87c1f1b112e70e4cedb92a8983fd8e`：迁移前 / 迁移后 / 全轮结束）| `$WD/paused_sandboxes.{before,after,final}.txt` |
+| **「行为零变化」** | 一整条生命周期跑通：create → 数据面 → pause → resume → 数据面 → delete；**跑完之后四张新表仍然全空** | `$WD/lifecycle-ids.txt`、`lifecycle-sandbox.json`、`lc2.json` |
+| 账本幂等 | scheduler **连续重启三次**，账本不重复执行、不报错 | |
+| **判据 P0** | ✅ **通过**，且形状就是 §11.3 那句话说的 `1 + N`（见 §13.1）| |
+
+### 13.3 🔴 2a 没有证明什么
+
+**这一节比上面所有 PASS 都重要**（照抄 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.6 的规矩）。
+
+1. 🔴 **2b / 2c 的任何东西都没有被证明。** 整轮**一次目录 RPC 都没有调用过**；
+   `SnapshotCatalog` 被验证的形态是「**二进制里存在这个字符串**」，不是「它答过一次」。
+   ⇒ 别把 2a 的 PASS 读成「目录这条路通了」。
+2. **P1 原封未动。** 目录 **32 条，不是 10k**；而且 `catalog_read = postgres` 这个取值
+   **今天还不存在** ⇒ **P1 的对照面在 2c 之前结构性地造不出来**。
+   §10.2 P1 那一行的「两相同答 ⇒ 探针瞎了」目前无法执行 —— 它需要两个相位，而我们只有一个。
+3. **迁移只跑过一次，而且是对着一个空库跑的。**
+   - **回滚没有演练过**。回滚是两行，逐字写在 `services/scheduler/internal/catalog/migrate.go:46-47`
+     （`DROP TABLE … aliases, builds, templates, snapshots CASCADE;` ＋
+     `DROP TABLE … catalog_schema_migrations;`），代码注释自己标了 🔴「第二行是会被忘掉的那一行，
+     而且忘掉是静默的」—— **这两行在集群上一次都没跑过。**
+   - **失败的迁移也没有演练过**。「迁移失败 ⇒ gRPC 答 `UNAVAILABLE` ⇒ pause 被挡在门外」
+     这条路径目前**只有单元测试**，没有任何集群取证。⇒ §8.4 那套部署顺序仍然是纸面的。
+4. **F4 清扫只在 N=2 台节点上演过。** 整机群守卫（`suppressed_all_silent`）**一次都没有开火**，
+   **改名路径**（一台机器换了名字回来）**从未走到** —— 而那正是唯一一种
+   「判错就会退掉一台**健康**机器的记录」的情形。清扫这一轮的完整记录与它自己的射程边界在
+   [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9。
+5. **只测了 `binding_store=redis`。** 内存 store 的 `Delete` 守卫在集群上**从未被执行过**。
+6. **全程单副本。** `P-A5-2`（HA 形态）**仍未跑**；recon §8 末尾那两条「射程外」也仍然挂着。
+
+### 13.4 🔴 一个没查清的观测：播 30 条快照打出 60 次 `get/catalog/error`
+
+**事实**（`$WD/p0.before.txt` 与 `seed-snapshots.txt`）：30 次创建**全部 201**，
+同时 `put/catalog/ok` **+60**、`get/catalog/error` **+60** —— 不多不少，**每条快照 2 次**。
+
+🔴 **没有追下去。** 最像的解释是「存在性检查把 404 记成了 `outcome="error"`」
+（`src/snapshot/repository/backends/oss/client.rs:163` 的 `exists`），
+但**这只是猜测，本轮没有取证**。另有同事在并行调查，**本文不预判它的结论**。
+
+🔴 **无论结论是什么，运维口径上的后果现在就成立**：
+`agentenv_snapshot_object_store_requests_total{outcome="error"}` **在完全正常的快照创建上就会涨**
+⇒ **任何对着 `outcome="error"` 做的告警都会在正常业务上误报**。
+在查清之前，别把这条 series 写进任何告警规则，也别拿它当 2b 双写健康度的判据。
+
+🟡 同形的第二处观测（同样未追、不做归因）：§13.2 那条生命周期跑完之后，
+`get/catalog/error` 的两台总数从 **60 涨到 62**（两台各 +1，`$WD/p0.b5.txt`）。
+
+### 13.5 本轮就地订正的三处（都在本文自己身上）
+
+| # | 原文 | 订正 |
+|---|---|---|
+| **C1** | §7.1「🔴 前置：集群里没有 Redis」及其 🔧「`redis.yaml` 已写好但**尚未 apply**」 | **已过时**：Redis 当日就部署了，scheduler 与 gateway 都已接上（recon §4.5 🔧 / §9 **SD-B1 全解**；[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.2）。🟢 §7.2 的**结论不受影响** —— 「缓存与目录同侧、落在 Go 进程里」本来就不依赖 Redis 在不在 |
+| **C2** | §7.1 末尾「顺带解掉滚 scheduler 的 **14s** 数据面 503 窗口」 | **14s 是上一轮的旧测量**，重测为 **2.3–3.3 秒**（recon §4.5）。🔧 **本轮已就地改掉** ⇒ recon §11.5 登记的「仍有一处未订正的引用」**可以销案** |
+| **C3** | §10.1「全仓没有对象存储请求计数指标 ⇒ 今天没法观测」＋ 那八个 `client.rs` 行号 | 指标**已经埋好并上线**（这正是 2a 的 Rust 侧交付物）⇒ 那句"今天没法观测"只作为**动手前的现状**存档。🔧 **八个行号全部漂了**（埋点本身把文件撑开了），现值：`get_bytes:117` / `get_to_file:135` / `exists:163` / `list_keys_recursive:182` / `put_bytes:213` / `put_file:251` / `delete:305` / `delete_prefix:325`（`sd2a-7cf9c30`）|
 
 ---
 

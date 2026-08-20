@@ -29,6 +29,19 @@
 > 还有一条清理沙箱的真坑：**`/sandboxes` 不列暂停的沙箱**（§11.3、§7.5）。
 > 就地更新三处：§7.4 ⑦（三个开关落地成 **D-12 / D-13 / D-14**）、§7.5（收尾那一步）、§9 **SD-B1**（已全解）。
 > 验收本身的记录不在本文，在 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13。
+>
+> 🔧 **第三轮更新（2026-08-20 夜，阶段 2a 验收当轮）：新增 §11.6，另有四处就地更新。**
+> 🔴 **同样不是只读**（taint 过节点、宿主机 `kill -9` 过、删过 Pod、`DEL` 过一次 Redis key、
+> 建删过沙箱、播了 30 条快照并**故意留着**）。这一轮最重要的两条：
+> ① **SD-B7 关闭** —— 猝死做得出来了（§11.6 ③ 的三步配方），
+> 🔴 **但最省事的那条路（有沙箱在跑时直接 `delete pod`）是陷阱：节点自己把路由记录删干净，
+> 探针扫无可扫、然后报"通过"**；
+> ② 🔴 **`/nodes` 的 `sandboxCount` 不含暂停的沙箱，而心跳 roster 含** ——
+> 拿它确认"这台机器是空的"会被骗（§11.3 第二个坑）。
+> 就地更新四处：§7.1 A4（registry 的 `Accept` 坑）、§7.5（resume 要带 body ＋ `limit` 上限）、
+> §9 **SD-B7**（已关闭）、§11.2（已被 §11.6 取代）。
+> 2a 的验收记录在 [`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13，清扫的在
+> [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9。
 
 ---
 
@@ -483,6 +496,12 @@ ssh supos@10.10.10.204 '
 
 # A4. 确认 registry 里真有这个 tag（比"push 没报错"硬）
 curl -s http://$REG/v2/agentenv-gateway/tags/list | grep -o "$TAG"
+
+# 🔧 🔴 A4 的坑（2026-08-20 夜第三次复现，三个仓库都一样）：
+#    别改用 /v2/<repo>/manifests/<tag> 去"确认"——**不显式带 Accept 头就拿不到你 push 的那份
+#    manifest**。查 tag 一律用上面的 /tags/list；确实要比 digest 时必须带媒体类型：
+#    curl -s -H 'Accept: application/vnd.oci.image.manifest.v1+json' #         -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' #         -D- -o /dev/null http://$REG/v2/agentenv-gateway/manifests/$TAG
+#    ⚠️ 本轮只记了"复现了"，**逐字响应没有留证** —— 照这条做，别照它推断 registry 的行为细节。
 ```
 
 ### 7.2 步骤 B：发布
@@ -502,6 +521,8 @@ kubectl -n $NS rollout status deploy/agentenv-scheduler --timeout=180s
 
 # 🔴 滚 node（DaemonSet）之前：先确认没有 running 沙箱，否则 grace=3600 会把 rollout 卡死
 curl -s -H 'X-API-Key: dummy' $GW/sandboxes | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))'   # 期望 0
+# 🔧 🔴 这一行只数 running（§11.3）。**暂停的那几台它看不见，而 rollout 会把它们恢复出来**
+#    ⇒ 判断"这台机器是空的"一律照 /v2/sandboxes 数，`/nodes` 的 sandboxCount 同样漏（§11.3 第二个坑）
 kubectl -n $NS set image ds/agentenv-node agentenv=$REG/agentenv-runtime:$TAG
 kubectl -n $NS rollout status ds/agentenv-node --timeout=600s
 # 🔴 绝不 --force --grace-period=0：强删只删 API 对象、容器还活着，
@@ -518,6 +539,8 @@ kubectl -n $NS get pod -l app.kubernetes.io/name=agentenv-gateway \
 不是上一轮记的 14s —— §4.5）。窗口内的 503 **既不是失败也不是"没有窗口"**。
 🟢 **`SCHEDULER_REDIS_ADDR` 配上之后同一次滚动是 0 次 503**，而集群今天已经配上了。
 滚 gateway 不用付。
+🔧 **再次复现（2026-08-20 夜，2a 发布当轮）**：带着 `SCHEDULER_REDIS_ADDR` 滚 scheduler，
+数据面**零错误**。⇒ 这条现在有两次独立取证，可以当作稳定结论用。
 
 ### 7.3 步骤 C：冒烟（每一发都跑，30 秒）
 
@@ -598,7 +621,16 @@ SB=$(python3 -c 'import json;print(json.load(open("/tmp/sd-sandbox.json"))["sand
 curl -s -o /dev/null -w 'pause=%{http_code}\n'  -X POST -H 'X-API-Key: dummy' $GW/sandboxes/$SB/pause
 kubectl -n $NS exec agentenv-postgres-0 -- psql -U aenv -d aenv \
   -c "SELECT state, origin_node_id, execution_id FROM paused_sandboxes WHERE sandbox_id='$SB';"
-curl -s -o /dev/null -w 'resume=%{http_code}\n' -X POST -H 'X-API-Key: dummy' $GW/sandboxes/$SB/resume
+
+# 🔧 🔴 订正（2026-08-20 夜实测）：resume **必须带 Content-Type ＋ body**，
+#    原来这里写的裸 POST 回的是 **415**，不是 201。
+#    requestBody 是 required: true / schema ResumedSandbox（src/api/openapi.yml:1629-1634，
+#    字段 timeout 在 :581-588）。
+curl -s -o /dev/null -w 'resume=%{http_code}\n' -X POST -H 'X-API-Key: dummy' \
+  -H 'Content-Type: application/json' -d '{"timeout": 1800}' $GW/sandboxes/$SB/resume
+# 🔴 这条坑危险在于**它看起来是无害的**：autoResume 开着时，紧接着的任何数据面请求
+#    都会把沙箱自动 resume，状态读出来就是 running ⇒ 那个 415 看着只像"头没写对"，
+#    实际含义是**这一发根本没有验到 resume API**。判据里含 resume 的探针必须单独校这个码。
 
 # 收尾
 curl -s -o /dev/null -w 'delete=%{http_code}\n' -X DELETE -H 'X-API-Key: dummy' $GW/sandboxes/$SB
@@ -611,6 +643,10 @@ curl -s -o /dev/null -w 'delete=%{http_code}\n' -X DELETE -H 'X-API-Key: dummy' 
 #    照 /sandboxes 数着清，暂停的那几台会留下来，而且不会安静地留着：见 §11.3。
 curl -s -H 'X-API-Key: dummy' $GW/v2/sandboxes \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d)); [print(" ", x["sandboxID"], x.get("state")) for x in d]'
+
+# 🔧 🟡 顺带（2026-08-20 夜）：列表接口的 limit 上限是 **100**
+#    （src/api/openapi.yml:93-103，maximum: 100）⇒ /snapshots?limit=200 直接 **400**（range error）。
+#    写脚本别用 200。另：limit 今天**不省任何对象存储请求**，见 _sd-impl-phase2.md §13.1。
 ```
 
 也可以用 203 上的 CLI（**必须写全路径**）：
@@ -710,7 +746,7 @@ kubectl -n $NS set image ds/agentenv-node          agentenv=$REG/agentenv-runtim
 | **SD-B4** | **本机 docker 无法直接 push 到 `10.10.10.204:5000`**，且上行只有 190 KB/s | 🟡 已有规避 | `/etc/docker/daemon.json` 的 `insecure-registries` 指的是另一套环境（`10.1.0.106:5000`）。**规避是既定的：全部构建在 204 上做**（§7.1）。要改本机也行（加 insecure registry + 重启 docker），但上行 190 KB/s ⇒ 推一次 runtime 镜像 ~11 分钟，**不值得** |
 | **SD-B5** | **PG / RustFS 的 PVC 都是 `local-path` 且钉死 204，5Gi / 100Gi，无备份** | 🟡 | 204 挂掉 = 登记表 + 快照桶一起丢。拆分之后 `api` 是 N 副本、登记表是唯一真相源 ⇒ **这条的暴露面会变大**。至少要在阶段 2（catalog 进 PG）之前谈一次持久化 |
 | **SD-B6** | 🔴 **scheduler 缺席超过 `binding_ttl` 的表现是 404，不是 503** | 🔴 **会让阶段 1 的验证探针假通过** | scheduler 缺席 **> 30 秒**（`binding_ttl`，`services/scheduler/internal/store.go:11`）之后恢复，会出现一段 **~13 秒的 404 窗口**，其间 gateway 对一个**活着、健康**的沙箱回答「不存在」，然后自愈。**Redis 不修这条**，`binding_ttl` 才是它的开关。机理与两条后果在 §9.1 |
-| **SD-B7** | 🔴 **这套集群做不出「整机猝死」** | 🔴 **一整类探针在这里拿不到取证** | 四条路三条堵死：deny-all NetworkPolicy **不执行**、`kill -STOP 1` 对 PID 1 **静默无效**、`--force --grace-period=0` 被 §7.2 明令禁止、优雅 `delete pod` 撞上 `terminationGracePeriodSeconds: 3600`。⇒ 判据里含「节点真的死了」的探针（F4 的窗口、陈旧路由存活时长、节点侧接管）**只能推，不能实测**。唯一建议路线（**也还没验证**）：挑一台**持零个沙箱**的节点做优雅 delete。机理与证据在 §11.1 / §11.2 |
+| **SD-B7** | 🔴 **这套集群做不出「整机猝死」** | 🔴 **一整类探针在这里拿不到取证** | 四条路三条堵死：deny-all NetworkPolicy **不执行**、`kill -STOP 1` 对 PID 1 **静默无效**、`--force --grace-period=0` 被 §7.2 明令禁止、优雅 `delete pod` 撞上 `terminationGracePeriodSeconds: 3600`。⇒ 判据里含「节点真的死了」的探针（F4 的窗口、陈旧路由存活时长、节点侧接管）**只能推，不能实测**。唯一建议路线（**也还没验证**）：挑一台**持零个沙箱**的节点做优雅 delete。机理与证据在 §11.1 / §11.2。🔧 **2026-08-20 夜：本条关闭** —— 猝死做得出来了（§11.6 ③：`taint NoSchedule` → 宿主机 `kill -9` 容器 init → `delete pod --grace-period=1`），并有正面证据（endpoint 掉了、`/nodes` 掉到一条、死节点的路由记录留在 Redis 里）。🔴 **但上面那条"唯一建议路线"本身是陷阱**：节点上还有沙箱时它会自己删干净路由记录，探针扫无可扫、读起来像通过（§11.6 ②） |
 
 ### 9.1 🔴 SD-B6 的机理 —— 三段都在代码里
 
@@ -819,6 +855,13 @@ kubectl -n $NS set image ds/agentenv-node          agentenv=$REG/agentenv-runtim
 先用 `/v2/sandboxes` ＋ `placement` 确认它真的是空的（§11.3 的坑正好在这里咬人），
 再删。**这条路线本身也还没验证过。**
 
+🔧 **已被 §11.6 取代（2026-08-20 夜）。** 上面这段**两半各对了一半**，原文保留以便对照：
+- ✅ 「空节点上 `delete pod` 是无害的」**成立**：实测 1.9 秒返回、53 秒起来、`restarts=0`。
+- 🔴 「**这样就能制造猝死**」**不成立** —— 节点上有沙箱时它自己会把路由记录删干净，
+  于是探针**扫无可扫、读起来像通过**。真正做得出猝死的三步配方在 §11.6 ③。
+- 🔴 「先确认它是空的」这一步的读法也要改：`/v2/sandboxes` ＋ `placement` 是对的，
+  **但别用 `/nodes` 的 `sandboxCount`**（§11.3 第二个坑）。
+
 ### 11.3 🔴 清理沙箱的坑：`/sandboxes` **不列暂停的沙箱**
 
 - `/sandboxes` 是 deprecated 的，语义就是「列 **running**」（`src/api/openapi.yml:1344-1348`）；
@@ -832,6 +875,24 @@ kubectl -n $NS set image ds/agentenv-node          agentenv=$REG/agentenv-runtim
 
 ⇒ 已写进 §7.5 的收尾步骤。🔴 **收尾一律照 `/v2/sandboxes` 数**，
 并且**删完再数一次** —— 这是唯一能把「暂停的那几台」也算进去的读法。
+
+#### 🔧 第二个坑（2026-08-20 夜新增）：`/nodes` 的 `sandboxCount` 也漏暂停的，**而心跳 roster 不漏**
+
+**实测**：pause 掉一台之后，`/nodes` 的 `sandboxCount` 读 **1**，
+同一时刻 `/v2/sandboxes` 是 **2**（一台 running、一台 paused）。
+
+| 面 | 数的是什么 | 出处 |
+|---|---|---|
+| `/nodes` 的 `sandboxCount` | **只数 VM 还活着的那几个状态**（`Running` ＋ `Pausing`/`Snapshotting`/`Forking`/`Killing`），暂停的记在另一个字段 `sandboxPausedCount` | `src/observability/service.rs:81`；`src/orchestrator/metrics.rs:60-66, 88-96`；`src/api/openapi.yml:1232-1235`（描述逐字「running on the node」）与 `:1250-1253` |
+| 🔴 心跳 roster（`sandbox_ids` / `sandbox_roster`） | **整个内存 store，不区分状态** —— 暂停的也在里面 | `src/observability/service.rs:82-83` → `src/orchestrator/service.rs:795`、`:805-823` |
+
+🔴 **两件事因此会被骗**：
+1. **「这台机器是空的」** —— 拿 `sandboxCount == 0` 下结论会偏小。删节点、做猝死（§11.6）、
+   滚 DaemonSet 之前，**一律照 `/v2/sandboxes` 数**。
+2. 🔴 **清扫读的正是 roster 那一份**（含暂停的）⇒ 一个按 `sandboxCount` 设计判据的清扫探针，
+   **期望值从一开始就是错的**。
+
+
 
 ### 11.4 🔧 三个路由投影开关落地了 ⇒ 漂移多出 D-12 / D-13 / D-14
 
@@ -867,3 +928,80 @@ CM literal 在 `kustomization.yaml:120-124`，集群里的 CM 叫 `routing-proje
 
 🟡 **仍有一处未订正的引用**：`_sd-impl-phase2.md:1116` 还写着
 「顺带解掉滚 scheduler 的 **14s** 数据面 503 窗口」。**不归本文改**，登记在这里。
+
+🟢 **销案（2026-08-20 夜）**：那处已就地订正为 2.3–3.3 秒，并在
+[`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13.5 **C2** 留了订正记录。全仓再无 14s 的活引用
+（`_impl-plan-control-plane-phase3.md` 里那处是历史测量，按原议不动）。
+
+### 11.6 🔧 第三轮（2026-08-20 夜，阶段 2a 验收当轮）：**SD-B7 关闭** —— 猝死做得出来了，但最省事的那条路是陷阱
+
+> 🔴 **这一轮同样不是只读**：taint 过节点、`kill -9` 过宿主进程、删过 Pod、`DEL` 过一次 Redis key、
+> 建删过沙箱、播了 30 条快照（**故意留着**，见 [`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13.1）。
+> 本节只写**手法**；清扫的验收结论在 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9，
+> 2a 的验收在 [`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13。
+
+§11.2 把 `kubectl delete pod --grace-period=1` 记为「唯一建议、**也还没验证**」的路线。
+**验了，而它同时给出两个答案。**
+
+#### ① 🟢 安全性：这条命令本身是安全的（§7.2 的恐惧是专指另一条命令的）
+
+在一台**持零个沙箱**的节点上：
+
+| 项 | 实测 |
+|---|---|
+| `delete pod --grace-period=1` 返回 | **1.9 秒**（不是 3600 —— `terminationGracePeriodSeconds` 是**上限**，不是等待时间）|
+| 替代 Pod ready | **53 秒** |
+| `restarts` | **0** |
+| `records.db` / `LOCK` 抢占导致的 CrashLoop | **没有出现** |
+
+⇒ 🔧 **§7.2 那条「绝不强删」的纪律，射程是 `--force --grace-period=0`**（只删 API 对象、
+容器还活着、新 Pod 抢不到锁），**不覆盖 `--grace-period=1`** —— 后者是正常的优雅删除，
+只是把宽限期设成 1 秒。原纪律不变，但别把它读成"任何小 grace 都危险"。
+
+#### ② 🔴 但它**做不出猝死**，而且失败的样子读起来像通过
+
+**节点上有 running 沙箱时**，SIGTERM 一到，节点**反应得够快**（**~4 秒**）就开始它的
+关机暂停流程，并且顺手**把自己的路由记录删干净**：
+
+- Redis **被清空**（不是"留下一条陈旧记录"，是**一条都不剩**）；
+- 那台沙箱停在 `paused_sandboxes.state='publishing'`。
+
+🔴 **于是用这种方式布置的清扫探针，扫无可扫，然后报"通过"。**
+它测的是一个**恰好不发生**的现象 —— 与上一轮记录过的「一个在每个相位都通过的探针」
+是同一个失效类（§8 第 1、2 条）。**这条要当陷阱记，不是当选项记。**
+
+#### ③ ✅ 真正做得出猝死的配方（三步，实测有效）
+
+```bash
+# 1) 先把这台机器踢出调度，但 🔴 绝不用 NoExecute
+kubectl taint nodes <node> k=down:NoSchedule
+# 🔴 NoExecute 会把 postgres / redis / rustfs / gateway / scheduler 一起赶走 ——
+#    worker-01 上跑着这些（§2 / §3.1），一条 NoExecute 就是把整个控制面端了。
+#    用完记得摘： kubectl taint nodes <node> k-
+
+# 2) 从这台节点的【宿主机】上，SIGKILL 容器里的 /server init
+#    定位：遍历宿主 PID，在 /proc/<pid>/cgroup 里匹配这个 Pod 的 UID
+ssh supos@<node-ip> 'sudo kill -9 <host PID of the container /server init>'
+
+# 3) 再删 Pod（此时容器里已经没有活着的 init，走的就是 ① 那条 1.9 秒的路）
+kubectl -n $NS delete pod <node-pod> --grace-period=1
+```
+
+🔴 **第 2 步为什么有效，而 §11.1 的 SD-E2 无效**：内核不向**同一 PID 命名空间内**的 PID 1
+投递「默认动作」的信号（所以 Pod 内 `kill -STOP 1` 被静默丢弃），
+**而祖先命名空间不受这条保护** —— 从宿主机发出的 `SIGKILL` **是会被投递的**。
+⇒ SD-E2 那条结论不用改，它只对"在 Pod 内部动手"成立。
+
+🔴 **第 1 步之前怎么确认这台机器"是空的"**：照 `/v2/sandboxes` ＋ `placement` 数，
+**不要看 `/nodes` 的 `sandboxCount`** —— 它把暂停的沙箱漏掉了（§11.3 的第二个坑）。
+
+#### ④ 正面证据（§11.1 要求的那种：先证明它真的死了）
+
+| 证据 | 值 |
+|---|---|
+| `agentenv-nodes` 的 endpoints | **少了这一个** |
+| `/nodes` | 从两条**掉到一条** |
+| 🔴 死节点的两条路由记录 | **都还在 Redis 里**，TTL **~24 小时** |
+
+第三条同时是两件事：**猝死成功的证据**，以及 **F4 的现场**
+（陈旧记录活过了它的节点 —— 严重度见 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9）。

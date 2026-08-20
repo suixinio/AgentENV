@@ -8,8 +8,6 @@
 //! requests does listing snapshots cost", which is what the catalog migration
 //! is measured against.
 
-use crate::observability::prometheus::result_status;
-
 /// Repository-relative key prefix that holds catalog rows: snapshot records
 /// under `catalog/records/` and alias bindings under `catalog/aliases/`.
 const CATALOG_PREFIX: &str = "catalog/";
@@ -87,17 +85,70 @@ impl ObjectStoreOp {
     }
 }
 
+/// What the store answered.
+///
+/// 🔴 `NotFound` exists because the absence of an object is a *successful*
+/// answer from the store, and repository code asks that question constantly:
+/// "is this alias already bound", "does this record exist yet", "has this
+/// content-addressed layer already been uploaded". Folding those into
+/// `outcome="error"` made a plain snapshot creation emit two catalog errors
+/// (`load_alias_target` before the bind, plus the pre-bind or pre-commit
+/// record read), so anyone alerting on the error series fired on entirely
+/// healthy traffic. `Error` now means only what it says: the request did not
+/// produce a usable answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectStoreOutcome {
+    /// The store returned the object, the listing, or the write acknowledgement.
+    Ok,
+    /// The request completed and the store answered "no such object". Callers
+    /// routinely turn this into `Ok(None)` or `Ok(false)`.
+    NotFound,
+    /// The request produced no usable answer: transport, credentials, a
+    /// server-side failure, or a response the caller could not use.
+    Error,
+}
+
+impl ObjectStoreOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotFound => "not_found",
+            Self::Error => "error",
+        }
+    }
+
+    /// Classifies an operation that cannot miss: a write, a listing, or any
+    /// composite whose constituent requests are counted in their own right.
+    pub(crate) fn from_success(ok: bool) -> Self {
+        if ok {
+            Self::Ok
+        } else {
+            Self::Error
+        }
+    }
+
+    /// Classifies a lookup: `true` means the object was there, `false` means
+    /// the store said it was not.
+    pub(crate) fn from_present(present: bool) -> Self {
+        if present {
+            Self::Ok
+        } else {
+            Self::NotFound
+        }
+    }
+}
+
 /// Records one object-storage request against the repository backend store.
 pub(crate) fn record_object_store_request(
     op: ObjectStoreOp,
     surface: ObjectStoreSurface,
-    ok: bool,
+    outcome: ObjectStoreOutcome,
 ) {
     metrics::counter!(
         OBJECT_STORE_REQUESTS_TOTAL,
         "op" => op.as_str(),
         "surface" => surface.as_str(),
-        "outcome" => result_status(ok),
+        "outcome" => outcome.as_str(),
     )
     .increment(1);
 }

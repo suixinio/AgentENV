@@ -1233,11 +1233,12 @@ mod tests {
     const TEST_BUCKET: &str = "bucket";
     const TEST_PREFIX: &str = "snapshots";
 
-    type FakeObjects = Arc<BTreeMap<String, Vec<u8>>>;
+    type FakeObjects = Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>;
 
-    /// Minimal S3 stand-in: enough of `ListObjectsV2` plus object GET for the
-    /// catalog read path, so the request count can be asserted without a real
-    /// object store.
+    /// Minimal S3 stand-in: enough of `ListObjectsV2` plus object
+    /// GET/HEAD/PUT/DELETE for the catalog read *and write* paths, so the
+    /// request count of a whole publish can be asserted without a real object
+    /// store.
     async fn fake_s3(State(objects): State<FakeObjects>, request: Request) -> Response {
         let query = request.uri().query().unwrap_or("").to_owned();
         if query.contains("list-type=2") {
@@ -1250,7 +1251,8 @@ mod tests {
                 r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated>"#,
             );
             xml.push_str(&format!("<Name>{TEST_BUCKET}</Name>"));
-            for (key, body) in objects.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+            let stored = objects.lock().expect("fake s3 objects");
+            for (key, body) in stored.iter().filter(|(key, _)| key.starts_with(&prefix)) {
                 xml.push_str(&format!(
                     "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
                     body.len()
@@ -1260,15 +1262,29 @@ mod tests {
             return ([(CONTENT_TYPE, "application/xml")], xml).into_response();
         }
 
+        let method = request.method().clone();
         let path = request.uri().path().trim_start_matches('/');
         let key = path
             .strip_prefix(&format!("{TEST_BUCKET}/"))
             .unwrap_or(path)
             .to_owned();
-        match objects.get(&key) {
-            Some(body) => {
-                ([(CONTENT_TYPE, "application/octet-stream")], body.clone()).into_response()
-            }
+
+        if method == axum::http::Method::PUT {
+            let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+                Ok(body) => body.to_vec(),
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            objects.lock().expect("fake s3 objects").insert(key, body);
+            return StatusCode::OK.into_response();
+        }
+        if method == axum::http::Method::DELETE {
+            objects.lock().expect("fake s3 objects").remove(&key);
+            return StatusCode::NO_CONTENT.into_response();
+        }
+
+        let stored = objects.lock().expect("fake s3 objects").get(&key).cloned();
+        match stored {
+            Some(body) => ([(CONTENT_TYPE, "application/octet-stream")], body).into_response(),
             None => (
                 StatusCode::NOT_FOUND,
                 "<Error><Code>NoSuchKey</Code></Error>",
@@ -1305,7 +1321,7 @@ mod tests {
         let addr = listener.local_addr().expect("fake s3 addr");
         let app = Router::new()
             .fallback(fake_s3)
-            .with_state(Arc::new(objects));
+            .with_state(Arc::new(std::sync::Mutex::new(objects)));
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -1390,6 +1406,50 @@ mod tests {
                 ("get/catalog/ok".to_owned(), record_count),
                 ("get/artifact/ok".to_owned(), 1),
             ]),
+        );
+    }
+
+    /// The cluster measurement this test exists for: seeding 30 template
+    /// snapshots produced `get/catalog/error = 60` — exactly two per snapshot —
+    /// alongside `put/catalog/ok = 60`, while every create returned 201. Both
+    /// "errors" are lookups that legitimately miss on a store that has never
+    /// seen the snapshot before:
+    ///
+    ///   1. `create()`'s pre-flight `load_alias_target`, and
+    ///   2. `bind_alias()`'s step 1, which reads the same alias key again.
+    ///
+    /// Nothing failed. Anyone alerting on `outcome="error"` would have paged on
+    /// ordinary snapshot creation, so the miss gets its own outcome label.
+    #[tokio::test]
+    async fn expected_catalog_misses_are_not_counted_as_errors() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let (_client, repository) = fake_s3_repository(addr);
+        let record = SnapshotRecord::template_waiting(
+            SnapshotId::generate(),
+            Some(SnapshotAlias::parse("template-alias").expect("alias parses")),
+            SandboxResources::default(),
+        );
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let created = repository.create(record.clone()).await;
+        drop(guard);
+
+        created.expect("create should succeed against an empty store");
+        assert_eq!(
+            object_store_requests(&snapshotter),
+            BTreeMap::from([
+                // The record key is probed once and is absent.
+                ("head/catalog/not_found".to_owned(), 1),
+                // The two alias lookups that used to read as errors.
+                ("get/catalog/not_found".to_owned(), 2),
+                // `bind_alias` step 6 reads its own binding back.
+                ("get/catalog/ok".to_owned(), 1),
+                // The record and the alias binding.
+                ("put/catalog/ok".to_owned(), 2),
+            ]),
+            "a create against an empty store must record no failed request"
         );
     }
 

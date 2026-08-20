@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
 use crate::snapshot::repository::metrics::{
-    record_object_store_request, ObjectStoreOp, ObjectStoreSurface,
+    record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
 
 /// Multipart part size for streaming file uploads. S3/OSS caps a multipart
@@ -126,7 +126,7 @@ impl OssClient {
         record_object_store_request(
             ObjectStoreOp::Get,
             ObjectStoreSurface::for_key(key),
-            result.is_ok(),
+            read_outcome(&result),
         );
         result
     }
@@ -154,7 +154,7 @@ impl OssClient {
         record_object_store_request(
             ObjectStoreOp::Get,
             ObjectStoreSurface::for_key(key),
-            result.is_ok(),
+            read_outcome(&result),
         );
         result
     }
@@ -170,10 +170,16 @@ impl OssClient {
             .await
             .with_context(|| format!("oss exists '{key}'"));
         metric.finish(&result);
+        // A HEAD that answers "absent" is a completed request, not a failure:
+        // `upload_managed_layer_if_missing` and `snapshot_exists` both ask this
+        // question expecting "no" to be a routine answer.
         record_object_store_request(
             ObjectStoreOp::Head,
             ObjectStoreSurface::for_key(key),
-            result.is_ok(),
+            match &result {
+                Ok(present) => ObjectStoreOutcome::from_present(*present),
+                Err(_) => ObjectStoreOutcome::Error,
+            },
         );
         result
     }
@@ -192,10 +198,12 @@ impl OssClient {
             })
             .await
             .with_context(|| format!("oss list '{prefix}'"));
+        // A LIST always answers; an empty listing is a legitimate answer, not
+        // a miss.
         record_object_store_request(
             ObjectStoreOp::List,
             ObjectStoreSurface::for_key(prefix),
-            listed.is_ok(),
+            ObjectStoreOutcome::from_success(listed.is_ok()),
         );
         let keys: Vec<String> = listed?;
 
@@ -233,7 +241,7 @@ impl OssClient {
         record_object_store_request(
             ObjectStoreOp::Put,
             ObjectStoreSurface::for_key(key),
-            result.is_ok(),
+            ObjectStoreOutcome::from_success(result.is_ok()),
         );
         if result.is_ok() {
             metrics::counter!(
@@ -278,7 +286,7 @@ impl OssClient {
         record_object_store_request(
             ObjectStoreOp::Put,
             ObjectStoreSurface::for_key(key),
-            result.is_ok(),
+            ObjectStoreOutcome::from_success(result.is_ok()),
         );
         match result {
             Ok(size) => {
@@ -303,11 +311,14 @@ impl OssClient {
 
     /// Delete a single object. Idempotent – missing objects are not errors.
     pub(crate) async fn delete(&self, key: &str) -> Result<()> {
+        // `Deleted::Absent` records the idempotent case the public signature
+        // erases: the store answered "no such object" and the caller was told
+        // the delete succeeded.
         let result = self
             .run_with_key(key, |operator, key| async move {
                 match operator.delete(&key).await {
-                    Ok(()) => Ok(()),
-                    Err(err) if err.kind() == OpenDalErrorKind::NotFound => Ok(()),
+                    Ok(()) => Ok(Deleted::Removed),
+                    Err(err) if err.kind() == OpenDalErrorKind::NotFound => Ok(Deleted::Absent),
                     Err(err) => Err(err),
                 }
             })
@@ -316,9 +327,12 @@ impl OssClient {
         record_object_store_request(
             ObjectStoreOp::Delete,
             ObjectStoreSurface::for_key(key),
-            result.is_ok(),
+            match &result {
+                Ok(deleted) => ObjectStoreOutcome::from_present(*deleted == Deleted::Removed),
+                Err(_) => ObjectStoreOutcome::Error,
+            },
         );
-        result
+        result.map(|_| ())
     }
 
     /// Delete all objects under a prefix.
@@ -339,7 +353,7 @@ impl OssClient {
         record_object_store_request(
             ObjectStoreOp::DeletePrefix,
             ObjectStoreSurface::for_key(prefix),
-            result.is_ok(),
+            ObjectStoreOutcome::from_success(result.is_ok()),
         );
         result
     }
@@ -414,6 +428,25 @@ impl OssClient {
         );
         *self.cached_operator.write().await = Some(entry.clone());
         Ok(entry)
+    }
+}
+
+/// Whether a delete actually removed an object or found nothing to remove.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deleted {
+    Removed,
+    Absent,
+}
+
+/// Classifies a read: a `NotFound` from the store is an answer, not a failure.
+/// Every catalog read path in this backend (`read_record`, `load_alias_target`,
+/// `resolve_alias`) turns that same error into `Ok(None)`, so counting it as
+/// `outcome="error"` made routine lookups indistinguishable from real ones.
+fn read_outcome<T>(result: &Result<T>) -> ObjectStoreOutcome {
+    match result {
+        Ok(_) => ObjectStoreOutcome::Ok,
+        Err(error) if OssClient::is_not_found_error(error) => ObjectStoreOutcome::NotFound,
+        Err(_) => ObjectStoreOutcome::Error,
     }
 }
 

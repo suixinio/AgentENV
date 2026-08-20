@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::snapshot::repository::metrics::{
-    record_object_store_request, ObjectStoreOp, ObjectStoreSurface,
+    record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
 use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
@@ -217,7 +217,7 @@ impl PosixFsCatalogStore {
         record_object_store_request(
             ObjectStoreOp::List,
             ObjectStoreSurface::Catalog,
-            listed.is_ok(),
+            ObjectStoreOutcome::from_success(listed.is_ok()),
         );
         for entry in listed.map_err(|error| {
             RepositoryError::backend(
@@ -389,18 +389,51 @@ impl PosixFsCatalogStore {
     where
         T: DeserializeOwned,
     {
+        self.read_json_if_exists(path)?.ok_or_else(|| {
+            RepositoryError::backend(
+                format!("read '{}'", path.display()),
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            )
+        })
+    }
+
+    /// Reads one catalog row, treating a missing file as an answer rather than
+    /// a failure.
+    ///
+    /// Reading and handling `ENOENT` replaces an `exists()`-then-read pair: it
+    /// is one syscall instead of two, it has no window between the two, and it
+    /// gives the miss a metric of its own. Callers that previously returned
+    /// `Ok(None)` from an `exists()` guard recorded nothing at all, which made
+    /// the POSIX and OSS backends disagree about what a lookup costs.
+    fn read_json_if_exists<T>(&self, path: &Path) -> RepositoryResult<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
         // Every path this store reads is a catalog row: a snapshot record or
         // an alias binding. Snapshot bytes live in `artifacts.rs`.
         let read = fs::read(path);
         record_object_store_request(
             ObjectStoreOp::Get,
             ObjectStoreSurface::Catalog,
-            read.is_ok(),
+            match &read {
+                Ok(_) => ObjectStoreOutcome::Ok,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ObjectStoreOutcome::NotFound
+                }
+                Err(_) => ObjectStoreOutcome::Error,
+            },
         );
-        let bytes = read.map_err(|error| {
-            RepositoryError::backend(format!("read '{}'", path.display()), error)
-        })?;
-        serde_json::from_slice(&bytes).map_err(|error| {
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read '{}'", path.display()),
+                    error,
+                ))
+            }
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
             RepositoryError::backend(format!("parse json '{}'", path.display()), error)
         })
     }
@@ -414,7 +447,7 @@ impl PosixFsCatalogStore {
         record_object_store_request(
             ObjectStoreOp::Put,
             ObjectStoreSurface::Catalog,
-            result.is_ok(),
+            ObjectStoreOutcome::from_success(result.is_ok()),
         );
         result
     }
@@ -534,19 +567,13 @@ impl PosixFsCatalogStore {
         &self,
         id: &SnapshotId,
     ) -> RepositoryResult<Option<SnapshotRecord>> {
-        let path = self.record_path(id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        self.read_json(&path).map(Some)
+        self.read_json_if_exists(&self.record_path(id))
     }
 
     fn load_alias_target(&self, alias: &SnapshotAlias) -> RepositoryResult<Option<SnapshotId>> {
-        let path = PosixFsSnapshotArtifactLayout::alias_path(&self.root, alias);
-        if !path.exists() {
-            return Ok(None);
-        }
-        self.read_json(&path).map(Some)
+        self.read_json_if_exists(&PosixFsSnapshotArtifactLayout::alias_path(
+            &self.root, alias,
+        ))
     }
 
     fn acquire_file_lock(

@@ -307,8 +307,13 @@ func appendFilters(sb *strings.Builder, a *args, f Filter) error {
 			// A union, because the caller holds one and does not know which.
 			// The id half only participates when the value could be one at all.
 			if isCanonicalUUID(value) {
-				placeholder := a.add(strings.ToLower(value))
-				sb.WriteString("\n   AND (s.id = " + placeholder + "::uuid OR a.alias = " + placeholder + ")")
+				// Two placeholders for one value, and not one used twice: the
+				// driver infers a parameter's type from where it appears, and a
+				// single placeholder compared against both a uuid column and a
+				// text one has no type that satisfies both.
+				id := a.add(strings.ToLower(value))
+				alias := a.add(value)
+				sb.WriteString("\n   AND (s.id = " + id + "::uuid OR a.alias = " + alias + ")")
 			} else {
 				sb.WriteString("\n   AND a.alias = " + a.add(value))
 			}

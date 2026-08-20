@@ -8,6 +8,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/routing"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -699,15 +700,19 @@ func normalizeExecutionID(raw string) string {
 // incrementing that series from here would merge two unrelated facts into one
 // number, and the number is one somebody reads to decide whether the fleet has
 // finished upgrading.
+// 🔴 The trimming and the lower-casing are routing.NormalizeExecutionID's, not
+// a second spelling of them. That is the half the gateway runs too, and the
+// half the ordering is defined over; what stays here is the half that is this
+// package's own — the shape check, and the reason a value was dropped.
 func normalizeExecutionIDReason(raw string) (normalized string, dropReason string) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	normalized = routing.NormalizeExecutionID(raw)
+	if normalized == "" {
 		return "", "no_execution"
 	}
-	if !isCanonicalUUIDText(trimmed) {
+	if !isCanonicalUUIDText(normalized) {
 		return "", "bad_uuid"
 	}
-	return strings.ToLower(trimmed), ""
+	return normalized, ""
 }
 
 // isCanonicalUUIDText is the shape check, deliberately narrow: the ids come

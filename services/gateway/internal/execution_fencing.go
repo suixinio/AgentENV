@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 
 	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
+	"agentenv/services/shared/routing"
 
 	"go.uber.org/zap"
 )
@@ -269,16 +269,18 @@ func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.Looku
 	}
 }
 
-// normalizeExecutionID puts an incarnation into the one shape the ordering is
-// defined over.
+// normalizeExecutionID is routing.NormalizeExecutionID, and nothing else.
 //
-// 🔴 Lower case is not cosmetic. The whole comparison is lexicographic — a UUIDv7
-// sorts in the order it was minted — and '0'-'9' < 'A'-'F' < 'a'-'f', so one
-// upper-case value compared against a lower-case one orders backwards. The
-// scheduler's own id validator accepts either case, so the gateway cannot assume
-// the normalisation already happened.
+// 🔴 The rule belongs to the package both processes share, for the reason
+// written on it: the comparison is lexicographic — a UUIDv7 sorts in the order
+// it was minted — and '0'-'9' < 'A'-'F' < 'a'-'f', so one upper-case value
+// compared against a lower-case one orders backwards. The scheduler's own id
+// validator accepts either case, so the gateway cannot assume the normalisation
+// already happened, and a second copy of the rule here would be free to stop
+// agreeing with the one the scheduler orders by. What is left is a name this
+// file already reads well with.
 func normalizeExecutionID(raw string) string {
-	return strings.ToLower(strings.TrimSpace(raw))
+	return routing.NormalizeExecutionID(raw)
 }
 
 // stampGatewayHeader writes one of the gateway's own outbound headers over

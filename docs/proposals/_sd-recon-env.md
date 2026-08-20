@@ -21,6 +21,14 @@
 > ⚠️ **①②不是本次只读侦察的产物**：Redis 清单是另一批工作落的，
 > 2.3–3.3 秒是一次带 `rollout restart` 的**写操作**测量。
 > §10 的「全部只读」只描述本文最初那一轮。
+>
+> 🔧 **第二轮更新（2026-08-20 晚，阶段 1 验收当轮）：新增 §11，另有三处就地更新。**
+> 🔴 **那一轮不是只读**（改开关、scale、applied 一个 NetworkPolicy、DEL 过 Redis key、建删过沙箱）。
+> 里面有两条**会让未来探针整发作废**的：**这套集群不执行 NetworkPolicy**、
+> **`kill -STOP 1` 对 PID 1 是静默无效**（§11.1）⇒ 目前**没有制造整机猝死的可用手法**（§11.2）；
+> 还有一条清理沙箱的真坑：**`/sandboxes` 不列暂停的沙箱**（§11.3、§7.5）。
+> 就地更新三处：§7.4 ⑦（三个开关落地成 **D-12 / D-13 / D-14**）、§7.5（收尾那一步）、§9 **SD-B1**（已全解）。
+> 验收本身的记录不在本文，在 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13。
 
 ---
 
@@ -34,7 +42,7 @@
 | PG | ✅ 就绪（`agentenv-postgres-0`，`paused_sandboxes` **14 列 / 0 行**） |
 | 对象存储 | ✅ RustFS 就绪（`rustfs` svc + NodePort 30900/30901，控制台 200） |
 | Registry | ✅ `10.10.10.204:5000` 明文 HTTP，两节点 k3s 已信任 |
-| **Redis** | 🔧 侦察时全集群没有；**同日已部署**（`deploy/k8s/base/redis.yaml`，提交 `77aa98f`）。scheduler 已接上（`binding_store="redis"`），🔴 **gateway 还没接**。见 §4.5 |
+| **Redis** | 🔧 侦察时全集群没有；**同日已部署**（`deploy/k8s/base/redis.yaml`，提交 `77aa98f`）。scheduler 已接上（`binding_store="redis"`）；🔧 **当晚 gateway 也接上了**（`GATEWAY_REDIS_ADDR`）⇒ SD-B1 全解。见 §4.5、§9 |
 | 镜像链路 | 在 **204** 上 `sudo docker build -f deploy/docker/Dockerfile.<svc> -t 10.10.10.204:5000/agentenv-<svc>:<不可变 tag> .` → `push` → `kubectl set image`。**绝不在本机构建再传**（上行实测 190 KB/s） |
 
 **离「能部署测试服务拆分」还差什么**：见 §9 的阻塞项。**Redis 那条已经解掉一半**
@@ -553,17 +561,23 @@ kubectl -n $NS get svc agentenv-gateway-nodeport -o jsonpath='{.spec.ports[0].no
 kubectl -n $NS get cm execution-fencing-config -o jsonpath='{.data}{"\n"}'
 # 期望 enforce / true / enforce。出现 observe 或 off = 被 apply 退回了
 
-# ⑦ 🟡 待补：阶段 1 的三个路由投影开关（**尚未进 deploy/k8s/base，先别加进例行复核**）
-#    名字已定（[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §8），解析代码已在
-#    services/shared/config/config.go，缺的是清单里的 env：
-#      GATEWAY_ROUTING_PROJECTION_READ           （gateway，读侧）
-#      GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE  （gateway，写侧）
-#      SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE（scheduler，写侧）
-#    🔴 与既有三个化身开关**方向相反**：那三个的终态是「开」，D-11 查的是「别被退回 off」；
-#    这三个的代码默认与 ConfigMap 起点都是 off，发布期间要查的是「确实开成了预期值」。
-#    ⇒ 它们落地后成为 D-12 / D-13 / D-14，本清单相应加三条 `set env` 读回断言。
-#    🔴 成对约束（落地后要一并查）：SCHEDULER_ROUTING_EXECUTION_ARBITRATION=off
-#       必须同时 GATEWAY_ROUTING_PROJECTION_READ=off。
+# ⑦ 🔧 D-12 / D-13 / D-14（**已落地，原文写的「尚未进 deploy/k8s/base」已过时**）：
+#    三个路由投影开关现在有清单了 —— gateway-deployment.yaml:129-144、
+#    scheduler-deployment.yaml:169-174，CM literal 在 kustomization.yaml:120-124，
+#    集群里的 CM 叫 routing-projection-config（不是 execution-fencing-config，故意分开的）。
+kubectl -n $NS get cm routing-projection-config -o jsonpath='{.data}'; echo
+# 期望三个全 on（2026-08-20 阶段 1 验收后的终态）：
+#   GATEWAY_ROUTING_PROJECTION_READ / GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE
+#   / SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE
+# 🔴 与 D-11 的形状一样、方向相反：仓内 literal 是 **off**（kustomization.yaml:122-124），
+#    集群终态是 **on** ⇒ 一次 apply 把三个全部**静默**退回 off。这就是 D-12/13/14。
+# 🔴 这一条比 D-11 更贵：退回 off 不只是「新行为不生效」，**再翻回 on 要付一次 404 窗口**
+#    （_sd-impl-phase1.md §13.4 的 SD-D1；机理与代价见本文 §11.4）。
+# 🔴 成对约束：SCHEDULER_ROUTING_EXECUTION_ARBITRATION=off 必须同时
+#    GATEWAY_ROUTING_PROJECTION_READ=off。
+# 🔴 回退只用 `kubectl set env`，**绝不删 key**：集群里在跑的 Deployment 上这三条
+#    configMapKeyRef **没有** optional: true（仓内清单有，集群那份没有），
+#    删 key ⇒ Pod CreateContainerConfigError，不是「落回代码默认」。
 ```
 
 ### 7.5 步骤 E：功能验证（造真沙箱）
@@ -588,6 +602,15 @@ curl -s -o /dev/null -w 'resume=%{http_code}\n' -X POST -H 'X-API-Key: dummy' $G
 
 # 收尾
 curl -s -o /dev/null -w 'delete=%{http_code}\n' -X DELETE -H 'X-API-Key: dummy' $GW/sandboxes/$SB
+
+# 🔴 🔧 收尾的真坑（2026-08-20 实测踩到）：`/sandboxes` **不列暂停的沙箱**。
+#    它 deprecated，语义就是「列 running」（src/api/openapi.yml:1344-1348）；
+#    `/v2/sandboxes` 才列全部，并且带 state 过滤（:1489-1512）。
+#    ⚠️ 别照 /v2/sandboxes 那个 200 的描述文案判断语义 —— 它仍写着
+#    "all running sandboxes"（:1521），和它自己的 summary 冲突，是个陈旧文案。
+#    照 /sandboxes 数着清，暂停的那几台会留下来，而且不会安静地留着：见 §11.3。
+curl -s -H 'X-API-Key: dummy' $GW/v2/sandboxes \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d)); [print(" ", x["sandboxID"], x.get("state")) for x in d]'
 ```
 
 也可以用 203 上的 CLI（**必须写全路径**）：
@@ -681,12 +704,13 @@ kubectl -n $NS set image ds/agentenv-node          agentenv=$REG/agentenv-runtim
 
 | # | 阻塞项 | 严重度 | 说明与处置 |
 |---|---|---|---|
-| **SD-B1** | ~~集群里没有 Redis~~ 🔧 **已部署，gateway 侧未接线** | 🟡 **不再阻塞阶段 1 的①；仍差②的接线** | **它挡住过什么（记录保留）**：阶段 1（gateway 直读 Redis）与阶段 3（活跃态折叠进 Redis）全部以它为前提；`P-A5-2「HA 形态」`探针因此结构性地跑不了；滚 scheduler 要付一个数据面 503 窗口。🔧 **2026-08-20 当日进展**：`deploy/k8s/base/redis.yaml`（提交 `77aa98f`）建了 Deployment ＋ Service ＋ PVC 并进了 `kustomization.yaml:11`；`scheduler-deployment.yaml:82-83` 注了 `SCHEDULER_REDIS_ADDR`，日志已是 `binding_store="redis"`。🔴 **还差**：`gateway-deployment.yaml` **没有任何 redis env** ⇒ 阶段 1 的②（gateway 直读）还不能验。🔴 **仍然成立的两条**：**不要把 Redis 凭据发到 node**（那会撤销上一轮 G7 摘掉 node 侧 PG 凭据的成果，拆分提案 §0 硬约束 2）；Redis 是**单副本 ＋ 单 local-path 卷、落在 204**，HA 是敞口（见 SD-B5 与 `redis.yaml` 抬头的 OPEN ITEM）。🔧 **顺带解掉的那条数字改了**：滚动窗口是 **2.3–3.3 秒**，不是 14 秒（§4.5） |
+| **SD-B1** | ~~集群里没有 Redis~~ 🔧 **已部署，gateway 侧未接线** | 🟡 **不再阻塞阶段 1 的①；仍差②的接线** | **它挡住过什么（记录保留）**：阶段 1（gateway 直读 Redis）与阶段 3（活跃态折叠进 Redis）全部以它为前提；`P-A5-2「HA 形态」`探针因此结构性地跑不了；滚 scheduler 要付一个数据面 503 窗口。🔧 **2026-08-20 当日进展**：`deploy/k8s/base/redis.yaml`（提交 `77aa98f`）建了 Deployment ＋ Service ＋ PVC 并进了 `kustomization.yaml:11`；`scheduler-deployment.yaml:82-83` 注了 `SCHEDULER_REDIS_ADDR`，日志已是 `binding_store="redis"`。🔴 **还差**：`gateway-deployment.yaml` **没有任何 redis env** ⇒ 阶段 1 的②（gateway 直读）还不能验。🔴 **仍然成立的两条**：**不要把 Redis 凭据发到 node**（那会撤销上一轮 G7 摘掉 node 侧 PG 凭据的成果，拆分提案 §0 硬约束 2）；Redis 是**单副本 ＋ 单 local-path 卷、落在 204**，HA 是敞口（见 SD-B5 与 `redis.yaml` 抬头的 OPEN ITEM）。🔧 **顺带解掉的那条数字改了**：滚动窗口是 **2.3–3.3 秒**，不是 14 秒（§4.5）。🔧 **2026-08-20 晚：本条全解** —— gateway 侧的 addr 已接（`gateway-deployment.yaml:100-101`，集群实测同值），阶段 1 的②已在集群上验过（[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.2）；`P-A5-2「HA 形态」`现在**跑得了但仍未跑**（同上 §13.6 第 7 条）|
 | **SD-B2** | **`--role` 在代码里不存在** | 🔴 阻塞阶段 3 | `grep -rn "role" src/bin/server.rs` **零命中**。拆 `api`/`node` 的第一刀还没落。集群侧对应的空缺：**没有 `agentenv-api` 的 Deployment 清单**（`deploy/k8s/base/` 只有 gateway/scheduler Deployment + node DaemonSet） |
 | **SD-B3** | **`deploy/k8s/base` 与集群实际有 11 处漂移，且 apply 会静默拆掉一半** | 🔴 每次发布都要防 | 十条在 `_impl-plan-control-plane-phase3.md` §6.0.2，本文补了 **D-11**（化身开关会被退回 observe/off）。**拆分要新增 `agentenv-api` 工作负载 ⇒ 迟早绕不开一次 apply。** 有牙的做法（按性价比）：① 给 `kustomization.yaml` 的 `images:` 补 registry 前缀入口，或给 `run.sh` 加 `IMAGE_REGISTRY`/`IMAGE_TAG` env —— D-7 是唯一一条 apply 后会**响亮**失败的；② 主仓 `deploy/agentenv-sg/` 补一个 overlay 承接 `agentenv.toml`（D-1/D-2）、regctl 挂载（D-5）、30800（D-8）、PG（D-9）、化身开关（D-11）；③ 把 §7.4 那六组探针做成 `make` 目标或定时任务 |
 | **SD-B4** | **本机 docker 无法直接 push 到 `10.10.10.204:5000`**，且上行只有 190 KB/s | 🟡 已有规避 | `/etc/docker/daemon.json` 的 `insecure-registries` 指的是另一套环境（`10.1.0.106:5000`）。**规避是既定的：全部构建在 204 上做**（§7.1）。要改本机也行（加 insecure registry + 重启 docker），但上行 190 KB/s ⇒ 推一次 runtime 镜像 ~11 分钟，**不值得** |
 | **SD-B5** | **PG / RustFS 的 PVC 都是 `local-path` 且钉死 204，5Gi / 100Gi，无备份** | 🟡 | 204 挂掉 = 登记表 + 快照桶一起丢。拆分之后 `api` 是 N 副本、登记表是唯一真相源 ⇒ **这条的暴露面会变大**。至少要在阶段 2（catalog 进 PG）之前谈一次持久化 |
 | **SD-B6** | 🔴 **scheduler 缺席超过 `binding_ttl` 的表现是 404，不是 503** | 🔴 **会让阶段 1 的验证探针假通过** | scheduler 缺席 **> 30 秒**（`binding_ttl`，`services/scheduler/internal/store.go:11`）之后恢复，会出现一段 **~13 秒的 404 窗口**，其间 gateway 对一个**活着、健康**的沙箱回答「不存在」，然后自愈。**Redis 不修这条**，`binding_ttl` 才是它的开关。机理与两条后果在 §9.1 |
+| **SD-B7** | 🔴 **这套集群做不出「整机猝死」** | 🔴 **一整类探针在这里拿不到取证** | 四条路三条堵死：deny-all NetworkPolicy **不执行**、`kill -STOP 1` 对 PID 1 **静默无效**、`--force --grace-period=0` 被 §7.2 明令禁止、优雅 `delete pod` 撞上 `terminationGracePeriodSeconds: 3600`。⇒ 判据里含「节点真的死了」的探针（F4 的窗口、陈旧路由存活时长、节点侧接管）**只能推，不能实测**。唯一建议路线（**也还没验证**）：挑一台**持零个沙箱**的节点做优雅 delete。机理与证据在 §11.1 / §11.2 |
 
 ### 9.1 🔴 SD-B6 的机理 —— 三段都在代码里
 
@@ -700,6 +724,15 @@ kubectl -n $NS set image ds/agentenv-node          agentenv=$REG/agentenv-runtim
 | ③ | scheduler 的 warm-up 闸门**只等 15 秒**，到点就 latch 成 warm；此后 `lookupAbsent` 直接给 `codes.NotFound`，gateway 把它翻成 **404**（而 `Unavailable` 才翻 503） | `services/scheduler/internal/warmup.go:12` `:79-82`；`lookup.go:388-390`；`services/gateway/internal/server.go:373-374` vs `:375-376` |
 
 ⇒ ③ 让闸门在 15 秒时开，② 让第一发心跳更晚才到，**中间那段就是 404**。
+
+🔧 **行号复核（2026-08-20 晚，阶段 1 改过这两个文件）** —— 结论一字不变，只是三处引用漂了：
+
+| 原文写的 | 现在在哪（`1f79e8f`） |
+|---|---|
+| 对账写在 `redis_store.go:448` | 🔧 `:448` 现在是 `redisKeepsDeadlineEphemeral` 那段前言；对账脚本体在 **`redis_store.go:560-618`**，其中 TTL 的那一刀在 **`:587-606`** |
+| `lookup.go:388-390` | 🔧 **`lookup.go:391`**（`codes.NotFound`） |
+| `gateway/internal/server.go:373-374` vs `:375-376` | 🔧 都搬进了 `writeSchedulerError`：**404 在 `:431-432`，503 在 `:433-434`**（函数从 `:422` 起） |
+| `store.go:11`（30s）、`warmup.go:12` `:79-82`、`reporter.rs:20` | ✅ 未动 |
 
 🔴 **两条后果，第二条对本轮更致命：**
 
@@ -735,3 +768,102 @@ kubectl -n $NS set image ds/agentenv-node          agentenv=$REG/agentenv-runtim
 - 两次 20 MB 的 `ssh + dd` 吞吐测量（`dd if=/dev/zero … | cat > /dev/null`，**两端都写 `/dev/null`**，不落盘）。
 - **未执行**任何 `apply` / `delete` / `restart` / `scale` / `set image` / `edit` / `patch` / `port-forward`；
   **未对 `paused_sandboxes` 做任何写操作**；**未创建任何临时 Pod**。
+
+---
+
+## 11. 🔧 第二轮：阶段 1 验收当轮的环境发现（2026-08-20 晚）
+
+> 🔴 **这一轮不是只读** —— 翻过三个开关、`scale` 过 scheduler、`apply` 过一个 NetworkPolicy、
+> `DEL` 过 Redis key、建过也删过沙箱。§10 只描述本文最初那一轮。
+>
+> **本节只写环境**：哪些手法在这套集群上根本不生效、清理时会踩什么。
+> 阶段 1 的验收结论、探针结果、新缺陷与射程边界在
+> [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13，**不在这里重复**。
+
+### 11.1 🔴 两条「以为能用、其实是空转」的手法
+
+两条都是想制造「节点失联」时踩到的。**它们不是失败，是无效** —— 用它们跑出来的
+「零失败」看着像通过，实际上探针根本没有开火。
+
+| # | 手法 | 实测 | 结论 |
+|---|---|---|---|
+| **SD-E1** | 给某个 node Pod 打标签、挂一条 deny-all `NetworkPolicy`（`Ingress` ＋ `Egress` 全空），制造「这台节点被网络隔离」 | 覆盖 **40.7 秒**（19:04:14.15Z 挂上 → 19:04:54.86Z 摘掉）：**心跳零失败**，scheduler 侧 `binding_execution_total{decision="refreshed",source="heartbeat"}` 在指标窗口（61 秒，19:04:08–19:05:09Z，完整覆盖这一段）里 **+125**，与「两台 × 5 条记录 / 5 秒心跳 ≈ 2/s ⇒ ≈122」吻合 ⇒ **两台都在报，一台都没掉队**；数据面 **620/620 × 204**；被采样的 binding key 全程 **0 次缺席** | 🔴 **这套 k3s 不执行 NetworkPolicy**：**任何以 netpol 做隔离的探针在这里恒为空转** —— 对象建得出来、`kubectl get netpol` 看得见，就是没人执行。（大概率是起 k3s 时关掉了 netpol 控制器，**没有去核实原因** —— 结论只依赖「挂上去没有任何效果」这一条实测） |
+| **SD-E2** | `kubectl exec <node-pod> -- kill -STOP 1`，冻住节点进程 | PID 1 状态**仍是 `Ssl`**（不是 `T`）；心跳零失败 | 🔴 **内核不向同一 PID 命名空间内的 PID 1 投递「默认动作」的信号** —— PID 1 没给 `SIGSTOP` 装 handler，于是信号被直接丢弃。**用它跑的那一发是 no-op，不是证据** |
+
+证据：`$WD/f4-netpol.yaml`、`f4-marks.txt`、`f4-dp.csv`、`f4-ttl.csv`、`m-f4-{a,b}-*.txt`、`m-f4b-{a,b}-*.txt`
+（`$WD` 见 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13 抬头；**临时目录，会被清掉**）。
+
+🔴 **方法论上这是 §8 第 2 条的又一个形态**：「某指标恒 0」不是证据。
+这两发里恒 0 的是**心跳失败数**，而它恒 0 的原因不是系统扛住了，是**手法没生效**。
+⇒ **任何声称「隔离/冻结了一台节点」的探针，必须先给出这台节点确实失联的正面证据**
+（心跳失败计数涨了、`ListObservedNodes` 里它掉了、或者 PID 状态变成 `T`），
+再去看被测对象的表现。
+
+### 11.2 🔴 由此产生的缺口：这套集群**没有**制造「整机猝死」的可用手法
+
+四条路，三条堵死：
+
+| 路 | 状态 |
+|---|---|
+| deny-all NetworkPolicy | ❌ **不执行**（SD-E1） |
+| `kill -STOP 1` | ❌ **静默无效**（SD-E2） |
+| `kubectl delete pod --force --grace-period=0` | ❌ **runbook §7.2 明令禁止** —— 强删只删 API 对象、容器还活着，新 Pod 抢不到 `records.db`/`LOCK` 会 CrashLoop |
+| 优雅 `delete pod` | 🟡 **有沙箱在跑时不可用**：`terminationGracePeriodSeconds: 3600`（`deploy/k8s/base/agentenv-daemonset.yaml:29`）⇒ 一次删要等一小时 |
+
+🔴 **登记为开放缺口**：凡是判据里含「一台节点真的死了」的探针（F4 的窗口、
+节点侧接管、陈旧路由的存活时长），**在这套集群上目前都拿不到取证**，
+只能推。**别把推出来的窗口写成实测的**。
+
+🟢 **唯一建议的路线**：挑一台**当前持有零个沙箱**的节点做优雅 `delete pod` ——
+3600 秒的 grace 只对「还有沙箱要保」的时候才咬人，空节点上它是无害的。
+先用 `/v2/sandboxes` ＋ `placement` 确认它真的是空的（§11.3 的坑正好在这里咬人），
+再删。**这条路线本身也还没验证过。**
+
+### 11.3 🔴 清理沙箱的坑：`/sandboxes` **不列暂停的沙箱**
+
+- `/sandboxes` 是 deprecated 的，语义就是「列 **running**」（`src/api/openapi.yml:1344-1348`）；
+  `/v2/sandboxes` 才是「列全部」，并且带 `state` 过滤（`:1489-1512`）。
+- ⚠️ **别照 `/v2/sandboxes` 那个 200 的描述文案判断语义** —— 它仍写着
+  `"Successfully returned all running sandboxes"`（`:1521`），与它自己的 summary 冲突，是陈旧文案。
+
+**实际踩到的样子**：一轮清理按 `/sandboxes` 数着删，**三台暂停的沙箱因此活了下来**；
+随后一次 node rollout 把它们从持久化存储里恢复成 `Paused`，
+数据面一碰就**自动 resume** 了 —— 于是「已经清干净」的集群上凭空出现三台 running 沙箱。
+
+⇒ 已写进 §7.5 的收尾步骤。🔴 **收尾一律照 `/v2/sandboxes` 数**，
+并且**删完再数一次** —— 这是唯一能把「暂停的那几台」也算进去的读法。
+
+### 11.4 🔧 三个路由投影开关落地了 ⇒ 漂移多出 D-12 / D-13 / D-14
+
+§7.4 ⑦ 原本写的是「尚未进 `deploy/k8s/base`，先别加进例行复核」，**已过时**：
+清单在 `gateway-deployment.yaml:129-144` / `scheduler-deployment.yaml:169-174`，
+CM literal 在 `kustomization.yaml:120-124`，集群里的 CM 叫 `routing-projection-config`
+（**和 `execution-fencing-config` 故意分开**：不同的改动、不同的日子）。
+
+| # | 集群 out-of-band 的东西 | 仓内清单说的是什么 | apply 后的症状 |
+|---|---|---|---|
+| **D-12 / D-13 / D-14**（新） | CM `routing-projection-config` 三个键 **全 `on`**（2026-08-20 阶段 1 验收后的终态） | `kustomization.yaml:122-124` 的 literal **全 `off`**（发布**起点**，也是代码默认） | 🔴 **静默**：三个开关整体退回 `off`。形状与 D-11 一样、方向相反 |
+
+🔴 **它比 D-11 贵**：退回 `off` 不只是「新行为不生效」——
+**再翻回 `on` 要付一次数据面 404 窗口**（实测 2.7 秒 / 15 次 404，
+[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.4 的 **SD-D1**）。
+⇒ 在这套集群上，**一次 `make k8s-apply` 的代价里现在含一次可测量的数据面故障**。
+
+另外两条一并记住（§7.4 ⑦ 已就地写进复核清单）：
+
+- 🔴 **成对约束**：`SCHEDULER_ROUTING_EXECUTION_ARBITRATION=off` 必须同时
+  `GATEWAY_ROUTING_PROJECTION_READ=off`。没有任何机制强制它，是运维约束。
+- 🔴 **回退只用 `kubectl set env`，绝不删 key**：集群里在跑的 Deployment 上这三条
+  `configMapKeyRef` **没有** `optional: true`（仓内清单有，集群那份没有，
+  见 `$WD/baseline-env-agentenv-{gateway,scheduler}.json`）⇒
+  删 key 是 **Pod 起不来**，不是「落回代码默认」。
+
+### 11.5 「14s → 2.3–3.3s」这条订正的复核
+
+本轮顺手核过一遍，**三处一致、没有内部矛盾**：本文 §4.5（重测表）、
+§9 **SD-B1**（顺带解掉的那条）、[`_sd-impl-phase1.md`](_sd-impl-phase1.md) §12 硬前置 **B3**。
+`_impl-plan-control-plane-phase3.md` 里的 14s 是**上一轮自己那次测量的记录**，
+属于历史，不动它。
+
+🟡 **仍有一处未订正的引用**：`_sd-impl-phase2.md:1116` 还写着
+「顺带解掉滚 scheduler 的 **14s** 数据面 503 窗口」。**不归本文改**，登记在这里。

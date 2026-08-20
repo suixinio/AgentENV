@@ -7,6 +7,15 @@
 >
 > 🔴 **本文推翻了母提案的三处事实判断**（§1），其中两处直接决定这一阶段能不能成立。
 > 与母提案冲突时**以本文为准**，并把冲突登记回母提案。
+>
+> 🔧 **更新（2026-08-20 晚）：阶段 1 已在 dev 集群通过验收，记录在 §13。**
+> 规格本体一字未改，但 §13 里有三件事会改变别的东西：
+> ① **一个新缺陷 SD-D1** —— 把写侧开关 `off → on` 会在活着的沙箱上打出一段 404（§13.4），
+> ⇒ 这一翻要当维护事件排期，**回滚方向反而是免费的**；
+> ② **F4 的框架订正** —— 制造 F4 的是**写**开关，读开关既不制造也不加宽它（§13.5），
+> ⇒ 要门控就门控写开关；
+> ③ **射程边界**（§13.6）—— 七条没有被这一轮证明的东西，其中「真正的整机猝死」
+> 在这套集群上目前**没有可用手法**（[`_sd-recon-env.md`](_sd-recon-env.md) §11.2）。
 
 ---
 
@@ -989,7 +998,7 @@ A 相位从不未命中，所以它无法证明回落还在。补一发：
 
 | # | 项 | 状态 |
 |---|---|---|
-| **B1** | 🔧 **已解一半**（[`_sd-recon-env.md`](_sd-recon-env.md) §4.5、SD-B1）：`deploy/k8s/base/redis.yaml`（提交 `77aa98f`）建了 Deployment ＋ Service ＋ PVC，`scheduler-deployment.yaml:82-83` 注了 `SCHEDULER_REDIS_ADDR`，日志已是 `binding_store="redis"` | 🔴 **还差 gateway 侧的 addr** —— `gateway-deployment.yaml` 里没有任何 redis env ⇒ ②（gateway 直读）还不能验。🔴 **不要把 Redis 凭据发到 node** —— 那会撤销上一轮 G7 摘掉 node 侧 PG 凭据的成果 |
+| **B1** | 🔧 **已全解**（原文：「已解一半」）。`deploy/k8s/base/redis.yaml`（提交 `77aa98f`）建了 Deployment ＋ Service ＋ PVC，`scheduler-deployment.yaml:82-83` 注了 `SCHEDULER_REDIS_ADDR`，日志已是 `binding_store="redis"`；🔧 **gateway 侧的 addr 也已接上**（`gateway-deployment.yaml:100-101`，集群实测同值，见 §13.7 C2）—— ②（gateway 直读）已在集群上验过（§13.2 A 相位）| 🔴 **仍然成立**：**不要把 Redis 凭据发到 node** —— 那会撤销上一轮 G7 摘掉 node 侧 PG 凭据的成果 |
 | **B2** | `make k8s-apply` 会把化身开关退回 `observe`/`off`（D-11） | 本阶段新增三个开关会成为 D-12 / D-13 / D-14。发布只用 `set image` ＋ `set env`，不碰 ConfigMap（§7.2 的纪律） |
 | **B3** | scheduler 滚动更新的数据面 503 窗口（binding 在内存里）。🔧 **窗口是 2.3–3.3 秒，不是 14 秒** —— 同法重测，见 [`_sd-recon-env.md`](_sd-recon-env.md) §4.5 | 一旦 Redis 到位，**这条顺带解掉**（重测确认：配上 `SCHEDULER_REDIS_ADDR` 后同一次滚动 0 次 503）—— 也是先做 B1 的额外理由。🔴 **但它不覆盖「缺席」** —— scheduler 缺席 > `binding_ttl` 的表现是 **404 而不是 503**，Redis 不修，见 `_sd-recon-env.md` SD-B6／§9.1。**②的验证探针必须按状态码分类计数** |
 
@@ -1017,6 +1026,217 @@ A 相位从不未命中，所以它无法证明回落还在。补一发：
 | 附证据索引 | 「CREATE / FORK 的投影写已经是同步的，**且带化身**」删去后半句，改指 `src/api/proxy.rs:95` `:352-364` |
 | `2026-08-20-module-responsibilities.md` D10 表 | RESUME 一行补「需要 Rust 侧响应头，否则在 `enforce` 仲裁下被静默拒绝」 |
 | `_sd-recon-env.md` §7.4 | D-11 复核清单加三个新开关；补一条「`SCHEDULER_ROUTING_EXECUTION_ARBITRATION` 与 `GATEWAY_ROUTING_PROJECTION_READ` 必须成对」 |
+| 🔧 `_sd-recon-env.md` §7.4 | **已做**（2026-08-20 晚）：三个开关落地成 **D-12 / D-13 / D-14**，成对约束也补了。见 `_sd-recon-env.md` §7.4 ⑦ 与 §11.4 |
+| 🔴 `2026-08-20-service-decomposition.md` §7 阶段 1「开关与回退」 | **新增 SD-D1**：写侧开关 `off → on` 会打出一段 404（§13.4）。母提案里「开关可以随时翻」这个前提要改成「**翻开是维护事件、翻回是免费的**」 |
+| 🔴 `2026-08-20-service-decomposition.md` / 模块文档里凡引用 F4 的地方 | F4 的框架订正（§13.5）：制造 F4 的是**写**开关，读开关既不制造也不加宽它。**凡是「因为 F4 所以门控读开关」的说法都要改成门控写开关** |
+
+---
+
+## 13. 🔧 集群验收记录（2026-08-20 晚，`pve-sg dev` 203/204）
+
+> **阶段 1 已在 dev 集群通过验收**：P1 / P1-b / P2 / P3 / P3-b / P4 / P5 / P6 全部 PASS，**无 VOID**。
+> 本节是验收回执，**不改前面的规格**；现场与规格不一致的两处单列在 §13.7。
+>
+> 🔴 **本节里重要的不是那些 PASS**，是三件事：
+> **§13.4 的新缺陷**（翻开关会打出一段 404）、**§13.5 对 F4 的框架订正**（该被门控的是**写**开关）、
+> 以及 **§13.6「这一轮没有证明什么」**。
+>
+> 证据目录 `$WD = /tmp/claude-1000/-home-debian-AgentENV/6fffa6a8-45b2-4e85-acd7-d41688c06560/scratchpad/p1/`
+> —— 🔴 **临时目录，会被清掉；下面表里的数字就是它的全部内容**。时间戳一律 UTC。
+> 环境侧的发现（哪些手法在这套集群上根本不生效）在
+> [`_sd-recon-env.md`](_sd-recon-env.md) §11，**本节不重复**。
+
+### 13.1 基线
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 三个服务的镜像 | `10.10.10.204:5000/agentenv-{runtime,gateway,scheduler}:sd1-1f79e8f`，**三个同 tag** | `$WD/baseline-images.txt` |
+| 源码 | `1f79e8f`（tag 里的就是它） | `git rev-parse --short HEAD` |
+| 开关（验收前） | 三个全 `off` | `$WD/baseline-cm-routing-projection.yaml` |
+| **开关（验收后）** | **三个全 `on`，留在 `routing-projection-config` 里没有翻回去** | 同上 CM |
+| Redis 接线 | scheduler 与 **gateway 都有** `…_REDIS_ADDR=agentenv-redis:6379` ⇒ §12 硬前置 **B1 已全解** | `$WD/baseline-env-agentenv-{gateway,scheduler}.json` |
+| 沙箱 | 10 台 running，`timeout=3600`、`autoResume.enabled=true`，两台节点各 5 台 | `$WD/placement.txt`、`master-fleet.txt`、`worker-fleet.txt` |
+| 负载 | 每台 1 rps 的数据面代理请求（`204` 为成功） | `$WD/probe.py` |
+
+### 13.2 头号判据（P1）：控制面停 5 分钟，数据面不掉
+
+| 相位 | 动作 | 数据面 | gateway `route_resolution_total` |
+|---|---|---|---|
+| 基线 | 不动，60 秒 | **600 / 600 × 204** | — |
+| **A（处理组）** | 三个开关全 `on`，`scale deploy/agentenv-scheduler --replicas=0`，**300 秒**（18:37:51.11Z → 18:42:51.61Z） | 🟢 **4200 / 4200 × 204**，非 204 **0 次** | `{redis_hit}` **+4200**；`{redis_miss}` +0；`{scheduler}` +0 |
+| **B（对照组，必须失败）** | `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=off` ＋ rollout ＋ 等记录 TTL 回到 30 秒，再 scale 0，**同样 300 秒**（18:47:30.47Z → 18:52:30.96Z） | 🔴 **1190 / 4200 × 204（28.33%）**，**3010 次 503**，连续覆盖 18:47:56.54Z–18:52:56.55Z（301 个采样秒） | `{redis_hit}` **+1190**、`{redis_miss}` **+3010**、`{scheduler}` **+0** |
+
+- 🔴 **A ≠ B，探针有分辨力**（[`_sd-recon-env.md`](_sd-recon-env.md) §8 第 1 条）。
+- 🔴 **两侧互证**（同 §8 第 3 条）：B 相位 `redis_miss` 的 **+3010** 与数据面 503 的 **3010** 逐个对上。
+- 🟢 B 相位 scheduler 侧指标一条都没动（进程 0 副本）—— 对照面自己也自证了。
+- 🔴 **B 相位失败的形状是 503，不是 404**（`codes.Unavailable` ⇒ `services/gateway/internal/server.go:433-434`）。
+  这**没有**推翻 SD-B6：SD-B6 说的是「scheduler 回来之后、心跳还没到」那一段，
+  本轮的 B 相位停在 5 分钟窗口内取样，**没有覆盖恢复段**。见 §13.6 第 4 条。
+
+证据：`$WD/p1-baseline.csv`、`p1-A.csv`、`p1-B.csv`、`p1-A-marks.txt`、`p1-B-marks.txt`、
+`m-{A,B}-{a,b}-{gw,sched}.txt`（用 `$WD/mdiff.py` 取差值）。
+
+### 13.3 逐探针
+
+| 探针 | 结果 | 正面 | 🔴 对照面（必须失败的那一面） |
+|---|---|---|---|
+| **P1** | ✅ | 见 §13.2 A | 见 §13.2 B |
+| **P1-b** | ✅ | 手工 `DEL` 一把 binding key 后立刻打一次数据面：**成功**；gw `{redis_miss}` +1、`{scheduler}` +1；sched `lookup_node_total{result="bound_roster"}` +1（**两侧 1 = 1**） | 对一个**从不存在**的 sandbox id 打同一请求 ⇒ **404**；gw `{redis_miss}` +1、**`{scheduler}` +0**；sched `{result="not_found"}` +1 |
+| **P2** | ✅ | 上界 300s ＋ `timeout=3600` ⇒ `endAt - startedAt = **300.06s**`（`p2-probe.txt`） | 上界 0 ⇒ 同一请求 `= **3600.23s**`（`p2-control.txt`） |
+| **P3** | ✅ | 上界 300s、create `timeout=60`、t=30s 时续 3600 ⇒ **HTTP 204（不是 400）**，`endAt - startedAt = **300.22s**`（`p3-probe.txt`） | 上界 0 ⇒ 同一调用后 **3630.63s**，越过 300s 线（`p3-control.txt`） |
+| **P3-b** | ✅ | 暂停 **330 秒**（> 300s 上界）后 resume ⇒ 201，**等到 +15s 仍是 `running`**（`p3b-probe.log`） | 同一台把 **300 秒运行预算跑满** ⇒ resume 之后约 1 秒回到 `paused`（`p3b-control.log`） |
+| **P4** | ✅ **四发** | ① 正常 `DELETE` ⇒ `sandbox_event_total{event_type="delete",outcome="deleted"}` **+1**（`m-p4-a/b`） | ② **真行真化身**的旧化身 E1 事件 ⇒ `rejected_stale` **+1**、key 存活（`m-p4c-a/b`）；③ `execution_id=""` ⇒ `ignored_unknown_execution` **+1**、key 存活（`m-p4c-b/c`）；④ 🔴 **收尾一发**：换成正确化身 ⇒ `deleted` **+1**（`m-p4c-c/d`）—— 这一发证明 ②③ 是**真拒**，不是守卫整体瞎了 |
+| **P5** | ✅ | 上界 86400：create 后 `PTTL = 86,459,425 ms`；40 秒后 `86,419,630 ms`，**少了 39,795 ms**，全程 **0 次回升**（`p5-ttl.csv`，10 Hz × 40s）。载体也当场坐实：201 响应头 `X-Agentenv-Projection-Ttl-Secs: 86460`（= 86400 ＋ 60 grace，`p5-hdr.txt`） | 写侧 `off` ⇒ 同样采样 60 秒，PTTL 在 **25.0–30.0 秒**之间来回，**0 次缺席**（`p5c-ttl.csv`，599 采样）—— 每个心跳都在重置 |
+| **P6** | ✅（**替代对照面**） | 5 次 trial：从 resume 的 201 到「记录出现且带**新**化身」= **0.007 – 0.18 秒**，全部早于下一发心跳；首见 PTTL ≈ **86.0×10⁶ ms**（长 TTL，不是 30 秒）（`p6-on.txt`、`p6-on-{1..5}-keys.csv`） | 🔴 规格写的对照面（把 node 回滚到 `cp3-bff4993`）**没有做**。用的是替代面，射程小得多，见 §13.6 第 2 条 |
+
+### 13.4 🔴 新缺陷 **SD-D1**：把写侧开关 `off → on`，会在活着的沙箱上打出一段 404
+
+**测出来的，带因果闭合。** 10 台沙箱 / 1 rps 的规模上：
+
+| 时刻（UTC） | 发生了什么 | 证据 |
+|---|---|---|
+| 18:56:22.76 / :27.86 / :32.86 | 记录仍被每 5 秒一次的心跳按 `PX ~30s` 续期（PTTL 三次跳回 ~29.9 秒） | `f1-onflip.csv` |
+| **18:56:32.86 之后** | 🔴 **再没有任何一次续期**：新 scheduler 接手对账，`KEEPTTL` **忠实地保留了 OFF 时期装进去的那个短 deadline**。此后 PTTL 严格单调递减 | 同上 |
+| 18:57:00.39 | 一台节点漏掉一发心跳（滚动期竞争），退避 5 秒 | 当场读的 node 日志，**未存档** |
+| 18:57:02.79 | 短 deadline 到期，记录消失（最后一次可见是 18:57:02.743Z，`PTTL = 48 ms`） | `f1-onflip.csv` |
+| **18:57:02.84 – 18:57:05.54** | **记录持续缺席 2.7 秒**（28 个采样 @ 10 Hz） | 同上 |
+| 18:57:03.13 – 18:57:05.14 | 🔴 **数据面 15 次 404，落在 5 台活着的、健康的沙箱上** | `f1-onflip-dp.csv` |
+| 18:57:05.64 | 下一发心跳把记录按**长 TTL** 重新装入（`PTTL = 85,178,945 ms` ≈ 23.66 小时），自愈 | `f1-onflip.csv` |
+
+> ⚠️ 一处**报告与采样的小出入**，不影响结论：新 scheduler 报 Ready 是 **18:56:25Z**（当场读的 rollout 状态），
+> 而最后一次 `PX ~30s` 续期落在 **18:56:32.86Z** —— 差的这 7.5 秒是滚动更新期旧 Pod 还在对账。
+> 「**从某一刻起再也不续期**」这件事本身是采样直接给出的（此后 PTTL 严格单调递减），
+> 起点取 18:56:32.86 是保守的那一头。
+
+🔴 **因果闭合**：那 5 台 404 的沙箱**正是漏心跳那台节点上的 5 台**
+（`master-fleet.txt` / `placement.txt` 逐个对得上）；另一台节点的 5 台在同一窗口
+**500 / 500 × 204**。总计 985 / 1000 × 204 ＋ 15 × 404。
+
+🟢 **反方向是免费的**：同法测的 `on → off`（18:45:22.14Z `set env`，18:45:34.01Z rollout 完成）——
+TTL 在 rollout 完成后 **2.42 秒**从 ~23.9 小时塌回 **29,920 ms**（18:45:36.43Z），
+90 秒采样窗口内 **0 次缺席**（`f1-collapse.csv`，899 采样）。记录一次都没消失过 ⇒ 404 那个形状**没有成因**。
+
+> ⚠️ `on → off` 这一发**没有留数据面 trace**，「0 次失败」是从「记录一次都没缺席」推出来的，不是直接测的。
+
+**机理**（决定它能不能修）——`services/scheduler/internal/redis_store.go:587-606`：
+
+```lua
+if keeps_deadline(incumbent, execution_id, entry_ttl_n) and redis.call("PTTL", key) > 0 then
+  redis.call("SET", key, value, "KEEPTTL")
+else
+  redis.call("SET", key, value, "PX", entry_ttl_ms)
+end
+```
+
+对**已存在**的记录保留旧 deadline，这在稳态正是 §6.5 要的；但在 `off → on` 的那一刻，
+「旧 deadline」恰好是 OFF 时期装的那个 30 秒。长 TTL 只有走 `else` 分支才写得进去，
+而在 `KEEPTTL` 一直命中的情况下，**只有记录先死一次、变成「不存在」，下一发心跳才会给它长 TTL**。
+⇒ **缺席是拿到长 TTL 的必经之路。**
+
+🔴 **由此得出的运维规则，写进发布计划**：
+
+1. **`off → on` 这一翻要当成一次维护事件排期。** 回滚（`on → off`）便宜，
+   **重新打开才是要付钱的那一次** —— 这与「开关哪个方向危险」的常识相反。
+2. 窗口宽度由「短 deadline 到期」到「下一发心跳」决定（本轮 **2.7 秒**）；
+   **受影响的沙箱数 = 翻开关时带着短 TTL 的存量记录数**。空集群上翻不会有任何症状，
+   **别拿空集群的一次成功当证据**。
+3. 🔴 **窗口宽度实际由「节点退避多久」决定，而漏心跳是这一翻自带的**：翻开关**必然**滚 scheduler，
+   滚动期节点就会漏心跳并进入退避（本轮正是如此，退避 5 秒）。最坏是退避封顶 **60 秒**
+   （`src/observability/reporter.rs:20`）⇒ **别在同一个时间窗口里再叠别的滚动**（滚 node、滚 gateway），
+   叠上去就是把退避叠上去。
+
+**没修，登记为 SD-D1。** 两个方向的缓解手法都**没有验证过，别当结论**：
+① 翻完立刻对每台在跑的沙箱触发一次带 TTL 的写；
+② 在 Lua 里把条件收紧成「PTTL 还剩的比这次带来的预算短很多就重设」——
+但那会重新引入「心跳能延长记录寿命」的语义，与 §6.5 正面冲突，要单独想。
+
+### 13.5 🔴 F4 的框架订正：造成 F4 的是**写**开关，不是读开关
+
+**此前记的是**：「读开关打开之后，一次整机猝死会让一条路由被钉住整个 TTL」。
+**这个框架是错的，而且它会让人去门控错的那个开关。**
+
+| 事实 | 证据 |
+|---|---|
+| 读开关 `off` 时，gateway 去问 scheduler，**scheduler 读的是同一条 Redis 记录**，答出来的是**同一个死节点** | `services/scheduler/internal/lookup.go:150-169`：第 1 步就是 `store.Get`，命中即 `return`，注释逐字写着 *"This is the hot path — every proxied request lands here — so nothing below it may run on a hit."* |
+| 现场坐实 | 写一条指向**错误节点**的 binding，再直接对 scheduler 打一次 `LookupNode`：答的是 `bound_binding` / `SANDBOX_LOCATION_BOUND` ＋ **那个错误 endpoint**（`$WD/m-f4b-{a,b}-sched.txt`：`binding_execution_total{decision="refreshed",source="assignment"}` +1 ⇒ `lookup_node_total{result="bound_binding"}` +1） |
+| 🔴 **两条读路径都没有任何东西去交叉核对一条陈旧 binding** | gateway 直读：`services/gateway/internal/projection.go:53-58`，命中即 `routing.Synthesize(record)` 返回；scheduler：同上 `lookup.go:150-169` |
+
+⇒ **真正的严重度差在写开关上**：
+
+| 位置 | 一条指向死节点的记录能活多久 |
+|---|---|
+| 写开关 `off`（两个读开关任意） | **30 秒**（`binding_ttl`）到期，之后由**带活性判定**的心跳 roster 兜底 |
+| **写开关 `on`** | **最长 ~24 小时**（投影 TTL ＝ 沙箱寿命），**与读开关无关** |
+
+🔴 **如果要为 F4 门控某个开关，门控的是写开关**（`*_ROUTING_PROJECTION_AUTHORITATIVE`），
+不是 `GATEWAY_ROUTING_PROJECTION_READ`。读开关既不制造 F4，也不加宽它。
+
+🟢 **节点回来之后的修复是 ≤5 秒（一发心跳），实测**：§13.4 那次缺席就是被下一发心跳
+在 2.7 秒内重新装回去的。F4 疼的是**节点不回来**那一支。
+
+🔴 **注意射程**：本条订正的是**框架**（哪个开关制造了它、有没有活性判定），
+这两件都是**代码取证 ＋ 现场坐实**。而「~24 小时」这个**窗口本身仍然是推出来的**，
+不是从一台真死掉的节点上量出来的 —— 见 §13.6 第 1 条。
+
+### 13.6 🔴 射程边界：这一轮**没有**证明什么
+
+**这一节比上面所有 PASS 都重要。**
+
+1. **一次真正的整机猝死。** F4 的窗口是「实测的『TTL 再也不被续期』＋ 实测的『读路径上没有任何活性判定』」
+   两件事推出来的，**不是从一台真死掉的节点上量出来的**。
+   🔴 这套集群目前**没有**制造整机猝死的可用手法，原因与唯一的建议路线见
+   [`_sd-recon-env.md`](_sd-recon-env.md) §11.2。
+2. **P6 规格里写的那个对照面。** 没有把 node 回滚到 `cp3-bff4993`，用的是替代面
+   （对着**活着的在位者**发一次**不带化身**的 `RecordAssignment`，被静默拒绝 ⇒
+   `binding_execution_total{decision="rejected_unknown",source="assignment"}` +1）。
+   `cp3-bff4993` 那个镜像的行为**只有静态取证**：
+   `git show bff4993:src/api/openapi.yml | grep -c x-agentenv-execution-id` = **0**，
+   而 HEAD（`1f79e8f`）= **5**。⇒ 「那个镜像不发这个头」是真的，
+   「所以那个序列会落成 `rejected_unknown` 且 5 秒内没有记录」**没有在集群上跑过**。
+3. **P3 的 400 分支。** 只有单元测试，**存在性确认、没有重跑**（§9 P3 早已写明它端到端不可稳定复现）。
+4. **「缺席」这条路径在当前开关位置下还会不会出 404。** B 相位整整 301 秒**全程是 503**，
+   没有覆盖 SD-B6 说的恢复段。本轮唯一一次 404 是**翻开关**打出来的（§13.4），
+   不是「scheduler 缺席」打出来的。⇒ **SD-B6 的兑现判据尚未被这一轮证伪或证实。**
+5. **任何超过「10 台沙箱 × 1 rps × 5 分钟」的负载。** 两台节点全程都远没吃满
+   —— 这句话对容量**什么都没说**，本轮也没有做任何容量取样。
+6. 🔴 **Redis 自己出故障。** `route_resolution_total{source="redis_error"}` 全程 **0**，
+   而且**一次都没有被顶起来过** ⇒ 按方法论第 2 条（[`_sd-recon-env.md`](_sd-recon-env.md) §8），
+   这条 series 是 **UNVERIFIED，不是「零错误」的证据**。
+   读失败的回落分支（`projection.go:43-52`）**在集群上从未被执行过**。
+7. **多副本 scheduler / HA（`--query-only`）。** `P-A5-2` 仍然**结构性未跑**。
+   Redis 到位之后它已经**跑得了**，只是这一轮没跑。
+
+### 13.7 现场对规格的两处修正
+
+| # | 规格怎么写的 | 现场 | 处置 |
+|---|---|---|---|
+| **C1** | §8：「删 key（`optional: true`）与写空串都要等 Pod 重启才生效，且删 key 落回代码默认」 | 仓内清单**确实**是 `optional: true`（`deploy/k8s/base/gateway-deployment.yaml:129-144`、`scheduler-deployment.yaml:169-174`），**但集群里在跑的那份 Deployment 上没有这一行**（`$WD/baseline-env-agentenv-{gateway,scheduler}.json`：三条 `configMapKeyRef` 都不带 `optional`，而既有的 fencing 三条都带） | 🔴 **在这套集群上「删 key」不是落回代码默认，是 Pod 起不来**（`CreateContainerConfigError`）。回退**一律 `kubectl set env`**，§8 的那条命令本身仍然正确 |
+| **C2** | §12 硬前置 **B1**：「还差 gateway 侧的 addr」 | ✅ **已解**：`gateway-deployment.yaml:100-101` 与集群里在跑的 Deployment 都有 `GATEWAY_REDIS_ADDR=agentenv-redis:6379`；且它是**读开关还关着的时候就先配上的**（读开关 `on` 而没有 addr 时 gateway 拒绝启动） | B1 关闭 |
+
+### 13.8 交叉核对时挖出来的两个坑（都会让下一发探针骗人）
+
+**坑 1 —— `route_resolution_total{source="scheduler"}` 只在回落「成功」时才 +1。**
+
+失败的那一次只被 `redis_miss` 记到。代码：`services/gateway/internal/server.go:305-313` ——
+`LookupNode` 出错就 `writeSchedulerError` 直接 `return`，
+而 `recordRouteResolution(source)` 在它**后面**一行，够不着。
+现场两处坐实：P1-b 的对照面（不存在的 id）`redis_miss` +1 而 `scheduler` **+0**；
+§13.2 的 B 相位 3010 次失败回落，`scheduler` 同样 **+0**。
+
+⇒ 🔴 **不要把 `source="scheduler"` 读成「回落尝试次数」，它是「回落成功次数」。**
+要数尝试，用 `redis_miss + redis_error`。
+（`metrics.go:80` 那条对账等式 `Δ{redis_miss} + Δ{redis_error} ≈ Δ scheduler_lookup_total` 不受影响，
+它对的是 scheduler 那一侧，不是 gateway 的 `{scheduler}` 标签。）
+
+**坑 2 —— 不带化身的写「可以装上」，它只是不能「顶掉」在位者。**
+
+| 做法 | 结果 |
+|---|---|
+| 先 `DEL` key，再发一次不带化身的 `RecordAssignment`（`$WD/m-p6c2-{a,b}-sched.txt`） | `binding_execution_total{decision="installed_unknown",…}` +1 —— 🔴 **装上了** |
+| 对着**活着的在位者**发同一个写（`$WD/m-p6c3-{a,b}-sched.txt`） | `binding_execution_total{decision="rejected_unknown",…}` +1 —— **被拒** |
+
+⇒ 🔴 **一个「先删 key 再写」的探针什么都证明不了**：它删掉的正是守卫要保护的那个东西。
+这是 [`_sd-recon-env.md`](_sd-recon-env.md) §8 第 1 条在本轮的又一个具体形态。
 
 ---
 

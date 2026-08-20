@@ -38,6 +38,41 @@ spec:
                   name: sandbox-proxy-config
                   key: SANDBOX_PROXY_DOMAINS
                   optional: true
+            # The shared secret the gateway stamps on every request it forwards
+            # to a node, so the node can tell control-plane traffic from
+            # anything that reached it another way.
+            #
+            # 🔴 The same Secret the DaemonSet mounts, and the ordering between
+            # the two is not symmetric. Injection has to be switched on *first*
+            # and switched off *last*: a node whose gate is open while the
+            # gateway is not stamping refuses every platform request. Rolling
+            # this out is therefore "write the Secret, roll the gateway, then
+            # let the node pick the file up"; rolling it back is "empty the
+            # node's file, then stop stamping".
+            #
+            # optional: an absent Secret leaves the value empty, the gateway
+            # stamps nothing, and the node's gate stays open — which is the
+            # state this ships in.
+            - name: GATEWAY_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-control-plane-token
+                  key: token
+                  optional: true
+            # 🔴 Off at first contact, on purpose, and this is why the setting
+            # has to be here at all: the code's default is `enforce`, and the
+            # release sequence requires the gateway to go out injecting the
+            # token while refusing nothing. Without this the deployment cannot
+            # express the step it is supposed to be at.
+            #
+            # See the scheduler Deployment for why the environment carries these
+            # alongside the mounted config file.
+            - name: GATEWAY_ROUTING_EXECUTION_FENCING
+              valueFrom:
+                configMapKeyRef:
+                  name: execution-fencing-config
+                  key: GATEWAY_ROUTING_EXECUTION_FENCING
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

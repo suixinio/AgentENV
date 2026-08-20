@@ -6,6 +6,9 @@
     "scheduler_addr": "agentenv-scheduler:9090",
     "request_timeout": "90s",
     "forward_response_size": 4194304,
-    "sandbox_proxy_domains": []
+    "sandbox_proxy_domains": [],
+    "routing": {
+      "execution_fencing": "off"
+    }
   }
 }

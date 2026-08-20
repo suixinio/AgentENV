@@ -109,6 +109,22 @@ type SchedulerRegistryConfig struct {
 	// describe, and defaulting to on would put every existing deployment into
 	// that window on an upgrade nobody asked for.
 	WriteEnabled bool `json:"write_enabled"`
+	// WriteFencing adds the identity-axis predicates to begin_pause and
+	// mark_running: a write claiming to come from an incarnation is refused
+	// unless the row names that incarnation.
+	//
+	// 🔴 On by default, and the rollback is this setting rather than a code
+	// path. It is also *not* the same switch as
+	// scheduler.routing.execution_arbitration or
+	// gateway.routing.execution_fencing — the three names carry their scope for
+	// exactly that reason, because "fencing is off" otherwise has three
+	// possible meanings and only this one loses a workspace.
+	//
+	// 🔴 It turns the checking off, never the column. The CHECK constraint is
+	// DDL and does not follow the setting, so nodes must go on sending an
+	// execution id however this is set; with it false their writes are simply
+	// not compared against the row.
+	WriteFencing bool `json:"write_fencing"`
 	// WriteMaxConnections caps the writable pool. This is the number the whole
 	// fleet's writes now share, where each node used to hold its own.
 	WriteMaxConnections int32 `json:"write_max_connections"`
@@ -148,6 +164,7 @@ func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
 		LeaseWarnWindow   json.RawMessage `json:"lease_warn_window"`
 
 		WriteEnabled        *bool           `json:"write_enabled"`
+		WriteFencing        *bool           `json:"write_fencing"`
 		WriteMaxConnections *int32          `json:"write_max_connections"`
 		LeaseTTL            json.RawMessage `json:"lease_ttl"`
 		LeaseTTLFloor       json.RawMessage `json:"lease_ttl_floor"`
@@ -195,6 +212,9 @@ func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
 
 	if parsed.WriteEnabled != nil {
 		s.WriteEnabled = *parsed.WriteEnabled
+	}
+	if parsed.WriteFencing != nil {
+		s.WriteFencing = *parsed.WriteFencing
 	}
 	if parsed.WriteMaxConnections != nil {
 		s.WriteMaxConnections = *parsed.WriteMaxConnections
@@ -244,6 +264,7 @@ type SchedulerConfig struct {
 	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
 	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
 	Registry                SchedulerRegistryConfig  `json:"registry"`
+	Routing                 SchedulerRoutingConfig   `json:"routing"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -264,6 +285,12 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		// so a config that names only one registry key keeps the defaults
 		// for the others instead of zeroing them.
 		Registry json.RawMessage `json:"registry"`
+		// Nested one pointer deep on each side, so a config file that names
+		// the block without naming the key inside it leaves the default alone
+		// rather than blanking it.
+		Routing *struct {
+			ExecutionArbitration *string `json:"execution_arbitration"`
+		} `json:"routing"`
 	}
 
 	parsed := wire{}
@@ -303,6 +330,13 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(parsed.Registry, &s.Registry); err != nil {
 			return err
 		}
+	}
+	if parsed.Routing != nil && parsed.Routing.ExecutionArbitration != nil {
+		// Carried through verbatim rather than parsed here: an unrecognised
+		// value has to reach validate() and stop the process, and parsing at
+		// this depth would turn it into an unmarshal error whose message names
+		// the JSON rather than the setting.
+		s.Routing.ExecutionArbitration = SchedulerExecutionArbitration(*parsed.Routing.ExecutionArbitration)
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
@@ -348,6 +382,122 @@ func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, e
 	return 0, fmt.Errorf("%s must be a duration string like \"30s\"", field)
 }
 
+// SchedulerExecutionArbitration is the three-state switch over what the
+// scheduler's routing half does with an incarnation: whether a binding written
+// by an older one may displace a newer one, and whether LookupNode answers with
+// an incarnation at all.
+//
+// 🔴 It governs the routing half alone. scheduler.registry.write_fencing turns
+// off the registry's SQL predicates and gateway.routing.execution_fencing turns
+// off the gateway's refusal; the three are deliberately separate settings with
+// their scope in their names. Merging any two would let one panicked flip
+// switch off a half nobody meant to — and the half that goes quiet is not the
+// one whose failure is visible.
+type SchedulerExecutionArbitration string
+
+const (
+	// Off is the complete rollback: bindings are overwritten by whoever
+	// reported last, exactly as before, and the two new LookupNode fields stay
+	// at their zero values.
+	SchedulerExecutionArbitrationOff SchedulerExecutionArbitration = "off"
+	// Observe works out what arbitration would have decided and counts it, but
+	// writes the way Off does. The release runs a round of this first.
+	SchedulerExecutionArbitrationObserve SchedulerExecutionArbitration = "observe"
+	// Enforce is the default: an older incarnation cannot take a binding back.
+	SchedulerExecutionArbitrationEnforce SchedulerExecutionArbitration = "enforce"
+)
+
+// ParseSchedulerExecutionArbitration is the one place a mode string becomes a
+// mode.
+//
+// 🔴 An unrecognised value is an error, never a fallback. A fallback makes one
+// mistyped letter switch arbitration off without saying so, and the resulting
+// behaviour is indistinguishable from the value having been meant. The empty
+// string is not a mistyped value: it is the absence of a setting, and it
+// resolves to the documented default.
+func ParseSchedulerExecutionArbitration(raw string) (SchedulerExecutionArbitration, error) {
+	switch SchedulerExecutionArbitration(strings.ToLower(strings.TrimSpace(raw))) {
+	case "":
+		return SchedulerExecutionArbitrationEnforce, nil
+	case SchedulerExecutionArbitrationOff:
+		return SchedulerExecutionArbitrationOff, nil
+	case SchedulerExecutionArbitrationObserve:
+		return SchedulerExecutionArbitrationObserve, nil
+	case SchedulerExecutionArbitrationEnforce:
+		return SchedulerExecutionArbitrationEnforce, nil
+	default:
+		return "", fmt.Errorf("scheduler.routing.execution_arbitration must be one of %s, %s, %s, got %q",
+			SchedulerExecutionArbitrationOff, SchedulerExecutionArbitrationObserve, SchedulerExecutionArbitrationEnforce, raw)
+	}
+}
+
+// SchedulerRoutingConfig groups the switches over what the scheduler does with
+// a routing answer, as opposed to what it does with the registry table.
+type SchedulerRoutingConfig struct {
+	ExecutionArbitration SchedulerExecutionArbitration `json:"execution_arbitration"`
+}
+
+// GatewayExecutionFencing is the three-state switch over the gateway's routing
+// layer refusal: whether it stamps the incarnation it routed against onto the
+// request, and whether a mismatch is refused or only counted.
+//
+// 🔴 It governs the gateway alone. Two other switches carry names that read the
+// same way and turn off different halves — scheduler.registry.write_fencing
+// guards the registry's SQL predicates, scheduler.routing.execution_arbitration
+// guards binding arbitration — so "is fencing off" has no single answer and
+// each has to be named. They are deliberately not merged: sharing one would let
+// a single panic-flip switch off a half nobody meant to, silently.
+type GatewayExecutionFencing string
+
+const (
+	// Off is the complete rollback: the gateway behaves byte for byte as it did
+	// before execution fencing existed.
+	GatewayExecutionFencingOff GatewayExecutionFencing = "off"
+	// Observe compares and counts, and stamps nothing.
+	//
+	// 🔴 The "stamps nothing" is the load-bearing half, not a detail: stamping
+	// the expect header is what arms the node's own refusal, and a 412 the node
+	// has already produced cannot be withdrawn by a gateway that was only meant
+	// to be watching — it can only be translated into a 409 the client did not
+	// get before. So observe delegates nothing, and takes its whole reading off
+	// the echo the node sends regardless of what was expected of it, which costs
+	// it no observability at all. (This comment previously read "stamps and
+	// compares and counts"; corrected 2026-08-20 — observe never stamped after
+	// the adjudication that made it a real dry run.)
+	GatewayExecutionFencingObserve GatewayExecutionFencing = "observe"
+	// Enforce is the default. Both gates are live.
+	GatewayExecutionFencingEnforce GatewayExecutionFencing = "enforce"
+)
+
+// ParseGatewayExecutionFencing is the one place a mode string becomes a mode.
+//
+// 🔴 An unrecognised value is an error, never a fallback. A fallback would make
+// one mistyped letter switch fencing off — or on — without saying so, and the
+// resulting behaviour is indistinguishable from the value having been meant.
+// The empty string is not a mistyped value: it is the absence of a setting, and
+// it resolves to the documented default.
+func ParseGatewayExecutionFencing(raw string) (GatewayExecutionFencing, error) {
+	switch GatewayExecutionFencing(strings.ToLower(strings.TrimSpace(raw))) {
+	case "":
+		return GatewayExecutionFencingEnforce, nil
+	case GatewayExecutionFencingOff:
+		return GatewayExecutionFencingOff, nil
+	case GatewayExecutionFencingObserve:
+		return GatewayExecutionFencingObserve, nil
+	case GatewayExecutionFencingEnforce:
+		return GatewayExecutionFencingEnforce, nil
+	default:
+		return "", fmt.Errorf("gateway.routing.execution_fencing must be one of %s, %s, %s, got %q",
+			GatewayExecutionFencingOff, GatewayExecutionFencingObserve, GatewayExecutionFencingEnforce, raw)
+	}
+}
+
+// GatewayRoutingConfig groups the switches over what the gateway does with a
+// routing answer, as opposed to where it listens or who it talks to.
+type GatewayRoutingConfig struct {
+	ExecutionFencing GatewayExecutionFencing `json:"execution_fencing"`
+}
+
 type GatewayConfig struct {
 	HTTPListenAddr         string        `json:"http_listen_addr"`
 	MetricsListenAddr      string        `json:"metrics_listen_addr"`
@@ -358,7 +508,19 @@ type GatewayConfig struct {
 	SandboxProxyDomains    []string      `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
-	DebugMode bool `json:"debug_mode"`
+	DebugMode bool                 `json:"debug_mode"`
+	Routing   GatewayRoutingConfig `json:"routing"`
+	// ControlPlaneToken is the shared secret the gateway stamps on every request
+	// it forwards to a node, so the node can tell control-plane traffic from
+	// anything that reached it another way.
+	//
+	// It is a credential, so it arrives through the environment or a Secret and
+	// never through the config file, which is a ConfigMap — the same rule the
+	// registry DSN follows, and the reason it is absent from the JSON shape
+	// below rather than merely undocumented. Empty is an ordinary value: the
+	// gateway stamps nothing and the node's gate stays open, which is what makes
+	// the rollout config-driven instead of deploy-driven.
+	ControlPlaneToken string `json:"-"`
 }
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
@@ -371,6 +533,12 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		ForwardResponseSize    *int64          `json:"forward_response_size"`
 		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
 		DebugMode              *bool           `json:"debug_mode"`
+		// Nested one pointer deep on each side, so a config file that names the
+		// block without naming the key inside it leaves the default alone rather
+		// than blanking it.
+		Routing *struct {
+			ExecutionFencing *string `json:"execution_fencing"`
+		} `json:"routing"`
 	}
 
 	parsed := wire{}
@@ -398,6 +566,13 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.DebugMode != nil {
 		g.DebugMode = *parsed.DebugMode
+	}
+	if parsed.Routing != nil && parsed.Routing.ExecutionFencing != nil {
+		// Carried through verbatim rather than parsed here: an unrecognised
+		// value has to reach validate() and stop the process, and parsing at
+		// this depth would turn it into an unmarshal error whose message names
+		// the JSON rather than the setting.
+		g.Routing.ExecutionFencing = GatewayExecutionFencing(*parsed.Routing.ExecutionFencing)
 	}
 
 	if len(bytes.TrimSpace(parsed.RequestTimeout)) > 0 {
@@ -501,7 +676,16 @@ func defaultConfig(service string) Config {
 				ReclaimInterval:     defaultSchedulerRegistryReclaimInterval,
 				DiscardMaxRows:      defaultSchedulerRegistryDiscardMaxRows,
 				DiscardMaxRatio:     defaultSchedulerRegistryDiscardMaxRatio,
+				// 🔴 On by default. This is the half whose absence costs a
+				// workspace, so a cluster that says nothing gets it; the
+				// runbook's caution belongs in the runbook.
+				WriteFencing: true,
 			},
+			// Same reasoning as the gateway's: the default names the end
+			// state, and starting a release on observe is release discipline.
+			// A default of observe leaves clusters parked there with nobody
+			// aware they were never flipped.
+			Routing: SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
 		},
 		Gateway: GatewayConfig{
 			HTTPListenAddr:      ":8080",
@@ -510,6 +694,11 @@ func defaultConfig(service string) Config {
 			RequestTimeout:      30 * time.Second,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
+			// The default points at the end state rather than at the cautious
+			// first step. Starting a release on observe is release discipline,
+			// which belongs in the runbook; putting it in the default leaves
+			// clusters parked there with nobody aware they were never flipped.
+			Routing: GatewayRoutingConfig{ExecutionFencing: GatewayExecutionFencingEnforce},
 		},
 	}
 }
@@ -530,6 +719,9 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
 	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
+	// A shared secret, so it arrives the same way the DSN does and never through
+	// the ConfigMap.
+	set("GATEWAY_CONTROL_PLANE_TOKEN", &cfg.Gateway.ControlPlaneToken)
 	// The DSN carries credentials, so it only ever arrives this way — never
 	// through the config file, which is a ConfigMap.
 	set("SCHEDULER_REGISTRY_DSN", &cfg.Scheduler.Registry.DSN)
@@ -627,6 +819,30 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Gateway.DebugMode = b
 	}
 
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_WRITE_FENCING")); v != "" {
+		fencing, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_WRITE_FENCING %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.WriteFencing = fencing
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ROUTING_EXECUTION_ARBITRATION")); v != "" {
+		mode, err := ParseSchedulerExecutionArbitration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_ROUTING_EXECUTION_ARBITRATION: %w", err)
+		}
+		cfg.Scheduler.Routing.ExecutionArbitration = mode
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_ROUTING_EXECUTION_FENCING")); v != "" {
+		mode, err := ParseGatewayExecutionFencing(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_ROUTING_EXECUTION_FENCING: %w", err)
+		}
+		cfg.Gateway.Routing.ExecutionFencing = mode
+	}
+
 	return nil
 }
 
@@ -688,8 +904,22 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Scheduler.Discovery.Kubernetes.Scheme) == "" {
 		c.Scheduler.Discovery.Kubernetes.Scheme = "http"
 	}
+	// An explicitly empty value in the config file means the same thing as the
+	// key being absent. Anything else is left alone for validate() to refuse:
+	// defaulting a value it could not read would be the silent fallback this
+	// setting must not have.
+	if strings.TrimSpace(string(c.Scheduler.Routing.ExecutionArbitration)) == "" {
+		c.Scheduler.Routing.ExecutionArbitration = SchedulerExecutionArbitrationEnforce
+	}
 	if strings.TrimSpace(c.Gateway.MetricsListenAddr) == "" {
 		c.Gateway.MetricsListenAddr = ":9102"
+	}
+	// An explicitly empty value in the config file means the same thing as the
+	// key being absent. Anything else is left alone for validate() to refuse:
+	// defaulting a value it could not read would be the silent fallback this
+	// setting must not have.
+	if strings.TrimSpace(string(c.Gateway.Routing.ExecutionFencing)) == "" {
+		c.Gateway.Routing.ExecutionFencing = GatewayExecutionFencingEnforce
 	}
 }
 
@@ -817,6 +1047,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if c.Scheduler.BindingTTL <= 0 {
 			return errors.New("scheduler.binding_ttl must be greater than zero")
 		}
+		// Refused rather than defaulted, and refused on the query-only replica
+		// too: that replica is the one serving data-plane lookups, so a typo
+		// there is a typo on the path that matters most.
+		if _, err := ParseSchedulerExecutionArbitration(string(c.Scheduler.Routing.ExecutionArbitration)); err != nil {
+			return err
+		}
 		// Checked before the query-only early return: a query-only replica is
 		// given the same registry reader, so a bad registry config has to fail
 		// there too rather than only on the primary.
@@ -869,6 +1105,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Gateway.SchedulerAddr == "" {
 			return errors.New("gateway.scheduler_addr is required")
+		}
+		if _, err := ParseGatewayExecutionFencing(string(c.Gateway.Routing.ExecutionFencing)); err != nil {
+			return err
 		}
 	}
 	return nil

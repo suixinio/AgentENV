@@ -12,6 +12,12 @@
         "port": 8000,
         "scheme": "http"
       }
+    },
+    "registry": {
+      "write_fencing": true
+    },
+    "routing": {
+      "execution_arbitration": "observe"
     }
   }
 }

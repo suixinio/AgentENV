@@ -35,6 +35,20 @@ configMapGenerator:
   - name: cluster-identity-config
     literals:
       - CLUSTER_ID=00000000-0000-0000-0000-000000000000
+  # 🔴 config/agentenv.toml is NOT in this repository, and that is deliberate.
+  # `deploy/k8s/run.sh` copies the whole of deploy/k8s into a temp directory and
+  # writes it there from config/default.toml (run.sh:30) before invoking
+  # kustomize, so the node's TOML and the repo's own default can never be two
+  # different files. That is also why editing this ConfigMap in a live cluster
+  # is undone by the next apply — see the note on AENV_PAUSED_REGISTRY_BACKEND
+  # in agentenv-daemonset.yaml, and the one on [orchestrator.paused_registry]
+  # in config/default.toml.
+  #
+  # Consequence: `kubectl kustomize deploy/k8s/base` fails on a clean checkout,
+  # and always has — this tree is not a kustomize entry point. Render or apply
+  # through `make k8s-render` / `make k8s-apply` (or `bash deploy/k8s/run.sh
+  # render|apply|delete`), which also selects an overlay; base is only ever
+  # consumed as `resources: [../../base]` from one of them.
   - name: agentenv-k8s-config
     files:
       - config/agentenv.toml
@@ -47,6 +61,38 @@ configMapGenerator:
   - name: sandbox-proxy-config
     literals:
       - SANDBOX_PROXY_DOMAINS=
+  # The three switches of the incarnation work, in one place because the
+  # release sequence flips them one at a time and an operator has to be able to
+  # see all three at once.
+  #
+  # 🔴 They are three settings, not one. "Is fencing off" has no single answer:
+  #   · SCHEDULER_REGISTRY_WRITE_FENCING guards the registry's SQL predicates
+  #     — the half whose failure loses a workspace;
+  #   · SCHEDULER_ROUTING_EXECUTION_ARBITRATION guards binding arbitration
+  #     — the half whose failure routes to whichever node reported last;
+  #   · GATEWAY_ROUTING_EXECUTION_FENCING guards the gateway's refusal.
+  # Merging any two would let one panicked flip switch off a half nobody meant
+  # to, and two of the three failures are silent.
+  #
+  # The values here are the *starting* state of the release, not the end state.
+  # The code defaults to the end state — a default of "observe" would leave
+  # clusters parked there with nobody aware they were never flipped — so the
+  # caution belongs here and in the runbook, where somebody is watching.
+  - name: execution-fencing-config
+    literals:
+      # A3 is on from the moment the scheduler carrying it starts: it is the
+      # reason the release exists, and the rows it protects are the ones that
+      # cannot be reconstructed.
+      - SCHEDULER_REGISTRY_WRITE_FENCING=true
+      # Arbitration starts by observing. It is flipped to `enforce` once
+      # heartbeat_legacy_roster_total has reached zero — while it has not, some
+      # node is still too old to report incarnations and arbitration would be
+      # refusing writes it cannot judge.
+      - SCHEDULER_ROUTING_EXECUTION_ARBITRATION=observe
+      # The gateway goes out injecting the control-plane token and refusing
+      # nothing. It moves to `observe` only after the node-side gate has been
+      # switched on and verified, and to `enforce` after that.
+      - GATEWAY_ROUTING_EXECUTION_FENCING=off
 
 images:
   - name: agentenv-gateway

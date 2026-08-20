@@ -86,6 +86,36 @@ spec:
                   name: cluster-identity-config
                   key: CLUSTER_ID
                   optional: true
+            # The two halves of the incarnation work that can be switched off,
+            # each named for the half it governs.
+            #
+            # 🔴 Two settings and not one. `write_fencing` guards the registry's
+            # SQL predicates — the half whose failure lets a superseded VM
+            # publish a stale snapshot over a live one and then delete the
+            # snapshot the live one is running from. `execution_arbitration`
+            # guards binding arbitration — the half whose failure sends traffic
+            # to whichever node reported last. A single switch would let one
+            # panicked flip turn off a half nobody meant to, and only one of the
+            # two announces itself in traffic.
+            #
+            # The ConfigMap under them carries the release's *starting* values;
+            # these environment variables exist so the rollback is a
+            # `kubectl set env` rather than an edit to a mounted file, which is
+            # the difference between seconds and a ConfigMap round trip during
+            # an incident. Both are read once at start-up, so either way is a
+            # rollout — the environment simply wins.
+            - name: SCHEDULER_REGISTRY_WRITE_FENCING
+              valueFrom:
+                configMapKeyRef:
+                  name: execution-fencing-config
+                  key: SCHEDULER_REGISTRY_WRITE_FENCING
+                  optional: true
+            - name: SCHEDULER_ROUTING_EXECUTION_ARBITRATION
+              valueFrom:
+                configMapKeyRef:
+                  name: execution-fencing-config
+                  key: SCHEDULER_ROUTING_EXECUTION_ARBITRATION
+                  optional: true
           ports:
             - name: grpc
               containerPort: 9090

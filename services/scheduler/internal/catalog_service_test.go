@@ -17,6 +17,7 @@ import (
 	pausedregistry "agentenv/services/scheduler/internal/registry"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -740,12 +741,8 @@ func newPausedHalfFixture(t *testing.T) *pausedHalfFixture {
 	}
 	t.Cleanup(registryStore.Close)
 
-	if err := registryStore.Migrate(ctx); err != nil {
-		t.Fatalf("migrate the registry: %v", err)
-	}
-	if err := catalog.Migrate(ctx, registryStore.Pool()); err != nil {
-		t.Fatalf("migrate the catalog: %v", err)
-	}
+	migrateWithRetry(t, "the registry", func() error { return registryStore.Migrate(ctx) })
+	migrateWithRetry(t, "the catalog", func() error { return catalog.Migrate(ctx, registryStore.Pool()) })
 
 	// The same pool for both, which is the arrangement the two halves need.
 	store := catalog.NewStoreWithPool(registryStore.Pool(), catalog.StoreConfig{
@@ -760,6 +757,36 @@ func newPausedHalfFixture(t *testing.T) *pausedHalfFixture {
 		svc:      NewSnapshotCatalogService(zap.NewNop(), store, stubGate{}, serviceCluster),
 		pool:     registryStore.Pool(),
 	}
+}
+
+// migrateWithRetry applies one schema, retrying a deadlock.
+//
+// 🔴 Not papering over a fault in the migration. Both migrations take the same
+// cluster-wide advisory lock, and the whole test suite shares one database:
+// while one process holds that lock and issues DDL, another's per-test
+// `DROP SCHEMA ... CASCADE` can be waiting on the same system-catalog rows,
+// and PostgreSQL resolves the three-way wait by killing somebody. The victim is
+// whichever session asked last, which is this one.
+//
+// It cannot happen in a deployment — there is one schema there and nothing
+// drops it — and the process that migrates for real already retries every
+// failure forever, on the reasoning that a schema that cannot be applied must
+// not stop the scheduler from routing traffic. This is that loop, bounded.
+func migrateWithRetry(t *testing.T, what string, migrate func() error) {
+	t.Helper()
+
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = migrate(); err == nil {
+			return
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			t.Fatalf("migrate %s: %v", what, err)
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	t.Fatalf("migrate %s: still deadlocking after five attempts: %v", what, err)
 }
 
 func serviceTestSchema(t *testing.T) string {

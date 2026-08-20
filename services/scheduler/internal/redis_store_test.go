@@ -21,10 +21,10 @@ func TestRedisBindingStoreGetCases(t *testing.T) {
 	store := newRedisBindingStoreForTest(t, 5*time.Second)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 
-	if got, ok, err := store.Get("missing", time.Now()); err != nil || ok || got != (Node{}) {
+	if got, ok, err := store.Get("missing", time.Now()); err != nil || ok || got != (Binding{}) {
 		t.Fatalf("expected missing binding to return zero/miss, got (%+v, %v, %v)", got, ok, err)
 	}
-	if got, ok, err := store.Get("   ", time.Now()); err != nil || ok || got != (Node{}) {
+	if got, ok, err := store.Get("   ", time.Now()); err != nil || ok || got != (Binding{}) {
 		t.Fatalf("expected blank sandbox id to return zero/miss, got (%+v, %v, %v)", got, ok, err)
 	}
 
@@ -36,7 +36,7 @@ func TestRedisBindingStoreGetCases(t *testing.T) {
 	if err := store.client.Set(context.Background(), malformedKey, "not-json", time.Minute).Err(); err != nil {
 		t.Fatalf("write malformed binding failed: %v", err)
 	}
-	if got, ok, err := store.Get("malformed", time.Now()); err != nil || ok || got != (Node{}) {
+	if got, ok, err := store.Get("malformed", time.Now()); err != nil || ok || got != (Binding{}) {
 		t.Fatalf("expected malformed binding to return zero/miss, got (%+v, %v, %v)", got, ok, err)
 	}
 	if exists := redisExists(t, store, malformedKey); !exists {
@@ -47,7 +47,7 @@ func TestRedisBindingStoreGetCases(t *testing.T) {
 	if err := store.client.Set(context.Background(), invalidNodeKey, `{"node":{"node_id":"node-a","endpoint":""}}`, time.Minute).Err(); err != nil {
 		t.Fatalf("write invalid-node binding failed: %v", err)
 	}
-	if got, ok, err := store.Get("invalid-node", time.Now()); err != nil || ok || got != (Node{}) {
+	if got, ok, err := store.Get("invalid-node", time.Now()); err != nil || ok || got != (Binding{}) {
 		t.Fatalf("expected invalid-node binding to return zero/miss, got (%+v, %v, %v)", got, ok, err)
 	}
 	if exists := redisExists(t, store, invalidNodeKey); !exists {
@@ -61,22 +61,22 @@ func TestRedisBindingStoreRecordCases(t *testing.T) {
 	nodeATrimmed := Node{ID: " node-a ", Endpoint: " http://node-a "}
 	nodeB := Node{ID: "node-b", Endpoint: "http://node-b"}
 
-	store.Record("  sbx-1  ", nodeATrimmed, time.Now())
+	store.Record("  sbx-1  ", Binding{Node: nodeATrimmed}, time.Now())
 	assertRedisBinding(t, store, "sbx-1", nodeA)
 	assertRedisSetEqual(t, store, store.nodeKey("node-a"), []string{"sbx-1"})
 	assertRedisBindingJSON(t, store, "sbx-1", nodeA)
 	assertRedisBindingHasPositiveTTL(t, store, "sbx-1")
 	assertRedisKeyHasPositiveTTL(t, store, store.nodeKey("node-a"))
 
-	store.Record("sbx-1", nodeB, time.Now())
+	store.Record("sbx-1", Binding{Node: nodeB}, time.Now())
 	assertRedisBinding(t, store, "sbx-1", nodeB)
 	assertRedisSetEqual(t, store, store.nodeKey("node-a"), nil)
 	assertRedisSetEqual(t, store, store.nodeKey("node-b"), []string{"sbx-1"})
 	assertRedisKeyHasPositiveTTL(t, store, store.nodeKey("node-b"))
 
-	store.Record("", Node{ID: "node-c", Endpoint: "http://node-c"}, time.Now())
-	store.Record("sbx-blank-node", Node{Endpoint: "http://node-c"}, time.Now())
-	store.Record("sbx-blank-endpoint", Node{ID: "node-c"}, time.Now())
+	store.Record("", Binding{Node: Node{ID: "node-c", Endpoint: "http://node-c"}}, time.Now())
+	store.Record("sbx-blank-node", Binding{Node: Node{Endpoint: "http://node-c"}}, time.Now())
+	store.Record("sbx-blank-endpoint", Binding{Node: Node{ID: "node-c"}}, time.Now())
 	assertRedisMissing(t, store, "sbx-blank-node")
 	assertRedisMissing(t, store, "sbx-blank-endpoint")
 	assertRedisSetEqual(t, store, store.nodeKey("node-c"), nil)
@@ -85,7 +85,7 @@ func TestRedisBindingStoreRecordCases(t *testing.T) {
 	if err := store.client.Set(context.Background(), store.bindingKey("malformed"), "not-json", time.Minute).Err(); err != nil {
 		t.Fatalf("write malformed binding failed: %v", err)
 	}
-	store.Record("malformed", nodeA, time.Now())
+	store.Record("malformed", Binding{Node: nodeA}, time.Now())
 	assertRedisBinding(t, store, "malformed", nodeA)
 	assertRedisSetEqual(t, store, store.nodeKey("node-a"), []string{"malformed"})
 }
@@ -98,12 +98,12 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 
 	// Build initial state with a stale binding for node-a, two active node-b bindings,
 	// and one node-c binding that will be moved by ReconcileNode.
-	store.Record("stale-a", nodeA, time.Now())
-	store.Record("keep-b", nodeB, time.Now())
-	store.Record("drop-b", nodeB, time.Now())
-	store.Record("move-c-to-b", nodeC, time.Now())
+	store.Record("stale-a", Binding{Node: nodeA}, time.Now())
+	store.Record("keep-b", Binding{Node: nodeB}, time.Now())
+	store.Record("drop-b", Binding{Node: nodeB}, time.Now())
+	store.Record("move-c-to-b", Binding{Node: nodeC}, time.Now())
 
-	store.ReconcileNode(Node{ID: " node-b ", Endpoint: " http://node-b "}, []string{"keep-b", "new-b", "move-c-to-b", "keep-b", ""}, time.Now())
+	store.ReconcileNode(Node{ID: " node-b ", Endpoint: " http://node-b "}, rosterOf("keep-b", "new-b", "move-c-to-b", "keep-b", ""), time.Now())
 
 	assertRedisBinding(t, store, "keep-b", nodeB)
 	assertRedisBinding(t, store, "new-b", nodeB)
@@ -120,7 +120,7 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 
 	// If a node reverse index has a stale sandbox whose binding now points to another node,
 	// empty reconcile should remove only the reverse-index entry and must not delete that binding.
-	store.Record("foreign", nodeB, time.Now())
+	store.Record("foreign", Binding{Node: nodeB}, time.Now())
 	if err := store.client.SAdd(context.Background(), store.nodeKey("node-a"), "foreign").Err(); err != nil {
 		t.Fatalf("inject stale reverse-index entry failed: %v", err)
 	}
@@ -131,13 +131,23 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 	assertRedisSetEqual(t, store, store.nodeKey("node-b"), []string{"keep-b", "new-b", "move-c-to-b", "foreign"})
 
 	// Invalid node inputs should be ignored.
-	store.ReconcileNode(Node{Endpoint: "http://missing-id"}, []string{"ignored"}, time.Now())
+	store.ReconcileNode(Node{Endpoint: "http://missing-id"}, rosterOf("ignored"), time.Now())
 	assertRedisMissing(t, store, "ignored")
-	store.ReconcileNode(Node{ID: "node-no-endpoint"}, []string{"ignored-no-endpoint"}, time.Now())
+	store.ReconcileNode(Node{ID: "node-no-endpoint"}, rosterOf("ignored-no-endpoint"), time.Now())
 	assertRedisMissing(t, store, "ignored-no-endpoint")
 	if redisExists(t, store, store.bindingKey("ignored-no-endpoint")) {
 		t.Fatal("expected reconcile with non-empty desired list and empty endpoint not to write a phantom binding key")
 	}
+}
+
+// rosterOf turns a list of sandbox ids into a roster carrying no incarnations,
+// which is what a node too old to report them sends.
+func rosterOf(sandboxIDs ...string) []RosterEntry {
+	entries := make([]RosterEntry, 0, len(sandboxIDs))
+	for _, sandboxID := range sandboxIDs {
+		entries = append(entries, RosterEntry{SandboxID: sandboxID})
+	}
+	return entries
 }
 
 func newRedisBindingStoreForTest(t *testing.T, ttl time.Duration) *RedisBindingStore {
@@ -161,6 +171,20 @@ func startRedisServerForTest(t *testing.T) string {
 		var err error
 		bin, err = exec.LookPath("redis-server")
 		if err != nil {
+			// 🔴 A skip reports as a pass, so a run that is *meant* to be
+			// exercising Redis — CI, or a verification pass — sets
+			// SCHEDULER_REDIS_TEST_REQUIRED and gets a failure instead.
+			//
+			// It matters more here than the same escape hatch does for
+			// PostgreSQL. The tests below are the only ones that catch an
+			// incarnation implemented for the in-memory store and forgotten
+			// for Redis, and that defect is invisible everywhere else: every
+			// other test in this package passes, and the failure only appears
+			// in the one deployment shape that uses Redis, as fencing that
+			// quietly does nothing.
+			if os.Getenv("SCHEDULER_REDIS_TEST_REQUIRED") != "" {
+				t.Fatal("SCHEDULER_REDIS_TEST_REQUIRED is set but no redis-server was found: these binding-store tests would have been skipped")
+			}
 			t.Skip("redis-server not found; set REDIS_SERVER_BIN or install redis-server to run RedisBindingStore integration test")
 		}
 	}
@@ -224,7 +248,7 @@ func startRedisServerForTest(t *testing.T) string {
 
 func writeRawRedisBinding(t *testing.T, store *RedisBindingStore, sandboxID string, node Node) {
 	t.Helper()
-	value, err := marshalRedisBindingRecord(node)
+	value, err := marshalRedisBindingRecord(node, "")
 	if err != nil {
 		t.Fatalf("marshal binding record failed: %v", err)
 	}
@@ -236,7 +260,7 @@ func writeRawRedisBinding(t *testing.T, store *RedisBindingStore, sandboxID stri
 func assertRedisBinding(t *testing.T, store *RedisBindingStore, sandboxID string, want Node) {
 	t.Helper()
 	got, ok, err := store.Get(sandboxID, time.Now())
-	if err != nil || !ok || got != want {
+	if err != nil || !ok || got.Node != want {
 		t.Fatalf("expected %s to resolve to %+v, got (%+v, %v, %v)", strings.TrimSpace(sandboxID), want, got, ok, err)
 	}
 }

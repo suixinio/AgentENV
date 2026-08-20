@@ -28,6 +28,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,33 +46,6 @@ const (
 	contractNodeA = "node-a"
 	contractNodeB = "node-b"
 )
-
-// contractSchemaDDL is the node's own schema bootstrap, copied verbatim from
-// src/orchestrator/paused_registry/postgres.rs. It is duplicated rather than
-// referenced on purpose: the point is to exercise a table shaped exactly the
-// way the nodes create it today, and a paraphrase would pass while the real
-// thing failed.
-const contractSchemaDDL = `
-CREATE TABLE IF NOT EXISTS paused_sandboxes (
-    sandbox_id     UUID        PRIMARY KEY,
-    cluster_id     UUID        NOT NULL,
-    state          TEXT        NOT NULL,
-    generation     BIGINT      NOT NULL,
-    origin_node_id TEXT        NOT NULL,
-    snapshot_id    UUID,
-    metadata       JSONB       NOT NULL,
-    paused_at      TIMESTAMPTZ NOT NULL,
-    updated_at     TIMESTAMPTZ NOT NULL
-);
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS claimed_by_node_id TEXT;
-ALTER TABLE paused_sandboxes DROP CONSTRAINT IF EXISTS paused_sandboxes_state_check;
-ALTER TABLE paused_sandboxes ADD CONSTRAINT paused_sandboxes_state_check
-    CHECK (state IN ('publishing', 'paused', 'resuming', 'local_only', 'running'));
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS sandbox_expires_at TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
-CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
-`
 
 // contractDSN returns the test database DSN, or skips the calling test when
 // none is configured.
@@ -113,6 +87,13 @@ func contractStore(t *testing.T, dsn string) Store {
 	store, err := NewStore(context.Background(), StoreConfig{
 		DSN:      dsn,
 		LeaseTTL: contractLeaseTTL,
+		// 🔴 Fenced, because that is what a deployment runs. These are the
+		// semantics tests — the port of the node's own behavioural suite — and
+		// running them against the rollback statements would leave the
+		// statements production actually uses covered only by the tests written
+		// for them, with nothing checking that fencing left the rest of the
+		// contract intact.
+		WriteFencing: true,
 	})
 	if err != nil {
 		t.Fatalf("build the store under test: %v", err)
@@ -135,6 +116,42 @@ type contractEnv struct {
 	conn    *pgx.Conn
 	schema  string
 	cluster string
+
+	// executions is the incarnation each sandbox in this test is currently
+	// living under, so the helpers below can send the *same* one through a
+	// pause that a resume installed — which is what the node does, and what
+	// the fenced statements require.
+	mu         sync.Mutex
+	executions map[string]string
+}
+
+// executionOf is the incarnation this sandbox is running under, minting one
+// the first time it is asked for.
+func (e *contractEnv) executionOf(sandboxID string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.executions == nil {
+		e.executions = make(map[string]string)
+	}
+	if id, ok := e.executions[sandboxID]; ok {
+		return id
+	}
+	id := newExecutionID()
+	e.executions[sandboxID] = id
+	return id
+}
+
+// nextExecutionOf mints a *new* incarnation for a sandbox and remembers it.
+// A claim is where one is allocated, so that is where this is called.
+func (e *contractEnv) nextExecutionOf(sandboxID string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.executions == nil {
+		e.executions = make(map[string]string)
+	}
+	id := newExecutionID()
+	e.executions[sandboxID] = id
+	return id
 }
 
 // contractSetup gives the calling test a private schema holding a table of
@@ -180,11 +197,11 @@ func contractSetup(t *testing.T) *contractEnv {
 	if _, err := conn.Exec(ctx, "SET search_path TO "+quoted); err != nil {
 		t.Fatalf("point the test connection at %s: %v", schema, err)
 	}
-	if _, err := conn.Exec(ctx, contractSchemaDDL); err != nil {
-		t.Fatalf("create the node-shaped table in %s: %v", schema, err)
+	if _, err := conn.Exec(ctx, legacyNodeSchemaDDL); err != nil {
+		t.Fatalf("create the pre-phase-3 table in %s: %v", schema, err)
 	}
 
-	env := &contractEnv{conn: conn, schema: schema, cluster: contractUUID(t)}
+	env := &contractEnv{conn: conn, schema: schema, cluster: contractUUID(t), executions: make(map[string]string)}
 	env.store = contractStore(t, contractDSNInSchema(t, dsn, schema))
 
 	return env
@@ -287,6 +304,7 @@ func (e *contractEnv) beginPause(t *testing.T, cluster, sandboxID, origin string
 		SandboxID:    sandboxID,
 		OriginNodeID: origin,
 		Metadata:     contractMetadata(origin),
+		ExecutionID:  e.executionOf(sandboxID),
 	})
 	if err != nil {
 		t.Fatalf("begin pause on %s: %v", sandboxID, err)
@@ -318,7 +336,7 @@ func (e *contractEnv) markRunning(t *testing.T, cluster, sandboxID, node string)
 func (e *contractEnv) markRunningOutcome(t *testing.T, cluster, sandboxID, node string) MarkRunningOutcome {
 	t.Helper()
 
-	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node, nil)
+	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node, e.executionOf(sandboxID), nil)
 	if err != nil {
 		t.Fatalf("mark %s running on %s: %v", sandboxID, node, err)
 	}
@@ -329,7 +347,7 @@ func (e *contractEnv) markRunningOutcome(t *testing.T, cluster, sandboxID, node 
 func (e *contractEnv) claim(t *testing.T, cluster, sandboxID, node string) ResumeClaim {
 	t.Helper()
 
-	claim, err := e.store.ClaimForResume(context.Background(), cluster, sandboxID, node)
+	claim, err := e.store.ClaimForResume(context.Background(), cluster, sandboxID, node, e.nextExecutionOf(sandboxID))
 	if err != nil {
 		t.Fatalf("claim %s for %s: %v", sandboxID, node, err)
 	}
@@ -692,6 +710,7 @@ func TestContractBeginPauseRefusesAnotherClustersRow(t *testing.T) {
 		SandboxID:    sandboxID,
 		OriginNodeID: contractNodeB,
 		Metadata:     contractMetadata(contractNodeB),
+		ExecutionID:  newExecutionID(),
 	})
 	if !errors.Is(hijack, ErrInvalidRecord) {
 		t.Fatalf("a foreign cluster must not be able to rewrite the row: got %v, want %v", hijack, ErrInvalidRecord)

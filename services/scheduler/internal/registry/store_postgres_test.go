@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,41 @@ type storeFixture struct {
 	store   *PostgresStore
 	cluster string
 	other   string
+
+	// executions is the incarnation each sandbox in this test is living
+	// under. The fenced statements compare against the row, so a pause has to
+	// send the value the resume installed — the same coupling the node has.
+	mu         sync.Mutex
+	executions map[string]string
+}
+
+// executionFor is the incarnation this sandbox is running under, minting one
+// the first time it is asked for.
+func (f *storeFixture) executionFor(sandboxID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.executions == nil {
+		f.executions = make(map[string]string)
+	}
+	if id, ok := f.executions[sandboxID]; ok {
+		return id
+	}
+	id := newExecutionID()
+	f.executions[sandboxID] = id
+	return id
+}
+
+// nextExecutionFor mints a new incarnation for a sandbox and remembers it. A
+// claim is where one is allocated, so that is where this belongs.
+func (f *storeFixture) nextExecutionFor(sandboxID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.executions == nil {
+		f.executions = make(map[string]string)
+	}
+	id := newExecutionID()
+	f.executions[sandboxID] = id
+	return id
 }
 
 const (
@@ -64,7 +100,21 @@ func newStoreFixture(t *testing.T) *storeFixture {
 	if err := Migrate(context.Background(), f.pool); err != nil {
 		t.Fatalf("migrate failed: %v", err)
 	}
-	f.store = newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop()})
+	f.store = newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop(), WriteFencing: true})
+	return f
+}
+
+// newUnfencedStoreFixture is the same table with the rollback statements
+// selected, so the behaviour the setting restores is covered by tests of its
+// own rather than only by the absence of the fenced ones.
+func newUnfencedStoreFixture(t *testing.T) *storeFixture {
+	t.Helper()
+
+	f := newSchemaFixture(t)
+	if err := Migrate(context.Background(), f.pool); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+	f.store = newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop(), WriteFencing: false})
 	return f
 }
 
@@ -117,7 +167,7 @@ func newSchemaFixture(t *testing.T) *storeFixture {
 		}
 	})
 
-	return &storeFixture{t: t, pool: pool, cluster: stCluster, other: stOther}
+	return &storeFixture{t: t, pool: pool, cluster: stCluster, other: stOther, executions: make(map[string]string)}
 }
 
 // testSchemaName is a legal, unique, obviously disposable identifier.
@@ -154,6 +204,12 @@ type seedRow struct {
 	metadata      string
 	leaseExpires  string // SQL expression, empty means NULL
 	sandboxExpiry string // SQL expression, empty means NULL
+	// executionID is the incarnation on the row. Empty means "let the fixture
+	// choose": a live state gets the one this test is already using for that
+	// sandbox, a parked state gets NULL, because that is what the CHECK
+	// constraint allows. Set it explicitly to seed a row belonging to somebody
+	// else's incarnation.
+	executionID string
 }
 
 func (f *storeFixture) seed(row seedRow) {
@@ -177,23 +233,36 @@ func (f *storeFixture) seed(row seedRow) {
 		expiry = "NULL"
 	}
 
-	var claimedBy, snapshot any
+	var claimedBy, snapshot, execution any
 	if row.claimedBy != "" {
 		claimedBy = row.claimedBy
 	}
 	if row.snapshotID != "" {
 		snapshot = row.snapshotID
 	}
+	switch {
+	case row.executionID != "":
+		execution = row.executionID
+	case row.state == "running" || row.state == "publishing" || row.state == "resuming":
+		execution = f.executionFor(row.sandboxID)
+	}
+	// execution_started_at travels with execution_id: the CHECK ties them
+	// together, so a seed that set one and not the other would be refused.
+	started := "NULL"
+	if execution != nil {
+		started = "now()"
+	}
 
 	sql := `INSERT INTO paused_sandboxes (
         sandbox_id, cluster_id, state, generation, origin_node_id, claimed_by_node_id,
-        snapshot_id, metadata, paused_at, updated_at, lease_expires_at, sandbox_expires_at
+        snapshot_id, metadata, paused_at, updated_at, lease_expires_at, sandbox_expires_at,
+        execution_id, execution_started_at
     ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8::jsonb, now(), now(), ` +
-		lease + `, ` + expiry + `)`
+		lease + `, ` + expiry + `, $9::uuid, ` + started + `)`
 
 	if _, err := f.pool.Exec(context.Background(), sql,
 		row.sandboxID, row.cluster, row.state, row.generation, row.originNode,
-		claimedBy, snapshot, row.metadata,
+		claimedBy, snapshot, row.metadata, execution,
 	); err != nil {
 		f.t.Fatalf("seed %s failed: %v", row.sandboxID, err)
 	}
@@ -202,16 +271,29 @@ func (f *storeFixture) seed(row seedRow) {
 // raw reads a row without going through the decoder, so a test can look at a
 // row the decoder would refuse.
 type rawRow struct {
-	state         string
-	generation    int64
-	originNode    string
-	claimedBy     *string
-	snapshotID    *string
-	pausedAt      time.Time
-	updatedAt     time.Time
-	leaseExpires  *time.Time
-	sandboxExpiry *time.Time
-	found         bool
+	state          string
+	generation     int64
+	originNode     string
+	claimedBy      *string
+	snapshotID     *string
+	pausedAt       time.Time
+	updatedAt      time.Time
+	leaseExpires   *time.Time
+	sandboxExpiry  *time.Time
+	executionID    *string
+	executionStart *time.Time
+	found          bool
+}
+
+// execution renders the incarnation column for a comparison, "none" standing
+// for NULL — the difference between "somebody else holds this" and "the cluster
+// believes nobody does" is the whole reason the column is nullable, so it must
+// not collapse into an empty string.
+func (r rawRow) execution() string {
+	if r.executionID == nil {
+		return "none"
+	}
+	return *r.executionID
 }
 
 func (f *storeFixture) raw(sandboxID string) rawRow {
@@ -220,10 +302,12 @@ func (f *storeFixture) raw(sandboxID string) rawRow {
 	var row rawRow
 	err := f.pool.QueryRow(context.Background(), `
         SELECT state, generation, origin_node_id, claimed_by_node_id, snapshot_id::text,
-               paused_at, updated_at, lease_expires_at, sandbox_expires_at
+               paused_at, updated_at, lease_expires_at, sandbox_expires_at,
+               execution_id::text, execution_started_at
           FROM paused_sandboxes WHERE sandbox_id = $1::uuid`, sandboxID).
 		Scan(&row.state, &row.generation, &row.originNode, &row.claimedBy, &row.snapshotID,
-			&row.pausedAt, &row.updatedAt, &row.leaseExpires, &row.sandboxExpiry)
+			&row.pausedAt, &row.updatedAt, &row.leaseExpires, &row.sandboxExpiry,
+			&row.executionID, &row.executionStart)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return rawRow{}
@@ -265,67 +349,112 @@ func snapshotUUID(n int) string {
 // Migration
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMigrateIsIdempotentOverATableTheNodeCreated is what the switchover rests
-// on, and it outlived the switchover.
+// TestMigrateOverAnEmptyPrePhase3Table is the upgrade path that still has to
+// work.
 //
-// It used to have a companion asserting this migration was the node's own
-// script byte for byte, because during the changeover both processes ran it and
-// both dropped and re-added the state CHECK unconditionally. That companion is
-// gone with the node's copy: this process is the only writer now and may extend
-// the schema — the reclamation index below the original statements is the first
-// thing it added.
+// Every cluster that ran the old node-side backend has a table of exactly that
+// shape. Once the runbook's DROP TABLE has emptied it — or on a cluster that
+// only ever created it and never wrote — migrating has to bring it forward
+// rather than fail: the ALTERs below the CREATE TABLE are the only route it
+// has, which is why they are kept in a script that is otherwise a fresh build's.
 //
-// What survives is the harder half. Every cluster that has ever run the old
-// backend has a table an old node built, and this migration has to be a no-op
-// over it — including the parts this side has since grown. So the table here is
-// created from a verbatim copy of that node's DDL rather than from Migrate,
-// which is the whole point: a paraphrase would pass against a table this side
-// built and fail against a real one.
-func TestMigrateIsIdempotentOverATableTheNodeCreated(t *testing.T) {
+// The table is created from a verbatim copy of the node's own DDL
+// (legacyNodeSchemaDDL) rather than from Migrate. That is the point: a
+// paraphrase would pass here and fail against a real one.
+func TestMigrateOverAnEmptyPrePhase3Table(t *testing.T) {
 	f := newStoreFixtureWithoutMigration(t)
 	ctx := context.Background()
 
-	// 1. The node comes up first and builds the table.
-	if _, err := f.pool.Exec(ctx, schemaDDL); err != nil {
-		t.Fatalf("the node's own bootstrap failed: %v", err)
+	if _, err := f.pool.Exec(ctx, legacyNodeSchemaDDL); err != nil {
+		t.Fatalf("the pre-phase-3 bootstrap failed: %v", err)
 	}
-	// 2. The controller migrates over it.
 	if err := Migrate(ctx, f.pool); err != nil {
-		t.Fatalf("migrating a table the node created failed: %v", err)
+		t.Fatalf("migrating an empty pre-phase-3 table failed: %v", err)
 	}
-	// 3. The node restarts and runs its script again. This is the direction
-	//    that strands a machine: it fails on *that* node, whose configuration
-	//    nobody changed, naming a constraint nobody there touched.
-	if _, err := f.pool.Exec(ctx, schemaDDL); err != nil {
-		t.Fatalf("the node could not start after the controller migrated: %v", err)
-	}
-	// 4. And once more each way, because a rollout is not two steps.
+	// And again, because a rollout is not one step.
 	if err := Migrate(ctx, f.pool); err != nil {
-		t.Fatalf("second controller migration failed: %v", err)
-	}
-	if _, err := f.pool.Exec(ctx, schemaDDL); err != nil {
-		t.Fatalf("second node bootstrap failed: %v", err)
+		t.Fatalf("second migration failed: %v", err)
 	}
 
-	// The table still works for both sides afterwards.
-	store := newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop()})
+	store := newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop(), WriteFencing: true})
 	if _, err := store.BeginPause(ctx, BeginPauseInput{
 		ClusterID:    f.cluster,
 		SandboxID:    sandboxUUID(8),
 		OriginNodeID: stNodeA,
 		Metadata:     json.RawMessage(stMetadata),
+		ExecutionID:  newExecutionID(),
 	}); err != nil {
 		t.Fatalf("the table is unusable after the round trip: %v", err)
 	}
 }
 
-// TestATableTheControllerCreatedAcceptsTheNodesBootstrap is the same gate from
-// the other side: the controller came up first on a fresh database.
-func TestATableTheControllerCreatedAcceptsTheNodesBootstrap(t *testing.T) {
-	f := newStoreFixture(t) // already migrated
+// TestMigrateRefusesAPrePhase3Table is the other half, and the one an operator
+// meets.
+//
+// A populated pre-phase-3 table cannot be brought forward: every live row in it
+// names no incarnation, so the ADD CONSTRAINT would scan the table and fail
+// naming a constraint that was born a second ago. The refusal has to arrive
+// before that, say how many rows are in the way, and name the command that
+// fixes it.
+//
+// 🔴 The assertion that this is *not* the raw PostgreSQL message is the whole
+// test. Dropping the preflight leaves a build that still fails — just with the
+// message this exists to replace.
+func TestMigrateRefusesAPrePhase3Table(t *testing.T) {
+	f := newStoreFixtureWithoutMigration(t)
+	ctx := context.Background()
 
-	if _, err := f.pool.Exec(context.Background(), schemaDDL); err != nil {
-		t.Fatalf("a node could not start against a table the controller created: %v", err)
+	if _, err := f.pool.Exec(ctx, legacyNodeSchemaDDL); err != nil {
+		t.Fatalf("the pre-phase-3 bootstrap failed: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `INSERT INTO paused_sandboxes (
+        sandbox_id, cluster_id, state, generation, origin_node_id, metadata, paused_at, updated_at
+    ) VALUES ($1::uuid, $2::uuid, 'running', 3, $3, '{}'::jsonb, now(), now())`,
+		sandboxUUID(9), f.cluster, stNodeA); err != nil {
+		t.Fatalf("seed a pre-phase-3 row: %v", err)
+	}
+
+	err := Migrate(ctx, f.pool)
+	if err == nil {
+		t.Fatal("migrating a populated pre-phase-3 table succeeded; the live row it holds has no incarnation and nothing would ever give it one")
+	}
+	message := err.Error()
+	for _, want := range []string{"DROP TABLE", "paused_sandboxes", "1"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("the refusal does not mention %q, so it does not tell an operator what to do: %s", want, message)
+		}
+	}
+	// 🔴 The negative half. PostgreSQL's own wording names a constraint nobody
+	// there created and says nothing about what to do; if that is what comes
+	// out, the preflight did not run.
+	if strings.Contains(message, "paused_sandboxes_execution_check") {
+		t.Fatalf("the refusal is PostgreSQL's constraint violation rather than the preflight's: %s", message)
+	}
+}
+
+// TestMigrateAcceptsATableItAlreadyOwns: the check is about pre-phase-3 rows,
+// not about rows.
+//
+// 🟢 The control for the test above. Without it a preflight that refused every
+// non-empty table would look correct — and would stop every restart of a
+// healthy controller.
+func TestMigrateAcceptsATableItAlreadyOwns(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+
+	id := sandboxUUID(10)
+	if _, err := f.store.BeginPause(ctx, BeginPauseInput{
+		ClusterID:    f.cluster,
+		SandboxID:    id,
+		OriginNodeID: stNodeA,
+		Metadata:     json.RawMessage(stMetadata),
+		ExecutionID:  f.executionFor(id),
+	}); err != nil {
+		t.Fatalf("begin pause: %v", err)
+	}
+
+	if err := Migrate(ctx, f.pool); err != nil {
+		t.Fatalf("migrating a table this build populated was refused: %v", err)
 	}
 }
 
@@ -341,13 +470,16 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestMigrateAddsNoColumnOfItsOwn pins the column set to the node's.
+// TestMigratePinsTheTableShape is the drift alarm on the schema.
 //
-// A column added here that the node does not know about is not neutral: a NOT
-// NULL one without a default makes every insert the node still issues fail, and
-// the node's insert names its columns explicitly, so it would never populate it
-// anyway.
-func TestMigrateAddsNoColumnOfItsOwn(t *testing.T) {
+// It used to pin the column set to the node's, on the grounds that this side
+// must add nothing the node does not know about. The node no longer writes
+// here, so what is pinned now is this build's own declared shape — columns and
+// constraint definitions both. Anybody adding a column to SchemaDDL without
+// adding it here turns this red immediately, which is the point: the two column
+// lists the read and write paths keep are already easy to miss one of, and a
+// schema that grows silently is how the third gets missed too.
+func TestMigratePinsTheTableShape(t *testing.T) {
 	f := newStoreFixture(t)
 
 	rows, err := f.pool.Query(context.Background(), `
@@ -372,12 +504,46 @@ func TestMigrateAddsNoColumnOfItsOwn(t *testing.T) {
 	}
 
 	want := []string{
-		"claimed_by_node_id", "cluster_id", "generation", "lease_expires_at",
+		"claimed_by_node_id", "cluster_id", "execution_id", "execution_started_at",
+		"generation", "lease_expires_at",
 		"metadata", "origin_node_id", "paused_at", "sandbox_expires_at",
 		"sandbox_id", "snapshot_id", "state", "updated_at",
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("column set changed:\n got %v\nwant %v", got, want)
+	}
+
+	// The constraint definitions, not merely their names. A CHECK that lost
+	// one of the three live states, or one of its two conjuncts, would still
+	// be present under the same name and would fence nothing.
+	constraints := map[string]string{}
+	crows, err := f.pool.Query(context.Background(), `
+        SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c
+          JOIN pg_namespace n ON n.oid = c.connamespace
+         WHERE n.nspname = current_schema() AND c.contype = 'c'`)
+	if err != nil {
+		t.Fatalf("read constraints failed: %v", err)
+	}
+	defer crows.Close()
+	for crows.Next() {
+		var name, def string
+		if err := crows.Scan(&name, &def); err != nil {
+			t.Fatalf("scan constraint failed: %v", err)
+		}
+		constraints[name] = def
+	}
+	if err := crows.Err(); err != nil {
+		t.Fatalf("read constraints failed: %v", err)
+	}
+
+	execution, ok := constraints["paused_sandboxes_execution_check"]
+	if !ok {
+		t.Fatalf("paused_sandboxes_execution_check is missing; nothing then stops a live row from naming no incarnation: %v", constraints)
+	}
+	for _, fragment := range []string{"running", "publishing", "resuming", "execution_id", "execution_started_at"} {
+		if !strings.Contains(execution, fragment) {
+			t.Fatalf("the execution CHECK no longer mentions %q: %s", fragment, execution)
+		}
 	}
 }
 
@@ -417,6 +583,7 @@ func (f *storeFixture) beginPause(sandboxID, node string) BeganPause {
 		SandboxID:    sandboxID,
 		OriginNodeID: node,
 		Metadata:     json.RawMessage(stMetadata),
+		ExecutionID:  f.executionFor(sandboxID),
 	})
 	if err != nil {
 		f.t.Fatalf("begin_pause %s failed: %v", sandboxID, err)
@@ -444,7 +611,7 @@ func TestAFailedPublishKeepsTheSnapshotTheSandboxAlreadyHad(t *testing.T) {
 
 	// Resume it, then pause it again — and let that second pause fail before it
 	// publishes anything.
-	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, nil); err != nil {
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, f.executionFor(id), nil); err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
 	second := f.beginPause(id, stNodeA)
@@ -496,6 +663,7 @@ func TestBeginPauseRefusesToTakeOverAnotherClustersRow(t *testing.T) {
 		SandboxID:    id,
 		OriginNodeID: stNodeA,
 		Metadata:     json.RawMessage(stMetadata),
+		ExecutionID:  f.executionFor(id),
 	})
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord for another cluster's row, got %v", err)
@@ -563,6 +731,7 @@ func TestBeginPauseRefusesMetadataThatIsNotAnObject(t *testing.T) {
 				SandboxID:    sandboxUUID(5),
 				OriginNodeID: stNodeA,
 				Metadata:     json.RawMessage(metadata),
+				ExecutionID:  f.executionFor(sandboxUUID(5)),
 			})
 			if !errors.Is(err, ErrInvalidRecord) {
 				t.Fatalf("expected ErrInvalidRecord, got %v", err)
@@ -590,6 +759,7 @@ func TestBeginPauseAcceptsAnyObject(t *testing.T) {
 				SandboxID:    sandboxUUID(7),
 				OriginNodeID: stNodeA,
 				Metadata:     json.RawMessage(metadata),
+				ExecutionID:  f.executionFor(sandboxUUID(7)),
 			}); err != nil {
 				t.Fatalf("a JSON object was refused: %v", err)
 			}
@@ -908,7 +1078,7 @@ func TestAPausedSandboxIsClaimableImmediately(t *testing.T) {
 		t.Fatalf("complete_pause failed: %v", err)
 	}
 
-	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -958,7 +1128,7 @@ func TestALiveSandboxIsNeverTakenOverOnALapsedLease(t *testing.T) {
 			}
 			f.seed(row)
 
-			claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+			claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 			if err != nil {
 				t.Fatalf("claim failed: %v", err)
 			}
@@ -992,7 +1162,7 @@ func TestAParkedSandboxMovesOnOnceItsHolderStopsRenewing(t *testing.T) {
 				leaseExpires: "now() - interval '1 hour'",
 			})
 
-			claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+			claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 			if err != nil {
 				t.Fatalf("claim failed: %v", err)
 			}
@@ -1017,7 +1187,7 @@ func TestAParkedSandboxWithALiveLeaseStaysWithItsOrigin(t *testing.T) {
 		leaseExpires: "now() + interval '1 hour'",
 	})
 
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -1041,7 +1211,7 @@ func TestASandboxThatNeverPublishedIsNeverClaimable(t *testing.T) {
 		leaseExpires: "now() - interval '1 hour'",
 	})
 
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -1056,7 +1226,7 @@ func TestASandboxThatNeverPublishedIsNeverClaimable(t *testing.T) {
 func TestAClaimOnAnUnknownSandboxIsNotFound(t *testing.T) {
 	f := newStoreFixture(t)
 
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, sandboxUUID(35), stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, sandboxUUID(35), stNodeB, f.nextExecutionFor(sandboxUUID(35)))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -1071,7 +1241,7 @@ func TestAClaimCannotReachAnotherClustersSandbox(t *testing.T) {
 
 	f.seed(seedRow{sandboxID: id, cluster: f.other, state: "paused", originNode: "node-z", snapshotID: snapshotUUID(36)})
 
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -1093,7 +1263,7 @@ func TestAClaimCarriesTheMetadataTheResumeWillRebuildFrom(t *testing.T) {
 		t.Fatalf("complete_pause failed: %v", err)
 	}
 
-	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil || claim.Outcome != ClaimOutcomeClaimed {
 		t.Fatalf("claim failed: %v (%s)", err, claim.Outcome)
 	}
@@ -1122,7 +1292,7 @@ func TestReleasingAClaimPutsTheSandboxBack(t *testing.T) {
 	if err := f.store.CompletePause(ctx, f.cluster, id, began.Generation, snapshotUUID(40)); err != nil {
 		t.Fatalf("complete_pause failed: %v", err)
 	}
-	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil || claim.Outcome != ClaimOutcomeClaimed {
 		t.Fatalf("claim failed: %v (%s)", err, claim.Outcome)
 	}
@@ -1190,7 +1360,7 @@ func TestMarkingAnUntrackedSandboxRunningReportsThatItIsUntracked(t *testing.T) 
 	f := newStoreFixture(t)
 	id := sandboxUUID(43)
 
-	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA, nil)
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA, f.executionFor(id), nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1216,7 +1386,7 @@ func TestMarkingRunningCannotEraseAnotherNodesClaim(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(44),
 	})
 
-	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", nil)
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", f.executionFor(id), nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1246,7 +1416,7 @@ func TestMarkingATrackedSandboxRunningReportsTheNodeAsHolder(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(45),
 	})
 
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, nil)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, f.executionFor(id), nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1284,7 +1454,7 @@ func TestMarkRunningStampsTheDeadlineReclamationNeeds(t *testing.T) {
 	}
 
 	deadline := f.dbNow().Add(2 * time.Hour)
-	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, &deadline); err != nil || outcome != MarkRunningAdopted {
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, f.executionFor(id), &deadline); err != nil || outcome != MarkRunningAdopted {
 		t.Fatalf("mark_running failed: %v (%s)", err, outcome)
 	}
 
@@ -1309,7 +1479,7 @@ func TestMarkRunningLeavesAnAbsentDeadlineAbsent(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(48),
 	})
 
-	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, nil); err != nil {
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, f.executionFor(id), nil); err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
 	if row := f.raw(id); row.sandboxExpiry != nil {
@@ -1331,7 +1501,7 @@ func TestMarkRunningPropagatesARowItCannotDecode(t *testing.T) {
 	// re-read that follows has something to complain about.
 	f.seed(seedRow{sandboxID: id, state: "paused", originNode: stNodeA, claimedBy: stNodeB})
 
-	_, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", nil)
+	_, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", f.executionFor(id), nil)
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
 	}
@@ -1932,7 +2102,7 @@ func TestOneClusterCannotReachAnothersSandboxes(t *testing.T) {
 	if matched, err := f.store.ReleaseClaim(ctx, f.cluster, id, 3); err != nil || matched {
 		t.Fatalf("release_claim reached another cluster: %v, %v", matched, err)
 	}
-	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, nil); err != nil || outcome != MarkRunningUntracked {
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, f.executionFor(id), nil); err != nil || outcome != MarkRunningUntracked {
 		t.Fatalf("mark_running reached another cluster: %v, %v", outcome, err)
 	}
 	if renewed, err := f.store.RenewLease(ctx, f.cluster, "node-z", []HeldSandbox{{SandboxID: id}}); err != nil || renewed != 0 {
@@ -1966,7 +2136,7 @@ func TestARowWrittenBeforeTheLeaseColumnExistedCountsAsExpired(t *testing.T) {
 	// No lease column at all, and last written long ago.
 	f.setLease(id, "now() - interval '1 hour'", "NULL")
 
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -2008,7 +2178,7 @@ func TestAStateThisBuildDoesNotKnowIsRefusedRatherThanSkipped(t *testing.T) {
 	if rows.Entries != nil || rows.Covered != nil {
 		t.Fatalf("get_many returned rows alongside its error: %+v", rows)
 	}
-	if _, err := f.store.ClaimForResume(ctx, f.cluster, unknown, stNodeB); !errors.Is(err, ErrInvalidRecord) {
+	if _, err := f.store.ClaimForResume(ctx, f.cluster, unknown, stNodeB, f.nextExecutionFor(unknown)); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("claim: expected ErrInvalidRecord, got %v", err)
 	}
 }

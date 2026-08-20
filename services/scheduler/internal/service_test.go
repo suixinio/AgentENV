@@ -15,15 +15,15 @@ import (
 
 type failingBindingStore struct{}
 
-func (failingBindingStore) Get(string, time.Time) (Node, bool, error) {
-	return Node{}, false, errors.New("binding store failed")
+func (failingBindingStore) Get(string, time.Time) (Binding, bool, error) {
+	return Binding{}, false, errors.New("binding store failed")
 }
 
-func (failingBindingStore) Record(string, Node, time.Time) error {
+func (failingBindingStore) Record(string, Binding, time.Time) error {
 	return errors.New("binding store failed")
 }
 
-func (failingBindingStore) ReconcileNode(Node, []string, time.Time) error {
+func (failingBindingStore) ReconcileNode(Node, []RosterEntry, time.Time) error {
 	return errors.New("binding store failed")
 }
 
@@ -112,7 +112,7 @@ func TestListNodesReturnsActiveAndLingeringNodes(t *testing.T) {
 
 func TestQueryOnlyServiceOnlySupportsLookupNode(t *testing.T) {
 	store := NewInMemoryBindingStore(defaultObservedReportTTL)
-	store.Record("sbx-1", Node{ID: "node-a", Endpoint: "http://node-a"}, time.Now())
+	store.Record("sbx-1", Binding{Node: Node{ID: "node-a", Endpoint: "http://node-a"}}, time.Now())
 	service := NewQueryOnlyService(zap.NewNop(), store)
 
 	resp, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "sbx-1"})

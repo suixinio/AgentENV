@@ -71,6 +71,11 @@ func TestContractARenewalKeepsAParkedRowWithItsHolder(t *testing.T) {
 	// Published once, then a second pause that is still uploading: parked,
 	// with a durable snapshot behind it, which is the shape the lease decides.
 	env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	// Woken in place between the two pauses. A parked row names no
+	// incarnation, and a pause carries the one already on the row rather than
+	// installing one, so a second pause has to follow a resume — which is also
+	// the only way this shape arises in the field.
+	env.markRunning(t, env.cluster, sandboxID, contractNodeA)
 	env.beginPause(t, env.cluster, sandboxID, contractNodeA)
 
 	deadline := time.Now().Add(time.Hour)
@@ -384,6 +389,11 @@ func TestContractReclamationLeavesParkedRowsAlone(t *testing.T) {
 	// bypassed.
 	localOnly := contractUUID(t)
 	env.pauseAndPublish(t, env.cluster, localOnly, contractNodeA)
+	// Woken in place before it is paused again. A parked row names no
+	// incarnation, and a pause carries the one already on the row rather than
+	// installing a new one, so the second pause has to follow a resume — which
+	// is also the only way this shape arises in the field.
+	env.markRunning(t, env.cluster, localOnly, contractNodeA)
 	second := env.beginPause(t, env.cluster, localOnly, contractNodeA)
 	if err := env.store.MarkLocalOnly(context.Background(), env.cluster, localOnly, second.Generation); err != nil {
 		t.Fatalf("the second publish never landed: %v", err)
@@ -481,11 +491,17 @@ func TestContractTheLeaseTTLTheCallerReportsIsWhatStampsTheRow(t *testing.T) {
 	patient := env.store.WithLeaseTTL(time.Hour)
 
 	env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	// Woken in place first. A parked row names no incarnation, and a pause
+	// carries the one already on the row rather than installing a new one, so
+	// pausing a parked row is refused — correctly, and it is not what this test
+	// is about.
+	env.markRunning(t, env.cluster, sandboxID, contractNodeA)
 	if _, err := patient.BeginPause(context.Background(), BeginPauseInput{
 		ClusterID:    env.cluster,
 		SandboxID:    sandboxID,
 		OriginNodeID: contractNodeA,
 		Metadata:     contractMetadata(contractNodeA),
+		ExecutionID:  env.executionOf(sandboxID),
 	}); err != nil {
 		t.Fatalf("begin a pause reporting an hour-long lease: %v", err)
 	}

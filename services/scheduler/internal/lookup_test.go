@@ -21,11 +21,13 @@ import (
 // them.
 type missingBindingStore struct{}
 
-func (missingBindingStore) Get(string, time.Time) (Node, bool, error) { return Node{}, false, nil }
+func (missingBindingStore) Get(string, time.Time) (Binding, bool, error) {
+	return Binding{}, false, nil
+}
 
-func (missingBindingStore) Record(string, Node, time.Time) error { return nil }
+func (missingBindingStore) Record(string, Binding, time.Time) error { return nil }
 
-func (missingBindingStore) ReconcileNode(Node, []string, time.Time) error { return nil }
+func (missingBindingStore) ReconcileNode(Node, []RosterEntry, time.Time) error { return nil }
 
 // forbiddenRegistryReader fails the test on any read. It pins the two answers
 // that must be reachable without a database round trip: a binding hit, which
@@ -156,7 +158,7 @@ func TestLookupBindingHitNeverReadsTheRegistry(t *testing.T) {
 	store := NewInMemoryBindingStore(time.Minute)
 	svc := newLookupTestService(t, store, forbiddenRegistryReader{t: t}, testReportTTL)
 	allNodesReady(t, svc)
-	if err := store.Record("sbx-1", lookupTestNodes[0], time.Now()); err != nil {
+	if err := store.Record("sbx-1", Binding{Node: lookupTestNodes[0]}, time.Now()); err != nil {
 		t.Fatalf("record binding failed: %v", err)
 	}
 
@@ -530,7 +532,7 @@ func TestQueryOnlyLookupRunsTheSameLadder(t *testing.T) {
 
 	t.Run("binding hit", func(t *testing.T) {
 		store := NewInMemoryBindingStore(time.Minute)
-		if err := store.Record("sbx-1", lookupTestNodes[0], time.Now()); err != nil {
+		if err := store.Record("sbx-1", Binding{Node: lookupTestNodes[0]}, time.Now()); err != nil {
 			t.Fatalf("record binding failed: %v", err)
 		}
 		reader := &stubRegistryReader{listing: registryRow("sbx-1", pausedregistry.StatePaused, "node-a", "")}

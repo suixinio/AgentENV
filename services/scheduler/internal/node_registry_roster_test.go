@@ -29,6 +29,16 @@ func heartbeatWithClusterRoster(t *testing.T, nodes *AtomicNodeRegistry, nodeID 
 	}
 }
 
+// rosterIDs is the sandbox ids of a roster, for the assertions that predate
+// the incarnation half and are still about the ids alone.
+func rosterIDs(roster []RosterEntry) []string {
+	ids := make([]string, 0, len(roster))
+	for _, entry := range roster {
+		ids = append(ids, entry.SandboxID)
+	}
+	return ids
+}
+
 func TestRosterOfKeepsTheHeartbeatRoster(t *testing.T) {
 	nodes := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
 	now := time.Unix(1_700_000_000, 0)
@@ -43,7 +53,7 @@ func TestRosterOfKeepsTheHeartbeatRoster(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a roster after a heartbeat")
 	}
-	if !reflect.DeepEqual(roster, []string{"s1", "s2"}) {
+	if !reflect.DeepEqual(rosterIDs(roster), []string{"s1", "s2"}) {
 		t.Fatalf("unexpected roster %v", roster)
 	}
 	if !lastSeen.Equal(now) {
@@ -51,8 +61,8 @@ func TestRosterOfKeepsTheHeartbeatRoster(t *testing.T) {
 	}
 
 	// The returned slice is a copy: mutating it must not corrupt the registry.
-	roster[0] = "tampered"
-	if again, _, _ := nodes.RosterOf("node-a"); again[0] != "s1" {
+	roster[0] = RosterEntry{SandboxID: "tampered"}
+	if again, _, _ := nodes.RosterOf("node-a"); again[0].SandboxID != "s1" {
 		t.Fatalf("expected the stored roster to be insulated from the caller, got %v", again)
 	}
 }
@@ -64,7 +74,7 @@ func TestRosterNormalisesBlanksAndDuplicates(t *testing.T) {
 	heartbeatWithRoster(t, nodes, "node-a", now, " s1 ", "", "s1", "s2")
 
 	roster, _, _ := nodes.RosterOf("node-a")
-	if !reflect.DeepEqual(roster, []string{"s1", "s2"}) {
+	if !reflect.DeepEqual(rosterIDs(roster), []string{"s1", "s2"}) {
 		t.Fatalf("unexpected roster %v", roster)
 	}
 }
@@ -121,8 +131,8 @@ func TestRostersReturnsEveryObservedNodeSorted(t *testing.T) {
 	if rosters[0].NodeID != "node-a" || rosters[1].NodeID != "node-b" {
 		t.Fatalf("expected rosters sorted by node id, got %s then %s", rosters[0].NodeID, rosters[1].NodeID)
 	}
-	if !reflect.DeepEqual(rosters[0].SandboxIDs, []string{"s1", "s2"}) {
-		t.Fatalf("unexpected roster for node-a: %v", rosters[0].SandboxIDs)
+	if !reflect.DeepEqual(rosters[0].SandboxIDs(), []string{"s1", "s2"}) {
+		t.Fatalf("unexpected roster for node-a: %v", rosters[0].Entries)
 	}
 	if !rosters[0].LastSeen.Equal(now.Add(time.Second)) {
 		t.Fatalf("unexpected last seen for node-a: %s", rosters[0].LastSeen)
@@ -227,8 +237,8 @@ func TestRostersInClusterReportsNodesThatHaveNeverReported(t *testing.T) {
 	if !silent.LastSeen.IsZero() {
 		t.Fatalf("expected a node that never reported to carry no timestamp, got %s", silent.LastSeen)
 	}
-	if len(silent.SandboxIDs) != 0 {
-		t.Fatalf("expected a node that never reported to hold nothing, got %v", silent.SandboxIDs)
+	if len(silent.Entries) != 0 {
+		t.Fatalf("expected a node that never reported to hold nothing, got %v", silent.Entries)
 	}
 
 	// A node that reported to a *different* cluster is not silent, it is

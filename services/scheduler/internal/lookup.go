@@ -80,9 +80,10 @@ const (
 // is an authoritative "no such sandbox", and a replica that cannot see the
 // nodes has no standing to give one.
 type nodePlacer interface {
-	// rosterHolder returns the node that most recently reported holding this
-	// sandbox in a heartbeat, provided that report is still fresh.
-	rosterHolder(sandboxID string, now time.Time) (Node, bool)
+	// rosterHolder returns the node the cluster should route this sandbox to
+	// out of everybody whose last heartbeat listed it, together with the
+	// incarnation that node reported for it.
+	rosterHolder(sandboxID string, now time.Time) (Node, string, bool)
 	// liveNode resolves a node id to a discovered node with a fresh heartbeat.
 	// It says nothing about whether that node accepts new work.
 	liveNode(nodeID string, now time.Time) (Node, bool)
@@ -109,6 +110,11 @@ type lookupDeps struct {
 	// (the query-only replica requires Redis, whose bindings outlive it).
 	warmup *warmupGate
 	placer nodePlacer
+	// silentExecution blanks the two incarnation fields in every answer. It is
+	// the rollback mode: a caller reading a response from this build then sees
+	// exactly what it saw from the build before, rather than a field it half
+	// believes.
+	silentExecution bool
 }
 
 // lookupNode answers a sandbox lookup by walking, in order, everything that can
@@ -142,7 +148,7 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 
 	// 1. The binding. This is the hot path — every proxied request lands here —
 	// so nothing below it may run on a hit.
-	node, ok, getErr := deps.store.Get(sandboxID, now)
+	binding, ok, getErr := deps.store.Get(sandboxID, now)
 	if getErr != nil {
 		result = lookupResultStoreUnavailable
 		logger.Warn("scheduler lookup binding store failed", zap.String("sandbox_id", sandboxID), zap.Error(getErr))
@@ -152,11 +158,13 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 		result = lookupResultBinding
 		logger.Debug("scheduler lookup resolved sandbox assignment",
 			zap.String("sandbox_id", sandboxID),
-			zap.String("node_id", node.ID),
-			zap.String("endpoint", node.Endpoint),
+			zap.String("node_id", binding.Node.ID),
+			zap.String("endpoint", binding.Node.Endpoint),
+			zap.String("execution_id", binding.ExecutionID),
 			zap.String("source", string(lookupResultBinding)),
 		)
-		return lookupResponse(node, schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND, ""), nil
+		return deps.answer(binding.Node, schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND, "",
+			binding.ExecutionID, authorityFor(binding.ExecutionID)), nil
 	}
 
 	// 2. The roster. A binding expires on its own TTL while the roster that
@@ -164,15 +172,17 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 	// heartbeat is late for, and the one where another node's reconciliation
 	// dropped a binding this node still lists.
 	if deps.placer != nil {
-		if holder, held := deps.placer.rosterHolder(sandboxID, now); held {
+		if holder, executionID, held := deps.placer.rosterHolder(sandboxID, now); held {
 			result = lookupResultRoster
 			logger.Debug("scheduler lookup resolved sandbox from a heartbeat roster",
 				zap.String("sandbox_id", sandboxID),
 				zap.String("node_id", holder.ID),
 				zap.String("endpoint", holder.Endpoint),
+				zap.String("execution_id", executionID),
 				zap.String("source", string(lookupResultRoster)),
 			)
-			return lookupResponse(holder, schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND, ""), nil
+			return deps.answer(holder, schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND, "",
+				executionID, authorityFor(executionID)), nil
 		}
 	}
 
@@ -249,7 +259,13 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 			zap.String("origin_node_id", entry.OriginNodeID),
 			zap.Bool("origin_preferred", placed.ID == entry.OriginNodeID),
 		)
-		return lookupResponse(placed, schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED, entry.OriginNodeID), nil
+		// 🔴 PENDING with an empty incarnation, hard-coded rather than let flow
+		// from the row. A `paused` row names none by construction, and the node
+		// is about to mint one: an answer that claimed authority here would be
+		// authoritatively naming nothing, and the caller would compare against
+		// an empty string.
+		return deps.answer(placed, schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED, entry.OriginNodeID,
+			"", schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_PENDING), nil
 
 	case pausedregistry.StatePublishing, pausedregistry.StateLocalOnly:
 		// No snapshot in shared storage: the only copy is on origin's disk, so
@@ -291,7 +307,14 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 			zap.String("state", string(entry.State)),
 			zap.String("node_id", origin.ID),
 		)
-		return lookupResponse(origin, schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED, entry.OriginNodeID), nil
+		// 🔴 PENDING here too, and this is the half that has to be hard-coded
+		// rather than inferred. `local_only` names no incarnation, but
+		// `publishing` names one — and that one belongs to a VM that was
+		// stopped before the upload began. Letting it flow through would make
+		// one branch answer with two different strengths, and would refuse
+		// every data-plane wake-up of a publishing sandbox.
+		return deps.answer(origin, schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED, entry.OriginNodeID,
+			"", schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_PENDING), nil
 
 	case pausedregistry.StateRunning, pausedregistry.StateResuming:
 		// 🔴 Holder(), not origin_node_id. A claim leaves origin pointing at
@@ -322,9 +345,14 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 			zap.String("sandbox_id", sandboxID),
 			zap.String("state", string(entry.State)),
 			zap.String("node_id", holder.ID),
+			zap.String("execution_id", entry.ExecutionID),
 			zap.String("source", string(lookupResultRegistry)),
 		)
-		return lookupResponse(holder, schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND, entry.OriginNodeID), nil
+		// Both live states name an incarnation: `running` is the one on the
+		// machine, `resuming` is the one the claim allocated for the resume
+		// that is under way.
+		return deps.answer(holder, schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND, entry.OriginNodeID,
+			entry.ExecutionID, authorityFor(entry.ExecutionID)), nil
 
 	default:
 		// The table's CHECK constraint pins the five states above, so this is a
@@ -362,40 +390,113 @@ func lookupAbsent(logger *zap.Logger, sandboxID string, warm bool, result *looku
 	return nil, status.Error(codes.NotFound, "sandbox assignment not found")
 }
 
-func lookupResponse(node Node, location schedulerv1.SandboxLocation, originNodeID string) *schedulerv1.LookupNodeResponse {
-	return &schedulerv1.LookupNodeResponse{
-		Node:         node.ToProto(),
-		Location:     location,
-		OriginNodeId: originNodeID,
+// answer builds a lookup response.
+//
+// 🔴 Five parameters and no defaults. Every exit passes both incarnation fields
+// explicitly, so a branch added later that forgets to classify itself is a
+// compile error rather than an answer that silently claims to know nothing.
+func (deps lookupDeps) answer(
+	node Node,
+	location schedulerv1.SandboxLocation,
+	originNodeID string,
+	executionID string,
+	authority schedulerv1.ExecutionAuthority,
+) *schedulerv1.LookupNodeResponse {
+	if deps.silentExecution {
+		// The rollback mode. Zero values, and nothing counted: a caller sees
+		// exactly the response the build before this one gave.
+		return &schedulerv1.LookupNodeResponse{
+			Node:         node.ToProto(),
+			Location:     location,
+			OriginNodeId: originNodeID,
+		}
 	}
+	recordLookupExecutionAuthority(authority)
+	return &schedulerv1.LookupNodeResponse{
+		Node:               node.ToProto(),
+		Location:           location,
+		OriginNodeId:       originNodeID,
+		ExecutionId:        executionID,
+		ExecutionAuthority: authority,
+	}
+}
+
+// authorityFor is the one place an incarnation becomes an authority.
+//
+// 🔴 REGISTRY is never reported with an empty value. "Authoritatively, no
+// incarnation" is a sentence the caller would have to compare an empty string
+// against; when this side cannot name one, the honest answer is that it does
+// not know.
+func authorityFor(executionID string) schedulerv1.ExecutionAuthority {
+	if strings.TrimSpace(executionID) == "" {
+		return schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN
+	}
+	return schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY
 }
 
 // rosterHolder implements nodePlacer.
 //
 // More than one node listing the same sandbox is normal mid-takeover: the
-// origin keeps its paused record until its own reconciliation drops it. The
-// most recent report wins, which is the closest thing a one-way heartbeat can
-// offer to "who has it now".
-func (s *Service) rosterHolder(sandboxID string, now time.Time) (Node, bool) {
+// origin keeps its paused record until its own reconciliation drops it.
+//
+// 🔴 It used to be "the most recent report wins", which is arrival order — the
+// same defect the binding store had, in the fallback that covers for the
+// binding store. A node that lost a sandbox and then came back would win every
+// round, because it is reporting now.
+//
+// 🟢 The tie-break keeps that old rule, deliberately. Two reports of the *same*
+// incarnation — one machine under two names during a rollout — have to be
+// resolved somehow, and freshness is the right answer there.
+func (s *Service) rosterHolder(sandboxID string, now time.Time) (Node, string, bool) {
 	var (
-		best     Node
-		bestSeen time.Time
-		found    bool
+		best          Node
+		bestExecution string
+		bestSeen      time.Time
+		found         bool
 	)
 	for _, nodeID := range s.nodes.NodesHolding(sandboxID) {
 		node, resolved := s.nodes.Resolve(nodeID)
 		if !resolved {
 			continue
 		}
-		_, lastSeen, ok := s.nodes.RosterOf(node.ID)
+		entries, lastSeen, ok := s.nodes.RosterOf(node.ID)
 		if !ok || !s.rosterFresh(lastSeen, now) {
 			continue
 		}
-		if !found || lastSeen.After(bestSeen) {
-			best, bestSeen, found = node, lastSeen, true
+		execution := ""
+		for _, entry := range entries {
+			if entry.SandboxID == sandboxID {
+				execution = entry.ExecutionID
+				break
+			}
+		}
+		if !found {
+			best, bestExecution, bestSeen, found = node, execution, lastSeen, true
+			continue
+		}
+		if s.rosterPrefers(execution, lastSeen, bestExecution, bestSeen) {
+			best, bestExecution, bestSeen = node, execution, lastSeen
 		}
 	}
-	return best, found
+	return best, bestExecution, found
+}
+
+// rosterPrefers says whether a challenger's report should displace the best one
+// so far. Same order as the binding arbitration, with freshness only where the
+// incarnations cannot separate them.
+func (s *Service) rosterPrefers(execution string, lastSeen time.Time, bestExecution string, bestSeen time.Time) bool {
+	switch {
+	case execution == bestExecution:
+		return lastSeen.After(bestSeen)
+	case bestExecution == "":
+		// One side names an incarnation and the other does not. The one that
+		// does wins: it is the only one that can be checked against anything.
+		return execution != ""
+	case execution == "":
+		return false
+	default:
+		return execution > bestExecution
+	}
 }
 
 // liveNode implements nodePlacer.

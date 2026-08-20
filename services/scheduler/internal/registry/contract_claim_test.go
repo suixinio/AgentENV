@@ -177,6 +177,11 @@ func TestContractAParkedSandboxMovesOnOnceItsHolderStopsRenewing(t *testing.T) {
 	// A first pause that published, then a second that did not: the row is
 	// `publishing` while still naming the older, durable snapshot.
 	snapshot := env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	// Woken in place between the two pauses. A parked row names no
+	// incarnation, and a pause carries the one already on the row rather than
+	// installing one, so a second pause has to follow a resume — which is also
+	// the only way this shape arises in the field.
+	env.markRunning(t, env.cluster, sandboxID, contractNodeA)
 	env.beginPause(t, env.cluster, sandboxID, contractNodeA)
 
 	claim := env.claim(t, env.cluster, sandboxID, contractNodeB)

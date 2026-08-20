@@ -37,6 +37,10 @@ type Service struct {
 	// which is why it is one value rather than two.
 	reportTTL               time.Duration
 	registryLeaseWarnWindow time.Duration
+	// silentExecution blanks the two incarnation fields in every lookup
+	// answer. Set only in the rollback mode, where a response from this build
+	// has to be indistinguishable from one before it.
+	silentExecution bool
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -90,6 +94,19 @@ func WithArtifactStore(store ArtifactStore) ServiceOption {
 	}
 }
 
+// WithSilentExecutionAxis makes lookups answer with the two incarnation fields
+// left at their zero values.
+//
+// 🔴 Paired with the binding store's own arbiter, never on its own: the
+// rollback has to turn off the arbitration *and* the answer, because a caller
+// acting on an incarnation this scheduler did not arbitrate is worse than one
+// acting on none.
+func WithSilentExecutionAxis() ServiceOption {
+	return func(s *Service) {
+		s.silentExecution = true
+	}
+}
+
 // WithPausedRegistry installs the read-only paused-registry reader, together
 // with the two intervals the shadow reconciliation judges rosters and leases
 // against.
@@ -110,9 +127,10 @@ func WithPausedRegistry(reader pausedregistry.Reader, reportTTL time.Duration, l
 
 type QueryOnlyService struct {
 	schedulerv1.UnimplementedSchedulerServer
-	logger   *zap.Logger
-	store    BindingStore
-	registry pausedregistry.Reader
+	logger          *zap.Logger
+	store           BindingStore
+	registry        pausedregistry.Reader
+	silentExecution bool
 }
 
 // QueryOnlyServiceOption configures optional QueryOnlyService behaviour.
@@ -132,6 +150,17 @@ func WithQueryOnlyPausedRegistry(reader pausedregistry.Reader) QueryOnlyServiceO
 			reader = pausedregistry.Disabled()
 		}
 		s.registry = reader
+	}
+}
+
+// WithQueryOnlySilentExecutionAxis is WithSilentExecutionAxis for the replica.
+//
+// 🔴 It has to exist separately. The replica is the one serving data-plane
+// lookups, so a rollback applied only to the primary would leave the answers
+// that matter unchanged.
+func WithQueryOnlySilentExecutionAxis() QueryOnlyServiceOption {
+	return func(s *QueryOnlyService) {
+		s.silentExecution = true
 	}
 }
 
@@ -160,9 +189,10 @@ func (s *QueryOnlyService) LookupNode(ctx context.Context, req *schedulerv1.Look
 	// registry, because the answer that matters most here — "unreadable, so
 	// this is not a 404" — needs nothing but the reader.
 	return lookupNode(ctx, lookupDeps{
-		logger:   s.logger,
-		store:    s.store,
-		registry: s.registry,
+		logger:          s.logger,
+		store:           s.store,
+		registry:        s.registry,
+		silentExecution: s.silentExecution,
 	}, req)
 }
 
@@ -294,11 +324,12 @@ func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) 
 
 func (s *Service) LookupNode(ctx context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
 	return lookupNode(ctx, lookupDeps{
-		logger:   s.logger,
-		store:    s.store,
-		registry: s.registry,
-		warmup:   s.warmup,
-		placer:   s,
+		logger:          s.logger,
+		store:           s.store,
+		registry:        s.registry,
+		warmup:          s.warmup,
+		placer:          s,
+		silentExecution: s.silentExecution,
 	}, req)
 }
 
@@ -324,7 +355,14 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 		)
 		return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
 	}
-	if err := s.store.Record(req.GetSandboxId(), node, time.Now()); err != nil {
+	// 🔴 Through the store's arbitration, like a heartbeat. The incarnation is
+	// optional here — the gateway reads it off the node's response and may not
+	// have one — and an assignment for a sandbox that has just been created or
+	// forked has no incumbent to lose to, because both mint a fresh sandbox id.
+	// What is not optional is going through the same rule: a write that skipped
+	// it would be the way around everything the heartbeat path enforces.
+	execution := normalizeExecutionID(req.GetExecutionId())
+	if err := s.store.Record(req.GetSandboxId(), Binding{Node: node, ExecutionID: execution}, time.Now()); err != nil {
 		s.logger.Warn("scheduler record assignment binding store failed",
 			zap.String("sandbox_id", req.GetSandboxId()),
 			zap.String("node_id", node.ID),
@@ -336,6 +374,7 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 		zap.String("sandbox_id", req.GetSandboxId()),
 		zap.String("node_id", node.ID),
 		zap.String("endpoint", node.Endpoint),
+		zap.String("execution_id", execution),
 	)
 	return &schedulerv1.RecordAssignmentResponse{}, nil
 }
@@ -358,7 +397,19 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
-	if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {
+	roster, legacy := rosterFromHeartbeat(req)
+	if legacy {
+		// 🔴 Counted per node, not merely logged: this is the number that has
+		// to reach zero before the gateway starts refusing on incarnations,
+		// and "how many nodes are still on the old build" is not a question a
+		// log line answers.
+		recordLegacyRoster(nodeID)
+		s.logger.Warn("scheduler heartbeat used the legacy sandbox_ids roster",
+			zap.String("node_id", nodeID),
+			zap.Int("sandboxes", len(roster)),
+		)
+	}
+	if err := s.store.ReconcileNode(node, roster, now); err != nil {
 		s.logger.Warn("scheduler heartbeat binding reconcile failed",
 			zap.String("node_id", nodeID),
 			zap.Error(err),
@@ -659,6 +710,11 @@ func registrySandboxToProto(sandbox pausedregistry.Sandbox) *schedulerv1.Registr
 		LeaseExpiresAtUnixMs:   optionalUnixMilli(sandbox.LeaseExpiresAt),
 		SandboxExpiresAtUnixMs: optionalUnixMilli(sandbox.SandboxExpiresAt),
 		HolderNodeId:           sandbox.Holder(),
+		// The only endpoint on which an operator can see, row by row, which
+		// incarnation the cluster believes is alive. That is the view a
+		// suspected double-live is reconciled against, so an empty field here
+		// is not cosmetic.
+		ExecutionId: sandbox.ExecutionID,
 	}
 }
 

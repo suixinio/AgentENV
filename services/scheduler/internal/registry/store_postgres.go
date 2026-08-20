@@ -38,7 +38,9 @@ const entryColumns = `sandbox_id::text         AS sandbox_id,
        paused_at                AS paused_at,
        updated_at               AS updated_at,
        lease_expires_at         AS lease_expires_at,
-       sandbox_expires_at       AS sandbox_expires_at`
+       sandbox_expires_at       AS sandbox_expires_at,
+       execution_id::text       AS execution_id,
+       execution_started_at     AS execution_started_at`
 
 // leaseExpired is the node's LEASE_EXPIRED predicate, verbatim.
 //
@@ -104,6 +106,17 @@ type PostgresStore struct {
 	// breaker vetoes a reclamation pass that would delete more than it can
 	// account for. Nil means no limit.
 	breaker *DiscardBreaker
+
+	// beginPauseSQL and markRunningSQL are chosen once, at construction, from
+	// two constants each. 🔴 Deliberately not one statement with an `OR $flag`
+	// arm in it: a single statement covering both settings can never be tested
+	// in either, and the planner decides in what order it evaluates the arm.
+	// Two constants means the "off" behaviour is the statement this table had
+	// before the identity axis, unchanged, and the tests it already has still
+	// cover it.
+	beginPauseSQL   string
+	markRunningSQL  string
+	executionFenced bool
 }
 
 var _ Store = (*PostgresStore)(nil)
@@ -154,13 +167,21 @@ func newStoreWithPool(pool *pgxpool.Pool, cfg StoreConfig) *PostgresStore {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &PostgresStore{
-		pool:         pool,
-		leaseTTL:     leaseTTL,
-		queryTimeout: queryTimeout,
-		log:          log,
-		ownsPool:     true,
+	store := &PostgresStore{
+		pool:            pool,
+		leaseTTL:        leaseTTL,
+		queryTimeout:    queryTimeout,
+		log:             log,
+		ownsPool:        true,
+		beginPauseSQL:   beginPauseUnfencedSQL,
+		markRunningSQL:  markRunningUnfencedSQL,
+		executionFenced: cfg.WriteFencing,
 	}
+	if cfg.WriteFencing {
+		store.beginPauseSQL = beginPauseFencedSQL
+		store.markRunningSQL = markRunningFencedSQL
+	}
+	return store
 }
 
 // WithGuards attaches the restart gate and the discard breaker.
@@ -257,7 +278,19 @@ func (s *PostgresStore) Get(ctx context.Context, clusterID, sandboxID string) (E
 // fetch is Get without the argument checking, for the internal re-reads that
 // already hold validated ids.
 func (s *PostgresStore) fetch(ctx context.Context, clusterID, sandboxID string) (Entry, bool, error) {
-	rows, err := s.pool.Query(ctx, getSQL, sandboxID, clusterID)
+	return fetchWith(ctx, s.pool, clusterID, sandboxID)
+}
+
+// rowQuerier is the sliver of pgxpool.Pool and pgx.Tx a read needs. It exists
+// so a classification re-read can be made to run inside the transaction that
+// wrote — the difference between "the row my statement did not match" and
+// "whatever the table holds by now".
+type rowQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func fetchWith(ctx context.Context, q rowQuerier, clusterID, sandboxID string) (Entry, bool, error) {
+	rows, err := q.Query(ctx, getSQL, sandboxID, clusterID)
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("registry get: %w", err)
 	}
@@ -378,7 +411,32 @@ func (s *PostgresStore) GetMany(ctx context.Context, clusterID string, sandboxID
 // downtime than there was, which shortens the grace period, which is exactly
 // the case it exists to cover. The caller's paused_at was already being
 // discarded by the node's own binding, so nothing depended on it.
-const beginPauseSQL = `
+// beginPauseFencedSQL adds one predicate to the upsert: the row has to already
+// name the incarnation this pause belongs to.
+//
+// 🔴 What each arm of the WHERE keeps out:
+//
+//   - cluster_id (older): one cluster taking over another's row.
+//   - execution_id (this release): a pause sent by an incarnation the cluster
+//     has moved past. Three shapes reach it — a row a reclaim parked and
+//     blanked (NULL, so the comparison is NULL and never matches), a row a
+//     second node has since claimed and marked running under its own
+//     incarnation, and a stale in-flight pause landing on a row whose next
+//     incarnation is already up on the same machine.
+//
+// 🔴 The three-valued logic is the point, not an accident: every parked state
+// carries NULL here, so no begin_pause can ever match a row the cluster
+// believes nobody holds. That is fail-closed with nothing to remember.
+//
+// state is deliberately absent from the predicate. running→publishing and
+// publishing→publishing (a retried upload) are both legitimate and both carry
+// the same incarnation, so the identity axis judges this more precisely than
+// the state would.
+//
+// execution_id and execution_started_at are absent from the update list on
+// purpose: the predicate has already established they are equal, and writing
+// them anyway would read as though a pause could change incarnations.
+const beginPauseFencedSQL = `
 WITH previous AS (
     SELECT snapshot_id FROM paused_sandboxes
      WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid
@@ -387,10 +445,10 @@ upserted AS (
     INSERT INTO paused_sandboxes (
         sandbox_id, cluster_id, state, generation, origin_node_id,
         claimed_by_node_id, snapshot_id, metadata, paused_at, updated_at,
-        lease_expires_at
+        lease_expires_at, execution_id, execution_started_at
     )
     VALUES ($1::uuid, $2::uuid, 'publishing', 1, $3, NULL, NULL, $4::jsonb, now(), now(),
-            now() + make_interval(secs => $5::double precision))
+            now() + make_interval(secs => $5::double precision), $6::uuid, now())
     ON CONFLICT (sandbox_id) DO UPDATE SET
         state              = 'publishing',
         generation         = paused_sandboxes.generation + 1,
@@ -400,6 +458,48 @@ upserted AS (
         paused_at          = EXCLUDED.paused_at,
         updated_at         = EXCLUDED.updated_at,
         lease_expires_at   = EXCLUDED.lease_expires_at
+    WHERE paused_sandboxes.cluster_id   = EXCLUDED.cluster_id
+      AND paused_sandboxes.execution_id = EXCLUDED.execution_id
+    RETURNING generation
+)
+SELECT upserted.generation          AS generation,
+       previous.snapshot_id::text   AS previous_snapshot_id
+  FROM upserted
+  LEFT JOIN previous ON TRUE`
+
+// beginPauseUnfencedSQL is the statement this table had before the identity
+// axis, with one addition it cannot do without: it installs execution_id
+// instead of comparing it.
+//
+// 🔴 The addition is not a half-measure. The CHECK constraint is DDL and does
+// not follow the setting, so a `publishing` row still has to name an
+// incarnation — an upsert that left the column alone would move a parked row to
+// `publishing` with a NULL in it and fail with 23514 every time. Switching the
+// fencing off switches off the *checking*, never the column.
+const beginPauseUnfencedSQL = `
+WITH previous AS (
+    SELECT snapshot_id FROM paused_sandboxes
+     WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid
+),
+upserted AS (
+    INSERT INTO paused_sandboxes (
+        sandbox_id, cluster_id, state, generation, origin_node_id,
+        claimed_by_node_id, snapshot_id, metadata, paused_at, updated_at,
+        lease_expires_at, execution_id, execution_started_at
+    )
+    VALUES ($1::uuid, $2::uuid, 'publishing', 1, $3, NULL, NULL, $4::jsonb, now(), now(),
+            now() + make_interval(secs => $5::double precision), $6::uuid, now())
+    ON CONFLICT (sandbox_id) DO UPDATE SET
+        state                = 'publishing',
+        generation           = paused_sandboxes.generation + 1,
+        origin_node_id       = EXCLUDED.origin_node_id,
+        claimed_by_node_id   = NULL,
+        metadata             = EXCLUDED.metadata,
+        paused_at            = EXCLUDED.paused_at,
+        updated_at           = EXCLUDED.updated_at,
+        lease_expires_at     = EXCLUDED.lease_expires_at,
+        execution_id         = EXCLUDED.execution_id,
+        execution_started_at = EXCLUDED.execution_started_at
     WHERE paused_sandboxes.cluster_id = EXCLUDED.cluster_id
     RETURNING generation
 )
@@ -450,22 +550,42 @@ func (s *PostgresStore) BeginPause(ctx context.Context, in BeginPauseInput) (Beg
 		return BeganPause{}, fmt.Errorf("%w: sandbox %s has no metadata object", ErrInvalidRecord, sandbox)
 	}
 
+	execution, err := requireExecutionUUID(in.ExecutionID)
+	if err != nil {
+		return BeganPause{}, err
+	}
+
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+
+	// 🔴 One transaction, because a zero-row upsert has to be classified and
+	// the classification is a second statement. Read on another connection it
+	// would see whatever a third party committed in between and could report
+	// "another cluster owns this" about a row that was fenced, or the reverse.
+	// The caller's response to the two is not the same — one is a bug report,
+	// the other is "stop, you are dead" — so the classification has to see the
+	// same table the write did. READ COMMITTED is enough: what is needed is
+	// "the version my write did not match", not serialisability.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return BeganPause{}, fmt.Errorf("registry begin_pause: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	var (
 		generation       int64
 		previousSnapshot *string
 	)
-	err = s.pool.QueryRow(ctx, beginPauseSQL,
-		sandbox, cluster, in.OriginNodeID, []byte(in.Metadata), s.ttlSeconds(),
+	err = tx.QueryRow(ctx, s.beginPauseSQL,
+		sandbox, cluster, in.OriginNodeID, []byte(in.Metadata), s.ttlSeconds(), execution,
 	).Scan(&generation, &previousSnapshot)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// The upsert's WHERE kept one cluster from taking over another's row.
-		// Told rather than silently rewritten: the row belongs to somebody else.
-		return BeganPause{}, fmt.Errorf("%w: registry already holds sandbox %s for a different cluster", ErrInvalidRecord, sandbox)
+		return BeganPause{}, s.classifyRefusedPause(ctx, tx, cluster, sandbox, execution)
 	}
 	if err != nil {
+		return BeganPause{}, fmt.Errorf("registry begin_pause: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return BeganPause{}, fmt.Errorf("registry begin_pause: %w", err)
 	}
 
@@ -476,10 +596,70 @@ func (s *PostgresStore) BeginPause(ctx context.Context, in BeginPauseInput) (Beg
 	return began, nil
 }
 
+// classifyRefusedPause says which predicate turned the upsert away.
+//
+// 🔴 The two answers are opposites and the caller acts on them differently: a
+// row belonging to another cluster is a configuration fault nobody on the node
+// can fix, while a fenced pause is this VM being told the cluster has moved on
+// — stop, publish nothing, delete nothing. Reporting either as the other sends
+// a node down the wrong path with no way to notice.
+//
+// It reads outside the cluster filter on purpose: the row it is asking about
+// may be one this caller has no business seeing, and that is the fact being
+// established.
+func (s *PostgresStore) classifyRefusedPause(ctx context.Context, tx pgx.Tx, clusterID, sandboxID, executionID string) error {
+	var (
+		owner    string
+		observed *string
+	)
+	err := tx.QueryRow(ctx,
+		`SELECT cluster_id::text, execution_id::text FROM paused_sandboxes WHERE sandbox_id = $1::uuid`,
+		sandboxID).Scan(&owner, &observed)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// The row was there when the upsert ran — that is why it matched
+		// nothing — and is gone now. Fenced, not retryable: the row this pause
+		// meant to continue no longer exists, and re-sending would insert a
+		// fresh one, resurrecting a sandbox somebody deleted.
+		return fmt.Errorf("%w: sandbox %s has no registry row any more; incarnation %s is not the cluster's",
+			ErrExecutionFenced, sandboxID, executionID)
+	case err != nil:
+		return fmt.Errorf("registry begin_pause: %w", err)
+	}
+	if !strings.EqualFold(owner, clusterID) {
+		// Told rather than silently rewritten: the row belongs to somebody else.
+		return fmt.Errorf("%w: registry already holds sandbox %s for a different cluster", ErrInvalidRecord, sandboxID)
+	}
+	return fmt.Errorf("%w: sandbox %s belongs to incarnation %s, not %s",
+		ErrExecutionFenced, sandboxID, describeExecution(observed), executionID)
+}
+
+// describeExecution renders the incarnation column for an error message.
+// "none" rather than an empty string, because the difference between "a
+// different VM holds this" and "the cluster believes nobody does" is the whole
+// reason the column is nullable.
+func describeExecution(observed *string) string {
+	if observed == nil {
+		return "none"
+	}
+	return *observed
+}
+
+// 🔴 The two execution columns are cleared, and that is not tidying: the
+// target state is `paused`, which the table's CHECK pins to carrying no
+// incarnation. Leaving them would fail the statement with 23514.
+//
+// No execution predicate here, deliberately. This transition is guarded by the
+// generation CAS, which begin_pause has already moved past for any stale
+// incarnation, and every field made mandatory is another one a caller can
+// forget to send. Worth revisiting when `publishing` becomes a long-lived
+// retry state — a generation can then sit still for a long time — but not
+// before.
 const completePauseSQL = `
 UPDATE paused_sandboxes
    SET state = 'paused', snapshot_id = $3::uuid, updated_at = now(),
-       lease_expires_at = now() + make_interval(secs => $4::double precision)
+       lease_expires_at = now() + make_interval(secs => $4::double precision),
+       execution_id = NULL, execution_started_at = NULL
  WHERE sandbox_id = $1::uuid AND cluster_id = $5::uuid
    AND generation = $2 AND state = 'publishing'`
 
@@ -511,10 +691,14 @@ func (s *PostgresStore) CompletePause(ctx context.Context, clusterID, sandboxID 
 	return nil
 }
 
+// The execution columns are cleared for the same reason as in
+// completePauseSQL: `local_only` is a parked state and the CHECK pins parked
+// rows to carrying no incarnation.
 const markLocalOnlySQL = `
 UPDATE paused_sandboxes
    SET state = 'local_only', updated_at = now(),
-       lease_expires_at = now() + make_interval(secs => $3::double precision)
+       lease_expires_at = now() + make_interval(secs => $3::double precision),
+       execution_id = NULL, execution_started_at = NULL
  WHERE sandbox_id = $1::uuid AND cluster_id = $4::uuid
    AND generation = $2 AND state = 'publishing'`
 
@@ -591,6 +775,7 @@ WITH previous AS (
 claimed AS (
     UPDATE paused_sandboxes
        SET state = 'resuming', claimed_by_node_id = $2,
+           execution_id = $5::uuid, execution_started_at = now(),
            generation = generation + 1, updated_at = now(),
            lease_expires_at = now() + make_interval(secs => $3::double precision)
      WHERE sandbox_id = $1::uuid
@@ -615,6 +800,7 @@ WITH previous AS (
 claimed AS (
     UPDATE paused_sandboxes
        SET state = 'resuming', claimed_by_node_id = $2,
+           execution_id = $5::uuid, execution_started_at = now(),
            generation = generation + 1, updated_at = now(),
            lease_expires_at = now() + make_interval(secs => $3::double precision)
      WHERE sandbox_id = $1::uuid
@@ -633,7 +819,7 @@ SELECT claimed.*, previous.previous_state
 // succeeds and MarkRunning repoints it. claimed_by_node_id is what says who is
 // doing the work meanwhile — without it the origin node cannot tell a resume
 // happening elsewhere from its own row and would happily start a second copy.
-func (s *PostgresStore) ClaimForResume(ctx context.Context, clusterID, sandboxID, nodeID string) (ResumeClaim, error) {
+func (s *PostgresStore) ClaimForResume(ctx context.Context, clusterID, sandboxID, nodeID, executionID string) (ResumeClaim, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
 		return ResumeClaim{}, err
@@ -644,6 +830,10 @@ func (s *PostgresStore) ClaimForResume(ctx context.Context, clusterID, sandboxID
 	}
 	if strings.TrimSpace(nodeID) == "" {
 		return ResumeClaim{}, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
+	}
+	execution, err := requireExecutionUUID(executionID)
+	if err != nil {
+		return ResumeClaim{}, err
 	}
 
 	ctx, cancel := s.withTimeout(ctx)
@@ -660,7 +850,7 @@ func (s *PostgresStore) ClaimForResume(ctx context.Context, clusterID, sandboxID
 		claimSQL = claimForResumeDurableOnlySQL
 	}
 
-	rows, err := s.pool.Query(ctx, claimSQL, sandbox, nodeID, s.ttlSeconds(), cluster)
+	rows, err := s.pool.Query(ctx, claimSQL, sandbox, nodeID, s.ttlSeconds(), cluster, execution)
 	if err != nil {
 		return ResumeClaim{}, fmt.Errorf("registry claim_for_resume: %w", err)
 	}
@@ -778,10 +968,20 @@ func (s *PostgresStore) logClaim(sandboxID, nodeID string, entry Entry, previous
 	}
 }
 
+// 🔴 One of the three paths that take a sandbox away from whoever held it,
+// and every one of them has to blank the identity axis. A `paused` row still
+// carrying an incarnation is a row the old node's next automatic pause matches
+// — which is the first step of the sequence this release exists to break, and
+// it would be back with the fencing predicates still in place and doing
+// nothing.
+//
+// No execution predicate, for the same reason: this is a seizure, and a
+// seizure that needs the consent of whoever is being seized is not one.
 const releaseClaimSQL = `
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL, updated_at = now(),
-       lease_expires_at = now() + make_interval(secs => $3::double precision)
+       lease_expires_at = now() + make_interval(secs => $3::double precision),
+       execution_id = NULL, execution_started_at = NULL
  WHERE sandbox_id = $1::uuid AND cluster_id = $4::uuid
    AND generation = $2 AND state = 'resuming'`
 
@@ -828,9 +1028,107 @@ func (s *PostgresStore) ReleaseClaim(ctx context.Context, clusterID, sandboxID s
 // reconcile interval carrying none, and a node lost inside that window left a
 // row that could not be reclaimed, claimed or removed by anything. e2b has no
 // equivalent gap because its catalog carries the expiry on every write.
-const markRunningSQL = `
+// markRunningFencedSQL replaces the old claim guard with three explicit ways a
+// node may say a sandbox is live on it, and no fourth.
+//
+//	① a cross-node resume this node holds the claim on, running under the
+//	   incarnation the claim allocated. The incarnation clause is what makes
+//	   this a check rather than an installation, and it is the contract with the
+//	   node: it must start the VM under the value AcquireSandbox handed back.
+//	② a sandbox parked on this node's own disk, woken in place. No claim was
+//	   ever taken, so this is where an incarnation gets installed. Guarded on
+//	   origin and on the row not being claimed by anybody.
+//	③ the same incarnation saying so twice, which is what a retried RPC looks
+//	   like.
+//
+// 🔴 What the old guard let through: `running` rows carry a NULL
+// claimed_by_node_id, so `claimed_by_node_id IS NULL OR = $2` was true for
+// every live row in the cluster — one data-plane request against the wrong node
+// could repoint a sandbox that was running perfectly well somewhere else.
+// Branch ③ now requires the incarnation to match, and `running` is absent from
+// branch ②, so neither reaches a row belonging to another VM.
+//
+// 🔴 execution_started_at is NOT re-stamped on branch ③, which is a deliberate
+// departure from the design's literal statement (`_design-phase3-scheduler.md`
+// §3.3, corrected there under this adjudication). The whole reason the column
+// exists is that updated_at is refreshed by every lease renewal and therefore
+// cannot be the origin of the grace period B3's KillOrphan measures (§2.5).
+// Branch ③ is the retried RPC: the predicate has already established that this
+// is the same incarnation, so moving its start would put back exactly the drift
+// the column was added to escape — the grace would restart on every retry, and
+// an orphan that keeps retrying would never age out of it. Today mark_running
+// is not periodic, so the effect is invisible; B3 is where it would bite, and by
+// then nothing points back to this line. Branches ① and ② still stamp: ② is the
+// installation point, and ① is the moment the VM the claim pre-allocated
+// actually starts, which is a later and more accurate origin than the claim.
+//
+// 🔴 The unfenced statement carries the same CASE, and deliberately: this is a
+// property of the column, not a feature of fencing. See markRunningUnfencedSQL
+// for the adjudication — an invariant that held only in one position of the
+// switch would make what the column means depend on where the switch stood.
+//
+// The CASE reads the pre-update row (in an UPDATE, SET expressions see the old
+// values), and `state = 'running'` identifies branch ③ uniquely — branch ②
+// excludes `running` and branch ① requires `resuming`. The execution_id clause
+// is redundant against the WHERE and kept anyway so the expression states its
+// own precondition instead of borrowing one from thirty lines below.
+const markRunningFencedSQL = `
 UPDATE paused_sandboxes
    SET state = 'running', origin_node_id = $2, claimed_by_node_id = NULL,
+       execution_id = $6::uuid,
+       execution_started_at = CASE
+           WHEN state = 'running' AND execution_id = $6::uuid
+                THEN execution_started_at
+           ELSE now()
+       END,
+       generation = generation + 1, updated_at = now(),
+       lease_expires_at = now() + make_interval(secs => $3::double precision),
+       sandbox_expires_at = $5
+ WHERE sandbox_id = $1::uuid
+   AND cluster_id = $4::uuid
+   AND (
+         (state = 'resuming' AND claimed_by_node_id = $2
+                             AND execution_id = $6::uuid)
+      OR (state IN ('paused', 'publishing', 'local_only')
+                             AND origin_node_id = $2
+                             AND claimed_by_node_id IS NULL)
+      OR (state = 'running'  AND origin_node_id = $2
+                             AND execution_id = $6::uuid)
+       )`
+
+// markRunningUnfencedSQL is the guard this statement had before the identity
+// axis, plus the column write the CHECK constraint requires of any row moving
+// to `running`. See beginPauseUnfencedSQL: the setting turns the checking off,
+// never the column.
+//
+// 🔴 The CASE is the same one the fenced statement carries, and it is here on
+// purpose (adjudicated 2026-08-20).
+//
+// The earlier reading was that this statement needed no counterpart to branch
+// ③, because it has no branches to tell a retry from a takeover and switching
+// fencing off is precisely giving up that distinction — so a row whose
+// incarnation anybody may overwrite has no start time worth preserving. ✅ 已裁决
+// against: what execution_started_at means is a property of the column, not a
+// feature of fencing. If it moved whenever the setting was off, the origin of
+// the grace period B3 measures would depend on which position the switch was in
+// when the row was last written, and one flip of that switch would silently
+// change what the data means for rows nobody touched afterwards. What
+// `write_fencing` is allowed to turn off is the *predicate* — whether a write is
+// refused — never what a column records.
+//
+// The condition is decidable without any predicate: `state = 'running' AND
+// execution_id = $6::uuid` reads the pre-update row and says "this row already
+// names the incarnation the caller is declaring", which is a retry under either
+// setting. A takeover names a different incarnation and still stamps.
+const markRunningUnfencedSQL = `
+UPDATE paused_sandboxes
+   SET state = 'running', origin_node_id = $2, claimed_by_node_id = NULL,
+       execution_id = $6::uuid,
+       execution_started_at = CASE
+           WHEN state = 'running' AND execution_id = $6::uuid
+                THEN execution_started_at
+           ELSE now()
+       END,
        generation = generation + 1, updated_at = now(),
        lease_expires_at = now() + make_interval(secs => $3::double precision),
        sandbox_expires_at = $5
@@ -849,7 +1147,7 @@ UPDATE paused_sandboxes
 // in-flight one. Without it a blind write here would clear claimed_by_node_id
 // mid-claim, and both nodes would go on to bring the same sandbox up believing
 // they held it.
-func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string, expiresAt *time.Time) (MarkRunningOutcome, error) {
+func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
 		return MarkRunningUntracked, err
@@ -861,43 +1159,83 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	if strings.TrimSpace(nodeID) == "" {
 		return MarkRunningUntracked, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
 	}
+	execution, err := requireExecutionUUID(executionID)
+	if err != nil {
+		return MarkRunningUntracked, err
+	}
 
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 
-	tag, err := s.pool.Exec(ctx, markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster, expiresAt)
+	// 🔴 One transaction around the write and the re-read that classifies it.
+	// The classification used to run on another pooled connection, which was a
+	// benign race while it only decided a log line; it now decides whether the
+	// caller retries or stops for good, and a classification made against a
+	// version of the row this statement never saw can send a node either way
+	// for no reason.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return MarkRunningUntracked, fmt.Errorf("registry mark_running: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	tag, err := tx.Exec(ctx, s.markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster, expiresAt, execution)
 	if err != nil {
 		return MarkRunningUntracked, fmt.Errorf("registry mark_running: %w", err)
 	}
 	if tag.RowsAffected() > 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return MarkRunningUntracked, fmt.Errorf("registry mark_running: %w", err)
+		}
 		return MarkRunningAdopted, nil
 	}
 
-	// Nothing matched: either the cluster does not track this sandbox (by far
-	// the common case, and correct), or somebody else holds the claim — which
-	// means two nodes believe they are resuming it and is worth saying out loud.
+	// Nothing matched. Three possibilities now, not two: the cluster does not
+	// track this sandbox (by far the common case, and correct), somebody else
+	// holds it, or this node holds it under an incarnation that is no longer
+	// the one on the row.
 	//
 	// The re-read's error is propagated rather than folded into an outcome:
 	// "untracked" tells the caller the registry has no say over this sandbox,
 	// and a row that exists but could not be decoded is not that.
 	//
-	// 🔴 The re-read is also the whole reason this returns three answers rather
-	// than two. It happens here now, so a caller across the wire never sees it;
+	// 🔴 The re-read is also the whole reason this returns more than one
+	// answer. It happens here now, so a caller across the wire never sees it;
 	// before phase 2 the node did it itself and could act on what it found.
-	entry, found, err := s.fetch(ctx, cluster, sandbox)
+	entry, found, err := fetchWith(ctx, tx, cluster, sandbox)
 	if err != nil {
 		return MarkRunningUntracked, err
 	}
-	if found {
+	if !found {
+		return MarkRunningUntracked, nil
+	}
+
+	// Read straight off the statement above: branches ① and ③ are the only two
+	// carrying an incarnation clause, so a row eligible for either can have
+	// failed on nothing else. Branch ② has no such clause — if it were eligible
+	// the UPDATE would have matched.
+	staleIncarnation := (entry.State == StateResuming && entry.ClaimedByNodeID == nodeID) ||
+		(entry.State == StateRunning && entry.OriginNodeID == nodeID)
+	if staleIncarnation {
 		registryMarkRunningRefused.Inc()
-		s.log.Warn("refused to mark the sandbox running here: another node holds the resume claim",
+		s.log.Warn("refused to mark the sandbox running here: this node's incarnation is not the one on the row",
 			zap.String("sandbox_id", sandbox),
 			zap.String("node_id", nodeID),
-			zap.String("claimed_by", entry.ClaimedByNodeID),
+			zap.String("expected_execution_id", entry.ExecutionID),
+			zap.String("observed_execution_id", execution),
+			zap.String("fencing_stage", "registry_write"),
 		)
-		return MarkRunningHeldElsewhere, nil
+		return MarkRunningUntracked, fmt.Errorf("%w: sandbox %s belongs to incarnation %s, not %s",
+			ErrExecutionFenced, sandbox, entry.ExecutionID, execution)
 	}
-	return MarkRunningUntracked, nil
+
+	registryMarkRunningRefused.Inc()
+	s.log.Warn("refused to mark the sandbox running here: another node holds the resume claim",
+		zap.String("sandbox_id", sandbox),
+		zap.String("node_id", nodeID),
+		zap.String("claimed_by", entry.ClaimedByNodeID),
+	)
+	return MarkRunningHeldElsewhere, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -992,9 +1330,16 @@ func (s *PostgresStore) RenewLease(ctx context.Context, clusterID, nodeID string
 // A NULL sandbox_expires_at never matches, which covers both a sandbox asked
 // never to expire and a row whose holder has not renewed since the column
 // existed. Both are the safe answer: leave it alone.
+// 🔴 execution_id = NULL is the second of the three seizure paths, and the
+// one the sequence in the design starts from: reclaim parks a live row, the
+// node that was running it comes back, its one-second eviction timer fires,
+// and its begin_pause lands on the row. Blanked, that pause compares against
+// NULL and never matches. Left in place, it matches perfectly and the old
+// incarnation publishes a stale snapshot over the new one's.
 const reclaimReleasedSQL = `
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL,
+       execution_id = NULL, execution_started_at = NULL,
        generation = generation + 1, updated_at = now(),
        lease_expires_at = now()
  WHERE cluster_id = $1::uuid
@@ -1104,9 +1449,12 @@ func (s *PostgresStore) reclaimExpiredHoldings(ctx context.Context, clusterID st
 	return out, nil
 }
 
+// The third seizure path, and it blanks the identity axis for the same reason
+// reclaimReleasedSQL does — see the note there.
 const releaseHoldingsReleasedSQL = `
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL,
+       execution_id = NULL, execution_started_at = NULL,
        generation = generation + 1, updated_at = now(),
        lease_expires_at = now()
  WHERE cluster_id = $1::uuid
@@ -1239,6 +1587,7 @@ func scanEntry(rows pgx.Rows) (Entry, error) {
 		state           string
 		claimedByNodeID *string
 		snapshotID      *string
+		executionID     *string
 		metadata        []byte
 	)
 	if err := rows.Scan(
@@ -1254,6 +1603,8 @@ func scanEntry(rows pgx.Rows) (Entry, error) {
 		&entry.UpdatedAt,
 		&entry.LeaseExpiresAt,
 		&entry.SandboxExpiresAt,
+		&executionID,
+		&entry.ExecutionStartedAt,
 	); err != nil {
 		return Entry{}, fmt.Errorf("decode registry row: %w", err)
 	}
@@ -1268,6 +1619,9 @@ func scanEntry(rows pgx.Rows) (Entry, error) {
 	}
 	if snapshotID != nil {
 		entry.SnapshotID = *snapshotID
+	}
+	if executionID != nil {
+		entry.ExecutionID = *executionID
 	}
 	if entry.Invalid() {
 		return Entry{}, fmt.Errorf("%w: sandbox %s is paused but names no snapshot", ErrInvalidRecord, entry.SandboxID)
@@ -1284,6 +1638,7 @@ func scanClaim(rows pgx.Rows) (Entry, State, error) {
 		previous        string
 		claimedByNodeID *string
 		snapshotID      *string
+		executionID     *string
 		metadata        []byte
 	)
 	if err := rows.Scan(
@@ -1299,6 +1654,8 @@ func scanClaim(rows pgx.Rows) (Entry, State, error) {
 		&entry.UpdatedAt,
 		&entry.LeaseExpiresAt,
 		&entry.SandboxExpiresAt,
+		&executionID,
+		&entry.ExecutionStartedAt,
 		&previous,
 	); err != nil {
 		return Entry{}, "", fmt.Errorf("decode registry row: %w", err)
@@ -1318,6 +1675,9 @@ func scanClaim(rows pgx.Rows) (Entry, State, error) {
 	}
 	if snapshotID != nil {
 		entry.SnapshotID = *snapshotID
+	}
+	if executionID != nil {
+		entry.ExecutionID = *executionID
 	}
 	if entry.Invalid() {
 		return Entry{}, "", fmt.Errorf("%w: sandbox %s is paused but names no snapshot", ErrInvalidRecord, entry.SandboxID)
@@ -1378,6 +1738,23 @@ func requireUUID(field, raw string) (string, error) {
 		return "", fmt.Errorf("%w: %s %q is not a uuid", ErrInvalidArgument, field, raw)
 	}
 	return trimmed, nil
+}
+
+// requireExecutionUUID is requireUUID plus the lower-casing the arbitration
+// downstream depends on.
+//
+// 🔴 isCanonicalUUID accepts upper-case hex, and the routing side orders these
+// ids lexicographically to decide which of two incarnations is newer — and in
+// ASCII '0'-'9' < 'A'-'F' < 'a'-'f', so one upper-case id reverses that order.
+// The column is a uuid so PostgreSQL normalises whatever it stores; this
+// normalises the copy that travels back out in an entry and in an error
+// message, which is the copy the comparison actually sees.
+func requireExecutionUUID(raw string) (string, error) {
+	id, err := requireUUID("execution_id", raw)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(id), nil
 }
 
 func isCanonicalUUID(s string) bool {

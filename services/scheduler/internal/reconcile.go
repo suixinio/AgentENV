@@ -137,6 +137,18 @@ type registryReconcileResult struct {
 	// decoder fails the whole get_many batch on one of these, so a single bad
 	// row silently freezes one machine's reconciliation. It should be zero.
 	invalidRows int
+	// executionMismatch counts sandboxes a node reports under one incarnation
+	// that the registry row names under another, grouped by that node.
+	//
+	// 🔴 The most direct signal in this whole pass that a sandbox is live
+	// twice: the row and the machine disagree about which VM is the sandbox.
+	// It costs nothing to compute — this round already holds both sides — and
+	// it is the observation the eventual orphan reaper will act on.
+	//
+	// Only fresh rosters and only live rows are compared. A parked row names
+	// no incarnation by construction, so comparing it would count every
+	// ordinary pause.
+	executionMismatch map[string]int
 }
 
 // computeRegistryReconcile derives one round's counters. It is pure so the
@@ -169,6 +181,7 @@ func computeRegistryReconcile(in registryReconcileInput) registryReconcileResult
 		staleCopy:         make(map[string]int, len(in.rosters)),
 		rowsWithoutRoster: make(map[string]int),
 		rosterStale:       make(map[string]bool, len(in.rosters)),
+		executionMismatch: make(map[string]int, len(in.rosters)),
 	}
 
 	// 1. The rosters, and above all which of them are still evidence of
@@ -192,9 +205,11 @@ func computeRegistryReconcile(in registryReconcileInput) registryReconcileResult
 		result.ghost[roster.NodeID] = 0
 		result.staleCopy[roster.NodeID] = 0
 		result.rowsWithoutRoster[roster.NodeID] = 0
+		result.executionMismatch[roster.NodeID] = 0
 
-		set := make(map[string]struct{}, len(roster.SandboxIDs))
-		for _, sandboxID := range roster.SandboxIDs {
+		set := make(map[string]struct{}, len(roster.Entries))
+		for _, entry := range roster.Entries {
+			sandboxID := entry.SandboxID
 			set[sandboxID] = struct{}{}
 			if !fresh {
 				continue
@@ -276,11 +291,20 @@ func computeRegistryReconcile(in registryReconcileInput) registryReconcileResult
 		if !rosterFresh[roster.NodeID] {
 			continue
 		}
-		for _, sandboxID := range roster.SandboxIDs {
+		for _, entry := range roster.Entries {
+			sandboxID := entry.SandboxID
 			sandbox, tracked := byID[sandboxID]
 			if !tracked {
 				result.untracked[roster.NodeID]++
 				continue
+			}
+			// Both sides have to name one before they can disagree. A row
+			// with no incarnation is a parked row, and a roster entry with
+			// none came from a node too old to report them — reading either as
+			// a mismatch would make this count ordinary pauses and ordinary
+			// rollouts.
+			if entry.ExecutionID != "" && sandbox.ExecutionID != "" && entry.ExecutionID != sandbox.ExecutionID {
+				result.executionMismatch[roster.NodeID]++
 			}
 			if _, conflicted := unattributable[sandboxID]; conflicted {
 				continue

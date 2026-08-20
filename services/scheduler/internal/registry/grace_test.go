@@ -222,7 +222,7 @@ func TestTheRestartPassExtendsALeaseTheOutageLapsed(t *testing.T) {
 	}
 
 	// And the row is no longer takeable, which is the whole point.
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, id, stNodeB, f.nextExecutionFor(id))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestTheGraceWindowWithholdsOnlyTheTakeoverArm(t *testing.T) {
 	// exactly as it would be if it had been written during the outage.
 	f.setLease(parked, "now() - interval '1 hour'", "now() - interval '1 hour'")
 
-	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, parked, stNodeB)
+	claim, err := f.store.ClaimForResume(context.Background(), f.cluster, parked, stNodeB, f.nextExecutionFor(parked))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestTheGraceWindowWithholdsOnlyTheTakeoverArm(t *testing.T) {
 		t.Fatalf("the parked row was modified: %+v", row)
 	}
 
-	claim, err = f.store.ClaimForResume(context.Background(), f.cluster, durable, stNodeB)
+	claim, err = f.store.ClaimForResume(context.Background(), f.cluster, durable, stNodeB, f.nextExecutionFor(durable))
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}

@@ -6,54 +6,68 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// SchemaDDL is the node's own schema bootstrap, copied verbatim from
-// SCHEMA_DDL in src/orchestrator/paused_registry/postgres.rs.
+// SchemaDDL is this process's schema for `paused_sandboxes`.
 //
-// 🔴 Verbatim, and it has to stay verbatim for as long as any node can still be
-// configured with the `postgres` backend. That node runs this same script on
-// every start, and two of its statements are unconditional:
+// It began as the node's own bootstrap, copied verbatim from SCHEMA_DDL in
+// src/orchestrator/paused_registry/postgres.rs. That file is gone — the node's
+// `postgres` backend went with D11 — so this process is now the only writer and
+// the only thing that applies DDL here. The historical ALTER statements are
+// kept below the CREATE TABLE anyway: they are no-ops on a table that is
+// already current, and deleting them would remove the only path a table an old
+// node built has to reach this shape. When the operator forgot the runbook's
+// DROP TABLE we want a *refusal* (see checkExecutionAxis), not a table that
+// cannot grow its columns.
 //
-//	ALTER TABLE ... DROP CONSTRAINT IF EXISTS paused_sandboxes_state_check;
-//	ALTER TABLE ... ADD CONSTRAINT paused_sandboxes_state_check CHECK (state IN (...));
-//
-// So the moment this copy admits a state the node's copy does not — and one row
-// is written carrying it — the next node to start cannot add its constraint
-// back, and that node never comes up. The failure lands on a machine whose own
-// configuration is unchanged and whose logs name a constraint nobody there
-// touched, which is the worst combination a schema owner can hand somebody.
-//
-// A column is the same story one step removed: a new NOT NULL column without a
-// default makes every insert the node still issues fail. That constraint is
-// lifted now — the `postgres` backend is gone and this process is the only
-// writer — but only for additions no earlier writer could trip over. Indexes
-// qualify; a NOT NULL column still would not.
-//
-// Everything after the CREATE TABLE brings an already-deployed table up to the
-// current shape, because CREATE TABLE IF NOT EXISTS silently does nothing when
-// the table exists — including when its columns and constraints are a version
-// behind. Each statement is a no-op on a table that is already current, so this
-// runs unchanged against a fresh database and one seeded by an earlier build.
+// 🔴 What is not lifted is the ban on a NOT NULL column without a default: it
+// still fails every insert an older writer issues. The execution axis below is
+// nullable for a stronger reason than that, though — see
+// paused_sandboxes_execution_check.
 const SchemaDDL = `
 CREATE TABLE IF NOT EXISTS paused_sandboxes (
-    sandbox_id     UUID        PRIMARY KEY,
-    cluster_id     UUID        NOT NULL,
-    state          TEXT        NOT NULL,
-    generation     BIGINT      NOT NULL,
-    origin_node_id TEXT        NOT NULL,
-    snapshot_id    UUID,
-    metadata       JSONB       NOT NULL,
-    paused_at      TIMESTAMPTZ NOT NULL,
-    updated_at     TIMESTAMPTZ NOT NULL
+    sandbox_id           UUID        PRIMARY KEY,
+    cluster_id           UUID        NOT NULL,
+    state                TEXT        NOT NULL,
+    generation           BIGINT      NOT NULL,
+    origin_node_id       TEXT        NOT NULL,
+    snapshot_id          UUID,
+    metadata             JSONB       NOT NULL,
+    paused_at            TIMESTAMPTZ NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL,
+    claimed_by_node_id   TEXT,
+    lease_expires_at     TIMESTAMPTZ,
+    sandbox_expires_at   TIMESTAMPTZ,
+    execution_id         UUID,
+    execution_started_at TIMESTAMPTZ
 );
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS claimed_by_node_id TEXT;
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS claimed_by_node_id   TEXT;
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at     TIMESTAMPTZ;
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS sandbox_expires_at   TIMESTAMPTZ;
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS execution_id         UUID;
+ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS execution_started_at TIMESTAMPTZ;
 ALTER TABLE paused_sandboxes DROP CONSTRAINT IF EXISTS paused_sandboxes_state_check;
 ALTER TABLE paused_sandboxes ADD CONSTRAINT paused_sandboxes_state_check
     CHECK (state IN ('publishing', 'paused', 'resuming', 'local_only', 'running'));
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS sandbox_expires_at TIMESTAMPTZ;
+ALTER TABLE paused_sandboxes DROP CONSTRAINT IF EXISTS paused_sandboxes_execution_check;
+-- The identity axis, stated as an equivalence rather than as NOT NULL.
+--
+-- 🔴 'resuming' is on the live side. A claim allocates the incarnation the
+-- resume will run under and writes it in the same statement that takes the
+-- claim, so mark_running can check the incarnation rather than only the
+-- claimant. Leaving it off — the shape this constraint had before that was
+-- settled — makes every cross-node resume's claim fail with 23514.
+--
+-- 🔴 Nullable rather than NOT NULL because "no live incarnation" is a real
+-- state a parked row has to be able to express. A blanket NOT NULL forces a
+-- sentinel uuid into those rows, and a sentinel is a value somebody eventually
+-- compares for equality — at which point the fencing is gone, silently.
+ALTER TABLE paused_sandboxes ADD  CONSTRAINT paused_sandboxes_execution_check
+    CHECK ( (state IN ('running', 'publishing', 'resuming')) = (execution_id IS NOT NULL)
+        AND (execution_id IS NULL) = (execution_started_at IS NULL) );
 CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
 CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
 -- Serves the two reclamation statements, which run on a timer against the whole
@@ -70,16 +84,91 @@ CREATE INDEX IF NOT EXISTS paused_sandboxes_reclaim_idx
     WHERE state IN ('running', 'resuming') AND sandbox_expires_at IS NOT NULL;
 `
 
-// schemaLockKey is the advisory lock the node takes around its own bootstrap,
-// reused here so the two serialise against each other rather than only against
-// themselves.
+// executionAxisViolationsSQL counts the rows paused_sandboxes_execution_check
+// would refuse. It is phrased as the constraint's own negation so the two
+// cannot drift apart.
 //
-// CREATE TABLE IF NOT EXISTS is not atomic against a concurrent creator: two
-// writers booting together both pass the existence check and then collide
-// inside the system catalogs, which is fatal for whichever one loses. During
-// the changeover a node and this controller are exactly that pair, so sharing
-// the key is not tidiness — it is the only thing standing between a rollout and
-// a node that will not start.
+// The whole negation, not the "live row with no incarnation" half: a table that
+// has been rolled forward, back and forward again can carry either direction,
+// and a row this misses is a row that comes back as a raw constraint violation
+// from the ALTER — which is the message this check exists to replace.
+const executionAxisViolationsSQL = `
+SELECT count(*) FROM paused_sandboxes
+ WHERE (state IN ('running', 'publishing', 'resuming')) IS DISTINCT FROM (execution_id IS NOT NULL)
+    OR (execution_id IS NULL) IS DISTINCT FROM (execution_started_at IS NULL)`
+
+// anyRowSQL is the fallback for a table that predates the execution columns,
+// where the statement above cannot even be parsed. Every row in such a table
+// violates the constraint by construction, so the count is the whole table.
+const anyRowSQL = `SELECT count(*) FROM paused_sandboxes`
+
+const (
+	// undefinedTable is what PostgreSQL answers for a table that is not there:
+	// a fresh database, which has nothing to check.
+	undefinedTable = "42P01"
+	// undefinedColumn is what it answers for a table that exists without the
+	// execution columns — a pre-phase-3 table, which is the shape this check
+	// exists for.
+	//
+	// 🔴 Handling only 42P01 would let that shape through as an unhandled
+	// driver error, which is exactly the "an error nobody recognises" outcome
+	// the check is here to replace.
+	undefinedColumn = "42703"
+)
+
+// preflight refuses to migrate a table carrying rows this build's CHECK
+// constraint would reject.
+//
+// 🔴 Why it exists. ADD CONSTRAINT scans the whole table, so without this the
+// operator who skipped the runbook's DROP TABLE gets
+// `check constraint "paused_sandboxes_execution_check" is violated by some row`
+// — a constraint born a second ago, on a machine whose own configuration is
+// unchanged, with nothing anywhere saying what to do about it. That is the same
+// lesson the state CHECK taught, seen from the other side.
+//
+// 🔴 Why it does not backfill. The only backfill that satisfies the constraint
+// is turning live rows into `paused` ones, and `paused` means "any node may
+// claim this" — so the repair would hand every live sandbox to the next resume
+// that came along. That is manufacturing the double-live this release is about.
+// Refusing is cheaper by a wide margin, and the runbook has the one command
+// that fixes it.
+func preflight(ctx context.Context, conn interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}) error {
+	var offending int64
+	err := conn.QueryRow(ctx, executionAxisViolationsSQL).Scan(&offending)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			return fmt.Errorf("inspect paused_sandboxes before migrating: %w", err)
+		}
+		switch pgErr.Code {
+		case undefinedTable:
+			// Nothing there yet. The CREATE TABLE below builds it correct.
+			return nil
+		case undefinedColumn:
+			if err := conn.QueryRow(ctx, anyRowSQL).Scan(&offending); err != nil {
+				return fmt.Errorf("inspect paused_sandboxes before migrating: %w", err)
+			}
+		default:
+			return fmt.Errorf("inspect paused_sandboxes before migrating: %w", err)
+		}
+	}
+	if offending == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"paused_sandboxes 里有 %d 行是阶段 3 之前的形状（活状态的行没有 execution_id，或停放的行带着一个）。"+
+			"本 build 不做自动回填 —— 把 running 行降级成 paused 会让它们变成可抢，等于人为制造双活。"+
+			"按 runbook 处置（dev/test：DROP TABLE paused_sandboxes 后重启本进程）", offending)
+}
+
+// schemaLockKey is the advisory lock the node used to take around its own
+// bootstrap. The node no longer applies DDL, but the key is kept: two
+// controllers rolling over each other are the pair that has to serialise now,
+// and CREATE TABLE IF NOT EXISTS is not atomic against a concurrent creator —
+// both pass the existence check and then collide inside the system catalogs,
+// which is fatal for whichever one loses.
 const schemaLockKey int64 = 0x0A6E_7653_4348_4D41
 
 // unlockTimeout bounds the advisory unlock, which runs on a context detached
@@ -91,6 +180,11 @@ const unlockTimeout = 5 * time.Second
 // The lock is taken on one pinned connection because advisory locks are
 // session-scoped: taking it from a pool and releasing it on a different
 // connection would leave it held until the first session ends.
+//
+// 🔴 The preflight runs inside the lock and before the DDL. Inside, so two
+// controllers cannot both look at a table one of them is halfway through
+// changing; before, because the statement it is protecting against is the
+// ADD CONSTRAINT further down the same script.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if pool == nil {
 		return errors.New("migrate paused registry schema: no pool")
@@ -111,7 +205,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("lock paused registry schema: %w", err)
 	}
 
-	_, applyErr := conn.Exec(ctx, SchemaDDL)
+	applyErr := preflight(ctx, conn)
+	if applyErr == nil {
+		_, applyErr = conn.Exec(ctx, SchemaDDL)
+	}
 
 	// Released before the DDL outcome is reported: holding the lock through an
 	// error path would block every other writer until this session drops.

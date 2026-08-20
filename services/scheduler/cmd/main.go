@@ -69,7 +69,11 @@ func main() {
 		// query-only scheduler sends it every sandbox data-plane lookup, so a
 		// registry wired only into the primary would never be consulted on the
 		// path that needs it.
-		svc := scheduler.NewQueryOnlyService(logger, store, scheduler.WithQueryOnlyPausedRegistry(registryReader))
+		queryOnlyOpts := []scheduler.QueryOnlyServiceOption{scheduler.WithQueryOnlyPausedRegistry(registryReader)}
+		if cfg.Scheduler.Routing.ExecutionArbitration == config.SchedulerExecutionArbitrationOff {
+			queryOnlyOpts = append(queryOnlyOpts, scheduler.WithQueryOnlySilentExecutionAxis())
+		}
+		svc := scheduler.NewQueryOnlyService(logger, store, queryOnlyOpts...)
 		schedulerv1.RegisterSchedulerServer(g, svc)
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
@@ -85,11 +89,7 @@ func main() {
 			registry.Set(nodes, nil)
 		}
 
-		svc := scheduler.NewService(
-			logger,
-			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
-			store,
+		serviceOpts := []scheduler.ServiceOption{
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
@@ -101,6 +101,16 @@ func main() {
 				cfg.Scheduler.ReportTTL,
 				cfg.Scheduler.Registry.LeaseWarnWindow,
 			),
+		}
+		if cfg.Scheduler.Routing.ExecutionArbitration == config.SchedulerExecutionArbitrationOff {
+			serviceOpts = append(serviceOpts, scheduler.WithSilentExecutionAxis())
+		}
+		svc := scheduler.NewService(
+			logger,
+			registry,
+			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			store,
+			serviceOpts...,
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		go svc.RunRegistryReconcile(sigCtx, cfg.Scheduler.Registry.ReconcileInterval)
@@ -165,7 +175,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", registryHealthHandler(cfg.Scheduler.Registry.ClusterID, registryPhase))
+	mux.HandleFunc("/healthz", registryHealthHandler(cfg.Scheduler.Registry.ClusterID, registryPhase, healthSwitches{
+		writeFencing:         switchLabel(cfg.Scheduler.Registry.WriteFencing),
+		executionArbitration: string(cfg.Scheduler.Routing.ExecutionArbitration),
+	}))
 	metricsServer := &http.Server{
 		Addr:    cfg.Scheduler.MetricsListenAddr,
 		Handler: mux,
@@ -230,11 +243,33 @@ func main() {
 }
 
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {
-	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
-		return scheduler.NewInMemoryBindingStore(cfg.Scheduler.BindingTTL), func() {}
+	mode := cfg.Scheduler.Routing.ExecutionArbitration
+
+	// 🔴 Loud when it is not enforcing, and resident in a gauge as well as in
+	// this line: the failure of a scheduler that is not arbitrating is a
+	// sandbox whose traffic goes to the wrong copy, which nothing in the logs
+	// of the moment will say.
+	scheduler.SetRoutingExecutionArbitration(string(mode))
+	scheduler.SetBindingArbitrationLogger(logger)
+	switch mode {
+	case config.SchedulerExecutionArbitrationOff:
+		logger.Warn("scheduler binding arbitration is OFF: whichever node reports last owns a sandbox's binding, so a superseded incarnation takes it back on every heartbeat",
+			zap.String("setting", "scheduler.routing.execution_arbitration"),
+			zap.String("env", "SCHEDULER_ROUTING_EXECUTION_ARBITRATION"),
+		)
+	case config.SchedulerExecutionArbitrationObserve:
+		logger.Warn("scheduler binding arbitration is OBSERVING: decisions are counted but not applied",
+			zap.String("setting", "scheduler.routing.execution_arbitration"),
+		)
 	}
 
-	store, err := scheduler.NewRedisBindingStore(cfg.Scheduler.RedisAddr, cfg.Scheduler.BindingTTL)
+	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
+		return scheduler.NewInMemoryBindingStoreWithArbitration(
+			cfg.Scheduler.BindingTTL, scheduler.InMemoryArbitrationFor(string(mode))), func() {}
+	}
+
+	store, err := scheduler.NewRedisBindingStoreWithArbitration(
+		cfg.Scheduler.RedisAddr, cfg.Scheduler.BindingTTL, scheduler.RedisArbitrationFor(string(mode)))
 	if err != nil {
 		logger.Fatal("create redis binding store failed", zap.Error(err), zap.String("addr", cfg.Scheduler.RedisAddr))
 	}
@@ -289,6 +324,22 @@ func createRegistryReader(logger *zap.Logger, cfg config.Config) (pausedregistry
 	return reader, reader.Close
 }
 
+// healthSwitches is what /healthz says about the two settings that can turn a
+// half of this release off. Both are reported by name and by value, never as a
+// bare boolean somewhere in the body: an operator reading this during an
+// incident has to be able to tell "off" from "absent from this build".
+type healthSwitches struct {
+	writeFencing         string
+	executionArbitration string
+}
+
+func switchLabel(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}
+
 // createRegistryStore builds the writable store, or nothing when the write
 // surface is switched off.
 //
@@ -302,6 +353,15 @@ func createRegistryStore(logger *zap.Logger, cfg config.Config, queryOnly bool) 
 		logger.Info("scheduler paused registry write surface stays off on a query-only replica")
 	}
 	if queryOnly || !registryWriteEnabled(cfg) {
+		// 🔴 Both gauges are set here, on the path that builds nothing, and
+		// that is the point of this pair. Leaving them at the default made
+		// "fencing is off" and "there is no write surface here" the same
+		// reading — every query-only replica and every write_enabled=false
+		// cluster published a 0 that an alerting rule could not tell from the
+		// one shape that needs an operator. See registryWriteSurfaceEnabled for
+		// how the three registry gauges read as a tuple.
+		scheduler.SetRegistryWriteSurfaceEnabled(false)
+		scheduler.SetRegistryWriteFencingEnabled(false)
 		return nil, nil, func() {}
 	}
 
@@ -318,6 +378,7 @@ func createRegistryStore(logger *zap.Logger, cfg config.Config, queryOnly bool) 
 		LeaseTTL:       cfg.Scheduler.Registry.LeaseTTL,
 		MaxConnections: cfg.Scheduler.Registry.WriteMaxConnections,
 		QueryTimeout:   cfg.Scheduler.Registry.QueryTimeout,
+		WriteFencing:   cfg.Scheduler.Registry.WriteFencing,
 	})
 	if err != nil {
 		// A DSN that will not parse is a configuration error that does not fix
@@ -334,6 +395,24 @@ func createRegistryStore(logger *zap.Logger, cfg config.Config, queryOnly bool) 
 		logger.Fatal("paused registry store is not the postgres implementation; the restart gate cannot be attached")
 	}
 	store.WithGuards(grace, breaker)
+
+	// 🔴 Loud when it is off. This is the half whose failure costs a
+	// workspace, and the way an operator finds out today would otherwise be a
+	// stale snapshot published over a live one, weeks later, with nothing
+	// pointing back to a setting.
+	//
+	// The surface gauge goes with it, always, so the fencing one is only ever
+	// read where it means something. 1 here is "assembled", not "serving": a
+	// surface with no cluster id is registered and stays cold, and only
+	// /healthz's phase can say that.
+	scheduler.SetRegistryWriteSurfaceEnabled(true)
+	scheduler.SetRegistryWriteFencingEnabled(cfg.Scheduler.Registry.WriteFencing)
+	if !cfg.Scheduler.Registry.WriteFencing {
+		logger.Warn("paused registry write fencing is DISABLED: an incarnation the cluster has written off can overwrite the row of the one that replaced it",
+			zap.String("setting", "scheduler.registry.write_fencing"),
+			zap.String("env", "SCHEDULER_REGISTRY_WRITE_FENCING"),
+		)
+	}
 
 	return store, grace, store.Close
 }
@@ -405,7 +484,7 @@ func openRegistryWriteSurface(
 // other measure: /healthz 200, gRPC probe passing, one error line at startup
 // that has long since scrolled away. An operator who can read the id back can
 // tell "configured" from "assumed" without redeploying anything.
-func registryHealthHandler(clusterID string, phase func() (string, time.Duration, time.Duration)) http.HandlerFunc {
+func registryHealthHandler(clusterID string, phase func() (string, time.Duration, time.Duration), switches healthSwitches) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body := map[string]any{"status": "ok"}
 		if phase == nil {
@@ -419,7 +498,15 @@ func registryHealthHandler(clusterID string, phase func() (string, time.Duration
 				"cluster_id":                strings.TrimSpace(clusterID),
 				"grace_remaining_seconds":   remaining.Seconds(),
 				"inferred_downtime_seconds": downtime.Seconds(),
+				// 🔴 Reported next to the phase because "the registry is
+				// healthy" and "the registry is checking who is writing to it"
+				// are separate questions and only one of them has ever been
+				// visible here.
+				"write_fencing": switches.writeFencing,
 			}
+		}
+		body["routing"] = map[string]any{
+			"execution_arbitration": switches.executionArbitration,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

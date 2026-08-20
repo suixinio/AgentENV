@@ -9,33 +9,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// schemaDDL is the node's own schema bootstrap, copied verbatim from
-// src/orchestrator/paused_registry/postgres.rs. It is duplicated here rather
-// than referenced because the point of this test is to read a table shaped
-// exactly the way the nodes create it — a paraphrase would pass while the real
-// thing failed.
-const schemaDDL = `
-CREATE TABLE IF NOT EXISTS paused_sandboxes (
-    sandbox_id     UUID        PRIMARY KEY,
-    cluster_id     UUID        NOT NULL,
-    state          TEXT        NOT NULL,
-    generation     BIGINT      NOT NULL,
-    origin_node_id TEXT        NOT NULL,
-    snapshot_id    UUID,
-    metadata       JSONB       NOT NULL,
-    paused_at      TIMESTAMPTZ NOT NULL,
-    updated_at     TIMESTAMPTZ NOT NULL
-);
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS claimed_by_node_id TEXT;
-ALTER TABLE paused_sandboxes DROP CONSTRAINT IF EXISTS paused_sandboxes_state_check;
-ALTER TABLE paused_sandboxes ADD CONSTRAINT paused_sandboxes_state_check
-    CHECK (state IN ('publishing', 'paused', 'resuming', 'local_only', 'running'));
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
-ALTER TABLE paused_sandboxes ADD COLUMN IF NOT EXISTS sandbox_expires_at TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS paused_sandboxes_origin_node_idx ON paused_sandboxes (origin_node_id);
-CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (updated_at);
-`
-
 const (
 	clusterA = "11111111-1111-1111-1111-111111111111"
 	clusterB = "22222222-2222-2222-2222-222222222222"
@@ -50,6 +23,13 @@ const (
 	snapshotPaused    = "cccccccc-0000-0000-0000-000000000002"
 	snapshotResuming  = "cccccccc-0000-0000-0000-000000000003"
 	snapshotOtherClus = "cccccccc-0000-0000-0000-000000000009"
+
+	// The three live states below have to name an incarnation: the table's
+	// CHECK constraint pins that, and a seed that left them NULL would fail
+	// with 23514 rather than testing anything.
+	executionPublishing = "00000001-0000-7000-8000-0000000000a1"
+	executionResuming   = "00000001-0000-7000-8000-0000000000a3"
+	executionRunning    = "00000001-0000-7000-8000-0000000000a5"
 )
 
 // requireTestDSN returns the test database DSN, or skips the calling test when
@@ -118,7 +98,10 @@ func setupRegistryDatabase(t *testing.T) string {
 		t.Fatalf("point the test connection at %s: %v", schema, err)
 	}
 
-	if _, err := conn.Exec(ctx, schemaDDL); err != nil {
+	// The table this build owns, not the fossil: this suite exercises the
+	// read model, and the read model selects columns only the current shape
+	// has.
+	if _, err := conn.Exec(ctx, SchemaDDL); err != nil {
 		t.Fatalf("create schema failed: %v", err)
 	}
 
@@ -127,33 +110,43 @@ func setupRegistryDatabase(t *testing.T) string {
 	seed := `
 INSERT INTO paused_sandboxes (
     sandbox_id, cluster_id, state, generation, origin_node_id, claimed_by_node_id,
-    snapshot_id, metadata, paused_at, updated_at, lease_expires_at, sandbox_expires_at
+    snapshot_id, metadata, paused_at, updated_at, lease_expires_at, sandbox_expires_at,
+    execution_id, execution_started_at
 ) VALUES
     -- publishing: no snapshot yet, lease live.
     ($1, $7, 'publishing', 1, 'node-a', NULL, NULL, '{}'::jsonb,
-     now() - interval '2 minutes', now() - interval '2 minutes', now() + interval '90 seconds', NULL),
-    -- paused: snapshot published, claimable by anybody.
+     now() - interval '2 minutes', now() - interval '2 minutes', now() + interval '90 seconds', NULL,
+     $12, now() - interval '2 minutes'),
+    -- paused: snapshot published, claimable by anybody, and — by the CHECK —
+    -- naming no incarnation at all.
     ($2, $7, 'paused', 4, 'node-a', NULL, $9, '{}'::jsonb,
-     now() - interval '10 minutes', now() - interval '9 minutes', now() + interval '90 seconds', NULL),
-    -- resuming: origin still holds the artifacts, claimer is bringing it up.
+     now() - interval '10 minutes', now() - interval '9 minutes', now() + interval '90 seconds', NULL,
+     NULL, NULL),
+    -- resuming: origin still holds the artifacts, claimer is bringing it up
+    -- under the incarnation its claim allocated.
     ($3, $7, 'resuming', 5, 'node-a', 'node-b', $10, '{}'::jsonb,
-     now() - interval '10 minutes', now() - interval '30 seconds', now() + interval '90 seconds', now() + interval '1 hour'),
+     now() - interval '10 minutes', now() - interval '30 seconds', now() + interval '90 seconds', now() + interval '1 hour',
+     $13, now() - interval '30 seconds'),
     -- local_only: the upload failed, the only copy is on node-b, and both
     -- lease columns were never written.
     ($4, $7, 'local_only', 2, 'node-b', NULL, NULL, '{}'::jsonb,
-     now() - interval '1 hour', now() - interval '1 hour', NULL, NULL),
+     now() - interval '1 hour', now() - interval '1 hour', NULL, NULL,
+     NULL, NULL),
     -- running: live on node-b, lease lapsed and deadline passed, which is the
     -- combination the node-side reclaim acts on.
     ($5, $7, 'running', 7, 'node-b', NULL, NULL, '{}'::jsonb,
-     now() - interval '3 hours', now() - interval '3 hours', now() - interval '2 hours', now() - interval '1 hour'),
+     now() - interval '3 hours', now() - interval '3 hours', now() - interval '2 hours', now() - interval '1 hour',
+     $14, now() - interval '3 hours'),
     -- another cluster's row, to prove the cluster filter.
     ($6, $8, 'paused', 1, 'node-z', NULL, $11, '{}'::jsonb,
-     now(), now(), now() + interval '90 seconds', NULL)
+     now(), now(), now() + interval '90 seconds', NULL,
+     NULL, NULL)
 `
 	if _, err := conn.Exec(ctx, seed,
 		sandboxPublishing, sandboxPaused, sandboxResuming, sandboxLocalOnly, sandboxRunning, sandboxOtherClust,
 		clusterA, clusterB,
 		snapshotPaused, snapshotResuming, snapshotOtherClus,
+		executionPublishing, executionResuming, executionRunning,
 	); err != nil {
 		t.Fatalf("seed rows failed: %v", err)
 	}

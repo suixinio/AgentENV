@@ -67,7 +67,15 @@ type Store interface {
 	// The three-way test lives here (see the ResumeClaim doc): a published
 	// snapshot may be taken by anybody, an unpublished one only after its
 	// holder's lease lapses, and a live sandbox never.
-	ClaimForResume(ctx context.Context, clusterID, sandboxID, nodeID string) (ResumeClaim, error)
+	//
+	// 🔴 executionID is the incarnation the claimant will run the sandbox
+	// under, allocated *here* rather than when the VM starts, and written by
+	// the same statement that takes the claim. That is what lets MarkRunning
+	// check the incarnation instead of only the claimant — and it is a contract
+	// with the node, which must start the VM under the value it gets back in
+	// the claim rather than minting one of its own. A node that mints its own
+	// fails MarkRunning's first branch on every cross-node resume.
+	ClaimForResume(ctx context.Context, clusterID, sandboxID, nodeID, executionID string) (ResumeClaim, error)
 
 	// ReleaseClaim hands a claimed sandbox back without resuming it. The bool
 	// is whether the statement matched a row.
@@ -107,7 +115,13 @@ type Store interface {
 	// first reconcile interval with no deadline at all — and a node lost inside
 	// that window left a row nothing could reclaim, claim or remove again.
 	// A nil expiresAt means the sandbox was asked never to expire.
-	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID string, expiresAt *time.Time) (MarkRunningOutcome, error)
+	//
+	// 🔴 executionID names the incarnation making the claim. On the cross-node
+	// path it must be the one ClaimForResume handed out; on the local path —
+	// a node waking a sandbox parked on its own disk, with no claim involved —
+	// it is the incarnation this call installs. Anything else is refused with
+	// ErrExecutionFenced, which the caller must never retry.
+	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error)
 
 	// ReleaseNodeHoldings frees the rows a previous process on this same
 	// machine was holding when it died.
@@ -247,6 +261,12 @@ type BeginPauseInput struct {
 	SandboxID    string
 	OriginNodeID string
 	Metadata     json.RawMessage
+	// ExecutionID is the incarnation this pause belongs to, and it is
+	// required. A pause is the same VM instance being stopped, so the value
+	// has to be the one already on the row — the statement compares rather
+	// than installs it, and a row naming a different incarnation, or none at
+	// all, is refused with ErrExecutionFenced.
+	ExecutionID string
 }
 
 // BeganPause is what BeginPause hands back.
@@ -347,6 +367,19 @@ var (
 	// view is stale, while the other says there is nothing to write to at all.
 	ErrGenerationConflict = errors.New("registry generation conflict")
 
+	// ErrExecutionFenced means the row names a different incarnation than the
+	// caller does, or none at all: the caller is a VM the cluster has already
+	// written off.
+	//
+	// 🔴 Never to be retried, and that is the whole reason it is not
+	// ErrGenerationConflict. A generation conflict says "your view is stale,
+	// re-read and try again"; a node that re-reads after *this* one picks up
+	// the live incarnation's generation, sends the same write again, and walks
+	// straight around the fence. The two leave the table equally unchanged and
+	// call for opposite responses, so they are separate errors and separate
+	// gRPC codes.
+	ErrExecutionFenced = errors.New("registry execution fenced")
+
 	// ErrInvalidRecord means a row exists but this build cannot make sense of
 	// it — an unknown state, or a `paused` row with no snapshot to resume from.
 	//
@@ -369,6 +402,16 @@ type StoreConfig struct {
 	LeaseTTL       time.Duration
 	MaxConnections int32
 	QueryTimeout   time.Duration
+	// WriteFencing selects the fenced statements for begin_pause and
+	// mark_running. False restores the predicates this table had before the
+	// identity axis existed, which is the rollback path: one setting, no new
+	// code to trust, and the two statements stay separately testable because
+	// they really are two statements rather than one with a flag in it.
+	//
+	// 🔴 It switches the *checking* off, not the column. The CHECK constraint
+	// is DDL and stays; nodes still have to send an execution_id or their
+	// `running` rows will not go in.
+	WriteFencing bool
 }
 
 // The constructor's shape is part of this seam, and is fixed here rather than

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
 
@@ -170,7 +172,124 @@ var (
 			Help: "Unix time of the last successful paused-registry reconciliation.",
 		},
 	)
+
+	// The routing half's identity axis. Every series below has a closed label
+	// set, the same rule the lookup results follow.
+
+	// 🔴 The one series that says whether arrival-order overwriting is really
+	// gone. On a healthy cluster rejected_older is zero; anything else is
+	// either a clock that went backwards or two live copies of one sandbox.
+	schedulerBindingExecution = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_binding_execution_total",
+			Help: "Binding writes by what the incarnation arbitration decided and where the write came from. rejected_older should be zero on a healthy cluster.",
+		},
+		[]string{"decision", "source"},
+	)
+	// Coverage, and the other half of a cross-service check: this should agree
+	// series for series with the gateway's count of routing answers it could
+	// not fence. Where they disagree, one of the two is computing it wrong.
+	schedulerLookupExecutionAuthority = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_lookup_execution_authority_total",
+			Help: "Sandbox lookups by how strong the incarnation in the answer is. Reconcile against the gateway's unfenced-answer counters.",
+		},
+		[]string{"authority"},
+	)
+	// 🔴 How many nodes are still too old to report incarnations. It has to
+	// read zero before the gateway is switched to enforcing: while it does not,
+	// some node's sandboxes are being routed on arrival order.
+	schedulerHeartbeatLegacyRoster = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_heartbeat_legacy_roster_total",
+			Help: "Heartbeats that carried only the pre-incarnation sandbox_ids roster, by node. Must be zero before the gateway is switched to enforcing.",
+		},
+		[]string{"node"},
+	)
+	// Roster entries this build could not use as reported. Narrowing something
+	// silently is how a fleet ends up with fencing that is not running.
+	schedulerHeartbeatRosterDropped = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_heartbeat_roster_dropped_total",
+			Help: "Roster entries whose incarnation could not be used as reported, by reason. The entry itself is kept and routed to; only its incarnation is discarded.",
+		},
+		[]string{"reason"},
+	)
+	// 🔴 The direct signal that a sandbox is live twice: the registry and the
+	// node disagree about which incarnation is running. Derived from the
+	// reconciliation pass that already reads both, so it costs no I/O.
+	schedulerRegistryExecutionMismatch = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_registry_execution_mismatch",
+			Help: "Sandboxes whose roster-reported incarnation differs from the registry row's, by node. Non-zero means two incarnations of one sandbox are known to the cluster at once. Reads zero while any node is still on a pre-incarnation build — read it beside heartbeat_legacy_roster_total.",
+		},
+		[]string{"node"},
+	)
+	// Resident, because the question "is arbitration on" is asked months later,
+	// during an incident, about a process whose start-up logs are long gone.
+	schedulerRoutingExecutionArbitration = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_routing_execution_arbitration_enabled",
+			Help: "0 when binding arbitration is off, 1 when it only observes, 2 when it enforces. Zero means an older incarnation can take a binding back from a newer one.",
+		},
+	)
 )
+
+// The two sources a binding write can come from. Closed set: a third would be a
+// write path nobody arbitrated.
+const (
+	bindingSourceHeartbeat  = "heartbeat"
+	bindingSourceAssignment = "assignment"
+)
+
+// recordBindingArbitration counts one decision. An empty decision is the
+// rollback mode, which made none.
+func recordBindingArbitration(source string, decision bindingDecision) {
+	if decision == "" {
+		return
+	}
+	schedulerBindingExecution.WithLabelValues(string(decision), source).Inc()
+}
+
+func recordLookupExecutionAuthority(authority schedulerv1.ExecutionAuthority) {
+	schedulerLookupExecutionAuthority.WithLabelValues(executionAuthorityLabel(authority)).Inc()
+}
+
+func executionAuthorityLabel(authority schedulerv1.ExecutionAuthority) string {
+	switch authority {
+	case schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY:
+		return "registry"
+	case schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_PENDING:
+		return "pending"
+	case schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN:
+		return "unknown"
+	default:
+		// UNSPECIFIED is what an older scheduler's answer decodes to, and it
+		// means the same thing as UNKNOWN. Counting it apart would split one
+		// fact across two series for the length of a rollout.
+		return "unknown"
+	}
+}
+
+func recordLegacyRoster(nodeID string) {
+	schedulerHeartbeatLegacyRoster.WithLabelValues(nodeID).Inc()
+}
+
+func recordRosterDropped(reason string) {
+	schedulerHeartbeatRosterDropped.WithLabelValues(reason).Inc()
+}
+
+// SetRoutingExecutionArbitration publishes the mode. Called once at start-up.
+func SetRoutingExecutionArbitration(mode string) {
+	value := 2.0
+	switch mode {
+	case "off":
+		value = 0
+	case "observe":
+		value = 1
+	}
+	schedulerRoutingExecutionArbitration.Set(value)
+}
 
 // SetRegistryEnabled publishes whether this process was configured with a
 // paused registry at all. Called once at start-up, by both the primary and the
@@ -181,6 +300,53 @@ func SetRegistryEnabled(enabled bool) {
 		value = 1
 	}
 	schedulerRegistryEnabled.Set(value)
+}
+
+// warnRefusedBinding says so when a write was turned away.
+//
+// 🔴 Both refusals are worth a line. rejected_older means an older incarnation
+// tried to take a sandbox back, which is either a clock that moved backwards or
+// a live double; rejected_unknown means a node too old to report incarnations
+// tried to displace one that does, which during a rollout is exactly the node
+// whose copy is stale.
+func warnRefusedBinding(source, sandboxID string, decision bindingDecision) {
+	switch decision {
+	case bindingRejectedOlder:
+		bindingArbitrationLogger().Warn("scheduler binding refused an older execution",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("source", source),
+			zap.String("fencing_stage", "binding_arbitration"),
+		)
+	case bindingRejectedUnknown:
+		bindingArbitrationLogger().Warn("scheduler binding refused a challenger without an execution",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("source", source),
+			zap.String("fencing_stage", "binding_arbitration"),
+		)
+	}
+}
+
+// bindingArbitrationLogger is the logger the stores warn through.
+//
+// The binding stores are constructed without one — they predate this and are
+// shared by the primary and the query-only replica — so it is set once at
+// start-up rather than threaded through three constructors. Nil-safe: a test
+// that never sets it gets a no-op.
+var bindingArbitrationLog atomic.Pointer[zap.Logger]
+
+// SetBindingArbitrationLogger points the binding stores' warnings at a logger.
+func SetBindingArbitrationLogger(logger *zap.Logger) {
+	if logger == nil {
+		return
+	}
+	bindingArbitrationLog.Store(logger)
+}
+
+func bindingArbitrationLogger() *zap.Logger {
+	if logger := bindingArbitrationLog.Load(); logger != nil {
+		return logger
+	}
+	return zap.NewNop()
 }
 
 func recordSchedulerLookup(result lookupResult) {
@@ -236,6 +402,13 @@ func recordRegistryReconcile(result registryReconcileResult, now time.Time) {
 	schedulerRegistryRowsWithoutRoster.Reset()
 	for node, count := range result.rowsWithoutRoster {
 		schedulerRegistryRowsWithoutRoster.WithLabelValues(node).Set(float64(count))
+	}
+
+	// Reset for the same reason as the others: a node that has left must stop
+	// reporting the count it had when it did.
+	schedulerRegistryExecutionMismatch.Reset()
+	for node, count := range result.executionMismatch {
+		schedulerRegistryExecutionMismatch.WithLabelValues(node).Set(float64(count))
 	}
 
 	schedulerRegistryRosterStale.Reset()

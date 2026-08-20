@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -25,17 +26,45 @@ var metadataFixtures = []string{
 	"sandbox_metadata_minimal.json",
 }
 
+// requiredFieldsFixture is the third file in that set, and the only one that is
+// not a document: it is REQUIRED_FIELDS itself, dumped by the same Rust test
+// run. It exists so this side can compare its list against the node's list
+// instead of against a document that happens to contain it — see
+// TestTheRequiredFieldListMatchesTheNodes for why that difference is the whole
+// point.
+const requiredFieldsFixture = "sandbox_metadata_required_fields.json"
+
 // requiredMetadataFields have neither a Go-side equivalent of `Option` nor a
 // serde default on the node, so a document missing any one of them stops
 // decoding there — and `get`, `get_many` and `claim_for_resume` share that
 // decoder, which makes the sandbox unreadable and unclaimable at the same time.
 // The failure only surfaces at the next resume, possibly days later.
 //
-// Kept in step by hand with REQUIRED_FIELDS in
-// src/orchestrator/store/metadata.rs; the Rust side proves the list is exact by
-// dropping each field and checking the record stops decoding.
+// The Rust side proves the list is exact by dropping each field and checking
+// the record stops decoding, and publishes it as a fixture of its own that
+// TestTheRequiredFieldListMatchesTheNodes compares this list against.
+//
+// 🔴 Kept in step by hand until 2026-08-20, and the hand-sync had teeth in one
+// direction only: these names were asserted to be *present* in the metadata
+// fixtures, so adding a field the Rust side does not require failed here, while
+// dropping one the Rust side does require passed — the fixtures simply carry
+// more keys than this list names. `execution_id` was exactly that case: the
+// node made it required and regenerated the fixtures, and this list stayed
+// green while silently naming one field fewer.
+//
+// ✅ 已订正: the list is no longer a restatement. metadata.rs publishes
+// REQUIRED_FIELDS into requiredFieldsFixture, both sides read that same file,
+// and the comparison below is set equality rather than containment — so a name
+// added there and a name dropped here each fail. This list is kept in source
+// anyway, spelled out, because the reader of these tests has to be able to see
+// what is being asserted without opening a fixture; what changed is that it is
+// now checked rather than trusted.
 var requiredMetadataFields = []string{
 	"id",
+	// Required on the node since the incarnation work: a record without it is
+	// refused at load rather than given a fresh incarnation, because a fresh
+	// one would name a VM that never ran.
+	"execution_id",
 	"snapshot_id",
 	"state",
 	"created_at",
@@ -212,5 +241,82 @@ func TestMetadataFixturesAreReadableWithoutADatabase(t *testing.T) {
 				t.Fatalf("%s is missing required field %q", name, field)
 			}
 		}
+	}
+}
+
+// TestTheRequiredFieldListMatchesTheNodes is the tooth the hand-sync did not
+// have.
+//
+// 🔴 Set equality, not containment, and the difference is the entire reason
+// this test exists. The two assertions above check that every name in
+// requiredMetadataFields is present in a document — and the documents carry
+// more keys than the list names, so they answer "is this list a subset of a
+// valid record", which stays true no matter how many names the list loses.
+// This one answers "is this list the node's list", which is the question the
+// column's decodability actually turns on:
+//
+//   - a name added here that the node does not require fails, as it did before;
+//   - a name dropped here that the node does require now fails too. That is the
+//     direction `execution_id` slipped through, and it is the dangerous one: a
+//     writer on this side is free to omit what nobody names, and the row it
+//     produces stops decoding on every node read path at once — get, get_many
+//     and claim_for_resume share the decoder — surfacing at the next resume,
+//     possibly days later.
+//
+// Neither side owns the file: the Rust test writes it under
+// UPDATE_METADATA_GOLDEN=1 and fails when it is stale, so a change to
+// REQUIRED_FIELDS that is not published fails there, and one that is published
+// but not adopted fails here. Same shape as the manifest test in
+// services/shared/config: read the other side's artefact, do not restate it.
+//
+// No database and no fixtures-as-documents involved, so this runs on every
+// runner, including the ones where the round-trip test above has no PostgreSQL.
+func TestTheRequiredFieldListMatchesTheNodes(t *testing.T) {
+	var published []string
+	if err := json.Unmarshal(readMetadataFixture(t, requiredFieldsFixture), &published); err != nil {
+		t.Fatalf("decode %s: %v", requiredFieldsFixture, err)
+	}
+	if len(published) == 0 {
+		// A file that decoded to nothing would agree with an empty list on this
+		// side, which is the one shape that must not read as agreement.
+		t.Fatalf("%s names no fields at all", requiredFieldsFixture)
+	}
+
+	ours := map[string]bool{}
+	for _, field := range requiredMetadataFields {
+		if ours[field] {
+			t.Fatalf("requiredMetadataFields names %q twice", field)
+		}
+		ours[field] = true
+	}
+
+	theirs := map[string]bool{}
+	for _, field := range published {
+		theirs[field] = true
+	}
+
+	var missing, extra []string
+	for field := range theirs {
+		if !ours[field] {
+			missing = append(missing, field)
+		}
+	}
+	for field := range ours {
+		if !theirs[field] {
+			extra = append(extra, field)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+
+	if len(missing) > 0 {
+		t.Errorf("the node requires %v and this side does not name them. A write from here may omit "+
+			"one, and the row it produces stops decoding on the node in every read path at once. "+
+			"Add them to requiredMetadataFields", missing)
+	}
+	if len(extra) > 0 {
+		t.Errorf("this side names %v and the node does not require them. Either the node dropped a "+
+			"requirement and %s was regenerated, or these names were never right",
+			extra, requiredFieldsFixture)
 	}
 }

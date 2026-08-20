@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 	pausedregistry "agentenv/services/scheduler/internal/registry"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -58,7 +60,11 @@ type fakeStore struct {
 	lastHeld []pausedregistry.HeldSandbox
 	lastGen  int64
 	lastMeta json.RawMessage
-	reclaims int
+	// lastExecution is what the handler passed down as the incarnation, so a
+	// test can assert the value reached the store rather than only that the
+	// call was accepted.
+	lastExecution string
+	reclaims      int
 }
 
 func (f *fakeStore) record(name string) {
@@ -78,9 +84,14 @@ func (f *fakeStore) called(name string) bool {
 	return false
 }
 
+// rsExecution is the incarnation the fenced transitions carry. Its shape is
+// what the node sends: canonical, lower case, v7.
+const rsExecution = "00000001-0000-7000-8000-00000000000a"
+
 func (f *fakeStore) BeginPause(_ context.Context, in pausedregistry.BeginPauseInput) (pausedregistry.BeganPause, error) {
 	f.record("BeginPause")
 	f.lastMeta = in.Metadata
+	f.lastExecution = in.ExecutionID
 	return f.began, f.err
 }
 
@@ -110,8 +121,9 @@ func (f *fakeStore) GetMany(_ context.Context, _ string, ids []string) (pausedre
 	return pausedregistry.Rows{Entries: f.entries, Covered: ids, Now: f.now}, nil
 }
 
-func (f *fakeStore) ClaimForResume(_ context.Context, _, _, _ string) (pausedregistry.ResumeClaim, error) {
+func (f *fakeStore) ClaimForResume(_ context.Context, _, _, _, executionID string) (pausedregistry.ResumeClaim, error) {
 	f.record("ClaimForResume")
+	f.lastExecution = executionID
 	if f.err != nil {
 		return pausedregistry.ResumeClaim{}, f.err
 	}
@@ -133,8 +145,9 @@ func (f *fakeStore) RenewLease(_ context.Context, _, _ string, held []pausedregi
 	return f.renewed, nil
 }
 
-func (f *fakeStore) MarkRunning(_ context.Context, _, _, _ string, expiresAt *time.Time) (pausedregistry.MarkRunningOutcome, error) {
+func (f *fakeStore) MarkRunning(_ context.Context, _, _, _, executionID string, expiresAt *time.Time) (pausedregistry.MarkRunningOutcome, error) {
 	f.record("MarkRunning")
+	f.lastExecution = executionID
 	f.lastExpiresAt = expiresAt
 	if f.err != nil {
 		return pausedregistry.MarkRunningUntracked, f.err
@@ -440,11 +453,15 @@ func TestATransitionRefusesFieldsItsKindNeverWrites(t *testing.T) {
 			MetadataJson: metadata}},
 		{"remove without a generation", &schedulerv1.TransitionSandboxRequest{
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE}},
-		// 🔴 The unconditional delete is refused outright rather than served as
-		// a compatibility case. A node still asking for it is a node still
-		// deciding for itself whether somebody else's sandbox may be destroyed.
-		{"the unconditional remove", &schedulerv1.TransitionSandboxRequest{
-			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE_UNCONDITIONAL}},
+		// 🔴 6 is the reserved number the unconditional delete used to have. It
+		// is refused outright rather than served as a compatibility case: a
+		// node still asking for it is a node still deciding for itself whether
+		// somebody else's sandbox may be destroyed. The constant is gone from
+		// the proto, so the number is quoted directly — the assertion has to
+		// outlive the enum entry, or "one branch fewer" quietly becomes "one
+		// gate fewer".
+		{"the unconditional remove (reserved 6)", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind(6)}},
 		{"mark_running with a generation", &schedulerv1.TransitionSandboxRequest{
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExpectGeneration: &gen}},
 		{"complete_pause with metadata", &schedulerv1.TransitionSandboxRequest{
@@ -522,6 +539,7 @@ func TestBeginPauseCarriesMetadataThroughUntouched(t *testing.T) {
 	resp, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
 		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
 		Kind: schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE, MetadataJson: metadata,
+		ExecutionId: rsExecution,
 	})
 	if err != nil {
 		t.Fatalf("begin_pause failed: %v", err)
@@ -564,7 +582,7 @@ func TestAnUntrackedSandboxIsASuccessfulAnswer(t *testing.T) {
 		t.Helper()
 		resp, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
 			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
-			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING,
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExecutionId: rsExecution,
 		})
 		if err != nil {
 			t.Fatalf("mark_running was reported as a failure: %v", err)
@@ -670,7 +688,7 @@ func TestAllFourClaimOutcomesReachTheWire(t *testing.T) {
 			svc := newTestRegistryService(t, store)
 
 			resp, err := svc.AcquireSandbox(context.Background(), &schedulerv1.AcquireSandboxRequest{
-				ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+				ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, ExecutionId: rsExecution,
 			})
 			if err != nil {
 				t.Fatalf("acquire failed: %v", err)
@@ -687,7 +705,7 @@ func TestAClaimWithNoEntryIsAFailure(t *testing.T) {
 	svc := newTestRegistryService(t, store)
 
 	resp, err := svc.AcquireSandbox(context.Background(), &schedulerv1.AcquireSandboxRequest{
-		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, ExecutionId: rsExecution,
 	})
 	if err == nil {
 		t.Fatalf("a claim with no entry was granted: %+v", resp)
@@ -748,7 +766,7 @@ func TestTheCallersLeaseLengthReachesTheStore(t *testing.T) {
 	if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
 		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
 		Kind:         schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
-		MetadataJson: json.RawMessage(`{"id":"s"}`), LeaseTtlMillis: 120_000,
+		MetadataJson: json.RawMessage(`{"id":"s"}`), LeaseTtlMillis: 120_000, ExecutionId: rsExecution,
 	}); err != nil {
 		t.Fatalf("begin_pause failed: %v", err)
 	}
@@ -758,7 +776,7 @@ func TestTheCallersLeaseLengthReachesTheStore(t *testing.T) {
 
 	store.leaseTTL = 0
 	if _, err := svc.AcquireSandbox(context.Background(), &schedulerv1.AcquireSandboxRequest{
-		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, LeaseTtlMillis: 45_000,
+		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, LeaseTtlMillis: 45_000, ExecutionId: rsExecution,
 	}); err != nil {
 		t.Fatalf("acquire failed: %v", err)
 	}
@@ -891,6 +909,7 @@ func TestALeaseTooShortToBeMeantIsRaisedNotRefused(t *testing.T) {
 				Kind:           schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
 				MetadataJson:   json.RawMessage(`{"id":"s"}`),
 				LeaseTtlMillis: tc.reported,
+				ExecutionId:    rsExecution,
 			}); err != nil {
 				t.Fatalf("a reported lease of %dms was refused: %v", tc.reported, err)
 			}
@@ -925,11 +944,11 @@ func TestTheFloorAppliesToEveryPathThatStampsALease(t *testing.T) {
 	gen := int64(4)
 
 	transitions := []*schedulerv1.TransitionSandboxRequest{
-		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE, MetadataJson: json.RawMessage(`{"id":"s"}`)},
+		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE, MetadataJson: json.RawMessage(`{"id":"s"}`), ExecutionId: rsExecution},
 		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_COMPLETE_PAUSE, ExpectGeneration: &gen, SnapshotId: rsSnap},
 		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY, ExpectGeneration: &gen},
 		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM, ExpectGeneration: &gen},
-		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING},
+		{Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExecutionId: rsExecution},
 	}
 	for _, req := range transitions {
 		t.Run(req.GetKind().String(), func(t *testing.T) {
@@ -952,7 +971,7 @@ func TestTheFloorAppliesToEveryPathThatStampsALease(t *testing.T) {
 		svc := NewPausedRegistryService(zap.NewNop(), store, nil, rsCluster, 90*time.Second, floor)
 
 		if _, err := svc.AcquireSandbox(context.Background(), &schedulerv1.AcquireSandboxRequest{
-			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, LeaseTtlMillis: 1,
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, LeaseTtlMillis: 1, ExecutionId: rsExecution,
 		}); err != nil {
 			t.Fatalf("acquire failed: %v", err)
 		}
@@ -986,11 +1005,188 @@ func TestAZeroFloorFallsBackToTheDefault(t *testing.T) {
 	if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
 		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
 		Kind:         schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
-		MetadataJson: json.RawMessage(`{"id":"s"}`), LeaseTtlMillis: 1,
+		MetadataJson: json.RawMessage(`{"id":"s"}`), LeaseTtlMillis: 1, ExecutionId: rsExecution,
 	}); err != nil {
 		t.Fatalf("begin_pause failed: %v", err)
 	}
 	if store.leaseTTL != defaultLeaseTTLFloor {
 		t.Fatalf("stamped %s, want the default floor %s", store.leaseTTL, defaultLeaseTTLFloor)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The identity axis at the contract layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestATransitionWithoutAnExecutionIsRefused — T-A3-7.
+//
+// 🔴 The two fenced kinds require the field; the other four refuse it. Stated
+// kind by kind rather than as "checked when present", because an optional
+// fencing token needs a "missing means allowed" branch and that branch is the
+// whole attack surface.
+func TestATransitionWithoutAnExecutionIsRefused(t *testing.T) {
+	gen := int64(4)
+
+	cases := []struct {
+		name string
+		req  *schedulerv1.TransitionSandboxRequest
+	}{
+		{"begin_pause without an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind:         schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
+			MetadataJson: json.RawMessage(`{"id":"s"}`)}},
+		{"mark_running without an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING}},
+		// The other four refuse the field outright: it means nothing for them,
+		// and a caller that sent it would believe a write was fenced that never
+		// was.
+		{"complete_pause with an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind:             schedulerv1.TransitionKind_TRANSITION_KIND_COMPLETE_PAUSE,
+			ExpectGeneration: &gen, SnapshotId: rsSnap, ExecutionId: rsExecution}},
+		{"mark_local_only with an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind:             schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY,
+			ExpectGeneration: &gen, ExecutionId: rsExecution}},
+		{"release_claim with an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind:             schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM,
+			ExpectGeneration: &gen, ExecutionId: rsExecution}},
+		{"remove with an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind:             schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE,
+			ExpectGeneration: &gen, ExecutionId: rsExecution}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{began: pausedregistry.BeganPause{Generation: 1}}
+			svc := newTestRegistryService(t, store)
+
+			tc.req.ClusterId, tc.req.SandboxId, tc.req.NodeId = rsCluster, rsSandbox, rsNode
+			_, err := svc.TransitionSandbox(context.Background(), tc.req)
+			if codeOf(err) != codes.InvalidArgument {
+				t.Fatalf("expected InvalidArgument, got %s (%v)", codeOf(err), err)
+			}
+			if len(store.calls) != 0 {
+				t.Fatalf("the request reached the store anyway: %v", store.calls)
+			}
+		})
+	}
+}
+
+// TestTheFencedKindsPassTheExecutionDown is the control for the test above: the
+// field is not merely demanded, it arrives.
+func TestTheFencedKindsPassTheExecutionDown(t *testing.T) {
+	t.Run("begin_pause", func(t *testing.T) {
+		store := &fakeStore{began: pausedregistry.BeganPause{Generation: 1}}
+		svc := newTestRegistryService(t, store)
+		if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind:         schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
+			MetadataJson: json.RawMessage(`{"id":"s"}`), ExecutionId: rsExecution,
+		}); err != nil {
+			t.Fatalf("begin_pause failed: %v", err)
+		}
+		if store.lastExecution != rsExecution {
+			t.Fatalf("the store was given %q, want %q", store.lastExecution, rsExecution)
+		}
+	})
+
+	t.Run("mark_running", func(t *testing.T) {
+		store := &fakeStore{markRunning: pausedregistry.MarkRunningAdopted}
+		svc := newTestRegistryService(t, store)
+		if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExecutionId: rsExecution,
+		}); err != nil {
+			t.Fatalf("mark_running failed: %v", err)
+		}
+		if store.lastExecution != rsExecution {
+			t.Fatalf("the store was given %q, want %q", store.lastExecution, rsExecution)
+		}
+	})
+
+	// 🔴 The claim is where an incarnation is allocated, so it is required
+	// there too — and it is the value the node reads back and starts the VM
+	// under.
+	t.Run("acquire", func(t *testing.T) {
+		store := &fakeStore{claim: pausedregistry.ResumeClaim{Outcome: pausedregistry.ClaimOutcomeNotFound}}
+		svc := newTestRegistryService(t, store)
+		if _, err := svc.AcquireSandbox(context.Background(), &schedulerv1.AcquireSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode, ExecutionId: rsExecution,
+		}); err != nil {
+			t.Fatalf("acquire failed: %v", err)
+		}
+		if store.lastExecution != rsExecution {
+			t.Fatalf("the store was given %q, want %q", store.lastExecution, rsExecution)
+		}
+	})
+
+	t.Run("acquire without one", func(t *testing.T) {
+		store := &fakeStore{claim: pausedregistry.ResumeClaim{Outcome: pausedregistry.ClaimOutcomeNotFound}}
+		svc := newTestRegistryService(t, store)
+		_, err := svc.AcquireSandbox(context.Background(), &schedulerv1.AcquireSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+		})
+		if codeOf(err) != codes.InvalidArgument {
+			t.Fatalf("expected InvalidArgument, got %s (%v)", codeOf(err), err)
+		}
+		if len(store.calls) != 0 {
+			t.Fatalf("the claim reached the store with no incarnation to allocate: %v", store.calls)
+		}
+	})
+}
+
+// TestExecutionFencedIsPermissionDenied — T-A3-6.
+//
+// 🔴 Never Aborted. The node's handler for Aborted is to re-read and try
+// again, and a re-read after a fenced write hands it the live incarnation's
+// generation — with which the same write goes straight through.
+func TestExecutionFencedIsPermissionDenied(t *testing.T) {
+	got := registryErrorCode(fmt.Errorf("wrapped: %w", pausedregistry.ErrExecutionFenced))
+	if got != codes.PermissionDenied {
+		t.Fatalf("ErrExecutionFenced maps to %s, want %s", got, codes.PermissionDenied)
+	}
+	if got == codes.Aborted {
+		t.Fatal("a fenced write maps to the code the node retries around")
+	}
+	// The control: the version axis still maps to the retryable code, so this
+	// is not a build that collapsed both onto one answer.
+	if generation := registryErrorCode(pausedregistry.ErrGenerationConflict); generation != codes.Aborted {
+		t.Fatalf("ErrGenerationConflict maps to %s, want %s", generation, codes.Aborted)
+	}
+}
+
+// TestAFencedWriteReachesTheWireAsPermissionDenied is the same statement made
+// through the handler, so a mapping that exists but is never consulted fails
+// here.
+func TestAFencedWriteReachesTheWireAsPermissionDenied(t *testing.T) {
+	store := &fakeStore{err: fmt.Errorf("sandbox belongs to another incarnation: %w", pausedregistry.ErrExecutionFenced)}
+	svc := newTestRegistryService(t, store)
+
+	_, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+		Kind:         schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
+		MetadataJson: json.RawMessage(`{"id":"s"}`), ExecutionId: rsExecution,
+	})
+	if codeOf(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %s (%v)", codeOf(err), err)
+	}
+}
+
+// TestACheckViolationIsNotReportedAsUnavailable.
+//
+// The execution CHECK is the one constraint a statement of ours can trip. It
+// falls to FailedPrecondition — an operator with a psql prompt — rather than to
+// the default arm, which reads as "try again later" and would put every node
+// into a retry loop over a write that can never succeed.
+func TestACheckViolationIsNotReportedAsUnavailable(t *testing.T) {
+	violation := &pgconn.PgError{Code: "23514", ConstraintName: "paused_sandboxes_execution_check"}
+	got := registryErrorCode(fmt.Errorf("registry begin_pause: %w", violation))
+	if got != codes.FailedPrecondition {
+		t.Fatalf("a CHECK violation maps to %s, want %s", got, codes.FailedPrecondition)
+	}
+
+	// The control: an unrecognised database error is still Unavailable, so this
+	// is not a build that stopped retrying everything.
+	other := &pgconn.PgError{Code: "08006"}
+	if got := registryErrorCode(fmt.Errorf("registry begin_pause: %w", other)); got != codes.Unavailable {
+		t.Fatalf("a connection failure maps to %s, want %s", got, codes.Unavailable)
 	}
 }

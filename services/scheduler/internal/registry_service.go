@@ -11,12 +11,79 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 	pausedregistry "agentenv/services/scheduler/internal/registry"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// registryWriteFencingEnabled is the resident answer to "is the half that
+// costs a workspace switched on".
+//
+// 🔴 A gauge rather than a log line at start-up, because the question is asked
+// months later, in the middle of an incident, about a process nobody has the
+// logs of any more.
+var registryWriteFencingEnabled = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "agentenv_scheduler_registry_write_fencing_enabled",
+	Help: "1 when begin_pause and mark_running carry their identity-axis predicates, 0 when scheduler.registry.write_fencing has switched them off. Zero means a superseded incarnation can overwrite the row of the one that replaced it.",
+})
+
+// registryWriteSurfaceEnabled says whether this process assembled the write
+// surface at all.
+//
+// 🔴 It exists because the gauge above cannot answer that on its own, and used
+// to be read as though it could. SetRegistryWriteFencingEnabled is called from
+// createRegistryStore, which returns early on a query-only replica and on a
+// cluster with write_enabled=false — so "fencing is switched off" and "there is
+// no write surface here to switch it off on" both read 0. An alerting rule on
+// the fencing gauge fires forever on every read-only replica, and an operator
+// reading it during an incident cannot tell which cluster they are looking at.
+//
+// Set explicitly on every start-up path, 1 or 0, rather than left at the
+// default: a gauge whose 0 sometimes means "nobody wrote it" is the exact
+// ambiguity this is here to remove. And a gauge, not a sentinel value in the
+// one above — a -1 or a NaN in there would be taken for a number and compared
+// with one sooner or later.
+//
+// The three of them together, read as a tuple with
+// agentenv_scheduler_registry_enabled:
+//
+//	0 / 0 / 0  no DSN: the whole feature is off
+//	1 / 0 / 0  configured, but this process does not write — write_enabled=false
+//	           or a --query-only replica
+//	1 / 1 / 1  writing, with the identity-axis predicates on
+//	1 / 1 / 0  🔴 writing, with them off: the one shape that needs attention
+//
+// 1 here does not mean the surface is serving: a write surface with no cluster
+// id is assembled and stays cold. That distinction is /healthz's `phase`, which
+// is the only thing that can report it.
+var registryWriteSurfaceEnabled = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "agentenv_scheduler_registry_write_surface_enabled",
+	Help: "1 when this process assembled the paused-registry write surface, 0 when it did not (no DSN, scheduler.registry.write_enabled=false, or a --query-only replica). Read agentenv_scheduler_registry_write_fencing_enabled only where this is 1: below it, that gauge's 0 means 'no write surface', not 'fencing off'.",
+})
+
+// SetRegistryWriteFencingEnabled publishes the setting. Called once at
+// start-up, on every path — including the ones that build no write surface,
+// where it reports 0 as a fact rather than leaving it at the default.
+func SetRegistryWriteFencingEnabled(enabled bool) {
+	value := 0.0
+	if enabled {
+		value = 1
+	}
+	registryWriteFencingEnabled.Set(value)
+}
+
+// SetRegistryWriteSurfaceEnabled publishes whether the write surface was built.
+// Called once at start-up, on every path.
+func SetRegistryWriteSurfaceEnabled(enabled bool) {
+	value := 0.0
+	if enabled {
+		value = 1
+	}
+	registryWriteSurfaceEnabled.Set(value)
+}
 
 var registryLeaseTTLClamped = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "agentenv_scheduler_registry_write_lease_ttl_clamped_total",
@@ -195,11 +262,16 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		if len(req.GetMetadataJson()) == 0 {
 			return nil, s.fail("TransitionSandbox", fmt.Errorf("%w: begin_pause carries no metadata", pausedregistry.ErrInvalidArgument))
 		}
+		execution, err := requireExecution(req)
+		if err != nil {
+			return nil, s.fail("TransitionSandbox", err)
+		}
 		began, err := store.BeginPause(ctx, pausedregistry.BeginPauseInput{
 			ClusterID:    req.GetClusterId(),
 			SandboxID:    req.GetSandboxId(),
 			OriginNodeID: req.GetNodeId(),
 			Metadata:     req.GetMetadataJson(),
+			ExecutionID:  execution,
 		})
 		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
@@ -211,7 +283,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		}, nil
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_COMPLETE_PAUSE:
-		if err := rejectFields(req, fieldMetadata); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldExecution); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -224,7 +296,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		return s.ok("TransitionSandbox")
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY:
-		if err := rejectFields(req, fieldMetadata|fieldSnapshot); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -237,7 +309,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		return s.ok("TransitionSandbox")
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM:
-		if err := rejectFields(req, fieldMetadata|fieldSnapshot); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -267,6 +339,10 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		if err := rejectFields(req, fieldGeneration|fieldMetadata|fieldSnapshot); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
+		execution, err := requireExecution(req)
+		if err != nil {
+			return nil, s.fail("TransitionSandbox", err)
+		}
 		var expiresAt *time.Time
 		if req.SandboxExpiresAtUnixMicros != nil {
 			// Absent is not zero. Absent means the sandbox was asked never to
@@ -275,7 +351,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 			deadline := time.UnixMicro(req.GetSandboxExpiresAtUnixMicros()).UTC()
 			expiresAt = &deadline
 		}
-		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId(), expiresAt)
+		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId(), execution, expiresAt)
 		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
@@ -296,7 +372,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		}, nil
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE:
-		if err := rejectFields(req, fieldMetadata|fieldSnapshot); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -321,15 +397,6 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		}
 		registryWriteRPCs.WithLabelValues("TransitionSandbox", codes.OK.String()).Inc()
 		return &schedulerv1.TransitionSandboxResponse{Removed: removed}, nil
-
-	case schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE_UNCONDITIONAL:
-		// 🔴 Refused, not served. This build has no unconditional delete: the
-		// guard used to be the caller reading the row first, and a node that
-		// still asks for this one is a node still deciding for itself whether
-		// somebody else's sandbox may be destroyed.
-		return nil, s.fail("TransitionSandbox",
-			fmt.Errorf("%w: the unconditional remove is no longer served; quote a generation",
-				pausedregistry.ErrInvalidArgument))
 
 	default:
 		return nil, s.fail("TransitionSandbox",
@@ -406,6 +473,7 @@ const (
 	fieldGeneration requestField = 1 << iota
 	fieldMetadata
 	fieldSnapshot
+	fieldExecution
 )
 
 // rejectFields refuses a request that carries a field its kind never writes.
@@ -427,7 +495,29 @@ func rejectFields(req *schedulerv1.TransitionSandboxRequest, unused requestField
 		return fmt.Errorf("%w: %v names a snapshot, which only complete_pause records",
 			pausedregistry.ErrInvalidArgument, req.GetKind())
 	}
+	if unused&fieldExecution != 0 && strings.TrimSpace(req.GetExecutionId()) != "" {
+		return fmt.Errorf("%w: %v names an incarnation, which only begin_pause and mark_running are fenced on",
+			pausedregistry.ErrInvalidArgument, req.GetKind())
+	}
 	return nil
+}
+
+// requireExecution refuses a fenced write that names no incarnation.
+//
+// 🔴 Required rather than optional, and the two kinds that require it say so
+// one by one instead of the field being "checked when present". e2b's
+// equivalent is opt-in for a reason that does not apply to us — an empty value
+// there means "act on a fresh read, or on the user's direct instruction", and
+// every caller on this path is the controller telling a node what to do. An
+// optional fencing token needs a "missing means allowed" branch, and that
+// branch is the entire attack surface.
+func requireExecution(req *schedulerv1.TransitionSandboxRequest) (string, error) {
+	v := strings.TrimSpace(req.GetExecutionId())
+	if v == "" {
+		return "", fmt.Errorf("%w: %v carries no execution id, and every write this build fences does",
+			pausedregistry.ErrInvalidArgument, req.GetKind())
+	}
+	return v, nil
 }
 
 func requireGeneration(req *schedulerv1.TransitionSandboxRequest) (int64, error) {
@@ -454,8 +544,19 @@ func (s *PausedRegistryService) AcquireSandbox(ctx context.Context, req *schedul
 		return nil, s.fail("AcquireSandbox", err)
 	}
 
+	execution := strings.TrimSpace(req.GetExecutionId())
+	if execution == "" {
+		// 🔴 The claim is where an incarnation is allocated, not where the VM
+		// starts. A claim that named none would leave a `resuming` row with a
+		// NULL in a column the CHECK constraint requires, and mark_running
+		// would have nothing to check itself against.
+		return nil, s.fail("AcquireSandbox",
+			fmt.Errorf("%w: acquire carries no execution id, and the claim is what allocates one",
+				pausedregistry.ErrInvalidArgument))
+	}
+
 	store := s.leaseStore(req.GetLeaseTtlMillis())
-	claim, err := store.ClaimForResume(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId())
+	claim, err := store.ClaimForResume(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId(), execution)
 	if err != nil {
 		return nil, s.fail("AcquireSandbox", err)
 	}
@@ -687,7 +788,29 @@ func registryErrorCode(err error) codes.Code {
 		return codes.InvalidArgument
 	case errors.Is(err, pausedregistry.ErrGenerationConflict):
 		return codes.Aborted
-	case errors.Is(err, pausedregistry.ErrInvalidRecord):
+	case errors.Is(err, pausedregistry.ErrExecutionFenced):
+		// 🔴 Never Aborted. The node's handler for Aborted is to re-read and
+		// try again, and a re-read here hands it the *live* incarnation's
+		// generation — with which the same write goes straight through. The
+		// two failures leave the table equally unchanged and call for opposite
+		// responses, so they carry opposite codes.
+		//
+		// PermissionDenied says, word for word, "you are not the entity
+		// entitled to do this". FailedPrecondition is taken by ErrInvalidRecord
+		// and means "nobody can repair this row"; NotFound would collide with
+		// MarkRunningUntracked, which is a perfectly ordinary answer.
+		//
+		// 🔴 This code belongs to PausedRegistryService alone. The gateway's
+		// scheduler error mapping has no branch for it and renders it as 502,
+		// so no method of the Scheduler service may ever return it.
+		return codes.PermissionDenied
+	case errors.Is(err, pausedregistry.ErrInvalidRecord), isCheckViolation(err):
+		// A CHECK violation is a row this build's own statements produced and
+		// its own constraint refused, which is the same class of fault as a row
+		// it cannot decode: an operator with a psql prompt, not a retry.
+		// Without this arm it would fall to the default and read as
+		// "unavailable", sending every node into a retry loop over a write that
+		// cannot ever succeed.
 		return codes.FailedPrecondition
 	case errors.Is(err, pausedregistry.ErrNotReady), errors.Is(err, pausedregistry.ErrGracePeriod):
 		return codes.Unavailable
@@ -698,6 +821,17 @@ func registryErrorCode(err error) codes.Code {
 	default:
 		return codes.Unavailable
 	}
+}
+
+// checkViolation is PostgreSQL's SQLSTATE for a CHECK constraint refusing a
+// row. Here it can only come from paused_sandboxes_execution_check: a statement
+// that moved a row to a live state without an incarnation, or to a parked one
+// with it.
+const checkViolation = "23514"
+
+func isCheckViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == checkViolation
 }
 
 // registryEntryToProto converts a row for the wire, without metadata.
@@ -717,6 +851,11 @@ func registryEntryToProto(entry pausedregistry.Entry) *schedulerv1.RegistryEntry
 		SnapshotId:          entry.SnapshotID,
 		PausedAtUnixMicros:  entry.PausedAt.UnixMicro(),
 		UpdatedAtUnixMicros: entry.UpdatedAt.UnixMicro(),
+		// 🔴 The node reads this back off a granted claim and starts the VM
+		// under it. Dropping it here does not degrade anything visibly — it
+		// makes every cross-node resume fail mark_running's first branch,
+		// because the node would have had to mint an incarnation of its own.
+		ExecutionId: entry.ExecutionID,
 	}
 }
 

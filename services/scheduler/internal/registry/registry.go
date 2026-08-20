@@ -86,6 +86,22 @@ type Sandbox struct {
 	// SandboxExpiresAt is the deadline the sandbox's own owner set. Only
 	// renew_lease writes it, and a NULL never matches a reclaim condition.
 	SandboxExpiresAt *time.Time
+	// ExecutionID names the incarnation living on this row: one VM instance's
+	// whole life, from the resume that allocated it to the pause that parks it.
+	// Empty means the column is NULL, which the table's CHECK pins to exactly
+	// the parked states — `paused` and `local_only`.
+	//
+	// 🔴 Empty is therefore not "unknown". It is a positive statement that the
+	// cluster believes no incarnation is alive here, and it is what makes every
+	// write claiming to be one fail on SQL's own three-valued logic rather than
+	// on a comparison somebody has to remember to write.
+	ExecutionID string
+	// ExecutionStartedAt is when that incarnation was installed.
+	//
+	// It exists because updated_at cannot serve as its stand-in: renew_lease
+	// stamps updated_at on every heartbeat, so a live row's updated_at is
+	// always fresh and any grace period measured from it never elapses.
+	ExecutionStartedAt *time.Time
 }
 
 // Holder returns the node this row makes authoritative for the sandbox.

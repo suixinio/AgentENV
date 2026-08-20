@@ -28,6 +28,12 @@ const (
 //
 // It is deliberately wider than the node's own ENTRY_COLUMNS: the two lease
 // columns are the whole point of reading this table centrally.
+//
+// 🔴 This is the second of two column lists over the same table — the write
+// path has its own in store_postgres.go. Adding a column to one and not the
+// other does not fail: it makes that column read as empty on whichever paths
+// use the list that was missed, which for the incarnation means fencing that
+// silently passes everything.
 const selectColumns = `sandbox_id::text,
        cluster_id::text,
        state,
@@ -38,7 +44,9 @@ const selectColumns = `sandbox_id::text,
        paused_at,
        updated_at,
        lease_expires_at,
-       sandbox_expires_at`
+       sandbox_expires_at,
+       execution_id::text,
+       execution_started_at`
 
 // Config configures a PostgresReader. A zero DSN is not valid here; callers
 // that may be switched off should use Disabled instead.
@@ -247,6 +255,7 @@ func scanSandbox(rows pgx.Rows) (Sandbox, error) {
 		state           string
 		claimedByNodeID *string
 		snapshotID      *string
+		executionID     *string
 	)
 	err := rows.Scan(
 		&sandbox.SandboxID,
@@ -260,6 +269,8 @@ func scanSandbox(rows pgx.Rows) (Sandbox, error) {
 		&sandbox.UpdatedAt,
 		&sandbox.LeaseExpiresAt,
 		&sandbox.SandboxExpiresAt,
+		&executionID,
+		&sandbox.ExecutionStartedAt,
 	)
 	if err != nil {
 		return Sandbox{}, fmt.Errorf("decode registry row: %w", err)
@@ -271,6 +282,9 @@ func scanSandbox(rows pgx.Rows) (Sandbox, error) {
 	}
 	if snapshotID != nil {
 		sandbox.SnapshotID = *snapshotID
+	}
+	if executionID != nil {
+		sandbox.ExecutionID = *executionID
 	}
 	return sandbox, nil
 }

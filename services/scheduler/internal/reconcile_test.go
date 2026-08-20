@@ -47,10 +47,23 @@ func (f *reconcileFixture) run(leaseWarnWindow time.Duration) registryReconcileR
 }
 
 func (f *reconcileFixture) roster(nodeID string, age time.Duration, sandboxIDs ...string) {
+	entries := make([]RosterEntry, 0, len(sandboxIDs))
+	for _, sandboxID := range sandboxIDs {
+		entries = append(entries, RosterEntry{SandboxID: sandboxID})
+	}
 	f.rosters = append(f.rosters, Roster{
-		NodeID:     nodeID,
-		SandboxIDs: sandboxIDs,
-		LastSeen:   f.localNow.Add(-age),
+		NodeID:   nodeID,
+		Entries:  entries,
+		LastSeen: f.localNow.Add(-age),
+	})
+}
+
+// rosterWithExecutions is the same, with the incarnations the node reported.
+func (f *reconcileFixture) rosterWithExecutions(nodeID string, age time.Duration, entries ...RosterEntry) {
+	f.rosters = append(f.rosters, Roster{
+		NodeID:   nodeID,
+		Entries:  entries,
+		LastSeen: f.localNow.Add(-age),
 	})
 }
 
@@ -697,5 +710,59 @@ func TestReconcileInputIsScopedByTheReadersOwnCluster(t *testing.T) {
 	}
 	if got := input.resolveNodeID("node-gone"); got != "node-gone" {
 		t.Fatalf("expected an unknown identity to be left alone, got %q", got)
+	}
+}
+
+// TestReconcileCountsExecutionMismatches.
+//
+// 🔴 The most direct signal in this pass that a sandbox is live twice: the row
+// and the machine disagree about which VM is the sandbox. It costs nothing —
+// the round already holds both sides — and it is what an orphan reaper will
+// eventually act on.
+func TestReconcileCountsExecutionMismatches(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		// The registry says node-a is running it under execNew.
+		{SandboxID: "s1", State: pausedregistry.StateRunning, OriginNodeID: "node-a",
+			ExecutionID: execNew, LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Agreed: no mismatch.
+		{SandboxID: "s2", State: pausedregistry.StateRunning, OriginNodeID: "node-a",
+			ExecutionID: execOld, LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// The node reports an incarnation, the row names none. Not a mismatch:
+		// a parked row names none by construction, and counting it would make
+		// this series report every ordinary pause.
+		{SandboxID: "s3", State: pausedregistry.StatePaused, OriginNodeID: "node-a",
+			SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+	}
+	f.rosterWithExecutions("node-a", time.Second,
+		RosterEntry{SandboxID: "s1", ExecutionID: execOld},
+		RosterEntry{SandboxID: "s2", ExecutionID: execOld},
+		RosterEntry{SandboxID: "s3", ExecutionID: execNew},
+	)
+
+	result := f.run(time.Minute)
+	if got := result.executionMismatch["node-a"]; got != 1 {
+		t.Fatalf("execution mismatches for node-a: got %d, want 1 (%+v)", got, result.executionMismatch)
+	}
+}
+
+// TestReconcileDoesNotCountAMismatchAgainstANodeTooOldToReportOne is the
+// control, and the reason this series has to be read beside the legacy roster
+// counter.
+//
+// 🟢 Without it, a build that counted "the node reported nothing" as a
+// disagreement would report every sandbox on every pre-incarnation node as a
+// double-live, for the whole length of a rollout.
+func TestReconcileDoesNotCountAMismatchAgainstANodeTooOldToReportOne(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		{SandboxID: "s1", State: pausedregistry.StateRunning, OriginNodeID: "node-a",
+			ExecutionID: execNew, LeaseExpiresAt: at(f.dbNow, time.Hour)},
+	}
+	f.roster("node-a", time.Second, "s1")
+
+	result := f.run(time.Minute)
+	if got := result.executionMismatch["node-a"]; got != 0 {
+		t.Fatalf("a node that reported no incarnation was counted as disagreeing: %d", got)
 	}
 }

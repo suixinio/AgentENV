@@ -28,7 +28,7 @@ type NodeRegistry interface {
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
 	// RosterOf returns the sandbox roster a node reported in its last
 	// heartbeat, and when it reported it.
-	RosterOf(nodeID string) ([]string, time.Time, bool)
+	RosterOf(nodeID string) ([]RosterEntry, time.Time, bool)
 	// NodesHolding returns every node whose last heartbeat listed this
 	// sandbox. More than one is normal during a cross-node takeover: the
 	// origin keeps its paused record until its own reconciliation drops it.
@@ -52,9 +52,22 @@ type NodeRegistry interface {
 // heartbeat. That is a real and reportable state, not a placeholder: a machine
 // that came up and never checked in is exactly the one an operator needs to see.
 type Roster struct {
-	NodeID     string
-	SandboxIDs []string
-	LastSeen   time.Time
+	NodeID string
+	// Entries carries the incarnation each sandbox is reported under alongside
+	// its id. 🔴 The pair travels together: a roster of bare ids can say where
+	// a sandbox is but not whether what is there is the copy the cluster
+	// believes in, and that is the difference between routing and guessing.
+	Entries  []RosterEntry
+	LastSeen time.Time
+}
+
+// SandboxIDs is the ids alone, for the consumers that only need the set.
+func (r Roster) SandboxIDs() []string {
+	ids := make([]string, 0, len(r.Entries))
+	for _, entry := range r.Entries {
+		ids = append(ids, entry.SandboxID)
+	}
+	return ids
 }
 
 var (
@@ -67,8 +80,8 @@ type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
-	// sandboxIDs is the roster from this node's last heartbeat, normalised.
-	sandboxIDs []string
+	// entries is the roster from this node's last heartbeat, normalised.
+	entries []RosterEntry
 	// lastSeen duplicates node.LastSeenUnixMs as a time.Time so roster
 	// freshness is decided without a millisecond round trip.
 	lastSeen time.Time
@@ -252,10 +265,10 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		},
 		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
 		reportTTL:   r.observedTTL,
-		sandboxIDs:  normalizeRoster(req.GetSandboxIds()),
+		entries:     normalizeHeartbeatRoster(req),
 		lastSeen:    now,
 	}
-	r.applyRosterLocked(nodeID, record.sandboxIDs)
+	r.applyRosterLocked(nodeID, record.entries)
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
 	}
@@ -448,7 +461,7 @@ func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID
 }
 
 // RosterOf returns a copy of a node's last reported roster.
-func (r *AtomicNodeRegistry) RosterOf(nodeID string) ([]string, time.Time, bool) {
+func (r *AtomicNodeRegistry) RosterOf(nodeID string) ([]RosterEntry, time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -456,7 +469,7 @@ func (r *AtomicNodeRegistry) RosterOf(nodeID string) ([]string, time.Time, bool)
 	if !ok {
 		return nil, time.Time{}, false
 	}
-	return append([]string(nil), record.sandboxIDs...), record.lastSeen, true
+	return append([]RosterEntry(nil), record.entries...), record.lastSeen, true
 }
 
 // NodesHolding returns the nodes whose last heartbeat listed this sandbox,
@@ -509,9 +522,9 @@ func (r *AtomicNodeRegistry) RostersInCluster(clusterID string) []Roster {
 			continue
 		}
 		rosters = append(rosters, Roster{
-			NodeID:     nodeID,
-			SandboxIDs: append([]string(nil), record.sandboxIDs...),
-			LastSeen:   record.lastSeen,
+			NodeID:   nodeID,
+			Entries:  append([]RosterEntry(nil), record.entries...),
+			LastSeen: record.lastSeen,
 		})
 	}
 	for nodeID := range r.nodesByID {
@@ -536,17 +549,17 @@ func normalizeClusterID(clusterID string) string {
 
 // applyRosterLocked moves a node from its previous roster to a new one,
 // keeping the reverse index in step. r.mu must be held by the caller.
-func (r *AtomicNodeRegistry) applyRosterLocked(nodeID string, roster []string) {
+func (r *AtomicNodeRegistry) applyRosterLocked(nodeID string, roster []RosterEntry) {
 	next := make(map[string]struct{}, len(roster))
-	for _, sandboxID := range roster {
-		next[sandboxID] = struct{}{}
+	for _, entry := range roster {
+		next[entry.SandboxID] = struct{}{}
 	}
 
-	for _, sandboxID := range r.observed[nodeID].sandboxIDs {
-		if _, ok := next[sandboxID]; ok {
+	for _, entry := range r.observed[nodeID].entries {
+		if _, ok := next[entry.SandboxID]; ok {
 			continue
 		}
-		r.removeHolderLocked(sandboxID, nodeID)
+		r.removeHolderLocked(entry.SandboxID, nodeID)
 	}
 
 	for sandboxID := range next {
@@ -562,8 +575,8 @@ func (r *AtomicNodeRegistry) applyRosterLocked(nodeID string, roster []string) {
 // clearRosterLocked drops a node from the reverse index entirely. r.mu must be
 // held by the caller.
 func (r *AtomicNodeRegistry) clearRosterLocked(nodeID string) {
-	for _, sandboxID := range r.observed[nodeID].sandboxIDs {
-		r.removeHolderLocked(sandboxID, nodeID)
+	for _, entry := range r.observed[nodeID].entries {
+		r.removeHolderLocked(entry.SandboxID, nodeID)
 	}
 }
 
@@ -578,15 +591,65 @@ func (r *AtomicNodeRegistry) removeHolderLocked(sandboxID string, nodeID string)
 	}
 }
 
-// normalizeRoster trims, drops blanks, and de-duplicates a reported roster so
-// the reverse index never carries an id the node did not really name.
-func normalizeRoster(sandboxIDs []string) []string {
-	if len(sandboxIDs) == 0 {
-		return nil
+// normalizeHeartbeatRoster is the one place a heartbeat's roster becomes the
+// scheduler's, and the only place the two generations of the field are
+// reconciled.
+//
+// 🔴 It does not count anything. The service layer counts, once, on the same
+// answer — this is called from the node registry as well, and a metric
+// incremented in both would report twice as many old nodes as there are.
+func normalizeHeartbeatRoster(req *schedulerv1.HeartbeatRequest) []RosterEntry {
+	entries, _ := rosterFromHeartbeat(req)
+	return entries
+}
+
+// rosterFromHeartbeat collapses the two generations of the roster field into
+// one shape, and says which one it used.
+//
+//	roster present                  → use it
+//	roster empty, sandbox_ids present → use those, with no incarnations
+//	both empty                        → a genuinely empty roster
+//
+// 🔴 The fallback is not politeness towards old builds, it is the difference
+// between a rolling upgrade and an outage. Nodes are a DaemonSet and roll one
+// at a time, so a scheduler that only read the new field would see an empty
+// roster from every node it has not reached yet — and an empty roster is not a
+// degraded report here, it is "this node holds nothing", which deletes every
+// binding that node owns. The sandboxes that then answer nothing are the ones
+// that have never been paused, because those have no registry row to fall back
+// to. The field goes when heartbeat_legacy_roster_total has been zero across a
+// release, not before.
+func rosterFromHeartbeat(req *schedulerv1.HeartbeatRequest) (entries []RosterEntry, legacy bool) {
+	if roster := req.GetRoster(); len(roster) > 0 {
+		out := make([]RosterEntry, 0, len(roster))
+		seen := make(map[string]struct{}, len(roster))
+		for _, item := range roster {
+			sandboxID := strings.TrimSpace(item.GetSandboxId())
+			if sandboxID == "" {
+				continue
+			}
+			if _, ok := seen[sandboxID]; ok {
+				continue
+			}
+			seen[sandboxID] = struct{}{}
+			out = append(out, RosterEntry{
+				SandboxID:   sandboxID,
+				ExecutionID: normalizeExecutionID(item.GetExecutionId()),
+			})
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		return out, false
 	}
-	seen := make(map[string]struct{}, len(sandboxIDs))
-	normalized := make([]string, 0, len(sandboxIDs))
-	for _, sandboxID := range sandboxIDs {
+
+	legacyIDs := req.GetSandboxIds() //nolint:staticcheck // the deprecated field is the rollout fallback; see the note above.
+	if len(legacyIDs) == 0 {
+		return nil, false
+	}
+	out := make([]RosterEntry, 0, len(legacyIDs))
+	seen := make(map[string]struct{}, len(legacyIDs))
+	for _, sandboxID := range legacyIDs {
 		sandboxID = strings.TrimSpace(sandboxID)
 		if sandboxID == "" {
 			continue
@@ -595,12 +658,61 @@ func normalizeRoster(sandboxIDs []string) []string {
 			continue
 		}
 		seen[sandboxID] = struct{}{}
-		normalized = append(normalized, sandboxID)
+		out = append(out, RosterEntry{SandboxID: sandboxID})
 	}
-	if len(normalized) == 0 {
-		return nil
+	if len(out) == 0 {
+		return nil, false
 	}
-	return normalized
+	return out, true
+}
+
+// normalizeExecutionID trims, checks the shape, and lower-cases.
+//
+// 🔴 A value that is not a canonical uuid is dropped rather than carried: the
+// arbitration orders these as strings, so anything that is not the shape it
+// expects would order unpredictably against everything else. The roster entry
+// itself is kept — losing a route to avoid an unfenced one is a bad trade — and
+// the drop is counted, because narrowing something without saying so is how a
+// fleet ends up with fencing that is not running.
+//
+// 🔴 The lower-casing is the part that looks cosmetic and is not: in ASCII
+// '0'-'9' < 'A'-'F' < 'a'-'f', so one upper-case id reverses the comparison and
+// the older incarnation wins.
+func normalizeExecutionID(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		recordRosterDropped("no_execution")
+		return ""
+	}
+	if !isCanonicalUUIDText(trimmed) {
+		recordRosterDropped("bad_uuid")
+		return ""
+	}
+	return strings.ToLower(trimmed)
+}
+
+// isCanonicalUUIDText is the shape check, deliberately narrow: the ids come
+// from a type whose Display is always canonical, so anything else on this path
+// came from a caller this build does not recognise.
+func isCanonicalUUIDText(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // deriveObservedNodeViewLocked builds the external ObservedNode view for a

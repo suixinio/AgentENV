@@ -10,9 +10,9 @@ func TestBindingStoreExpiresBindingsOnLookup(t *testing.T) {
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 	base := time.Unix(100, 0)
 
-	store.Record("sbx-1", node, base)
+	store.Record("sbx-1", Binding{Node: node}, base)
 
-	if got, ok, err := store.Get("sbx-1", base.Add(500*time.Millisecond)); err != nil || !ok || got.ID != node.ID {
+	if got, ok, err := store.Get("sbx-1", base.Add(500*time.Millisecond)); err != nil || !ok || got.Node.ID != node.ID {
 		t.Fatalf("expected binding before ttl expiry, got (%+v, %v, %v)", got, ok, err)
 	}
 	if _, ok, err := store.Get("sbx-1", base.Add(time.Second)); err != nil || ok {
@@ -28,17 +28,17 @@ func TestBindingStoreReconcileNodeRefreshesAndRemovesBindings(t *testing.T) {
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 	base := time.Unix(200, 0)
 
-	store.Record("sbx-1", node, base)
-	store.Record("sbx-2", node, base)
+	store.Record("sbx-1", Binding{Node: node}, base)
+	store.Record("sbx-2", Binding{Node: node}, base)
 
-	store.ReconcileNode(node, []string{"sbx-2", "sbx-3", "sbx-3", ""}, base.Add(time.Second))
+	store.ReconcileNode(node, rosterOf("sbx-2", "sbx-3", "sbx-3", ""), base.Add(time.Second))
 
 	if _, ok, err := store.Get("sbx-1", base.Add(2*time.Second)); err != nil || ok {
 		t.Fatalf("expected reconcile to remove sandbox missing from heartbeat roster, got ok=%v err=%v", ok, err)
 	}
 	for _, sandboxID := range []string{"sbx-2", "sbx-3"} {
 		got, ok, err := store.Get(sandboxID, base.Add(2*time.Second))
-		if err != nil || !ok || got.ID != node.ID {
+		if err != nil || !ok || got.Node.ID != node.ID {
 			t.Fatalf("expected %s to resolve to node-a, got (%+v, %v, %v)", sandboxID, got, ok, err)
 		}
 	}
@@ -51,16 +51,16 @@ func TestBindingStoreMovesBindingBetweenNodes(t *testing.T) {
 	store := NewInMemoryBindingStore(10 * time.Second)
 	base := time.Unix(300, 0)
 
-	store.Record("sbx-1", Node{ID: "node-a", Endpoint: "http://node-a"}, base)
-	store.Record("sbx-1", Node{ID: "node-b", Endpoint: "http://node-b"}, base.Add(time.Second))
+	store.Record("sbx-1", Binding{Node: Node{ID: "node-a", Endpoint: "http://node-a"}}, base)
+	store.Record("sbx-1", Binding{Node: Node{ID: "node-b", Endpoint: "http://node-b"}}, base.Add(time.Second))
 	store.ReconcileNode(Node{ID: "node-a", Endpoint: "http://node-a"}, nil, base.Add(2*time.Second))
 
 	got, ok, err := store.Get("sbx-1", base.Add(3*time.Second))
 	if err != nil || !ok {
 		t.Fatalf("expected moved binding to remain available, got ok=%v err=%v", ok, err)
 	}
-	if got.ID != "node-b" {
-		t.Fatalf("expected binding to move to node-b, got %q", got.ID)
+	if got.Node.ID != "node-b" {
+		t.Fatalf("expected binding to move to node-b, got %q", got.Node.ID)
 	}
 }
 

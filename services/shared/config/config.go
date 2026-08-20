@@ -13,6 +13,21 @@ import (
 
 const defaultSchedulerArtifactStoreCapacity = 1_000_000
 
+// defaultSchedulerMaxProjectionTTL caps how long a node may ask this scheduler
+// to keep a routing projection.
+//
+// 🔴 25 hours, not the node's own 24-hour lifetime ceiling, and the extra hour
+// is the point. A node computes its budget as "time left on the sandbox's life,
+// plus a grace period so the record outlives the sandbox rather than dying just
+// before it". Capping at exactly 24 hours would clamp every record by precisely
+// that grace — undoing what the grace is for, and pinning the "clamped" counter
+// at 100% so it could never signal a real misconfiguration.
+//
+// 🔴 It is a storage owner's limit on writers. It is not a second definition of
+// how long a sandbox lives; that stays on the node, in one place, because a
+// second copy would drift and the drift would look exactly like a cold cache.
+const defaultSchedulerMaxProjectionTTL = 25 * time.Hour
+
 const (
 	defaultSchedulerRegistryMaxConnections    = 4
 	defaultSchedulerRegistryReconcileInterval = 30 * time.Second
@@ -258,6 +273,7 @@ type SchedulerConfig struct {
 	BindingTTL              time.Duration            `json:"binding_ttl"`
 	WarmupTimeout           time.Duration            `json:"warmup_timeout"`
 	RedisAddr               string                   `json:"redis_addr"`
+	MaxProjectionTTL        time.Duration            `json:"max_projection_ttl"`
 	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
 	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
 	Nodes                   []Node                   `json:"nodes"`
@@ -276,6 +292,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		BindingTTL              json.RawMessage           `json:"binding_ttl"`
 		WarmupTimeout           json.RawMessage           `json:"warmup_timeout"`
 		RedisAddr               *string                   `json:"redis_addr"`
+		MaxProjectionTTL        json.RawMessage           `json:"max_projection_ttl"`
 		ArtifactStoreCapacity   *int                      `json:"artifact_store_capacity"`
 		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
 		Nodes                   *[]Node                   `json:"nodes"`
@@ -289,7 +306,8 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		// the block without naming the key inside it leaves the default alone
 		// rather than blanking it.
 		Routing *struct {
-			ExecutionArbitration *string `json:"execution_arbitration"`
+			ExecutionArbitration    *string `json:"execution_arbitration"`
+			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
 		} `json:"routing"`
 	}
 
@@ -337,6 +355,17 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		// this depth would turn it into an unmarshal error whose message names
 		// the JSON rather than the setting.
 		s.Routing.ExecutionArbitration = SchedulerExecutionArbitration(*parsed.Routing.ExecutionArbitration)
+	}
+	if parsed.Routing != nil && parsed.Routing.ProjectionAuthoritative != nil {
+		s.Routing.ProjectionAuthoritative = *parsed.Routing.ProjectionAuthoritative
+	}
+
+	if len(bytes.TrimSpace(parsed.MaxProjectionTTL)) > 0 {
+		d, err := parseSchedulerDuration(parsed.MaxProjectionTTL, "scheduler.max_projection_ttl")
+		if err != nil {
+			return err
+		}
+		s.MaxProjectionTTL = d
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
@@ -435,6 +464,20 @@ func ParseSchedulerExecutionArbitration(raw string) (SchedulerExecutionArbitrati
 // a routing answer, as opposed to what it does with the registry table.
 type SchedulerRoutingConfig struct {
 	ExecutionArbitration SchedulerExecutionArbitration `json:"execution_arbitration"`
+	// ProjectionAuthoritative promotes the routing projection from a cache the
+	// heartbeat rewrites every five seconds into a record with a lifetime of
+	// its own: node-supplied TTLs are honoured, pause and delete events remove
+	// records, and a heartbeat that finds nothing changed stops resetting the
+	// deadline.
+	//
+	// 🔴 Off by default, which is the opposite of the switch above it, and the
+	// reason is not caution for its own sake. Every node in the fleet is
+	// already sending the lifecycle events this makes act; a cluster that
+	// upgraded the scheduler binary without setting anything would start
+	// mutating its own routing table the moment a pod restarted, having asked
+	// for nothing. The switches above default to their end state because that
+	// release existed in order to turn them on.
+	ProjectionAuthoritative bool `json:"projection_authoritative"`
 }
 
 // GatewayExecutionFencing is the three-state switch over the gateway's routing
@@ -492,20 +535,66 @@ func ParseGatewayExecutionFencing(raw string) (GatewayExecutionFencing, error) {
 	}
 }
 
+// ParseRoutingProjectionSwitch is the one place an on/off setting becomes a
+// bool.
+//
+// 🔴 An unrecognised value is an error rather than a false. These switches
+// change what a running cluster does to its own routing table, and the failure
+// mode of guessing is a rollout that reports success while the switch it was
+// for never moved. "true"/"false"/"1"/"0" are accepted alongside "on"/"off"
+// because operators reach for all of them and a typo should be the only thing
+// that stops the process.
+func ParseRoutingProjectionSwitch(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "true", "1":
+		return true, nil
+	case "off", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("must be one of on, off (got %q)", raw)
+	}
+}
+
 // GatewayRoutingConfig groups the switches over what the gateway does with a
 // routing answer, as opposed to where it listens or who it talks to.
 type GatewayRoutingConfig struct {
 	ExecutionFencing GatewayExecutionFencing `json:"execution_fencing"`
+	// ProjectionRead lets the gateway answer a sandbox route from the routing
+	// projection directly, falling back to the scheduler on a miss or an error.
+	// Off leaves every request going through LookupNode, which is what shipped
+	// before this existed.
+	//
+	// 🔴 Turning this on must be paired with routing.execution_arbitration
+	// staying anything other than "off". The scheduler's rollback for the
+	// incarnation axis works by blanking the two incarnation fields on the way
+	// out of LookupNode; a gateway reading the projection itself never sees
+	// that blanking and would go on fencing against incarnations the scheduler
+	// has stopped arbitrating. There is no mechanism for it — the pairing is an
+	// operational rule, written here because this is where somebody reads it.
+	ProjectionRead bool `json:"projection_read"`
+	// ProjectionAuthoritative is the gateway's half of the write-side switch:
+	// it makes resume and connect record an assignment, and makes the gateway
+	// forward the incarnation and TTL a node reports. Off means it forwards
+	// neither, which is a projection write identical to today's.
+	//
+	// 🔴 The write side is one logical switch across two processes and each
+	// holds half of it. Neither ordering is unsafe — see the note in the stage
+	// plan — so they do not have to be flipped together.
+	ProjectionAuthoritative bool `json:"projection_authoritative"`
 }
 
 type GatewayConfig struct {
-	HTTPListenAddr         string        `json:"http_listen_addr"`
-	MetricsListenAddr      string        `json:"metrics_listen_addr"`
-	SchedulerAddr          string        `json:"scheduler_addr"`
-	QueryOnlySchedulerAddr string        `json:"query_only_scheduler_addr"`
-	RequestTimeout         time.Duration `json:"request_timeout"`
-	ForwardResponseSize    int64         `json:"forward_response_size"`
-	SandboxProxyDomains    []string      `json:"sandbox_proxy_domains"`
+	HTTPListenAddr         string `json:"http_listen_addr"`
+	MetricsListenAddr      string `json:"metrics_listen_addr"`
+	SchedulerAddr          string `json:"scheduler_addr"`
+	QueryOnlySchedulerAddr string `json:"query_only_scheduler_addr"`
+	// RedisAddr is where the routing projection lives. Read-only from here:
+	// the gateway never writes a record, and the scheduler is the only process
+	// that arbitrates one.
+	RedisAddr           string        `json:"redis_addr"`
+	RequestTimeout      time.Duration `json:"request_timeout"`
+	ForwardResponseSize int64         `json:"forward_response_size"`
+	SandboxProxyDomains []string      `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
 	DebugMode bool                 `json:"debug_mode"`
@@ -529,6 +618,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		MetricsListenAddr      *string         `json:"metrics_listen_addr"`
 		SchedulerAddr          *string         `json:"scheduler_addr"`
 		QueryOnlySchedulerAddr *string         `json:"query_only_scheduler_addr"`
+		RedisAddr              *string         `json:"redis_addr"`
 		RequestTimeout         json.RawMessage `json:"request_timeout"`
 		ForwardResponseSize    *int64          `json:"forward_response_size"`
 		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
@@ -537,7 +627,9 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		// block without naming the key inside it leaves the default alone rather
 		// than blanking it.
 		Routing *struct {
-			ExecutionFencing *string `json:"execution_fencing"`
+			ExecutionFencing        *string `json:"execution_fencing"`
+			ProjectionRead          *bool   `json:"projection_read"`
+			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
 		} `json:"routing"`
 	}
 
@@ -558,6 +650,9 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	if parsed.QueryOnlySchedulerAddr != nil {
 		g.QueryOnlySchedulerAddr = *parsed.QueryOnlySchedulerAddr
 	}
+	if parsed.RedisAddr != nil {
+		g.RedisAddr = *parsed.RedisAddr
+	}
 	if parsed.ForwardResponseSize != nil {
 		g.ForwardResponseSize = *parsed.ForwardResponseSize
 	}
@@ -573,6 +668,12 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		// this depth would turn it into an unmarshal error whose message names
 		// the JSON rather than the setting.
 		g.Routing.ExecutionFencing = GatewayExecutionFencing(*parsed.Routing.ExecutionFencing)
+	}
+	if parsed.Routing != nil && parsed.Routing.ProjectionRead != nil {
+		g.Routing.ProjectionRead = *parsed.Routing.ProjectionRead
+	}
+	if parsed.Routing != nil && parsed.Routing.ProjectionAuthoritative != nil {
+		g.Routing.ProjectionAuthoritative = *parsed.Routing.ProjectionAuthoritative
 	}
 
 	if len(bytes.TrimSpace(parsed.RequestTimeout)) > 0 {
@@ -685,7 +786,8 @@ func defaultConfig(service string) Config {
 			// state, and starting a release on observe is release discipline.
 			// A default of observe leaves clusters parked there with nobody
 			// aware they were never flipped.
-			Routing: SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
+			Routing:          SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
+			MaxProjectionTTL: defaultSchedulerMaxProjectionTTL,
 		},
 		Gateway: GatewayConfig{
 			HTTPListenAddr:      ":8080",
@@ -719,6 +821,7 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
 	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
+	set("GATEWAY_REDIS_ADDR", &cfg.Gateway.RedisAddr)
 	// A shared secret, so it arrives the same way the DSN does and never through
 	// the ConfigMap.
 	set("GATEWAY_CONTROL_PLANE_TOKEN", &cfg.Gateway.ControlPlaneToken)
@@ -843,6 +946,48 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Gateway.Routing.ExecutionFencing = mode
 	}
 
+	// 🔴 The three projection switches arrive as environment variables and
+	// never as a mounted file. The two are not interchangeable here: a mounted
+	// value that cannot be read is deliberately held at its last good value by
+	// the consumer that reads one, and kubelet refreshes volumes minutes apart
+	// and unevenly across nodes — so deleting a key and writing an empty string
+	// have opposite effects and the failing side is silent. A configMapKeyRef
+	// is read once at start-up: deleting the key falls back to the code
+	// default, writing an empty string leaves the value alone, and neither
+	// takes effect until the pod restarts. Flipping one is therefore `kubectl
+	// set env`, which rolls the deployment and is loud.
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE")); v != "" {
+		on, err := ParseRoutingProjectionSwitch(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE: %w", err)
+		}
+		cfg.Scheduler.Routing.ProjectionAuthoritative = on
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_ROUTING_PROJECTION_READ")); v != "" {
+		on, err := ParseRoutingProjectionSwitch(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_ROUTING_PROJECTION_READ: %w", err)
+		}
+		cfg.Gateway.Routing.ProjectionRead = on
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE")); v != "" {
+		on, err := ParseRoutingProjectionSwitch(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE: %w", err)
+		}
+		cfg.Gateway.Routing.ProjectionAuthoritative = on
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_MAX_PROJECTION_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_MAX_PROJECTION_TTL %q: %w", v, err)
+		}
+		cfg.Scheduler.MaxProjectionTTL = d
+	}
+
 	return nil
 }
 
@@ -867,6 +1012,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Scheduler.BindingTTL <= 0 {
 		c.Scheduler.BindingTTL = 30 * time.Second
+	}
+	if c.Scheduler.MaxProjectionTTL <= 0 {
+		c.Scheduler.MaxProjectionTTL = defaultSchedulerMaxProjectionTTL
 	}
 	if c.Scheduler.Registry.MaxConnections <= 0 {
 		c.Scheduler.Registry.MaxConnections = defaultSchedulerRegistryMaxConnections
@@ -1108,6 +1256,13 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if _, err := ParseGatewayExecutionFencing(string(c.Gateway.Routing.ExecutionFencing)); err != nil {
 			return err
+		}
+		// 🔴 Refused rather than quietly ignored. A read switch with nowhere to
+		// read from is a switch that reports as on and does nothing, and the
+		// symptom — every request still going to the scheduler — is exactly
+		// what the switch being off looks like.
+		if c.Gateway.Routing.ProjectionRead && strings.TrimSpace(c.Gateway.RedisAddr) == "" {
+			return errors.New("gateway.routing.projection_read requires gateway.redis_addr")
 		}
 	}
 	return nil

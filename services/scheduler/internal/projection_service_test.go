@@ -7,7 +7,6 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -175,33 +174,12 @@ func TestReportSandboxEventIgnoresAnUnnamedIncarnation(t *testing.T) {
 	}
 }
 
-// sandboxEventCount reads one series of the sandbox-event counter, through a
-// private registry over the process-wide collector — the same shape
-// bindingDecisionCount uses.
+// sandboxEventCount reads one series of the sandbox-event counter.
 func sandboxEventCount(t *testing.T, eventType string, outcome string) float64 {
 	t.Helper()
-
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(schedulerSandboxEvent)
-	families, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather sandbox events: %v", err)
-	}
-	for _, family := range families {
-		if family.GetName() != "agentenv_scheduler_sandbox_event_total" {
-			continue
-		}
-		for _, metric := range family.GetMetric() {
-			labels := map[string]string{}
-			for _, label := range metric.GetLabel() {
-				labels[label.GetName()] = label.GetValue()
-			}
-			if labels["event_type"] == eventType && labels["outcome"] == outcome {
-				return metric.GetCounter().GetValue()
-			}
-		}
-	}
-	return 0
+	return counterSeriesValue(t, schedulerSandboxEvent,
+		"agentenv_scheduler_sandbox_event_total",
+		map[string]string{"event_type": eventType, "outcome": outcome})
 }
 
 // TestReportSandboxEventLeavesTheOtherEventTypesAlone: create, resume and fork
@@ -322,6 +300,30 @@ func TestProjectionTTLFromSecsNeverMeansForever(t *testing.T) {
 	}
 }
 
+// assertServiceExpiry pins a record's deadline from both sides.
+//
+// 🔴 Both sides, always. A one-sided assertion on this value cannot tell the
+// number it is checking from two of the failures it exists to catch: a lower
+// bound passes a record with no deadline at all, and an upper bound passes one
+// that collapsed to the receiver's 30-second default — which is exactly what a
+// clamp implemented as "ignore it" would produce, under a test named for
+// clamping. The tolerance covers the wall clock the service reads inside.
+func assertServiceExpiry(t *testing.T, store *InMemoryBindingStore, sandboxID string, reference time.Time, want time.Duration) {
+	t.Helper()
+
+	store.mu.Lock()
+	record, ok := store.bindings[sandboxID]
+	store.mu.Unlock()
+	if !ok {
+		t.Fatalf("no record for %s", sandboxID)
+	}
+	got := record.expiresAt.Sub(reference)
+	const tolerance = 5 * time.Second
+	if got < want-tolerance || got > want+tolerance {
+		t.Fatalf("%s expires %s after the write, want %s (+/- %s)", sandboxID, got, want, tolerance)
+	}
+}
+
 // TestRecordAssignmentCarriesTheBudgetToTheStore is the create path end to end.
 func TestRecordAssignmentCarriesTheBudgetToTheStore(t *testing.T) {
 	store := NewInMemoryBindingStore(30 * time.Second)
@@ -329,13 +331,7 @@ func TestRecordAssignmentCarriesTheBudgetToTheStore(t *testing.T) {
 
 	before := time.Now()
 	recordAssignment(t, service, "sbx-1", execA, 3600)
-
-	store.mu.Lock()
-	record := store.bindings["sbx-1"]
-	store.mu.Unlock()
-	if record.expiresAt.Before(before.Add(59 * time.Minute)) {
-		t.Fatalf("the node's budget did not reach the store: expires at %s", record.expiresAt)
-	}
+	assertServiceExpiry(t, store, "sbx-1", before, time.Hour)
 }
 
 // TestRecordAssignmentIgnoresTheBudgetWhileTheSwitchIsOff keeps "off" equal to
@@ -347,13 +343,7 @@ func TestRecordAssignmentIgnoresTheBudgetWhileTheSwitchIsOff(t *testing.T) {
 
 	before := time.Now()
 	recordAssignment(t, service, "sbx-1", execA, 86460)
-
-	store.mu.Lock()
-	record := store.bindings["sbx-1"]
-	store.mu.Unlock()
-	if record.expiresAt.After(before.Add(31 * time.Second)) {
-		t.Fatalf("the switch is off but the budget was honoured: expires at %s", record.expiresAt)
-	}
+	assertServiceExpiry(t, store, "sbx-1", before, 30*time.Second)
 }
 
 // TestHeartbeatRosterCarriesTheBudget covers the repair path: a projection
@@ -377,17 +367,8 @@ func TestHeartbeatRosterCarriesTheBudget(t *testing.T) {
 		t.Fatalf("heartbeat failed: %v", err)
 	}
 
-	store.mu.Lock()
-	withBudget := store.bindings["sbx-1"]
-	withoutBudget := store.bindings["sbx-2"]
-	store.mu.Unlock()
-
-	if withBudget.expiresAt.Before(before.Add(59 * time.Minute)) {
-		t.Fatalf("the roster's budget did not reach the store: expires at %s", withBudget.expiresAt)
-	}
-	if withoutBudget.expiresAt.After(before.Add(31 * time.Second)) {
-		t.Fatalf("an entry with no budget must fall back to binding_ttl, got %s", withoutBudget.expiresAt)
-	}
+	assertServiceExpiry(t, store, "sbx-1", before, time.Hour)
+	assertServiceExpiry(t, store, "sbx-2", before, 30*time.Second)
 }
 
 // TestHeartbeatRosterBudgetIsClamped: the ceiling is the storage owner's limit
@@ -407,12 +388,10 @@ func TestHeartbeatRosterBudgetIsClamped(t *testing.T) {
 		t.Fatalf("heartbeat failed: %v", err)
 	}
 
-	store.mu.Lock()
-	record := store.bindings["sbx-1"]
-	store.mu.Unlock()
-	if record.expiresAt.After(before.Add(time.Hour + time.Minute)) {
-		t.Fatalf("the ceiling was not applied: expires at %s", record.expiresAt)
-	}
+	// 🔴 The ceiling, from both sides. "Clamped" means the record got the
+	// ceiling — not that it got something below it, which a clamp collapsing to
+	// the 30-second default would also satisfy under this name.
+	assertServiceExpiry(t, store, "sbx-1", before, time.Hour)
 }
 
 // TestSandboxEventTypeLabelIsClosed keeps the metric's label set from opening
@@ -435,18 +414,49 @@ func TestSandboxEventTypeLabelIsClosed(t *testing.T) {
 	}
 }
 
-// TestNormalizeExecutionIDReasonDoesNotTouchTheRosterCounter is a shape
-// assertion, not a metric one: the event path has to use the quiet normaliser,
-// because the counter the other one increments is named and documented for
-// rosters and is read to decide whether the fleet has finished upgrading.
+// TestNormalizeExecutionIDReasonDoesNotTouchTheRosterCounter reads the counter
+// it is named for.
+//
+// The event path has to use the quiet normaliser, because the counter the other
+// one increments is named and documented for rosters and is read to decide
+// whether the fleet has finished upgrading. Merging the two facts into one
+// number would make that reading wrong in a way nothing else would show — so
+// the counter is sampled either side of each call, and the shape assertions
+// stay alongside.
 func TestNormalizeExecutionIDReasonDoesNotTouchTheRosterCounter(t *testing.T) {
-	if got, reason := normalizeExecutionIDReason("  " + execA + "  "); got != execA || reason != "" {
-		t.Fatalf("got (%q, %q), want the canonical id and no drop", got, reason)
+	cases := []struct {
+		raw        string
+		want       string
+		wantReason string
+	}{
+		{raw: "  " + execA + "  ", want: execA, wantReason: ""},
+		{raw: "", want: "", wantReason: "no_execution"},
+		{raw: "nope", want: "", wantReason: "bad_uuid"},
 	}
-	if got, reason := normalizeExecutionIDReason(""); got != "" || reason != "no_execution" {
-		t.Fatalf("got (%q, %q), want an empty value and no_execution", got, reason)
+	for _, tc := range cases {
+		before := map[string]float64{
+			"no_execution": rosterDroppedCount(t, "no_execution"),
+			"bad_uuid":     rosterDroppedCount(t, "bad_uuid"),
+		}
+		got, reason := normalizeExecutionIDReason(tc.raw)
+		if got != tc.want || reason != tc.wantReason {
+			t.Fatalf("normalizeExecutionIDReason(%q) = (%q, %q), want (%q, %q)", tc.raw, got, reason, tc.want, tc.wantReason)
+		}
+		for label, was := range before {
+			if now := rosterDroppedCount(t, label); now != was {
+				t.Fatalf("normalizeExecutionIDReason(%q) moved the roster counter %s from %v to %v", tc.raw, label, was, now)
+			}
+		}
 	}
-	if got, reason := normalizeExecutionIDReason("nope"); got != "" || reason != "bad_uuid" {
-		t.Fatalf("got (%q, %q), want an empty value and bad_uuid", got, reason)
+
+	// The control face: the roster normaliser over the same inputs *does* move
+	// it, which is what makes the assertion above a statement about these two
+	// functions rather than about a counter nothing ever increments.
+	before := rosterDroppedCount(t, "bad_uuid")
+	if got := normalizeExecutionID("nope"); got != "" {
+		t.Fatalf("normalizeExecutionID(%q) = %q, want empty", "nope", got)
+	}
+	if now := rosterDroppedCount(t, "bad_uuid"); now != before+1 {
+		t.Fatalf("the roster normaliser did not count a drop: %v -> %v", before, now)
 	}
 }

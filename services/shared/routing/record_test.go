@@ -2,6 +2,7 @@ package routing
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -119,8 +120,9 @@ func TestBindingKeyAndNodeIndexKey(t *testing.T) {
 }
 
 func TestSynthesizeFillsEveryFieldTheReaderCannotSee(t *testing.T) {
+	const podName = "agentenv-node-7f4c2"
 	record := Record{
-		Node:        Node{ID: "node-a", Endpoint: "http://node-a", PodName: "pod-a"},
+		Node:        Node{ID: "node-a", Endpoint: "http://node-a", PodName: podName},
 		ExecutionID: "0198b7cc-1111-7000-8000-000000000001",
 	}
 	resp := Synthesize(record)
@@ -130,8 +132,17 @@ func TestSynthesizeFillsEveryFieldTheReaderCannotSee(t *testing.T) {
 	}
 	// 🔴 The pod name is an identity, not an address. Putting it in a lookup
 	// answer would invite a caller to forward to it.
-	if raw, _ := json.Marshal(resp.GetNode()); string(raw) == "" {
-		t.Fatal("unreachable, keeps the marshal honest")
+	//
+	// Asserted over the whole marshalled message rather than over the one
+	// field that could hold it today: the wire node has no pod field at all
+	// just now, so a field-by-field check would be a check of nothing, and the
+	// day something grows one this is what notices.
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal the synthesized answer: %v", err)
+	}
+	if strings.Contains(string(raw), podName) {
+		t.Fatalf("the pod name reached the lookup answer: %s", raw)
 	}
 	if resp.GetLocation() != schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND {
 		t.Fatalf("location = %v, want BOUND: the binding hit this stands in for has exactly one location", resp.GetLocation())

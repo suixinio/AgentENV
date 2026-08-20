@@ -230,16 +230,16 @@ func TestInMemoryNonPositiveBudgetNeverMeansForever(t *testing.T) {
 	}
 }
 
-// TestBindingStoreImplementationsShareTheType keeps the alias honest: the
-// scheduler's Node and the shared record's Node must remain one type, or the
-// gateway reads a shape this never writes.
-func TestBindingStoreImplementationsShareTheType(t *testing.T) {
-	var shared routing.Node = Node{ID: "node-a", Endpoint: "http://node-a"}
-	var local Node = shared
-	if local.ID != "node-a" {
-		t.Fatalf("unexpected node: %+v", local)
-	}
-}
+// 🔴 Compile-time, not a test. The scheduler's Node and the shared record's
+// Node must remain one type — an alias, not two structs that happen to match —
+// or the gateway decodes a shape this never writes. A runtime assertion could
+// only ever confirm that the assignment on the line above it compiled, which is
+// what the compiler already said; this is that same statement with nothing
+// around it pretending to check.
+var (
+	_ routing.Node = Node{}
+	_ Node         = routing.Node{}
+)
 
 func mustRecord(t *testing.T, store *InMemoryBindingStore, sandboxID string, binding Binding, now time.Time) {
 	t.Helper()

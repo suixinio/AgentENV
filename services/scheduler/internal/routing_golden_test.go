@@ -71,15 +71,27 @@ func TestSynthesizedAnswerMatchesSchedulerAnswer(t *testing.T) {
 	}
 }
 
-// TestAuthorityForIsTheSharedRule pins that the scheduler has no second copy of
-// the rule. If somebody reintroduces a local implementation, this keeps passing
-// only for as long as the two agree — which is exactly the window the shared
-// package exists to close, so the assertion is deliberately over the shared
-// function's own behaviour rather than over an internal one.
+// TestAuthorityForIsTheSharedRule is two assertions, and the first is the one
+// that matters.
+//
+// 🔴 authorityFor delegates to routing.AuthorityFor today, so comparing the two
+// is comparing a function with itself — it would go on passing if the rule
+// itself inverted. The expected values are therefore spelled out, and the
+// cross-check is kept beside them as a drift guard for the day somebody
+// reintroduces a local implementation: from that commit on the two assertions
+// stop being the same one.
 func TestAuthorityForIsTheSharedRule(t *testing.T) {
-	for _, executionID := range []string{"", "   ", "0198b7cc-1111-7000-8000-000000000001"} {
-		if got, want := authorityFor(executionID), routing.AuthorityFor(executionID); got != want {
-			t.Fatalf("authorityFor(%q) = %v, shared rule says %v", executionID, got, want)
+	cases := map[string]schedulerv1.ExecutionAuthority{
+		"":                                     schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN,
+		"   ":                                  schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN,
+		"0198b7cc-1111-7000-8000-000000000001": schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
+	}
+	for executionID, want := range cases {
+		if got := authorityFor(executionID); got != want {
+			t.Fatalf("authorityFor(%q) = %v, want %v", executionID, got, want)
+		}
+		if got, shared := authorityFor(executionID), routing.AuthorityFor(executionID); got != shared {
+			t.Fatalf("authorityFor(%q) = %v, the shared rule says %v", executionID, got, shared)
 		}
 	}
 }

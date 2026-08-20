@@ -8,10 +8,13 @@ spec:
   # 🔴 One replica, and it stays one. The registry write surface would be safe
   # with more — every statement it runs is a single conditional write, so two
   # writers cannot corrupt each other — but this process is more than that
-  # surface. Bindings, observed-node state and the P2P artifact index all live
-  # in its memory, and a second replica would serve half the cluster from an
-  # empty copy of each. Sharing them needs `scheduler.redis_addr` and
-  # `--query-only` replicas, which is a different change from this one.
+  # surface. Bindings now live in Redis (see SCHEDULER_REDIS_ADDR below and
+  # redis.yaml), but observed-node state and the P2P artifact index are still
+  # per-process memory, so a second full replica would still serve half the
+  # cluster from an empty copy of both. Redis is the prerequisite for scaling
+  # out, not the act of it: the replicas it unlocks are `--query-only` ones,
+  # which serve LookupNode and nothing else, and adding them is a different
+  # change from this one.
   #
   # What is fixed here is the window, not the count: since phase 2 this process
   # is a hard dependency of every node's renewals, pauses and resumes, and how
@@ -48,6 +51,36 @@ spec:
             - -config
             - /config/scheduler.json
           env:
+            # Where the sandbox-to-node bindings live. Set, they go to the
+            # Redis in redis.yaml; unset, they stay in this process's memory
+            # and every rollout of this Deployment drops the whole routing
+            # table, which the data plane pays for as 503s until heartbeats
+            # refill it. Measured on the dev cluster across paired rollout
+            # restarts of this Deployment, one running sandbox, probes at 3/s:
+            # unset, a contiguous 2.3-3.3s window of 503 on the sandbox proxy
+            # path; set, zero 503s in the same probe.
+            #
+            # 🔴 What it does NOT buy: bindings still carry `binding_ttl`
+            # (30s by default). A scheduler absent for longer than that loses
+            # them from Redis too, and the failure that follows is worse than
+            # the 503 — for the ~13s until a heartbeat re-seeds the binding,
+            # LookupNode answers NOT_FOUND and the gateway returns 404 for a
+            # sandbox that is up and healthy. Redis shortens the window that
+            # rollouts open; it does not make the routing table durable.
+            #
+            # 🔴 Control plane only. This address must never be handed to the
+            # `agentenv-node` DaemonSet: nodes reach the binding store through
+            # the scheduler's gRPC surface and giving them a direct line to the
+            # shared store is the same mistake as the registry DSN that was
+            # taken off the nodes in phase 3.
+            #
+            # A plain value rather than a Secret ref because it is a Service
+            # name, not a credential — this Redis has no password and is
+            # reachable only inside the cluster (see the note in redis.yaml).
+            # Adding `requirepass` means moving this to a Secret in the same
+            # change.
+            - name: SCHEDULER_REDIS_ADDR
+              value: agentenv-redis:6379
             # Read-only DSN for the node-owned `paused_sandboxes` table. It
             # carries credentials, so it never goes near the ConfigMap.
             #

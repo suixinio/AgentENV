@@ -1,0 +1,167 @@
+# Redis for the control plane's shared binding store.
+#
+# Today this holds exactly one thing: the scheduler's sandbox-to-node bindings
+# (`agentenv:scheduler:bindings:*`, written by services/scheduler/internal/
+# redis_store.go). Without it those bindings live in one process's memory, so
+# every scheduler rollout drops them and the data plane pays a 503 window while
+# heartbeats rebuild the roster. Pointing `SCHEDULER_REDIS_ADDR` at this Service
+# is what closes that window, and it is also the hard prerequisite for the
+# query-only scheduler replicas (`--query-only` refuses to start without it).
+#
+# 🔴 It is provisioned as a *durable store*, not as a cache, because of what is
+# scheduled to land in it next: phase 3 of the service-decomposition proposal
+# folds active sandbox state in here. Two settings below follow directly from
+# that and must not be "tidied up" into cache-shaped defaults:
+#
+#   · appendonly yes — a lost write here will eventually mean a lost sandbox,
+#     not a slow lookup that repairs itself on the next heartbeat.
+#   · maxmemory-policy noeviction — the only policy that fails *loudly*. Every
+#     other policy answers a full instance by silently discarding live keys,
+#     which for sandbox state means the control plane forgets a running VM and
+#     nothing anywhere reports an error.
+#
+# 🔴 OPEN ITEM — HA. This is a single replica with a single local-path volume,
+# which makes it a new single point of failure for the control plane, on the
+# same node that already carries Postgres and RustFS. That is proposal §8
+# 陷阱 8 and it is NOT resolved here: this manifest is what unblocks SD-B1 on
+# the dev cluster, not a production topology. Anything that promotes Redis from
+# "bindings, rebuildable from heartbeats within one binding_ttl" to "the record
+# of which sandboxes exist" has to settle replication/failover first.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agentenv-redis-data
+  labels:
+    app.kubernetes.io/name: agentenv-redis
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Bindings are a few hundred bytes each and bounded by the live sandbox
+      # count, so this is sized for the AOF rather than for the dataset: worst
+      # case the append log reaches roughly twice `maxmemory` before automatic
+      # rewrite compacts it. Raise this in step with `maxmemory` below.
+      storage: 5Gi
+  # storageClassName is deliberately unset so the cluster default applies
+  # (`local-path` on the dev cluster). Naming it here would hard-code one
+  # cluster's storage into the shared base layer.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-redis
+  labels:
+    app.kubernetes.io/name: agentenv-redis
+spec:
+  # ClusterIP only, and no NodePort: the scheduler reaches this over the pod
+  # network and nothing outside the cluster has any business talking to it.
+  # There is no password on this instance, so cluster-internal reachability is
+  # the whole of its access control — do not add an external port without
+  # adding `requirepass` in the same change.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agentenv-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentenv-redis
+  labels:
+    app.kubernetes.io/name: agentenv-redis
+spec:
+  replicas: 1
+  strategy:
+    # 🔴 Recreate, not RollingUpdate. The volume is ReadWriteOnce, so a
+    # surge Pod cannot mount it while the incumbent still holds it and the
+    # rollout would deadlock with the new Pod stuck ContainerCreating. The
+    # cost is a short gap on every Redis restart; the scheduler survives it
+    # because a binding that fails to write is re-sent by the next heartbeat.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentenv-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentenv-redis
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      # No `kubernetes.io/hostname` selector on purpose. Once the local-path
+      # volume is provisioned its PV carries a nodeAffinity for the node it was
+      # created on, and the scheduler honours that — so the Pod is already
+      # pinned, without this base layer naming a host that only exists in one
+      # cluster.
+      containers:
+        - name: redis
+          # Mirrored into the dev cluster's registry from
+          # docker.io/library/redis:7-alpine
+          #   @sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+          # (Redis 7.4.10). Pinned to an immutable version tag rather than
+          # `:7-alpine` or `:latest` — the node containerd caches by tag with
+          # `IfNotPresent`, so a moving tag is how a cluster ends up silently
+          # running something other than what this file says.
+          image: 10.10.10.204:5000/redis:7.4.10-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - --dir
+            - /data
+            # Durability. `everysec` is Redis's default fsync cadence and the
+            # right trade here: a host-level crash can lose at most the last
+            # second of binding writes, all of which the next heartbeat
+            # re-sends anyway.
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            # 🔴 Keep `maxmemory` meaningfully below the container memory limit.
+            # An AOF rewrite forks, and the parent's copy-on-write pages during
+            # the rewrite are charged to the same cgroup — sizing these two
+            # equal is how you get an OOM kill instead of the refusal that
+            # `noeviction` is here to produce.
+            - --maxmemory
+            - 512mb
+            - --maxmemory-policy
+            - noeviction
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              # Matching on the reply rather than on redis-cli's exit status:
+              # redis-cli reports a successful round trip even when the server
+              # answers `-LOADING`, which is exactly the window — replaying the
+              # AOF after a restart — that readiness has to keep traffic out of.
+              command: ["sh", "-c", "redis-cli ping | grep -q PONG"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli ping | grep -q PONG"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # No CPU limit. Redis serves from one thread and every binding
+              # lookup sits in the sandbox routing path, so CFS throttling
+              # would show up as latency on the data plane rather than as
+              # anything that names Redis.
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agentenv-redis-data

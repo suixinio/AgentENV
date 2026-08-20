@@ -8,6 +8,7 @@ resources:
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
+  - redis.yaml
   - scheduler-service.yaml
   - scheduler-deployment.yaml
   - scheduler-pdb.yaml

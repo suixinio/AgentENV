@@ -193,6 +193,15 @@ CREATE INDEX IF NOT EXISTS snapshots_source_sandbox_idx
 -- 🔴 The only index the origin block appears in — see rule 3 above. It answers
 -- "what is stranded on which node", which is both the operator's view and the
 -- measurement that decides when these two columns can go.
+--
+-- 🔴 deleted_at_ms IS NULL is in the predicate for the second of those jobs, and
+-- the spec this file was written from (§4.2) omits it — a mistake, not a
+-- choice. The rule that retires the origin block is "count(*) of unpublished
+-- rows stayed at zero for thirty days"; an index that keeps soft-deleted rows
+-- makes that count include snapshots the user deleted months ago, so it never
+-- reaches zero and the columns are never dropped. The two indexes above it both
+-- filter the same way, and there is no query that wants a stranded row that no
+-- longer exists.
 CREATE INDEX IF NOT EXISTS snapshots_unpublished_idx
     ON snapshots (cluster_id, origin_node_id)
-    WHERE NOT published;
+    WHERE NOT published AND deleted_at_ms IS NULL;

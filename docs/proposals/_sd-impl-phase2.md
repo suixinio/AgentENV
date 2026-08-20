@@ -627,6 +627,22 @@ CREATE INDEX IF NOT EXISTS snapshots_unpublished_idx
     WHERE NOT published;
 ```
 
+> 🔴 **上面这条 DDL 写错了（2026-08-20 修正，实现里已经不是这样）。**
+> 谓词漏了 `deleted_at_ms IS NULL` —— 它上面两条索引都带。
+> 后果不在读路径，而在 §3.1.a 那条退休判据：「`count(*) WHERE NOT published`
+> 连续 30 天为 0 ⇒ 可以删掉 origin 两列」。软删除的行永远留在这条索引里，
+> 那个计数就永远到不了 0，两列于是永远删不掉 —— 一条只会在几个月之后、
+> 以「为什么这个数不降」的形式暴露的错。
+> `0001_snapshots.sql` 里的实际 DDL 是：
+>
+> ```sql
+> CREATE INDEX IF NOT EXISTS snapshots_unpublished_idx
+>     ON snapshots (cluster_id, origin_node_id)
+>     WHERE NOT published AND deleted_at_ms IS NULL;
+> ```
+>
+> 相应地，§3.1.a 的运维查询也要带上 `AND deleted_at_ms IS NULL`。
+
 🔴 **`snapshots_list_idx` 里的 `status_group = 'ready'` 是部分索引谓词，不是列上的普通索引。**
 这一条把 §5.3 的"未翻牌的行选不中"从"每次查询都要写对谓词"降级成"写错谓词会立刻变慢"，
 是一道有反馈的护栏。

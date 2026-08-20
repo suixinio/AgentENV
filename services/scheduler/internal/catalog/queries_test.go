@@ -104,15 +104,38 @@ func TestKeysetComparisonSwapsItsOperands(t *testing.T) {
 	}
 
 	// The cursor's id must reach the statement lower-cased; an upper-case
-	// rendering sorts on the far side of every real id.
+	// rendering sorts on the far side of every real id, because '0'-'9' <
+	// 'A'-'F' < 'a'-'f' in ASCII and the page boundary is decided by comparing
+	// ids as text. One page silently skipped, no error anywhere.
+	//
+	// 🔴 So the cursor this half feeds in is upper-case. Asserting the
+	// lower-cased form against an id that was already lower-case is a test of
+	// nothing at all: it passes with the conversion deleted.
+	upper := ListInput{
+		ClusterID:   anyCluster,
+		Cursor:      &Cursor{CreatedAtMs: 1700000000123, SnapshotID: "0189AB00-0000-7000-8000-00000000000B"},
+		ReadOptions: ReadOptions{OnlyReady: true},
+	}
+	_, upperArgs, err := listSnapshotsSQL(upper, 10)
+	if err != nil {
+		t.Fatalf("build the listing statement: %v", err)
+	}
 	found := false
-	for _, a := range args {
-		if s, ok := a.(string); ok && s == "0189ab00-0000-7000-8000-000000000001" {
+	for _, a := range upperArgs {
+		s, ok := a.(string)
+		if !ok {
+			continue
+		}
+		if s == "0189ab00-0000-7000-8000-00000000000b" {
 			found = true
+		}
+		if s == "0189AB00-0000-7000-8000-00000000000B" {
+			t.Fatalf("the cursor id reached the statement upper-cased: it sorts after every "+
+				"canonical id, so this page boundary skips rows and reports nothing:\n%#v", upperArgs)
 		}
 	}
 	if !found {
-		t.Fatalf("the cursor id was not bound: %#v", args)
+		t.Fatalf("the cursor id was not bound lower-cased: %#v", upperArgs)
 	}
 }
 

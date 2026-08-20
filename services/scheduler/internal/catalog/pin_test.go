@@ -140,6 +140,50 @@ func TestPinIsTheOnlyPlaceTheOriginBlockDecidesAnything(t *testing.T) {
 	}
 }
 
+// TestPredicateClausesAreFoundHoweverTheyAreWritten tests the scanner rule V5
+// stands on, directly.
+//
+// 🔴 Because the rule above is only as good as this, and its failure mode is
+// silence: a scanner that finds nothing reports no violations, which is exactly
+// what a clean run looks like. Every shape below was a shape the literal
+// " WHERE " search missed, and each of them is a way somebody could add a
+// filter on `published` and be told it was fine.
+func TestPredicateClausesAreFoundHoweverTheyAreWritten(t *testing.T) {
+	for name, sql := range map[string]string{
+		"indented where":                      "SELECT id FROM s\n WHERE s.published",
+		"unindented where":                    "SELECT id FROM s\nWHERE s.published",
+		"where at the very start of the text": "WHERE s.published",
+		"lower case":                          "select id from s where s.published",
+		"join conjunct":                       "SELECT id FROM a JOIN s ON s.id = a.id AND s.published",
+		"having":                              "SELECT count(*) FROM s GROUP BY id HAVING bool_and(s.published)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			found := false
+			for _, clause := range predicateClausesOf(sql) {
+				if strings.Contains(clause, "published") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("the filter in %q was not found: rule V5 would pass over it", sql)
+			}
+		})
+	}
+
+	// And the other direction: a projection is not a filter, or the rule would
+	// forbid the statements it exists to permit.
+	for _, sql := range []string{
+		"SELECT s.published, s.origin_node_id FROM snapshots s",
+		"SELECT s.published FROM snapshots s ORDER BY s.created_at_ms DESC",
+	} {
+		for _, clause := range predicateClausesOf(sql) {
+			if strings.Contains(clause, "published") {
+				t.Fatalf("a projection was read as a filter in %q: %s", sql, clause)
+			}
+		}
+	}
+}
+
 // TestResolvingReadsProjectTheOriginBlock is the other half: not filtering is
 // only correct because the values reach the caller, who decides with them.
 func TestResolvingReadsProjectTheOriginBlock(t *testing.T) {
@@ -288,24 +332,56 @@ func everyReadOption() []ReadOptions {
 	}
 }
 
+// filterKeywords are the keywords after which a column name means "filter on
+// this" rather than "return this".
+//
+// 🔴 ON is in the list, and it is the one that was missing. `JOIN aliases a ON
+// a.snapshot_id = s.id AND s.published` filters exactly as hard as the same
+// conjunct in a WHERE, and reads as part of the join rather than as a
+// predicate — which is what makes it the likelier place for one to be added
+// without anybody calling it a filter.
+var filterKeywords = []string{"WHERE", "ON", "HAVING", "USING"}
+
 // predicateClausesOf returns the parts of a statement in which a column name
-// means "filter on this": everything from a WHERE onwards, plus a LATERAL
-// subquery's own WHERE.
+// means "filter on this".
+//
+// 🔴 Matched as whole words against a case-folded copy, not as the literal
+// " WHERE ". That string is a formatting assumption wearing a parser's clothes:
+// a WHERE at the start of a line with no indentation has a newline in front of
+// it and not a space, so it did not match — and neither did anything after it,
+// because the search began at the first hit. The rule this helper serves is a
+// rule about every statement in the package, so the one statement somebody
+// formats differently is precisely the one it must not miss. (The fallback that
+// used to sit under the literal, "\n WHERE ", could never fire either: it
+// contains " WHERE " as a substring, so the first search had already found it.)
 func predicateClausesOf(sql string) []string {
 	var clauses []string
-	rest := sql
-	for {
-		idx := strings.Index(rest, " WHERE ")
-		if idx < 0 {
-			idx = strings.Index(rest, "\n WHERE ")
-			if idx < 0 {
-				break
-			}
+	for _, keyword := range filterKeywords {
+		for _, idx := range keywordIndexes(sql, keyword) {
+			clauses = append(clauses, sql[idx:])
 		}
-		clauses = append(clauses, rest[idx:])
-		rest = rest[idx+len(" WHERE "):]
 	}
 	return clauses
+}
+
+// keywordIndexes finds every occurrence of keyword as a whole word, whatever
+// case it is written in and whatever whitespace surrounds it.
+func keywordIndexes(sql, keyword string) []int {
+	upper := strings.ToUpper(sql)
+	var out []int
+	for i := 0; i+len(keyword) <= len(upper); i++ {
+		if !strings.HasPrefix(upper[i:], keyword) {
+			continue
+		}
+		if i > 0 && isSQLIdentifierByte(upper[i-1]) {
+			continue
+		}
+		if end := i + len(keyword); end < len(upper) && isSQLIdentifierByte(upper[end]) {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
 }
 
 func mustListSQL(t *testing.T, in ListInput) string {

@@ -1262,15 +1262,24 @@ func TestPaginationEndsWithoutACursorAndNotEarly(t *testing.T) {
 func TestListingCapsWhatACallerMayAskFor(t *testing.T) {
 	f := newFixture(t)
 
-	f.seedPage(12, 2)
+	// 🔴 One row more than the default page, and that is the point of the
+	// number. Twelve rows could not tell "the default is a hundred" from "no
+	// limit at all" — every listing returned all twelve either way — so the
+	// property that stops one request pulling the whole catalog into memory was
+	// asserted by a page smaller than any limit it could have hit.
+	f.seedPage(int(defaultListLimit)+1, 3)
 
 	// Zero is the default, not "every row".
 	page, err := f.store.ListSnapshots(f.ctx, ListInput{ClusterID: f.cluster, ReadOptions: ReadOptions{OnlyReady: true}})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(page.Rows) != 12 {
-		t.Fatalf("the default page held %d rows", len(page.Rows))
+	if len(page.Rows) != int(defaultListLimit) {
+		t.Fatalf("the default page held %d rows, want %d: a request for no limit is not a request for all of them",
+			len(page.Rows), defaultListLimit)
+	}
+	if page.Next == nil {
+		t.Fatal("the default page reported no continuation, with a row left over")
 	}
 
 	page, err = f.store.ListSnapshots(f.ctx, ListInput{ClusterID: f.cluster, Limit: 5, ReadOptions: ReadOptions{OnlyReady: true}})
@@ -1282,6 +1291,30 @@ func TestListingCapsWhatACallerMayAskFor(t *testing.T) {
 	}
 	if page.Next == nil {
 		t.Fatal("a limited page reported no continuation")
+	}
+
+	// 🔴 And the ceiling this test is named for, which nothing above it went
+	// anywhere near. Seeding a thousand and one rows to watch a thousand come
+	// back would buy the assertion at the price of the slowest test in the
+	// package; the ceiling is arithmetic, and the statement carries the result
+	// of it — `LIMIT` is bound as the page size plus the one row that says
+	// there is another page.
+	if got := clampLimit(maxListLimit + 1); got != maxListLimit {
+		t.Fatalf("a request for %d rows was resolved to %d, want the ceiling %d",
+			maxListLimit+1, got, maxListLimit)
+	}
+	if got := clampLimit(maxListLimit * 10); got != maxListLimit {
+		t.Fatalf("a request for %d rows was resolved to %d, want the ceiling %d",
+			maxListLimit*10, got, maxListLimit)
+	}
+	_, args, err := listSnapshotsSQL(
+		ListInput{ClusterID: f.cluster, ReadOptions: ReadOptions{OnlyReady: true}},
+		clampLimit(maxListLimit*10))
+	if err != nil {
+		t.Fatalf("build the listing statement: %v", err)
+	}
+	if got := args[len(args)-1]; got != int64(maxListLimit)+1 {
+		t.Fatalf("the capped statement binds LIMIT %v, want %d", got, int64(maxListLimit)+1)
 	}
 }
 

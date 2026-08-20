@@ -268,8 +268,19 @@ func TestRefusalsCarryWhatTheCallerActsOn(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 	got := resp.GetRejected()
-	if got.GetObservedStatus() != "building" || got.GetAliasHolderSnapshotId() == "" || got.GetActiveBuildId() == "" {
-		t.Fatalf("the refusal lost its detail: %+v", got)
+	// 🔴 Each field against the value the stub gave it, not against "not
+	// empty". The two ids are both uuids and both travel in the same message;
+	// a translation that crossed them over — the alias holder into the build
+	// id, or one value into both — satisfies every emptiness check there is,
+	// and sends the caller after the wrong snapshot.
+	if got.GetObservedStatus() != "building" {
+		t.Fatalf("observed status = %q, want \"building\"", got.GetObservedStatus())
+	}
+	if got.GetAliasHolderSnapshotId() != "aaaaaaaa-0000-4000-8000-000000000001" {
+		t.Fatalf("alias holder = %q, want the holder the store named", got.GetAliasHolderSnapshotId())
+	}
+	if got.GetActiveBuildId() != "bbbbbbbb-0000-4000-8000-000000000002" {
+		t.Fatalf("active build = %q, want the build the store named", got.GetActiveBuildId())
 	}
 	if got.GetObservedGeneration() != generation {
 		t.Fatalf("observed generation = %d, want %d", got.GetObservedGeneration(), generation)
@@ -571,8 +582,22 @@ func TestListingTranslatesItsCursorAndFilterBothWays(t *testing.T) {
 	if len(store.lastList.Filter.SourceKinds) != 1 || store.lastList.Filter.AliasPrefix == nil {
 		t.Fatalf("the filter did not travel: %+v", store.lastList.Filter)
 	}
-	if resp.GetNextCursor().GetCreatedAtUnixMs() != 5 || resp.GetNextCursor().GetSnapshotId() == "" {
-		t.Fatalf("the next cursor did not come back: %+v", resp.GetNextCursor())
+	// 🔴 The id by value. It is the position the next page starts after, and a
+	// cursor carrying some other row's id — the first of the page rather than
+	// the last, say — is not empty and is not a failure anywhere: it is a page
+	// boundary in the wrong place, which skips rows and reports nothing.
+	if resp.GetNextCursor().GetCreatedAtUnixMs() != 5 {
+		t.Fatalf("next cursor timestamp = %d, want 5", resp.GetNextCursor().GetCreatedAtUnixMs())
+	}
+	if resp.GetNextCursor().GetSnapshotId() != "aaaaaaaa-0000-4000-8000-000000000001" {
+		t.Fatalf("next cursor id = %q, want the id the store's cursor named",
+			resp.GetNextCursor().GetSnapshotId())
+	}
+	// And the row itself, which shares both values with the cursor: a
+	// translation that filled the cursor from the row it happened to have would
+	// pass every assertion above.
+	if len(resp.GetRows()) != 1 || resp.GetRows()[0].GetSnapshotId() != "aaaaaaaa-0000-4000-8000-000000000001" {
+		t.Fatalf("the page's rows did not travel: %+v", resp.GetRows())
 	}
 }
 

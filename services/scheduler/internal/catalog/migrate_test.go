@@ -424,8 +424,29 @@ func TestMigrateRefusesATableItDidNotCreate(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a refusal, got success")
 	}
+	// 🔴 Asserted on the preflight's own words, not on the table name.
+	//
+	// "snapshots" appears in almost every failure this migration can produce —
+	// the first file is called 0001_snapshots.sql, so a run that skipped the
+	// preflight entirely, proceeded, and died on `column "deleted_at_ms" does
+	// not exist` names it too. A test that only looked for the table name
+	// passed with the preflight deleted, which is the one thing it was there
+	// to hold down.
+	if !strings.Contains(err.Error(), "不是本进程建的") {
+		t.Fatalf("this is not the preflight's refusal — the migration got past it and failed later: %v", err)
+	}
 	if !strings.Contains(err.Error(), "snapshots") {
 		t.Fatalf("the refusal does not name the table: %v", err)
+	}
+	// And it stopped before writing anything: a preflight that refused after
+	// applying 0001 would leave the ledger claiming a version.
+	var recorded int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM catalog_schema_migrations`).Scan(&recorded); err != nil {
+		t.Fatalf("read the ledger: %v", err)
+	}
+	if recorded != 0 {
+		t.Fatalf("the refused run recorded %d versions", recorded)
 	}
 
 	// The control: the same call against a database whose ledger has an entry

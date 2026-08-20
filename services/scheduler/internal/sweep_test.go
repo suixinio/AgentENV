@@ -543,9 +543,23 @@ func TestBindingSweepRetiresOncePerReport(t *testing.T) {
 	start := time.Now()
 
 	f.report(t, sweepNodeA(), start, RosterEntry{SandboxID: "sbx-1", ExecutionID: execOld})
+	assertBinding(t, store, "sbx-1", "node-a", execOld)
 
 	sweepAt := start.Add(f.silence + time.Second)
+
+	// 🔴 The first round is asserted too, and it is the half that was missing.
+	// "The second round did nothing" is also true of a sweep that does nothing
+	// at all, so without this the test passed with the whole delete path
+	// removed — the thing it is named for never had to happen even once.
+	firstBefore := sweepCounts(t)
 	f.sweeper.sweepOnce(sweepAt)
+	first := sweepCounts(t).since(firstBefore)
+	if got := first.node[bindingSweepNodeSwept]; got != 1 {
+		t.Fatalf("the first round did not sweep the node: %v", first.node)
+	}
+	if _, ok, _ := store.Get("sbx-1", sweepAt); ok {
+		t.Fatal("the first round left the record in place")
+	}
 
 	before := sweepCounts(t)
 	f.sweeper.sweepOnce(sweepAt.Add(30 * time.Second))
@@ -557,6 +571,9 @@ func TestBindingSweepRetiresOncePerReport(t *testing.T) {
 	// number that rises forever on a cluster where nothing is happening.
 	if len(delta.node) != 0 || len(delta.sandbox) != 0 {
 		t.Fatalf("the second round acted again: nodes=%v sandboxes=%v", delta.node, delta.sandbox)
+	}
+	if _, ok, _ := store.Get("sbx-1", sweepAt.Add(30*time.Second)); ok {
+		t.Fatal("the record came back between the two rounds")
 	}
 }
 

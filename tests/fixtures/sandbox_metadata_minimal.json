@@ -25,6 +25,10 @@
     "disk_size_mib": 1024,
     "memory_mib": 128
   },
+  "running_elapsed": {
+    "nanos": 0,
+    "secs": 0
+  },
   "runtime_versions": {
     "envd_version": "unknown",
     "firecracker_version": "unknown",

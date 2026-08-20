@@ -1892,6 +1892,10 @@ mod routing_header_tests {
         let metadata = SandboxMetadata {
             created_at,
             max_lifetime: Some(Duration::from_secs(86_400)),
+            // Running since 1970, so its budget really is long gone —
+            // `created_at` alone would not say that any more, because paused
+            // time does not count against the ceiling.
+            running_since: Some(created_at),
             ..Default::default()
         };
 
@@ -1899,9 +1903,9 @@ mod routing_header_tests {
 
         assert_eq!(routing.sandbox_id, metadata.id.to_string());
         assert_eq!(routing.execution_id, metadata.execution_id.to_string());
-        // A sandbox created at the epoch is long past its ceiling. What comes
-        // out is still positive: the receiver has to be able to read every
-        // value here as a duration, and 0 is spoken for.
+        // A sandbox that has been running since the epoch is long past its
+        // ceiling. What comes out is still positive: the receiver has to be
+        // able to read every value here as a duration, and 0 is spoken for.
         assert!(
             routing.projection_ttl_secs > 0,
             "a sandbox past its ceiling still asks for a short record, not an immortal one"

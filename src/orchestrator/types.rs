@@ -90,6 +90,30 @@ pub enum SandboxState {
     Killing,
 }
 
+impl SandboxState {
+    /// Whether a sandbox in this state is spending its lifetime budget.
+    ///
+    /// 🔴 Everything but `Paused`, and the asymmetry is the point. A paused
+    /// sandbox is a row and a set of layers on disk: no VM, no vCPU, no memory,
+    /// no network slot. Every other state — the transitional ones included —
+    /// has a machine attached to it. So the ceiling bounds how long a sandbox
+    /// may *run*, and wall-clock time spent paused does not count against it.
+    ///
+    /// The alternative, charging paused time, is what the first cut of the
+    /// ceiling did by deriving the deadline from `created_at` alone, and it
+    /// made a sandbox resumed a day after creation resume successfully and then
+    /// be evicted within the second — because its deadline was already in the
+    /// past. e2b, which this whole stage follows, cannot even ask the question:
+    /// it has no paused state (`sandboxtypes/states.go` is running / pausing /
+    /// killing / snapshotting), and a paused sandbox there leaves the active
+    /// store entirely to become a catalog row, so its `MaxInstanceLength` can
+    /// only ever bound running time. Charging paused time here would be a
+    /// product change smuggled into an infrastructure stage.
+    pub fn spends_lifetime(self) -> bool {
+        !matches!(self, SandboxState::Paused)
+    }
+}
+
 impl Display for SandboxState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {

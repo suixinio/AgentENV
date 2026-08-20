@@ -1722,6 +1722,41 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
     Ok(())
 }
 
+/// 🔴 The run has to be charged *before* the record is written, not merely
+/// before the store sees it.
+///
+/// `running_since` is `#[serde(skip)]`, so the only thing a restarted node can
+/// read back is `running_elapsed`. A pause that left the charging to the store
+/// would persist a record with the last run missing from it, and every node
+/// restart would hand that run back for free.
+#[tokio::test]
+async fn pause_charges_the_run_into_the_record_it_persists() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    sleep(Duration::from_millis(30)).await;
+
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let persisted = persister.persisted();
+    let record = persisted.first().expect("one persisted record");
+    assert_eq!(record.state, SandboxState::Paused);
+    assert_eq!(record.running_since, None);
+    assert!(
+        record.running_elapsed >= Duration::from_millis(25),
+        "the persisted record must carry the run that just ended, got {:?}",
+        record.running_elapsed
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn pause_persistence_failure_rolls_back_to_running() -> Result<()> {
     setup();
@@ -2796,6 +2831,9 @@ async fn keep_alive_clamps_an_over_long_renewal_to_the_ceiling() -> Result<()> {
         state: SandboxState::Running,
         created_at,
         max_lifetime: Some(Duration::from_secs(300)),
+        // Running since it was created, so its window is pinned there and this
+        // test can name the instant the ceiling falls on.
+        running_since: Some(created_at),
         ..Default::default()
     };
     metadata.set_timeout(Some(Duration::from_secs(30)));
@@ -2869,6 +2907,9 @@ async fn keep_alive_refuses_a_sandbox_that_is_already_past_its_ceiling() {
         state: SandboxState::Running,
         created_at,
         max_lifetime: Some(Duration::from_secs(300)),
+        // 🔴 Running for the whole hour, not merely created an hour ago. That
+        // is what puts it past a five-minute ceiling: paused time would not.
+        running_since: Some(created_at),
         ..Default::default()
     };
 
@@ -2887,6 +2928,251 @@ async fn keep_alive_refuses_a_sandbox_that_is_already_past_its_ceiling() {
         }
         other => panic!("expected SandboxLifetimeExceeded, got {other:?}"),
     }
+}
+
+/// 🔴 QA F3. A sandbox paused for longer than the ceiling has to resume — and
+/// stay resumed.
+///
+/// The first cut of the ceiling derived the deadline from `created_at` alone,
+/// so this sequence returned a successful 201 and then handed the eviction loop
+/// a Running sandbox whose `expires_at` was already in the past. Within one
+/// `auto_evict_interval_ms` the sandbox was paused again (or deleted, for a
+/// sandbox carrying that timeout action), and the client saw a resume that
+/// worked followed by a sandbox that was dead.
+///
+/// Twenty-five hours of wall clock cannot be waited out in a unit test, and
+/// they do not have to be: `created_at` is the whole of what the old model read
+/// and it is set directly here. The paired control face below shows the ceiling
+/// still bites when the budget is genuinely spent.
+#[tokio::test]
+async fn a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+
+    // Put the node's default ceiling on it, then pause.
+    let mut running = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a running sandbox");
+    running.max_lifetime = Some(Duration::from_secs(86_400));
+    orchestrator.store.update(running).await?;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    let mut paused = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a paused sandbox");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(
+        paused.running_elapsed < Duration::from_secs(60),
+        "the pause charged the run it actually had, not the ceiling"
+    );
+    assert_eq!(
+        paused.running_since, None,
+        "a paused sandbox has no run in progress to charge"
+    );
+
+    // Twenty-five hours later.
+    paused.created_at = SystemTime::now() - Duration::from_secs(90_000);
+    orchestrator.store.update(paused).await?;
+
+    let resumed = orchestrator
+        .resume_sandbox(
+            sandbox_id,
+            NewTimeout::Set(Duration::from_secs(60)),
+            test_claim(),
+        )
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    let deadline = resumed
+        .expires_at
+        .expect("a resumed sandbox has a deadline");
+    assert!(
+        deadline > SystemTime::now(),
+        "resume handed back a deadline that had already passed"
+    );
+
+    // The half that actually kills the sandbox: the eviction loop reads
+    // `expires_at` and state, and would tear this one down within the second.
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert!(
+        evicted.is_empty(),
+        "a sandbox resumed inside its running budget must not be evicted: {evicted:?}"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("the sandbox is still there")
+            .state,
+        SandboxState::Running
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+/// 🔴 The control face for the test above, and the reason it proves anything.
+///
+/// Same sequence, same evictor, one difference: this sandbox really has spent
+/// its running budget. It still resumes — §6.3 clamps rather than refuses — and
+/// the evictor still takes it, which is what says the ceiling was not simply
+/// switched off.
+#[tokio::test]
+async fn a_sandbox_that_has_spent_its_running_budget_is_still_evicted_after_a_resume() -> Result<()>
+{
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+
+    let mut running = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a running sandbox");
+    running.max_lifetime = Some(Duration::from_secs(300));
+    // Five minutes of budget, six minutes already burned by earlier runs.
+    running.running_elapsed = Duration::from_secs(360);
+    orchestrator.store.update(running).await?;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    let resumed = orchestrator
+        .resume_sandbox(
+            sandbox_id,
+            NewTimeout::Set(Duration::from_secs(60)),
+            test_claim(),
+        )
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert!(
+        resumed.expires_at.expect("a deadline") <= SystemTime::now(),
+        "an exhausted budget clamps the deadline into the past"
+    );
+
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert_eq!(
+        evicted,
+        vec![sandbox_id],
+        "a sandbox with no running budget left is still evicted"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("the sandbox is still tracked")
+            .state,
+        SandboxState::Paused,
+        "the configured timeout action is Pause"
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+/// The budget is spent by running and only by running, across as many
+/// pause/resume cycles as it takes.
+#[tokio::test]
+async fn running_time_accumulates_across_pause_and_resume_cycles() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let after_first = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a paused sandbox")
+        .running_elapsed;
+
+    // Sitting paused costs nothing, however many times it is read.
+    sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("a paused sandbox")
+            .running_elapsed,
+        after_first,
+        "paused wall-clock time must not be charged"
+    );
+
+    orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
+        .await?;
+    sleep(Duration::from_millis(30)).await;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    let after_second = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a paused sandbox")
+        .running_elapsed;
+    assert!(
+        after_second >= after_first + Duration::from_millis(25),
+        "the second run has to be charged too: {after_first:?} then {after_second:?}"
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+/// A fork's child starts its budget over, the way it starts `created_at` over.
+#[tokio::test]
+async fn a_forked_child_does_not_inherit_the_parents_spent_budget() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+
+    let mut parent = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a running sandbox");
+    parent.max_lifetime = Some(Duration::from_secs(300));
+    // Nearly all of it spent: a child that cloned this would be evicted almost
+    // at once.
+    parent.running_elapsed = Duration::from_secs(290);
+    orchestrator.store.update(parent).await?;
+
+    let children = orchestrator
+        .fork_sandbox(sandbox_id, 1, NewTimeout::Set(Duration::from_secs(120)))
+        .await?;
+    let child = children
+        .into_iter()
+        .next()
+        .expect("one child")
+        .expect("the child started");
+
+    assert_eq!(child.running_elapsed, Duration::ZERO);
+    assert_eq!(
+        child.max_lifetime,
+        Some(Duration::from_secs(300)),
+        "the ceiling itself is inherited; only the spend is reset"
+    );
+    let deadline = child.expires_at.expect("a deadline");
+    assert!(
+        deadline > SystemTime::now() + Duration::from_secs(110),
+        "the child keeps the two minutes it asked for, not the parent's last ten seconds"
+    );
+
+    orchestrator.delete_sandbox(child.id).await?;
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
 }
 
 #[tokio::test]

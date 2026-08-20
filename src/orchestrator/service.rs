@@ -714,6 +714,12 @@ where
             metadata.execution_id = child.execution_id;
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
+            // 🔴 And the lifetime clock with it. The clone above carries the
+            // parent's spent budget; leaving it would hand a child forked from
+            // a sandbox that has been running for 23 hours a one-hour life,
+            // which is neither what `created_at = now` above says nor what a
+            // fresh sandbox on this node would get.
+            metadata.restart_lifetime_clock(now);
             metadata.paused_state = None;
             metadata.update_timeout(new_timeout);
 
@@ -951,8 +957,9 @@ where
         // left to clamp into. Reversing this — refusing anything that asks for
         // more than the ceiling allows — would hand a new 400 to every client
         // that passes a generous timeout.
-        if let Some(deadline) = metadata.lifetime_deadline() {
-            if SystemTime::now() >= deadline {
+        let now = SystemTime::now();
+        if let Some(deadline) = metadata.lifetime_deadline(now) {
+            if now >= deadline {
                 info!(?deadline, "sandbox has exceeded its maximum lifetime");
                 return Err(OrchestratorError::SandboxLifetimeExceeded {
                     sandbox_id,
@@ -1487,6 +1494,11 @@ where
                 .await?
                 .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
             metadata.state = SandboxState::Paused;
+            // 🔴 Before `persist_paused` below, not after. The persisted copy
+            // is what a restarted node reads back, and `running_since` is not
+            // serialised — so a run charged only into the in-memory record
+            // would be given back for free by the next node restart.
+            metadata.sync_running_clock(SystemTime::now());
             metadata.paused_state = Some(paused_state.clone());
             metadata
         };

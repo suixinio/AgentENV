@@ -100,14 +100,18 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
-    /// The lifetime ceiling this sandbox was created under, measured from
-    /// `created_at`, or `None` when the node had no ceiling configured.
+    /// The lifetime ceiling this sandbox was created under, or `None` when the
+    /// node had no ceiling configured.
     ///
-    /// Stored as the budget rather than as an absolute deadline on purpose. A
-    /// fork resets `created_at` and so gets a whole fresh window; a resume
-    /// keeps it and so keeps shrinking the same one. Both are the right reading
-    /// of "maximum lifetime", and neither needs a line of clamping code at the
-    /// call site.
+    /// 🔴 A budget of *running* time, not a wall-clock window from
+    /// `created_at`. It is spent by `running_elapsed` below and by the run in
+    /// progress, and a sandbox that sits paused spends none of it. See
+    /// [`SandboxState::spends_lifetime`] for why paused time is free.
+    ///
+    /// Stored as the budget rather than as an absolute deadline on purpose: a
+    /// fork restarts the clock and so gets a whole fresh window, while a resume
+    /// picks the same one back up where it was left. Neither needs a line of
+    /// clamping code at the call site.
     ///
     /// 🔴 `#[serde(default)]` is load-bearing here, unlike on `execution_id`
     /// above: `persister.load_all` runs inside `Orchestrator::new`, so a
@@ -116,6 +120,30 @@ pub struct SandboxMetadata {
     /// Do not copy the neighbour.
     #[serde(default)]
     pub max_lifetime: Option<Duration>,
+    /// Running time already spent, summed over the runs that have finished.
+    /// The run in progress is not in here — `running_since` holds its start.
+    ///
+    /// 🔴 `#[serde(default)]` for the same reason as `max_lifetime`: a paused
+    /// record written before this field existed has to decode, or the node
+    /// stops starting. Decoding to zero is also the right answer for such a
+    /// record — the build that wrote it had no way to spend the budget.
+    #[serde(default)]
+    pub running_elapsed: Duration,
+    /// When the run in progress started, or `None` while the sandbox is paused.
+    ///
+    /// 🔴 Deliberately not persisted. This names an interval inside *one
+    /// process's* run of the sandbox, and a record only ever leaves this
+    /// process at pause, by which point `pause_sandbox_inner` has already
+    /// charged the interval into `running_elapsed`. Persisting it would buy
+    /// nothing and introduce exactly one new failure mode: a record whose open
+    /// interval spans a node outage, charging the downtime as running time —
+    /// which is the bug this whole field exists to prevent.
+    ///
+    /// The invariant `running_since.is_some() == state.spends_lifetime()` is
+    /// maintained by [`SandboxMetadata::sync_running_clock`], which the
+    /// metadata store calls after every mutation it performs.
+    #[serde(skip)]
+    pub running_since: Option<SystemTime>,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
@@ -154,6 +182,8 @@ impl Default for SandboxMetadata {
             custom_extension_params: None,
             secure: false,
             max_lifetime: None,
+            running_elapsed: Duration::ZERO,
+            running_since: None,
             paused_state: None,
         }
     }
@@ -164,14 +194,73 @@ impl SandboxMetadata {
         self._set_timeout(timeout, SystemTime::now());
     }
 
-    /// `created_at + max_lifetime`. `None` means this sandbox has no ceiling.
-    pub fn lifetime_deadline(&self) -> Option<SystemTime> {
-        self.max_lifetime
-            .and_then(|lifetime| self.created_at.checked_add(lifetime))
+    /// The instant this sandbox runs out of lifetime budget. `None` means it
+    /// has no ceiling.
+    ///
+    /// 🔴 Two anchors, one formula. While the sandbox is running the window is
+    /// pinned to the start of the run, so the answer is fixed for the duration
+    /// of that run and may already be in the past — which is exactly what
+    /// `keep_alive_for` reports as `SandboxLifetimeExceeded`. While it is
+    /// paused nothing is being spent, so the window is anchored at `now` and
+    /// the deadline recedes with it: a sandbox paused for a week resumes with
+    /// the budget it went away with, instead of resuming into a deadline that
+    /// expired while it was gone.
+    pub fn lifetime_deadline(&self, now: SystemTime) -> Option<SystemTime> {
+        let remaining = self.max_lifetime?.saturating_sub(self.running_elapsed);
+        let anchor = match self.running_since {
+            // The state is consulted as well as the timestamp, so a record that
+            // somehow carries a stale start — one that never went through
+            // `sync_running_clock` — degrades to "the clock is not running"
+            // rather than to "the budget has been draining since then".
+            Some(since) if self.state.spends_lifetime() => since,
+            _ => now,
+        };
+
+        anchor.checked_add(remaining)
+    }
+
+    /// Brings the running clock in step with `state`, charging a run that has
+    /// just ended and starting one that has just begun.
+    ///
+    /// Idempotent, and driven by nothing but `state`. That is what lets the
+    /// metadata store call it after *every* mutation it performs — including
+    /// the ones whose callback sets `state` directly — and still lets a caller
+    /// that needs the exact instant call it early. `pause_sandbox_inner` does
+    /// exactly that: it has to charge the run before the record is persisted,
+    /// because the persisted copy is the one a restarted node reads back.
+    pub fn sync_running_clock(&mut self, now: SystemTime) {
+        match (self.state.spends_lifetime(), self.running_since) {
+            (true, None) => self.running_since = Some(now),
+            (false, Some(since)) => {
+                self.running_elapsed = self
+                    .running_elapsed
+                    .saturating_add(now.duration_since(since).unwrap_or(Duration::ZERO));
+                self.running_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Gives this record a whole fresh lifetime window.
+    ///
+    /// Only a fork's child gets one: it is a new sandbox that happens to have
+    /// been built from a running one, so it starts its budget at zero the same
+    /// way it starts `created_at` at `now`. A resume is the other case, and it
+    /// deliberately does not call this — the sandbox coming back is the same
+    /// sandbox, and it picks its budget up where it left it.
+    pub fn restart_lifetime_clock(&mut self, now: SystemTime) {
+        self.running_elapsed = Duration::ZERO;
+        self.running_since = self.state.spends_lifetime().then_some(now);
     }
 
     /// How long this sandbox's routing projection should live, in whole
     /// seconds, or `0` when there is no ceiling to derive it from.
+    ///
+    /// Derived from the *remaining running budget*, so a paused sandbox reports
+    /// the whole of what it has left rather than a window that has been
+    /// draining while it sat still. The worst-case leak the ceiling bounds is
+    /// unchanged by that: a record still cannot outlive `max_lifetime` plus the
+    /// grace without a heartbeat to renew it.
     ///
     /// 🔴 `0` is the only non-positive value that may ever leave here, and it
     /// means "use the receiver's default TTL". It must never be read as "never
@@ -182,7 +271,7 @@ impl SandboxMetadata {
     }
 
     fn _projection_ttl_secs(&self, now: SystemTime, grace_secs: u64) -> u32 {
-        let Some(cap) = self.lifetime_deadline() else {
+        let Some(cap) = self.lifetime_deadline(now) else {
             return 0;
         };
         let remaining = cap.duration_since(now).unwrap_or(Duration::ZERO);
@@ -204,7 +293,7 @@ impl SandboxMetadata {
         // auto-resume, keep-alive — funnels through here, which is why the
         // ceiling is applied here and at no call site: there are six of them
         // and clamping them one by one would miss one.
-        self.expires_at = match (deadline, self.lifetime_deadline()) {
+        self.expires_at = match (deadline, self.lifetime_deadline(from)) {
             (Some(deadline), Some(cap)) => Some(deadline.min(cap)),
             (deadline, _) => deadline,
         };
@@ -296,26 +385,137 @@ mod tests {
         SandboxMetadata {
             created_at: base,
             max_lifetime: None,
+            running_since: Some(base),
             ..Default::default()
         }
     }
 
+    /// A sandbox that has been running since `base` and has spent none of its
+    /// budget yet. `running_since` is set explicitly rather than left to the
+    /// store, so every deadline below is a fixed instant these tests can name.
     fn capped(base: SystemTime, lifetime_secs: u64) -> SandboxMetadata {
         SandboxMetadata {
             created_at: base,
             max_lifetime: Some(Duration::from_secs(lifetime_secs)),
+            running_since: Some(base),
             ..Default::default()
         }
     }
 
     #[test]
-    fn lifetime_deadline_is_created_at_plus_the_budget() {
+    fn lifetime_deadline_is_the_run_start_plus_what_is_left_of_the_budget() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
 
-        assert_eq!(uncapped(base).lifetime_deadline(), None);
+        assert_eq!(uncapped(base).lifetime_deadline(base), None);
         assert_eq!(
-            capped(base, 300).lifetime_deadline(),
+            capped(base, 300).lifetime_deadline(base),
             Some(base + Duration::from_secs(300))
+        );
+
+        // Half the budget already spent by earlier runs: the window that is
+        // left is half as long, and it still starts at this run's start.
+        let mut resumed = capped(base, 300);
+        resumed.running_elapsed = Duration::from_secs(150);
+        assert_eq!(
+            resumed.lifetime_deadline(base),
+            Some(base + Duration::from_secs(150))
+        );
+
+        // 🔴 And it does not move while the run is under way: the deadline read
+        // 100 seconds in is the same instant, not 100 seconds later.
+        assert_eq!(
+            resumed.lifetime_deadline(base + Duration::from_secs(100)),
+            Some(base + Duration::from_secs(150))
+        );
+    }
+
+    /// 🔴 The defect this model exists to fix. A paused sandbox is not running,
+    /// so its clock is stopped: the deadline is measured from whenever it comes
+    /// back, however long it has been away.
+    #[test]
+    fn a_paused_sandbox_carries_its_budget_forward_instead_of_burning_it() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let paused = SandboxMetadata {
+            created_at: base,
+            state: SandboxState::Paused,
+            max_lifetime: Some(Duration::from_secs(86_400)),
+            running_elapsed: Duration::from_secs(60),
+            running_since: None,
+            ..Default::default()
+        };
+
+        // Twenty-five hours later — past the point where a deadline derived
+        // from `created_at` alone would already have expired.
+        let much_later = base + Duration::from_secs(90_000);
+        assert_eq!(
+            paused.lifetime_deadline(much_later),
+            Some(much_later + Duration::from_secs(86_340)),
+            "the budget left is the ceiling minus the minute actually spent running"
+        );
+    }
+
+    /// The clock is driven by `state` and by nothing else, and running it twice
+    /// costs nothing — which is what lets the store call it after every write
+    /// while `pause_sandbox_inner` also calls it early, at the instant it needs.
+    #[test]
+    fn the_running_clock_charges_a_run_once_and_only_once() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut metadata = SandboxMetadata {
+            created_at: base,
+            state: SandboxState::Running,
+            max_lifetime: Some(Duration::from_secs(300)),
+            ..Default::default()
+        };
+
+        metadata.sync_running_clock(base);
+        assert_eq!(metadata.running_since, Some(base));
+        // Still Running: a second sync must not restart the run and throw the
+        // elapsed time away.
+        metadata.sync_running_clock(base + Duration::from_secs(30));
+        assert_eq!(metadata.running_since, Some(base));
+        assert_eq!(metadata.running_elapsed, Duration::ZERO);
+
+        metadata.state = SandboxState::Paused;
+        metadata.sync_running_clock(base + Duration::from_secs(60));
+        assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
+        assert_eq!(metadata.running_since, None);
+        // And a second sync while paused charges nothing further, however much
+        // wall-clock time goes by.
+        metadata.sync_running_clock(base + Duration::from_secs(90_000));
+        assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
+
+        // Resuming picks the same budget back up rather than starting over.
+        metadata.state = SandboxState::Running;
+        metadata.sync_running_clock(base + Duration::from_secs(90_000));
+        assert_eq!(
+            metadata.running_since,
+            Some(base + Duration::from_secs(90_000))
+        );
+        assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
+    }
+
+    /// A fork's child is a new sandbox, so it starts the budget over. A resume
+    /// is the same sandbox, so it does not — the contrast is the test.
+    #[test]
+    fn restarting_the_clock_clears_the_spent_budget() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let mut child = SandboxMetadata {
+            created_at: base,
+            state: SandboxState::Running,
+            max_lifetime: Some(Duration::from_secs(300)),
+            running_elapsed: Duration::from_secs(290),
+            running_since: Some(base),
+            ..Default::default()
+        };
+
+        let forked_at = base + Duration::from_secs(10);
+        child.restart_lifetime_clock(forked_at);
+
+        assert_eq!(child.running_elapsed, Duration::ZERO);
+        assert_eq!(child.running_since, Some(forked_at));
+        assert_eq!(
+            child.lifetime_deadline(forked_at),
+            Some(forked_at + Duration::from_secs(300))
         );
     }
 
@@ -377,15 +577,23 @@ mod tests {
         assert_eq!(metadata.expires_at, None);
     }
 
+    /// A fork's child gets a whole fresh window. The parent, 280 seconds into
+    /// a 300-second budget, is 20 seconds from its own ceiling at that moment —
+    /// so a child that merely cloned the record would be too.
     #[test]
-    fn a_forked_child_gets_a_fresh_window_because_created_at_moved() {
+    fn a_forked_child_gets_a_fresh_window_because_the_clock_restarted() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
         let mut parent = capped(base, 300);
         parent._set_timeout(Some(Duration::from_secs(300)), base);
+        let later = base + Duration::from_secs(280);
+        assert_eq!(
+            parent.lifetime_deadline(later),
+            Some(base + Duration::from_secs(300))
+        );
 
         let mut child = parent.clone();
-        let later = base + Duration::from_secs(280);
         child.created_at = later;
+        child.restart_lifetime_clock(later);
         child._set_timeout(Some(Duration::from_secs(300)), later);
 
         assert_eq!(child.expires_at, Some(later + Duration::from_secs(300)));
@@ -435,6 +643,7 @@ mod tests {
         let ragged = SandboxMetadata {
             created_at: base,
             max_lifetime: Some(Duration::new(300, 1)),
+            running_since: Some(base),
             ..Default::default()
         };
         assert_eq!(ragged._projection_ttl_secs(base, 0), 301);
@@ -450,6 +659,7 @@ mod tests {
         let metadata = SandboxMetadata {
             created_at: base,
             max_lifetime: Some(Duration::new(0, 1)),
+            running_since: Some(base),
             ..Default::default()
         };
 
@@ -492,7 +702,7 @@ mod tests {
             serde_json::from_value(document).expect("an older record must still load");
 
         assert_eq!(decoded.max_lifetime, None);
-        assert_eq!(decoded.lifetime_deadline(), None);
+        assert_eq!(decoded.lifetime_deadline(SystemTime::now()), None);
         // And an uncapped record keeps behaving as it did before the ceiling
         // existed, rather than being retro-fitted with this node's ceiling.
         assert_eq!(decoded.projection_ttl_secs(SystemTime::now()), 0);
@@ -511,6 +721,68 @@ mod tests {
                 .expect("deserialize");
 
         assert_eq!(decoded.max_lifetime, Some(Duration::from_secs(86_400)));
+    }
+
+    /// 🔴 N2 again, for the field the ceiling is actually spent through. A node
+    /// upgraded onto this build reads paused records that predate
+    /// `running_elapsed`, and `load_all` runs inside `Orchestrator::new` — so a
+    /// record that does not decode is a node that does not start.
+    #[test]
+    fn a_record_written_before_the_running_clock_existed_still_decodes() {
+        let mut document = serde_json::to_value(SandboxMetadata {
+            created_at: UNIX_EPOCH + Duration::from_secs(100),
+            state: SandboxState::Paused,
+            max_lifetime: Some(Duration::from_secs(86_400)),
+            running_elapsed: Duration::from_secs(600),
+            ..Default::default()
+        })
+        .expect("serialize");
+        document
+            .as_object_mut()
+            .expect("an object")
+            .remove("running_elapsed")
+            .expect("the field is written");
+
+        let decoded: SandboxMetadata =
+            serde_json::from_value(document).expect("an older record must still load");
+
+        // Nothing spent, which is the truthful reading: the build that wrote
+        // the record had no way to spend the budget.
+        assert_eq!(decoded.running_elapsed, Duration::ZERO);
+        assert_eq!(decoded.running_since, None);
+
+        let now = UNIX_EPOCH + Duration::from_secs(500_000);
+        assert_eq!(
+            decoded.lifetime_deadline(now),
+            Some(now + Duration::from_secs(86_400)),
+            "a record with no spend history resumes with the whole ceiling, however \
+             long ago it was written"
+        );
+    }
+
+    /// The spent budget is the half of the model that has to survive a restart,
+    /// and it does — while the open interval deliberately does not.
+    #[test]
+    fn the_spent_budget_survives_a_round_trip_and_the_open_interval_does_not() {
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let metadata = SandboxMetadata {
+            created_at: base,
+            state: SandboxState::Running,
+            max_lifetime: Some(Duration::from_secs(86_400)),
+            running_elapsed: Duration::from_secs(3_600),
+            running_since: Some(base),
+            ..Default::default()
+        };
+
+        let decoded: SandboxMetadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).expect("serialize"))
+                .expect("deserialize");
+
+        assert_eq!(decoded.running_elapsed, Duration::from_secs(3_600));
+        // 🔴 Dropped on purpose. A persisted record is a paused record, and the
+        // only way an open interval could reach the wire is a run this process
+        // never closed — reading it back would charge the whole outage.
+        assert_eq!(decoded.running_since, None);
     }
 }
 
@@ -689,6 +961,9 @@ mod golden {
             custom_extension_params: Some(custom_extension_params),
             secure: true,
             max_lifetime: Some(Duration::new(86_400, 0)),
+            running_elapsed: Duration::new(5_400, 0),
+            // Not written: `#[serde(skip)]`, and this record is paused anyway.
+            running_since: None,
             paused_state: None,
         }
     }
@@ -874,11 +1149,12 @@ mod golden {
             "expires_at",
             "startup",
             "user_metadata",
-            // 🔴 The one whose absence a node actually meets in production:
+            // 🔴 The two whose absence a node actually meets in production:
             // every paused record written before the lifetime ceiling existed
-            // is missing it, and `load_all` runs inside `Orchestrator::new`, so
-            // a decode failure here is a node that will not start.
+            // is missing them, and `load_all` runs inside `Orchestrator::new`,
+            // so a decode failure here is a node that will not start.
             "max_lifetime",
+            "running_elapsed",
         ] {
             let mut trimmed = full.clone();
             trimmed

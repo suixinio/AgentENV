@@ -47,6 +47,7 @@ impl fmt::Display for RecordingCall {
 pub(crate) struct RecordingPersister {
     pub(crate) calls: Arc<Mutex<Vec<RecordingCall>>>,
     loaded: Arc<Mutex<Vec<SandboxMetadata>>>,
+    persisted: Arc<Mutex<Vec<SandboxMetadata>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
 }
 
@@ -60,6 +61,16 @@ impl RecordingPersister {
 
     pub(crate) fn calls(&self) -> Vec<RecordingCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The records handed to `persist_paused`, in order.
+    ///
+    /// What reaches the persister is not what the in-memory store ends up
+    /// holding — the store reconciles a record on the way in, and the persister
+    /// does not — so a caller that has to get the record right *before* it is
+    /// written can only be checked here.
+    pub(crate) fn persisted(&self) -> Vec<SandboxMetadata> {
+        self.persisted.lock().unwrap().clone()
     }
 
     pub(crate) fn clear_calls(&self) {
@@ -113,10 +124,11 @@ impl SandboxPersister for RecordingPersister {
 
     async fn persist_paused(
         &self,
-        _metadata: &SandboxMetadata,
+        metadata: &SandboxMetadata,
         _artifact_root: Option<&Path>,
         _paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
+        self.persisted.lock().unwrap().push(metadata.clone());
         self.record(RecordingCall::PersistPaused);
         self.maybe_fail(RecordingCall::PersistPaused)?;
         Ok(())

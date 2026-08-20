@@ -79,6 +79,10 @@
     "disk_size_mib": 20480,
     "memory_mib": 4096
   },
+  "running_elapsed": {
+    "nanos": 0,
+    "secs": 5400
+  },
   "runtime_versions": {
     "envd_version": "0.5.15",
     "firecracker_version": "1.13.1",

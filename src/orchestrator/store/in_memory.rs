@@ -91,15 +91,27 @@ impl StoreInner {
     }
 }
 
+/// 🔴 Every one of the four methods below that writes a record calls
+/// [`SandboxMetadata::sync_running_clock`] before it publishes the result, and
+/// that is the whole of the lifetime clock's bookkeeping.
+///
+/// The alternative — a hook at each of the eight or so places that assign
+/// `metadata.state` — was rejected for the same reason `_set_timeout` is the
+/// single clamp point: with that many call sites, one of them is eventually
+/// written without the hook, and the symptom is a sandbox that quietly loses
+/// or gains budget. Here the callback in `update_if_state` is free to set
+/// whatever state it likes; the store reconciles the clock afterwards, because
+/// the clock is a function of the state and nothing else.
 #[async_trait]
 impl MetadataStore for InMemoryMetadataStore {
-    async fn add(&self, metadata: SandboxMetadata) -> Result<()> {
+    async fn add(&self, mut metadata: SandboxMetadata) -> Result<()> {
         let mut inner = self.inner.write().await;
         if inner.records.contains_key(&metadata.id) {
             return Err(StoreError::SandboxAlreadyExists {
                 sandbox_id: metadata.id,
             });
         }
+        metadata.sync_running_clock(SystemTime::now());
 
         let (tx, _) = watch::channel(Some(metadata.state));
         inner.index_expiry(&metadata.id, metadata.expires_at);
@@ -113,7 +125,8 @@ impl MetadataStore for InMemoryMetadataStore {
         Ok(())
     }
 
-    async fn update(&self, metadata: SandboxMetadata) -> Result<()> {
+    async fn update(&self, mut metadata: SandboxMetadata) -> Result<()> {
+        metadata.sync_running_clock(SystemTime::now());
         let new_state = metadata.state;
         let sandbox_id = metadata.id;
         let new_expires_at = metadata.expires_at;
@@ -161,6 +174,7 @@ impl MetadataStore for InMemoryMetadataStore {
             }
 
             record.metadata.state = new_state;
+            record.metadata.sync_running_clock(SystemTime::now());
             let tx = record.state_tx.clone();
             (previous_state, tx)
         };
@@ -197,6 +211,7 @@ impl MetadataStore for InMemoryMetadataStore {
 
                 let previous = record.metadata.clone();
                 update(&mut record.metadata);
+                record.metadata.sync_running_clock(SystemTime::now());
                 let current = record.metadata.clone();
                 (previous, current, record.state_tx.clone())
             };
@@ -804,6 +819,64 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, StoreError::SandboxAlreadyExists { .. }));
+    }
+
+    /// 🔴 The funnel, proved end to end through the store rather than by
+    /// calling `sync_running_clock` directly.
+    ///
+    /// Each of the four writing methods is exercised: `add` opens the clock,
+    /// `update_state_if_state` closes it on the way to `Paused`, `update`
+    /// leaves it closed while paused, and the `update_if_state` callback
+    /// reopens it by setting `Running` — without that callback saying anything
+    /// about the clock, which is the point of putting the reconcile here.
+    #[tokio::test]
+    async fn the_store_keeps_the_running_clock_in_step_with_the_state() {
+        let store = InMemoryMetadataStore::new();
+        let id = SandboxId::new();
+
+        store
+            .add(SandboxMetadata {
+                id,
+                state: SandboxState::Running,
+                max_lifetime: Some(Duration::from_secs(300)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let opened = store.get(&id).await.unwrap().unwrap().running_since;
+        assert!(
+            opened.is_some(),
+            "add must open the clock for a running record"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store
+            .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Running])
+            .await
+            .unwrap();
+        let paused = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(paused.running_since, None);
+        let charged = paused.running_elapsed;
+        assert!(charged >= Duration::from_millis(15), "{charged:?}");
+
+        // A whole-record write while paused charges nothing further.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.update(paused).await.unwrap();
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().running_elapsed,
+            charged
+        );
+
+        // The callback only sets the state; the clock follows on its own.
+        store
+            .update_if_state(&id, &[SandboxState::Paused], |metadata| {
+                metadata.state = SandboxState::Running;
+            })
+            .await
+            .unwrap();
+        let resumed = store.get(&id).await.unwrap().unwrap();
+        assert!(resumed.running_since.is_some());
+        assert_eq!(resumed.running_elapsed, charged);
     }
 
     #[tokio::test]

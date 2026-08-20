@@ -411,6 +411,68 @@ mod tests {
         );
     }
 
+    /// 🔴 The two sides of the credential read *different keys of one Secret*,
+    /// and the release order depends on nothing else.
+    ///
+    /// The gateway takes its half from an environment variable and this node
+    /// takes its half from a projected file. Point both at the same key and
+    /// creating the Secret — the single act that starts the gateway stamping —
+    /// also drops the file that opens this node's gate, in the one order the
+    /// rollout must never happen in. Nothing fails at that moment; what fails
+    /// is every platform request between then and the gateway's rollout
+    /// finishing, and the runbook step that says "gateway first, node second"
+    /// becomes a sentence with nothing behind it.
+    ///
+    /// Checked here rather than trusted to review because the regression is
+    /// deleting four lines of YAML, and the manifest that results is valid,
+    /// renders, applies, and reads exactly like the safe one.
+    #[test]
+    fn the_gateway_and_the_node_read_different_keys_of_the_credential_secret() {
+        const DAEMONSET: &str = include_str!("../../deploy/k8s/base/agentenv-daemonset.yaml");
+        const GATEWAY: &str = include_str!("../../deploy/k8s/base/gateway-deployment.yaml");
+        const SECRET: &str = "agentenv-control-plane-token";
+        const GATEWAY_KEY: &str = "token";
+        const NODE_KEY: &str = "node-gate-token";
+
+        assert!(
+            DAEMONSET.contains(SECRET) && GATEWAY.contains(SECRET),
+            "both sides still read one Secret; splitting it into two is a \
+             different design and this test would be the wrong one for it"
+        );
+
+        // The node projects one named key, and names it. Without `items:` the
+        // whole Secret lands in the directory and the gateway's own key
+        // becomes the node's file the moment it is written.
+        let volume = DAEMONSET
+            .rsplit_once("- name: control-plane-token")
+            .expect("the daemonset mounts the control-plane credential")
+            .1;
+        assert!(
+            volume.contains("items:") && volume.contains(NODE_KEY),
+            "the node's credential volume must project `{NODE_KEY}` by name, or creating the \
+             Secret opens the node's gate at the same moment it starts the gateway stamping"
+        );
+        assert!(
+            volume.contains("optional: true"),
+            "the projection must stay optional, or a Secret without `{NODE_KEY}` fails the \
+             mount instead of leaving the gate off"
+        );
+
+        // ...and it is not the key the gateway reads.
+        assert_ne!(
+            NODE_KEY, GATEWAY_KEY,
+            "the two halves must be different keys of the Secret"
+        );
+        assert!(
+            GATEWAY.contains("GATEWAY_CONTROL_PLANE_TOKEN"),
+            "the gateway still reads the credential it stamps"
+        );
+        assert!(
+            !volume.contains(&format!("key: {GATEWAY_KEY}\n")),
+            "the node must not project the gateway's key"
+        );
+    }
+
     #[test]
     fn only_the_read_half_of_the_sandbox_listing_is_exempt() {
         assert!(is_exempt(&Method::GET, "/health"));

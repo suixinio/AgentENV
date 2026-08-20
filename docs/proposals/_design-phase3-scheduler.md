@@ -340,7 +340,8 @@ callers acting on a fresh read or on user intent`。而 D11 已经把它从无�
 
 > ### ✅ 裁决：采纳方案 γ（drop 重建），但那次 `DROP TABLE` 不是一个独立动作
 >
-> 🔴 **它与 node 侧"清空节点上的 `$AENV_HOME/persisted-sandboxes`"（`_design-phase3-node.md` §2.3）
+> 🔴 **它与 node 侧"清空节点上的 `$AENV_HOME/persisted-sandboxes`"（`_design-phase3-node.md` §2.3；
+> ⚠️ 该路径已订正为 **`/workspace/env/persisted-sandboxes`**，`AENV_HOME` 在容器里是空串，见该节）
 > 是同一次破坏性操作的两半，必须写进 runbook 的同一个步骤**，不许分成两条各自独立的指令。
 > 一句话理由：分开写，就一定会有集群只做了其中一半 —— 中央说没有、节点说有的半清状态，比两边都不清更难查。
 >

@@ -32,7 +32,24 @@
 >   §2.3 表与 §3.4 SQL 的**块内**作废标注；node 设计补 `T-A4-7/8/9`。
 > - 若干锚点行号订正（daemonset / auth.rs / server.go / central.rs / redis_store_test.go）。
 >
+> 🔧 **2026-08-20 六次修订（集群验证开工前的实地校正 · pve-sg dev 实测）**：
+> - **[§6.0](#60--本轮的部署方式定点更新不走-make-k8s-apply不许抹掉集群侧的-out-of-band-配置)（新）**：
+>   **本轮改判为定点更新，不走 `make k8s-apply`** —— 这两套集群与仓内清单有 **10 处 out-of-band 漂移**，
+>   全量 apply 会把它们一起抹掉且大多数不报错。含：漂移清单（6.0.2）、要显式创建的资源（6.0.3）、
+>   **可直接执行的定点更新命令序列**（6.0.4）、每步的漂移复核探针（6.0.5，全部带对照面）、
+>   **control-plane token Secret 拆成两个 key** 的方案与"key 缺失时行为"的查实（6.0.6）、
+>   **哪几步要滚服务、哪一步是真热生效**（6.0.7）。
+> - **§6.3 的 2.4 / 2.5 已订正**：`$AENV_HOME` 在容器里**是空串**（真变量是 `AENV_HOME_PATH=/workspace/env`），
+>   原命令是**静默无操作 + 打印 `0` 伪装成"每台都清干净了"**；同时把"条目数"口径改成
+>   `artifacts/` 子目录数或启动日志 `loaded=/retained=`。原表述保留为问题陈述。
+> - **§6.5 补齐**：原先只点名 30800 一条，现在引用 §6.0.2 的完整十条清单。
+> - **§12.5（新）**：技术债「部署清单与集群实际长期漂移」。
+> - **仓内清单改动**：`deploy/k8s/base/agentenv-daemonset.yaml` 的 `control-plane-token` 卷加
+>   `items: [{key: node-gate-token, path: token}]`（gateway 仍读 `token`），
+>   新增测试 `the_gateway_and_the_node_read_different_keys_of_the_credential_secret` 钉住该不变式。
+>
 > **🔴 三个实现 agent 只需读：§0 P1 边界 → §3 自己那行 → §6 → §10.2/§10.3 → §11 自己那块 → 自己那份设计文档。**
+> **🔴 上集群执行的人另加一份必读：§6.0（部署方式与漂移）。**
 > 权威方案：[`2026-08-19-agentenv-control-plane-refactor.md`](2026-08-19-agentenv-control-plane-refactor.md)（§4 阶段 3 / §8 清单）
 > 决策材料：[`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md) §3
 > 三家对照：[`2026-08-19-aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
@@ -419,6 +436,393 @@ and this write`。**Go 侧"先查后写"之间就是 resume 插队的窗口。**
 
 ---
 
+### 6.0 🔴 本轮的部署方式：**定点更新，不走 `make k8s-apply`**（不许抹掉集群侧的 out-of-band 配置）
+
+> **2026-08-20 新增。集群验证开工前的实地侦察产物，`pve-sg dev`（VM 203/204）逐条实测。**
+> 原文（§6.2 表头）写的是"所有部署动作一律走 `make k8s-apply`"，**已在 §6.2 就地订正并保留原表述**。
+
+#### 6.0.1 判决与理由
+
+**判决：本轮 dev / test 两套 k3s 集群一律走定点更新（`kubectl patch` / `kubectl set image` + 显式建 CM/Secret），不跑 `make k8s-apply`。**
+
+理由不是 `run.sh` 有毛病，而是**这两套集群与仓内清单已经长期漂移**：快照 OSS 后端、
+`AENV_PAUSED_REGISTRY_BACKEND=central`、带 registry 前缀的镜像引用、regctl 挂载 ——
+全部是 out-of-band 的（清单见 6.0.2）。一次全量 apply 会把它们**一起抹掉，而且大部分抹掉后不报错**，
+症状分别是"快照不再落 OSS"、"中央登记表关掉"、"模板镜像拉不动"、"三个工作负载 ImagePullBackOff"。
+
+🟡 **这些漂移一条都不是阶段 3 引入的** —— 它们比本轮早。所以本轮的处置是：
+
+- **不消灭它们**。要消灭就得把 RustFS 的端点与凭据搬进仓库，超出本轮范围且危险（凭据入库）。
+- **登记 + 保护**：漂移清单写在 6.0.2，每一步执行完都跑一遍 6.0.5 的复核探针确认它们还在。
+- **单开一条技术债**记「部署清单与集群实际长期漂移」这件事本身，见 [§12.5](#125-部署清单与集群实际长期漂移本轮只登记不治)。
+
+🔴 **`make k8s-render` 本轮照用**（只渲染不 apply）：定点补丁的内容就是从它的输出里摘出来的，
+这样补丁不会与仓内清单漂移。**只有 `apply` 被禁**。
+
+#### 6.0.2 🔴 out-of-band 漂移清单（`pve-sg dev`，2026-08-20 实测）
+
+> §6.5 此前**只点名了 30800 一条**，那是不完整的。完整清单在这里，§6.5 的 R3 已改为引用本表。
+
+| # | 集群里 out-of-band 的东西 | 仓内清单说的是什么 | 🔴 被 apply 抹掉后的症状 |
+|---|---|---|---|
+| **D-1** | CM `agentenv-k8s-config` 的 `agentenv.toml`：`repository_backend = "oss"` + 整段 `[backend.oss]`（RustFS 端点 + 凭据） | `config/default.toml` 是 `posix_fs`，无 `[backend.oss]` | 🔴 **静默**：`run.sh:30` 每次 apply 从 `config/default.toml` 重生成该 CM（`disableNameSuffixHash: true` ⇒ 同名覆盖）⇒ 快照不再落 OSS，pause 全退化 `local_only`，**不报错** |
+| **D-2** | 同一份 toml 的缓存预算：`image.cache.capacity_gb=24` / `remote_blocks.max_size_gb=12` / oss cache（合 44G，**按 master 96G 根盘定尺**） | `100` / `100`（合 200G+） | 🟡 预算回到 200G+ 而 master 只有 ~90G 可用 ⇒ GC 高水位（capacity 的 95%）**永远触发不到**，盘先满 |
+| **D-3** | 同一份 toml 的 `[orchestrator.paused_registry] backend = "postgres"` —— **一个新版已经删掉的值** | `backend = "local"` | 🔴 **看它跟 D-4 一起丢还是单独丢**：<br>① D-3+D-4 一起（= 一次完整 apply）⇒ 静默回落 `local`，中央登记表关掉、不报错；<br>② **只丢 D-4、CM 还是老的** ⇒ 新 node 读到 `postgres` 会**拒绝启动**（`src/orchestrator/paused_registry/mod.rs` 的 `bail!`，两节点一起 CrashLoop）。今天靠 D-4 的 env 压着，**env 赢文件**（confique：env > file > default；实测节点日志 `paused sandbox registry ready backend="central"`） |
+| **D-4** | DS `agentenv-node` 的 `env AENV_PAUSED_REGISTRY_BACKEND=central`（**硬写字面值**） | `configMapKeyRef: paused-registry-config`（`optional: true`），而该 CM **在 dev 集群不存在**（实测 `NotFound`） | 🔴 **静默**：apply 后该 env 变成"引用一个不存在 CM 的 optional key" ⇒ env 消失 ⇒ 与 D-3 合流成"中央登记表悄悄关掉" |
+| **D-5** | DS 的 `env HOME=/root` + volumeMount `regctl-config` → `/root/.regctl/config.json` + CM `regctl-config`（内容：`10.10.10.204:5000` 走明文 HTTP） | 仓内 DS **完全没有** regctl 的 env / volume / volumeMount | 🔴 apply 不 prune ⇒ **CM 还在**，但 **DS 的挂载被抹掉** ⇒ node 上拉模板镜像失败（症状出现在建沙箱时，不在 apply 时）|
+| **D-6** | DS 的 `env AENV_PAUSED_REGISTRY_DSN` ←`Secret agentenv-postgres/dsn` | 仓内 DS 已删（D11 把 PG 从 node 摘除） | 🟢 抹掉无害，新 node 根本不读它。**登记它只是为了排错时别把它当成"新版还在直连 PG"的证据** |
+| **D-7** | 三个工作负载的 image 全是 `10.10.10.204:5000/agentenv-*:<不可变 tag>` | `deploy/k8s/base/kustomization.yaml` 的 `images:` 钉成 `agentenv-{gateway,scheduler,runtime}:latest`（**无 registry 前缀**），且 `run.sh` **没有镜像覆盖入口**（grep 零命中） | 🔴 apply 后三个工作负载引用 `docker.io/library/agentenv-*:latest` ⇒ **ImagePullBackOff**。🔴 更阴的是 203 的 containerd 里那份 `…:latest` 是**脏的**（R3 §1.3）⇒ 配合 `IfNotPresent` 有可能**不报错地跑旧代码** |
+| **D-8** | Service `agentenv-gateway-nodeport`（NodePort **30800**） | 仓内**没有这个文件**（`gateway-service.yaml` 只有 ClusterIP `8080` + `9102`） | 🟡 apply **不删也不建**它（不 prune）。危险动作是 `run.sh delete` 之后再 apply ⇒ 30800 没了，平台侧全线打不通。**备份已在步骤 1 落盘** |
+| **D-9** | `agentenv-postgres`（StatefulSet + Service + Secret）、RustFS 全套、`agent-console` | 仓内无清单（RustFS 在**主仓** `deploy/agentenv-sg/rustfs.yaml`；PG 与 agent-console 只活在集群里）| 🟡 apply 不动它们。登记是因为**重建集群会漏**（R3 的 B3）|
+| **D-10** | scheduler 的 `SCHEDULER_REGISTRY_CLUSTER_ID` ← `Secret agentenv-postgres/cluster_id` | 仓内改成 ← CM `cluster-identity-config/CLUSTER_ID`（本轮新增的 CM，集群里还没有）| 🟢 **唯一良性的一条**：两处的值**实测相同**（都是全零 UUID，且与 toml 的 `[node_identity].cluster_id`、节点日志里的 `cluster_id=00000000-…` 三方一致）⇒ 本轮**不需要**创建 `cluster-identity-config` |
+
+🔴 **抹掉这十条里的大多数，`kubectl` 都会回你一句 `configured`。**"apply 成功"与"apply 把这套集群拆了"在终端上是同一行字。
+
+#### 6.0.3 本轮要**显式创建**的资源（仓内清单里有，集群里没有）
+
+实测四个都是 `NotFound`：`paused-registry-config` / `execution-fencing-config` / `cluster-identity-config` / `secret agentenv-control-plane-token`。其中：
+
+| 资源 | 本轮建吗 | 为什么 |
+|---|---|---|
+| CM `execution-fencing-config` | ✅ **必须建**（步骤 4 之前） | 三个开关都靠它注入。🔴 不建 ⇒ 三个 env 全落空 ⇒ **回落代码默认值**，而代码默认是**终态**（`write_fencing=true` / `arbitration=enforce` / gateway `enforce`）⇒ 步骤 4 直接跳过 observe 期，步骤 5/6/10/11 的闸门全部失去意义 |
+| Secret `agentenv-control-plane-token` | ✅ **分两次建**（步骤 8 建 key `token`，步骤 9 补 key `node-gate-token`）| 见 6.0.4 步骤 8/9 与 §6.0.6 |
+| CM `cluster-identity-config` | ❌ **不建** | D-10：集群侧已从 `Secret agentenv-postgres/cluster_id` 拿到同一个全零 UUID，node 侧从 toml 落到同一个值。建它不会错，但会多一份需要跟另外两处保持一致的真相源 |
+| CM `paused-registry-config` | ❌ **不建** | D-4：DS 里已硬写 `central`。定点更新不碰这条 env，建这个 CM 只是给"以后某次 apply"埋一个看起来没问题的伏笔 |
+
+#### 6.0.4 🔢 定点更新命令序列（可直接执行；步骤号对齐 §6.2 步骤表）
+
+```bash
+# ── 公共变量（每个新 shell 都要重设）
+export KUBECONFIG=~/.kube/config-aenv-sg
+NS=agentenv-system
+REG=10.10.10.204:5000
+TAG=cp3-bff4993                 # 🔴 不可变 tag，绝不用 :latest（R3 §3.3：203 的 :latest 是脏的）
+GW=http://10.10.10.203:30800
+
+# 容器名（已查实，patch/set image 必须写对，写错是静默 no-op）
+#   ds/agentenv-node          → 容器名 agentenv
+#   deploy/agentenv-gateway   → 容器名 gateway
+#   deploy/agentenv-scheduler → 容器名 scheduler
+
+# 三个镜像已构建并推到 registry（实测 tags/list 里都有 cp3-bff4993），且已预拉到两节点 containerd
+```
+
+---
+
+**步骤 3 —— node（🔴 全程唯一一次滚 DaemonSet，所以 image 与四处新增必须在同一个 patch 里）**
+
+🔴 **不能只 `set image`**。集群里那份 DS 是漂移版，**缺**新版 node 需要的四样东西
+（实测 `live-ds` 里全部不存在）：
+
+| 缺什么 | 不补的后果 |
+|---|---|
+| `env AENV_API_CONTROL_PLANE_TOKEN_FILE` | 🔴 **步骤 9 直接做不成** —— gate 没有文件可读，A4 永远启用不了 |
+| volume + volumeMount `control-plane-token` | 同上 |
+| preStop 脚本里的 `x-agentenv-control-plane` 头 | 🔴 步骤 9 之后 preStop 的 `POST /nodes/{id}` 被 gate 拒 403，而脚本 `|| echo` 把失败吞掉 ⇒ **节点静默不再 drain**，沙箱继续被排到一台正在关机的机器上 |
+| image | —— |
+
+🔴 **分两次做 = 滚两次 DaemonSet = 两次全集群 pause 风暴（§6.1）。必须一个 patch。**
+补丁**从 `make k8s-render` 的输出里摘**，这样它不会与仓内清单漂移：
+
+```bash
+cd <AgentENV 仓库根>
+bash deploy/k8s/run.sh render > /tmp/aenv-cv/rendered-$TAG.yaml    # 🔴 render，不是 apply
+
+python3 - "$REG" "$TAG" <<'PY' > /tmp/aenv-cv/patch-node.yaml
+import sys, yaml
+reg, tag = sys.argv[1], sys.argv[2]
+docs = [d for d in yaml.safe_load_all(open(f"/tmp/aenv-cv/rendered-{tag}.yaml")) if d]
+ds = next(d for d in docs if d["kind"] == "DaemonSet")
+spec = ds["spec"]["template"]["spec"]
+c = spec["containers"][0]
+assert c["name"] == "agentenv", c["name"]
+env = [e for e in c["env"] if e["name"] == "AENV_API_CONTROL_PLANE_TOKEN_FILE"]
+vm  = [m for m in c["volumeMounts"] if m["name"] == "control-plane-token"]
+vol = [v for v in spec["volumes"] if v["name"] == "control-plane-token"]
+# 自证：三样都必须摘到，摘不到就是仓内清单变了，停下来看
+assert len(env) == 1 and len(vm) == 1 and len(vol) == 1, (env, vm, vol)
+assert vol[0]["secret"].get("items"), "node 卷必须只投影 node-gate-token（见 §6.0.6）"
+print(yaml.safe_dump({"spec": {"template": {"spec": {
+    "containers": [{
+        "name": "agentenv",
+        "image": f"{reg}/agentenv-runtime:{tag}",
+        "env": env,
+        "volumeMounts": vm,
+        "lifecycle": {"preStop": c["lifecycle"]["preStop"]},
+    }],
+    "volumes": vol,
+}}}}, allow_unicode=True, sort_keys=False))
+PY
+
+# 🔴 先肉眼过一遍补丁：它只应含 image / 一条 env / 一条 volumeMount / preStop / 一个 volume
+cat /tmp/aenv-cv/patch-node.yaml
+
+kubectl -n "$NS" patch ds/agentenv-node --type=strategic --patch-file /tmp/aenv-cv/patch-node.yaml
+kubectl -n "$NS" rollout status ds/agentenv-node --timeout=900s
+```
+
+> 🟢 **为什么 strategic merge 不会误删 out-of-band 的东西**：`env` 按 `name` 合并、
+> `volumeMounts` 按 `mountPath` 合并、`volumes` 按 `name` 合并、`containers` 按 `name` 合并
+> （都是 k8s API 类型自带的 `patchMergeKey`）⇒ D-4 的 `AENV_PAUSED_REGISTRY_BACKEND`、
+> D-5 的 `HOME` 与 regctl 挂载、D-6 的 DSN env **全部原样保留**。
+> 🔴 `lifecycle` 不是列表，是**整体替换**——所以 preStop 必须从 render 里整段摘，不能手抄。
+> **patch 完立刻跑 6.0.5 的复核**，用命令确认上面这句是真的，而不是相信它。
+
+---
+
+**步骤 4 —— scheduler（一次 patch：image + 两个开关 env）**
+
+🔴 集群里那份 scheduler **没有** `SCHEDULER_REGISTRY_WRITE_FENCING` / `SCHEDULER_ROUTING_EXECUTION_ARBITRATION`
+（实测只有 `SCHEDULER_REGISTRY_DSN` / `SCHEDULER_REGISTRY_CLUSTER_ID` / `SCHEDULER_REGISTRY_WRITE_ENABLED`）。
+**不补 env ⇒ 回落代码默认 `enforce` ⇒ 步骤 4 一起来就是 enforce，步骤 5/6 的 observe 闸门形同虚设。**
+
+```bash
+# 4.0 先建开关 CM（🔴 必须在 patch 之前，否则 Pod 起来时 optional key 落空 = 回落终态默认值）
+kubectl -n "$NS" create configmap execution-fencing-config \
+  --from-literal=SCHEDULER_REGISTRY_WRITE_FENCING=true \
+  --from-literal=SCHEDULER_ROUTING_EXECUTION_ARBITRATION=observe \
+  --from-literal=GATEWAY_ROUTING_EXECUTION_FENCING=off
+kubectl -n "$NS" get cm execution-fencing-config -o jsonpath='{.data}{"\n"}'   # 三个键都要在
+
+# 4.1 一次 patch：image + 两条 env
+kubectl -n "$NS" patch deploy/agentenv-scheduler --type=strategic -p "$(cat <<EOF
+spec:
+  template:
+    spec:
+      containers:
+        - name: scheduler
+          image: ${REG}/agentenv-scheduler:${TAG}
+          env:
+            - name: SCHEDULER_REGISTRY_WRITE_FENCING
+              valueFrom:
+                configMapKeyRef: {name: execution-fencing-config, key: SCHEDULER_REGISTRY_WRITE_FENCING, optional: true}
+            - name: SCHEDULER_ROUTING_EXECUTION_ARBITRATION
+              valueFrom:
+                configMapKeyRef: {name: execution-fencing-config, key: SCHEDULER_ROUTING_EXECUTION_ARBITRATION, optional: true}
+EOF
+)"
+kubectl -n "$NS" rollout status deploy/agentenv-scheduler --timeout=300s
+
+# 4.2 自证：env 真进去了、值是 observe 而不是 enforce
+kubectl -n "$NS" exec deploy/agentenv-scheduler -- env 2>/dev/null | grep -a "^SCHEDULER_ROUTING_EXECUTION_ARBITRATION=" || \
+kubectl -n "$NS" logs deploy/agentenv-scheduler --tail=200 | grep -a "arbitration"
+# 指标口径（权威）：agentenv_scheduler_routing_execution_arbitration_enabled == 1（observe）/ 2（enforce）
+```
+
+> 🟡 **步骤 6 翻 `enforce`**：改 CM 之后**必须滚 Deployment**，见 §6.0.7。
+> ```bash
+> kubectl -n "$NS" patch cm execution-fencing-config --type=merge \
+>   -p '{"data":{"SCHEDULER_ROUTING_EXECUTION_ARBITRATION":"enforce"}}'
+> kubectl -n "$NS" rollout restart deploy/agentenv-scheduler
+> kubectl -n "$NS" rollout status  deploy/agentenv-scheduler --timeout=300s
+> ```
+
+---
+
+**步骤 8 —— gateway（一次 patch：image + 两条 env）+ 建 Secret 的 key A**
+
+🔴 集群里那份 gateway **只有** `GATEWAY_SANDBOX_PROXY_DOMAINS` 一条 env ——
+`GATEWAY_CONTROL_PLANE_TOKEN` 与 `GATEWAY_ROUTING_EXECUTION_FENCING` **都没有**。
+只 `set image` 的话：注入不会发生（步骤 8 的验收直接挂），fencing 回落代码默认 `enforce`（跳过步骤 10 的 observe）。
+
+```bash
+# 8.0 🔴 只建 key A（gateway 的那半）。key B 留到步骤 9 —— 这是顺序约束能成立的全部原因，见 §6.0.6
+# 🔴 凭据只在这一条命令里出现一次，之后一律从 Secret 里取（含步骤 9 的 key B）
+kubectl -n "$NS" create secret generic agentenv-control-plane-token \
+  --from-literal=token="$(head -c 48 /dev/urandom | base64 | tr -d '=+/\n' | head -c 40)"
+# 🔴 单行内联，不落变量 —— 别写成 TOKEN=... 再引用：那样它会留在 shell 历史与环境里
+
+# 自证：此刻 Secret 只有一个键，node 侧那半还不存在
+kubectl -n "$NS" get secret agentenv-control-plane-token -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{end}}'
+# 期望恰好一行：token   （出现 node-gate-token = 顺序已经破了，见 §6.0.6）
+
+# 8.1 一次 patch：image + 两条 env
+kubectl -n "$NS" patch deploy/agentenv-gateway --type=strategic -p "$(cat <<EOF
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          image: ${REG}/agentenv-gateway:${TAG}
+          env:
+            - name: GATEWAY_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef: {name: agentenv-control-plane-token, key: token, optional: true}
+            - name: GATEWAY_ROUTING_EXECUTION_FENCING
+              valueFrom:
+                configMapKeyRef: {name: execution-fencing-config, key: GATEWAY_ROUTING_EXECUTION_FENCING, optional: true}
+EOF
+)"
+kubectl -n "$NS" rollout status deploy/agentenv-gateway --timeout=300s
+
+# 8.2 🔴 node 侧此刻必须还是全放行（对照面：证明建 Secret 没顺手点亮 node）
+kubectl -n "$NS" logs -l app.kubernetes.io/name=agentenv-node --tail=200 --prefix \
+  | sed 's/\x1b\[[0-9;]*m//g' | grep -a "no control-plane credential is configured" 
+# 或直接读 gauge：agentenv_api_control_plane_gate_enabled 必须为 0
+```
+
+---
+
+**步骤 9 —— 启用 A4：给 Secret 补上 key B（🔴 唯一一步真热生效，不滚 DaemonSet）**
+
+```bash
+# 🔴 key B 的值从 key A 里派生，不许手敲 —— 敲错一个字符 = 平台每一个请求 403
+kubectl -n "$NS" patch secret agentenv-control-plane-token --type=merge -p "$(python3 - <<'PY'
+import base64, json, subprocess
+raw = subprocess.check_output([
+    "kubectl","-n","agentenv-system","get","secret","agentenv-control-plane-token",
+    "-o","jsonpath={.data.token}"])
+print(json.dumps({"data": {"node-gate-token": raw.decode()}}))   # 逐字节同一份 base64，不解码不重编
+PY
+)"
+
+# 自证 ①：两个键的 base64 逐字节相同（不打印明文）
+kubectl -n "$NS" get secret agentenv-control-plane-token \
+  -o jsonpath='{.data.token}{"\n"}{.data.node-gate-token}{"\n"}' | uniq | wc -l   # 必须是 1
+
+# 自证 ②：🔴 Pod 没重启（这就是走文件不走 env 的全部理由）
+kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node \
+  -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.metadata.creationTimestamp
+# 与步骤 3 之后记下的那份逐行相同。Secret 卷刷新有 ≤60s 延迟，等 gate 指标翻 1 再验，别急着重试
+
+# 自证 ③：gate 真的开了
+#   agentenv_api_control_plane_gate_enabled 由 0 → 1
+#   然后跑 §6.6 的 P-A4-1 / P-A4-2 / P-A4-3
+```
+
+🔴 **步骤 9 的回退不是"删掉 key B"，是"把 key B 写成空串"**：
+
+```bash
+kubectl -n "$NS" patch secret agentenv-control-plane-token --type=merge \
+  -p '{"stringData":{"node-gate-token":""}}'
+```
+
+理由见 §6.0.6 的"key 缺失时行为"——**删键之后文件消失，而 node 对"读失败"是刻意保留上一个 good 值的**，
+gate 会**继续开着**，回退看起来做了、其实没做。空串是一次**成功读到零个凭据**，那才是设计好的关闭开关。
+
+---
+
+**回滚（任何一步）**
+
+```bash
+kubectl -n "$NS" rollout undo deploy/agentenv-gateway      # 回上一个 ReplicaSet
+kubectl -n "$NS" rollout undo deploy/agentenv-scheduler
+kubectl -n "$NS" rollout undo ds/agentenv-node             # 🔴 又一次滚 = 又一次 pause 风暴，先 drain
+# 或显式钉回当前已知好版本（实测集群现值）：
+#   ds/agentenv-node          10.10.10.204:5000/agentenv-runtime:d11-9a8fd88
+#   deploy/agentenv-scheduler 10.10.10.204:5000/agentenv-scheduler:d11-9a8fd88
+#   deploy/agentenv-gateway   10.10.10.204:5000/agentenv-gateway:cp1-c35f5ec
+```
+
+#### 6.0.5 🔴 每一步做完都要跑的「out-of-band 还在吗」复核（带对照面）
+
+> 探针必须先自证（§8.3）。下面每条都配了一个**必然为假的对照输入**：对照不返回"假"的那一刻，
+> 说明这条探针没有分辨力，它给出的"还在"是无意义的。
+
+```bash
+export KUBECONFIG=~/.kube/config-aenv-sg; NS=agentenv-system
+
+# ① D-1：OSS 后端与 [backend.oss] 段还在（🔴 只数行，不打印内容 —— 那段里有 RustFS 凭据）
+kubectl -n "$NS" get cm agentenv-k8s-config -o jsonpath='{.data.agentenv\.toml}' | grep -c '^repository_backend = "oss"'   # 期望 1
+kubectl -n "$NS" get cm agentenv-k8s-config -o jsonpath='{.data.agentenv\.toml}' | grep -c '^\[backend\.oss\]'              # 期望 1
+#    对照面（必然不存在的串）：
+kubectl -n "$NS" get cm agentenv-k8s-config -o jsonpath='{.data.agentenv\.toml}' | grep -c '^repository_backend = "no_such_backend"'  # 必须 0
+
+# ② D-4：中央登记表开关还在
+kubectl -n "$NS" get ds agentenv-node -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="AENV_PAUSED_REGISTRY_BACKEND")].value}{"\n"}'   # 期望 central
+#    对照面（不存在的 env 名）：下面必须打印空行，否则这条 jsonpath 是在瞎匹配
+kubectl -n "$NS" get ds agentenv-node -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="AENV_NO_SUCH_ENV")].value}{"\n"}'
+#    🔴 运行时口径（比 spec 更硬，spec 对了不代表进程读到了）：
+kubectl -n "$NS" logs -l app.kubernetes.io/name=agentenv-node --tail=2000 --prefix | sed 's/\x1b\[[0-9;]*m//g' \
+  | grep -a 'paused sandbox registry ready'     # 每台都必须是 backend="central"，不是 "local"
+
+# ③ D-5：regctl 挂载与 HOME 还在
+kubectl -n "$NS" get ds agentenv-node -o jsonpath='{.spec.template.spec.containers[0].volumeMounts[?(@.name=="regctl-config")].mountPath}{"\n"}'  # /root/.regctl/config.json
+kubectl -n "$NS" get ds agentenv-node -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="HOME")].value}{"\n"}'                        # /root
+
+# ④ D-7：三个镜像都带 registry 前缀 + 不可变 tag
+for r in ds/agentenv-node deploy/agentenv-gateway deploy/agentenv-scheduler; do
+  kubectl -n "$NS" get "$r" -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+done
+#    🔴 三行都必须以 10.10.10.204:5000/ 开头。出现裸 agentenv-*:latest = 有人 apply 过，立刻停下
+#    🔴 换完镜像要比 imageID，不是比 image 名（203 的 :latest 是脏的）：
+kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node -o jsonpath='{range .items[*]}{.spec.nodeName}{" "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+
+# ⑤ D-8：30800 还在
+kubectl -n "$NS" get svc agentenv-gateway-nodeport -o jsonpath='{.spec.ports[0].nodePort}{"\n"}'   # 30800
+#    没了就用步骤 1 的备份：kubectl apply -f /tmp/aenv-cv/nodeport-30800.bak.yaml
+```
+
+#### 6.0.6 🔴 Secret 拆成两个 key：为什么，以及"key 缺失时到底发生什么"
+
+**问题**：`GATEWAY_CONTROL_PLANE_TOKEN`（gateway 的 env）与 node 的 `/etc/agentenv/control-plane/token`
+（挂载卷）原本**共用一个 Secret 且共用同一个 key** ⇒ **创建这个 Secret 这一个动作，会同时点亮两侧**。
+于是步骤 8→9 那条"gateway 先注入、node 后开 gate"的顺序约束**形同虚设**：Secret 一建，
+node 的 gate 立刻开始生效，而 gateway 的新 Pod 还没滚完 —— 正好是**唯一不许出现的那个顺序**
+（node 拒掉一切平台流量）。
+
+**改法（已落地仓内清单）**：一个 Secret、两个 key。
+
+| 谁 | 读哪个 key | 怎么读 | 在哪一步被点亮 |
+|---|---|---|---|
+| gateway | `token` | `secretKeyRef`（env） | **步骤 8** 建 Secret |
+| node | `node-gate-token` | 卷投影成文件 `token`（`items:` + `optional: true`） | **步骤 9** `kubectl patch` 补这个 key |
+
+- `deploy/k8s/base/agentenv-daemonset.yaml`：`control-plane-token` 卷加 `items: [{key: node-gate-token, path: token}]`，`optional: true` 保留；挂载路径与 `AENV_API_CONTROL_PLANE_TOKEN_FILE` 都**不变**。
+- `deploy/k8s/base/gateway-deployment.yaml`：仍读 `key: token`，注释改写说明两半的关系与顺序。
+- 🔴 不变式由测试钉住：`src/api/control_plane_gate.rs` 的
+  `the_gateway_and_the_node_read_different_keys_of_the_credential_secret`
+  （删掉 `items:` 那四行 ⇒ 测试变红，已用变异验证过分辨力）。
+
+**为什么不用"两个独立 Secret"**：两侧必须是**同一个凭据**，而两个对象之间的"值相等"没有任何东西看得住；
+放在一个对象里，`kubectl get secret -o yaml` 一眼能比，而且步骤 9 的命令可以**直接从 key A 派生 key B**
+（见 6.0.4），从构造上消掉"两边不一致"这个失败模式。改动面也更小：只动 node 卷的四行。
+
+##### 🔴 查实：`items` 里的 key 不存在时，卷会怎样
+
+**依据一 · Kubernetes 自己的 API 契约**（read-only 取自本集群的 OpenAPI，
+`kubectl explain daemonset.spec.template.spec.volumes.secret.items`）：
+
+> "If a key is specified which is not present in the Secret, **the volume setup will error unless it is marked optional**."
+> 以及 `…volumes.secret.optional`："optional field specify whether **the Secret or its keys** must be defined"。
+
+⇒ 卷上已经有的 `optional: true` **同时覆盖"Secret 不存在"与"列出的 key 不存在"**两种情况：
+**不报错、不阻塞 Pod 启动、该文件干脆不出现**。这就是本方案要的确定行为。
+
+**依据二 · node 侧对"文件不存在"的处置**（`src/api/control_plane_gate.rs` 的 `file_tokens()`）：
+
+| 情形 | 代码走哪条路 | gate 结果 |
+|---|---|---|
+| 文件**从未**被成功读过（key 一直没给 / 卷没挂上） | `read_to_string` 失败 → `state.tokens` 还是 `None` → 返回空 | 🟢 **关**（`GateDecision::Disabled`，等价于 gate 出现之前的行为）|
+| 文件**曾被成功读过**，之后消失（删 key、卷抽走、磁盘抖） | `read_to_string` 失败 → `state.tokens` 是 `Some(...)` → **保留上一个 good 值** | 🔴 **仍然开着**，并打一条 warn |
+| 文件存在且**内容为空** | 读**成功**，得到零个凭据 | 🟢 **关**（这是设计好的关闭开关）|
+
+⇒ 上一轮的裁决"读失败保留上一个 good 值、空文件是有意的关闭开关"，
+**"文件不存在"落在两边都有**：**第一次成功读之前**落在"关"这一边（所以步骤 8 安全），
+**成功读过之后**落在"保留上一个 good 值"那一边（所以**步骤 9 的回退必须写空串，不能删 key**）。
+🔴 这一条不写清楚，步骤 9 的回退就是不可靠的 —— 而它失败的方式是**静默的**：删完 key，`kubectl` 说 patched，gate 还开着。
+
+已有的两个测试就是这条结论的可执行版本，本轮**未改动**它们：
+`src/api/server.rs` 的 `the_gate_picks_up_a_token_written_after_startup`（T-A4-8：没挂上 ⇒ 放行；写入 ⇒ 拒；清空 ⇒ 放行）
+与 `an_unreadable_token_file_keeps_the_last_known_value`（T-A4-9：**删文件 ⇒ 仍然拒**；写空 ⇒ 放行）。
+
+#### 6.0.7 🔴 哪几步要滚服务，哪一步是真热生效（别把两种机制混着记）
+
+| 步骤 | 动作 | 机制 | 要滚吗 |
+|---|---|---|---|
+| 3 | node：image + token 文件接线 + preStop | DaemonSet pod template | 🔴 **滚 DaemonSet（全程唯一一次）** |
+| 4 | scheduler：image + 两条开关 env | Deployment pod template | ✅ 滚 Deployment（patch 自带） |
+| 6 | `SCHEDULER_ROUTING_EXECUTION_ARBITRATION` → `enforce` | 🔴 **`configMapKeyRef` 注入的 env，不会热刷新** | 🔴 **必须 `rollout restart deploy/agentenv-scheduler`**。只改 CM 不滚 = 什么都没发生，而指标会照旧显示 observe —— 看起来像"翻了没生效"，其实是"根本没翻" |
+| 8 | gateway：image + 两条 env（+ 建 Secret key A） | Deployment pod template | ✅ 滚 Deployment（patch 自带） |
+| **9** | **node gate 开启：Secret 补 key B** | 🔴 **挂载卷里的文件，进程按请求重读** | 🟢 **真热生效，绝不许滚 DaemonSet**（滚一次 = 一次全集群 pause 风暴，§6.1）。kubelet 刷新卷有 **≤60s** 延迟，等指标翻 1，别急着重试 |
+| 10 / 11 | `GATEWAY_ROUTING_EXECUTION_FENCING` → `observe` / `enforce` | 🔴 **`configMapKeyRef` 注入的 env，不会热刷新** | 🔴 **必须 `rollout restart deploy/agentenv-gateway`** |
+
+🔴 **一句话记法**：**三个开关都是 env ⇒ 改完必须滚；只有步骤 9 的 node token 是文件 ⇒ 改完不滚。**
+把这两种机制混起来，会得到两个方向都错的结论：要么"改了 CM 就等于翻了开关"（其实没翻），
+要么"翻 node token 也得滚一次 DaemonSet"（白付一次 pause 风暴）。
+
+---
+
 ### 6.1 依赖图（为什么是这个线性顺序）
 
 🔴 **依赖图分两条轴看：代码落地（编译进哪个镜像）与功能启用（哪个配置翻了）。**
@@ -482,27 +886,43 @@ A5: node 接收端已在位 ─▶ scheduler observe→enforce ─▶ gateway ob
 > 这是本轮 node 只滚一次的代价分摊方式，见 §6.1 的追认块。
 > 🔴 **node 全程只滚一次（步骤 3）**。步骤 9 是**配置热翻转，不滚 DaemonSet** ——
 > 任何让 node 重启的动作都会触发一次全集群 pause 风暴（§6.1）。
+> 🔴 **本表只说"部署什么、验什么"；具体怎么部署一律看 [§6.0.4](#604--定点更新命令序列可直接执行步骤号对齐-62-步骤表) 的定点更新命令序列**
+> —— 这两套集群与仓内清单已长期漂移，**不许用 `make k8s-apply`**（§6.0）。
+> 🔴 **别只 `set image`**：集群里那三份工作负载**缺**本轮要的 env / volume / preStop
+> （node 缺 4 样、scheduler 缺 2 条开关 env、gateway 缺 2 条 env），只换镜像的后果逐条列在 §6.0.4。
+> 🔴 **哪几步要滚服务、哪一步是真热生效**，看 [§6.0.7](#607--哪几步要滚服务哪一步是真热生效别把两种机制混着记)：
+> **三个开关都是 `configMapKeyRef` 注入的 env ⇒ 改完必须滚 Deployment；只有步骤 9 的 node token 是挂载文件 ⇒ 改完不滚。**
 
-> 🔴 **本表所有"部署/滚服务"的动作一律走 `make k8s-apply`（= `bash deploy/k8s/run.sh apply`），
-> 不要直接 `kubectl apply -k deploy/k8s/base`。**
+> ⚠️ **本段原表述已订正（2026-08-20，pve-sg dev 实测）**，原文保留在下面作为问题陈述：
+> ~~🔴 **本表所有"部署/滚服务"的动作一律走 `make k8s-apply`（= `bash deploy/k8s/run.sh apply`），
+> 不要直接 `kubectl apply -k deploy/k8s/base`。**~~
+> ✅ **本轮（dev / test 两套 k3s）一律不走 `make k8s-apply`，改走 §6.0 的定点更新。**
+> 理由不是 `run.sh` 有问题，而是**这两套集群已经与仓内清单长期漂移**：OSS 快照后端、
+> `AENV_PAUSED_REGISTRY_BACKEND=central`、registry 前缀镜像、regctl 挂载全是 out-of-band 的，
+> 全量 apply 会把它们**一起抹掉且不报错**（完整清单 + 抹掉后的症状见 **[§6.0](#60--本轮的部署方式定点更新不走-make-k8s-apply不许抹掉集群侧的-out-of-band-配置)**）。
+> 🟡 **这些漂移都不是阶段 3 引入的** —— 本轮既不消灭它们，也不假装没有：登记 + 在每一步的验证里保护它们。
+>
+> 下面这条关于 `run.sh` 的事实**仍然成立且仍然要知道**（`make k8s-render` 本轮照用，用来核对定点补丁写对了没）：
 > `deploy/k8s/base/config/agentenv.toml` **不在仓库里**：`run.sh` 会把整个 `deploy/k8s` 复制到临时目录，
 > 再从 `config/default.toml` 生成它（`run.sh:30`），之后才调 kustomize。绕过 `run.sh` ⇒ kustomize 在
 > `configMapGenerator` 上直接报文件不存在。
+> 🔴 而这条机制正是漂移不可 apply 的**头号原因**：`generatorOptions.disableNameSuffixHash: true` ⇒
+> 同名覆盖，一次 apply 就把集群里那份手工调过的 `agentenv.toml` 换成 `config/default.toml`。
 > 🟡 **这不是阶段 3 引入的**：该引用自开源首版提交（`8f028b1`，2026-07-25）就在，`agentenv.toml` 从未被提交过，
 > 也不在任何 `.gitignore` 里 —— 它就是个渲染期产物。而且 `base` 本来也不是 kustomize 入口，
 > 入口是 `deploy/k8s/overlays/{default,local-dev}`，`run.sh` 用 `K8S_OVERLAY` 选。
 
 | # | 部署什么 | 前置条件 | 验证方法（可执行）| 回退动作 |
 |---|---|---|---|---|
-| **1** | **什么都不部署 —— 基线与前置盘点** | 无 | ① `kubectl -n <ns> get svc agentenv-gateway-nodeport -o yaml > /tmp/nodeport-30800.bak.yaml`（🔴 **out-of-band 资源，必须先备份**，见 §6.5）；② `psql -c "SELECT state, count(*) FROM paused_sandboxes GROUP BY 1"` **存档**（顺带取 T2 N3 那条 `invalid_rows` 零分辨力的样本）；③ 记下每个节点本地 paused 目录的条目数；④ 确认三个开关在**旧 build 里都不存在**（grep 配置，避免"以为翻了其实没读"）；⑤ 🔴 **清点仍在 `Running` 的沙箱**（`GET /v2/sandboxes`）—— 它们在步骤 3 会被无登记表的关机 pause 打掉，见 §6.3 | —— |
+| **1** | **什么都不部署 —— 基线与前置盘点** | 无 | ① `kubectl -n <ns> get svc agentenv-gateway-nodeport -o yaml > /tmp/nodeport-30800.bak.yaml`（🔴 **out-of-band 资源，必须先备份**，见 §6.5）；② `psql -c "SELECT state, count(*) FROM paused_sandboxes GROUP BY 1"` **存档**（顺带取 T2 N3 那条 `invalid_rows` 零分辨力的样本）；③ 记下每个节点本地 paused 目录的条目数（⚠️ **口径已订正**：数 `/workspace/env/persisted-sandboxes/artifacts/` 的**子目录数**，或读节点启动日志的 `loaded=N retained=N`；**数 `persisted-sandboxes/` 顶层条目永远得 2**，见 §6.3）；④ 确认三个开关在**旧 build 里都不存在**（grep 配置，避免"以为翻了其实没读"）；⑤ 🔴 **清点仍在 `Running` 的沙箱**（`GET /v2/sandboxes`）—— 它们在步骤 3 会被无登记表的关机 pause 打掉，见 §6.3 | —— |
 | **2** | 🔴 **破坏性步骤 + 🔴 服务窗口开始 —— 见 §6.3，有独立确认点**<br>🔴 **窗口不只是控制面**：scheduler 停 ⇒ gateway 的 `LookupNode` 也答不出 ⇒ **数据面同时不可用** | 步骤 1 全部完成且**存档已落盘** | 见 §6.3 的逐条验证 | 见 §6.3（**不可逆：登记行清零**；本步的"回退"只是把旧镜像放回去，数据回不来）|
-| **3** | 🔴 **node 镜像（全程唯一一次滚）**<br>**立即生效**：A1（`ExecutionId` 类型 + `LaunchPlan` 两变体各带 execution + `ClaimedExecution` token + `SandboxMetadata.execution_id` 必填 + 心跳带 `roster` **且保留 `sandbox_ids`** + `AcquireSandbox`/`TransitionSandbox` 带 execution）+ A6 的 node 响应字段（`Sandbox` / `SandboxDetail` / `ListedSandbox` 三个 schema，additive）<br>🟡 **本步部署但未启用**：<br>· **A4 的 gate**（token 与 token 文件**都留空** ⇒ 全放行 = 今天的行为）⇒ 启用点在**步骤 9**<br>· **A5 的接收端**（gateway 尚未下发 expect 头 ⇒ 恒放行）⇒ 启用点在**步骤 10**<br>· **preStop 带 `x-agentenv-control-plane` 头**（node 还没开 gate ⇒ 头被忽略）⇒ 与步骤 9 同时变成必需 | 步骤 2 已完成（本地 paused 目录已清空，否则本步会因缺 `execution_id` **响亮报错**）| ① `kubectl rollout status ds/agentenv-node -n <ns>`（🔴 DaemonSet 名是 **`agentenv-node`**，不是 `agentenv`）；② 每个节点日志**不得**出现"paused 记录加载失败"（出现 = 步骤 2 的 node 那一半漏做）；③ 🔴 **此刻不要试 pause/resume** —— scheduler 仍是 0 副本、表已 DROP，登记表路径必然失败，那不是回归；能做的是 `GET /health` 与 `GET /sandboxes` 通、进程不 crash-loop、心跳失败日志是"连不上 scheduler"而不是别的；④ 🔴 **A4 未启用的对照探针**（本步的关键自证）：`kubectl port-forward pod/<node-pod> 18000:8000` 后**无 token** `POST /sandboxes/{id}/pause` ⇒ **不是 403**（是 4xx/5xx 的业务错都行）。看到 403 说明 token 被误配了，步骤 8 之前 node 会拒掉一切 | 换回旧 node 镜像 + **再清一次本地 paused 目录**（旧 build 读不懂新记录里的 `execution_id`？—— serde 未知字段是忽略的，**能读**；但 A1 之后写下的记录在旧 build 上会丢失化身，属可接受）|
-| **4** | **scheduler 镜像：A2 + A3 + A5 的 scheduler 侧**（新 `SchemaDDL` + fail-fast 自检 + 两条 SQL 谓词 + 三条夺权路径清轴 + binding/roster 带 execution + 仲裁 + `LookupNode` 两个新字段 + `rosterFromHeartbeat` 回落）<br>**开关**：`scheduler.registry.write_fencing=true`（默认）、🔴 `scheduler.routing.execution_arbitration=observe`（**发布纪律，不是默认值**）<br>🔴 **服务窗口在本步 Ready 时关闭**（§6.3）| 步骤 3 的 DaemonSet **rollout 已 Ready**（`desiredNumberScheduled == numberReady`）| ① `Migrate` 成功、`kubectl logs` 无 fail-fast 报错；② `\d paused_sandboxes` 有 14 列与两条 CHECK；③ pause 一台沙箱 → `SELECT state, execution_id FROM paused_sandboxes` ⇒ `publishing`/非空；④ resume → `running`/**同一个** execution；⑤ 🔴 **必然序列探针**（§6.6 P-A3）| **配置级**：`SCHEDULER_REGISTRY_WRITE_FENCING=false` + `SCHEDULER_ROUTING_EXECUTION_ARBITRATION=off`，滚 Deployment。**镜像不必回退** |
+| **3** | 🔴 **node 镜像（全程唯一一次滚）**<br>**立即生效**：A1（`ExecutionId` 类型 + `LaunchPlan` 两变体各带 execution + `ClaimedExecution` token + `SandboxMetadata.execution_id` 必填 + 心跳带 `roster` **且保留 `sandbox_ids`** + `AcquireSandbox`/`TransitionSandbox` 带 execution）+ A6 的 node 响应字段（`Sandbox` / `SandboxDetail` / `ListedSandbox` 三个 schema，additive）<br>🟡 **本步部署但未启用**：<br>· **A4 的 gate**（token 与 token 文件**都留空** ⇒ 全放行 = 今天的行为）⇒ 启用点在**步骤 9**<br>· **A5 的接收端**（gateway 尚未下发 expect 头 ⇒ 恒放行）⇒ 启用点在**步骤 10**<br>· **preStop 带 `x-agentenv-control-plane` 头**（node 还没开 gate ⇒ 头被忽略）⇒ 与步骤 9 同时变成必需 | 步骤 2 已完成（本地 paused 目录已清空，否则本步会因缺 `execution_id` **响亮报错**）<br>🔴 **执行方式见 §6.0.4 步骤 3**：一个 `kubectl patch` 同时带 image + `AENV_API_CONTROL_PLANE_TOKEN_FILE` + `control-plane-token` 卷与挂载 + 新 preStop。**分两次做 = 滚两次 DaemonSet = 两次全集群 pause 风暴**| ① `kubectl rollout status ds/agentenv-node -n <ns>`（🔴 DaemonSet 名是 **`agentenv-node`**，不是 `agentenv`）；② 每个节点日志**不得**出现"paused 记录加载失败"（出现 = 步骤 2 的 node 那一半漏做）；③ 🔴 **此刻不要试 pause/resume** —— scheduler 仍是 0 副本、表已 DROP，登记表路径必然失败，那不是回归；能做的是 `GET /health` 与 `GET /sandboxes` 通、进程不 crash-loop、心跳失败日志是"连不上 scheduler"而不是别的；④ 🔴 **A4 未启用的对照探针**（本步的关键自证）：`kubectl port-forward pod/<node-pod> 18000:8000` 后**无 token** `POST /sandboxes/{id}/pause` ⇒ **不是 403**（是 4xx/5xx 的业务错都行）。看到 403 说明 token 被误配了，步骤 8 之前 node 会拒掉一切 | 换回旧 node 镜像 + **再清一次本地 paused 目录**（旧 build 读不懂新记录里的 `execution_id`？—— serde 未知字段是忽略的，**能读**；但 A1 之后写下的记录在旧 build 上会丢失化身，属可接受）|
+| **4** | **scheduler 镜像：A2 + A3 + A5 的 scheduler 侧**（新 `SchemaDDL` + fail-fast 自检 + 两条 SQL 谓词 + 三条夺权路径清轴 + binding/roster 带 execution + 仲裁 + `LookupNode` 两个新字段 + `rosterFromHeartbeat` 回落）<br>**开关**：`scheduler.registry.write_fencing=true`（默认）、🔴 `scheduler.routing.execution_arbitration=observe`（**发布纪律，不是默认值**）<br>🔴 **服务窗口在本步 Ready 时关闭**（§6.3）| 步骤 3 的 DaemonSet **rollout 已 Ready**（`desiredNumberScheduled == numberReady`）<br>🔴 **必须先建 CM `execution-fencing-config`**（集群里没有，实测 `NotFound`）：不建 ⇒ 两条 env 落空 ⇒ **回落代码默认 `enforce`**，步骤 5/6 的 observe 闸门直接被跳过。执行方式见 §6.0.4 步骤 4 | ① `Migrate` 成功、`kubectl logs` 无 fail-fast 报错；② `\d paused_sandboxes` 有 14 列与两条 CHECK；③ pause 一台沙箱 → `SELECT state, execution_id FROM paused_sandboxes` ⇒ `publishing`/非空；④ resume → `running`/**同一个** execution；⑤ 🔴 **必然序列探针**（§6.6 P-A3）| **配置级**：`SCHEDULER_REGISTRY_WRITE_FENCING=false` + `SCHEDULER_ROUTING_EXECUTION_ARBITRATION=off`，滚 Deployment。**镜像不必回退** |
 | **5** | 🟡 **混版本窗口的关闭点（不部署，只观察）** | 步骤 4 已上 | 盯 `agentenv_scheduler_heartbeat_legacy_roster_total{node}` —— 🔴 **必须归零**。非零 = 集群里还有没带 A1 的 node（步骤 3 漏了某台，或有节点 cordoned）| —— |
 | **6** | **翻 `scheduler.routing.execution_arbitration=enforce`** | 步骤 5 归零 **且** `agentenv_scheduler_binding_execution_total{decision="rejected_older"}` 在 observe 期间**恒 0** | ① 指标 `agentenv_scheduler_routing_execution_arbitration_enabled == 2`；② `agentenv_scheduler_lookup_execution_authority_total{authority="registry"}` 占比达到预期；③ 数据面照常 | 翻回 `observe`（或 `off`），滚 Deployment |
 | **7** | 🚦 **闸门：A3 集群验证（不部署）** | 步骤 4–6 全部完成 | §6.6 的 **P-A3-1 / P-A3-2 / P-A3-3** 三发探针**全过**，且每发都带对照面。🔴 **不过就不许进步骤 8**，更不许开 B 批次 | —— |
-| **8** | **gateway 镜像：A4 的注入 + A5 的 gateway 侧 + A6 的三个 DTO + `GET /v2/sandboxes` 去重按 execution**<br>**开关**：`GATEWAY_CONTROL_PLANE_TOKEN=<token>`（**开始注入**）、🔴 `gateway.routing.execution_fencing=off`<br>🟡 **本步部署但未启用**：A5 的 gateway 侧（`off` 在 `decideFencing` 入口 early return ⇒ 不下发 expect、不比对回声）⇒ 启用点在**步骤 10/11** | 步骤 7 闸门通过 | ① `kubectl rollout status deploy/agentenv-gateway`；② 🔴 **注入生效探针**：在 node 上抓一次经 gateway 的控制面请求，确认带 `x-agentenv-control-plane`（或用一个临时 echo 上游）；③ **对照面**：客户端自己塞 `x-agentenv-control-plane: forged` ⇒ 上游收到的是 gateway 的值，不是 forged；④ `GET /v2/sandboxes` 仍 200，且此刻**已能看到 `executionID` 字段**（node 的 A6 从步骤 3 就在报了，本步是 gateway 侧 DTO 不再把它吃掉）| `GATEWAY_CONTROL_PLANE_TOKEN=""`（停止注入**并删除**入站同名头），滚 Deployment |
-| **9** | 🔴 **启用 A4（配置热翻转，不滚 DaemonSet、不换镜像）**：把 token 写进 node 挂载的 Secret 文件（`_design-phase3-node.md` §3.2）⇒ 步骤 3 就躺在那儿的 gate 开始生效<br>🔴 **绝不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env** —— 改 env 要重启 Pod，等于在满载集群上再付一次全集群 pause 风暴（§6.1） | 步骤 8 的**注入已验证生效**（🔴 顺序颠倒 ⇒ node 会拒掉所有平台流量）| ① 先确认**热生效**：改文件后 `kubectl get pod -l app.kubernetes.io/name=agentenv-node` 的 `RESTARTS` 与 `AGE` **一个都没变**（Secret 卷刷新有 ≤60s 延迟，等指标/日志出现 gate 启用记录再验）；② §6.6 的 **P-A4-1/2/3**；③ 🔴 **无 token 的 `GET /sandboxes` 仍通、无 token 的 `POST /sandboxes` 被拒**（缺后半句，"整条路径前缀豁免"的变异会假绿）；④ `GET /v2/sandboxes` 集群列表**仍然 200**（D6 豁免生效，否则整体 502）；⑤ preStop：`kubectl drain` 一台节点，确认它进 DRAINING 而不是静默失败（🔴 这一发会把该节点的沙箱 pause 掉，**放在本步最后做**）| 🔴 **node 先**：把该 Secret 文件**清空**（空 = 全放行 = 今天的行为），同样**不滚 DaemonSet**。**绝不能先回退 gateway** |
+| **8** | **gateway 镜像：A4 的注入 + A5 的 gateway 侧 + A6 的三个 DTO + `GET /v2/sandboxes` 去重按 execution**<br>**开关**：`GATEWAY_CONTROL_PLANE_TOKEN=<token>`（**开始注入**）、🔴 `gateway.routing.execution_fencing=off`<br>🟡 **本步部署但未启用**：A5 的 gateway 侧（`off` 在 `decideFencing` 入口 early return ⇒ 不下发 expect、不比对回声）⇒ 启用点在**步骤 10/11** | 步骤 7 闸门通过<br>🔴 **建 Secret 时只建 key `token`**（gateway 那半），**key `node-gate-token` 留到步骤 9** —— 否则一个动作同时点亮两侧，步骤 8→9 的顺序约束形同虚设（§6.0.6）。集群里那份 gateway 只有一条 env，两条新 env 都要 patch 进去，见 §6.0.4 步骤 8 | ① `kubectl rollout status deploy/agentenv-gateway`；② 🔴 **注入生效探针**：在 node 上抓一次经 gateway 的控制面请求，确认带 `x-agentenv-control-plane`（或用一个临时 echo 上游）；③ **对照面**：客户端自己塞 `x-agentenv-control-plane: forged` ⇒ 上游收到的是 gateway 的值，不是 forged；④ `GET /v2/sandboxes` 仍 200，且此刻**已能看到 `executionID` 字段**（node 的 A6 从步骤 3 就在报了，本步是 gateway 侧 DTO 不再把它吃掉）| `GATEWAY_CONTROL_PLANE_TOKEN=""`（停止注入**并删除**入站同名头），滚 Deployment |
+| **9** | 🔴 **启用 A4（配置热翻转，不滚 DaemonSet、不换镜像）**：把 token 写进 node 挂载的 Secret 文件（`_design-phase3-node.md` §3.2）⇒ 步骤 3 就躺在那儿的 gate 开始生效<br>🔴 **绝不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env** —— 改 env 要重启 Pod，等于在满载集群上再付一次全集群 pause 风暴（§6.1） | 步骤 8 的**注入已验证生效**（🔴 顺序颠倒 ⇒ node 会拒掉所有平台流量）<br>🔴 **本步的动作 = 给 Secret 补上 key `node-gate-token`，值从 key `token` 派生（不许手敲）**，见 §6.0.4 步骤 9 / §6.0.6 | ① 先确认**热生效**：改文件后 `kubectl get pod -l app.kubernetes.io/name=agentenv-node` 的 `RESTARTS` 与 `AGE` **一个都没变**（Secret 卷刷新有 ≤60s 延迟，等指标/日志出现 gate 启用记录再验）；② §6.6 的 **P-A4-1/2/3**；③ 🔴 **无 token 的 `GET /sandboxes` 仍通、无 token 的 `POST /sandboxes` 被拒**（缺后半句，"整条路径前缀豁免"的变异会假绿）；④ `GET /v2/sandboxes` 集群列表**仍然 200**（D6 豁免生效，否则整体 502）；⑤ preStop：`kubectl drain` 一台节点，确认它进 DRAINING 而不是静默失败（🔴 这一发会把该节点的沙箱 pause 掉，**放在本步最后做**）| 🔴 **node 先**：把该 Secret 文件**清空**（空 = 全放行 = 今天的行为），同样**不滚 DaemonSet**。**绝不能先回退 gateway**<br>🔴 **"清空"字面意思是把 key `node-gate-token` 写成空串，不是删掉这个 key**：删 key ⇒ 文件消失 ⇒ node 对"读失败"是刻意**保留上一个 good 值**的（`control_plane_gate.rs`，测试 T-A4-9 钉住）⇒ **gate 还开着，而 `kubectl` 会回你 patched**。命令见 §6.0.4 步骤 9 末尾，机理见 §6.0.6 |
 | **10** | **翻 `gateway.routing.execution_fencing=observe`** | 步骤 9 的热翻转**已验证生效**（P-A4-1/2/3 全过）| ① `agentenv_gateway_execution_fencing_total{decision="unfenced_node_silent"}` **必须为 0**（非 0 = 还有 node 没装 A5 接收端）；② ⚠️ **本判据已订正（2026-08-20，对齐 gateway 设计 §10 的裁决 A5-U5）**：~~`refused_preflight` / `refused_echo` 在健康集群上**恒 0**（🔴 非 0 是**先查再开**，不是"翻了再说"）~~ —— 两个系列必须**分开读**。✅ **`refused_echo == 0` 才是真判据**（🔴 非 0 是**先查再开**，不是“翻了再说”）。🔴 **`refused_preflight` 在 observe 期恒 0 是必然，不是证据**：observe **不下发 expect 头** ⇒ 闸 1 根本没上膛 ⇒ node 无从拒 ⇒ 这个系列**只可能**是 0。拿它当“闸 1 正常”的证据是**假绿**。它**非 0 反而说明有别的东西在往 node 发 expect 头** —— 另一个跑在 `enforce` 上的 gateway、翻转瞬间仍在途的请求、或中间件重放；③ `unfenced_no_authority` 与 scheduler 的 `lookup_execution_authority_total{authority="unknown"}` **逐条对得上**（跨服务互证，对不上就是有一侧算错了）| 翻回 `off` |
 | **11** | **翻 `gateway.routing.execution_fencing=enforce`** | 步骤 10 的三条判据全过 | ① 数据面照常；② `refused_*` 仍恒 0（🔴 **闸 1 真阳性为 0 不算失败**，见 §10.3 A5-U3）；③ `agentenv_scheduler_registry_execution_mismatch` 恒 0 | 翻回 `observe` / `off` |
 | **12** | **回退演练（不改代码，必须真跑一遍）** | 步骤 11 完成 | §6.5 逐条 | —— |
@@ -584,7 +1004,11 @@ kubectl -n "$NS" rollout status deploy/agentenv-scheduler --timeout=120s   # 应
 psql "$DSN" -c "DROP TABLE IF EXISTS paused_sandboxes;"
 
 # 2.4 清空【每一个】节点的本地 paused 记录（🔴 后半，与 2.3 是同一次操作）
-#     逐节点执行；AENV_HOME 以该集群实际配置为准
+#     ⚠️ 本小节两条命令已订正（2026-08-20，pve-sg dev 实测），原文见本代码块下方的「已订正」块。
+#     🔴 路径是 /workspace/env/persisted-sandboxes，不是 "$AENV_HOME"/persisted-sandboxes：
+#        容器里 AENV_HOME **是空串**，真正的变量叫 AENV_HOME_PATH=/workspace/env
+#        （镜像里写死：deploy/docker/Dockerfile.agentenv 的 `ENV AENV_HOME_PATH=/workspace/env`；
+#         /workspace 是 hostPath /var/lib/aenv，所以宿主机上是 /var/lib/aenv/env/persisted-sandboxes）。
 #     🔴 selector 必须是 app.kubernetes.io/name=agentenv-node（DaemonSet 名 agentenv-node，
 #        `deploy/k8s/base/agentenv-daemonset.yaml:3-6`）。写错 label 的后果是**静默无操作**：
 #        for 循环遍历空列表 ⇒ 什么都没清，而下面 2.5 的检查同样遍历空列表 ⇒ 一行输出都没有，
@@ -593,16 +1017,48 @@ NODES=$(kubectl get node --no-headers | wc -l)
 PODS=$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node --no-headers | wc -l)
 [ "$NODES" = "$PODS" ] || { echo "selector 选出 $PODS 个 pod，节点有 $NODES 个 —— 停下来查，别继续"; exit 1; }
 
+PSD=/workspace/env/persisted-sandboxes
+
+# 2.4a 🔴 清空之前先自证目标目录【存在】（这是本轮第二次踩"空列表伪装成已清空"，见下方失败形态）
 for n in $(kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node -o name); do
-  kubectl -n "$NS" exec "$n" -- sh -c 'rm -rf "$AENV_HOME"/persisted-sandboxes/* || true'
+  echo "== $n"
+  kubectl -n "$NS" exec "$n" -- sh -c '
+    D='"$PSD"'
+    [ -d "$D" ] || { echo "FAIL: $D 不存在 —— 路径写错了，停下来查"; exit 9; }
+    echo "OK  $D 存在；artifacts 子目录 $(ls -1 "$D/artifacts" 2>/dev/null | wc -l) 个"
+  ' || exit 9
+done
+
+# 2.4b 🔴 对照面：同一条命令指向一个【必然不存在】的路径，必须报错并 exit 9，而不是打印 0
+kubectl -n "$NS" exec "$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node -o name | head -1)" -- sh -c '
+  D=/workspace/env/persisted-sandboxes-NOPE
+  [ -d "$D" ] || { echo "FAIL: $D 不存在"; exit 9; }
+  echo "artifacts 子目录 $(ls -1 "$D/artifacts" 2>/dev/null | wc -l) 个"
+'; echo "对照面 rc=$?  # 必须是 9。是 0 就说明这条探针没有分辨力，上面那些 OK 都不算数"
+
+# 2.4c 真正清空
+for n in $(kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node -o name); do
+  kubectl -n "$NS" exec "$n" -- sh -c 'rm -rf /workspace/env/persisted-sandboxes/artifacts/* || true'
 done
 
 # 2.5 确认两半都做了
 psql "$DSN" -c "\dt paused_sandboxes"     # 应为 "Did not find any relation"
+# 🔴 口径是 artifacts/ 的【子目录数】，不是 persisted-sandboxes/ 的条目数：
+#    persisted-sandboxes/ 下永远是 artifacts/ + records.db 两个固定条目，与 paused 沙箱数【无关】——
+#    数它永远得 2，既不会因为清空而变 0，也不会因为有 5 台 paused 而变 5。
 for n in $(kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node -o name); do
   echo -n "$n: "
-  kubectl -n "$NS" exec "$n" -- sh -c 'ls -1 "$AENV_HOME"/persisted-sandboxes | wc -l'   # 每台都应为 0
+  kubectl -n "$NS" exec "$n" -- sh -c '
+    D=/workspace/env/persisted-sandboxes
+    [ -d "$D/artifacts" ] || { echo "FAIL: $D/artifacts 不存在"; exit 9; }
+    ls -1 "$D/artifacts" | wc -l
+  '   # 每台都应为 0
 done   # 🔴 输出行数必须等于 $NODES；一行都没有 = selector 写错了，不是"都清干净了"
+
+# 2.5b 🔴 权威口径（比数目录更硬）：步骤 3 node 起来后看启动日志的 loaded=/retained=
+#      这两个数才是"节点认为自己手上有几条 paused 记录"，两台都必须是 loaded=0 retained=0
+kubectl -n "$NS" logs -l app.kubernetes.io/name=agentenv-node --tail=2000 --prefix \
+  | sed 's/\x1b\[[0-9;]*m//g' | grep -a "loaded paused sandbox records"
 
 # 2.6 controller 先【不要】起 —— 它要等步骤 3 的 node 滚完，见步骤表
 #     🔴 原因（也是服务窗口为什么这么长的全部原因）：步骤 4 那版 scheduler 对
@@ -613,6 +1069,46 @@ done   # 🔴 输出行数必须等于 $NODES；一行都没有 = selector 写�
 ```
 
 🔴 **2.5 的两条命令都必须跑**。只跑一条 = 只确认了一半，而"半清状态"正是这一步最想避免的东西。
+
+##### ⚠️ 2.4 / 2.5 的原命令（保留为问题陈述，**实测不符，勿照抄**）
+
+```bash
+# ❌ 原文 2.4
+kubectl -n "$NS" exec "$n" -- sh -c 'rm -rf "$AENV_HOME"/persisted-sandboxes/* || true'
+# ❌ 原文 2.5
+kubectl -n "$NS" exec "$n" -- sh -c 'ls -1 "$AENV_HOME"/persisted-sandboxes | wc -l'   # 每台都应为 0
+```
+
+**为什么它们是静默失败的**（2026-08-20 在 dev 两台节点上逐条实测）：
+
+| # | 事实 | 原命令实际做了什么 |
+|---|---|---|
+| 1 | 容器里 **`AENV_HOME` 是空串**，真变量是 `AENV_HOME_PATH=/workspace/env`（镜像里 `ENV` 写死，见 `deploy/docker/Dockerfile.agentenv`）| `"$AENV_HOME"/persisted-sandboxes` 展开成 **`/persisted-sandboxes`** |
+| 2 | `/persisted-sandboxes` 不存在 | 2.4 的 `rm -rf /persisted-sandboxes/*`：glob 无匹配 ⇒ 传字面串 ⇒ **无操作**（`\|\| true` 再把一切吞掉）|
+| 3 | 同上 | 2.5 的 `ls -1 /persisted-sandboxes \| wc -l`：`ls` 的报错走 **stderr**，`wc -l` 数到 0 行 ⇒ **stdout 打印 `0`、退出码 `0`** |
+| 4 | 合起来 | 🔴 **每台节点都打印 `0`，看起来"两台都清干净了"，实际一台都没清** —— 而真正的 1.8G paused 沙箱还在 worker-01 上 |
+
+> 🔴 **这是本轮第二次踩同一个失败形态：「空列表 / 空目录被伪装成『已经清干净了』」。**
+> 第一次是 **selector label 写错**（`for` 遍历空 Pod 列表 ⇒ 一行输出都没有 ⇒ 读成"每台都是 0"），
+> 已经在 2.4 的注释里写过；第二次就是这里的**路径写错**（目录不存在 ⇒ `ls` 报到 stderr、`wc` 数到 0）。
+> **两次的形状完全一样：一个本该是「查不到」的结果，被打印成了「查到了，结果是零」。**
+>
+> ⇒ **本 runbook 的通用纪律**：凡是「数一个数，期望它是 0」的检查，
+> **必须先用一个必然失败的对照输入证明它分得清「0」与「没查成」**
+> —— 目录检查就先 `[ -d ]`，列表检查就先断言条数，探针就配一个必然不存在的输入（2.4b 就是这么写的）。
+
+##### ⚠️ 2.5「条目数」口径的订正
+
+~~记下每个节点本地 paused 目录的**条目数**~~ —— **口径错了**。
+`persisted-sandboxes/` 下**永远**只有 `artifacts/` 与 `records.db` 两个固定条目，
+**与 paused 沙箱数量无关**（dev 实测：master-01 有 0 台 paused、worker-01 有 1 台，两台的顶层条目数**都是 2**）。
+
+✅ **正确口径两个，取其一或都取**：
+
+1. **`artifacts/` 的子目录数** —— dev 实测 master-01 = `0`、worker-01 = `1`，与真实 paused 数一致；
+2. **节点启动日志的 `loaded=N retained=N`**（`loaded paused sandbox records`）—— 这是节点自己认的数，最权威。
+
+步骤 1 的第 ③ 项「记下每个节点本地 paused 目录的条目数」按此口径执行。
 
 #### 🔴 这一步做错的三种症状（供排错）
 
@@ -638,7 +1134,7 @@ done   # 🔴 输出行数必须等于 $NODES；一行都没有 = selector 写�
 | 客户端大量 `409 sandbox_execution_superseded` | `gateway.routing.execution_fencing` | `observe`（先看，别直接 `off`）| ⚠️ **本格原文两处都错，已订正（2026-08-20）**：~~`observe` 仍下发 expect 头与计数、只是不拒；🔴 **注意**：若拒绝来自 node 的 412，`observe` 也会把它翻成放行~~<br>✅ **正确读法**：(a) `observe` **不下发 expect 头**（裁决 A5-U5），它只读回声、只计数、不拒；(b) node 的 412 在 `observe` 下**不是被翻成放行**，而是被翻成 **409 —— 仍然是拒绝**，只是换成唯一的对外形状。但正因为没盖章，node 本来就无从产生 412，这条分支在正常接线下不可达。<br>🟢 **改判之后这条运维建议本身反而更成立**：409 的两个来源在 `observe` 下**全部止住** —— 闸 1（412→409）因没盖章而不可达，闸 2（回声拒绝）因 `refuse=false` 只记不拒。🔴 **但别拿旧解释去解释它**：止血不是因为把拒绝翻成了放行，而是因为一条不可达、一条只观察 |
 | 每一次同机 pause→resume 之后第一批请求 409 | **先别拉开关** | —— | 这是**比对写成等值了**（应为有序，`live > expect` 必须放行，裁决 A5-U4）。拉开关只掩盖，改代码才对 |
 | 平台开始"重建工作区"、用户工作区蒸发 | 🔴 **立即** `gateway.routing.execution_fencing=off` | `off` | 说明某处把拒绝落成了 **404**。**这是本轮唯一一个"先止血再查"的症状** |
-| 平台 create/pause/resume 全被 node 拒（403） | node 侧 control-plane token **文件**（**node 先**）| **清空该文件**（热生效）。🔴 **不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env、不要滚 DaemonSet** —— 滚一次 = 一次全集群 pause 风暴（§6.1）| A4 整个没了，回到 presence-only。🔴 **绝不能先回退 gateway 的注入** —— 那会让 node 拒掉一切 |
+| 平台 create/pause/resume 全被 node 拒（403） | node 侧 control-plane token **文件**（**node 先**）| **清空该文件**（热生效）——🔴 具体是把 Secret 的 key `node-gate-token` **写成空串**，**不是删这个 key**（删 key = 读失败 = 保留上一个 good 值 = gate 还开着，§6.0.6）。🔴 **不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env、不要滚 DaemonSet** —— 滚一次 = 一次全集群 pause 风暴（§6.1）| A4 整个没了，回到 presence-only。🔴 **绝不能先回退 gateway 的注入** —— 那会让 node 拒掉一切 |
 | 集群列表 `GET /v2/sandboxes` 整体 502 | 同上（清空 node 侧 token 文件）| 空 | 说明 D6 的 `GET /sandboxes` 豁免没生效（`cluster_list.go:84-96` all-or-nothing）|
 | 🔴 **告警守卫（不是症状，是读表前必须先知道的一条）**：`agentenv_scheduler_registry_write_fencing_enabled == 0` | **先别拉任何开关** | —— | 🔴 **这个 gauge 读 0 有两种完全不同的含义，它自己分不开**：① fencing 真的被关了；② **写面根本没装配** —— `SetRegistryWriteFencingEnabled` 只在 `createRegistryStore` 建出写 store 之后才被调用（`services/scheduler/cmd/main.go:394`），而该函数在 `queryOnly \|\| !registryWriteEnabled(cfg)` 时**提前返回**，gauge 就停在默认的 0 上。query-only 副本、没配 DSN 的集群、`write_enabled=false` 的集群**全都读 0**。✅ **任何基于该 gauge 的告警必须用 `agentenv_scheduler_registry_enabled == 1` 做守卫**（该 gauge 在 `createRegistryReader` 里**无条件**设置，见 `main.go:292`）。⚠️ **守卫之后仍有一处残留歧义**：`registry_enabled=1`（配了 DSN）但 `write_enabled=false` 或 `--query-only` 的副本，两个 gauge 会是 `1 / 0`，与“写面开着但 fencing 关了”同形 —— 这类副本要么按实例排除，要么就别在它上面挂这条告警。<br>✅ **已订正（2026-08-20）**：上面这一整段是**问题陈述**，不是现状。残留歧义已由第三个 gauge `agentenv_scheduler_registry_write_surface_enabled` 消掉：**三个 gauge 在每一条启动路径上都被显式设值**（装配写面设 1、没装配设 0，含 `fencing` 那个 —— 它不再停在“没人写过”的默认 0 上）。读法见本表下方「🔴 三个 registry gauge 的组合读法」。旧的“用 `registry_enabled` 守卫”仍然是对的，但已不必够用 |
 
@@ -672,11 +1168,21 @@ done   # 🔴 输出行数必须等于 $NODES；一行都没有 = selector 写�
 `deploy/k8s/base/gateway-service.yaml` **全文 18 行、无 `type:` 字段（即 ClusterIP）、只有 `http:8080` + `metrics:9102`**，
 且 `grep -rn "30800\|NodePort" deploy/` **零命中**。它是集群里手工 `kubectl apply` 的 **out-of-band 资源**。
 
+> ⚠️ **本节原先只点名了 30800 一条，这是不完整的（已订正 2026-08-20）**：
+> 实测这两套集群共有 **十条** out-of-band 漂移（OSS 快照后端 + 凭据段、缓存预算、
+> `[orchestrator.paused_registry] backend`、DS 里硬写的 `AENV_PAUSED_REGISTRY_BACKEND=central`、
+> regctl 挂载 + `HOME`、node 的 PG DSN env、三个带 registry 前缀的镜像引用、30800、
+> PG/RustFS/agent-console 三套无清单资源、scheduler 的 cluster id 来源）。
+> **完整清单与"抹掉后的症状"见 [§6.0.2](#602--out-of-band-漂移清单pve-sg-dev2026-08-20-实测)，
+> 复核命令见 [§6.0.5](#605--每一步做完都要跑的out-of-band-还在吗复核带对照面)。**
+> 🔴 30800 之所以还单列一行，是因为它是**唯一一个"apply 不会删、但 delete 之后 apply 不会重建"**的，
+> 失效方式与其余九条不同。
+
 | # | 演练项 | 做法 | 🔴 自证 / 陷阱 |
 |---|---|---|---|
 | R1 | 三个开关各自回退一次 | 逐个翻到最保守值、滚服务、跑一遍冒烟；再翻回来 | 每次只翻**一个**，翻完确认**另外两个的指标没变** —— 否则你验的是"一起关了"，不是"能分别关"。🟢 三个开关都在 scheduler / gateway（Deployment）上，**演练本身不碰 node** |
 | R2 | node 侧 A4 回退 | **清空 node 的 control-plane token 文件** → 直连 node 的 `POST /sandboxes/{id}/pause` **不再 403** → 再写回去 | 🔴 **顺序**：回退必须 **node 先**；先回退 gateway 会让 node 拒掉一切。<br>🔴 **不许用"改 env + 滚 DaemonSet"来做这一发** —— 演练要来回翻两次，那就是**两次满载全集群 pause 风暴**（§6.1）；token 走挂载文件的全部理由就在这里，本发同时是**该机制的验收**：翻两次之后 `kubectl get pod` 的 `RESTARTS`/`AGE` 必须一动不动 |
-| R3 | 🔴 **30800 存活确认** | `kubectl -n <ns> get svc agentenv-gateway-nodeport` | 🔴 **`kubectl apply -k deploy/k8s/...` 不会重建它，也不会删它** —— 以为"重新部署一遍就恢复原状"的人会踩空。若它没了：`kubectl apply -f /tmp/nodeport-30800.bak.yaml`（步骤 1 的备份） |
+| R3 | 🔴 **out-of-band 十条全体存活确认**（含 30800）| 跑一遍 **§6.0.5** 的五组探针（每组自带对照面）| 🔴 **`kubectl apply -k deploy/k8s/...` 不会重建 30800，也不会删它** —— 以为"重新部署一遍就恢复原状"的人会踩空。若它没了：`kubectl apply -f /tmp/aenv-cv/nodeport-30800.bak.yaml`（步骤 1 的备份）。<br>🔴 其余九条**大多数是 apply 会静默抹掉**的（D-1/D-3/D-4/D-5/D-7），所以本演练不只是"看看 30800 在不在"，而是**每一步之后都要跑**（§6.0.2）|
 | R4 | 🔴 **别用 30800 验"直连被拒"** | 用 `kubectl port-forward pod/<node-pod> 18000:8000` 直连 | 30800 落在 **gateway**（gateway 默认透传），经它打永远成功。看到 200 会被误读成"收窄失效" |
 | R5 | A2 的 schema 不回退 | 确认旧 build 能跑（`entryColumns` / `selectColumns` 是显式列清单，多两列不会被选中）| 若必须彻底回退：再 `DROP TABLE` 一次 + 跑旧 build 的 `Migrate`。**两个方向都只要一次运维动作，不依赖新写的回滚代码** |
 
@@ -1219,7 +1725,9 @@ REDIS_SERVER_BIN="$(command -v redis-server)" \
 
 > 🔴 **为什么单列一节**：本轮修掉的那条（Go 侧 `requiredMetadataFields` ↔ Rust `REQUIRED_FIELDS`）
 > 不是孤例，它只是**唯一一条已经咬过人的**（`execution_id` 漏登记、单向无牙、全绿）。
-> 下面三条是同一类：**两侧（甚至三侧）手抄同一个事实，靠注释承诺"保持同步"，没有任何机制会在漂移时变红**。
+> §12.1–§12.3 是同一类：**两侧（甚至三侧）手抄同一个事实，靠注释承诺"保持同步"，没有任何机制会在漂移时变红**。
+> §12.4 是本轮已还的那一条（留作模板）。**§12.5 是 2026-08-20 新立的，类别不同**
+> —— 手抄的两侧不是两份代码，而是**仓内部署清单与集群实际状态**，但同样属于"只登记、本轮不动"。
 >
 > 🔴 **本轮不动它们**：三处都不属于阶段 3 的改动面，现在改会把爆炸半径从"新加的东西"扩大到"既有主路径"。
 > 登记在这里，是为了下一个碰它们的人不必再考古一遍。
@@ -1273,3 +1781,18 @@ REDIS_SERVER_BIN="$(command -v redis-server)" \
 | Go 侧列表**删**一个字段 | `TestTheRequiredFieldListMatchesTheNodes`（Go） |
 | Rust 侧 `REQUIRED_FIELDS` **加**一个字段而不重生成 fixture | `the_required_field_list_is_published_for_the_other_side`（Rust） |
 | Rust 侧加字段**并**重生成 fixture（`execution_id` 当年的真实形态） | `TestTheRequiredFieldListMatchesTheNodes`（Go）—— 这一格正是旧机制漏掉的那一格 |
+
+### 12.5 部署清单与集群实际**长期漂移**（本轮只登记，不治）
+
+> 🟡 **类别不同**：12.1–12.4 是"两侧手抄同一个事实"，这一条是"**清单与现实**两侧手抄同一套部署"。
+> 但归属同一本账：**只登记，本轮不动**。2026-08-20 在 pve-sg dev 实测后立此条。
+
+| 项 | 内容 |
+|---|---|
+| **现象** | `deploy/k8s/`（仓内 kustomize）与 dev / test 两套 k3s 集群的实际状态，有 **10 处 out-of-band 差异**（完整清单 [§6.0.2](#602--out-of-band-漂移清单pve-sg-dev2026-08-20-实测)）。它们**都不是阶段 3 引入的**，其中最早的可以追到集群搭起来那天 |
+| **为什么会漂** | 三个成因，性质不同：<br>① **凭据类**（D-1 的 RustFS 端点 + access key）—— 仓内清单不该带凭据，所以它只能活在集群里；<br>② **本环境类**（D-2 的缓存预算按 master 的 96G 根盘定尺、D-5 的 registry 明文 HTTP、D-7 的 `10.10.10.204:5000` 前缀）—— 是"这套集群的事实"，写进 `deploy/k8s/base` 会污染上游；<br>③ **纯遗漏**（D-3 的 `backend = "postgres"` 是新版已删的值、D-8 的 30800 从来没有清单文件、D-9 的 PG/RustFS/agent-console） |
+| **🔴 为什么危险** | `deploy/k8s/run.sh` 把 `config/default.toml` **逐字覆盖**到 `agentenv-k8s-config`（`disableNameSuffixHash: true`），而 `kubectl apply -k` **不 prune**。合起来的效果是：**一次 apply 会抹掉一半漂移、留下另一半**，且抹掉的那一半**大多数不报错**（D-1/D-3/D-4/D-5）。终端上你只会看到一串 `configured` |
+| **🔴 最坏的一格** | **D-3 单独丢**（CM 还是老的、只有 DS 的 env 没了）⇒ 新 node 读到 `backend = "postgres"` **拒绝启动**，两台一起 CrashLoop。这是唯一一条"漂移半边"会**响亮**炸掉的组合 —— 其余的都是安静的 |
+| **本轮怎么处理** | **不治**。治它要么把 RustFS 凭据搬进仓库（不许），要么给主仓 `deploy/agentenv-sg/` 加一层承接 `agentenv.toml` 与镜像引用的 overlay（是活儿，且属于部署工程不属于阶段 3）。本轮的处置是**登记（§6.0.2）+ 每步复核（§6.0.5）+ 本轮不 apply（§6.0.1）** |
+| **有牙的做法（留给下一个人）** | 三件事，按性价比排：<br>1. 🔴 **给 `deploy/k8s/base/kustomization.yaml` 的 `images:` 补 registry 前缀入口**，或给 `run.sh` 加一个 `IMAGE_REGISTRY` / `IMAGE_TAG` 环境变量 —— D-7 是十条里**唯一一条 apply 后会立刻响亮失败**（ImagePullBackOff）的，也是最容易根治的；<br>2. 主仓 `deploy/agentenv-sg/` 补一个 overlay，承接 `agentenv.toml`（D-1/D-2/D-3）、regctl 挂载（D-5）、30800（D-8）、PG（D-9）。凭据走 Secret 引用，不落盘进仓库；<br>3. 补一条**漂移探测**（就是 §6.0.5 那五组探针）进定时任务或 `make` 目标，让"集群被 apply 拆了"这件事在**下一次有人看的时候**就红，而不是在下一次有人 pause 的时候才发现快照没落 OSS |
+| **🔴 反模式（别做）** | 把 `patch-node-config.sh` 那种"apply 完再补一刀"的脚本继续加长。R3 已经记过：那个脚本**只认识 OSS 与缓存预算，不认识 `[orchestrator.paused_registry]`** —— 补刀脚本与漂移清单是两份要手动保持同步的东西，正是本节这本账要消灭的形态 |

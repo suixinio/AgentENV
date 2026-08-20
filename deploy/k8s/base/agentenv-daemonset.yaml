@@ -243,7 +243,33 @@ spec:
         # credential, and the gate stays off — which is the state this ships in.
         # Enabling the gate is writing this Secret; rolling it back is emptying
         # it. Neither restarts the pod.
+        #
+        # 🔴 `items` is what makes the release order real. One Secret carries
+        # both halves of this credential, and the gateway reads its half as an
+        # environment variable (`token`) while this node reads its half as a
+        # file (`node-gate-token`). Projecting the whole Secret instead would
+        # mean the single act of creating it — the step that starts the
+        # gateway stamping — also drops the file that opens this node's gate,
+        # in the one order the rollout must never happen in: a node refusing
+        # everything the gateway has not yet been rolled to stamp. With the
+        # projection named, creating the Secret with only `token` lights the
+        # gateway alone; the node's file appears when `node-gate-token` is
+        # added, one step later, and not before.
+        #
+        # A listed key that the Secret does not have is skipped rather than
+        # failing the mount, because the volume is `optional` — "optional
+        # specifies whether the Secret *or its keys* must be defined". The file
+        # is simply absent, which the gate reads as "never read successfully",
+        # which is off. 🔴 That is only true of a key that has *never* arrived:
+        # once the file has been read once, taking the key away again makes the
+        # read fail, and a failed read deliberately keeps the last credential
+        # (see `src/api/control_plane_gate.rs`). Rolling the gate back is
+        # therefore setting `node-gate-token` to the empty string — a
+        # successful read of zero credentials — never deleting the key.
         - name: control-plane-token
           secret:
             secretName: agentenv-control-plane-token
             optional: true
+            items:
+              - key: node-gate-token
+                path: token

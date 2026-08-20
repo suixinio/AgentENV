@@ -269,6 +269,12 @@ Fork:    fork_sandbox_inner        → SandboxForkSpec{id, exec}    [铸 B-3]   
 P1（未上生产、dev 存量可丢）覆盖这一点，**且这是刻意的**：一个 `#[serde(default)]` 就等于给"缺 execution 的行"
 留了一条永久 fail-open 通道，任务书 §0 P1 明写要禁的就是它。
 🟡 **但要在发布说明里点名**：升级前需清空节点上的 `$AENV_HOME/persisted-sandboxes`（或等价目录），
+⚠️ **路径已订正（2026-08-20，pve-sg dev 实测）**：容器里 **`AENV_HOME` 是空串**，
+真变量是 `AENV_HOME_PATH=/workspace/env`（镜像 `ENV` 写死），实际路径
+**`/workspace/env/persisted-sandboxes`**（宿主机 `/var/lib/aenv/env/persisted-sandboxes`）。
+照 `$AENV_HOME` 写的命令会展开成 `/persisted-sandboxes` ⇒ **静默无操作**，
+而配套的 `ls | wc -l` 会打印 `0` 伪装成"已清空"。可执行版本见
+[`_impl-plan-control-plane-phase3.md` §6.3](_impl-plan-control-plane-phase3.md) 的 2.4 / 2.5。
 否则加载失败会以「沙箱不见了」的形态出现。见 §5 未决项 O2。
 
 > ✅ **裁决（O2，2026-08-19 主 agent）：`serde(default)` 不加，两处"清干净"合并成同一个 runbook 步骤。**

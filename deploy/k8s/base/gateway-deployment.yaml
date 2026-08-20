@@ -42,13 +42,23 @@ spec:
             # to a node, so the node can tell control-plane traffic from
             # anything that reached it another way.
             #
-            # 🔴 The same Secret the DaemonSet mounts, and the ordering between
-            # the two is not symmetric. Injection has to be switched on *first*
-            # and switched off *last*: a node whose gate is open while the
-            # gateway is not stamping refuses every platform request. Rolling
-            # this out is therefore "write the Secret, roll the gateway, then
-            # let the node pick the file up"; rolling it back is "empty the
-            # node's file, then stop stamping".
+            # 🔴 The same Secret the DaemonSet mounts, but a different key in
+            # it, and that is the whole reason the ordering below is
+            # expressible at all. Injection has to be switched on *first* and
+            # switched off *last*: a node whose gate is open while the gateway
+            # is not stamping refuses every platform request. If both sides
+            # read the same key, creating the Secret would switch both on at
+            # once and the ordering would be a sentence in a runbook with
+            # nothing behind it. So the gateway reads `token` and the node's
+            # volume projects `node-gate-token` (see the `items:` block on the
+            # DaemonSet's control-plane-token volume).
+            #
+            # Rolling out is therefore "create the Secret with `token` only,
+            # roll the gateway, verify it stamps, *then* add
+            # `node-gate-token`"; rolling back is "set `node-gate-token` to the
+            # empty string, then stop stamping". 🔴 The two values must be the
+            # same credential — derive the second from the first rather than
+            # retyping it, since a typo there is every platform request 403.
             #
             # optional: an absent Secret leaves the value empty, the gateway
             # stamps nothing, and the node's gate stays open — which is the

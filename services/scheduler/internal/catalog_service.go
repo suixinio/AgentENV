@@ -50,6 +50,14 @@ var catalogRejections = promauto.NewCounterVec(
 // RPC answered before the gate is one whose tables may not exist. A refusal is
 // the only honest answer there: an empty page reads as "this cluster has no
 // snapshots", and a caller acts on that by deciding a snapshot is gone.
+//
+// 🔴 Sharing it costs something in the other direction, and the cost is worth
+// knowing before an incident rather than during one: because the gate opens
+// after *both* migrations, a catalog schema that cannot be applied also holds
+// the paused registry's writes shut — begin_pause, complete_pause,
+// mark_local_only and claim_for_resume all answer UNAVAILABLE. Phase 1's
+// functionality depends on this schema applying cleanly, even though it does
+// not read a single one of these tables.
 type catalogGate interface{ Require() error }
 
 // SnapshotCatalogService serves the catalog to the nodes.

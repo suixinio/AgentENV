@@ -577,9 +577,22 @@ func openRegistryWriteSurface(
 // 🔴 Same loop, and after the registry's migration rather than beside it. Both
 // take the same advisory lock, so running them concurrently from one process
 // would be a lock this process waits on itself for; running them in a fixed
-// order makes that impossible. And the retry loop's contract already covers
-// this case: a schema that cannot be applied refuses its RPCs and leaves
-// routing, discovery and bindings alone, rather than taking the process down.
+// order makes that impossible.
+//
+// 🔴 What a failure here costs, stated exactly, because half of it is easy to
+// miss. The gate is shared: an error returned from this function means
+// grace.Enter is never reached, the phase stays cold, and Grace.Require refuses
+// — so it is not only the catalog's own RPCs that answer UNAVAILABLE. Every
+// paused-registry *write* does too: begin_pause, complete_pause,
+// mark_local_only, claim_for_resume. That is phase 1's live functionality, held
+// shut by a schema this process had never applied before, and it is the reason
+// the migration is worth being careful with rather than a background detail.
+//
+// Routing, discovery and bindings do keep working, which is why this is
+// retried rather than fatal — but "leaves the rest of the process alone" is
+// three subsystems, not all of them. TestACatalogMigrationFailureHoldsThe
+// PausedRegistryShut in this package is what keeps that from drifting back
+// into a comfortable half-truth.
 //
 // A store that is not the postgres one has no pool and no catalog to migrate.
 // NewStore only ever returns the postgres one today, so this is the shape of a

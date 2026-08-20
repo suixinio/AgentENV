@@ -100,6 +100,14 @@ spec:
               value: "true"
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
               value: http://agentenv-scheduler:9090
+            # Where the control-plane credential is read from, re-read while
+            # the process runs. 🔴 Mounted as a volume, never as a
+            # secretKeyRef environment variable: kubelet refreshes volumes and
+            # does not refresh env, and this node's graceful shutdown pauses
+            # every sandbox it holds — so a rollback that needs a restart is a
+            # rollback nobody will reach for.
+            - name: AENV_API_CONTROL_PLANE_TOKEN_FILE
+              value: /etc/agentenv/control-plane/token
             - name: AENV_SANDBOX_PROXY_DOMAINS
               valueFrom:
                 configMapKeyRef:
@@ -137,7 +145,15 @@ spec:
                     # X-Admin-Token, not X-API-Key: the node status endpoint is
                     # declared with AdminApiKeyAuth, and a key sent under the
                     # wrong header is a 401 that the || below would swallow.
+                    # 🔴 The control-plane credential travels with it. This
+                    # script is itself a caller of the node's REST API, and its
+                    # failures are swallowed by the || below — so a missing
+                    # header here does not fail loudly, it just silently stops
+                    # draining, and sandboxes keep landing on a node that is
+                    # going away.
+                    CONTROL_PLANE_TOKEN="$(cat /etc/agentenv/control-plane/token 2>/dev/null | head -n1)"
                     curl -sf -X POST -H 'X-Admin-Token: preStop' \
+                      -H "x-agentenv-control-plane: ${CONTROL_PLANE_TOKEN}" \
                       -H 'Content-Type: application/json' \
                       -d '{"status":"draining"}' \
                       "http://localhost:8000/nodes/${AENV_NODE_ID}" \
@@ -145,7 +161,13 @@ spec:
                       || echo "preStop: failed to drain node, continuing"
                     echo "preStop: waiting for sandboxes to drain..."
                     while true; do
-                      count=$(curl -sf -H 'X-API-Key: preStop' http://localhost:8000/sandboxes | jq 'length') || count=""
+                      # GET /sandboxes is exempt from the gate (the gateway's
+                      # cluster listing fans out to it without the credential),
+                      # but send it anyway: the exemption is a property of the
+                      # gate's list, not of this caller.
+                      count=$(curl -sf -H 'X-API-Key: preStop' \
+                        -H "x-agentenv-control-plane: ${CONTROL_PLANE_TOKEN}" \
+                        http://localhost:8000/sandboxes | jq 'length') || count=""
                       if [ -z "$count" ]; then
                         echo "preStop: failed to query sandbox count, retrying..."
                         sleep 3
@@ -202,6 +224,9 @@ spec:
               readOnly: true
             - name: host-dev
               mountPath: /dev
+            - name: control-plane-token
+              mountPath: /etc/agentenv/control-plane
+              readOnly: true
       volumes:
         - name: workspace
           hostPath:
@@ -214,3 +239,11 @@ spec:
           hostPath:
             path: /dev
             type: Directory
+        # optional: an absent Secret mounts nothing, the node reads no
+        # credential, and the gate stays off — which is the state this ships in.
+        # Enabling the gate is writing this Secret; rolling it back is emptying
+        # it. Neither restarts the pod.
+        - name: control-plane-token
+          secret:
+            secretName: agentenv-control-plane-token
+            optional: true

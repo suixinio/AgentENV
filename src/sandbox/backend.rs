@@ -19,7 +19,7 @@ use super::{
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// A concrete sandbox backend's paused state.
 ///
@@ -83,6 +83,16 @@ pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 #[derive(Clone, Debug)]
 pub struct SandboxForkSpec {
     pub sandbox_id: SandboxId,
+    /// The child's own incarnation.
+    ///
+    /// 🔴 Required, and deliberately not defaulted. A fork child's metadata is
+    /// built by cloning the parent's and overwriting the fields that differ, so
+    /// an incarnation that could be left out would be inherited from the parent
+    /// — two live VMs sharing one identity, with nothing to warn about it.
+    /// Making it a field of this struct puts the mint next to
+    /// `SandboxId::new()` at every construction site and makes forgetting it a
+    /// compile error.
+    pub execution_id: ExecutionId,
     pub envd_access_token: Option<EnvdAccessToken>,
 }
 
@@ -203,6 +213,13 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 /// `Arc<Mutex<Box<dyn SandboxBackend>>>` handles managed by the Orchestrator.
 #[async_trait]
 pub trait SandboxBackend: Send + 'static {
+    /// The incarnation this backend was built for.
+    ///
+    /// Fixed for the lifetime of the backend: there is no setter, and neither
+    /// `snapshot` nor the parent side of `fork` changes it, because both pause
+    /// and resume the same VM in place rather than starting a new one.
+    fn execution_id(&self) -> ExecutionId;
+
     /// Start the sandbox and block until readiness.
     async fn start(&mut self) -> Result<()>;
 
@@ -295,10 +312,16 @@ pub trait SandboxBackend: Send + 'static {
 /// `create_sandbox` and `resume_sandbox` request.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a brand-new sandbox backend from a high-level launch request.
+    ///
+    /// `execution_id` is required rather than derived: a factory that could
+    /// default it would have a branch in which a sandbox starts under an
+    /// incarnation nobody minted, and that branch is exactly what fencing has
+    /// no defence against.
     fn build(
         &self,
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>>;
 
     /// Build a sandbox backend from a runnable committed snapshot plus launch request.
@@ -306,6 +329,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         &self,
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>>;
 
     /// Decode backend-specific paused state loaded from persistence.
@@ -316,9 +340,14 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
     ) -> Result<Arc<dyn PausedSandboxState>>;
 
     /// Build a sandbox backend from backend-specific paused state captured by `pause`.
+    ///
+    /// 🔴 `decode_paused_state` above deliberately takes no incarnation: it
+    /// reads the state a previous run left on disk, which says nothing about
+    /// which run is about to happen. This one does, because it builds the run.
     fn build_from_paused_state(
         &self,
         sandbox_id: crate::types::SandboxId,
+        execution_id: ExecutionId,
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>>;

@@ -1,0 +1,436 @@
+//! Who is allowed to call the node's user-facing REST API.
+//!
+//! The node's control plane used to accept anything that could reach the port:
+//! the generated auth layer checks that a credential is *present*, not what it
+//! is. Everything that legitimately calls it arrives through the gateway, and
+//! the gateway is the only thing that has to be believed — so the gateway
+//! stamps its outbound requests with a shared credential and this gate refuses
+//! calls that do not carry it.
+//!
+//! # Where it is attached, and why that is the whole design
+//!
+//! The layer goes on the **generated router**, *before* `proxy::router(...)` is
+//! merged in. `Router::merge` keeps each router's own layers, so the data plane
+//! — `/proxy/*` and the fallback that carries host-routed sandbox traffic — is
+//! not covered by this gate as a matter of *assembly order*, not as a matter of
+//! this function remembering to check the path.
+//!
+//! That distinction is the point. The three layers that already sit on this
+//! router are applied after the merge and therefore do run on data-plane
+//! requests; they each open with a path check to get out of the way again. A
+//! fourth layer written that way would put the node's whole data plane behind a
+//! string comparison in a function whose job is to refuse things.
+//!
+//! # What it does not do
+//!
+//! Nothing about the node acting on its own. TTL eviction, graceful-shutdown
+//! pauses, the reclaim upkeep pass and the data plane's own auto-resume all
+//! happen without any inbound request, and this gate is invisible to every one
+//! of them. Refusing outside callers is worth doing and is not the same thing
+//! as the sandbox being safe from a superseded incarnation; that is what the
+//! registry's write fencing is for.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::{header, HeaderValue, Method, Response, StatusCode},
+    middleware::Next,
+};
+use tracing::{info, warn};
+
+use crate::cfg::ConfigManager;
+
+/// The credential the gateway stamps on its outbound control-plane requests.
+///
+/// Lowercase, like every other `x-agentenv-*` header. Deliberately not the
+/// existing `X-Admin-Token` / `X-API-Key`: those stay exactly as they are, and
+/// what they mean stays exactly what it meant. This is a separate question —
+/// "did this come through the control plane" — asked outside the generated auth
+/// layer rather than instead of it.
+pub(crate) const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
+
+/// Paths this gate never applies to.
+///
+/// 🔴 Two entries, and both are load-bearing. Keep the list this short: every
+/// addition is a route that becomes reachable without a credential, and the
+/// only defence against that going unnoticed is that the list is small enough
+/// to read.
+///
+/// * `/health` is what kubelet polls, three ways. kubelet does not go through
+///   the gateway and has no credential, so gating it stops the pod from ever
+///   becoming ready.
+/// * `GET /sandboxes` and `GET /v2/sandboxes` are what the gateway fans out to
+///   when it builds the cluster-wide list. That fan-out uses the gateway's own
+///   HTTP client, not the reverse proxy, so it never passes through the hook
+///   that stamps the credential — and the endpoint is all-or-nothing, so one
+///   refusal turns the whole cluster listing into a 502.
+///
+/// ⚠️ Only the reads are exempt. `POST /sandboxes` creates a sandbox and stays
+/// behind the gate.
+fn is_exempt(method: &Method, path: &str) -> bool {
+    if path == "/health" {
+        return true;
+    }
+
+    method == Method::GET && matches!(path, "/sandboxes" | "/v2/sandboxes")
+}
+
+/// The credentials this node accepts, and where they come from.
+///
+/// Two sources, unioned: a static list read once at startup, and a file re-read
+/// while the process runs. Both empty means the gate is off.
+pub(crate) struct ControlPlaneGate {
+    /// From configuration/environment. Fixed for the life of the process.
+    static_tokens: Vec<String>,
+    /// The file to re-read, or `None` when none was configured.
+    token_file: Option<PathBuf>,
+    file_state: Mutex<TokenFileState>,
+    /// Whether the "no credentials configured, gate is off" line has been
+    /// logged. It says something an operator needs to see once, not once per
+    /// request.
+    announced_disabled: AtomicBool,
+}
+
+#[derive(Default)]
+struct TokenFileState {
+    /// Modification time and length of the contents behind `tokens`. Used to
+    /// skip re-reading a file that has not changed.
+    fingerprint: Option<(SystemTime, u64)>,
+    /// The last contents that were read successfully.
+    ///
+    /// 🔴 Survives a failed read on purpose. A read that fails is not evidence
+    /// that the credential was withdrawn — it is evidence of nothing at all —
+    /// and treating it as "no credentials configured" would let a single disk
+    /// hiccup turn the gate off without anyone being told. Turning the gate off
+    /// is done by writing an empty file, which is a *successful* read of zero
+    /// credentials.
+    tokens: Option<Vec<String>>,
+}
+
+/// What the gate did with one request. A closed set: the label goes on a metric
+/// and a metric label with unbounded values is a memory leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    /// No credentials configured, so the gate is off and this request went
+    /// through the way it would have before the gate existed.
+    Disabled,
+    /// A path the gate never applies to.
+    Exempt,
+    /// Carried a credential this node accepts.
+    Allowed,
+    /// 🔴 Refused. On a healthy cluster this is always zero, because every
+    /// legitimate caller reaches the node through the gateway. A non-zero count
+    /// is not an attack alert — it is the shortest route to finding the
+    /// platform path that is not going through the gateway.
+    Refused,
+}
+
+impl GateDecision {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Exempt => "exempt",
+            Self::Allowed => "allowed",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+impl ControlPlaneGate {
+    pub(crate) fn from_global_config() -> Self {
+        let config = &ConfigManager::global_config().api;
+        Self::new(
+            config.control_plane_tokens.clone(),
+            config.control_plane_token_file.clone(),
+        )
+    }
+
+    pub(crate) fn new(static_tokens: Vec<String>, token_file: impl Into<String>) -> Self {
+        let token_file = token_file.into();
+        let token_file = token_file.trim();
+
+        let gate = Self {
+            static_tokens: normalize(static_tokens),
+            token_file: (!token_file.is_empty()).then(|| PathBuf::from(token_file)),
+            file_state: Mutex::new(TokenFileState::default()),
+            announced_disabled: AtomicBool::new(false),
+        };
+
+        // Publish the gauge before any request arrives. Both the enable step
+        // and the rollback are watched by looking at exactly this series, and a
+        // series that only appears once traffic happens to arrive is not
+        // something anyone can watch — a node whose gate is off would be
+        // indistinguishable from a node that has not been scraped yet.
+        metrics::gauge!("agentenv_api_control_plane_gate_enabled")
+            .set(if gate.accepted().is_empty() { 0.0 } else { 1.0 });
+
+        gate
+    }
+
+    /// The credentials in force right now.
+    fn accepted(&self) -> Vec<String> {
+        let mut accepted = self.static_tokens.clone();
+        accepted.extend(self.file_tokens());
+        accepted
+    }
+
+    fn file_tokens(&self) -> Vec<String> {
+        let Some(path) = self.token_file.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut state = self
+            .file_state
+            .lock()
+            .expect("token file state is poisoned");
+
+        // Skip the read when the file is byte-for-byte the one already held.
+        // A control-plane request is rare enough that a stat per request costs
+        // nothing, and this keeps the common case to exactly that.
+        let fingerprint = std::fs::metadata(path)
+            .and_then(|meta| Ok((meta.modified()?, meta.len())))
+            .ok();
+        if let (Some(fingerprint), Some(held), Some(tokens)) =
+            (fingerprint, state.fingerprint, state.tokens.as_ref())
+        {
+            if fingerprint == held {
+                metrics::counter!(
+                    "agentenv_api_control_plane_token_reload_total",
+                    "result" => "unchanged",
+                )
+                .increment(1);
+
+                return tokens.clone();
+            }
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let tokens = normalize(contents.lines().map(str::to_string).collect());
+                state.fingerprint = fingerprint;
+                state.tokens = Some(tokens.clone());
+                metrics::counter!(
+                    "agentenv_api_control_plane_token_reload_total",
+                    "result" => "loaded",
+                )
+                .increment(1);
+
+                tokens
+            }
+            Err(err) => match state.tokens.as_ref() {
+                // 🔴 Never fail open. Keep serving on the credential that was
+                // last known good and say loudly that the file cannot be read;
+                // the alternative is that a transient read error silently opens
+                // the node's whole control plane.
+                Some(tokens) => {
+                    metrics::counter!(
+                        "agentenv_api_control_plane_token_reload_total",
+                        "result" => "error_kept_previous",
+                    )
+                    .increment(1);
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "cannot read the control-plane credential file; keeping the last one that \
+                         was read successfully. Clear the file to turn the gate off deliberately \
+                         — an unreadable file is not the same thing as an empty one"
+                    );
+
+                    tokens.clone()
+                }
+                // Never read successfully, which is what an unconfigured or
+                // not-yet-mounted file looks like. That is the off state, and
+                // the request below reports it as `disabled` rather than as an
+                // error.
+                None => Vec::new(),
+            },
+        }
+    }
+
+    fn decide(&self, method: &Method, path: &str, presented: Option<&str>) -> GateDecision {
+        if is_exempt(method, path) {
+            return GateDecision::Exempt;
+        }
+
+        let accepted = self.accepted();
+        if accepted.is_empty() {
+            if !self.announced_disabled.swap(true, Ordering::Relaxed) {
+                info!(
+                    "no control-plane credential is configured; the node's REST API accepts any \
+                     caller that can reach it"
+                );
+            }
+
+            return GateDecision::Disabled;
+        }
+
+        let presented = presented.unwrap_or_default();
+        if accepted
+            .iter()
+            .any(|accepted| constant_time_eq(accepted.as_bytes(), presented.as_bytes()))
+        {
+            GateDecision::Allowed
+        } else {
+            GateDecision::Refused
+        }
+    }
+}
+
+/// Compares two credentials without leaking where they first differ.
+///
+/// 🔴 Not `==`. This is a secret, and `==` on a byte slice stops at the first
+/// mismatch, which turns "is this the credential" into a byte-at-a-time oracle.
+/// Written out rather than pulled from a crate because it is six lines and the
+/// crate would be a new direct dependency for them.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        difference |= left ^ right;
+    }
+
+    difference == 0
+}
+
+fn normalize(tokens: Vec<String>) -> Vec<String> {
+    tokens
+        .into_iter()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Refuses control-plane calls that did not come through the gateway.
+pub(crate) async fn require_control_plane(
+    State(gate): State<Arc<ControlPlaneGate>>,
+    request: Request,
+    next: Next,
+) -> Response<Body> {
+    let presented = request
+        .headers()
+        .get(CONTROL_PLANE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let decision = gate.decide(request.method(), request.uri().path(), presented);
+
+    metrics::counter!(
+        "agentenv_api_control_plane_gate_total",
+        "decision" => decision.label(),
+    )
+    .increment(1);
+    // A gauge rather than something derived from the counters: "is the gate on"
+    // has to be answerable without traffic, and the enable step and the
+    // rollback are both watched by looking at exactly this.
+    //
+    // Exempt requests leave it alone: they say nothing about whether a
+    // credential is configured, and letting a kubelet probe drive this gauge
+    // would make it report "on" on a node where the gate is off.
+    match decision {
+        GateDecision::Exempt => {}
+        GateDecision::Disabled => {
+            metrics::gauge!("agentenv_api_control_plane_gate_enabled").set(0.0)
+        }
+        GateDecision::Allowed | GateDecision::Refused => {
+            metrics::gauge!("agentenv_api_control_plane_gate_enabled").set(1.0)
+        }
+    }
+
+    if decision != GateDecision::Refused {
+        return next.run(request).await;
+    }
+
+    warn!(
+        method = %request.method(),
+        path = %request.uri().path(),
+        "refusing a control-plane call that did not come through the gateway"
+    );
+
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
+        .body(Body::from("control plane credential required"))
+        .expect("static forbidden response is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-A4-6. 🔴 The node's own preStop hook is a caller of its REST API.
+    ///
+    /// It runs `curl` against `localhost:8000` and swallows its own failures
+    /// with `|| echo "... continuing"`, so a missing credential does not show up
+    /// as an error anywhere — it shows up weeks later as sandboxes being placed
+    /// on a node that is shutting down. Nothing at runtime can catch that, so it
+    /// is caught here, against the manifest itself.
+    #[test]
+    fn the_prestop_drain_carries_the_control_plane_credential() {
+        const MANIFEST: &str = include_str!("../../deploy/k8s/base/agentenv-daemonset.yaml");
+
+        let pre_stop = MANIFEST
+            .split_once("preStop:")
+            .expect("the daemonset has a preStop hook")
+            .1
+            .split_once("postStart:")
+            .expect("preStop is followed by postStart")
+            .0;
+
+        let calls = pre_stop.matches("curl ").count();
+        let credentials = pre_stop.matches(CONTROL_PLANE_HEADER).count();
+
+        assert!(calls > 0, "the preStop hook still calls the node's API");
+        assert_eq!(
+            credentials, calls,
+            "every preStop call to the node's API must carry the control-plane credential; \
+             found {calls} call(s) and {credentials} credential header(s)"
+        );
+
+        // ...and the file it reads the credential from is the one the server
+        // was pointed at. Two halves of one mount; naming them differently
+        // fails silently in exactly the same way.
+        assert!(
+            MANIFEST.contains("AENV_API_CONTROL_PLANE_TOKEN_FILE"),
+            "the node must be told where to read the control-plane credential"
+        );
+        assert!(
+            MANIFEST
+                .matches("/etc/agentenv/control-plane/token")
+                .count()
+                >= 2,
+            "the preStop hook and the server must read the same credential file"
+        );
+    }
+
+    #[test]
+    fn only_the_read_half_of_the_sandbox_listing_is_exempt() {
+        assert!(is_exempt(&Method::GET, "/health"));
+        assert!(is_exempt(&Method::POST, "/health"));
+        assert!(is_exempt(&Method::GET, "/sandboxes"));
+        assert!(is_exempt(&Method::GET, "/v2/sandboxes"));
+
+        assert!(!is_exempt(&Method::POST, "/sandboxes"));
+        assert!(!is_exempt(&Method::DELETE, "/sandboxes"));
+        assert!(!is_exempt(&Method::GET, "/sandboxes/some-id"));
+        assert!(!is_exempt(&Method::POST, "/nodes/some-id"));
+    }
+
+    /// The comparison is constant time, and it is still a comparison.
+    #[test]
+    fn the_credential_comparison_agrees_with_equality() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"tokeo"));
+        assert!(!constant_time_eq(b"token", b"token-longer"));
+        assert!(!constant_time_eq(b"", b"token"));
+        assert!(constant_time_eq(b"", b""));
+    }
+}

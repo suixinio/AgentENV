@@ -137,6 +137,49 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+    #[config(nested)]
+    pub api: ApiConfig,
+}
+
+/// The node's own HTTP API.
+#[derive(Debug, Config, Clone)]
+pub struct ApiConfig {
+    /// Credentials that prove a control-plane call came through the gateway.
+    ///
+    /// A list rather than a single value so a rotation can accept the old and
+    /// the new one at once. Empty — together with an empty
+    /// [`control_plane_token_file`](Self::control_plane_token_file) — means the
+    /// gate is off and the node behaves exactly as it did before it existed,
+    /// which is what makes turning it off a configuration change rather than a
+    /// code change.
+    ///
+    /// 🔴 Read once, at startup. Changing it means restarting the process, and
+    /// this process pauses every sandbox on the node on its way out. Use the
+    /// file below to turn the gate on and off.
+    #[config(
+        default = [],
+        env = "AENV_API_CONTROL_PLANE_TOKEN",
+        parse_env = confique::env::parse::list_by_comma
+    )]
+    pub control_plane_tokens: Vec<String>,
+    /// A file holding the same thing, one credential per line, re-read while
+    /// the process runs.
+    ///
+    /// 🔴 This is what makes enabling and disabling the gate free. The node is
+    /// a DaemonSet whose graceful shutdown pauses every sandbox it holds, so a
+    /// restart is never cheap and a rollback that needs one is a rollback
+    /// nobody will reach for. Point this at a mounted Secret — mounted, not
+    /// `secretKeyRef`, because kubelet refreshes volumes and does not refresh
+    /// environment variables.
+    ///
+    /// The effective set is the union of both. Empty or unset contributes
+    /// nothing.
+    #[config(
+        default = "",
+        env = "AENV_API_CONTROL_PLANE_TOKEN_FILE",
+        parse_env = parse_trimmed_string
+    )]
+    pub control_plane_token_file: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]

@@ -35,11 +35,11 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::ApiImpl,
+    api::{impls::ResumeArbitration, ApiImpl},
     cfg::ConfigManager,
     observability::prometheus::HttpRouteSource,
     orchestrator::{NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
-    types::SandboxId,
+    types::{ExecutionId, SandboxId},
 };
 
 /// Shared outbound HTTP client for the client-facing reverse proxy.
@@ -84,6 +84,22 @@ const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
 const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
+/// Set by the gateway when the control plane can name the incarnation it is
+/// routing to. Absent whenever it cannot, which is an ordinary answer.
+const EXPECT_EXECUTION_HEADER: &str = "x-agentenv-expect-execution-id";
+/// Answered on every proxy response, allowed or refused: the incarnation this
+/// node has alive for the sandbox, or nothing when it has none.
+///
+/// It doubles as this node's capability signal — a gateway that never sees it
+/// knows the node is not taking part in fencing.
+const EXECUTION_ECHO_HEADER: &str = "x-agentenv-execution-id";
+/// Sent with the refusal below. 🔴 Internal: the gateway translates the pair
+/// into the one shape clients see, and never passes it through.
+const REFUSAL_HEADER: &str = "x-agentenv-refusal";
+/// 🔴 The only refusal string on the wire. Not `stale_execution`, not a third
+/// spelling — the whole point is that one grep joins gateway, node and
+/// controller.
+const REFUSAL_EXECUTION_SUPERSEDED: &str = "sandbox_execution_superseded";
 
 #[cfg(test)]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -260,6 +276,149 @@ fn with_route_source(mut response: Response<Body>, source: HttpRouteSource) -> R
     response
 }
 
+/// What this node did with the incarnation the control plane named.
+///
+/// 🔴 Five values, not two. `pass_ahead` (a same-node pause/resume the control
+/// plane has not caught up with) and `pass_absent` (a cross-node resume whose
+/// VM is not up here yet) are both ordinary and both frequent; collapsing them
+/// into a plain "passed" throws away the only evidence that the two rules
+/// meant to allow them are working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencingDecision {
+    /// The control plane named the incarnation this node is running.
+    Pass,
+    /// This node is running a *newer* incarnation than the one named. It is
+    /// ahead of the control plane by a heartbeat, and the traffic was routed
+    /// here, so there is no second live copy to protect against.
+    PassAhead,
+    /// No header: the control plane could not name an incarnation.
+    PassNoExpect,
+    /// This node has no live copy of the sandbox. Absence is not evidence of a
+    /// superseded run.
+    PassAbsent,
+    /// 🔴 The only refusal: this node's live incarnation is older than the one
+    /// the control plane named, so this node has been replaced.
+    RefusedStale,
+}
+
+impl FencingDecision {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::PassAhead => "pass_ahead",
+            Self::PassNoExpect => "pass_no_expect",
+            Self::PassAbsent => "pass_absent",
+            Self::RefusedStale => "refused_stale",
+        }
+    }
+}
+
+/// Compares what the control plane expects against what is alive here.
+///
+/// 🔴 Ordered, not equal. `live > expect` is what a same-node pause/resume
+/// looks like from a control plane that is one heartbeat behind — TTL eviction
+/// runs on a one-second tick and the data plane resumes sandboxes by itself, so
+/// it happens constantly. Refusing on inequality would turn the most common
+/// legitimate path into a refusal, at the exact moment a user is waiting for a
+/// sandbox to wake up.
+fn fencing_decision(expected: Option<ExecutionId>, live: Option<ExecutionId>) -> FencingDecision {
+    let Some(expected) = expected else {
+        return FencingDecision::PassNoExpect;
+    };
+    let Some(live) = live else {
+        return FencingDecision::PassAbsent;
+    };
+    match live.cmp(&expected) {
+        std::cmp::Ordering::Less => FencingDecision::RefusedStale,
+        std::cmp::Ordering::Equal => FencingDecision::Pass,
+        std::cmp::Ordering::Greater => FencingDecision::PassAhead,
+    }
+}
+
+fn parse_expect_execution_header(headers: &HeaderMap) -> Option<ExecutionId> {
+    // A header that will not parse is treated as absent rather than as a
+    // refusal: it is the control plane's mistake, and refusing on it would take
+    // a sandbox off the air for a malformed string.
+    let raw = first_header_value(headers, &[EXPECT_EXECUTION_HEADER])?;
+    ExecutionId::parse_str(raw).ok()
+}
+
+/// Stamps the incarnation this node has alive onto a response.
+///
+/// Applied to allowed and refused responses alike: the gateway uses its
+/// presence to tell a node that takes part in fencing from one that does not,
+/// so a node that answered it only when refusing would look silent exactly
+/// when everything is healthy.
+fn echo_execution(mut response: Response<Body>, live: Option<ExecutionId>) -> Response<Body> {
+    if let Some(live) = live {
+        if let Ok(value) = HeaderValue::from_str(&live.to_string()) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static(EXECUTION_ECHO_HEADER), value);
+        }
+    }
+    response
+}
+
+/// 🔴 412, and the code matters more than the body.
+///
+/// Not 404: on this path the platform reads 404 as "the sandbox is gone" and
+/// rebuilds the workspace from its template, which destroys the user's work.
+/// Not 410 either: `/proxy` already uses it for "not proxyable in this state".
+/// 412 is the free slot, and the gateway rewrites it into the one shape clients
+/// see.
+fn execution_superseded_response(
+    sandbox_id: SandboxId,
+    expected: ExecutionId,
+    live: ExecutionId,
+) -> Response<Body> {
+    warn!(
+        sandbox_id = %sandbox_id,
+        expected_execution_id = %expected,
+        observed_execution_id = %live,
+        refusal_code = REFUSAL_EXECUTION_SUPERSEDED,
+        fencing_stage = "node_proxy",
+        "refusing proxied traffic addressed to an incarnation this node has replaced"
+    );
+
+    Response::builder()
+        .status(StatusCode::PRECONDITION_FAILED)
+        .header(
+            REFUSAL_HEADER,
+            HeaderValue::from_static(REFUSAL_EXECUTION_SUPERSEDED),
+        )
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
+        .body(Body::from("sandbox execution superseded"))
+        .expect("static superseded proxy response is valid")
+}
+
+/// Which incarnation is about to serve this request.
+///
+/// 🔴 Read *after* the request has been resolved, not when it arrived. This
+/// path resumes paused sandboxes by itself, so a sandbox with no live
+/// incarnation when the request came in has one by the time it is served —
+/// and reporting the earlier answer would leave the gateway reading a node
+/// that has just done exactly the right thing as a node that is not taking
+/// part in fencing at all, which is the one signal the rollout watches.
+///
+/// `on_arrival` is the fallback for the reverse case: a route that has gone
+/// away again since. What was true when the request arrived is a better answer
+/// than nothing.
+async fn execution_that_served(
+    api_impl: &ApiImpl,
+    sandbox_id: SandboxId,
+    on_arrival: Option<ExecutionId>,
+) -> Option<ExecutionId> {
+    api_impl
+        .orchestrator()
+        .live_execution_id(&sandbox_id)
+        .await
+        .or(on_arrival)
+}
+
 async fn proxy_request(
     api_impl: &ApiImpl,
     websocket_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
@@ -268,17 +427,50 @@ async fn proxy_request(
 ) -> Response<Body> {
     let is_websocket_request = is_websocket_upgrade_request(request.headers());
     let (parts, body) = request.into_parts();
+
+    // 🔴 Before anything else on this path, and in particular before the
+    // auto-resume inside `resolve_proxy_request`. Resolving first would let
+    // traffic addressed to a replaced incarnation wake the sandbox up — the
+    // node would perform the very act it is about to refuse.
+    let sandbox_id = parse_sandbox_id_header(&parts.headers).ok();
+    let live_execution = match sandbox_id {
+        Some(sandbox_id) => api_impl.orchestrator().live_execution_id(&sandbox_id).await,
+        None => None,
+    };
+    let expected_execution = parse_expect_execution_header(&parts.headers);
+    let decision = fencing_decision(expected_execution, live_execution);
+    metrics::counter!(
+        "agentenv_proxy_execution_fencing_total",
+        "decision" => decision.label(),
+    )
+    .increment(1);
+    if decision == FencingDecision::RefusedStale {
+        // Both are `Some` on this branch by construction.
+        return echo_execution(
+            execution_superseded_response(
+                sandbox_id.expect("a refusal names a sandbox"),
+                expected_execution.expect("a refusal quotes an expectation"),
+                live_execution.expect("a refusal observed a live incarnation"),
+            ),
+            live_execution,
+        );
+    }
+
     let resolved =
         match resolve_proxy_request(api_impl, &forward_path, &parts, is_websocket_request).await {
             Ok(resolved) => resolved,
-            Err(response) => return response,
+            Err(response) => return echo_execution(response, live_execution),
         };
 
-    if is_websocket_request {
-        return proxy_websocket_request(websocket_upgrade, parts, resolved).await;
-    }
+    let served_by = execution_that_served(api_impl, resolved.sandbox_id, live_execution).await;
 
-    proxy_http_request(api_impl, parts, body, resolved).await
+    let response = if is_websocket_request {
+        proxy_websocket_request(websocket_upgrade, parts, resolved).await
+    } else {
+        proxy_http_request(api_impl, parts, body, resolved).await
+    };
+
+    echo_execution(response, served_by)
 }
 
 fn strip_proxy_prefix(path: &str) -> &str {
@@ -798,11 +990,47 @@ async fn authorize_secure_envd_auto_resume(
 }
 
 async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<(), Response<Body>> {
+    // 🔴 The data plane takes the same resume decision the REST route does.
+    // It used to go straight to the orchestrator, past both the supersession
+    // check and the claim — so a request arriving here could bring up a second
+    // copy of a sandbox that is live on another node, with nothing recorded
+    // anywhere. It cannot any more: the claim is the only source of the token
+    // `resume_sandbox` requires.
+    let (claimed, held) = match api_impl.arbitrate_resume(sandbox_id).await {
+        ResumeArbitration::Proceed(claimed) => (claimed, None),
+        ResumeArbitration::Held(entry, claimed) => (claimed, Some(entry.generation)),
+        // Somebody else holds it, or nobody could be asked. Either way this
+        // node must not start it. 🔴 Never 404 here: on this route a 404 says
+        // "no such sandbox", and the sandbox exists — it is just not ours.
+        ResumeArbitration::Blocked { origin_node_id }
+        | ResumeArbitration::NotReady { origin_node_id } => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                node_id = %origin_node_id,
+                "refusing to auto-resume a sandbox the cluster holds elsewhere"
+            );
+            return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
+                sandbox_id,
+            )));
+        }
+        ResumeArbitration::Unavailable { reason } => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %reason,
+                "refusing to auto-resume a sandbox the cluster could not be asked about"
+            );
+            return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
+                sandbox_id,
+            )));
+        }
+    };
+
     match timeout(
         PROXY_AUTO_RESUME_TIMEOUT,
         api_impl.orchestrator().resume_sandbox(
             sandbox_id,
             NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout()),
+            claimed,
         ),
     )
     .await
@@ -813,6 +1041,9 @@ async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<()
         }
         Ok(Err(err)) => {
             warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume failed");
+            if let Some(generation) = held {
+                api_impl.abandon_claim(sandbox_id, generation).await;
+            }
             Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
                 sandbox_id,
             )))
@@ -823,6 +1054,9 @@ async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<()
                 timeout_ms = PROXY_AUTO_RESUME_TIMEOUT.as_millis(),
                 "sandbox auto-resume timed out"
             );
+            if let Some(generation) = held {
+                api_impl.abandon_claim(sandbox_id, generation).await;
+            }
             Err(proxy_error_response(
                 &ProxyRequestError::AutoResumeTimedOut(sandbox_id),
             ))
@@ -1471,7 +1705,7 @@ mod tests {
         second_response.into_body().collect().await.unwrap();
     }
 
-    async fn spawn_upstream(router: axum::Router) -> SocketAddr {
+    pub(super) async fn spawn_upstream(router: axum::Router) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1699,7 +1933,7 @@ mod tests {
         .await
     }
 
-    async fn build_api() -> Arc<ApiImpl> {
+    pub(super) async fn build_api() -> Arc<ApiImpl> {
         build_api_with_sandbox_proxy_domains(Vec::new()).await
     }
 
@@ -2989,6 +3223,370 @@ mod tests {
         assert_eq!(
             response.body().as_deref(),
             Some(b"upstream denied websocket".as_slice())
+        );
+    }
+}
+
+#[cfg(test)]
+mod execution_fencing_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use crate::api::server;
+    use crate::orchestrator::{ProxyTarget, SandboxState};
+
+    use super::tests::{build_api, spawn_upstream};
+
+    /// An upstream that counts what reaches it, so "the request was refused"
+    /// can be told apart from "the request was served and then relabelled".
+    async fn start_counting_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let router = axum::Router::new().fallback(get(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                "served"
+            }
+        }));
+
+        (spawn_upstream(router).await, hits)
+    }
+
+    /// Builds a node that is running `sandbox_id` under `live`.
+    async fn app_running_under(sandbox_id: SandboxId, live: ExecutionId) -> axum::Router {
+        let api = build_api().await;
+        api.orchestrator()
+            .set_live_execution_for_test(sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), live)
+            .await;
+        server::new(api)
+    }
+
+    fn proxy_request(sandbox_id: SandboxId, port: u16, expect: Option<ExecutionId>) -> Request {
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri("/proxy/health")
+            .header("x-api-key", "test-key")
+            .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+            .header(TARGET_PORT_HEADER, port.to_string());
+        if let Some(expect) = expect {
+            builder = builder.header(EXPECT_EXECUTION_HEADER, expect.to_string());
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// Two incarnations in a known order. UUIDv7 is time-ordered, so the second
+    /// one minted is the later one — which is what the whole comparison relies
+    /// on.
+    fn older_and_newer() -> (ExecutionId, ExecutionId) {
+        let first = ExecutionId::new();
+        let second = ExecutionId::new();
+        assert!(first < second, "uuid v7 must mint in ascending order");
+        (first, second)
+    }
+
+    /// T-A5N-1. The control plane names an incarnation newer than the one alive
+    /// here: this node has been replaced and must refuse.
+    ///
+    /// 🔴 Also asserts the upstream was never contacted. A refusal decided after
+    /// the request has already been served is not a refusal.
+    #[tokio::test]
+    async fn a_proxy_request_naming_a_dead_execution_is_refused() {
+        let (upstream, hits) = start_counting_upstream().await;
+        let sandbox_id = SandboxId::new();
+        let (live, expect) = older_and_newer();
+        let app = app_running_under(sandbox_id, live).await;
+
+        let response = app
+            .oneshot(proxy_request(sandbox_id, upstream.port(), Some(expect)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            response
+                .headers()
+                .get(REFUSAL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(REFUSAL_EXECUTION_SUPERSEDED)
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a refused request must never reach the sandbox"
+        );
+    }
+
+    /// T-A5N-2. The control group. Without it, "refuse everything" passes the
+    /// test above.
+    #[tokio::test]
+    async fn a_proxy_request_naming_the_live_execution_passes_through() {
+        let (upstream, hits) = start_counting_upstream().await;
+        let sandbox_id = SandboxId::new();
+        let live = ExecutionId::new();
+        let app = app_running_under(sandbox_id, live).await;
+
+        let response = app
+            .oneshot(proxy_request(sandbox_id, upstream.port(), Some(live)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// T-A5N-6. 🔴 This node is *ahead* of the control plane.
+    ///
+    /// A same-node pause and resume mints a new incarnation, and the control
+    /// plane learns about it a heartbeat later. In between, every request
+    /// carries the previous incarnation as its expectation. An equality test
+    /// would refuse all of them — and it would do it at the moment a user is
+    /// waiting for their sandbox to come back.
+    #[tokio::test]
+    async fn a_node_ahead_of_the_control_plane_still_serves() {
+        let (upstream, hits) = start_counting_upstream().await;
+        let sandbox_id = SandboxId::new();
+        let (expect, live) = older_and_newer();
+        let app = app_running_under(sandbox_id, live).await;
+
+        let response = app
+            .oneshot(proxy_request(sandbox_id, upstream.port(), Some(expect)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a node newer than the control plane is not a superseded node"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// T-A5N-7. 🔴 Absence is not evidence.
+    ///
+    /// During a cross-node resume the gateway sends traffic to the claiming
+    /// node while its VM is still coming up. Reading "I do not have it" as "I
+    /// have an older one" would refuse every request in that window.
+    #[tokio::test]
+    async fn a_sandbox_this_node_does_not_have_is_not_a_superseded_execution() {
+        let sandbox_id = SandboxId::new();
+        let app = {
+            let api = build_api().await;
+            server::new(api)
+        };
+
+        let response = app
+            .oneshot(proxy_request(sandbox_id, 8080, Some(ExecutionId::new())))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "a sandbox this node has never seen is not a superseded incarnation"
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// T-A5N-7b. The paused half of the same rule: a sandbox parked here has no
+    /// live incarnation, so its record must not be read as a stale one — the
+    /// data plane's own resume path depends on this request getting through.
+    #[tokio::test]
+    async fn a_paused_sandbox_is_not_a_superseded_execution() {
+        let sandbox_id = SandboxId::new();
+        let app = {
+            let api = build_api().await;
+            api.orchestrator()
+                .set_proxy_target_for_test(
+                    sandbox_id,
+                    ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                    SandboxState::Paused,
+                )
+                .await;
+            api.orchestrator()
+                .set_auto_resume_for_test(&sandbox_id, true)
+                .await
+                .unwrap();
+            server::new(api)
+        };
+
+        let response = app
+            .oneshot(proxy_request(sandbox_id, 8080, Some(ExecutionId::new())))
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// T-A5N-3. No header is an ordinary answer: the control plane only names an
+    /// incarnation when it can, and treating silence as a refusal would take
+    /// every unknown sandbox off the air.
+    #[tokio::test]
+    async fn a_proxy_request_without_the_expect_header_is_not_refused() {
+        let (upstream, hits) = start_counting_upstream().await;
+        let sandbox_id = SandboxId::new();
+        let app = app_running_under(sandbox_id, ExecutionId::new()).await;
+
+        let response = app
+            .oneshot(proxy_request(sandbox_id, upstream.port(), None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// T-A5N-4. 🔴 The refusal code, pinned.
+    ///
+    /// 404 on this path means "no such sandbox", and the platform answers that
+    /// by rebuilding the workspace from its template — the user's work is gone.
+    /// 410 is already spoken for on `/proxy` ("not proxyable in this state").
+    /// The refusal is 412 and nothing else.
+    #[tokio::test]
+    async fn the_refusal_is_never_four_oh_four_or_gone() {
+        let (upstream, _hits) = start_counting_upstream().await;
+        let sandbox_id = SandboxId::new();
+        let (live, expect) = older_and_newer();
+        let app = app_running_under(sandbox_id, live).await;
+
+        let status = app
+            .oneshot(proxy_request(sandbox_id, upstream.port(), Some(expect)))
+            .await
+            .unwrap()
+            .status();
+
+        assert_ne!(status, StatusCode::NOT_FOUND);
+        assert_ne!(status, StatusCode::GONE);
+        assert_ne!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// T-A5N-5. The echo is on every answer, refused or not.
+    ///
+    /// It is how a gateway tells a node that takes part in fencing from one that
+    /// does not. A node that only echoed when refusing would look silent for as
+    /// long as everything was healthy.
+    #[tokio::test]
+    async fn every_proxy_response_names_the_execution_that_served_it() {
+        let (upstream, _hits) = start_counting_upstream().await;
+        let sandbox_id = SandboxId::new();
+        let (live, expect) = older_and_newer();
+
+        let allowed = app_running_under(sandbox_id, live)
+            .await
+            .oneshot(proxy_request(sandbox_id, upstream.port(), Some(live)))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .headers()
+                .get(EXECUTION_ECHO_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(live.to_string().as_str()),
+            "an allowed response must name the incarnation that served it"
+        );
+
+        let refused = app_running_under(sandbox_id, live)
+            .await
+            .oneshot(proxy_request(sandbox_id, upstream.port(), Some(expect)))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            refused
+                .headers()
+                .get(EXECUTION_ECHO_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(live.to_string().as_str()),
+            "a refusal must name the incarnation that refused"
+        );
+    }
+
+    /// The comparison itself, away from the HTTP shell — one case per branch,
+    /// so a merged branch cannot hide behind another's coverage.
+    #[test]
+    fn the_comparison_is_ordered_and_only_refuses_older() {
+        let (older, newer) = older_and_newer();
+
+        assert_eq!(
+            fencing_decision(Some(newer), Some(older)),
+            FencingDecision::RefusedStale
+        );
+        assert_eq!(
+            fencing_decision(Some(older), Some(older)),
+            FencingDecision::Pass
+        );
+        assert_eq!(
+            fencing_decision(Some(older), Some(newer)),
+            FencingDecision::PassAhead
+        );
+        assert_eq!(
+            fencing_decision(None, Some(older)),
+            FencingDecision::PassNoExpect
+        );
+        assert_eq!(
+            fencing_decision(Some(older), None),
+            FencingDecision::PassAbsent
+        );
+        assert_eq!(fencing_decision(None, None), FencingDecision::PassNoExpect);
+    }
+}
+
+#[cfg(test)]
+mod execution_echo_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    use crate::orchestrator::ProxyTarget;
+    use crate::types::ExecutionId;
+
+    use super::tests::build_api;
+
+    /// 🔴 The echo names the run that is about to serve the request, not the
+    /// one that was live when it arrived.
+    ///
+    /// The data plane wakes paused sandboxes by itself. A request that does
+    /// that finds no live incarnation on arrival and a brand-new one by the
+    /// time it is answered — and answering with the first would make every
+    /// successful wake-up look, to the gateway, like a node that has no fencing
+    /// at all. That count is a release gate, so a false one there stops a
+    /// rollout on a node that is working perfectly.
+    #[tokio::test]
+    async fn the_echo_names_the_incarnation_that_is_live_now() {
+        let api = build_api().await;
+        let sandbox_id = SandboxId::new();
+        let on_arrival = ExecutionId::new();
+        let after_waking = ExecutionId::new();
+
+        api.orchestrator()
+            .set_live_execution_for_test(
+                sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                after_waking,
+            )
+            .await;
+
+        assert_eq!(
+            execution_that_served(&api, sandbox_id, Some(on_arrival)).await,
+            Some(after_waking),
+            "the answer must come from the sandbox that is live now"
+        );
+
+        // ...and the other direction: a route that has gone away again since
+        // leaves what was true on arrival as the best answer there is.
+        api.orchestrator()
+            .remove_proxy_route_for_test(&sandbox_id)
+            .await;
+        assert_eq!(
+            execution_that_served(&api, sandbox_id, Some(on_arrival)).await,
+            Some(on_arrival)
         );
     }
 }

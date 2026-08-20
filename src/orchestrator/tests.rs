@@ -729,9 +729,18 @@ fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
     )
 }
 
+/// A claim token for tests that drive the orchestrator directly.
+///
+/// Goes through the same constructor the arbitration uses, so these tests
+/// exercise the real shape rather than a test-only door.
+fn test_claim() -> ClaimedExecution {
+    ClaimedExecution::from_claim(ExecutionId::new())
+}
+
 fn resume_launch_plan(sandbox_id: SandboxId) -> LaunchPlan {
     LaunchPlan::for_resume(
         sandbox_id,
+        test_claim(),
         Arc::clone(test_paused_state()),
         NewTimeout::None,
         SandboxResources::default(),
@@ -835,7 +844,7 @@ async fn proxy_target_for_only_returns_running_routes() {
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
 
     orchestrator
-        .upsert_proxy_route(sandbox_id, target.clone())
+        .upsert_proxy_route(sandbox_id, target.clone(), ExecutionId::new())
         .await;
     assert_eq!(
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
@@ -850,7 +859,7 @@ async fn restore_proxy_route_republishes_running_target() {
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 77));
 
     orchestrator
-        .upsert_proxy_route(sandbox_id, target.clone())
+        .upsert_proxy_route(sandbox_id, target.clone(), ExecutionId::new())
         .await;
 
     let (_, removed) = orchestrator
@@ -913,9 +922,10 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let plan = create_launch_plan_with_resources(sandbox_id);
-    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
-        MockBehavior::new(),
-    )))));
+    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
+        Arc::new(MockBehavior::new()),
+        ExecutionId::new(),
+    ))));
 
     orchestrator
         .store
@@ -942,9 +952,10 @@ async fn cleanup_failed_launch_restores_resume_metadata() {
     let mut running_metadata = rollback_metadata.clone();
     running_metadata.state = SandboxState::Running;
     let plan = resume_launch_plan(sandbox_id);
-    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
-        MockBehavior::new(),
-    )))));
+    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
+        Arc::new(MockBehavior::new()),
+        ExecutionId::new(),
+    ))));
 
     orchestrator.store.add(running_metadata).await.unwrap();
 
@@ -971,9 +982,11 @@ async fn stale_handle_cannot_republish_running_proxy_route() {
     let behavior = Arc::new(MockBehavior::new());
     let current_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
         behavior.clone(),
+        ExecutionId::new(),
     ))));
     let stale_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
         behavior.clone(),
+        ExecutionId::new(),
     ))));
 
     orchestrator
@@ -987,6 +1000,7 @@ async fn stale_handle_cannot_republish_running_proxy_route() {
             sandbox_id,
             &stale_handle,
             ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 99)),
+            ExecutionId::new(),
         )
         .await;
 
@@ -1004,9 +1018,10 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
     let plan = create_launch_plan_with_resources(sandbox_id);
     let stale_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
         Arc::new(MockBehavior::new()),
+        ExecutionId::new(),
     ))));
     let replacement_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(
-        MockSandboxBackend::new(Arc::new(MockBehavior::new())),
+        MockSandboxBackend::new(Arc::new(MockBehavior::new()), ExecutionId::new()),
     )));
     let replacement_target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
 
@@ -1025,7 +1040,7 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
         .await
         .insert(sandbox_id, replacement_handle.clone());
     orchestrator
-        .upsert_proxy_route(sandbox_id, replacement_target.clone())
+        .upsert_proxy_route(sandbox_id, replacement_target.clone(), ExecutionId::new())
         .await;
 
     orchestrator
@@ -1478,7 +1493,11 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
     ));
 
     let resumed_metadata = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::Set(Duration::from_secs(90)))
+        .resume_sandbox(
+            sandbox_id,
+            NewTimeout::Set(Duration::from_secs(90)),
+            test_claim(),
+        )
         .await?;
     assert_eq!(resumed_metadata.state, SandboxState::Running);
     assert_eq!(resumed_metadata.timeout, Some(Duration::from_secs(90)));
@@ -1502,7 +1521,11 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 
     // Calling resume again while already running should be idempotent.
     let resumed_metadata = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::Set(Duration::from_secs(120)))
+        .resume_sandbox(
+            sandbox_id,
+            NewTimeout::Set(Duration::from_secs(120)),
+            test_claim(),
+        )
         .await?;
     assert_eq!(resumed_metadata.state, SandboxState::Running);
     assert_eq!(resumed_metadata.timeout, Some(Duration::from_secs(120)));
@@ -2073,7 +2096,7 @@ async fn resume_sandbox_build_failure_does_not_subtract_metrics_that_were_never_
     let baseline_metrics = current_metrics(&orchestrator).await;
 
     let err = orchestrator
-        .resume_sandbox(paused_id, NewTimeout::None)
+        .resume_sandbox(paused_id, NewTimeout::None, test_claim())
         .await
         .expect_err("resume should fail when building from paused state fails");
     assert!(matches!(
@@ -2120,7 +2143,7 @@ async fn orchestrator_proxy_lookup_tracks_create_pause_resume_delete_lifecycle()
     assert_proxy_paused(&orchestrator, &sandbox_id).await?;
 
     orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
         .await?;
     assert_metrics_values(
         &orchestrator,
@@ -2261,7 +2284,10 @@ async fn orchestrator_concurrent_resume_calls_all_return_running() -> Result<()>
         .map(|_| {
             let orch = Arc::clone(&orchestrator);
             let id = sandbox_id;
-            tokio::spawn(async move { orch.resume_sandbox(id, NewTimeout::UseExisting).await })
+            tokio::spawn(async move {
+                orch.resume_sandbox(id, NewTimeout::UseExisting, test_claim())
+                    .await
+            })
         })
         .collect();
 
@@ -2408,7 +2434,7 @@ async fn orchestrator_keep_alive_during_resume_never_reports_resuming_state() ->
 
     let resume_handle = tokio::spawn(async move {
         orch_resume
-            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+            .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
             .await
     });
     let keep_alive_handle = tokio::spawn(async move {
@@ -2573,7 +2599,7 @@ async fn orchestrator_unknown_sandbox_behaviors() -> Result<()> {
     assert!(matches!(pause_err, OrchestratorError::SandboxNotFound(_)));
 
     let resume_err = orchestrator
-        .resume_sandbox(missing_id, NewTimeout::None)
+        .resume_sandbox(missing_id, NewTimeout::None, test_claim())
         .await
         .expect_err("resume_sandbox should fail for unknown sandbox");
     assert!(matches!(resume_err, OrchestratorError::SandboxNotFound(_)));
@@ -3147,9 +3173,17 @@ async fn concurrent_resume_when_leader_build_fails_is_consistent() -> anyhow::Re
     let orch1 = Arc::clone(&orchestrator);
     let orch2 = Arc::clone(&orchestrator);
 
-    let h1 = tokio::spawn(async move { orch1.resume_sandbox(id, NewTimeout::UseExisting).await });
+    let h1 = tokio::spawn(async move {
+        orch1
+            .resume_sandbox(id, NewTimeout::UseExisting, test_claim())
+            .await
+    });
     sleep(Duration::from_millis(100)).await;
-    let h2 = tokio::spawn(async move { orch2.resume_sandbox(id, NewTimeout::UseExisting).await });
+    let h2 = tokio::spawn(async move {
+        orch2
+            .resume_sandbox(id, NewTimeout::UseExisting, test_claim())
+            .await
+    });
 
     let r1 = h1.await.expect("resume leader should not panic");
     let r2 = h2.await.expect("resume waiter should not panic");
@@ -3230,7 +3264,7 @@ async fn resume_sandbox_start_failure_from_launch_rolls_back_to_paused_and_allow
     );
 
     let err = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
         .await
         .expect_err("resume should fail when start_nowait fails after snapshot restore");
     assert!(matches!(
@@ -3253,7 +3287,7 @@ async fn resume_sandbox_start_failure_from_launch_rolls_back_to_paused_and_allow
     assert_metrics_snapshot(&orchestrator, &paused_metrics).await;
 
     let resumed = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
         .await?;
     assert_eq!(resumed.state, SandboxState::Running);
     assert_metrics_values(
@@ -3297,7 +3331,7 @@ async fn resume_sandbox_wait_ready_failure_from_launch_rolls_back_to_paused_and_
     );
 
     let err = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
         .await
         .expect_err("resume should fail when wait_for_ready fails after snapshot restore");
     assert!(matches!(
@@ -3320,7 +3354,7 @@ async fn resume_sandbox_wait_ready_failure_from_launch_rolls_back_to_paused_and_
     assert_metrics_snapshot(&orchestrator, &paused_metrics).await;
 
     let resumed = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
         .await?;
     assert_eq!(resumed.state, SandboxState::Running);
     assert_metrics_values(
@@ -3354,7 +3388,7 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
     persister.clear_calls();
 
     orchestrator
-        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .resume_sandbox(created.id, NewTimeout::UseExisting, test_claim())
         .await?;
 
     assert_eq!(
@@ -3393,7 +3427,7 @@ async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
     persister.fail_next(RecordingCall::MarkResuming);
 
     let err = orchestrator
-        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .resume_sandbox(created.id, NewTimeout::UseExisting, test_claim())
         .await
         .expect_err("resume should fail when persister cannot mark record resuming");
 
@@ -3433,7 +3467,7 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     );
 
     let err = orchestrator
-        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .resume_sandbox(created.id, NewTimeout::UseExisting, test_claim())
         .await
         .expect_err("resume should fail when restored sandbox does not become ready");
 
@@ -3534,7 +3568,7 @@ async fn resume_running_with_none_timeout_clears_timeout() -> Result<()> {
     .await;
 
     let resumed = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::None)
+        .resume_sandbox(sandbox_id, NewTimeout::None, test_claim())
         .await?;
     assert_eq!(resumed.state, SandboxState::Running);
     assert_eq!(resumed.timeout, None);
@@ -3586,7 +3620,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
     assert_eq!(listed[0].virtualization_mode, sandbox_mode);
 
     let error = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting, test_claim())
         .await
         .expect_err("cross-mode paused sandbox must not resume");
 
@@ -4190,6 +4224,7 @@ async fn launch_sandbox_create_with_stale_handle_skips_proxy_route_publication()
         Arc::new(Mutex::new(Box::new(MockSandboxBackend::new_with_host_ip(
             replacement_control,
             Some(Ipv4Addr::new(127, 0, 0, 2)),
+            ExecutionId::new(),
         ))));
     let sandbox_id_for_hook = sandbox_id;
     let replacement_for_hook = replacement_handle.clone();
@@ -4819,18 +4854,38 @@ fn disabled_registry_is_not_cluster_backed() {
 /// a pause reached it without standing up a registry.
 #[derive(Default)]
 struct RecordingPublisher {
-    published: StdMutex<Vec<SandboxId>>,
-    marked_running: StdMutex<Vec<SandboxId>>,
+    published: StdMutex<Vec<(SandboxId, ExecutionId)>>,
+    /// Both halves of the write, because "which sandbox" and "which run of it"
+    /// are separate facts and only the second one can be got wrong.
+    marked_running: StdMutex<Vec<(SandboxId, ExecutionId)>>,
     forgotten: StdMutex<Vec<SandboxId>>,
 }
 
 impl RecordingPublisher {
-    fn published(&self) -> Vec<SandboxId> {
+    fn published(&self) -> Vec<(SandboxId, ExecutionId)> {
         self.published.lock().unwrap().clone()
     }
 
-    fn marked_running(&self) -> Vec<SandboxId> {
+    fn published_ids(&self) -> Vec<SandboxId> {
+        self.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sandbox_id, _)| *sandbox_id)
+            .collect()
+    }
+
+    fn marked_running(&self) -> Vec<(SandboxId, ExecutionId)> {
         self.marked_running.lock().unwrap().clone()
+    }
+
+    fn marked_running_ids(&self) -> Vec<SandboxId> {
+        self.marked_running
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sandbox_id, _)| *sandbox_id)
+            .collect()
     }
 
     fn forgotten(&self) -> Vec<SandboxId> {
@@ -4841,7 +4896,10 @@ impl RecordingPublisher {
 #[async_trait::async_trait]
 impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
     async fn publish_paused(&self, outcome: crate::orchestrator::PauseOutcome) -> Option<String> {
-        self.published.lock().unwrap().push(outcome.metadata.id);
+        self.published
+            .lock()
+            .unwrap()
+            .push((outcome.metadata.id, outcome.metadata.execution_id));
 
         Some("test-node".to_string())
     }
@@ -4849,9 +4907,13 @@ impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
     async fn mark_running(
         &self,
         sandbox_id: SandboxId,
+        execution_id: ExecutionId,
         _expires_at: Option<std::time::SystemTime>,
     ) {
-        self.marked_running.lock().unwrap().push(sandbox_id);
+        self.marked_running
+            .lock()
+            .unwrap()
+            .push((sandbox_id, execution_id));
     }
 
     async fn forget(&self, sandbox_id: SandboxId) {
@@ -4879,7 +4941,7 @@ async fn an_api_pause_is_published_to_the_cluster() -> Result<()> {
 
     orchestrator.pause_sandbox(created.id).await?;
 
-    assert_eq!(publisher.published(), vec![created.id]);
+    assert_eq!(publisher.published_ids(), vec![created.id]);
 
     Ok(())
 }
@@ -4897,7 +4959,7 @@ async fn an_expiry_auto_pause_is_published_to_the_cluster() -> Result<()> {
     let evicted = orchestrator.evict_expired_sandboxes().await?;
 
     assert_eq!(evicted, vec![created.id], "the sandbox should have expired");
-    assert_eq!(publisher.published(), vec![created.id]);
+    assert_eq!(publisher.published_ids(), vec![created.id]);
 
     Ok(())
 }
@@ -4914,7 +4976,7 @@ async fn a_shutdown_pause_is_published_to_the_cluster() -> Result<()> {
 
     orchestrator.shutdown().await?;
 
-    assert_eq!(publisher.published(), vec![created.id]);
+    assert_eq!(publisher.published_ids(), vec![created.id]);
 
     Ok(())
 }
@@ -4930,10 +4992,10 @@ async fn a_resume_marks_the_sandbox_running_in_the_cluster() -> Result<()> {
     orchestrator.pause_sandbox(created.id).await?;
 
     orchestrator
-        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .resume_sandbox(created.id, NewTimeout::UseExisting, test_claim())
         .await?;
 
-    assert_eq!(publisher.marked_running(), vec![created.id]);
+    assert_eq!(publisher.marked_running_ids(), vec![created.id]);
 
     Ok(())
 }
@@ -5054,10 +5116,312 @@ async fn an_isolated_node_still_resumes_a_sandbox_it_alone_holds() -> Result<()>
     orchestrator.set_scheduling_disabled(true);
 
     let resumed = orchestrator
-        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .resume_sandbox(created.id, NewTimeout::UseExisting, test_claim())
         .await
         .expect("an isolated node must still resume what only it can recover");
     assert_eq!(resumed.state, SandboxState::Running);
 
+    Ok(())
+}
+
+// ── A1: incarnations ─────────────────────────────────────────────────────────
+//
+// Every assertion below reads the incarnation off the mock backend wherever it
+// can, not off the metadata store. Reading the store would only show that the
+// value written there is the value written there; reading the backend shows
+// which incarnation the VM was actually started under.
+
+/// T-A1-1. A pause and resume is a new run of the same machine, so it gets a
+/// new incarnation — and the record says so too.
+#[tokio::test]
+async fn a_resume_runs_under_a_new_execution() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    let first = orchestrator
+        .backend_execution_id_for_test(&created.id)
+        .await
+        .expect("a running sandbox has a backend");
+    assert_eq!(created.execution_id, first);
+
+    orchestrator.pause_sandbox(created.id).await?;
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting, test_claim())
+        .await?;
+
+    let second = orchestrator
+        .backend_execution_id_for_test(&created.id)
+        .await
+        .expect("a resumed sandbox has a backend");
+    assert_ne!(
+        first, second,
+        "a resume is a new run and must not reuse the paused run's incarnation"
+    );
+    assert_eq!(
+        resumed.execution_id, second,
+        "the record must name the incarnation the VM was started under"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .expect("resumed sandbox is tracked")
+            .execution_id,
+        second
+    );
+
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+/// T-A1-2. Creating from a snapshot is a create. The backend below it boots
+/// through `LaunchMode::Resume`, so anything that decided on the launch mode or
+/// on the hook kind would call this a resume and hand out one incarnation for
+/// every sandbox ever launched from that snapshot.
+#[tokio::test]
+async fn a_create_from_a_snapshot_is_a_new_execution_not_a_resume() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+
+    let first = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let second = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    assert_ne!(first.id, second.id);
+    assert_ne!(
+        first.execution_id, second.execution_id,
+        "two sandboxes launched from one snapshot are two runs"
+    );
+    assert_eq!(
+        orchestrator
+            .backend_execution_id_for_test(&first.id)
+            .await
+            .expect("first sandbox has a backend"),
+        first.execution_id
+    );
+    assert_eq!(
+        orchestrator
+            .backend_execution_id_for_test(&second.id)
+            .await
+            .expect("second sandbox has a backend"),
+        second.execution_id
+    );
+
+    // The other half of the same statement: the plan itself says Create, which
+    // is what the incarnation decision is taken on.
+    let plan = create_launch_plan_with_resources(SandboxId::new());
+    assert_eq!(plan.transitional_state(), SandboxState::Creating);
+
+    orchestrator.delete_sandbox(first.id).await?;
+    orchestrator.delete_sandbox(second.id).await?;
+    Ok(())
+}
+
+/// T-A1-3. A snapshot pauses and resumes the VM in place. Same run, same
+/// incarnation.
+#[tokio::test]
+async fn a_snapshot_does_not_change_the_execution() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let before = orchestrator
+        .backend_execution_id_for_test(&created.id)
+        .await
+        .expect("a running sandbox has a backend");
+
+    orchestrator.capture_snapshot(created.id).await?;
+
+    assert_eq!(
+        orchestrator
+            .backend_execution_id_for_test(&created.id)
+            .await
+            .expect("the sandbox is still running after a snapshot"),
+        before
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .expect("the sandbox is still tracked")
+            .execution_id,
+        before
+    );
+
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+/// T-A1-4. Forking pauses and resumes the *parent* in place, so the parent is
+/// still the same run.
+#[tokio::test]
+async fn forking_leaves_the_parent_execution_alone() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let before = orchestrator
+        .backend_execution_id_for_test(&source.id)
+        .await
+        .expect("a running sandbox has a backend");
+
+    let outcomes = orchestrator
+        .fork_sandbox(source.id, 2, NewTimeout::UseExisting)
+        .await?;
+    let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
+
+    assert_eq!(
+        orchestrator
+            .backend_execution_id_for_test(&source.id)
+            .await
+            .expect("the parent survives a fork"),
+        before
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&source.id)
+            .await?
+            .expect("the parent is still tracked")
+            .execution_id,
+        before
+    );
+
+    for child in children {
+        orchestrator.delete_sandbox(child.id).await?;
+    }
+    orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+/// T-A1-5. 🔴 Each fork child is a brand-new sandbox and a brand-new run.
+///
+/// The child's record is built by cloning the parent's, so an incarnation that
+/// is merely a field would be inherited — two live VMs under one identity, with
+/// no warning of any kind.
+#[tokio::test]
+async fn every_fork_child_gets_its_own_execution() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let parent = orchestrator
+        .backend_execution_id_for_test(&source.id)
+        .await
+        .expect("a running sandbox has a backend");
+
+    let outcomes = orchestrator
+        .fork_sandbox(source.id, 3, NewTimeout::UseExisting)
+        .await?;
+    let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
+    assert_eq!(children.len(), 3);
+
+    let mut seen = Vec::new();
+    for child in &children {
+        let recorded = child.execution_id;
+        let on_backend = orchestrator
+            .backend_execution_id_for_test(&child.id)
+            .await
+            .expect("a forked child has a backend");
+
+        assert_eq!(
+            recorded, on_backend,
+            "the child's record must name the incarnation its VM was started under"
+        );
+        assert_ne!(
+            recorded, parent,
+            "a fork child must not inherit the parent's incarnation"
+        );
+        assert!(
+            !seen.contains(&recorded),
+            "fork children must not share an incarnation with each other"
+        );
+        seen.push(recorded);
+    }
+
+    for child in children {
+        orchestrator.delete_sandbox(child.id).await?;
+    }
+    orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+/// T-A1-6. 🔴 What `mark_running` reports must be the incarnation the claim
+/// allocated and the VM actually started under.
+///
+/// The controller's cross-node branch matches on exactly this value. Minting a
+/// fresh one at report time, or reporting the one the record held before the
+/// resume, makes every cross-node resume fail — and it fails silently, because
+/// the write simply matches no row.
+#[tokio::test]
+async fn a_resume_reports_the_execution_it_actually_started() -> Result<()> {
+    setup();
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let before = created.execution_id;
+
+    orchestrator.pause_sandbox(created.id).await?;
+    let claimed = test_claim();
+    let allocated = claimed.execution_id();
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting, claimed)
+        .await?;
+
+    let started = orchestrator
+        .backend_execution_id_for_test(&created.id)
+        .await
+        .expect("a resumed sandbox has a backend");
+    assert_eq!(
+        started, allocated,
+        "the VM must run under the incarnation the claim allocated"
+    );
+    assert_eq!(resumed.execution_id, allocated);
+    assert_ne!(started, before);
+
+    let reported = publisher.marked_running();
+    assert_eq!(reported, vec![(created.id, allocated)]);
+
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+/// T-A1-7. A paused record names the run that produced it — which is what
+/// `begin_pause` quotes, and therefore what the registry fences the row against.
+#[tokio::test]
+async fn a_paused_record_carries_the_execution_that_produced_it() -> Result<()> {
+    setup();
+    let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let ran_as = orchestrator
+        .backend_execution_id_for_test(&created.id)
+        .await
+        .expect("a running sandbox has a backend");
+
+    let paused = orchestrator.pause_sandbox(created.id).await?;
+
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert_eq!(
+        paused.execution_id, ran_as,
+        "pausing does not start a new run, so the record still names the old one"
+    );
+    assert_eq!(
+        publisher.published(),
+        vec![(created.id, ran_as)],
+        "the pause published to the cluster must quote the run that produced it"
+    );
+
+    orchestrator.delete_sandbox(created.id).await?;
     Ok(())
 }

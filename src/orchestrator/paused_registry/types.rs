@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// Lifecycle of a registry row.
 ///
@@ -100,6 +100,14 @@ pub struct PausedSandboxEntry {
     /// is not the sandbox that was asked for, and nothing would report an
     /// error.
     pub metadata: Option<SandboxMetadata>,
+    /// The incarnation this row is fenced against, or `None` when the row's
+    /// state has none — a parked row names no run.
+    ///
+    /// 🔴 On a granted claim this is the incarnation the claim allocated, and
+    /// it is the one the claimant must run under and quote at `mark_running`.
+    /// A claimant that mints its own instead matches no predicate on the
+    /// registry side, and every cross-node resume fails.
+    pub execution_id: Option<ExecutionId>,
     pub paused_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

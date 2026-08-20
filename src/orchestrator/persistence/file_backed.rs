@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs;
 use tokio::sync::OnceCell;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{ClusterRegistration, PersistenceResult, SandboxPersistenceError, SandboxPersister};
@@ -90,6 +90,24 @@ fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
         })?;
     ensure_supported_version(record.version)?;
     Ok(record)
+}
+
+/// Whether a record that would not decode is one written before sandboxes had
+/// incarnations.
+///
+/// 🔴 Told apart from ordinary corruption on purpose. An unreadable record is
+/// discarded, which is right for a record whose bytes are damaged and wrong for
+/// a whole node's worth of records that are merely one field short: the first
+/// costs one sandbox, the second costs every paused sandbox on the machine.
+/// This one is kept and reported instead, with the command to clear it.
+fn record_predates_executions(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    let Some(metadata) = value.get("metadata") else {
+        return false;
+    };
+    metadata.is_object() && metadata.get("execution_id").is_none()
 }
 
 fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
@@ -278,6 +296,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
         })?;
         let mut sandboxes = Vec::new();
         let mut retained_artifacts = HashSet::new();
+        // Counted so "some records did not load" is alertable rather than
+        // something an operator has to notice in a log.
+        let mut rejected = 0_u64;
 
         for (key, bytes) in records {
             let sandbox_id_from_key = std::str::from_utf8(&key)
@@ -285,7 +306,27 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 .and_then(|value| SandboxId::parse_str(value).ok());
             let record = match decode_record(&bytes) {
                 Ok(record) => record,
+                Err(_) if record_predates_executions(&bytes) => {
+                    // 🔴 Loud, actionable, and not silent: the record is left
+                    // where it is, so this repeats on every start until someone
+                    // acts on it. Reporting it as "discarding an invalid
+                    // record" would have made a whole node's paused sandboxes
+                    // disappear behind a warning nobody could act on.
+                    rejected += 1;
+                    error!(
+                        record_key = %String::from_utf8_lossy(&key),
+                        store = %self.root.display(),
+                        "paused sandbox record was written before sandboxes carried an execution \
+                         id, so it cannot be loaded and is being kept rather than discarded. \
+                         Clear this node's paused records to continue — this deletes the paused \
+                         sandboxes on this machine, and it is the node half of the same step that \
+                         drops the registry table: rm -rf {}",
+                        self.root.display()
+                    );
+                    continue;
+                }
                 Err(err) => {
+                    rejected += 1;
                     warn!(record_key = %String::from_utf8_lossy(&key), error = %err, "discarding invalid paused sandbox record");
                     if let Some(sandbox_id) = sandbox_id_from_key {
                         let _ = self.remove_record(&sandbox_id).await;
@@ -297,6 +338,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
                 warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
+                rejected += 1;
                 self.cleanup_invalid_record(&sandbox_id).await?;
                 continue;
             }
@@ -319,6 +361,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     sandboxes.push(metadata);
                 }
                 Err(err) => {
+                    rejected += 1;
                     warn!(sandbox_id = %sandbox_id, error = %err, "discarding unusable paused sandbox record");
                     self.cleanup_invalid_record(&sandbox_id).await?;
                 }
@@ -327,9 +370,15 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
         self.cleanup_orphan_artifacts(&retained_artifacts).await?;
 
+        metrics::counter!("agentenv_persisted_sandbox_load_total", "result" => "restored")
+            .increment(sandboxes.len() as u64);
+        metrics::counter!("agentenv_persisted_sandbox_load_total", "result" => "rejected")
+            .increment(rejected);
+
         info!(
             loaded = sandboxes.len(),
             retained = retained_artifacts.len(),
+            rejected,
             "loaded paused sandbox records"
         );
 
@@ -479,6 +528,7 @@ mod tests {
             &self,
             _build_spec: FreshSandboxBuildSpec,
             _launch_config: SandboxLaunchConfig,
+            _execution_id: crate::types::ExecutionId,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }
@@ -487,6 +537,7 @@ mod tests {
             &self,
             _snapshot: &RunnableSnapshot,
             _launch_config: SandboxLaunchConfig,
+            _execution_id: crate::types::ExecutionId,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }
@@ -494,6 +545,7 @@ mod tests {
         fn build_from_paused_state(
             &self,
             _sandbox_id: SandboxId,
+            _execution_id: crate::types::ExecutionId,
             _state: &dyn PausedSandboxState,
             _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
         ) -> Result<Box<dyn SandboxBackend>> {
@@ -962,6 +1014,55 @@ mod tests {
 
         assert!(loaded.is_empty());
         assert!(!has_record(&persister, &sandbox_id).await?);
+        Ok(())
+    }
+
+    /// 🔴 A record from before incarnations existed is kept, not thrown away.
+    ///
+    /// Both halves matter. Discarding it would make a whole node's paused
+    /// sandboxes vanish behind a line that reads like routine cleanup — the
+    /// exact shape of "the sandbox is gone" that costs a user their workspace.
+    /// And loading it with a fresh incarnation would be worse: fencing would
+    /// then be comparing against a value nothing ever ran under.
+    #[tokio::test]
+    async fn load_all_keeps_and_reports_a_record_that_predates_executions() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+
+        // A record exactly as an older build wrote it: valid in every way
+        // except that its metadata has no incarnation.
+        let mut record = serde_json::to_value(PersistedPausedRecord {
+            version: RECORD_VERSION,
+            lifecycle: PersistedPausedLifecycle::Paused,
+            metadata: SandboxMetadata {
+                id: sandbox_id,
+                ..Default::default()
+            },
+            artifact_root: temp.path().join("artifacts"),
+            state: serde_json::json!({}),
+            cluster_registered: false,
+            registered_as: None,
+        })?;
+        record["metadata"]
+            .as_object_mut()
+            .expect("metadata is an object")
+            .remove("execution_id")
+            .expect("the field is there to remove");
+        persister
+            .db()
+            .await?
+            .put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
+            .await?;
+
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert!(loaded.is_empty(), "the record must not load");
+        assert!(
+            has_record(&persister, &sandbox_id).await?,
+            "a record that predates incarnations must be kept for an operator to clear, \
+             never silently deleted"
+        );
         Ok(())
     }
 

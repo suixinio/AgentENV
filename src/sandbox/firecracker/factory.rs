@@ -18,7 +18,7 @@ use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
 };
 use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 pub struct FirecrackerSandboxFactory {
     cpu_config_arc: Option<Arc<RwLock<Option<String>>>>,
@@ -79,6 +79,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         &self,
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>> {
         let user_image_config = OverlaybdConfig {
             image_config_path: build_spec.image_config_path,
@@ -139,7 +140,8 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         config.common.default_workdir = Some(build_spec.context.workdir.clone());
         config.common.default_user = build_spec.context.user.clone();
         let config = config.apply_launch_config(&launch_config);
-        let sandbox = FirecrackerSandbox::new_with_id(config, launch_config.sandbox_id)?;
+        let sandbox =
+            FirecrackerSandbox::new_with_id(config, launch_config.sandbox_id, execution_id)?;
         Ok(Box::new(sandbox))
     }
 
@@ -147,8 +149,9 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         &self,
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>> {
-        let sandbox = FirecrackerSandbox::from_snapshot(snapshot, &launch_config)?;
+        let sandbox = FirecrackerSandbox::from_snapshot(snapshot, &launch_config, execution_id)?;
         Ok(Box::new(sandbox))
     }
 
@@ -166,6 +169,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
     fn build_from_paused_state(
         &self,
         sandbox_id: SandboxId,
+        execution_id: ExecutionId,
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
@@ -175,6 +179,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
             paused_state.snapshot_config().clone(),
             sandbox_id,
+            execution_id,
             envd_access_token,
         )?;
         Ok(Box::new(sandbox))
@@ -251,7 +256,12 @@ mod tests {
         let factory = FirecrackerSandboxFactory::new();
         let state: Arc<dyn PausedSandboxState> = Arc::new(WrongPausedState);
 
-        match factory.build_from_paused_state(SandboxId::new(), state.as_ref(), None) {
+        match factory.build_from_paused_state(
+            SandboxId::new(),
+            ExecutionId::new(),
+            state.as_ref(),
+            None,
+        ) {
             Ok(_) => panic!("wrong snapshot type should fail"),
             Err(err) => assert!(err.to_string().contains("not a Firecracker paused state")),
         }

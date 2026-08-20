@@ -11,7 +11,7 @@ use agentenv::snapshot::{
     SnapshotRuntimeVersions,
 };
 use agentenv::template::TemplateBuildSpec;
-use agentenv::types::{SandboxId, SandboxResources};
+use agentenv::types::{ExecutionId, SandboxId, SandboxResources};
 use anyhow::{anyhow, bail, Context, Result};
 use tempfile::tempdir;
 
@@ -271,8 +271,11 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     );
 
     let runnable = snapshot_manager.resolve_runnable(derived.clone()).await?;
-    let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+    let mut sandbox = FirecrackerSandbox::from_snapshot(
+        &runnable,
+        &SandboxLaunchConfig::default(),
+        ExecutionId::new(),
+    )?;
     sandbox.start().await?;
     let version_out = sandbox
         .run_command("sh", &["-lc", "envd --version 2>&1 || envd -version 2>&1"])
@@ -376,7 +379,8 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
             custom_extension_params: None,
             envd_access_token: None,
         };
-        let mut child = FirecrackerSandbox::from_snapshot(runnable, &launch_config)?;
+        let mut child =
+            FirecrackerSandbox::from_snapshot(runnable, &launch_config, ExecutionId::new())?;
         child.start().await?;
         assert_guest_file(&child, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
         if runnable.record().id == first_snapshot.id {
@@ -577,7 +581,11 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         custom_extension_params: None,
                         envd_access_token: None,
                     };
-                    let mut sandbox = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;
+                    let mut sandbox = FirecrackerSandbox::from_snapshot(
+                        &runnable,
+                        &launch_config,
+                        ExecutionId::new(),
+                    )?;
                     sandbox.start().await?;
                     assert_expected_files(&sandbox, &snapshots[snapshot_index].expected_files)
                         .await?;

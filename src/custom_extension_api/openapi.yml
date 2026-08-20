@@ -136,7 +136,10 @@ components:
           description: >-
             Unique identifier of this runtime instance of the sandbox. A new
             value is generated for every start-fresh / start-resume; the
-            subsequent stop hook carries the same value.
+            subsequent stop hook carries the same value. Internally this is the
+            sandbox's execution id — the same value the node reports as
+            executionID on its own sandbox API and quotes to the control plane;
+            the wire name here is kept for compatibility.
         networkNamespacePath:
           type: string
           description: Host path of the sandbox's network namespace file (e.g. /var/run/netns/agentenv-ns-*).
@@ -170,7 +173,10 @@ components:
           description: >-
             Unique identifier of this runtime instance of the sandbox. A new
             value is generated for every start-fresh / start-resume; the
-            subsequent stop hook carries the same value.
+            subsequent stop hook carries the same value. Internally this is the
+            sandbox's execution id — the same value the node reports as
+            executionID on its own sandbox API and quotes to the control plane;
+            the wire name here is kept for compatibility.
         networkNamespacePath:
           type: string
           description: Host path of the sandbox's network namespace file (e.g. /var/run/netns/agentenv-ns-*).
@@ -213,6 +219,7 @@ components:
           type: string
           description: >-
             Identifier of the runtime instance being torn down: the value
-            delivered by that instance's start-fresh / start-resume hook.
+            delivered by that instance's start-fresh / start-resume hook, i.e.
+            the sandbox's execution id.
             May arrive after a newer start for the same sandboxId; ignore it
             when it does not match the latest started instance.

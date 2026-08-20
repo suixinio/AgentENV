@@ -33,7 +33,7 @@ use crate::cfg::{ClusterConfig, PausedRegistryBackendKind, PausedRegistryConfig}
 use crate::identity::NodeIdentity;
 use crate::orchestrator::PauseOutcome;
 use crate::snapshot::SnapshotId;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
@@ -64,6 +64,22 @@ pub enum PausedRegistryError {
     /// re-reads and decides.
     #[error("paused sandbox '{sandbox_id}' moved on from generation {expected}")]
     GenerationConflict { sandbox_id: String, expected: i64 },
+    /// The write came from an incarnation the registry has already replaced.
+    ///
+    /// 🔴 Terminal, and deliberately *not* the same thing as
+    /// [`GenerationConflict`](Self::GenerationConflict). A generation conflict
+    /// says "your view of the row is stale, re-read and try again"; this says
+    /// "the run you are writing on behalf of is over". Retrying it would re-read
+    /// the row, pick up the current generation and send the same write again —
+    /// walking straight around the fence. Callers must not retry it, must not
+    /// publish behind it, and must not delete the snapshot it was about to
+    /// replace.
+    ///
+    /// On the wire this is `codes.PermissionDenied` from `PausedRegistry`, and
+    /// wherever it has to be named as a string it is
+    /// `sandbox_execution_superseded`.
+    #[error("paused sandbox '{sandbox_id}' has been taken over by a newer incarnation")]
+    ExecutionFenced { sandbox_id: String },
 }
 
 impl PausedRegistryError {
@@ -127,10 +143,21 @@ pub trait PausedSandboxRegistry: Send + Sync {
     ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>>;
 
     /// Takes ownership of a paused sandbox so this node can resume it.
+    ///
+    /// `execution_id` is the incarnation this node will run the sandbox under.
+    /// It is allocated *before* the claim and written by the same statement
+    /// that names the claimant, so a `resuming` row names the run that is about
+    /// to happen rather than the stopped one it replaces — which is what keeps
+    /// the resume window fenced instead of open.
+    ///
+    /// 🔴 The value to quote at [`mark_running`](Self::mark_running) is the one
+    /// on the returned entry, not the one passed in. They are normally the
+    /// same; when they are not, the registry's is the one the row holds.
     async fn claim_for_resume(
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        execution_id: ExecutionId,
     ) -> RegistryResult<ResumeClaim>;
 
     /// Returns a claimed sandbox to the paused state after a failed resume.
@@ -217,10 +244,16 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// anything to say about the sandbox in either case: reconciliation reads
     /// an absent row as "the cluster has moved past this sandbox", which for an
     /// untracked one would be a freshly created sandbox being torn down.
+    ///
+    /// 🔴 `execution_id` must be the incarnation the claim allocated — the one
+    /// carried by [`ResumeClaim::Claimed`]'s entry — and never a freshly minted
+    /// one. The cross-node branch of this write matches on it, so quoting a new
+    /// value makes every cross-node resume fail.
     async fn mark_running(
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome>;
 
@@ -315,7 +348,12 @@ pub trait PausedSandboxPublisher: Send + Sync {
     /// interval before its first renewal used to leave a row nothing could
     /// reclaim, claim or remove again. `None` means the sandbox was asked never
     /// to expire, which is a different fact and stays one.
-    async fn mark_running(&self, sandbox_id: SandboxId, expires_at: Option<SystemTime>);
+    async fn mark_running(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
+    );
 
     /// Drops the cluster's record of the sandbox and the snapshot behind it.
     async fn forget(&self, sandbox_id: SandboxId);
@@ -469,6 +507,7 @@ mod claim_outcome_tests {
             claimed_by_node_id: None,
             snapshot_id: Some(SnapshotId::generate()),
             metadata: Some(SandboxMetadata::default()),
+            execution_id: Some(ExecutionId::new()),
             paused_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

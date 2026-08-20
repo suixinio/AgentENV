@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::Ipv4Addr, time::SystemTime};
 
 use crate::orchestrator::SandboxState;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyTarget {
@@ -22,6 +22,13 @@ pub(crate) struct ProxyRoute {
     target: ProxyTarget,
     version: u64,
     updated_at: SystemTime,
+    /// The incarnation serving this route.
+    ///
+    /// Kept here rather than looked up from the metadata store because this
+    /// table is what the data plane already reads on every request, and it is
+    /// also the exact notion of "alive on this node": a route exists from the
+    /// moment a VM is reachable until the moment it stops being.
+    execution_id: ExecutionId,
 }
 
 #[derive(Debug, Default)]
@@ -38,12 +45,17 @@ impl ProxyTarget {
 }
 
 impl ProxyRoute {
-    pub fn new(target: ProxyTarget, version: u64) -> Self {
+    pub fn new(target: ProxyTarget, version: u64, execution_id: ExecutionId) -> Self {
         Self {
             target,
             version,
             updated_at: SystemTime::now(),
+            execution_id,
         }
+    }
+
+    pub fn execution_id(&self) -> ExecutionId {
+        self.execution_id
     }
 
     pub fn target(&self) -> &ProxyTarget {
@@ -65,8 +77,9 @@ impl ProxyRouteTable {
         sandbox_id: SandboxId,
         target: ProxyTarget,
         version: u64,
+        execution_id: ExecutionId,
     ) -> ProxyRoute {
-        let route = ProxyRoute::new(target, version);
+        let route = ProxyRoute::new(target, version, execution_id);
         self.routes.insert(sandbox_id, route.clone());
         route
     }
@@ -97,10 +110,10 @@ mod tests {
         let target = ProxyTarget::new(Ipv4Addr::LOCALHOST);
         let mut table = ProxyRouteTable::default();
 
-        table.upsert(sandbox_id, target.clone(), 1);
+        table.upsert(sandbox_id, target.clone(), 1, ExecutionId::new());
         assert_eq!(table.proxy_target(&sandbox_id), Some(target.clone()));
 
-        table.upsert(sandbox_id, target.clone(), 2);
+        table.upsert(sandbox_id, target.clone(), 2, ExecutionId::new());
         assert_eq!(table.proxy_target(&sandbox_id), Some(target));
         assert_eq!(table.routes.get(&sandbox_id).unwrap().version(), 2);
     }
@@ -110,7 +123,12 @@ mod tests {
         let sandbox_id = SandboxId::new();
         let mut table = ProxyRouteTable::default();
 
-        table.upsert(sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), 3);
+        table.upsert(
+            sandbox_id,
+            ProxyTarget::new(Ipv4Addr::LOCALHOST),
+            3,
+            ExecutionId::new(),
+        );
         let _removed = table.remove(&sandbox_id).unwrap();
 
         assert!(!table.routes.contains_key(&sandbox_id));

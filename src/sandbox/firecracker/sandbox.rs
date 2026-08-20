@@ -48,7 +48,7 @@ use crate::sandbox::ublk::{
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -165,6 +165,15 @@ pub(super) fn managed_snapshot_base() -> PathBuf {
 /// Implements [`SandboxBackend`] for use by the Orchestrator.
 pub struct FirecrackerSandbox {
     id: SandboxId,
+    /// This handle's incarnation, handed in by the orchestrator alongside `id`.
+    ///
+    /// 🔴 Kept here and never in `FirecrackerCommonConfig`: that config is
+    /// serialised into the paused state and into snapshots, so an incarnation
+    /// stored there would be read back at resume time and the sandbox would
+    /// come up claiming to be the run that produced the snapshot. There is no
+    /// setter, which is what makes "snapshot and the parent side of fork do not
+    /// change it" structural rather than a convention.
+    execution_id: ExecutionId,
     launch: LaunchMode,
     work_dir: TempDir,
     fc_instance: FirecrackerInstance,
@@ -271,6 +280,10 @@ impl FirecrackerCapturedSnapshot {
 
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
+    fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
     async fn start(&mut self) -> Result<()> {
         FirecrackerSandbox::start(self).await
     }
@@ -390,6 +403,7 @@ impl SandboxBackend for FirecrackerSandbox {
                 Self::from_snapshot_config_with_override(
                     snapshot_config.clone(),
                     child.sandbox_id,
+                    child.execution_id,
                     child.envd_access_token.clone(),
                 )
                 .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
@@ -492,17 +506,21 @@ impl FirecrackerSandbox {
     /// This does not start Firecracker; it only prepares the object and its
     /// per-instance work directory.
     pub fn new(config: FirecrackerSandboxConfig) -> Result<Self> {
-        Self::new_with_id(config, SandboxId::new())
+        Self::new_with_id(config, SandboxId::new(), ExecutionId::new())
     }
 
-    pub(crate) fn new_with_id(config: FirecrackerSandboxConfig, id: SandboxId) -> Result<Self> {
+    pub(crate) fn new_with_id(
+        config: FirecrackerSandboxConfig,
+        id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> Result<Self> {
         debug!(
             firecracker_binary = %config.common.firecracker_binary.display(),
             kernel_image = %config.kernel_image.display(),
             tools_drive_version = %config.common.tools_drive_version,
             "creating fresh firecracker sandbox"
         );
-        Self::build(id, LaunchMode::Fresh(config))
+        Self::build(id, execution_id, LaunchMode::Fresh(config))
     }
 
     /// Create a sandbox handle that resumes from the provided snapshot config.
@@ -514,6 +532,7 @@ impl FirecrackerSandbox {
         Self::from_snapshot_config_with_override(
             snapshot.clone(),
             SandboxId::new(),
+            ExecutionId::new(),
             snapshot.common.envd_access_token.clone(),
         )
     }
@@ -521,6 +540,7 @@ impl FirecrackerSandbox {
     pub(crate) fn from_snapshot_config_with_override(
         mut snapshot: FirecrackerSnapshotConfig,
         id: SandboxId,
+        execution_id: ExecutionId,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Self> {
         // Runtime identity and auth override their values in the source snapshot.
@@ -541,21 +561,27 @@ impl FirecrackerSandbox {
             tools_drive_version = %snapshot.common.tools_drive_version,
             "creating firecracker sandbox from snapshot config"
         );
-        Self::build(id, LaunchMode::Resume(snapshot))
+        Self::build(id, execution_id, LaunchMode::Resume(snapshot))
     }
 
     /// Create a sandbox handle that boots from a resolved runnable committed snapshot.
     ///
     /// This only prepares the sandbox object and its per-instance workspace.
     /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
+    /// 🔴 This is a *create*, even though the backend below it boots through
+    /// `LaunchMode::Resume`. The incarnation is handed in by the caller, who
+    /// took the decision on the `LaunchPlan` variant; nothing here may infer it
+    /// from the launch mode.
     pub fn from_snapshot(
         snapshot: &RunnableSnapshot,
         launch_config: &SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Self> {
         let snapshot_config = Self::snapshot_config_for_launch(snapshot, launch_config)?;
 
         Self::build(
             launch_config.sandbox_id,
+            execution_id,
             LaunchMode::Resume(snapshot_config),
         )
     }
@@ -1179,7 +1205,7 @@ impl Drop for FirecrackerSandbox {
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 impl FirecrackerSandbox {
-    fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
+    fn build(id: SandboxId, execution_id: ExecutionId, launch: LaunchMode) -> Result<Self> {
         let work_dir =
             create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
@@ -1190,6 +1216,7 @@ impl FirecrackerSandbox {
 
         Ok(Self {
             id,
+            execution_id,
             runtime_policy,
             current_rootfs_virtual_size: match &launch {
                 LaunchMode::Fresh(_) => None,
@@ -1338,7 +1365,7 @@ impl FirecrackerSandbox {
 
         // ── Custom extension hook: start-fresh (may contribute extra boot args) ──
         if let Some(client) = CustomExtensionClient::global() {
-            let mut guard = CustomExtensionHookGuard::new(client, self.id);
+            let mut guard = CustomExtensionHookGuard::new(client, self.id, self.execution_id);
             let extra_boot_args = guard
                 .start_fresh(
                     &netns.to_string_lossy(),
@@ -1542,7 +1569,7 @@ impl FirecrackerSandbox {
                 .network_slot
                 .as_ref()
                 .context("network slot must be allocated before start-resume hook")?;
-            let mut guard = CustomExtensionHookGuard::new(client, self.id);
+            let mut guard = CustomExtensionHookGuard::new(client, self.id, self.execution_id);
             guard
                 .start_resume(
                     &slot.namespace_path().to_string_lossy(),
@@ -2129,9 +2156,11 @@ mod tests {
             managed_snapshot_root: None,
         };
 
+        let child_execution_id = ExecutionId::new();
         let child = FirecrackerSandbox::from_snapshot_config_with_override(
             snapshot,
             child_id,
+            child_execution_id,
             Some(child_token.clone()),
         )?;
         let common = child.launch.common();

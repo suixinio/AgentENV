@@ -21,11 +21,11 @@ use tracing::{debug, error, info, warn};
 
 use super::{ApiImpl, StaleReleaseOutcome};
 use crate::orchestrator::{
-    ClusterRegistration, CreateSandboxRequest, HeldSandbox, NewTimeout, PausedRegistryState,
-    PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter, SandboxMetadata,
-    SandboxState,
+    ClaimedExecution, ClusterRegistration, CreateSandboxRequest, HeldSandbox, NewTimeout,
+    PausedRegistryState, PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter,
+    SandboxMetadata, SandboxState,
 };
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// 本节点既没有本地副本、又没拿到认领权时，一次 resume 该怎么收场。
 ///
@@ -114,14 +114,23 @@ pub(super) enum CrossNodeResume {
 /// gateway hands a resume to an arbitrary node whenever the scheduler holds no
 /// binding, and bindings live in memory with a short TTL and are lost outright
 /// when the scheduler restarts.
-pub(super) enum ResumeArbitration {
+pub(in crate::api) enum ResumeArbitration {
     /// The registry has no say: it is not cluster-backed, or it does not track
     /// this sandbox. Whatever is on local disk is the whole truth.
-    Proceed,
+    ///
+    /// Carries a claim token all the same. 🔴 That is the point: both granting
+    /// answers hand one out, so this decision is the single place a resume can
+    /// acquire the right to start, and there is no second constructor for the
+    /// paths that have no cluster to ask.
+    Proceed(ClaimedExecution),
     /// This node holds the claim, and must release it if the resume fails. The
     /// row travels with it so a rebuild never has to claim a second time —
     /// claiming twice would deadlock against this node's own claim.
-    Held(Box<PausedSandboxEntry>),
+    ///
+    /// 🔴 The token carries the incarnation *the registry wrote*, not the one
+    /// this node proposed. They normally agree; when they do not, the row's
+    /// value is the one `mark_running` has to quote.
+    Held(Box<PausedSandboxEntry>, ClaimedExecution),
     /// The newest snapshot is still being published by another node, which is
     /// therefore the only node that can serve this resume.
     NotReady { origin_node_id: String },
@@ -163,9 +172,20 @@ impl ApiImpl {
     /// one exception: a registry that cannot answer about a sandbox it was
     /// told about. See [`unreachable_arbitration`] for why that one is
     /// different.
-    pub(super) async fn arbitrate_resume(&self, sandbox_id: SandboxId) -> ResumeArbitration {
+    pub(in crate::api) async fn arbitrate_resume(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> ResumeArbitration {
+        // Minted before the claim so the registry can write it in the same
+        // statement that names this node as the claimant: a `resuming` row then
+        // names the run that is about to happen instead of the stopped one it
+        // replaces, and the resume window stays fenced.
+        let proposed = ExecutionId::new();
+
         if !self.paused.registry().is_cluster_backed() {
-            return ResumeArbitration::Proceed;
+            // No cluster to ask, so this local decision is the whole of the
+            // arbitration — and it is still the only mint point.
+            return ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed));
         }
 
         // A claim that lands writes `resuming` with this node's name on it, and
@@ -178,7 +198,7 @@ impl ApiImpl {
         let claim = match self
             .paused
             .registry()
-            .claim_for_resume(&sandbox_id, node_id)
+            .claim_for_resume(&sandbox_id, node_id, proposed)
             .await
         {
             Ok(claim) => claim,
@@ -191,11 +211,16 @@ impl ApiImpl {
                     .await
                     .ok();
 
-                return unreachable_arbitration(registration, sandbox_id, &err.to_string());
+                return unreachable_arbitration(
+                    registration,
+                    sandbox_id,
+                    &err.to_string(),
+                    proposed,
+                );
             }
         };
 
-        arbitration(claim, node_id)
+        arbitration(claim, node_id, proposed)
     }
 
     /// Returns a claim after the resume it was taken for failed.
@@ -277,7 +302,13 @@ impl ApiImpl {
         }
     }
 
-    pub(super) async fn abandon_claim(&self, sandbox_id: SandboxId, generation: i64) {
+    /// Hands back a claim taken for a resume that did not happen.
+    ///
+    /// Visible to the data plane as well as to the REST routes: every path that
+    /// can take a claim has to be able to give it back, or a failed wake-up
+    /// leaves the row in `resuming` until its lease lapses and nothing else can
+    /// touch the sandbox in the meantime.
+    pub(in crate::api) async fn abandon_claim(&self, sandbox_id: SandboxId, generation: i64) {
         self.release_claim(&sandbox_id, generation).await;
     }
 
@@ -368,7 +399,7 @@ impl ApiImpl {
                 // its former node that its copy is stale, and keeps the
                 // snapshot around as this sandbox's durable fallback.
                 self.paused
-                    .mark_sandbox_running(sandbox_id, metadata.expires_at)
+                    .mark_sandbox_running(sandbox_id, metadata.execution_id, metadata.expires_at)
                     .await;
 
                 CrossNodeResume::Restored(Box::new(metadata))
@@ -940,6 +971,7 @@ fn unreachable_arbitration(
     registration: Option<ClusterRegistration>,
     sandbox_id: SandboxId,
     reason: &str,
+    proposed: ExecutionId,
 ) -> ResumeArbitration {
     if !matches!(registration, Some(ClusterRegistration::As(_))) {
         metrics::counter!(
@@ -954,7 +986,7 @@ fn unreachable_arbitration(
              this node holds no copy the cluster was told about"
         );
 
-        return ResumeArbitration::Proceed;
+        return ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed));
     }
 
     metrics::counter!(
@@ -983,19 +1015,28 @@ fn unreachable_arbitration(
 /// where X is itself — its own in-flight publish, its own pause that never
 /// published, its own already-running sandbox — and reading those as refusals
 /// would make a node unable to resume its own sandboxes.
-fn arbitration(claim: ResumeClaim, node_id: &str) -> ResumeArbitration {
+fn arbitration(claim: ResumeClaim, node_id: &str, proposed: ExecutionId) -> ResumeArbitration {
     match claim {
-        ResumeClaim::Claimed { entry, .. } => ResumeArbitration::Held(entry),
+        ResumeClaim::Claimed { entry, .. } => {
+            // 🔴 The row's incarnation wins over the one proposed above. A
+            // controller that predates incarnations answers with none, and the
+            // proposed value is then the honest fallback — it is what this node
+            // will run under, and the old controller ignores it either way.
+            let granted = entry.execution_id.unwrap_or(proposed);
+            ResumeArbitration::Held(entry, ClaimedExecution::from_claim(granted))
+        }
         // The cluster does not track this sandbox, so there is nobody to
         // arbitrate with and a local copy, if any, is the whole truth.
-        ResumeClaim::NotFound => ResumeArbitration::Proceed,
+        ResumeClaim::NotFound => ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed)),
         ResumeClaim::NotReady { origin_node_id } if origin_node_id == node_id => {
-            ResumeArbitration::Proceed
+            ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed))
         }
         ResumeClaim::Conflict {
             origin_node_id,
             reason: _,
-        } if origin_node_id == node_id => ResumeArbitration::Proceed,
+        } if origin_node_id == node_id => {
+            ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed))
+        }
         ResumeClaim::NotReady { origin_node_id } => ResumeArbitration::NotReady { origin_node_id },
         // 🔴 Both reasons block, and deliberately so. `ClaimLost` means the row
         // is claimable again and a retry would be legitimate, but retrying is
@@ -1347,7 +1388,7 @@ mod tests {
         );
         assert!(matches!(
             api.arbitrate_resume(sandbox_id).await,
-            ResumeArbitration::Proceed
+            ResumeArbitration::Proceed(_)
         ));
     }
 
@@ -1359,7 +1400,7 @@ mod tests {
 
         assert!(matches!(
             api.arbitrate_resume(crate::types::SandboxId::new()).await,
-            ResumeArbitration::Proceed
+            ResumeArbitration::Proceed(_)
         ));
     }
 
@@ -1371,7 +1412,7 @@ mod tests {
 
         assert!(matches!(
             api.arbitrate_resume(crate::types::SandboxId::new()).await,
-            ResumeArbitration::Proceed
+            ResumeArbitration::Proceed(_)
         ));
     }
 
@@ -1385,25 +1426,36 @@ mod tests {
             unreachable_arbitration(
                 Some(ClusterRegistration::As(SELF.to_string())),
                 sandbox_id,
-                "no route to host"
+                "no route to host",
+                ExecutionId::new(),
             ),
             ResumeArbitration::Unavailable { .. }
         ));
         // Never announced: the local copy is the only copy.
         assert!(matches!(
-            unreachable_arbitration(Some(ClusterRegistration::Never), sandbox_id, "no route"),
-            ResumeArbitration::Proceed
+            unreachable_arbitration(
+                Some(ClusterRegistration::Never),
+                sandbox_id,
+                "no route",
+                ExecutionId::new()
+            ),
+            ResumeArbitration::Proceed(_)
         ));
         // Announced by a build that did not store the identity: the row cannot
         // be judged against it either, which is how `supersession` treats it.
         assert!(matches!(
-            unreachable_arbitration(Some(ClusterRegistration::Anonymous), sandbox_id, "no route"),
-            ResumeArbitration::Proceed
+            unreachable_arbitration(
+                Some(ClusterRegistration::Anonymous),
+                sandbox_id,
+                "no route",
+                ExecutionId::new()
+            ),
+            ResumeArbitration::Proceed(_)
         ));
         // No local record at all: nothing here to duplicate.
         assert!(matches!(
-            unreachable_arbitration(None, sandbox_id, "no route"),
-            ResumeArbitration::Proceed
+            unreachable_arbitration(None, sandbox_id, "no route", ExecutionId::new()),
+            ResumeArbitration::Proceed(_)
         ));
     }
 
@@ -1543,9 +1595,61 @@ mod tests {
             claimed_by_node_id: claimed_by.map(str::to_string),
             snapshot_id: Some(SnapshotId::generate()),
             metadata: Some(SandboxMetadata::default()),
+            execution_id: Some(ExecutionId::new()),
             paused_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// 🔴 The claim token carries the registry's incarnation, not the one this
+    /// node proposed.
+    ///
+    /// They normally agree — the registry writes what the claim asked for. When
+    /// they do not, the row's value is the one `mark_running` matches on, so
+    /// running under the proposed one instead fails every cross-node resume,
+    /// and fails it by matching no row rather than by returning an error.
+    #[test]
+    fn a_granted_claim_hands_back_the_registrys_incarnation() {
+        let mut entry = entry(PausedRegistryState::Resuming, SELF, Some(SELF));
+        let registry_side = ExecutionId::new();
+        entry.execution_id = Some(registry_side);
+
+        let ResumeArbitration::Held(_, claimed) = arbitration(
+            ResumeClaim::Claimed {
+                entry: Box::new(entry),
+                previous_state: PausedRegistryState::Paused,
+            },
+            SELF,
+            ExecutionId::new(),
+        ) else {
+            panic!("a granted claim is Held");
+        };
+
+        assert_eq!(claimed.execution_id(), registry_side);
+    }
+
+    /// ...and falls back to the proposed one when the registry named none,
+    /// which is what a controller from before incarnations answers. The resume
+    /// still has to run under something, and the honest something is the value
+    /// this node was going to use anyway.
+    #[test]
+    fn a_claim_from_an_older_controller_runs_under_the_proposed_incarnation() {
+        let mut entry = entry(PausedRegistryState::Resuming, SELF, Some(SELF));
+        entry.execution_id = None;
+        let proposed = ExecutionId::new();
+
+        let ResumeArbitration::Held(_, claimed) = arbitration(
+            ResumeClaim::Claimed {
+                entry: Box::new(entry),
+                previous_state: PausedRegistryState::Paused,
+            },
+            SELF,
+            proposed,
+        ) else {
+            panic!("a granted claim is Held");
+        };
+
+        assert_eq!(claimed.execution_id(), proposed);
     }
 
     /// The steady state after a cross-node recovery. Until this node notices,
@@ -1738,7 +1842,10 @@ mod tests {
             },
         ] {
             assert!(
-                matches!(arbitration(claim, SELF), ResumeArbitration::Proceed),
+                matches!(
+                    arbitration(claim, SELF, ExecutionId::new()),
+                    ResumeArbitration::Proceed(_)
+                ),
                 "a node must not be blocked from resuming by its own hold"
             );
         }
@@ -1755,7 +1862,8 @@ mod tests {
                     origin_node_id: OTHER.to_string(),
                     reason: crate::orchestrator::ConflictReason::LiveElsewhere,
                 },
-                SELF
+                SELF,
+                ExecutionId::new(),
             ),
             ResumeArbitration::Blocked { .. }
         ));
@@ -1764,7 +1872,8 @@ mod tests {
                 ResumeClaim::NotReady {
                     origin_node_id: OTHER.to_string()
                 },
-                SELF
+                SELF,
+                ExecutionId::new(),
             ),
             ResumeArbitration::NotReady { .. }
         ));
@@ -1775,8 +1884,8 @@ mod tests {
     #[test]
     fn an_untracked_sandbox_resumes_without_arbitration() {
         assert!(matches!(
-            arbitration(ResumeClaim::NotFound, SELF),
-            ResumeArbitration::Proceed
+            arbitration(ResumeClaim::NotFound, SELF, ExecutionId::new()),
+            ResumeArbitration::Proceed(_)
         ));
     }
 
@@ -1792,7 +1901,7 @@ mod tests {
             entry: Box::new(row),
             previous_state: PausedRegistryState::Paused,
         };
-        let ResumeArbitration::Held(held) = arbitration(claim, SELF) else {
+        let ResumeArbitration::Held(held, _) = arbitration(claim, SELF, ExecutionId::new()) else {
             panic!("a granted claim must be held");
         };
 

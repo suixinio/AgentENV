@@ -21,9 +21,9 @@ use crate::sandbox::{
     SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
-use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
+use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
 
-use super::launch_plan::{CreateLaunchSource, LaunchPlan};
+use super::launch_plan::{ClaimedExecution, CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
@@ -626,6 +626,11 @@ where
                 let sandbox_id = SandboxId::new();
                 SandboxForkSpec {
                     sandbox_id,
+                    // A fork child is a brand-new sandbox, so it is a brand-new
+                    // incarnation. Minted in the same expression as its id
+                    // because the two are born together and the child's
+                    // metadata below is a clone of the parent's.
+                    execution_id: ExecutionId::new(),
                     envd_access_token: source_metadata
                         .secure
                         .then(|| self.access_tokens.generate(sandbox_id)),
@@ -700,6 +705,10 @@ where
 
             let mut metadata = source_metadata.clone();
             metadata.id = sandbox_id;
+            // 🔴 The clone above carries the parent's incarnation. Leaving it
+            // would give two live VMs one identity, with nothing to warn about
+            // it: fencing would read them as the same run and refuse neither.
+            metadata.execution_id = child.execution_id;
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
             metadata.paused_state = None;
@@ -729,7 +738,8 @@ where
                 .write()
                 .await
                 .insert(metadata.id, Arc::new(Mutex::new(backend)));
-            self.upsert_proxy_route(metadata.id, proxy_target).await;
+            self.upsert_proxy_route(metadata.id, proxy_target, metadata.execution_id)
+                .await;
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Fork,
                 metadata.id,
@@ -776,6 +786,22 @@ where
         Ok(self.store.list_ids().await?)
     }
 
+    /// Lists every sandbox this node tracks together with the incarnation it is
+    /// running under.
+    ///
+    /// The same set [`list_sandbox_ids`](Self::list_sandbox_ids) reports, which
+    /// is deliberate: the heartbeat sends both, and a receiver that finds them
+    /// describing different sets could not tell which one to believe.
+    pub async fn list_sandbox_roster(&self) -> Result<Vec<(SandboxId, ExecutionId)>> {
+        Ok(self
+            .store
+            .list()
+            .await?
+            .into_iter()
+            .map(|metadata| (metadata.id, metadata.execution_id))
+            .collect())
+    }
+
     /// Lists sandboxes that match the provided filter criteria:
     /// - If `states` is provided, only sandboxes in those states will be included.
     /// - If `user_metadata` is provided, only sandboxes whose user metadata contains
@@ -796,6 +822,29 @@ where
 
     pub fn validate_envd_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
         self.access_tokens.matches(sandbox_id, candidate)
+    }
+
+    /// The incarnation of this sandbox that is alive on this node right now, or
+    /// `None` when no VM of it is up here.
+    ///
+    /// 🔴 Only positive evidence. `None` means "this node is not currently
+    /// serving this sandbox" and never "this node is serving an old one". A
+    /// sandbox that is paused here, or being resumed here, or has never been
+    /// here, all answer `None` — because their records name a run that is not
+    /// the one about to serve traffic. A caller that refused on the strength of
+    /// one of those would refuse every request in a cross-node resume window,
+    /// which is precisely the window a user is waiting through.
+    ///
+    /// Reads the runtime route table rather than the backend handle: taking the
+    /// sandbox mutex on the data-plane path would queue every request behind a
+    /// pause or a snapshot, and the route table already holds the value the
+    /// backend was built with.
+    pub async fn live_execution_id(&self, sandbox_id: &SandboxId) -> Option<ExecutionId> {
+        self.proxy_routes
+            .read()
+            .await
+            .route(sandbox_id)
+            .map(|route| route.execution_id())
     }
 
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.
@@ -1491,14 +1540,25 @@ where
     /// returns the actual outcome (either `Running` or an error) rather than
     /// duplicating the work. On success the sandbox is ready for use when this
     /// method returns.
+    /// Brings a paused sandbox back up under the incarnation its claim
+    /// allocated.
+    ///
+    /// 🔴 The [`ClaimedExecution`] is the resume's licence, not a parameter of
+    /// convenience: the only way to obtain one is the resume arbitration, so
+    /// every path that reaches this function — the REST resume, the cross-node
+    /// rebuild, and the data-plane auto-resume — has been through that one
+    /// decision point. Taking it by value is what makes one claim start one
+    /// sandbox.
     pub async fn resume_sandbox(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
         timeout: NewTimeout,
+        claimed: ClaimedExecution,
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("resume", sandbox_id, async move {
-            this.resume_sandbox_inner(sandbox_id, timeout).await
+            this.resume_sandbox_inner(sandbox_id, timeout, claimed)
+                .await
         })
         .await
     }
@@ -1512,6 +1572,7 @@ where
         self: Arc<Self>,
         sandbox_id: SandboxId,
         timeout: NewTimeout,
+        claimed: ClaimedExecution,
     ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
@@ -1602,9 +1663,11 @@ where
             OrchestratorError::InternalError("missing paused state".to_string())
         })?;
 
+        let resumed_execution_id = claimed.execution_id();
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
                 sandbox_id,
+                claimed,
                 Arc::clone(paused_state),
                 timeout,
                 metadata.resources,
@@ -1629,8 +1692,11 @@ where
                 // until the first lease renewal the row would otherwise carry
                 // none — a window in which losing this node strands the row
                 // permanently.
+                // 🔴 The incarnation the claim allocated, not a fresh one.
+                // The registry's cross-node branch matches on exactly this
+                // value, so minting here would fail every cross-node resume.
                 publisher
-                    .mark_running(sandbox_id, metadata.expires_at)
+                    .mark_running(sandbox_id, resumed_execution_id, metadata.expires_at)
                     .await;
             }
         }
@@ -2333,6 +2399,7 @@ where
         }
 
         let launch_timeout = plan.timeout();
+        let launch_execution_id = plan.execution_id();
         let final_metadata = match self
             .store
             .update_if_state(
@@ -2340,6 +2407,10 @@ where
                 std::slice::from_ref(&transitional_state),
                 move |metadata| {
                     metadata.resources = runtime_resources;
+                    // A resume starts from the record the pause left behind,
+                    // which names the run that produced it. This is where the
+                    // record starts naming the run that is about to serve it.
+                    metadata.execution_id = launch_execution_id;
                     metadata.state = SandboxState::Running;
                     metadata.update_timeout(launch_timeout);
                 },
@@ -2369,7 +2440,12 @@ where
             }
         };
         if !self
-            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
+            .upsert_proxy_route_if_current_handle(
+                sandbox_id,
+                &handle,
+                proxy_target,
+                launch_execution_id,
+            )
             .await
         {
             debug!("skipping runtime proxy route publication because sandbox handle is stale");
@@ -2386,17 +2462,23 @@ where
     }
 
     fn build_sandbox(&self, plan: &LaunchPlan) -> Result<Box<dyn SandboxBackend>> {
+        let execution_id = plan.execution_id();
         let build_result = match plan {
             LaunchPlan::Create(plan) => match &plan.source {
-                CreateLaunchSource::Snapshot { snapshot } => self
-                    .factory
-                    .build_from_snapshot(snapshot, plan.launch_config.clone()),
-                CreateLaunchSource::Fresh { build_spec } => self
-                    .factory
-                    .build((**build_spec).clone(), plan.launch_config.clone()),
+                CreateLaunchSource::Snapshot { snapshot } => self.factory.build_from_snapshot(
+                    snapshot,
+                    plan.launch_config.clone(),
+                    execution_id,
+                ),
+                CreateLaunchSource::Fresh { build_spec } => self.factory.build(
+                    (**build_spec).clone(),
+                    plan.launch_config.clone(),
+                    execution_id,
+                ),
             },
             LaunchPlan::Resume(plan) => self.factory.build_from_paused_state(
                 plan.sandbox_id,
+                execution_id,
                 plan.paused_state.as_ref(),
                 plan.envd_access_token.clone(),
             ),
@@ -2522,15 +2604,20 @@ where
             })
     }
 
-    async fn upsert_proxy_route(&self, sandbox_id: SandboxId, target: ProxyTarget) {
+    async fn upsert_proxy_route(
+        &self,
+        sandbox_id: SandboxId,
+        target: ProxyTarget,
+        execution_id: ExecutionId,
+    ) {
         let version = self
             .next_proxy_route_version
             .fetch_add(1, Ordering::Relaxed);
-        let route = self
-            .proxy_routes
-            .write()
-            .await
-            .upsert(sandbox_id, target, version);
+        let route =
+            self.proxy_routes
+                .write()
+                .await
+                .upsert(sandbox_id, target, version, execution_id);
         debug!(
             version = route.version(),
             updated_at = ?route.updated_at(),
@@ -2544,6 +2631,7 @@ where
         sandbox_id: SandboxId,
         handle: &SandboxHandle,
         target: ProxyTarget,
+        execution_id: ExecutionId,
     ) -> bool {
         // Keep the lock order aligned with detach_sandbox_handle_and_route:
         // sandboxes first, then proxy_routes.
@@ -2559,11 +2647,11 @@ where
         let version = self
             .next_proxy_route_version
             .fetch_add(1, Ordering::Relaxed);
-        let route = self
-            .proxy_routes
-            .write()
-            .await
-            .upsert(sandbox_id, target, version);
+        let route =
+            self.proxy_routes
+                .write()
+                .await
+                .upsert(sandbox_id, target, version, execution_id);
         drop(sandboxes);
 
         debug!(
@@ -2579,7 +2667,9 @@ where
         let Some(route) = route else {
             return;
         };
-        self.upsert_proxy_route(sandbox_id, route.target().clone())
+        // Restoring a route puts back the incarnation it was published under:
+        // this path exists for operations that never started a new run.
+        self.upsert_proxy_route(sandbox_id, route.target().clone(), route.execution_id())
             .await;
     }
 
@@ -2777,7 +2867,16 @@ where
             .expect("seed proxy metadata state for test");
 
         if state == SandboxState::Running {
-            self.upsert_proxy_route(sandbox_id, target).await;
+            let execution_id = self
+                .store
+                .get(&sandbox_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|metadata| metadata.execution_id)
+                .unwrap_or_else(ExecutionId::new);
+            self.upsert_proxy_route(sandbox_id, target, execution_id)
+                .await;
         } else {
             let _ = self.proxy_routes.write().await.remove(&sandbox_id);
         }
@@ -2837,6 +2936,39 @@ where
 
     pub(crate) async fn remove_proxy_route_for_test(&self, sandbox_id: &SandboxId) {
         let _ = self.proxy_routes.write().await.remove(sandbox_id);
+    }
+
+    /// The incarnation the live backend was built with.
+    ///
+    /// 🔴 Read off the backend, not the store. Asserting against the store
+    /// would only prove that the value written there is the value written
+    /// there; this proves the VM was actually started under it.
+    pub(crate) async fn backend_execution_id_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Option<ExecutionId> {
+        let handle = self.sandboxes.read().await.get(sandbox_id).cloned()?;
+        let backend = handle.lock().await;
+        Some(backend.execution_id())
+    }
+
+    /// Seeds a running sandbox whose live incarnation is a chosen value, so the
+    /// data plane's ordered comparison can be driven from both sides.
+    pub(crate) async fn set_live_execution_for_test(
+        &self,
+        sandbox_id: SandboxId,
+        target: ProxyTarget,
+        execution_id: ExecutionId,
+    ) {
+        self.set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+            .await
+            .expect("seed running metadata for test");
+        if let Ok(Some(mut metadata)) = self.store.get(&sandbox_id).await {
+            metadata.execution_id = execution_id;
+            let _ = self.store.update(metadata).await;
+        }
+        self.upsert_proxy_route(sandbox_id, target, execution_id)
+            .await;
     }
 }
 

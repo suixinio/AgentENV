@@ -403,6 +403,14 @@ components:
           type: string
           nullable: true
           description: Base domain where the sandbox traffic is accessible
+        executionID:
+          type: string
+          description: >
+            Identifier of the current run of this sandbox. A sandbox keeps its
+            sandboxID for its whole life; this changes every time it is started,
+            including every resume, so two answers naming the same sandbox but
+            different executionIDs describe two different runs of it. Read-only:
+            it is never accepted as input.
 
     SandboxDetail:
       required:
@@ -465,6 +473,14 @@ components:
           $ref: "#/components/schemas/SandboxNetworkConfig"
         lifecycle:
           $ref: "#/components/schemas/SandboxLifecycle"
+        executionID:
+          type: string
+          description: >
+            Identifier of the current run of this sandbox. A sandbox keeps its
+            sandboxID for its whole life; this changes every time it is started,
+            including every resume, so two answers naming the same sandbox but
+            different executionIDs describe two different runs of it. Read-only:
+            it is never accepted as input.
 
     ListedSandbox:
       required:
@@ -512,6 +528,14 @@ components:
           $ref: "#/components/schemas/SandboxState"
         envdVersion:
           $ref: "#/components/schemas/EnvdVersion"
+        executionID:
+          type: string
+          description: >
+            Identifier of the current run of this sandbox. A sandbox keeps its
+            sandboxID for its whole life; this changes every time it is started,
+            including every resume, so two answers naming the same sandbox but
+            different executionIDs describe two different runs of it. Read-only:
+            it is never accepted as input.
 
     NewSandbox:
       required:

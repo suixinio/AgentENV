@@ -1,3 +1,4 @@
+mod control_plane_gate;
 mod impls;
 mod isolation;
 mod proxy;

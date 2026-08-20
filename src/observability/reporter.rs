@@ -361,6 +361,13 @@ impl ObservabilityReporter {
         Ok(())
     }
 
+    // `sandbox_ids` is deprecated on the wire and still sent on purpose: the
+    // controller deletes every binding a node owns when it receives an empty
+    // roster, so a node that stopped sending the old field before the whole
+    // fleet reads the new one would have its sandboxes answer 404 on the data
+    // plane for the length of the rolling window. Both fields travel until the
+    // controller reports it has seen no legacy roster.
+    #[allow(deprecated)]
     fn build_heartbeat_request(
         snapshot: super::NodeSnapshot,
         now_ms: i64,
@@ -424,6 +431,14 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            roster: snapshot
+                .sandbox_roster
+                .into_iter()
+                .map(|(sandbox_id, execution_id)| scheduler::SandboxRosterEntry {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                })
+                .collect(),
         }
     }
 

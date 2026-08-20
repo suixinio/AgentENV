@@ -38,7 +38,7 @@ use super::{
 use crate::orchestrator::store::SandboxMetadata;
 use crate::proto::scheduler as pb;
 use crate::snapshot::SnapshotId;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// How long any one registry call may take.
 ///
@@ -238,6 +238,19 @@ impl CentralPausedSandboxRegistry {
             ));
         }
 
+        // Empty is an ordinary answer: a parked row names no run, and a
+        // controller from before incarnations existed names none either. A
+        // value that is present but unreadable is not ordinary — passing on a
+        // row whose incarnation could not be parsed would hand the resume an
+        // entry that silently has none.
+        let execution_id = if row.execution_id.is_empty() {
+            None
+        } else {
+            Some(ExecutionId::parse_str(&row.execution_id).map_err(|_| {
+                Self::invalid(&row.sandbox_id, "execution id is not a uuid".to_string())
+            })?)
+        };
+
         Ok(PausedSandboxEntry {
             sandbox_id,
             cluster_id,
@@ -247,6 +260,7 @@ impl CentralPausedSandboxRegistry {
             claimed_by_node_id: Some(row.claimed_by_node_id).filter(|node| !node.is_empty()),
             snapshot_id,
             metadata,
+            execution_id,
             paused_at: decode_micros(&row.sandbox_id, row.paused_at_unix_micros, "paused_at")?,
             updated_at: decode_micros(&row.sandbox_id, row.updated_at_unix_micros, "updated_at")?,
         })
@@ -351,6 +365,7 @@ impl CentralPausedSandboxRegistry {
         expect_generation: Option<i64>,
         metadata_json: Vec<u8>,
         snapshot_id: String,
+        execution_id: Option<ExecutionId>,
     ) -> RegistryResult<pb::TransitionSandboxResponse> {
         self.transition_with_deadline(
             operation,
@@ -360,6 +375,7 @@ impl CentralPausedSandboxRegistry {
             expect_generation,
             metadata_json,
             snapshot_id,
+            execution_id,
             None,
         )
         .await
@@ -376,6 +392,11 @@ impl CentralPausedSandboxRegistry {
         expect_generation: Option<i64>,
         metadata_json: Vec<u8>,
         snapshot_id: String,
+        // 🔴 The incarnation this write is made on behalf of. Required by the
+        // controller on `begin_pause` and `mark_running` and refused on the
+        // other four kinds, so it is threaded per call rather than stored on
+        // the client: "which run is writing" is a property of the write.
+        execution_id: Option<ExecutionId>,
         sandbox_expires_at_unix_micros: Option<i64>,
     ) -> RegistryResult<pb::TransitionSandboxResponse> {
         // 🔴 The lease travels with every transition that stamps one, which is
@@ -400,6 +421,7 @@ impl CentralPausedSandboxRegistry {
                 lease_ttl_millis,
                 snapshot_id,
                 sandbox_expires_at_unix_micros,
+                execution_id: execution_id.map(|id| id.to_string()).unwrap_or_default(),
             }))
             .await
             .map_err(|status| {
@@ -432,6 +454,15 @@ impl CentralPausedSandboxRegistry {
             (tonic::Code::Aborted, Some(expected)) => PausedRegistryError::GenerationConflict {
                 sandbox_id: sandbox_id.to_string(),
                 expected,
+            },
+            // 🔴 The other refusal, and the one that must never be retried.
+            // `PermissionDenied` on this service means the incarnation quoted
+            // is not the one the row is fenced against; unlike `Aborted`, a
+            // re-read would not fix it, it would defeat it. Note the absence of
+            // an `expect_generation` condition: a fenced write is fenced
+            // whether or not it quoted a generation.
+            (tonic::Code::PermissionDenied, _) => PausedRegistryError::ExecutionFenced {
+                sandbox_id: sandbox_id.to_string(),
             },
             _ => Self::unreachable(operation, status),
         }
@@ -507,6 +538,11 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 None,
                 metadata_json,
                 String::new(),
+                // 🔴 Required on this kind. The value is the record's own — the
+                // run that is being paused — read off the metadata rather than
+                // taken as a separate argument, so a caller cannot pause one
+                // run while quoting another.
+                Some(metadata.execution_id),
             )
             .await?;
 
@@ -545,6 +581,9 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
             Some(generation),
             Vec::new(),
             snapshot_id.to_string(),
+            // Refused on this kind by the controller: only begin_pause and
+            // mark_running carry an incarnation.
+            None,
         )
         .await?;
 
@@ -562,6 +601,8 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
             Some(generation),
             Vec::new(),
             String::new(),
+            // Refused on this kind by the controller.
+            None,
         )
         .await?;
 
@@ -589,6 +630,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        execution_id: ExecutionId,
     ) -> RegistryResult<ResumeClaim> {
         let response = self
             .client()
@@ -597,6 +639,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 sandbox_id: sandbox_id.to_string(),
                 node_id: node_id.to_string(),
                 lease_ttl_millis: self.lease_ttl_millis,
+                execution_id: execution_id.to_string(),
             }))
             .await
             .map_err(|status| Self::unreachable("claim_for_resume", status))?
@@ -674,6 +717,8 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 Some(generation),
                 Vec::new(),
                 String::new(),
+                // Refused on this kind by the controller.
+                None,
             )
             .await?;
 
@@ -740,6 +785,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {
         let response = self
@@ -751,6 +797,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 None,
                 Vec::new(),
                 String::new(),
+                Some(execution_id),
                 expires_at.map(micros_since_epoch),
             )
             .await?;
@@ -794,6 +841,8 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 Some(generation),
                 Vec::new(),
                 String::new(),
+                // Refused on this kind by the controller.
+                None,
             )
             .await?;
 
@@ -1084,10 +1133,12 @@ mod tests {
             snapshot_id: SnapshotId::generate().to_string(),
             paused_at_unix_micros: 1_755_561_600_123_456,
             updated_at_unix_micros: 1_755_561_700_654_321,
+            execution_id: String::new(),
         }
     }
 
     fn entry_for(sandbox_id: SandboxId, metadata: SandboxMetadata) -> PausedSandboxEntry {
+        let metadata_execution_id = metadata.execution_id;
         PausedSandboxEntry {
             sandbox_id,
             cluster_id: Uuid::nil(),
@@ -1097,6 +1148,7 @@ mod tests {
             claimed_by_node_id: None,
             snapshot_id: None,
             metadata: Some(metadata),
+            execution_id: Some(metadata_execution_id),
             paused_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1188,7 +1240,9 @@ mod tests {
             Err(PausedRegistryError::Backend { .. })
         ));
         assert!(matches!(
-            registry.claim_for_resume(&sandbox_id, NODE).await,
+            registry
+                .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+                .await,
             Err(PausedRegistryError::Backend { .. })
         ));
         assert!(matches!(
@@ -1228,7 +1282,9 @@ mod tests {
             Err(PausedRegistryError::Backend { .. })
         ));
         assert!(matches!(
-            registry.claim_for_resume(&sandbox_id, NODE).await,
+            registry
+                .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+                .await,
             Err(PausedRegistryError::Backend { .. })
         ));
 
@@ -1299,7 +1355,10 @@ mod tests {
 
         let _ = harness.registry.get(&sandbox_id).await;
         let _ = harness.registry.remove(&sandbox_id, 1).await;
-        let _ = harness.registry.claim_for_resume(&sandbox_id, NODE).await;
+        let _ = harness
+            .registry
+            .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+            .await;
         let _ = harness
             .registry
             .renew_lease(NODE, &[held(sandbox_id)])
@@ -1326,7 +1385,7 @@ mod tests {
 
         let answer = harness
             .registry
-            .claim_for_resume(&SandboxId::new(), NODE)
+            .claim_for_resume(&SandboxId::new(), NODE, ExecutionId::new())
             .await;
 
         assert!(
@@ -1354,7 +1413,7 @@ mod tests {
         assert!(matches!(
             harness
                 .registry
-                .claim_for_resume(&SandboxId::new(), NODE)
+                .claim_for_resume(&SandboxId::new(), NODE, ExecutionId::new())
                 .await,
             Err(PausedRegistryError::Backend { .. })
         ));
@@ -1371,7 +1430,10 @@ mod tests {
             )),
         }));
         assert!(matches!(
-            harness.registry.claim_for_resume(&sandbox_id, NODE).await,
+            harness
+                .registry
+                .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+                .await,
             Ok(ResumeClaim::NotFound)
         ));
 
@@ -1384,7 +1446,7 @@ mod tests {
             )),
         }));
         assert!(matches!(
-            harness.registry.claim_for_resume(&sandbox_id, NODE).await,
+            harness.registry.claim_for_resume(&sandbox_id, NODE, ExecutionId::new()).await,
             Ok(ResumeClaim::NotReady { origin_node_id }) if origin_node_id == OTHER
         ));
 
@@ -1397,7 +1459,7 @@ mod tests {
             )),
         }));
         assert!(matches!(
-            harness.registry.claim_for_resume(&sandbox_id, NODE).await,
+            harness.registry.claim_for_resume(&sandbox_id, NODE, ExecutionId::new()).await,
             Ok(ResumeClaim::Conflict { origin_node_id, reason })
                 if origin_node_id == OTHER && reason == ConflictReason::LiveElsewhere
         ));
@@ -1424,7 +1486,7 @@ mod tests {
 
         let claim = harness
             .registry
-            .claim_for_resume(&sandbox_id, NODE)
+            .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
             .await
             .expect("the claim should be granted");
 
@@ -1477,7 +1539,7 @@ mod tests {
 
         let ResumeClaim::Claimed { entry, .. } = harness
             .registry
-            .claim_for_resume(&sandbox_id, NODE)
+            .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
             .await
             .expect("the claim should be granted")
         else {
@@ -1510,7 +1572,10 @@ mod tests {
         }));
 
         assert!(matches!(
-            harness.registry.claim_for_resume(&sandbox_id, NODE).await,
+            harness
+                .registry
+                .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+                .await,
             Err(PausedRegistryError::InvalidRecord { .. })
         ));
     }
@@ -1670,7 +1735,7 @@ mod tests {
             .unwrap();
         harness
             .registry
-            .mark_running(&sandbox_id, OTHER, None)
+            .mark_running(&sandbox_id, OTHER, ExecutionId::new(), None)
             .await
             .unwrap();
         harness
@@ -1741,7 +1806,7 @@ mod tests {
             .unwrap();
         harness
             .registry
-            .mark_running(&sandbox_id, NODE, None)
+            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
             .await
             .unwrap();
         harness
@@ -1752,7 +1817,7 @@ mod tests {
         harness.registry.remove(&sandbox_id, 21).await.unwrap();
         harness
             .registry
-            .claim_for_resume(&sandbox_id, NODE)
+            .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
             .await
             .ok();
         harness
@@ -2033,7 +2098,7 @@ mod tests {
             assert_eq!(
                 harness
                     .registry
-                    .mark_running(&sandbox_id, NODE, None)
+                    .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
                     .await
                     .unwrap(),
                 expected
@@ -2056,7 +2121,7 @@ mod tests {
 
         harness
             .registry
-            .mark_running(&sandbox_id, NODE, Some(deadline))
+            .mark_running(&sandbox_id, NODE, ExecutionId::new(), Some(deadline))
             .await
             .expect("mark running");
 
@@ -2072,7 +2137,7 @@ mod tests {
         // first alone forever. A zero here would be a deadline in 1970.
         harness
             .registry
-            .mark_running(&sandbox_id, NODE, None)
+            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
             .await
             .expect("mark running");
         let seen = harness.fake.seen_transition.lock().unwrap().clone();
@@ -2118,13 +2183,125 @@ mod tests {
         *harness.fake.transition.lock().unwrap() = Some(Err(Status::aborted("unexpected")));
         let failure = harness
             .registry
-            .mark_running(&sandbox_id, NODE, None)
+            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
             .await
             .expect_err("an aborted transition is a failure");
         assert!(
             matches!(failure, PausedRegistryError::Backend { .. }),
             "an unconditional write cannot report a generation conflict, got {failure:?}"
         );
+    }
+
+    /// 🔴 The two refusals on this interface are not interchangeable.
+    ///
+    /// A stale generation says "re-read the row and try again". A superseded
+    /// incarnation says "the run you are writing for is over" — and the retry
+    /// the first one invites is exactly how the second one gets defeated: the
+    /// caller would re-read, pick up the current generation, and send the same
+    /// write again, straight past the fence.
+    #[tokio::test]
+    async fn a_superseded_incarnation_is_fenced_not_a_conflict_and_not_an_outage() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+
+        // The unconditional write, where the tempting reading is "outage".
+        *harness.fake.transition.lock().unwrap() = Some(Err(Status::permission_denied(
+            "sandbox_execution_superseded",
+        )));
+        let failure = harness
+            .registry
+            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+            .await
+            .expect_err("a refused transition is a failure");
+        assert!(
+            matches!(failure, PausedRegistryError::ExecutionFenced { .. }),
+            "a fenced write is a precise fact, not a transport failure: {failure:?}"
+        );
+
+        // The conditional one, where the tempting reading is "conflict".
+        *harness.fake.transition.lock().unwrap() = Some(Err(Status::permission_denied(
+            "sandbox_execution_superseded",
+        )));
+        let failure = harness
+            .registry
+            .complete_pause(&sandbox_id, 7, &SnapshotId::generate())
+            .await
+            .expect_err("a refused transition is a failure");
+        assert!(
+            matches!(failure, PausedRegistryError::ExecutionFenced { .. }),
+            "a fenced write must not arrive as a generation conflict, or the caller will \
+             re-read and walk around the fence: {failure:?}"
+        );
+    }
+
+    /// A pause quotes the run that produced it, and a claim quotes the run it
+    /// is about to start. Both reach the controller as the field it fences on.
+    #[tokio::test]
+    async fn the_incarnation_reaches_the_controller_on_both_writes() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..Default::default()
+        };
+
+        harness
+            .registry
+            .begin_pause(&entry_for(sandbox_id, metadata.clone()))
+            .await
+            .expect("begin_pause should land");
+        assert_eq!(
+            harness.fake.seen_transition.lock().unwrap()[0].execution_id,
+            metadata.execution_id.to_string(),
+            "a pause must quote the run that produced it"
+        );
+
+        let proposed = ExecutionId::new();
+        let _ = harness
+            .registry
+            .claim_for_resume(&sandbox_id, NODE, proposed)
+            .await;
+        assert_eq!(
+            harness.fake.seen_acquire.lock().unwrap()[0].execution_id,
+            proposed.to_string(),
+            "a claim must carry the run it is allocating, so the row it writes names it"
+        );
+    }
+
+    /// 🔴 The value on a granted claim is the one the registry wrote, and it is
+    /// the one the resume has to run under.
+    ///
+    /// The controller's `mark_running` matches on it. A node that ran under
+    /// anything else would match no row, and every cross-node resume would fail
+    /// — silently, because a write that matches nothing is not an error.
+    #[tokio::test]
+    async fn a_granted_claim_carries_the_incarnation_the_registry_wrote() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+        let registry_side = ExecutionId::new();
+        let mut granted = row(harness.cluster_id, sandbox_id, "resuming");
+        granted.execution_id = registry_side.to_string();
+
+        *harness.fake.acquire.lock().unwrap() = Some(Ok(pb::AcquireSandboxResponse {
+            outcome: Some(pb::acquire_sandbox_response::Outcome::Claimed(
+                pb::AcquiredSandbox {
+                    entry: Some(granted),
+                    metadata_json: serde_json::to_vec(&SandboxMetadata::default()).unwrap(),
+                    previous_state: "paused".to_string(),
+                },
+            )),
+        }));
+
+        let ResumeClaim::Claimed { entry, .. } = harness
+            .registry
+            .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+            .await
+            .expect("the claim should be granted")
+        else {
+            panic!("the claim should be granted");
+        };
+
+        assert_eq!(entry.execution_id, Some(registry_side));
     }
 
     /// The two conflicts are not interchangeable on the way in either.
@@ -2158,7 +2335,11 @@ mod tests {
                 )),
             }));
 
-            match harness.registry.claim_for_resume(&sandbox_id, NODE).await {
+            match harness
+                .registry
+                .claim_for_resume(&sandbox_id, NODE, ExecutionId::new())
+                .await
+            {
                 Ok(ResumeClaim::Conflict { reason, .. }) => assert_eq!(reason, expected),
                 other => panic!("expected a conflict, got {other:?}"),
             }
@@ -2244,7 +2425,7 @@ mod tests {
             assert_eq!(
                 harness
                     .registry
-                    .mark_running(&sandbox_id, NODE, None)
+                    .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
                     .await
                     .unwrap(),
                 expected

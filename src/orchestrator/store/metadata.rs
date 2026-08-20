@@ -10,7 +10,7 @@ use crate::orchestrator::SandboxState;
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -30,6 +30,17 @@ pub enum NewTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxMetadata {
     pub id: SandboxId,
+    /// The incarnation this record belongs to: the single run of the sandbox
+    /// that produced it.
+    ///
+    /// 🔴 Required, and deliberately without `#[serde(default)]`. A default
+    /// here would be a permanent fail-open path — every record that has no
+    /// incarnation would quietly acquire a fresh one at load time, and fencing
+    /// would then be comparing a value nobody ever ran under. Records written
+    /// before this field existed are refused at load; see
+    /// `FileBackedSandboxPersister` for the message that says so and what to do
+    /// about it.
+    pub execution_id: ExecutionId,
     pub snapshot_id: String,
     pub snapshot_alias: Option<String>,
     pub state: SandboxState,
@@ -68,6 +79,10 @@ impl Default for SandboxMetadata {
     fn default() -> Self {
         Self {
             id: SandboxId::new(),
+            // A `Default` record never stands for a run that happened — it is a
+            // test fixture — so minting here names nothing that could be
+            // confused with a real incarnation.
+            execution_id: ExecutionId::new(),
             snapshot_id: "unknown".to_string(),
             snapshot_alias: None,
             state: SandboxState::Creating,
@@ -217,8 +232,13 @@ mod golden {
 
     /// Fields with neither `Option` nor `#[serde(default)]`. Losing any one of
     /// them makes the row permanently undecodable.
-    const REQUIRED_FIELDS: [&str; 10] = [
+    const REQUIRED_FIELDS: [&str; 11] = [
         "id",
+        // 🔴 Required, and deliberately so. A record without it is refused at
+        // load rather than given a fresh incarnation, because a fresh one would
+        // be a value nothing ever ran under — which is exactly what fencing
+        // cannot detect.
+        "execution_id",
         "snapshot_id",
         "state",
         "created_at",
@@ -233,6 +253,10 @@ mod golden {
     /// Fields written only when they carry something, so a valid document may
     /// or may not have them. Both shapes have a fixture.
     const OMISSIBLE_FIELDS: [&str; 2] = ["image_configs", "custom_extension_params"];
+
+    /// The file REQUIRED_FIELDS is published in, so the other side can check
+    /// itself against the list rather than against a restatement of it.
+    const REQUIRED_FIELDS_FIXTURE: &str = "sandbox_metadata_required_fields.json";
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -293,6 +317,7 @@ mod golden {
 
         SandboxMetadata {
             id: SandboxId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07").unwrap(),
+            execution_id: ExecutionId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08").unwrap(),
             snapshot_id: "0199c8ff-1122-7000-8000-aabbccddeeff".to_string(),
             snapshot_alias: Some("tpl-node22".to_string()),
             state: SandboxState::Paused,
@@ -359,6 +384,9 @@ mod golden {
     fn minimal_metadata() -> SandboxMetadata {
         SandboxMetadata {
             id: SandboxId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08").unwrap(),
+            // Pinned, like the id above: `Default` mints a fresh incarnation,
+            // and a fixture that changes on every run can never be a fixture.
+            execution_id: ExecutionId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c09").unwrap(),
             created_at: UNIX_EPOCH + Duration::new(1_755_561_600, 0),
             ..SandboxMetadata::default()
         }
@@ -469,6 +497,50 @@ mod golden {
                  sandbox in every read path at once"
             );
         }
+    }
+
+    /// 🔴 Publishes REQUIRED_FIELDS as a file of its own, which is what lets
+    /// the other side be *wrong about the list* rather than merely wrong about
+    /// a document.
+    ///
+    /// Until now the Go side restated these names in its own source and checked
+    /// that each of them was present in the two metadata fixtures. That had
+    /// teeth in one direction only: the fixtures carry more keys than the list
+    /// names, so adding a name this side does not require failed over there,
+    /// while dropping one this side does require passed. `execution_id` went
+    /// missing exactly that way — it was made required here, the fixtures were
+    /// regenerated, and the Go list stayed green while naming one field fewer.
+    ///
+    /// With the list itself in a file, both sides read the same bytes and the
+    /// comparison over there is set equality, so a name added here and a name
+    /// dropped there each fail. Order is not part of the contract — the other
+    /// side compares sets — but the rendering is declaration order, because a
+    /// fixture whose contents move on their own is not a fixture.
+    #[test]
+    fn the_required_field_list_is_published_for_the_other_side() {
+        let path = fixture_path(REQUIRED_FIELDS_FIXTURE);
+        let mut rendered =
+            serde_json::to_string_pretty(&REQUIRED_FIELDS).expect("render the required field list");
+        rendered.push('\n');
+
+        if std::env::var("UPDATE_METADATA_GOLDEN").is_ok() {
+            std::fs::write(&path, &rendered).expect("rewrite the fixture");
+        }
+
+        let stored = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "read {}: {err}. Regenerate with UPDATE_METADATA_GOLDEN=1",
+                path.display()
+            )
+        });
+        assert_eq!(
+            stored,
+            rendered,
+            "{} is out of step with REQUIRED_FIELDS. If the change is intended, regenerate with \
+             UPDATE_METADATA_GOLDEN=1 — and expect the Go side to fail next, because it compares \
+             its own list against this file and has to be brought along in the same change",
+            path.display()
+        );
     }
 
     /// The other half of the boundary. These five are genuinely optional, and a

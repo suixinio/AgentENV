@@ -7,7 +7,7 @@ use super::{
     ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::snapshot::SnapshotId;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// Default registry: records nothing, claims nothing.
 ///
@@ -59,6 +59,7 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         &self,
         _sandbox_id: &SandboxId,
         _node_id: &str,
+        _execution_id: ExecutionId,
     ) -> RegistryResult<ResumeClaim> {
         Ok(ResumeClaim::NotFound)
     }
@@ -86,6 +87,7 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         &self,
         _sandbox_id: &SandboxId,
         _node_id: &str,
+        _execution_id: ExecutionId,
         _expires_at: Option<std::time::SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {
         // Untracked, not held-elsewhere: this backend has no cluster to hold a

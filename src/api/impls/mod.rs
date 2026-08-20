@@ -24,6 +24,9 @@ use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 use agentenv_http_server::{apis, models};
 pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
+// The data-plane auto-resume takes the same decision the REST resume does; both
+// reach it through this one point.
+pub(in crate::api) use paused_recovery::ResumeArbitration;
 
 #[derive(Clone, Debug)]
 pub struct Claims;

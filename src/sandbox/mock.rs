@@ -24,6 +24,7 @@ use super::backend::{
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
+use crate::types::ExecutionId;
 
 #[derive(Debug)]
 pub struct MockSnapshot;
@@ -244,23 +245,45 @@ impl MockBehavior {
 pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
+    /// 🔴 Recorded, not ignored.
+    ///
+    /// Every incarnation assertion worth making — a resume runs under a new
+    /// one, a snapshot does not change it, each fork child gets its own — is
+    /// only meaningful against what the backend actually received. Reading it
+    /// back off the metadata store instead would assert that the value written
+    /// there is the value written there. Keeping it here is what lets all of it
+    /// run under `cargo test --lib`, without root and without `/dev/kvm`.
+    execution_id: ExecutionId,
 }
 
 impl MockSandboxBackend {
-    pub fn new(behavior: Arc<MockBehavior>) -> Self {
-        Self::new_with_host_ip(behavior, Some(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+    pub fn new(behavior: Arc<MockBehavior>, execution_id: ExecutionId) -> Self {
+        Self::new_with_host_ip(
+            behavior,
+            Some(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            execution_id,
+        )
     }
 
     pub fn new_with_host_ip(
         behavior: Arc<MockBehavior>,
         host_ip: Option<std::net::Ipv4Addr>,
+        execution_id: ExecutionId,
     ) -> Self {
-        Self { behavior, host_ip }
+        Self {
+            behavior,
+            host_ip,
+            execution_id,
+        }
     }
 }
 
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
+    fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
     async fn start(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Start).await
     }
@@ -320,13 +343,16 @@ impl SandboxBackend for MockSandboxBackend {
             .await?;
         Ok(spec
             .iter()
-            .map(|_| {
+            .map(|child| {
                 self.behavior
                     .apply_sync(MockOperation::ForkChild)
                     .map(|()| {
+                        // Each child runs under the incarnation its spec named,
+                        // never the parent's.
                         Box::new(Self::new_with_host_ip(
                             Arc::clone(&self.behavior),
                             self.host_ip,
+                            child.execution_id,
                         )) as Box<dyn SandboxBackend>
                     })
             })
@@ -400,11 +426,13 @@ impl SandboxBackendFactory for MockBackendFactory {
         &self,
         _build_spec: FreshSandboxBuildSpec,
         _launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::Build)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
             Arc::clone(&self.behavior),
             self.host_ip,
+            execution_id,
         )))
     }
 
@@ -412,17 +440,20 @@ impl SandboxBackendFactory for MockBackendFactory {
         &self,
         _snapshot: &RunnableSnapshot,
         _launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::Build)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
             Arc::clone(&self.behavior),
             self.host_ip,
+            execution_id,
         )))
     }
 
     fn build_from_paused_state(
         &self,
         _sandbox_id: crate::types::SandboxId,
+        execution_id: ExecutionId,
         _state: &dyn PausedSandboxState,
         _envd_access_token: Option<super::EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
@@ -430,6 +461,7 @@ impl SandboxBackendFactory for MockBackendFactory {
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
             Arc::clone(&self.behavior),
             self.host_ip,
+            execution_id,
         )))
     }
 

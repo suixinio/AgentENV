@@ -138,6 +138,21 @@ peer_discovery_refresh_interval_secs = 5
 # Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
 
+[api]
+# Credentials that prove a control-plane call arrived through the gateway.
+# Empty (together with control_plane_token_file) leaves the node's user-facing
+# REST open to anything that can reach it, which is the behaviour that predates
+# this setting.
+#
+# 🔴 This one is read once at startup. The file below is re-read while the
+# process runs, and is the only way to turn the gate on or off without
+# restarting the node — a restart pauses every sandbox on the machine.
+control_plane_tokens = []
+# Path to a file holding the same credentials, one per line. Point it at a
+# mounted Secret; a secretKeyRef environment variable is not refreshed by
+# kubelet, and a mounted volume is.
+control_plane_token_file = ""
+
 [sandbox_proxy]
 # DNS suffixes accepted for host-based routes such as
 # {port}-{sandboxID}.{domain}. The first entry is advertised to clients.

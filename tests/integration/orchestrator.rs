@@ -2,8 +2,9 @@ use crate::common;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::orchestrator::{
-    CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore, NewTimeout,
-    Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
+    ClaimedExecution, CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore,
+    NewTimeout, Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState,
+    SandboxTimeoutAction,
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
@@ -178,7 +179,11 @@ async fn orchestrator_lifecycle() -> Result<()> {
         );
 
         let resumed = restarted
-            .resume_sandbox(sandbox_id, NewTimeout::Set(Duration::from_secs(120)))
+            .resume_sandbox(
+                sandbox_id,
+                NewTimeout::Set(Duration::from_secs(120)),
+                ClaimedExecution::minted_for_test(),
+            )
             .await?;
         assert_eq!(resumed.state, SandboxState::Running);
         assert_eq!(resumed.timeout, Some(Duration::from_secs(120)));

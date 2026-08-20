@@ -127,6 +127,11 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             metadata: m.user_metadata,
             state: m.state.into(),
             envd_version: m.runtime_versions.envd_version.clone(),
+            // 🔴 Easiest of the three to leave out, and the one whose absence is
+            // hardest to see: the gateway's cluster listing is decoded from
+            // this shape, so a missing value there is an empty field and no
+            // error anywhere.
+            execution_id: Some(m.execution_id.to_string()),
         }
     }
 }
@@ -142,6 +147,7 @@ impl From<SandboxMetadata> for models::Sandbox {
             envd_access_token: None,
             traffic_access_token: None,
             domain: None,
+            execution_id: Some(m.execution_id.to_string()),
         }
     }
 }
@@ -213,6 +219,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 auto_resume: m.auto_resume,
                 on_timeout: m.timeout_action.into(),
             }),
+            execution_id: Some(m.execution_id.to_string()),
         }
     }
 }
@@ -737,26 +744,84 @@ impl Sandboxes<()> for ApiImpl {
             SandboxState::Pausing | SandboxState::Paused => {}
         }
 
+        // Ask the cluster who may resume this sandbox before resuming it. This
+        // route used to go straight to the orchestrator, which made it a second
+        // way to bring a sandbox up beside one that is already live elsewhere;
+        // there is now one decision point and every resume path goes through
+        // it.
+        let (claimed, connect_held) = match self.arbitrate_resume(sandbox_id).await {
+            ResumeArbitration::Proceed(claimed) => (claimed, None),
+            ResumeArbitration::Held(entry, claimed) => (claimed, Some(entry.generation)),
+            ResumeArbitration::Blocked { origin_node_id } => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                    Self::error(400, format!("sandbox is held by node '{origin_node_id}'")),
+                ));
+            }
+            ResumeArbitration::NotReady { origin_node_id } => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                    Self::error(
+                        400,
+                        format!(
+                            "sandbox snapshot is still being published by node '{origin_node_id}'"
+                        ),
+                    ),
+                ));
+            }
+            // 🔴 Not a 404, for the reason spelled out on the resume route: a
+            // 404 here reads downstream as "the sandbox is gone, rebuild it".
+            ResumeArbitration::Unavailable { reason } => {
+                return Ok(
+                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("cannot determine whether the sandbox is live elsewhere: {reason}"),
+                    )),
+                );
+            }
+        };
+
         // try to resume the sandbox
         match self
             .orchestrator
             .resume_sandbox(
                 sandbox_id,
                 NewTimeout::Set(Duration::from_secs(body.timeout as u64)),
+                claimed,
             )
             .await
         {
-            Ok(resumed_metadata) => return Ok(
+            Ok(resumed_metadata) => {
+                // Same as the resume route: the orchestrator repoints the row
+                // for a resume it performed, but not for one that found the
+                // sandbox already running, and a claim nobody confirms sits in
+                // `resuming` until its lease lapses.
+                if connect_held.is_some() {
+                    self.paused
+                        .mark_sandbox_running(
+                            sandbox_id,
+                            resumed_metadata.execution_id,
+                            resumed_metadata.expires_at,
+                        )
+                        .await;
+                }
+
+                return Ok(
                 SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully(
                     self.sandbox_model(resumed_metadata),
                 ),
-            ),
+            );
+            }
             Err(OrchestratorError::SandboxNotFound(id)) => {
+                if let Some(generation) = connect_held {
+                    self.abandon_claim(sandbox_id, generation).await;
+                }
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
                     sandbox_not_found(id),
                 ));
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                if let Some(generation) = connect_held {
+                    self.abandon_claim(sandbox_id, generation).await;
+                }
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
                     Self::error(
                         400,
@@ -765,6 +830,9 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
+                if let Some(generation) = connect_held {
+                    self.abandon_claim(sandbox_id, generation).await;
+                }
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
                 );
@@ -1299,8 +1367,19 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
-            ResumeArbitration::Held(entry) => Some(entry.generation),
-            ResumeArbitration::Proceed => None,
+            ResumeArbitration::Held(entry, _) => Some(entry.generation),
+            ResumeArbitration::Proceed(_) => None,
+        };
+
+        // Split the granting answers into the row (which the rebuild below
+        // still needs) and the claim token (which the resume consumes). The
+        // rebuild path does not need a token: it is a create, and a create mints
+        // its own incarnation.
+        let (entry, claimed) = match arbitration {
+            ResumeArbitration::Held(entry, claimed) => (Some(entry), claimed),
+            ResumeArbitration::Proceed(claimed) => (None, claimed),
+            // Every refusing variant returned above.
+            _ => unreachable!("refusals return before this point"),
         };
 
         let timer = SandboxStageTimer::new("resume");
@@ -1308,7 +1387,7 @@ impl Sandboxes<()> for ApiImpl {
             .time(
                 "resume",
                 self.orchestrator
-                    .resume_sandbox(sandbox_id, NewTimeout::Set(timeout)),
+                    .resume_sandbox(sandbox_id, NewTimeout::Set(timeout), claimed),
             )
             .await
         {
@@ -1321,7 +1400,11 @@ impl Sandboxes<()> for ApiImpl {
                 // `resuming` until its lease lapses.
                 if held.is_some() {
                     self.paused
-                        .mark_sandbox_running(sandbox_id, metadata.expires_at)
+                        .mark_sandbox_running(
+                            sandbox_id,
+                            metadata.execution_id,
+                            metadata.expires_at,
+                        )
                         .await;
                 }
 
@@ -1335,7 +1418,7 @@ impl Sandboxes<()> for ApiImpl {
                 // Nothing local to resume. If the claim above came with a row,
                 // the cluster still has a snapshot to rebuild it from — under
                 // the same ID, on this node.
-                let ResumeArbitration::Held(entry) = arbitration else {
+                let Some(entry) = entry else {
                     // 既没有本地副本、也没拿到认领权。单发请求下这确实是"沙箱没了"，
                     // 但并发下不是 —— 输家会走到这里，而赢家正把同一台拉起来。
                     // 🔴 回 404 之前必须先问清集群：404 的下游契约是"可以重建"，
@@ -1658,5 +1741,77 @@ mod tests {
             .expect("empty update should be valid");
 
         assert_eq!(policy, SandboxNetworkPolicy::default());
+    }
+}
+
+#[cfg(test)]
+mod execution_exposure_tests {
+    use super::*;
+
+    /// T-A6-1. Every shape that names a sandbox names the run it is on.
+    ///
+    /// 🔴 All three, from one record, compared against each other. `ListedSandbox`
+    /// is the one that gets forgotten, and the symptom of forgetting it is not an
+    /// error: the gateway decodes the cluster listing into its own struct, an
+    /// absent field decodes as empty, and the field is simply blank forever.
+    #[test]
+    fn every_sandbox_response_names_its_execution() {
+        let metadata = SandboxMetadata::default();
+        let expected = metadata.execution_id.to_string();
+
+        let listed = models::ListedSandbox::from(metadata.clone());
+        let sandbox = models::Sandbox::from(metadata.clone());
+        let detail = models::SandboxDetail::from(metadata);
+
+        for (name, value) in [
+            ("ListedSandbox", listed.execution_id),
+            ("Sandbox", sandbox.execution_id),
+            ("SandboxDetail", detail.execution_id),
+        ] {
+            assert_eq!(
+                value.as_deref(),
+                Some(expected.as_str()),
+                "{name} must name the run it describes"
+            );
+        }
+    }
+
+    /// T-A6-2. 🔴 Read-only, and that is a line in the contract rather than an
+    /// oversight.
+    ///
+    /// A client that could name the incarnation it wants could name one that has
+    /// already been replaced, and every fencing rule downstream is built on the
+    /// assumption that the value came from the control plane. Pinned against the
+    /// spec, so it holds for shapes nobody has written a handler for yet.
+    #[test]
+    fn the_execution_is_never_an_input() {
+        let spec = include_str!("../openapi.yml");
+        let mut schema = None;
+        let mut offenders = Vec::new();
+
+        for line in spec.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_end();
+            // Schema names sit at six spaces of indent under `schemas:`.
+            if indent == 4 && trimmed.ends_with(':') && !trimmed.trim_start().starts_with('-') {
+                schema = Some(trimmed.trim().trim_end_matches(':').to_string());
+            }
+            if trimmed.trim_start().starts_with("executionID:") {
+                if let Some(schema) = schema.as_deref() {
+                    let is_request_shape = schema.starts_with("New")
+                        || schema.starts_with("Resumed")
+                        || schema.ends_with("Request");
+                    if is_request_shape {
+                        offenders.push(schema.to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "the incarnation must never be accepted as input, but these request shapes take it: \
+             {offenders:?}"
+        );
     }
 }

@@ -1863,6 +1863,12 @@ pub struct ListedSandbox {
     #[serde(rename = "envdVersion")]
     #[validate(custom(function = "check_xss_string"))]
     pub envd_version: String,
+
+    /// Identifier of the current run of this sandbox. A sandbox keeps its sandboxID for its whole life; this changes every time it is started, including every resume, so two answers naming the same sandbox but different executionIDs describe two different runs of it. Read-only: it is never accepted as input.
+    #[serde(rename = "executionID")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 impl ListedSandbox {
@@ -1892,6 +1898,7 @@ impl ListedSandbox {
             metadata: None,
             state,
             envd_version,
+            execution_id: None,
         }
     }
 }
@@ -1925,6 +1932,9 @@ impl std::fmt::Display for ListedSandbox {
             // Skipping state in query parameter serialization
             Some("envdVersion".to_string()),
             Some(self.envd_version.to_string()),
+            self.execution_id.as_ref().map(|execution_id| {
+                ["executionID".to_string(), execution_id.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -1958,6 +1968,7 @@ impl std::str::FromStr for ListedSandbox {
             pub metadata: Vec<std::collections::HashMap<String, String>>,
             pub state: Vec<models::SandboxState>,
             pub envd_version: Vec<String>,
+            pub execution_id: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2032,6 +2043,10 @@ impl std::str::FromStr for ListedSandbox {
                     "envdVersion" => intermediate_rep.envd_version.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "executionID" => intermediate_rep.execution_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing ListedSandbox".to_string(),
@@ -2098,6 +2113,7 @@ impl std::str::FromStr for ListedSandbox {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "envdVersion missing in ListedSandbox".to_string())?,
+            execution_id: intermediate_rep.execution_id.into_iter().next(),
         })
     }
 }
@@ -4583,6 +4599,12 @@ pub struct Sandbox {
     #[serde(default = "default_optional_nullable")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<Nullable<String>>,
+
+    /// Identifier of the current run of this sandbox. A sandbox keeps its sandboxID for its whole life; this changes every time it is started, including every resume, so two answers naming the same sandbox but different executionIDs describe two different runs of it. Read-only: it is never accepted as input.
+    #[serde(rename = "executionID")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 impl Sandbox {
@@ -4602,6 +4624,7 @@ impl Sandbox {
             envd_access_token: None,
             traffic_access_token: None,
             domain: None,
+            execution_id: None,
         }
     }
 }
@@ -4646,6 +4669,9 @@ impl std::fmt::Display for Sandbox {
                 ]
                 .join(",")
             }),
+            self.execution_id.as_ref().map(|execution_id| {
+                ["executionID".to_string(), execution_id.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -4675,6 +4701,7 @@ impl std::str::FromStr for Sandbox {
             pub envd_access_token: Vec<String>,
             pub traffic_access_token: Vec<String>,
             pub domain: Vec<String>,
+            pub execution_id: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4732,6 +4759,10 @@ impl std::str::FromStr for Sandbox {
                                 .to_string(),
                         );
                     }
+                    #[allow(clippy::redundant_clone)]
+                    "executionID" => intermediate_rep.execution_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing Sandbox".to_string(),
@@ -4774,6 +4805,7 @@ impl std::str::FromStr for Sandbox {
             domain: std::result::Result::Err(
                 "Nullable types not supported in Sandbox".to_string(),
             )?,
+            execution_id: intermediate_rep.execution_id.into_iter().next(),
         })
     }
 }
@@ -5080,6 +5112,12 @@ pub struct SandboxDetail {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<models::SandboxLifecycle>,
+
+    /// Identifier of the current run of this sandbox. A sandbox keeps its sandboxID for its whole life; this changes every time it is started, including every resume, so two answers naming the same sandbox but different executionIDs describe two different runs of it. Read-only: it is never accepted as input.
+    #[serde(rename = "executionID")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 impl SandboxDetail {
@@ -5114,6 +5152,7 @@ impl SandboxDetail {
             state,
             network: None,
             lifecycle: None,
+            execution_id: None,
         }
     }
 }
@@ -5174,6 +5213,9 @@ impl std::fmt::Display for SandboxDetail {
             // Skipping network in query parameter serialization
 
             // Skipping lifecycle in query parameter serialization
+            self.execution_id.as_ref().map(|execution_id| {
+                ["executionID".to_string(), execution_id.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -5212,6 +5254,7 @@ impl std::str::FromStr for SandboxDetail {
             pub state: Vec<models::SandboxState>,
             pub network: Vec<models::SandboxNetworkConfig>,
             pub lifecycle: Vec<models::SandboxLifecycle>,
+            pub execution_id: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -5308,6 +5351,10 @@ impl std::str::FromStr for SandboxDetail {
                         <models::SandboxLifecycle as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "executionID" => intermediate_rep.execution_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxDetail".to_string(),
@@ -5383,6 +5430,7 @@ impl std::str::FromStr for SandboxDetail {
                 .ok_or_else(|| "state missing in SandboxDetail".to_string())?,
             network: intermediate_rep.network.into_iter().next(),
             lifecycle: intermediate_rep.lifecycle.into_iter().next(),
+            execution_id: intermediate_rep.execution_id.into_iter().next(),
         })
     }
 }

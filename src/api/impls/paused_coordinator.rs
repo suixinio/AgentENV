@@ -26,7 +26,7 @@ use crate::orchestrator::{
 use crate::snapshot::{
     SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
 };
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// Which sandboxes running on this node the registry has confirmed this node as
 /// the holder of, and the identity it confirmed each of them under.
@@ -277,6 +277,10 @@ impl PausedSandboxCoordinator {
             claimed_by_node_id: None,
             snapshot_id: None,
             metadata: Some(outcome.metadata.clone()),
+            // The run that produced this pause. `begin_pause` quotes it, and the
+            // registry refuses the write if the row is fenced against a newer
+            // one.
+            execution_id: Some(outcome.metadata.execution_id),
             paused_at: DateTime::<Utc>::from(outcome.metadata.created_at),
             updated_at: Utc::now(),
         };
@@ -429,6 +433,7 @@ impl PausedSandboxCoordinator {
     pub async fn mark_sandbox_running(
         &self,
         sandbox_id: SandboxId,
+        execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
     ) {
         // Before the write: see `note_taking_sandbox_live`.
@@ -436,7 +441,7 @@ impl PausedSandboxCoordinator {
 
         let confirmed = match self
             .registry
-            .mark_running(&sandbox_id, &self.node_id, expires_at)
+            .mark_running(&sandbox_id, &self.node_id, execution_id, expires_at)
             .await
         {
             Ok(MarkRunningOutcome::HeldElsewhere) => {
@@ -622,8 +627,14 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
         self.publish(outcome).await
     }
 
-    async fn mark_running(&self, sandbox_id: SandboxId, expires_at: Option<SystemTime>) {
-        self.mark_sandbox_running(sandbox_id, expires_at).await;
+    async fn mark_running(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
+    ) {
+        self.mark_sandbox_running(sandbox_id, execution_id, expires_at)
+            .await;
     }
 
     async fn forget(&self, sandbox_id: SandboxId) {
@@ -705,6 +716,32 @@ fn publish_metadata(metadata: &SandboxMetadata) -> SnapshotPublishMetadata {
 mod tests {
     use super::test_support::{CountingRegistry, GetAnswer};
     use super::*;
+
+    /// T-A1-9. 🔴 A committed snapshot must not carry the incarnation that
+    /// produced it.
+    ///
+    /// A snapshot is a template: any node may launch it, any number of times,
+    /// at any later moment. An incarnation baked into it would hand every
+    /// sandbox ever created from it the same identity, and fencing would then
+    /// be unable to tell any of them apart.
+    ///
+    /// Asserted through `Debug` because `SnapshotPublishMetadata` is built
+    /// field by field and derives it: a field added to the struct shows up here
+    /// whether or not anyone remembers to update this test.
+    #[test]
+    fn the_snapshot_a_sandbox_publishes_carries_no_execution() {
+        let metadata = SandboxMetadata::default();
+        let rendered = format!("{:?}", publish_metadata(&metadata));
+
+        assert!(
+            !rendered.contains(&metadata.execution_id.to_string()),
+            "the published snapshot names the run that produced it: {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("execution"),
+            "the published snapshot has an incarnation-shaped field: {rendered}"
+        );
+    }
 
     /// The failure that motivated all this: `complete_pause` fails, nothing
     /// ever points at the snapshot, and it sits in the repository forever.
@@ -797,6 +834,7 @@ mod tests {
             claimed_by_node_id: claimed_by.map(str::to_string),
             snapshot_id: Some(SnapshotId::generate()),
             metadata: Some(SandboxMetadata::default()),
+            execution_id: Some(ExecutionId::new()),
             paused_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -995,7 +1033,7 @@ mod tests {
         let coordinator = coordinator(Arc::clone(&registry));
 
         coordinator
-            .mark_sandbox_running(SandboxId::new(), None)
+            .mark_sandbox_running(SandboxId::new(), ExecutionId::new(), None)
             .await;
 
         assert_eq!(
@@ -1019,7 +1057,7 @@ mod tests {
         let coordinator = coordinator(Arc::clone(&registry));
 
         coordinator
-            .mark_sandbox_running(SandboxId::new(), None)
+            .mark_sandbox_running(SandboxId::new(), ExecutionId::new(), None)
             .await;
         coordinator.retain_running_registrations(&HashSet::new());
 
@@ -1043,7 +1081,7 @@ pub(super) mod test_support {
         PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::snapshot::SnapshotId;
-    use crate::types::SandboxId;
+    use crate::types::{ExecutionId, SandboxId};
 
     /// A cluster-backed registry that counts what it is asked to do and can be
     /// told to fail a fixed number of times first.
@@ -1169,6 +1207,7 @@ pub(super) mod test_support {
                     claimed_by_node_id: None,
                     snapshot_id: Some(snapshot_id.clone()),
                     metadata: Some(crate::orchestrator::SandboxMetadata::default()),
+                    execution_id: Some(ExecutionId::new()),
                     paused_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 })),
@@ -1186,6 +1225,7 @@ pub(super) mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _node_id: &str,
+            _execution_id: ExecutionId,
         ) -> RegistryResult<ResumeClaim> {
             if self.claim_fails {
                 return Err(unreachable_backend("claim_for_resume"));
@@ -1219,6 +1259,7 @@ pub(super) mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _node_id: &str,
+            _execution_id: ExecutionId,
             _expires_at: Option<std::time::SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {
             if self.mark_running_fails {

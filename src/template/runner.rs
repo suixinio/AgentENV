@@ -20,7 +20,7 @@ use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
     StartupCommand,
 };
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
 /// Default command to use for ready check when start command is provided but ready command is not.
@@ -149,6 +149,9 @@ impl TemplateBuildRunner {
         config.common.default_user = context.initial_context.user.clone();
         config.common.default_workdir = Some(context.initial_context.workdir.clone());
         let sandbox_id = SandboxId::new();
+        // A template build VM is a throwaway that never enters the registry, so
+        // its incarnation is minted next to its id and goes no further.
+        let execution_id = ExecutionId::new();
         let image_configs = image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())
@@ -160,7 +163,7 @@ impl TemplateBuildRunner {
             sandbox_id,
             context.resources,
             image_configs,
-            move || FirecrackerSandbox::new_with_id(config, sandbox_id),
+            move || FirecrackerSandbox::new_with_id(config, sandbox_id, execution_id),
         )
     }
 
@@ -175,6 +178,7 @@ impl TemplateBuildRunner {
     ) -> Result<TemplateBuildExecution> {
         let base_snapshot = base_snapshot.clone();
         let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
         let image_configs = base_snapshot.committed().image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())
@@ -182,7 +186,7 @@ impl TemplateBuildRunner {
         let resources = *base_snapshot.resources();
 
         self.run_template_build(context, sandbox_id, resources, image_configs, move || {
-            FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config)
+            FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config, execution_id)
         })
     }
 

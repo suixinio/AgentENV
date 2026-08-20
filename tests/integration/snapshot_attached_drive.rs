@@ -14,7 +14,7 @@ use agentenv::snapshot::{
     SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
 };
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
-use agentenv::types::SandboxResources;
+use agentenv::types::{ExecutionId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;
 
@@ -229,8 +229,11 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
     let runnable = snapshot_manager
         .resolve_runnable(loaded_snapshot.clone())
         .await?;
-    let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+    let mut sandbox = FirecrackerSandbox::from_snapshot(
+        &runnable,
+        &SandboxLaunchConfig::default(),
+        ExecutionId::new(),
+    )?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", true).await?;
     sandbox.stop().await?;
@@ -267,8 +270,11 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
     );
 
     let runnable = snapshot_manager.resolve_runnable(derived).await?;
-    let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+    let mut sandbox = FirecrackerSandbox::from_snapshot(
+        &runnable,
+        &SandboxLaunchConfig::default(),
+        ExecutionId::new(),
+    )?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", true).await?;
 
@@ -319,8 +325,11 @@ async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -
     );
 
     let runnable = snapshot_manager.resolve_runnable(committed).await?;
-    let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+    let mut sandbox = FirecrackerSandbox::from_snapshot(
+        &runnable,
+        &SandboxLaunchConfig::default(),
+        ExecutionId::new(),
+    )?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", false).await?;
     sandbox.stop().await?;

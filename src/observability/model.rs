@@ -1,5 +1,5 @@
 use super::DiskMetric;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 /// Static machine descriptors reported as part of node observability.
 #[derive(Clone, Debug)]
@@ -42,6 +42,15 @@ pub struct NodeSnapshot {
     pub machine_info: MachineInfo,
     pub sandbox_count: u32,
     pub sandbox_ids: Vec<SandboxId>,
+    /// The same sandboxes as `sandbox_ids`, each with the incarnation it is
+    /// running under.
+    ///
+    /// 🔴 Sent alongside the older field rather than instead of it. The
+    /// controller deletes every binding a node owns when it receives an empty
+    /// roster, so dropping `sandbox_ids` before the whole fleet reads this one
+    /// would make every sandbox that has never been paused answer 404 on the
+    /// data plane for the length of the rolling window.
+    pub sandbox_roster: Vec<(SandboxId, ExecutionId)>,
     pub metrics: NodeMetricsSnapshot,
     /// Whether this node is isolated: still serving what it holds, refusing new
     /// sandboxes. Reported so the scheduler stops picking it without having to

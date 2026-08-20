@@ -1,4 +1,5 @@
 mod launch_plan;
+
 mod metrics;
 mod paused_registry;
 mod persistence;
@@ -10,6 +11,7 @@ mod types;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
+pub use launch_plan::ClaimedExecution;
 pub use metrics::OrchestratorMetrics;
 pub use paused_registry::{
     build_paused_registry, BeganPause, ConflictReason, DisabledPausedSandboxRegistry, HeldSandbox,

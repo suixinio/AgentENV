@@ -236,6 +236,21 @@ func (s *PostgresStore) BeginSnapshot(ctx context.Context, in BeginInput) (Begin
 		if strings.TrimSpace(in.NodeID) == "" {
 			return BeginOutcome{}, fmt.Errorf("%w: a pause names the node its bytes are going to", ErrInvalidArgument)
 		}
+		// 🔴 A pause opens its row unpublished, always (§5.2①). The bytes have
+		// not been written yet — that is step ②, and this is step ① — so
+		// `published=true` here says any node may start a snapshot that does
+		// not exist. The paused row created in the same transaction goes to
+		// `publishing` on this node, so the two halves would disagree from the
+		// instant they were written, which is the disagreement CommitSnapshot
+		// refuses on the way out (see the transition/published XOR in
+		// catalog_service.go). Refused rather than corrected: a caller that
+		// sent true believes something about where these bytes are going, and
+		// it is wrong.
+		if in.Published {
+			return BeginOutcome{}, fmt.Errorf(
+				"%w: a pause opens its row unpublished — the bytes are still going to %s and nowhere else, and published=true says any node can start it",
+				ErrInvalidArgument, strings.TrimSpace(in.NodeID))
+		}
 		// Scoped from the catalog write rather than from the caller: the two
 		// rows this transaction touches belong to one cluster and one node by
 		// construction, and there is no way to state otherwise.

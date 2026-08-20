@@ -2077,6 +2077,79 @@ func TestBeginSnapshotAndBeginPauseCommitTogether(t *testing.T) {
 	}
 }
 
+// TestBeginSnapshotRefusesAPublishedPause pins §5.2①: a pause opens its row
+// unpublished.
+//
+// 🔴 The two halves cannot be allowed to disagree at birth. This one statement
+// writes both — the catalog row and `paused_sandboxes` going to `publishing` on
+// this node — and step ② has not happened yet, so there are no bytes anywhere
+// but here. `published=true` says any node can start it. CommitSnapshot already
+// refuses the same disagreement on the way out (the transition/published XOR in
+// catalog_service.go); this is the entry that could otherwise create it, and
+// nothing between the two would have noticed: the row reads as a perfectly
+// ordinary published snapshot, and a resume scheduled anywhere finds nothing.
+func TestBeginSnapshotRefusesAPublishedPause(t *testing.T) {
+	f := newFixture(t)
+
+	sandbox := newUUID(t)
+	published := func() BeginInput {
+		return BeginInput{
+			SnapshotID:      newUUID(t),
+			NodeID:          "node-a",
+			SourceKind:      SourceKindSandbox,
+			SourceSandboxID: sandbox,
+			Status:          StatusBuilding,
+			Published:       true,
+			OriginNodeID:    "node-a",
+			Paused: &PausedBegin{
+				SandboxID:   sandbox,
+				Metadata:    mustJSON(t, map[string]string{"kind": "sandbox"}),
+				ExecutionID: newUUID(t),
+			},
+		}
+	}
+
+	_, err := f.beginRaw(published())
+	if err == nil {
+		t.Fatal("a pause was allowed to open its row published")
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("error is not ErrInvalidArgument: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unpublished") {
+		t.Fatalf("the refusal does not say what is wrong with the row: %v", err)
+	}
+
+	// Neither half moved. A refusal that had already written one of them is the
+	// state this whole transaction exists to make impossible.
+	var rows int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM snapshots`).Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("snapshots = %d, want 0: the refused begin left a row behind", rows)
+	}
+	if state, ok := f.pausedState(sandbox); ok {
+		t.Fatalf("the paused half moved to %q on a begin that was refused", state)
+	}
+
+	// 🔴 The control. Everything else about this input is valid, so the refusal
+	// above is about `published` and not about some other field the builder got
+	// wrong — and the same call with published=false goes through.
+	in := published()
+	in.Published = false
+	out, err := f.beginRaw(in)
+	if err != nil {
+		t.Fatalf("the same pause, unpublished, was refused too: %v", err)
+	}
+	if out.Rejected != nil {
+		t.Fatalf("refused: %+v", out.Rejected)
+	}
+	if state, ok := f.pausedState(sandbox); !ok || state != "publishing" {
+		t.Fatalf("paused state = %q (%v), want publishing", state, ok)
+	}
+}
+
 // TestARefusedCatalogWriteLeavesTheRegistryUntouched is the direction the
 // object-store design could not have: the catalog half refuses, and the
 // sandbox's own row does not move.

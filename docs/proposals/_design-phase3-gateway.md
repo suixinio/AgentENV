@@ -913,6 +913,26 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T)
 **健康集群上 `refused_*` 与 `duplicate_total` 都应恒为 0** ⇒ 它们直接可做告警，
 且 `unfenced_*` 的绝对值就是**覆盖缺口的大小**（方法论 §8.4：无声收窄必须可见）。
 
+> ⚠️ **2026-08-20 · dev 集群验证补两条实测订正**（详见任务书 [§6.8](_impl-plan-control-plane-phase3.md#68-dev-集群验证结果2026-08-20)）：
+>
+> 1. 🔴 **本表缺一条「当前 fencing 模式」的 gauge，而三个开关里只有 gateway 这个读不出来。**
+>    scheduler 那两个各有 gauge（`agentenv_scheduler_registry_write_fencing_enabled` /
+>    `agentenv_scheduler_routing_execution_arbitration_enabled`），gateway 侧**没有任何 gauge**
+>    ⇒ 只能读**启动日志**的 `execution_fencing` 字段（`services/gateway/cmd/main.go:85`）
+>    或从 `execution_fencing_total{decision="off"}` **反推**。
+>    后果：任务书 §6.5 的 **R1 演练**要求"每次只翻一个开关，翻完确认另外两个的指标没变" ——
+>    **对 gateway 这半做不到**，只能靠日志核对。**已登记为待补的可观测缺口**
+>    （任务书 [§12.6](_impl-plan-control-plane-phase3.md#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修) 一并收）。
+>
+> 2. ⚠️ **"`unfenced_*` 的绝对值就是覆盖缺口的大小"这句要打折**：`unfenced_node_silent`
+>    **不只**来自"node 没装 A5 接收端"。**paused 且未配 autoResume** 的沙箱被打数据面时，
+>    node 回 **410 且不带回声头**（`src/api/proxy.rs` 的 `echo_execution(..., live_execution=None)`
+>    在 `None` 时什么也不盖），gateway 记的也是这一档。
+>    ⇒ **有 paused 沙箱被数据面访问的集群上，这个序列会把"覆盖缺口"报大**。
+>    正确读法：先按响应码排除 410 那一支，剩下的才指向真的覆盖缺口。
+>    🟢 dev 上已做过分辨力自证：**刻意 pause 一台再打数据面 ⇒ 该序列长出 3**，
+>    所以前面读到的 0 是事实、不是探针瞎了。
+
 ---
 
 ## 12. 风险与未决缺口（不掩盖）

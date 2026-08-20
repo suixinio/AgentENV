@@ -48,6 +48,20 @@
 >   `items: [{key: node-gate-token, path: token}]`（gateway 仍读 `token`），
 >   新增测试 `the_gateway_and_the_node_read_different_keys_of_the_credential_secret` 钉住该不变式。
 >
+> 🔧 **2026-08-20 七次修订（dev 集群验证完成 · 结果回写）**：
+> - **[§6.8](#68-dev-集群验证结果2026-08-20)（新）**：`pve-sg dev`（VM 203/204）**13 步全跑完，闸门 7 与闸门 13 均 PASS**。
+>   三服务同跑 `cp3-bff4993`（commit `bff4993`），全程 `RESTARTS=0`；终态三开关 =
+>   `SCHEDULER_REGISTRY_WRITE_FENCING=true` / `SCHEDULER_ROUTING_EXECUTION_ARBITRATION=enforce` /
+>   `GATEWAY_ROUTING_EXECUTION_FENCING=enforce`。逐发实测（**每发的对照面**）与**射程边界**都写在该节。
+> - **runbook 被实测推翻的 7 处已就地订正**（原表述一律保留为问题陈述）：步骤 10 判据①因果不完整、
+>   翻 scheduler 开关要付一个数据面 **503 窗口**、kubelet Secret 刷新**跨节点不同步**、
+>   R5「旧 build 能跑」只对**读侧**成立、步骤 8 验证②在这套集群不可照抄（并新增 **[§6.5.1](#651--抓包自证之后必须轮换凭据零停机轮换法)**
+>   「抓包自证之后必须轮换凭据」）、gateway **没有** fencing 模式 gauge、node `/metrics` 在 gate 覆盖面之外（🟢 对新版有利）。
+> - **[§12.6](#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修)（新）**：四条只登记不修的待办 ——
+>   scheduler 侧被 fence 的 `begin_pause` **零日志**、那条 fencing 日志缺 `refusal_code` + 冒出第 4 个 `fencing_stage` 取值、
+>   `reclaimable_now` 恒 0 不能当预警、`local_only` 不在 reclaim 索引覆盖面内（P7）。
+> - **状态**：步骤 13「解锁 B 批次」✅ **可解锁**（dev 一套）。🟡 **test（VM 201/202）那一遍尚未跑。**
+>
 > **🔴 三个实现 agent 只需读：§0 P1 边界 → §3 自己那行 → §6 → §10.2/§10.3 → §11 自己那块 → 自己那份设计文档。**
 > **🔴 上集群执行的人另加一份必读：§6.0（部署方式与漂移）。**
 > 权威方案：[`2026-08-19-agentenv-control-plane-refactor.md`](2026-08-19-agentenv-control-plane-refactor.md)（§4 阶段 3 / §8 清单）
@@ -99,6 +113,11 @@
 
 **🔴 闸门放行的是"开工"，不是"提前放宽不变式"**：在 A3 落地并通过集群验证之前，
 `running` / `resuming` 永不可抢这条**不许放宽**。
+
+> ✅ **2026-08-20 更新（本条前置已满足）**：A3 已落地并在 `pve-sg dev` 通过集群验证
+> （**闸门 7 PASS**，三发探针 P-A3-1/2/3 全过且各带对照面，见 [§6.8](#68-dev-集群验证结果2026-08-20)）。
+> ⇒ "放宽永不可抢"这件事从此**交由 B 批次自己的设计裁决**，不再被本条挡住。
+> 🟡 **但只过了 dev 一套**：test（VM 201/202）尚未跑，别把 dev 的结论当成两套都过了。
 
 ---
 
@@ -367,7 +386,7 @@ OSS `artifacts/{uuid}/` 天然不相交、层内容寻址 ⇒ **旧化身写 OSS
 | **A2** | 登记表 schema：**加** `execution_id UUID`（**nullable**）+ `execution_started_at TIMESTAMPTZ`。🔴 ✅ **裁决（§10 第 3 / 22 条）：不按本任务书原先的字面 `NOT NULL` 写** —— 一刀切 NOT NULL 会逼出哨兵 UUID，而哨兵迟早被人拿去比相等、fencing 无声破掉（第二个理由仍是 §9 第 5 条那条：`services/scheduler/internal/registry/migrate.go:28-32` 自认这套 `ADD COLUMN IF NOT EXISTS` bootstrap 对"无默认值 NOT NULL 列"不安全）。改用**按状态的 CHECK**（严格更强，还管住"不该有的时候没有"）：<br>`CHECK ((state IN ('running','publishing','resuming')) = (execution_id IS NOT NULL) AND (execution_id IS NULL) = (execution_started_at IS NULL))`<br>（`resuming` 在集合内，是裁决 §10 第 1 条走 E-A 的直接结果；`execution_started_at` 是 §10 第 22 条 —— `updated_at` 被 `renewLeaseSQL:925` 每心跳刷新，B3 的 grace 不能拿它当起点）。迁移走 **P1 drop 重建**：运维一次 `DROP TABLE`，🔴 **与 node 侧清空本地 paused 记录是同一个 runbook 步骤**（§10 第 4 条），并保留 `Migrate` 的 fail-fast 自检。**身份轴 / 版本轴分开**（generation 保持版本轴，语义不动）。🟢 **只加列、不删列/不改名 ⇒ Console 的 PG 直连不会失明**（表清零只让那一页变空，`source` 仍是 `ok`，与"读不到"是两个显示结果） | CHECK 生效：`running`/`publishing`/`resuming` 行缺 execution 写不进去（`23514`），`paused`/`local_only` 行带 execution 也写不进去；三条读路径（`Get` / `GetMany` / `ListRegistrySandboxes`）都带出 execution；`Migrate` 遇到阶段 3 之前的存量行**报错并指明 `DROP TABLE`**，不是 PostgreSQL 的约束原文 | 去掉 CHECK（或只写单向）⇒ "缺 execution 的 running 行被拒" 与 "parked 行不许带 execution" 两发用例必须 FAIL；去掉自检 ⇒ 错误退化成约束原文，`TestMigrateRefusesAPrePhase3Table` 必须 FAIL |
 | **A3** | **写路径 fencing（主角）**。范围按 R5 扩大为三件事：① **改 proto 契约**让 `begin_pause` / `mark_running` **接受并要求** execution（今天是 `registry_service.go:192`/`:267` 的 `rejectFields` **主动拒收**）；② 改 `beginPauseSQL`（`store_postgres.go:381-409`）与 `markRunningSQL`（`:831-839`）的 **WHERE**；③ **数据面 auto-resume 那条 PG 写也必须校验**（`src/api/proxy.rs:686` → `:800` → `mark_running`）。🔴 校验在 **SQL 事务内**原子完成。<br>✅ **裁决收口三条**：① **化身谓词本轮只加这两条**（`begin_pause` / `mark_running`）——另外四条转换（`complete_pause` / `mark_local_only` / `release_claim` / `remove`）保持 **generation-only**，且契约层**拒收** `execution_id`（§10 第 13 / 19 条）；② 🔴 **三条夺权路径（reclaim / releaseHoldings / releaseClaim）必须清空 `execution_id`**，不清则"reclaim 后老节点 1 秒自动 pause 打回来"那条必然序列**第一步就成立**（§10 第 13 条）；③ 拒绝语义**两分**：`ErrExecutionFenced → codes.PermissionDenied`（**永不重试**）与既有 `GenerationConflict → codes.Aborted`（重读再试）**严格分开**，合并会让节点重读拿新 generation 再发一次而**绕过 fencing**（§10 第 2 条） | 旧 execution 的 pause / publish / remove 全部被拒且**零副作用**（行未变、无文件写出）；**必须守住的两点**：`completePauseSQL` 翻牌 与 `paused_coordinator.rs:313-320` 删 `previous_snapshot_id` | ① 把校验挪到事务外的 handler ⇒ 并发插队用例必须 FAIL；② 去掉校验 ⇒ 拒绝用例必须 FAIL。🔴 **第一发变异指定打 `begin_pause`**（R5 风险 #1 那条必然序列）|
 | **A4** | node API 收窄（原阶段 4）。🔴 **改读法**：node 用户级 REST **只接受来自 gateway / scheduler 的调用**，把 gateway 认定为 controller 的前端（R1：controller 无下行通道，按字面"只接受 controller"等于谁都进不来）。**数据面反代不变**。切点在 node 的 generated 控制面 router（`src/api/server.rs:24-41`），**不碰** `.merge(proxy::router(...))`。**同批收 `POST /nodes/{id}`**（gateway 无条件透传 + node presence-only 鉴权 ⇒ 任何能打到 30800 的人都能把节点置 DRAINING；无代码调用方，收窄零打击面）。<br>🔴 ✅ **裁决（§10 第 9 条）：豁免清单是两条，不是一条** —— 除 `/health` 外，**必须放行 `GET /sandboxes`（含 `GET /v2/sandboxes`）**：gateway 的集群列表是自聚合扇出、不经 `ReverseProxy.Rewrite`（拿不到注入的 token），而该端点 all-or-nothing（`cluster_list.go:84-96`）⇒ 不放行就是集群列表整体 502。🟡 **只豁免只读 GET，`POST /sandboxes` 仍收**。<br>✅ **裁决（§10 第 17 条）：node 同批实现 A5 的接收端** —— 比对 `x-agentenv-expect-execution-id`、不匹配回 **412** + `x-agentenv-refusal`、并**始终回声** `x-agentenv-execution-id`（落点在数据面 `proxy.rs`，且**必须在 auto-resume 之前**）| 直连 node 的破坏性调用被拒；经 gateway 的同一调用成功；**平台 6 个调用一行不改全部仍通**；`POST /nodes/{id}` 直连被拒；🔴 **无 token 的 `GET /sandboxes` 仍通、无 token 的 `POST /sandboxes` 被拒**（后半句是对照面，缺了它"整条路径前缀豁免"的变异会假绿） | 放开鉴权 ⇒ 直连拒绝用例必须 FAIL；把 `/sandboxes` 整条前缀豁免 ⇒ `POST` 那发必须 FAIL |
-| **A5** | 路由层拒旧 execution：`LookupNode` 携带身份。🔴 ✅ **裁决 A5-U3（§10.3）改写了本项的定位，照实写、不粉饰**：**A5 的主体是「让路由答案变正确」**（binding / roster 持久化 execution + 仲裁改成 UUID v7 大者胜，治的是**旧化身活着时每个心跳把 binding 抢回去**这条必然序列，`store.go:99-102` / `redis_store.go:293-300` 两处实证）；**闸 2（回程比对 node 回声）提供检测与自证**；**闸 1（下发 expect 由 node 拒）只覆盖「node 比中央旧」这一种情形，本阶段真阳性集合接近空集** —— 因为路由与 expect 来自同一个 lookup 答案，不匹配只可能是节点比中央新。🔴 **不要把 A5 说成「能拦截飞行中的旧化身流量」，那是 A3（SQL 事务内 fencing）与 reclaim 顺序的职责。**闸 1 保留是为 B4/B6 上膛（那时 execution 由 controller 铸，`live < expect` 才变成可达状态）。🔴 **硬约束：拒绝码绝不能是 404**（见 §7.5）—— 用 **409**（与 resume 撞 running 的既有语义一致）并配独立错误码。<br>✅ **裁决收口五条**：① 拒绝链路定稿 **node 412 + `x-agentenv-refusal` → gateway 409 + `code=sandbox_execution_superseded`**，🔴 **也不许复用 410**（node `/proxy` 已用它表示 not proxyable，`src/api/proxy.rs:869-872`）（§10 第 2 条）；② 🔴 **binding 存储必须持久化 execution 并在 `LookupNode` 的 binding 命中分支回出**，且**必须在 HA / query-only 副本形态下验证**（本地单 scheduler 测不出它失效）（§10 第 5 条）；③ 冲突仲裁 = **UUID v7 字典序大者胜** + 对反向覆盖打 warn，**登记表在被查询时是真相**（§10 第 6 条）；④ **闸 3（长连接周期性撤销）本轮不做**，残留缺口标注"已知、有意推迟"（§10 第 10 条）；⑤ 开关**默认 `enforce`**，发布时先跑一轮 `observe`（§10 第 11 条）。<br>🟢 **`GET /v2/sandboxes` 的非确定性排序缺陷并入本轮**（双活时 `startedAt` 与 `sandboxID` 全同 ⇒ `sort.Slice` 不稳定 ⇒ 胜者随机；`cluster_list.go:248-249` 的 TODO 自己写了正解 = ExecutionID）（§10 第 12 条）| 🔴 ✅ **判据按 A5-U3 重写（旧措辞「被拒（非仅仅改道）」已作废，它夸大了 A5 的射程）**：① **路由不再指向旧化身** —— 旧化身节点的心跳**抢不回** binding（内存 + Redis 两个实现，且必须在 **HA / query-only 副本**形态下验证）；② **仲裁确定** —— 同 `sandboxID` 冲突稳定选 v7 较大的那条（连跑 20 次一致），`GET /v2/sandboxes` 去重同理；③ **闸 1/闸 2 已装配且可自证** —— node 始终回声 `x-agentenv-execution-id`；gateway 的 `unfenced_node_silent` 与 scheduler 的 `lookup_execution_authority_total{authority="unknown"}` **逐条对得上**（对不上就是有一侧算错了）；④ **拒绝形状正确** —— 一旦真的产生拒绝，HTTP 码是 **409** 且 **≠ 404、≠ 410、≠ 503**；⑤ **成功证据是路由指标，不是拒绝率** —— `binding_execution_total{decision="rejected_older"}` 在健康集群恒 0，`registry_execution_mismatch` 恒 0；🔴 **闸 1 的真阳性率为 0 不算失败**（A5-U3）。⚠️ **已建立的长连接本轮不兑现**（闸 3 推迟，已登记）| ① 退回"只按 sandbox 路由" ⇒ 拒绝用例必须 FAIL；② 🔴 把拒绝码改成 404 ⇒ **"平台不得把化身过期读成沙箱不存在"用例必须 FAIL** |
+| **A5** | 路由层拒旧 execution：`LookupNode` 携带身份。🔴 ✅ **裁决 A5-U3（§10.3）改写了本项的定位，照实写、不粉饰**：**A5 的主体是「让路由答案变正确」**（binding / roster 持久化 execution + 仲裁改成 UUID v7 大者胜，治的是**旧化身活着时每个心跳把 binding 抢回去**这条必然序列，`store.go:99-102` / `redis_store.go:293-300` 两处实证）；**闸 2（回程比对 node 回声）提供检测与自证**；**闸 1（下发 expect 由 node 拒）只覆盖「node 比中央旧」这一种情形，本阶段真阳性集合接近空集** —— 因为路由与 expect 来自同一个 lookup 答案，不匹配只可能是节点比中央新。🔴 **不要把 A5 说成「能拦截飞行中的旧化身流量」，那是 A3（SQL 事务内 fencing）与 reclaim 顺序的职责。**闸 1 保留是为 B4/B6 上膛（那时 execution 由 controller 铸，`live < expect` 才变成可达状态）。🔴 **硬约束：拒绝码绝不能是 404**（见 §7.5）—— 用 **409**（与 resume 撞 running 的既有语义一致）并配独立错误码。<br>✅ **裁决收口五条**：① 拒绝链路定稿 **node 412 + `x-agentenv-refusal` → gateway 409 + `code=sandbox_execution_superseded`**，🔴 **也不许复用 410**（node `/proxy` 已用它表示 not proxyable，`src/api/proxy.rs:869-872`）（§10 第 2 条）；② 🔴 **binding 存储必须持久化 execution 并在 `LookupNode` 的 binding 命中分支回出**，且**必须在 HA / query-only 副本形态下验证**（本地单 scheduler 测不出它失效）（§10 第 5 条）；③ 冲突仲裁 = **UUID v7 字典序大者胜** + 对反向覆盖打 warn，**登记表在被查询时是真相**（§10 第 6 条）；④ **闸 3（长连接周期性撤销）本轮不做**，残留缺口标注"已知、有意推迟"（§10 第 10 条）；⑤ 开关**默认 `enforce`**，发布时先跑一轮 `observe`（§10 第 11 条）。<br>🟢 **`GET /v2/sandboxes` 的非确定性排序缺陷并入本轮**（双活时 `startedAt` 与 `sandboxID` 全同 ⇒ `sort.Slice` 不稳定 ⇒ 胜者随机；`cluster_list.go:248-249` 的 TODO 自己写了正解 = ExecutionID）（§10 第 12 条）| 🔴 ✅ **判据按 A5-U3 重写（旧措辞「被拒（非仅仅改道）」已作废，它夸大了 A5 的射程）**：① **路由不再指向旧化身** —— 旧化身节点的心跳**抢不回** binding（内存 + Redis 两个实现，且必须在 **HA / query-only 副本**形态下验证）；② **仲裁确定** —— 同 `sandboxID` 冲突稳定选 v7 较大的那条（连跑 20 次一致），`GET /v2/sandboxes` 去重同理；③ **闸 1/闸 2 已装配且可自证** —— node 始终回声 `x-agentenv-execution-id`；⚠️ **本半句的指标配对已订正（2026-08-20 通读发现，见 §6.8.4）**：~~gateway 的 `unfenced_node_silent` 与 scheduler 的 `lookup_execution_authority_total{authority="unknown"}` **逐条对得上**~~ ⇒ ✅ **应为 gateway 的 `unfenced_no_authority` ↔ scheduler 的 `authority="unknown"`**（与 §6.2 步骤 10 判据③一致）。`unfenced_node_silent` 说的是"node 没回声"，与 scheduler 答不答得出权威**是两件事**，配错了这条互证就永远对不上（对不上就是有一侧算错了）；④ **拒绝形状正确** —— 一旦真的产生拒绝，HTTP 码是 **409** 且 **≠ 404、≠ 410、≠ 503**；⑤ **成功证据是路由指标，不是拒绝率** —— `binding_execution_total{decision="rejected_older"}` 在健康集群恒 0，`registry_execution_mismatch` 恒 0；🔴 **闸 1 的真阳性率为 0 不算失败**（A5-U3）。⚠️ **已建立的长连接本轮不兑现**（闸 3 推迟，已登记）| ① 退回"只按 sandbox 路由" ⇒ 拒绝用例必须 FAIL；② 🔴 把拒绝码改成 404 ⇒ **"平台不得把化身过期读成沙箱不存在"用例必须 FAIL** |
 | **A6** | 外部**只读**暴露 execution（`GET /sandboxes/{id}`、resume 响应）| 字段存在且与内部一致；**不作为入参** | —— |
 
 **A3 的 SQL 事务内校验为什么是硬要求**：抄 e2b 的教训 ——
@@ -390,6 +409,11 @@ and this write`。**Go 侧"先查后写"之间就是 resume 插队的窗口。**
 ---
 
 ## 4. 批次 B：语义上收本体（A3 验证通过后才许放宽"永不可抢"）
+
+> ✅ **2026-08-20：前置已满足** —— A3 的集群验证（步骤 7 闸门）在 `pve-sg dev` **已 PASS**，
+> 步骤 13「解锁 B 批次」**已可解锁**（[§6.8](#68-dev-集群验证结果2026-08-20)）。
+> 🟡 test 集群那一遍还没跑；🔴 B 批次动手前先读 §6.8 的**射程边界**与 [§12.6](#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修) 的四条待办
+> （其中 P7「`local_only` 不在 `paused_sandboxes_reclaim_idx` 覆盖面内」**B2 做 reclaim 分离时会正面撞上**）。
 
 | # | 事 | 关键约束 / 验收 |
 |---|---|---|
@@ -433,6 +457,15 @@ and this write`。**Go 侧"先查后写"之间就是 resume 插队的窗口。**
 > 🔴 **执行以本节为准**；各设计文档里的局部顺序段保留为"这一项自己的依赖方向"，是本节的推导材料，不是执行清单。
 > 🟡 **适用范围**：dev（VM 203/204）与 test（VM 201/202）两套 k3s 集群，**各完整跑一遍**。
 > AgentENV 尚未上生产（P1），本 runbook 含**破坏性步骤与服务窗口**，只在这两套集群执行。
+>
+> 🔧 **2026-08-20 · 本节本轮修订（dev 集群验证结果回写）**
+> - **dev（VM 203/204）已完整跑完 13 步，全过** —— 结果、每发探针的对照面、以及**本 runbook 射程之外的那一块**，
+>   全部写在 **[§6.8](#68-dev-集群验证结果2026-08-20)**。**test（VM 201/202）那一遍还没跑。**
+> - 本节有 **7 处被实测推翻**，已就地订正、原表述保留为问题陈述：
+>   [§6.0.7](#607--哪几步要滚服务哪一步是真热生效别把两种机制混着记)（新增"翻 scheduler 开关要付数据面 503 窗口"与"kubelet 卷刷新**跨节点不同步**"）、
+>   §6.2 的步骤 6 / 8 / 9 / 10、§6.5 的 R1 / R2 / R5、新增 **[§6.5.1](#651--抓包自证之后必须轮换凭据零停机轮换法)**、
+>   §6.6 的 P-A4-3。
+> - 🔴 **读法**：订正块里划线的是**问题陈述**（当初怎么写、为什么不对），✅ / ⚠️ 后面的才是现行口径。
 
 ---
 
@@ -683,7 +716,9 @@ kubectl -n "$NS" get secret agentenv-control-plane-token \
 # 自证 ②：🔴 Pod 没重启（这就是走文件不走 env 的全部理由）
 kubectl -n "$NS" get pod -l app.kubernetes.io/name=agentenv-node \
   -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.metadata.creationTimestamp
-# 与步骤 3 之后记下的那份逐行相同。Secret 卷刷新有 ≤60s 延迟，等 gate 指标翻 1 再验，别急着重试
+# 与步骤 3 之后记下的那份逐行相同（dev 实测：diff 逐行相同；对照面 = 改一个字节，diff 必须报差异）
+# 🔴 Secret 卷刷新不只是有 ≤60s 上界，两台 node 还【互不同步】（dev 实测偏斜 12-60s，见 6.0.7 订正二）
+#    ⇒ 判据是【每台】的 agentenv_api_control_plane_gate_enabled 都翻 1，不是"集群里出现了 1"；别急着重试
 
 # 自证 ③：gate 真的开了
 #   agentenv_api_control_plane_gate_enabled 由 0 → 1
@@ -814,12 +849,62 @@ node 的 gate 立刻开始生效，而 gateway 的新 Pod 还没滚完 —— �
 | 4 | scheduler：image + 两条开关 env | Deployment pod template | ✅ 滚 Deployment（patch 自带） |
 | 6 | `SCHEDULER_ROUTING_EXECUTION_ARBITRATION` → `enforce` | 🔴 **`configMapKeyRef` 注入的 env，不会热刷新** | 🔴 **必须 `rollout restart deploy/agentenv-scheduler`**。只改 CM 不滚 = 什么都没发生，而指标会照旧显示 observe —— 看起来像"翻了没生效"，其实是"根本没翻" |
 | 8 | gateway：image + 两条 env（+ 建 Secret key A） | Deployment pod template | ✅ 滚 Deployment（patch 自带） |
-| **9** | **node gate 开启：Secret 补 key B** | 🔴 **挂载卷里的文件，进程按请求重读** | 🟢 **真热生效，绝不许滚 DaemonSet**（滚一次 = 一次全集群 pause 风暴，§6.1）。kubelet 刷新卷有 **≤60s** 延迟，等指标翻 1，别急着重试 |
+| **9** | **node gate 开启：Secret 补 key B** | 🔴 **挂载卷里的文件，进程按请求重读** | 🟢 **真热生效，绝不许滚 DaemonSet**（滚一次 = 一次全集群 pause 风暴，§6.1）。~~kubelet 刷新卷有 **≤60s** 延迟，等指标翻 1，别急着重试~~ ⚠️ **这句已订正，见下方「订正二」：延迟不只是有上界，两台 node 还互不同步（实测偏斜 12–60s）** |
 | 10 / 11 | `GATEWAY_ROUTING_EXECUTION_FENCING` → `observe` / `enforce` | 🔴 **`configMapKeyRef` 注入的 env，不会热刷新** | 🔴 **必须 `rollout restart deploy/agentenv-gateway`** |
 
 🔴 **一句话记法**：**三个开关都是 env ⇒ 改完必须滚；只有步骤 9 的 node token 是文件 ⇒ 改完不滚。**
 把这两种机制混起来，会得到两个方向都错的结论：要么"改了 CM 就等于翻了开关"（其实没翻），
 要么"翻 node token 也得滚一次 DaemonSet"（白付一次 pause 风暴）。
+
+##### ⚠️ 订正一：**滚 scheduler 要付一个数据面 503 窗口，滚 gateway 不用**（2026-08-20 dev 实测补）
+
+> **原表述（问题陈述，保留）**：~~上表只说了步骤 6 / 10 / 11 "必须 `rollout restart`"，
+> 把三次滚写成了同一种代价 —— 读起来像"滚一下就好，没别的"。~~
+> ✅ **实测不符：三次滚里只有 scheduler 那次会打断数据面，而且不是一瞬间。**
+
+🔴 **机理**：dev 这套集群的 scheduler 跑的是 **内存 binding store**（🟡 test 那套未查，跑之前先确认）
+（`services/scheduler/cmd/main.go:245` 的 `createBindingStore`，未配 Redis 走 `NewInMemoryBindingStoreWithArbitration`；
+启动日志 `binding_store="memory"`，`main.go:171`）⇒ **滚 Deployment = 所有 binding 随进程一起没了**。
+新副本在各节点下一次心跳把 roster 报回来之前，对任何沙箱的 `LookupNode` 都只能答 `Unavailable`
+⇒ 由 gateway 翻成 **503**，而 **pause / resume / 数据面走的是同一个 lookup** ⇒ 三者**同时**不可用。
+
+| | dev 实测 |
+|---|---|
+| `kubectl rollout status deploy/agentenv-scheduler` Ready | **11s** |
+| 数据面（与 pause/resume）恢复到正常应答 | **14s**（从发起 restart 起算）|
+
+🟢 **gateway 侧没有这个窗口**（步骤 10 / 11、以及 §6.5 R1 里 gateway 那两发）：gateway 不持有 binding，
+新 Pod Ready 即可服务。
+
+⇒ **代价归属（写清楚，免得演练现场把它读成故障）**：
+
+| 动作 | 数据面代价 |
+|---|---|
+| 步骤 6（`arbitration` → `enforce`）| 🔴 **一次 ~14s 的 503 窗口** |
+| 步骤 10 / 11（gateway `fencing` → `observe` / `enforce`）| 🟢 0 |
+| §6.5 **R1 演练**：三个开关各"翻到保守值再翻回来" | 🔴 **只有 scheduler 那个开关每翻一次付一次 ⇒ 一来一回 = 两次 503 窗口**；另两个 = 0 |
+
+🔴 **这不是缺陷，是已知代价** —— 但它必须提前说出来：不写，演练现场看到 pause/resume/数据面**同时**
+503 会先去查 A5，而 A5 与它毫无关系。
+**要消掉它得给这套集群配上 Redis binding store** —— 代码里已经有（`NewRedisBindingStoreWithArbitration`），
+这是**部署侧**的事，本轮不做。🔴 **顺带说明**：正因为 dev 跑的是内存 store，
+§6.6 的 **P-A5-2「HA 形态」在 dev 上结构性地跑不了**（见 [§6.8.7](#687--射程边界照实写别让下一个人把它当成全覆盖)）。
+
+##### ⚠️ 订正二：kubelet 卷刷新**不只是有延迟，而且两台 node 互不同步**（2026-08-20 dev 实测补）
+
+> **原表述（问题陈述，保留）**：~~"kubelet 刷新卷有 **≤60s** 延迟，等指标翻 1，别急着重试"~~
+> —— 只写了**延迟上界**，读起来像"等一会儿，然后全集群一起翻"。
+> ✅ **实测不符：两台 node 的刷新时刻是各自独立的，偏斜 12–60s。**
+
+dev 实测：同一次 `kubectl patch secret` 之后，一台 node 的挂载文件 **12s** 就到位，另一台 **60s** 才到
+（§6.8 的 R2 演练里两个方向都复现了这个偏斜）。⇒ 步骤 9 与 §6.5 R2 **必然出现"一台已生效、另一台还没"的中间态**。
+
+- 🟢 **对"启用"方向是良性的**：gateway 从步骤 8 起就一直在注入 `x-agentenv-control-plane`，
+  所以两台谁先开 gate 都不会拒掉平台流量 —— 这也是步骤 8→9 顺序约束的价值所在。
+- 🔴 **但把它当止血手段时，它不是原子的**：§6.4 那行"平台全被 node 拒 403 ⇒ 清空 token 文件"，
+  最坏情况下要 **60s** 才对最后一台生效，期间那台仍在 403。
+  ⇒ **止血按"最慢那台"计时**，看到第一台翻了就宣布回退完成是错的；判据用**每台**的
+  `agentenv_api_control_plane_gate_enabled` 都为 0，不是"集群里出现了 0"。
 
 ---
 
@@ -919,14 +1004,14 @@ A5: node 接收端已在位 ─▶ scheduler observe→enforce ─▶ gateway ob
 | **3** | 🔴 **node 镜像（全程唯一一次滚）**<br>**立即生效**：A1（`ExecutionId` 类型 + `LaunchPlan` 两变体各带 execution + `ClaimedExecution` token + `SandboxMetadata.execution_id` 必填 + 心跳带 `roster` **且保留 `sandbox_ids`** + `AcquireSandbox`/`TransitionSandbox` 带 execution）+ A6 的 node 响应字段（`Sandbox` / `SandboxDetail` / `ListedSandbox` 三个 schema，additive）<br>🟡 **本步部署但未启用**：<br>· **A4 的 gate**（token 与 token 文件**都留空** ⇒ 全放行 = 今天的行为）⇒ 启用点在**步骤 9**<br>· **A5 的接收端**（gateway 尚未下发 expect 头 ⇒ 恒放行）⇒ 启用点在**步骤 10**<br>· **preStop 带 `x-agentenv-control-plane` 头**（node 还没开 gate ⇒ 头被忽略）⇒ 与步骤 9 同时变成必需 | 步骤 2 已完成（本地 paused 目录已清空，否则本步会因缺 `execution_id` **响亮报错**）<br>🔴 **执行方式见 §6.0.4 步骤 3**：一个 `kubectl patch` 同时带 image + `AENV_API_CONTROL_PLANE_TOKEN_FILE` + `control-plane-token` 卷与挂载 + 新 preStop。**分两次做 = 滚两次 DaemonSet = 两次全集群 pause 风暴**| ① `kubectl rollout status ds/agentenv-node -n <ns>`（🔴 DaemonSet 名是 **`agentenv-node`**，不是 `agentenv`）；② 每个节点日志**不得**出现"paused 记录加载失败"（出现 = 步骤 2 的 node 那一半漏做）；③ 🔴 **此刻不要试 pause/resume** —— scheduler 仍是 0 副本、表已 DROP，登记表路径必然失败，那不是回归；能做的是 `GET /health` 与 `GET /sandboxes` 通、进程不 crash-loop、心跳失败日志是"连不上 scheduler"而不是别的；④ 🔴 **A4 未启用的对照探针**（本步的关键自证）：`kubectl port-forward pod/<node-pod> 18000:8000` 后**无 token** `POST /sandboxes/{id}/pause` ⇒ **不是 403**（是 4xx/5xx 的业务错都行）。看到 403 说明 token 被误配了，步骤 8 之前 node 会拒掉一切 | 换回旧 node 镜像 + **再清一次本地 paused 目录**（旧 build 读不懂新记录里的 `execution_id`？—— serde 未知字段是忽略的，**能读**；但 A1 之后写下的记录在旧 build 上会丢失化身，属可接受）|
 | **4** | **scheduler 镜像：A2 + A3 + A5 的 scheduler 侧**（新 `SchemaDDL` + fail-fast 自检 + 两条 SQL 谓词 + 三条夺权路径清轴 + binding/roster 带 execution + 仲裁 + `LookupNode` 两个新字段 + `rosterFromHeartbeat` 回落）<br>**开关**：`scheduler.registry.write_fencing=true`（默认）、🔴 `scheduler.routing.execution_arbitration=observe`（**发布纪律，不是默认值**）<br>🔴 **服务窗口在本步 Ready 时关闭**（§6.3）| 步骤 3 的 DaemonSet **rollout 已 Ready**（`desiredNumberScheduled == numberReady`）<br>🔴 **必须先建 CM `execution-fencing-config`**（集群里没有，实测 `NotFound`）：不建 ⇒ 两条 env 落空 ⇒ **回落代码默认 `enforce`**，步骤 5/6 的 observe 闸门直接被跳过。执行方式见 §6.0.4 步骤 4 | ① `Migrate` 成功、`kubectl logs` 无 fail-fast 报错；② `\d paused_sandboxes` 有 14 列与两条 CHECK；③ pause 一台沙箱 → `SELECT state, execution_id FROM paused_sandboxes` ⇒ `publishing`/非空；④ resume → `running`/**同一个** execution；⑤ 🔴 **必然序列探针**（§6.6 P-A3）| **配置级**：`SCHEDULER_REGISTRY_WRITE_FENCING=false` + `SCHEDULER_ROUTING_EXECUTION_ARBITRATION=off`，滚 Deployment。**镜像不必回退** |
 | **5** | 🟡 **混版本窗口的关闭点（不部署，只观察）** | 步骤 4 已上 | 盯 `agentenv_scheduler_heartbeat_legacy_roster_total{node}` —— 🔴 **必须归零**。非零 = 集群里还有没带 A1 的 node（步骤 3 漏了某台，或有节点 cordoned）| —— |
-| **6** | **翻 `scheduler.routing.execution_arbitration=enforce`** | 步骤 5 归零 **且** `agentenv_scheduler_binding_execution_total{decision="rejected_older"}` 在 observe 期间**恒 0** | ① 指标 `agentenv_scheduler_routing_execution_arbitration_enabled == 2`；② `agentenv_scheduler_lookup_execution_authority_total{authority="registry"}` 占比达到预期；③ 数据面照常 | 翻回 `observe`（或 `off`），滚 Deployment |
-| **7** | 🚦 **闸门：A3 集群验证（不部署）** | 步骤 4–6 全部完成 | §6.6 的 **P-A3-1 / P-A3-2 / P-A3-3** 三发探针**全过**，且每发都带对照面。🔴 **不过就不许进步骤 8**，更不许开 B 批次 | —— |
-| **8** | **gateway 镜像：A4 的注入 + A5 的 gateway 侧 + A6 的三个 DTO + `GET /v2/sandboxes` 去重按 execution**<br>**开关**：`GATEWAY_CONTROL_PLANE_TOKEN=<token>`（**开始注入**）、🔴 `gateway.routing.execution_fencing=off`<br>🟡 **本步部署但未启用**：A5 的 gateway 侧（`off` 在 `decideFencing` 入口 early return ⇒ 不下发 expect、不比对回声）⇒ 启用点在**步骤 10/11** | 步骤 7 闸门通过<br>🔴 **建 Secret 时只建 key `token`**（gateway 那半），**key `node-gate-token` 留到步骤 9** —— 否则一个动作同时点亮两侧，步骤 8→9 的顺序约束形同虚设（§6.0.6）。集群里那份 gateway 只有一条 env，两条新 env 都要 patch 进去，见 §6.0.4 步骤 8 | ① `kubectl rollout status deploy/agentenv-gateway`；② 🔴 **注入生效探针**：在 node 上抓一次经 gateway 的控制面请求，确认带 `x-agentenv-control-plane`（或用一个临时 echo 上游）；③ **对照面**：客户端自己塞 `x-agentenv-control-plane: forged` ⇒ 上游收到的是 gateway 的值，不是 forged；④ `GET /v2/sandboxes` 仍 200，且此刻**已能看到 `executionID` 字段**（node 的 A6 从步骤 3 就在报了，本步是 gateway 侧 DTO 不再把它吃掉）| `GATEWAY_CONTROL_PLANE_TOKEN=""`（停止注入**并删除**入站同名头），滚 Deployment |
-| **9** | 🔴 **启用 A4（配置热翻转，不滚 DaemonSet、不换镜像）**：把 token 写进 node 挂载的 Secret 文件（`_design-phase3-node.md` §3.2）⇒ 步骤 3 就躺在那儿的 gate 开始生效<br>🔴 **绝不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env** —— 改 env 要重启 Pod，等于在满载集群上再付一次全集群 pause 风暴（§6.1） | 步骤 8 的**注入已验证生效**（🔴 顺序颠倒 ⇒ node 会拒掉所有平台流量）<br>🔴 **本步的动作 = 给 Secret 补上 key `node-gate-token`，值从 key `token` 派生（不许手敲）**，见 §6.0.4 步骤 9 / §6.0.6 | ① 先确认**热生效**：改文件后 `kubectl get pod -l app.kubernetes.io/name=agentenv-node` 的 `RESTARTS` 与 `AGE` **一个都没变**（Secret 卷刷新有 ≤60s 延迟，等指标/日志出现 gate 启用记录再验）；② §6.6 的 **P-A4-1/2/3**；③ 🔴 **无 token 的 `GET /sandboxes` 仍通、无 token 的 `POST /sandboxes` 被拒**（缺后半句，"整条路径前缀豁免"的变异会假绿）；④ `GET /v2/sandboxes` 集群列表**仍然 200**（D6 豁免生效，否则整体 502）；⑤ preStop：`kubectl drain` 一台节点，确认它进 DRAINING 而不是静默失败（🔴 这一发会把该节点的沙箱 pause 掉，**放在本步最后做**）| 🔴 **node 先**：把该 Secret 文件**清空**（空 = 全放行 = 今天的行为），同样**不滚 DaemonSet**。**绝不能先回退 gateway**<br>🔴 **"清空"字面意思是把 key `node-gate-token` 写成空串，不是删掉这个 key**：删 key ⇒ 文件消失 ⇒ node 对"读失败"是刻意**保留上一个 good 值**的（`control_plane_gate.rs`，测试 T-A4-9 钉住）⇒ **gate 还开着，而 `kubectl` 会回你 patched**。命令见 §6.0.4 步骤 9 末尾，机理见 §6.0.6 |
-| **10** | **翻 `gateway.routing.execution_fencing=observe`** | 步骤 9 的热翻转**已验证生效**（P-A4-1/2/3 全过）| ① `agentenv_gateway_execution_fencing_total{decision="unfenced_node_silent"}` **必须为 0**（非 0 = 还有 node 没装 A5 接收端）；② ⚠️ **本判据已订正（2026-08-20，对齐 gateway 设计 §10 的裁决 A5-U5）**：~~`refused_preflight` / `refused_echo` 在健康集群上**恒 0**（🔴 非 0 是**先查再开**，不是"翻了再说"）~~ —— 两个系列必须**分开读**。✅ **`refused_echo == 0` 才是真判据**（🔴 非 0 是**先查再开**，不是“翻了再说”）。🔴 **`refused_preflight` 在 observe 期恒 0 是必然，不是证据**：observe **不下发 expect 头** ⇒ 闸 1 根本没上膛 ⇒ node 无从拒 ⇒ 这个系列**只可能**是 0。拿它当“闸 1 正常”的证据是**假绿**。它**非 0 反而说明有别的东西在往 node 发 expect 头** —— 另一个跑在 `enforce` 上的 gateway、翻转瞬间仍在途的请求、或中间件重放；③ `unfenced_no_authority` 与 scheduler 的 `lookup_execution_authority_total{authority="unknown"}` **逐条对得上**（跨服务互证，对不上就是有一侧算错了）| 翻回 `off` |
+| **6** | **翻 `scheduler.routing.execution_arbitration=enforce`** | 步骤 5 归零 **且** `agentenv_scheduler_binding_execution_total{decision="rejected_older"}` 在 observe 期间**恒 0** | ① 指标 `agentenv_scheduler_routing_execution_arbitration_enabled == 2`；② `agentenv_scheduler_lookup_execution_authority_total{authority="registry"}` 占比达到预期；③ 数据面照常<br>🔴 **代价（原表漏写，2026-08-20 dev 实测补）**：本步要滚 scheduler，而 binding 存在**内存**里 ⇒ 滚动期 `LookupNode` 答 `Unavailable` ⇒ **pause / resume / 数据面同时 503**，实测 **14s** 恢复（`rollout` Ready 11s）。判据③"数据面照常"指的是**窗口关闭之后**；窗口内的 503 既不是失败、也不是"没有窗口"。机理与三次滚的代价归属见 [§6.0.7 订正一](#-订正一滚-scheduler-要付一个数据面-503-窗口滚-gateway-不用2026-08-20-dev-实测补) | 翻回 `observe`（或 `off`），滚 Deployment（🔴 **回退这一发同样付一次 503 窗口**）|
+| **7** | 🚦 **闸门：A3 集群验证（不部署）**<br>✅ **dev 已 PASS（2026-08-20）** | 步骤 4–6 全部完成 | §6.6 的 **P-A3-1 / P-A3-2 / P-A3-3** 三发探针**全过**，且每发都带对照面。🔴 **不过就不许进步骤 8**，更不许开 B 批次<br>✅ **实测结果（含每发的对照面与射程边界）见 [§6.8](#68-dev-集群验证结果2026-08-20)**；🟡 test 集群那一遍未跑 | —— |
+| **8** | **gateway 镜像：A4 的注入 + A5 的 gateway 侧 + A6 的三个 DTO + `GET /v2/sandboxes` 去重按 execution**<br>**开关**：`GATEWAY_CONTROL_PLANE_TOKEN=<token>`（**开始注入**）、🔴 `gateway.routing.execution_fencing=off`<br>🟡 **本步部署但未启用**：A5 的 gateway 侧（`off` 在 `decideFencing` 入口 early return ⇒ 不下发 expect、不比对回声）⇒ 启用点在**步骤 10/11** | 步骤 7 闸门通过<br>🔴 **建 Secret 时只建 key `token`**（gateway 那半），**key `node-gate-token` 留到步骤 9** —— 否则一个动作同时点亮两侧，步骤 8→9 的顺序约束形同虚设（§6.0.6）。集群里那份 gateway 只有一条 env，两条新 env 都要 patch 进去，见 §6.0.4 步骤 8 | ① `kubectl rollout status deploy/agentenv-gateway`；② ⚠️ **本条在这套集群不可照抄，已订正（2026-08-20 dev 实测）**：<br>~~🔴 **注入生效探针**：在 node 上抓一次经 gateway 的控制面请求，确认带 `x-agentenv-control-plane`（或用一个临时 echo 上游）~~<br>🔴 **实测不符**：node 容器里**只有 `curl`**（无 `tcpdump` / `socat` / `nc` / `python3`），gateway 是 **distroless、连 `sh` 都没有** ⇒ 两侧都没法就地抓包。<br>✅ **可行做法**：`kubectl debug <node-pod> --profile=netadmin --image=nicolaka/netshoot`（ephemeral 容器与目标**共享 netns**，**不重启 Pod**）。<br>🔴 **附带的硬性条款**：抓包会把凭据**明文**写进 ephemeral 容器的可写层，而 ephemeral 容器**删不掉**、只能等 Pod 重建 —— 而删 node Pod = 一次 pause 风暴 ⇒ **抓包自证之后必须轮换凭据**，零停机轮换法见 [§6.5.1](#651--抓包自证之后必须轮换凭据零停机轮换法)；③ **对照面**：客户端自己塞 `x-agentenv-control-plane: forged` ⇒ 上游收到的是 gateway 的值，不是 forged；④ `GET /v2/sandboxes` 仍 200，且此刻**已能看到 `executionID` 字段**（node 的 A6 从步骤 3 就在报了，本步是 gateway 侧 DTO 不再把它吃掉）| `GATEWAY_CONTROL_PLANE_TOKEN=""`（停止注入**并删除**入站同名头），滚 Deployment |
+| **9** | 🔴 **启用 A4（配置热翻转，不滚 DaemonSet、不换镜像）**：把 token 写进 node 挂载的 Secret 文件（`_design-phase3-node.md` §3.2）⇒ 步骤 3 就躺在那儿的 gate 开始生效<br>🔴 **绝不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env** —— 改 env 要重启 Pod，等于在满载集群上再付一次全集群 pause 风暴（§6.1） | 步骤 8 的**注入已验证生效**（🔴 顺序颠倒 ⇒ node 会拒掉所有平台流量）<br>🔴 **本步的动作 = 给 Secret 补上 key `node-gate-token`，值从 key `token` 派生（不许手敲）**，见 §6.0.4 步骤 9 / §6.0.6 | ① 先确认**热生效**：改文件后 `kubectl get pod -l app.kubernetes.io/name=agentenv-node` 的 `RESTARTS` 与 `AGE` **一个都没变**（🟢 dev 实测：与步骤 9 之前的 `diff` **逐行相同**；对照面 = 故意改一个字节，证明这个 `diff` 分得清"没变"与"变了"）。⚠️ **括号里那句"≤60s 延迟"已订正**：~~Secret 卷刷新有 ≤60s 延迟，等指标/日志出现 gate 启用记录再验~~ ⇒ 🔴 **延迟不只是有上界，两台 node 还互不同步**（dev 实测偏斜 **12–60s**）⇒ 本步必然出现"一台已开、另一台还没"的中间态；判据要用**每台**的 `agentenv_api_control_plane_gate_enabled` 都翻 1，不是"集群里出现了 1"。见 [§6.0.7 订正二](#-订正二kubelet-卷刷新不只是有延迟而且两台-node-互不同步2026-08-20-dev-实测补)；② §6.6 的 **P-A4-1/2/3**；③ 🔴 **无 token 的 `GET /sandboxes` 仍通、无 token 的 `POST /sandboxes` 被拒**（缺后半句，"整条路径前缀豁免"的变异会假绿）；④ `GET /v2/sandboxes` 集群列表**仍然 200**（D6 豁免生效，否则整体 502）；⑤ preStop：`kubectl drain` 一台节点，确认它进 DRAINING 而不是静默失败（🔴 这一发会把该节点的沙箱 pause 掉，**放在本步最后做**）| 🔴 **node 先**：把该 Secret 文件**清空**（空 = 全放行 = 今天的行为），同样**不滚 DaemonSet**。**绝不能先回退 gateway**<br>🔴 **"清空"字面意思是把 key `node-gate-token` 写成空串，不是删掉这个 key**：删 key ⇒ 文件消失 ⇒ node 对"读失败"是刻意**保留上一个 good 值**的（`control_plane_gate.rs`，测试 T-A4-9 钉住）⇒ **gate 还开着，而 `kubectl` 会回你 patched**。命令见 §6.0.4 步骤 9 末尾，机理见 §6.0.6 |
+| **10** | **翻 `gateway.routing.execution_fencing=observe`** | 步骤 9 的热翻转**已验证生效**（P-A4-1/2/3 全过）| ① ⚠️ **本判据的因果不完整，已订正（2026-08-20 dev 实测）**：<br>~~`agentenv_gateway_execution_fencing_total{decision="unfenced_node_silent"}` **必须为 0**（非 0 = 还有 node 没装 A5 接收端）~~<br>🔴 **实测不符**：`unfenced_node_silent` 非 0 **不只**意味着"有 node 没装 A5 接收端"。**paused 且未配 autoResume** 的沙箱被打数据面时，node 回 **410 且不带回声头**（`src/api/proxy.rs` 的 `echo_execution(response, live_execution)` 在 `live_execution=None` 时**什么也不盖**）—— gateway 记的也是这一档。⇒ **只要集群里有 paused 沙箱被数据面访问，这条判据就会误报。**<br>✅ **正确读法（两步，顺序不能换）**：先按响应码把 **410 那一支排除**（它是常态，不是缺陷），剩下的非 0 才指向"有 node 没装 A5 接收端"；要坐实"剩余为 0 不是探针瞎了"，用 §6.8 的分辨力自证（**刻意 pause 一台再打数据面 ⇒ 该序列必须长出来**）。<br>🟡 值仍然要看，但它是**线索**不是判据；② ⚠️ **本判据已订正（2026-08-20，对齐 gateway 设计 §10 的裁决 A5-U5）**：~~`refused_preflight` / `refused_echo` 在健康集群上**恒 0**（🔴 非 0 是**先查再开**，不是"翻了再说"）~~ —— 两个系列必须**分开读**。✅ **`refused_echo == 0` 才是真判据**（🔴 非 0 是**先查再开**，不是“翻了再说”）。🔴 **`refused_preflight` 在 observe 期恒 0 是必然，不是证据**：observe **不下发 expect 头** ⇒ 闸 1 根本没上膛 ⇒ node 无从拒 ⇒ 这个系列**只可能**是 0。拿它当“闸 1 正常”的证据是**假绿**。它**非 0 反而说明有别的东西在往 node 发 expect 头** —— 另一个跑在 `enforce` 上的 gateway、翻转瞬间仍在途的请求、或中间件重放；③ `unfenced_no_authority` 与 scheduler 的 `lookup_execution_authority_total{authority="unknown"}` **逐条对得上**（跨服务互证，对不上就是有一侧算错了）| 翻回 `off` |
 | **11** | **翻 `gateway.routing.execution_fencing=enforce`** | 步骤 10 的三条判据全过 | ① 数据面照常；② `refused_*` 仍恒 0（🔴 **闸 1 真阳性为 0 不算失败**，见 §10.3 A5-U3）；③ `agentenv_scheduler_registry_execution_mismatch` 恒 0 | 翻回 `observe` / `off` |
 | **12** | **回退演练（不改代码，必须真跑一遍）** | 步骤 11 完成 | §6.5 逐条 | —— |
-| **13** | 🚦 **解锁 B 批次** | 步骤 1–12 全过 | —— | —— |
+| **13** | 🚦 **解锁 B 批次**<br>✅ **可解锁（2026-08-20，dev）** | 步骤 1–12 全过 | ✅ **dev 已 13/13 全过**（闸门 7 与本步均 PASS，三服务同跑 `cp3-bff4993`、`RESTARTS=0`，终态三开关 = `true` / `enforce` / `enforce`）—— 结果见 [§6.8](#68-dev-集群验证结果2026-08-20)。<br>🔴 **解锁前必读两件事**：① §6.8 的**射程边界**（步骤 7 的探针用的是合成行 + 两个不存在的节点名，OSS 那半只证明了"整桶未变"）；② [§12.6](#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修) 的四条待办，其中 P7 会被 **B2** 正面撞上。<br>🟡 **test 集群（VM 201/202）那一遍尚未跑** | —— |
 
 ---
 
@@ -1134,7 +1219,7 @@ kubectl -n "$NS" exec "$n" -- sh -c 'ls -1 "$AENV_HOME"/persisted-sandboxes | wc
 | 客户端大量 `409 sandbox_execution_superseded` | `gateway.routing.execution_fencing` | `observe`（先看，别直接 `off`）| ⚠️ **本格原文两处都错，已订正（2026-08-20）**：~~`observe` 仍下发 expect 头与计数、只是不拒；🔴 **注意**：若拒绝来自 node 的 412，`observe` 也会把它翻成放行~~<br>✅ **正确读法**：(a) `observe` **不下发 expect 头**（裁决 A5-U5），它只读回声、只计数、不拒；(b) node 的 412 在 `observe` 下**不是被翻成放行**，而是被翻成 **409 —— 仍然是拒绝**，只是换成唯一的对外形状。但正因为没盖章，node 本来就无从产生 412，这条分支在正常接线下不可达。<br>🟢 **改判之后这条运维建议本身反而更成立**：409 的两个来源在 `observe` 下**全部止住** —— 闸 1（412→409）因没盖章而不可达，闸 2（回声拒绝）因 `refuse=false` 只记不拒。🔴 **但别拿旧解释去解释它**：止血不是因为把拒绝翻成了放行，而是因为一条不可达、一条只观察 |
 | 每一次同机 pause→resume 之后第一批请求 409 | **先别拉开关** | —— | 这是**比对写成等值了**（应为有序，`live > expect` 必须放行，裁决 A5-U4）。拉开关只掩盖，改代码才对 |
 | 平台开始"重建工作区"、用户工作区蒸发 | 🔴 **立即** `gateway.routing.execution_fencing=off` | `off` | 说明某处把拒绝落成了 **404**。**这是本轮唯一一个"先止血再查"的症状** |
-| 平台 create/pause/resume 全被 node 拒（403） | node 侧 control-plane token **文件**（**node 先**）| **清空该文件**（热生效）——🔴 具体是把 Secret 的 key `node-gate-token` **写成空串**，**不是删这个 key**（删 key = 读失败 = 保留上一个 good 值 = gate 还开着，§6.0.6）。🔴 **不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env、不要滚 DaemonSet** —— 滚一次 = 一次全集群 pause 风暴（§6.1）| A4 整个没了，回到 presence-only。🔴 **绝不能先回退 gateway 的注入** —— 那会让 node 拒掉一切 |
+| 平台 create/pause/resume 全被 node 拒（403） | node 侧 control-plane token **文件**（**node 先**）| **清空该文件**（热生效）——🔴 具体是把 Secret 的 key `node-gate-token` **写成空串**，**不是删这个 key**（删 key = 读失败 = 保留上一个 good 值 = gate 还开着，§6.0.6）。🔴 **不要改 `AENV_API_CONTROL_PLANE_TOKEN` 这个 env、不要滚 DaemonSet** —— 滚一次 = 一次全集群 pause 风暴（§6.1）。<br>⚠️ **止血不是原子的（2026-08-20 实测补）**：两台 node 的 kubelet 刷新偏斜 **12–60s** ⇒ 最坏情况下最后一台要 60s 才停止 403。**按最慢那台计时**，判据是**每台**的 `agentenv_api_control_plane_gate_enabled` 都为 0，不是"集群里出现了 0"（[§6.0.7 订正二](#-订正二kubelet-卷刷新不只是有延迟而且两台-node-互不同步2026-08-20-dev-实测补)）| A4 整个没了，回到 presence-only。🔴 **绝不能先回退 gateway 的注入** —— 那会让 node 拒掉一切 |
 | 集群列表 `GET /v2/sandboxes` 整体 502 | 同上（清空 node 侧 token 文件）| 空 | 说明 D6 的 `GET /sandboxes` 豁免没生效（`cluster_list.go:84-96` all-or-nothing）|
 | 🔴 **告警守卫（不是症状，是读表前必须先知道的一条）**：`agentenv_scheduler_registry_write_fencing_enabled == 0` | **先别拉任何开关** | —— | 🔴 **这个 gauge 读 0 有两种完全不同的含义，它自己分不开**：① fencing 真的被关了；② **写面根本没装配** —— `SetRegistryWriteFencingEnabled` 只在 `createRegistryStore` 建出写 store 之后才被调用（`services/scheduler/cmd/main.go:394`），而该函数在 `queryOnly \|\| !registryWriteEnabled(cfg)` 时**提前返回**，gauge 就停在默认的 0 上。query-only 副本、没配 DSN 的集群、`write_enabled=false` 的集群**全都读 0**。✅ **任何基于该 gauge 的告警必须用 `agentenv_scheduler_registry_enabled == 1` 做守卫**（该 gauge 在 `createRegistryReader` 里**无条件**设置，见 `main.go:292`）。⚠️ **守卫之后仍有一处残留歧义**：`registry_enabled=1`（配了 DSN）但 `write_enabled=false` 或 `--query-only` 的副本，两个 gauge 会是 `1 / 0`，与“写面开着但 fencing 关了”同形 —— 这类副本要么按实例排除，要么就别在它上面挂这条告警。<br>✅ **已订正（2026-08-20）**：上面这一整段是**问题陈述**，不是现状。残留歧义已由第三个 gauge `agentenv_scheduler_registry_write_surface_enabled` 消掉：**三个 gauge 在每一条启动路径上都被显式设值**（装配写面设 1、没装配设 0，含 `fencing` 那个 —— 它不再停在“没人写过”的默认 0 上）。读法见本表下方「🔴 三个 registry gauge 的组合读法」。旧的“用 `registry_enabled` 守卫”仍然是对的，但已不必够用 |
 
@@ -1180,11 +1265,36 @@ kubectl -n "$NS" exec "$n" -- sh -c 'ls -1 "$AENV_HOME"/persisted-sandboxes | wc
 
 | # | 演练项 | 做法 | 🔴 自证 / 陷阱 |
 |---|---|---|---|
-| R1 | 三个开关各自回退一次 | 逐个翻到最保守值、滚服务、跑一遍冒烟；再翻回来 | 每次只翻**一个**，翻完确认**另外两个的指标没变** —— 否则你验的是"一起关了"，不是"能分别关"。🟢 三个开关都在 scheduler / gateway（Deployment）上，**演练本身不碰 node** |
-| R2 | node 侧 A4 回退 | **清空 node 的 control-plane token 文件** → 直连 node 的 `POST /sandboxes/{id}/pause` **不再 403** → 再写回去 | 🔴 **顺序**：回退必须 **node 先**；先回退 gateway 会让 node 拒掉一切。<br>🔴 **不许用"改 env + 滚 DaemonSet"来做这一发** —— 演练要来回翻两次，那就是**两次满载全集群 pause 风暴**（§6.1）；token 走挂载文件的全部理由就在这里，本发同时是**该机制的验收**：翻两次之后 `kubectl get pod` 的 `RESTARTS`/`AGE` 必须一动不动 |
+| R1 | 三个开关各自回退一次 | 逐个翻到最保守值、滚服务、跑一遍冒烟；再翻回来 | 每次只翻**一个**，翻完确认**另外两个的指标没变** —— 否则你验的是"一起关了"，不是"能分别关"。🟢 三个开关都在 scheduler / gateway（Deployment）上，**演练本身不碰 node**。<br>⚠️ **"确认另外两个的指标没变"这句对 gateway 那个开关做不到，已订正（2026-08-20 dev 实测）**：🔴 **gateway 没有 fencing 模式 gauge** —— 三个开关里只有 scheduler 那两个能用指标读（`agentenv_scheduler_registry_write_fencing_enabled` / `..._routing_execution_arbitration_enabled`）；gateway 侧**没有任何 gauge**（`services/gateway/internal/metrics.go` 全部 6 条 series 里没有它），只能读**启动日志**的 `execution_fencing` 字段（`services/gateway/cmd/main.go:85`）或从 `agentenv_gateway_execution_fencing_total{decision="off"}` **反推**。⇒ R1 里"另外两个没变"这半，对 gateway 只能靠日志核对。**已登记为待补的可观测缺口，见 [§12.6](#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修)**。<br>🔴 **代价**：R1 里 scheduler 那个开关**每翻一次付一次 ~14s 数据面 503 窗口**（一来一回 = 两次），gateway 那两发为 0，见 [§6.0.7 订正一](#-订正一滚-scheduler-要付一个数据面-503-窗口滚-gateway-不用2026-08-20-dev-实测补) |
+| R2 | node 侧 A4 回退 | **清空 node 的 control-plane token 文件** → 直连 node 的 `POST /sandboxes/{id}/pause` **不再 403** → 再写回去 | 🔴 **顺序**：回退必须 **node 先**；先回退 gateway 会让 node 拒掉一切。<br>🔴 **不许用"改 env + 滚 DaemonSet"来做这一发** —— 演练要来回翻两次，那就是**两次满载全集群 pause 风暴**（§6.1）；token 走挂载文件的全部理由就在这里，本发同时是**该机制的验收**：翻两次之后 `kubectl get pod` 的 `RESTARTS`/`AGE` 必须一动不动。<br>🔴 **本发的核心实测（2026-08-20 dev，两种做法结果完全不同，必须照表做）**：**「删 key」与「写空串」结果完全相反，对照表见 [§6.8 的 R2 表](#68-dev-集群验证结果2026-08-20)**：删 key ⇒ `kubectl` 说 `patched`、文件 12s 后消失、但 **gate gauge 仍然 1、直连 `POST /pause` 仍然 403**；写空串 ⇒ 文件 60s 后变 0 字节、**gauge 归 0、直连 204 放行**。删 key 之后两台 node 都出现 `agentenv_api_control_plane_token_reload_total{result="error_kept_previous"}`（worker **28** / master **3**）+ warn 日志 —— 这正是 §6.0.6 那张表里"文件曾被成功读过、之后消失 ⇒ 保留上一个 good 值"那一格在集群上的样子。<br>🔴 **失败是静默的：命令成功、无报错、无重启，而 gate 根本没关掉。**⇒ 回退**只能写空串**。<br>⚠️ **另外，本发不是原子的**：两台 node 的 kubelet 刷新偏斜 **12–60s**（上表两行的时间差就是它），止血要按**最慢那台**计时，见 [§6.0.7 订正二](#-订正二kubelet-卷刷新不只是有延迟而且两台-node-互不同步2026-08-20-dev-实测补) |
 | R3 | 🔴 **out-of-band 十条全体存活确认**（含 30800）| 跑一遍 **§6.0.5** 的五组探针（每组自带对照面）| 🔴 **`kubectl apply -k deploy/k8s/...` 不会重建 30800，也不会删它** —— 以为"重新部署一遍就恢复原状"的人会踩空。若它没了：`kubectl apply -f /tmp/aenv-cv/nodeport-30800.bak.yaml`（步骤 1 的备份）。<br>🔴 其余九条**大多数是 apply 会静默抹掉**的（D-1/D-3/D-4/D-5/D-7），所以本演练不只是"看看 30800 在不在"，而是**每一步之后都要跑**（§6.0.2）|
 | R4 | 🔴 **别用 30800 验"直连被拒"** | 用 `kubectl port-forward pod/<node-pod> 18000:8000` 直连 | 30800 落在 **gateway**（gateway 默认透传），经它打永远成功。看到 200 会被误读成"收窄失效" |
-| R5 | A2 的 schema 不回退 | 确认旧 build 能跑（`entryColumns` / `selectColumns` 是显式列清单，多两列不会被选中）| 若必须彻底回退：再 `DROP TABLE` 一次 + 跑旧 build 的 `Migrate`。**两个方向都只要一次运维动作，不依赖新写的回滚代码** |
+| R5 | A2 的 schema 不回退 | ⚠️ **原做法已订正（2026-08-20 dev 实测）**：~~确认旧 build 能跑（`entryColumns` / `selectColumns` 是显式列清单，多两列不会被选中）~~ ⇒ ✅ **这句只对读侧成立**，见右栏 | 🔴 **「旧 build 能跑」只对读侧成立，写侧必挂**（实测在事务内做、`ROLLBACK` 收尾，未污染表）：<br>· `state='paused'` 且 execution 两列为空 ⇒ **可插入**（读侧/停放行没问题）；<br>· `state='publishing'` 且 execution 两列为空 ⇒ **`23514` violates `paused_sandboxes_execution_check`**。<br>⇒ 旧 build **一 pause 就撞**（`publishing` 是 pause 的第一站），它不是"能跑"，是"能读、能停放，但发不出一次 pause"。<br>✅ **逃生口本格早就写了，仍然成立**：若必须彻底回退，再 `DROP TABLE` 一次 + 跑旧 build 的 `Migrate`。**两个方向都只要一次运维动作，不依赖新写的回滚代码** —— 订正的只是"不 DROP 也能凑合跑"这个印象 |
+
+#### 6.5.1 🔴 抓包自证之后**必须轮换凭据**（零停机轮换法）
+
+> **2026-08-20 新增，dev 实测。这是正式条款，不是脚注** —— 它是步骤 8 验证②被订正之后必然跟着来的那一半。
+
+**为什么必须轮换**：步骤 8 的"确认 gateway 真的注入了 `x-agentenv-control-plane`"在这套集群上只能靠
+`kubectl debug --profile=netadmin`（node 容器只有 `curl`，gateway 是 distroless）。抓包**必然**把
+共享 secret **明文**写进 ephemeral 容器的可写层，而 **ephemeral 容器删不掉** —— Pod spec 里加了就在那儿，
+只能等 Pod 重建才消失。而**删 node Pod = 一次 pause 风暴**（§6.1）。
+⇒ 只剩一条路：**让那份被看见的凭据作废**。
+
+🔴 **不能用"删 Secret 再重建"来轮换**：那等于先把 gateway 的注入停掉、或让两侧短暂不一致 ——
+node 侧那半还开着 gate，平台会被 403。
+
+✅ **零停机轮换法（全程零重启，dev 实测通过）**，成立的全部理由是
+`file_tokens()` **按行解析**（`src/api/control_plane_gate.rs`：`contents.lines()` ⇒ 一个文件里可以同时有多个有效凭据）：
+
+1. **先让 node 双接受**：把 Secret 的 `node-gate-token` 写成 `NEW\nOLD` 两行 —— 此刻新旧凭据**都通**；
+2. **再换 gateway**：把 Secret 的 `token`（gateway 那半）改成 `NEW`，滚 gateway（gateway 是无状态 Deployment，🟢 无 503 窗口）；
+3. **最后收敛**：把 `node-gate-token` 收成只剩 `NEW` 一行。
+
+- 🔴 **顺序不能换**：先换 gateway 再让 node 双接受 = 中间有一段 node 只认 OLD 而 gateway 发 NEW ⇒ **平台全线 403**。
+- 🟢 **三步都不滚 DaemonSet**（node 侧是挂载文件、按请求重读）⇒ **零 pause 风暴**。
+- ⚠️ 每一步都要等**两台** node 都刷到（偏斜 12–60s，§6.0.7 订正二），再做下一步。
+- 🔴 **收敛那一步别写成删 key**：删 key = 文件消失 = 保留上一个 good 值（§6.0.6 与 R2 实测）⇒ OLD 会**继续有效**，轮换等于没做。
 
 ---
 
@@ -1201,7 +1311,7 @@ kubectl -n "$NS" exec "$n" -- sh -c 'ls -1 "$AENV_HOME"/persisted-sandboxes | wc
 | **P-A3-3**「两种拒绝分得开」 | 步骤 7 | 同一行两次：`complete_pause` 带错 generation ⇒ `GenerationConflict`（`Aborted`）；`begin_pause` 带错 execution ⇒ `ExecutionFenced`（`PermissionDenied`）；两者 `errors.Is` 互不成立 | 若合并成一个码，节点会重读拿新 generation 再发一次，**绕过 fencing** |
 | **P-A4-1**「直连被拒」 | 步骤 9 | `kubectl port-forward pod/<node-pod> 18000:8000` → `curl -X POST localhost:18000/sandboxes/{id}/pause` ⇒ **403** | 同一命令**带上正确 token** ⇒ 非 403。没有对照就分不清"403"与"路由不存在" |
 | **P-A4-2**「经 gateway 成功」 | 步骤 9 | 经 30800 打同一个 pause ⇒ 2xx | 临时把 gateway 的 token 改错 ⇒ **必须 403**。不做这步就分不清"注入生效"与"node 根本没开 gate" |
-| **P-A4-3**「只读豁免精确」 | 步骤 9 | 无 token 的 `GET /sandboxes` ⇒ **非 403** | 无 token 的 `POST /sandboxes` ⇒ **403**。🔴 缺这半句，"把 `/sandboxes` 整条前缀豁免"的变异会假绿 |
+| **P-A4-3**「只读豁免精确」 | 步骤 9 | 无 token 的 `GET /sandboxes` ⇒ **非 403**<br>✅ **dev 实测**：`GET /sandboxes` = **200**、`GET /v2/sandboxes` = **200**、**无 token `POST /sandboxes` = 403 且沙箱数未变** | 无 token 的 `POST /sandboxes` ⇒ **403**。🔴 缺这半句，"把 `/sandboxes` 整条前缀豁免"的变异会假绿。<br>🔴 **再加一发对照面（dev 实测已做）**：带一个**错误的** token ⇒ 仍 **403** —— 排除"有这个头就放行"这种更弱的实现。<br>🟢 **豁免表的精确边界（2026-08-20 实测确认，对新版有利）**：`/health`（**任意方法**）+ **GET** `/sandboxes` + **GET** `/v2/sandboxes`，就这三条。`/metrics` **结构性地在 gate 覆盖面之外**（`src/api/server.rs` 里 `.route("/metrics", …)` 加在 `assemble()` **之后**）⇒ **开 gate 不打断 Prometheus 抓取**，不需要为它加豁免、也不该加。设计出处见 [`_design-phase3-node.md` §3.3](_design-phase3-node.md) 的豁免表 |
 | **P-A5-1**「路由不再被抢回」 | 步骤 10/11 | 让 nodeA 的旧化身继续心跳上报同一沙箱，nodeB 持有新化身 ⇒ 连续 20 次 `LookupNode` **恒指向 nodeB** | `binding_execution_total{decision="rejected_older"}` 在这期间应 +N（证明拒绝真的发生过，而不是 A 恰好没上报）|
 | **P-A5-2**「HA 形态」 | 步骤 10/11 | 🔴 **必须用 Redis binding store + query-only 副本**跑一遍 P-A5-1 | 先对一个"只有登记表行、没有 binding"的沙箱在副本上 `LookupNode` ⇒ 必须 `Unavailable`（证明确实跑在**没有 placer 的副本**上，而不是 primary）|
 | **P-A5-3**「聚合端点稳定」 | 步骤 11 | 造同 `sandboxID`、同 `startedAt`、不同 execution 的两条行 ⇒ `GET /v2/sandboxes` **连跑 20 次返回同一条**（v7 较大者）| 退回 keep-first ⇒ 20 次里出现两种结果 |
@@ -1222,6 +1332,215 @@ kubectl -n "$NS" exec "$n" -- sh -c 'ls -1 "$AENV_HOME"/persisted-sandboxes | wc
   A 批次的回退面 = 三个配置开关 + 一个空 token，全部配置级；
   唯一不可配置级回退的是**步骤 2 的数据清零**，它已在 §6.3 单独列为破坏性步骤并配了确认点。
 
+
+---
+
+### 6.8 dev 集群验证结果（2026-08-20）
+
+> **执行环境**：`pve-sg dev`（VM 203/204），按 §6.0.4 的定点更新序列走完 §6.2 的 **13 步**。
+> **本节只写结果与它们为什么可信**；怎么做仍以 §6.0–§6.7 为准。
+> 🟡 **test 集群（VM 201/202）那一遍尚未跑**，本节所有结论只覆盖 dev 一套。
+
+#### 6.8.0 结论
+
+✅ **13 步全过。闸门 7（A3 集群验证）与闸门 13（解锁 B 批次）均 PASS。**
+
+| 项 | 终态 |
+|---|---|
+| 三服务镜像 | 全部 `cp3-bff4993`（对应 commit `bff4993`）|
+| 重启 | 🟢 **全程 `RESTARTS=0`**（含步骤 9 的热翻转与 §6.5 的两轮回退演练）|
+| `SCHEDULER_REGISTRY_WRITE_FENCING` | `true` |
+| `SCHEDULER_ROUTING_EXECUTION_ARBITRATION` | `enforce` |
+| `GATEWAY_ROUTING_EXECUTION_FENCING` | `enforce` |
+
+🔴 **下面每一条都写清它的对照面。** 那不是格式要求 —— 对照面就是这些结论可信的**全部**原因
+（方法论 §8.3：探针必须先自证）。没有对照面的一条，读起来和"探针瞎了"没有区别。
+
+#### 6.8.1 闸门 7：A3 的三发探针
+
+**P-A3-1「必然序列」——「停放」是双条件造成的，这一点被单独证了一遍**
+
+在正式断言之前先拆了一次 reclaim 的双条件（§4 B2 那条"租约过期**且** deadline 过期不许放宽成单条件"）：
+
+| 做法 | 结果 |
+|---|---|
+| **只**把死线推到过去（租约仍有效）| 🟢 **93s / ≥3 个 reclaim tick 内，行纹丝不动** |
+| 把租约也推过去（两个条件都满足）| ✅ **27s 内被释放，且只释放了这 1 行** |
+
+⇒ 停放**确实**是双条件造成的，不是"死线一到就收"。这一发同时也是后面所有断言的地基：
+它证明了造出来的这一行**确实处在 reclaim 的射程内**，而不是因为别的原因没被动。
+
+正式断言与自证：
+
+| 发 | 请求 | 结果 |
+|---|---|---|
+| 断言 | `begin_pause(origin=probe-node-a, exec=E_A)` | ✅ **`PermissionDenied`** |
+| 🔴 对照面 | `begin_pause(origin=**同一个** probe-node-a, exec=E_B)` | ✅ **OK** |
+
+🔴 **对照面为什么这么设计**：同一沙箱、同一条语句、**同一个 origin 节点名**，**只换 execution**
+⇒ 拒绝只可能来自新加的化身谓词，不可能来自 `cluster_id` / `state` / origin 归属。
+
+🔴 **还补了第三发，它才是 A3 的价值所在**：让行的 **generation 变化之后再拒一次** ——
+措辞与第一次**逐字相同**，仍是 `PermissionDenied`。
+⇒ **重读拿一个新 generation 绕不过 fencing**。这正是"`ExecutionFenced → PermissionDenied`
+与 `GenerationConflict → Aborted` 必须分家"（§10 第 2 条）在集群上的兑现：
+若两者合并成一个码，节点的处置是"重读再试"，而重读会把**活化身的 generation** 递给它，同一发写就直穿。
+
+**P-A3-2「零副作用」**
+
+| 面 | 结果 |
+|---|---|
+| 登记行 | ✅ **逐列一致**，且 `metadata` 用 **md5** 比（不是"看起来一样"）|
+| OSS | ✅ **全树 2374 个对象逐行零差异** |
+| `previousSnapshotId` | ✅ 被拒那一发**根本没拿到**它 —— 不是"拿到了但没删" |
+
+🔴 **对照面**：紧接着**成功**那一发把 `generation` 与三个时间戳**全部刷新**并**返回了 `previousSnapshotId`**。
+⇒ 上面三个"没变"是**这条路径有能力改它们**的前提下没变，而不是这条路径本来就什么都不动。
+
+**P-A3-3「两种拒绝分得开」**
+
+同一行连打**四发**：
+
+| 发 | 结果 |
+|---|---|
+| 错 execution 的 `begin_pause` | ✅ `PermissionDenied` |
+| 错 generation 的那一发（§6.6 P-A3-3 指定的 `complete_pause`）| ✅ `Aborted` |
+| 两个对照面（各自正确的那一版）| ✅ **都 OK** |
+
+✅ 指标侧：`agentenv_scheduler_registry_write_rpc_total` 上**两个码各自独立计数，不折叠** ——
+这是"两种拒绝真的是两件事"在**可观测面**上的那一半（错误类型层面由 `errors.Is` 互不成立保证）。
+
+#### 6.8.2 步骤 9：热生效是真的
+
+| 判据 | 结果 |
+|---|---|
+| node Pod 的 `RESTARTS` / `AGE` | ✅ 与步骤 9 **之前**记下的那份 `diff` **逐行相同** |
+| 🔴 对照面 | 故意改一个字节 ⇒ `diff` **报出差异** —— 证明这个 `diff` 分得清"没变"与"变了" |
+
+#### 6.8.3 A4：收窄精确，且 30800 的陷阱被坐实
+
+| 探针 | 结果 |
+|---|---|
+| 无 token `GET /sandboxes` | ✅ **200** |
+| 无 token `GET /v2/sandboxes` | ✅ **200** |
+| 🔴 无 token `POST /sandboxes` | ✅ **403**，且**沙箱数未变**（不只看码，还看有没有真的被创建）|
+| 🔴 对照面：带**错误** token | ✅ **403** —— 排除"有这个头就放行" |
+
+🔴 **R4 被坐实（这是最容易误判的一条）**：**同一发** `POST .../pause`
+
+| 打法 | 结果 |
+|---|---|
+| 经 **30800** | **204** |
+| 直连 **node:8000** | **403** |
+
+⇒ 30800 落在 **gateway**，经它打永远成功。**拿 30800 去验"直连被拒"必然读到"收窄失效"**，
+而那是探针错了，不是功能错了。
+
+#### 6.8.4 A5：有序比对、跨服务互证、以及 observe 期到底证明了什么
+
+**A5-U4 有序比对（三个方向都打了，结果符合裁决）**
+
+| `expect` 传什么 | 结果 |
+|---|---|
+| **旧**化身 | ✅ 204 / `pass_ahead` |
+| **当前**化身 | ✅ 204 / `pass` |
+| **更新**的化身 | ✅ **412 + `x-agentenv-refusal: sandbox_execution_superseded`** / `refused_stale` |
+
+⇒ 比对是**有序**的（`live >= expect` 放行、`live < expect` 拒），不是等值。
+若写成等值，第一行那发会变成 409 —— 而那正是"同机 pause→resume 之后第一批请求"的形状（§6.4 有专门一行）。
+
+**跨服务互证**
+
+✅ gateway 侧增量 **46** = scheduler 侧 `lookup_execution_authority_total{authority="registry"}` 增量 **46**。
+⇒ 两侧对"这次路由的权威来自登记表"的记账**逐条对得上**（对不上就是有一侧算错了）。
+
+> 🔴 **别把这一发读成判据③也过了**：本发对上的是 **`authority="registry"`** 这一对；
+> §6.2 步骤 10 的判据③点名的是**另一对** —— `unfenced_no_authority` ↔ `authority="unknown"`
+> （"gateway 没拿到权威" ↔ "scheduler 答了 unknown"）。两对是**两件事**，一对成立不蕴含另一对成立。
+>
+> ⚠️ **顺带记一处文档内部的不一致（本轮通读发现，未改判）**：**§3 的 A5 行判据③**把这一对写成了
+> `unfenced_node_silent` ↔ `authority="unknown"`，与 §6.2 步骤 10 判据③的 `unfenced_no_authority` **对不上**。
+> 按语义应以 **§6.2 那一版为准**（`unfenced_node_silent` 说的是"node 没回声"，与 scheduler 答不答得出权威无关）。
+> 已在 §3 的 A5 行就地标注，**原表述保留为问题陈述**。
+
+**🔴 observe 期"闸 1 没上膛"是被实测出来的，不是推断**
+
+| 阶段 | node 侧 `agentenv_proxy_execution_fencing_total` |
+|---|---|
+| `observe` 期 | **只有** `pass_no_expect`（**145**）|
+| 翻 `enforce` 之后 | `pass_no_expect` **冻结**、新增 `pass` = **30** |
+
+⇒ observe **确实不下发 expect 头**（裁决 A5-U5），node 无从比对 ⇒ 闸 1 根本没上膛。
+🔴 **这就是为什么 `refused_preflight` 在 observe 期恒 0 不能当证据**（§6.2 步骤 10 判据②早已写明），
+现在它有了集群上的直接证据：**同一个计数器在两个阶段落在不同的标签上**。
+
+**🔴 `unfenced_node_silent` 的分辨力自证（否则"它是 0"什么也不说明）**
+
+刻意把一台测试沙箱 **pause 掉再打数据面** ⇒ 该序列**长出 3**。
+⇒ 前面读到的 **0 是事实，不是探针瞎了**。
+🔴 **同时这也正是 §6.2 步骤 10 判据①被订正的原因**：能把这个序列顶起来的**不止**"node 没装 A5 接收端"，
+paused 且未配 autoResume 的沙箱被访问时 node 回 **410 且不带回声头**，gateway 记的也是这一档。
+
+#### 6.8.5 §6.5 回退演练：R2 的核心实测
+
+🔴 **「删 key」与「写空串」结果完全相反，而失败那一侧是静默的。**
+
+| 做法 | `kubectl` | 挂载文件 | gate gauge | 直连 `POST /pause` |
+|---|---|---|---|---|
+| **删 key** | `patched` | **12s** 后消失 | 🔴 **仍然 1** | 🔴 **仍然 403** |
+| **写空串** | `patched` | **60s** 后 0 字节 | ✅ **0** | ✅ **204 放行** |
+
+- 删 key 之后两台 node 都出现 `agentenv_api_control_plane_token_reload_total{result="error_kept_previous"}`
+  （worker **28** / master **3**）+ warn 日志 —— §6.0.6 那张表里"曾被成功读过、之后消失 ⇒ 保留上一个 good 值"
+  这一格在集群上的样子。
+- 🔴 **失败形态**：**命令成功、无报错、无重启，而 gate 没关掉。**
+  "回退做了"与"回退没做"在终端上是同一行 `patched`。⇒ **回退只能写空串。**
+- ⚠️ 顺带量到了 kubelet 的**跨节点偏斜**：上表两行的 12s / 60s 就是两台 node 各自的刷新时刻
+  （§6.0.7 订正二）。**止血按最慢那台计时。**
+
+其余演练项：**R5 的"旧 build 能跑"只对读侧成立**（`paused` 行可插入、`publishing` 行撞 `23514`
+⇒ 旧 build 一 pause 就挂），逐条已写进 [§6.5](#65--回退演练步骤-12--必须点名-30800) 的 R5 格。
+
+#### 6.8.6 现场顺带撞见的一条：R5 #2 自己演了一遍
+
+基线里那行 `01a01d2d` 在 **03:49:46** 由 **`aenv-master-01` 自主 TTL pause** 掉了 ——
+节点日志里带着 **"删旧快照 reason=superseded by a newer pause"**。
+
+⇒ 侦察结论 [§1.5 R5](#15-r5controller-之外有无自主-pause--publish-路径-有-9-条) 的 **#2「TTL 自动 pause，默认 1 秒一跳的定时器」**
+**在集群上自己演了一遍**，没人去触发它。它同时也是 §3 里"A4 的网络收窄对 R5 #2/#4 完全无效、
+唯一解是 A3 的 SQL 层校验"那条论断的现场证据：**这条路径不需要任何外部请求**。
+
+#### 6.8.7 🔴 射程边界（照实写，别让下一个人把它当成全覆盖）
+
+**步骤 7 的三发探针用的是「合成行 + 两个不存在的节点名」。** 这带来一处必须说清的边界：
+
+- ✅ **P-A3-2 的 OSS 那一半，证明的是「整桶未变」**（2374 个对象逐行零差异）——
+  在**没有真节点参与**的前提下，它能证明的就是这个。
+- 🔴 **它 *不* 证明**："一个**真节点**收到 `PermissionDenied` 之后，克制住了没有 publish、没有删 `previous_snapshot_id`"。
+  那是**节点侧的行为**，合成行的探针够不着。
+- ✅ **后者由步骤 9–11 在集群上覆盖**（真沙箱、真 pause/resume、真数据面），本节 §6.8.3 / §6.8.4 是它的结果。
+
+⇒ **读法**：闸门 7 证明的是**登记表这一侧的谓词是对的、拒绝是零副作用的、两种拒绝分得开**；
+"节点收到拒绝之后不会自己去动快照链"那半的证据在步骤 9–11。**两半合起来才是 A3 的完整验收**，
+拆开引用任何一半都会夸大它的射程。
+
+**🔴 第二条边界：P-A5-2「HA 形态」这一发在 dev 上结构性地跑不了。**
+
+§6.6 的 P-A5-2 写的是"**必须用 Redis binding store + query-only 副本**跑一遍 P-A5-1"，
+理由是 §10 第 5 条：**binding 带 execution 这件事，本地单 scheduler 测不出它失效**。
+而 dev 这套集群跑的是 **内存 binding store**（这一点由 §6.0.7 订正一的 503 窗口反过来坐实：
+binding 若在 Redis 里，滚 scheduler 就不会丢它、也就没有那个窗口）。
+⇒ **P-A5-2 的证据不在本轮里。** 处置只有两条，**不许默认它跟着步骤 10/11 一起过了**：
+① 在 test 集群（若那套配了 Redis）补跑；② 显式登记为未验证项，并在 B 批次前补上。
+
+**🔴 第三条边界：本节只写本轮实际取到的证据。**
+
+§6.6 的 **P-A5-1**（旧化身心跳抢不回 binding）与 **P-A5-3**（聚合端点连跑 20 次稳定）
+在本轮结果里**没有留下单独的取证记录** —— 步骤 10/11 是按**指标判据**过的（§6.2 那两行），
+而指标判据与这两发探针**不是同一件事**（前者是"健康集群上恒 0"，后者是"造出冲突再看谁赢"）。
+⇒ **补记录或补跑，二选一**，别把"步骤 10/11 过了"读成"P-A5-1/3 也过了"。
+
+---
 
 ## 7. 已知陷阱（写在前面，别再踩一遍）
 
@@ -1408,7 +1727,7 @@ gateway → 客户端      409 Conflict + {"code":"sandbox_execution_superseded"
 | `expected_execution_id` | 小写 canonical UUID v7 或空 | 中央/权威侧认为的那个（gateway 下发的 expect、scheduler 行上的 execution、node 收到的 expect）|
 | `observed_execution_id` | 小写 canonical UUID v7 或空 | 事实侧实际的那个（node 本机活化身、scheduler 请求里带上来的 execution、gateway 收到的回声）|
 | `refusal_code` | **`sandbox_execution_superseded`** | 只在拒绝时打。**与 wire 上的机器码逐字相同**，不许另起日志专用措辞 |
-| `fencing_stage` | `registry_write` / `node_proxy` / `gateway_route` | 哪一段拒的。三个值封闭 |
+| `fencing_stage` | `registry_write` / `node_proxy` / `gateway_route` | 哪一段拒的。三个值封闭。⚠️ **代码已出现第 4 个取值 `binding_arbitration`（2026-08-20 实测），本表仍是契约**，处置见 [§12.6 (2)](#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修) |
 | `node_id` | 节点 id | scheduler / gateway 侧必打（node 侧是自己）|
 
 🟡 **措辞统一，不是把三个词合并成一个东西**：Go / Rust 的**类型名**仍叫 `ExecutionFenced`
@@ -1539,6 +1858,13 @@ proto 层做不到逐 kind 分字段 —— 这正是 `requireExecution` / `reje
 > 仅剩的两件观测物之一。落地：`logMsgExecutionRefused` / `logMsgExecutionObserved` 两条常量，
 > 字段集一字不动；测试 `TestTheObserveLineDoesNotClaimToHaveRefused` 同时钉住"两条 message 不同"
 > 与"六个字段一个不少"。
+>
+> ⚠️ **2026-08-20 · 集群验证发现三处代码已偏离本表，只登记不修（[§12.6 (1)(2)](#126-阶段-3-集群验证发现的待办2026-08-20只登记本轮不修)）**：
+> ① `store_postgres.go` 里 `mark_running` 那条 fencing `Warn` **缺 `refusal_code`**；
+> ② `services/scheduler/internal/metrics.go` 的 `warnRefusedBinding` 打了 **第 4 个 `fencing_stage` 取值
+> `binding_arbitration`**，不在冻结三元组内。**本表仍是契约**，两处按 §12.6 的处置意见收，不要照代码反推契约。
+> ③ 另有一处**整段缺失**：scheduler 侧被 fence 的 `begin_pause` **一行日志都没有** ——
+> 而 §11.1(g) 这套字段的本意（一次 grep 串起三段）在**头号场景 R5 #1** 上因此是断的。
 
 ---
 
@@ -1728,6 +2054,8 @@ REDIS_SERVER_BIN="$(command -v redis-server)" \
 > §12.1–§12.3 是同一类：**两侧（甚至三侧）手抄同一个事实，靠注释承诺"保持同步"，没有任何机制会在漂移时变红**。
 > §12.4 是本轮已还的那一条（留作模板）。**§12.5 是 2026-08-20 新立的，类别不同**
 > —— 手抄的两侧不是两份代码，而是**仓内部署清单与集群实际状态**，但同样属于"只登记、本轮不动"。
+> **§12.6 是 2026-08-20 集群验证跑完之后新立的**：四条**在 dev 集群上被实地撞出来**的缺口
+> （两条可观测、两条语义），同样**只登记、本轮不修**。
 >
 > 🔴 **本轮不动它们**：三处都不属于阶段 3 的改动面，现在改会把爆炸半径从"新加的东西"扩大到"既有主路径"。
 > 登记在这里，是为了下一个碰它们的人不必再考古一遍。
@@ -1796,3 +2124,45 @@ REDIS_SERVER_BIN="$(command -v redis-server)" \
 | **本轮怎么处理** | **不治**。治它要么把 RustFS 凭据搬进仓库（不许），要么给主仓 `deploy/agentenv-sg/` 加一层承接 `agentenv.toml` 与镜像引用的 overlay（是活儿，且属于部署工程不属于阶段 3）。本轮的处置是**登记（§6.0.2）+ 每步复核（§6.0.5）+ 本轮不 apply（§6.0.1）** |
 | **有牙的做法（留给下一个人）** | 三件事，按性价比排：<br>1. 🔴 **给 `deploy/k8s/base/kustomization.yaml` 的 `images:` 补 registry 前缀入口**，或给 `run.sh` 加一个 `IMAGE_REGISTRY` / `IMAGE_TAG` 环境变量 —— D-7 是十条里**唯一一条 apply 后会立刻响亮失败**（ImagePullBackOff）的，也是最容易根治的；<br>2. 主仓 `deploy/agentenv-sg/` 补一个 overlay，承接 `agentenv.toml`（D-1/D-2/D-3）、regctl 挂载（D-5）、30800（D-8）、PG（D-9）。凭据走 Secret 引用，不落盘进仓库；<br>3. 补一条**漂移探测**（就是 §6.0.5 那五组探针）进定时任务或 `make` 目标，让"集群被 apply 拆了"这件事在**下一次有人看的时候**就红，而不是在下一次有人 pause 的时候才发现快照没落 OSS |
 | **🔴 反模式（别做）** | 把 `patch-node-config.sh` 那种"apply 完再补一刀"的脚本继续加长。R3 已经记过：那个脚本**只认识 OSS 与缓存预算，不认识 `[orchestrator.paused_registry]`** —— 补刀脚本与漂移清单是两份要手动保持同步的东西，正是本节这本账要消灭的形态 |
+
+### 12.6 阶段 3 集群验证发现的待办（2026-08-20，只登记、本轮不修）
+
+> 来源：[§6.8](#68-dev-集群验证结果2026-08-20) 那一轮 `pve-sg dev` 的 13 步验证。
+> 四条都**不属于本轮的改动面**，登记在这里是为了下一个碰它们的人不必再考古一遍。
+> 🔴 **B 批次开工前至少要读第 4 条 —— B2 会正面撞上它。**
+
+#### (1) 🔴 scheduler 侧被 fence 的 `begin_pause` **零日志**
+
+| 项 | 内容 |
+|---|---|
+| **现象** | 一次被 fencing 拒掉的 `begin_pause`，在 scheduler 侧**只留下一个计数器**：`agentenv_scheduler_registry_write_rpc_total{code="PermissionDenied"}`。**一行日志都没有。** |
+| **为什么** | 两处各差一点，合起来就断了：<br>· `PausedRegistryService.fail`（`services/scheduler/internal/registry_service.go`）**只对 `Unavailable` / `FailedPrecondition` 打 `Warn`** ⇒ `PermissionDenied`（正是 `ErrExecutionFenced` 的码）落在 `if` 外面；<br>· 产生这个错误的 `classifyRefusedPause`（`services/scheduler/internal/registry/store_postgres.go`）**只构造错误、不打日志**。 |
+| 🔴 **为什么这条要紧** | §11.1(g) 冻结那六个日志字段的**本意**是"一次 grep 串起 gateway→node→scheduler"。而**头号场景恰恰是 R5 #1 那条必然序列**（TTL 自动 pause 撞上 reclaim ⇒ `begin_pause` 被 fence）—— **scheduler 这一端在它上面是断的**。排错时能看到的只有一个计数器涨了，看不到是哪个沙箱、哪个化身、被哪个谓词拒的。 |
+| **对照** | 同一套 fencing 在 `mark_running` 那条路径上**是有日志的**（`store_postgres.go` 的 `refused to mark the sandbox running here…`）。⇒ 缺的不是机制，是这一条路径漏了。 |
+| **有牙的做法** | 在 `classifyRefusedPause` 返回 `ErrExecutionFenced` 的两个分支各补一条 `Warn`，字段按 §11.1(g) 的六元组；测试照 gateway 侧 `TestTheObserveLineDoesNotClaimToHaveRefused` 的形态，钉住"六个字段一个不少"。 |
+
+#### (2) 唯一那条 fencing 日志缺 `refusal_code`，且 `fencing_stage` 冒出了第 4 个取值
+
+| 项 | 内容 |
+|---|---|
+| **现象 A** | `store_postgres.go` 里 `mark_running` 那条 fencing `Warn` 打了 `sandbox_id` / `node_id` / `expected_execution_id` / `observed_execution_id` / `fencing_stage`，**独缺 `refusal_code`** —— 而它在 §11.1(g) 的冻结字段集里。⇒ 按 `refusal_code` grep 串三段时，scheduler 侧这条会漏掉。 |
+| **现象 B** | `services/scheduler/internal/metrics.go` 的 `warnRefusedBinding` 打的是 `fencing_stage="binding_arbitration"` —— **第 4 个取值**，而 §10.2 / §11.1(g) 冻结的是**封闭三元组** `{registry_write, node_proxy, gateway_route}`。 |
+| **该怎么收** | 两条路都行，但**必须选一条**：① 认为 binding 仲裁是 A5 的一部分、归 `gateway_route` 或另立一个**显式写进冻结表**的第 4 个值；② 认为它不属于这条链路，改用别的字段名。🔴 **现状是最糟的那种**——冻结表说三个值，代码里有四个，而没有任何东西会在漂移时变红。 |
+| **有牙的做法** | 给 `fencing_stage` 一个 Go 侧的封闭常量集（三段各自的常量已有一半：gateway 侧 `fencingStageGatewayRoute`），加一发测试断言"所有打这个字段的地方用的都是这个集合里的值"。 |
+
+#### (3) `agentenv_scheduler_registry_reclaimable_now` **恒 0，不能当预警用**
+
+| 项 | 内容 |
+|---|---|
+| **现象** | dev 全程该 gauge **恒 0** —— **包括 P-A3-1 里那个"两个条件都已满足、27s 后行真的被释放"的窗口**。 |
+| **后果** | 🔴 **不能把它当成"下一 tick 会被回收"的预警**。它读 0 时，可能真的没有可回收行，也可能正好有一行马上要被收走 —— 这两种情况它分不开，而后者正是运维想提前知道的那一种。 |
+| **边界** | 本条只登记**观测到的行为**，不下"它坏了"的断言：口径可能是"某一相位的快照"而非"此刻可回收数"（`services/scheduler/internal/reconcile.go` 的 `reclaimable_now` 与 `services/scheduler/internal/metrics.go` 的同名 gauge）。**要用它之前先把口径读清楚**，别照名字理解。 |
+
+#### (4) 🔴 P7：`local_only` 不在 `paused_sandboxes_reclaim_idx` 的覆盖面内 ⇒ 过期的 `local_only` 行**永不回收**
+
+| 项 | 内容 |
+|---|---|
+| **出处** | 早前侦察记为 P7，本轮在 dev 上复核后一并登记。 |
+| **事实** | `services/scheduler/internal/registry/migrate.go` 的部分索引：<br>`CREATE INDEX … paused_sandboxes_reclaim_idx ON paused_sandboxes (cluster_id, sandbox_expires_at) WHERE state IN ('running','resuming') AND sandbox_expires_at IS NOT NULL` ⇒ **`local_only` 不在 `WHERE` 里**。 |
+| **后果** | 过期的 `local_only` 行既不会被回收、也不会被别人认领，**永久留在表上**。形态与 §5 的 **T3 F6**（首个续租周期内失联留永久孤儿行）同类。 |
+| 🔴 **谁会撞上** | **B2（evictor 与 reclaim 分离）**。B2 的整件事就是把 reclaim 单拎出来做对，而它一上来就会发现自己的索引覆盖面里没有 `local_only`。<br>⚠️ **注意这不是"把 `local_only` 加进 `WHERE` 就完了"**：索引是**部分索引**，加进去要连带回答"`local_only` 行的回收语义是什么"（它没有活节点持有，`sandbox_expires_at` 的含义与 `running` 那一支不同）。**这是 B2 的设计问题，不是一行 SQL。** |

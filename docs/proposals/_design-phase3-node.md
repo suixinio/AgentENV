@@ -636,6 +636,16 @@ generated auth 层继续按 openapi 的 security 声明抽 claims，A4 的 gate 
 ⇒ gate 的路径判断有**两条**：`/health` 与 `GET /sandboxes`（`GET /v2/sandboxes` 同）。
 这是刻意的：豁免清单越短越可审。🟡 若将来 openapi 增加公开只读端点，必须同批更新这个清单**并加一发测试**。
 
+> ✅ **2026-08-20 · dev 集群实测确认（结论对新版有利，写在这里免得下一个人再去加豁免）**：
+> **gate 的豁免面精确等于**「`/health`（**任意方法**）+ **GET** `/sandboxes` + **GET** `/v2/sandboxes`」，实测：
+> 无 token `GET /sandboxes` = **200**、无 token `GET /v2/sandboxes` = **200**、
+> 🔴 无 token `POST /sandboxes` = **403 且沙箱数未变**；再加一发对照面 —— 带一个**错误的** token ⇒ 仍 **403**
+> （排除"有这个头就放行"这种更弱的实现）。
+> 🟢 **`/metrics` 结构性地在 gate 覆盖面之外**（`.route("/metrics", …)` 链在 `assemble(...)` **之后**，`src/api/server.rs`）
+> ⇒ **开 gate 不打断 Prometheus 抓取**。它**不需要**、也**不应该**进 gate 的路径判断 ——
+> 本表上一行说的"结构性"在集群上成立。
+> 出处：任务书 [§6.8](_impl-plan-control-plane-phase3.md#68-dev-集群验证结果2026-08-20)。
+
 > ✅ **裁决 D-6 的两条附带说明**：
 > 1. 🟡 **打击面**：`GET /sandboxes` 是只读列举，泄露的是本节点上的沙箱 id 与资源信息 ——
 >    与今天（presence-only，等于全公开）相比不劣化，且它本来就是 gateway 聚合出去的公开视图。

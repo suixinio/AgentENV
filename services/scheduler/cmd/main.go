@@ -136,6 +136,27 @@ func main() {
 			schedulerv1.RegisterPausedRegistryServer(g, registrySvc)
 			registryPhase = registrySvc.Phase
 
+			// The snapshot catalog, on the registry's own pool.
+			//
+			// 🔴 The same pool and not a second one. A pause writes two facts —
+			// the sandbox is parked, and here is the snapshot it parked into —
+			// and the only reason the catalog is served from this process is
+			// that those two can then be one transaction. A second pool would
+			// be a second connection and the window would still be open.
+			//
+			// Registered before the migration has run and gated on the same
+			// grace as the registry, which opens after both schemas are
+			// applied. Until then every catalog RPC answers UNAVAILABLE — a
+			// refusal a caller can act on, where an empty page would read as
+			// "this cluster has no snapshots".
+			catalogStore := catalog.NewStoreWithPool(registryWriter.Pool(), catalog.StoreConfig{
+				Logger: logger,
+				Paused: scheduler.NewPausedHalfAdapter(registryWriter),
+			})
+			schedulerv1.RegisterSnapshotCatalogServer(g, scheduler.NewSnapshotCatalogService(
+				logger, catalogStore, registryGrace, cfg.Scheduler.Registry.ClusterID,
+			))
+
 			// 🔴 Registered either way, and left cold when there is no cluster
 			// scope. Not registering would answer Unimplemented, which reads as
 			// "this build does not have the feature" rather than "it is

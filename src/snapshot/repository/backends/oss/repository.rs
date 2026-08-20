@@ -1214,8 +1214,184 @@ fn validate_publish_manifest_image_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store_operator::CredentialSource;
+    use object_store_operator::{CredentialSource, ResolvedCredential};
     use serde_json::json;
+
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+
+    use axum::extract::{Request, State};
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::Router;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    use crate::snapshot::repository::metrics::test_support::object_store_requests;
+    use crate::types::SandboxResources;
+
+    const TEST_BUCKET: &str = "bucket";
+    const TEST_PREFIX: &str = "snapshots";
+
+    type FakeObjects = Arc<BTreeMap<String, Vec<u8>>>;
+
+    /// Minimal S3 stand-in: enough of `ListObjectsV2` plus object GET for the
+    /// catalog read path, so the request count can be asserted without a real
+    /// object store.
+    async fn fake_s3(State(objects): State<FakeObjects>, request: Request) -> Response {
+        let query = request.uri().query().unwrap_or("").to_owned();
+        if query.contains("list-type=2") {
+            let prefix = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("prefix="))
+                .map(percent_decode)
+                .unwrap_or_default();
+            let mut xml = String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated>"#,
+            );
+            xml.push_str(&format!("<Name>{TEST_BUCKET}</Name>"));
+            for (key, body) in objects.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+                xml.push_str(&format!(
+                    "<Contents><Key>{key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+                    body.len()
+                ));
+            }
+            xml.push_str("</ListBucketResult>");
+            return ([(CONTENT_TYPE, "application/xml")], xml).into_response();
+        }
+
+        let path = request.uri().path().trim_start_matches('/');
+        let key = path
+            .strip_prefix(&format!("{TEST_BUCKET}/"))
+            .unwrap_or(path)
+            .to_owned();
+        match objects.get(&key) {
+            Some(body) => {
+                ([(CONTENT_TYPE, "application/octet-stream")], body.clone()).into_response()
+            }
+            None => (
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchKey</Code></Error>",
+            )
+                .into_response(),
+        }
+    }
+
+    fn percent_decode(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut bytes = value.as_bytes().iter().copied();
+        while let Some(byte) = bytes.next() {
+            if byte != b'%' {
+                out.push(byte as char);
+                continue;
+            }
+            let hex: String = [bytes.next(), bytes.next()]
+                .into_iter()
+                .flatten()
+                .map(|byte| byte as char)
+                .collect();
+            match u8::from_str_radix(&hex, 16) {
+                Ok(decoded) => out.push(decoded as char),
+                Err(_) => out.push('%'),
+            }
+        }
+        out
+    }
+
+    async fn spawn_fake_s3(objects: BTreeMap<String, Vec<u8>>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake s3");
+        let addr = listener.local_addr().expect("fake s3 addr");
+        let app = Router::new()
+            .fallback(fake_s3)
+            .with_state(Arc::new(objects));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn fake_s3_repository(addr: SocketAddr) -> (Arc<OssClient>, OssSnapshotRepository) {
+        let client = Arc::new(
+            OssClient::new(
+                TEST_BUCKET.to_string(),
+                format!("http://{addr}"),
+                "us-east-1".to_string(),
+                TEST_PREFIX.to_string(),
+                CredentialSource::Static(ResolvedCredential {
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    security_token: None,
+                    expires_at: None,
+                }),
+            )
+            .expect("oss client"),
+        );
+        let repository = OssSnapshotRepository::new(
+            Arc::clone(&client),
+            SnapshotImageStoragePolicy::ObjectStorage,
+        );
+        (client, repository)
+    }
+
+    /// Today a single `GET /snapshots` costs one LIST of `catalog/records/`
+    /// plus one GET per record. Pin that `1 + N` down now, while it is still
+    /// non-zero: a counter that reads zero both before and after the catalog
+    /// moves out of object storage cannot tell the two apart. The same read
+    /// also proves the `surface` label separates catalog rows from snapshot
+    /// bytes, which is what keeps the later zero from being drowned out by
+    /// byte traffic that legitimately continues.
+    #[tokio::test]
+    async fn catalog_list_and_artifact_read_are_counted_on_separate_surfaces() {
+        let record_count = 3_u64;
+        let mut objects = BTreeMap::new();
+        for index in 0..record_count {
+            let record = SnapshotRecord::template_waiting(
+                SnapshotId::generate(),
+                Some(SnapshotAlias::parse(&format!("template-{index}")).expect("alias parses")),
+                SandboxResources::default(),
+            );
+            objects.insert(
+                format!("{TEST_PREFIX}/catalog/records/{}.json", record.id),
+                serde_json::to_vec(&record).expect("serialize record"),
+            );
+        }
+        let artifact_key = "artifacts/0198f0a1-0000-7000-8000-000000000000/vm_state.bin";
+        objects.insert(
+            format!("{TEST_PREFIX}/{artifact_key}"),
+            b"vm state".to_vec(),
+        );
+
+        let addr = spawn_fake_s3(objects).await;
+        let (client, repository) = fake_s3_repository(addr);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let listed = repository
+            .list(SnapshotListFilter::matches_all())
+            .await
+            .expect("list should work");
+        let artifact = client
+            .get_bytes(artifact_key)
+            .await
+            .expect("artifact read should work");
+
+        drop(guard);
+
+        assert_eq!(listed.len(), record_count as usize);
+        assert_eq!(artifact.as_ref(), b"vm state");
+        assert_eq!(
+            object_store_requests(&snapshotter),
+            BTreeMap::from([
+                ("list/catalog/ok".to_owned(), 1),
+                ("get/catalog/ok".to_owned(), record_count),
+                ("get/artifact/ok".to_owned(), 1),
+            ]),
+        );
+    }
 
     fn write_test_image(path: &Path, value: serde_json::Value) {
         std::fs::write(

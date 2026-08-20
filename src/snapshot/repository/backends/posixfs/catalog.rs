@@ -8,6 +8,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
+use crate::snapshot::repository::metrics::{
+    record_object_store_request, ObjectStoreOp, ObjectStoreSurface,
+};
 use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
     CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
@@ -210,7 +213,13 @@ impl PosixFsCatalogStore {
         self.ensure_layout()?;
         let records_dir = self.records_dir();
         let mut records = Vec::new();
-        for entry in fs::read_dir(&records_dir).map_err(|error| {
+        let listed = fs::read_dir(&records_dir);
+        record_object_store_request(
+            ObjectStoreOp::List,
+            ObjectStoreSurface::Catalog,
+            listed.is_ok(),
+        );
+        for entry in listed.map_err(|error| {
             RepositoryError::backend(
                 format!("read records dir '{}'", records_dir.display()),
                 error,
@@ -380,7 +389,15 @@ impl PosixFsCatalogStore {
     where
         T: DeserializeOwned,
     {
-        let bytes = fs::read(path).map_err(|error| {
+        // Every path this store reads is a catalog row: a snapshot record or
+        // an alias binding. Snapshot bytes live in `artifacts.rs`.
+        let read = fs::read(path);
+        record_object_store_request(
+            ObjectStoreOp::Get,
+            ObjectStoreSurface::Catalog,
+            read.is_ok(),
+        );
+        let bytes = read.map_err(|error| {
             RepositoryError::backend(format!("read '{}'", path.display()), error)
         })?;
         serde_json::from_slice(&bytes).map_err(|error| {
@@ -389,6 +406,20 @@ impl PosixFsCatalogStore {
     }
 
     fn write_json<T>(&self, path: &Path, value: &T) -> RepositoryResult<()>
+    where
+        T: Serialize,
+    {
+        // As with `read_json`, every write this store makes is a catalog row.
+        let result = self.write_json_inner(path, value);
+        record_object_store_request(
+            ObjectStoreOp::Put,
+            ObjectStoreSurface::Catalog,
+            result.is_ok(),
+        );
+        result
+    }
+
+    fn write_json_inner<T>(&self, path: &Path, value: &T) -> RepositoryResult<()>
     where
         T: Serialize,
     {
@@ -763,14 +794,60 @@ fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use metrics_util::debugging::DebuggingRecorder;
     use tempfile::TempDir;
 
     use super::super::layout::PosixFsSnapshotArtifactLayout;
     use super::PosixFsCatalogStore;
+    use crate::snapshot::repository::metrics::test_support::object_store_requests;
     use crate::snapshot::{
         CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
         SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
     };
+    use crate::types::SandboxResources;
+
+    /// A catalog read must be *visible* as object-store traffic: one LIST for
+    /// the records directory plus one GET per record. The whole point of the
+    /// counter is that this number can later be shown to drop to zero, and a
+    /// probe that reads zero both before and after proves nothing — so assert
+    /// the exact `1 + N` here, while it is still non-zero.
+    #[test]
+    fn catalog_list_counts_one_list_plus_one_get_per_record() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        // Seed outside the recorder so only the read under test is counted.
+        let record_count = 3_u64;
+        for index in 0..record_count {
+            store
+                .create(SnapshotRecord::template_waiting(
+                    SnapshotId::generate(),
+                    Some(SnapshotAlias::parse(&format!("template-{index}")).expect("alias parses")),
+                    SandboxResources::default(),
+                ))
+                .expect("create should work");
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let listed = metrics::with_local_recorder(&recorder, || {
+            store.list(SnapshotListFilter::matches_all())
+        })
+        .expect("list should work");
+        assert_eq!(listed.len(), record_count as usize);
+
+        let counters = object_store_requests(&snapshotter);
+        assert_eq!(
+            counters,
+            BTreeMap::from([
+                ("list/catalog/ok".to_owned(), 1),
+                ("get/catalog/ok".to_owned(), record_count),
+            ]),
+            "listing {record_count} records should cost exactly 1 + {record_count} catalog \
+             requests and touch no byte traffic"
+        );
+    }
 
     #[test]
     fn begin_and_commit_make_snapshot_visible() {

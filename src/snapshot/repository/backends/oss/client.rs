@@ -16,6 +16,9 @@ use tracing::info;
 use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
+use crate::snapshot::repository::metrics::{
+    record_object_store_request, ObjectStoreOp, ObjectStoreSurface,
+};
 
 /// Multipart part size for streaming file uploads. S3/OSS caps a multipart
 /// upload at 10,000 parts, so this bounds the largest uploadable object
@@ -120,6 +123,11 @@ impl OssClient {
             .await
             .with_context(|| format!("oss get '{key}'"));
         metric.finish(&result);
+        record_object_store_request(
+            ObjectStoreOp::Get,
+            ObjectStoreSurface::for_key(key),
+            result.is_ok(),
+        );
         result
     }
 
@@ -143,6 +151,11 @@ impl OssClient {
             .await
             .with_context(|| format!("oss download '{key}'"));
         metric.finish(&result);
+        record_object_store_request(
+            ObjectStoreOp::Get,
+            ObjectStoreSurface::for_key(key),
+            result.is_ok(),
+        );
         result
     }
 
@@ -157,12 +170,17 @@ impl OssClient {
             .await
             .with_context(|| format!("oss exists '{key}'"));
         metric.finish(&result);
+        record_object_store_request(
+            ObjectStoreOp::Head,
+            ObjectStoreSurface::for_key(key),
+            result.is_ok(),
+        );
         result
     }
 
     /// List all files recursively under a prefix.
     pub(crate) async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
-        let keys = self
+        let listed = self
             .run_with_key(prefix, |operator, prefix| async move {
                 let entries = operator.list_with(&prefix).recursive(true).await?;
 
@@ -173,7 +191,13 @@ impl OssClient {
                     .collect())
             })
             .await
-            .with_context(|| format!("oss list '{prefix}'"))?;
+            .with_context(|| format!("oss list '{prefix}'"));
+        record_object_store_request(
+            ObjectStoreOp::List,
+            ObjectStoreSurface::for_key(prefix),
+            listed.is_ok(),
+        );
+        let keys: Vec<String> = listed?;
 
         if self.prefix.is_empty() {
             return Ok(keys);
@@ -206,6 +230,11 @@ impl OssClient {
             .await
             .with_context(|| format!("oss put '{key}'"));
         metric.finish(&result);
+        record_object_store_request(
+            ObjectStoreOp::Put,
+            ObjectStoreSurface::for_key(key),
+            result.is_ok(),
+        );
         if result.is_ok() {
             metrics::counter!(
                 "agentenv_snapshot_oss_upload_bytes_total",
@@ -246,6 +275,11 @@ impl OssClient {
         }
         .await;
         metric.finish(&result);
+        record_object_store_request(
+            ObjectStoreOp::Put,
+            ObjectStoreSurface::for_key(key),
+            result.is_ok(),
+        );
         match result {
             Ok(size) => {
                 metrics::counter!(
@@ -269,15 +303,22 @@ impl OssClient {
 
     /// Delete a single object. Idempotent – missing objects are not errors.
     pub(crate) async fn delete(&self, key: &str) -> Result<()> {
-        self.run_with_key(key, |operator, key| async move {
-            match operator.delete(&key).await {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == OpenDalErrorKind::NotFound => Ok(()),
-                Err(err) => Err(err),
-            }
-        })
-        .await
-        .with_context(|| format!("oss delete '{key}'"))
+        let result = self
+            .run_with_key(key, |operator, key| async move {
+                match operator.delete(&key).await {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == OpenDalErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+            .await
+            .with_context(|| format!("oss delete '{key}'"));
+        record_object_store_request(
+            ObjectStoreOp::Delete,
+            ObjectStoreSurface::for_key(key),
+            result.is_ok(),
+        );
+        result
     }
 
     /// Delete all objects under a prefix.
@@ -285,10 +326,22 @@ impl OssClient {
         // `list_keys_recursive()` returns repository-relative keys with the
         // configured backend prefix stripped, while `delete()` expects that
         // same repository-relative form and re-applies the backend prefix.
-        let keys = self.list_keys_recursive(prefix).await?;
-        stream::iter(keys.into_iter().map(Ok::<_, anyhow::Error>))
-            .try_for_each_concurrent(16, |key| async move { self.delete(&key).await })
-            .await
+        // The constituent LIST and DELETEs are counted by the leaf methods
+        // themselves; this increment covers the composite so a caller of
+        // `delete_prefix` is still visible as one backend operation.
+        let result = async {
+            let keys = self.list_keys_recursive(prefix).await?;
+            stream::iter(keys.into_iter().map(Ok::<_, anyhow::Error>))
+                .try_for_each_concurrent(16, |key| async move { self.delete(&key).await })
+                .await
+        }
+        .await;
+        record_object_store_request(
+            ObjectStoreOp::DeletePrefix,
+            ObjectStoreSurface::for_key(prefix),
+            result.is_ok(),
+        );
+        result
     }
 
     pub(crate) fn is_not_found_error(error: &anyhow::Error) -> bool {

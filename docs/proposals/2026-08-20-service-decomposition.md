@@ -19,8 +19,13 @@
 >
 > **v4（2026-08-20）**：第三轮对抗审查，重点在「照着能不能执行」。
 > 阶段 1 的 ① 被证明是把一条**已经同步**的写降级成异步（§7 阶段 1）；
-> 路由投影与活跃态 store 被证明必须是**两个**结构（§4.2.1）；
+> 路由投影与活跃态 store 被证明必须是**两个**结构（§4.2.2）；
 > auto-resume 的归属是全文最大的空缺（§4.3、阶段 3 第 5 条）。处置在 §12。
+>
+> **v5（2026-08-20）**：去 e2b 里查了 v4 悬置的两个决策。
+> **沙箱寿命上界已定** —— 照抄，含它的三处强制（§7 阶段 1 第 4 点）。
+> **节点失联接管也定了，但答案是「两个形态都不选」** —— 折叠之后没有需要接管的东西（§4.2.1）。
+> 两条都不再阻塞阶段 3。
 
 ---
 
@@ -276,39 +281,92 @@ StateSnapshotting State = "snapshotting"
 是 AgentENV 独有的形状，两家参考都没有。
 
 > 🔧 **但折叠之后不是一条记录，是两条。** v3 在这里写过「同一条记录的三个字段」——
-> 那句话把路由投影和活跃态 store 混成了一个东西。见 §4.2.1。
+> 那句话把路由投影和活跃态 store 混成了一个东西。见 §4.2.2。
 
 这一步同时解决三件事：`api` 能有 N 副本（F1）、13,640 行跨语言登记表消失、
 以及第一轮就发现的「中央登记表不是沙箱表，所以 `GET /sandboxes` 只能扇出」。
 
-**租约去哪了 —— 🔴 不是「折叠进 TTL」，这条要单独设计。**
+**租约去哪了 —— 🔴 不是「折叠进 TTL」。** TTL 只负责「记录不会永久泄漏」。
 
 v2 写的是「节点死了 ⇒ 记录到期 ⇒ 不再被路由，这也是 e2b 的做法」。**归因错了**：
-e2b 的记录 expiration 是 `MaxLengthInHours`（`packages/api/internal/orchestrator/lifecycle.go:38`）——
-**沙箱的最大寿命，小时级**。节点死了记录**不会**很快到期；清理靠
+e2b 的记录 expiration 是 `MaxLengthInHours`（`orchestrator/lifecycle.go:38`）——
+**沙箱的最大寿命**。节点死了记录**不会**很快到期；清理靠
 `nodemanager.Sync` → `store.Reconcile(orphanCandidates, nodeID)`。
-它的 `UnreachableSince` 消费者为零，恰恰说明它**不靠 TTL 自动接管**。
 
-⇒ TTL 只负责「记录不会永久泄漏」，**不负责「节点失联了要不要接管」**。后者是独立决策，
-而且是上一轮那条铁律的落点（`running` / `resuming` 永不可抢）。两种可选形态：
+租约今天干的是**另外两件事**，得分开处置：
 
-| 形态 | 语义 | 代价 |
+| | 租约今天负责 | 折叠之后归谁 |
 |---|---|---|
-| **fail-closed（e2b）** | 节点失联 ⇒ 等它回来对账，期间沙箱不可 resume | 一台机器长时间失联 = 那批沙箱长时间不可用 |
-| **有条件接管（我们今天）** | 租约过期 ＋ deadline 过期 ⇒ 允许别处认领 | 比 e2b 激进，**正因如此更依赖 fencing**（outcome §3.1 已登记） |
+| **(a)** 「原节点还在吗？在的话我不能在别处恢复」 | **消失** —— 见 §4.2.1 |
+| **(b)** 「两个执行者不能同时恢复同一个沙箱」 | `Paused → Resuming` 的**原子 CAS**（阶段 3 的 §8 工作，本来就要建） |
 
-**本文不替这条做决定** —— 它必须与 §6 的 fencing 方案一起裁决。但**必须在阶段 3 建 Redis
-记录结构之前定下来**，因为两种形态需要的字段不同（fail-closed 只要 `execution_id` ＋
-`node_id`；有条件接管还要 `lease_expires_at` ＋ `sandbox_expires_at`）。
+### 4.2.1 ✅ 节点失联接管 —— 问题被取消提问资格，不是被回答
 
-> 🔴 **一个必须同批决定的前提：`local_only` 怎么办。**
-> 今天 pause 可能发布失败，留下只有原节点能恢复的沙箱 —— 而目录行是全集群可见的。
-> 最优解是让**暂停必然落共享存储**（主仓 `docs/proposals/2026-08-19-aenv-pause-publish-durability.md`，
-> 不在本 submodule 内），`local_only` 随之消失，模型精确落在 e2b 上。
-> 若该项不能同期完成，退路是目录行上带 `origin_node_id` ＋ `published` 两列，
-> resume 时对未发布的行硬钉 origin。**这是阶段 2 建表时就要定的，不能拖到阶段 3。**
+> **v5 定的。** v4 把它列成 fail-closed / 有条件接管两选一并悬置。
+> 去 e2b 里查完之后，正确答案是**两个都不选** —— 折叠之后没有需要接管的东西。
 
-### 4.2.1 🔴 路由投影与活跃态 store 是**两个**结构，不是一个
+**e2b 的 resume 是有节点亲和的**（`sandbox_resume.go:209` 读 `snap.OriginNodeID`），
+但看它怎么用（`create_instance.go:333-341`）：
+
+```go
+if isResume && sbxData.NodeID != nil {
+    node = o.GetNode(clusterID, *sbxData.NodeID)
+    if node != nil && !node.CanAcceptNewRequests() {
+        node = nil                    // ← 亲和落空，直接放弃
+    }
+}
+placed, err := placement.PlaceSandbox(ctx, algo, clusterNodes, node /* 可为 nil */, ...)
+```
+
+节点没了 ⇒ `GetNode` 返回 nil；节点在但接不了 ⇒ 显式置 nil。**然后走通用放置 ——
+没有租约、不等过期、没有任何仲裁。** 更彻底的是 `maybeRemapResumeOriginNode`
+（`create_instance.go:460`）：一次 resume 落到别处之后，它**把 DB 里的 `OriginNodeID`
+改写成新节点**，提示会自愈。它还把 `node_affinity_requested` 与 `node_affinity_success`
+做成两个独立 telemetry 属性（`:372-373`）—— 说明「落空」在设计上就是正常结果，不是错误。
+
+⇒ **e2b 把「哪台节点」从「所有权」降格成了「缓存亲和」。一旦是亲和，
+失联就不需要策略 —— 那只是一次缓存未命中。**
+
+**我们今天为什么需要接管**：因为暂停沙箱身上的节点绑定是**所有权**。
+而它之所以是所有权，只有一个原因 —— **`local_only`**：发布失败的 pause 把字节只留在原节点，
+那台机器**确实**是唯一能恢复它的地方。只要存在这种沙箱，系统就必须回答
+「原节点没了怎么办」，那个回答就是接管策略。
+
+**⇒ 消掉它的三件事都已经在本文计划里**：
+
+| 计划里已有的 | 消掉什么 |
+|---|---|
+| **两分折叠**（§4.2，阶段 2） | 暂停沙箱离开活跃态、变成目录行 —— 它身上不再有租约 |
+| 🔴 **pause 必然发布共享存储**（见下方跨仓依赖） | 消掉 `local_only` —— **唯一让 origin 成为「必需」而非「偏好」的东西** |
+| **阶段 3 的状态 CAS**（§8） | 接手上表的 (b)：并发恢复互斥 |
+
+⇒ 阶段 3 的 Redis 记录**只需要 `execution_id` ＋ `node_id`**，
+不是因为选了 fail-closed，而是因为需要接管的那个 case 没有了。
+顺带是一次**净提升**：今天一个已发布的暂停沙箱要等租约过期才能被别处认领，
+折叠之后它根本没有租约，**立刻可以在任何节点恢复**。
+
+🔴 **三条必须说清的边界：**
+
+1. **运行中的沙箱不在此列，而且哪儿都没有答案。**
+   原节点失联、沙箱还在跑 —— e2b 也不接管：内存在那台机器上，别处无从恢复。
+   它只是过期，期间流量 502。这与上一轮
+   [`控制面重构收口`](2026-08-19-control-plane-refactor-outcome.md) 的判断一致
+   （提交 `14456f1`：「Neither of them solved a partitioned node that still holds a
+   **live** sandbox … there is no answer to copy」）。
+   **那句话说的是运行中的沙箱；本节说的是暂停的沙箱。前者无解也不需要解，后者有解。**
+
+2. 🔴 **硬依赖，而且跨仓。** 整个论证挂在「pause 必然发布」上 ——
+   主仓 `docs/proposals/2026-08-19-aenv-pause-publish-durability.md`，
+   **不在本 submodule 内**。它不落地，`local_only` 就还在，origin 就还是「必需」，
+   接管问题原样回来（退路仍是目录行带 `origin_node_id` ＋ `published` 两列，
+   resume 时对未发布的行硬钉 origin）。
+   ⇒ **阶段 3 的记录结构现在依赖一个本仓之外的交付物**，排期时要显式挂上去。
+
+3. **亲和性本身要保留，作为提示。** D5 已经写了我们有一半（P2P / 缓存亲和）。
+   `maybeRemapResumeOriginNode` 那个模式值得抄：**提示落空时改写提示**，
+   而不是反复重试一台死掉的机器。
+
+### 4.2.2 🔴 路由投影与活跃态 store 是**两个**结构，不是一个
 
 **e2b 是两个，而且刻意隔离**：
 
@@ -377,7 +435,7 @@ src/api/generated/src/models.rs      # 只是 E2B 兼容 schema 的字段，没�
 
 影响两处，都要在阶段 3 之前明确：
 
-- **e2b store 的 team 分片对我们不适用**（§4.2.1 末尾）；
+- **e2b store 的 team 分片对我们不适用**（§4.2.2 末尾）；
 - 🔴 **`Reserve` 的四态里，`limitExceeded` 没有可对照的配额主体。**
   模块文档 §8.4 说它「同时带来团队配额」、上表把「鉴权 / 配额」归 `api` 并引 e2b
   `team/` —— 这两处**目前是无对应物**。阶段 3 实际拿到的是**三态**
@@ -592,7 +650,7 @@ type redisBindingRecord struct {
 
 扁平 key `agentenv:scheduler:bindings:<id>`，值是「节点 ＋ 化身」。**这就是 e2b 的
 `SandboxInfo`**（`packages/shared/pkg/sandbox-catalog/catalog.go:11-18`）少两个字段。
-⇒ 阶段 1 不是新建一个过渡结构，是**把已有结构补成 §4.2.1 的投影**。四件事：
+⇒ 阶段 1 不是新建一个过渡结构，是**把已有结构补成 §4.2.2 的投影**。四件事：
 
 **1. CREATE / FORK：不动，它已经是同步的。**
 `services/gateway/internal/server.go:557-561` 在**响应路径上**写，还从响应头取到了化身
@@ -629,23 +687,55 @@ func (s *Service) ReportSandboxEvent(...) (*schedulerv1.ReportSandboxEventRespon
 ⇒ proto 加一个字段 `SandboxEvent.execution_id`（今天只有 `SandboxRosterEntry` 有它，
 `scheduler.proto:309`）。本仓无兼容包袱，additive 直接加。
 
-**4. 🔴 TTL 从 30s 改成什么 —— 这一条今天没有答案，开工前要拍板。**
-e2b 用 `MaxLengthInHours`（`orchestrator/lifecycle.go:38`）：**建时确定、之后不变**的上界，
-所以能直接当 Redis TTL。我们没有这个量：
+**4. TTL 从 30s 改成什么 —— ✅ 已定：引入沙箱寿命上界，照抄 e2b。**
+
+> 🔧 **v5 定的。** v4 把它列成两选一并悬置；去 e2b 里查了之后，它有完整答案。
+
+我们今天没有「寿命上界」这个量 —— 只有一个**可被 `SetTimeout` 反复推后**的 deadline：
 
 ```
 $ grep -rn "max_instance_length|MaxLength|max_sandbox_lifetime" config/default.toml src/cfg.rs
 （无匹配）
-config/default.toml:215:  default_sandbox_timeout_secs = 15   # 可被 SetTimeout 反复推后
+config/default.toml:215:  default_sandbox_timeout_secs = 15
 ```
 
-| 选项 | 做法 | 代价 |
-|---|---|---|
-| **(a) 引入 `max_sandbox_lifetime` 上界**（建议） | 对标 e2b，TTL 一次写定，永不续期 | 给用户一个新的硬上限 |
-| (b) TTL ＝ 当前 deadline ＋ 宽限 | 每次改 timeout 都要 `EXPIRE` 续期 | 正是 e2b 在 `operations.go:159-215` 里靠 `redis.KeepTTL` ＋ ZAdd 重打分处理的那类问题 —— **属于阶段 3 的机制** |
+e2b 有，而且**它不是一个系统常量，是一张配额表的列**：
 
-⇒ **建议 (a)**。阶段 1 的价值全在「投影的存活不依赖 scheduler 在线」，
-而 (b) 让它重新依赖一条周期性写路径。
+```sql
+-- packages/db/migrations/20240219190940_add_max_length_hours.sql
+ALTER TABLE "public"."tiers" ADD COLUMN "max_length_hours" bigint NULL;
+UPDATE  "public"."tiers" SET "max_length_hours" = 1 WHERE "max_length_hours" IS NULL;
+ALTER TABLE "public"."tiers" ALTER COLUMN "max_length_hours" SET NOT NULL;
+```
+
+默认 **1 小时**，按 tier 分档，后来加了项目级覆盖
+（`COALESCE(pl.max_length_hours, tier.max_length_hours)`，`20260728163016`）。
+建沙箱时解析成 `Sandbox.MaxInstanceLength`。
+
+🔴 **关键不在这个值，在它被强制的三个位置** —— 少任何一个，TTL 就不能写一次定死：
+
+| 位置 | 做什么 |
+|---|---|
+| `sandbox/store.go:82-83` | **入库时钳制** —— `if endTime.Sub(StartTime) > MaxInstanceLength { EndTime = StartTime + MaxInstanceLength }` |
+| `keep_alive.go:28` `:31-32` | **续期时拒绝** —— `getMaxAllowedTTL(now, StartTime, duration, MaxInstanceLength)`；越界 ⇒ `errMaxInstanceLengthExceeded` ⇒ **HTTP 400 "Max instance length exceeded"** |
+| `lifecycle.go:36` `:39` | 投影 TTL ＝ `MaxLengthInHours * time.Hour` |
+
+⇒ **因为 `SetTimeout` 在前门就被钳住了，投影 TTL 才可以「写一次、永不续期」。**
+这不是「选了个粗糙的 TTL」，是**把那个会移动的量在源头锁死，TTL 就变成建时可推导的**。
+
+**我们的落法**：`[orchestrator] max_sandbox_lifetime_secs` 一个 config 值即可 ——
+没有租户模型（§4.4）反而省掉了 tier 表。三处强制照搬，
+一处都不能省：只做 TTL 不做钳制，等于让投影在沙箱还活着时过期。
+
+🔴 **抄的时候有一个坑**：`lifecycle.go:36` 的 `int64(MaxInstanceLength / time.Hour)`
+是**整数除法**。它在 e2b 安全，只因为源头本来就是整小时。
+**我们的上界如果做成秒级，不能沿用这个截断** —— 90 分钟会被截成 1 小时，
+投影比沙箱先过期，路由在沙箱还活着的时候就查不到了。
+
+> 被否掉的另一条：TTL ＝ 当前 deadline ＋ 宽限、每次改 timeout 都 `EXPIRE` 续期。
+> 那正是 e2b 在 `operations.go:159-215` 里靠 `redis.KeepTTL` ＋ ZAdd 重打分处理的那类问题，
+> **属于阶段 3 的机制**；在阶段 1 走这条，等于让投影的存活重新依赖一条周期性写路径，
+> 把这一阶段唯一的兑现抵消掉。
 
 🔴 **心跳对账保留为修复路径，不是主路径。** 事件是尽力而为的（节点侧广播无订阅者即丢弃），
 丢了必须有东西把投影修回来。e2b 是同一形状：`StoreSandbox` 在 create 时写，
@@ -705,8 +795,11 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 「跨副本失效」这个问题。目录在哪，目录缓存就在哪，两件事一起做才不用做两次。
 
 🔴 **建表时就要定的两件**：
-1. **暂停态的落点**（§4.2 的红框）：`local_only` 是消掉还是用
-   `origin_node_id` ＋ `published` 两列表达。拖到阶段 3 会变成一次 schema 重做。
+1. **暂停态的落点**（§4.2.1）：**目标是消掉 `local_only`** —— 它是唯一让原节点从
+   「偏好」变成「必需」的东西，消掉之后阶段 3 的接管问题跟着消失。
+   🔴 但它依赖主仓的 pause-publish-durability。**建表时必须同时确认那一项的排期**：
+   若不能同期完成，退路是目录行带 `origin_node_id` ＋ `published` 两列，
+   resume 时对未发布的行硬钉 origin。拖到阶段 3 会变成一次 schema 重做。
 2. **`builds` 表的形状要能承载构建队列** —— e2b 有
    `get_concurrent_template_builds` / `active_template_builds` 做并发控制，我们今天没有。
 
@@ -722,6 +815,11 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 ### 阶段 3 —— 活跃态折叠进 Redis ＋ `--role` 拆分 ＋ `api` N 副本
 
 **前置**：阶段 2。
+
+🔴 **外加一条跨仓前置**：主仓的 pause-publish-durability。
+它决定 Redis 记录要不要带接管字段 —— 落地了就只要 `execution_id` ＋ `node_id`（§4.2.1），
+没落地就得回到「有条件接管」，多两个字段和一套仲裁。**记录结构一旦建起来改不动，
+所以这一项的状态要在本阶段开工前确认，不能开工后再问。**
 
 🔴 **这三件事是同一批，不能拆。** 理由是 §0 的第二条硬约束：只有 `api` 持有 Redis 凭据。
 先搬活跃态、后拆 role，等于把 Redis 凭据发到每台跑用户代码的 KVM 机器上，
@@ -992,7 +1090,7 @@ src/orchestrator/paused_registry           3,564 行
 | **H1** | 阶段 1 的「TTL ＝ 沙箱寿命」**无量可取** —— `grep max_instance_length` 全仓无匹配，我们只有一个可被 `SetTimeout` 反复推后的 deadline | 阶段 1 第 4 点：列成 (a) 引入上界 / (b) 续期 两选一，**建议 (a)**，并注明 (b) 等于把阶段 3 的机制提前引进来 |
 | **H2** | 阶段 1 ① 把 CREATE / FORK 这条**今天已经同步、且已带化身**的写（`server.go:557-561`）降级成异步事件；e2b `store.go:43` 明确要求它同步 | 阶段 1 ① 重写成四点：CREATE/FORK 不动、RESUME 补进同一机制、PAUSE/DELETE 才走事件、TTL 单独裁决。规模从 600–800 回到 400–500 |
 | **H3** | **auto-resume 没有被任何一张职责表分配。** 它在 `src/api/proxy.rs:878` `:891` 的数据面反代路径上，而 §4.3 把本机反代留给 `node` ⇒ `--role node` 之后 node 仍自主发起 resume，§6.1 的前提被架空；阶段 4 删掉 `LookupNode` 后冷路径无人接管 | 新增阶段 3 第 5 条（迁到 `api`，照 `proxy.go:109` ＋ `paused_sandbox_resumer_grpc.go`）；§4.3 加「暂停沙箱的按需唤醒」一行；阶段 4 加硬前提 |
-| **H4** | 路由投影与活跃态 store 被写成「同一条记录的三个字段」，而 **e2b 是两个结构且刻意隔离**（`grep api/internal/sandbox packages/client-proxy/` 零命中） | 新增 §4.2.1 与模块文档 D11；§4.3 表拆成四行；并指出**阶段 1 建的就是这个投影 —— 记录结构在阶段 3 保留，换的只是写入方**（gateway → `api`），不是过渡投入 |
+| **H4** | 路由投影与活跃态 store 被写成「同一条记录的三个字段」，而 **e2b 是两个结构且刻意隔离**（`grep api/internal/sandbox packages/client-proxy/` 零命中） | 新增 §4.2.2 与模块文档 D11；§4.3 表拆成四行；并指出**阶段 1 建的就是这个投影 —— 记录结构在阶段 3 保留，换的只是写入方**（gateway → `api`），不是过渡投入 |
 | **M5** | §3.3「Redis store 是 N 副本的**充要条件**」逻辑过强 —— 文档自己另列了四个原语 | 改为「必要条件，不是充分条件」 |
 | **M6** | 阶段 3 第 4 条句子被编辑破坏：`proxy_routes` 出现在标题后再未出现，末尾「前者……后者……」悬空 | 重写成两个子项 ＋ 一句「不分开会怎样」 |
 | **M7** | 阶段 3 判据 3 的对照组指向「第 2 项」，而第 2 项与分布式锁无关 | 改指本项 |
@@ -1035,7 +1133,8 @@ src/orchestrator/paused_registry           3,564 行
 | execution fencing 批次 A 已合并 | `f7eef4c` `7851bb4` `04c5d37` `bff4993`；`store_postgres.go:462` `:501` |
 | 🔴 CREATE / FORK 的投影写**已经是同步的**，且带化身 | `services/gateway/internal/server.go:557-561` |
 | 路由投影的记录结构已存在：扁平 key ＋ 节点 ＋ 化身 | `services/scheduler/internal/redis_store.go:17` |
-| 🔴 没有「沙箱最大寿命」这个量 | `config/default.toml:215`；`grep max_instance_length` 全仓无匹配 |
+| 🔴 没有「沙箱最大寿命」这个量（✅ 已定：引入 `max_sandbox_lifetime_secs`） | `config/default.toml:215`；`grep max_instance_length` 全仓无匹配 |
+| 运行中沙箱的分区问题无解可抄，且只针对**运行中**的 | 提交 `14456f1` 的提交信息 |
 | 🔴 auto-resume 在 node 的数据面反代路径上 | `src/api/proxy.rs:878` `:891` |
 | 🔴 没有租户模型；鉴权是 presence-only | `src/api/impls/auth.rs`；`grep team_id src/` 仅命中 generated |
 
@@ -1064,6 +1163,12 @@ src/orchestrator/paused_registry           3,564 行
 | 🔴 跨副本的每沙箱分布式锁 | `packages/api/internal/sandbox/storage/redis/lock.go`、`state_change.go:41` `:190` |
 | 并发 create 去重：`ErrAlreadyExists` ⇒ `waitForStart` | `packages/api/internal/sandbox/store.go:157` |
 | 路由记录的 TTL 是沙箱寿命，不是租约 | `packages/api/internal/orchestrator/lifecycle.go:38` |
+| 寿命上界是**配额表的列**，默认 1 小时，可按项目覆盖 | `packages/db/migrations/20240219190940_add_max_length_hours.sql`、`20260728163016_add_project_limits.sql:56` |
+| 🔴 上界的三处强制：入库钳制 / 续期拒绝 / 投影 TTL | `sandbox/store.go:82-83`、`keep_alive.go:28` `:31-32`、`lifecycle.go:36` `:39` |
+| 🔴 resume 的节点亲和**落空即放弃**，无租约、无仲裁 | `packages/api/internal/orchestrator/create_instance.go:333-341` |
+| 亲和落空后**改写 DB 里的 origin**，提示自愈 | `create_instance.go:460-505`、`UpdateSnapshotOriginNode` |
+| 亲和成功与否是两个独立 telemetry 属性 ⇒ 落空是正常结果 | `create_instance.go:372-373` |
+| 失联观测存在但**零生产消费者**；`Reconcile` 只在节点应答后执行 | `nodemanager/status.go:98-130`、`sync.go:63-70`；`grep UnreachableSince` 仅命中测试 |
 | 🔴 路由投影是独立结构，client-proxy 从不引用 api 的 store 包 | `packages/shared/pkg/sandbox-catalog/catalog.go:11-18`；`grep -rn "api/internal/sandbox" packages/client-proxy/` 零命中 |
 | 🔴 投影写必须**同步**，且是 store 的插入回调 | `packages/api/internal/sandbox/store.go:43-44`、`orchestrator/lifecycle.go:15` |
 | store key 按 team 分片；投影 key 扁平 | `storage/redis/utils.go:62-67`、`catalog_redis.go:111-112` |

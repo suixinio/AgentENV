@@ -6,6 +6,9 @@
 > 考古基准：e2b `/home/debian/e2b-infra`。所有 `packages/...` 路径都指它。
 > 行数均为**非测试**代码。
 >
+> **v5（2026-08-20）**：两个悬置决策裁决完毕 ——
+> 沙箱寿命上界照抄 e2b（D10 末尾），节点失联接管**取消提问**（新增 **D12**）。
+>
 > **v4（2026-08-20）**：随拆分方案第三轮对抗审查同步更新。
 > 新增 **D11（路由投影与活跃态 store 是两个结构）**；
 > **D10 改了一半** —— CREATE / FORK 的投影写今天已经同步，不该改走事件通道；
@@ -27,7 +30,7 @@ e2b 的模块划分不是按「功能」切的，是按**谁拥有哪份真相**
 | P3 跨副本协调走 Redis pub/sub | ✅ `publisher.go` ＋ `subscription_manager.go` | ❌ 进程内 broadcast channel |
 | P6 对账是拉的 | ✅ `nodemanager.Sync → List → store.Reconcile` | ❌ 只有推（心跳），没有拉 |
 
-§4–§5 是 AgentENV 的目标模块表与连边表；§6 是十一个设计决策；
+§4–§5 是 AgentENV 的目标模块表与连边表；§6 是十二个设计决策；
 §8 是活跃态 store 的四个缺口。
 
 ---
@@ -172,7 +175,7 @@ registered in-process waiters」。`WaitForStateChange` 因此能跨副本工作
 | `src/orchestrator/store/redis_cas.rs` | 🆕 **新建** | `update_state_if_state` / `update_if_state` / `wait_while_in_states` 的 Redis 实现（Lua ＋ pub/sub 唤醒） | Redis | `storage/redis/scripts.go`、`state_change.go` |
 | `src/orchestrator/store/lock.rs` | 🆕 **新建，范围比想象小** | 只用于 CAS 表达不了的两处：跨多次往返的读-判断-写、TTL 有界的崩溃恢复（见 D9） | Redis | `sandbox/storage/redis/lock.go` |
 | `src/orchestrator/store/reserve.rs` | 🆕 **新建** | 并发 create 去重：已存在时返回「等第一个的结果」而不是报错（🔴 我们只有**三态**，见 8.4） | Redis | `sandbox/store.go:157`、`reservations/redis/` |
-| `src/orchestrator/routing_projection.rs` | 🆕 **新建** | 🔴 **路由投影** —— 五字段扁平记录，随 store 插入**同步**写；`gateway` 唯一读的东西。**与活跃态 store 是两个结构**（拆分方案 §4.2.1） | Redis（派生） | `shared/pkg/sandbox-catalog/` ＋ `orchestrator/lifecycle.go:15` |
+| `src/orchestrator/routing_projection.rs` | 🆕 **新建** | 🔴 **路由投影** —— 五字段扁平记录，随 store 插入**同步**写；`gateway` 唯一读的东西。**与活跃态 store 是两个结构**（拆分方案 §4.2.2） | Redis（派生） | `shared/pkg/sandbox-catalog/` ＋ `orchestrator/lifecycle.go:15` |
 | `src/orchestrator/evictor.rs` | 已有，提出来 | 超时驱逐（唯一发起方） | —— | `evictor/` |
 | `src/orchestrator/placement/` | 🆕 **新建**（Go port） | 优选 ＋ **试到有人接为止** | —— | `placement/` |
 | `src/orchestrator/node_manager/` | 🆕 **新建** | 每节点代理对象：连接、状态、机器信息、`Sync` 循环 | 进程内缓存 | `nodemanager/` |
@@ -232,7 +235,7 @@ registered in-process waiters」。`WaitForStateChange` 因此能跨副本工作
 
 ---
 
-## 6. 十一个设计决策
+## 6. 十二个设计决策
 
 ### D1 推与拉都要，但各管各的
 
@@ -405,10 +408,15 @@ sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
 **事件（稀疏、只管删）** 与 **心跳（对账、周期）**，两条的失败模式不同 ——
 事件丢了由心跳修，心跳晚了不影响记录存活。
 
-🔴 **TTL 写成什么，今天没有答案。** e2b 用 `MaxLengthInHours`（建时确定、之后不变），
-我们没有这个量（`grep max_instance_length` 全仓无匹配），只有一个可被 `SetTimeout`
-反复推后的 deadline。要么引入上界，要么每次改 timeout 都续期 ——
-后者是阶段 3 的机制。取舍见拆分方案 §7 阶段 1 第 4 点。
+✅ **TTL 写成什么，已定：引入沙箱寿命上界，照抄 e2b。**
+它的上界是**配额表的列**（`tiers.max_length_hours`，默认 1 小时），
+而真正让 TTL 得以「写一次、永不续期」的是**三处强制**：
+入库时钳制 `EndTime`（`sandbox/store.go:82-83`）、续期时越界拒绝并回 400
+（`keep_alive.go:31-32`）、投影 TTL 由它推导（`lifecycle.go:36` `:39`）。
+**把会移动的量在源头锁死，TTL 才变成建时可推导的。**
+我们没有租户模型，一个 config 值即可，但三处强制一处不能省。
+🔴 抄的时候注意 `lifecycle.go:36` 是整数除法 —— 秒级上界不能沿用那个截断。
+详见拆分方案 §7 阶段 1 第 4 点。
 
 ---
 
@@ -437,6 +445,41 @@ node，gateway 是唯一同时看得见「请求」和「哪台节点答的」�
 
 ---
 
+### D12 ✅ 节点是**亲和提示**，不是所有者
+
+**v5 定的**，它取消了「节点失联要不要接管」这个提问 —— 详细论证在拆分方案 §4.2.1，
+这里只记模块层面的后果。
+
+e2b 的 resume **有**节点亲和（`sandbox_resume.go:209` 读 `snap.OriginNodeID`），
+但它是提示不是绑定（`create_instance.go:333-341`）：
+
+```go
+node = o.GetNode(clusterID, *sbxData.NodeID)
+if node != nil && !node.CanAcceptNewRequests() {
+    node = nil                    // ← 落空就放弃，走通用放置
+}
+```
+
+没有租约、不等过期、没有仲裁。落空之后 `maybeRemapResumeOriginNode`
+还会**改写 DB 里的 origin**，让提示自愈。
+
+⇒ 三条模块级后果：
+
+1. **`src/orchestrator/placement/` 要接受一个可空的 preferred node**，
+   并在它不可用时静默降级 —— 不是报错，不是重试那台机器。
+   这与 D4「试到有人接为止」是同一套控制流。
+2. **`src/orchestrator/routing_projection.rs` 的记录只要 `execution_id` ＋ `node_id`**，
+   不带 `lease_expires_at` / `sandbox_expires_at`。租约的两件事里，
+   「原节点还在吗」消失，「并发恢复互斥」归 §8 的状态 CAS。
+3. **提示落空要改写提示**（对标 `UpdateSnapshotOriginNode`），
+   这正好接上 D5 —— 我们已经有 P2P / 缓存亲和的一半，缺的是这个自愈回路。
+
+🔴 **前提是 `local_only` 被消掉**，而那依赖主仓的 pause-publish-durability，
+**不在本 submodule 内**。它不落地，原节点就仍是「必需」而非「偏好」，
+上面三条全部回退。
+
+---
+
 ## 7. 新建模块与阶段的对应
 
 | 模块 | 阶段 | 备注 |
@@ -445,7 +488,10 @@ node，gateway 是唯一同时看得见「请求」和「哪台节点答的」�
 | `scheduler` 的 `ReportSandboxEvent` 实现（今天丢弃） | **1** | D10，阶段 1 的① |
 | proto 加 `SandboxEvent.execution_id` | **1** | D10 的 execution 守卫删除需要它 |
 | `shouldRecordAssignment` 覆盖 RESUME | **1** | D10 —— 投影真正缺的那条同步写 |
-| 🔴 裁决沙箱寿命上界（`max_sandbox_lifetime`） | **1** | D10 末尾；不定就写不出投影的 TTL |
+| ✅ `max_sandbox_lifetime_secs` ＋ **三处强制**（入库钳制 / 续期 400 / 投影 TTL） | **1** | D10 末尾；已定，照抄 e2b。三处一起做才有意义 |
+| `placement` 接受可空 preferred node ＋ 落空静默降级 | **4** | D12 第 1 条 |
+| 亲和提示落空后**改写提示**（对标 `UpdateSnapshotOriginNode`） | **4** | D12 第 3 条；接上 D5 缺的自愈回路 |
+| 🔴 跨仓前置：主仓 pause-publish-durability 消掉 `local_only` | **3 之前** | D12 的前提；不落地则 D12 三条全部回退 |
 | `src/snapshot/repository/pg/` | **2** | 目录进 PG |
 | `src/template` 的并发上限 ＋ `builds` 表 | **2** | 建表时留形状，别等阶段 3 |
 | `src/orchestrator/store/redis.rs` | **3** | `api` N 副本的**必要条件**（不是充分 —— 还要 8.5 那六件） |
@@ -626,6 +672,11 @@ healer 的三个设计点值得逐条抄：
 | 分布式锁保护的是跨多次往返的读-判断-写 | `packages/api/internal/sandbox/storage/redis/lock.go`、`state_change.go:41` `:190` |
 | 并发 create 去重 | `packages/api/internal/sandbox/store.go:157` |
 | 路由记录 TTL＝沙箱寿命，由 api 显式写／删 | `packages/api/internal/orchestrator/lifecycle.go:38`、`catalog_redis.go` 的 `DeleteSandbox` |
+| 寿命上界是配额表的列，默认 1 小时 | `packages/db/migrations/20240219190940_add_max_length_hours.sql` |
+| 🔴 上界的三处强制 | `sandbox/store.go:82-83`、`keep_alive.go:28` `:31-32`、`lifecycle.go:36` `:39` |
+| 🔴 resume 节点亲和落空即放弃，无租约无仲裁 | `packages/api/internal/orchestrator/create_instance.go:333-341` |
+| 亲和落空后改写 DB 里的 origin | `create_instance.go:460-505` |
+| 失联观测零生产消费者；`Reconcile` 只在节点应答后跑 | `nodemanager/status.go:98-130`、`sync.go:63-70` |
 | 活跃态只有 Redis 一个后端 | `packages/api/internal/sandbox/storage/`（仅 `redis/`） |
 | 测试跑 testcontainer 里的真 Redis | `packages/shared/pkg/redis/tests.go:17` |
 | 节点的 `List` 来自进程内句柄表 | `packages/orchestrator/pkg/server/sandboxes.go:568` |

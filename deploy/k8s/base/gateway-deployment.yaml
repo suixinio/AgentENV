@@ -83,6 +83,61 @@ spec:
                   name: execution-fencing-config
                   key: GATEWAY_ROUTING_EXECUTION_FENCING
                   optional: true
+            # Where the routing projection lives, for the gateway to read
+            # directly. The same Redis the scheduler writes to (redis.yaml), and
+            # the same reasoning as SCHEDULER_REDIS_ADDR: a Service name is not
+            # a credential, so it is a plain value rather than a Secret ref.
+            #
+            # 🔴 Set here from the start, while the read switch below is still
+            # `off`, and that ordering is not optional. The gateway refuses to
+            # start with `projection_read` on and no address — deliberately, so
+            # that a switch reporting as on can never be doing nothing — which
+            # means turning the switch on *first* is a CrashLoop, not a
+            # degraded read. With the switch off this value is inert: the
+            # gateway builds no client at all and never opens a connection, so
+            # carrying it costs nothing and removes the ordering hazard from
+            # the flip entirely.
+            - name: GATEWAY_REDIS_ADDR
+              value: agentenv-redis:6379
+            # The two halves of the routing projection the gateway owns: whether
+            # it may answer a sandbox route out of the projection instead of
+            # asking the scheduler, and whether it writes the projection as a
+            # record with a lifetime of its own.
+            #
+            # 🔴 Both start `off`, and unlike the fencing switches above the
+            # *code* defaults to off as well. The reason is written out in
+            # services/shared/config: turning the write side on makes
+            # ReportSandboxEvent — an RPC every node in the fleet is already
+            # sending — stop being a guaranteed no-op and start deleting
+            # records. A cluster that rolled this image without asking for that
+            # would acquire the behaviour the moment a pod restarted.
+            #
+            # 🔴 The read switch is paired with the scheduler's
+            # SCHEDULER_ROUTING_EXECUTION_ARBITRATION: it may only be on while
+            # that one is anything other than `off`. The arbitration rollback
+            # works by blanking the incarnation fields on the way out of
+            # LookupNode, and a gateway reading the projection itself never
+            # passes through that code — it would go on fencing against
+            # incarnations the scheduler has stopped arbitrating. Nothing
+            # enforces the pairing; it is an operational rule.
+            #
+            # As with the fencing switches, the ConfigMap carries the release's
+            # starting values and these environment variables exist so a
+            # rollback is `kubectl set env` — which rolls the deployment and is
+            # loud — rather than an edit to a mounted file, which would not take
+            # effect at all until something restarted the pod anyway.
+            - name: GATEWAY_ROUTING_PROJECTION_READ
+              valueFrom:
+                configMapKeyRef:
+                  name: routing-projection-config
+                  key: GATEWAY_ROUTING_PROJECTION_READ
+                  optional: true
+            - name: GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE
+              valueFrom:
+                configMapKeyRef:
+                  name: routing-projection-config
+                  key: GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

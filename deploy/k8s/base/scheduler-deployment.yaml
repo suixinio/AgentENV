@@ -149,6 +149,29 @@ spec:
                   name: execution-fencing-config
                   key: SCHEDULER_ROUTING_EXECUTION_ARBITRATION
                   optional: true
+            # The scheduler's half of the routing projection's write side:
+            # whether a node's TTL budget is honoured, whether a heartbeat may
+            # leave an existing deadline alone, and whether a pause or delete
+            # event removes a record instead of being logged and dropped.
+            #
+            # 🔴 `off` here is not "the new code is inactive" — it is the whole
+            # of the old behaviour, and it has to stay reachable in one flip:
+            # every record goes back to binding_ttl within one heartbeat, with
+            # no rollback logic of its own to run, because the path a rollback
+            # takes is the branch that shipped before this.
+            #
+            # 🔴 Turning it on and off is safe in either order with respect to
+            # the gateway's GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE, and that
+            # is by design: scheduler-first means a resume's record is installed
+            # by the heartbeat repair path up to 5s late with the right TTL;
+            # gateway-first means one redundant write carrying a TTL this
+            # process ignores. Neither intermediate state is a new system.
+            - name: SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE
+              valueFrom:
+                configMapKeyRef:
+                  name: routing-projection-config
+                  key: SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE
+                  optional: true
           ports:
             - name: grpc
               containerPort: 9090

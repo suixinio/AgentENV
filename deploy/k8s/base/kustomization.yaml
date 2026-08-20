@@ -94,6 +94,34 @@ configMapGenerator:
       # nothing. It moves to `observe` only after the node-side gate has been
       # switched on and verified, and to `enforce` after that.
       - GATEWAY_ROUTING_EXECUTION_FENCING=off
+  # The routing projection's three switches — two logical ones, split across two
+  # processes, so three environment variables. Kept apart from the fencing
+  # ConfigMap above because they belong to a different change and are flipped on
+  # a different day; an operator reading either one should see one release.
+  #
+  # 🔴 All three start `off`, and here the code agrees with the ConfigMap
+  # instead of contradicting it. The three above default to their end state
+  # because a cluster parked in `observe` was the failure that release feared.
+  # These are the opposite case: switching the write side on gives
+  # ReportSandboxEvent — which every node is already sending — the power to
+  # delete routing records, so a cluster that rolled the image without asking
+  # for it would acquire that at the next pod restart. `off` is the only safe
+  # code default, and the ConfigMap simply says so out loud.
+  #
+  # Order to flip them in: the two write-side switches first, in either order,
+  # then the read switch. Rolling back is `kubectl set env` on the Deployment,
+  # which rolls it and is loud — editing this ConfigMap in a live cluster does
+  # nothing until something restarts the pods, and is undone by the next apply.
+  #
+  # 🔴 GATEWAY_ROUTING_PROJECTION_READ additionally requires
+  # GATEWAY_REDIS_ADDR to be set on the gateway Deployment (it is, from the
+  # start) and requires SCHEDULER_ROUTING_EXECUTION_ARBITRATION above to be
+  # anything other than `off`.
+  - name: routing-projection-config
+    literals:
+      - SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=off
+      - GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE=off
+      - GATEWAY_ROUTING_PROJECTION_READ=off
 
 images:
   - name: agentenv-gateway

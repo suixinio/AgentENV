@@ -421,8 +421,15 @@ A4 想修的根因（`make k8s-apply` 把集群的 `postgres` 覆盖成文件里
    （今天连续漏 3 次几乎不可能），归 Slice C 更合适。
 5. **Go 侧那 10 个必需字段的清单是手抄的**（`metadata_golden_test.go` 的
    `requiredMetadataFields` vs `metadata.rs` 的 `REQUIRED_FIELDS`）。
-   两边都有测试守着 fixture，所以清单抄错会被 fixture 抓到；但清单本身没有机器同步。
+   ~~两边都有测试守着 fixture，所以清单抄错会被 fixture 抓到~~；但清单本身没有机器同步。
    与 `schemaDDL` 逐字复制是同一种取舍。
+   > 🔴 **已订正（2026-08-20）**：删去的那半句是错的，而且正是它让人放心了太久 —— fixture 只挡得住
+   > **多写**一个名字（fixture 里没有 ⇒ 红），挡不住**漏写**（fixture 是超集，少一个照样绿）。
+   > `execution_id` 就是这么漏的：node 把它设为必需并重生成了 fixture，Go 侧清单少一个名字，全绿。
+   > ✅ 已改成"Rust 侧把 `REQUIRED_FIELDS` 导出成 `tests/fixtures/sandbox_metadata_required_fields.json`，
+   > Go 侧读同一份文件做**集合相等**"，两个方向各有变异实证。
+   > 同类的其余三处手抄（`LeaseExpired` / `Store` 接口 / 测试常量）已登记在
+   > `_impl-plan-control-plane-phase3.md` §12，**本轮不动**。
 6. **`tests/paused_registry.rs` 不做任何清理**（不 DELETE / 不 DROP，靠每测试一个随机
    `cluster_id` 分区）。CI 里每次是全新容器所以无所谓，但本地反复跑会让表无限增长。
    本轮没改它的 harness —— 那是 Slice B 移植语义时更合适一并处理的事。

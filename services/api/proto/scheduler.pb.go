@@ -5762,14 +5762,19 @@ type GetSnapshotRequest struct {
 	// A snapshot id or an alias. Which one it is, the server decides — the node's
 	// own get() takes the same union and callers do not know which they hold.
 	IdOrAlias string `protobuf:"bytes,2,opt,name=id_or_alias,json=idOrAlias,proto3" json:"id_or_alias,omitempty"`
-	// 🔴 Whether to apply the `status_group = 'ready'` predicate.
+	// 🔴 Whether to drop the `status_group = 'ready'` predicate.
 	//
-	// True for everything that is about to *run* the snapshot, which is the
-	// predicate that stops a half-uploaded snapshot from starting a VM. False for
-	// the endpoint that reports build status, which exists precisely to see rows
-	// that are building or failed. There is no safe default, so it is required of
-	// the caller rather than assumed here.
-	OnlyReady bool `protobuf:"varint,3,opt,name=only_ready,json=onlyReady,proto3" json:"only_ready,omitempty"`
+	// False — the zero value, and what a caller that never heard of this field
+	// sends — keeps the predicate, which is what stops a half-uploaded snapshot
+	// from starting a VM. True is for the endpoint that reports build status,
+	// which exists precisely to see rows that are building or failed.
+	//
+	// 🔴 Stated this way round because proto3 cannot make a bool required and an
+	// absent field is indistinguishable from false. Spelled as `only_ready`, the
+	// value a forgetful caller sends is the one that resolves a snapshot whose
+	// bytes are still uploading; spelled this way, forgetting it costs a caller
+	// nothing worse than not seeing its own failed build.
+	AllowAnyStatus bool `protobuf:"varint,3,opt,name=allow_any_status,json=allowAnyStatus,proto3" json:"allow_any_status,omitempty"`
 	// Include the build row's timestamps in the answer.
 	WithBuild     bool `protobuf:"varint,4,opt,name=with_build,json=withBuild,proto3" json:"with_build,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -5820,9 +5825,9 @@ func (x *GetSnapshotRequest) GetIdOrAlias() string {
 	return ""
 }
 
-func (x *GetSnapshotRequest) GetOnlyReady() bool {
+func (x *GetSnapshotRequest) GetAllowAnyStatus() bool {
 	if x != nil {
-		return x.OnlyReady
+		return x.AllowAnyStatus
 	}
 	return false
 }
@@ -5836,7 +5841,7 @@ func (x *GetSnapshotRequest) GetWithBuild() bool {
 
 type GetSnapshotResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Absent when there is no such row, or when only_ready excluded it. Not an
+	// Absent when there is no such row, or when the ready predicate excluded it. Not an
 	// error: "no such snapshot" is an answer.
 	Row           *SnapshotRow `protobuf:"bytes,1,opt,name=row,proto3,oneof" json:"row,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -5958,9 +5963,9 @@ type SnapshotFilter struct {
 	SourceSandboxId *string `protobuf:"bytes,5,opt,name=source_sandbox_id,json=sourceSandboxId,proto3,oneof" json:"source_sandbox_id,omitempty"`
 	// Template build statuses to keep. Matches template rows only.
 	//
-	// 🔴 Meaningful only when only_ready is false. Asking for `building` rows
-	// under the ready predicate is a filter that can never match, and a caller
-	// that does it is reading an empty page as "there are none".
+	// 🔴 Meaningful only when allow_any_status is true. Asking for `building`
+	// rows under the ready predicate is a filter that can never match, and a
+	// caller that does it is reading an empty page as "there are none".
 	TemplateStatuses []string `protobuf:"bytes,6,rep,name=template_statuses,json=templateStatuses,proto3" json:"template_statuses,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
@@ -6050,11 +6055,12 @@ type ListSnapshotsRequest struct {
 	// single request comes to pull ten thousand rows into memory. Here zero means
 	// "the server's default".
 	Limit uint32 `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`
-	// See GetSnapshotRequest.only_ready. The listing endpoints pass true.
-	OnlyReady     bool `protobuf:"varint,5,opt,name=only_ready,json=onlyReady,proto3" json:"only_ready,omitempty"`
-	WithBuild     bool `protobuf:"varint,6,opt,name=with_build,json=withBuild,proto3" json:"with_build,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// See GetSnapshotRequest.allow_any_status. The listing endpoints leave it
+	// false; the one that reports build status sets it.
+	AllowAnyStatus bool `protobuf:"varint,5,opt,name=allow_any_status,json=allowAnyStatus,proto3" json:"allow_any_status,omitempty"`
+	WithBuild      bool `protobuf:"varint,6,opt,name=with_build,json=withBuild,proto3" json:"with_build,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ListSnapshotsRequest) Reset() {
@@ -6115,9 +6121,9 @@ func (x *ListSnapshotsRequest) GetLimit() uint32 {
 	return 0
 }
 
-func (x *ListSnapshotsRequest) GetOnlyReady() bool {
+func (x *ListSnapshotsRequest) GetAllowAnyStatus() bool {
 	if x != nil {
-		return x.OnlyReady
+		return x.AllowAnyStatus
 	}
 	return false
 }
@@ -6303,10 +6309,11 @@ type ResolveAliasRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	ClusterId string                 `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
 	Alias     string                 `protobuf:"bytes,2,opt,name=alias,proto3" json:"alias,omitempty"`
-	// See GetSnapshotRequest.only_ready. Resolving in order to run means true.
-	OnlyReady     bool `protobuf:"varint,3,opt,name=only_ready,json=onlyReady,proto3" json:"only_ready,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// See GetSnapshotRequest.allow_any_status. Resolving in order to run means
+	// leaving it false, which is also what forgetting it does.
+	AllowAnyStatus bool `protobuf:"varint,3,opt,name=allow_any_status,json=allowAnyStatus,proto3" json:"allow_any_status,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ResolveAliasRequest) Reset() {
@@ -6353,9 +6360,9 @@ func (x *ResolveAliasRequest) GetAlias() string {
 	return ""
 }
 
-func (x *ResolveAliasRequest) GetOnlyReady() bool {
+func (x *ResolveAliasRequest) GetAllowAnyStatus() bool {
 	if x != nil {
-		return x.OnlyReady
+		return x.AllowAnyStatus
 	}
 	return false
 }
@@ -7317,13 +7324,12 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x14FailSnapshotResponse\x123\n" +
 	"\x06failed\x18\x01 \x01(\v2\x19.scheduler.v1.SnapshotRowH\x00R\x06failed\x12;\n" +
 	"\brejected\x18\x02 \x01(\v2\x1d.scheduler.v1.CatalogRejectedH\x00R\brejectedB\t\n" +
-	"\aoutcome\"\x91\x01\n" +
+	"\aoutcome\"\x9c\x01\n" +
 	"\x12GetSnapshotRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1e\n" +
-	"\vid_or_alias\x18\x02 \x01(\tR\tidOrAlias\x12\x1d\n" +
-	"\n" +
-	"only_ready\x18\x03 \x01(\bR\tonlyReady\x12\x1d\n" +
+	"\vid_or_alias\x18\x02 \x01(\tR\tidOrAlias\x12(\n" +
+	"\x10allow_any_status\x18\x03 \x01(\bR\x0eallowAnyStatus\x12\x1d\n" +
 	"\n" +
 	"with_build\x18\x04 \x01(\bR\twithBuild\"O\n" +
 	"\x13GetSnapshotResponse\x120\n" +
@@ -7342,15 +7348,14 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11template_statuses\x18\x06 \x03(\tR\x10templateStatusesB\x0f\n" +
 	"\r_alias_prefixB\x17\n" +
 	"\x15_snapshot_id_or_aliasB\x14\n" +
-	"\x12_source_sandbox_id\"\x85\x02\n" +
+	"\x12_source_sandbox_id\"\x90\x02\n" +
 	"\x14ListSnapshotsRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x124\n" +
 	"\x06filter\x18\x02 \x01(\v2\x1c.scheduler.v1.SnapshotFilterR\x06filter\x129\n" +
 	"\x06cursor\x18\x03 \x01(\v2\x1c.scheduler.v1.SnapshotCursorH\x00R\x06cursor\x88\x01\x01\x12\x14\n" +
-	"\x05limit\x18\x04 \x01(\rR\x05limit\x12\x1d\n" +
-	"\n" +
-	"only_ready\x18\x05 \x01(\bR\tonlyReady\x12\x1d\n" +
+	"\x05limit\x18\x04 \x01(\rR\x05limit\x12(\n" +
+	"\x10allow_any_status\x18\x05 \x01(\bR\x0eallowAnyStatus\x12\x1d\n" +
 	"\n" +
 	"with_build\x18\x06 \x01(\bR\twithBuildB\t\n" +
 	"\a_cursor\"\x9a\x01\n" +
@@ -7367,13 +7372,12 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x16DeleteSnapshotResponse\x12\x18\n" +
 	"\adeleted\x18\x01 \x01(\bR\adeleted\x120\n" +
 	"\x03row\x18\x02 \x01(\v2\x19.scheduler.v1.SnapshotRowH\x00R\x03row\x88\x01\x01B\x06\n" +
-	"\x04_row\"i\n" +
+	"\x04_row\"t\n" +
 	"\x13ResolveAliasRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x14\n" +
-	"\x05alias\x18\x02 \x01(\tR\x05alias\x12\x1d\n" +
-	"\n" +
-	"only_ready\x18\x03 \x01(\bR\tonlyReady\"{\n" +
+	"\x05alias\x18\x02 \x01(\tR\x05alias\x12(\n" +
+	"\x10allow_any_status\x18\x03 \x01(\bR\x0eallowAnyStatus\"{\n" +
 	"\x14ResolveAliasResponse\x12\x1f\n" +
 	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
 	"snapshotId\x12\x1c\n" +

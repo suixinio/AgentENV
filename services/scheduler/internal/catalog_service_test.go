@@ -65,6 +65,9 @@ type stubCatalogStore struct {
 	lastFail   catalog.FailInput
 	lastList   catalog.ListInput
 	lastRead   catalog.ReadOptions
+	// ResolveAlias takes its predicate as a bare bool rather than in
+	// ReadOptions, so it needs its own field to be assertable at all.
+	lastAliasOnlyReady bool
 }
 
 func (s *stubCatalogStore) BeginSnapshot(_ context.Context, in catalog.BeginInput) (catalog.BeginOutcome, error) {
@@ -96,7 +99,8 @@ func (s *stubCatalogStore) DeleteSnapshot(_ context.Context, _, _ string, _ int6
 	return s.deleted, s.deleteErr
 }
 
-func (s *stubCatalogStore) ResolveAlias(_ context.Context, _, _ string, _ bool) (*catalog.AliasTarget, error) {
+func (s *stubCatalogStore) ResolveAlias(_ context.Context, _, _ string, onlyReady bool) (*catalog.AliasTarget, error) {
+	s.lastAliasOnlyReady = onlyReady
 	return s.alias, s.aliasErr
 }
 
@@ -546,7 +550,6 @@ func TestListingTranslatesItsCursorAndFilterBothWays(t *testing.T) {
 			AliasPrefix: &prefix,
 		},
 		Limit:     25,
-		OnlyReady: true,
 		WithBuild: true,
 	})
 	if err != nil {
@@ -590,7 +593,7 @@ func TestAbsentAndPresentAreNotTheSameOnTheWire(t *testing.T) {
 	svc := newCatalogService(t, store, stubGate{})
 
 	resp, err := svc.GetSnapshot(context.Background(), &schedulerv1.GetSnapshotRequest{
-		ClusterId: serviceCluster, IdOrAlias: "x", OnlyReady: true, WithBuild: true,
+		ClusterId: serviceCluster, IdOrAlias: "x", WithBuild: true,
 	})
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -615,6 +618,68 @@ func TestAbsentAndPresentAreNotTheSameOnTheWire(t *testing.T) {
 	}
 	if !store.lastRead.OnlyReady || !store.lastRead.WithBuild {
 		t.Fatalf("the read options did not reach the store: %+v", store.lastRead)
+	}
+}
+
+// TestTheReadyPredicateIsWhatForgettingTheFieldGivesYou pins the inversion on
+// all three read RPCs, in both directions.
+//
+// 🔴 The direction is the whole point. proto3 cannot make a bool required, and
+// an absent field arrives as false — so whichever reading false carries is the
+// one every caller that has not been updated, every hand-written grpcurl probe
+// and every future client with a typo will get. `only_ready` put the unsafe
+// reading there: a caller that forgot the field resolved a snapshot whose bytes
+// were still uploading, and started a VM on it. Stated as allow_any_status, the
+// same forgetful caller merely fails to see its own failed build.
+//
+// So this test asserts the mapping is a negation, not that it is "wired up":
+// a service that passed the field through unchanged would satisfy any assertion
+// that only checked the true case.
+func TestTheReadyPredicateIsWhatForgettingTheFieldGivesYou(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name           string
+		allowAnyStatus bool
+		wantOnlyReady  bool
+	}{
+		{name: "field absent", allowAnyStatus: false, wantOnlyReady: true},
+		{name: "field set", allowAnyStatus: true, wantOnlyReady: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &stubCatalogStore{alias: &catalog.AliasTarget{SnapshotID: "aaaaaaaa-0000-4000-8000-000000000001"}}
+			svc := newCatalogService(t, store, stubGate{})
+
+			if _, err := svc.GetSnapshot(ctx, &schedulerv1.GetSnapshotRequest{
+				ClusterId: serviceCluster, IdOrAlias: "x", AllowAnyStatus: tc.allowAnyStatus,
+			}); err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if store.lastRead.OnlyReady != tc.wantOnlyReady {
+				t.Fatalf("GetSnapshot: allow_any_status=%v reached the store as OnlyReady=%v, want %v",
+					tc.allowAnyStatus, store.lastRead.OnlyReady, tc.wantOnlyReady)
+			}
+
+			if _, err := svc.ListSnapshots(ctx, &schedulerv1.ListSnapshotsRequest{
+				ClusterId: serviceCluster, AllowAnyStatus: tc.allowAnyStatus,
+			}); err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if store.lastList.OnlyReady != tc.wantOnlyReady {
+				t.Fatalf("ListSnapshots: allow_any_status=%v reached the store as OnlyReady=%v, want %v",
+					tc.allowAnyStatus, store.lastList.OnlyReady, tc.wantOnlyReady)
+			}
+
+			if _, err := svc.ResolveAlias(ctx, &schedulerv1.ResolveAliasRequest{
+				ClusterId: serviceCluster, Alias: "a", AllowAnyStatus: tc.allowAnyStatus,
+			}); err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if store.lastAliasOnlyReady != tc.wantOnlyReady {
+				t.Fatalf("ResolveAlias: allow_any_status=%v reached the store as onlyReady=%v, want %v",
+					tc.allowAnyStatus, store.lastAliasOnlyReady, tc.wantOnlyReady)
+			}
+		})
 	}
 }
 

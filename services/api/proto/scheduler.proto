@@ -1253,20 +1253,25 @@ message GetSnapshotRequest {
   // A snapshot id or an alias. Which one it is, the server decides — the node's
   // own get() takes the same union and callers do not know which they hold.
   string id_or_alias = 2;
-  // 🔴 Whether to apply the `status_group = 'ready'` predicate.
+  // 🔴 Whether to drop the `status_group = 'ready'` predicate.
   //
-  // True for everything that is about to *run* the snapshot, which is the
-  // predicate that stops a half-uploaded snapshot from starting a VM. False for
-  // the endpoint that reports build status, which exists precisely to see rows
-  // that are building or failed. There is no safe default, so it is required of
-  // the caller rather than assumed here.
-  bool only_ready = 3;
+  // False — the zero value, and what a caller that never heard of this field
+  // sends — keeps the predicate, which is what stops a half-uploaded snapshot
+  // from starting a VM. True is for the endpoint that reports build status,
+  // which exists precisely to see rows that are building or failed.
+  //
+  // 🔴 Stated this way round because proto3 cannot make a bool required and an
+  // absent field is indistinguishable from false. Spelled as `only_ready`, the
+  // value a forgetful caller sends is the one that resolves a snapshot whose
+  // bytes are still uploading; spelled this way, forgetting it costs a caller
+  // nothing worse than not seeing its own failed build.
+  bool allow_any_status = 3;
   // Include the build row's timestamps in the answer.
   bool with_build = 4;
 }
 
 message GetSnapshotResponse {
-  // Absent when there is no such row, or when only_ready excluded it. Not an
+  // Absent when there is no such row, or when the ready predicate excluded it. Not an
   // error: "no such snapshot" is an answer.
   optional SnapshotRow row = 1;
 }
@@ -1301,9 +1306,9 @@ message SnapshotFilter {
   optional string source_sandbox_id = 5;
   // Template build statuses to keep. Matches template rows only.
   //
-  // 🔴 Meaningful only when only_ready is false. Asking for `building` rows
-  // under the ready predicate is a filter that can never match, and a caller
-  // that does it is reading an empty page as "there are none".
+  // 🔴 Meaningful only when allow_any_status is true. Asking for `building`
+  // rows under the ready predicate is a filter that can never match, and a
+  // caller that does it is reading an empty page as "there are none".
   repeated string template_statuses = 6;
 }
 
@@ -1318,8 +1323,9 @@ message ListSnapshotsRequest {
   // single request comes to pull ten thousand rows into memory. Here zero means
   // "the server's default".
   uint32 limit = 4;
-  // See GetSnapshotRequest.only_ready. The listing endpoints pass true.
-  bool only_ready = 5;
+  // See GetSnapshotRequest.allow_any_status. The listing endpoints leave it
+  // false; the one that reports build status sets it.
+  bool allow_any_status = 5;
   bool with_build = 6;
 }
 
@@ -1348,8 +1354,9 @@ message DeleteSnapshotResponse {
 message ResolveAliasRequest {
   string cluster_id = 1;
   string alias = 2;
-  // See GetSnapshotRequest.only_ready. Resolving in order to run means true.
-  bool only_ready = 3;
+  // See GetSnapshotRequest.allow_any_status. Resolving in order to run means
+  // leaving it false, which is also what forgetting it does.
+  bool allow_any_status = 3;
 }
 
 message ResolveAliasResponse {

@@ -287,7 +287,11 @@ func (s *SnapshotCatalogService) GetSnapshot(ctx context.Context, req *scheduler
 	}
 
 	row, err := s.store.GetSnapshot(ctx, req.GetClusterId(), req.GetIdOrAlias(), catalog.ReadOptions{
-		OnlyReady: req.GetOnlyReady(),
+		// 🔴 Inverted here, and only here. The wire field is negative so that
+		// its zero value — what a caller that forgot it sends — is the safe
+		// reading; the store's option is positive so that a statement reads the
+		// way its predicate does. The negation is the seam between the two.
+		OnlyReady: !req.GetAllowAnyStatus(),
 		WithBuild: req.GetWithBuild(),
 	})
 	if err != nil {
@@ -314,7 +318,8 @@ func (s *SnapshotCatalogService) ListSnapshots(ctx context.Context, req *schedul
 		Filter:    filterFromProto(req.GetFilter()),
 		Limit:     req.GetLimit(),
 		ReadOptions: catalog.ReadOptions{
-			OnlyReady: req.GetOnlyReady(),
+			// Inverted; see GetSnapshot.
+			OnlyReady: !req.GetAllowAnyStatus(),
 			WithBuild: req.GetWithBuild(),
 		},
 	}
@@ -351,7 +356,8 @@ func (s *SnapshotCatalogService) ResolveAlias(ctx context.Context, req *schedule
 		return nil, s.fail(rpc, err)
 	}
 
-	target, err := s.store.ResolveAlias(ctx, req.GetClusterId(), req.GetAlias(), req.GetOnlyReady())
+	// Inverted; see GetSnapshot.
+	target, err := s.store.ResolveAlias(ctx, req.GetClusterId(), req.GetAlias(), !req.GetAllowAnyStatus())
 	if err != nil {
 		return nil, s.fail(rpc, err)
 	}

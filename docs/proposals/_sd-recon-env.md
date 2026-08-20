@@ -976,7 +976,10 @@ CM literal 在 `kustomization.yaml:120-124`，集群里的 CM 叫 `routing-proje
 # 1) 先把这台机器踢出调度，但 🔴 绝不用 NoExecute
 kubectl taint nodes <node> k=down:NoSchedule
 # 🔴 NoExecute 会把 postgres / redis / rustfs / gateway / scheduler 一起赶走 ——
-#    worker-01 上跑着这些（§2 / §3.1），一条 NoExecute 就是把整个控制面端了。
+#    worker-01（204）上跑着这些，一条 NoExecute 就是把整个控制面端了。
+#    其中 postgres / rustfs / redis 是**钉死**在 204 的（PVC 全是 local-path，§2 与 §9 SD-B1）；
+#    gateway / scheduler 当晚也在 204 上（本轮实测的落点，仓内清单没有 nodeSelector ⇒
+#    🔴 动手前自己 `kubectl -n $NS get pod -o wide` 复核一遍，别照抄这句）。
 #    用完记得摘： kubectl taint nodes <node> k-
 
 # 2) 从这台节点的【宿主机】上，SIGKILL 容器里的 /server init

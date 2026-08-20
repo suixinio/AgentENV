@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -510,14 +509,23 @@ func TestResumeRecordsTheRoutedSandbox(t *testing.T) {
 }
 
 // TestResumeRecordsNothingWhileTheWriteSwitchIsOff keeps "off" equal to today.
+//
+// 🔴 It asserts on the calls, not on the status code. The version of this test
+// that shipped delegated its whole claim to a stub returning an error — and
+// Server.recordAssignment swallows a failed RecordAssignment with a Warn,
+// deliberately, because a projection write must never fail a client's request.
+// So the stub could fire on every request and the test would still have gone
+// green on its 201. A write that must not happen has to be counted.
 func TestResumeRecordsNothingWhileTheWriteSwitchIsOff(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(headerExecutionID, "0198b7cc-1111-7000-8000-000000000001")
+		w.Header().Set(headerProjectionTTLSecs, "86460")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(upstream.Close)
 
+	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 4)
 	scheduler := stubSchedulerClient{
 		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
 			return &schedulerv1.LookupNodeResponse{
@@ -526,16 +534,140 @@ func TestResumeRecordsNothingWhileTheWriteSwitchIsOff(t *testing.T) {
 			}, nil
 		},
 		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			return nil, fmt.Errorf("resume must not record an assignment while the switch is off, got %v", req)
+			recorded <- req
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}
+
+	// Both entry points, for the reason assignmentRouteFor covers both: the
+	// node routes connect into the same resume path, so a switch that governed
+	// only one would leave the identical write under a different name.
+	for _, path := range []string{"/sandboxes/sbx-1/resume", "/sandboxes/sbx-1/connect"} {
+		t.Run(path, func(t *testing.T) {
+			server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201", rec.Code)
+			}
+			// The write is made inside ModifyResponse, before the response is
+			// written back, so anything that was going to arrive already has.
+			select {
+			case got := <-recorded:
+				t.Fatalf("the switch is off and an assignment was recorded anyway: %v", got)
+			default:
+			}
+		})
+	}
+}
+
+// TestCreateSendsNoBudgetWhileTheWriteSwitchIsOff is the gateway's half of the
+// write switch, which nothing exercised.
+//
+// 🔴 Create records either way — the switch was never about *whether* a create
+// is recorded, only about the TTL it carries — so "off" here is a zero in one
+// field of a request that still has to be sent, with the incarnation still on
+// it. That is what makes the projection write byte-identical to the one that
+// shipped before any of this, and what lets the two halves of the write switch
+// be flipped in either order.
+func TestCreateSendsNoBudgetWhileTheWriteSwitchIsOff(t *testing.T) {
+	const executionID = "0198b7cc-1111-7000-8000-000000000001"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerSandboxID, "sbx-new")
+		w.Header().Set(headerExecutionID, executionID)
+		// The node stamps the budget whatever the gateway's switch says: it
+		// knows nothing about the gateway's configuration, and the header is
+		// the same one the switched-on case reads.
+		w.Header().Set(headerProjectionTTLSecs, "86460")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"sandboxID":"sbx-new"}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 2)
+	scheduler := stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req
+			return &schedulerv1.RecordAssignmentResponse{}, nil
 		},
 	}
 
 	server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-	req := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"tpl"}`))
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	select {
+	case got := <-recorded:
+		if got.GetSandboxId() != "sbx-new" {
+			t.Fatalf("recorded sandbox %q, want sbx-new", got.GetSandboxId())
+		}
+		if got.GetProjectionTtlSecs() != 0 {
+			t.Fatalf("recorded ttl %d with the switch off, want 0 so the scheduler uses binding_ttl", got.GetProjectionTtlSecs())
+		}
+		// 🔴 The incarnation is not gated. Forwarding it is behaviour that
+		// already shipped, and withholding it here would refuse the write at
+		// the scheduler's arbitration rather than shorten its TTL.
+		if got.GetExecutionId() != executionID {
+			t.Fatalf("recorded incarnation %q, want %q", got.GetExecutionId(), executionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no assignment was recorded for the created sandbox")
+	}
+}
+
+// TestForkSendsNoBudgetWhileTheWriteSwitchIsOff is the same for the body path,
+// where the budget comes off each element rather than off a header.
+func TestForkSendsNoBudgetWhileTheWriteSwitchIsOff(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`[
+			{"sandbox":{"sandboxID":"sbx-child","executionID":"0198b7cc-1111-7000-8000-000000000001"},"projectionTtlSecs":3600}
+		]`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 4)
+	scheduler := stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			return &schedulerv1.LookupNodeResponse{
+				Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
+				Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
+			}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}
+
+	server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-parent/fork", strings.NewReader(`{"count":1}`))
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	select {
+	case got := <-recorded:
+		if got.GetSandboxId() != "sbx-child" {
+			t.Fatalf("recorded sandbox %q, want sbx-child", got.GetSandboxId())
+		}
+		if got.GetProjectionTtlSecs() != 0 {
+			t.Fatalf("recorded ttl %d with the switch off, want 0", got.GetProjectionTtlSecs())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no assignment was recorded for the forked child")
 	}
 }
 

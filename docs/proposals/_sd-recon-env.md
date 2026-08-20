@@ -38,8 +38,9 @@
 > 探针扫无可扫、然后报"通过"**；
 > ② 🔴 **`/nodes` 的 `sandboxCount` 不含暂停的沙箱，而心跳 roster 含** ——
 > 拿它确认"这台机器是空的"会被骗（§11.3 第二个坑）。
-> 就地更新四处：§7.1 A4（registry 的 `Accept` 坑）、§7.5（resume 要带 body ＋ `limit` 上限）、
-> §9 **SD-B7**（已关闭）、§11.2（已被 §11.6 取代）。
+> 就地更新四处：§7.1 A4 ＋ 新增 §7.1.a（registry 的 `Accept` 坑 —— 🔴 **头写错与 tag 不存在
+> 都是 404，只有 body 分得出**，而本项目已经有一发探针栽在这上面）、
+> §7.5（resume 要带 body ＋ `limit` 上限）、§9 **SD-B7**（已关闭）、§11.2（已被 §11.6 取代）。
 > 2a 的验收记录在 [`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13，清扫的在
 > [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9。
 
@@ -496,12 +497,47 @@ ssh supos@10.10.10.204 '
 
 # A4. 确认 registry 里真有这个 tag（比"push 没报错"硬）
 curl -s http://$REG/v2/agentenv-gateway/tags/list | grep -o "$TAG"
+# 🔴 存在性一律用 /tags/list —— 它不吃 Accept 头，裸查就是 200。
+#    只有需要 digest 时才去碰 /manifests/<tag>，那条路有个会骗人的坑：见 §7.1.a
+```
 
-# 🔧 🔴 A4 的坑（2026-08-20 夜第三次复现，三个仓库都一样）：
-#    别改用 /v2/<repo>/manifests/<tag> 去"确认"——**不显式带 Accept 头就拿不到你 push 的那份
-#    manifest**。查 tag 一律用上面的 /tags/list；确实要比 digest 时必须带媒体类型：
-#    curl -s -H 'Accept: application/vnd.oci.image.manifest.v1+json' #         -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' #         -D- -o /dev/null http://$REG/v2/agentenv-gateway/manifests/$TAG
-#    ⚠️ 本轮只记了"复现了"，**逐字响应没有留证** —— 照这条做，别照它推断 registry 的行为细节。
+#### 7.1.a 🔴 registry 的 `Accept` 坑：两个 404 长得一模一样
+
+**2026-08-20 夜实测，逐字留证**（`10.10.10.204:5000`，repo `agentenv-runtime`，
+tag `sd2a-7cf9c30` —— **一个确实存在的 tag**）：
+
+| # | 请求带的 `Accept` | 结果 |
+|---|---|---|
+| **A** | **不带** | `404`，`content-type=application/json`，body：`{"errors":[{"code":"MANIFEST_UNKNOWN","message":"OCI index found, but accept header does not support OCI indexes"}]}` |
+| **B** | `application/vnd.docker.distribution.manifest.v2+json` | 🔴 **仍然 404** |
+| **C** | `application/vnd.oci.image.index.v1+json` | ✅ `200`，`Content-Type: application/vnd.oci.image.index.v1+json`，`Docker-Content-Digest: sha256:3623b89ee89c…375ed7` |
+| **D**（对照面）| 正确的 Accept ＋ **不存在的 tag** `sd2a-deadbeef` | `404` |
+
+🔴 **B 说明这不是"v1 还是 v2"的问题**：docker v2 这个类型**本身**就被拒。
+这些镜像是 **OCI index**，只有点名 index 类型的 `Accept` 才拿得到。
+
+🔴 **而真正让它成为陷阱的是 A 与 D：两发都是 404 ——
+状态码分不出「我的头写错了」和「这个 tag 根本不在」。**
+只有 **body** 分得出：头写错的那一发带着
+`"OCI index found, but accept header does not support OCI indexes"`，
+真的不存在的那一发**没有这一句**（两者的 `code` 都是 `MANIFEST_UNKNOWN`）。
+
+⇒ 这正是 §8 第 1 条那类失效，而且**本项目已经踩过**：一发探针拿真 tag 与假 tag
+各查一次 manifest、两次都收到 404，于是判成"这个 tag 不在" —— **它毫无分辨力**。
+
+**两条规矩：**
+
+1. **查存在性用 `/v2/<repo>/tags/list`**（不吃 Accept，裸查 200，本轮再次确认）。
+2. **只有要 digest 时才碰 `/manifests/<tag>`**，且必须带 OCI index 类型，
+   并且 🔴 **看 body，不只看状态码**：
+
+```bash
+# 🔴 别加 -o /dev/null：body 是这里唯一的信息源
+curl -s -D- \
+  -H 'Accept: application/vnd.oci.image.index.v1+json' \
+  http://$REG/v2/agentenv-runtime/manifests/$TAG | head -20
+# 期望 200 ＋ Docker-Content-Digest。拿到 404 就看 body 里有没有
+# "accept header does not support OCI indexes" —— 有，就是头的问题，不是 tag 不在。
 ```
 
 ### 7.2 步骤 B：发布

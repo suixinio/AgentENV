@@ -109,11 +109,33 @@ async fn main() -> anyhow::Result<()> {
         .then(|| Arc::clone(&p2p_transport));
     let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport)?);
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    // The handle the cold-boot paths read the CPUID intersection from.
+    //
+    // 🔴 Separate from the one the reporter writes, and only when the setting
+    // is off. Reporting keeps running either way — the scheduler still collects
+    // this node's CPU config and still computes the cluster intersection, so
+    // the observability surface does not go dark and turning the setting back
+    // on needs no other change. What stops is applying it to a booting microVM,
+    // which is the half a host can refuse: see
+    // `FirecrackerConfig::apply_cluster_cpu_template` for the Granite Rapids
+    // failure this exists for.
+    let applied_cpu_arc: Arc<RwLock<Option<String>>> =
+        if config.firecracker.apply_cluster_cpu_template {
+            Arc::clone(&cluster_cpu_arc)
+        } else {
+            warn!(
+                target: "agentenv",
+                "cluster CPU template will not be applied to cold-booting microVMs \
+                 (firecracker.apply_cluster_cpu_template = false); this is only safe \
+                 while every node in the cluster has the same CPU"
+            );
+            Arc::new(RwLock::new(None))
+        };
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
-        &cluster_cpu_arc,
+        &applied_cpu_arc,
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
-    let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
+    let factory = FirecrackerSandboxFactory::with_cpu_config(applied_cpu_arc);
     let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {

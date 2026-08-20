@@ -222,6 +222,29 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), Firecracker logging is enabled and written to a
     /// `firecracker.log` file in the same directory as the Firecracker stdout log.
     pub log_level: Option<String>,
+    /// Whether the cluster-wide CPUID intersection the scheduler computes is
+    /// applied to a cold-booting microVM via `PUT /cpu-config`.
+    ///
+    /// 🔴 Default on, because turning it off is a real loss: the template is
+    /// what makes two machines with different CPUs present the same CPUID to a
+    /// sandbox, and a snapshot that cold-boots on one host and is expected to
+    /// behave the same on another depends on it.
+    ///
+    /// It is a setting at all because a host can refuse the template outright.
+    /// On Intel Granite Rapids (Xeon 6975P-C) the helper dumps CPUID leaf 0x1f
+    /// subleaf 1, which KVM will not let a VMM write, and Firecracker answers
+    /// the pre-boot call with
+    ///   `Template changes a CPUID entry not supported by KVM: Leaf: 1f, Subleaf: 1`
+    /// — every cold boot fails, which means every template build and every new
+    /// sandbox fails, with nothing in the message pointing at a setting.
+    ///
+    /// Turning it off is safe exactly when every node in the cluster has the
+    /// same CPU, which is the only shape the intersection was protecting.
+    /// Resume is unaffected either way: a snapshot carries the full CPU state
+    /// in `vm_state.bin` and Firecracker rejects re-applying a template on top
+    /// of it, so this path is cold boot only.
+    #[config(default = true, env = "AENV_FIRECRACKER_APPLY_CLUSTER_CPU_TEMPLATE")]
+    pub apply_cluster_cpu_template: bool,
 }
 
 #[derive(Debug, Config, Clone)]

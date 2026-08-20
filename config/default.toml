@@ -49,6 +49,23 @@ socket_poll_ms = 1
 # levels are Error, Warning, Info, Debug, and Trace; unset disables it.
 # log_level = "Info"
 
+# Whether the cluster-wide CPUID intersection the scheduler computes is applied
+# to a cold-booting microVM (`PUT /cpu-config`). Resume is unaffected: a
+# snapshot carries the full CPU state and Firecracker rejects a template on top
+# of it.
+#
+# 🔴 Turn it off only when every node in the cluster has the same CPU — that
+# uniformity is the whole thing the intersection was protecting. The reason it
+# is a setting: some hosts refuse the template outright. On Intel Granite
+# Rapids (Xeon 6975P-C) the helper dumps CPUID leaf 0x1f subleaf 1, which KVM
+# will not let a VMM write, and every cold boot dies with
+#   Template changes a CPUID entry not supported by KVM: Leaf: 1f, Subleaf: 1
+# — which means every template build and every new sandbox, with nothing in the
+# message pointing at a setting.
+#
+# A deployment selects this through AENV_FIRECRACKER_APPLY_CLUSTER_CPU_TEMPLATE.
+# apply_cluster_cpu_template = true
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.

@@ -394,6 +394,71 @@ async fn a_taken_alias_from_the_central_catalog_still_fails_the_create() {
     );
 }
 
+/// 🔴 I2 on the opening statement, and the `?` that carries it. A refusal this
+/// build cannot read means the catalog is answering something the client never
+/// asked; the publish fails and the object store is not touched, because a row
+/// object storage holds that the catalog refused is the one disagreement the
+/// batch has no story for.
+#[tokio::test]
+async fn a_refusal_the_opening_statement_cannot_read_fails_the_publish() {
+    let fixture = Fixture::new().await;
+    fixture
+        .central
+        .refuse(CentralCall::Begin, CatalogRefusal::Unknown(4242));
+    let id = SnapshotId::generate();
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, None))
+        .await
+        .expect_err("a refusal this build cannot read must fail the publish");
+
+    assert!(
+        fixture.object_store.calls().is_empty(),
+        "the object store must not hold a row the catalog refused: {:?}",
+        fixture.object_store.calls()
+    );
+    assert_eq!(
+        fixture.backlog.lag(),
+        0,
+        "a refused write is owed to nobody"
+    );
+}
+
+/// The same on the second statement, which is a separate guard: the row was
+/// opened, the flip was refused for a reason nothing here can act on, and the
+/// object store still must not be written.
+#[tokio::test]
+async fn a_refusal_the_commit_cannot_read_fails_the_publish() {
+    let fixture = Fixture::new().await;
+    fixture
+        .central
+        .refuse(CentralCall::Commit, CatalogRefusal::ExecutionSuperseded);
+    let id = SnapshotId::generate();
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, None))
+        .await
+        .expect_err("a refusal this build cannot read must fail the publish");
+
+    assert!(
+        fixture
+            .central
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("commit:")),
+        "the commit must have been the thing that refused: {:?}",
+        fixture.central.calls()
+    );
+    assert!(
+        fixture.object_store.calls().is_empty(),
+        "the object store must not hold a row the catalog refused: {:?}",
+        fixture.object_store.calls()
+    );
+    assert_eq!(fixture.backlog.lag(), 0);
+}
+
 /// 🔴 An alias the object store will not bind is the caller's problem: reads
 /// come from the object store in this phase, so reporting success would hand
 /// back a snapshot the user cannot reach by the name they asked for.

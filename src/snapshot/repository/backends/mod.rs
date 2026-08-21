@@ -64,6 +64,32 @@ pub async fn build_snapshot_backend(
     };
 
     let backlog = MirrorBacklog::open(&config.snapshot.catalog.mirror_backlog_path).await?;
+    let object_store_catalog = repository.catalog();
+
+    // 🔴 Before the guard, because it is what the guard reads. The double write
+    // only mirrors writes made after it was turned on, so every snapshot older
+    // than the switch is invisible to both gauges — measured on this cluster at
+    // the moment of the flip as `lag = 0, diverged = 0`, PostgreSQL 0 rows,
+    // object storage 32. Queueing that history as ordinary debt is what makes
+    // `lag == 0 && diverged == 0` mean "the two catalogs agree" rather than
+    // "nothing is queued".
+    //
+    // 🔴 A failure here does not stop the node. The history is queued so that a
+    // *later* switch is honest, and the switch is what the guard refuses; a
+    // node that cannot list its object store right now is a node that should
+    // keep serving, and the marker stays unset so the next start tries again.
+    if let Err(error) = backlog
+        .queue_history_toward_central(object_store_catalog.as_ref())
+        .await
+    {
+        tracing::error!(
+            target: "agentenv",
+            %error,
+            "could not queue the object-store catalog's history for the central catalog; the \
+             read side will stay refused from PostgreSQL until a start succeeds at it"
+        );
+    }
+
     // 🔴 Before anything is served. A node whose read side has just been moved
     // back onto a store that is behind would answer "absent" for every snapshot
     // the mirror still owes, and absence is an instruction downstream.
@@ -74,7 +100,6 @@ pub async fn build_snapshot_backend(
         })
         .await?;
 
-    let object_store_catalog = repository.catalog();
     let compensator = MirrorCompensator::spawn(
         Arc::clone(&backlog),
         MirrorTargets::object_store(Arc::clone(&object_store_catalog))
@@ -133,6 +158,28 @@ async fn drain_a_rolled_back_mirror(
     // dropping them is not this function's call either.
     let owed = backlog.lag_toward(MirrorDirection::ObjectStore);
     if owed == 0 {
+        // 🔴 Say what is being left behind. Opening the backlog has already
+        // published both gauges for both directions, so the numbers are on the
+        // metrics endpoint — but a rolled-back node with central-direction
+        // entries still on disk looks, from its logs, exactly like a node that
+        // never double-wrote. Those entries do not go away: they are owed to a
+        // catalog this configuration is not writing, and the next flip back to
+        // `write = "both"` brings them straight back as pinned lag.
+        let central_owed = backlog.lag_toward(MirrorDirection::Central);
+        let central_diverged = backlog.diverged_toward(MirrorDirection::Central);
+        if central_owed > 0 || central_diverged > 0 {
+            tracing::warn!(
+                target: "agentenv",
+                mirror_lag = central_owed,
+                mirror_diverged = central_diverged,
+                backlog = %path.display(),
+                "the snapshot catalog mirror backlog still holds writes the central catalog is \
+                 owed, and disagreements nobody settled, from when double writing was on. \
+                 Nothing replays them while write = \"object_store\" — the catalog they are \
+                 owed to is switched off — and turning double writing back on will surface them \
+                 as lag that was there all along"
+            );
+        }
         return Ok(None);
     }
 

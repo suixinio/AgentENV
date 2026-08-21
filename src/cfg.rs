@@ -1264,12 +1264,23 @@ impl AppConfig {
             // it inherits a second refusal it has to satisfy rather than
             // remove: `MirrorBacklog::guard_read_side` will not let a node move
             // its reads onto PostgreSQL while PostgreSQL is behind, and
-            // "behind" includes the disagreements no replay can settle — in
-            // this build, every template, because `try_start_build` writes
-            // object storage alone. A cluster holding templates reads a mirror
-            // lag of zero and would otherwise be waved through into making all
-            // of them vanish from the API. See
-            // `agentenv_snapshot_catalog_mirror_diverged`.
+            // "behind" means three separate things there.
+            //
+            //   1. Owed writes — `mirror_lag{direction="central"}`.
+            //   2. Disagreements no replay can settle —
+            //      `mirror_diverged{direction="central"}`. In this build that
+            //      is every template, because `try_start_build` writes object
+            //      storage alone. A cluster holding templates reads a mirror
+            //      lag of zero and would otherwise be waved through into making
+            //      all of them vanish from the API.
+            //   3. 🔴 The snapshots that predate the double write. Neither
+            //      number says anything about those — both count writes the
+            //      mirror *saw* — so on the cluster this was measured on, the
+            //      instant `write = "both"` was switched on read `lag = 0,
+            //      diverged = 0` over thirty-two snapshots PostgreSQL had never
+            //      heard of. `MirrorBacklog::queue_history_toward_central` puts
+            //      them into the queue at startup and the guard refuses the
+            //      switch until it has run.
             (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => bail!(
                 "snapshot.catalog: read = \"postgres\" is not served yet. The central catalog is \
                  written in this build and read in the next one; until then reads come from \

@@ -27,6 +27,21 @@
 //! Those are recorded here too, durably, as divergences rather than as debt —
 //! separately counted, because the compensator cannot pay them, and consulted
 //! by the same guard, because a read side moved over the top of one loses rows.
+//!
+//! 🔴 **And lag is not history.** Both numbers describe writes the double write
+//! *saw*, so a snapshot published before it was turned on is counted by
+//! neither: at the moment of the flip, this cluster read `lag = 0,
+//! diverged = 0`, PostgreSQL 0 rows, object storage 32. Every one of those
+//! thirty-two would have vanished from the API the moment reads moved.
+//! [`MirrorBacklog::queue_history_toward_central`] puts them in here as
+//! ordinary debt, so that `lag == 0 && diverged == 0` means "the two catalogs
+//! agree" rather than "nothing is queued".
+//!
+//! 🔴 **Nothing is retried forever.** An entry that fails
+//! [`MAX_REPLAY_ATTEMPTS`] passes without either settling or learning anything
+//! stops being debt and becomes a recorded divergence. The permanent rejection
+//! that motivated it is classified at the wire now, but a cap has to hold for
+//! the failure nobody has classified yet.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,9 +56,14 @@ use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::snapshot::repository::backends::central::{
     commit_opening_record, opening_status, CatalogRefusal, CatalogWrite, STATUS_BUILDING,
 };
-use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
+use crate::snapshot::repository::interfaces::{
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
+use crate::snapshot::types::{
+    SnapshotId, SnapshotPublishSource, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
+    TemplateBuildStatus,
+};
 
 use super::central::CentralCatalogWrites;
 use super::metrics::{
@@ -144,13 +164,45 @@ impl MirrorOp {
     }
 }
 
-/// One owed write and the store that owes it.
+/// One owed write, the store that owes it, and how many times a pass has tried.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OwedWrite {
     #[serde(default)]
     direction: MirrorDirection,
     op: MirrorOp,
+    /// Replays that neither settled this write nor learned anything from it.
+    ///
+    /// 🔴 Persisted, and it is the persistence that makes the cap mean
+    /// anything: a counter held in memory would reset on every restart, and a
+    /// node that restarts more often than the cap expires would retry the same
+    /// unwinnable write for as long as the cluster lived. Defaulted, because
+    /// entries written before this field existed are ordinary entries that have
+    /// simply not been counted yet.
+    #[serde(default)]
+    attempts: u32,
 }
+
+/// How many passes may fail to settle one entry before it stops being debt.
+///
+/// 🔴 An unbounded retry is a defect whatever it is retrying. The measured one
+/// was a permanent rejection misread as an outage — that is classified at the
+/// source now — but a cap has to hold for the failure nobody classified, which
+/// is every failure that has not happened yet.
+///
+/// At [`super::DEFAULT_COMPENSATOR_INTERVAL`] this is about an hour, and the
+/// hour is the trade. Shorter, and a controller rollout that runs long turns
+/// real debt into a permanent disagreement. Longer, and a queue nothing can
+/// drain keeps a switch shut without saying why. An hour is longer than any
+/// rollout this cluster has taken and short enough that an operator looking at
+/// a stuck lag the next morning finds a divergence record naming the reason
+/// rather than a counter still climbing.
+///
+/// 🔴 What it costs when it fires: the entry leaves the lag and becomes a
+/// recorded divergence, which no replay clears. That is the honest state — the
+/// central catalog really is missing the write — and it keeps the read-side
+/// switch shut, which is the behaviour that matters. Clearing it takes deleting
+/// the snapshot, or an operator.
+pub(super) const MAX_REPLAY_ATTEMPTS: u32 = 120;
 
 impl OwedWrite {
     /// Decodes an entry, including one written before the queue had directions.
@@ -167,6 +219,7 @@ impl OwedWrite {
                 Ok(op) => Ok(Self {
                     direction: MirrorDirection::ObjectStore,
                     op,
+                    attempts: 0,
                 }),
                 Err(_) => Err(newer),
             },
@@ -479,6 +532,15 @@ impl CatalogReadSide {
 /// Key holding the read side the last process ran with.
 const READ_SIDE_KEY: &[u8] = b"meta:read_side";
 
+/// Key recording that everything object storage already held has been queued
+/// for the central catalog.
+///
+/// 🔴 Set only once the whole listing is on disk. A marker written over a
+/// partial enumeration would be the exact failure this whole mechanism exists
+/// to prevent: a number that says the two catalogs agree because nobody
+/// counted.
+const HISTORY_KEY: &[u8] = b"meta:history_queued";
+
 /// First byte of every queued entry's key.
 const OWED_PREFIX: u8 = b'o';
 
@@ -681,6 +743,17 @@ impl MirrorBacklog {
     /// down, which is exactly the trade the double write exists to avoid. So
     /// the side the last process ran with is recorded, and only a move is
     /// refused.
+    ///
+    /// 🔴 The one condition that is *not* about a switch: reads may not be
+    /// answered from PostgreSQL while the object store's history has never been
+    /// queued for it. Debt and divergence both describe writes the double write
+    /// saw; a snapshot published before it was turned on was seen by neither,
+    /// so both numbers read zero about it — which is how a cluster arrived at
+    /// `lag = 0, diverged = 0, PostgreSQL 0 rows, object storage 32`. Unlike
+    /// debt, this cannot come back: once
+    /// [`Self::queue_history_toward_central`] has run, the marker is on disk
+    /// for good, so refusing here cannot strand a node that was serving
+    /// PostgreSQL reads a moment ago.
     pub async fn guard_read_side(&self, configured: CatalogReadSide) -> anyhow::Result<()> {
         let previous = self
             .store
@@ -688,6 +761,22 @@ impl MirrorBacklog {
             .await
             .context("read the catalog mirror's recorded read side")?
             .and_then(|raw| CatalogReadSide::parse(&raw));
+
+        if configured == CatalogReadSide::Postgres && !self.history_is_queued().await? {
+            anyhow::bail!(
+                "snapshot.catalog.read = \"postgres\" is refused: the snapshots object storage \
+                 held before the double write was turned on have never been queued for the \
+                 central catalog, so neither \
+                 agentenv_snapshot_catalog_mirror_lag{{direction=\"central\"}} nor \
+                 agentenv_snapshot_catalog_mirror_diverged{{direction=\"central\"}} says \
+                 anything about them — they read zero because nothing counted them, not because \
+                 the two catalogs agree. Reads from PostgreSQL would report every one of those \
+                 snapshots as absent, and callers delete artifacts and refuse resumes on that \
+                 answer. Start this node once with snapshot.catalog.write = \"both\" and a \
+                 reachable object store so the history is queued, wait for both gauges to reach \
+                 0, then switch."
+            );
+        }
 
         if previous.is_some() && previous != Some(configured) {
             let direction = configured.debt_that_would_be_invisible();
@@ -719,20 +808,121 @@ impl MirrorBacklog {
             .context("record the catalog mirror's read side")
     }
 
+    /// Whether the object store's history has been queued for the central
+    /// catalog.
+    pub async fn history_is_queued(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .store
+            .get(HISTORY_KEY.to_vec())
+            .await
+            .context("read whether the catalog mirror has queued the object store's history")?
+            .is_some())
+    }
+
+    /// Queues everything object storage already holds, for the catalog that
+    /// was not there when it was written.
+    ///
+    /// 🔴 The gap this closes was measured, on both nodes, at the moment
+    /// `write = "both"` was switched on: `mirror_lag{central} = 0`,
+    /// `mirror_diverged{central} = 0`, PostgreSQL **0 rows**, object storage
+    /// **32**. Both gauges said the two catalogs agreed about thirty-two
+    /// snapshots neither of them had ever compared. The double write only ever
+    /// looks forward — it mirrors writes made *after* it was turned on — so
+    /// every snapshot older than the switch was invisible to it, and a
+    /// read-side switch authorised on those two numbers would have made all
+    /// thirty-two vanish from the API.
+    ///
+    /// 🔴 The invariant this restores is the whole point of the numbers:
+    /// **`lag == 0 && diverged == 0` must mean "the two catalogs agree", not
+    /// "nothing is queued".** History is queued as ordinary debt rather than
+    /// copied by a bespoke path, so it inherits everything the queue already
+    /// does — durability across restarts, per-snapshot ordering, the
+    /// probe-before-verdict that makes a replay idempotent, the attempt cap,
+    /// and a permanent refusal becoming a recorded divergence instead of a
+    /// silent loss. A separate copier would have needed all of that written
+    /// again, and would have been the one path nothing else tests.
+    ///
+    /// Returns how many entries were queued. Idempotent by the marker, and
+    /// harmless without it: a replay is judged against what the target already
+    /// has, so queueing a snapshot the central catalog already holds settles as
+    /// repaired on the first pass.
+    ///
+    /// 🔴 Per node, and that is a real cost rather than an oversight. A second
+    /// node joining a cluster whose history another node has already mirrored
+    /// enumerates it again and replays it into a catalog that already agrees —
+    /// N entries that all settle on the first pass. The alternative is a
+    /// cluster-wide "this has been done" fact, which nothing in this phase has
+    /// a place to keep.
+    pub async fn queue_history_toward_central(
+        &self,
+        object_store: &dyn SnapshotCatalog,
+    ) -> anyhow::Result<u64> {
+        if self.history_is_queued().await? {
+            return Ok(0);
+        }
+
+        let records = object_store
+            .list(SnapshotListFilter::matches_all())
+            .await
+            .context(
+                "list the object-store catalog in order to queue its history for the central \
+                 catalog",
+            )?;
+
+        let mut queued = 0u64;
+        let mut all_recorded = true;
+        for record in records {
+            for op in history_ops(record) {
+                all_recorded &= self.record(MirrorDirection::Central, op).await;
+                queued += 1;
+            }
+        }
+
+        if !all_recorded {
+            anyhow::bail!(
+                "queued {queued} historical catalog write(s) for the central catalog, but at \
+                 least one could not be written down; leaving the backfill unmarked so the next \
+                 start does it again"
+            );
+        }
+
+        self.store
+            .put(HISTORY_KEY.to_vec(), b"queued".to_vec())
+            .await
+            .context("record that the object store's history has been queued")?;
+
+        if queued > 0 {
+            warn!(
+                queued,
+                "queued the object-store catalog's history for the central catalog; the read side \
+                 cannot move to PostgreSQL until the compensator has replayed all of it"
+            );
+        }
+        Ok(queued)
+    }
+
     /// Records one owed write.
     ///
     /// 🔴 A failure here is loud but not fatal to the caller: the other store
     /// already took the write and the operation already did what it was asked.
     /// What is lost is the durable record that this store is behind — so the
     /// lag counts it anyway, from memory, and says separately that it did.
-    pub(super) async fn record(&self, direction: MirrorDirection, op: MirrorOp) {
+    ///
+    /// Returns whether the note is on disk. Only the history backfill reads the
+    /// answer: it must not mark itself done over a write nothing wrote down.
+    pub(super) async fn record(&self, direction: MirrorDirection, op: MirrorOp) -> bool {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let owed = OwedWrite { direction, op };
+        let owed = OwedWrite {
+            direction,
+            op,
+            attempts: 0,
+        };
         let stored = match serde_json::to_vec(&owed) {
             Ok(encoded) => self.put_locally(encode_seq(seq), encoded).await,
             Err(error) => Err(error.into()),
         };
 
+        let persisted = stored.is_ok();
         match stored {
             Ok(()) => {
                 self.counters(direction).owed.fetch_add(1, Ordering::AcqRel);
@@ -759,6 +949,7 @@ impl MirrorBacklog {
             }
         }
         self.publish_gauges();
+        persisted
     }
 
     /// Records that the two catalogs disagree about one snapshot, permanently.
@@ -875,6 +1066,7 @@ impl MirrorBacklog {
                 }
             };
             let direction = owed.direction;
+            let attempts = owed.attempts;
             let op = owed.op;
 
             let Some(target) = targets.for_direction(direction) else {
@@ -900,7 +1092,16 @@ impl MirrorBacklog {
                     .ok()
                     .map(|existing| reflects(&op, existing.as_ref()))
             };
-            let verdict = verdict_for(&replay, already_applied);
+            let mut verdict = verdict_for(&replay, already_applied);
+            // 🔴 The cap is applied here rather than inside `verdict_for`,
+            // which is a decision about *this* attempt and has no business
+            // knowing how many came before it. What the cap changes is whether
+            // an attempt that learned nothing is still worth keeping as debt.
+            let attempts = attempts.saturating_add(1);
+            let exhausted = verdict == RepairVerdict::Retry && attempts >= MAX_REPLAY_ATTEMPTS;
+            if exhausted {
+                verdict = RepairVerdict::Diverged;
+            }
 
             match verdict {
                 RepairVerdict::Repaired => {
@@ -937,11 +1138,19 @@ impl MirrorBacklog {
                     // of it is durable, because a queue entry that was dropped
                     // and not written down anywhere would be a disagreement
                     // that disappeared.
-                    let reason = replay
+                    let refusal = replay
                         .as_ref()
                         .err()
                         .map(|error| error.to_string())
                         .unwrap_or_else(|| "the store refused the replay".to_string());
+                    let reason = if exhausted {
+                        format!(
+                            "{MAX_REPLAY_ATTEMPTS} replays did not settle this write, so it is \
+                             no longer counted as debt: {refusal}"
+                        )
+                    } else {
+                        refusal
+                    };
                     let recorded = self
                         .note_divergence(direction, op.snapshot_id(), op.name(), reason)
                         .await;
@@ -952,6 +1161,26 @@ impl MirrorBacklog {
                     blocked.insert((direction, op.snapshot_id().clone()));
                 }
                 RepairVerdict::Retry => {
+                    // The count goes back to disk before the entry is left
+                    // alone, so that the cap survives the restart the entry
+                    // itself is designed to survive.
+                    let counted = OwedWrite {
+                        direction,
+                        op: op.clone(),
+                        attempts,
+                    };
+                    match serde_json::to_vec(&counted) {
+                        Ok(encoded) => {
+                            if let Err(error) = self.put_locally(key, encoded).await {
+                                warn!(
+                                    %error,
+                                    "could not count a failed catalog mirror replay; this entry \
+                                     will be retried without its attempts being capped"
+                                );
+                            }
+                        }
+                        Err(error) => warn!(%error, "could not encode a catalog mirror entry"),
+                    }
                     pass.retry += 1;
                     record_mirror_repair_failed(direction, op.name(), verdict.as_str());
                     blocked.insert((direction, op.snapshot_id().clone()));
@@ -1011,6 +1240,66 @@ fn decode_diverged_direction(key: &[u8]) -> Option<MirrorDirection> {
     }
 }
 
+/// The writes that would have been mirrored had the double write been on when
+/// this record was made.
+///
+/// 🔴 The *operations*, reconstructed — not a row copy. A committed record
+/// replays as the publish it was, which is the one write that carries the
+/// payload and binds the alias; an uncommitted one replays as the create it
+/// was, and a build that failed replays as the create plus the failure, because
+/// no single central statement opens a row already in `error`.
+fn history_ops(record: SnapshotRecord) -> Vec<MirrorOp> {
+    if record.committed.is_some() {
+        return match commit_from_record(record) {
+            Some(commit) => vec![MirrorOp::PublishCommit { commit }],
+            None => Vec::new(),
+        };
+    }
+
+    let failed = match &record.source {
+        SnapshotSource::Template { build } if build.status == TemplateBuildStatus::Error => {
+            Some(build.error_reason.clone().unwrap_or_else(|| {
+                TemplateBuildErrorReason::new(
+                    "this build had already failed when the catalog mirror was turned on, and \
+                     object storage did not record why",
+                )
+            }))
+        }
+        _ => None,
+    };
+
+    match failed {
+        Some(reason) => {
+            let id = record.id.clone();
+            vec![
+                MirrorOp::Create { record },
+                MirrorOp::MarkBuildError { id, reason },
+            ]
+        }
+        None => vec![MirrorOp::Create { record }],
+    }
+}
+
+/// The commit a committed record describes.
+///
+/// The inverse of `commit_opening_record`, and it exists only for the backfill:
+/// every other publish still has the real `SnapshotCommit` in hand.
+fn commit_from_record(record: SnapshotRecord) -> Option<SnapshotCommit> {
+    let committed = record.committed?;
+    Some(SnapshotCommit {
+        id: record.id,
+        alias: record.alias,
+        source: match record.source {
+            SnapshotSource::Template { .. } => SnapshotPublishSource::Template,
+            SnapshotSource::Sandbox { source_sandbox_id } => {
+                SnapshotPublishSource::Sandbox { source_sandbox_id }
+            }
+        },
+        resources: record.resources,
+        committed,
+    })
+}
+
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1022,10 +1311,28 @@ fn now_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::snapshot::repository::mirror::test_doubles::{
-        commit_for, record_for, ScriptedCatalog, ScriptedCentral,
+        commit_for, committed_record, record_for, ScriptedCatalog, ScriptedCentral,
     };
 
+    /// A backlog on a node that has already queued its object store's history.
+    ///
+    /// 🔴 The default, deliberately. Every test below is about *debt*, and a
+    /// node that has not run the backfill is refused from PostgreSQL for a
+    /// reason that has nothing to do with what those tests hold still — so
+    /// leaving it unqueued would make them all fail for one shared, unrelated
+    /// reason, which is the same as not testing them. The unqueued state is
+    /// covered on its own, further down.
     async fn backlog(dir: &tempfile::TempDir) -> Arc<MirrorBacklog> {
+        let backlog = unmirrored_backlog(dir).await;
+        backlog
+            .queue_history_toward_central(&ScriptedCatalog::default())
+            .await
+            .expect("an empty object store has no history to queue");
+        backlog
+    }
+
+    /// A backlog exactly as it comes off disk, history not yet queued.
+    async fn unmirrored_backlog(dir: &tempfile::TempDir) -> Arc<MirrorBacklog> {
         MirrorBacklog::open(dir.path().join("mirror"))
             .await
             .expect("the backlog should open")
@@ -1787,5 +2094,313 @@ mod tests {
             .guard_read_side(CatalogReadSide::Postgres)
             .await
             .expect("a node that has never recorded a side is not moving one");
+    }
+
+    // ── the attempt cap ─────────────────────────────────────────────────
+
+    /// 🔴 An unbounded retry is a defect whatever it is retrying. A store that
+    /// never comes back would otherwise be asked forever, one request per
+    /// entry per interval, against the store the acceptance number is measured
+    /// on — and the lag it holds up is what the next batch's gate reads.
+    #[tokio::test]
+    async fn an_entry_that_never_settles_stops_being_debt() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let target = Arc::new(ScriptedCatalog::default());
+        target.break_it();
+
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        for attempt in 1..MAX_REPLAY_ATTEMPTS {
+            let pass = backlog
+                .drain_once(&targets(&target))
+                .await
+                .expect("the pass should run");
+            assert_eq!(
+                pass.retry, 1,
+                "attempt {attempt} must still be counted as debt worth keeping"
+            );
+            assert_eq!(backlog.lag_toward(MirrorDirection::ObjectStore), 1);
+        }
+
+        let pass = backlog
+            .drain_once(&targets(&target))
+            .await
+            .expect("the pass should run");
+        assert_eq!(pass.diverged, 1, "the cap has to actually fire");
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::ObjectStore),
+            0,
+            "an entry nothing can settle stops being debt"
+        );
+        assert_eq!(
+            backlog.diverged_toward(MirrorDirection::ObjectStore),
+            1,
+            "and becomes a disagreement an operator can see instead of disappearing"
+        );
+    }
+
+    /// 🔴 The count is on disk, not in memory. A node that restarts more often
+    /// than the cap expires would otherwise retry the same unwinnable write for
+    /// as long as the cluster lived, which is the cap not existing.
+    #[tokio::test]
+    async fn the_attempt_count_survives_a_restart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = Arc::new(ScriptedCatalog::default());
+        target.break_it();
+
+        {
+            let backlog = backlog(&dir).await;
+            backlog
+                .record(
+                    MirrorDirection::ObjectStore,
+                    MirrorOp::Create {
+                        record: record_for(&SnapshotId::generate()),
+                    },
+                )
+                .await;
+            for _ in 1..MAX_REPLAY_ATTEMPTS {
+                backlog
+                    .drain_once(&targets(&target))
+                    .await
+                    .expect("the pass should run");
+            }
+            assert_eq!(backlog.lag_toward(MirrorDirection::ObjectStore), 1);
+        }
+
+        let restarted = unmirrored_backlog(&dir).await;
+        assert_eq!(
+            restarted.lag_toward(MirrorDirection::ObjectStore),
+            1,
+            "the entry itself survives, which is what the queue is for"
+        );
+        let pass = restarted
+            .drain_once(&targets(&target))
+            .await
+            .expect("the pass should run");
+        assert_eq!(
+            pass.diverged, 1,
+            "and so does what it has already cost: one more attempt is the last one"
+        );
+    }
+
+    /// The control face: an entry that settles clears without ever reaching the
+    /// cap, and a store that comes back on the last attempt is repaired rather
+    /// than abandoned.
+    #[tokio::test]
+    async fn a_store_that_comes_back_before_the_cap_is_repaired() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let target = Arc::new(ScriptedCatalog::default());
+        target.break_it();
+
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+        for _ in 1..MAX_REPLAY_ATTEMPTS {
+            backlog
+                .drain_once(&targets(&target))
+                .await
+                .expect("the pass should run");
+        }
+
+        target.fix_it();
+        let pass = backlog
+            .drain_once(&targets(&target))
+            .await
+            .expect("the pass should run");
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(backlog.lag(), 0);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::ObjectStore), 0);
+    }
+
+    // ── the history the double write never saw ──────────────────────────
+
+    fn errored_template(id: &SnapshotId) -> SnapshotRecord {
+        let mut record = record_for(id);
+        if let SnapshotSource::Template { build } = &mut record.source {
+            build.status = TemplateBuildStatus::Error;
+            build.error_reason = Some(TemplateBuildErrorReason::new("it did not build"));
+        }
+        record
+    }
+
+    /// 🔴 The state every cluster is in at the moment `write = "both"` is
+    /// switched on: object storage holds snapshots, PostgreSQL holds none, and
+    /// both gauges read zero because the double write only ever mirrors writes
+    /// made after it was turned on. Measured on the cluster as `lag = 0,
+    /// diverged = 0, PG 0 rows, object storage 32` — and a read-side switch
+    /// authorised on those numbers makes all thirty-two vanish from the API.
+    #[tokio::test]
+    async fn the_history_the_double_write_never_saw_is_queued_as_debt() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+        let published = SnapshotId::generate();
+        let waiting = SnapshotId::generate();
+        let failed = SnapshotId::generate();
+        let object_store = ScriptedCatalog::default().with_history(vec![
+            committed_record(&published),
+            record_for(&waiting),
+            errored_template(&failed),
+        ]);
+
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::Central),
+            0,
+            "nothing is queued before the backfill runs, which is the whole problem"
+        );
+
+        let queued = backlog
+            .queue_history_toward_central(&object_store)
+            .await
+            .expect("the history should queue");
+
+        // Four: the publish, the create, and the create-then-fail pair that a
+        // build which had already failed takes two statements to describe.
+        assert_eq!(queued, 4);
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 4);
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::ObjectStore),
+            0,
+            "object storage is the side that already has all of this"
+        );
+    }
+
+    /// It runs once. A node that restarts would otherwise re-queue its whole
+    /// history every start, which is harmless per entry and unbounded in
+    /// aggregate.
+    #[tokio::test]
+    async fn the_history_is_queued_only_once() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+        let object_store =
+            ScriptedCatalog::default().with_history(vec![record_for(&SnapshotId::generate())]);
+
+        assert_eq!(
+            backlog
+                .queue_history_toward_central(&object_store)
+                .await
+                .expect("the history should queue"),
+            1
+        );
+        assert_eq!(
+            backlog
+                .queue_history_toward_central(&object_store)
+                .await
+                .expect("a second call should do nothing"),
+            0
+        );
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 1);
+    }
+
+    /// 🔴 What is queued is replayable, which is the reason it goes through the
+    /// queue at all rather than through a bespoke copier. A backfill that
+    /// produced entries the compensator could not land would be a lag that
+    /// never drains — the same defect it was written to remove.
+    #[tokio::test]
+    async fn the_queued_history_replays_into_the_central_catalog() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+        let published = SnapshotId::generate();
+        let waiting = SnapshotId::generate();
+        let object_store = Arc::new(
+            ScriptedCatalog::default()
+                .with_history(vec![committed_record(&published), record_for(&waiting)]),
+        );
+        backlog
+            .queue_history_toward_central(object_store.as_ref())
+            .await
+            .expect("the history should queue");
+
+        let central = Arc::new(ScriptedCentral::default());
+        let pass = backlog
+            .drain_once(
+                &MirrorTargets::object_store(Arc::clone(&object_store) as Arc<dyn SnapshotCatalog>)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 2);
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
+        assert!(
+            central
+                .holds(&published)
+                .is_some_and(|row| row.committed.is_some()),
+            "a snapshot that was published before the mirror existed must arrive published"
+        );
+        assert!(central.holds(&waiting).is_some());
+    }
+
+    /// 🔴 A backfill that could not read the object store must not mark itself
+    /// done. Marking it would make the gauges say the two catalogs agree about
+    /// snapshots nobody managed to enumerate — which is the exact shape of the
+    /// bug, one level up.
+    #[tokio::test]
+    async fn a_backfill_that_cannot_list_leaves_itself_undone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+        let object_store = ScriptedCatalog::default();
+        object_store.break_it();
+
+        backlog
+            .queue_history_toward_central(&object_store)
+            .await
+            .expect_err("an object store that cannot be listed has not been queued");
+        assert!(!backlog
+            .history_is_queued()
+            .await
+            .expect("reading the marker should work"));
+    }
+
+    /// 🔴 And until it has run, reads may not be answered from PostgreSQL. Debt
+    /// and divergence both describe writes the double write *saw*; a snapshot
+    /// published before it was turned on was seen by neither, so both numbers
+    /// read zero about it. This is the condition that is not about a switch —
+    /// a first start counts too, because there is no state a fresh node could
+    /// be coming back from.
+    #[tokio::test]
+    async fn reads_may_not_move_to_postgres_before_the_history_is_queued() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+
+        let error = backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect_err("PostgreSQL has never been given the history to answer from");
+        assert!(
+            error.to_string().contains("never been queued"),
+            "the refusal must say what is missing: {error}"
+        );
+
+        // Reading from object storage is unaffected: it is the side that has
+        // the history.
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("object storage is the side that already holds all of it");
+
+        // The control: once the history is queued and drained, the same switch
+        // is allowed.
+        backlog
+            .queue_history_toward_central(&ScriptedCatalog::default())
+            .await
+            .expect("an empty object store has no history to queue");
+        backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect("a queued and empty history must let the switch through");
     }
 }

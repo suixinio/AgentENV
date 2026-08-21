@@ -70,8 +70,11 @@ pub(crate) struct ScriptedCatalog {
     broken: AtomicBool,
     /// When set, `get` itself fails.
     get_fails: AtomicBool,
-    /// When set, `publish_commit` refuses with an alias conflict.
+    /// When set, the writes that bind a name refuse with an alias conflict.
     alias_conflict: Mutex<Option<SnapshotId>>,
+    /// What `list` answers with — the rows this store held before anybody
+    /// started mirroring it.
+    history: Mutex<Vec<SnapshotRecord>>,
 }
 
 impl ScriptedCatalog {
@@ -111,6 +114,26 @@ impl ScriptedCatalog {
         *self.alias_conflict.lock().expect("alias") = Some(holder);
     }
 
+    /// Gives the store a past: rows that exist and that nothing mirrored.
+    pub(crate) fn with_history(self, records: Vec<SnapshotRecord>) -> Self {
+        *self.history.lock().expect("history") = records;
+        self
+    }
+
+    /// The conflict a name-binding write answers with, if one is armed.
+    fn refused_alias(
+        &self,
+        alias: Option<&SnapshotAlias>,
+        id: &SnapshotId,
+    ) -> Option<RepositoryError> {
+        let holder = self.alias_conflict.lock().expect("alias").clone()?;
+        Some(RepositoryError::AliasConflict {
+            alias: alias.map(ToString::to_string).unwrap_or_default(),
+            existing: holder,
+            new_id: id.clone(),
+        })
+    }
+
     fn outcome(&self, id: &SnapshotId) -> RepositoryResult<()> {
         if self.broken.load(Ordering::SeqCst) {
             return Err(RepositoryError::Backend {
@@ -136,21 +159,19 @@ impl ScriptedCatalog {
 impl SnapshotCatalog for ScriptedCatalog {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.note(format!("create:{}", record.id));
+        // `create` binds a name too, and the store refuses it the same way
+        // `publish_commit` does. Modelling the conflict on only one of them is
+        // what let the missing carve-out on the other go unnoticed.
+        if let Some(conflict) = self.refused_alias(record.alias.as_ref(), &record.id) {
+            return Err(conflict);
+        }
         self.outcome(&record.id).map(|()| record)
     }
 
     async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
         self.note(format!("publish_commit:{}", commit.id));
-        if let Some(holder) = self.alias_conflict.lock().expect("alias").clone() {
-            return Err(RepositoryError::AliasConflict {
-                alias: commit
-                    .alias
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                existing: holder,
-                new_id: commit.id.clone(),
-            });
+        if let Some(conflict) = self.refused_alias(commit.alias.as_ref(), &commit.id) {
+            return Err(conflict);
         }
         self.outcome(&commit.id)?;
         let mut record = SnapshotRecord::template_waiting(
@@ -196,7 +217,7 @@ impl SnapshotCatalog for ScriptedCatalog {
                 source: None,
             });
         }
-        Ok(Vec::new())
+        Ok(self.history.lock().expect("history").clone())
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
@@ -264,6 +285,7 @@ pub(crate) struct ScriptedCentral {
     calls: Mutex<Vec<String>>,
     rows: Mutex<HashMap<String, SnapshotRecord>>,
     unreachable: Mutex<Vec<CentralCall>>,
+    rejected: Mutex<Vec<CentralCall>>,
     refusals: Mutex<Vec<(CentralCall, CatalogRefusal)>>,
 }
 
@@ -283,6 +305,13 @@ impl ScriptedCentral {
 
     pub(crate) fn reachable_again(&self) {
         self.unreachable.lock().expect("unreachable").clear();
+    }
+
+    /// Makes one call fail the way a controller that will never accept this
+    /// request fails: an answer, arriving as a status code rather than as a
+    /// [`CatalogRefusal`], that asking again cannot change.
+    pub(crate) fn reject_permanently_on(&self, call: CentralCall) {
+        self.rejected.lock().expect("rejected").push(call);
     }
 
     /// Makes one call answer with a refusal.
@@ -320,6 +349,16 @@ impl ScriptedCentral {
             return Some(Err(RepositoryError::Backend {
                 message: format!("the central catalog's '{}' is unreachable", call.as_str()),
                 source: None,
+            }));
+        }
+        if self.rejected.lock().expect("rejected").contains(&call) {
+            // The shape `CentralSnapshotCatalog::unreachable` produces for a
+            // status the controller will repeat.
+            return Some(Err(RepositoryError::InvalidRequest {
+                reason: format!(
+                    "the snapshot catalog rejected '{}' permanently: InvalidArgument: no",
+                    call.as_str()
+                ),
             }));
         }
         let refusal = self

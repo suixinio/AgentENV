@@ -43,10 +43,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agentenv::api::{snapshot_cursor_from_token, snapshot_next_token};
 use agentenv::sandbox::FirecrackerSnapshotManifest;
 use agentenv::snapshot::repository::backends::{CatalogReadScope, CentralSnapshotCatalog};
 use agentenv::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
-use agentenv::snapshot::repository::{RepositoryError, SnapshotListFilter};
+use agentenv::snapshot::repository::{RepositoryError, SnapshotCursor, SnapshotListFilter};
 use agentenv::snapshot::{
     CommandContext, CommittedSnapshot, ManagedLayer, SnapshotAlias, SnapshotId,
     SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
@@ -2005,4 +2006,257 @@ mod bytes_then_commit {
             Some(id)
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Keyset pagination, pushed into the server
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Publishes `count` snapshots for one source sandbox, in `groups` of rows
+/// sharing a creation instant.
+///
+/// 🔴 The shared instants are the point. Ordering is `created_at_ms DESC, id
+/// ASC`, so a cursor is only correct if it breaks ties by id — and a fixture
+/// whose rows all have distinct timestamps cannot tell a cursor that does from
+/// one that stops at the timestamp. Every page boundary below lands inside a
+/// tie.
+async fn publish_a_page_fixture(
+    catalog: &CentralSnapshotCatalog,
+    sandbox_id: &str,
+    count: usize,
+    group: usize,
+) -> Vec<SnapshotId> {
+    let base = now_unix_ms();
+    let mut ids = Vec::with_capacity(count);
+    for n in 0..count {
+        let id = SnapshotId::generate();
+        let mut commit =
+            sandbox_commit_created_at(id.clone(), None, "paging", base - (n / group) as i64);
+        commit.source = SnapshotPublishSource::Sandbox {
+            source_sandbox_id: sandbox_id.to_string(),
+        };
+        catalog
+            .publish_commit(commit)
+            .await
+            .expect("publishing should work");
+        ids.push(id);
+    }
+    ids
+}
+
+fn page_filter(sandbox_id: &str, limit: u32, cursor: Option<SnapshotCursor>) -> SnapshotListFilter {
+    SnapshotListFilter {
+        source_sandbox_id: Some(sandbox_id.to_string()),
+        ..SnapshotListFilter::default()
+    }
+    .paginated(Some(limit), cursor)
+}
+
+/// 🔴 P2, against the real keyset: walk a catalog to the end in pages of three
+/// and get every row exactly once, in the listing's order.
+#[tokio::test]
+async fn walking_the_servers_cursor_returns_every_row_exactly_once() {
+    let catalog = catalog!();
+    let sandbox_id = unique_alias("sbx-page");
+    let published = publish_a_page_fixture(&catalog, &sandbox_id, 10, 3).await;
+
+    let mut seen: Vec<(i64, SnapshotId)> = Vec::new();
+    let mut cursor: Option<SnapshotCursor> = None;
+    for _ in 0..published.len() + 1 {
+        let page = catalog
+            .list_page(page_filter(&sandbox_id, 3, cursor.clone()))
+            .await
+            .expect("the listing should work");
+        assert!(page.items.len() <= 3, "the server honoured the page size");
+        seen.extend(
+            page.items
+                .iter()
+                .map(|row| (row.created_at_unix_ms, row.id.clone())),
+        );
+        match page.next {
+            None => break,
+            Some(next) => cursor = Some(next),
+        }
+    }
+
+    let ids: Vec<SnapshotId> = seen.iter().map(|(_, id)| id.clone()).collect();
+    assert_eq!(ids.len(), published.len(), "every row came back");
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), published.len(), "and none of them twice");
+    for id in &published {
+        assert!(ids.contains(id), "{id} was published and never listed");
+    }
+
+    // 🔴 And in the order the index was built for: newest first, ties broken by
+    // ascending id. Stated as the order the walk *produced*, sorted
+    // independently, so a cursor that stopped at the timestamp fails here —
+    // the fixture puts three rows in every instant precisely so that it can.
+    let mut expected = seen.clone();
+    expected.sort_by(|(a_ms, a_id), (b_ms, b_id)| b_ms.cmp(a_ms).then_with(|| a_id.cmp(b_id)));
+    assert_eq!(
+        seen, expected,
+        "the walk must come back in `created_at_ms DESC, id ASC`"
+    );
+    assert!(
+        seen.windows(2).any(|pair| pair[0].0 == pair[1].0),
+        "the fixture must contain rows sharing an instant, or the tie-break is untested"
+    );
+}
+
+/// 🔴 The whole batch, in one assertion: the page size reaches the query.
+///
+/// Before this, a listing was read whole and sliced afterwards, so a request
+/// for one row cost what a request for a hundred did — measured on the dev
+/// cluster as `1 + 32` object-store requests either way. The server answering
+/// with one row and a cursor is what says the limit is no longer decoration.
+#[tokio::test]
+async fn a_page_of_one_is_answered_with_one_row_and_a_cursor() {
+    let catalog = catalog!();
+    let sandbox_id = unique_alias("sbx-limit");
+    publish_a_page_fixture(&catalog, &sandbox_id, 4, 2).await;
+
+    let page = catalog
+        .list_page(page_filter(&sandbox_id, 1, None))
+        .await
+        .expect("the listing should work");
+
+    assert_eq!(page.items.len(), 1);
+    assert!(
+        page.next.is_some(),
+        "three more rows match, so there is another page"
+    );
+
+    let whole = catalog
+        .list(SnapshotListFilter {
+            source_sandbox_id: Some(sandbox_id.clone()),
+            ..SnapshotListFilter::default()
+        })
+        .await
+        .expect("the unbounded listing should work");
+    assert_eq!(
+        whole.len(),
+        4,
+        "and the unbounded listing still sees all of them"
+    );
+}
+
+/// 🔴 The public token, carried through the server and back.
+///
+/// This is the test that catches the failure mode with no error message: the
+/// public cursor orders ids by their *text* form, PostgreSQL is asked to
+/// compare `s.id::text`, and the node compares `SnapshotId`. If those three ever
+/// disagreed, a page boundary would silently skip a row. Rendering the server's
+/// cursor into the public token, parsing it back, and asking the server to
+/// continue from it exercises all three in one round trip.
+#[tokio::test]
+async fn the_public_token_round_trips_through_the_server_without_losing_a_row() {
+    let catalog = catalog!();
+    let sandbox_id = unique_alias("sbx-token");
+    let published = publish_a_page_fixture(&catalog, &sandbox_id, 9, 3).await;
+
+    let mut seen: Vec<SnapshotId> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..published.len() + 1 {
+        let cursor = match token.as_deref() {
+            Some(token) => Some(
+                snapshot_cursor_from_token(token).expect("the token this service minted parses"),
+            ),
+            None => None,
+        };
+        let page = catalog
+            .list_page(page_filter(&sandbox_id, 2, cursor))
+            .await
+            .expect("the listing should work");
+        seen.extend(page.items.iter().map(|row| row.id.clone()));
+        match page.next.as_ref() {
+            None => break,
+            // 🔴 Through the public rendering every time, not around it.
+            Some(next) => token = Some(snapshot_next_token(next)),
+        }
+    }
+
+    assert_eq!(seen.len(), published.len(), "every row survived the token");
+    let unique: std::collections::HashSet<_> = seen.iter().collect();
+    assert_eq!(unique.len(), published.len(), "and none of them twice");
+}
+
+/// 🔴 §5.3, on the paged read: the resolvable predicate is in the query, and a
+/// caller that says nothing about status gets the reading that cannot start a
+/// half-written VM.
+///
+/// `allow_any_status`'s zero value is the safe one on purpose — a client that
+/// forgets it must not be handed a snapshot whose bytes are still uploading —
+/// and this is the paged half of that, which did not exist before.
+#[tokio::test]
+async fn a_still_building_row_is_absent_from_a_page_that_did_not_ask_for_it() {
+    let catalog = catalog!();
+    let sandbox_id = unique_alias("sbx-scope");
+    let building = SnapshotId::generate();
+    let mut opening = SnapshotRecord::template_waiting(
+        building.clone(),
+        None,
+        SandboxResources {
+            cpu_count: 1,
+            memory_mib: 256,
+            disk_size_mib: 0,
+        },
+    );
+    opening.source = SnapshotSource::Sandbox {
+        source_sandbox_id: sandbox_id.clone(),
+    };
+    catalog
+        .begin_snapshot(
+            &opening,
+            agentenv::snapshot::repository::backends::central::STATUS_BUILDING,
+            false,
+        )
+        .await
+        .expect("opening the row should work");
+
+    let resolvable = catalog
+        .list_page(page_filter(&sandbox_id, 10, None))
+        .await
+        .expect("the listing should work");
+    assert!(
+        !resolvable.items.iter().any(|row| row.id == building),
+        "a row whose bytes are still uploading must not appear in a resolvable page"
+    );
+
+    // The control: the endpoint that exists to look at builds does see it, and
+    // it is the same query with the one flag set.
+    let any = catalog
+        .list_page_scoped(
+            page_filter(&sandbox_id, 10, None),
+            CatalogReadScope::AnyStatus,
+        )
+        .await
+        .expect("the listing should work");
+    assert!(
+        any.items.iter().any(|row| row.id == building),
+        "asking for any status must find it, or this test proves nothing"
+    );
+}
+
+/// A page size the caller did not state is the server's default, not "all of
+/// them" — and the node's idea of that default has to be the server's, or an
+/// unbounded request means two different things either side of the read switch.
+#[tokio::test]
+async fn a_page_with_no_stated_limit_is_bounded_by_the_server() {
+    let catalog = catalog!();
+    let sandbox_id = unique_alias("sbx-default");
+    publish_a_page_fixture(&catalog, &sandbox_id, 3, 1).await;
+
+    let page = catalog
+        .list_page(SnapshotListFilter {
+            source_sandbox_id: Some(sandbox_id.clone()),
+            ..SnapshotListFilter::default()
+        })
+        .await
+        .expect("the listing should work");
+
+    assert_eq!(page.items.len(), 3);
+    assert!(
+        page.next.is_none(),
+        "three rows fit inside the default page"
+    );
 }

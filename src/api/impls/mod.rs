@@ -2,6 +2,7 @@ mod admin;
 mod attached_drives;
 mod auth;
 mod pagination;
+pub use pagination::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
 mod paused_coordinator;
 mod paused_recovery;
 mod sandbox;

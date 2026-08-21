@@ -324,18 +324,40 @@ mod tests {
         // shutdown path tells "I isolated the node" from "it already was".
         assert!(!orchestration.set_scheduling_disabled(true));
 
-        assert!(orchestration.list_sandboxes().await.unwrap().is_empty());
-        assert!(orchestration.list_sandbox_ids().await.unwrap().is_empty());
-        assert!(orchestration
-            .list_sandbox_roster()
+        // 🔴 Seed a record before asking anything about the lists.
+        //
+        // This test used to assert that the four list-shaped answers were
+        // empty, which they were — because nothing had happened yet. A
+        // forwarding that answered every one of them with
+        // `Default::default()` satisfies that perfectly, so the assertions
+        // were about the shape of the return type and not about where the
+        // answer came from. The node lane hit the same trap from the other
+        // side: a handle-table read and a store read agree exactly when the
+        // node is empty, so an empty node cannot tell them apart.
+        let seeded = SandboxId::new();
+        orchestration
+            .set_metadata_state_for_test(seeded, SandboxState::Running)
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+
+        let listed = orchestration.list_sandboxes().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, seeded, "the list is about the seeded sandbox");
+        assert_eq!(
+            orchestration.list_sandbox_ids().await.unwrap(),
+            vec![seeded]
+        );
+        assert_eq!(orchestration.list_sandbox_roster().await.unwrap().len(), 1);
         let metrics = orchestration.metrics_snapshot().await.unwrap();
-        assert_eq!(metrics.running_sandbox_count, 0);
+        assert_eq!(metrics.running_sandbox_count, 1);
+        // Seeding a record is not a create, and the counter knows the
+        // difference — which is what makes the 1 above mean something.
         assert_eq!(metrics.create_successes, 0);
 
+        // The contrast, so the answers above are about *this* sandbox rather
+        // than about anything the orchestrator would say to any question.
         let unknown = SandboxId::new();
+        assert!(orchestration.get_sandbox(&seeded).await.unwrap().is_some());
         assert!(orchestration.get_sandbox(&unknown).await.unwrap().is_none());
         assert!(orchestration.live_execution_id(&unknown).await.is_none());
         assert!(!orchestration.validate_envd_access_token(unknown, "nonsense"));

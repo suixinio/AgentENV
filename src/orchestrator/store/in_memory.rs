@@ -13,6 +13,21 @@ use super::{
 
 /// In-memory metadata store backed by a `RwLock<HashMap>`.
 ///
+/// # 🔴 A node's own ledger, not the cluster's authority
+///
+/// Under `--role all` and `--role node` this is the sandbox record for the
+/// machine it runs on. It is **not** a second backend for cluster state, and
+/// `--role api` never constructs it. Nothing should ever write to both this and
+/// the Redis store: two authorities for one fact is the arrangement this whole
+/// stage exists to remove.
+///
+/// The four cluster primitives — `start_transition`, `reserve`,
+/// `heal_expiry_index`, `reap_stuck_transitions` — are deliberately left at
+/// their trait defaults here, which refuse or answer trivially. A node's ledger
+/// never arbitrates between replicas, so a weaker imitation of a primitive
+/// would buy nothing and could be mistaken for the real guarantee; an explicit
+/// refusal cannot be.
+///
 /// Each sandbox has an associated `watch` channel that broadcasts its current
 /// `Option<SandboxState>` (where `None` means the sandbox has been removed).
 /// This enables efficient, lock-free waiting for state transitions via
@@ -313,10 +328,21 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 
     async fn list_expired(&self, now: SystemTime) -> Result<Vec<SandboxMetadata>> {
+        self.expired_batch(now, usize::MAX).await
+    }
+
+    /// The bounded form, which is what an evictor running on several replicas
+    /// needs: a fixed amount of work per round rather than the whole table.
+    ///
+    /// Three lines here because the expiry index and the records share one
+    /// lock. That is also why `heal_expiry_index` has nothing to do for this
+    /// store — the two cannot drift apart.
+    async fn expired_batch(&self, now: SystemTime, limit: usize) -> Result<Vec<SandboxMetadata>> {
         let inner = self.inner.read().await;
         let expired = inner
             .by_expiry
             .range(..=(now, SandboxId::max()))
+            .take(limit)
             .filter_map(|(_, sandbox_id)| inner.records.get(sandbox_id))
             .map(|record| record.metadata.clone())
             .collect();
@@ -392,6 +418,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// The shared contract, run against this backend. The Redis backend runs
+    /// the identical list; a change made to one and forgotten for the other
+    /// turns red here.
+    mod contract {
+        use super::super::InMemoryMetadataStore;
+
+        async fn new_contract_store(_test: &str) -> Option<InMemoryMetadataStore> {
+            Some(InMemoryMetadataStore::new())
+        }
+
+        crate::orchestrator::store::contract::metadata_store_contract!();
+    }
 
     #[tokio::test]
     async fn in_memory_store_roundtrip() {

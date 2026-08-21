@@ -54,7 +54,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-ublk install-ublk \
 	fmt clippy \
 	mutants coverage \
-	test test-unit test-integration test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
+	test test-unit test-integration test-with-redis test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
@@ -120,6 +120,34 @@ test-unit:
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
+
+# The metadata store's Redis suite, against a real redis-server.
+#
+# 🔴 Two disciplines borrowed from services/Makefile, both of them put there by
+# a real incident:
+#   * prove the dependency is present before running, so a missing one is a
+#     failure rather than a green run over skipped tests;
+#   * say out loud what the run skipped. A make target in this repository once
+#     silently skipped 152 tests and reported ok, and two of them were the only
+#     tests that would have caught a `KEEPTTL` being dropped.
+REDIS_TEST_LOG ?= target/redis-store-tests.log
+
+test-with-redis:
+	@command -v "$${REDIS_SERVER_BIN:-redis-server}" >/dev/null 2>&1 || { \
+	  echo "redis-server not found: the metadata store tests would skip instead of running."; \
+	  echo "Install redis-server, or point REDIS_SERVER_BIN at one."; \
+	  exit 1; }
+	@mkdir -p $(dir $(REDIS_TEST_LOG))
+	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p agentenv --lib orchestrator::store:: -- --nocapture \
+	  > $(REDIS_TEST_LOG) 2>&1; status=$$?; \
+	  cat $(REDIS_TEST_LOG); \
+	  if grep -q 'SKIPPED\[redis\]' $(REDIS_TEST_LOG); then \
+	    echo; echo "this run skipped store tests:"; \
+	    grep 'SKIPPED\[redis\]' $(REDIS_TEST_LOG); \
+	    exit 1; \
+	  fi; \
+	  if [ $$status -eq 0 ]; then echo; echo "no store tests were skipped"; fi; \
+	  exit $$status
 
 test-integration: test-agent-integration test-envd test-ublk
 

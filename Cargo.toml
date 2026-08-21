@@ -116,6 +116,7 @@ rand = "0.10"
 flate2 = "1"
 tar = "0.4"
 openssl-sys = { version = "0.9", optional = true }
+redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

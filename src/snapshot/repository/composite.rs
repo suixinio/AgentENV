@@ -670,6 +670,96 @@ mod tests {
         );
     }
 
+    /// 🔴 The same counter, driven by the code that actually decides — the
+    /// double write over a real central catalog and a real object store — and
+    /// through the arrangement that produced the leak measured on the cluster:
+    /// one orphan prefix, two objects, 22,194 bytes.
+    ///
+    /// The two tests either side of this one use a fake catalog that is *told*
+    /// to retain, so they hold the counter still and prove nothing about which
+    /// states reach it. Here the template row already exists, so the publish's
+    /// opening statement is answered `AlreadyExists` and the commit flips
+    /// somebody else's row — which means the undo may not take it back. Object
+    /// storage then refuses the alias, the publish fails, and the rollback
+    /// finds a `ready` row in PostgreSQL still pointing at the bytes. Keeping
+    /// them is right. Saying nothing about it was not.
+    #[test]
+    fn the_double_write_reaches_the_counter_over_a_row_it_may_not_take_back() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        use crate::snapshot::repository::metrics::test_support::counter_total;
+        use crate::snapshot::repository::metrics::ARTIFACTS_RETAINED_TOTAL;
+        use crate::snapshot::repository::mirror::test_doubles::{
+            record_for, ScriptedCatalog, ScriptedCentral,
+        };
+        use crate::snapshot::repository::mirror::{
+            CentralCatalogWrites, DualWriteCatalog, MirrorBacklog,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime should build");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let workspace = tempfile::TempDir::new().expect("tempdir should exist");
+        let metadata = metadata();
+        let id = metadata.id.clone();
+
+        let central = Arc::new(ScriptedCentral::default());
+        // A template row somebody else opened: the publish's `begin` will be
+        // answered `AlreadyExists`, so the undo is not allowed to delete it.
+        central.seed(record_for(&id));
+        let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.refuse_alias_to(SnapshotId::generate());
+
+        let journal = Arc::new(Journal::default());
+        let repository = runtime.block_on(async {
+            let backlog = MirrorBacklog::open(workspace.path().join("mirror"))
+                .await
+                .expect("the backlog should open");
+            SnapshotRepository::new(
+                Arc::new(DualWriteCatalog::new(
+                    Arc::clone(&central) as Arc<dyn CentralCatalogWrites>,
+                    Arc::clone(&object_store) as Arc<dyn SnapshotCatalog>,
+                    backlog,
+                )),
+                Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+            )
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                repository
+                    .publish(metadata, manifest())
+                    .await
+                    .expect_err("an alias the object store will not bind fails the publish");
+            });
+        });
+
+        assert!(
+            central
+                .holds(&id)
+                .is_some_and(|row| row.committed.is_some()),
+            "the arrangement only means anything while the central catalog still holds the \
+             committed row"
+        );
+        assert!(
+            !journal
+                .entries()
+                .iter()
+                .any(|entry| entry.starts_with("artifacts.delete")),
+            "the bytes must stay: {:?}",
+            journal.entries()
+        );
+        assert_eq!(
+            counter_total(&snapshotter, ARTIFACTS_RETAINED_TOTAL),
+            1,
+            "a leak nothing collects has to be a number somebody can look at"
+        );
+    }
+
     /// The control face: a rollback that actually deletes is not a leak and
     /// must not be counted as one.
     #[test]

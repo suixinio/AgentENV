@@ -98,17 +98,24 @@ pub struct SnapshotManager {
     repository: Arc<SnapshotRepository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
+    /// Held, not used. The replay of owed object-store writes stops when the
+    /// last handle is dropped, so it lives as long as the manager does.
+    _mirror_compensator: Option<Arc<crate::snapshot::repository::mirror::MirrorCompensator>>,
 }
 
 impl SnapshotManager {
     /// Builds a manager using the configured repository backend.
-    pub fn new(p2p_transport: Option<Arc<dyn P2pTransport>>) -> anyhow::Result<Self> {
-        let (repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
-        Ok(Self::from_parts(
-            repository,
-            runtime_resolver,
+    ///
+    /// Async because assembling the catalog may have to open the double
+    /// write's durable backlog and check it before anything is served.
+    pub async fn new(p2p_transport: Option<Arc<dyn P2pTransport>>) -> anyhow::Result<Self> {
+        let assembled = build_snapshot_backend(p2p_transport.clone()).await?;
+        Ok(Self {
+            repository: assembled.repository,
+            runtime_resolver: assembled.runtime_resolver,
             p2p_transport,
-        ))
+            _mirror_compensator: assembled.mirror_compensator,
+        })
     }
 
     /// Builds a manager from the given components.
@@ -121,6 +128,7 @@ impl SnapshotManager {
             repository,
             runtime_resolver,
             p2p_transport,
+            _mirror_compensator: None,
         }
     }
 

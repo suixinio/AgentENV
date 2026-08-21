@@ -1,0 +1,277 @@
+//! The wire and the domain, and the one place either is turned into the other.
+//!
+//! 🔴 The contract this file has to keep is the one in the proto's own header:
+//! the server sees scalar columns and two opaque blobs, and nothing else. Every
+//! type that is *not* a scalar — `CommittedSnapshot`, `OverlaybdLayerRef`,
+//! `ManagedLayer`, `CommittedAttachedDrive`, `PersistedDiskImagePublication`,
+//! `ImageConfigs`, `CustomExtensionParams`, `TemplateBuildErrorReason` —
+//! crosses as bytes this module encodes and decodes, and has no counterpart on
+//! the other side. That is what keeps this seam from repeating the twelve
+//! "Rust semantics that cannot be expressed on a Go interface" the paused
+//! registry's contract tests had to write down.
+//!
+//! The other half of the contract is that a value the server does not
+//! understand must arrive here intact rather than flattened. `status` and
+//! `source_kind` are strings for that reason, and a value this build has not
+//! heard of is refused *here*, by name — never silently mapped onto something
+//! plausible.
+
+use uuid::Uuid;
+
+use crate::proto::scheduler as pb;
+use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::types::{
+    CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource,
+    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+};
+use crate::types::SandboxResources;
+
+/// Which encoding of [`CommittedSnapshot`] this build writes.
+///
+/// 🔴 Sent on every commit and checked on every read. The column exists so that
+/// a payload written by a build whose `CommittedSnapshot` has since changed
+/// shape is refused rather than silently half-decoded — serde would happily
+/// drop fields it does not know and hand back a snapshot missing its memory
+/// layers. Bump it when the encoding stops being backward compatible, never for
+/// an added optional field.
+pub(super) const COMMITTED_PAYLOAD_SCHEMA: u32 = 1;
+
+pub const STATUS_WAITING: &str = "waiting";
+pub const STATUS_BUILDING: &str = "building";
+pub(super) const STATUS_READY: &str = "ready";
+pub(super) const STATUS_ERROR: &str = "error";
+
+pub(super) const SOURCE_KIND_TEMPLATE: &str = "template";
+pub(super) const SOURCE_KIND_SANDBOX: &str = "sandbox";
+
+pub(super) fn source_kind_str(kind: SnapshotSourceKind) -> &'static str {
+    match kind {
+        SnapshotSourceKind::Template => SOURCE_KIND_TEMPLATE,
+        SnapshotSourceKind::Sandbox => SOURCE_KIND_SANDBOX,
+    }
+}
+
+pub(super) fn build_status_str(status: TemplateBuildStatus) -> &'static str {
+    match status {
+        TemplateBuildStatus::Waiting => STATUS_WAITING,
+        TemplateBuildStatus::Building => STATUS_BUILDING,
+        TemplateBuildStatus::Ready => STATUS_READY,
+        TemplateBuildStatus::Error => STATUS_ERROR,
+    }
+}
+
+/// The status a record is asking the catalog to open its row in.
+///
+/// A sandbox record has no build state of its own — a pause is `building` from
+/// the moment its bytes start landing until the commit — so only templates
+/// carry a status worth reading off the record.
+pub fn opening_status(record: &SnapshotRecord) -> &'static str {
+    match &record.source {
+        SnapshotSource::Template { build } => match build.status {
+            // 🔴 Refused server-side rather than corrected: a row cannot be born
+            // `ready` or `error`, so anything but the two opening states is a
+            // caller believing something untrue about what it is creating. The
+            // clamp is here so the refusal names a status this build chose.
+            TemplateBuildStatus::Building => STATUS_BUILDING,
+            _ => STATUS_WAITING,
+        },
+        SnapshotSource::Sandbox { .. } => STATUS_BUILDING,
+    }
+}
+
+pub(super) fn source_sandbox_id(record: &SnapshotRecord) -> String {
+    match &record.source {
+        SnapshotSource::Sandbox { source_sandbox_id } => source_sandbox_id.clone(),
+        SnapshotSource::Template { .. } => String::new(),
+    }
+}
+
+pub(super) fn record_source_kind(record: &SnapshotRecord) -> &'static str {
+    match &record.source {
+        SnapshotSource::Sandbox { .. } => SOURCE_KIND_SANDBOX,
+        SnapshotSource::Template { .. } => SOURCE_KIND_TEMPLATE,
+    }
+}
+
+fn malformed(row_id: &str, reason: impl Into<String>) -> RepositoryError {
+    RepositoryError::Backend {
+        message: format!(
+            "snapshot catalog answered off contract for '{row_id}': {}",
+            reason.into()
+        ),
+        source: None,
+    }
+}
+
+/// Encodes a committed payload for the `bytea` column.
+pub(super) fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u8>> {
+    serde_json::to_vec(committed).map_err(|error| RepositoryError::Backend {
+        message: "serialize committed snapshot payload for the catalog".to_string(),
+        source: Some(error.into()),
+    })
+}
+
+/// Encodes a build failure for the `jsonb` column.
+///
+/// 🔴 Always an object. `TemplateBuildErrorReason` has a hand-written
+/// `Deserialize` that also accepts a bare string, and a bare string is a legal
+/// JSON document the column would take and the server's own guard would then
+/// refuse — so the encoder is pinned to the struct form rather than left to
+/// whatever the type happens to serialise as.
+pub(super) fn encode_build_error(reason: &TemplateBuildErrorReason) -> RepositoryResult<Vec<u8>> {
+    serde_json::to_vec(reason).map_err(|error| RepositoryError::Backend {
+        message: "serialize template build error for the catalog".to_string(),
+        source: Some(error.into()),
+    })
+}
+
+/// Turns one row on the wire into a record, refusing anything it cannot read.
+///
+/// 🔴 Never returns a plausible-looking record for a row it did not understand.
+/// Downstream a `SnapshotRecord` is launched from, deleted on the strength of,
+/// and counted in a page; a row decoded on a guess is worse than no row at all.
+pub(super) fn decode_row(
+    row: pb::SnapshotRow,
+    expected_cluster: Uuid,
+) -> RepositoryResult<SnapshotRecord> {
+    let id = SnapshotId::parse(&row.snapshot_id)
+        .map_err(|_| malformed(&row.snapshot_id, "snapshot id is not a uuid"))?;
+
+    // The scope every statement already carries. Checking it here as well is
+    // what rules out a controller answering for a different cluster — the one
+    // thing a request can merely *ask* for and not enforce.
+    let cluster_id = Uuid::parse_str(&row.cluster_id)
+        .map_err(|_| malformed(&row.snapshot_id, "cluster id is not a uuid"))?;
+    if cluster_id != expected_cluster {
+        return Err(malformed(
+            &row.snapshot_id,
+            format!(
+                "row belongs to cluster '{cluster_id}' but this node is in cluster '{expected_cluster}'"
+            ),
+        ));
+    }
+
+    let alias = if row.alias.is_empty() {
+        None
+    } else {
+        Some(
+            SnapshotAlias::parse(&row.alias)
+                .map_err(|error| malformed(&row.snapshot_id, error.to_string()))?,
+        )
+    };
+
+    let status = decode_status(&row.snapshot_id, &row.status)?;
+
+    let source = match row.source_kind.as_str() {
+        SOURCE_KIND_SANDBOX => {
+            if row.source_sandbox_id.is_empty() {
+                return Err(malformed(
+                    &row.snapshot_id,
+                    "a sandbox row must name the sandbox it was captured from",
+                ));
+            }
+            SnapshotSource::Sandbox {
+                source_sandbox_id: row.source_sandbox_id,
+            }
+        }
+        SOURCE_KIND_TEMPLATE => SnapshotSource::Template {
+            build: TemplateBuildInfo {
+                status,
+                started_at_unix_ms: row.build_started_at_unix_ms,
+                finished_at_unix_ms: row.build_finished_at_unix_ms,
+                error_reason: decode_build_error(&row.snapshot_id, &row.build_error_json)?,
+            },
+        },
+        other => {
+            return Err(malformed(
+                &row.snapshot_id,
+                format!("unknown source kind '{other}'"),
+            ))
+        }
+    };
+
+    let committed = decode_committed(
+        &row.snapshot_id,
+        &row.committed_payload,
+        row.committed_schema,
+    )?;
+    // The table states this as `status <> 'ready' OR committed_payload IS NOT
+    // NULL`. Restated here because the record's own shape says it too — a
+    // `Ready` template with no payload is a snapshot a resume would try to
+    // launch from nothing.
+    if status == TemplateBuildStatus::Ready && committed.is_none() {
+        return Err(malformed(
+            &row.snapshot_id,
+            "a ready row carries no committed payload",
+        ));
+    }
+
+    Ok(SnapshotRecord {
+        id,
+        alias,
+        source,
+        resources: SandboxResources {
+            cpu_count: row.cpu_count,
+            memory_mib: row.memory_mib,
+            disk_size_mib: row.disk_size_mib,
+        },
+        created_at_unix_ms: row.created_at_unix_ms,
+        updated_at_unix_ms: row.updated_at_unix_ms,
+        committed,
+    })
+}
+
+fn decode_status(row_id: &str, status: &str) -> RepositoryResult<TemplateBuildStatus> {
+    match status {
+        STATUS_WAITING => Ok(TemplateBuildStatus::Waiting),
+        STATUS_BUILDING => Ok(TemplateBuildStatus::Building),
+        STATUS_READY => Ok(TemplateBuildStatus::Ready),
+        STATUS_ERROR => Ok(TemplateBuildStatus::Error),
+        other => Err(malformed(row_id, format!("unknown status '{other}'"))),
+    }
+}
+
+fn decode_build_error(
+    row_id: &str,
+    raw: &[u8],
+) -> RepositoryResult<Option<TemplateBuildErrorReason>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(raw)
+        .map(Some)
+        .map_err(|error| malformed(row_id, format!("build error is not readable: {error}")))
+}
+
+fn decode_committed(
+    row_id: &str,
+    payload: &[u8],
+    schema: Option<u32>,
+) -> RepositoryResult<Option<CommittedSnapshot>> {
+    match (payload.is_empty(), schema) {
+        (true, None) => Ok(None),
+        // 🔴 Both halves or neither. The table pins the equivalence with a
+        // CHECK; a row that reached here with one of them is a row written by
+        // something that is not this contract, and decoding the payload without
+        // knowing its version is exactly the guess this column exists to stop.
+        (true, Some(version)) => Err(malformed(
+            row_id,
+            format!("payload schema {version} with no payload"),
+        )),
+        (false, None) => Err(malformed(row_id, "payload with no schema version")),
+        (false, Some(version)) => {
+            if version != COMMITTED_PAYLOAD_SCHEMA {
+                return Err(malformed(
+                    row_id,
+                    format!(
+                        "payload schema {version} is not one this build reads \
+                         (it writes and reads {COMMITTED_PAYLOAD_SCHEMA})"
+                    ),
+                ));
+            }
+            serde_json::from_slice(payload)
+                .map(Some)
+                .map_err(|error| malformed(row_id, format!("payload is not readable: {error}")))
+        }
+    }
+}

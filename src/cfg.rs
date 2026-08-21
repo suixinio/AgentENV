@@ -406,6 +406,64 @@ pub struct SnapshotConfig {
     pub p2p_enabled: bool,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
+    #[config(nested)]
+    pub catalog: SnapshotCatalogConfig,
+}
+
+/// Which store holds the snapshot catalog, while it is moving between two.
+///
+/// 🔴 Two knobs, not one, and they roll separately. Adding the second copy and
+/// starting to trust it are different decisions with different ways back — one
+/// is "stop writing there", the other is "stop reading there" — and the
+/// combination that is legal at any moment is the one the matrix in
+/// [`AppConfig::validate_snapshot_catalog`] allows.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotCatalogConfig {
+    /// 🔴 Settable from the environment for the reason
+    /// `paused_registry.backend` is: `deploy/k8s/run.sh` copies
+    /// `config/default.toml` over the cluster's ConfigMap on every apply, so a
+    /// cluster that expressed this by editing the ConfigMap would lose it
+    /// silently, and lose it in the quiet direction — back to writing one store
+    /// while believing it writes two.
+    #[config(default = "object_store", env = "AENV_SNAPSHOT_CATALOG_WRITE")]
+    pub write: SnapshotCatalogWrite,
+    #[config(default = "object_store", env = "AENV_SNAPSHOT_CATALOG_READ")]
+    pub read: SnapshotCatalogRead,
+    /// How often owed object-store writes are replayed.
+    #[config(default = 30u64)]
+    pub mirror_compensator_interval_secs: u64,
+    /// Where the owed writes are kept.
+    ///
+    /// Node-local and durable: what it holds is the difference between "the two
+    /// catalogs agree" and "they do not", and a process that crashed holding
+    /// the answer must not come back believing they agreed.
+    #[config(
+        default = "$AENV_HOME/snapshot-catalog-mirror",
+        env = "AENV_SNAPSHOT_CATALOG_MIRROR_PATH",
+        parse_env = parse_required_path
+    )]
+    pub mirror_backlog_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCatalogWrite {
+    /// Today: object storage is the catalog.
+    ObjectStore,
+    /// Both, object storage still answering reads. The central catalog gets a
+    /// second copy that can be checked against the first.
+    Both,
+    /// The central catalog alone. Only after the read side has been served from
+    /// it for an observation period — until then, dropping the object-store
+    /// copy removes the way back.
+    Postgres,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCatalogRead {
+    ObjectStore,
+    Postgres,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1121,6 +1179,11 @@ impl AppConfig {
 
         self.snapshot.local_cache_path =
             resolve_path(&self.home_path, config_dir, &self.snapshot.local_cache_path);
+        self.snapshot.catalog.mirror_backlog_path = resolve_path(
+            &self.home_path,
+            config_dir,
+            &self.snapshot.catalog.mirror_backlog_path,
+        );
 
         if self.snapshot.repository_backend == SnapshotRepositoryBackendKind::PosixFs {
             let posix_fs = self
@@ -1165,7 +1228,49 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_snapshot_catalog()?;
         Ok(())
+    }
+
+    /// The legal (write, read) pairs, and why the rest are not.
+    ///
+    /// 🔴 An illegal pair fails startup rather than being corrected. Both
+    /// mistakes it rules out are quiet ones: reading a store nobody writes
+    /// answers "no such snapshot" for everything written since the switch, and
+    /// reading an empty table answers it for everything, full stop. Neither
+    /// reports an error — they report absence, and callers delete artifacts and
+    /// refuse resumes on absence.
+    fn validate_snapshot_catalog(&self) -> Result<()> {
+        let catalog = &self.snapshot.catalog;
+        match (catalog.write, catalog.read) {
+            (SnapshotCatalogWrite::ObjectStore, SnapshotCatalogRead::ObjectStore) => Ok(()),
+            (SnapshotCatalogWrite::Both, SnapshotCatalogRead::ObjectStore) => Ok(()),
+            (SnapshotCatalogWrite::ObjectStore, SnapshotCatalogRead::Postgres) => bail!(
+                "snapshot.catalog: write = \"object_store\" with read = \"postgres\" reads a table \
+                 nothing writes. Set write = \"both\" first and let the mirror catch up."
+            ),
+            (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::ObjectStore) => bail!(
+                "snapshot.catalog: write = \"postgres\" with read = \"object_store\" reads a store \
+                 nothing writes any more, so every snapshot published since the switch reads as \
+                 absent. Set read = \"postgres\" in the same change."
+            ),
+            // Legal in the arrangement this is heading for, and not yet built:
+            // the read path against the central catalog is the next batch's
+            // work, and dropping the object-store copy is the batch after that.
+            // Refused by name so a deployment that sets it is told which batch
+            // it is waiting for instead of quietly reading an empty table.
+            (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => bail!(
+                "snapshot.catalog: read = \"postgres\" is not served yet. The central catalog is \
+                 written in this build and read in the next one; until then reads come from \
+                 object storage. Set read = \"object_store\"."
+            ),
+            (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::Postgres) => bail!(
+                "snapshot.catalog: write = \"postgres\" drops the object-store copy, which is the \
+                 only way back from the central catalog. It is allowed once the read side has \
+                 been served from PostgreSQL for an observation period and the mirror lag has \
+                 been 0 throughout; it is not allowed in this build. Set write = \"both\"."
+            ),
+        }
     }
 
     /// Reject internally inconsistent or out-of-range disk rate limit configs so

@@ -304,6 +304,26 @@ p2p_enabled = true
 # [snapshot.image_publish]
 # enabled = true
 
+# Where the snapshot catalog lives while it is moving out of object storage and
+# into the control plane's PostgreSQL.
+#
+# Two knobs, rolled separately, because adding the second copy and starting to
+# trust it are different decisions with different ways back. Both are settable
+# from the environment (AENV_SNAPSHOT_CATALOG_WRITE / _READ) because run.sh
+# copies this file over the cluster's ConfigMap on every apply.
+#
+#   write = "object_store"  today: object storage is the catalog
+#   write = "both"          object storage still answers reads; the central
+#                           catalog gets a second, checkable copy. Requires
+#                           [cluster].scheduler_endpoint.
+#   read  = "object_store"  the only value this build serves
+#
+# [snapshot.catalog]
+# write = "object_store"
+# read = "object_store"
+# mirror_compensator_interval_secs = 30
+# mirror_backlog_path = "$AENV_HOME/snapshot-catalog-mirror"
+
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]

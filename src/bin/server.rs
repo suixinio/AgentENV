@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport)?);
+    let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport).await?);
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     // The handle the cold-boot paths read the CPUID intersection from.
     //

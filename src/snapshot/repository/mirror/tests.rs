@@ -521,6 +521,40 @@ async fn a_build_start_the_object_store_refused_is_not_a_divergence() {
     assert_eq!(fixture.backlog.diverged_toward(MirrorDirection::Central), 0);
 }
 
+/// 🔴 A refusal the central row could not take is a disagreement in its own
+/// right, and not only when a build start put the row there. A commit refused
+/// because the row is not `building` leaves object storage `ready` and
+/// PostgreSQL behind — with nothing owed, because no replay would change the
+/// answer — and nothing else in the process would ever say so.
+#[tokio::test]
+async fn a_commit_the_central_catalog_refused_is_a_divergence_on_its_own() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.refuse(
+        CentralCall::Commit,
+        CatalogRefusal::StatusMismatch {
+            observed: "waiting".to_string(),
+        },
+    );
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, None))
+        .await
+        .expect("the object store answers reads, so the publish still succeeds");
+
+    assert_eq!(
+        fixture.backlog.lag(),
+        0,
+        "there is nothing here a replay could settle"
+    );
+    assert_eq!(
+        fixture.backlog.diverged_toward(MirrorDirection::Central),
+        1,
+        "but the two catalogs disagree about this snapshot, and the switch reads this"
+    );
+}
+
 /// The commit that follows a build start finds a row it cannot flip. Counted
 /// against the same snapshot, so one disagreement stays one.
 #[tokio::test]

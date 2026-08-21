@@ -24,6 +24,17 @@
 //!     cargo test -p agentenv --test snapshot_catalog
 //! ```
 //!
+//! 🔴 The throwaway PostgreSQL in that recipe is not a convenience. The server
+//! is whatever `AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT` names, these tests *write*
+//! to it — snapshots, templates, aliases — and nothing here cleans up after
+//! itself, so every row a run creates stays in that database under the cluster
+//! id it was handed. One run pointed at the deployed dev-cluster scheduler left
+//! 26 snapshot rows, 3 template rows and 10 alias rows behind in a database that
+//! real sandboxes were using, and nothing in this file said it would.
+//! `make test-snapshot-catalog` brings up a container PostgreSQL and a scheduler
+//! of its own and tears both down afterwards; that is the reason to reach for it
+//! rather than for an endpoint that already exists.
+//!
 //! 🔴 Without the endpoint every test here skips, and a skip in `go test`'s
 //! default mode reports as `ok`. `AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1` turns
 //! the missing dependency into a failure, which is what CI must set — the same
@@ -39,7 +50,7 @@ use agentenv::snapshot::repository::{RepositoryError, SnapshotListFilter};
 use agentenv::snapshot::{
     CommandContext, CommittedSnapshot, ManagedLayer, SnapshotAlias, SnapshotId,
     SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
-    TemplateBuildErrorReason,
+    TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use agentenv::types::{ImageConfigs, SandboxResources};
 use agentenv::virtualization::VirtualizationMode;
@@ -594,6 +605,113 @@ async fn a_client_scoped_to_another_cluster_is_refused_rather_than_served() {
         .get(&id.to_string())
         .await
         .expect_err("a client in another cluster must not be served this cluster's rows");
+}
+
+/// 🔴 P7's first blocker, against the server that produced it. Every v3
+/// template create failed the central catalog with `INVALID_ARGUMENT` while the
+/// user was told **202**: the node sends `disk_size_mib = 0` because a v3
+/// build request has no disk field and the real number is the built rootfs's
+/// virtual size, and the store refused the row over it. The rule belongs to a
+/// row somebody can launch, and a `waiting` template is not one.
+///
+/// A property of the *server* — the guard is in Go and the CHECK is in the
+/// table — which is why it is tested here and not against a double.
+#[tokio::test]
+async fn a_template_that_does_not_know_its_disk_size_yet_is_accepted() {
+    let catalog = catalog!();
+    let id = SnapshotId::generate();
+    let alias = unique_alias("nodisk");
+
+    let mut record = SnapshotRecord::template_waiting(
+        id.clone(),
+        Some(SnapshotAlias::parse(&alias).expect("alias should parse")),
+        SandboxResources {
+            cpu_count: 2,
+            memory_mib: 4096,
+            disk_size_mib: 0,
+        },
+    );
+    record.created_at_unix_ms = 1;
+    record.updated_at_unix_ms = 1;
+
+    catalog
+        .create(record)
+        .await
+        .expect("a template has no disk size until it has been built");
+
+    let stored = catalog
+        .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+        .await
+        .expect("reading should work")
+        .expect("the row should be there");
+    assert_eq!(stored.resources.cpu_count, 2);
+    assert_eq!(stored.resources.memory_mib, 4096);
+    assert_eq!(stored.resources.disk_size_mib, 0, "still unknown");
+
+    // And the build fills it in — which is where the rule applies, at the one
+    // statement that produces a row somebody can launch.
+    //
+    // Opened at `building` directly: the commit's fence wants that status and
+    // the transition into it is build admission, which this batch does not
+    // wire. Every other property under test is the same either way.
+    let built = SnapshotId::generate();
+    let mut building = template_record(built.clone(), None);
+    building.resources.disk_size_mib = 0;
+    if let SnapshotSource::Template { build } = &mut building.source {
+        build.status = TemplateBuildStatus::Building;
+    }
+    catalog
+        .create(building)
+        .await
+        .expect("a build in progress does not know its disk size either");
+
+    let mut commit = sandbox_commit(built.clone(), None, "built");
+    commit.source = SnapshotPublishSource::Template;
+    commit.resources.disk_size_mib = 8192;
+    catalog
+        .publish_commit(commit)
+        .await
+        .expect("the built template should commit");
+
+    assert_eq!(
+        catalog
+            .get(&built.to_string())
+            .await
+            .expect("reading should work")
+            .expect("the row should be ready")
+            .resources
+            .disk_size_mib,
+        8192,
+        "the size the build produced is what a launchable row states"
+    );
+}
+
+/// The control face, and the reason the constraint exists at all: a row that
+/// can be launched has to say how big its disk is. Moving the rule must not
+/// have removed it.
+#[tokio::test]
+async fn a_commit_still_has_to_state_a_disk_size() {
+    let catalog = catalog!();
+    let id = SnapshotId::generate();
+
+    let mut record = template_record(id.clone(), None);
+    record.resources.disk_size_mib = 0;
+    catalog.create(record).await.expect("the row should open");
+
+    let mut commit = sandbox_commit(id.clone(), None, "no-disk");
+    commit.source = SnapshotPublishSource::Template;
+    commit.resources.disk_size_mib = 0;
+    let error = catalog
+        .publish_commit(commit)
+        .await
+        .expect_err("a row nobody can launch must not be made launchable");
+
+    // 🔴 And it must arrive as a permanent rejection, not as a transport
+    // failure: the compensator retries transport failures forever.
+    assert!(
+        matches!(error, RepositoryError::InvalidRequest { .. }),
+        "a rule the store stated must not look like an outage: {error:?}"
+    );
 }
 
 /// The whole publish path through the repository seam, against the real
@@ -1191,6 +1309,300 @@ mod dual_write {
             .list(SnapshotListFilter::matches_all())
             .await
             .expect_err("so must a listing");
+    }
+
+    /// 🔴 P7 as it was actually measured: every template create answered **202**
+    /// and PostgreSQL held **zero** rows, because the node sent a disk size the
+    /// store refused. Through the double write, against the real server, with
+    /// the fully-specified request the cluster probe used.
+    #[tokio::test]
+    async fn a_template_create_reaches_both_catalogs() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+        let alias = unique_alias("tmpl");
+
+        let record = SnapshotRecord::template_waiting(
+            id.clone(),
+            Some(SnapshotAlias::parse(&alias).expect("alias should parse")),
+            SandboxResources {
+                cpu_count: 2,
+                memory_mib: 4096,
+                disk_size_mib: 0,
+            },
+        );
+        both.dual
+            .create(record)
+            .await
+            .expect("creating a template must reach both catalogs");
+
+        assert!(
+            both.central
+                .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                .await
+                .expect("reading should work")
+                .is_some(),
+            "the central catalog must hold the row the user was told was created"
+        );
+        assert!(both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_some());
+        assert_eq!(
+            both.backlog.lag_toward(MirrorDirection::Central),
+            0,
+            "nothing is owed, because nothing was refused"
+        );
+        assert_eq!(both.backlog.diverged_toward(MirrorDirection::Central), 0);
+    }
+
+    /// 🔴 P7's user-visible regression, as the invariant that was broken:
+    /// twenty concurrent creates for one name answered **202** twenty times
+    /// while three records existed. **As many callers told yes as there are
+    /// records**, however the two stores resolve the race.
+    ///
+    /// 🔴 What this does *not* prove is that `create`'s alias carve-out works,
+    /// and it is worth saying so: with a reachable central catalog the losers
+    /// are refused by PostgreSQL's unique index before the object store is
+    /// touched at all, so removing the carve-out leaves this test green. The
+    /// case the carve-out is for is the one below — a name only the object
+    /// store holds — and the unit test beside `DualWriteCatalog` covers the
+    /// same guard against a double.
+    #[tokio::test]
+    async fn as_many_creates_succeed_as_there_are_records() {
+        let central = catalog!();
+        let both = Arc::new(both(central).await);
+        let alias = unique_alias("contested");
+
+        let mut racing = Vec::new();
+        for _ in 0..8 {
+            let both = Arc::clone(&both);
+            let alias = alias.clone();
+            let id = SnapshotId::generate();
+            racing.push(tokio::spawn(async move {
+                let record = SnapshotRecord::template_waiting(
+                    id.clone(),
+                    Some(SnapshotAlias::parse(&alias).expect("alias should parse")),
+                    SandboxResources {
+                        cpu_count: 1,
+                        memory_mib: 256,
+                        disk_size_mib: 0,
+                    },
+                );
+                (id, both.dual.create(record).await.is_ok())
+            }));
+        }
+
+        let mut winners = Vec::new();
+        let mut losers = Vec::new();
+        for task in racing {
+            let (id, won) = task.await.expect("the create should not panic");
+            if won {
+                winners.push(id);
+            } else {
+                losers.push(id);
+            }
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one caller may be told they hold this name"
+        );
+        assert_eq!(losers.len(), 7);
+        assert_eq!(
+            both.object_store
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(winners[0].clone()),
+            "and the name must belong to the caller who was told so"
+        );
+        for id in &losers {
+            assert!(
+                both.central
+                    .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                    .await
+                    .expect("reading should work")
+                    .is_none(),
+                "a create the caller was told failed must not be left in the central catalog"
+            );
+        }
+    }
+
+    /// 🔴 The alias hijack, in the exact state every alias is in the moment
+    /// `write = "both"` is switched on: object storage holds the name and the
+    /// central catalog has never heard of it.
+    ///
+    /// Measured on the cluster: the user got an error, PostgreSQL was left
+    /// bound to the **new** snapshot and object storage still bound the old
+    /// one — so the same name resolved to two different snapshots depending on
+    /// which catalog answered, and moving reads to PostgreSQL would have
+    /// silently changed what it meant.
+    #[tokio::test]
+    async fn an_alias_only_the_object_store_holds_is_not_hijacked() {
+        let central = catalog!();
+        let both = both(central).await;
+        let alias = unique_alias("preflip");
+        let seeded = SnapshotId::generate();
+        let newcomer = SnapshotId::generate();
+
+        // The pre-flip state: object storage alone knows this name.
+        both.object_store
+            .publish_commit(sandbox_commit(seeded.clone(), Some(&alias), "seed"))
+            .await
+            .expect("seeding the object store should work");
+        assert_eq!(
+            both.central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            None,
+            "this test is only meaningful while the central catalog has never seen the name"
+        );
+
+        both.dual
+            .publish_commit(sandbox_commit(newcomer.clone(), Some(&alias), "hijacker"))
+            .await
+            .expect_err("a name the object store holds must not be handed to somebody else");
+
+        assert_eq!(
+            both.object_store
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(seeded.clone()),
+            "the store that answers reads must still bind the name it bound before"
+        );
+        assert_eq!(
+            both.central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            None,
+            "and the other one must not have been bound to the snapshot that lost"
+        );
+        assert!(
+            both.central
+                .get_scoped(&newcomer.to_string(), CatalogReadScope::AnyStatus)
+                .await
+                .expect("reading should work")
+                .is_none(),
+            "the row the failed publish opened must not be left behind either"
+        );
+    }
+
+    /// 🔴 `create`'s alias carve-out, in the state that needs it: the object
+    /// store holds the name and the central catalog has never heard of it,
+    /// which is every alias at the moment `write = "both"` is switched on. The
+    /// central catalog takes the row, the object store refuses the name, and
+    /// without the carve-out the caller is told **202** over a template no
+    /// catalog holds under the name they asked for.
+    #[tokio::test]
+    async fn a_name_only_the_object_store_holds_refuses_a_create() {
+        let central = catalog!();
+        let both = both(central).await;
+        let alias = unique_alias("held");
+        let seeded = SnapshotId::generate();
+        let newcomer = SnapshotId::generate();
+
+        both.object_store
+            .create(template_record(seeded.clone(), Some(&alias)))
+            .await
+            .expect("seeding the object store should work");
+        assert_eq!(
+            both.central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            None,
+            "this test is only meaningful while the central catalog has never seen the name"
+        );
+
+        let error = both
+            .dual
+            .create(template_record(newcomer.clone(), Some(&alias)))
+            .await
+            .expect_err("a name the object store holds must reach the caller");
+        assert!(
+            matches!(error, RepositoryError::AliasConflict { .. }),
+            "expected an alias conflict, got {error:?}"
+        );
+
+        assert_eq!(
+            both.object_store
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(seeded),
+            "the store that answers reads keeps the name it already bound"
+        );
+        assert!(
+            both.central
+                .get_scoped(&newcomer.to_string(), CatalogReadScope::AnyStatus)
+                .await
+                .expect("reading should work")
+                .is_none(),
+            "and the row the refused create opened must not be left behind"
+        );
+    }
+
+    /// 🔴 And once the history is queued, the same collision is refused by the
+    /// central catalog's own unique index rather than by an undo — which is the
+    /// difference between a race that is handled and one that cannot happen.
+    #[tokio::test]
+    async fn a_queued_history_makes_the_hijack_impossible_rather_than_undone() {
+        let central = catalog!();
+        let both = both(central).await;
+        let alias = unique_alias("backfilled");
+        let seeded = SnapshotId::generate();
+
+        both.object_store
+            .publish_commit(sandbox_commit(seeded.clone(), Some(&alias), "seed"))
+            .await
+            .expect("seeding the object store should work");
+
+        let queued = both
+            .backlog
+            .queue_history_toward_central(both.object_store.as_ref()
+                as &dyn agentenv::snapshot::repository::interfaces::SnapshotCatalog)
+            .await
+            .expect("the history should queue");
+        assert_eq!(queued, 1, "one snapshot older than the double write");
+
+        let pass = both
+            .backlog
+            .drain_once(&both.targets())
+            .await
+            .expect("the pass should run");
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(both.backlog.lag_toward(MirrorDirection::Central), 0);
+        assert_eq!(
+            both.central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(seeded),
+            "the backfill carries the name across, not just the row"
+        );
+
+        // Now the central catalog refuses it first, before the object store is
+        // ever asked — and the caller is told the same thing either way.
+        let error = both
+            .dual
+            .publish_commit(sandbox_commit(
+                SnapshotId::generate(),
+                Some(&alias),
+                "hijacker",
+            ))
+            .await
+            .expect_err("a name the central catalog now holds must fail the publish");
+        assert!(
+            matches!(error, RepositoryError::AliasConflict { .. }),
+            "a lost race for a name is a conflict on both sides: {error:?}"
+        );
     }
 }
 

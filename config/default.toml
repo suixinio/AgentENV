@@ -312,11 +312,37 @@ p2p_enabled = true
 # from the environment (AENV_SNAPSHOT_CATALOG_WRITE / _READ) because run.sh
 # copies this file over the cluster's ConfigMap on every apply.
 #
-#   write = "object_store"  today: object storage is the catalog
-#   write = "both"          object storage still answers reads; the central
-#                           catalog gets a second, checkable copy. Requires
+#   write = "object_store"  object storage is the catalog
+#   write = "both"          both catalogs are written; the central one gets a
+#                           second, checkable copy. Requires
 #                           [cluster].scheduler_endpoint.
-#   read  = "object_store"  the only value this build serves
+#   read  = "object_store"  object storage answers reads. Always available, and
+#                           the way back from the line below.
+#   read  = "postgres"      the central catalog answers reads. Requires
+#                           write = "both", so object storage stays a complete
+#                           copy and the rollback is a config change.
+#
+# Moving `read` onto PostgreSQL is refused unless PostgreSQL actually holds what
+# object storage does, and the node checks four separate things before serving:
+# writes still owed to it, disagreements no replay can settle, whether the
+# snapshots that predate double writing were ever queued for it, and — because
+# all three of those describe the queue rather than the catalogs — a direct
+# comparison of what each one holds. The last is the only one that needs no
+# marker and no counter to be right.
+#
+# 🔴 If you are clearing state before turning double writing on, clear
+# PostgreSQL **and** every node's mirror_backlog_path, in that order. Clearing
+# one alone has produced two different silent failures:
+#
+#   PostgreSQL cleared, mirror stores kept: the "history already queued" marker
+#     survives, the backfill returns immediately, nothing is queued, and both
+#     gauges report agreement over a database with no rows in it. The direct
+#     comparison catches this one; nothing else did.
+#   Mirror stores cleared, PostgreSQL kept: the backfill re-runs and replays
+#     into rows that already exist, so every replay is answered "already there"
+#     and rows written by an older build keep whatever creation instant they
+#     were given. The comparison does **not** catch this: it compares which
+#     snapshots each catalog holds, not what the rows say.
 #
 # [snapshot.catalog]
 # write = "object_store"

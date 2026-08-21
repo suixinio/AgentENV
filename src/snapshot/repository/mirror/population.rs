@@ -230,6 +230,50 @@ mod tests {
         );
     }
 
+    /// 🔴 Each half of the set comparison, isolated.
+    ///
+    /// The fixtures look odd on purpose. In any *realistic* disagreement at
+    /// least two of the three conditions fire together — 32 rows against 0
+    /// differs in the count as well as the set — so a test built from one
+    /// cannot tell whether either set check is doing anything. These two put a
+    /// duplicate on one side to hold the counts equal, which leaves exactly one
+    /// condition able to notice.
+    #[test]
+    fn rows_only_object_storage_holds_are_a_disagreement_on_their_own() {
+        let shared = ids(1);
+        let extra = ids(1);
+        let object_store = vec![shared[0].clone(), extra[0].clone()];
+        let central = vec![shared[0].clone(), shared[0].clone()];
+
+        let populations = CatalogPopulations::compare(&object_store, &central);
+
+        assert_eq!(populations.object_store_rows, populations.central_rows);
+        assert!(
+            populations.missing_from_object_store.is_empty(),
+            "the other direction must have nothing to say, or this proves nothing"
+        );
+        assert_eq!(populations.missing_from_central, extra);
+        assert!(!populations.agree());
+    }
+
+    #[test]
+    fn rows_only_the_central_catalog_holds_are_a_disagreement_on_their_own() {
+        let shared = ids(1);
+        let extra = ids(1);
+        let object_store = vec![shared[0].clone(), shared[0].clone()];
+        let central = vec![shared[0].clone(), extra[0].clone()];
+
+        let populations = CatalogPopulations::compare(&object_store, &central);
+
+        assert_eq!(populations.object_store_rows, populations.central_rows);
+        assert!(
+            populations.missing_from_central.is_empty(),
+            "the other direction must have nothing to say, or this proves nothing"
+        );
+        assert_eq!(populations.missing_from_object_store, extra);
+        assert!(!populations.agree());
+    }
+
     #[test]
     fn two_empty_catalogs_agree() {
         assert!(CatalogPopulations::compare(&[], &[]).agree());
@@ -530,6 +574,43 @@ mod admission_tests {
         )
         .await
         .expect("a restart on the side already being read is not a switch");
+    }
+
+    /// 🔴 The admission is what records the side, and nothing else may be.
+    ///
+    /// Every other test here records it by hand as setup, which means all of
+    /// them pass over an admission that never records anything — and a node
+    /// that never records a side reads every start as a switch, so it lists
+    /// both catalogs on every restart and can be stopped by an object store
+    /// that is briefly unreachable.
+    #[tokio::test]
+    async fn admitting_a_side_is_what_records_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog_at(dir.path(), true).await;
+        assert_eq!(
+            backlog
+                .recorded_read_side()
+                .await
+                .expect("reading the side should work"),
+            None
+        );
+
+        admit_read_side(
+            CatalogReadSide::ObjectStore,
+            &backlog,
+            &Unreachable,
+            &Unreachable,
+        )
+        .await
+        .expect("a first start on object storage is allowed");
+
+        assert_eq!(
+            backlog
+                .recorded_read_side()
+                .await
+                .expect("reading the side should work"),
+            Some(CatalogReadSide::ObjectStore)
+        );
     }
 
     /// 🔴 The rollback, which is the other half of the switch being real. Going

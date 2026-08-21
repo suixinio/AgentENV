@@ -676,11 +676,26 @@ impl Drop for IrohBlobsP2pTransport {
             return;
         }
         let router = self.router.clone();
-        tokio::spawn(async move {
-            if let Err(err) = router.shutdown().await {
-                debug!(error = %err, "embedded iroh-blobs artifact transport shutdown failed");
+        // 🔴 Asked, not assumed. `tokio::spawn` reads the current runtime out
+        // of a thread-local and panics when there is not one, and this value
+        // is held by the server's `main` for the whole of start-up — so every
+        // start-up that *fails* releases it somewhere no successful start ever
+        // goes. A designed refusal that ends in a panic teaches people to
+        // ignore panics, which is the expensive part. The rest of this
+        // codebase already asks: see `CustomExtensionHookGuard::drop`.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(err) = router.shutdown().await {
+                        debug!(error = %err, "embedded iroh-blobs artifact transport shutdown failed");
+                    }
+                });
             }
-        });
+            Err(_) => debug!(
+                "embedded iroh-blobs artifact transport dropped outside a tokio runtime; \
+                 its endpoint is released by process exit instead"
+            ),
+        }
     }
 }
 
@@ -841,6 +856,37 @@ mod tests {
         .await
         .context("start consumer P2P transport")?;
         Ok((provider, consumer))
+    }
+
+    /// 🔴 A `Drop` that spawns has to ask whether there is a runtime to spawn
+    /// on.
+    ///
+    /// This value is held by the server's `main` for the whole of start-up, so
+    /// every start-up that *fails* releases it on a path no successful start
+    /// ever takes — a refused catalog read side, a missing dependency, a
+    /// capability that is not there. An unconditional `tokio::spawn` turns each
+    /// of those designed refusals into a panic after the error has already been
+    /// printed, and a panic on a designed path is how people learn to ignore
+    /// panics.
+    #[test]
+    fn dropping_the_transport_without_a_runtime_does_not_panic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let transport = runtime
+            .block_on(test_transport(
+                &p2p_config(temp.path().join("store")),
+                "lonely-node",
+                Arc::new(NoopP2pPeerDiscovery),
+            ))
+            .expect("the transport should start");
+
+        // The runtime goes first, which is the order a process tearing itself
+        // down after a failed start uses.
+        drop(runtime);
+        drop(transport);
     }
 
     fn invalid_endpoint() -> P2pEndpoint {

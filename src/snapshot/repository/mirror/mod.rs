@@ -62,7 +62,9 @@ use crate::snapshot::repository::interfaces::{
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotAlias, SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
-pub use backlog::{CatalogReadSide, MirrorBacklog, MirrorDirection, MirrorTargets, RepairPass};
+pub use backlog::{
+    CatalogReadSide, DivergenceSweep, MirrorBacklog, MirrorDirection, MirrorTargets, RepairPass,
+};
 pub use central::CentralCatalogWrites;
 pub use compensator::{MirrorCompensator, DEFAULT_COMPENSATOR_INTERVAL};
 

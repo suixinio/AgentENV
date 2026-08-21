@@ -16,6 +16,16 @@ use super::backlog::{MirrorBacklog, MirrorTargets};
 /// How often the backlog is replayed.
 pub const DEFAULT_COMPENSATOR_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How many replay passes go by between sweeps of the recorded divergences.
+///
+/// 🔴 Slower than the replay on purpose. A replay pass usually has nothing to
+/// do — the queue is empty and the loop returns immediately — while a sweep
+/// reads *both* stores for every divergence it re-checks, and one of those is
+/// the store the whole migration's acceptance number is measured on. A
+/// divergence is a state that has already lasted, so noticing it has settled
+/// five minutes late costs nothing; asking twice a minute forever does.
+const SWEEP_EVERY_N_PASSES: u32 = 10;
+
 /// Replays owed catalog writes for as long as it is alive.
 pub struct MirrorCompensator {
     task: JoinHandle<()>,
@@ -35,14 +45,49 @@ impl MirrorCompensator {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let task = tokio::spawn(async move {
+            let mut passes: u32 = 0;
             loop {
                 ticker.tick().await;
-                // 🔴 The lag, not the divergences. A recorded divergence is not
-                // debt: no replay changes the answer, so a pass over one would
-                // spend a request against the store the acceptance number is
-                // measured on and learn nothing. They are cleared by the
-                // snapshot being deleted, or by the batch that wires build
-                // admission — never by this loop.
+                passes = passes.wrapping_add(1);
+
+                // 🔴 Every SWEEP_EVERY_N_PASSES ticks, and independently of
+                // whether anything is owed. A recorded divergence is not debt —
+                // no replay changes the answer — but it can *stop being true*,
+                // and the one thing that used to notice was a delete arriving
+                // at this node. The gateway routes deletes, so on a cluster the
+                // delete usually arrives somewhere else and the record here
+                // outlives the snapshot it is about, pinning the gauge the
+                // read-side switch is gated on. See
+                // `MirrorBacklog::retire_settled_divergences`.
+                if passes.is_multiple_of(SWEEP_EVERY_N_PASSES) {
+                    match backlog.retire_settled_divergences(&targets).await {
+                        Ok(sweep) if sweep.retired > 0 => info!(
+                            examined = sweep.examined,
+                            retired = sweep.retired,
+                            kept = sweep.kept,
+                            skipped = sweep.skipped,
+                            remaining = sweep.remaining,
+                            "retired snapshot catalog mirror divergences whose snapshots are gone"
+                        ),
+                        Ok(sweep) => debug!(
+                            examined = sweep.examined,
+                            kept = sweep.kept,
+                            skipped = sweep.skipped,
+                            remaining = sweep.remaining,
+                            "swept the snapshot catalog mirror divergences"
+                        ),
+                        Err(error) => warn!(
+                            %error,
+                            "a snapshot catalog mirror divergence sweep could not read its own \
+                             store"
+                        ),
+                    }
+                }
+
+                // The lag, not the divergences: no replay changes a recorded
+                // disagreement, so a pass over one would spend a request
+                // against the store the acceptance number is measured on and
+                // learn nothing.
                 if backlog.lag() == 0 {
                     continue;
                 }
@@ -282,6 +327,86 @@ mod tests {
         );
 
         advance_a_while().await;
+    }
+
+    /// 🔴 B-2, at the loop. `retire_settled_divergences` has its own tests; what
+    /// this holds still is that anything ever calls it. A sweep nothing drives
+    /// leaves the measured failure exactly where it was: a divergence recorded
+    /// on the node that did not handle the delete, pinning the gauge the
+    /// read-side switch is gated on, with no way for an operator to clear it.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_retires_a_divergence_whose_snapshot_is_gone() {
+        use crate::snapshot::repository::mirror::test_doubles::ScriptedCentral;
+        use crate::snapshot::repository::mirror::CentralCatalogWrites;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let catalog = Arc::new(CountingCatalog::default());
+        let central = Arc::new(ScriptedCentral::default());
+
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &SnapshotId::generate(),
+                "try_start_build",
+                "build admission is not wired".to_string(),
+            )
+            .await;
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+
+        let _compensator = MirrorCompensator::spawn(
+            Arc::clone(&backlog),
+            MirrorTargets::object_store(Arc::clone(&catalog) as Arc<dyn SnapshotCatalog>)
+                .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            Duration::from_secs(1),
+        );
+
+        advance_until("retired a divergence nothing is about any more", || {
+            backlog.diverged_toward(MirrorDirection::Central) == 0
+        })
+        .await;
+    }
+
+    /// The control: a divergence whose snapshot is still there is not swept
+    /// away. A loop that retired unconditionally would pass the test above and
+    /// silently unblock the switch this number exists to hold shut.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_leaves_a_divergence_that_is_still_true_alone() {
+        use crate::snapshot::repository::mirror::test_doubles::{record_for, ScriptedCentral};
+        use crate::snapshot::repository::mirror::CentralCatalogWrites;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        let central = Arc::new(ScriptedCentral::default());
+        central.seed(record_for(&id));
+
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &id,
+                "try_start_build",
+                "build admission is not wired".to_string(),
+            )
+            .await;
+
+        let _compensator = MirrorCompensator::spawn(
+            Arc::clone(&backlog),
+            MirrorTargets::object_store(
+                Arc::new(CountingCatalog::default()) as Arc<dyn SnapshotCatalog>
+            )
+            .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            Duration::from_secs(1),
+        );
+
+        advance_a_while().await;
+        advance_a_while().await;
+        advance_a_while().await;
+        assert_eq!(
+            backlog.diverged_toward(MirrorDirection::Central),
+            1,
+            "a snapshot a catalog still holds is still something to disagree about"
+        );
     }
 
     /// Dropping it stops the replay. It is held by the assembled backend for

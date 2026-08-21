@@ -67,8 +67,8 @@ use crate::snapshot::types::{
 
 use super::central::CentralCatalogWrites;
 use super::metrics::{
-    record_mirror_content_mismatch, record_mirror_repair_failed, record_mirror_repaired,
-    record_mirror_unrecorded, set_mirror_diverged, set_mirror_lag,
+    record_mirror_content_mismatch, record_mirror_divergence_retired, record_mirror_repair_failed,
+    record_mirror_repaired, record_mirror_unrecorded, set_mirror_diverged, set_mirror_lag,
 };
 
 /// Which store is behind.
@@ -676,6 +676,33 @@ pub struct RepairPass {
     pub remaining: u64,
 }
 
+/// What one sweep over the recorded divergences did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DivergenceSweep {
+    /// Divergences whose subject was looked up in both catalogs.
+    pub examined: usize,
+    /// Divergences retired: neither catalog holds the snapshot any more.
+    pub retired: usize,
+    /// Divergences kept: a catalog still holds the snapshot, or would not say.
+    pub kept: usize,
+    /// Divergences this sweep did not reach — the per-sweep cap, an
+    /// outstanding queue entry about the same snapshot, or only one store
+    /// configured.
+    pub skipped: usize,
+    /// Divergences still recorded, in both directions, after the sweep.
+    pub remaining: u64,
+}
+
+/// How many divergences one sweep re-checks.
+///
+/// 🔴 Capped, and the cap is the point of the cursor beside it. Each one costs
+/// a read against *both* stores, and one of those is the store the acceptance
+/// number is measured on. A cluster holding a divergence per template would
+/// otherwise turn a background tidy-up into a steady load nobody asked for.
+/// Sweeps resume where the last one stopped, so a large set is worked through
+/// over several rather than truncated at the same place forever.
+pub(super) const MAX_DIVERGENCES_PER_SWEEP: usize = 64;
+
 /// Which store answers catalog reads.
 ///
 /// Recorded across restarts so the guard below can tell an ordinary restart
@@ -770,6 +797,9 @@ pub struct MirrorBacklog {
     next_seq: AtomicU64,
     object_store: DirectionCounters,
     central: DirectionCounters,
+    /// Where the last divergence sweep stopped, so the next resumes rather than
+    /// re-reading the same first page every time.
+    sweep_cursor: std::sync::Mutex<Option<Vec<u8>>>,
     /// Test-only fault injection.
     ///
     /// The local store refusing a write is the one branch below that nothing
@@ -797,6 +827,7 @@ impl MirrorBacklog {
             next_seq: AtomicU64::new(1),
             object_store: DirectionCounters::default(),
             central: DirectionCounters::default(),
+            sweep_cursor: std::sync::Mutex::new(None),
             #[cfg(test)]
             refuse_local_writes: std::sync::atomic::AtomicBool::new(false),
         });
@@ -1203,13 +1234,142 @@ impl MirrorBacklog {
                 warn!(%error, snapshot_id = %id, "could not clear a catalog mirror divergence");
                 continue;
             }
-            let counters = self.counters(direction);
-            let previous = counters.diverged.fetch_sub(1, Ordering::AcqRel);
-            if previous == 0 {
-                counters.diverged.store(0, Ordering::Release);
-            }
+            self.drop_diverged(direction);
         }
         self.publish_gauges();
+    }
+
+    /// Retires recorded divergences whose subject no longer exists anywhere.
+    ///
+    /// 🔴 B-2. `clear_divergences` runs on delete, and the delete is routed —
+    /// by the gateway, to one node. The divergence record is node-local. So a
+    /// snapshot whose disagreement was recorded on one node and whose delete
+    /// went through another leaves that node's
+    /// `mirror_diverged{direction="central"}` pinned at one, forever, over a
+    /// snapshot that exists in neither catalog. Measured: thirteen deletes
+    /// split six/eight across two nodes, and one gauge stuck with no API call
+    /// able to clear it. That gauge is what the read-side switch is gated on,
+    /// so one stranded record blocks the switch permanently and the only remedy
+    /// is wiping the node's mirror store.
+    ///
+    /// 🔴 Chosen over broadcasting deletes or moving the record into the
+    /// cluster because it needs nothing that does not already exist, and
+    /// because it is the *same* test the delete path makes: a divergence is
+    /// superseded when both catalogs have stopped holding the snapshot. This
+    /// asks that question directly instead of inferring it from having seen the
+    /// delete go by.
+    ///
+    /// 🔴 What keeps it from retiring a disagreement that is still real:
+    ///
+    ///   - **Both** stores must answer, and both must answer *absent*. A store
+    ///     that still holds the row keeps the record; a store that could not be
+    ///     reached keeps it too, because "I could not look" is not "it is gone".
+    ///   - A snapshot the queue still owes a write about is skipped entirely.
+    ///     Otherwise a create waiting in the queue could be replayed into one
+    ///     catalog just after the sweep retired the record describing exactly
+    ///     that disagreement — the sweep resurrecting what it had just retired.
+    ///
+    /// Both targets are required: with the double write rolled back to one
+    /// direction there is no second store to ask, and a sweep that retired on
+    /// one store's word would be forgetting rather than settling.
+    pub async fn retire_settled_divergences(
+        &self,
+        targets: &MirrorTargets,
+    ) -> anyhow::Result<DivergenceSweep> {
+        let mut sweep = DivergenceSweep::default();
+        let recorded = self
+            .store
+            .scan_prefix(vec![DIVERGED_PREFIX])
+            .await
+            .context("read the snapshot catalog mirror divergences")?;
+        sweep.remaining = recorded.len() as u64;
+        if recorded.is_empty() {
+            return Ok(sweep);
+        }
+
+        let Some((object_store, central)) = targets.pair() else {
+            sweep.skipped = recorded.len();
+            return Ok(sweep);
+        };
+
+        // Snapshots the queue is still going to write about. Their rows are
+        // mid-flight and the sweep has no business deciding they have settled.
+        let owed = self
+            .store
+            .scan_prefix(vec![OWED_PREFIX])
+            .await
+            .context("read the snapshot catalog mirror backlog")?;
+        let in_flight: HashSet<SnapshotId> = owed
+            .iter()
+            .filter_map(|(_, value)| OwedWrite::decode(value).ok())
+            .map(|owed| owed.op.snapshot_id().clone())
+            .collect();
+
+        let resume_after = self.sweep_cursor.lock().expect("sweep cursor").clone();
+        let start = resume_after
+            .as_ref()
+            .map(|cursor| {
+                recorded
+                    .iter()
+                    .position(|(key, _)| key > cursor)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
+        let mut last_examined = None;
+        for offset in 0..recorded.len() {
+            let (key, _) = &recorded[(start + offset) % recorded.len()];
+            if sweep.examined >= MAX_DIVERGENCES_PER_SWEEP {
+                sweep.skipped += 1;
+                continue;
+            }
+            let (Some(direction), Some(id)) =
+                (decode_diverged_direction(key), decode_diverged_id(key))
+            else {
+                // Not a key this build wrote. Left where it is: it still counts
+                // toward the gauge, and removing a record nothing understands
+                // is exactly the forgetting this sweep must not do.
+                sweep.skipped += 1;
+                continue;
+            };
+            if in_flight.contains(&id) {
+                sweep.skipped += 1;
+                continue;
+            }
+
+            last_examined = Some(key.clone());
+            sweep.examined += 1;
+            match (object_store.probe(&id).await, central.probe(&id).await) {
+                (Ok(None), Ok(None)) => {}
+                _ => {
+                    sweep.kept += 1;
+                    continue;
+                }
+            }
+
+            if let Err(error) = self.store.delete(key.clone()).await {
+                warn!(%error, snapshot_id = %id, "could not retire a settled catalog mirror divergence");
+                sweep.kept += 1;
+                continue;
+            }
+            self.drop_diverged(direction);
+            record_mirror_divergence_retired(direction);
+            warn!(
+                direction = direction.as_str(),
+                snapshot_id = %id,
+                "retired a catalog mirror divergence: neither catalog holds this snapshot any \
+                 more, so there is nothing left for them to disagree about"
+            );
+            sweep.retired += 1;
+        }
+
+        *self.sweep_cursor.lock().expect("sweep cursor") = last_examined;
+        self.publish_gauges();
+        sweep.remaining = MirrorDirection::ALL
+            .into_iter()
+            .map(|direction| self.diverged_toward(direction))
+            .sum();
+        Ok(sweep)
     }
 
     /// Replays everything owed, in order, once.
@@ -1448,6 +1608,13 @@ impl MirrorBacklog {
             counters.owed.store(0, Ordering::Release);
         }
     }
+
+    fn drop_diverged(&self, direction: MirrorDirection) {
+        let counters = self.counters(direction);
+        if counters.diverged.fetch_sub(1, Ordering::AcqRel) == 0 {
+            counters.diverged.store(0, Ordering::Release);
+        }
+    }
 }
 
 /// Big-endian so the store's key order is the order the writes were made.
@@ -1485,6 +1652,20 @@ fn decode_diverged_direction(key: &[u8]) -> Option<MirrorDirection> {
         [DIVERGED_PREFIX, byte, ..] => MirrorDirection::ALL
             .into_iter()
             .find(|direction| direction.key_byte() == *byte),
+        _ => None,
+    }
+}
+
+/// The snapshot a divergence key is about.
+///
+/// Read off the key rather than out of the value: the key is the identity the
+/// record is filed under, and a value written by an older build might not carry
+/// one at all.
+fn decode_diverged_id(key: &[u8]) -> Option<SnapshotId> {
+    match key {
+        [DIVERGED_PREFIX, _, id @ ..] => {
+            SnapshotId::parse(std::str::from_utf8(id).ok()?.trim()).ok()
+        }
         _ => None,
     }
 }
@@ -2042,6 +2223,243 @@ mod tests {
         let reopened = backlog(&dir).await;
         assert_eq!(reopened.diverged_toward(MirrorDirection::Central), 1);
         assert_eq!(reopened.diverged_toward(MirrorDirection::ObjectStore), 0);
+    }
+
+    // ── divergences that stopped being true ─────────────────────────────
+
+    /// A backlog with both stores wired, so a comparison and a sweep have two
+    /// sides to work with.
+    fn both_targets(
+        object_store: &Arc<ScriptedCatalog>,
+        central: &Arc<ScriptedCentral>,
+    ) -> MirrorTargets {
+        targets(object_store).with_central(Arc::clone(central) as Arc<dyn CentralCatalogWrites>)
+    }
+
+    /// 🔴 B-2. A divergence must not outlive the snapshot it is about.
+    ///
+    /// `clear_divergences` runs on the node that handles the delete, and the
+    /// gateway chooses that node. Measured: thirteen deletes split six/eight
+    /// across two nodes, leaving one node's `mirror_diverged{central}` pinned
+    /// at one over a snapshot that no longer existed in either catalog, with no
+    /// API call able to clear it — and that gauge is what gates the read-side
+    /// switch.
+    #[tokio::test]
+    async fn a_divergence_about_a_snapshot_nothing_holds_any_more_is_retired() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &id,
+                "try_start_build",
+                "build admission is not wired".to_string(),
+            )
+            .await;
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+
+        // Deleted through some other node: neither store has it any more.
+        let object_store = Arc::new(ScriptedCatalog::default());
+        let central = Arc::new(ScriptedCentral::default());
+        let sweep = backlog
+            .retire_settled_divergences(&both_targets(&object_store, &central))
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(sweep.retired, 1);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 0);
+        assert_eq!(sweep.remaining, 0);
+    }
+
+    /// And it stays retired across a restart — the record is gone from disk,
+    /// not just from this process's counter.
+    #[tokio::test]
+    async fn a_retired_divergence_does_not_come_back() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = SnapshotId::generate();
+        {
+            let backlog = backlog(&dir).await;
+            backlog
+                .note_divergence(
+                    MirrorDirection::Central,
+                    &id,
+                    "try_start_build",
+                    "why".into(),
+                )
+                .await;
+            backlog
+                .retire_settled_divergences(&both_targets(
+                    &Arc::new(ScriptedCatalog::default()),
+                    &Arc::new(ScriptedCentral::default()),
+                ))
+                .await
+                .expect("the sweep should run");
+        }
+
+        let reopened = backlog(&dir).await;
+        assert_eq!(reopened.diverged_toward(MirrorDirection::Central), 0);
+    }
+
+    /// 🔴 The disagreement is still real while either catalog still holds the
+    /// snapshot. Retiring there would be forgetting one, which is the failure
+    /// the whole divergence record exists to prevent.
+    #[tokio::test]
+    async fn a_divergence_about_a_snapshot_that_still_exists_is_kept() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &id,
+                "try_start_build",
+                "why".into(),
+            )
+            .await;
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.seed(record_for(&id));
+        let central = Arc::new(ScriptedCentral::default());
+        let sweep = backlog
+            .retire_settled_divergences(&both_targets(&object_store, &central))
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(sweep.retired, 0);
+        assert_eq!(sweep.kept, 1);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+    }
+
+    /// 🔴 "I could not look" is not "it is gone". A store that would not answer
+    /// keeps the record.
+    #[tokio::test]
+    async fn a_divergence_is_kept_when_a_catalog_will_not_answer() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &id,
+                "try_start_build",
+                "why".into(),
+            )
+            .await;
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.break_reads();
+        let central = Arc::new(ScriptedCentral::default());
+        let sweep = backlog
+            .retire_settled_divergences(&both_targets(&object_store, &central))
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(sweep.retired, 0);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+    }
+
+    /// 🔴 The one way this sweep could resurrect a disagreement it had just
+    /// retired: a write still sitting in the queue is about to put the snapshot
+    /// back into one catalog and not the other. A snapshot the queue still owes
+    /// a write about is left alone until it does not.
+    #[tokio::test]
+    async fn a_divergence_is_not_retired_while_the_queue_still_owes_a_write_about_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &id,
+                "try_start_build",
+                "why".into(),
+            )
+            .await;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&id),
+                },
+            )
+            .await;
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        let central = Arc::new(ScriptedCentral::default());
+        let sweep = backlog
+            .retire_settled_divergences(&both_targets(&object_store, &central))
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(sweep.retired, 0);
+        assert_eq!(sweep.skipped, 1);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+    }
+
+    /// With the double write rolled back there is only one store, and one
+    /// store's word is not enough to say two of them have stopped disagreeing.
+    #[tokio::test]
+    async fn a_sweep_with_only_one_store_retires_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .note_divergence(
+                MirrorDirection::Central,
+                &id,
+                "try_start_build",
+                "why".into(),
+            )
+            .await;
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        let sweep = backlog
+            .retire_settled_divergences(&targets(&object_store))
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(sweep.retired, 0);
+        assert_eq!(sweep.skipped, 1);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+    }
+
+    /// 🔴 One sweep does bounded work. Each divergence costs a read against
+    /// both stores, and one of them is the store the migration's acceptance
+    /// number is measured on.
+    #[tokio::test]
+    async fn one_sweep_examines_at_most_its_cap_and_the_next_carries_on() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        for _ in 0..(MAX_DIVERGENCES_PER_SWEEP + 5) {
+            backlog
+                .note_divergence(
+                    MirrorDirection::Central,
+                    &SnapshotId::generate(),
+                    "try_start_build",
+                    "why".into(),
+                )
+                .await;
+        }
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        let central = Arc::new(ScriptedCentral::default());
+        let targets = both_targets(&object_store, &central);
+
+        let first = backlog
+            .retire_settled_divergences(&targets)
+            .await
+            .expect("the sweep should run");
+        assert_eq!(first.examined, MAX_DIVERGENCES_PER_SWEEP);
+        assert_eq!(first.retired, MAX_DIVERGENCES_PER_SWEEP);
+        assert_eq!(first.skipped, 5);
+
+        let second = backlog
+            .retire_settled_divergences(&targets)
+            .await
+            .expect("the sweep should run");
+        assert_eq!(second.retired, 5, "the next sweep finishes the rest");
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 0);
     }
 
     /// One snapshot's disagreement, discovered twice, is one divergence.

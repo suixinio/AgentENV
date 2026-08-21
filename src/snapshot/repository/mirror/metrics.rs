@@ -87,6 +87,18 @@ pub(crate) const MIRROR_REPAIR_FAILED_TOTAL: &str =
 pub(crate) const MIRROR_CONTENT_MISMATCH_TOTAL: &str =
     "agentenv_snapshot_catalog_mirror_content_mismatch_total";
 
+/// 🔴 Divergences retired because the snapshot they were about is gone from
+/// both catalogs.
+///
+/// The counter that says [`MIRROR_DIVERGED`] can come *down* without an
+/// operator wiping a node's mirror store. `clear_divergences` only runs on the
+/// node that handles the delete, and the gateway picks that node — so before
+/// this existed a divergence recorded on one node and deleted through another
+/// pinned that node's gauge at one over a snapshot that no longer existed, with
+/// no API call able to clear it and the read-side switch blocked for good.
+pub(crate) const MIRROR_DIVERGENCES_RETIRED_TOTAL: &str =
+    "agentenv_snapshot_catalog_mirror_divergences_retired_total";
+
 /// What one central call did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CentralOutcome {
@@ -162,6 +174,14 @@ pub(crate) fn record_mirror_content_mismatch(direction: MirrorDirection, field: 
         MIRROR_CONTENT_MISMATCH_TOTAL,
         "direction" => direction.as_str(),
         "field" => field,
+    )
+    .increment(1);
+}
+
+pub(crate) fn record_mirror_divergence_retired(direction: MirrorDirection) {
+    metrics::counter!(
+        MIRROR_DIVERGENCES_RETIRED_TOTAL,
+        "direction" => direction.as_str(),
     )
     .increment(1);
 }

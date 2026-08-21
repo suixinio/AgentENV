@@ -178,6 +178,7 @@ mod tests {
                 // Not exercised here: these suites call `plan`/`reclaim`
                 // directly, below the premise check `sweep` makes.
                 server_exe: None,
+                ublk_daemon_socket: PathBuf::from("/nonexistent/ublk.sock"),
             }
         }
 
@@ -325,6 +326,11 @@ mod tests {
     }
 
     /// T-NR-24. A work base that is not there is a cold host, not a fault.
+    ///
+    /// 🔴 The empty plan is only evidence next to a non-empty one. A `plan`
+    /// that returned `vec![]` for everything would pass the first two
+    /// assertions and go on passing them while reclaiming nothing, anywhere,
+    /// forever.
     #[test]
     fn a_missing_work_base_is_not_a_failure() {
         let fixture = Fixture::new();
@@ -334,6 +340,11 @@ mod tests {
         };
         assert!(plan(&paths, true).is_empty());
         assert_eq!(reclaim(&paths, true), ReclaimCounts::default());
+
+        // The same fixture with the directory there, and something in it.
+        fixture.dir("agentenv-fc-A1");
+        assert_eq!(plan(&fixture.paths(), true).len(), 1);
+        assert_eq!(reclaim(&fixture.paths(), true).reclaimed, 1);
     }
 
     /// T-NR-25. A file (not a directory) carrying the prefix is removed too —

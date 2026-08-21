@@ -320,6 +320,12 @@ mod tests {
                 }
             }
         }
+
+        // 🔴 The contrast, in the same test. Every assertion above is an
+        // "allowed", and a `serves` that answered `true` for everything would
+        // satisfy all of them while letting a node keep the whole user-facing
+        // surface — the one thing this file exists to prevent.
+        assert!(!serves(ServerRole::Node, &Method::POST, "/sandboxes"));
     }
 
     /// 🔴 T-RG-3. The allowlist and the generator cannot drift apart in
@@ -535,6 +541,21 @@ mod tests {
                 StatusCode::OK
             );
         }
+
+        // 🔴 The contrast, against the same stand-in router. Without it an
+        // `attach` that never attached anything would pass — and that is not a
+        // hypothetical mistake, it is what this function does for two of the
+        // three roles.
+        assert_eq!(
+            status(
+                attach(stand_in_generated(), ServerRole::Node),
+                Method::POST,
+                "/sandboxes"
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "the same call on the role that does get a layer is refused"
+        );
     }
 
     // ── The preStop hook, which is a caller of this gate ───────────────────

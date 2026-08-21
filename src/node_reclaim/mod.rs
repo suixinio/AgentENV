@@ -183,6 +183,18 @@ pub struct ReclaimPaths {
     /// "cannot tell" and refuses the sweep rather than assuming the host is
     /// ours alone.
     pub server_exe: Option<PathBuf>,
+    /// 🔴 `[ublk].daemon_socket_path`. A socket that still *answers* is a
+    /// server that still owns this machine's state, and it catches the case
+    /// [`another_server_instance`] cannot: two servers built from different
+    /// paths sharing one `AENV_HOME`, which is what a development host running
+    /// `cargo run` beside an installed binary looks like.
+    ///
+    /// This is not a new signal. `UblkDaemonClient::wait_for_socket_available`
+    /// already treats a socket that answers as "the old process is still here"
+    /// and refuses to start over it; §8.3 cites that as one of the two things
+    /// holding the sweep's premise up. All this does is ask the same question
+    /// before killing anything rather than after.
+    pub ublk_daemon_socket: PathBuf,
 }
 
 impl ReclaimPaths {
@@ -196,6 +208,7 @@ impl ReclaimPaths {
             proc_dir: PathBuf::from("/proc"),
             persisted_sandbox_store: config.orchestrator.persisted_sandbox_store_path.clone(),
             server_exe: std::env::current_exe().ok(),
+            ublk_daemon_socket: config.ublk.daemon_socket_path.clone(),
         }
     }
 }
@@ -261,6 +274,33 @@ pub struct ReclaimReport {
 /// what runs on a laptop next to a second copy of itself and does not.
 pub fn enabled_for(role: ServerRole, configured: Option<bool>) -> bool {
     let enabled = configured.unwrap_or_else(|| role.reclaims_host_leftovers_at_startup());
+
+    // 🔴 The one setting that can take the rollback away.
+    //
+    // `--role all` is defined as the pre-split process, and §11.3 needs it to
+    // stay a working rollback target. It does not sweep, so on `all` this whole
+    // module is one gauge and one log line — unless somebody sets
+    // `AENV_STARTUP_RECLAIM_ENABLED=true`, at which point the rollback target
+    // starts killing processes and deleting directories, which the thing being
+    // rolled back to never did.
+    //
+    // Said loudly rather than refused: the premise checks in `sweep` already
+    // catch the failure this would cause (another server on the host), and
+    // taking a documented override away is its own kind of surprise. But an
+    // operator who set this on a `--role all` node has almost certainly set it
+    // on the wrong workload, and nothing else would tell them.
+    if enabled && !role.reclaims_host_leftovers_at_startup() {
+        warn!(
+            target: "agentenv",
+            role = role.as_str(),
+            "startup reclaim has been turned on for a role that does not sweep by default. \
+             --role all is the rollback target and is meant to behave exactly as the process \
+             before the split did; sweeping the host is not something it ever did. This is \
+             only safe while nothing else on this machine owns a sandbox — unset \
+             AENV_STARTUP_RECLAIM_ENABLED unless that is deliberate"
+        );
+    }
+
     // A gauge, so "is this node sweeping" is answerable from a scrape with no
     // traffic and no restart to observe. A node that never sweeps and a node
     // whose sweep never found anything are otherwise the same three zeroes.
@@ -341,6 +381,9 @@ enum Refusal {
     /// This process could not work out what its own executable is, so it
     /// cannot check for the above.
     OwnBinaryUnknown,
+    /// The ublk daemon socket still answers, so a server still owns this
+    /// machine's state even though no process is running this same binary.
+    AnotherServerOwnsThisHost,
 }
 
 impl Refusal {
@@ -348,6 +391,7 @@ impl Refusal {
         match self {
             Self::AnotherServerInstance => "another_server_instance",
             Self::OwnBinaryUnknown => "own_binary_unknown",
+            Self::AnotherServerOwnsThisHost => "another_server_owns_this_host",
         }
     }
 }
@@ -396,16 +440,36 @@ fn another_server_instance(proc_dir: &Path, own_exe: &Path, own_pid: i32) -> Opt
     None
 }
 
+/// Whether another server is already answering on this machine's ublk daemon
+/// socket.
+///
+/// A socket file that nobody is listening on is a leftover, not a server, and
+/// says nothing — which is the same reading `wait_for_socket_available` takes
+/// before it deletes one.
+fn ublk_daemon_answers(socket_path: &Path) -> bool {
+    socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
 /// Whether the premise the sweep rests on holds right now.
+///
+/// 🔴 Two questions, because one of them has a hole. Comparing executables
+/// misses two servers built from different paths that share one `AENV_HOME` —
+/// `cargo run` next to an installed binary, which is the ordinary shape of a
+/// development host and exactly where the work directories *do* collide. The
+/// ublk daemon socket is the artefact that identifies the machine's state
+/// rather than the binary, so it catches what the first question cannot.
 fn premise_holds(paths: &ReclaimPaths) -> Result<(), Refusal> {
     let Some(own_exe) = paths.server_exe.as_deref() else {
         return Err(Refusal::OwnBinaryUnknown);
     };
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
-    match another_server_instance(&paths.proc_dir, own_exe, own_pid) {
-        Some(_) => Err(Refusal::AnotherServerInstance),
-        None => Ok(()),
+    if another_server_instance(&paths.proc_dir, own_exe, own_pid).is_some() {
+        return Err(Refusal::AnotherServerInstance);
     }
+    if ublk_daemon_answers(&paths.ublk_daemon_socket) {
+        return Err(Refusal::AnotherServerOwnsThisHost);
+    }
+    Ok(())
 }
 
 /// The sweep itself, without the enablement decision or the configuration
@@ -498,9 +562,26 @@ mod tests {
 
     /// A sweep of a host with nothing on it reports nothing, and does not
     /// invent a failure out of directories that do not exist.
+    ///
+    /// 🔴 In that order, and both halves in one test. "The report was empty" is
+    /// evidence of nothing on its own — a sweep that returned
+    /// `ReclaimReport::default()` unconditionally would pass a test that only
+    /// looked at a clean host, and would look identical to a working one
+    /// forever. So the host is swept once with something on it first, and the
+    /// zeroes below mean "settled" rather than "never happened".
     #[tokio::test]
     async fn a_clean_host_reclaims_nothing_and_fails_at_nothing() {
         let host = Host::new();
+        let work_dir = host.leftover("agentenv-fc-A1");
+
+        assert_eq!(
+            sweep(&host.paths()).await.work_dirs.reclaimed,
+            1,
+            "the probe has resolution before it reports an absence"
+        );
+        assert!(!work_dir.exists());
+
+        // ...and now there is genuinely nothing left.
         assert_eq!(sweep(&host.paths()).await, ReclaimReport::default());
     }
     /// A host a test can lay out: a forged `/proc`, a work base, a paused
@@ -533,6 +614,10 @@ mod tests {
                 proc_dir: self.root.path().join("proc"),
                 persisted_sandbox_store: self.root.path().join("persisted"),
                 server_exe: Some(self.root.path().join("server")),
+                // A path with nothing listening on it: no other server owns
+                // this machine. `a_ublk_daemon_that_still_answers_refuses_the_sweep`
+                // is where that is varied.
+                ublk_daemon_socket: self.root.path().join("ublk.sock"),
             }
         }
 
@@ -617,6 +702,36 @@ mod tests {
         assert!(work_dir.exists());
 
         // ...and knowing it, the same host is swept.
+        assert_eq!(sweep(&host.paths()).await.work_dirs.reclaimed, 1);
+        assert!(!work_dir.exists());
+    }
+
+    /// 🔴 T-NR-36. A ublk daemon that still answers is a server that still
+    /// owns this machine.
+    ///
+    /// Closes the hole in the executable comparison: two servers built from
+    /// different paths sharing one `AENV_HOME` are not the same binary, but
+    /// they are the same machine's state, and their work directories are the
+    /// same directories. That is what `cargo run` beside an installed binary
+    /// looks like.
+    ///
+    /// Both faces, and the second one is the one that keeps this from being an
+    /// unconditional refusal: a socket *file* with nothing listening is a
+    /// leftover, says nothing, and does not stop the sweep — the same reading
+    /// `wait_for_socket_available` takes before it deletes one.
+    #[tokio::test]
+    async fn a_ublk_daemon_that_still_answers_refuses_the_sweep() {
+        let host = Host::new();
+        let work_dir = host.leftover("agentenv-fc-A1");
+        let socket = host.root.path().join("ublk.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        assert_eq!(sweep(&host.paths()).await, ReclaimReport::default());
+        assert!(work_dir.exists(), "nothing may be deleted while it answers");
+
+        // A socket file nobody is listening on is a leftover, not a server.
+        drop(listener);
+        assert!(socket.exists(), "the file outlives the listener");
         assert_eq!(sweep(&host.paths()).await.work_dirs.reclaimed, 1);
         assert!(!work_dir.exists());
     }
@@ -718,6 +833,63 @@ mod tests {
         assert!(enabled_for(ServerRole::Node, None));
     }
 
+    /// 🔴 T-NR-37. No deployment manifest turns the sweep on.
+    ///
+    /// `AENV_STARTUP_RECLAIM_ENABLED=true` on a `--role all` node makes the
+    /// rollback target sweep the host, which the process before the split never
+    /// did — the sharpest available way to lose §11.3's rollback. It is a
+    /// deliberate operator override and stays one; what it must never be is
+    /// something that arrives in a manifest and is noticed later.
+    ///
+    /// The startup warning in [`enabled_for`] covers the operator who types it.
+    /// This covers the one who commits it, which nothing at runtime can.
+    #[test]
+    fn no_deployment_manifest_turns_the_startup_sweep_on() {
+        const VAR: &str = "AENV_STARTUP_RECLAIM_ENABLED";
+
+        // 🔴 Resolution: the name below has to be the name the config actually
+        // reads, or this scan looks for a string nothing would ever contain and
+        // passes on every manifest including one that sets the real variable.
+        assert!(
+            include_str!("../cfg.rs").contains(&format!("env = \"{VAR}\"")),
+            "{VAR} is no longer the environment variable this setting reads; \
+             update this test with it"
+        );
+
+        let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy");
+        let mut checked = 0;
+        let mut stack = vec![deploy.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                checked += 1;
+                assert!(
+                    !contents.contains(VAR),
+                    "{} sets {VAR}. On --role all that makes the rollback target sweep the \
+                     host, which the pre-split process never did. If this is deliberate, it \
+                     belongs on a --role node workload and this test needs to say so",
+                    path.display()
+                );
+            }
+        }
+        assert!(
+            checked > 10,
+            "only {checked} files under {} were read; a scan that reads nothing passes \
+             everything",
+            deploy.display()
+        );
+    }
+
     /// 🔴 T-NR-35. The reclaim never reads the ownership marker.
     ///
     /// The contract is that an absent `control_plane_config` means "the control
@@ -733,6 +905,17 @@ mod tests {
     #[test]
     fn nothing_in_this_module_consults_the_ownership_marker() {
         const MARKER: &str = "control_plane";
+
+        // 🔴 Resolution, once: the module header names the marker deliberately
+        // while explaining why it is never read. If it did not match here, the
+        // scan below would be searching for a string that appears nowhere —
+        // passing on every file, forever, including one that had just started
+        // reading it.
+        assert!(
+            include_str!("mod.rs").contains(MARKER),
+            "the module header should still explain why the marker is not consulted"
+        );
+
         for (name, source) in [
             ("mod.rs", include_str!("mod.rs")),
             ("firecracker.rs", include_str!("firecracker.rs")),

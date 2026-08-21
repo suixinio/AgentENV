@@ -474,6 +474,7 @@ mod tests {
                 // Not exercised here: these suites call `plan`/`reclaim`
                 // directly, below the premise check `sweep` makes.
                 server_exe: None,
+                ublk_daemon_socket: PathBuf::from("/nonexistent/ublk.sock"),
             }
         }
 
@@ -580,6 +581,15 @@ mod tests {
                 "neither a child of a work directory nor a sibling of the work base is one: {plan:?}"
             );
         }
+
+        // 🔴 And the control: the work directory itself, in the same fixture,
+        // is ours. Without it a `plan` that answered `Foreign` for everything —
+        // a sweep that reclaims nothing anywhere — passes the loop above.
+        let itself = fixture.sandbox_work_dir("agentenv-fc-A2");
+        fixture
+            .proc
+            .process(6003, "firecracker", Some(&itself), 6003);
+        assert_eq!(fixture.plan()[2].ownership, Ownership::Ours);
     }
 
     /// 🔴 T-NR-4. **`kill(-0)` is "my own process group" and `kill(-1)` is "the

@@ -94,9 +94,43 @@ pub struct BuildStatusReason {
 }
 
 impl Client {
+    /// 🔴 Follows the cursor, because a missing `limit` stopped meaning "all of
+    /// them".
+    ///
+    /// It used to be one request: the server read a missing `limit` as no limit
+    /// and answered with every template. The catalog move gives that request a
+    /// hundred-row page and a token instead — deliberately, so one request
+    /// cannot pull ten thousand rows into memory, and so an unbounded request
+    /// means the same thing whichever store answers it. A client that did not
+    /// follow the token would silently show the newest hundred and call it the
+    /// list, which is the shape of failure a listing command must not have.
+    ///
+    /// Same loop as `list_snapshots`, for the same reason.
     pub fn list_templates(&self) -> Result<Vec<Template>> {
-        let resp = handle_status(self.get("/v2/templates").call())?;
-        Ok(resp.into_json()?)
+        let mut templates = Vec::new();
+        let mut next_token: Option<String> = None;
+
+        loop {
+            let mut request = self.get("/v2/templates").query("limit", "100");
+            if let Some(token) = next_token.as_deref() {
+                request = request.query("nextToken", token);
+            }
+
+            let resp = handle_status(request.call())?;
+            next_token = resp
+                .header("x-next-token")
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string);
+            let mut page: Vec<Template> = resp.into_json()?;
+            templates.append(&mut page);
+
+            if next_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(templates)
     }
 
     pub fn resolve_alias(&self, alias: &str) -> Result<String> {

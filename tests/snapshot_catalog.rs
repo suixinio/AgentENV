@@ -2157,12 +2157,9 @@ async fn the_public_token_round_trips_through_the_server_without_losing_a_row() 
     let mut seen: Vec<SnapshotId> = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..published.len() + 1 {
-        let cursor = match token.as_deref() {
-            Some(token) => Some(
-                snapshot_cursor_from_token(token).expect("the token this service minted parses"),
-            ),
-            None => None,
-        };
+        let cursor = token.as_deref().map(|token| {
+            snapshot_cursor_from_token(token).expect("the token this service minted parses")
+        });
         let page = catalog
             .list_page(page_filter(&sandbox_id, 2, cursor))
             .await

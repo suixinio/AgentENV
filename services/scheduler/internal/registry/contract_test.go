@@ -100,7 +100,7 @@ func contractStore(t *testing.T, dsn string) Store {
 	}
 	t.Cleanup(store.Close)
 
-	if err := store.Migrate(context.Background()); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return store.Migrate(context.Background()) }); err != nil {
 		t.Fatalf("migrate a table the node already created: %v", err)
 	}
 

@@ -1139,7 +1139,7 @@ func TestMigrateRefusesAParkedRowCarryingAnExecution(t *testing.T) {
 		t.Fatalf("seed a parked row carrying an incarnation: %v", err)
 	}
 
-	err := Migrate(ctx, f.pool)
+	err := migrateRetryingDeadlock(func() error { return Migrate(ctx, f.pool) })
 	if err == nil {
 		t.Fatal("migrating over a parked row that names an incarnation succeeded; that row is one the old holder's next pause matches")
 	}

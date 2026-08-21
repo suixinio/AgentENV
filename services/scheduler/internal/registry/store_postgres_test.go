@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
@@ -81,6 +82,80 @@ const (
 // show up.
 const stMetadata = `{"id":"s","nested":{"list":[1,2,3],"big":9007199254740993},"unknown_to_this_build":true}`
 
+// migrateRetryingDeadlock applies the schema, retrying a deadlock the test
+// suite inflicted on itself.
+//
+// 🔴 Not papering over a fault in the migration. Migrate takes a cluster-wide
+// advisory lock, and the whole suite shares one database: while this session
+// holds that lock and issues DDL, another package's per-test
+// `DROP SCHEMA ... CASCADE` can be waiting on the same system-catalog rows, and
+// PostgreSQL breaks the three-way wait by killing whichever session asked last.
+// That is this one, and what it was killed for has nothing to do with what the
+// calling test asserts.
+//
+// It cannot happen in a deployment — there is one schema there and nothing
+// drops it — and the process that migrates for real already retries every
+// failure forever, so that a schema it cannot apply does not stop the scheduler
+// routing traffic. This is that loop, bounded.
+//
+// 🔴 It hands the error back rather than failing the test itself, which is
+// where it differs from the copy in the catalog suite. Two tests here assert on
+// a refusal Migrate is *supposed* to produce, and they need the same deadlock
+// retry without losing the error they are about to inspect. Anything that is
+// not a deadlock is returned on the first attempt, so a genuine migration fault
+// still surfaces as itself rather than as five attempts and a timeout.
+func migrateRetryingDeadlock(migrate func() error) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = migrate(); err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	return err
+}
+
+// TestMigrateRetryingDeadlockRefusesEverythingElse pins the one property that
+// keeps the retry above from hiding a real migration fault.
+//
+// 🔴 Drop the SQLSTATE check and the helper turns every genuine failure — a
+// refused preflight, a syntax error, a connection reset — into five attempts
+// and a slow, misattributed timeout. Nothing else in this package would notice:
+// the two tests that assert on a refusal Migrate is *supposed* to produce would
+// still pass, just three seconds later. So the distinction is asserted here
+// directly, on the helper, with no database involved.
+func TestMigrateRetryingDeadlockRefusesEverythingElse(t *testing.T) {
+	deadlock := &pgconn.PgError{Code: "40P01"}
+	for _, tc := range []struct {
+		name  string
+		err   error
+		calls int
+	}{
+		{"a deadlock is retried to the bound", deadlock, 5},
+		{"an undefined table is not", &pgconn.PgError{Code: "42P01"}, 1},
+		{"nor is a plain error", errors.New("connection reset by peer"), 1},
+		{"and success costs one attempt", nil, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			err := migrateRetryingDeadlock(func() error {
+				calls++
+				return tc.err
+			})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("the helper must hand back the error it gave up on: got %v, want %v", err, tc.err)
+			}
+			if calls != tc.calls {
+				t.Fatalf("got %d attempts, want %d", calls, tc.calls)
+			}
+		})
+	}
+}
+
 // newStoreFixture gives the test its own schema rather than its own database.
 //
 // The table's name is unqualified in every statement — the node's script says
@@ -97,7 +172,7 @@ func newStoreFixture(t *testing.T) *storeFixture {
 	// Created through Migrate rather than through a copy of the DDL, so every
 	// test using this fixture is also a test that the migration produces a
 	// table the node would recognise.
-	if err := Migrate(context.Background(), f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(context.Background(), f.pool) }); err != nil {
 		t.Fatalf("migrate failed: %v", err)
 	}
 	f.store = newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop(), WriteFencing: true})
@@ -111,7 +186,7 @@ func newUnfencedStoreFixture(t *testing.T) *storeFixture {
 	t.Helper()
 
 	f := newSchemaFixture(t)
-	if err := Migrate(context.Background(), f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(context.Background(), f.pool) }); err != nil {
 		t.Fatalf("migrate failed: %v", err)
 	}
 	f.store = newStoreWithPool(f.pool, StoreConfig{LeaseTTL: stLeaseTTL, Logger: zap.NewNop(), WriteFencing: false})
@@ -368,11 +443,11 @@ func TestMigrateOverAnEmptyPrePhase3Table(t *testing.T) {
 	if _, err := f.pool.Exec(ctx, legacyNodeSchemaDDL); err != nil {
 		t.Fatalf("the pre-phase-3 bootstrap failed: %v", err)
 	}
-	if err := Migrate(ctx, f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, f.pool) }); err != nil {
 		t.Fatalf("migrating an empty pre-phase-3 table failed: %v", err)
 	}
 	// And again, because a rollout is not one step.
-	if err := Migrate(ctx, f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, f.pool) }); err != nil {
 		t.Fatalf("second migration failed: %v", err)
 	}
 
@@ -414,7 +489,7 @@ func TestMigrateRefusesAPrePhase3Table(t *testing.T) {
 		t.Fatalf("seed a pre-phase-3 row: %v", err)
 	}
 
-	err := Migrate(ctx, f.pool)
+	err := migrateRetryingDeadlock(func() error { return Migrate(ctx, f.pool) })
 	if err == nil {
 		t.Fatal("migrating a populated pre-phase-3 table succeeded; the live row it holds has no incarnation and nothing would ever give it one")
 	}
@@ -453,7 +528,7 @@ func TestMigrateAcceptsATableItAlreadyOwns(t *testing.T) {
 		t.Fatalf("begin pause: %v", err)
 	}
 
-	if err := Migrate(ctx, f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, f.pool) }); err != nil {
 		t.Fatalf("migrating a table this build populated was refused: %v", err)
 	}
 }
@@ -462,10 +537,10 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	f := newStoreFixture(t)
 
 	// newStoreFixture already ran it once; a second run is what a restart does.
-	if err := Migrate(context.Background(), f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(context.Background(), f.pool) }); err != nil {
 		t.Fatalf("second migrate failed: %v", err)
 	}
-	if err := Migrate(context.Background(), f.pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(context.Background(), f.pool) }); err != nil {
 		t.Fatalf("third migrate failed: %v", err)
 	}
 }

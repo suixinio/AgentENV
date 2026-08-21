@@ -53,13 +53,14 @@ use async_trait::async_trait;
 use tracing::{error, warn};
 
 use crate::snapshot::repository::backends::central::{
-    commit_opening_record, opening_status, CatalogRefusal, CatalogWrite, STATUS_BUILDING,
+    alias_conflict, commit_opening_record, is_permanent_failure, opening_status, CatalogRefusal,
+    CatalogWrite, STATUS_BUILDING,
 };
 use crate::snapshot::repository::interfaces::{
     SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
+use crate::snapshot::types::{SnapshotAlias, SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
 pub use backlog::{CatalogReadSide, MirrorBacklog, MirrorDirection, MirrorTargets, RepairPass};
 pub use central::CentralCatalogWrites;
@@ -115,6 +116,35 @@ fn policy_for(refusal: &CatalogRefusal) -> RefusalPolicy {
     }
 }
 
+/// The error a [`RefusalPolicy::Fatal`] refusal is reported to the caller as.
+///
+/// 🔴 An alias somebody else holds is an alias conflict, on both sides of the
+/// double write. It used to be flattened into a `Backend` error here, which the
+/// API layer turns into a **500** carrying the text `central snapshot catalog
+/// refused 'publish_commit.commit'` — so turning the double write on changed a
+/// lost race for a name from a status a client can act on into one it cannot,
+/// and leaked the name of an internal statement onto the public API. The object
+/// store's path already produces [`RepositoryError::AliasConflict`] for exactly
+/// this; producing anything else on this path means the same user error is
+/// reported two different ways depending on a deployment switch.
+fn fatal_refusal(
+    op: &'static str,
+    id: &SnapshotId,
+    alias: Option<&SnapshotAlias>,
+    refusal: CatalogRefusal,
+) -> RepositoryError {
+    match refusal {
+        CatalogRefusal::AliasTaken { holder } => alias_conflict(alias, id, holder),
+        // Everything else fatal is the catalog answering something this build
+        // did not ask for. There is no shape for it beyond "the catalog said
+        // no", and inventing one would be guessing.
+        other => RepositoryError::backend(
+            format!("central snapshot catalog refused '{op}'"),
+            anyhow::anyhow!("{other}"),
+        ),
+    }
+}
+
 /// What a central write settled, from the caller's point of view.
 enum CentralWrite<T> {
     /// The catalog answered. Nothing is owed.
@@ -126,6 +156,17 @@ enum CentralWrite<T> {
 impl<T> CentralWrite<T> {
     fn is_owed(&self) -> bool {
         matches!(self, Self::Owed)
+    }
+
+    /// Whether this call is the one that inserted the row.
+    ///
+    /// `Settled(Some(_))` is `CatalogWrite::Applied`; `Settled(None)` is a
+    /// refusal the policy called satisfied, which on an opening statement means
+    /// `AlreadyExists` — somebody else's row. The difference decides whether a
+    /// failed operation may take the row back again; see
+    /// [`DualWriteCatalog::undo_central_open`].
+    fn opened_the_row(&self) -> bool {
+        matches!(self, Self::Settled(Some(_)))
     }
 }
 
@@ -158,10 +199,16 @@ impl DualWriteCatalog {
     /// `Err` is a refusal the caller has to fail on. [`CentralWrite::Owed`] is
     /// the catalog being unreachable, which the caller records and carries on
     /// from.
+    ///
+    /// `alias` is the name the *caller* asked for, and it is passed rather than
+    /// read off whatever record is in hand for the reason
+    /// `alias_conflict` documents: `publish_commit` opens its row from a
+    /// derived record that deliberately carries no alias.
     async fn central_write<T>(
         &self,
         op: &'static str,
         id: &SnapshotId,
+        alias: Option<&SnapshotAlias>,
         outcome: RepositoryResult<CatalogWrite<T>>,
     ) -> RepositoryResult<CentralWrite<T>> {
         match outcome {
@@ -193,12 +240,32 @@ impl DualWriteCatalog {
                     }
                     RefusalPolicy::Fatal => {
                         record_central_refused(op, refusal.as_metric_label());
-                        Err(RepositoryError::backend(
-                            format!("central snapshot catalog refused '{op}'"),
-                            anyhow::anyhow!("{refusal}"),
-                        ))
+                        Err(fatal_refusal(op, id, alias, refusal))
                     }
                 }
+            }
+            Err(error) if is_permanent_failure(&error) => {
+                // 🔴 Answered, and the answer was no. It arrives as a status
+                // code rather than as a `CatalogRefusal` — the wire has no room
+                // for one on this path — but it is the same kind of thing, and
+                // recording it as debt is what made
+                // `mirror_lag{direction="central"}` a number that could never
+                // reach zero on a cluster that creates templates. It is not
+                // owed, because no replay changes it; it is a disagreement, and
+                // that is where it goes.
+                record_central_request(op, CentralOutcome::Error);
+                record_central_diverged(op, "permanent_rejection");
+                error!(
+                    catalog_op = op,
+                    snapshot_id = %id,
+                    %error,
+                    "the central snapshot catalog rejected a write permanently; the two catalogs \
+                     now disagree about this snapshot and no replay will settle it"
+                );
+                self.backlog
+                    .note_divergence(MirrorDirection::Central, id, op, error.to_string())
+                    .await;
+                Ok(CentralWrite::Settled(None))
             }
             Err(error) => {
                 record_central_request(op, CentralOutcome::Error);
@@ -216,6 +283,100 @@ impl DualWriteCatalog {
                 Ok(CentralWrite::Owed)
             }
         }
+    }
+
+    /// Takes back a row this call opened, after the call went on to fail.
+    ///
+    /// 🔴 The alias is the reason this exists. A publish that the central
+    /// catalog accepted and the object store then refused used to leave
+    /// PostgreSQL bound to the *new* snapshot while object storage still bound
+    /// the old one — under a name the user was told they could not have. That
+    /// is the state every alias is in the moment `write = "both"` is switched
+    /// on, before the backfill has run, and it survives as a row that resolves
+    /// one name to two different snapshots depending on which catalog answers.
+    ///
+    /// 🔴 Only a row *this call* opened. `Applied` means the insert was ours
+    /// and the snapshot is brand new, so deleting it restores the catalog to
+    /// what it held a moment ago. `AlreadyExists` means somebody else's row —
+    /// a template opened when the template was created — and deleting that
+    /// would be destroying state to tidy up after a failure that did not create
+    /// it. Returns whether the undo settled the disagreement.
+    async fn undo_central_open(
+        &self,
+        op: &'static str,
+        id: &SnapshotId,
+        opened_here: bool,
+    ) -> bool {
+        if !opened_here {
+            return false;
+        }
+        match self.central.delete(&id.to_string(), now_unix_ms()).await {
+            Ok(_) => {
+                record_central_request("undo_open", CentralOutcome::Ok);
+                warn!(
+                    catalog_op = op,
+                    snapshot_id = %id,
+                    "the central snapshot catalog took a write the object store then refused; the \
+                     row this call opened has been taken back so the two agree"
+                );
+                true
+            }
+            Err(error) => {
+                record_central_request("undo_open", CentralOutcome::Error);
+                error!(
+                    catalog_op = op,
+                    snapshot_id = %id,
+                    %error,
+                    "could not take back a central snapshot catalog row after the object store \
+                     refused the write; the two catalogs disagree about this snapshot"
+                );
+                false
+            }
+        }
+    }
+
+    /// Queues a central write the catalog could not be reached for.
+    ///
+    /// 🔴 Called once the object store has answered, never before it. A write
+    /// the object store then refuses over an alias must leave nothing queued:
+    /// replaying it would bind, in PostgreSQL, the very name the caller was
+    /// just told they could not have — the same hijack the undo below exists to
+    /// prevent, arriving thirty seconds later instead of immediately.
+    async fn owe_central(&self, owed: bool, op: impl FnOnce() -> MirrorOp) {
+        if !owed {
+            return;
+        }
+        self.backlog.record(MirrorDirection::Central, op()).await;
+    }
+
+    /// Closes out a write the object store refused because the name is taken.
+    ///
+    /// The caller gets the conflict either way — that is the carve-out, and it
+    /// is the same answer `write = "object_store"` gives. What is settled here
+    /// is what the *other* catalog is left holding.
+    async fn settle_a_refused_alias(
+        &self,
+        op: &'static str,
+        id: &SnapshotId,
+        central_is_ahead: bool,
+        opened_here: bool,
+        error: &RepositoryError,
+    ) {
+        if self.undo_central_open(op, id, opened_here).await {
+            return;
+        }
+        if !central_is_ahead {
+            // Nothing was written on that side either — the catalog was
+            // unreachable, and `owe_central` has not run. The two stores are
+            // where they were before the call.
+            return;
+        }
+        // 🔴 A real disagreement, and the caller's error does not record one.
+        // The central catalog took this write and bound this name; the object
+        // store did neither, and reads still come from the object store.
+        self.backlog
+            .note_divergence(MirrorDirection::ObjectStore, id, op, error.to_string())
+            .await;
     }
 
     /// Writes the object store, and treats a failure as owed rather than fatal.
@@ -253,25 +414,42 @@ impl SnapshotCatalog for DualWriteCatalog {
             .central
             .begin(&record, opening_status(&record), true)
             .await;
-        if self
-            .central_write("create", &record.id, central)
-            .await?
-            .is_owed()
-        {
-            self.backlog
-                .record(
-                    MirrorDirection::Central,
-                    MirrorOp::Create {
-                        record: record.clone(),
-                    },
-                )
-                .await;
-        }
+        let began = self
+            .central_write("create", &record.id, record.alias.as_ref(), central)
+            .await?;
 
         let mirrored = self.object_store.create(record.clone()).await;
         match mirrored {
-            Ok(stored) => Ok(stored),
+            Ok(stored) => {
+                self.owe_central(began.is_owed(), || MirrorOp::Create {
+                    record: record.clone(),
+                })
+                .await;
+                Ok(stored)
+            }
+            // 🔴 The carve-out `publish_commit` has had since it was written,
+            // and `create` did not. An alias the store will not bind is the
+            // caller's problem, not the mirror's: without this, twenty
+            // concurrent creates for one template name all answered **202** and
+            // three records existed — seventeen templates reported created that
+            // no catalog holds under that name. Under `write = "object_store"`
+            // the same seventeen callers are told no.
+            Err(error) if matches!(error, RepositoryError::AliasConflict { .. }) => {
+                self.settle_a_refused_alias(
+                    "create",
+                    &record.id,
+                    !began.is_owed(),
+                    began.opened_the_row(),
+                    &error,
+                )
+                .await;
+                Err(error)
+            }
             Err(error) => {
+                self.owe_central(began.is_owed(), || MirrorOp::Create {
+                    record: record.clone(),
+                })
+                .await;
                 self.mirror_write("create", Err(error), || MirrorOp::Create {
                     record: record.clone(),
                 })
@@ -284,10 +462,11 @@ impl SnapshotCatalog for DualWriteCatalog {
     async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
         let opening = commit_opening_record(&commit);
         let began = self.central.begin(&opening, STATUS_BUILDING, false).await;
-        let mut central_owed = self
-            .central_write("publish_commit.begin", &commit.id, began)
-            .await?
-            .is_owed();
+        let began = self
+            .central_write("publish_commit.begin", &commit.id, None, began)
+            .await?;
+        let opened_here = began.opened_the_row();
+        let mut central_owed = began.is_owed();
 
         // 🔴 Only if the row was opened. The commit's fence requires a
         // `building` row, so running it against a catalog that never took the
@@ -295,28 +474,39 @@ impl SnapshotCatalog for DualWriteCatalog {
         // this snapshot — and would be counted as a divergence that is not one.
         if !central_owed {
             let committed = self.central.commit(&commit, true, now_unix_ms()).await;
-            central_owed = self
-                .central_write("publish_commit.commit", &commit.id, committed)
-                .await?
-                .is_owed();
-        }
-        if central_owed {
-            // One entry for the pair. Replaying it re-runs both statements, and
-            // the opening one answering `ALREADY_EXISTS` is the ordinary case
-            // rather than a failure.
-            self.backlog
-                .record(
-                    MirrorDirection::Central,
-                    MirrorOp::PublishCommit {
-                        commit: commit.clone(),
-                    },
+            match self
+                .central_write(
+                    "publish_commit.commit",
+                    &commit.id,
+                    commit.alias.as_ref(),
+                    committed,
                 )
-                .await;
+                .await
+            {
+                Ok(settled) => central_owed = settled.is_owed(),
+                Err(error) => {
+                    // 🔴 The row this call opened a moment ago is `building`
+                    // and the operation is failing. Left behind it is a row no
+                    // resolving query can see, no reaper collects until the
+                    // batch that wires build admission, and nothing the API can
+                    // delete — an operator with a psql prompt is the only way
+                    // out. We opened it; we close it.
+                    self.undo_central_open("publish_commit.commit", &commit.id, opened_here)
+                        .await;
+                    return Err(error);
+                }
+            }
         }
 
         let mirrored = self.object_store.publish_commit(commit.clone()).await;
         match mirrored {
-            Ok(record) => Ok(record),
+            Ok(record) => {
+                self.owe_central(central_owed, || MirrorOp::PublishCommit {
+                    commit: commit.clone(),
+                })
+                .await;
+                Ok(record)
+            }
             Err(error) => {
                 // 🔴 An alias the object store will not bind is the caller's
                 // problem and not the mirror's: reporting success would hand
@@ -324,22 +514,20 @@ impl SnapshotCatalog for DualWriteCatalog {
                 // for, which is exactly the defect the central catalog's unique
                 // index exists to remove.
                 if matches!(error, RepositoryError::AliasConflict { .. }) {
-                    // It is also a real disagreement, and the caller's error
-                    // does not record one. The central catalog took this commit
-                    // and bound this name; the object store did neither, and
-                    // reads still come from the object store.
-                    if !central_owed {
-                        self.backlog
-                            .note_divergence(
-                                MirrorDirection::ObjectStore,
-                                &commit.id,
-                                "publish_commit",
-                                error.to_string(),
-                            )
-                            .await;
-                    }
+                    self.settle_a_refused_alias(
+                        "publish_commit",
+                        &commit.id,
+                        !central_owed,
+                        opened_here,
+                        &error,
+                    )
+                    .await;
                     return Err(error);
                 }
+                self.owe_central(central_owed, || MirrorOp::PublishCommit {
+                    commit: commit.clone(),
+                })
+                .await;
                 self.mirror_write("publish_commit", Err(error), || MirrorOp::PublishCommit {
                     commit: commit.clone(),
                 })
@@ -456,7 +644,7 @@ impl SnapshotCatalog for DualWriteCatalog {
     ) -> RepositoryResult<()> {
         let failed = self.central.fail(id, &reason, now_unix_ms()).await;
         if self
-            .central_write("mark_build_error", id, failed)
+            .central_write("mark_build_error", id, None, failed)
             .await?
             .is_owed()
         {

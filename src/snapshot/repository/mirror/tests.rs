@@ -31,6 +31,13 @@ impl Fixture {
         let backlog = MirrorBacklog::open(dir.path().join("mirror"))
             .await
             .expect("the backlog should open");
+        // This fixture's object store has no history, and saying so is what
+        // lets the read-side tests below be about debt rather than about a
+        // backfill nobody ran. See `backlog::tests::backlog`.
+        backlog
+            .queue_history_toward_central(&ScriptedCatalog::default())
+            .await
+            .expect("an empty object store has no history to queue");
         let dual = DualWriteCatalog::new(
             Arc::clone(&central) as Arc<dyn CentralCatalogWrites>,
             Arc::clone(&object_store) as Arc<dyn SnapshotCatalog>,
@@ -463,10 +470,14 @@ async fn a_refusal_the_commit_cannot_read_fails_the_publish() {
 /// come from the object store in this phase, so reporting success would hand
 /// back a snapshot the user cannot reach by the name they asked for.
 ///
-/// It is also a real disagreement — the central catalog took the commit and
-/// bound the name — so it is recorded as one rather than only reported.
+/// 🔴 And the central catalog does not get to keep what the object store
+/// refused. It took this commit and bound this name; leaving that in place
+/// binds PostgreSQL to the *new* snapshot while object storage still binds the
+/// old one — measured, on a real cluster, as one name resolving to two
+/// different snapshots depending on which catalog answered. The row was opened
+/// by this very call, so taking it back restores what was there a moment ago.
 #[tokio::test]
-async fn an_alias_the_object_store_refuses_is_the_callers_problem() {
+async fn an_alias_the_object_store_refuses_is_taken_back_from_the_central_catalog() {
     let fixture = Fixture::new().await;
     let holder = SnapshotId::generate();
     fixture.object_store.refuse_alias_to(holder.clone());
@@ -482,10 +493,48 @@ async fn an_alias_the_object_store_refuses_is_the_callers_problem() {
         "expected an alias conflict, got {error:?}"
     );
 
+    assert!(
+        fixture.central.holds(&id).is_none(),
+        "the central catalog must not keep a row bound to a name the object store refused"
+    );
     assert_eq!(
         fixture.owed_to_object_store(),
         0,
         "a refused alias is not a write to replay"
+    );
+    assert_eq!(
+        fixture.owed_to_central(),
+        0,
+        "and it is not owed the other way either"
+    );
+    assert_eq!(
+        fixture
+            .backlog
+            .diverged_toward(MirrorDirection::ObjectStore),
+        0,
+        "the undo settled it, so there is nothing left to disagree about"
+    );
+}
+
+/// 🔴 The undo can fail too, and then the disagreement is real and has to be
+/// written down. Without this the catalogs are left apart with every gauge
+/// reading zero — which is the failure the divergence record exists for.
+#[tokio::test]
+async fn an_alias_undo_that_fails_leaves_the_disagreement_recorded() {
+    let fixture = Fixture::new().await;
+    fixture.object_store.refuse_alias_to(SnapshotId::generate());
+    fixture.central.unreachable_on(CentralCall::Delete);
+    let id = SnapshotId::generate();
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, Some("contested")))
+        .await
+        .expect_err("an alias the object store refuses must reach the caller");
+
+    assert!(
+        fixture.central.holds(&id).is_some(),
+        "this test is only meaningful while the undo actually failed"
     );
     assert_eq!(
         fixture
@@ -494,6 +543,215 @@ async fn an_alias_the_object_store_refuses_is_the_callers_problem() {
         1,
         "the two catalogs now disagree about this snapshot and something has to say so"
     );
+}
+
+/// 🔴 P7's user-visible regression. `create` had no carve-out at all: twenty
+/// concurrent creates for one template name each answered **202** while three
+/// records existed, so seventeen callers were told a template had been created
+/// that no catalog holds under that name. Under `write = "object_store"` those
+/// seventeen are told no.
+#[tokio::test]
+async fn an_alias_the_object_store_refuses_on_create_is_the_callers_problem() {
+    let fixture = Fixture::new().await;
+    let holder = SnapshotId::generate();
+    fixture.object_store.refuse_alias_to(holder.clone());
+    let id = SnapshotId::generate();
+
+    let mut record = record_for(&id);
+    record.alias = Some(crate::snapshot::types::SnapshotAlias::parse("contested").expect("alias"));
+
+    let error = fixture
+        .dual
+        .create(record)
+        .await
+        .expect_err("a name the object store will not bind must reach the caller");
+    assert!(
+        matches!(error, RepositoryError::AliasConflict { ref existing, .. } if *existing == holder),
+        "expected an alias conflict, got {error:?}"
+    );
+    assert!(
+        fixture.central.holds(&id).is_none(),
+        "the central catalog must not keep a row for a create the object store refused"
+    );
+    assert_eq!(fixture.backlog.lag(), 0, "a refused create owes nothing");
+}
+
+/// 🔴 And nothing is queued for it either. The central catalog being
+/// unreachable at the moment the object store refuses the name would otherwise
+/// leave a `create` on the queue that binds, in PostgreSQL, the very name the
+/// caller was just told they could not have — the same hijack, arriving one
+/// compensator interval later.
+#[tokio::test]
+async fn a_create_the_object_store_refuses_queues_nothing_for_the_central_catalog() {
+    let fixture = Fixture::new().await;
+    fixture.central.unreachable_on(CentralCall::Begin);
+    fixture.object_store.refuse_alias_to(SnapshotId::generate());
+
+    let mut record = record_for(&SnapshotId::generate());
+    record.alias = Some(crate::snapshot::types::SnapshotAlias::parse("contested").expect("alias"));
+
+    fixture
+        .dual
+        .create(record)
+        .await
+        .expect_err("a name the object store will not bind must reach the caller");
+
+    assert_eq!(
+        fixture.owed_to_central(),
+        0,
+        "a write the caller was told failed must not be replayed into either store"
+    );
+}
+
+/// 🔴 The status code, which the switch to `write = "both"` regressed. The
+/// object-store path answers a lost race for a name with
+/// [`RepositoryError::AliasConflict`]; the central path flattened it into a
+/// `Backend` error, which the API layer turns into a **500** carrying the text
+/// `central snapshot catalog refused 'publish_commit.commit'`. A client cannot
+/// act on a 500, and the name of an internal statement is not the API's
+/// business.
+#[tokio::test]
+async fn a_lost_alias_race_in_the_central_catalog_is_reported_as_a_conflict() {
+    let fixture = Fixture::new().await;
+    let holder = SnapshotId::generate();
+    fixture.central.refuse(
+        CentralCall::Commit,
+        CatalogRefusal::AliasTaken {
+            holder: holder.to_string(),
+        },
+    );
+    let id = SnapshotId::generate();
+
+    let error = fixture
+        .dual
+        .publish_commit(commit_for(&id, Some("contested")))
+        .await
+        .expect_err("a name the central catalog will not bind must fail the publish");
+
+    match &error {
+        RepositoryError::AliasConflict {
+            alias,
+            existing,
+            new_id,
+        } => {
+            assert_eq!(alias, "contested", "the name the caller asked for");
+            assert_eq!(existing, &holder);
+            assert_eq!(new_id, &id);
+        }
+        other => panic!("a lost alias race must be an alias conflict, got {other:?}"),
+    }
+    assert!(
+        !error.to_string().contains("publish_commit"),
+        "the API must not be told the name of an internal statement: {error}"
+    );
+}
+
+/// 🔴 And the row that failed publish opened does not stay behind. Left there
+/// it is `building` forever: no resolving query sees it, no reaper collects it
+/// until the batch that wires build admission, and no API call can delete it —
+/// four of them were left on the cluster and came out only through psql.
+#[tokio::test]
+async fn a_commit_the_central_catalog_refuses_takes_back_the_row_it_opened() {
+    let fixture = Fixture::new().await;
+    fixture.central.refuse(
+        CentralCall::Commit,
+        CatalogRefusal::AliasTaken {
+            holder: SnapshotId::generate().to_string(),
+        },
+    );
+    let id = SnapshotId::generate();
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, Some("contested")))
+        .await
+        .expect_err("a name the central catalog will not bind must fail the publish");
+
+    assert!(
+        fixture.central.holds(&id).is_none(),
+        "the opening statement's row must not outlive the publish that opened it"
+    );
+    assert!(
+        fixture.object_store.calls().is_empty(),
+        "the object store must not hold a row the catalog refused: {:?}",
+        fixture.object_store.calls()
+    );
+}
+
+/// 🔴 A row this call did *not* open is not this call's to delete. A template's
+/// row was created when the template was; a publish that fails against it must
+/// leave it where it is rather than destroying somebody else's state to tidy up
+/// after itself.
+#[tokio::test]
+async fn a_refused_commit_leaves_a_row_it_did_not_open_alone() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.seed(record_for(&id));
+    fixture.central.refuse(
+        CentralCall::Commit,
+        CatalogRefusal::AliasTaken {
+            holder: SnapshotId::generate().to_string(),
+        },
+    );
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, Some("contested")))
+        .await
+        .expect_err("a name the central catalog will not bind must fail the publish");
+
+    assert!(
+        fixture.central.holds(&id).is_some(),
+        "a row that was already there must survive a publish that failed against it"
+    );
+}
+
+/// 🔴 P7's blocker, on the forward path. A controller that *answers* and says
+/// the request will never be accepted is not an outage, and recording it as
+/// debt is what made `mirror_lag{direction="central"}` a number that could
+/// never reach zero: twenty entries replayed every thirty seconds forever,
+/// `repair_failed_total{verdict="retry"}` climbing by twenty a pass, the lag
+/// frozen — and the batch after this one is gated on exactly that number.
+#[tokio::test]
+async fn a_permanent_central_rejection_is_a_divergence_and_not_a_debt() {
+    let fixture = Fixture::new().await;
+    fixture.central.reject_permanently_on(CentralCall::Begin);
+    let id = SnapshotId::generate();
+
+    fixture
+        .dual
+        .create(record_for(&id))
+        .await
+        .expect("the object store still answers reads, so the create still succeeds");
+
+    assert_eq!(
+        fixture.owed_to_central(),
+        0,
+        "a write no replay can land is not debt; leaving it as debt is what froze the lag"
+    );
+    assert_eq!(
+        fixture.backlog.diverged_toward(MirrorDirection::Central),
+        1,
+        "it is a disagreement, and it has to land somewhere an operator can see"
+    );
+}
+
+/// The control face for the one above: a catalog nobody can *reach* is still
+/// debt, and must stay debt. Reading every failure as permanent would abandon
+/// writes over a scheduler that was restarting.
+#[tokio::test]
+async fn an_unreachable_central_catalog_is_still_a_debt() {
+    let fixture = Fixture::new().await;
+    fixture.central.unreachable_on(CentralCall::Begin);
+
+    fixture
+        .dual
+        .create(record_for(&SnapshotId::generate()))
+        .await
+        .expect("an unreachable catalog must not fail the create");
+
+    assert_eq!(fixture.owed_to_central(), 1);
+    assert_eq!(fixture.backlog.diverged_toward(MirrorDirection::Central), 0);
 }
 
 /// 🔴 The rollback that follows must not delete the bytes. The central catalog

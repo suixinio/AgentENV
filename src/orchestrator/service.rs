@@ -907,6 +907,22 @@ where
         // something very different from what "I could not read the records"
         // means.
         let records = self.store.get_many(&ids).await?;
+        // 🔴 And a read that only *partly* worked is the same failure wearing a
+        // success. A batch that skipped some ids returns rows for the rest, and
+        // every id it skipped then looks exactly like a sandbox with no record
+        // — which is how a live, claimed sandbox drops out of the answer the
+        // cluster reconciles against and gets treated as one that has gone.
+        if !records.covers(&ids) {
+            return Err(OrchestratorError::StoreOperationFailed(
+                StoreError::Backend {
+                    source: anyhow::anyhow!(
+                        "read the records for {} live sandboxes and got {}",
+                        ids.len(),
+                        records.covered.len()
+                    ),
+                },
+            ));
+        }
 
         let mut live = Vec::with_capacity(handles.len());
         for (sandbox_id, handle) in handles {

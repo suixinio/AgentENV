@@ -158,6 +158,142 @@ async fn a_sandbox_that_is_gone_leaves_the_listing() {
     assert_eq!(sandboxes[0].sandbox_id, staying.id.to_string());
 }
 
+/// 🔴 A batch read that only partly worked fails the listing rather than
+/// shortening it.
+///
+/// A store that answers for some of the ids it was given and quietly skips the
+/// rest produces exactly the same shape as a store that answered fully about a
+/// node running fewer sandboxes — and every skipped id then looks like a
+/// sandbox with no record, which means no ownership marker, which means it
+/// drops out of the answer the control plane reconciles against. The cluster
+/// would conclude those sandboxes are gone while their VMs are up.
+#[tokio::test]
+async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
+    use crate::orchestrator::{MetadataRows, MetadataStore, MetadataUpdateResult, StoreError};
+
+    /// Wraps the in-memory store and answers batch reads about all but one id.
+    struct HalfAnswering(InMemoryMetadataStore);
+
+    #[async_trait::async_trait]
+    impl MetadataStore for HalfAnswering {
+        async fn add(&self, metadata: SandboxMetadata) -> Result<(), StoreError> {
+            self.0.add(metadata).await
+        }
+        async fn update(&self, metadata: SandboxMetadata) -> Result<(), StoreError> {
+            self.0.update(metadata).await
+        }
+        async fn update_state_if_state(
+            &self,
+            sandbox_id: &crate::types::SandboxId,
+            new_state: crate::orchestrator::SandboxState,
+            expected_states: &[crate::orchestrator::SandboxState],
+        ) -> Result<crate::orchestrator::SandboxState, StoreError> {
+            self.0
+                .update_state_if_state(sandbox_id, new_state, expected_states)
+                .await
+        }
+        async fn update_if_state<F>(
+            &self,
+            sandbox_id: &crate::types::SandboxId,
+            expected_states: &[crate::orchestrator::SandboxState],
+            update: F,
+        ) -> Result<MetadataUpdateResult, StoreError>
+        where
+            F: FnOnce(&mut SandboxMetadata) + Send,
+        {
+            self.0
+                .update_if_state(sandbox_id, expected_states, update)
+                .await
+        }
+        async fn get(
+            &self,
+            sandbox_id: &crate::types::SandboxId,
+        ) -> Result<Option<SandboxMetadata>, StoreError> {
+            self.0.get(sandbox_id).await
+        }
+        async fn remove(
+            &self,
+            sandbox_id: &crate::types::SandboxId,
+        ) -> Result<Option<SandboxMetadata>, StoreError> {
+            self.0.remove(sandbox_id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxMetadata>, StoreError> {
+            self.0.list().await
+        }
+        async fn list_with_callback<F>(&self, callback: F) -> Result<(), StoreError>
+        where
+            F: FnMut(&SandboxMetadata) + Send,
+        {
+            self.0.list_with_callback(callback).await
+        }
+        async fn list_filtered(
+            &self,
+            filter: crate::orchestrator::SandboxListFilter,
+        ) -> Result<Vec<SandboxMetadata>, StoreError> {
+            self.0.list_filtered(filter).await
+        }
+        async fn list_expired(
+            &self,
+            now: std::time::SystemTime,
+        ) -> Result<Vec<SandboxMetadata>, StoreError> {
+            self.0.list_expired(now).await
+        }
+        async fn list_ids(&self) -> Result<Vec<crate::types::SandboxId>, StoreError> {
+            self.0.list_ids().await
+        }
+        async fn wait_while_in_states(
+            &self,
+            sandbox_id: &crate::types::SandboxId,
+            transitional_states: &[crate::orchestrator::SandboxState],
+        ) -> Result<Option<SandboxMetadata>, StoreError> {
+            self.0
+                .wait_while_in_states(sandbox_id, transitional_states)
+                .await
+        }
+
+        /// The one override: answer about everything except the first id.
+        async fn get_many(
+            &self,
+            ids: &[crate::types::SandboxId],
+        ) -> Result<MetadataRows, StoreError> {
+            let mut rows = self.0.get_many(ids).await?;
+            if let Some(dropped) = ids.first() {
+                rows.entries.remove(dropped);
+                rows.covered.retain(|covered| covered != dropped);
+            }
+            Ok(rows)
+        }
+    }
+
+    crate::logging::init_for_tests();
+    let orchestrator = Orchestrator::new(
+        HalfAnswering(InMemoryMetadataStore::new()),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(mock_snapshot_manager()),
+        NODE.to_string(),
+    );
+
+    start(&orchestration, Some(b"owned-a")).await;
+    start(&orchestration, Some(b"owned-b")).await;
+
+    let err = service
+        .list_sandboxes(Request::new(pb::ListSandboxesRequest {}))
+        .await
+        .expect_err("a listing built on a partial read must not be served");
+    assert_ne!(
+        err.code(),
+        Code::NotFound,
+        "a partial read is not an absence: {err}"
+    );
+}
+
 /// 🔴 The discriminator between "what this node holds" and "what it claims to
 /// hold": a paused sandbox keeps its record — marker and all — and loses its
 /// handle. It must not be listed.
@@ -171,7 +307,14 @@ async fn a_sandbox_that_is_gone_leaves_the_listing() {
 async fn a_paused_sandbox_keeps_its_record_and_leaves_the_listing() {
     let (orchestration, service) = service().await;
     let sandbox = start(&orchestration, Some(b"owned")).await;
-    assert_eq!(listed(&service).await.len(), 1);
+    // 🔴 A second sandbox that stays up, and it is load-bearing. With only one
+    // sandbox, pausing it empties the handle table *and* the running set at
+    // once, so a listing built from the records would come back empty for the
+    // wrong reason and look correct. Mutation testing found exactly that: an
+    // implementation that answered from `list_ids()` passed this test until
+    // there was something left running for it to get wrong.
+    let staying = start(&orchestration, Some(b"also-owned")).await;
+    assert_eq!(listed(&service).await.len(), 2);
 
     Arc::clone(&orchestration)
         .pause_sandbox(sandbox.id)
@@ -189,11 +332,14 @@ async fn a_paused_sandbox_keeps_its_record_and_leaves_the_listing() {
         "the marker did not survive the pause, so this test proves nothing"
     );
 
-    // ...and the listing does not report it, because nothing is running.
-    assert!(
-        listed(&service).await.is_empty(),
-        "a paused sandbox was reported as running"
+    // ...and the listing reports only the sandbox that is still running.
+    let sandboxes = listed(&service).await;
+    assert_eq!(
+        sandboxes.len(),
+        1,
+        "a paused sandbox was reported as running: {sandboxes:?}"
     );
+    assert_eq!(sandboxes[0].sandbox_id, staying.id.to_string());
 }
 
 /// The incarnation in the listing is the one that is running.

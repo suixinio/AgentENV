@@ -224,6 +224,20 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
+        // The two facts a record cannot supply — the address the sandbox
+        // reaches the host on, and the size the rootfs turned out to be — are
+        // only knowable from the live handle, and this is the one call that
+        // reaches one.
+        //
+        // It costs a scan of everything running on this node. That is a real
+        // cost and it is the right trade here: the call it is inside has just
+        // booted a virtual machine, and the alternative is a second accessor on
+        // the orchestration surface that exists to serve one field.
+        //
+        // 🔴 `.ok()` and not `?`: a create that *succeeded* must not be
+        // reported as a failure because the follow-up read did not work. The
+        // sandbox is running either way, and a caller told the create failed
+        // would leak it.
         let live = self.orchestration.list_live_sandboxes().await.ok();
         let facts = live.as_ref().and_then(|live| {
             live.iter()

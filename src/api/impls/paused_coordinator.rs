@@ -1097,6 +1097,7 @@ pub(super) mod test_support {
         claim_fails: bool,
         renew_calls: AtomicUsize,
         renewals_to_fail: usize,
+        remove_calls: AtomicUsize,
     }
 
     /// What a programmed `get` should answer.
@@ -1120,6 +1121,7 @@ pub(super) mod test_support {
                 claim_fails: false,
                 renew_calls: AtomicUsize::new(0),
                 renewals_to_fail: 0,
+                remove_calls: AtomicUsize::new(0),
             }
         }
 
@@ -1152,6 +1154,15 @@ pub(super) mod test_support {
 
         pub(crate) fn release_calls(&self) -> usize {
             self.release_calls.load(Ordering::SeqCst)
+        }
+
+        /// How many rows this registry was told to drop.
+        ///
+        /// 🔴 The destructive one. A row dropped here is the cluster's only
+        /// record that a paused sandbox exists, so a test about "was the row
+        /// thrown away" has to be able to see it.
+        pub(crate) fn remove_calls(&self) -> usize {
+            self.remove_calls.load(Ordering::SeqCst)
         }
 
         pub(crate) fn get_calls(&self) -> usize {
@@ -1279,6 +1290,7 @@ pub(super) mod test_support {
         }
 
         async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
+            self.remove_calls.fetch_add(1, Ordering::SeqCst);
             Ok(true)
         }
 

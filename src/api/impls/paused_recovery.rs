@@ -25,6 +25,7 @@ use crate::orchestrator::{
     PausedRegistryState, PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter,
     SandboxMetadata, SandboxState,
 };
+use crate::snapshot::CatalogReadScope;
 use crate::types::{ExecutionId, SandboxId};
 
 /// 本节点既没有本地副本、又没拿到认领权时，一次 resume 该怎么收场。
@@ -351,12 +352,40 @@ impl ApiImpl {
             "restoring paused sandbox from another node's snapshot"
         );
 
-        let snapshot = match self
+        // 🔴 Read at `AnyStatus`, and the destructive branch below is why.
+        //
+        // The resolvable reading answers "absent" for two states that could not
+        // be further apart: a snapshot that is genuinely gone, and one whose row
+        // exists but has not been flipped to `ready` — which on a node reading
+        // PostgreSQL is every pause whose commit was owed because the scheduler
+        // was unreachable, until the compensator replays it. This call treats
+        // absence as proof and *deletes the registry row*, so at the resolvable
+        // reading a mirror that is momentarily behind destroys the only
+        // cluster-wide record of a paused sandbox that is perfectly intact.
+        //
+        // So the question is asked in two parts: is there a row at all, and is
+        // it finished. Only the first answers the destructive branch.
+        let record = match self
             .snapshot_manager
-            .load_runnable(&snapshot_id.to_string())
+            .get_scoped(snapshot_id.to_string(), CatalogReadScope::AnyStatus)
             .await
         {
-            Ok(Some(snapshot)) => snapshot,
+            Ok(Some(record)) if record.committed.is_some() => record,
+            Ok(Some(_)) => {
+                // The row is there and the publish never finished — or has not
+                // reached this read side yet. Retryable, and above all not a
+                // reason to throw the row away.
+                warn!(
+                    %sandbox_id,
+                    %snapshot_id,
+                    "paused snapshot has a catalog row but no committed payload; leaving the                      registry row alone and failing this resume"
+                );
+                self.release_claim(&sandbox_id, entry.generation).await;
+
+                return CrossNodeResume::Failed(
+                    "paused snapshot has not finished publishing".to_string(),
+                );
+            }
             Ok(None) => {
                 // The registry names a snapshot the repository no longer has.
                 // Releasing the claim would just make the next resume fail the
@@ -385,6 +414,16 @@ impl ApiImpl {
             }
             Err(err) => {
                 warn!(error = ?err, %sandbox_id, %snapshot_id, "failed to load paused snapshot");
+                self.release_claim(&sandbox_id, entry.generation).await;
+
+                return CrossNodeResume::Failed(format!("failed to load paused snapshot: {err}"));
+            }
+        };
+
+        let snapshot = match self.snapshot_manager.resolve_runnable(record).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(error = ?err, %sandbox_id, %snapshot_id, "failed to resolve paused snapshot");
                 self.release_claim(&sandbox_id, entry.generation).await;
 
                 return CrossNodeResume::Failed(format!("failed to load paused snapshot: {err}"));
@@ -1990,5 +2029,242 @@ mod tests {
             missing_local_verdict(Some(&row), None, "self"),
             MissingLocalVerdict::Busy { .. }
         ));
+    }
+}
+
+/// 🔴 The one place in the tree where "the catalog says no such snapshot"
+/// deletes something.
+///
+/// A cross-node resume reads the snapshot the registry names, and on absence it
+/// drops the registry row — the cluster's only record that the paused sandbox
+/// exists. Read at the resolvable scope, absence covers two states that could
+/// not be further apart: a snapshot that is genuinely gone, and one whose row
+/// exists but has not been flipped to `ready`. On a node reading PostgreSQL the
+/// second is every pause whose commit was owed because the scheduler was
+/// unreachable, until the compensator replays it — so a mirror that is briefly
+/// behind destroys a paused sandbox that is entirely intact.
+#[cfg(test)]
+mod cross_node_resume_scope_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+
+    use super::super::paused_coordinator::test_support::CountingRegistry;
+    use super::*;
+    use crate::cfg::AppConfig;
+    use crate::identity::NodeIdentity;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{
+        FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
+    };
+    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit, StartedBuild};
+    use crate::snapshot::repository::{
+        RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
+    };
+    use crate::snapshot::{
+        SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
+    };
+    use crate::template::TemplateBuilder;
+
+    /// A catalog holding one row that has not been committed: present to a
+    /// scoped read, absent to the resolvable one. That is a pause mid-publish,
+    /// and it is what PostgreSQL shows while a commit is still owed.
+    struct UncommittedSnapshotCatalog {
+        row: Option<SnapshotRecord>,
+        scoped_reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SnapshotCatalog for UncommittedSnapshotCatalog {
+        async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+            unreachable!("these tests never create")
+        }
+
+        async fn publish_commit(
+            &self,
+            _commit: SnapshotCommit,
+        ) -> RepositoryResult<SnapshotRecord> {
+            unreachable!("these tests never commit")
+        }
+
+        async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+            // Resolvable: an uncommitted row is not one of these.
+            Ok(None)
+        }
+
+        async fn get_scoped(
+            &self,
+            _id_or_alias: &str,
+            scope: CatalogReadScope,
+        ) -> RepositoryResult<Option<SnapshotRecord>> {
+            if matches!(scope, CatalogReadScope::AnyStatus) {
+                self.scoped_reads.fetch_add(1, Ordering::SeqCst);
+                return Ok(self.row.clone());
+            }
+            Ok(None)
+        }
+
+        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
+            Ok(())
+        }
+
+        async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+            Ok(None)
+        }
+
+        async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+            Err(RepositoryError::Unsupported {
+                feature: "not part of this test".to_string(),
+            })
+        }
+
+        async fn mark_build_error(
+            &self,
+            _id: &SnapshotId,
+            _reason: TemplateBuildErrorReason,
+        ) -> RepositoryResult<()> {
+            Ok(())
+        }
+    }
+
+    /// An uncommitted sandbox row for `id`: the shape a pause has between its
+    /// bytes landing and its commit.
+    fn uncommitted(id: &SnapshotId) -> SnapshotRecord {
+        SnapshotRecord {
+            id: id.clone(),
+            alias: None,
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "sbx-mid-publish".to_string(),
+            },
+            resources: Default::default(),
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+            committed: None,
+        }
+    }
+
+    async fn api_with_catalog(
+        row: Option<SnapshotRecord>,
+        registry: Arc<CountingRegistry>,
+    ) -> (Arc<ApiImpl>, Arc<AtomicUsize>) {
+        let scoped_reads = Arc::new(AtomicUsize::new(0));
+        let catalog = Arc::new(UncommittedSnapshotCatalog {
+            row,
+            scoped_reads: Arc::clone(&scoped_reads),
+        });
+        let root = tempfile::tempdir().expect("a temp dir");
+        let orchestrator = Orchestrator::new(
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+        )
+        .await
+        .expect("an orchestrator");
+        std::mem::forget(root);
+
+        let snapshot_manager = Arc::new(SnapshotManager::from_parts(
+            Arc::new(SnapshotRepository::new(
+                catalog,
+                Arc::new(crate::snapshot::mock::MockSnapshotArtifactStore),
+            )),
+            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            None,
+        ));
+
+        let api = Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                registry as Arc<dyn PausedSandboxRegistry>,
+                snapshot_manager,
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+        ));
+        (api, scoped_reads)
+    }
+
+    fn claimed_entry(snapshot_id: SnapshotId) -> PausedSandboxEntry {
+        let sandbox_id = SandboxId::new();
+        PausedSandboxEntry {
+            sandbox_id,
+            cluster_id: uuid::Uuid::nil(),
+            state: PausedRegistryState::Resuming,
+            generation: 1,
+            origin_node_id: "node-b".to_string(),
+            claimed_by_node_id: Some("node-a".to_string()),
+            snapshot_id: Some(snapshot_id),
+            metadata: Some(SandboxMetadata {
+                id: sandbox_id,
+                ..Default::default()
+            }),
+            execution_id: Some(ExecutionId::new()),
+            paused_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// A row that exists but has not been committed must not cost the sandbox
+    /// its registry row.
+    #[tokio::test]
+    async fn a_snapshot_that_has_not_finished_publishing_does_not_drop_the_registry_row() {
+        let snapshot_id = SnapshotId::generate();
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let (api, scoped_reads) =
+            api_with_catalog(Some(uncommitted(&snapshot_id)), Arc::clone(&registry)).await;
+
+        let outcome = api
+            .restore_claimed_sandbox(claimed_entry(snapshot_id), NewTimeout::None)
+            .await;
+
+        assert!(
+            matches!(outcome, CrossNodeResume::Failed(_)),
+            "an unfinished publish is a retryable failure, not a sandbox that does not exist"
+        );
+        assert_eq!(
+            registry.remove_calls(),
+            0,
+            "🔴 the assertion. Dropping this row throws away the cluster's only record of a \
+             paused sandbox whose bytes are sitting in object storage, intact"
+        );
+        assert_eq!(
+            scoped_reads.load(Ordering::SeqCst),
+            1,
+            "and the question has to be asked at the scope that can tell the two states apart"
+        );
+    }
+
+    /// The control: a snapshot the catalog does not hold at *any* status really
+    /// is gone, and the row really should go with it — otherwise every resume
+    /// of it fails the same way for ever.
+    #[tokio::test]
+    async fn a_snapshot_no_row_exists_for_still_drops_the_registry_row() {
+        let snapshot_id = SnapshotId::generate();
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let (api, _) = api_with_catalog(None, Arc::clone(&registry)).await;
+
+        let outcome = api
+            .restore_claimed_sandbox(claimed_entry(snapshot_id), NewTimeout::None)
+            .await;
+
+        assert!(
+            matches!(outcome, CrossNodeResume::NotFound),
+            "a snapshot nothing holds is a sandbox that cannot be rebuilt"
+        );
+        assert_eq!(
+            registry.remove_calls(),
+            1,
+            "and the dangling row goes with it"
+        );
     }
 }

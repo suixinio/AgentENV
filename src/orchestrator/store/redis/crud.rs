@@ -519,9 +519,10 @@ impl MetadataStore for RedisMetadataStore {
             .update_if_state_locked(sandbox_id, expected_states, update, lock.as_ref())
             .await;
 
+        // 🔴 Released whether the update succeeded or failed, and the waiters
+        // are woken either way: a lock held through a failure is a sandbox
+        // nobody else can touch for the rest of its TTL.
         if let Some(lock) = lock {
-            let key = inner.keys().lock(sandbox_id);
-            let _ = key;
             if let Err(error) = inner.locks().release(lock).await {
                 debug!(%sandbox_id, %error, "failed to release the sandbox lock; it will expire");
             }

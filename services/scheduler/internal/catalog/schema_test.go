@@ -300,6 +300,80 @@ VALUES ($1, '11111111-1111-1111-1111-111111111111', 'template', 0, 128, 1024,
         'waiting', 'pending', 1, 1)`, newUUID(t))
 		refuses(t, "cpu_count", err)
 	})
+
+	// 🔴 disk_size_mib is the one resource a row may open without, because a
+	// v3 template has no disk size until its build has produced a rootfs; the
+	// node writes that as 0. See migration 0003 — the rule is gated on `ready`
+	// instead, exactly the way snapshots_ready_is_committed above is.
+	t.Run("a row that is not ready may have no disk size yet", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `
+INSERT INTO snapshots (id, cluster_id, source_kind, cpu_count, memory_mib, disk_size_mib,
+                       status, status_group, created_at_ms, updated_at_ms)
+VALUES ($1, '11111111-1111-1111-1111-111111111111', 'template', 1, 128, 0,
+        'waiting', 'pending', 1, 1)`, newUUID(t)); err != nil {
+			t.Fatalf("a template that does not know its disk size yet was refused: %v", err)
+		}
+	})
+
+	t.Run("ready with no disk size is refused", func(t *testing.T) {
+		id := newUUID(t)
+		if _, err := pool.Exec(ctx, `
+INSERT INTO snapshots (id, cluster_id, source_kind, cpu_count, memory_mib, disk_size_mib,
+                       status, status_group, created_at_ms, updated_at_ms)
+VALUES ($1, '11111111-1111-1111-1111-111111111111', 'template', 1, 128, 0,
+        'building', 'in_progress', 1, 1)`, id); err != nil {
+			t.Fatalf("open the row: %v", err)
+		}
+		// The flip commit_snapshot makes, with nothing filling the size in.
+		_, err := pool.Exec(ctx, `
+UPDATE snapshots
+   SET status = 'ready', committed_payload = $2, committed_schema = 1
+ WHERE id = $1`, id, []byte(`{"a":1}`))
+		refuses(t, "snapshots_ready_has_disk_size", err)
+	})
+
+	// The column is a signed INTEGER and the store casts a uint32 into it, so
+	// below zero is a value that arrived corrupted rather than one that means
+	// "not known yet". Dropping the old positivity CHECK must not have opened
+	// that door.
+	t.Run("a negative disk size is refused", func(t *testing.T) {
+		_, err := pool.Exec(ctx, `
+INSERT INTO snapshots (id, cluster_id, source_kind, cpu_count, memory_mib, disk_size_mib,
+                       status, status_group, created_at_ms, updated_at_ms)
+VALUES ($1, '11111111-1111-1111-1111-111111111111', 'template', 1, 128, -1,
+        'waiting', 'pending', 1, 1)`, newUUID(t))
+		refuses(t, "snapshots_disk_size_floor", err)
+	})
+
+	// And the column CHECK 0003 replaced is gone rather than merely shadowed:
+	// while it is on the table nothing else matters, because it refuses the
+	// insert before either rule above is consulted.
+	t.Run("the column-level positivity check is gone", func(t *testing.T) {
+		var leftover []string
+		rows, err := pool.Query(ctx, `
+SELECT c.conname
+  FROM pg_constraint c
+  JOIN pg_class t ON t.oid = c.conrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+ WHERE t.relname = 'snapshots' AND n.nspname = current_schema()
+   AND c.contype = 'c'
+   AND c.conname NOT IN ('snapshots_disk_size_floor', 'snapshots_ready_has_disk_size')
+   AND pg_get_constraintdef(c.oid) LIKE '%disk_size_mib%'`)
+		if err != nil {
+			t.Fatalf("read the table's check constraints: %v", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatalf("scan a constraint name: %v", err)
+			}
+			leftover = append(leftover, name)
+		}
+		if len(leftover) != 0 {
+			t.Fatalf("disk_size_mib is still constrained by %v: 0003 dropped the wrong name", leftover)
+		}
+	})
 }
 
 // TestOriginColumnsStayRemovable pins the rules that make the origin block

@@ -35,6 +35,22 @@ const (
 // this name. The store reads the constraint name rather than guessing.
 const uniqueViolation = "23505"
 
+// checkViolation is PostgreSQL's SQLSTATE for a CHECK constraint refusing a
+// row, and readyDiskSizeConstraint is the one of them a caller can act on.
+//
+// 🔴 Read by name for the same reason uniqueViolation is. Everything this
+// package does not classify falls through catalogErrorCode's default and
+// reaches the node as UNAVAILABLE, which is a retry instruction — so a commit
+// refused because the row still has no disk size would be retried forever
+// against a table that will refuse it every time. Named, it becomes
+// InvalidArgument: an answer the node can act on.
+const (
+	checkViolation = "23514"
+
+	// readyDiskSizeConstraint is 0003's `status <> 'ready' OR disk_size_mib > 0`.
+	readyDiskSizeConstraint = "snapshots_ready_has_disk_size"
+)
+
 // StoreConfig configures a PostgresStore.
 type StoreConfig struct {
 	DSN string
@@ -211,7 +227,7 @@ func (s *PostgresStore) BeginSnapshot(ctx context.Context, in BeginInput) (Begin
 	if in.Status != StatusWaiting && in.Status != StatusBuilding {
 		return BeginOutcome{}, fmt.Errorf("%w: a snapshot row opens at 'waiting' or 'building', not %q", ErrInvalidArgument, in.Status)
 	}
-	if err := requirePositiveResources(in.CPUCount, in.MemoryMiB, in.DiskSizeMiB); err != nil {
+	if err := requireResourcesKnownAtBegin(in.CPUCount, in.MemoryMiB); err != nil {
 		return BeginOutcome{}, err
 	}
 	origin := nilIfEmpty(in.OriginNodeID)
@@ -351,6 +367,15 @@ func (s *PostgresStore) CommitSnapshot(ctx context.Context, in CommitInput) (Com
 	if len(in.CommittedPayload) == 0 {
 		return CommitOutcome{}, fmt.Errorf("%w: a commit carries the payload that makes the row ready, and this one is empty", ErrInvalidArgument)
 	}
+	// 🔴 The same rule, one field along, and refused here for the same reason.
+	// A row opens with disk_size_mib = 0 meaning "not known yet" — a v3
+	// template has no disk size until its build has produced a rootfs — and
+	// this is the statement that ends that. A caller that states 0 *here* is
+	// saying the finished snapshot has no size, which is not a thing a launch
+	// can use.
+	if err := requireCommitDiskSize(in.DiskSizeMiB); err != nil {
+		return CommitOutcome{}, err
+	}
 	origin := nilIfEmpty(in.OriginNodeID)
 	if !in.Published && origin == nil {
 		return CommitOutcome{}, fmt.Errorf("%w: an unpublished snapshot must name the node its bytes are on", ErrInvalidArgument)
@@ -398,6 +423,18 @@ func (s *PostgresStore) CommitSnapshot(ctx context.Context, in CommitInput) (Com
 		execution,
 	)
 	if err != nil {
+		// 🔴 The residual case the guard above cannot see. The three resource
+		// fields are pointers and COALESCEd, so nil means "keep what the begin
+		// recorded" — and when what the begin recorded is 0, a commit that
+		// sends nothing asks for a `ready` row with no disk size. Nothing in
+		// this process knows that until the table says so. Classified rather
+		// than wrapped, so the node is told what is wrong in a sentence
+		// instead of retrying an UNAVAILABLE that will never clear.
+		if constraint, ok := checkViolationOn(err); ok && constraint == readyDiskSizeConstraint {
+			return CommitOutcome{}, fmt.Errorf(
+				"%w: snapshot %s still carries disk_size_mib = 0, which means 'not known yet', and this commit sent no size to replace it: a ready row carries the size of the rootfs the build produced",
+				ErrInvalidArgument, snapshot)
+		}
 		return CommitOutcome{}, fmt.Errorf("catalog commit_snapshot: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
@@ -1223,17 +1260,47 @@ func scanBuild(rows pgx.Rows) (BuildRow, error) {
 	return row, nil
 }
 
-func requirePositiveResources(cpu, memory, disk uint32) error {
+// requireResourcesKnownAtBegin checks the resources a row is born knowing.
+//
+// cpu and memory are both of them, and they are required: the create request
+// carries them or the node's config default fills them in, so a 0 in either is
+// a real error and the caller is better told which field than shown a CHECK
+// violation.
+//
+// 🔴 disk_size_mib is deliberately not here, and 0 there is not an error. A v3
+// template has no disk size at create time — the E2B-compatible request has no
+// disk field — and the node's own convention for "not known yet" is 0
+// (src/template/build_spec.rs: `disk_size_mib: 0, // disk size is determined
+// after build.`). The real figure is the built rootfs's virtual size, so the
+// rule that a disk size must be positive belongs to the commit, which is the
+// only place a launchable row is produced. See requireCommitDiskSize and
+// migration 0003.
+func requireResourcesKnownAtBegin(cpu, memory uint32) error {
 	switch {
 	case cpu == 0:
 		return fmt.Errorf("%w: cpu_count must be positive", ErrInvalidArgument)
 	case memory == 0:
 		return fmt.Errorf("%w: memory_mib must be positive", ErrInvalidArgument)
-	case disk == 0:
-		return fmt.Errorf("%w: disk_size_mib must be positive", ErrInvalidArgument)
 	default:
 		return nil
 	}
+}
+
+// requireCommitDiskSize is the other half of the rule above: the disk size a
+// launch needs, checked where a launchable row is made.
+//
+// nil is not a refusal — it means "keep what the begin recorded", which for a
+// sandbox snapshot is already the right number. A stated 0 is a refusal,
+// because the commit is where "not known yet" stops being an answer anything
+// can use. The remaining case — a nil landing on a row that is still at 0 — is
+// caught by the table; see the checkViolationOn arm in CommitSnapshot.
+func requireCommitDiskSize(disk *uint32) error {
+	if disk != nil && *disk == 0 {
+		return fmt.Errorf(
+			"%w: disk_size_mib must be positive on the commit that makes a row ready; send no value to keep the size the row already has",
+			ErrInvalidArgument)
+	}
+	return nil
 }
 
 func int32Ptr(v *uint32) *int32 {
@@ -1253,6 +1320,19 @@ func int32Ptr(v *uint32) *int32 {
 func uniqueViolationOn(err error) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != uniqueViolation {
+		return "", false
+	}
+	return pgErr.ConstraintName, true
+}
+
+// checkViolationOn names the constraint a check violation came from.
+//
+// Same shape as uniqueViolationOn, and for the same reason: which constraint
+// fired is the difference between a refusal the caller can act on and a failure
+// it can only retry.
+func checkViolationOn(err error) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != checkViolation {
 		return "", false
 	}
 	return pgErr.ConstraintName, true

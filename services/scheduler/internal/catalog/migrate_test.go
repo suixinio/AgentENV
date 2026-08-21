@@ -43,6 +43,41 @@ func TestEmbeddedMigrationsParse(t *testing.T) {
 	}
 }
 
+// TestEveryMigrationDeclaresItsRelations holds down the map both halves of the
+// schema self-check read.
+//
+// 🔴 An absent version is not "creates nothing", it is "written by a build
+// newer than this one" — verifyApplied skips those, because it cannot know what
+// their files created. A version this build ships and does not describe is
+// therefore indistinguishable from one it has never heard of, and the check
+// stops covering it. A migration that alters rather than creates gets an empty
+// entry, not no entry.
+func TestEveryMigrationDeclaresItsRelations(t *testing.T) {
+	a, err := newApplier(migrationsFS, migrationsDir)
+	if err != nil {
+		t.Fatalf("parse the embedded migrations: %v", err)
+	}
+	for _, m := range a.migrations {
+		if _, declared := relationsByVersion[m.version]; !declared {
+			t.Fatalf("%s has no relationsByVersion entry: an undeclared version this build ships "+
+				"reads to verifyApplied as one from a newer build, and stops being checked. "+
+				"Add an entry — empty if the file creates no relation.", m.name)
+		}
+	}
+	for version := range relationsByVersion {
+		found := false
+		for _, m := range a.migrations {
+			if m.version == version {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("relationsByVersion claims version %d, which no migration file carries", version)
+		}
+	}
+}
+
 func TestNewApplierRefusesUnusableSets(t *testing.T) {
 	cases := []struct {
 		name  string

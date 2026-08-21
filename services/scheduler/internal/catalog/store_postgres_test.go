@@ -255,6 +255,35 @@ func (f *fixture) beginRaw(in BeginInput) (BeginOutcome, error) {
 	return f.store.BeginSnapshot(f.ctx, in)
 }
 
+// beginWithoutADiskSize opens a row the way a v3 template create does: with the
+// disk size the build has not produced yet, which the node writes as 0.
+//
+// 🔴 Deliberately not routed through beginRaw, which fills a 0 in with 2048.
+// That convenience is what makes every other test readable and it is exactly
+// the value these tests are about, so they go straight to the store.
+func (f *fixture) beginWithoutADiskSize(status string) *SnapshotRow {
+	f.t.Helper()
+
+	out, err := f.store.BeginSnapshot(f.ctx, BeginInput{
+		ClusterID:   f.cluster,
+		SnapshotID:  newUUID(f.t),
+		SourceKind:  SourceKindTemplate,
+		Status:      status,
+		CPUCount:    2,
+		MemoryMiB:   512,
+		DiskSizeMiB: 0,
+		Published:   true,
+		CreatedAtMs: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		f.t.Fatalf("open a row that does not know its disk size yet: %v", err)
+	}
+	if out.Rejected != nil {
+		f.t.Fatalf("open a row that does not know its disk size yet was refused: %s", out.Rejected.Reason)
+	}
+	return out.Row
+}
+
 func (f *fixture) commit(in CommitInput) *SnapshotRow {
 	f.t.Helper()
 
@@ -428,11 +457,11 @@ func TestBeginSnapshotRefusesRowsNothingCanInterpret(t *testing.T) {
 			break_: func(in *BeginInput) { in.MemoryMiB = 0 },
 			want:   "memory_mib",
 		},
-		{
-			name:   "no disk",
-			break_: func(in *BeginInput) { in.DiskSizeMiB = 0 },
-			want:   "disk_size_mib",
-		},
+		// 🔴 There is deliberately no "no disk" case here. 0 is what a v3
+		// template legitimately opens with — see
+		// TestBeginSnapshotAcceptsATemplateThatDoesNotKnowItsDiskSizeYet — and
+		// the rule that a disk size must be positive lives on the commit
+		// instead, where the row becomes launchable.
 		{
 			name:   "an id that is not a uuid",
 			break_: func(in *BeginInput) { in.SnapshotID = "not-a-uuid" },
@@ -474,6 +503,83 @@ func TestBeginSnapshotRefusesRowsNothingCanInterpret(t *testing.T) {
 	// a builder that never worked.
 	if _, err := f.store.BeginSnapshot(f.ctx, valid()); err != nil {
 		t.Fatalf("the valid row was refused too: %v", err)
+	}
+}
+
+// TestBeginSnapshotAcceptsATemplateThatDoesNotKnowItsDiskSizeYet is the defect
+// migration 0003 exists for, run.
+//
+// 🔴 A v3 template genuinely has no disk size when its row opens. The
+// E2B-compatible create request carries name, tags, cpuCount and memoryMB and
+// has no disk field at all; the real figure is the virtual size of a rootfs the
+// build has not produced yet, and the node's encoding for "not known yet" is 0
+// (src/template/build_spec.rs). While a positive disk size was demanded here,
+// every v3 template create on the cluster was refused with InvalidArgument
+// before a build could ever produce the number being demanded.
+func TestBeginSnapshotAcceptsATemplateThatDoesNotKnowItsDiskSizeYet(t *testing.T) {
+	f := newFixture(t)
+
+	// Not f.beginRaw: the fixture fills a 0 disk size in with 2048, and 0 is
+	// the value under test.
+	out, err := f.store.BeginSnapshot(f.ctx, BeginInput{
+		ClusterID:   f.cluster,
+		SnapshotID:  newUUID(t),
+		SourceKind:  SourceKindTemplate,
+		Status:      StatusWaiting,
+		CPUCount:    2,
+		MemoryMiB:   512,
+		DiskSizeMiB: 0,
+		Published:   true,
+		CreatedAtMs: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("a template that does not know its disk size yet was refused: %v", err)
+	}
+	if out.Rejected != nil {
+		t.Fatalf("begin was refused: %s", out.Rejected.Reason)
+	}
+	if out.Row == nil {
+		t.Fatal("begin returned neither a row nor a refusal")
+	}
+	// Kept as sent rather than corrected to something plausible: 0 is the
+	// statement that the build has not run.
+	if out.Row.DiskSizeMiB != 0 {
+		t.Fatalf("disk_size_mib = %d, want 0", out.Row.DiskSizeMiB)
+	}
+	// And it is not launchable, which is why 0 is safe here: no resolving query
+	// can return a row outside the ready group.
+	if out.Row.StatusGroup == StatusGroupReady {
+		t.Fatalf("a row with no disk size landed in the ready group")
+	}
+}
+
+// TestABuildFillsInTheDiskSizeItsTemplateOpenedWithout is the round trip: open
+// at 0, build, commit the size the build produced.
+func TestABuildFillsInTheDiskSizeItsTemplateOpenedWithout(t *testing.T) {
+	f := newFixture(t)
+
+	opened := f.beginWithoutADiskSize(StatusBuilding)
+	if opened.DiskSizeMiB != 0 {
+		t.Fatalf("the row opened at %d MiB, want 0", opened.DiskSizeMiB)
+	}
+
+	built := uint32(4096)
+	row := f.commit(CommitInput{SnapshotID: opened.SnapshotID, Published: true, DiskSizeMiB: &built})
+	if row.Status != StatusReady {
+		t.Fatalf("status = %q, want %q", row.Status, StatusReady)
+	}
+	if row.DiskSizeMiB != built {
+		t.Fatalf("disk_size_mib = %d, want %d", row.DiskSizeMiB, built)
+	}
+
+	// Read back, because what a launch gets is the row and not the commit's
+	// return value.
+	after, err := f.store.GetSnapshot(f.ctx, f.cluster, opened.SnapshotID, ReadOptions{})
+	if err != nil {
+		t.Fatalf("read the committed row: %v", err)
+	}
+	if after == nil || after.DiskSizeMiB != built {
+		t.Fatalf("the ready row carries %+v, want disk_size_mib %d", after, built)
 	}
 }
 
@@ -657,6 +763,95 @@ func TestCommitRefusesAnEmptyPayload(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("error = %v, want ErrInvalidArgument", err)
+	}
+}
+
+// TestCommitRefusesADiskSizeOfZero is the other end of the split: 0 means "not
+// known yet", and the commit is where that stops being an answer anything can
+// use. Refused in the store rather than by the CHECK, so the caller is told
+// which field is wrong.
+func TestCommitRefusesADiskSizeOfZero(t *testing.T) {
+	f := newFixture(t)
+
+	row := f.begin(BeginInput{Status: StatusBuilding})
+	zero := uint32(0)
+	_, err := f.commitRaw(CommitInput{
+		SnapshotID:  row.SnapshotID,
+		Published:   true,
+		DiskSizeMiB: &zero,
+	})
+	if err == nil {
+		t.Fatal("a commit stating the finished snapshot has no disk size was accepted")
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("error = %v, want ErrInvalidArgument", err)
+	}
+	if !strings.Contains(err.Error(), "disk_size_mib") {
+		t.Fatalf("error %q does not name the field", err)
+	}
+
+	// And the row did not move: a refused commit leaves a retryable build, not
+	// a half-flipped row.
+	after, err := f.store.GetSnapshot(f.ctx, f.cluster, row.SnapshotID, ReadOptions{})
+	if err != nil {
+		t.Fatalf("read the row back: %v", err)
+	}
+	if after == nil || after.Status != StatusBuilding {
+		t.Fatalf("row = %+v, want it still building", after)
+	}
+
+	// 🔴 And it is this guard doing it, not the table's CHECK catching the
+	// same value one layer down. A stated 0 is wrong about the *argument*, so
+	// it is refused before the row is looked at — against an id that does not
+	// exist, the caller is still told which field is wrong rather than being
+	// handed a NOT_FOUND and sent looking for a row. With the guard removed
+	// this is the case the CHECK cannot cover: the update matches nothing, so
+	// nothing is ever checked.
+	out, err := f.commitRaw(CommitInput{
+		SnapshotID:  newUUID(t),
+		Published:   true,
+		DiskSizeMiB: &zero,
+	})
+	if err == nil {
+		t.Fatalf("a commit with disk_size_mib = 0 against a missing row was not refused: %+v", out)
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("error = %v, want ErrInvalidArgument", err)
+	}
+}
+
+// TestCommitRefusesLeavingAReadyRowWithNoDiskSize is the residual case, and the
+// one worth a test of its own.
+//
+// 🔴 The resource fields are pointers and COALESCEd, so nil means "keep what
+// the begin recorded" — and when that is 0, a commit sending nothing asks for a
+// launchable row with no disk size. Nothing in the store can see it coming; the
+// table's CHECK is what catches it. What this pins is that the refusal arrives
+// as ErrInvalidArgument and not as the bare pg error, because everything
+// unclassified maps to UNAVAILABLE and the node would retry a write that can
+// never succeed.
+func TestCommitRefusesLeavingAReadyRowWithNoDiskSize(t *testing.T) {
+	f := newFixture(t)
+
+	row := f.beginWithoutADiskSize(StatusBuilding)
+	_, err := f.commitRaw(CommitInput{SnapshotID: row.SnapshotID, Published: true})
+	if err == nil {
+		t.Fatal("a row with no disk size was made ready")
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("the table's refusal reached the caller unclassified, as %v: "+
+			"catalogErrorCode maps that to UNAVAILABLE, which tells the node to retry forever", err)
+	}
+	if !strings.Contains(err.Error(), "disk_size_mib") {
+		t.Fatalf("error %q does not name the field", err)
+	}
+
+	after, err := f.store.GetSnapshot(f.ctx, f.cluster, row.SnapshotID, ReadOptions{})
+	if err != nil {
+		t.Fatalf("read the row back: %v", err)
+	}
+	if after == nil || after.Status != StatusBuilding {
+		t.Fatalf("row = %+v, want it still building", after)
 	}
 }
 

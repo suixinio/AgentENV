@@ -127,9 +127,19 @@ const unlockTimeout = 5 * time.Second
 // 🔴 When a later migration drops one of these, move it out of this map in the
 // same file — otherwise verifyApplied refuses every start after that migration
 // applies, on a database that is perfectly correct.
+//
+// 🔴 A migration that creates nothing still gets an entry, empty. An *absent*
+// version is how verifyApplied recognises a ledger written by a build newer
+// than this one — it skips it, because it cannot know what those files created
+// — and a version this build ships must never look like that. Leaving 3 out
+// would work today only because it happens to own no relations; it would be a
+// version this build carries and cannot describe, which is the state the map
+// exists to make impossible. TestEveryMigrationDeclaresItsRelations holds it
+// down.
 var relationsByVersion = map[int][]string{
 	1: {"snapshots"},
 	2: {"templates", "builds", "aliases", "active_templates"},
+	3: {}, // moves a CHECK from the column to `ready`; creates no relation
 }
 
 // ownedRelations is relationsByVersion flattened in version order, which is

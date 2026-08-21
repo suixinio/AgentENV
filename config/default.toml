@@ -344,12 +344,32 @@ p2p_enabled = true
 #     were given. The comparison does **not** catch this: it compares which
 #     snapshots each catalog holds, not what the rows say.
 #
+# 🔴 ROLLING `read` BACK. Moving read from "postgres" to "object_store" is
+# refused while object storage still owes writes, because those are snapshots it
+# would answer as absent — and callers delete artifacts and refuse resumes on
+# absence. A node in that state now drains what it owes before the refusal is
+# decided, so the ordinary rollback just works. If it still refuses, the drain
+# could not finish, and the move that looks obvious — start the node so the
+# compensator runs — is the one that does not work: the compensator starts after
+# the refusal, so a node that will not start never drains.
+#
+# The way out, in order:
+#   1. put `read` back to the side the node was last serving ("postgres") and
+#      start it. The compensator runs once it is up.
+#   2. wait for agentenv_snapshot_catalog_mirror_lag{direction="object_store"}
+#      and ..._diverged{direction="object_store"} to reach 0.
+#   3. set read = "object_store" and restart.
+# A recorded divergence is not debt and no replay clears it; it takes deleting
+# the snapshot it names, or an operator.
+#
 # 🔴 build_heartbeat_interval_secs must stay comfortably below the scheduler's
 # scheduler.catalog.build_heartbeat_ttl (5 minutes by default). A build that
 # goes unheard from for the TTL is ended and its template handed to whoever asks
 # next; a third of the TTL leaves room for two renewals to be lost — to a
 # scheduler rollout, a slow network — before a build that is running perfectly
-# well is taken away from it.
+# well is taken away from it. The scheduler cannot see this number, so it is
+# declared there a second time as scheduler.catalog.node_build_heartbeat_
+# interval, which its TTL floor is computed from — change one, change both.
 #
 # [snapshot.catalog]
 # write = "object_store"

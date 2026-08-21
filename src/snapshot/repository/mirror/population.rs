@@ -385,7 +385,7 @@ pub async fn admit_read_side(
 mod admission_tests {
     use super::*;
     use crate::snapshot::repository::mirror::test_doubles::{record_for, ScriptedCatalog};
-    use crate::snapshot::repository::mirror::MirrorOp;
+    use crate::snapshot::repository::mirror::{MirrorOp, MirrorTargets};
     use crate::snapshot::types::SnapshotRecord;
 
     /// A backlog on disk. `with_history` says whether the object store's
@@ -437,6 +437,137 @@ mod admission_tests {
 
     fn ids(count: usize) -> Vec<SnapshotId> {
         (0..count).map(|_| SnapshotId::generate()).collect()
+    }
+
+    /// 🔴 The rollback that could not be reached from the state that needs it.
+    ///
+    /// A node serving reads from PostgreSQL is put back on object storage.
+    /// Object storage owes writes, so the guard refuses — correctly; those are
+    /// snapshots it would answer as absent. But the compensator that pays the
+    /// debt off is started *after* this point, so a node that cannot start
+    /// cannot drain, and a node that cannot drain cannot start: the rollback
+    /// was only reachable by putting the node back on the side it had just
+    /// been taken off, waiting, and switching again.
+    ///
+    /// The drain runs first now. The control is the second half: a debt the
+    /// drain cannot settle still refuses, because the refusal itself was never
+    /// the defect.
+    #[tokio::test]
+    async fn a_rollback_drains_what_it_owes_before_it_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog_at(dir.path(), true).await;
+
+        // The node was serving PostgreSQL reads.
+        backlog
+            .record_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect("recording the side should work");
+
+        // And object storage is behind, which is what the rollback is refused
+        // for.
+        let record = record_for(&SnapshotId::generate());
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record.clone(),
+                },
+            )
+            .await;
+        assert_eq!(backlog.lag_toward(MirrorDirection::ObjectStore), 1);
+
+        let object_store = std::sync::Arc::new(ScriptedCatalog::default());
+        let targets = MirrorTargets::object_store(std::sync::Arc::clone(&object_store)
+            as std::sync::Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>);
+
+        // 🔴 The store is unreachable on this attempt, so the drain settles
+        // nothing and the guard has to refuse exactly as it did before. This
+        // is the control: without it, a test could pass by the drain having
+        // quietly become "give up and allow it".
+        object_store.break_it();
+        assert_eq!(
+            backlog
+                .settle_before_reading_from(CatalogReadSide::ObjectStore, &targets)
+                .await,
+            1,
+            "a drain against a store nobody can reach settles nothing"
+        );
+        let error = admit_read_side(
+            CatalogReadSide::ObjectStore,
+            &backlog,
+            &Unreachable,
+            &Unreachable,
+        )
+        .await
+        .expect_err("a rollback onto a store that is genuinely behind is still refused");
+        assert!(
+            error.to_string().contains("THE WAY OUT"),
+            "the refusal has to say how to get out of it, because the obvious move — start the \
+             node so the compensator runs — is the one that does not work: {error}"
+        );
+
+        // Now the store is reachable, which is the ordinary case: the debt is
+        // real, it is settleable, and nothing but the ordering stopped it.
+        object_store.fix_it();
+        assert_eq!(
+            backlog
+                .settle_before_reading_from(CatalogReadSide::ObjectStore, &targets)
+                .await,
+            0,
+            "the drain has to pay off what the guard would refuse on"
+        );
+        admit_read_side(
+            CatalogReadSide::ObjectStore,
+            &backlog,
+            &Unreachable,
+            &Unreachable,
+        )
+        .await
+        .expect("the rollback is allowed once what object storage owed is written");
+        assert_eq!(
+            object_store.holds(&record.id).map(|held| held.id),
+            Some(record.id),
+            "and the write it owed really landed, rather than being dropped to clear the number"
+        );
+    }
+
+    /// A restart on the side the node was already reading does not wait on a
+    /// drain: the guard does not refuse it, so there is nothing to unblock,
+    /// and every start would otherwise pay for a queue nobody is switching
+    /// away from.
+    #[tokio::test]
+    async fn a_restart_on_the_same_side_does_not_drain() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog_at(dir.path(), true).await;
+        backlog
+            .record_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("recording the side should work");
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        let object_store = std::sync::Arc::new(ScriptedCatalog::default());
+        let targets = MirrorTargets::object_store(std::sync::Arc::clone(&object_store)
+            as std::sync::Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>);
+
+        assert_eq!(
+            backlog
+                .settle_before_reading_from(CatalogReadSide::ObjectStore, &targets)
+                .await,
+            1,
+            "it reports the debt"
+        );
+        assert!(
+            object_store.calls().is_empty(),
+            "but it must not have touched the store: {:?}",
+            object_store.calls()
+        );
     }
 
     /// 🔴 Refusal branch one, reached through the door the config layer used to

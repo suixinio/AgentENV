@@ -757,6 +757,14 @@ impl CatalogReadSide {
     }
 }
 
+/// How long a start-up drain may run before the guard is asked anyway.
+///
+/// 🔴 A bound and not a wait-until-done. The queue may be large and the store
+/// slow, and a node that hangs in start-up is worse than one that refuses with
+/// a number in the message: the refusal names the remaining debt and the
+/// operator can decide, while a hang names nothing.
+const READ_SIDE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Key holding the read side the last process ran with.
 const READ_SIDE_KEY: &[u8] = b"meta:read_side";
 
@@ -984,6 +992,87 @@ impl MirrorBacklog {
             .sum()
     }
 
+    /// Pays off what the side about to answer reads still owes, before
+    /// [`Self::guard_read_side`] decides whether the switch is allowed.
+    ///
+    /// 🔴 This exists because the guard and the thing that clears what the
+    /// guard refuses on were on the wrong sides of a startup that stops. A
+    /// node reading PostgreSQL and being rolled back to object storage is
+    /// refused while object storage owes writes — correctly, they are
+    /// snapshots it would answer as absent — but the compensator that would
+    /// pay them off is spawned *after* the refusal, and a process that never
+    /// starts never drains. The rollback was therefore unreachable from the
+    /// state that most needs it, and the only way out was to put the node back
+    /// on the side it had just been taken off, wait, and switch again.
+    ///
+    /// A pass that repairs nothing stops the loop. That bounds this to one
+    /// unproductive attempt — the cost of a single compensator tick — rather
+    /// than spending an entry's replay budget, which would turn debt that is
+    /// merely waiting into a divergence no replay clears.
+    ///
+    /// Returns what is still owed. It does not decide anything: the guard
+    /// still runs, and still refuses if this could not finish the job.
+    pub async fn settle_before_reading_from(
+        &self,
+        configured: CatalogReadSide,
+        targets: &MirrorTargets,
+    ) -> u64 {
+        let direction = configured.debt_that_would_be_invisible();
+        // Only a switch. A restart on the side it was already reading is not
+        // something the guard refuses, so there is nothing here to unblock and
+        // no reason to make every start wait on a drain.
+        match self.recorded_read_side().await {
+            Ok(Some(previous)) if previous != configured => {}
+            _ => return self.lag_toward(direction),
+        }
+
+        let owed = self.lag_toward(direction);
+        if owed == 0 {
+            return 0;
+        }
+
+        let deadline = std::time::Instant::now() + READ_SIDE_DRAIN_BUDGET;
+        info!(
+            direction = direction.as_str(),
+            owed,
+            "the read side is being moved onto a store that is behind; draining what it owes \
+             before deciding whether the switch is allowed"
+        );
+
+        loop {
+            match self.drain_once(targets).await {
+                Ok(pass) => {
+                    if pass.remaining == 0 || pass.repaired == 0 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "a drain pass before the read-side switch could not run");
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    direction = direction.as_str(),
+                    remaining = self.lag_toward(direction),
+                    "gave up draining before the read-side switch: the queue is still shrinking, \
+                     but startup will not wait longer for it"
+                );
+                break;
+            }
+        }
+
+        let left = self.lag_toward(direction);
+        if left == 0 {
+            info!(
+                direction = direction.as_str(),
+                settled = owed,
+                "drained what the read side owed; the switch is no longer blocked by debt"
+            );
+        }
+        left
+    }
+
     /// Refuses to move reads onto a store that is behind.
     ///
     /// 🔴 This is what makes "switching the read side loses nothing" a fact
@@ -1058,13 +1147,21 @@ impl MirrorBacklog {
                      behind: {lag} write(s) still owed and {diverged} snapshot(s) recorded as \
                      diverged. Those snapshots exist in the other catalog and not in this one, so \
                      reads from it would report them as absent and callers would treat them as \
-                     deleted. Leave the read side where it is until \
-                     agentenv_snapshot_catalog_mirror_lag{{direction=\"{direction}\"}} and \
-                     agentenv_snapshot_catalog_mirror_diverged{{direction=\"{direction}\"}} both \
-                     reach 0, then switch.",
+                     deleted. This start already tried to drain the debt and could not finish. \
+                     THE WAY OUT: put snapshot.catalog.read back to \"{previous}\" — the side \
+                     this node was last serving — and start it. The compensator runs once the \
+                     node is up, and only once it is up; it will pay the queue off. Then wait \
+                     for agentenv_snapshot_catalog_mirror_lag{{direction=\"{direction}\"}} and \
+                     agentenv_snapshot_catalog_mirror_diverged{{direction=\"{direction}\"}} to \
+                     reach 0 and switch again. A recorded divergence is not debt and no replay \
+                     clears it: it takes deleting the snapshot it names, or an operator.",
                     configured = match configured {
                         CatalogReadSide::ObjectStore => "object_store",
                         CatalogReadSide::Postgres => "postgres",
+                    },
+                    previous = match configured {
+                        CatalogReadSide::ObjectStore => "postgres",
+                        CatalogReadSide::Postgres => "object_store",
                     },
                     store = direction.store_name(),
                     direction = direction.as_str(),

@@ -108,6 +108,22 @@ pub async fn build_snapshot_backend(
         SnapshotCatalogRead::Postgres => CatalogReadSide::Postgres,
     };
 
+    let targets = MirrorTargets::object_store(Arc::clone(&object_store_catalog))
+        .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>);
+
+    // 🔴 Before the guard, because the guard refuses on debt and the only
+    // thing that pays debt off used to start after it. A node reading
+    // PostgreSQL that is being rolled back to object storage is refused while
+    // object storage still owes writes — and the compensator that would settle
+    // them is spawned below, on a start that never happens. The rollback was
+    // therefore unreachable from precisely the state that needs it.
+    //
+    // This is bounded and it decides nothing: the guard runs either way, on
+    // whatever is left.
+    backlog
+        .settle_before_reading_from(configured_read, &targets)
+        .await;
+
     // 🔴 Before anything is served. A node whose read side has just been moved
     // onto a store that does not hold everything would answer "absent" for
     // every snapshot the other one has, and absence is an instruction
@@ -134,8 +150,7 @@ pub async fn build_snapshot_backend(
 
     let compensator = MirrorCompensator::spawn(
         Arc::clone(&backlog),
-        MirrorTargets::object_store(Arc::clone(&object_store_catalog))
-            .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+        targets,
         std::time::Duration::from_secs(config.snapshot.catalog.mirror_compensator_interval_secs),
     );
 

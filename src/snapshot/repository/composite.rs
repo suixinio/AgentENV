@@ -141,12 +141,19 @@ impl SnapshotRepository {
             .await;
 
         match imported {
-            Ok(imported) => Ok(StagedSnapshot {
-                commit: SnapshotCommit::new(&metadata, imported),
-                staged_at_unix_ms: now_unix_ms(),
-                origin_node_id: self.origin_node_id.clone(),
-                execution_id,
-            }),
+            // 🔴 One clock read, used twice. The instant the bytes were staged
+            // *is* the instant the snapshot came into being, and it is the
+            // value both catalogs must record — so it is decided once, here,
+            // rather than by whichever store's `now` runs first.
+            Ok(imported) => {
+                let staged_at_unix_ms = now_unix_ms();
+                Ok(StagedSnapshot {
+                    commit: SnapshotCommit::new(&metadata, imported, staged_at_unix_ms),
+                    staged_at_unix_ms,
+                    origin_node_id: self.origin_node_id.clone(),
+                    execution_id,
+                })
+            }
             Err(error) => {
                 self.roll_back_publish(&metadata.id, &publications).await;
                 Err(error)

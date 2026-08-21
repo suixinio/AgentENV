@@ -138,6 +138,21 @@ fn committed(marker: &str) -> CommittedSnapshot {
 }
 
 fn sandbox_commit(id: SnapshotId, alias: Option<&str>, marker: &str) -> SnapshotCommit {
+    sandbox_commit_created_at(id, alias, marker, now_unix_ms())
+}
+
+/// The same commit, made to claim it was created at a stated instant.
+///
+/// 🔴 The backfill's whole job is to replay writes that are *older* than the
+/// queue, so the tests that cover it need a commit whose creation time is not
+/// the moment the test ran — otherwise "the replay stamped its own clock" and
+/// "the replay carried the original" look identical.
+fn sandbox_commit_created_at(
+    id: SnapshotId,
+    alias: Option<&str>,
+    marker: &str,
+    created_at_unix_ms: i64,
+) -> SnapshotCommit {
     SnapshotCommit {
         id,
         alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias should parse")),
@@ -149,8 +164,16 @@ fn sandbox_commit(id: SnapshotId, alias: Option<&str>, marker: &str) -> Snapshot
             memory_mib: 512,
             disk_size_mib: 2048,
         },
+        created_at_unix_ms: Some(created_at_unix_ms),
         committed: committed(marker),
     }
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn template_record(id: SnapshotId, alias: Option<&str>) -> SnapshotRecord {

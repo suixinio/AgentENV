@@ -120,21 +120,45 @@ pub struct SnapshotCommit {
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotPublishSource,
     pub resources: SandboxResources,
+    /// The instant the row this commit opens must record as its creation.
+    ///
+    /// 🔴 Carried rather than left to each store's clock, and the two reasons
+    /// are different sizes. The small one: a pause writes two catalogs, each
+    /// stamped its own `now`, so every snapshot's `createdAt` differed between
+    /// them by one RPC's latency and no comparison of the two could ever be
+    /// exact. The large one: a *replayed* commit stamps the replay's clock, so
+    /// the backfill that queued the object store's history into the central
+    /// catalog rewrote all thirty-two rows' creation times to the moment the
+    /// backfill ran — which is the column the listing orders by and the one
+    /// `createdAt` is served from.
+    ///
+    /// `None` means "whichever store takes this decides", which is what a
+    /// commit recorded by a build older than this field means and all a caller
+    /// with no better answer than *now* can say. It is not a default anything
+    /// new should choose.
+    #[serde(default)]
+    pub created_at_unix_ms: Option<i64>,
     pub committed: CommittedSnapshot,
 }
 
 impl SnapshotCommit {
     /// Joins a publish request with what the artifact store stored.
     ///
-    /// Pure: no I/O, no backend knowledge. This is the value that crosses from
-    /// the byte half to the row half, and the reason the row half can be
-    /// remote.
-    pub fn new(metadata: &SnapshotPublishMetadata, imported: ImportedSnapshotArtifacts) -> Self {
+    /// Pure: no I/O, no backend knowledge, and no clock — `created_at_unix_ms`
+    /// is passed in for the same reason the rest of this is a value. This is
+    /// what crosses from the byte half to the row half, and the reason the row
+    /// half can be remote.
+    pub fn new(
+        metadata: &SnapshotPublishMetadata,
+        imported: ImportedSnapshotArtifacts,
+        created_at_unix_ms: i64,
+    ) -> Self {
         Self {
             id: metadata.id.clone(),
             alias: metadata.alias.clone(),
             source: metadata.source.clone(),
             resources: metadata.resources,
+            created_at_unix_ms: Some(created_at_unix_ms),
             committed: CommittedSnapshot {
                 context: metadata.context.clone(),
                 startup: metadata.startup.clone(),

@@ -118,6 +118,7 @@ impl SnapshotCatalog for OssSnapshotCatalog {
                 commit.resources,
                 commit.committed,
                 commit.source,
+                commit.created_at_unix_ms,
             )
             .await?;
         debug!(snapshot_id = %id, "published snapshot to oss");
@@ -319,6 +320,12 @@ impl OssSnapshotCatalog {
             .map_err(|e| RepositoryError::backend("write snapshot record", e))
     }
 
+    /// `created_at_unix_ms` is the instant the *caller* decided this snapshot
+    /// came into being, and it is used only when this call is the one creating
+    /// the row. A record that already exists keeps the creation time it has —
+    /// that is the same rule `mark_committed` follows, and it is why a template
+    /// published long after it was created does not appear to be new.
+    #[allow(clippy::too_many_arguments)]
     async fn write_committed_record(
         &self,
         id: SnapshotId,
@@ -326,6 +333,7 @@ impl OssSnapshotCatalog {
         resources: crate::types::SandboxResources,
         committed: CommittedSnapshot,
         source: SnapshotPublishSource,
+        created_at_unix_ms: Option<i64>,
     ) -> RepositoryResult<SnapshotRecord> {
         let now = now_unix_ms();
         let record = if let Some(mut record) = self.read_record(&id).await? {
@@ -350,7 +358,7 @@ impl OssSnapshotCatalog {
                 alias,
                 source,
                 resources,
-                created_at_unix_ms: now,
+                created_at_unix_ms: created_at_unix_ms.unwrap_or(now),
                 updated_at_unix_ms: now,
                 committed: Some(committed),
             }
@@ -551,6 +559,7 @@ mod tests {
             alias: alias.map(|value| SnapshotAlias::parse(value).expect("alias parses")),
             source: SnapshotPublishSource::Template,
             resources: SandboxResources::default(),
+            created_at_unix_ms: None,
             committed: CommittedSnapshot::mock(),
         }
     }

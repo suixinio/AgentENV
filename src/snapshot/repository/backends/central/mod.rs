@@ -828,13 +828,19 @@ pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
         },
     };
 
+    // 🔴 The commit's instant, not this call's. A replay runs hours or days
+    // after the snapshot was made, and stamping the replay's clock here is what
+    // rewrote every backfilled row's creation time to the moment the backfill
+    // ran — the column the listing orders by. `updated_at` is the replay's
+    // clock on purpose: a replay really is the last thing that touched the row.
+    let now = now_unix_ms();
     SnapshotRecord {
         id: commit.id.clone(),
         alias: None,
         source,
         resources: commit.resources,
-        created_at_unix_ms: now_unix_ms(),
-        updated_at_unix_ms: now_unix_ms(),
+        created_at_unix_ms: commit.created_at_unix_ms.unwrap_or(now),
+        updated_at_unix_ms: now,
         committed: None,
     }
 }
@@ -912,6 +918,7 @@ mod tests {
                 source_sandbox_id: "sbx".to_string(),
             },
             resources: crate::types::SandboxResources::default(),
+            created_at_unix_ms: None,
             committed: crate::snapshot::types::CommittedSnapshot::mock(),
         };
 

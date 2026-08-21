@@ -43,7 +43,7 @@
 //! that motivated it is classified at the wire now, but a cap has to hold for
 //! the failure nobody has classified yet.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -67,8 +67,8 @@ use crate::snapshot::types::{
 
 use super::central::CentralCatalogWrites;
 use super::metrics::{
-    record_mirror_repair_failed, record_mirror_repaired, record_mirror_unrecorded,
-    set_mirror_diverged, set_mirror_lag,
+    record_mirror_content_mismatch, record_mirror_repair_failed, record_mirror_repaired,
+    record_mirror_unrecorded, set_mirror_diverged, set_mirror_lag,
 };
 
 /// Which store is behind.
@@ -381,6 +381,9 @@ impl MirrorTarget for CentralTarget {
     }
 }
 
+/// The object store and the central catalog, in that order.
+type TargetPair<'a> = (&'a Arc<dyn MirrorTarget>, &'a Arc<dyn MirrorTarget>);
+
 /// The stores a repair pass may replay into.
 ///
 /// 🔴 Either may be absent, and absent is not the same as broken. Rolling the
@@ -413,6 +416,192 @@ impl MirrorTargets {
             MirrorDirection::ObjectStore => self.object_store.as_ref(),
             MirrorDirection::Central => self.central.as_ref(),
         }
+    }
+
+    /// Both stores, or nothing.
+    ///
+    /// A comparison needs two sides. With the double write rolled back to one
+    /// direction there is no second row to compare against, and inventing one
+    /// would be the same failure as the number this comparison exists to fix.
+    fn pair(&self) -> Option<TargetPair<'_>> {
+        Some((self.object_store.as_ref()?, self.central.as_ref()?))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Do the two catalogs agree about this snapshot?
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What comparing the two catalogs' rows for one snapshot found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CatalogComparison {
+    /// Both stores answered and their rows say the same thing.
+    Agree,
+    /// There is only one store, so there is nothing to compare against.
+    NotComparable,
+    /// One of the stores could not be asked, so nothing was learned.
+    Unreadable(String),
+    /// Both answered and they say different things.
+    Disagree { field: &'static str, detail: String },
+}
+
+/// The fields the two catalogs are required to agree on, in the order a
+/// disagreement is reported.
+///
+/// 🔴 What is *not* here is as deliberate as what is, because every exclusion
+/// is a way the two rows may legitimately differ:
+///
+///   - `updated_at_unix_ms`. Each store stamps its own clock on the paths that
+///     do not carry one — the central table's trigger fills it in when the
+///     caller says nothing — so two rows written by one call differ by the
+///     latency of an RPC. It records when a row was last touched, and a replay
+///     really is a touch.
+///   - `build.started_at_unix_ms` / `build.finished_at_unix_ms`. This build
+///     never sends them to the central catalog; comparing them would report a
+///     disagreement about a value one side was never given.
+///   - `build.error_reason`. The history backfill synthesises a reason for a
+///     build that had already failed before the mirror existed and whose object
+///     store row records no reason at all. That is a deliberate asymmetry, and
+///     flagging it would make every such template a permanent divergence.
+///
+/// `created_at_unix_ms` leads the list because it is the one this comparison
+/// was written for: it is the column the listing orders by, the value
+/// `createdAt` is served from, and the only field no later write ever changes —
+/// so a difference in it is never a race and always a defect.
+fn catalog_disagreement(
+    object_store: Option<&SnapshotRecord>,
+    central: Option<&SnapshotRecord>,
+) -> Option<(&'static str, String)> {
+    let (left, right) = match (object_store, central) {
+        (None, None) => return None,
+        (Some(left), None) => {
+            return Some((
+                "presence",
+                format!(
+                    "object storage holds '{}' and the central catalog does not",
+                    left.id
+                ),
+            ))
+        }
+        (None, Some(right)) => {
+            return Some((
+                "presence",
+                format!(
+                    "the central catalog holds '{}' and object storage does not",
+                    right.id
+                ),
+            ))
+        }
+        (Some(left), Some(right)) => (left, right),
+    };
+
+    let compared: [(&'static str, String, String); 5] = [
+        (
+            "created_at",
+            left.created_at_unix_ms.to_string(),
+            right.created_at_unix_ms.to_string(),
+        ),
+        ("alias", alias_of(left), alias_of(right)),
+        ("resources", resources_of(left), resources_of(right)),
+        ("source", source_of(left), source_of(right)),
+        (
+            "build_status",
+            build_status_of(left),
+            build_status_of(right),
+        ),
+    ];
+    for (field, ours, theirs) in compared {
+        if ours != theirs {
+            return Some((
+                field,
+                format!(
+                    "the two catalogs disagree about '{}': object storage says {field} is \
+                     {ours}, the central catalog says {theirs}",
+                    left.id
+                ),
+            ));
+        }
+    }
+
+    // 🔴 Structurally, not by serialised bytes. `CommandContext` carries two
+    // `HashMap`s, whose JSON key order is whatever the hasher chose this
+    // process — so a byte comparison would call two identical payloads
+    // different, at random, on about every other run.
+    let payload = |record: &SnapshotRecord| {
+        record
+            .committed
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+    };
+    match (payload(left), payload(right)) {
+        (Ok(ours), Ok(theirs)) if ours != theirs => Some((
+            "committed",
+            format!(
+                "the two catalogs hold different committed payloads for '{}'",
+                left.id
+            ),
+        )),
+        // Neither payload can be re-encoded, which is this process's defect and
+        // not a disagreement between two stores. Left to the ordinary
+        // serialisation error paths rather than reported as a divergence.
+        _ => None,
+    }
+}
+
+fn alias_of(record: &SnapshotRecord) -> String {
+    record
+        .alias
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn resources_of(record: &SnapshotRecord) -> String {
+    format!(
+        "{}cpu/{}MiB/{}MiB",
+        record.resources.cpu_count, record.resources.memory_mib, record.resources.disk_size_mib
+    )
+}
+
+fn source_of(record: &SnapshotRecord) -> String {
+    match &record.source {
+        SnapshotSource::Template { .. } => "template".to_string(),
+        SnapshotSource::Sandbox { source_sandbox_id } => format!("sandbox/{source_sandbox_id}"),
+    }
+}
+
+fn build_status_of(record: &SnapshotRecord) -> String {
+    match build_status(record) {
+        Some(status) => format!("{status:?}"),
+        None => "n/a".to_string(),
+    }
+}
+
+/// Reads one snapshot out of both stores and compares the two rows.
+async fn compare_catalogs(targets: &MirrorTargets, id: &SnapshotId) -> CatalogComparison {
+    let Some((object_store, central)) = targets.pair() else {
+        return CatalogComparison::NotComparable;
+    };
+    let left = match object_store.probe(id).await {
+        Ok(row) => row,
+        Err(error) => {
+            return CatalogComparison::Unreadable(format!(
+                "object storage could not be asked what it holds for '{id}': {error}"
+            ))
+        }
+    };
+    let right = match central.probe(id).await {
+        Ok(row) => row,
+        Err(error) => {
+            return CatalogComparison::Unreadable(format!(
+                "the central catalog could not be asked what it holds for '{id}': {error}"
+            ))
+        }
+    };
+    match catalog_disagreement(left.as_ref(), right.as_ref()) {
+        None => CatalogComparison::Agree,
+        Some((field, detail)) => CatalogComparison::Disagree { field, detail },
     }
 }
 
@@ -1046,10 +1235,15 @@ impl MirrorBacklog {
         let mut pass = RepairPass::default();
         let mut blocked: HashSet<(MirrorDirection, SnapshotId)> = HashSet::new();
 
+        // 🔴 Decoded up front, because the pass needs to know which entry is
+        // the *last* one queued about each snapshot before it starts settling
+        // any of them. See where `last_word` is consulted below.
+        let mut queued: Vec<(Vec<u8>, u64, OwedWrite)> = Vec::with_capacity(entries.len());
+        let mut last_word: HashMap<SnapshotId, u64> = HashMap::new();
         for (key, value) in entries {
-            if decode_seq(&key).is_none() {
+            let Some(seq) = decode_seq(&key) else {
                 continue;
-            }
+            };
             let owed = match OwedWrite::decode(&value) {
                 Ok(owed) => owed,
                 Err(error) => {
@@ -1065,6 +1259,14 @@ impl MirrorBacklog {
                     continue;
                 }
             };
+            let latest = last_word
+                .entry(owed.op.snapshot_id().clone())
+                .or_insert(seq);
+            *latest = (*latest).max(seq);
+            queued.push((key, seq, owed));
+        }
+
+        for (key, seq, owed) in queued {
             let direction = owed.direction;
             let attempts = owed.attempts;
             let op = owed.op;
@@ -1093,6 +1295,42 @@ impl MirrorBacklog {
                     .map(|existing| reflects(&op, existing.as_ref()))
             };
             let mut verdict = verdict_for(&replay, already_applied);
+
+            // 🔴 Repaired used to mean "the target took the write", and the
+            // read-side guard reported that as the two catalogs *agreeing*.
+            // Those are not the same claim: the backfill replayed thirty-two
+            // publishes that every number called repaired, into rows whose
+            // creation times were all wrong. So an entry that is about to leave
+            // the queue is checked — both stores are read and their rows
+            // compared — and a difference keeps it as debt rather than letting
+            // the lag reach zero over it.
+            //
+            // 🔴 Only for the last entry queued about this snapshot. An earlier
+            // one is *meant* to be overtaken: a create followed by the failure
+            // that ended that build leaves the row in a state the create never
+            // described, and comparing there would record a divergence the very
+            // next entry was about to settle — permanently, since nothing but a
+            // delete clears one.
+            let mut mismatch: Option<(&'static str, String)> = None;
+            if verdict == RepairVerdict::Repaired && last_word.get(op.snapshot_id()) == Some(&seq) {
+                match compare_catalogs(targets, op.snapshot_id()).await {
+                    CatalogComparison::Agree | CatalogComparison::NotComparable => {}
+                    CatalogComparison::Unreadable(reason) => {
+                        // Unverified is not verified. The write landed, but the
+                        // claim the lag makes is about *agreement*, and nothing
+                        // here established any — so the entry stays debt until
+                        // something can.
+                        mismatch = Some(("unreadable", reason));
+                        verdict = RepairVerdict::Retry;
+                    }
+                    CatalogComparison::Disagree { field, detail } => {
+                        record_mirror_content_mismatch(direction, field);
+                        mismatch = Some((field, detail));
+                        verdict = RepairVerdict::Retry;
+                    }
+                }
+            }
+
             // 🔴 The cap is applied here rather than inside `verdict_for`,
             // which is a decision about *this* attempt and has no business
             // knowing how many came before it. What the cap changes is whether
@@ -1138,10 +1376,10 @@ impl MirrorBacklog {
                     // of it is durable, because a queue entry that was dropped
                     // and not written down anywhere would be a disagreement
                     // that disappeared.
-                    let refusal = replay
+                    let refusal = mismatch
                         .as_ref()
-                        .err()
-                        .map(|error| error.to_string())
+                        .map(|(_, detail)| detail.clone())
+                        .or_else(|| replay.as_ref().err().map(|error| error.to_string()))
                         .unwrap_or_else(|| "the store refused the replay".to_string());
                     let reason = if exhausted {
                         format!(
@@ -1161,6 +1399,17 @@ impl MirrorBacklog {
                     blocked.insert((direction, op.snapshot_id().clone()));
                 }
                 RepairVerdict::Retry => {
+                    if let Some((field, detail)) = &mismatch {
+                        warn!(
+                            direction = direction.as_str(),
+                            op = op.name(),
+                            snapshot_id = %op.snapshot_id(),
+                            field,
+                            detail,
+                            "an owed catalog mirror write replayed, but the two catalogs still \
+                             do not agree about this snapshot; it stays counted as debt"
+                        );
+                    }
                     // The count goes back to disk before the entry is left
                     // alone, so that the cap survives the restart the entry
                     // itself is designed to survive.
@@ -1284,6 +1533,14 @@ fn history_ops(record: SnapshotRecord) -> Vec<MirrorOp> {
 ///
 /// The inverse of `commit_opening_record`, and it exists only for the backfill:
 /// every other publish still has the real `SnapshotCommit` in hand.
+///
+/// 🔴 `created_at_unix_ms` is copied, not left for the replay to stamp. This
+/// is the one place in the whole queue where the write being replayed is older
+/// than the queue itself, and a replay that stamped its own clock rewrote every
+/// backfilled row's creation time to the moment the backfill ran. Measured:
+/// thirty-two rows in PostgreSQL all reading one instant, against object
+/// storage's real spread — a different listing order and a wrong `createdAt`
+/// for every snapshot that existed before the double write was turned on.
 fn commit_from_record(record: SnapshotRecord) -> Option<SnapshotCommit> {
     let committed = record.committed?;
     Some(SnapshotCommit {
@@ -1296,6 +1553,7 @@ fn commit_from_record(record: SnapshotRecord) -> Option<SnapshotCommit> {
             }
         },
         resources: record.resources,
+        created_at_unix_ms: Some(record.created_at_unix_ms),
         committed,
     })
 }
@@ -1313,6 +1571,7 @@ mod tests {
     use crate::snapshot::repository::mirror::test_doubles::{
         commit_for, committed_record, record_for, ScriptedCatalog, ScriptedCentral,
     };
+    use crate::snapshot::types::SnapshotAlias;
 
     /// A backlog on a node that has already queued its object store's history.
     ///
@@ -1575,7 +1834,10 @@ mod tests {
             )
             .await;
 
+        // The object store already took this write — that is *why* it is owed
+        // to the central catalog and to nothing else.
         let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.seed(record_for(&id));
         let central = Arc::new(ScriptedCentral::default());
         let pass = backlog
             .drain_once(
@@ -1588,8 +1850,12 @@ mod tests {
         assert_eq!(pass.repaired, 1);
         assert!(central.holds(&id).is_some());
         assert!(
-            object_store.calls().is_empty(),
-            "a central debt must not be paid into the object store: {:?}",
+            !object_store
+                .calls()
+                .iter()
+                .any(|call| !call.starts_with("get:")),
+            "a central debt must not be *written* into the object store; only read back to \
+             compare: {:?}",
             object_store.calls()
         );
     }
@@ -1625,6 +1891,7 @@ mod tests {
             },
         );
         let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.seed(record_for(&id));
 
         let pass = backlog
             .drain_once(
@@ -1854,6 +2121,7 @@ mod tests {
 
         let central = Arc::new(ScriptedCentral::default());
         let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.hold(&id);
         let pass = reopened
             .drain_once(
                 &targets(&object_store)
@@ -2342,6 +2610,316 @@ mod tests {
             "a snapshot that was published before the mirror existed must arrive published"
         );
         assert!(central.holds(&waiting).is_some());
+    }
+
+    /// 🔴 B-1. The replay carries the snapshot's own creation time, not the
+    /// replay's.
+    ///
+    /// Measured on the cluster: all thirty-two backfilled rows in PostgreSQL
+    /// read one instant — the moment the backfill ran — against object
+    /// storage's real spread across two minutes. `created_at_ms` is what the
+    /// listing orders by and what `createdAt` is served from, so PostgreSQL
+    /// returned those thirty-two in a completely different order and would have
+    /// told every caller the wrong creation date. And `lag == 0` called it
+    /// agreement.
+    #[tokio::test]
+    async fn a_backfilled_publish_keeps_the_creation_time_it_already_had() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+        let published = SnapshotId::generate();
+        let object_store =
+            Arc::new(ScriptedCatalog::default().with_history(vec![committed_record(&published)]));
+        backlog
+            .queue_history_toward_central(object_store.as_ref())
+            .await
+            .expect("the history should queue");
+
+        let central = Arc::new(ScriptedCentral::default());
+        let pass = backlog
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 1);
+        let row = central.holds(&published).expect("the row should be there");
+        assert_eq!(
+            row.created_at_unix_ms,
+            committed_record(&published).created_at_unix_ms,
+            "a replayed publish must record the snapshot's creation time, not the replay's"
+        );
+    }
+
+    /// 🔴 B-1, the other half. A store that *took* the write is not the same
+    /// thing as two stores that agree, and the lag is read as the second.
+    ///
+    /// Here the central catalog accepts a create whose creation time is not the
+    /// one object storage holds. Every number before this said repaired.
+    #[tokio::test]
+    async fn a_write_the_target_took_over_a_row_that_disagrees_is_still_debt() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.seed(record_for(&id));
+
+        let mut drifted = record_for(&id);
+        drifted.created_at_unix_ms += 5_000;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create { record: drifted },
+            )
+            .await;
+
+        let central = Arc::new(ScriptedCentral::default());
+        let pass = backlog
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 0, "the two catalogs do not agree");
+        assert_eq!(pass.retry, 1);
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::Central),
+            1,
+            "the lag must not reach zero over rows that say different things"
+        );
+    }
+
+    /// A disagreement no pass can close stops being debt and becomes a
+    /// divergence that names the field, rather than the refusal of a replay
+    /// that in fact succeeded.
+    #[tokio::test]
+    async fn a_disagreement_nothing_settles_becomes_a_divergence() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.seed(record_for(&id));
+        let mut drifted = record_for(&id);
+        drifted.created_at_unix_ms += 5_000;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create { record: drifted },
+            )
+            .await;
+
+        let central = Arc::new(ScriptedCentral::default());
+        let targets = targets(&object_store)
+            .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>);
+        for _ in 1..MAX_REPLAY_ATTEMPTS {
+            backlog
+                .drain_once(&targets)
+                .await
+                .expect("the pass should run");
+        }
+        let pass = backlog
+            .drain_once(&targets)
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.diverged, 1);
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+    }
+
+    /// 🔴 A comparison nobody could make is not a comparison that passed.
+    ///
+    /// The write landed; what the lag claims is that the two catalogs agree,
+    /// and a store that would not answer established nothing of the sort.
+    #[tokio::test]
+    async fn a_comparison_that_could_not_be_made_leaves_the_write_owed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        object_store.seed(record_for(&id));
+        object_store.break_reads();
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&id),
+                },
+            )
+            .await;
+
+        let central = Arc::new(ScriptedCentral::default());
+        let pass = backlog
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert!(
+            central.holds(&id).is_some(),
+            "the write itself still has to land"
+        );
+        assert_eq!(pass.repaired, 0);
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 1);
+    }
+
+    /// 🔴 Only the *last* entry queued about a snapshot is compared, and this
+    /// is why.
+    ///
+    /// A build that had already failed replays as a create plus the failure —
+    /// no single central statement opens a row already in `error`. Between the
+    /// two the central row is `waiting` while object storage says `error`, and
+    /// a comparison made there would record a divergence the very next entry
+    /// was about to settle. Nothing but deleting the snapshot clears one.
+    #[tokio::test]
+    async fn a_snapshot_still_holding_a_later_entry_is_not_compared_yet() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = unmirrored_backlog(&dir).await;
+        let failed = SnapshotId::generate();
+        let object_store =
+            Arc::new(ScriptedCatalog::default().with_history(vec![errored_template(&failed)]));
+        backlog
+            .queue_history_toward_central(object_store.as_ref())
+            .await
+            .expect("the history should queue");
+
+        let central = Arc::new(ScriptedCentral::default());
+        let pass = backlog
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 2, "both halves of the replay have to land");
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
+        assert_eq!(
+            backlog.diverged_toward(MirrorDirection::Central),
+            0,
+            "the state between a create and the failure that follows it is not a divergence"
+        );
+    }
+
+    // ── what "the two catalogs agree" compares ──────────────────────────
+
+    #[test]
+    fn two_rows_that_say_the_same_thing_agree() {
+        let id = SnapshotId::generate();
+        assert_eq!(
+            catalog_disagreement(Some(&committed_record(&id)), Some(&committed_record(&id))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_row_only_one_catalog_holds_is_a_disagreement() {
+        let id = SnapshotId::generate();
+        let row = record_for(&id);
+        assert_eq!(
+            catalog_disagreement(Some(&row), None).map(|(field, _)| field),
+            Some("presence")
+        );
+        assert_eq!(
+            catalog_disagreement(None, Some(&row)).map(|(field, _)| field),
+            Some("presence")
+        );
+        assert_eq!(catalog_disagreement(None, None), None);
+    }
+
+    #[test]
+    fn each_compared_field_is_actually_compared() {
+        let id = SnapshotId::generate();
+        let base = committed_record(&id);
+
+        let mut moved = base.clone();
+        moved.created_at_unix_ms += 1;
+        let mut renamed = base.clone();
+        renamed.alias = Some(SnapshotAlias::parse("named").expect("alias parses"));
+        let mut resized = base.clone();
+        resized.resources.memory_mib += 1;
+        let mut resourced = base.clone();
+        resourced.source = SnapshotSource::Sandbox {
+            source_sandbox_id: "sbx".to_string(),
+        };
+        let mut failed = base.clone();
+        if let SnapshotSource::Template { build } = &mut failed.source {
+            build.status = TemplateBuildStatus::Error;
+        }
+        let mut repayloaded = base.clone();
+        repayloaded
+            .committed
+            .as_mut()
+            .expect("a committed row")
+            .runtime_versions
+            .kernel_version = "kernel-other".to_string();
+        let mut uncommitted = base.clone();
+        uncommitted.committed = None;
+
+        for (expected, other) in [
+            ("created_at", moved),
+            ("alias", renamed),
+            ("resources", resized),
+            ("source", resourced),
+            ("build_status", failed),
+            ("committed", repayloaded),
+            ("committed", uncommitted),
+        ] {
+            assert_eq!(
+                catalog_disagreement(Some(&base), Some(&other)).map(|(field, _)| field),
+                Some(expected),
+                "a difference in {expected} has to be reported as one"
+            );
+        }
+    }
+
+    /// 🔴 The exclusions, held still. Each of these differs between the two
+    /// catalogs on paths that are working correctly, and reporting one would
+    /// make a healthy cluster look permanently divergent.
+    #[test]
+    fn the_bookkeeping_a_store_keeps_to_itself_is_not_a_disagreement() {
+        let id = SnapshotId::generate();
+        let base = committed_record(&id);
+
+        let mut touched = base.clone();
+        touched.updated_at_unix_ms += 60_000;
+
+        let mut timed = base.clone();
+        if let SnapshotSource::Template { build } = &mut timed.source {
+            build.started_at_unix_ms = Some(1);
+            build.finished_at_unix_ms = Some(2);
+        }
+
+        let mut explained = base.clone();
+        if let SnapshotSource::Template { build } = &mut explained.source {
+            build.error_reason = Some(TemplateBuildErrorReason::new("object storage never said"));
+        }
+
+        for (why, other) in [
+            ("updated_at is each store's own clock", touched),
+            (
+                "build timestamps are never sent to the central catalog",
+                timed,
+            ),
+            (
+                "the backfill synthesises a reason object storage does not hold",
+                explained,
+            ),
+        ] {
+            assert_eq!(
+                catalog_disagreement(Some(&base), Some(&other)),
+                None,
+                "{why}"
+            );
+        }
     }
 
     /// 🔴 A backfill that could not read the object store must not mark itself

@@ -22,12 +22,24 @@ use crate::types::SandboxResources;
 
 use super::central::CentralCatalogWrites;
 
+/// One instant, shared by every fixture here.
+///
+/// 🔴 Fixed rather than read from the clock. The checks these doubles feed
+/// compare the two catalogs' rows against each other, and two fixtures built a
+/// millisecond apart would disagree about a snapshot's creation time for a
+/// reason that has nothing to do with what the test is holding still.
+pub(crate) const CREATED_AT: i64 = 1_700_000_000_000;
+
 pub(crate) fn committed() -> CommittedSnapshot {
     CommittedSnapshot::mock()
 }
 
 pub(crate) fn record_for(id: &SnapshotId) -> SnapshotRecord {
-    SnapshotRecord::template_waiting(id.clone(), None, SandboxResources::default())
+    let mut record =
+        SnapshotRecord::template_waiting(id.clone(), None, SandboxResources::default());
+    record.created_at_unix_ms = CREATED_AT;
+    record.updated_at_unix_ms = CREATED_AT;
+    record
 }
 
 pub(crate) fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit {
@@ -36,6 +48,7 @@ pub(crate) fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit
         alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias parses")),
         source: SnapshotPublishSource::Template,
         resources: SandboxResources::default(),
+        created_at_unix_ms: Some(CREATED_AT),
         committed: committed(),
     }
 }
@@ -59,13 +72,18 @@ pub(crate) fn committed_record(id: &SnapshotId) -> SnapshotRecord {
 
 /// A catalog that answers however a test tells it to, and writes down what it
 /// was asked.
+/// 🔴 It keeps the rows it is given, rather than answering `get` from a set of
+/// ids. The double write's own checks now compare this store's row against the
+/// central catalog's, and a `get` that returned a *synthesised* record would
+/// make every one of those comparisons a test of the fixture rather than of the
+/// code — agreeing or disagreeing for reasons no production store has.
 #[derive(Default)]
 pub(crate) struct ScriptedCatalog {
     calls: Mutex<Vec<String>>,
     /// Ids whose writes fail, and how.
     failing: Mutex<Vec<(SnapshotId, bool)>>,
-    /// Ids the catalog claims to already hold.
-    holding: Mutex<Vec<SnapshotId>>,
+    /// The rows this store holds.
+    rows: Mutex<HashMap<String, SnapshotRecord>>,
     /// When set, every write fails as unreachable.
     broken: AtomicBool,
     /// When set, `get` itself fails.
@@ -94,8 +112,29 @@ impl ScriptedCatalog {
             .push((id.clone(), retryable));
     }
 
+    /// Puts a committed row in without going through a write.
     pub(crate) fn hold(&self, id: &SnapshotId) {
-        self.holding.lock().expect("holding").push(id.clone());
+        self.keep(committed_record(id));
+    }
+
+    /// Puts any row in without going through a write.
+    pub(crate) fn seed(&self, record: SnapshotRecord) {
+        self.keep(record);
+    }
+
+    pub(crate) fn holds(&self, id: &SnapshotId) -> Option<SnapshotRecord> {
+        self.rows
+            .lock()
+            .expect("rows")
+            .get(&id.to_string())
+            .cloned()
+    }
+
+    fn keep(&self, record: SnapshotRecord) {
+        self.rows
+            .lock()
+            .expect("rows")
+            .insert(record.id.to_string(), record);
     }
 
     pub(crate) fn break_it(&self) {
@@ -115,7 +154,14 @@ impl ScriptedCatalog {
     }
 
     /// Gives the store a past: rows that exist and that nothing mirrored.
+    ///
+    /// They go into the rows as well as into what `list` answers, because a
+    /// store that lists a snapshot it cannot then be asked about is not a state
+    /// any real one reaches.
     pub(crate) fn with_history(self, records: Vec<SnapshotRecord>) -> Self {
+        for record in &records {
+            self.keep(record.clone());
+        }
         *self.history.lock().expect("history") = records;
         self
     }
@@ -165,7 +211,9 @@ impl SnapshotCatalog for ScriptedCatalog {
         if let Some(conflict) = self.refused_alias(record.alias.as_ref(), &record.id) {
             return Err(conflict);
         }
-        self.outcome(&record.id).map(|()| record)
+        self.outcome(&record.id)?;
+        self.keep(record.clone());
+        Ok(record)
     }
 
     async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
@@ -174,18 +222,23 @@ impl SnapshotCatalog for ScriptedCatalog {
             return Err(conflict);
         }
         self.outcome(&commit.id)?;
-        let mut record = SnapshotRecord::template_waiting(
-            commit.id.clone(),
-            commit.alias.clone(),
-            commit.resources,
-        );
+        // Folds into the row this store already holds, exactly as the real
+        // backends do — which is what keeps the creation time of a template
+        // published long after it was created from moving.
+        let mut record = self.holds(&commit.id).unwrap_or_else(|| {
+            let mut fresh = record_for(&commit.id);
+            fresh.created_at_unix_ms = commit.created_at_unix_ms.unwrap_or(CREATED_AT);
+            fresh.updated_at_unix_ms = fresh.created_at_unix_ms;
+            fresh
+        });
         record.mark_committed(
             commit.alias,
             commit.resources,
             commit.committed,
             commit.source,
-            0,
+            record.created_at_unix_ms,
         );
+        self.keep(record.clone());
         Ok(record)
     }
 
@@ -197,17 +250,7 @@ impl SnapshotCatalog for ScriptedCatalog {
                 source: None,
             });
         }
-        let held = self
-            .holding
-            .lock()
-            .expect("holding")
-            .iter()
-            .any(|id| id.to_string() == id_or_alias);
-        if !held {
-            return Ok(None);
-        }
-        let id = SnapshotId::parse(id_or_alias).expect("a held id parses");
-        Ok(Some(committed_record(&id)))
+        Ok(self.rows.lock().expect("rows").get(id_or_alias).cloned())
     }
 
     async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -222,7 +265,12 @@ impl SnapshotCatalog for ScriptedCatalog {
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
         self.note(format!("delete_record:{}", record.id));
-        self.outcome(&record.id)
+        self.outcome(&record.id)?;
+        self.rows
+            .lock()
+            .expect("rows")
+            .remove(&record.id.to_string());
+        Ok(())
     }
 
     async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
@@ -232,20 +280,28 @@ impl SnapshotCatalog for ScriptedCatalog {
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
         self.note(format!("try_start_build:{id}"));
         self.outcome(id)?;
-        let mut record = record_for(id);
+        let mut record = self.holds(id).unwrap_or_else(|| record_for(id));
         if let crate::snapshot::types::SnapshotSource::Template { build } = &mut record.source {
             build.status = TemplateBuildStatus::Building;
         }
+        self.keep(record.clone());
         Ok(record)
     }
 
     async fn mark_build_error(
         &self,
         id: &SnapshotId,
-        _reason: TemplateBuildErrorReason,
+        reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
         self.note(format!("mark_build_error:{id}"));
-        self.outcome(id)
+        self.outcome(id)?;
+        let mut record = self.holds(id).unwrap_or_else(|| record_for(id));
+        if let crate::snapshot::types::SnapshotSource::Template { build } = &mut record.source {
+            build.status = TemplateBuildStatus::Error;
+            build.error_reason = Some(reason);
+        }
+        self.keep(record);
+        Ok(())
     }
 }
 
@@ -388,8 +444,22 @@ impl CentralCatalogWrites for ScriptedCentral {
         if rows.contains_key(&record.id.to_string()) {
             return Ok(CatalogWrite::Refused(CatalogRefusal::AlreadyExists));
         }
-        rows.insert(record.id.to_string(), record.clone());
-        Ok(CatalogWrite::Applied(record.clone()))
+        // 🔴 The row opens in the status the *caller stated*, not in whatever
+        // the record it was derived from happened to carry. The real catalog
+        // refuses a row born `ready` or `error`, which is why `opening_status`
+        // clamps — and a double that ignored the argument would hide every
+        // consequence of that clamp.
+        let mut opened = record.clone();
+        if let crate::snapshot::types::SnapshotSource::Template { build } = &mut opened.source {
+            build.status = match status {
+                "building" => TemplateBuildStatus::Building,
+                "ready" => TemplateBuildStatus::Ready,
+                "error" => TemplateBuildStatus::Error,
+                _ => TemplateBuildStatus::Waiting,
+            };
+        }
+        rows.insert(opened.id.to_string(), opened.clone());
+        Ok(CatalogWrite::Applied(opened))
     }
 
     async fn commit(

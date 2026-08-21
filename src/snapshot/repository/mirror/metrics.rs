@@ -73,6 +73,20 @@ pub(crate) const MIRROR_REPAIRED_TOTAL: &str = "agentenv_snapshot_catalog_mirror
 pub(crate) const MIRROR_REPAIR_FAILED_TOTAL: &str =
     "agentenv_snapshot_catalog_mirror_repair_failed_total";
 
+/// 🔴 Entries the target *took* and the two catalogs still disagreed about.
+///
+/// The number that says [`MIRROR_LAG`] is now the stronger claim it always
+/// read as. Before it existed, "repaired" meant only that the store accepted
+/// the write — which is how a backfill replayed thirty-two publishes into rows
+/// whose creation times were all the moment the backfill ran, with every gauge
+/// reporting agreement. Labelled by the field that differed, so an operator
+/// sees *what* disagrees rather than only that something does.
+///
+/// A non-zero value here with a non-zero lag is the honest state: the write
+/// landed, the rows do not match, and the entry is still counted as debt.
+pub(crate) const MIRROR_CONTENT_MISMATCH_TOTAL: &str =
+    "agentenv_snapshot_catalog_mirror_content_mismatch_total";
+
 /// What one central call did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CentralOutcome {
@@ -139,6 +153,15 @@ pub(crate) fn record_mirror_repair_failed(
         "direction" => direction.as_str(),
         "op" => op,
         "verdict" => verdict,
+    )
+    .increment(1);
+}
+
+pub(crate) fn record_mirror_content_mismatch(direction: MirrorDirection, field: &'static str) {
+    metrics::counter!(
+        MIRROR_CONTENT_MISMATCH_TOTAL,
+        "direction" => direction.as_str(),
+        "field" => field,
     )
     .increment(1);
 }

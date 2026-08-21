@@ -708,7 +708,10 @@ impl PosixFsCatalogStore {
             alias,
             source,
             resources,
-            created_at_unix_ms: now_unix_ms,
+            // The caller's instant when it has one, and only for the row this
+            // call creates: a record that already exists keeps the creation
+            // time it has. See `SnapshotCommit::created_at_unix_ms`.
+            created_at_unix_ms: commit.created_at_unix_ms.unwrap_or(now_unix_ms),
             updated_at_unix_ms: now_unix_ms,
             committed: Some(committed),
         })
@@ -952,6 +955,7 @@ mod tests {
                 alias: None,
                 source: SnapshotPublishSource::Template,
                 resources: SandboxResources::default(),
+                created_at_unix_ms: None,
                 committed: CommittedSnapshot::mock(),
             })
             .expect("commit should work");
@@ -979,6 +983,7 @@ mod tests {
             alias: Some(SnapshotAlias::parse(alias).expect("alias should parse")),
             source,
             resources: SandboxResources::default(),
+            created_at_unix_ms: None,
             committed: CommittedSnapshot::mock(),
         }
     }

@@ -3178,3 +3178,61 @@ func TestOnlyOneOfTwoRacingCommitsTakesAnAlias(t *testing.T) {
 		t.Fatalf("%d snapshots went ready, want the one that took the alias", ready)
 	}
 }
+
+// TestDeletingATemplateEndsTheBuildItWasHolding is the cascade the foreign key
+// does not perform.
+//
+// 🔴 `builds_template_fk` is declared ON DELETE CASCADE, and a snapshot delete
+// here is *soft* — so the cascade never fires. A template deleted mid-build
+// left its `builds` row in `in_progress`, where `countActiveBuildsSQL` goes on
+// counting it against the cluster-wide ceiling and
+// `builds_one_active_per_template` goes on holding a template that no longer
+// exists. Nothing released it but the heartbeat reaper, a TTL later, and only
+// once the builder stopped renewing; a builder still running would have held
+// the slot for as long as it ran.
+func TestDeletingATemplateEndsTheBuildItWasHolding(t *testing.T) {
+	f := newFixture(t, withBuildCeiling(1))
+
+	template := f.beginTemplate("")
+	started, err := f.startBuild(template.SnapshotID, "", "node-a", 0)
+	if err != nil || started.Rejected != nil {
+		t.Fatalf("the build was not admitted: %v %+v", err, started.Rejected)
+	}
+
+	deleted, err := f.store.DeleteSnapshot(f.ctx, f.cluster, template.SnapshotID, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if !deleted.Deleted {
+		t.Fatalf("the template was not deleted: %+v", deleted)
+	}
+
+	build, err := f.store.GetBuild(f.ctx, f.cluster, started.Build.BuildID)
+	if err != nil {
+		t.Fatalf("get build: %v", err)
+	}
+	if build == nil {
+		t.Fatal("the build row is gone entirely, which loses the record of what happened")
+	}
+	if build.StatusGroup == StatusGroupPending || build.StatusGroup == StatusGroupInProgress {
+		t.Fatalf("the deleted template's build is still %q/%q, so it still holds its slot",
+			build.Status, build.StatusGroup)
+	}
+	if len(build.ErrorReason) == 0 {
+		t.Fatal("nothing says why the build ended, so an operator reading the row cannot tell " +
+			"a deleted template from a build that crashed")
+	}
+
+	// 🔴 The assertion that matters to the cluster rather than to the row: the
+	// ceiling is one, and a build on a *different* template has to fit through
+	// it now. Before, this was refused as BUILD_QUEUE_FULL by a template that
+	// had been deleted.
+	other := f.beginTemplate("")
+	out, err := f.startBuild(other.SnapshotID, "", "node-a", 0)
+	if err != nil {
+		t.Fatalf("second build: %v", err)
+	}
+	if out.Rejected != nil {
+		t.Fatalf("a deleted template's build is still holding the cluster ceiling: %+v", out.Rejected)
+	}
+}

@@ -702,10 +702,11 @@ func (s *PostgresStore) GetBuild(ctx context.Context, clusterID, buildID string)
 // DeleteSnapshot soft-deletes one row, its template half, and the alias that
 // named it.
 //
-// All three in one transaction. `templates` carries its own deleted_at_ms and
-// two flags for one entity can disagree; the alias must go by hand because the
-// foreign key's cascade only fires on a hard delete, and a name reserved by a
-// row no read can reach would never be released.
+// All four in one transaction. `templates` carries its own deleted_at_ms and
+// two flags for one entity can disagree; the alias and any in-flight build must
+// go by hand because the foreign keys' cascade only fires on a hard delete, and
+// a name reserved by a row no read can reach — or a build slot held by a
+// template that no longer exists — would never be released.
 func (s *PostgresStore) DeleteSnapshot(ctx context.Context, clusterID, idOrAlias string, deletedAtMs int64) (Deleted, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
@@ -750,6 +751,15 @@ func (s *PostgresStore) DeleteSnapshot(ctx context.Context, clusterID, idOrAlias
 		return Deleted{}, fmt.Errorf("catalog delete_snapshot: %w", err)
 	}
 	if _, err := tx.Exec(ctx, softDeleteTemplateSQL, row.SnapshotID, cluster, deletedAtMs); err != nil {
+		return Deleted{}, fmt.Errorf("catalog delete_snapshot: %w", err)
+	}
+	// 🔴 And the build, for the same reason the alias goes by hand: the
+	// foreign key's cascade only fires on a hard delete. A template deleted
+	// while a build was in flight went on holding a slot of the cluster
+	// ceiling and its own exclusion until the reaper's TTL expired — over a
+	// template that no longer exists and that markSnapshotBuildingSQL's
+	// `deleted_at_ms IS NULL` means can never be admitted again anyway.
+	if _, err := tx.Exec(ctx, endActiveBuildOfDeletedTemplateSQL, row.SnapshotID, cluster, deletedAtMs, []byte(deletedTemplateBuildError)); err != nil {
 		return Deleted{}, fmt.Errorf("catalog delete_snapshot: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

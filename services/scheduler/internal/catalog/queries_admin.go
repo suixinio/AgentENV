@@ -168,6 +168,32 @@ UPDATE snapshots
 // Without it a failed build leaves a `pending`/`in_progress` row that
 // `builds_one_active_per_template` turns into a template nobody can build
 // again — the same trap the reaper exists for, reached by a different road.
+// endActiveBuildOfDeletedTemplateSQL ends whatever build a deleted template was
+// holding.
+//
+// 🔴 `builds_template_fk` cascades on a *hard* delete, and a snapshot delete
+// here is soft — so a template deleted mid-build left its `builds` row in
+// `pending`/`in_progress`, where `countActiveBuildsSQL` goes on counting it
+// against the cluster ceiling and `builds_one_active_per_template` goes on
+// holding a template that no longer exists. Nothing ever released it but the
+// heartbeat reaper, a TTL later, and only because the builder had stopped
+// renewing; a builder still running would hold the slot indefinitely.
+//
+// Separate from failActiveBuildSQL because the reason differs and the reason is
+// what an operator reads. The template is gone, which is not a build failure.
+const endActiveBuildOfDeletedTemplateSQL = `
+UPDATE builds
+   SET status         = 'error',
+       finished_at_ms = $3,
+       error_reason   = $4::jsonb
+ WHERE template_id = $1::uuid
+   AND cluster_id = $2::uuid
+   AND status_group IN ('pending', 'in_progress')
+RETURNING id::text`
+
+// The reason endActiveBuildOfDeletedTemplateSQL writes.
+const deletedTemplateBuildError = `{"message":"the template was deleted while this build was running","step":null}`
+
 const failActiveBuildSQL = `
 UPDATE builds
    SET status         = 'error',

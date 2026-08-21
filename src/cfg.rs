@@ -441,6 +441,13 @@ pub struct SnapshotCatalogConfig {
     /// margin: two renewals may be lost — to a scheduler rollout, a slow
     /// network — before a build that is running perfectly well is taken away
     /// from it.
+    ///
+    /// 🔴 The scheduler cannot see this number — nothing on the wire carries
+    /// it — so it is declared to the scheduler a second time, as
+    /// `scheduler.catalog.node_build_heartbeat_interval`, which is what its
+    /// TTL floor is computed from. Changing this without changing that leaves
+    /// the scheduler enforcing a floor for a cadence this cluster no longer
+    /// uses; the two must move together.
     #[config(default = 100u64)]
     pub build_heartbeat_interval_secs: u64,
     /// Where the owed writes are kept.

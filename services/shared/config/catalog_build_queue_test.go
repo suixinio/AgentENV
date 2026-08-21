@@ -56,9 +56,10 @@ func TestAHeartbeatTTLTooShortToBeMeantIsRefused(t *testing.T) {
 		schedulerCatalogBuildHeartbeatTTLFloor - time.Millisecond,
 	} {
 		cfg := schedulerWithCatalog(SchedulerCatalogConfig{
-			MaxConcurrentBuilds: 20,
-			BuildHeartbeatTTL:   ttl,
-			BuildReapInterval:   time.Nanosecond,
+			MaxConcurrentBuilds:        20,
+			BuildHeartbeatTTL:          ttl,
+			BuildReapInterval:          time.Nanosecond,
+			NodeBuildHeartbeatInterval: time.Nanosecond,
 		})
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("a heartbeat TTL of %s was accepted", ttl)
@@ -66,11 +67,14 @@ func TestAHeartbeatTTLTooShortToBeMeantIsRefused(t *testing.T) {
 	}
 
 	// And the floor itself is allowed: it is a floor, not a minimum somebody
-	// has to clear.
+	// has to clear. It takes saying that the nodes renew fast enough for it,
+	// which is the other half of the pair — see
+	// TestATTLBelowTheClusterSNodeRenewalCadenceIsRefused.
 	cfg := schedulerWithCatalog(SchedulerCatalogConfig{
-		MaxConcurrentBuilds: 20,
-		BuildHeartbeatTTL:   schedulerCatalogBuildHeartbeatTTLFloor,
-		BuildReapInterval:   time.Second,
+		MaxConcurrentBuilds:        20,
+		BuildHeartbeatTTL:          schedulerCatalogBuildHeartbeatTTLFloor,
+		BuildReapInterval:          time.Second,
+		NodeBuildHeartbeatInterval: schedulerCatalogBuildHeartbeatTTLFloor / schedulerCatalogBuildHeartbeatTTLMissedRenewals,
 	})
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("the floor itself was refused: %v", err)
@@ -79,9 +83,10 @@ func TestAHeartbeatTTLTooShortToBeMeantIsRefused(t *testing.T) {
 
 func TestAReapIntervalLongerThanTheTTLIsRefused(t *testing.T) {
 	cfg := schedulerWithCatalog(SchedulerCatalogConfig{
-		MaxConcurrentBuilds: 20,
-		BuildHeartbeatTTL:   time.Minute,
-		BuildReapInterval:   2 * time.Minute,
+		MaxConcurrentBuilds:        20,
+		BuildHeartbeatTTL:          time.Minute,
+		BuildReapInterval:          2 * time.Minute,
+		NodeBuildHeartbeatInterval: 10 * time.Second,
 	})
 	err := cfg.Validate()
 	if err == nil {
@@ -114,9 +119,10 @@ func TestNoCeilingTakesWritingANegativeNumber(t *testing.T) {
 	}
 
 	cfg := schedulerWithCatalog(SchedulerCatalogConfig{
-		MaxConcurrentBuilds: -1,
-		BuildHeartbeatTTL:   5 * time.Minute,
-		BuildReapInterval:   30 * time.Second,
+		MaxConcurrentBuilds:        -1,
+		BuildHeartbeatTTL:          5 * time.Minute,
+		BuildReapInterval:          30 * time.Second,
+		NodeBuildHeartbeatInterval: defaultSchedulerCatalogNodeBuildHeartbeatInterval,
 	})
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("removing the ceiling on purpose was refused: %v", err)
@@ -144,6 +150,10 @@ func TestNamingOneCatalogKeyKeepsTheDefaultsForTheOthers(t *testing.T) {
 	if cfg.Scheduler.Catalog.BuildReapInterval != defaultSchedulerCatalogBuildReapInterval {
 		t.Fatalf("naming one key blanked the interval: %s", cfg.Scheduler.Catalog.BuildReapInterval)
 	}
+	if cfg.Scheduler.Catalog.NodeBuildHeartbeatInterval != defaultSchedulerCatalogNodeBuildHeartbeatInterval {
+		t.Fatalf("naming one key blanked the node renewal cadence: %s",
+			cfg.Scheduler.Catalog.NodeBuildHeartbeatInterval)
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -157,6 +167,7 @@ func TestTheBuildQueueIsReachableFromTheEnvironment(t *testing.T) {
 	t.Setenv("SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS", "7")
 	t.Setenv("SCHEDULER_CATALOG_BUILD_HEARTBEAT_TTL", "9m")
 	t.Setenv("SCHEDULER_CATALOG_BUILD_REAP_INTERVAL", "45s")
+	t.Setenv("SCHEDULER_CATALOG_NODE_BUILD_HEARTBEAT_INTERVAL", "60s")
 
 	cfg := defaultConfig("scheduler")
 	if err := overrideWithEnv(&cfg); err != nil {
@@ -171,11 +182,15 @@ func TestTheBuildQueueIsReachableFromTheEnvironment(t *testing.T) {
 	if cfg.Scheduler.Catalog.BuildReapInterval != 45*time.Second {
 		t.Fatalf("interval = %s, want 45s", cfg.Scheduler.Catalog.BuildReapInterval)
 	}
+	if cfg.Scheduler.Catalog.NodeBuildHeartbeatInterval != 60*time.Second {
+		t.Fatalf("node renewal cadence = %s, want 60s", cfg.Scheduler.Catalog.NodeBuildHeartbeatInterval)
+	}
 
 	for _, key := range []string{
 		"SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS",
 		"SCHEDULER_CATALOG_BUILD_HEARTBEAT_TTL",
 		"SCHEDULER_CATALOG_BUILD_REAP_INTERVAL",
+		"SCHEDULER_CATALOG_NODE_BUILD_HEARTBEAT_INTERVAL",
 	} {
 		t.Run(key+" refuses nonsense", func(t *testing.T) {
 			t.Setenv(key, "not-a-value")
@@ -184,5 +199,87 @@ func TestTheBuildQueueIsReachableFromTheEnvironment(t *testing.T) {
 				t.Fatalf("%s accepted a value it cannot parse, which would leave the default silently in place", key)
 			}
 		})
+	}
+}
+
+// TestATTLBelowTheClusterSNodeRenewalCadenceIsRefused is the check the absolute
+// floor could not make.
+//
+// 🔴 The reaper ends a build it has not heard from within the TTL, and what it
+// hears from is a node renewing on a cadence configured in a different process
+// — `snapshot.catalog.build_heartbeat_interval_secs` in src/cfg.rs, 100 seconds
+// by default. The floor was 30 seconds, so every TTL in [30s, 100s] passed
+// validation and would have reaped every healthy build in the cluster, on
+// schedule, each one reported as a lapsed heartbeat. Nothing was ever armed
+// because the cluster default is 5 minutes, which is luck rather than design:
+// the two numbers had no relationship the process could check.
+func TestATTLBelowTheClusterSNodeRenewalCadenceIsRefused(t *testing.T) {
+	// The window the old floor let through, at the shipped node cadence.
+	for _, ttl := range []time.Duration{
+		schedulerCatalogBuildHeartbeatTTLFloor,
+		time.Minute,
+		defaultSchedulerCatalogNodeBuildHeartbeatInterval,
+		2 * defaultSchedulerCatalogNodeBuildHeartbeatInterval,
+	} {
+		cfg := schedulerWithCatalog(SchedulerCatalogConfig{
+			MaxConcurrentBuilds:        20,
+			BuildHeartbeatTTL:          ttl,
+			BuildReapInterval:          time.Second,
+			NodeBuildHeartbeatInterval: defaultSchedulerCatalogNodeBuildHeartbeatInterval,
+		})
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatalf("a TTL of %s was accepted against nodes renewing every %s: every build in "+
+				"the cluster would be reaped while it ran",
+				ttl, defaultSchedulerCatalogNodeBuildHeartbeatInterval)
+		}
+		// The message has to name both halves, because the fix may be in
+		// either process.
+		for _, needle := range []string{"build_heartbeat_ttl", "node_build_heartbeat_interval", "build_heartbeat_interval_secs"} {
+			if !strings.Contains(err.Error(), needle) {
+				t.Fatalf("the refusal does not mention %q, so it does not say where the fix is: %v", needle, err)
+			}
+		}
+	}
+
+	// 🔴 And the escape is real: a cluster whose nodes genuinely renew faster
+	// may say so and take the shorter TTL. Without this the floor would be a
+	// number nobody can move, and the way round it would be to remove it.
+	cfg := schedulerWithCatalog(SchedulerCatalogConfig{
+		MaxConcurrentBuilds:        20,
+		BuildHeartbeatTTL:          time.Minute,
+		BuildReapInterval:          time.Second,
+		NodeBuildHeartbeatInterval: 20 * time.Second,
+	})
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a TTL of three renewals was refused: %v", err)
+	}
+}
+
+// The default TTL is exactly the number the rule asks for, which is the thing
+// that made the old floor look adequate. Say it out loud so that moving either
+// end moves this test.
+func TestTheDefaultTTLIsThreeOfTheDefaultRenewals(t *testing.T) {
+	want := time.Duration(schedulerCatalogBuildHeartbeatTTLMissedRenewals) * defaultSchedulerCatalogNodeBuildHeartbeatInterval
+	if defaultSchedulerCatalogBuildHeartbeatTTL != want {
+		t.Fatalf("the default TTL is %s but %d renewals of %s is %s: the pair has drifted, and "+
+			"the node's snapshot.catalog.build_heartbeat_interval_secs is the other half to check",
+			defaultSchedulerCatalogBuildHeartbeatTTL,
+			schedulerCatalogBuildHeartbeatTTLMissedRenewals,
+			defaultSchedulerCatalogNodeBuildHeartbeatInterval, want)
+	}
+}
+
+// A renewal cadence of zero is a divide-by-nothing rule, so it is refused
+// rather than read as "no check".
+func TestARenewalCadenceOfZeroIsRefused(t *testing.T) {
+	cfg := schedulerWithCatalog(SchedulerCatalogConfig{
+		MaxConcurrentBuilds:        20,
+		BuildHeartbeatTTL:          5 * time.Minute,
+		BuildReapInterval:          30 * time.Second,
+		NodeBuildHeartbeatInterval: 0,
+	})
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an unset node renewal cadence was accepted, which turns the relationship check off")
 	}
 }

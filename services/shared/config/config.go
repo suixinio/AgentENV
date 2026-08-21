@@ -106,8 +106,27 @@ const (
 	// user a refused build for no further benefit.
 	defaultSchedulerCatalogBuildReapInterval = 30 * time.Second
 
+	// defaultSchedulerCatalogNodeBuildHeartbeatInterval is how often a node's
+	// builder says it is still running — the *other* half of the pair, which
+	// lives outside this module.
+	//
+	// 🔴 It mirrors `snapshot.catalog.build_heartbeat_interval_secs` in
+	// `src/cfg.rs`, whose default is 100 seconds. It is stated here because
+	// the floor below is meaningless without it and the scheduler has no way
+	// to ask: nodes do not report their renewal cadence, and by the time one
+	// is reaped it is too late to find out. Change one and change the other.
+	defaultSchedulerCatalogNodeBuildHeartbeatInterval = 100 * time.Second
+
+	// schedulerCatalogBuildHeartbeatTTLMissedRenewals is how many renewals in
+	// a row may be lost before a build is treated as gone.
+	//
+	// Two, plus the one that has to elapse to notice: a scheduler rollout, a
+	// slow network or a paused VM can eat a renewal or two without the build
+	// being in any trouble.
+	schedulerCatalogBuildHeartbeatTTLMissedRenewals = 3
+
 	// schedulerCatalogBuildHeartbeatTTLFloor is the shortest TTL this process
-	// will run a reaper against.
+	// will run a reaper against, whatever the renewal cadence is said to be.
 	//
 	// 🔴 A floor and not a default, because the two directions are not
 	// symmetrical. A TTL too long leaks a template until somebody notices; a
@@ -116,6 +135,15 @@ const (
 	// mistyped unit — 30 for 30 seconds where 30s was meant, or milliseconds
 	// where a duration was meant — lands on the second side, so it is refused
 	// at start-up rather than run.
+	//
+	// 🔴 This absolute floor is the *weaker* of the two checks and used to be
+	// the only one. At 30 seconds against a node renewing every 100 it let
+	// through every TTL in [30s, 100s] — each of which reaps every healthy
+	// build in the cluster, cluster-wide, on schedule. The cluster default of
+	// 5 minutes meant nothing was ever armed, which is luck and not design.
+	// The check that has the relationship in it is
+	// schedulerCatalogBuildHeartbeatTTLMissedRenewals above; this one stays as
+	// the guard on a renewal interval that has itself been mistyped.
 	schedulerCatalogBuildHeartbeatTTLFloor = 30 * time.Second
 )
 
@@ -143,13 +171,28 @@ type SchedulerCatalogConfig struct {
 
 	// BuildReapInterval is how often the reaping pass runs.
 	BuildReapInterval time.Duration `json:"build_reap_interval"`
+
+	// NodeBuildHeartbeatInterval is how often this cluster's nodes renew a
+	// running build's lease — `snapshot.catalog.build_heartbeat_interval_secs`
+	// on the node side.
+	//
+	// 🔴 The scheduler does not use this to do anything; it uses it to refuse
+	// a TTL that would reap healthy builds. It is a field rather than a
+	// constant so that lowering the TTL is possible at all, and it is a field
+	// the operator has to *say* rather than something inferred, because the
+	// number it stands for lives in a different process's configuration and
+	// nothing on the wire carries it. Lower the TTL without lowering this and
+	// start-up refuses; lower this without lowering the node's and every build
+	// in the cluster is reaped while it runs.
+	NodeBuildHeartbeatInterval time.Duration `json:"node_build_heartbeat_interval"`
 }
 
 func (s *SchedulerCatalogConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		MaxConcurrentBuilds *int            `json:"max_concurrent_builds"`
-		BuildHeartbeatTTL   json.RawMessage `json:"build_heartbeat_ttl"`
-		BuildReapInterval   json.RawMessage `json:"build_reap_interval"`
+		MaxConcurrentBuilds        *int            `json:"max_concurrent_builds"`
+		BuildHeartbeatTTL          json.RawMessage `json:"build_heartbeat_ttl"`
+		BuildReapInterval          json.RawMessage `json:"build_reap_interval"`
+		NodeBuildHeartbeatInterval json.RawMessage `json:"node_build_heartbeat_interval"`
 	}
 
 	parsed := wire{}
@@ -173,6 +216,13 @@ func (s *SchedulerCatalogConfig) UnmarshalJSON(data []byte) error {
 		}
 		s.BuildReapInterval = d
 	}
+	if len(bytes.TrimSpace(parsed.NodeBuildHeartbeatInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.NodeBuildHeartbeatInterval, "scheduler.catalog.node_build_heartbeat_interval")
+		if err != nil {
+			return err
+		}
+		s.NodeBuildHeartbeatInterval = d
+	}
 	return nil
 }
 
@@ -191,6 +241,26 @@ func validateSchedulerCatalog(c SchedulerCatalogConfig) error {
 		return fmt.Errorf(
 			"scheduler.catalog.build_heartbeat_ttl is %s, below the floor of %s: a TTL this short ends builds that are still running",
 			c.BuildHeartbeatTTL, schedulerCatalogBuildHeartbeatTTLFloor)
+	}
+	if c.NodeBuildHeartbeatInterval <= 0 {
+		return errors.New("scheduler.catalog.node_build_heartbeat_interval must be greater than zero")
+	}
+	// 🔴 The check with the relationship in it, and the one the absolute floor
+	// above cannot make. The reaper ends a build it has not heard from within
+	// the TTL, and what it hears from is a node renewing on its own cadence —
+	// so a TTL below that cadence reaps *every* build in the cluster, on
+	// schedule, and reports each as a lapsed heartbeat. That is a
+	// configuration whose effect is total and whose symptom names the wrong
+	// cause, which is the pair of properties that makes it worth refusing at
+	// start-up.
+	if floor := time.Duration(schedulerCatalogBuildHeartbeatTTLMissedRenewals) * c.NodeBuildHeartbeatInterval; c.BuildHeartbeatTTL < floor {
+		return fmt.Errorf(
+			"scheduler.catalog.build_heartbeat_ttl (%s) is below %d × scheduler.catalog.node_build_heartbeat_interval (%s = %s): "+
+				"a build is reaped when it has gone unheard from for the TTL, and this cluster's nodes are declared to renew every %s, "+
+				"so this TTL ends builds that are running perfectly well. Raise the TTL, or lower the node's "+
+				"snapshot.catalog.build_heartbeat_interval_secs and say so here",
+			c.BuildHeartbeatTTL, schedulerCatalogBuildHeartbeatTTLMissedRenewals,
+			c.NodeBuildHeartbeatInterval, floor, c.NodeBuildHeartbeatInterval)
 	}
 	if c.BuildReapInterval <= 0 {
 		return errors.New("scheduler.catalog.build_reap_interval must be greater than zero")
@@ -996,9 +1066,10 @@ func defaultConfig(service string) Config {
 			// A default of observe leaves clusters parked there with nobody
 			// aware they were never flipped.
 			Catalog: SchedulerCatalogConfig{
-				MaxConcurrentBuilds: defaultSchedulerCatalogMaxConcurrentBuilds,
-				BuildHeartbeatTTL:   defaultSchedulerCatalogBuildHeartbeatTTL,
-				BuildReapInterval:   defaultSchedulerCatalogBuildReapInterval,
+				MaxConcurrentBuilds:        defaultSchedulerCatalogMaxConcurrentBuilds,
+				BuildHeartbeatTTL:          defaultSchedulerCatalogBuildHeartbeatTTL,
+				BuildReapInterval:          defaultSchedulerCatalogBuildReapInterval,
+				NodeBuildHeartbeatInterval: defaultSchedulerCatalogNodeBuildHeartbeatInterval,
 			},
 			Routing:              SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
 			MaxProjectionTTL:     defaultSchedulerMaxProjectionTTL,
@@ -1104,6 +1175,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_CATALOG_BUILD_REAP_INTERVAL %q: %w", v, err)
 		}
 		cfg.Scheduler.Catalog.BuildReapInterval = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_CATALOG_NODE_BUILD_HEARTBEAT_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_CATALOG_NODE_BUILD_HEARTBEAT_INTERVAL %q: %w", v, err)
+		}
+		cfg.Scheduler.Catalog.NodeBuildHeartbeatInterval = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_SANDBOX_PROXY_DOMAINS")); v != "" {

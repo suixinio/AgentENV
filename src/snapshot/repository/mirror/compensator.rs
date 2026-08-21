@@ -26,11 +26,15 @@ impl MirrorCompensator {
     pub fn spawn(backlog: Arc<MirrorBacklog>, targets: MirrorTargets, interval: Duration) -> Self {
         // A zero period panics `tokio::time::interval`, so an operator could
         // otherwise take the node down with a configuration value.
-        let period = interval.max(Duration::from_secs(1));
+        //
+        // 🔴 Built here rather than inside the task. A panic inside a spawned
+        // task goes into its join handle and nowhere else, so a clamp applied
+        // in there could be removed without anything outside noticing — which
+        // is the same as not having one.
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(period);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
                 // 🔴 The lag, not the divergences. A recorded divergence is not

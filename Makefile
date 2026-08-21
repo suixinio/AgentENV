@@ -54,7 +54,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-ublk install-ublk \
 	fmt clippy \
 	mutants coverage \
-	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
+	test test-unit test-integration test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
@@ -122,6 +122,56 @@ test-unit:
 	bash scripts/tests/verify-install-service.sh
 
 test-integration: test-agent-integration test-envd test-ublk
+
+# Throwaway PostgreSQL and scheduler for `test-snapshot-catalog`.
+CATALOG_TEST_PG      ?= agentenv-catalog-test-pg
+CATALOG_TEST_PG_PORT ?= 15501
+CATALOG_TEST_GRPC    ?= 127.0.0.1:19090
+CATALOG_TEST_CLUSTER ?= 0198f0a1-0000-7000-8000-0000000c0ffe
+CATALOG_TEST_DIR     ?= $(CURDIR)/target/catalog-test
+
+# The central snapshot catalog client, against a real SnapshotCatalog server.
+#
+# 🔴 Without this, `cargo test --test snapshot_catalog` reports `ok` over a file
+# in which every test returned before it did anything. Which refusal a duplicate
+# alias produces, whether a `building` row is visible to a caller that never
+# mentioned allow_any_status, whether a bytea round-trips a CommittedSnapshot —
+# all of them are properties of the *server*, and a stub written from the same
+# reading of the proto as the client agrees with the client by construction.
+#
+# AENV_SNAPSHOT_CATALOG_TEST_REQUIRED turns a missing endpoint into a failure
+# rather than back into green skips, for the same reason
+# SCHEDULER_REGISTRY_TEST_REQUIRED does on the Go side.
+test-snapshot-catalog:
+	@command -v docker >/dev/null 2>&1 || { echo "docker not found: the catalog tests need a throwaway PostgreSQL"; exit 1; }
+	@command -v go >/dev/null 2>&1 || { echo "go not found: the catalog tests need the scheduler built from services/"; exit 1; }
+	mkdir -p $(CATALOG_TEST_DIR)
+	cd services && go build -o $(CATALOG_TEST_DIR)/scheduler ./scheduler/cmd
+	printf '%s\n' '{"log_level":"info","log_format":"json","scheduler":{"grpc_listen_addr":"$(CATALOG_TEST_GRPC)","metrics_listen_addr":"127.0.0.1:19101","strategy":"round_robin","report_ttl":"30s","binding_ttl":"30s","warmup_timeout":"15s","redis_addr":"","nodes":[{"id":"test-node-a","endpoint":"http://127.0.0.1:8000"}]},"gateway":{"http_listen_addr":"127.0.0.1:18080","metrics_listen_addr":"127.0.0.1:19102","scheduler_addr":"$(CATALOG_TEST_GRPC)","request_timeout":"90s","forward_response_size":4194304}}' > $(CATALOG_TEST_DIR)/config.json
+	docker run -d --rm --name $(CATALOG_TEST_PG) \
+		-e POSTGRES_PASSWORD=verify -e POSTGRES_DB=aenv_registry \
+		-p $(CATALOG_TEST_PG_PORT):5432 postgres:16-alpine >/dev/null
+	@for i in $$(seq 1 60); do \
+		docker exec $(CATALOG_TEST_PG) pg_isready -U postgres >/dev/null 2>&1 && break; \
+		sleep 1; \
+	done; \
+	SCHEDULER_REGISTRY_DSN="postgres://postgres:verify@127.0.0.1:$(CATALOG_TEST_PG_PORT)/aenv_registry" \
+	SCHEDULER_REGISTRY_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
+	SCHEDULER_REGISTRY_WRITE_ENABLED=true \
+	$(CATALOG_TEST_DIR)/scheduler -config $(CATALOG_TEST_DIR)/config.json > $(CATALOG_TEST_DIR)/scheduler.log 2>&1 & \
+	scheduler_pid=$$!; \
+	for i in $$(seq 1 60); do \
+		grep -q "scheduler gRPC server listening" $(CATALOG_TEST_DIR)/scheduler.log 2>/dev/null && break; \
+		sleep 1; \
+	done; \
+	AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT="http://$(CATALOG_TEST_GRPC)" \
+	AENV_SNAPSHOT_CATALOG_TEST_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
+	AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1 \
+	$(CARGO) test -p agentenv --test snapshot_catalog; \
+	status=$$?; \
+	kill $$scheduler_pid 2>/dev/null; \
+	docker rm -f $(CATALOG_TEST_PG) >/dev/null 2>&1; \
+	exit $$status
 
 prepare-agent-test-state:
 	$(CAPABILITY_TEST_ENV) $(CARGO) run --bin server -- --setup-only

@@ -48,9 +48,9 @@ pub async fn build_snapshot_backend(
 
     let Some(central) = build_central_catalog(config)? else {
         return Ok(AssembledSnapshotBackend {
+            mirror_compensator: drain_a_rolled_back_mirror(config, &repository).await?,
             repository,
             runtime_resolver,
-            mirror_compensator: None,
         });
     };
 
@@ -92,6 +92,48 @@ pub async fn build_snapshot_backend(
         runtime_resolver,
         mirror_compensator: Some(Arc::new(compensator)),
     })
+}
+
+/// Keeps paying off a mirror that the double write was turned off underneath.
+///
+/// 🔴 The rollback from `write = "both"` is `write = "object_store"`, and it is
+/// only lossless if what object storage was still owed gets written. Those
+/// entries are publishes that *succeeded* — the caller was told so — and object
+/// storage is about to be the only catalog there is, so abandoning them would
+/// make those snapshots disappear for good. The replay needs no central
+/// catalog, only the object store, so it can run perfectly well after the
+/// switch.
+///
+/// Nothing is created here: with no backlog on disk there is nothing to drain,
+/// which is every node that has never double-written.
+async fn drain_a_rolled_back_mirror(
+    config: &AppConfig,
+    repository: &Arc<SnapshotRepository>,
+) -> Result<Option<Arc<MirrorCompensator>>> {
+    let path = &config.snapshot.catalog.mirror_backlog_path;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let backlog = MirrorBacklog::open(path).await?;
+    if backlog.lag() == 0 {
+        return Ok(None);
+    }
+
+    tracing::warn!(
+        target: "agentenv",
+        mirror_lag = backlog.lag(),
+        backlog = %path.display(),
+        "snapshot catalog double writing is off, but object storage is still owed writes from \
+         when it was on; replaying them, because those snapshots reported success and object \
+         storage is now the only catalog that has them"
+    );
+
+    Ok(Some(Arc::new(MirrorCompensator::spawn(
+        backlog,
+        repository.catalog(),
+        std::time::Duration::from_secs(config.snapshot.catalog.mirror_compensator_interval_secs),
+    ))))
 }
 
 /// The central catalog client, when the configuration asks for one.

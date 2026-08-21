@@ -3766,4 +3766,91 @@ mod tests {
             .await
             .expect("a queued and empty history must let the switch through");
     }
+
+    // ── what the queue knows that no store can ──────────────────────────
+
+    /// 🔴 The question a cross-node resume asks before it deletes a paused
+    /// sandbox's registry row. A write that has been accepted and not yet
+    /// replayed is a snapshot on its way into a catalog that does not hold it,
+    /// and nothing but the queue can tell that from a snapshot that never
+    /// existed.
+    #[tokio::test]
+    async fn a_queued_write_says_the_snapshot_it_names_is_not_settled() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::PublishCommit {
+                    commit: commit_for(&id, None),
+                },
+            )
+            .await;
+
+        let because = backlog
+            .owes_a_write_about(&id)
+            .await
+            .expect("the queue can be read")
+            .expect("the queue owes a write about it");
+        assert!(
+            because.contains("publish_commit"),
+            "and it says which write, because the caller logs it: {because}"
+        );
+    }
+
+    /// 🔴 The control, and without it "always say something is owed" passes.
+    /// A queue that answered for every snapshot would make the destructive
+    /// branch unreachable, and a genuinely dangling registry row would then
+    /// fail every resume of it for ever.
+    #[tokio::test]
+    async fn a_queued_write_about_another_snapshot_says_nothing_about_this_one() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::PublishCommit {
+                    commit: commit_for(&SnapshotId::generate(), None),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            backlog
+                .owes_a_write_about(&SnapshotId::generate())
+                .await
+                .expect("the queue can be read"),
+            None,
+            "a busy queue is not a reason to keep every registry row alive"
+        );
+    }
+
+    /// A write nobody could write down is owed by a snapshot this process can
+    /// no longer name, so it answers for all of them. What that costs is a
+    /// dangling row left alone until the next restart; what it buys is that a
+    /// queue which lost its evidence never reports the two catalogs as settled.
+    #[tokio::test]
+    async fn a_write_that_could_not_be_written_down_leaves_nothing_settled() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog.refuse_local_writes.store(true, Ordering::SeqCst);
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        assert!(
+            backlog
+                .owes_a_write_about(&SnapshotId::generate())
+                .await
+                .expect("the queue can be read")
+                .is_some(),
+            "the queue knows a write is owed and no longer knows whose"
+        );
+    }
 }

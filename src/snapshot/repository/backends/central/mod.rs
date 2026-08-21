@@ -34,8 +34,8 @@ use uuid::Uuid;
 
 use crate::proto::scheduler as pb;
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
-    StartedBuild,
+    CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter,
+    SnapshotListPage, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -68,35 +68,6 @@ const LIST_PAGE_SIZE: u32 = 200;
 /// request open. The bound is generous — two hundred thousand rows — and being
 /// hit is a protocol failure, reported as one, not a short answer.
 const LIST_PAGE_LIMIT: usize = 1_000;
-
-/// Whether a read may see rows that are not resolvable yet.
-///
-/// 🔴 There is deliberately no `Default`, and the enum is deliberately not a
-/// `bool`. `true` is what stops a snapshot whose bytes are still uploading from
-/// starting a VM; `false` is what lets the build-status endpoint see a build
-/// that is running or has failed. Neither is safe to guess, so every call site
-/// says which it wants, out loud, and a new one cannot compile without
-/// deciding.
-///
-/// The wire field is spelled the other way round — `allow_any_status`, whose
-/// zero value is the safe reading — because proto3 cannot make a bool required.
-/// The inversion happens in exactly one place, [`Self::allow_any_status`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CatalogReadScope {
-    /// Only rows a caller may launch from: `status_group = 'ready'`.
-    Resolvable,
-    /// Every row, including `waiting`, `building` and `error`.
-    ///
-    /// The build-status endpoint is what this exists for. Nothing that resolves
-    /// a snapshot in order to run it may ask for it.
-    AnyStatus,
-}
-
-impl CatalogReadScope {
-    fn allow_any_status(self) -> bool {
-        matches!(self, Self::AnyStatus)
-    }
-}
 
 /// A refusal the caller has to act on, as opposed to a failure it can only
 /// report.
@@ -949,8 +920,23 @@ impl SnapshotCatalog for CentralSnapshotCatalog {
     /// [`CentralSnapshotCatalog::get_scoped`]; a caller that says nothing gets
     /// the reading that cannot start a half-written VM.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.get_scoped(id_or_alias, CatalogReadScope::Resolvable)
-            .await
+        CentralSnapshotCatalog::get_scoped(self, id_or_alias, CatalogReadScope::Resolvable).await
+    }
+
+    /// 🔴 The override that makes the scope mean anything.
+    ///
+    /// This is the one catalog in the tree whose storage can hide a row by
+    /// status, so it is the one whose reads change with the scope. Delegating
+    /// to the trait's default here — or forgetting the override on a future
+    /// backend that also has a status column — is exactly the shape of the
+    /// defect: every template surface would go on asking for `AnyStatus` and
+    /// go on being answered `ready`.
+    async fn get_scoped(
+        &self,
+        id_or_alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        CentralSnapshotCatalog::get_scoped(self, id_or_alias, scope).await
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -959,8 +945,16 @@ impl SnapshotCatalog for CentralSnapshotCatalog {
 
     /// See [`Self::get`] on why this is the resolvable reading.
     async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
-        self.list_page_scoped(filter, CatalogReadScope::Resolvable)
-            .await
+        CentralSnapshotCatalog::list_page_scoped(self, filter, CatalogReadScope::Resolvable).await
+    }
+
+    /// See [`SnapshotCatalog::get_scoped`] on this catalog.
+    async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        CentralSnapshotCatalog::list_page_scoped(self, filter, scope).await
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
@@ -978,8 +972,17 @@ impl SnapshotCatalog for CentralSnapshotCatalog {
 
     /// See [`Self::get`] on why this is the resolvable reading.
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        self.resolve_alias_scoped(alias, CatalogReadScope::Resolvable)
+        CentralSnapshotCatalog::resolve_alias_scoped(self, alias, CatalogReadScope::Resolvable)
             .await
+    }
+
+    /// See [`SnapshotCatalog::get_scoped`] on this catalog.
+    async fn resolve_alias_scoped(
+        &self,
+        alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotId>> {
+        CentralSnapshotCatalog::resolve_alias_scoped(self, alias, scope).await
     }
 
     /// The `waiting -> building` transition, which here is build admission:

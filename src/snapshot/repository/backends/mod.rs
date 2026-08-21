@@ -22,7 +22,7 @@ use crate::snapshot::repository::mirror::{
     MirrorCompensator, MirrorDirection, MirrorTargets, ObjectStoreCensus,
 };
 use crate::snapshot::repository::SnapshotRepository;
-pub use central::{CatalogReadScope, CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
+pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
 pub use oss::OssBackend;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 

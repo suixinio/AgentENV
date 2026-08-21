@@ -20,9 +20,9 @@
 use async_trait::async_trait;
 
 use crate::snapshot::repository::backends::central::{
-    now_unix_ms, CatalogReadScope, CatalogWrite, CentralSnapshotCatalog,
+    now_unix_ms, CatalogWrite, CentralSnapshotCatalog,
 };
-use crate::snapshot::repository::interfaces::{SnapshotCommit, StartedBuild};
+use crate::snapshot::repository::interfaces::{CatalogReadScope, SnapshotCommit, StartedBuild};
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 

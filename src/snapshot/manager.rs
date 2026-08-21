@@ -13,7 +13,7 @@ use crate::sandbox::{
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
-use crate::snapshot::repository::SnapshotRepository;
+use crate::snapshot::repository::{CatalogReadScope, SnapshotRepository};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
@@ -338,12 +338,26 @@ impl SnapshotManager {
     }
 
     /// Loads a snapshot record by id or alias.
+    ///
+    /// Resolvable rows only: this is the read a launch reaches. A caller that
+    /// is asking *about* a snapshot rather than in order to run one — every
+    /// endpoint under `/templates` — wants [`Self::get_scoped`].
     pub async fn get(
         &self,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
+        self.get_scoped(id_or_alias, CatalogReadScope::Resolvable)
+            .await
+    }
+
+    /// [`Self::get`] at an explicitly chosen scope.
+    pub async fn get_scoped(
+        &self,
+        id_or_alias: impl AsRef<str>,
+        scope: CatalogReadScope,
+    ) -> anyhow::Result<Option<SnapshotRecord>> {
         self.repository
-            .get(id_or_alias.as_ref())
+            .get_scoped(id_or_alias.as_ref(), scope)
             .await
             .with_context(|| {
                 format!(
@@ -367,8 +381,18 @@ impl SnapshotManager {
     /// that a catalog able to push them into its storage does, and one that
     /// cannot still answers the same page.
     pub async fn list_page(&self, filter: SnapshotListFilter) -> anyhow::Result<SnapshotListPage> {
+        self.list_page_scoped(filter, CatalogReadScope::Resolvable)
+            .await
+    }
+
+    /// [`Self::list_page`] at an explicitly chosen scope.
+    pub async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        scope: CatalogReadScope,
+    ) -> anyhow::Result<SnapshotListPage> {
         self.repository
-            .list_page(filter)
+            .list_page_scoped(filter, scope)
             .await
             .context("list one page of committed snapshots through repository")
     }
@@ -391,9 +415,22 @@ impl SnapshotManager {
 
     /// Resolves an alias to its committed snapshot id.
     pub async fn resolve_committed_alias(&self, alias: &str) -> anyhow::Result<Option<SnapshotId>> {
-        self.repository.resolve_alias(alias).await.with_context(|| {
-            format!("resolve committed snapshot alias '{alias}' through repository")
-        })
+        self.resolve_alias_scoped(alias, CatalogReadScope::Resolvable)
+            .await
+    }
+
+    /// [`Self::resolve_committed_alias`] at an explicitly chosen scope.
+    pub async fn resolve_alias_scoped(
+        &self,
+        alias: &str,
+        scope: CatalogReadScope,
+    ) -> anyhow::Result<Option<SnapshotId>> {
+        self.repository
+            .resolve_alias_scoped(alias, scope)
+            .await
+            .with_context(|| {
+                format!("resolve committed snapshot alias '{alias}' through repository")
+            })
     }
 
     /// Resolves a committed snapshot into node-local runnable artifact paths.

@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
-    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
-    StagedSnapshot, StartedBuild,
+    CatalogReadScope, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotListPage, StagedSnapshot, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -192,8 +192,20 @@ impl SnapshotRepository {
     }
 
     /// Loads one snapshot record by repository id or alias.
+    ///
+    /// Resolvable rows only — this is the read a launch reaches. The template
+    /// surface asks through [`Self::get_scoped`].
     pub async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         self.catalog.get(id_or_alias).await
+    }
+
+    /// [`Self::get`] at an explicitly chosen scope.
+    pub async fn get_scoped(
+        &self,
+        id_or_alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.catalog.get_scoped(id_or_alias, scope).await
     }
 
     /// Lists every snapshot record matching the provided filter.
@@ -209,12 +221,30 @@ impl SnapshotRepository {
         self.catalog.list_page(filter).await
     }
 
+    /// [`Self::list_page`] at an explicitly chosen scope.
+    pub async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        self.catalog.list_page_scoped(filter, scope).await
+    }
+
     /// Deletes one snapshot by id or alias. Idempotent.
     ///
     /// The row goes first so no reader can resolve a snapshot whose bytes are
     /// already being removed; the artifacts follow on a best-effort basis.
     pub async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let Some(record) = self.catalog.get(id_or_alias).await? else {
+        // 🔴 Every row, not the resolvable ones. A template is `waiting` from
+        // creation until its first build commits and `error` if that build
+        // failed, and a delete that could not see those rows found nothing to
+        // delete and said so with a 204 — the template stayed, and so did the
+        // `builds` row holding a slot of the cluster ceiling.
+        let Some(record) = self
+            .catalog
+            .get_scoped(id_or_alias, CatalogReadScope::AnyStatus)
+            .await?
+        else {
             return Ok(());
         };
         self.catalog.delete_record(&record).await?;
@@ -232,6 +262,15 @@ impl SnapshotRepository {
     /// Resolves a human-readable alias to the current snapshot id.
     pub async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         self.catalog.resolve_alias(alias).await
+    }
+
+    /// [`Self::resolve_alias`] at an explicitly chosen scope.
+    pub async fn resolve_alias_scoped(
+        &self,
+        alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotId>> {
+        self.catalog.resolve_alias_scoped(alias, scope).await
     }
 
     /// Says this node is still running `build_id`. `false` means stop.

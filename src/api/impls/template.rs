@@ -17,8 +17,8 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    CatalogReadScope, CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter,
+    SnapshotRecord, SnapshotSource, TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{TemplateBuildError, TemplateBuildFailure, TemplatePipelineError};
 use crate::types::ImageConfigs;
@@ -296,9 +296,16 @@ impl Templates<()> for ApiImpl {
             ));
         }
 
+        // 🔴 Every row. This is the template surface's name lookup — `aenv`
+        // turns every id-or-name argument into a call to it — and a template
+        // is `waiting` from creation until its first build commits. Resolving
+        // it only when it is `ready` means a template cannot be watched,
+        // deleted or built by the name it was created with. Nothing here
+        // launches anything: the id it returns still has to pass the
+        // resolvable read on the launch path.
         match self
             .snapshot_manager
-            .resolve_committed_alias(&path_params.alias)
+            .resolve_alias_scoped(&path_params.alias, CatalogReadScope::AnyStatus)
             .await
         {
             Ok(Some(snapshot_id)) => Ok(
@@ -350,7 +357,10 @@ impl Templates<()> for ApiImpl {
 
         let page = match self
             .snapshot_manager
-            .list_page(SnapshotListFilter::templates().paginated(query_params.limit, cursor))
+            .list_page_scoped(
+                SnapshotListFilter::templates().paginated(query_params.limit, cursor),
+                CatalogReadScope::AnyStatus,
+            )
             .await
         {
             Ok(page) => page,
@@ -392,7 +402,10 @@ impl Templates<()> for ApiImpl {
 
         let page = match self
             .snapshot_manager
-            .list_page(SnapshotListFilter::templates().paginated(query_params.limit, cursor))
+            .list_page_scoped(
+                SnapshotListFilter::templates().paginated(query_params.limit, cursor),
+                CatalogReadScope::AnyStatus,
+            )
             .await
         {
             Ok(page) => page,
@@ -431,9 +444,14 @@ impl Templates<()> for ApiImpl {
             );
         }
 
+        // 🔴 Every row, and this endpoint above all others. Its whole job is
+        // to report `waiting`, `building` and `error` — the three the
+        // resolvable reading hides — so at that scope it answered 404 for
+        // every build that had not finished, which is every build a caller
+        // polls it about.
         match self
             .snapshot_manager
-            .get(&path_params.template_id)
+            .get_scoped(&path_params.template_id, CatalogReadScope::AnyStatus)
             .await
         {
             Ok(Some(record)) => {
@@ -480,7 +498,14 @@ impl Templates<()> for ApiImpl {
         path_params: &models::TemplatesTemplateIdGetPathParams,
         query_params: &models::TemplatesTemplateIdGetQueryParams,
     ) -> Result<TemplatesTemplateIdGetResponse, ()> {
-        let record = match self.snapshot_manager.get(&path_params.template_id).await {
+        // 🔴 Every row: the response carries the build's status and error
+        // reason, so the states this must show are exactly the ones the
+        // resolvable reading refuses to return.
+        let record = match self
+            .snapshot_manager
+            .get_scoped(&path_params.template_id, CatalogReadScope::AnyStatus)
+            .await
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return Ok(TemplatesTemplateIdGetResponse::Status404_NotFound(
@@ -601,7 +626,16 @@ impl Templates<()> for ApiImpl {
                 )));
             }
         };
-        let pending_record = match self.snapshot_manager.get(&path_params.template_id).await {
+        // 🔴 Every row, and the name of the binding says why: the record this
+        // reads is *pending*. A template is `waiting` until a build commits,
+        // and this is the call that starts that build — so at the resolvable
+        // scope it 404s on the one state it is guaranteed to find, and the
+        // template can never leave `waiting`.
+        let pending_record = match self
+            .snapshot_manager
+            .get_scoped(&path_params.template_id, CatalogReadScope::AnyStatus)
+            .await
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return Ok(
@@ -1094,5 +1128,466 @@ mod tests {
 
         assert_eq!(error.code, 400);
         assert!(error.message.contains("dup"));
+    }
+}
+
+/// 🔴 The template surface, read through a catalog that hides what PostgreSQL
+/// hides.
+///
+/// Every endpoint here is asking about a row that is deliberately *not*
+/// resolvable: a template is `waiting` from the moment it is created until its
+/// first build commits, and the central catalog answers a resolvable read with
+/// `status_group = 'ready'`. Read at that scope the whole surface goes dark —
+/// 404 from the get, absent from both listings, 404 from the build start that
+/// would have moved the row out of `waiting`, and a delete that reports 204
+/// having deleted nothing. That is what a cluster on `read = postgres` did,
+/// and each test below is one of those endpoints.
+///
+/// The double is what makes them fail rather than pass by accident: a catalog
+/// that answered both scopes the same way — every object-store catalog does —
+/// agrees with a handler that asks at the wrong one.
+#[cfg(test)]
+mod template_read_scope_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+    use http::Method;
+
+    use agentenv_http_server::apis::templates::*;
+    use agentenv_http_server::models;
+
+    use super::ApiImpl;
+    use crate::cfg::AppConfig;
+    use crate::identity::NodeIdentity;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{
+        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
+        Orchestrator,
+    };
+    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::snapshot::repository::interfaces::{
+        SnapshotCatalog, SnapshotCommit, SnapshotListPage, StartedBuild,
+    };
+    use crate::snapshot::repository::{
+        RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
+    };
+    use crate::snapshot::{
+        CatalogReadScope, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotRecord,
+        SnapshotSource, TemplateBuildErrorReason, TemplateBuildInfo,
+    };
+    use crate::template::TemplateBuilder;
+
+    /// A catalog that hides a `waiting` row from a resolvable read, and shows
+    /// it to a scoped one. The central catalog, in the one respect these tests
+    /// are about.
+    struct PendingTemplateCatalog {
+        record: SnapshotRecord,
+        deletes: Arc<AtomicUsize>,
+        build_starts: Arc<AtomicUsize>,
+    }
+
+    impl PendingTemplateCatalog {
+        fn visible_at(&self, scope: CatalogReadScope) -> bool {
+            matches!(scope, CatalogReadScope::AnyStatus)
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotCatalog for PendingTemplateCatalog {
+        async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+            unreachable!("these tests never create")
+        }
+
+        async fn publish_commit(
+            &self,
+            _commit: SnapshotCommit,
+        ) -> RepositoryResult<SnapshotRecord> {
+            unreachable!("these tests never commit")
+        }
+
+        async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+            Ok(None)
+        }
+
+        async fn get_scoped(
+            &self,
+            id_or_alias: &str,
+            scope: CatalogReadScope,
+        ) -> RepositoryResult<Option<SnapshotRecord>> {
+            let names_it = id_or_alias == self.record.id.to_string()
+                || self
+                    .record
+                    .alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.as_ref() == id_or_alias);
+            Ok((self.visible_at(scope) && names_it).then(|| self.record.clone()))
+        }
+
+        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_page_scoped(
+            &self,
+            _filter: SnapshotListFilter,
+            scope: CatalogReadScope,
+        ) -> RepositoryResult<SnapshotListPage> {
+            Ok(SnapshotListPage {
+                items: if self.visible_at(scope) {
+                    vec![self.record.clone()]
+                } else {
+                    Vec::new()
+                },
+                next: None,
+            })
+        }
+
+        async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+            Ok(None)
+        }
+
+        async fn resolve_alias_scoped(
+            &self,
+            alias: &str,
+            scope: CatalogReadScope,
+        ) -> RepositoryResult<Option<SnapshotId>> {
+            let names_it = self
+                .record
+                .alias
+                .as_ref()
+                .is_some_and(|bound| bound.as_ref() == alias);
+            Ok((self.visible_at(scope) && names_it).then(|| self.record.id.clone()))
+        }
+
+        async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+            self.build_starts.fetch_add(1, Ordering::SeqCst);
+            // Reaching this call is the whole assertion; what it answers only
+            // has to be something that is not a 404, so that a test cannot
+            // pass by getting the right status code down the wrong road.
+            Err(RepositoryError::Backend {
+                message: "the admission is not what this test is about".to_string(),
+                source: None,
+            })
+        }
+
+        async fn mark_build_error(
+            &self,
+            _id: &SnapshotId,
+            _reason: TemplateBuildErrorReason,
+        ) -> RepositoryResult<()> {
+            Ok(())
+        }
+    }
+
+    /// What every test here reads: the surface, one template on it that has
+    /// never been built, and the two counters.
+    struct Surface {
+        api: Arc<ApiImpl>,
+        id: SnapshotId,
+        alias: SnapshotAlias,
+        deletes: Arc<AtomicUsize>,
+        build_starts: Arc<AtomicUsize>,
+    }
+
+    async fn surface() -> Surface {
+        let id = SnapshotId::generate();
+        let alias = SnapshotAlias::parse("pending-template").expect("alias parses");
+        let now = 1_700_000_000_000;
+        let record = SnapshotRecord {
+            id: id.clone(),
+            alias: Some(alias.clone()),
+            // 🔴 `waiting`, which is every template between its creation and
+            // its first commit — the state the whole defect is about.
+            source: SnapshotSource::Template {
+                build: TemplateBuildInfo::waiting(),
+            },
+            resources: Default::default(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            committed: None,
+        };
+
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let build_starts = Arc::new(AtomicUsize::new(0));
+        let catalog = Arc::new(PendingTemplateCatalog {
+            record,
+            deletes: Arc::clone(&deletes),
+            build_starts: Arc::clone(&build_starts),
+        });
+
+        let root = tempfile::tempdir().expect("a temp dir");
+        let orchestrator = Orchestrator::new(
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+        )
+        .await
+        .expect("an orchestrator");
+        // Held for the process's lifetime: the persister above keeps reading it.
+        std::mem::forget(root);
+
+        let snapshot_manager = Arc::new(SnapshotManager::from_parts(
+            Arc::new(SnapshotRepository::new(
+                catalog,
+                Arc::new(crate::snapshot::mock::MockSnapshotArtifactStore),
+            )),
+            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            None,
+        ));
+
+        let api = Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(DisabledPausedSandboxRegistry),
+                Arc::clone(&snapshot_manager),
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+        ));
+
+        Surface {
+            api,
+            id,
+            alias,
+            deletes,
+            build_starts,
+        }
+    }
+
+    fn claims() -> super::super::Claims {
+        super::super::Claims
+    }
+
+    fn host() -> Host {
+        Host::from(http::uri::Authority::from_static("localhost"))
+    }
+
+    /// `GET /templates/{id}`.
+    #[tokio::test]
+    async fn a_template_that_has_never_been_built_can_still_be_fetched() {
+        let s = surface().await;
+        let response = s
+            .api
+            .templates_template_id_get(
+                &Method::GET,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::TemplatesTemplateIdGetPathParams {
+                    template_id: s.id.to_string(),
+                },
+                &models::TemplatesTemplateIdGetQueryParams {
+                    limit: None,
+                    next_token: None,
+                },
+            )
+            .await
+            .expect("the handler answers");
+
+        assert!(
+            matches!(
+                response,
+                TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(_)
+            ),
+            "a pending template must be visible to the endpoint that reports its build state, \
+             got {response:?}"
+        );
+    }
+
+    /// `GET /templates` and `GET /v2/templates`.
+    #[tokio::test]
+    async fn both_listings_show_a_template_that_has_never_been_built() {
+        let s = surface().await;
+
+        let v1 = s
+            .api
+            .templates_get(
+                &Method::GET,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::TemplatesGetQueryParams {
+                    team_id: None,
+                    limit: None,
+                    next_token: None,
+                },
+            )
+            .await
+            .expect("the handler answers");
+        match v1 {
+            TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates { body, .. } => {
+                assert_eq!(
+                    body.len(),
+                    1,
+                    "a template is created `waiting`, so a listing that cannot see `waiting` \
+                     cannot see a newly created template"
+                );
+            }
+            other => panic!("the listing must succeed, got {other:?}"),
+        }
+
+        let v2 = s
+            .api
+            .v2_templates_get(
+                &Method::GET,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::V2TemplatesGetQueryParams {
+                    team_id: None,
+                    limit: None,
+                    next_token: None,
+                },
+            )
+            .await
+            .expect("the handler answers");
+        match v2 {
+            V2TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates { body, .. } => {
+                assert_eq!(
+                    body.len(),
+                    1,
+                    "and the v2 listing is the same endpoint twice"
+                );
+            }
+            other => panic!("the v2 listing must succeed, got {other:?}"),
+        }
+    }
+
+    /// `GET /templates/{id}/builds/{id}/status` — the endpoint a client polls.
+    #[tokio::test]
+    async fn the_build_status_endpoint_reports_a_build_that_has_not_finished() {
+        let s = surface().await;
+        let response = s
+            .api
+            .templates_template_id_builds_build_id_status_get(
+                &Method::GET,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams {
+                    template_id: s.id.to_string(),
+                    build_id: s.id.to_string(),
+                },
+            )
+            .await
+            .expect("the handler answers");
+
+        assert!(
+            matches!(
+                response,
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status200_SuccessfullyReturnedTheTemplate(_)
+            ),
+            "the states this endpoint exists to report are exactly the ones a resolvable read \
+             hides, got {response:?}"
+        );
+    }
+
+    /// `GET /templates/aliases/{alias}` — how `aenv` turns a name into an id.
+    #[tokio::test]
+    async fn a_pending_template_can_be_found_by_the_name_it_was_created_with() {
+        let s = surface().await;
+        let response = s
+            .api
+            .templates_aliases_alias_get(
+                &Method::GET,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::TemplatesAliasesAliasGetPathParams {
+                    alias: s.alias.to_string(),
+                },
+            )
+            .await
+            .expect("the handler answers");
+
+        assert!(
+            matches!(
+                response,
+                TemplatesAliasesAliasGetResponse::Status200_SuccessfullyQueriedTemplateByAlias(_)
+            ),
+            "every id-or-name argument goes through this endpoint, got {response:?}"
+        );
+    }
+
+    /// `POST /v2/templates/{id}/builds/{id}` — the call that would move the row
+    /// out of `waiting` in the first place.
+    #[tokio::test]
+    async fn a_build_can_be_started_on_a_template_that_has_never_been_built() {
+        let s = surface().await;
+        let response = s
+            .api
+            .v2_templates_template_id_builds_build_id_post(
+                &Method::POST,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams {
+                    template_id: s.id.to_string(),
+                    build_id: s.id.to_string(),
+                },
+                &models::TemplateBuildStartV2::new(),
+            )
+            .await
+            .expect("the handler answers");
+
+        assert!(
+            !matches!(
+                response,
+                V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(_)
+            ),
+            "the record this reads is named `pending` because it is: refusing it as absent is \
+             what left the template unable to leave `waiting`, got {response:?}"
+        );
+        assert_eq!(
+            s.build_starts.load(Ordering::SeqCst),
+            1,
+            "and the read must have got far enough to ask for the admission"
+        );
+    }
+
+    /// `DELETE /templates/{id}` — the failure that reports success.
+    #[tokio::test]
+    async fn deleting_a_template_that_has_never_been_built_deletes_it() {
+        let s = surface().await;
+        let response = s
+            .api
+            .templates_template_id_delete(
+                &Method::DELETE,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::TemplatesTemplateIdDeletePathParams {
+                    template_id: s.id.to_string(),
+                },
+            )
+            .await
+            .expect("the handler answers");
+
+        assert!(
+            matches!(
+                response,
+                TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully
+            ),
+            "got {response:?}"
+        );
+        assert_eq!(
+            s.deletes.load(Ordering::SeqCst),
+            1,
+            "🔴 the 204 is not the assertion. A delete that cannot see the row finds nothing to \
+             delete and reports success anyway, which is how a template survived being deleted \
+             and went on holding its build's slot of the cluster ceiling"
+        );
     }
 }

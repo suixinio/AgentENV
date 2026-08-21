@@ -37,7 +37,8 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 
 use super::backlog::{CatalogReadSide, MirrorBacklog, MirrorDirection};
-use crate::snapshot::repository::backends::central::{CatalogReadScope, CentralSnapshotCatalog};
+use crate::snapshot::repository::backends::central::CentralSnapshotCatalog;
+use crate::snapshot::repository::interfaces::CatalogReadScope;
 use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotListFilter};
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::SnapshotId;

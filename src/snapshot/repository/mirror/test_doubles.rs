@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 use crate::snapshot::repository::backends::central::{CatalogRefusal, CatalogWrite};
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StartedBuild,
+    CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
+    StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -93,6 +94,13 @@ pub(crate) struct ScriptedCatalog {
     /// What `list` answers with — the rows this store held before anybody
     /// started mirroring it.
     history: Mutex<Vec<SnapshotRecord>>,
+    /// When set, the store hides every row from an unscoped read, exactly as
+    /// `status_group = 'ready'` hides a `waiting` template in PostgreSQL.
+    ///
+    /// 🔴 Every other catalog double here answers both scopes identically,
+    /// which is why one that forgets to forward the scope agrees with one that
+    /// forwards it. This is the switch that makes the difference observable.
+    only_ready: AtomicBool,
 }
 
 impl ScriptedCatalog {
@@ -147,6 +155,16 @@ impl ScriptedCatalog {
 
     pub(crate) fn break_reads(&self) {
         self.get_fails.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the store behave like PostgreSQL: nothing is resolvable, and only
+    /// a read that says `AnyStatus` sees anything.
+    pub(crate) fn hide_from_unscoped_reads(&self) {
+        self.only_ready.store(true, Ordering::SeqCst);
+    }
+
+    fn hidden_at(&self, scope: CatalogReadScope) -> bool {
+        self.only_ready.load(Ordering::SeqCst) && scope == CatalogReadScope::Resolvable
     }
 
     pub(crate) fn refuse_alias_to(&self, holder: SnapshotId) {
@@ -243,14 +261,70 @@ impl SnapshotCatalog for ScriptedCatalog {
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.note(format!("get:{id_or_alias}"));
-        if self.get_fails.load(Ordering::SeqCst) || self.broken.load(Ordering::SeqCst) {
-            return Err(RepositoryError::Backend {
-                message: "cannot read".to_string(),
-                source: None,
+        // An unscoped read *is* the resolvable one — see
+        // `SnapshotCatalog::get` — so a store hiding unready rows hides them
+        // from this too. Without that this double answers a resolvable read
+        // more generously than PostgreSQL does, and the control half of the
+        // scope tests passes for the wrong reason.
+        if self.hidden_at(CatalogReadScope::Resolvable) {
+            self.note(format!("get:{id_or_alias}"));
+            return Ok(None);
+        }
+        self.unhidden_get(id_or_alias).await
+    }
+
+    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
+        if self.hidden_at(CatalogReadScope::Resolvable) {
+            return Ok(SnapshotListPage {
+                items: Vec::new(),
+                next: None,
             });
         }
-        Ok(self.rows.lock().expect("rows").get(id_or_alias).cloned())
+        self.unhidden_list_page(filter).await
+    }
+
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        if self.hidden_at(CatalogReadScope::Resolvable) {
+            return Ok(None);
+        }
+        self.unhidden_resolve_alias(alias).await
+    }
+
+    async fn get_scoped(
+        &self,
+        id_or_alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        if self.hidden_at(scope) {
+            self.note(format!("get_scoped:resolvable:{id_or_alias}"));
+            return Ok(None);
+        }
+        self.unhidden_get(id_or_alias).await
+    }
+
+    async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        if self.hidden_at(scope) {
+            return Ok(SnapshotListPage {
+                items: Vec::new(),
+                next: None,
+            });
+        }
+        self.unhidden_list_page(filter).await
+    }
+
+    async fn resolve_alias_scoped(
+        &self,
+        alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotId>> {
+        if self.hidden_at(scope) {
+            return Ok(None);
+        }
+        self.unhidden_resolve_alias(alias).await
     }
 
     async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -271,28 +345,6 @@ impl SnapshotCatalog for ScriptedCatalog {
             .expect("rows")
             .remove(&record.id.to_string());
         Ok(())
-    }
-
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        self.note(format!("resolve_alias:{alias}"));
-        if self.get_fails.load(Ordering::SeqCst) || self.broken.load(Ordering::SeqCst) {
-            return Err(RepositoryError::Backend {
-                message: "cannot read".to_string(),
-                source: None,
-            });
-        }
-        Ok(self
-            .rows
-            .lock()
-            .expect("rows")
-            .values()
-            .find(|record| {
-                record
-                    .alias
-                    .as_ref()
-                    .is_some_and(|held| held.to_string() == alias)
-            })
-            .map(|record| record.id.clone()))
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
@@ -320,6 +372,59 @@ impl SnapshotCatalog for ScriptedCatalog {
         }
         self.keep(record);
         Ok(())
+    }
+}
+
+impl ScriptedCatalog {
+    /// The reads with the `only_ready` curtain already lifted.
+    ///
+    /// Split out so that the scoped and unscoped entry points can each decide
+    /// whether the row is visible, and then share the one lookup.
+    async fn unhidden_list_page(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> RepositoryResult<SnapshotListPage> {
+        let limit = filter.effective_limit();
+        let cursor = filter.cursor.clone();
+        let records = self.list(filter.without_pagination()).await?;
+        Ok(crate::snapshot::repository::paginate_records(
+            records,
+            limit,
+            cursor.as_ref(),
+        ))
+    }
+
+    async fn unhidden_get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.note(format!("get:{id_or_alias}"));
+        if self.get_fails.load(Ordering::SeqCst) || self.broken.load(Ordering::SeqCst) {
+            return Err(RepositoryError::Backend {
+                message: "cannot read".to_string(),
+                source: None,
+            });
+        }
+        Ok(self.rows.lock().expect("rows").get(id_or_alias).cloned())
+    }
+
+    async fn unhidden_resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        self.note(format!("resolve_alias:{alias}"));
+        if self.get_fails.load(Ordering::SeqCst) || self.broken.load(Ordering::SeqCst) {
+            return Err(RepositoryError::Backend {
+                message: "cannot read".to_string(),
+                source: None,
+            });
+        }
+        Ok(self
+            .rows
+            .lock()
+            .expect("rows")
+            .values()
+            .find(|record| {
+                record
+                    .alias
+                    .as_ref()
+                    .is_some_and(|held| held.to_string() == alias)
+            })
+            .map(|record| record.id.clone()))
     }
 }
 

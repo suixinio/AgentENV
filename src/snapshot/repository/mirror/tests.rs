@@ -1491,3 +1491,92 @@ async fn the_unbounded_listing_stays_on_the_object_store_after_the_switch() {
     );
     assert_eq!(listed[0].id, history[0].id);
 }
+
+/// 🔴 The scope has to survive the hop through the mirror.
+///
+/// [`DualWriteCatalog`] is a `SnapshotCatalog` in front of another one, and
+/// the trait's scoped reads have a default that answers from the *unscoped*
+/// method. Inherit that default here and a node reading from PostgreSQL turns
+/// every template surface's `AnyStatus` back into `status_group = 'ready'` one
+/// layer above the query that would have honoured it — which is the whole
+/// defect, reintroduced by an omission rather than by a decision.
+#[tokio::test]
+async fn a_scoped_read_reaches_the_side_that_answers_reads_still_scoped() {
+    let fixture = Fixture::new().await;
+    let pending = a_row_named("never-built");
+    // `with_history` so the row is in the listing as well as the rows: a
+    // catalog that lists a snapshot it cannot be asked about is not a state a
+    // real one reaches.
+    let central_reads = Arc::new(ScriptedCatalog::default().with_history(vec![pending.clone()]));
+    // The one thing that tells a forwarded scope from a dropped one.
+    central_reads.hide_from_unscoped_reads();
+
+    let dual = DualWriteCatalog::new(
+        Arc::clone(&fixture.central) as Arc<dyn CentralCatalogWrites>,
+        Arc::clone(&fixture.object_store) as Arc<dyn SnapshotCatalog>,
+        Arc::clone(&fixture.backlog),
+    )
+    .reading_from_central(Arc::clone(&central_reads) as Arc<dyn SnapshotCatalog>);
+
+    assert!(
+        dual.get(&pending.id.to_string())
+            .await
+            .expect("the read should work")
+            .is_none(),
+        "the control: an unscoped read is the resolvable one, and must stay that way"
+    );
+
+    let found = dual
+        .get_scoped(&pending.id.to_string(), CatalogReadScope::AnyStatus)
+        .await
+        .expect("the read should work");
+    assert_eq!(
+        found.map(|row| row.id),
+        Some(pending.id.clone()),
+        "a template that has never been built is exactly what the scoped read is for"
+    );
+
+    let alias = pending
+        .alias
+        .as_ref()
+        .expect("the row is named")
+        .to_string();
+    assert!(
+        dual.resolve_alias(&alias)
+            .await
+            .expect("the read should work")
+            .is_none(),
+        "the control, for the alias"
+    );
+    assert_eq!(
+        dual.resolve_alias_scoped(&alias, CatalogReadScope::AnyStatus)
+            .await
+            .expect("the read should work"),
+        Some(pending.id.clone()),
+        "and the alias lookup is how every id-or-name argument is resolved"
+    );
+
+    assert!(
+        dual.list_page_scoped(
+            SnapshotListFilter::matches_all(),
+            CatalogReadScope::Resolvable
+        )
+        .await
+        .expect("the read should work")
+        .items
+        .is_empty(),
+        "the control, for the listing"
+    );
+    assert!(
+        !dual
+            .list_page_scoped(
+                SnapshotListFilter::matches_all(),
+                CatalogReadScope::AnyStatus
+            )
+            .await
+            .expect("the read should work")
+            .items
+            .is_empty(),
+        "and a listing that cannot see `waiting` cannot see a newly created template"
+    );
+}

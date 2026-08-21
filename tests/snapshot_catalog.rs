@@ -45,7 +45,8 @@ use std::sync::Arc;
 
 use agentenv::api::{snapshot_cursor_from_token, snapshot_next_token};
 use agentenv::sandbox::FirecrackerSnapshotManifest;
-use agentenv::snapshot::repository::backends::{CatalogReadScope, CentralSnapshotCatalog};
+use agentenv::snapshot::repository::backends::CentralSnapshotCatalog;
+use agentenv::snapshot::repository::interfaces::CatalogReadScope;
 use agentenv::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
 use agentenv::snapshot::repository::{
     RepositoryError, SnapshotCursor, SnapshotListFilter, StartedBuild,

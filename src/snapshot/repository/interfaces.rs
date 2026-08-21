@@ -432,6 +432,45 @@ impl StartedBuild {
     }
 }
 
+/// Whether a read may see rows that are not resolvable yet.
+///
+/// 🔴 There is deliberately no `Default`, and the enum is deliberately not a
+/// `bool`. `Resolvable` is what stops a snapshot whose bytes are still
+/// uploading from starting a VM; `AnyStatus` is what lets the *template*
+/// surface see a template that has never been built. Neither is safe to guess.
+///
+/// 🔴 The two are a property of the **surface**, not of the backend. A
+/// template is `waiting` from the moment it is created until its first build
+/// commits, so every endpoint under `/templates` is asking about rows that are
+/// deliberately not resolvable, and every endpoint that resolves a snapshot in
+/// order to *run* it — create-from-template, the build's base image, a
+/// cross-node resume — is asking for the opposite. Reading the template
+/// surface at `Resolvable` is what made a newly created template invisible:
+/// 404 from `GET /templates/{id}`, absent from `GET /templates`, and 404 from
+/// the build start that would have moved it out of `waiting` in the first
+/// place, so it could never become resolvable either.
+///
+/// The wire field is spelled the other way round — `allow_any_status`, whose
+/// zero value is the safe reading — because proto3 cannot make a bool
+/// required. The inversion happens in exactly one place,
+/// [`Self::allow_any_status`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogReadScope {
+    /// Only rows a caller may launch from: `status_group = 'ready'`.
+    Resolvable,
+    /// Every row, including `waiting`, `building` and `error`.
+    ///
+    /// The template surface is what this exists for. Nothing that resolves a
+    /// snapshot in order to run it may ask for it.
+    AnyStatus,
+}
+
+impl CatalogReadScope {
+    pub(crate) fn allow_any_status(self) -> bool {
+        matches!(self, Self::AnyStatus)
+    }
+}
+
 #[async_trait]
 /// The rows: snapshot records, template build state, and alias bindings.
 ///
@@ -471,7 +510,27 @@ pub trait SnapshotCatalog: Send + Sync {
     async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord>;
 
     /// Loads one snapshot record by repository id or alias.
+    ///
+    /// Resolvable rows only. See [`Self::get_scoped`] for the surface that
+    /// needs to see a template before it has ever been built.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
+
+    /// [`Self::get`] at an explicitly chosen scope.
+    ///
+    /// 🔴 The default ignores the scope, and that is the right answer for a
+    /// catalog whose storage has no status predicate to apply: an object-store
+    /// catalog is one object per record and hands back whatever it holds, so
+    /// both scopes already mean the same thing there. A backend that *can*
+    /// hide a row by status must override this — the central catalog does —
+    /// and one that could and did not would put back the defect the scope
+    /// exists for, a template invisible for the whole of its life.
+    async fn get_scoped(
+        &self,
+        id_or_alias: &str,
+        _scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get(id_or_alias).await
+    }
 
     /// Lists every snapshot record matching the provided filter.
     ///
@@ -501,6 +560,17 @@ pub trait SnapshotCatalog: Send + Sync {
         Ok(paginate_records(records, limit, cursor.as_ref()))
     }
 
+    /// [`Self::list_page`] at an explicitly chosen scope.
+    ///
+    /// See [`Self::get_scoped`] on why the default ignores the scope.
+    async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        _scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        self.list_page(filter).await
+    }
+
     /// Deletes one snapshot's row and any alias binding that still points at
     /// it. Idempotent. Leaves the artifacts to [`SnapshotArtifactStore`].
     ///
@@ -510,7 +580,20 @@ pub trait SnapshotCatalog: Send + Sync {
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()>;
 
     /// Resolves a human-readable alias to the current snapshot id.
+    ///
+    /// Resolvable rows only. See [`Self::resolve_alias_scoped`].
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
+
+    /// [`Self::resolve_alias`] at an explicitly chosen scope.
+    ///
+    /// See [`Self::get_scoped`] on why the default ignores the scope.
+    async fn resolve_alias_scoped(
+        &self,
+        alias: &str,
+        _scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotId>> {
+        self.resolve_alias(alias).await
+    }
 
     /// Atomically transitions one template build from waiting to building.
     ///

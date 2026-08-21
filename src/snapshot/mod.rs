@@ -10,7 +10,8 @@ mod types;
 
 pub use manager::SnapshotManager;
 pub use repository::{
-    RepositoryError, RepositoryResult, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
+    CatalogReadScope, RepositoryError, RepositoryResult, SnapshotCursor, SnapshotListFilter,
+    SnapshotListPage,
 };
 pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{

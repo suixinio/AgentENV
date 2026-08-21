@@ -58,7 +58,8 @@ use crate::snapshot::repository::backends::central::{
     CatalogWrite, STATUS_BUILDING,
 };
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage, StartedBuild,
+    CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
+    StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotAlias, SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
@@ -607,6 +608,18 @@ impl SnapshotCatalog for DualWriteCatalog {
         self.read_catalog().get(id_or_alias).await
     }
 
+    /// 🔴 Forwarded, not defaulted. The trait's default answers a scoped read
+    /// from [`Self::get`], which is the resolvable one — so a mirror reading
+    /// from PostgreSQL would quietly turn every template surface's `AnyStatus`
+    /// back into `status_group = 'ready'`, which is the defect itself.
+    async fn get_scoped(
+        &self,
+        id_or_alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.read_catalog().get_scoped(id_or_alias, scope).await
+    }
+
     /// 🔴 The unbounded listing stays on the object store whichever side serves
     /// reads.
     ///
@@ -622,6 +635,15 @@ impl SnapshotCatalog for DualWriteCatalog {
 
     async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
         self.read_catalog().list_page(filter).await
+    }
+
+    /// See [`Self::get_scoped`].
+    async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        self.read_catalog().list_page_scoped(filter, scope).await
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
@@ -669,6 +691,15 @@ impl SnapshotCatalog for DualWriteCatalog {
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         self.read_catalog().resolve_alias(alias).await
+    }
+
+    /// See [`Self::get_scoped`].
+    async fn resolve_alias_scoped(
+        &self,
+        alias: &str,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<Option<SnapshotId>> {
+        self.read_catalog().resolve_alias_scoped(alias, scope).await
     }
 
     /// 🔴 Object store only, on purpose, and the one write that is not doubled.

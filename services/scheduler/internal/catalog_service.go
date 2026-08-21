@@ -42,6 +42,36 @@ var catalogRejections = promauto.NewCounterVec(
 	[]string{"rpc", "reason"},
 )
 
+// catalogBuildsReaped counts builds the reaper ended.
+//
+// 🔴 Worth a series of its own, separate from the rejection counter. A build
+// this ends is work that was thrown away, and the number that matters is not
+// whether it is non-zero — a crashed builder should be reaped — but whether it
+// is *rising steadily*, which is what a TTL set too short, or a fleet whose
+// clocks disagree, looks like from outside.
+var catalogBuildsReaped = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "agentenv_scheduler_catalog_builds_reaped_total",
+	Help: "Builds ended by the reaper because their heartbeat lapsed.",
+})
+
+// catalogReaperWarmup counts passes held back by the reaper's own warm-up
+// window, so that a process too short-lived to ever complete one is visible as
+// something other than a reaper that never finds anything.
+var catalogReaperWarmup = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "agentenv_scheduler_catalog_build_reaper_warmup_passes_total",
+	Help: "Reaping passes skipped because this process has not been able to hear a heartbeat for a full TTL yet.",
+})
+
+// catalogClockSkew counts build heartbeats whose node clock is far from this
+// process's. See noteClockSkew.
+var catalogClockSkew = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_catalog_build_clock_skew_total",
+		Help: "Build heartbeats carrying a node clock more than a minute from this controller's.",
+	},
+	[]string{"rpc"},
+)
+
 // catalogGate is the part of the registry's restart grace this service needs:
 // whether the schema this build expects has been applied yet.
 //
@@ -395,13 +425,20 @@ func (s *SnapshotCatalogService) StartBuild(ctx context.Context, req *schedulerv
 		return nil, s.fail(rpc, err)
 	}
 
+	// 🔴 heartbeat_at_unix_ms arrives on the wire and is deliberately not
+	// passed on. The first heartbeat is stamped by the admitting statement from
+	// the database's clock, because the reaper judges that value against a
+	// clock too and the two have to be the same one. What the field is still
+	// good for is telling an operator that this node's clock disagrees; see
+	// noteClockSkew.
+	s.noteClockSkew(rpc, req.GetNodeId(), req.GetHeartbeatAtUnixMs())
+
 	out, err := s.store.StartBuild(ctx, catalog.StartBuildInput{
-		ClusterID:     req.GetClusterId(),
-		NodeID:        req.GetNodeId(),
-		BuildID:       req.GetBuildId(),
-		TemplateID:    req.GetTemplateId(),
-		StartedAtMs:   req.GetStartedAtUnixMs(),
-		HeartbeatAtMs: req.GetHeartbeatAtUnixMs(),
+		ClusterID:   req.GetClusterId(),
+		NodeID:      req.GetNodeId(),
+		BuildID:     req.GetBuildId(),
+		TemplateID:  req.GetTemplateId(),
+		StartedAtMs: req.GetStartedAtUnixMs(),
 	})
 	if err != nil {
 		return nil, s.fail(rpc, err)
@@ -432,11 +469,12 @@ func (s *SnapshotCatalogService) RenewBuildLease(ctx context.Context, req *sched
 		return nil, s.fail(rpc, err)
 	}
 
+	s.noteClockSkew(rpc, req.GetNodeId(), req.GetHeartbeatAtUnixMs())
+
 	live, err := s.store.RenewBuildLease(ctx, catalog.RenewBuildLeaseInput{
-		ClusterID:     req.GetClusterId(),
-		NodeID:        req.GetNodeId(),
-		BuildID:       req.GetBuildId(),
-		HeartbeatAtMs: req.GetHeartbeatAtUnixMs(),
+		ClusterID: req.GetClusterId(),
+		NodeID:    req.GetNodeId(),
+		BuildID:   req.GetBuildId(),
 	})
 	if err != nil {
 		return nil, s.fail(rpc, err)
@@ -496,9 +534,40 @@ func (s *SnapshotCatalogService) RunBuildReaper(ctx context.Context, interval, t
 			zap.Duration("interval", interval), zap.Duration("ttl", ttl))
 		return
 	}
+	if s.store == nil {
+		s.log.Warn("snapshot catalog build reaper disabled: this process serves no snapshot catalog")
+		return
+	}
+	if s.clusterID == "" {
+		// Every pass is scoped to a cluster and the store refuses a scope it
+		// cannot cast to a uuid, so this loop would do nothing but log. Said
+		// once, at the level an operator reads, rather than every interval.
+		s.log.Error("snapshot catalog build reaper disabled: no cluster id, so stranded builds will hold their templates shut",
+			zap.String("env", "SCHEDULER_REGISTRY_CLUSTER_ID"))
+		return
+	}
+
+	s.log.Info("snapshot catalog build reaper started",
+		zap.Duration("interval", interval), zap.Duration("heartbeat_ttl", ttl))
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	// 🔴 openedAt is when this process first became able to *hear* a heartbeat,
+	// and the first TTL after it is a window in which nothing is reaped.
+	//
+	// Without it the reaper has the failure the paused registry's restart grace
+	// exists for, reached through the one door that does not use it. Every
+	// builder in the cluster renews through this process; a rollout, an image
+	// pull or an OOM stops all of them at once. Come back after longer than the
+	// TTL and every heartbeat in the table is stale — not because the builders
+	// stopped, but because nothing was listening — and the first pass ends the
+	// lot of them, each one a build VM's worth of work.
+	//
+	// The registry's own grace window is not the right length here: it is sized
+	// to a lease, and this is sized to a build heartbeat. Hence a window of
+	// this reaper's own, anchored where it belongs.
+	var openedAt time.Time
 
 	for {
 		select {
@@ -507,11 +576,25 @@ func (s *SnapshotCatalogService) RunBuildReaper(ctx context.Context, interval, t
 		case <-ticker.C:
 		}
 		if err := s.gate.Require(); err != nil {
+			// Not open yet, or open and then closed again. Either way the
+			// window has to start over: what matters is an uninterrupted TTL of
+			// being able to accept heartbeats, not a TTL since the first time
+			// this was ever true.
+			openedAt = time.Time{}
 			continue
 		}
+		if openedAt.IsZero() {
+			openedAt = time.Now()
+		}
+		if waited := time.Since(openedAt); waited < ttl {
+			catalogReaperWarmup.Inc()
+			s.log.Debug("snapshot catalog build reaping pass held back: this process has not been able to hear a heartbeat for a full TTL yet",
+				zap.Duration("waited", waited), zap.Duration("heartbeat_ttl", ttl))
+			continue
+		}
+
 		reaped, err := s.store.ReapExpiredBuilds(ctx, catalog.ReapInput{
 			ClusterID: s.clusterID,
-			NowMs:     time.Now().UnixMilli(),
 			TTLMs:     ttl.Milliseconds(),
 		})
 		if err != nil {
@@ -519,10 +602,45 @@ func (s *SnapshotCatalogService) RunBuildReaper(ctx context.Context, interval, t
 			continue
 		}
 		if len(reaped) > 0 {
+			catalogBuildsReaped.Add(float64(len(reaped)))
 			s.log.Info("snapshot catalog build reaping pass", zap.Int("reaped", len(reaped)))
 		}
 	}
 }
+
+// noteClockSkew reports a node whose clock disagrees with this process's.
+//
+// 🔴 What it is for. The build heartbeat used to be stored as the node stamped
+// it and judged against whoever ran the reaping pass, so a node running slow had
+// its builds ended while they were still running — silently, because nothing in
+// either process compares the two clocks. Both ends are the database's now, so
+// the skew no longer decides anything; this is what stops it from going back to
+// being invisible, and it is the first thing to look at when builds are being
+// reaped and nobody can say why.
+func (s *SnapshotCatalogService) noteClockSkew(rpc, nodeID string, assertedUnixMs int64) {
+	if assertedUnixMs <= 0 {
+		return
+	}
+	skew := time.Since(time.UnixMilli(assertedUnixMs))
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew < buildClockSkewWarn {
+		return
+	}
+	catalogClockSkew.WithLabelValues(rpc).Inc()
+	s.log.Warn("build heartbeat carries a clock far from this controller's",
+		zap.String("rpc", rpc),
+		zap.String("node_id", nodeID),
+		zap.Duration("skew", skew),
+	)
+}
+
+// buildClockSkewWarn is how far apart two clocks have to be before it is worth
+// saying so. Generous on purpose: this reports a machine that needs looking at,
+// not a scheduling decision, and a threshold tight enough to fire on ordinary
+// NTP drift would be one nobody reads.
+const buildClockSkewWarn = time.Minute
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plumbing

@@ -43,6 +43,11 @@ type Store interface {
 	// execution fencing lands on the catalog side, and it is what makes a
 	// crash between the bytes and the commit leave a row that every resolving
 	// query already refuses to see.
+	//
+	// 🔴 It also takes the template's build off the queue, in the same
+	// transaction. Nothing else does on the success path, and a build that
+	// stays on the queue after it has succeeded holds a slot under the
+	// cluster ceiling for ever.
 	CommitSnapshot(ctx context.Context, in CommitInput) (CommitOutcome, error)
 
 	// FailSnapshot moves a row to `error` with a reason — transaction C.
@@ -357,6 +362,12 @@ type Filter struct {
 }
 
 // StartBuildInput admits one build.
+//
+// 🔴 There is no heartbeat field. The first heartbeat is stamped by the
+// statement that admits the build, from the database's clock — a build admitted
+// without one is the row nothing can ever reap, and the partial unique index
+// would hold its template shut for as long as the database lives, so it must
+// not be possible to ask for one.
 type StartBuildInput struct {
 	ClusterID  string
 	NodeID     string
@@ -364,29 +375,28 @@ type StartBuildInput struct {
 	TemplateID string
 
 	StartedAtMs int64
-	// HeartbeatAtMs is stamped by the statement that admits the build.
-	//
-	// 🔴 Not optional in practice. The reaper only acts on rows carrying a
-	// heartbeat, so a build admitted without one is the row nothing can ever
-	// clean up — and the partial unique index would block that template
-	// forever behind it.
-	HeartbeatAtMs int64
 }
 
 // RenewBuildLeaseInput is one heartbeat.
+//
+// 🔴 It carries no timestamp either, and for the reason that matters most in
+// this package: what is recorded is when this process heard from the builder.
+// A heartbeat stamped by the node and judged by the reaper is a comparison
+// between two machines' clocks, and a node running slow would have every one of
+// its builds ended while they were still running.
 type RenewBuildLeaseInput struct {
-	ClusterID     string
-	NodeID        string
-	BuildID       string
-	HeartbeatAtMs int64
+	ClusterID string
+	NodeID    string
+	BuildID   string
 }
 
 // ReapInput bounds one reaping pass.
 type ReapInput struct {
 	ClusterID string
-	// NowMs and TTLMs are the caller's, not the database's, so a test can move
-	// the clock without moving the server's.
-	NowMs int64
+	// TTLMs is how long a build may go without being heard from. It is a
+	// duration and not a deadline: "now" comes from the database, in the same
+	// statement that reads the heartbeats it is compared against, so there is
+	// no clock a caller could supply that would be the right one.
 	TTLMs int64
 }
 

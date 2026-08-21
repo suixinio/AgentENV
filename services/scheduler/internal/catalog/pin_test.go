@@ -275,6 +275,7 @@ func everyStatement() map[string]string {
 		"commitSnapshot":         commitSnapshotSQL,
 		"failSnapshot":           failSnapshotSQL,
 		"failActiveBuild":        failActiveBuildSQL,
+		"finishActiveBuild":      finishActiveBuildSQL,
 		"softDeleteSnapshot":     softDeleteSnapshotSQL,
 		"dropAliasesOfSnapshot":  dropAliasesOfSnapshotSQL,
 		"softDeleteTemplate":     softDeleteTemplateSQL,

@@ -10,6 +10,23 @@ package catalog
 // endpoint answer "no such build" for every build that has not finished, which
 // is every build a caller is actually asking about.
 
+// nowMs is the database's own clock, in the milliseconds this schema stores.
+//
+// 🔴 Not a convenience. The build heartbeat is the one axis in this file where
+// two clocks are compared against each other: a builder says it is alive and,
+// some minutes later, the reaper decides it is not. If the "alive" end is
+// stamped by the node and the "not alive" end by whoever runs the reaping pass,
+// then the difference between them is the difference between two machines'
+// clocks as much as it is elapsed time — and a node running a few minutes slow
+// has every one of its builds reaped while they are still running, repeatedly,
+// with no error anywhere to say why. The registry made this exact move for the
+// same reason and wrote it down; see beginPauseSQL's note on paused_at.
+//
+// clock_timestamp() rather than now(): now() is the transaction's start time,
+// and a reaping pass that opened its transaction before a heartbeat landed
+// would judge that heartbeat against an instant that predates it.
+const nowMs = `(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT`
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Transaction A — the row before the bytes
 // ─────────────────────────────────────────────────────────────────────────────
@@ -161,6 +178,29 @@ UPDATE builds
    AND status_group IN ('pending', 'in_progress')
 RETURNING id::text`
 
+// finishActiveBuildSQL takes the build off the queue when its snapshot commits.
+//
+// 🔴 The other half of admission, and leaving it out is not a leak but an
+// outage on a timer. `builds_one_active_per_template` and the cluster ceiling
+// both count `pending`/`in_progress` rows, and nothing else moves a build out
+// of that group on the success path — so every build that *worked* would go on
+// occupying a slot for ever, and the twenty-first build in the cluster's life
+// would be refused with the queue full and stay refused.
+//
+// Unconditional rather than a flag the caller sets, unlike failActiveBuildSQL.
+// There is no commit that should leave a build in flight, so a caller able to
+// say "leave it" is only a caller able to forget; and the statement costs one
+// index probe on a commit that has no build, which every pause is.
+const finishActiveBuildSQL = `
+UPDATE builds
+   SET status         = 'ready',
+       finished_at_ms = $3,
+       error_reason   = NULL
+ WHERE template_id = $1::uuid
+   AND cluster_id = $2::uuid
+   AND status_group IN ('pending', 'in_progress')
+RETURNING id::text`
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Delete
 // ─────────────────────────────────────────────────────────────────────────────
@@ -248,7 +288,11 @@ UPDATE snapshots
 // heartbeat_at_ms is stamped by this statement and not by a later one: the
 // reaper only acts on rows carrying a heartbeat, so a build admitted without
 // one is the single row nothing can ever clean up — and it would hold the
-// template forever behind the partial unique index.
+// template forever behind the partial unique index. Stamped here, that row
+// cannot be written at all rather than being refused by a check somebody could
+// remove.
+//
+// 🔴 The stamp is the database's, not the admitting node's. See nowMs.
 const insertBuildSQL = `
 INSERT INTO builds (
     id, template_id, cluster_id,
@@ -258,8 +302,8 @@ INSERT INTO builds (
 ) VALUES (
     $1::uuid, $2::uuid, $3::uuid,
     'building', 'in_progress',
-    $4, $5,
-    $6, $6
+    $4, ` + nowMs + `,
+    $5, $5
 )`
 
 // renewBuildLeaseSQL is one heartbeat.
@@ -267,9 +311,13 @@ INSERT INTO builds (
 // The node id is in the predicate: a process that is not the one running this
 // build must not be able to keep it alive, which is what would happen after the
 // reaper freed the template and somebody else took it.
+//
+// 🔴 What is recorded is when this process heard from the builder, not when the
+// builder says it spoke. See nowMs: the reaper compares this value against a
+// clock, and it has to be the same one.
 const renewBuildLeaseSQL = `
 UPDATE builds
-   SET heartbeat_at_ms = $4
+   SET heartbeat_at_ms = ` + nowMs + `
  WHERE id = $3::uuid
    AND cluster_id = $1::uuid
    AND node_id = $2
@@ -298,15 +346,20 @@ SELECT id::text, template_id::text, cluster_id::text,
 //
 // 🔴 No ready predicate here either, for the obvious reason: everything this
 // touches is by definition not ready.
+//
+// 🔴 Both ends of the comparison come from the database. $2 is a duration, not
+// an instant, and there is deliberately no way for a caller to supply "now":
+// this is the statement where a clock read from the wrong machine ends work
+// that is still running. See nowMs.
 const reapBuildsSQL = `
 UPDATE builds
    SET status         = 'error',
-       finished_at_ms = $2,
-       error_reason   = $4::jsonb
+       finished_at_ms = ` + nowMs + `,
+       error_reason   = $3::jsonb
  WHERE cluster_id = $1::uuid
    AND status_group IN ('pending', 'in_progress')
    AND heartbeat_at_ms IS NOT NULL
-   AND heartbeat_at_ms < $3
+   AND heartbeat_at_ms < ` + nowMs + ` - $2
 RETURNING id::text, template_id::text, node_id`
 
 // failReapedTemplatesSQL frees the template rows those builds were holding.
@@ -319,10 +372,10 @@ RETURNING id::text, template_id::text, node_id`
 const failReapedTemplatesSQL = `
 UPDATE snapshots
    SET status        = 'error',
-       build_error   = $3::jsonb,
-       updated_at_ms = $2
+       build_error   = $2::jsonb,
+       updated_at_ms = ` + nowMs + `
  WHERE cluster_id = $1::uuid
-   AND id = ANY($4::uuid[])
+   AND id = ANY($3::uuid[])
    AND status = 'building'`
 
 // reapedBuildError is the reason recorded on both halves.

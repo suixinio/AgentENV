@@ -44,12 +44,43 @@ func TestReadyPredicateIsCarriedExactlyWhereItIsAskedFor(t *testing.T) {
 		"list, unfenced":       mustListSQL(t, ListInput{ClusterID: anyCluster}),
 		"resolve alias, any":   resolveAliasSQL(false),
 		"fail active build":    failActiveBuildSQL,
+		"finish active build":  finishActiveBuildSQL,
 		"fail reaped template": failReapedTemplatesSQL,
 	}
 	for name, sql := range withoutPredicate {
 		if strings.Contains(sql, readyPredicate) {
 			t.Fatalf("%s carries %q, and it must not:\n%s", name, readyPredicate, sql)
 		}
+	}
+}
+
+// TestTheHeartbeatAxisNeverTakesACallersClock is the property behind the
+// reaper, asserted where it can be seen without a database.
+//
+// 🔴 The three statements below are the whole of the heartbeat axis: two write
+// it and one judges it. If any of them took its instant from a parameter, the
+// comparison the reaper makes would be between two machines' clocks — and a
+// node running slow would have its builds ended while they were still running,
+// with the error saying the heartbeat lapsed when it never had. There is no
+// test a caller could write that would notice, because both processes behave
+// exactly as written; the only symptom is builds dying.
+func TestTheHeartbeatAxisNeverTakesACallersClock(t *testing.T) {
+	for name, sql := range map[string]string{
+		"admit a build":     insertBuildSQL,
+		"renew the lease":   renewBuildLeaseSQL,
+		"reap stale builds": reapBuildsSQL,
+	} {
+		if !strings.Contains(sql, "clock_timestamp()") {
+			t.Fatalf("%s does not take its instant from the database:\n%s", name, sql)
+		}
+	}
+
+	// And the reaper's threshold is that clock minus a duration, not an instant
+	// somebody sent. A statement carrying `heartbeat_at_ms < $n` with nothing
+	// else is the shape this rules out.
+	const threshold = "heartbeat_at_ms < " + nowMs + " - $2"
+	if !strings.Contains(reapBuildsSQL, threshold) {
+		t.Fatalf("the reaper's staleness test is not %q:\n%s", threshold, reapBuildsSQL)
 	}
 }
 

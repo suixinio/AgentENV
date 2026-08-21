@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +58,12 @@ type stubCatalogStore struct {
 	buildRErr error
 	reaped    []catalog.ReapedBuild
 	reapErr   error
+
+	// The reaper runs on its own goroutine, so what it did has to be read
+	// under a lock rather than off a plain field.
+	reapMu    sync.Mutex
+	reapCalls int
+	lastReap  catalog.ReapInput
 
 	// What the store was actually asked for, so a test can assert the
 	// translation rather than only the answer.
@@ -116,8 +123,18 @@ func (s *stubCatalogStore) GetBuild(_ context.Context, _, _ string) (*catalog.Bu
 	return s.buildRow, s.buildRErr
 }
 
-func (s *stubCatalogStore) ReapExpiredBuilds(_ context.Context, _ catalog.ReapInput) ([]catalog.ReapedBuild, error) {
+func (s *stubCatalogStore) ReapExpiredBuilds(_ context.Context, in catalog.ReapInput) ([]catalog.ReapedBuild, error) {
+	s.reapMu.Lock()
+	s.reapCalls++
+	s.lastReap = in
+	s.reapMu.Unlock()
 	return s.reaped, s.reapErr
+}
+
+func (s *stubCatalogStore) reapsSoFar() (int, catalog.ReapInput) {
+	s.reapMu.Lock()
+	defer s.reapMu.Unlock()
+	return s.reapCalls, s.lastReap
 }
 
 func (s *stubCatalogStore) Close() {}
@@ -125,6 +142,25 @@ func (s *stubCatalogStore) Close() {}
 type stubGate struct{ err error }
 
 func (g stubGate) Require() error { return g.err }
+
+// shiftingGate is a gate a test can close and open again, which is what the
+// reaper's warm-up window has to survive.
+type shiftingGate struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (g *shiftingGate) Require() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.err
+}
+
+func (g *shiftingGate) set(err error) {
+	g.mu.Lock()
+	g.err = err
+	g.mu.Unlock()
+}
 
 const serviceCluster = "11111111-1111-1111-1111-111111111111"
 
@@ -722,6 +758,158 @@ func TestRenewBuildLeaseReportsTheReapedBuild(t *testing.T) {
 	}
 	if resp.GetLive() {
 		t.Fatal("a reaped build was reported live")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The reaper's driver
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 🔴 These are the refusal tests, and they are the ones to break first when
+// checking whether this file holds anything. The reaper's two directions are
+// not the same size: a pass that misses a stranded build costs an operator a
+// query, and a pass that ends a build still running costs a user the VM-minutes
+// it had spent and tells them their heartbeat lapsed when it never did.
+
+// reaperTiming keeps the two numbers these tests turn on in one place. The TTL
+// is long enough that a warm-up window is unmistakable and short enough that
+// the suite does not wait on it.
+const (
+	reaperTestTTL      = 300 * time.Millisecond
+	reaperTestInterval = 5 * time.Millisecond
+)
+
+// TestTheReaperWillNotEndBuildsItWasNeverAbleToHearFrom is the failure the
+// paused registry's restart grace exists for, reached through the one door that
+// does not use it.
+//
+// 🔴 Every builder in the cluster renews through this process. A rollout, an
+// image pull or an OOM stops all of them at once — so on the way back up every
+// heartbeat in the table is stale, not because the builders stopped but because
+// nothing was listening. A reaper that starts work immediately ends the lot of
+// them on its first pass, each one a build VM's worth of a user's time, and the
+// error each user gets says their heartbeat lapsed.
+func TestTheReaperWillNotEndBuildsItWasNeverAbleToHearFrom(t *testing.T) {
+	store := &stubCatalogStore{}
+	svc := newCatalogService(t, store, stubGate{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.RunBuildReaper(ctx, reaperTestInterval, reaperTestTTL)
+
+	// Well past several intervals, and well short of one TTL.
+	time.Sleep(reaperTestTTL / 3)
+	if calls, _ := store.reapsSoFar(); calls != 0 {
+		t.Fatalf("the reaper ran %d passes before it had been able to hear a heartbeat for a full TTL", calls)
+	}
+}
+
+// TestTheReaperRunsOnceItHasBeenListeningForAFullTTL is the other half: the
+// window has to end, or the reaper never runs and the partial unique index
+// turns one crashed build into a template nobody can build again.
+func TestTheReaperRunsOnceItHasBeenListeningForAFullTTL(t *testing.T) {
+	store := &stubCatalogStore{}
+	svc := newCatalogService(t, store, stubGate{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.RunBuildReaper(ctx, reaperTestInterval, reaperTestTTL)
+
+	deadline := time.Now().Add(5 * reaperTestTTL)
+	for time.Now().Before(deadline) {
+		if calls, in := store.reapsSoFar(); calls > 0 {
+			if in.ClusterID != serviceCluster {
+				t.Fatalf("the pass was scoped to %q, want %q", in.ClusterID, serviceCluster)
+			}
+			// 🔴 A duration, and there is no field for an instant. The
+			// heartbeats this is compared against are stamped by the database,
+			// so a "now" from this process would be the second clock the whole
+			// design exists to remove.
+			if in.TTLMs != reaperTestTTL.Milliseconds() {
+				t.Fatalf("the pass carried ttl=%dms, want %dms", in.TTLMs, reaperTestTTL.Milliseconds())
+			}
+			return
+		}
+		time.Sleep(reaperTestInterval)
+	}
+	t.Fatal("the reaper never ran a pass: a stranded build would hold its template shut for ever")
+}
+
+// TestTheReaperStartsItsWindowOverWhenTheGateCloses covers the case that makes
+// the window worth having at all: the database going away and coming back is
+// exactly when every heartbeat looks stale.
+func TestTheReaperStartsItsWindowOverWhenTheGateCloses(t *testing.T) {
+	store := &stubCatalogStore{}
+	gate := &shiftingGate{}
+	svc := newCatalogService(t, store, gate)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.RunBuildReaper(ctx, reaperTestInterval, reaperTestTTL)
+
+	// Most of the way through the first window, then the gate shuts.
+	time.Sleep(reaperTestTTL * 3 / 4)
+	gate.set(pausedregistry.ErrNotReady)
+	time.Sleep(reaperTestTTL / 2)
+	gate.set(nil)
+
+	// Whatever the first window had accumulated, it is gone: the reaper has
+	// been able to hear a heartbeat again only since the line above.
+	time.Sleep(reaperTestTTL / 3)
+	if calls, _ := store.reapsSoFar(); calls != 0 {
+		t.Fatalf("the reaper ran %d passes on a window that a closed gate should have restarted", calls)
+	}
+}
+
+// TestTheReaperRefusesToRunWithoutSomethingToScopeItTo keeps the loop from
+// spending a process's lifetime logging the same refusal.
+//
+// 🔴 It returns rather than looping, and it says so at error level. A reaper
+// that is not running is a fact somebody has to be able to find, because the
+// symptom is a template that cannot be built and nothing anywhere connects the
+// two.
+func TestTheReaperRefusesToRunWithoutSomethingToScopeItTo(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		svc      *SnapshotCatalogService
+		interval time.Duration
+		ttl      time.Duration
+	}{
+		{
+			name:     "no cluster",
+			svc:      NewSnapshotCatalogService(zap.NewNop(), &stubCatalogStore{}, stubGate{}, ""),
+			interval: reaperTestInterval, ttl: reaperTestTTL,
+		},
+		{
+			name:     "no store",
+			svc:      NewSnapshotCatalogService(zap.NewNop(), nil, stubGate{}, serviceCluster),
+			interval: reaperTestInterval, ttl: reaperTestTTL,
+		},
+		{
+			name:     "no ttl",
+			svc:      newCatalogService(t, &stubCatalogStore{}, stubGate{}),
+			interval: reaperTestInterval, ttl: 0,
+		},
+		{
+			name:     "no interval",
+			svc:      newCatalogService(t, &stubCatalogStore{}, stubGate{}),
+			interval: 0, ttl: reaperTestTTL,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			done := make(chan struct{})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				tc.svc.RunBuildReaper(ctx, tc.interval, tc.ttl)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * reaperTestTTL):
+				t.Fatal("the reaper kept looping over a configuration it cannot run")
+			}
+		})
 	}
 }
 

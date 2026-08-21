@@ -1242,7 +1242,7 @@ func TestWithBuildProjectsTheNewestBuild(t *testing.T) {
 	out, err := f.store.StartBuild(f.ctx, StartBuildInput{
 		ClusterID: f.cluster, NodeID: "node-a",
 		BuildID: template.SnapshotID, TemplateID: template.SnapshotID,
-		StartedAtMs: started, HeartbeatAtMs: started,
+		StartedAtMs: started,
 	})
 	if err != nil || out.Rejected != nil {
 		t.Fatalf("start build: %v %+v", err, out.Rejected)
@@ -1826,8 +1826,29 @@ func (f *fixture) startBuild(templateID, buildID, node string, at int64) (StartB
 	return f.store.StartBuild(f.ctx, StartBuildInput{
 		ClusterID: f.cluster, NodeID: node,
 		BuildID: buildID, TemplateID: templateID,
-		StartedAtMs: at, HeartbeatAtMs: at,
+		StartedAtMs: at,
 	})
+}
+
+// ageBuildHeartbeat pushes a build's last heartbeat into the past.
+//
+// 🔴 This is how a test makes a build look stranded, and there is deliberately
+// no other way. The heartbeat and the reaper's threshold both come from the
+// database's clock, so nothing a caller passes can move either — which is the
+// property under test as much as it is an inconvenience here. A stranded build
+// *is* a row whose heartbeat is old, and that is what this writes.
+func (f *fixture) ageBuildHeartbeat(buildID string, by time.Duration) {
+	f.t.Helper()
+
+	tag, err := f.pool.Exec(f.ctx,
+		`UPDATE builds SET heartbeat_at_ms = heartbeat_at_ms - $2 WHERE id = $1::uuid`,
+		buildID, by.Milliseconds())
+	if err != nil {
+		f.t.Fatalf("age the heartbeat of build %s: %v", buildID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		f.t.Fatalf("aging build %s touched %d rows", buildID, tag.RowsAffected())
+	}
 }
 
 func TestStartBuildAdmitsOneAndMovesTheTemplate(t *testing.T) {
@@ -1901,7 +1922,7 @@ func TestStartBuildIsExclusiveUnderConcurrency(t *testing.T) {
 			out, err := f.store.StartBuild(context.Background(), StartBuildInput{
 				ClusterID: f.cluster, NodeID: fmt.Sprintf("node-%d", i),
 				BuildID: newUUID(t), TemplateID: template.SnapshotID,
-				StartedAtMs: time.Now().UnixMilli(), HeartbeatAtMs: time.Now().UnixMilli(),
+				StartedAtMs: time.Now().UnixMilli(),
 			})
 			mu.Lock()
 			defer mu.Unlock()
@@ -2028,27 +2049,252 @@ func TestStartBuildStopsAtTheClusterCeiling(t *testing.T) {
 	}
 }
 
-func TestStartBuildRefusesABuildNothingCouldEverReap(t *testing.T) {
+// TestNoAdmittedBuildCanBeOneNothingCouldEverReap is the guard that used to be
+// a check on an input field, made structural.
+//
+// 🔴 The row it keeps out is the worst one this table can hold: a build with no
+// heartbeat is invisible to the reaper for ever, and `builds_one_active_per_
+// template` turns it into a template nobody can build again for as long as the
+// database lives. It used to be refused when a caller left the field unset,
+// which meant the guarantee was only as good as every future caller. The
+// admitting statement stamps the heartbeat itself now, so there is no input
+// that can produce the row at all — this asserts that, over the surface a
+// caller actually has.
+// TestTheClusterCeilingHoldsUnderConcurrency is what the advisory lock is for,
+// and the only test that can tell whether it is there.
+//
+// 🔴 Under READ COMMITTED two admissions cannot see each other's uncommitted
+// rows, so "insert, then count" lets both through and a ceiling of two admits
+// three. The sequential test above passes either way — it is this one that
+// fails when the lock goes.
+func TestTheClusterCeilingHoldsUnderConcurrency(t *testing.T) {
+	const ceiling = 3
+	f := newFixture(t, withBuildCeiling(ceiling))
+
+	const racers = 12
+	templates := make([]string, 0, racers)
+	for i := 0; i < racers; i++ {
+		templates = append(templates, f.beginTemplate("").SnapshotID)
+	}
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		admitted int
+		full     int
+		failures []error
+	)
+	start := make(chan struct{})
+	for i, template := range templates {
+		wg.Add(1)
+		go func(i int, template string) {
+			defer wg.Done()
+			<-start
+			out, err := f.store.StartBuild(context.Background(), StartBuildInput{
+				ClusterID: f.cluster, NodeID: fmt.Sprintf("node-%d", i),
+				BuildID: newUUID(t), TemplateID: template,
+				StartedAtMs: time.Now().UnixMilli(),
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				failures = append(failures, err)
+			case out.Rejected == nil:
+				admitted++
+			case out.Rejected.Reason == RejectionBuildQueueFull:
+				full++
+			default:
+				failures = append(failures, fmt.Errorf("unexpected refusal %s", out.Rejected.Reason))
+			}
+		}(i, template)
+	}
+	close(start)
+	wg.Wait()
+
+	if len(failures) > 0 {
+		t.Fatalf("errors during the race: %v", failures)
+	}
+	if admitted != ceiling {
+		t.Fatalf("%d builds were admitted against a ceiling of %d: the count is not being taken under a lock", admitted, ceiling)
+	}
+	if full != racers-ceiling {
+		t.Fatalf("%d admissions were refused for the ceiling, want %d", full, racers-ceiling)
+	}
+}
+
+func TestNoAdmittedBuildCanBeOneNothingCouldEverReap(t *testing.T) {
 	f := newFixture(t)
+
+	for _, at := range []int64{0, 1, -1, time.Now().UnixMilli()} {
+		template := f.beginTemplate("")
+		out, err := f.store.StartBuild(f.ctx, StartBuildInput{
+			ClusterID: f.cluster, NodeID: "node-a",
+			BuildID: template.SnapshotID, TemplateID: template.SnapshotID,
+			StartedAtMs: at,
+		})
+		if err != nil || out.Rejected != nil {
+			t.Fatalf("started_at_ms=%d: %v %+v", at, err, out.Rejected)
+		}
+		if out.Build.HeartbeatAtMs == nil {
+			t.Fatalf("started_at_ms=%d admitted a build with no heartbeat: nothing could ever reap it", at)
+		}
+		// And it is this machine's clock, not whatever the caller's timeline
+		// said — the reaper judges it against the same one.
+		if drift := time.Since(time.UnixMilli(*out.Build.HeartbeatAtMs)); drift > time.Minute || drift < -time.Minute {
+			t.Fatalf("started_at_ms=%d stamped a heartbeat %s away from now", at, drift)
+		}
+	}
 
 	template := f.beginTemplate("")
 	_, err := f.store.StartBuild(f.ctx, StartBuildInput{
-		ClusterID: f.cluster, NodeID: "node-a",
-		BuildID: template.SnapshotID, TemplateID: template.SnapshotID,
-		StartedAtMs: time.Now().UnixMilli(),
-		// No heartbeat: the reaper only touches rows that carry one, so this
-		// build would hold its template behind the unique index forever.
-	})
-	if !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("error = %v, want ErrInvalidArgument", err)
-	}
-
-	_, err = f.store.StartBuild(f.ctx, StartBuildInput{
 		ClusterID: f.cluster, BuildID: template.SnapshotID, TemplateID: template.SnapshotID,
-		StartedAtMs: 1, HeartbeatAtMs: 1,
+		StartedAtMs: 1,
 	})
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("a build with no node was accepted: %v", err)
+	}
+}
+
+// TestTheHeartbeatAxisIsOneClock is the reason the two build statements stopped
+// taking a timestamp.
+//
+// 🔴 The bug it locks out. A heartbeat stamped by the node and a staleness
+// threshold computed by whoever runs the reaping pass are two different
+// machines' clocks, and their difference is indistinguishable from elapsed
+// time. A node running five minutes slow had every build it ran reaped while it
+// was still running — repeatedly, with the error saying its heartbeat lapsed
+// when it had never missed one. Nothing on either side compares the clocks, so
+// the only symptom is builds dying. Both ends come from the database now, and
+// the surface no longer has anywhere to put a second clock.
+func TestTheHeartbeatAxisIsOneClock(t *testing.T) {
+	f := newFixture(t)
+
+	template := f.beginTemplate("")
+	// A caller whose whole timeline is a week behind everyone else's.
+	behind := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
+	out, err := f.startBuild(template.SnapshotID, "", "node-slow", behind)
+	if err != nil || out.Rejected != nil {
+		t.Fatalf("start: %v %+v", err, out.Rejected)
+	}
+
+	// The reaper would end anything unheard from for a minute. This build is a
+	// week old by its own account and was admitted a moment ago by the
+	// database's, and the database's is the one that counts.
+	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 60_000})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(reaped) != 0 {
+		t.Fatalf("a build from a node whose clock is a week slow was reaped while it was still running: %+v", reaped)
+	}
+
+	// Same again for the renewal: a builder that reports a stale instant is
+	// still a builder that just spoke.
+	f.ageBuildHeartbeat(out.Build.BuildID, 10*time.Minute)
+	live, err := f.store.RenewBuildLease(f.ctx, RenewBuildLeaseInput{
+		ClusterID: f.cluster, NodeID: "node-slow", BuildID: out.Build.BuildID,
+	})
+	if err != nil || !live {
+		t.Fatalf("renew: live=%v err=%v", live, err)
+	}
+	reaped, err = f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 60_000})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(reaped) != 0 {
+		t.Fatalf("a build that had just renewed was reaped: %+v", reaped)
+	}
+}
+
+// TestASuccessfulBuildComesOffTheQueue is the half of admission that only ever
+// shows up as an outage, and only after twenty successes.
+//
+// 🔴 What it locks. Both the per-template exclusion and the cluster ceiling
+// count exactly the `pending`/`in_progress` build rows. Nothing but this moves
+// a build out of that group when it *works* — the reaper only touches rows
+// whose heartbeat has lapsed, and the failure path is a different statement. So
+// without it, every successful build in the cluster's life goes on holding a
+// slot, the count creeps up as a monotone function of how well things are
+// going, and one day every build in the cluster is refused with the queue full
+// while nothing is building at all.
+func TestASuccessfulBuildComesOffTheQueue(t *testing.T) {
+	const ceiling = 3
+	f := newFixture(t, withBuildCeiling(ceiling))
+
+	// One more successful build than the ceiling. Every one of them starts,
+	// commits, and must leave the queue empty behind it.
+	for i := 0; i < ceiling+1; i++ {
+		template := f.beginTemplate("")
+		out, err := f.startBuild(template.SnapshotID, "", "node-a", 0)
+		if err != nil {
+			t.Fatalf("build %d: %v", i, err)
+		}
+		if out.Rejected != nil {
+			t.Fatalf("build %d was refused with %s: a successful build is still holding its slot",
+				i, out.Rejected.Reason)
+		}
+
+		size := uint32(10)
+		f.commit(CommitInput{SnapshotID: template.SnapshotID, DiskSizeMiB: &size})
+
+		build, err := f.store.GetBuild(f.ctx, f.cluster, out.Build.BuildID)
+		if err != nil {
+			t.Fatalf("get build %d: %v", i, err)
+		}
+		if build.StatusGroup != StatusGroupReady {
+			t.Fatalf("build %d is %q/%q after its snapshot committed", i, build.Status, build.StatusGroup)
+		}
+		// The finish has to be recorded too — `builds_finished_axis` states the
+		// equivalence, so a terminal group without one cannot be written at all
+		// and this would have failed above; asserted anyway, because the column
+		// is what an operator reads to see how long the build took.
+		if build.FinishedAtMs == nil {
+			t.Fatalf("build %d ended without recording when", i)
+		}
+	}
+
+	var active int64
+	if err := f.pool.QueryRow(f.ctx, countActiveBuildsSQL, f.cluster).Scan(&active); err != nil {
+		t.Fatalf("count active builds: %v", err)
+	}
+	if active != 0 {
+		t.Fatalf("%d builds are still on the queue with nothing building", active)
+	}
+}
+
+// TestACommitWithNoBuildOfItsOwnLeavesOtherBuildsAlone is the refusal half of
+// the statement above. A pause commits a snapshot too, and it has no build.
+func TestACommitWithNoBuildOfItsOwnLeavesOtherBuildsAlone(t *testing.T) {
+	f := newFixture(t)
+
+	// A build running for one template…
+	building := f.beginTemplate("")
+	out, err := f.startBuild(building.SnapshotID, "", "node-a", 0)
+	if err != nil || out.Rejected != nil {
+		t.Fatalf("start: %v %+v", err, out.Rejected)
+	}
+
+	// …and an unrelated snapshot committing.
+	other := f.begin(BeginInput{
+		SnapshotID:      newUUID(t),
+		SourceKind:      SourceKindSandbox,
+		SourceSandboxID: "sbx-unrelated",
+		Status:          StatusBuilding,
+		CPUCount:        2,
+		MemoryMiB:       512,
+		DiskSizeMiB:     4,
+		Published:       true,
+		CreatedAtMs:     time.Now().UnixMilli(),
+	})
+	f.commit(CommitInput{SnapshotID: other.SnapshotID})
+
+	still, err := f.store.GetBuild(f.ctx, f.cluster, out.Build.BuildID)
+	if err != nil {
+		t.Fatalf("get build: %v", err)
+	}
+	if still.StatusGroup != StatusGroupInProgress {
+		t.Fatalf("another snapshot's commit ended a running build: %+v", still)
 	}
 }
 
@@ -2061,8 +2307,16 @@ func TestRenewBuildLease(t *testing.T) {
 		t.Fatalf("start: %v %+v", err, out.Rejected)
 	}
 
+	// Aged first, so that "the renewal moved it" is a change this test can see
+	// rather than two reads of the same second.
+	f.ageBuildHeartbeat(out.Build.BuildID, time.Hour)
+	before, err := f.store.GetBuild(f.ctx, f.cluster, out.Build.BuildID)
+	if err != nil {
+		t.Fatalf("get build: %v", err)
+	}
+
 	live, err := f.store.RenewBuildLease(f.ctx, RenewBuildLeaseInput{
-		ClusterID: f.cluster, NodeID: "node-a", BuildID: out.Build.BuildID, HeartbeatAtMs: 2000,
+		ClusterID: f.cluster, NodeID: "node-a", BuildID: out.Build.BuildID,
 	})
 	if err != nil || !live {
 		t.Fatalf("renew: live=%v err=%v", live, err)
@@ -2071,15 +2325,15 @@ func TestRenewBuildLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get build: %v", err)
 	}
-	if after.HeartbeatAtMs == nil || *after.HeartbeatAtMs != 2000 {
-		t.Fatalf("heartbeat = %v, want 2000", after.HeartbeatAtMs)
+	if after.HeartbeatAtMs == nil || *after.HeartbeatAtMs <= *before.HeartbeatAtMs {
+		t.Fatalf("the renewal did not move the heartbeat: %v -> %v", before.HeartbeatAtMs, after.HeartbeatAtMs)
 	}
 
 	// 🔴 A process that is not the one running this build must not keep it
 	// alive — that is exactly what would happen after the reaper freed the
 	// template and somebody else took it.
 	live, err = f.store.RenewBuildLease(f.ctx, RenewBuildLeaseInput{
-		ClusterID: f.cluster, NodeID: "node-b", BuildID: out.Build.BuildID, HeartbeatAtMs: 3000,
+		ClusterID: f.cluster, NodeID: "node-b", BuildID: out.Build.BuildID,
 	})
 	if err != nil {
 		t.Fatalf("renew: %v", err)
@@ -2089,7 +2343,7 @@ func TestRenewBuildLease(t *testing.T) {
 	}
 
 	live, err = f.store.RenewBuildLease(f.ctx, RenewBuildLeaseInput{
-		ClusterID: f.cluster, NodeID: "node-a", BuildID: newUUID(t), HeartbeatAtMs: 3000,
+		ClusterID: f.cluster, NodeID: "node-a", BuildID: newUUID(t),
 	})
 	if err != nil {
 		t.Fatalf("renew: %v", err)
@@ -2154,14 +2408,13 @@ func TestReaperEndsBothHalvesOfAStrandedBuild(t *testing.T) {
 	f := newFixture(t)
 
 	template := f.beginTemplate("")
-	started := int64(1_000_000)
-	out, err := f.startBuild(template.SnapshotID, "", "node-a", started)
+	out, err := f.startBuild(template.SnapshotID, "", "node-a", 0)
 	if err != nil || out.Rejected != nil {
 		t.Fatalf("start: %v %+v", err, out.Rejected)
 	}
 
-	now := started + 10*60*1000
-	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, NowMs: now, TTLMs: 5 * 60 * 1000})
+	f.ageBuildHeartbeat(out.Build.BuildID, 10*time.Minute)
+	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 5 * 60 * 1000})
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
@@ -2198,7 +2451,7 @@ func TestReaperEndsBothHalvesOfAStrandedBuild(t *testing.T) {
 
 	// And the builder finds out, which is the only notice it gets.
 	live, err := f.store.RenewBuildLease(f.ctx, RenewBuildLeaseInput{
-		ClusterID: f.cluster, NodeID: "node-a", BuildID: out.Build.BuildID, HeartbeatAtMs: now,
+		ClusterID: f.cluster, NodeID: "node-a", BuildID: out.Build.BuildID,
 	})
 	if err != nil {
 		t.Fatalf("renew: %v", err)
@@ -2213,15 +2466,13 @@ func TestReaperEndsBothHalvesOfAStrandedBuild(t *testing.T) {
 func TestReaperIsWhatKeepsTheExclusionFromBecomingAnOutage(t *testing.T) {
 	f := newFixture(t)
 
-	started := int64(2_000_000)
-	now := started + 10*60*1000
-
 	strand := func() string {
 		template := f.beginTemplate("")
-		out, err := f.startBuild(template.SnapshotID, "", "node-a", started)
+		out, err := f.startBuild(template.SnapshotID, "", "node-a", 0)
 		if err != nil || out.Rejected != nil {
 			f.t.Fatalf("start: %v %+v", err, out.Rejected)
 		}
+		f.ageBuildHeartbeat(out.Build.BuildID, 10*time.Minute)
 		return template.SnapshotID
 	}
 
@@ -2229,7 +2480,7 @@ func TestReaperIsWhatKeepsTheExclusionFromBecomingAnOutage(t *testing.T) {
 	// stays blocked. If this half passed too, the test below would prove
 	// nothing about the reaper.
 	blocked := strand()
-	out, err := f.startBuild(blocked, newUUID(t), "node-b", now)
+	out, err := f.startBuild(blocked, newUUID(t), "node-b", 0)
 	if err != nil {
 		t.Fatalf("retry without reaping: %v", err)
 	}
@@ -2239,10 +2490,10 @@ func TestReaperIsWhatKeepsTheExclusionFromBecomingAnOutage(t *testing.T) {
 
 	// And now with one.
 	reaped := strand()
-	if _, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, NowMs: now, TTLMs: 5 * 60 * 1000}); err != nil {
+	if _, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 5 * 60 * 1000}); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
-	out, err = f.startBuild(reaped, newUUID(t), "node-b", now)
+	out, err = f.startBuild(reaped, newUUID(t), "node-b", 0)
 	if err != nil {
 		t.Fatalf("retry after reaping: %v", err)
 	}
@@ -2251,17 +2502,36 @@ func TestReaperIsWhatKeepsTheExclusionFromBecomingAnOutage(t *testing.T) {
 	}
 }
 
+// TestReaperLeavesAliveAndUnevidencedBuildsAlone is the refusal half, and it is
+// the one that matters most in this file.
+//
+// 🔴 A reaper that leaks a row costs an operator a query. A reaper that ends a
+// build still running costs a user the VM-minutes it had spent, tells them
+// their heartbeat lapsed when it did not, and — because the template row is
+// failed alongside it — hands them an error for a build that was working. The
+// two directions are not the same size, so this is the test to break first when
+// checking whether these tests actually hold anything.
 func TestReaperLeavesAliveAndUnevidencedBuildsAlone(t *testing.T) {
 	f := newFixture(t)
 
-	now := int64(3_000_000)
-
-	// Alive: heartbeat inside the TTL.
+	// Alive: last heard from a minute ago, well inside the TTL.
 	alive := f.beginTemplate("")
-	aliveBuild, err := f.startBuild(alive.SnapshotID, "", "node-a", now-60*1000)
+	aliveBuild, err := f.startBuild(alive.SnapshotID, "", "node-a", 0)
 	if err != nil || aliveBuild.Rejected != nil {
 		t.Fatalf("start: %v %+v", err, aliveBuild.Rejected)
 	}
+	f.ageBuildHeartbeat(aliveBuild.Build.BuildID, time.Minute)
+
+	// 🔴 Just inside, too: a build one millisecond short of the TTL is still a
+	// build that is running. Without this the boundary could be > instead of >=
+	// — or the TTL could be ignored altogether — and the test above would not
+	// notice.
+	fresh := f.beginTemplate("")
+	freshBuild, err := f.startBuild(fresh.SnapshotID, "", "node-a", 0)
+	if err != nil || freshBuild.Rejected != nil {
+		t.Fatalf("start: %v %+v", err, freshBuild.Rejected)
+	}
+	f.ageBuildHeartbeat(freshBuild.Build.BuildID, 5*time.Minute-2*time.Second)
 
 	// 🔴 No heartbeat at all. The reaper leaves it alone forever, which is
 	// exactly why the admitting statement stamps one — this row is the shape
@@ -2272,11 +2542,11 @@ func TestReaperLeavesAliveAndUnevidencedBuildsAlone(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `
 INSERT INTO builds (id, template_id, cluster_id, status, status_group, node_id, created_at_ms, started_at_ms)
 VALUES ($1::uuid, $2::uuid, $3::uuid, 'building', 'in_progress', 'node-a', $4, $4)`,
-		unevidencedBuild, unevidenced.SnapshotID, f.cluster, now-999999); err != nil {
+		unevidencedBuild, unevidenced.SnapshotID, f.cluster, time.Now().Add(-time.Hour).UnixMilli()); err != nil {
 		t.Fatalf("insert a heartbeatless build: %v", err)
 	}
 
-	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, NowMs: now, TTLMs: 5 * 60 * 1000})
+	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 5 * 60 * 1000})
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
@@ -2284,7 +2554,7 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, 'building', 'in_progress', 'node-a', $4, $
 		t.Fatalf("the pass reaped %+v, want nothing", reaped)
 	}
 
-	for _, id := range []string{aliveBuild.Build.BuildID, unevidencedBuild} {
+	for _, id := range []string{aliveBuild.Build.BuildID, freshBuild.Build.BuildID, unevidencedBuild} {
 		build, err := f.store.GetBuild(f.ctx, f.cluster, id)
 		if err != nil {
 			t.Fatalf("get build: %v", err)
@@ -2293,13 +2563,80 @@ VALUES ($1::uuid, $2::uuid, $3::uuid, 'building', 'in_progress', 'node-a', $4, $
 			t.Fatalf("build %s was ended: %+v", id, build)
 		}
 	}
+
+	// 🔴 And their templates. A pass that left the build rows alone but failed
+	// the template rows anyway would still have taken a working build away from
+	// its user — the reaper writes both halves, so the refusal has to cover
+	// both halves too.
+	for _, id := range []string{alive.SnapshotID, fresh.SnapshotID, unevidenced.SnapshotID} {
+		row, err := f.store.GetSnapshot(f.ctx, f.cluster, id, ReadOptions{})
+		if err != nil {
+			t.Fatalf("get snapshot: %v", err)
+		}
+		if row.Status == StatusError {
+			t.Fatalf("template %s was failed under a build that is still running: %+v", id, row.BuildError)
+		}
+	}
+}
+
+// TestTheReaperDoesNotFailATemplateThatHasAlreadyPublished is the second half
+// of the refusal, on the half of the pass that writes to `snapshots`.
+//
+// 🔴 The reaper fails the template alongside the build, and that is right for a
+// template stuck at `building` — it is what stops the exclusion becoming an
+// outage. It is very wrong for a template that has published: the snapshot is
+// complete, users are starting sandboxes from it, and marking it `error` tells
+// every one of them it failed. The predicate that keeps the two apart is a
+// single `AND status = 'building'`, which removes cleanly and breaks nothing
+// else.
+func TestTheReaperDoesNotFailATemplateThatHasAlreadyPublished(t *testing.T) {
+	f := newFixture(t)
+
+	template := f.beginTemplate("")
+	out, err := f.startBuild(template.SnapshotID, "", "node-a", 0)
+	if err != nil || out.Rejected != nil {
+		t.Fatalf("start: %v %+v", err, out.Rejected)
+	}
+	size := uint32(12)
+	f.commit(CommitInput{SnapshotID: template.SnapshotID, DiskSizeMiB: &size})
+
+	// A second build row for a template that has already published. The store
+	// cannot produce one — the admitting statement refuses a `ready` template —
+	// so this is written round it, which is the point: the predicate has to
+	// hold against a row it did not create.
+	stale := newUUID(t)
+	if _, err := f.pool.Exec(f.ctx, `
+INSERT INTO builds (id, template_id, cluster_id, status, status_group, node_id, heartbeat_at_ms, created_at_ms, started_at_ms)
+VALUES ($1::uuid, $2::uuid, $3::uuid, 'building', 'in_progress', 'node-a', $4, $4, $4)`,
+		stale, template.SnapshotID, f.cluster, time.Now().Add(-time.Hour).UnixMilli()); err != nil {
+		t.Fatalf("plant a stale build under a published template: %v", err)
+	}
+
+	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 60_000})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(reaped) != 1 || reaped[0].BuildID != stale {
+		t.Fatalf("reaped %+v, want just the stale build", reaped)
+	}
+
+	row, err := f.store.GetSnapshot(f.ctx, f.cluster, template.SnapshotID, ReadOptions{OnlyReady: true})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if row == nil {
+		t.Fatal("the reaper took a published template out of every resolving query")
+	}
+	if row.Status != StatusReady || row.BuildError != nil {
+		t.Fatalf("a published template was failed by the reaper: status=%q error=%s", row.Status, row.BuildError)
+	}
 }
 
 func TestReaperRefusesAPassWithNoTTL(t *testing.T) {
 	f := newFixture(t)
 
 	// A pass with no TTL would end every live build in the cluster.
-	if _, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, NowMs: 1, TTLMs: 0}); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{ClusterID: f.cluster, TTLMs: 0}); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("error = %v, want ErrInvalidArgument", err)
 	}
 }
@@ -2308,13 +2645,14 @@ func TestReaperIsScopedToItsCluster(t *testing.T) {
 	f := newFixture(t)
 
 	template := f.beginTemplate("")
-	out, err := f.startBuild(template.SnapshotID, "", "node-a", 1000)
+	out, err := f.startBuild(template.SnapshotID, "", "node-a", 0)
 	if err != nil || out.Rejected != nil {
 		t.Fatalf("start: %v %+v", err, out.Rejected)
 	}
+	f.ageBuildHeartbeat(out.Build.BuildID, time.Hour)
 
 	reaped, err := f.store.ReapExpiredBuilds(f.ctx, ReapInput{
-		ClusterID: "22222222-2222-2222-2222-222222222222", NowMs: 10_000_000, TTLMs: 1000,
+		ClusterID: "22222222-2222-2222-2222-222222222222", TTLMs: 1000,
 	})
 	if err != nil {
 		t.Fatalf("reap: %v", err)

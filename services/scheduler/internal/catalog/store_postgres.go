@@ -455,6 +455,17 @@ func (s *PostgresStore) CommitSnapshot(ctx context.Context, in CommitInput) (Com
 		}
 	}
 
+	// 🔴 The build comes off the queue here, in the same transaction as the
+	// flip. Nothing else does it on the success path: without this, a build
+	// that worked keeps its `in_progress` row for ever, and since both the
+	// per-template exclusion and the cluster ceiling count exactly those rows,
+	// the cluster stops admitting builds after the ceiling's worth of
+	// successes. Unconditional; see finishActiveBuildSQL on why it is not a
+	// flag the caller sets.
+	if _, err := tx.Exec(ctx, finishActiveBuildSQL, snapshot, cluster, in.UpdatedAtMs); err != nil {
+		return CommitOutcome{}, fmt.Errorf("catalog commit_snapshot: %w", err)
+	}
+
 	row, err := readSnapshot(ctx, tx, cluster, snapshot, ReadOptions{})
 	if err != nil {
 		return CommitOutcome{}, err
@@ -775,12 +786,6 @@ func (s *PostgresStore) StartBuild(ctx context.Context, in StartBuildInput) (Sta
 	if strings.TrimSpace(in.NodeID) == "" {
 		return StartBuildOutcome{}, fmt.Errorf("%w: node_id is required: a build nobody is running cannot be reaped", ErrInvalidArgument)
 	}
-	if in.HeartbeatAtMs <= 0 {
-		// 🔴 Refused rather than defaulted. The reaper only touches rows with a
-		// heartbeat, so a build admitted without one holds its template behind
-		// the unique index for as long as the database lives.
-		return StartBuildOutcome{}, fmt.Errorf("%w: a build is admitted with its first heartbeat, and this one has none", ErrInvalidArgument)
-	}
 
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
@@ -836,7 +841,7 @@ func (s *PostgresStore) StartBuild(ctx context.Context, in StartBuildInput) (Sta
 	}
 
 	if _, err := tx.Exec(ctx, insertBuildSQL,
-		build, template, cluster, strings.TrimSpace(in.NodeID), in.HeartbeatAtMs, in.StartedAtMs,
+		build, template, cluster, strings.TrimSpace(in.NodeID), in.StartedAtMs,
 	); err != nil {
 		// Reachable only against a writer that did not take the admission lock.
 		// The index is the enforcement and the read above is only what makes
@@ -887,7 +892,7 @@ func (s *PostgresStore) RenewBuildLease(ctx context.Context, in RenewBuildLeaseI
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 
-	tag, err := s.pool.Exec(ctx, renewBuildLeaseSQL, cluster, node, build, in.HeartbeatAtMs)
+	tag, err := s.pool.Exec(ctx, renewBuildLeaseSQL, cluster, node, build)
 	if err != nil {
 		return false, fmt.Errorf("catalog renew_build_lease: %w", err)
 	}
@@ -914,7 +919,7 @@ func (s *PostgresStore) ReapExpiredBuilds(ctx context.Context, in ReapInput) ([]
 	}
 	defer rollback()
 
-	rows, err := tx.Query(ctx, reapBuildsSQL, cluster, in.NowMs, in.NowMs-in.TTLMs, []byte(reapedBuildError))
+	rows, err := tx.Query(ctx, reapBuildsSQL, cluster, in.TTLMs, []byte(reapedBuildError))
 	if err != nil {
 		return nil, fmt.Errorf("catalog reap_builds: %w", err)
 	}
@@ -945,7 +950,7 @@ func (s *PostgresStore) ReapExpiredBuilds(ctx context.Context, in ReapInput) ([]
 	for _, r := range reaped {
 		templates = append(templates, r.TemplateID)
 	}
-	if _, err := tx.Exec(ctx, failReapedTemplatesSQL, cluster, in.NowMs, []byte(reapedBuildError), templates); err != nil {
+	if _, err := tx.Exec(ctx, failReapedTemplatesSQL, cluster, []byte(reapedBuildError), templates); err != nil {
 		return nil, fmt.Errorf("catalog reap_builds: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

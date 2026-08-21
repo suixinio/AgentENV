@@ -715,7 +715,10 @@ async fn rescoring_moves_existing_members_and_resurrects_none() {
     super::expiry::rescore_existing_members(
         &mut connection,
         &key,
-        &[(500i64, "present".to_string()), (500i64, "absent".to_string())],
+        &[
+            (500i64, "present".to_string()),
+            (500i64, "absent".to_string()),
+        ],
     )
     .await
     .unwrap();

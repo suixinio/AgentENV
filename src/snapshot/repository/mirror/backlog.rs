@@ -1,37 +1,104 @@
-//! The writes the object store still owes, and the pass that pays them.
+//! The writes each catalog still owes, and the pass that pays them.
 //!
 //! 🔴 Durable, and that is the whole reason it is here rather than a `Vec` in a
 //! field. The number this holds is what decides whether the read side may be
-//! pointed back at the object store — "no data is lost by rolling back" is only
-//! true while nothing is outstanding — and a backlog that emptied itself on
-//! restart would make that check pass by forgetting rather than by being right.
+//! moved — "no data is lost by switching" is only true while nothing is
+//! outstanding — and a backlog that emptied itself on restart would make that
+//! check pass by forgetting rather than by being right.
 //!
-//! 🔴 One direction only: central catalog to object store. The reverse is not
-//! reconstructible — a catalog row carries `status_group`, `published` and the
-//! build's heartbeat, none of which the object store has — so a mirror that
-//! could drift both ways would have one direction it could never repair.
+//! 🔴 **Both directions, tagged.** It used to be one: central catalog to object
+//! store, on the argument that an object-store row can be rebuilt from a
+//! catalog row and not the other way round. That argument is about
+//! *reconstructing a row by diffing state*, and this queue does not do that. It
+//! records the **operation** — the whole [`MirrorOp`], carrying the whole
+//! `SnapshotRecord` or `SnapshotCommit` — and replays it, which works equally
+//! well against either store. What the one-way rule actually bought was a
+//! central write that had to fail the user's publish when the scheduler was
+//! unreachable, and that trade is not worth making: see [`super`].
+//!
+//! The direction is not cosmetic. [`MirrorBacklog::lag_toward`] is read by two
+//! different switches that care about two different debts, so a lag that meant
+//! both at once would answer neither.
+//!
+//! 🔴 **Lag is not agreement.** A write nothing can replay is not owed, but the
+//! two catalogs still disagree about it, and the batch has a known permanent
+//! source of those: `try_start_build` writes object storage alone, so every
+//! template's central row stays `waiting` while the object store's moves on.
+//! Those are recorded here too, durably, as divergences rather than as debt —
+//! separately counted, because the compensator cannot pay them, and consulted
+//! by the same guard, because a read side moved over the top of one loses rows.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
+use crate::snapshot::repository::backends::central::{
+    commit_opening_record, opening_status, CatalogRefusal, CatalogWrite, STATUS_BUILDING,
+};
 use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
-use super::metrics::{record_mirror_repair_failed, record_mirror_repaired, set_mirror_lag};
+use super::central::CentralCatalogWrites;
+use super::metrics::{
+    record_mirror_repair_failed, record_mirror_repaired, record_mirror_unrecorded,
+    set_mirror_diverged, set_mirror_lag,
+};
 
-/// One catalog write the object store has not taken yet.
+/// Which store is behind.
+///
+/// 🔴 Names the store that still owes the write, not the store the write came
+/// from. Every counter and every guard below reads it that way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum MirrorDirection {
+    /// The object-store catalog has not taken it.
+    #[default]
+    ObjectStore,
+    /// The central catalog has not taken it.
+    Central,
+}
+
+impl MirrorDirection {
+    pub(super) const ALL: [Self; 2] = [Self::ObjectStore, Self::Central];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ObjectStore => "object_store",
+            Self::Central => "central",
+        }
+    }
+
+    /// What the store on this side is called in a message to an operator.
+    fn store_name(self) -> &'static str {
+        match self {
+            Self::ObjectStore => "the object-store catalog",
+            Self::Central => "the central catalog",
+        }
+    }
+
+    fn key_byte(self) -> u8 {
+        match self {
+            Self::ObjectStore => b'o',
+            Self::Central => b'c',
+        }
+    }
+}
+
+/// One catalog write a store has not taken yet.
 ///
 /// The *operation*, not the row it would produce. Recording the operation is
 /// what lets a replay be judged against the same contract the original call
 /// was: a `delete_record` whose target is already gone succeeded, and a row
-/// diff could not tell that from a delete that never ran.
+/// diff could not tell that from a delete that never ran. It is also what makes
+/// the queue work in both directions — an operation is replayable against
+/// whichever store missed it, while a row diff would only be replayable against
+/// the store whose columns are a subset of the other's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum MirrorOp {
     Create {
@@ -75,48 +142,63 @@ impl MirrorOp {
             Self::TryStartBuild { id } | Self::MarkBuildError { id, .. } => id,
         }
     }
+}
 
-    async fn replay(&self, target: &dyn SnapshotCatalog) -> RepositoryResult<()> {
-        match self {
-            Self::Create { record } => target.create(record.clone()).await.map(|_| ()),
-            Self::PublishCommit { commit } => {
-                target.publish_commit(commit.clone()).await.map(|_| ())
-            }
-            Self::TryStartBuild { id } => target.try_start_build(id).await.map(|_| ()),
-            Self::MarkBuildError { id, reason } => {
-                target.mark_build_error(id, reason.clone()).await
-            }
-            Self::DeleteRecord { record } => target.delete_record(record).await,
+/// One owed write and the store that owes it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OwedWrite {
+    #[serde(default)]
+    direction: MirrorDirection,
+    op: MirrorOp,
+}
+
+impl OwedWrite {
+    /// Decodes an entry, including one written before the queue had directions.
+    ///
+    /// A backlog on disk outlives the build that wrote it — `write = "both"` is
+    /// rolled back by turning the double write off and letting the compensator
+    /// finish, so the entries a *previous* build recorded are exactly the ones
+    /// the rollback depends on. An entry from before this field existed is an
+    /// object-store debt, which is all the queue held then.
+    fn decode(value: &[u8]) -> Result<Self, serde_json::Error> {
+        match serde_json::from_slice::<Self>(value) {
+            Ok(owed) => Ok(owed),
+            Err(newer) => match serde_json::from_slice::<MirrorOp>(value) {
+                Ok(op) => Ok(Self {
+                    direction: MirrorDirection::ObjectStore,
+                    op,
+                }),
+                Err(_) => Err(newer),
+            },
         }
     }
+}
 
-    /// Whether the target already reflects this write.
-    ///
-    /// 🔴 A read, not an error-message match. A replay can fail because the
-    /// first attempt actually landed and only its acknowledgement was lost, and
-    /// the two are indistinguishable from the error alone — every backend
-    /// spells "already exists" differently and one of them spells it
-    /// `InvalidRequest`. Asking the target what it has settles it.
-    async fn already_applied(&self, target: &dyn SnapshotCatalog) -> RepositoryResult<bool> {
-        let existing = target.get(&self.snapshot_id().to_string()).await?;
-        Ok(match self {
-            Self::Create { .. } => existing.is_some(),
-            Self::PublishCommit { .. } => existing
-                .map(|record| record.committed.is_some())
-                .unwrap_or(false),
-            Self::DeleteRecord { .. } => existing.is_none(),
-            Self::TryStartBuild { .. } => existing
-                .map(|record| build_status_at_least_started(&record))
-                .unwrap_or(false),
-            Self::MarkBuildError { .. } => existing
-                .map(|record| {
-                    matches!(
-                        build_status(&record),
-                        Some(crate::snapshot::types::TemplateBuildStatus::Error)
-                    )
-                })
-                .unwrap_or(false),
-        })
+/// Whether `existing` already reflects `op`.
+///
+/// 🔴 A read, not an error-message match. A replay can fail because the first
+/// attempt actually landed and only its acknowledgement was lost, and the two
+/// are indistinguishable from the error alone — every backend spells "already
+/// exists" differently and one of them spells it `InvalidRequest`. Asking the
+/// target what it has settles it.
+fn reflects(op: &MirrorOp, existing: Option<&SnapshotRecord>) -> bool {
+    match op {
+        MirrorOp::Create { .. } => existing.is_some(),
+        MirrorOp::PublishCommit { .. } => existing
+            .map(|record| record.committed.is_some())
+            .unwrap_or(false),
+        MirrorOp::DeleteRecord { .. } => existing.is_none(),
+        MirrorOp::TryStartBuild { .. } => {
+            existing.map(build_status_at_least_started).unwrap_or(false)
+        }
+        MirrorOp::MarkBuildError { .. } => existing
+            .map(|record| {
+                matches!(
+                    build_status(record),
+                    Some(crate::snapshot::types::TemplateBuildStatus::Error)
+                )
+            })
+            .unwrap_or(false),
     }
 }
 
@@ -140,20 +222,163 @@ fn build_status_at_least_started(record: &SnapshotRecord) -> bool {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Replay targets
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A store an owed write can be replayed against.
+///
+/// Two implementations, one per direction. They are not interchangeable: the
+/// probe a replay is judged against has to see rows at the widest scope the
+/// store has, and for the central catalog that is a different call from the one
+/// an ordinary read makes.
+#[async_trait]
+trait MirrorTarget: Send + Sync {
+    async fn apply(&self, op: &MirrorOp) -> RepositoryResult<()>;
+    async fn probe(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>;
+}
+
+struct ObjectStoreTarget(Arc<dyn SnapshotCatalog>);
+
+#[async_trait]
+impl MirrorTarget for ObjectStoreTarget {
+    async fn apply(&self, op: &MirrorOp) -> RepositoryResult<()> {
+        match op {
+            MirrorOp::Create { record } => self.0.create(record.clone()).await.map(|_| ()),
+            MirrorOp::PublishCommit { commit } => {
+                self.0.publish_commit(commit.clone()).await.map(|_| ())
+            }
+            MirrorOp::TryStartBuild { id } => self.0.try_start_build(id).await.map(|_| ()),
+            MirrorOp::MarkBuildError { id, reason } => {
+                self.0.mark_build_error(id, reason.clone()).await
+            }
+            MirrorOp::DeleteRecord { record } => self.0.delete_record(record).await,
+        }
+    }
+
+    async fn probe(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.0.get(&id.to_string()).await
+    }
+}
+
+struct CentralTarget(Arc<dyn CentralCatalogWrites>);
+
+impl CentralTarget {
+    /// Turns a refusal into a replay outcome.
+    ///
+    /// 🔴 `AlreadyExists` is a success here, and it is the ordinary answer
+    /// rather than an edge case: every replayed `publish_commit` opens the row
+    /// before flipping it, and a replay that got as far as opening it once
+    /// already finds it open. That is exactly what makes central writes
+    /// re-runnable, which is what the queue's second direction rests on.
+    fn settled<T>(op: &'static str, write: CatalogWrite<T>) -> RepositoryResult<()> {
+        match write {
+            CatalogWrite::Applied(_) | CatalogWrite::Refused(CatalogRefusal::AlreadyExists) => {
+                Ok(())
+            }
+            CatalogWrite::Refused(refusal) => Err(RepositoryError::InvalidRequest {
+                reason: format!("the central catalog refused a replayed '{op}': {refusal}"),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl MirrorTarget for CentralTarget {
+    async fn apply(&self, op: &MirrorOp) -> RepositoryResult<()> {
+        match op {
+            MirrorOp::Create { record } => Self::settled(
+                "create",
+                self.0.begin(record, opening_status(record), true).await?,
+            ),
+            MirrorOp::PublishCommit { commit } => {
+                let opening = commit_opening_record(commit);
+                Self::settled(
+                    "publish_commit.begin",
+                    self.0.begin(&opening, STATUS_BUILDING, false).await?,
+                )?;
+                Self::settled(
+                    "publish_commit.commit",
+                    self.0.commit(commit, true, now_unix_ms()).await?,
+                )
+            }
+            // Never recorded toward the central catalog: the transition is
+            // build admission, which this batch does not wire, so there is no
+            // write to owe. The arm exists because the enum is shared.
+            MirrorOp::TryStartBuild { id } => Err(RepositoryError::Unsupported {
+                feature: format!(
+                    "replaying a build start for '{id}' into the central catalog: the transition \
+                     is build admission, which is not wired"
+                ),
+            }),
+            MirrorOp::MarkBuildError { id, reason } => Self::settled(
+                "mark_build_error",
+                self.0.fail(id, reason, now_unix_ms()).await?,
+            ),
+            MirrorOp::DeleteRecord { record } => self
+                .0
+                .delete(&record.id.to_string(), now_unix_ms())
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    async fn probe(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.0.get_any_status(&id.to_string()).await
+    }
+}
+
+/// The stores a repair pass may replay into.
+///
+/// 🔴 Either may be absent, and absent is not the same as broken. Rolling the
+/// double write back to `write = "object_store"` takes the central catalog away
+/// on purpose; the pass still has to pay off what object storage is owed,
+/// because those publishes reported success and object storage is about to be
+/// the only catalog there is. Central-direction entries are then left alone
+/// rather than attempted or dropped.
+#[derive(Clone, Default)]
+pub struct MirrorTargets {
+    object_store: Option<Arc<dyn MirrorTarget>>,
+    central: Option<Arc<dyn MirrorTarget>>,
+}
+
+impl MirrorTargets {
+    pub fn object_store(catalog: Arc<dyn SnapshotCatalog>) -> Self {
+        Self {
+            object_store: Some(Arc::new(ObjectStoreTarget(catalog))),
+            central: None,
+        }
+    }
+
+    pub fn with_central(mut self, central: Arc<dyn CentralCatalogWrites>) -> Self {
+        self.central = Some(Arc::new(CentralTarget(central)));
+        self
+    }
+
+    fn for_direction(&self, direction: MirrorDirection) -> Option<&Arc<dyn MirrorTarget>> {
+        match direction {
+            MirrorDirection::ObjectStore => self.object_store.as_ref(),
+            MirrorDirection::Central => self.central.as_ref(),
+        }
+    }
+}
+
 /// What one replay attempt settled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RepairVerdict {
-    /// The object store now reflects the write. Drop the entry.
+    /// The target now reflects the write. Drop the entry.
     Repaired,
     /// Nothing was learned; the same attempt may work later. Keep the entry and
     /// stop touching this snapshot for the rest of the pass.
     Retry,
-    /// The object store refused in a way a retry cannot change.
+    /// The target refused in a way a retry cannot change.
     ///
-    /// 🔴 The entry stays. It is a real outstanding write — the two stores
-    /// disagree about this snapshot and nothing here can settle it — so the lag
-    /// must keep counting it, which is what keeps the read side from being
-    /// switched back over the top of a divergence.
+    /// 🔴 The write stops being *debt* and becomes a recorded *divergence*: the
+    /// two stores disagree about this snapshot and nothing here can settle it,
+    /// so replaying it every thirty seconds forever buys nothing and costs a
+    /// request against the store the acceptance number is measured on. It stays
+    /// counted — by [`MirrorBacklog::diverged_toward`] rather than by the lag —
+    /// and the read-side guard consults both.
     Diverged,
 }
 
@@ -203,8 +428,8 @@ pub struct RepairPass {
     pub repaired: usize,
     pub retry: usize,
     pub diverged: usize,
-    /// Entries the pass did not attempt because an earlier entry for the same
-    /// snapshot had not cleared.
+    /// Entries the pass did not attempt: an earlier entry for the same snapshot
+    /// and direction had not cleared, or this direction has no target.
     pub skipped: usize,
     pub remaining: u64,
 }
@@ -212,7 +437,7 @@ pub struct RepairPass {
 /// Which store answers catalog reads.
 ///
 /// Recorded across restarts so the guard below can tell an ordinary restart
-/// from somebody moving the read side back.
+/// from somebody moving the read side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogReadSide {
     ObjectStore,
@@ -234,6 +459,21 @@ impl CatalogReadSide {
             _ => None,
         }
     }
+
+    /// The direction whose debt would be lost by reading from this side.
+    ///
+    /// Reads answered from object storage cannot see what object storage does
+    /// not have, and reads answered from PostgreSQL cannot see what the central
+    /// catalog does not have. The switch onto a side is guarded by that side's
+    /// own debt, and by nothing else — which is what keeps a mirror that is
+    /// behind in the direction nobody is about to read from being treated as an
+    /// outage.
+    fn debt_that_would_be_invisible(self) -> MirrorDirection {
+        match self {
+            Self::ObjectStore => MirrorDirection::ObjectStore,
+            Self::Postgres => MirrorDirection::Central,
+        }
+    }
 }
 
 /// Key holding the read side the last process ran with.
@@ -242,11 +482,52 @@ const READ_SIDE_KEY: &[u8] = b"meta:read_side";
 /// First byte of every queued entry's key.
 const OWED_PREFIX: u8 = b'o';
 
-/// The durable queue of owed object-store writes.
+/// First byte of every recorded divergence's key.
+const DIVERGED_PREFIX: u8 = b'd';
+
+/// One snapshot the two catalogs disagree about, which no replay can settle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Divergence {
+    snapshot_id: SnapshotId,
+    /// The write that discovered it.
+    op: String,
+    reason: String,
+    noted_at_unix_ms: i64,
+}
+
+/// The counters for one direction.
+#[derive(Default)]
+struct DirectionCounters {
+    /// Entries sitting in the durable queue.
+    owed: AtomicU64,
+    /// 🔴 Writes this process could not even write down.
+    ///
+    /// Counted into the lag rather than dropped from it. The write is owed
+    /// whether or not the note survived, and a lag that only counted what it
+    /// managed to record would report agreement precisely when it had lost the
+    /// evidence of disagreement. What it cannot do is survive a restart —
+    /// nothing wrote it anywhere — so it is also a counter an operator can see.
+    unrecorded: AtomicU64,
+    /// Snapshots recorded as permanently disagreeing.
+    diverged: AtomicU64,
+}
+
+/// The durable queue of owed catalog writes, and the disagreements nothing can
+/// replay.
 pub struct MirrorBacklog {
     store: LocalKvStore,
     next_seq: AtomicU64,
-    lag: AtomicU64,
+    object_store: DirectionCounters,
+    central: DirectionCounters,
+    /// Test-only fault injection.
+    ///
+    /// The local store refusing a write is the one branch below that nothing
+    /// else can reach — RocksDB takes a write into its memtable whatever the
+    /// filesystem is doing — and it is the branch where the lag has to keep
+    /// counting a write it could not write down. Injecting it is the only way
+    /// to hold that behaviour still.
+    #[cfg(test)]
+    refuse_local_writes: std::sync::atomic::AtomicBool,
 }
 
 impl MirrorBacklog {
@@ -259,53 +540,147 @@ impl MirrorBacklog {
         let store = LocalKvStore::open(path, LocalStoreDurability::Wal)
             .await
             .context("open the snapshot catalog mirror backlog")?;
-        let entries = store
-            .entries()
+
+        let backlog = Arc::new(Self {
+            store,
+            next_seq: AtomicU64::new(1),
+            object_store: DirectionCounters::default(),
+            central: DirectionCounters::default(),
+            #[cfg(test)]
+            refuse_local_writes: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let owed = backlog
+            .store
+            .scan_prefix(vec![OWED_PREFIX])
             .await
             .context("read the snapshot catalog mirror backlog")?;
-
         let mut highest = 0u64;
-        let mut lag = 0u64;
-        for (key, _) in &entries {
-            if let Some(seq) = decode_seq(key) {
-                highest = highest.max(seq);
-                lag += 1;
+        for (key, value) in &owed {
+            let Some(seq) = decode_seq(key) else { continue };
+            highest = highest.max(seq);
+            // An entry nobody can decode is still an entry. Counted against the
+            // object store, which is the conservative reading: it is the side
+            // whose debt refuses the rollback the promise of zero data loss
+            // rests on.
+            let direction = OwedWrite::decode(value)
+                .map(|owed| owed.direction)
+                .unwrap_or(MirrorDirection::ObjectStore);
+            backlog
+                .counters(direction)
+                .owed
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        backlog
+            .next_seq
+            .store(highest.saturating_add(1), Ordering::Release);
+
+        let diverged = backlog
+            .store
+            .scan_prefix(vec![DIVERGED_PREFIX])
+            .await
+            .context("read the snapshot catalog mirror divergences")?;
+        for (key, _) in &diverged {
+            if let Some(direction) = decode_diverged_direction(key) {
+                backlog
+                    .counters(direction)
+                    .diverged
+                    .fetch_add(1, Ordering::AcqRel);
             }
         }
-        set_mirror_lag(lag);
-        if lag > 0 {
-            warn!(
-                mirror_lag = lag,
-                "the snapshot catalog mirror starts with writes the object store still owes"
-            );
+
+        backlog.publish_gauges();
+        for direction in MirrorDirection::ALL {
+            let lag = backlog.lag_toward(direction);
+            let diverged = backlog.diverged_toward(direction);
+            if lag > 0 || diverged > 0 {
+                warn!(
+                    direction = direction.as_str(),
+                    mirror_lag = lag,
+                    mirror_diverged = diverged,
+                    "the snapshot catalog mirror starts with writes {} still owes",
+                    direction.store_name()
+                );
+            }
         }
 
-        Ok(Arc::new(Self {
-            store,
-            next_seq: AtomicU64::new(highest.saturating_add(1)),
-            lag: AtomicU64::new(lag),
-        }))
+        Ok(backlog)
     }
 
-    /// How many writes the object store owes right now.
+    #[cfg(test)]
+    fn local_writes_refused(&self) -> bool {
+        self.refuse_local_writes.load(Ordering::SeqCst)
+    }
+
+    #[cfg(not(test))]
+    fn local_writes_refused(&self) -> bool {
+        false
+    }
+
+    async fn put_locally(&self, key: Vec<u8>, value: Vec<u8>) -> anyhow::Result<()> {
+        if self.local_writes_refused() {
+            anyhow::bail!("the local store refused the write");
+        }
+        self.store.put(key, value).await
+    }
+
+    fn counters(&self, direction: MirrorDirection) -> &DirectionCounters {
+        match direction {
+            MirrorDirection::ObjectStore => &self.object_store,
+            MirrorDirection::Central => &self.central,
+        }
+    }
+
+    fn publish_gauges(&self) {
+        for direction in MirrorDirection::ALL {
+            set_mirror_lag(direction, self.lag_toward(direction));
+            set_mirror_diverged(direction, self.diverged_toward(direction));
+        }
+    }
+
+    /// How many writes the store on `direction` owes right now.
+    pub fn lag_toward(&self, direction: MirrorDirection) -> u64 {
+        let counters = self.counters(direction);
+        counters.owed.load(Ordering::Acquire) + counters.unrecorded.load(Ordering::Acquire)
+    }
+
+    /// How many snapshots the store on `direction` is known to disagree about
+    /// in a way no replay can settle.
+    pub fn diverged_toward(&self, direction: MirrorDirection) -> u64 {
+        self.counters(direction).diverged.load(Ordering::Acquire)
+    }
+
+    /// Everything owed, in either direction.
     pub fn lag(&self) -> u64 {
-        self.lag.load(Ordering::Acquire)
+        MirrorDirection::ALL
+            .into_iter()
+            .map(|direction| self.lag_toward(direction))
+            .sum()
     }
 
-    /// Refuses to point reads back at the object store while it is behind.
+    /// Refuses to move reads onto a store that is behind.
     ///
-    /// 🔴 This is what makes "rolling the read side back loses nothing" a fact
-    /// rather than a hope. Every outstanding entry is a snapshot the central
-    /// catalog knows about and the object store does not, so a node serving
-    /// reads from object storage would answer "no such snapshot" for each of
-    /// them — and callers delete artifacts and refuse resumes on that answer.
+    /// 🔴 This is what makes "switching the read side loses nothing" a fact
+    /// rather than a hope. Every outstanding entry is a snapshot one catalog
+    /// knows about and the other does not, so a node serving reads from the
+    /// side that is behind would answer "no such snapshot" for each of them —
+    /// and callers delete artifacts and refuse resumes on that answer.
+    ///
+    /// 🔴 Debt is not the only way the two can disagree. `try_start_build`
+    /// writes object storage alone in this batch, so every template's central
+    /// row stays `waiting` while the object store's moves on — permanently, and
+    /// with a lag of zero, because nothing the compensator could replay would
+    /// close it. Moving reads to PostgreSQL on a cluster holding those
+    /// templates would make every one of them vanish from the API while every
+    /// number said the mirror was clean. So the guard reads the recorded
+    /// divergences as well, and the switch is refused while either is non-zero.
     ///
     /// 🔴 It fires on the *switch*, not on every start. A node that crashed
-    /// holding a backlog while already reading the object store has to come
-    /// back — refusing there would turn a mirror that is behind into a node
-    /// that is down, which is exactly the trade the double write exists to
-    /// avoid. So the side the last process ran with is recorded, and only
-    /// moving from PostgreSQL back to object storage is refused.
+    /// holding a backlog while already reading a store has to come back —
+    /// refusing there would turn a mirror that is behind into a node that is
+    /// down, which is exactly the trade the double write exists to avoid. So
+    /// the side the last process ran with is recorded, and only a move is
+    /// refused.
     pub async fn guard_read_side(&self, configured: CatalogReadSide) -> anyhow::Result<()> {
         let previous = self
             .store
@@ -314,18 +689,28 @@ impl MirrorBacklog {
             .context("read the catalog mirror's recorded read side")?
             .and_then(|raw| CatalogReadSide::parse(&raw));
 
-        let lag = self.lag();
-        if previous == Some(CatalogReadSide::Postgres)
-            && configured == CatalogReadSide::ObjectStore
-            && lag > 0
-        {
-            anyhow::bail!(
-                "snapshot.catalog.read is being moved from \"postgres\" back to \"object_store\" \
-                 while the object-store catalog is behind by {lag} write(s). Those snapshots exist \
-                 in the central catalog and not in object storage, so object storage would report \
-                 them as absent and callers would treat them as deleted. Leave read = \"postgres\" \
-                 until agentenv_snapshot_catalog_mirror_lag reaches 0, then switch."
-            );
+        if previous.is_some() && previous != Some(configured) {
+            let direction = configured.debt_that_would_be_invisible();
+            let lag = self.lag_toward(direction);
+            let diverged = self.diverged_toward(direction);
+            if lag > 0 || diverged > 0 {
+                anyhow::bail!(
+                    "snapshot.catalog.read is being moved to \"{configured}\" while {store} is \
+                     behind: {lag} write(s) still owed and {diverged} snapshot(s) recorded as \
+                     diverged. Those snapshots exist in the other catalog and not in this one, so \
+                     reads from it would report them as absent and callers would treat them as \
+                     deleted. Leave the read side where it is until \
+                     agentenv_snapshot_catalog_mirror_lag{{direction=\"{direction}\"}} and \
+                     agentenv_snapshot_catalog_mirror_diverged{{direction=\"{direction}\"}} both \
+                     reach 0, then switch.",
+                    configured = match configured {
+                        CatalogReadSide::ObjectStore => "object_store",
+                        CatalogReadSide::Postgres => "postgres",
+                    },
+                    store = direction.store_name(),
+                    direction = direction.as_str(),
+                );
+            }
         }
 
         self.store
@@ -336,36 +721,115 @@ impl MirrorBacklog {
 
     /// Records one owed write.
     ///
-    /// 🔴 A failure here is loud but not fatal to the caller: the central write
-    /// already succeeded and the operation already did what it was asked. What
-    /// is lost is the record that the object store is behind, so it is logged
-    /// at `error` — this is the one place the lag can be understated.
-    pub(super) async fn record(&self, op: MirrorOp) {
+    /// 🔴 A failure here is loud but not fatal to the caller: the other store
+    /// already took the write and the operation already did what it was asked.
+    /// What is lost is the durable record that this store is behind — so the
+    /// lag counts it anyway, from memory, and says separately that it did.
+    pub(super) async fn record(&self, direction: MirrorDirection, op: MirrorOp) {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let encoded = match serde_json::to_vec(&op) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                error!(
-                    op = op.name(),
-                    snapshot_id = %op.snapshot_id(),
-                    %error,
-                    "could not record an owed catalog mirror write; the object store is now \
-                     behind by one write nothing will replay"
-                );
-                return;
-            }
+        let owed = OwedWrite { direction, op };
+        let stored = match serde_json::to_vec(&owed) {
+            Ok(encoded) => self.put_locally(encode_seq(seq), encoded).await,
+            Err(error) => Err(error.into()),
         };
-        if let Err(error) = self.store.put(encode_seq(seq), encoded).await {
-            error!(
-                op = op.name(),
-                snapshot_id = %op.snapshot_id(),
-                %error,
-                "could not record an owed catalog mirror write; the object store is now \
-                 behind by one write nothing will replay"
-            );
-            return;
+
+        match stored {
+            Ok(()) => {
+                self.counters(direction).owed.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(error) => {
+                // 🔴 Counted all the same. The write is owed whether or not the
+                // note survived, and a lag that quietly dropped it would report
+                // the two catalogs as agreeing at the one moment it had proof
+                // they did not. What it cannot do is survive a restart, so it
+                // is counted where an operator can see that too.
+                self.counters(direction)
+                    .unrecorded
+                    .fetch_add(1, Ordering::AcqRel);
+                record_mirror_unrecorded(direction, owed.op.name());
+                error!(
+                    direction = direction.as_str(),
+                    op = owed.op.name(),
+                    snapshot_id = %owed.op.snapshot_id(),
+                    %error,
+                    "could not record an owed catalog mirror write; {} is now behind by a write \
+                     nothing will replay, and a restart will forget it",
+                    direction.store_name()
+                );
+            }
         }
-        set_mirror_lag(self.lag.fetch_add(1, Ordering::AcqRel) + 1);
+        self.publish_gauges();
+    }
+
+    /// Records that the two catalogs disagree about one snapshot, permanently.
+    ///
+    /// Keyed by snapshot and direction, so the same disagreement discovered
+    /// twice — a template's build start and then its commit — is one
+    /// divergence, not two. Returns whether it was written down durably.
+    pub(super) async fn note_divergence(
+        &self,
+        direction: MirrorDirection,
+        id: &SnapshotId,
+        op: &'static str,
+        reason: String,
+    ) -> bool {
+        let key = encode_diverged(direction, id);
+        let already = matches!(self.store.get(key.clone()).await, Ok(Some(_)));
+
+        let mark = Divergence {
+            snapshot_id: id.clone(),
+            op: op.to_string(),
+            reason,
+            noted_at_unix_ms: now_unix_ms(),
+        };
+        let stored = match serde_json::to_vec(&mark) {
+            Ok(encoded) => self.put_locally(key, encoded).await,
+            Err(error) => Err(error.into()),
+        };
+
+        if let Err(error) = &stored {
+            error!(
+                direction = direction.as_str(),
+                catalog_op = op,
+                snapshot_id = %id,
+                %error,
+                "could not record a catalog mirror divergence; it is counted for as long as this \
+                 process lives and forgotten after that"
+            );
+        }
+        if !already {
+            self.counters(direction)
+                .diverged
+                .fetch_add(1, Ordering::AcqRel);
+            self.publish_gauges();
+        }
+        stored.is_ok()
+    }
+
+    /// Forgets every recorded disagreement about one snapshot.
+    ///
+    /// 🔴 Called when the snapshot is deleted, and only then. A delete goes to
+    /// both catalogs — one of them now, the other now or from the queue — so
+    /// whatever they used to disagree about is superseded by both of them not
+    /// having it at all. Clearing it anywhere else would be forgetting a
+    /// disagreement rather than resolving one.
+    pub(super) async fn clear_divergences(&self, id: &SnapshotId) {
+        for direction in MirrorDirection::ALL {
+            let key = encode_diverged(direction, id);
+            if !matches!(self.store.get(key.clone()).await, Ok(Some(_))) {
+                continue;
+            }
+            if let Err(error) = self.store.delete(key).await {
+                warn!(%error, snapshot_id = %id, "could not clear a catalog mirror divergence");
+                continue;
+            }
+            let counters = self.counters(direction);
+            let previous = counters.diverged.fetch_sub(1, Ordering::AcqRel);
+            if previous == 0 {
+                counters.diverged.store(0, Ordering::Release);
+            }
+        }
+        self.publish_gauges();
     }
 
     /// Replays everything owed, in order, once.
@@ -374,47 +838,67 @@ impl MirrorBacklog {
     /// snapshot have to land in the order they were made — a commit replayed
     /// before the create it depends on is a different outcome — but a snapshot
     /// whose queue is stuck must not hold up every other snapshot's, which is
-    /// what a single global stop-on-first-failure would do.
-    pub async fn drain_once(&self, target: &dyn SnapshotCatalog) -> anyhow::Result<RepairPass> {
+    /// what a single global stop-on-first-failure would do. The two directions
+    /// are independent queues for the same reason: they are different stores.
+    ///
+    /// 🔴 `scan_prefix`, not `entries`. The read side's recorded value and
+    /// every divergence live in this store too, and a pass that loaded the
+    /// whole database to find the queue would grow with the number of
+    /// snapshots the two catalogs have ever disagreed about.
+    pub async fn drain_once(&self, targets: &MirrorTargets) -> anyhow::Result<RepairPass> {
         let entries = self
             .store
-            .entries()
+            .scan_prefix(vec![OWED_PREFIX])
             .await
             .context("read the snapshot catalog mirror backlog")?;
 
         let mut pass = RepairPass::default();
-        let mut blocked: HashSet<SnapshotId> = HashSet::new();
+        let mut blocked: HashSet<(MirrorDirection, SnapshotId)> = HashSet::new();
 
         for (key, value) in entries {
             if decode_seq(&key).is_none() {
                 continue;
             }
-            let op: MirrorOp = match serde_json::from_slice(&value) {
-                Ok(op) => op,
+            let owed = match OwedWrite::decode(&value) {
+                Ok(owed) => owed,
                 Err(error) => {
                     // Unreadable and never going to become readable. Left in
                     // place so the lag still counts it and the read side stays
                     // pinned; an operator has to look.
                     error!(
                         %error,
-                        "an owed catalog mirror write cannot be decoded; the object store is \
-                         behind by a write nothing can replay"
+                        "an owed catalog mirror write cannot be decoded; a catalog is behind by a \
+                         write nothing can replay"
                     );
                     pass.diverged += 1;
                     continue;
                 }
             };
+            let direction = owed.direction;
+            let op = owed.op;
 
-            if blocked.contains(op.snapshot_id()) {
+            let Some(target) = targets.for_direction(direction) else {
+                // Nothing to replay into. Not an error and not a divergence:
+                // the double write was turned off in this direction on purpose,
+                // and the entry keeps counting until somebody turns it back on.
+                pass.skipped += 1;
+                continue;
+            };
+
+            if blocked.contains(&(direction, op.snapshot_id().clone())) {
                 pass.skipped += 1;
                 continue;
             }
 
-            let replay = op.replay(target).await;
+            let replay = target.apply(&op).await;
             let already_applied = if replay.is_ok() {
                 None
             } else {
-                op.already_applied(target).await.ok()
+                target
+                    .probe(op.snapshot_id())
+                    .await
+                    .ok()
+                    .map(|existing| reflects(&op, existing.as_ref()))
             };
             let verdict = verdict_for(&replay, already_applied);
 
@@ -426,42 +910,73 @@ impl MirrorBacklog {
                         // is checked against the target first — so leave it.
                         warn!(%error, "could not clear a repaired catalog mirror entry");
                         pass.retry += 1;
-                        blocked.insert(op.snapshot_id().clone());
+                        blocked.insert((direction, op.snapshot_id().clone()));
                         continue;
                     }
-                    set_mirror_lag(self.lag.fetch_sub(1, Ordering::AcqRel).saturating_sub(1));
-                    record_mirror_repaired(op.name());
+                    self.drop_owed(direction);
+                    record_mirror_repaired(direction, op.name());
                     pass.repaired += 1;
                 }
-                RepairVerdict::Retry | RepairVerdict::Diverged => {
-                    if verdict == RepairVerdict::Diverged {
-                        error!(
-                            op = op.name(),
-                            snapshot_id = %op.snapshot_id(),
-                            error = ?replay.as_ref().err(),
-                            "the object store refused an owed catalog mirror write in a way a \
-                             retry cannot change; the two catalogs disagree about this snapshot"
-                        );
-                        pass.diverged += 1;
-                    } else {
-                        pass.retry += 1;
+                RepairVerdict::Diverged => {
+                    error!(
+                        direction = direction.as_str(),
+                        op = op.name(),
+                        snapshot_id = %op.snapshot_id(),
+                        error = ?replay.as_ref().err(),
+                        "{} refused an owed catalog mirror write in a way a retry cannot change; \
+                         the two catalogs disagree about this snapshot",
+                        direction.store_name()
+                    );
+                    record_mirror_repair_failed(direction, op.name(), verdict.as_str());
+
+                    // 🔴 Moved out of the queue rather than left in it. Nothing
+                    // a replay can do will change the answer, so retrying it
+                    // every interval buys nothing and costs one request against
+                    // the store the acceptance number is measured on. It is
+                    // still counted, as a divergence — but only once the record
+                    // of it is durable, because a queue entry that was dropped
+                    // and not written down anywhere would be a disagreement
+                    // that disappeared.
+                    let reason = replay
+                        .as_ref()
+                        .err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "the store refused the replay".to_string());
+                    let recorded = self
+                        .note_divergence(direction, op.snapshot_id(), op.name(), reason)
+                        .await;
+                    if recorded && self.store.delete(key).await.is_ok() {
+                        self.drop_owed(direction);
                     }
-                    record_mirror_repair_failed(op.name(), verdict.as_str());
-                    blocked.insert(op.snapshot_id().clone());
+                    pass.diverged += 1;
+                    blocked.insert((direction, op.snapshot_id().clone()));
+                }
+                RepairVerdict::Retry => {
+                    pass.retry += 1;
+                    record_mirror_repair_failed(direction, op.name(), verdict.as_str());
+                    blocked.insert((direction, op.snapshot_id().clone()));
                 }
             }
         }
 
+        self.publish_gauges();
         pass.remaining = self.lag();
         Ok(pass)
+    }
+
+    fn drop_owed(&self, direction: MirrorDirection) {
+        let counters = self.counters(direction);
+        if counters.owed.fetch_sub(1, Ordering::AcqRel) == 0 {
+            counters.owed.store(0, Ordering::Release);
+        }
     }
 }
 
 /// Big-endian so the store's key order is the order the writes were made.
 ///
-/// Prefixed so the one piece of metadata this store also holds — which side
-/// reads came from last — cannot land inside the queue's key range and be
-/// replayed as if it were a write.
+/// Prefixed so the other things this store holds — which side reads came from
+/// last, and every recorded divergence — cannot land inside the queue's key
+/// range and be replayed as if they were writes.
 fn encode_seq(seq: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 8);
     key.push(OWED_PREFIX);
@@ -477,176 +992,47 @@ fn decode_seq(key: &[u8]) -> Option<u64> {
     seq.try_into().ok().map(u64::from_be_bytes)
 }
 
+/// Keyed by direction then snapshot, so one disagreement is one entry however
+/// many times it is discovered.
+fn encode_diverged(direction: MirrorDirection, id: &SnapshotId) -> Vec<u8> {
+    let mut key = Vec::new();
+    key.push(DIVERGED_PREFIX);
+    key.push(direction.key_byte());
+    key.extend_from_slice(id.to_string().as_bytes());
+    key
+}
+
+fn decode_diverged_direction(key: &[u8]) -> Option<MirrorDirection> {
+    match key {
+        [DIVERGED_PREFIX, byte, ..] => MirrorDirection::ALL
+            .into_iter()
+            .find(|direction| direction.key_byte() == *byte),
+        _ => None,
+    }
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
-
     use super::*;
-    use crate::snapshot::repository::interfaces::SnapshotListFilter;
-    use crate::snapshot::types::{CommittedSnapshot, SnapshotAlias, SnapshotPublishSource};
-    use crate::types::SandboxResources;
-
-    /// A catalog that answers however a test tells it to, and writes down what
-    /// it was asked.
-    #[derive(Default)]
-    struct ScriptedCatalog {
-        calls: Mutex<Vec<String>>,
-        /// Ids whose writes fail, and how.
-        failing: Mutex<Vec<(SnapshotId, bool)>>,
-        /// Ids the catalog claims to already hold.
-        holding: Mutex<Vec<SnapshotId>>,
-        /// When set, `get` itself fails.
-        get_fails: bool,
-    }
-
-    impl ScriptedCatalog {
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().expect("calls").clone()
-        }
-
-        fn record(&self, entry: impl Into<String>) {
-            self.calls.lock().expect("calls").push(entry.into());
-        }
-
-        /// `retryable` picks which error kind the write fails with.
-        fn fail(&self, id: &SnapshotId, retryable: bool) {
-            self.failing
-                .lock()
-                .expect("failing")
-                .push((id.clone(), retryable));
-        }
-
-        fn hold(&self, id: &SnapshotId) {
-            self.holding.lock().expect("holding").push(id.clone());
-        }
-
-        fn outcome(&self, id: &SnapshotId) -> RepositoryResult<()> {
-            let failing = self.failing.lock().expect("failing");
-            match failing.iter().find(|(failing, _)| failing == id) {
-                Some((_, true)) => Err(RepositoryError::Backend {
-                    message: "the store is unreachable".to_string(),
-                    source: None,
-                }),
-                Some((_, false)) => Err(RepositoryError::InvalidRequest {
-                    reason: "the store will not take this".to_string(),
-                }),
-                None => Ok(()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SnapshotCatalog for ScriptedCatalog {
-        async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-            self.record(format!("create:{}", record.id));
-            self.outcome(&record.id).map(|()| record)
-        }
-
-        async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
-            self.record(format!("publish_commit:{}", commit.id));
-            self.outcome(&commit.id)?;
-            let mut record = SnapshotRecord::template_waiting(
-                commit.id.clone(),
-                commit.alias.clone(),
-                commit.resources,
-            );
-            record.mark_committed(
-                commit.alias,
-                commit.resources,
-                commit.committed,
-                commit.source,
-                0,
-            );
-            Ok(record)
-        }
-
-        async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-            self.record(format!("get:{id_or_alias}"));
-            if self.get_fails {
-                return Err(RepositoryError::Backend {
-                    message: "cannot read".to_string(),
-                    source: None,
-                });
-            }
-            let held = self
-                .holding
-                .lock()
-                .expect("holding")
-                .iter()
-                .any(|id| id.to_string() == id_or_alias);
-            if !held {
-                return Ok(None);
-            }
-            let id = SnapshotId::parse(id_or_alias).expect("a held id parses");
-            let mut record =
-                SnapshotRecord::template_waiting(id, None, SandboxResources::default());
-            record.mark_committed(
-                None,
-                SandboxResources::default(),
-                committed(),
-                SnapshotPublishSource::Template,
-                0,
-            );
-            Ok(Some(record))
-        }
-
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            Ok(Vec::new())
-        }
-
-        async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-            self.record(format!("delete_record:{}", record.id));
-            self.outcome(&record.id)
-        }
-
-        async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-            Ok(None)
-        }
-
-        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-            self.record(format!("try_start_build:{id}"));
-            self.outcome(id)?;
-            Ok(SnapshotRecord::template_waiting(
-                id.clone(),
-                None,
-                SandboxResources::default(),
-            ))
-        }
-
-        async fn mark_build_error(
-            &self,
-            id: &SnapshotId,
-            _reason: TemplateBuildErrorReason,
-        ) -> RepositoryResult<()> {
-            self.record(format!("mark_build_error:{id}"));
-            self.outcome(id)
-        }
-    }
-
-    fn committed() -> CommittedSnapshot {
-        CommittedSnapshot::mock()
-    }
-
-    fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit {
-        SnapshotCommit {
-            id: id.clone(),
-            alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias parses")),
-            source: SnapshotPublishSource::Template,
-            resources: SandboxResources::default(),
-            committed: committed(),
-        }
-    }
-
-    fn record_for(id: &SnapshotId) -> SnapshotRecord {
-        SnapshotRecord::template_waiting(id.clone(), None, SandboxResources::default())
-    }
+    use crate::snapshot::repository::mirror::test_doubles::{
+        commit_for, record_for, ScriptedCatalog, ScriptedCentral,
+    };
 
     async fn backlog(dir: &tempfile::TempDir) -> Arc<MirrorBacklog> {
         MirrorBacklog::open(dir.path().join("mirror"))
             .await
             .expect("the backlog should open")
+    }
+
+    fn targets(catalog: &Arc<ScriptedCatalog>) -> MirrorTargets {
+        MirrorTargets::object_store(Arc::clone(catalog) as Arc<dyn SnapshotCatalog>)
     }
 
     // ── the repair decision ─────────────────────────────────────────────
@@ -715,6 +1101,43 @@ mod tests {
         }
     }
 
+    /// The probe's reading, per operation. A delete is applied when the row is
+    /// *gone*, which is the one that inverts.
+    #[test]
+    fn what_counts_as_already_applied_depends_on_the_operation() {
+        let id = SnapshotId::generate();
+        let record = record_for(&id);
+        let mut committed = record_for(&id);
+        committed.mark_committed(
+            None,
+            crate::types::SandboxResources::default(),
+            crate::snapshot::types::CommittedSnapshot::mock(),
+            crate::snapshot::types::SnapshotPublishSource::Template,
+            0,
+        );
+
+        let create = MirrorOp::Create {
+            record: record.clone(),
+        };
+        assert!(!reflects(&create, None));
+        assert!(reflects(&create, Some(&record)));
+
+        let publish = MirrorOp::PublishCommit {
+            commit: commit_for(&id, None),
+        };
+        assert!(
+            !reflects(&publish, Some(&record)),
+            "a waiting row is not a commit"
+        );
+        assert!(reflects(&publish, Some(&committed)));
+
+        let delete = MirrorOp::DeleteRecord {
+            record: record.clone(),
+        };
+        assert!(reflects(&delete, None), "a row that is gone was deleted");
+        assert!(!reflects(&delete, Some(&record)));
+    }
+
     // ── the pass ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -725,15 +1148,20 @@ mod tests {
 
         assert_eq!(backlog.lag(), 0);
         backlog
-            .record(MirrorOp::PublishCommit {
-                commit: commit_for(&id, None),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::PublishCommit {
+                    commit: commit_for(&id, None),
+                },
+            )
             .await;
         assert_eq!(backlog.lag(), 1);
+        assert_eq!(backlog.lag_toward(MirrorDirection::ObjectStore), 1);
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
 
-        let target = ScriptedCatalog::default();
+        let target = Arc::new(ScriptedCatalog::default());
         let pass = backlog
-            .drain_once(&target)
+            .drain_once(&targets(&target))
             .await
             .expect("the pass should run");
 
@@ -741,6 +1169,169 @@ mod tests {
         assert_eq!(pass.remaining, 0);
         assert_eq!(backlog.lag(), 0);
         assert_eq!(target.calls(), vec![format!("publish_commit:{id}")]);
+    }
+
+    /// 🔴 The two directions are two queues. A snapshot the object store owes
+    /// and the central catalog does not must not have its central lag counted,
+    /// because the two numbers guard two different switches.
+    #[tokio::test]
+    async fn the_two_directions_are_counted_apart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        assert_eq!(backlog.lag_toward(MirrorDirection::ObjectStore), 1);
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 2);
+        assert_eq!(backlog.lag(), 3);
+    }
+
+    /// 🔴 A direction with no target is left alone rather than attempted or
+    /// dropped. Rolling the double write back takes the central catalog away on
+    /// purpose, and the pass still has to pay off what object storage is owed.
+    #[tokio::test]
+    async fn a_direction_with_no_target_is_skipped_and_the_other_still_drains() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let owed_here = SnapshotId::generate();
+
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&owed_here),
+                },
+            )
+            .await;
+
+        let target = Arc::new(ScriptedCatalog::default());
+        let pass = backlog
+            .drain_once(&targets(&target))
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(pass.skipped, 1);
+        assert_eq!(backlog.lag_toward(MirrorDirection::ObjectStore), 0);
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::Central),
+            1,
+            "the central debt is still owed, and still counted"
+        );
+        assert_eq!(target.calls(), vec![format!("create:{owed_here}")]);
+    }
+
+    /// A central-direction entry replays into the central catalog, through the
+    /// probe that can see rows an ordinary read cannot.
+    #[tokio::test]
+    async fn a_central_entry_replays_into_the_central_catalog() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&id),
+                },
+            )
+            .await;
+
+        let object_store = Arc::new(ScriptedCatalog::default());
+        let central = Arc::new(ScriptedCentral::default());
+        let pass = backlog
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 1);
+        assert!(central.holds(&id).is_some());
+        assert!(
+            object_store.calls().is_empty(),
+            "a central debt must not be paid into the object store: {:?}",
+            object_store.calls()
+        );
+    }
+
+    /// 🔴 A central replay is judged against rows an ordinary read cannot see.
+    ///
+    /// A template the catalog holds is `waiting` and a build it failed is
+    /// `error`; both are invisible at the resolvable scope. A probe made there
+    /// would report a row that is plainly present as absent — and every replay
+    /// it judged would be retried or abandoned forever.
+    #[tokio::test]
+    async fn a_central_replay_is_judged_against_rows_an_ordinary_read_cannot_see() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&id),
+                },
+            )
+            .await;
+
+        let central = Arc::new(ScriptedCentral::default());
+        // The row is there, `waiting`, which no resolvable read would return —
+        // and the write itself is refused, so the probe is what decides.
+        central.seed(record_for(&id));
+        central.refuse(
+            super::super::test_doubles::CentralCall::Begin,
+            CatalogRefusal::AliasTaken {
+                holder: SnapshotId::generate().to_string(),
+            },
+        );
+        let object_store = Arc::new(ScriptedCatalog::default());
+
+        let pass = backlog
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(
+            pass.repaired, 1,
+            "the catalog plainly holds the row; the entry must clear"
+        );
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
     }
 
     /// 🔴 Per-snapshot ordering. A commit replayed before the create it depends
@@ -754,26 +1345,35 @@ mod tests {
         let healthy = SnapshotId::generate();
 
         backlog
-            .record(MirrorOp::Create {
-                record: record_for(&stuck),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&stuck),
+                },
+            )
             .await;
         backlog
-            .record(MirrorOp::PublishCommit {
-                commit: commit_for(&stuck, None),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::PublishCommit {
+                    commit: commit_for(&stuck, None),
+                },
+            )
             .await;
         backlog
-            .record(MirrorOp::Create {
-                record: record_for(&healthy),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&healthy),
+                },
+            )
             .await;
 
-        let target = ScriptedCatalog::default();
+        let target = Arc::new(ScriptedCatalog::default());
         target.fail(&stuck, true);
 
         let pass = backlog
-            .drain_once(&target)
+            .drain_once(&targets(&target))
             .await
             .expect("the pass should run");
 
@@ -789,31 +1389,102 @@ mod tests {
         assert!(target.calls().contains(&format!("create:{healthy}")));
     }
 
-    /// A diverged entry stays counted. It is a real disagreement between the
-    /// two stores, and the lag is what keeps the read side from being moved
-    /// over the top of it.
+    /// 🔴 A divergence stops being debt and becomes a recorded disagreement.
+    ///
+    /// Left in the queue it would be replayed, and probed for, every interval
+    /// for as long as the node lived — buying an answer that cannot change and
+    /// costing a request against the store the acceptance number is measured
+    /// on. It still has to be *counted*, because the two stores really do
+    /// disagree, so it moves rather than disappearing.
     #[tokio::test]
-    async fn a_diverged_entry_keeps_counting_against_the_lag() {
+    async fn a_diverged_entry_becomes_a_recorded_divergence_and_stops_being_replayed() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let backlog = backlog(&dir).await;
         let id = SnapshotId::generate();
         backlog
-            .record(MirrorOp::Create {
-                record: record_for(&id),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&id),
+                },
+            )
             .await;
 
-        let target = ScriptedCatalog::default();
+        let target = Arc::new(ScriptedCatalog::default());
         target.fail(&id, false);
 
         let pass = backlog
-            .drain_once(&target)
+            .drain_once(&targets(&target))
             .await
             .expect("the pass should run");
 
         assert_eq!(pass.diverged, 1);
         assert_eq!(pass.repaired, 0);
-        assert_eq!(backlog.lag(), 1);
+        assert_eq!(
+            backlog.lag(),
+            0,
+            "it is not debt any more; nothing can replay it"
+        );
+        assert_eq!(
+            backlog.diverged_toward(MirrorDirection::ObjectStore),
+            1,
+            "but the two stores still disagree, and the guard reads this"
+        );
+
+        // The control: a second pass does not touch the store again.
+        let before = target.calls().len();
+        backlog
+            .drain_once(&targets(&target))
+            .await
+            .expect("the pass should run");
+        assert_eq!(
+            target.calls().len(),
+            before,
+            "a recorded divergence must not be replayed again: {:?}",
+            target.calls()
+        );
+    }
+
+    /// 🔴 And it stays counted across a restart. A divergence that only lived
+    /// in memory would let the next start authorise the switch it had just
+    /// refused.
+    #[tokio::test]
+    async fn a_recorded_divergence_survives_the_process_that_found_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = SnapshotId::generate();
+        {
+            let backlog = backlog(&dir).await;
+            backlog
+                .note_divergence(
+                    MirrorDirection::Central,
+                    &id,
+                    "try_start_build",
+                    "build admission is not wired".to_string(),
+                )
+                .await;
+            assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
+        }
+
+        let reopened = backlog(&dir).await;
+        assert_eq!(reopened.diverged_toward(MirrorDirection::Central), 1);
+        assert_eq!(reopened.diverged_toward(MirrorDirection::ObjectStore), 0);
+    }
+
+    /// One snapshot's disagreement, discovered twice, is one divergence.
+    #[tokio::test]
+    async fn the_same_disagreement_discovered_twice_is_counted_once() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+
+        backlog
+            .note_divergence(MirrorDirection::Central, &id, "try_start_build", "a".into())
+            .await;
+        backlog
+            .note_divergence(MirrorDirection::Central, &id, "publish_commit", "b".into())
+            .await;
+
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 1);
     }
 
     /// The lost-acknowledgement case end to end: the replay is refused, the
@@ -824,26 +1495,31 @@ mod tests {
         let backlog = backlog(&dir).await;
         let id = SnapshotId::generate();
         backlog
-            .record(MirrorOp::PublishCommit {
-                commit: commit_for(&id, None),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::PublishCommit {
+                    commit: commit_for(&id, None),
+                },
+            )
             .await;
 
-        let target = ScriptedCatalog::default();
+        let target = Arc::new(ScriptedCatalog::default());
         target.fail(&id, false);
         target.hold(&id);
 
         let pass = backlog
-            .drain_once(&target)
+            .drain_once(&targets(&target))
             .await
             .expect("the pass should run");
 
         assert_eq!(pass.repaired, 1);
         assert_eq!(backlog.lag(), 0);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::ObjectStore), 0);
     }
 
     /// 🔴 The whole reason this is on disk. A process that crashed holding
-    /// owed writes must come back still owing them.
+    /// owed writes must come back still owing them, in the direction it owed
+    /// them.
     #[tokio::test]
     async fn owed_writes_survive_the_process_that_recorded_them() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -851,23 +1527,124 @@ mod tests {
         {
             let backlog = backlog(&dir).await;
             backlog
-                .record(MirrorOp::PublishCommit {
-                    commit: commit_for(&id, None),
-                })
+                .record(
+                    MirrorDirection::Central,
+                    MirrorOp::PublishCommit {
+                        commit: commit_for(&id, None),
+                    },
+                )
                 .await;
             assert_eq!(backlog.lag(), 1);
         }
 
         let reopened = backlog(&dir).await;
         assert_eq!(reopened.lag(), 1, "a restart must not forget what is owed");
+        assert_eq!(
+            reopened.lag_toward(MirrorDirection::Central),
+            1,
+            "nor which store owed them"
+        );
 
-        let target = ScriptedCatalog::default();
+        let central = Arc::new(ScriptedCentral::default());
+        let object_store = Arc::new(ScriptedCatalog::default());
         let pass = reopened
-            .drain_once(&target)
+            .drain_once(
+                &targets(&object_store)
+                    .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
             .await
             .expect("the pass should run");
         assert_eq!(pass.repaired, 1);
-        assert_eq!(target.calls(), vec![format!("publish_commit:{id}")]);
+    }
+
+    /// 🔴 An entry a previous build wrote is still an entry. The rollback from
+    /// `write = "both"` depends on paying off what an older process recorded,
+    /// and that process wrote the operation with no direction on it.
+    #[tokio::test]
+    async fn an_entry_from_before_directions_existed_is_an_object_store_debt() {
+        let id = SnapshotId::generate();
+        let legacy = serde_json::to_vec(&MirrorOp::Create {
+            record: record_for(&id),
+        })
+        .expect("the old shape should encode");
+
+        let decoded = OwedWrite::decode(&legacy).expect("an old entry must still decode");
+        assert_eq!(decoded.direction, MirrorDirection::ObjectStore);
+        assert_eq!(decoded.op.snapshot_id(), &id);
+
+        assert!(OwedWrite::decode(b"not json at all").is_err());
+    }
+
+    // ── the lag it cannot write down ────────────────────────────────────
+
+    /// 🔴 F-7. A write the local store refused is still owed. Dropping it from
+    /// the lag would report the two catalogs as agreeing at the one moment
+    /// there is proof they do not — and the lag is what the read-side switch
+    /// is authorised on.
+    #[tokio::test]
+    async fn a_write_that_could_not_be_written_down_still_counts_against_the_lag() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog.refuse_local_writes.store(true, Ordering::SeqCst);
+
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::ObjectStore),
+            1,
+            "the write is owed whether or not the note survived"
+        );
+
+        // And it pins the switch, which is the point of counting it.
+        backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect("recording the side should work");
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect_err("a lag that cannot be replayed still refuses the switch");
+    }
+
+    /// 🔴 A divergence the queue could not record keeps its queue entry. The
+    /// entry is dropped only once something durable has taken its place;
+    /// dropping it either way would be a disagreement that disappeared.
+    #[tokio::test]
+    async fn a_divergence_that_could_not_be_recorded_keeps_its_queue_entry() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&id),
+                },
+            )
+            .await;
+
+        let target = Arc::new(ScriptedCatalog::default());
+        target.fail(&id, false);
+        backlog.refuse_local_writes.store(true, Ordering::SeqCst);
+
+        let pass = backlog
+            .drain_once(&targets(&target))
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.diverged, 1);
+        assert_eq!(
+            backlog.lag_toward(MirrorDirection::ObjectStore),
+            1,
+            "the entry stays until something durable replaces it"
+        );
     }
 
     // ── the read-side guard ─────────────────────────────────────────────
@@ -884,9 +1661,12 @@ mod tests {
             .await
             .expect("the first start records the side");
         backlog
-            .record(MirrorOp::Create {
-                record: record_for(&SnapshotId::generate()),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
             .await;
 
         backlog
@@ -906,9 +1686,12 @@ mod tests {
             .await
             .expect("recording the side should work");
         backlog
-            .record(MirrorOp::Create {
-                record: record_for(&SnapshotId::generate()),
-            })
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
             .await;
 
         let error = backlog
@@ -916,14 +1699,14 @@ mod tests {
             .await
             .expect_err("the switch must be refused while writes are owed");
         assert!(
-            error.to_string().contains("behind by 1 write"),
+            error.to_string().contains("1 write(s) still owed"),
             "the refusal must say how far behind: {error}"
         );
 
         // The control: with nothing owed, the same switch is allowed.
-        let target = ScriptedCatalog::default();
+        let target = Arc::new(ScriptedCatalog::default());
         backlog
-            .drain_once(&target)
+            .drain_once(&targets(&target))
             .await
             .expect("the pass should run");
         assert_eq!(backlog.lag(), 0);
@@ -931,5 +1714,78 @@ mod tests {
             .guard_read_side(CatalogReadSide::ObjectStore)
             .await
             .expect("a drained mirror must let the switch through");
+    }
+
+    /// 🔴 The switch is guarded by the debt of the side being switched *to*,
+    /// and by nothing else. An object-store debt says nothing about whether
+    /// PostgreSQL is complete, and refusing over it would make a mirror that is
+    /// behind in the direction nobody is about to read stop the node.
+    #[tokio::test]
+    async fn only_the_debt_of_the_side_being_read_refuses_the_switch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("recording the side should work");
+        backlog
+            .record(
+                MirrorDirection::ObjectStore,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect("an object-store debt must not refuse a move onto PostgreSQL");
+    }
+
+    /// The symmetric refusal: PostgreSQL is behind, so reads must not move onto
+    /// it.
+    #[tokio::test]
+    async fn moving_reads_to_postgres_is_refused_while_the_central_catalog_is_behind() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("recording the side should work");
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect_err("reads must not move onto a catalog that is behind");
+    }
+
+    /// A first start records the side without judging it: there is nothing to
+    /// switch from.
+    #[tokio::test]
+    async fn a_first_start_is_never_a_switch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog
+            .record(
+                MirrorDirection::Central,
+                MirrorOp::Create {
+                    record: record_for(&SnapshotId::generate()),
+                },
+            )
+            .await;
+
+        backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect("a node that has never recorded a side is not moving one");
     }
 }

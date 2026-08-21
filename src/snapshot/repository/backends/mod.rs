@@ -17,7 +17,8 @@ use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::mirror::{
-    CatalogReadSide, DualWriteCatalog, MirrorBacklog, MirrorCompensator,
+    CatalogReadSide, CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorCompensator,
+    MirrorDirection, MirrorTargets,
 };
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogReadScope, CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
@@ -47,8 +48,16 @@ pub async fn build_snapshot_backend(
     let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
 
     let Some(central) = build_central_catalog(config)? else {
+        let compensator = drain_a_rolled_back_mirror(
+            &config.snapshot.catalog.mirror_backlog_path,
+            std::time::Duration::from_secs(
+                config.snapshot.catalog.mirror_compensator_interval_secs,
+            ),
+            repository.catalog(),
+        )
+        .await?;
         return Ok(AssembledSnapshotBackend {
-            mirror_compensator: drain_a_rolled_back_mirror(config, &repository).await?,
+            mirror_compensator: compensator,
             repository,
             runtime_resolver,
         });
@@ -68,12 +77,13 @@ pub async fn build_snapshot_backend(
     let object_store_catalog = repository.catalog();
     let compensator = MirrorCompensator::spawn(
         Arc::clone(&backlog),
-        Arc::clone(&object_store_catalog),
+        MirrorTargets::object_store(Arc::clone(&object_store_catalog))
+            .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
         std::time::Duration::from_secs(config.snapshot.catalog.mirror_compensator_interval_secs),
     );
 
     let dual = Arc::new(DualWriteCatalog::new(
-        central,
+        central as Arc<dyn CentralCatalogWrites>,
         object_store_catalog,
         backlog,
     ));
@@ -102,27 +112,33 @@ pub async fn build_snapshot_backend(
 /// storage is about to be the only catalog there is, so abandoning them would
 /// make those snapshots disappear for good. The replay needs no central
 /// catalog, only the object store, so it can run perfectly well after the
-/// switch.
+/// switch — and the entries owed the *other* way are left alone rather than
+/// dropped, because the central catalog is the thing being turned off.
 ///
 /// Nothing is created here: with no backlog on disk there is nothing to drain,
 /// which is every node that has never double-written.
 async fn drain_a_rolled_back_mirror(
-    config: &AppConfig,
-    repository: &Arc<SnapshotRepository>,
+    path: &std::path::Path,
+    interval: std::time::Duration,
+    object_store: Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>,
 ) -> Result<Option<Arc<MirrorCompensator>>> {
-    let path = &config.snapshot.catalog.mirror_backlog_path;
     if !path.exists() {
         return Ok(None);
     }
 
     let backlog = MirrorBacklog::open(path).await?;
-    if backlog.lag() == 0 {
+    // 🔴 Object storage's debt, not the total. The other direction's entries are
+    // owed to the catalog this rollback is switching off; spinning a loop that
+    // could only skip them would burn a pass every interval for no reason, and
+    // dropping them is not this function's call either.
+    let owed = backlog.lag_toward(MirrorDirection::ObjectStore);
+    if owed == 0 {
         return Ok(None);
     }
 
     tracing::warn!(
         target: "agentenv",
-        mirror_lag = backlog.lag(),
+        mirror_lag = owed,
         backlog = %path.display(),
         "snapshot catalog double writing is off, but object storage is still owed writes from \
          when it was on; replaying them, because those snapshots reported success and object \
@@ -131,8 +147,8 @@ async fn drain_a_rolled_back_mirror(
 
     Ok(Some(Arc::new(MirrorCompensator::spawn(
         backlog,
-        repository.catalog(),
-        std::time::Duration::from_secs(config.snapshot.catalog.mirror_compensator_interval_secs),
+        MirrorTargets::object_store(object_store),
+        interval,
     ))))
 }
 
@@ -231,4 +247,126 @@ pub(crate) fn shared_runtime_cache_root() -> PathBuf {
         .snapshot
         .local_cache_path
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::snapshot::repository::interfaces::SnapshotCatalog;
+    use crate::snapshot::repository::mirror::test_doubles::{record_for, ScriptedCatalog};
+    use crate::snapshot::types::SnapshotId;
+
+    /// 🔴 A node that has never double-written must not have a backlog created
+    /// underneath it. Creating one here would put a RocksDB directory on every
+    /// node in the fleet and make "there is nothing outstanding" a thing that
+    /// had to be read rather than a thing that was obvious.
+    #[tokio::test]
+    async fn a_node_that_never_double_wrote_gets_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("never-existed");
+        let catalog = Arc::new(ScriptedCatalog::default()) as Arc<dyn SnapshotCatalog>;
+
+        let compensator = drain_a_rolled_back_mirror(&path, Duration::from_secs(1), catalog)
+            .await
+            .expect("the decision should be answerable");
+
+        assert!(compensator.is_none());
+        assert!(!path.exists(), "nothing may be created here");
+    }
+
+    /// A backlog that is already paid off needs no loop.
+    #[tokio::test]
+    async fn a_drained_backlog_needs_no_compensator() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("mirror");
+        MirrorBacklog::open(&path)
+            .await
+            .expect("the backlog should open");
+
+        let catalog = Arc::new(ScriptedCatalog::default()) as Arc<dyn SnapshotCatalog>;
+        let compensator = drain_a_rolled_back_mirror(&path, Duration::from_secs(1), catalog)
+            .await
+            .expect("the decision should be answerable");
+
+        assert!(compensator.is_none());
+    }
+
+    /// 🔴 The whole "rolling back loses nothing" claim, and it runs at startup.
+    ///
+    /// The entries left behind are publishes that *succeeded* — the caller was
+    /// told so — and object storage is about to be the only catalog there is.
+    /// Abandoning them makes those snapshots disappear for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_that_still_owes_object_storage_keeps_paying() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("mirror");
+        let id = SnapshotId::generate();
+        {
+            let backlog = MirrorBacklog::open(&path)
+                .await
+                .expect("the backlog should open");
+            crate::snapshot::repository::mirror::test_support::owe_a_create(
+                &backlog,
+                MirrorDirection::ObjectStore,
+                record_for(&id),
+            )
+            .await;
+        }
+
+        let catalog = Arc::new(ScriptedCatalog::default());
+        let compensator = drain_a_rolled_back_mirror(
+            &path,
+            Duration::from_secs(1),
+            Arc::clone(&catalog) as Arc<dyn SnapshotCatalog>,
+        )
+        .await
+        .expect("the decision should be answerable")
+        .expect("a backlog that is still owed must keep a compensator alive");
+
+        for _ in 0..50 {
+            if catalog.calls().contains(&format!("create:{id}")) {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1_100)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(compensator);
+        assert!(
+            catalog.calls().contains(&format!("create:{id}")),
+            "the rollback must replay what object storage was owed: {:?}",
+            catalog.calls()
+        );
+    }
+
+    /// 🔴 A debt owed the *other* way does not start a loop. The central catalog
+    /// is the thing being switched off, so there is nothing to replay into and a
+    /// pass every interval would only skip.
+    #[tokio::test]
+    async fn a_debt_owed_to_the_catalog_being_switched_off_starts_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("mirror");
+        {
+            let backlog = MirrorBacklog::open(&path)
+                .await
+                .expect("the backlog should open");
+            crate::snapshot::repository::mirror::test_support::owe_a_create(
+                &backlog,
+                MirrorDirection::Central,
+                record_for(&SnapshotId::generate()),
+            )
+            .await;
+            assert_eq!(backlog.lag(), 1);
+        }
+
+        let catalog = Arc::new(ScriptedCatalog::default()) as Arc<dyn SnapshotCatalog>;
+        let compensator = drain_a_rolled_back_mirror(&path, Duration::from_secs(1), catalog)
+            .await
+            .expect("the decision should be answerable");
+
+        assert!(compensator.is_none());
+    }
 }

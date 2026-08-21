@@ -315,6 +315,83 @@ async fn an_alias_a_live_snapshot_holds_refuses_the_second_commit() {
     );
 }
 
+/// P3, concurrently. The sequential version proves the unique index refuses a
+/// name already committed; it does not prove the index is what decides a race,
+/// because a check-then-write with a wide enough gap passes it every time.
+///
+/// 🔴 Both commits are in flight before either has finished. Exactly one may
+/// win — two winners would mean the name is not unique, and no winner would
+/// mean two callers can lock each other out of a name neither gets.
+#[tokio::test]
+async fn two_commits_racing_for_one_name_produce_exactly_one_winner() {
+    let catalog = catalog!();
+    let alias = unique_alias("raced");
+    let first = SnapshotId::generate();
+    let second = SnapshotId::generate();
+
+    let one = Arc::clone(&catalog);
+    let two = Arc::clone(&catalog);
+    let alias_one = alias.clone();
+    let alias_two = alias.clone();
+    let id_one = first.clone();
+    let id_two = second.clone();
+
+    let (left, right) = tokio::join!(
+        async move {
+            one.publish_commit(sandbox_commit(id_one, Some(&alias_one), "left"))
+                .await
+        },
+        async move {
+            two.publish_commit(sandbox_commit(id_two, Some(&alias_two), "right"))
+                .await
+        }
+    );
+
+    let winners = [&left, &right]
+        .iter()
+        .filter(|outcome| outcome.is_ok())
+        .count();
+    assert_eq!(
+        winners, 1,
+        "exactly one commit may take the name; got left={left:?} right={right:?}"
+    );
+
+    let winner = match (&left, &right) {
+        (Ok(record), _) => record.id.clone(),
+        (_, Ok(record)) => record.id.clone(),
+        _ => unreachable!("checked above"),
+    };
+    let loser = match (&left, &right) {
+        (Err(error), _) => error,
+        (_, Err(error)) => error,
+        _ => unreachable!("checked above"),
+    };
+    assert!(
+        matches!(loser, RepositoryError::AliasConflict { .. }),
+        "the loser must be told the name is taken, not handed some other failure: {loser:?}"
+    );
+    assert_eq!(
+        catalog
+            .resolve_alias(&alias)
+            .await
+            .expect("resolving should work"),
+        Some(winner.clone())
+    );
+
+    // 🔴 And the loser committed nothing at all. A row that took the commit but
+    // not the name is a snapshot the user cannot reach by the name they asked
+    // for, which is the defect the index exists to remove.
+    let loser_id = if winner == first { second } else { first };
+    assert!(
+        catalog
+            .get(&loser_id.to_string())
+            .await
+            .expect("reading should work")
+            .is_none(),
+        "a refused alias must leave no committed row behind"
+    );
+}
+
 /// The commit's fence, from the outside. A snapshot whose row nobody opened
 /// cannot be flipped to `ready` — which is what makes a crash between the bytes
 /// and the commit leave nothing resolvable behind.
@@ -555,7 +632,9 @@ mod dual_write {
 
     use super::*;
     use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use agentenv::snapshot::repository::mirror::{DualWriteCatalog, MirrorBacklog};
+    use agentenv::snapshot::repository::mirror::{
+        CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorDirection, MirrorTargets,
+    };
     use agentenv::snapshot::repository::RepositoryResult;
 
     /// A real object-store catalog with a switch that takes it away.
@@ -683,7 +762,7 @@ mod dual_write {
             .await
             .expect("the backlog should open");
         let dual = DualWriteCatalog::new(
-            Arc::clone(&central),
+            Arc::clone(&central) as Arc<dyn CentralCatalogWrites>,
             Arc::clone(&object_store) as Arc<dyn SnapshotCatalog>,
             Arc::clone(&backlog),
         );
@@ -694,6 +773,14 @@ mod dual_write {
             object_store,
             backlog,
             dual,
+        }
+    }
+
+    impl Both {
+        /// The two stores a repair pass may replay into.
+        fn targets(&self) -> MirrorTargets {
+            MirrorTargets::object_store(Arc::clone(&self.object_store) as Arc<dyn SnapshotCatalog>)
+                .with_central(Arc::clone(&self.central) as Arc<dyn CentralCatalogWrites>)
         }
     }
 
@@ -758,11 +845,21 @@ mod dual_write {
         );
     }
 
-    /// 🔴 I2. The central catalog fails, and the object store is never touched.
-    /// A row object storage held that the catalog did not would be the one
-    /// direction the compensator cannot walk back.
+    /// 🔴 I2, as it now stands. A central catalog nobody can reach does **not**
+    /// fail the write: the object store is written, the central write is
+    /// recorded as owed, and the operation succeeds.
+    ///
+    /// It used to propagate, and what that bought was a pause whose scheduler
+    /// was down failing at `commit_staged`, which rolled the publish back,
+    /// which asked whether the artifacts were still owned, which was answered
+    /// from the object store that had never been written — and deleted the
+    /// bytes of the sandbox the user had just paused.
+    ///
+    /// What is still refused is a catalog that *answered* and said no; that is
+    /// `an_alias_a_live_snapshot_holds_refuses_the_second_commit`, and the unit
+    /// tests beside `DualWriteCatalog` cover every path's version of it.
     #[tokio::test]
-    async fn a_central_failure_fails_the_write_and_leaves_the_object_store_alone() {
+    async fn an_unreachable_central_catalog_does_not_fail_the_write() {
         let Some(_) = fixture() else { return };
         // Nothing is listening here; the client is lazy, so this fails on use.
         let unreachable = Arc::new(
@@ -778,22 +875,97 @@ mod dual_write {
         let id = SnapshotId::generate();
 
         both.dual
-            .publish_commit(sandbox_commit(id.clone(), None, "never-written"))
+            .publish_commit(sandbox_commit(id.clone(), None, "owed-to-the-catalog"))
             .await
-            .expect_err("a central failure must fail the whole write");
+            .expect("an unreachable central catalog must not fail a real publish");
 
         assert!(
             both.object_store
                 .get(&id.to_string())
                 .await
                 .expect("reading should work")
-                .is_none(),
-            "object storage must not hold a row the central catalog refused"
+                .is_some(),
+            "the store that answers reads must still have been written"
         );
         assert_eq!(
-            both.backlog.lag(),
-            0,
-            "a write that never reached the central catalog is not owed to anybody"
+            both.backlog.lag_toward(MirrorDirection::Central),
+            1,
+            "and the write the catalog missed must be owed to it"
+        );
+        assert_eq!(both.backlog.lag_toward(MirrorDirection::ObjectStore), 0);
+    }
+
+    /// 🔴 The debt is payable against the *real* catalog, which is what makes
+    /// recording it instead of failing defensible. The replay re-runs both
+    /// statements and the opening one answering `ALREADY_EXISTS` is the
+    /// ordinary case — a property of the server, and the reason a stub would
+    /// prove nothing here.
+    #[tokio::test]
+    async fn a_publish_owed_to_the_real_catalog_replays_into_it() {
+        let central = catalog!();
+        let unreachable = Arc::new(
+            CentralSnapshotCatalog::connect_lazy(
+                "http://127.0.0.1:1",
+                Uuid::now_v7(),
+                "test-node-a".to_string(),
+            )
+            .expect("the endpoint should parse")
+            .with_call_timeout(std::time::Duration::from_millis(500)),
+        );
+        let both = both(unreachable).await;
+        let id = SnapshotId::generate();
+        let alias = unique_alias("owed");
+
+        both.dual
+            .publish_commit(sandbox_commit(id.clone(), Some(&alias), "replayed-later"))
+            .await
+            .expect("an unreachable catalog must not fail the publish");
+        assert_eq!(both.backlog.lag_toward(MirrorDirection::Central), 1);
+        assert!(
+            central
+                .get(&id.to_string())
+                .await
+                .expect("reading should work")
+                .is_none(),
+            "nothing reached the catalog yet"
+        );
+
+        let pass = both
+            .backlog
+            .drain_once(
+                &MirrorTargets::object_store(
+                    Arc::clone(&both.object_store) as Arc<dyn SnapshotCatalog>
+                )
+                .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>),
+            )
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(both.backlog.lag_toward(MirrorDirection::Central), 0);
+        let replayed = central
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .expect("the replay must have committed the row into the real catalog");
+        assert_eq!(
+            replayed
+                .committed
+                .expect("a ready row must carry its payload")
+                .context
+                .env_vars
+                .get("MARKER")
+                .map(String::as_str),
+            Some("replayed-later"),
+            "and it must carry the payload the original publish had"
+        );
+        assert_eq!(
+            central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(id),
+            "including the name it was published under"
         );
     }
 
@@ -835,7 +1007,7 @@ mod dual_write {
         both.object_store.fix_it();
         let pass = both
             .backlog
-            .drain_once(both.object_store.as_ref())
+            .drain_once(&both.targets())
             .await
             .expect("the repair pass should run");
         assert_eq!(pass.repaired, 3);
@@ -991,6 +1163,13 @@ mod dual_write {
             0,
             "the gap is not an owed write: nothing the compensator can replay would close it"
         );
+        assert_eq!(
+            both.backlog.diverged_toward(MirrorDirection::Central),
+            1,
+            "🔴 but it is a disagreement, and something other than the lag has to say so — \
+             a switch to reading PostgreSQL authorised on a lag of zero would make this \
+             template vanish from the API"
+        );
     }
 
     /// Reads come from object storage in this phase, and only from it.
@@ -1023,7 +1202,9 @@ mod bytes_then_commit {
     use super::*;
 
     use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use agentenv::snapshot::repository::mirror::{DualWriteCatalog, MirrorBacklog};
+    use agentenv::snapshot::repository::mirror::{
+        CentralCatalogWrites, DualWriteCatalog, MirrorBacklog,
+    };
     use agentenv::snapshot::repository::{SnapshotRepository, StagedSnapshot};
     use agentenv::snapshot::{SnapshotManager, SnapshotPublishMetadata};
 
@@ -1055,7 +1236,7 @@ mod bytes_then_commit {
             .await
             .expect("the backlog should open");
         let dual = Arc::new(DualWriteCatalog::new(
-            Arc::clone(&central),
+            Arc::clone(&central) as Arc<dyn CentralCatalogWrites>,
             Arc::clone(&object_store),
             backlog,
         ));

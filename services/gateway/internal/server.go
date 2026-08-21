@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -425,16 +426,90 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 		http.Error(w, "scheduler unavailable", http.StatusBadGateway)
 		return
 	}
+	reason := s.schedulerReason(st)
 	switch st.Code() {
 	case codes.InvalidArgument:
-		http.Error(w, st.Message(), http.StatusBadRequest)
+		http.Error(w, reason, http.StatusBadRequest)
 	case codes.NotFound:
-		http.Error(w, st.Message(), http.StatusNotFound)
+		http.Error(w, reason, http.StatusNotFound)
 	case codes.Unavailable, codes.FailedPrecondition:
-		http.Error(w, st.Message(), http.StatusServiceUnavailable)
+		http.Error(w, reason, http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "scheduler error", http.StatusBadGateway)
 	}
+}
+
+// schedulerUnreachable is what a caller is told when the RPC never reached a
+// scheduler at all.
+const schedulerUnreachable = "the scheduler could not be reached"
+
+// transportNoise is the vocabulary of a gRPC client that never got an answer.
+//
+// 🔴 A status with one of these in it was written by the *client*, not by the
+// scheduler: nothing on the scheduler side has any reason to say "dial tcp" or
+// "transport:". Measured on the dev cluster with the scheduler scaled to zero,
+// POST /v3/templates answered 503 — correctly — with
+// `dial tcp 10.43.165.31:9090: connect: connection refused` as the body.
+var transportNoise = []string{
+	"connection error",
+	"transport:",
+	"dial tcp",
+	"dial udp",
+	"dial unix",
+	"connection refused",
+	"connection reset",
+	"broken pipe",
+	"no such host",
+	"name resolver error",
+	"produced zero addresses",
+	"i/o timeout",
+	"context deadline exceeded",
+	"the client connection is closing",
+	"grpc: the connection is unavailable",
+}
+
+// hostPort matches anything shaped like a network endpoint: `10.43.165.31:9090`,
+// `scheduler.default.svc:9090`, `[::1]:9090`.
+var hostPort = regexp.MustCompile(`(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):[0-9]{1,5}\b`)
+
+// schedulerReason is what of the scheduler's answer a caller may see.
+//
+// 🔴 The scheduler's message is deliberately forwarded — `local_only on node
+// "node-a"` and `paused registry is not ready` are reasons a client acts on,
+// and the tests above pin them. What must not be forwarded is the text a
+// failed *dial* produces, because it is not the scheduler speaking and it names
+// the cluster's internal addressing to whoever asked.
+//
+// Two layers, and the second is the one that matters. The first recognises the
+// shapes grpc-go produces today. The second redacts anything that looks like a
+// network endpoint whatever wrapped it, so a phrasing this list has not seen —
+// a future grpc-go, a proxy, a service mesh — still cannot put an address in a
+// response body.
+//
+// The raw text is logged, so nothing is lost to the operator.
+func (s *Server) schedulerReason(st *status.Status) string {
+	message := strings.TrimSpace(st.Message())
+	if message == "" {
+		return schedulerUnreachable
+	}
+	lowered := strings.ToLower(message)
+	for _, noise := range transportNoise {
+		if strings.Contains(lowered, noise) {
+			s.logger.Warn("the scheduler RPC did not reach a scheduler",
+				zap.String("code", st.Code().String()),
+				zap.String("scheduler_error", message),
+			)
+			return schedulerUnreachable
+		}
+	}
+	redacted := hostPort.ReplaceAllString(message, "[redacted]")
+	if redacted != message {
+		s.logger.Warn("redacted an endpoint from a scheduler error before answering",
+			zap.String("code", st.Code().String()),
+			zap.String("scheduler_error", message),
+		)
+	}
+	return redacted
 }
 
 type proxyRequestOptions struct {

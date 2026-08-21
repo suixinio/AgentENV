@@ -2507,6 +2507,89 @@ func TestPinnedOriginThatCannotServeIsFiveOhThreeAndNeverForwarded(t *testing.T)
 	}
 }
 
+// 🔴 A 503 is right; the gRPC client's own dial error is not a body.
+//
+// Measured on the dev cluster with the scheduler scaled to zero replicas:
+// POST /v3/templates answered 503 with
+// `dial tcp 10.43.165.31:9090: connect: connection refused`, handing every
+// caller the cluster's internal addressing and a Go transport string neither
+// this service nor the scheduler wrote.
+func TestSchedulerTransportTextIsNotHandedToTheClient(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+	}{
+		{
+			name:    "the dial failure measured on the cluster",
+			message: `connection error: desc = "transport: Error while dialing dial tcp 10.43.165.31:9090: connect: connection refused"`,
+		},
+		{
+			name:    "a name that does not resolve",
+			message: `connection error: desc = "transport: Error while dialing dial tcp: lookup scheduler.agentenv.svc: no such host"`,
+		},
+		{
+			name:    "a resolver that produced nothing",
+			message: `name resolver error: produced zero addresses`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, stubSchedulerClient{
+				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+					return nil, status.Error(codes.Unavailable, tc.message)
+				},
+			}, 5*time.Second, 4<<20)
+
+			request := httptest.NewRequest(http.MethodPost, "/templates", strings.NewReader("{}"))
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected status 503, got %d (body %q)", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			for _, leaked := range []string{"dial tcp", "transport:", "10.43.165.31", "9090", "connection refused", "no such host", "resolver"} {
+				if strings.Contains(body, leaked) {
+					t.Fatalf("the body leaks %q to the caller: %q", leaked, body)
+				}
+			}
+			if !strings.Contains(body, "the scheduler could not be reached") {
+				t.Fatalf("the body has to say what happened: %q", body)
+			}
+		})
+	}
+}
+
+// 🔴 The backstop, for a phrasing the list above has not seen. Whatever wrapped
+// it, an endpoint does not go in a response body — a future grpc-go, a proxy or
+// a mesh may word its failure any way it likes.
+func TestAnEndpointInASchedulerMessageIsRedacted(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return nil, status.Error(codes.Unavailable, "upstream 10.43.165.31:9090 said no, and so did [fd00::1]:8443")
+		},
+	}, 5*time.Second, 4<<20)
+
+	request := httptest.NewRequest(http.MethodPost, "/templates", strings.NewReader("{}"))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d (body %q)", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, leaked := range []string{"10.43.165.31", "9090", "fd00::1", "8443"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("the body leaks %q to the caller: %q", leaked, body)
+		}
+	}
+	// 🔴 And only the endpoint goes. Redacting the whole message would take the
+	// reason with it, which is the failure the two tests above this one exist
+	// to prevent.
+	if !strings.Contains(body, "upstream") || !strings.Contains(body, "said no") {
+		t.Fatalf("redaction ate the reason: %q", body)
+	}
+}
+
 // The control: the same missing assignment on a non-resume endpoint must still
 // fail at the gateway, and a scheduler NotFound must still be a 404. Without
 // this, mapping every scheduler error to 503 would pass every test above.

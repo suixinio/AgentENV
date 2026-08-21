@@ -31,7 +31,7 @@ func migratedPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
 	pool := newTestPool(t)
-	if err := Migrate(context.Background(), pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(context.Background(), pool) }); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return pool

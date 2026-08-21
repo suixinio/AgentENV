@@ -11,7 +11,10 @@ import (
 	"testing/fstest"
 	"time"
 
+	"errors"
+
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -240,6 +243,79 @@ func requireTestDSN(t *testing.T) string {
 // newTestPool gives each test its own schema, so two of them can assert on an
 // unfiltered read of the same table name without seeing each other's rows — and
 // so the cleanup can drop everything by dropping one schema.
+// TestMigrateRetryingDeadlockRefusesEverythingElse pins the one property that
+// keeps the retry above from hiding a real migration fault.
+//
+// 🔴 Drop the SQLSTATE check and the helper turns every genuine failure — a
+// refused preflight, a syntax error, a connection reset — into five attempts
+// and a slow, misattributed timeout. Nothing else in this package would notice:
+// the three callers that assert on a refusal the applier is *supposed* to
+// produce would still pass, just three seconds later. So the distinction is
+// asserted here directly, on the helper, with no database involved.
+func TestMigrateRetryingDeadlockRefusesEverythingElse(t *testing.T) {
+	deadlock := &pgconn.PgError{Code: "40P01"}
+	for _, tc := range []struct {
+		name  string
+		err   error
+		calls int
+	}{
+		{"a deadlock is retried to the bound", deadlock, 5},
+		{"an undefined table is not", &pgconn.PgError{Code: "42P01"}, 1},
+		{"nor is a plain error", errors.New("connection reset by peer"), 1},
+		{"and success costs one attempt", nil, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			err := migrateRetryingDeadlock(func() error {
+				calls++
+				return tc.err
+			})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("the helper must hand back the error it gave up on: got %v, want %v", err, tc.err)
+			}
+			if calls != tc.calls {
+				t.Fatalf("got %d attempts, want %d", calls, tc.calls)
+			}
+		})
+	}
+}
+
+// migrateRetryingDeadlock applies a schema, retrying a deadlock the test suite
+// inflicted on itself.
+//
+// 🔴 The same hazard the paused-registry suite carries, and observed here too:
+// this package's migrations take a cluster-wide advisory lock and issue DDL —
+// including CREATE INDEX CONCURRENTLY, which waits on other sessions by design
+// — while another package's per-test `DROP SCHEMA ... CASCADE` contends for the
+// same system-catalog rows. PostgreSQL breaks the wait by killing whichever
+// session asked last, and what it was killed for has nothing to do with what
+// the calling test asserts.
+//
+// It cannot happen in a deployment — one schema, nothing dropping it — and the
+// process that migrates for real retries every failure forever so that a schema
+// it cannot apply does not stop the scheduler routing traffic. This is that
+// loop, bounded.
+//
+// 🔴 The error comes back rather than failing the test here, because three
+// callers below assert on a refusal the applier is *supposed* to produce and
+// need the retry without losing the error they are about to inspect. Anything
+// that is not a deadlock is returned on the first attempt, so a genuine
+// migration fault still surfaces as itself.
+func migrateRetryingDeadlock(migrate func() error) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = migrate(); err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	return err
+}
+
 func newTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -326,7 +402,7 @@ func TestMigrateCreatesTheCatalogOnAnEmptyDatabase(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("migrate an empty database: %v", err)
 	}
 
@@ -392,7 +468,7 @@ func TestMigrateTwiceChangesNothing(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("first migration: %v", err)
 	}
 
@@ -425,7 +501,7 @@ func TestMigrateTwiceChangesNothing(t *testing.T) {
 	// A row that survives the second run untouched is the evidence: an applier
 	// that re-ran a file would either fail on a CREATE or restamp applied_at_ms.
 	time.Sleep(2 * time.Millisecond)
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("second migration: %v", err)
 	}
 
@@ -455,7 +531,7 @@ func TestMigrateRefusesATableItDidNotCreate(t *testing.T) {
 		t.Fatalf("plant a foreign table: %v", err)
 	}
 
-	err := Migrate(ctx, pool)
+	err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) })
 	if err == nil {
 		t.Fatal("expected a refusal, got success")
 	}
@@ -489,10 +565,10 @@ func TestMigrateRefusesATableItDidNotCreate(t *testing.T) {
 	if _, err := pool.Exec(ctx, "DROP TABLE snapshots"); err != nil {
 		t.Fatalf("remove the foreign table: %v", err)
 	}
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("migrate after removing the foreign table: %v", err)
 	}
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("a second run must not trip the preflight: %v", err)
 	}
 }
@@ -515,7 +591,7 @@ func TestMigrateRefusesALedgerWhoseTablesAreGone(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("first migration: %v", err)
 	}
 
@@ -525,7 +601,7 @@ func TestMigrateRefusesALedgerWhoseTablesAreGone(t *testing.T) {
 		t.Fatalf("drop the catalog tables: %v", err)
 	}
 
-	err := Migrate(ctx, pool)
+	err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) })
 	if err == nil {
 		t.Fatal("a ledger with no tables under it migrated 'successfully': " +
 			"that is the silent no-op this check exists to stop")
@@ -561,7 +637,7 @@ func TestMigrateRefusesALedgerWhoseTablesAreGone(t *testing.T) {
 	if _, err := pool.Exec(ctx, rollbackCommand); err != nil {
 		t.Fatalf("run the rollback the error quotes: %v", err)
 	}
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("migrate after a completed rollback: %v", err)
 	}
 	seedSnapshot(t, pool, snapshotSeed{status: "waiting"})
@@ -574,7 +650,7 @@ func TestMigrateAcceptsALedgerFromANewerBuild(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("first migration: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
@@ -582,7 +658,7 @@ func TestMigrateAcceptsALedgerFromANewerBuild(t *testing.T) {
 		t.Fatalf("record a version from the future: %v", err)
 	}
 
-	if err := Migrate(ctx, pool); err != nil {
+	if err := migrateRetryingDeadlock(func() error { return Migrate(ctx, pool) }); err != nil {
 		t.Fatalf("a rolled-back build refused to start against a newer ledger: %v", err)
 	}
 }
@@ -605,7 +681,7 @@ func TestNoTransactionDirectiveIsWhatMakesConcurrentIndexesWork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if err := a.run(context.Background(), pool); err != nil {
+		if err := migrateRetryingDeadlock(func() error { return a.run(context.Background(), pool) }); err != nil {
 			t.Fatalf("apply: %v", err)
 		}
 
@@ -634,7 +710,7 @@ func TestNoTransactionDirectiveIsWhatMakesConcurrentIndexesWork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		err = a.run(context.Background(), pool)
+		err = migrateRetryingDeadlock(func() error { return a.run(context.Background(), pool) })
 		if err == nil {
 			t.Fatal("expected CREATE INDEX CONCURRENTLY inside a transaction to fail")
 		}

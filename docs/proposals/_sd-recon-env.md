@@ -43,6 +43,14 @@
 > §7.5（resume 要带 body ＋ `limit` 上限）、§9 **SD-B7**（已关闭）、§11.2（已被 §11.6 取代）。
 > 2a 的验收记录在 [`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13，清扫的在
 > [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9。
+>
+> 🔧 **第四轮更新（2026-08-21，阶段 2b 验收当轮）：新增 §11.7，另有 §7.2 就地加宽一处。**
+> ① 🔴 **`tests/snapshot_catalog.rs` 会写进它被指向的那套集群** —— 它对着真服务器跑、只建行不清理；
+> 一次把 endpoint 指向**部署中的** dev 集群 scheduler 的运行，在那套库里留下
+> **26 条快照行 / 3 条模板行 / 10 条别名行**（§11.7）；
+> ② 🔴 **§7.2 那条 preStop 警告原来只写「滚 node（DaemonSet）之前」，射程写窄了** ——
+> 钩子里是个**没有超时**的 `while true`，**任何一次 node Pod 删除**都会执行它，
+> 带着运行中的沙箱删就是无限期 `Terminating`。**就地加宽，没有新增重复条目。**
 
 ---
 
@@ -555,10 +563,26 @@ kubectl -n $NS set image deploy/agentenv-scheduler scheduler=$REG/agentenv-sched
 kubectl -n $NS rollout status deploy/agentenv-gateway   --timeout=180s
 kubectl -n $NS rollout status deploy/agentenv-scheduler --timeout=180s
 
-# 🔴 滚 node（DaemonSet）之前：先确认没有 running 沙箱，否则 grace=3600 会把 rollout 卡死
-curl -s -H 'X-API-Key: dummy' $GW/sandboxes | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))'   # 期望 0
-# 🔧 🔴 这一行只数 running（§11.3）。**暂停的那几台它看不见，而 rollout 会把它们恢复出来**
-#    ⇒ 判断"这台机器是空的"一律照 /v2/sandboxes 数，`/nodes` 的 sandboxCount 同样漏（§11.3 第二个坑）
+# 🔴 删任何一个 node Pod 之前 —— **不只是下面这条 set image 滚动** —— 这台节点上必须一个沙箱都没有。
+# 🔧 **射程订正（2026-08-21，2b 验收当轮）**：原文这条只写「滚 node（DaemonSet）之前」，
+#    射程写窄了。卡住的不是 rollout，是 **preStop 钩子**，而**任何一次 node Pod 删除都会执行它**：
+#    set image / rollout restart / delete pod / drain / 节点重启，一模一样。
+#    机制逐字在 `deploy/k8s/base/agentenv-daemonset.yaml:163-183`（钩子从 `:134` 起）：
+#      while true; do
+#        count=$(curl -sf … http://localhost:8000/sandboxes | jq 'length') || count=""
+#        …
+#        if [ "$count" = "0" ]; then echo "preStop: all sandboxes drained, exiting"; break; fi
+#        sleep 3
+#      done
+#    🔴 **没有超时，也没有逃生口** —— 只有数到 0 才 break
+#    （`terminationGracePeriodSeconds: 3600`（`:29`）是上限，不是这里的等待时间）。
+#    ⇒ **带着运行中的沙箱删一个 node Pod，正在终止的那个和它的替代 Pod 会一起
+#    无限期停在 `Terminating`。**
+# ⇒ 判据一律照 `/v2/sandboxes` 数：`/sandboxes` 只数 running（§11.3）、`/nodes` 的
+#    `sandboxCount` 漏暂停的（§11.3 第二个坑），**而 rollout 会把暂停的那几台恢复出来**。
+curl -s -H 'X-API-Key: dummy' $GW/v2/sandboxes \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d)); [print(" ", x["sandboxID"], x.get("state")) for x in d]'
+# 期望 **0**。非 0 就逐条确认没有一台落在要删的这台节点上（读法照 §11.6 ③ 的第 1 步）。
 kubectl -n $NS set image ds/agentenv-node agentenv=$REG/agentenv-runtime:$TAG
 kubectl -n $NS rollout status ds/agentenv-node --timeout=600s
 # 🔴 绝不 --force --grace-period=0：强删只删 API 对象、容器还活着，
@@ -1044,3 +1068,33 @@ kubectl -n $NS delete pod <node-pod> --grace-period=1
 
 第三条同时是两件事：**猝死成功的证据**，以及 **F4 的现场**
 （陈旧记录活过了它的节点 —— 严重度见 [`_sd-impl-phase1.md`](_sd-impl-phase1.md) §13.9）。
+
+### 11.7 🔧 第四轮（2026-08-21，阶段 2b 验收当轮）：🔴 catalog 集成套件会写进**它被指向的那套集群**
+
+`tests/snapshot_catalog.rs` 不是对着 stub 跑的，它对着一台**真的** `SnapshotCatalog` gRPC 服务器跑，
+而那台服务器由两个环境变量选定：`AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT` ＋
+`AENV_SNAPSHOT_CATALOG_TEST_CLUSTER_ID`。**指哪写哪，而且只建行、不清理。**
+
+**实测（本轮踩到）**：一次把 endpoint 指向**部署中的 dev 集群 scheduler** 的运行，
+在那套准生产的库里留下 **26 条快照行、3 条模板行、10 条别名行**，
+而当时文件里**没有一个字**提示会发生这件事。
+
+| 项 | 值 |
+|---|---|
+| 残留快照行 | **26** |
+| 残留模板行 | **3** |
+| 残留别名行 | **10** |
+
+🔴 **⇒ 这两个 env 只能指向一次性的 PostgreSQL。** `make test-snapshot-catalog`（`Makefile:145`）
+给的就是这个：起一个 `postgres:16-alpine` 容器 ＋ 一个临时 scheduler，跑完两个都拆掉 ——
+**这才是"跑它"的默认读法**，不是"对着已经在跑的那套集群跑一遍看看"。
+
+🔴 **两条连带的**：
+
+1. **残留不会自己消失，也不在 §7.5 的收尾射程里** —— 那一段清的是沙箱，这些是**目录行**
+   （`snapshots` / `templates` / `aliases`），删沙箱一条都碰不到。
+2. 🔴 **真要去清的时候先看清楚**：2a 故意留在集群里的 **30 条种子快照是 2c 的对照面**
+   （§11.6 抬头、[`_sd-impl-phase2.md`](_sd-impl-phase2.md) §13.1 与 §11.3 的 P0 备注），
+   **别连它们一起清掉**。
+
+文件侧的对应记录写在 `tests/snapshot_catalog.rs` 的模块头注释里（同一条发现的两处落点）。

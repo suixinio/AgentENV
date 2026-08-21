@@ -560,7 +560,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     -- resources（SandboxResources，三个 u32）
     cpu_count            INTEGER     NOT NULL CHECK (cpu_count      > 0),
     memory_mib           INTEGER     NOT NULL CHECK (memory_mib     > 0),
-    disk_size_mib        INTEGER     NOT NULL CHECK (disk_size_mib  > 0),
+    disk_size_mib        INTEGER     NOT NULL CHECK (disk_size_mib  > 0),  -- 🔴 已订正，见下
 
     -- 生效状态：committed IS NOT NULL 的 PG 表达
     status               TEXT        NOT NULL
@@ -634,6 +634,34 @@ CREATE INDEX IF NOT EXISTS snapshots_unpublished_idx
     ON snapshots (cluster_id, origin_node_id)
     WHERE NOT published;
 ```
+
+> 🔴 **`disk_size_mib > 0` 这一条也写错了（2026-08-21 订正，2b 验收当轮实测）。**
+> 上面那句「CHECK 就是将来 launch 会施加的那几条，提前施加在写不进坏行的地方」是对的 ——
+> 但它讲的是**一台能被启动的机器**，而 `waiting` / `building` 的行不是。
+> **v3 建模板的请求里根本没有磁盘大小**（`TemplateBuildRequestV3` 只有
+> `name` / `tags` / `cpuCount` / `memoryMB`），真实值是构建产出的 rootfs 虚拟大小，
+> 由 `TemplateBuilder::execute_and_publish` 在构建结束后写回；`0` 是本仓既定的
+> 「还不知道」编码（`template/build_spec.rs`、`sandbox/firecracker/factory.rs` 都按这个读）。
+> 后果是实测出来的：**每一次模板创建都被中心目录以 `INVALID_ARGUMENT` 拒掉，
+> 用户拿到 202、PG 里 0 行**，而那条被拒的写又被当成「不可达」记成欠账、
+> 每 30 秒重放一次、`mirror_lag{central}` 永远回不到 0 —— 也就是 §9.3 给 2c 定的那个数
+> 在这个 build 上**不可能达到**。
+>
+> 规则搬到它成立的地方，形状照抄同表已有的 `snapshots_ready_is_committed`：
+>
+> ```sql
+> -- 0003_disk_size_known_at_ready.sql
+> ALTER TABLE snapshots DROP CONSTRAINT IF EXISTS snapshots_disk_size_mib_check;
+> ALTER TABLE snapshots ADD CONSTRAINT snapshots_disk_size_floor
+>     CHECK (disk_size_mib >= 0);
+> ALTER TABLE snapshots ADD CONSTRAINT snapshots_ready_has_disk_size
+>     CHECK (status <> 'ready' OR disk_size_mib > 0);
+> ```
+>
+> Go 侧同步拆开：`BeginSnapshot` 只要求 cpu / memory 为正，
+> `CommitSnapshot`（唯一产出 `ready` 行的语句）拒绝显式的 0，
+> 并把 `23514` 违反归类成 `ErrInvalidArgument` —— 否则它落到
+> `catalogErrorCode` 的默认臂变成 `UNAVAILABLE`，也就是「永远重试」。
 
 > 🔴 **上面这条 DDL 写错了（2026-08-20 修正，实现里已经不是这样）。**
 > 谓词漏了 `deleted_at_ms IS NULL` —— 它上面两条索引都带。
@@ -1394,6 +1422,32 @@ I5 是让父提案「回退是把读侧开关切回对象存储，**零数据损
 > `agentenv_snapshot_catalog_mirror_lag{direction="central"}` **与**
 > `agentenv_snapshot_catalog_mirror_diverged{direction="central"}` 连续 7 天同时为 0。
 > 只满足前者不构成放行——而这正是 2c 之前打算读的那个数。
+>
+> #### 🔴 再补一条：lag == 0 也不覆盖**双写打开之前**已经存在的快照（2026-08-21，2b 验收当轮）
+>
+> 上面那条只修了「lag 之外还有 diverged」。还漏了一整类：**这两个数都只统计双写*看见过*的写**。
+> 双写打开的那一瞬间，对象存储里已经躺着的快照，两边谁都没记过一笔 ——
+> 集群实测：翻开关当时两台节点都是 `mirror_lag{central}=0`、`mirror_diverged{central}=0`，
+> **PG 0 行、对象存储 32 行**。⇒ 只看这两个数就切 `read = postgres`，
+> **那 32 条会全部从 API 上消失**，而所有数字仍然说镜像是干净的 —— 与 `try_start_build`
+> 那条一模一样的失效方式，只是打在了「开关之前的全部历史」上。
+>
+> 2b 已补：`MirrorBacklog::queue_history_toward_central` 在启动时把对象存储目录里的
+> **每一行**按它当初的那次操作（committed ⇒ `PublishCommit`；未提交 ⇒ `Create`；
+> 构建失败 ⇒ `Create` ＋ `MarkBuildError`）**当成普通欠账压进待补队列**，
+> 落盘一个一次性标记；补偿器照常重放，永久拒绝照常变成 divergence。
+> 走队列而不是另写一个搬运器，是为了让它直接继承队列已有的持久化、按快照定序、
+> 重放前先探测目标、重试上限、以及「永久拒绝落成 divergence」——
+> 另写一条路就得把这些全部再写一遍，而且会是唯一没人测的那条。
+> `guard_read_side` 增加第三个拒绝条件：**这个标记没落盘就不许把读切到 PG**。
+>
+> ⇒ **要守住的那句话是**：`lag == 0 && diverged == 0` 必须意味着**「两边一致」**，
+> 而不是**「队列里没东西」**。
+>
+> 🔴 **但这两个数今天没有集群级的算法。** 它们是**每节点**的 gauge，全仓没有任何东西把它们
+> 聚成集群一个数，也没有告警；一台节点离开集群，它的欠账就从手算的那个和里消失。
+> ⇒ **2c 的出场判据点名了一个今天没有任何系统在算的数** —— 登记在 §12.1 末行，
+> 设计 2c 的人必须先把"怎么聚合"答了。
 
 ### 9.3 什么时候拆掉双写
 
@@ -1582,6 +1636,7 @@ metrics::counter!(
 | `POST …/builds/{id}` 的 `tokio::spawn` 脱管，进程死掉记录永卡 `Building`，全仓无收割器 | `src/api/impls/template.rs:652` | 🔴 **必须在阶段 2 修**，否则 `builds_one_active_per_template` 把泄漏升级成故障（§3.2、P6） |
 | `templates_get`（v1）完全没有分页，返回全量模板 | `src/api/impls/template.rs:322-346` | 阶段 2 同批补上，否则 10k 记录下它先炸而判据看不到 |
 | PG / RustFS 的 PVC 都是 `local-path`、钉死 204、无备份 | recon SD-B5 | 🔴 目录进 PG 之后 PG 成为不可逆用户数据的唯一真相源。**2a 上线前必须谈一次持久化**，这是 recon 自己提的 |
+| 🔴 **`agentenv_snapshot_catalog_mirror_lag{direction}` / `agentenv_snapshot_catalog_mirror_diverged{direction}` 是每节点的 gauge，而 2c 的出场判据是拿它们当集群一个数在读** —— 每个 node 的补偿器只把自己那份欠账写进自己的 `:8000/metrics`，全仓**没有任何东西做集群级聚合，也没有告警**；🔴 更硬的一条：**一台节点离开集群（宕机、被摘、被删 Pod），它的欠账就从手算的那个和里消失，而且不留痕** ⇒ 在"恰好还活着的那几台"上求和可以读出 **0**，同一时刻真实欠账正停在一台已经不在的机器上 | gauge 名在 `src/snapshot/repository/mirror/metrics.rs:47,59`，谁在写在 `mirror/backlog.rs:636-637`（每节点自己的补偿器）；node 的 `/metrics` 无 NodePort、只在本机（recon §4.4） | 🔴 **登记为 2c 出场判据的设计开放项，不是一条待修的 bug。** §9.3 第 2 条经 §9.2 的 2b 修订之后要求 `mirror_lag{direction="central"}` **与** `mirror_diverged{direction="central"}` 连续 7 天同时为 0 —— **这个数今天没有任何系统在算**，手算的和不具备判据资格。设计 2c 的人必须先答两问：① 集群级怎么聚合（谁抓、按哪个节点集合求和、少抓一台算不算数）；② 一台带着欠账离开的节点，那笔账算到哪里去 —— 今天的答案是"凭空消失"，而判据读起来正好像通过（recon §8 第 2 条那一类失效） |
 
 ---
 

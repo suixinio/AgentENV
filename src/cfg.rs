@@ -866,6 +866,19 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+    /// Whether this process sweeps the host at startup for what a previous
+    /// process on this machine left behind: leftover Firecracker VMMs and the
+    /// work directories they were running in. See `crate::node_reclaim`.
+    ///
+    /// 🔴 Three states, and the unset one is not "off". Unset means the role
+    /// decides — `--role node` sweeps, `--role all` does not — because the
+    /// sweep is only sound while "the previous process on this machine is
+    /// gone" holds, and that is a property of the deployment rather than of
+    /// the code. A DaemonSet with `maxSurge: 0` guarantees it; a developer's
+    /// laptop running a second server alongside the first does not, and a
+    /// sweep there would kill the other one's VMs.
+    #[config(env = "AENV_STARTUP_RECLAIM_ENABLED")]
+    pub startup_reclaim_enabled: Option<bool>,
     /// How long shutdown waits, after isolating the node, before it starts
     /// tearing sandboxes down.
     ///

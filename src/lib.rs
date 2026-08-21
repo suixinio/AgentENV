@@ -5,6 +5,7 @@ pub mod identity;
 pub mod image;
 mod local_store;
 pub mod logging;
+pub mod node_reclaim;
 pub mod observability;
 pub mod orchestrator;
 pub mod overlaybd;

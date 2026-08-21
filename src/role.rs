@@ -98,6 +98,36 @@ impl ServerRole {
         matches!(self, Self::Api | Self::All)
     }
 
+    /// Whether this role answers the user-facing REST surface: the
+    /// `sandboxes`, `snapshots` and `templates` route groups.
+    ///
+    /// 🔴 A `node` does not. It runs VMs; deciding that a sandbox should exist,
+    /// be paused, or be thrown away is the other half's job, and a node that
+    /// kept answering those routes while the API half believed it owned the
+    /// same sandboxes would be a second ledger for one set of machines. The
+    /// routes are still compiled in and still attached — see
+    /// `crate::api::role_gate` for why refusing them is a layer rather than a
+    /// shorter route table — they are simply answered with 404.
+    pub fn serves_user_facing_rest(self) -> bool {
+        matches!(self, Self::Api | Self::All)
+    }
+
+    /// Whether this role sweeps the host for what a previous process on this
+    /// machine left behind: leftover Firecracker VMMs, their work directories,
+    /// their serial logs.
+    ///
+    /// 🔴 `node` only, and this is a safety property rather than a preference.
+    /// The sweep is sound because of *when* it runs: before the listener opens,
+    /// on the premise that the previous process on this machine is gone, so
+    /// nothing on the host is this process's yet. `all` is what runs on a
+    /// developer's machine, where two servers sharing one host is ordinary and
+    /// that premise is simply false — a sweep there would tear down the other
+    /// one's VMs. `[orchestrator].startup_reclaim_enabled` can override this
+    /// either way; this is what it defaults to.
+    pub fn reclaims_host_leftovers_at_startup(self) -> bool {
+        matches!(self, Self::Node)
+    }
+
     /// Whether this role sends heartbeats to the scheduler.
     ///
     /// A heartbeat reports a *machine* — its CPU, its memory, the sandboxes on
@@ -222,6 +252,13 @@ mod tests {
         assert!(all.arbitrates_paused_sandbox_ownership());
         assert!(all.sends_heartbeats());
         assert!(all.drains_on_shutdown());
+        assert!(all.serves_user_facing_rest());
+        // 🔴 The one gate `all` answers *no* to, and it is not a capability
+        // being taken away — it is a behaviour `all` never had. Sweeping the
+        // host at startup is new, and turning it on for the rollback target
+        // would mean the thing being rolled back to is not the thing that was
+        // running before.
+        assert!(!all.reclaims_host_leftovers_at_startup());
         assert!(all.check_setup_flags(true, false).is_ok());
         assert!(all.check_setup_flags(false, true).is_ok());
     }
@@ -232,8 +269,11 @@ mod tests {
         assert!(!api.runs_sandbox_runtime());
         assert!(!api.sends_heartbeats());
         assert!(!api.drains_on_shutdown());
-        // It does decide who owns a paused sandbox — that is the half it is.
+        assert!(!api.reclaims_host_leftovers_at_startup());
+        // It does decide who owns a paused sandbox — that is the half it is,
+        // and it is the half that answers users.
         assert!(api.arbitrates_paused_sandbox_ownership());
+        assert!(api.serves_user_facing_rest());
     }
 
     #[test]
@@ -243,6 +283,8 @@ mod tests {
         assert!(node.sends_heartbeats());
         assert!(node.drains_on_shutdown());
         assert!(!node.arbitrates_paused_sandbox_ownership());
+        assert!(!node.serves_user_facing_rest());
+        assert!(node.reclaims_host_leftovers_at_startup());
     }
 
     #[test]

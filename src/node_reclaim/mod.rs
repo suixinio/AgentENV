@@ -51,6 +51,28 @@
 //! the wrong question: this sweep is about a machine, and that marker is about
 //! a sandbox.
 //!
+//! 🔴 And the mistake it would be is not a marginal one. An absent marker means
+//! *the control plane does not own this record* — never *leftover*, never *safe
+//! to kill*. Through the shadow phase the DaemonSet stays on `--role all`, and
+//! in that role every sandbox created through the node's own REST leaves the
+//! marker absent. Absence is therefore the **majority** case on a node, and
+//! every one of those is a live user sandbox. A reclaim that read absence as a
+//! licence would not fail rarely at the margin; it would take most of a node's
+//! sandboxes the first time it ran, in exactly the deployment shape the shadow
+//! phase specifies. `nothing_in_this_module_consults_the_ownership_marker`
+//! checks the source, because the regression is an addition that compiles,
+//! passes everything else here, and reads like a safety improvement.
+//!
+//! # The premise, checked rather than assumed
+//!
+//! Everything above turns on "the previous process on this machine is gone",
+//! and until it was checked that was a sentence in a comment. [`sweep`] now
+//! refuses outright when another copy of this executable is running on the
+//! host, and refuses when it cannot work out what its own executable is. The
+//! DaemonSet's `maxSurge: 0` still carries the argument; this makes a broken
+//! premise a refusal rather than a silent, expensive assumption — which matters
+//! most on a development host, where two servers on one machine is ordinary.
+//!
 //! # What this is not
 //!
 //! It is not reconciliation, and the two must not grow into each other. The API
@@ -153,6 +175,14 @@ pub struct ReclaimPaths {
     /// milliseconds after this sweep finishes. Deleting them turns a restart
     /// into permanent data loss for every sandbox parked here.
     pub persisted_sandbox_store: PathBuf,
+    /// 🔴 This process's own executable, used to check that no other copy of
+    /// it is running on this host — the premise the whole sweep rests on. See
+    /// [`another_server_instance`].
+    ///
+    /// `None` when the executable could not be resolved, which is treated as
+    /// "cannot tell" and refuses the sweep rather than assuming the host is
+    /// ours alone.
+    pub server_exe: Option<PathBuf>,
 }
 
 impl ReclaimPaths {
@@ -165,6 +195,7 @@ impl ReclaimPaths {
                 .unwrap_or_else(std::env::temp_dir),
             proc_dir: PathBuf::from("/proc"),
             persisted_sandbox_store: config.orchestrator.persisted_sandbox_store_path.clone(),
+            server_exe: std::env::current_exe().ok(),
         }
     }
 }
@@ -299,9 +330,108 @@ pub async fn run(role: ServerRole, config: &AppConfig) -> ReclaimReport {
     report
 }
 
+/// Why a sweep was refused before it looked at anything.
+///
+/// A closed set: the label goes on a metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Another copy of this executable is running on this host, so the
+    /// previous process on this machine is *not* gone.
+    AnotherServerInstance,
+    /// This process could not work out what its own executable is, so it
+    /// cannot check for the above.
+    OwnBinaryUnknown,
+}
+
+impl Refusal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AnotherServerInstance => "another_server_instance",
+            Self::OwnBinaryUnknown => "own_binary_unknown",
+        }
+    }
+}
+
+/// The pid of another process running this same executable, if there is one.
+///
+/// 🔴 This is §8.3's premise turned into a check. Everything the sweep does is
+/// safe *because* the previous process on this machine is gone; that is
+/// asserted by the DaemonSet's `maxSurge: 0` and by the ublk client refusing to
+/// start while an old daemon answers, and until now it was asserted nowhere
+/// else. A second live server on the host makes it false, and the cost of it
+/// being false is not a leak — it is this process killing the other one's
+/// running VMs and deleting the directories they are running in.
+///
+/// The comparison is the resolved executable, not a name: `comm` is truncated
+/// to 15 bytes and says nothing about which build or which install a process
+/// came from, while `/proc/<pid>/exe` is the file itself.
+///
+/// 🔴 Three answers collapse to two here, in the safe direction. A candidate
+/// whose `exe` cannot be read is *not* claimed as another instance — it is
+/// another user's process, and this process could not be running as a user that
+/// cannot read its own binary. Getting that wrong the other way would refuse
+/// every sweep on any host that happens to run something unreadable, which is
+/// every host.
+fn another_server_instance(proc_dir: &Path, own_exe: &Path, own_pid: i32) -> Option<i32> {
+    let own_exe = std::fs::canonicalize(own_exe).unwrap_or_else(|_| own_exe.to_path_buf());
+    for entry in std::fs::read_dir(proc_dir).ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 || pid == own_pid {
+            continue;
+        }
+        let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
+            continue;
+        };
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if exe == own_exe {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Whether the premise the sweep rests on holds right now.
+fn premise_holds(paths: &ReclaimPaths) -> Result<(), Refusal> {
+    let Some(own_exe) = paths.server_exe.as_deref() else {
+        return Err(Refusal::OwnBinaryUnknown);
+    };
+    let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    match another_server_instance(&paths.proc_dir, own_exe, own_pid) {
+        Some(_) => Err(Refusal::AnotherServerInstance),
+        None => Ok(()),
+    }
+}
+
 /// The sweep itself, without the enablement decision or the configuration
 /// lookup, so tests can drive it against a directory tree.
 async fn sweep(paths: &ReclaimPaths) -> ReclaimReport {
+    // 🔴 Before anything is read, let alone killed. Everything below is blind
+    // to ownership by design — a live user sandbox and a leftover look
+    // identical on the host — so the only thing separating "reclaim the
+    // leftovers" from "kill this machine's running VMs" is that no other
+    // process on this machine has any.
+    if let Err(refusal) = premise_holds(paths) {
+        metrics::counter!(
+            "agentenv_node_reclaim_refused_total",
+            "reason" => refusal.label(),
+        )
+        .increment(1);
+        warn!(
+            target: "agentenv",
+            reason = refusal.label(),
+            "refusing to reclaim host leftovers: this sweep cannot tell a leftover from a live \
+             sandbox and is only safe while nothing else on this machine owns any. Leftovers stay \
+             where they are"
+        );
+        return ReclaimReport::default();
+    }
+
     // 🔴 Processes before files, and the whole reason the two are separate
     // steps: deleting the directory a live VMM is running in leaves the VMM
     // running with its files gone, which is strictly worse than either doing
@@ -370,13 +500,259 @@ mod tests {
     /// invent a failure out of directories that do not exist.
     #[tokio::test]
     async fn a_clean_host_reclaims_nothing_and_fails_at_nothing() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ReclaimPaths {
-            work_base: temp.path().join("firecracker-work"),
-            proc_dir: temp.path().join("proc"),
-            persisted_sandbox_store: temp.path().join("persisted"),
-        };
+        let host = Host::new();
+        assert_eq!(sweep(&host.paths()).await, ReclaimReport::default());
+    }
+    /// A host a test can lay out: a forged `/proc`, a work base, a paused
+    /// -sandbox store, and a stand-in for this process's own executable.
+    ///
+    /// 🔴 Nothing here ever gives `reclaim` a Firecracker to signal. `reclaim`
+    /// calls `kill(2)` with the pid it was handed, and a pid invented by a test
+    /// is a pid that may belong to something real on the machine running it.
+    /// Tests that need the process half assert against `plan`, which decides
+    /// and does not signal; tests that need the sweep end to end use leftovers
+    /// with no process at all — which is also what a leftover looks like on the
+    /// DaemonSet, where the pod's PID namespace has already taken the VMMs.
+    struct Host {
+        root: tempfile::TempDir,
+    }
 
-        assert_eq!(sweep(&paths).await, ReclaimReport::default());
+    impl Host {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("proc")).unwrap();
+            std::fs::create_dir_all(root.path().join("firecracker-work")).unwrap();
+            std::fs::create_dir_all(root.path().join("persisted")).unwrap();
+            std::fs::write(root.path().join("server"), "#!/bin/false\n").unwrap();
+            Self { root }
+        }
+
+        fn paths(&self) -> ReclaimPaths {
+            ReclaimPaths {
+                work_base: self.root.path().join("firecracker-work"),
+                proc_dir: self.root.path().join("proc"),
+                persisted_sandbox_store: self.root.path().join("persisted"),
+                server_exe: Some(self.root.path().join("server")),
+            }
+        }
+
+        /// What a sandbox leaves behind once its VMM is gone: the directory.
+        fn leftover(&self, name: &str) -> std::path::PathBuf {
+            let work_dir = self.root.path().join("firecracker-work").join(name);
+            std::fs::create_dir_all(&work_dir).unwrap();
+            work_dir
+        }
+
+        /// A live sandbox exactly as one looks on the host: a Firecracker whose
+        /// working directory is one of ours, and that directory.
+        ///
+        /// For `plan` only — see the note on [`Host`].
+        fn live_sandbox(&self, name: &str, pid: i32) -> std::path::PathBuf {
+            let work_dir = self.leftover(name);
+            let process = self.root.path().join("proc").join(pid.to_string());
+            std::fs::create_dir_all(&process).unwrap();
+            std::fs::write(process.join("comm"), "firecracker\n").unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!("{pid} (firecracker) S 1 {pid} {pid} 0 -1 4194304"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&work_dir, process.join("cwd")).unwrap();
+            work_dir
+        }
+
+        /// A second copy of this process's own executable, running.
+        fn second_server(&self, pid: i32) {
+            let process = self.root.path().join("proc").join(pid.to_string());
+            std::fs::create_dir_all(&process).unwrap();
+            std::os::unix::fs::symlink(self.root.path().join("server"), process.join("exe"))
+                .unwrap();
+        }
+    }
+
+    /// 🔴 T-NR-30. **A second server on this host stops the sweep dead.**
+    ///
+    /// §8.3's argument is that everything here is safe *because* the previous
+    /// process on this machine is gone. Until now that was asserted by a
+    /// DaemonSet setting and a comment, and by nothing in the code. It is the
+    /// one premise whose failure is not a leak but this process deleting
+    /// another one's running sandboxes — and two servers sharing a development
+    /// host is ordinary rather than exotic.
+    ///
+    /// Both faces, against the same host and the same leftover. Without the
+    /// second half the refusal is indistinguishable from a sweep that never
+    /// worked at all.
+    #[tokio::test]
+    async fn a_second_copy_of_this_server_on_the_host_refuses_the_whole_sweep() {
+        let host = Host::new();
+        let work_dir = host.leftover("agentenv-fc-A1");
+        host.second_server(4002);
+
+        assert_eq!(
+            sweep(&host.paths()).await,
+            ReclaimReport::default(),
+            "nothing may be examined, let alone retired, while the premise is false"
+        );
+        assert!(work_dir.exists(), "and nothing may be deleted");
+
+        // Push it up: the same host without the second server does retire it,
+        // so the zeroes above are the refusal and not an inert sweep.
+        std::fs::remove_dir_all(host.root.path().join("proc").join("4002")).unwrap();
+        assert_eq!(sweep(&host.paths()).await.work_dirs.reclaimed, 1);
+        assert!(!work_dir.exists());
+    }
+
+    /// 🔴 T-NR-31. Not being able to name our own executable is "cannot tell",
+    /// and "cannot tell" does not sweep.
+    #[tokio::test]
+    async fn a_process_that_cannot_identify_its_own_binary_refuses_to_sweep() {
+        let host = Host::new();
+        let work_dir = host.leftover("agentenv-fc-A1");
+
+        let blind = ReclaimPaths {
+            server_exe: None,
+            ..host.paths()
+        };
+        assert_eq!(sweep(&blind).await, ReclaimReport::default());
+        assert!(work_dir.exists());
+
+        // ...and knowing it, the same host is swept.
+        assert_eq!(sweep(&host.paths()).await.work_dirs.reclaimed, 1);
+        assert!(!work_dir.exists());
+    }
+
+    /// T-NR-32. A process whose `exe` cannot be read is not claimed as a
+    /// second instance.
+    ///
+    /// Reading it the other way — "unreadable, so it might be us" — would
+    /// refuse every sweep on every host, because every host runs something this
+    /// process may not look at.
+    #[test]
+    fn a_process_whose_executable_cannot_be_read_is_not_a_second_instance() {
+        let host = Host::new();
+        let proc_dir = host.root.path().join("proc");
+        // No `exe` link at all, which is what an unreadable one looks like from
+        // here.
+        std::fs::create_dir_all(proc_dir.join("5001")).unwrap();
+        // ...and one that points somewhere else entirely.
+        std::fs::create_dir_all(proc_dir.join("5002")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", proc_dir.join("5002").join("exe")).unwrap();
+
+        let own_exe = host.root.path().join("server");
+        assert_eq!(another_server_instance(&proc_dir, &own_exe, 1), None);
+
+        // The control face: a link to the same binary is found.
+        host.second_server(5003);
+        assert_eq!(
+            another_server_instance(&proc_dir, &own_exe, 1),
+            Some(5003),
+            "the probe has resolution"
+        );
+        // ...and this process is never its own second instance.
+        assert_eq!(another_server_instance(&proc_dir, &own_exe, 5003), None);
+    }
+
+    /// 🔴 T-NR-33. **What a node full of live sandboxes looks like to this
+    /// sweep, said plainly.**
+    ///
+    /// Throughout the shadow phase the DaemonSet stays on `--role all`, and in
+    /// that role every sandbox a user creates leaves `control_plane_config` as
+    /// `None`. `None` is therefore not the exceptional case on a node — it is
+    /// the majority case, and every one of those is a live user sandbox that
+    /// the API half simply does not own.
+    ///
+    /// 🔴 This sweep cannot spare them, and this test says so rather than
+    /// implying a protection that does not exist. A live sandbox and a leftover
+    /// are the same two things on the host — a Firecracker under the work base,
+    /// and a directory — and the marker is not on the host at all. Pointed at a
+    /// running node, the sweep takes everything.
+    ///
+    /// What keeps it from being pointed at one is the two tests above and the
+    /// one below: the premise is checked before anything is touched, and the
+    /// role that runs during the shadow phase does not sweep at all.
+    #[tokio::test]
+    async fn a_host_laid_out_like_a_running_node_is_swept_wholesale() {
+        let host = Host::new();
+        for index in 0..3 {
+            host.live_sandbox(&format!("agentenv-fc-live{index}"), 6000 + index);
+        }
+
+        // The process half, through `plan`, which decides without signalling.
+        let plans = firecracker::plan(&host.paths());
+        assert_eq!(plans.len(), 3);
+        for plan in &plans {
+            assert_eq!(
+                plan.ownership,
+                firecracker::Ownership::Ours,
+                "a live user sandbox is indistinguishable from a leftover here: {plan:?}"
+            );
+        }
+
+        // The file half, end to end, once the VMMs are gone — which on the
+        // DaemonSet the pod's own PID namespace has already done.
+        let files_only = Host::new();
+        let dirs: Vec<_> = (0..3)
+            .map(|index| files_only.leftover(&format!("agentenv-fc-live{index}")))
+            .collect();
+        assert_eq!(sweep(&files_only.paths()).await.work_dirs.reclaimed, 3);
+        for work_dir in &dirs {
+            assert!(!work_dir.exists());
+        }
+    }
+
+    /// 🔴 T-NR-34. The role that runs during the shadow phase does not sweep.
+    ///
+    /// This is the protection for the case above, and it is one line of policy
+    /// rather than any cleverness in the sweep. Pushed up in both directions,
+    /// so the `false` is a decision and not a constant.
+    #[test]
+    fn the_role_that_runs_during_the_shadow_phase_does_not_sweep() {
+        // The shadow phase keeps the DaemonSet on `--role all`, so the sweep
+        // never runs there, whatever is on the node.
+        assert!(!enabled_for(ServerRole::All, None));
+        // ...and it is a decision: an operator can turn it on, which is what
+        // makes the line above worth asserting.
+        assert!(enabled_for(ServerRole::All, Some(true)));
+        // The role that does sweep, whose startup is the one moment at which
+        // the premise holds.
+        assert!(enabled_for(ServerRole::Node, None));
+    }
+
+    /// 🔴 T-NR-35. The reclaim never reads the ownership marker.
+    ///
+    /// The contract is that an absent `control_plane_config` means "the control
+    /// plane does not own this record" and never "leftover, safe to kill".
+    /// Nothing here consults it — it is not on the host, and the store is empty
+    /// at this point — but it is a plausible thing for someone arriving later
+    /// to reach for, and during the shadow phase it would retire most of a
+    /// node's live sandboxes on the first run.
+    ///
+    /// Checked against the source rather than trusted to review, because the
+    /// regression is an addition that compiles, passes every other test here,
+    /// and reads like a safety improvement.
+    #[test]
+    fn nothing_in_this_module_consults_the_ownership_marker() {
+        const MARKER: &str = "control_plane";
+        for (name, source) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("firecracker.rs", include_str!("firecracker.rs")),
+            ("work_dirs.rs", include_str!("work_dirs.rs")),
+        ] {
+            // Production code only. The prose above this line names the marker
+            // on purpose, and so does this test.
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            for (number, line) in production.lines().enumerate() {
+                let is_prose = line.trim_start().starts_with("//");
+                assert!(
+                    is_prose || !line.contains(MARKER),
+                    "{name}:{} reads the ownership marker. An absent marker is not evidence \
+                     about leftovers: it means the control plane does not own the record, and \
+                     during the shadow phase that is true of most of the live sandboxes on a \
+                     node. This sweep is sound because of when it runs, not because of what it \
+                     knows.",
+                    number + 1
+                );
+            }
+        }
     }
 }

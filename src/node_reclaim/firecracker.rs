@@ -471,6 +471,9 @@ mod tests {
                 work_base: self.work.path().to_path_buf(),
                 proc_dir: self.proc.dir(),
                 persisted_sandbox_store: self.persisted.path().to_path_buf(),
+                // Not exercised here: these suites call `plan`/`reclaim`
+                // directly, below the premise check `sweep` makes.
+                server_exe: None,
             }
         }
 

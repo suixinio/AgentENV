@@ -321,6 +321,44 @@ mod tests {
         }
     }
 
+    /// 🔴 `published` and `origin_node_id` are a projection, and this side does
+    /// not read them.
+    ///
+    /// The two columns are designed to be droppable — one migration file and
+    /// three deletions — and what buys that is their never reaching a `WHERE`
+    /// and never being re-derived from something else. Decoding them into
+    /// `SnapshotRecord` would put them into the node's domain model, where the
+    /// next thing to want them is a filter. A behavioural test is the only kind
+    /// that can say "this code does not depend on that": two rows differing in
+    /// nothing else must decode to the same record.
+    #[test]
+    fn the_origin_columns_are_projected_and_this_side_does_not_read_them() {
+        let published = ready_row();
+        let pinned = pb::SnapshotRow {
+            published: false,
+            origin_node_id: "worker-01".to_string(),
+            ..published.clone()
+        };
+
+        let from_published = decode_row(published, cluster()).expect("a row should decode");
+        let from_pinned = decode_row(pinned, cluster()).expect("a row should decode");
+
+        assert_eq!(from_published.id, from_pinned.id);
+        assert_eq!(from_published.alias, from_pinned.alias);
+        assert_eq!(from_published.resources, from_pinned.resources);
+        assert_eq!(
+            from_published.created_at_unix_ms,
+            from_pinned.created_at_unix_ms
+        );
+        assert_eq!(
+            serde_json::to_value(&from_published).expect("a record should serialize"),
+            serde_json::to_value(&from_pinned).expect("a record should serialize"),
+            "an unpublished row pinned to a node must decode to the same record as a published \
+             one; anything else means this side has started depending on columns that are meant \
+             to be droppable"
+        );
+    }
+
     #[test]
     fn a_ready_row_decodes_with_its_payload() {
         let decoded = decode_row(ready_row(), cluster()).expect("a ready row should decode");

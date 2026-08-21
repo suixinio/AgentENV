@@ -2260,3 +2260,92 @@ async fn a_page_with_no_stated_limit_is_bounded_by_the_server() {
         "three rows fit inside the default page"
     );
 }
+
+/// 🔴 The read-side gate's census counts rows no resolving query can see.
+///
+/// Every other read this node makes of the central catalog is at the resolvable
+/// scope, and that is right: it is what stops a snapshot whose bytes are still
+/// uploading from starting a VM. Here it would be wrong in a way that fails
+/// *closed on healthy clusters* — a template sitting at `waiting` is a row
+/// object storage holds and counts, so hiding it on this side alone would make
+/// the comparison refuse every cluster that has ever built a template. A gate
+/// that refuses healthy clusters gets turned off, which is the same as not
+/// having one.
+#[tokio::test]
+async fn the_read_side_gates_census_counts_rows_the_resolvable_reading_hides() {
+    use agentenv::snapshot::repository::mirror::CatalogCensus;
+
+    let catalog = catalog!();
+    let waiting = SnapshotId::generate();
+    catalog
+        .create(template_record(waiting.clone(), None))
+        .await
+        .expect("creating the template row should work");
+
+    let counted = catalog
+        .every_snapshot_id()
+        .await
+        .expect("the census should work");
+    assert!(
+        counted.contains(&waiting),
+        "the census must count a template that has not been built yet"
+    );
+
+    // The control: the reading everything else uses does not see it, so the
+    // scope is doing the work rather than the row happening to be visible.
+    let resolvable = catalog
+        .list(SnapshotListFilter::matches_all())
+        .await
+        .expect("the resolvable listing should work");
+    assert!(
+        !resolvable.iter().any(|row| row.id == waiting),
+        "a waiting template must be invisible to the resolvable reading"
+    );
+}
+
+/// 🔴 The unbounded listing walks past its first page.
+///
+/// `list_scoped` is what the read-side gate's census and the mirror's history
+/// backfill both read, and both are *counting everything*. A listing that
+/// stopped at one page would make the gate compare a truncated central catalog
+/// against a whole object store — refusing healthy clusters — and would make
+/// the backfill queue only the first page of a history it reported as done.
+/// Neither would look like a bug from the outside.
+///
+/// The fixture is deliberately larger than the client's internal page size,
+/// which is the only size at which the difference exists.
+#[tokio::test]
+async fn the_unbounded_listing_walks_past_its_first_page() {
+    let catalog = catalog!();
+    // One more than the 200-row page the client asks the server for.
+    const ROWS: usize = 201;
+    let prefix = unique_alias("drain");
+
+    for n in 0..ROWS {
+        catalog
+            .create(template_record(
+                SnapshotId::generate(),
+                Some(&format!("{prefix}-{n:04}")),
+            ))
+            .await
+            .expect("creating the template row should work");
+    }
+
+    let listed = catalog
+        .list_scoped(
+            SnapshotListFilter {
+                alias_prefix: Some(prefix.clone()),
+                ..SnapshotListFilter::default()
+            },
+            CatalogReadScope::AnyStatus,
+        )
+        .await
+        .expect("the unbounded listing should work");
+
+    assert_eq!(
+        listed.len(),
+        ROWS,
+        "the listing stopped early; a walk that ends at its first page reports a smaller \
+         catalog than there is"
+    );
+}

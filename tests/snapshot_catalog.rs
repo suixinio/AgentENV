@@ -1014,3 +1014,148 @@ mod dual_write {
             .expect_err("so must a listing");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The seam, consumed across a process boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod bytes_then_commit {
+    use super::*;
+
+    use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use agentenv::snapshot::repository::mirror::{DualWriteCatalog, MirrorBacklog};
+    use agentenv::snapshot::repository::{SnapshotRepository, StagedSnapshot};
+    use agentenv::snapshot::{SnapshotManager, SnapshotPublishMetadata};
+
+    /// 🔴 The whole point of the split, end to end and across a real process
+    /// boundary.
+    ///
+    /// `stage` writes bytes to this machine's disk and announces nothing. The
+    /// value it hands back is written down, read back, and committed — and the
+    /// commit travels over gRPC to a different process, which is the property
+    /// `--role api` will depend on and the reason the value may not carry a
+    /// path, a handle, or a manifest.
+    ///
+    /// The controls are the two reads between the two calls: with the bytes on
+    /// disk and no commit, neither of them finds the snapshot.
+    #[tokio::test]
+    async fn bytes_land_here_and_the_commit_happens_in_another_process() {
+        let central = catalog!();
+        agentenv::cfg::ConfigManager::init_global().expect("a config should load");
+
+        let workspace = tempfile::TempDir::new().expect("tempdir should exist");
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: workspace.path().join("repository"),
+            cache_root: Some(workspace.path().join("cache")),
+            runtime_cache_root: Some(workspace.path().join("cache").join("runtime")),
+        })
+        .expect("the POSIX backend should build");
+        let object_store = backend.repository().catalog();
+        let backlog = MirrorBacklog::open(workspace.path().join("mirror"))
+            .await
+            .expect("the backlog should open");
+        let dual = Arc::new(DualWriteCatalog::new(
+            Arc::clone(&central),
+            Arc::clone(&object_store),
+            backlog,
+        ));
+        let manager = SnapshotManager::from_parts(
+            Arc::new(SnapshotRepository::on_node(
+                dual,
+                backend.repository().artifacts(),
+                "test-node-a".to_string(),
+            )),
+            backend.runtime_resolver(),
+            None,
+        );
+
+        let artifacts = tempfile::TempDir::new().expect("tempdir should exist");
+        let (_, _, manifest) =
+            agentenv::snapshot::mock::write_mock_built_artifacts(artifacts.path())
+                .expect("mock artifacts should write");
+
+        let id = SnapshotId::generate();
+        let alias = unique_alias("seam");
+        let metadata = SnapshotPublishMetadata {
+            id: id.clone(),
+            alias: Some(SnapshotAlias::parse(&alias).expect("alias should parse")),
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "sbx-seam".to_string(),
+            },
+            context: CommandContext::new(HashMap::new(), "/workspace"),
+            startup: None,
+            resources: SandboxResources {
+                cpu_count: 2,
+                memory_mib: 512,
+                disk_size_mib: 2048,
+            },
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "kernel-6.1".to_string(),
+                firecracker_version: "1.7.0".to_string(),
+                envd_version: "0.9.9".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::default(),
+            image_configs: ImageConfigs::new(),
+            custom_extension_params: None,
+        };
+
+        let handle = manager
+            .stage(metadata, manifest, None)
+            .await
+            .expect("staging should work");
+        assert_eq!(handle.staged().origin_node_id, "test-node-a");
+
+        // The bytes are here.
+        assert!(workspace
+            .path()
+            .join("repository")
+            .join("snapshots")
+            .join(id.to_string())
+            .join("vm_state.bin")
+            .exists());
+        // And nobody can find them, in either catalog.
+        assert!(object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_none());
+        assert!(central
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("reading should work")
+            .is_none());
+
+        // 🔴 Down the wire and back before it is used.
+        let encoded = serde_json::to_vec(handle.staged()).expect("the staged value should encode");
+        drop(handle);
+        let decoded: StagedSnapshot =
+            serde_json::from_slice(&encoded).expect("the staged value should decode");
+
+        let record = manager
+            .commit_staged(decoded)
+            .await
+            .expect("a round-tripped staged snapshot must commit");
+        assert_eq!(record.id, id);
+
+        // Both catalogs now have it — the second one in a different process.
+        assert!(object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_some());
+        let remote = central
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .expect("the row committed in the other process should be there");
+        assert_eq!(remote.resources.cpu_count, 2);
+        assert_eq!(
+            central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(id)
+        );
+    }
+}

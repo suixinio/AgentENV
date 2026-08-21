@@ -400,8 +400,10 @@ impl ApiImpl {
                 // central calls and skips the second when the first found the
                 // scheduler unreachable, so PostgreSQL holds no row at all
                 // while the bytes sit in object storage, intact. Read at any
-                // scope, that snapshot is missing. Only the backlog knows it is
-                // on its way.
+                // scope on the read side, that snapshot is missing — and the
+                // store that took the write says otherwise. When *neither*
+                // store took it, only this node's queue does, which is why the
+                // question below asks both.
                 match self.snapshot_manager.absence_of(&snapshot_id).await {
                     Ok(SnapshotAbsence::Settled) => {}
                     Ok(SnapshotAbsence::Unsettled { because }) => {

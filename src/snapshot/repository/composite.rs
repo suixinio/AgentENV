@@ -246,6 +246,16 @@ impl SnapshotRepository {
             .await
             .unwrap_or(false);
         if retained {
+            // 🔴 Said out loud, because nothing else will. These bytes are
+            // staying and no collector exists for them; the only way anyone
+            // learns the prefix is here is by being told now.
+            crate::snapshot::repository::metrics::record_artifacts_retained();
+            tracing::warn!(
+                snapshot_id = %id,
+                artifact_count = publications.len(),
+                "a failed publish left this snapshot's artifacts in place because a catalog \
+                 still holds a committed row for it; nothing collects them"
+            );
             return;
         }
         self.artifacts.delete_artifacts(id, publications).await;
@@ -607,6 +617,87 @@ mod tests {
             ],
             "no artifact deletion may follow a catalog that claims the bytes"
         );
+    }
+
+    /// 🔴 And it says so. The bytes are staying, nothing collects them, and
+    /// until this counter existed the only evidence was an orphan prefix in the
+    /// store — measured on the cluster as two objects and 22,194 bytes that
+    /// nothing outside the store could see. The trade is deliberate; being
+    /// silent about it was not.
+    #[test]
+    fn keeping_the_bytes_is_counted_where_somebody_can_see_it() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        use crate::snapshot::repository::metrics::test_support::counter_total;
+        use crate::snapshot::repository::metrics::ARTIFACTS_RETAINED_TOTAL;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime should build");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::new(
+            Arc::new(FakeCatalog {
+                journal: Arc::clone(&journal),
+                commit_fails: true,
+                retains_artifacts: true,
+            }),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+        );
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                repository
+                    .publish(metadata(), manifest())
+                    .await
+                    .expect_err("commit failure should fail the publish");
+            });
+        });
+
+        assert_eq!(
+            counter_total(&snapshotter, ARTIFACTS_RETAINED_TOTAL),
+            1,
+            "a leak nothing collects has to be a number somebody can look at"
+        );
+    }
+
+    /// The control face: a rollback that actually deletes is not a leak and
+    /// must not be counted as one.
+    #[test]
+    fn deleting_the_bytes_is_not_counted_as_keeping_them() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        use crate::snapshot::repository::metrics::test_support::counter_total;
+        use crate::snapshot::repository::metrics::ARTIFACTS_RETAINED_TOTAL;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime should build");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::new(
+            Arc::new(FakeCatalog {
+                journal: Arc::clone(&journal),
+                commit_fails: true,
+                retains_artifacts: false,
+            }),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+        );
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                repository
+                    .publish(metadata(), manifest())
+                    .await
+                    .expect_err("commit failure should fail the publish");
+            });
+        });
+
+        assert_eq!(counter_total(&snapshotter, ARTIFACTS_RETAINED_TOTAL), 0);
     }
 
     /// Deleting in the other order would let a reader resolve a snapshot whose

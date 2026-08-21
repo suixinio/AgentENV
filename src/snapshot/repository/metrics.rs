@@ -22,6 +22,24 @@ const CATALOG_PREFIX: &str = "catalog/";
 pub(crate) const OBJECT_STORE_REQUESTS_TOTAL: &str =
     "agentenv_snapshot_object_store_requests_total";
 
+/// Publish rollbacks that deliberately left a snapshot's artifacts in place.
+///
+/// 🔴 A counter over a leak, and the leak is on purpose. A failed publish asks
+/// both catalogs whether anything still points at the bytes and keeps them if
+/// *either* says yes, because the alternative — deleting on a single "no" — is
+/// what once destroyed the bytes of a sandbox a user had just paused. The trade
+/// is right and it is not being revisited here; what was missing is that
+/// nothing said when it fired. Measured on the cluster: one orphan prefix, two
+/// objects, 22,194 bytes, and no way to tell from outside that it existed.
+///
+/// Nothing collects these. Every increment is bytes that will sit in the store
+/// until somebody looks, so a rising number is the signal to go and look.
+pub(crate) const ARTIFACTS_RETAINED_TOTAL: &str = "agentenv_snapshot_artifacts_retained_total";
+
+pub(crate) fn record_artifacts_retained() {
+    metrics::counter!(ARTIFACTS_RETAINED_TOTAL).increment(1);
+}
+
 /// Which body of data a request touched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectStoreSurface {
@@ -160,6 +178,20 @@ pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
     use metrics_util::debugging::{DebugValue, Snapshotter};
+
+    /// The total of every sample of one unlabelled counter.
+    pub(crate) fn counter_total(snapshotter: &Snapshotter, name: &str) -> u64 {
+        let mut total = 0u64;
+        for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
+            if composite.key().name() != name {
+                continue;
+            }
+            if let DebugValue::Counter(count) = value {
+                total += count;
+            }
+        }
+        total
+    }
 
     /// Collects every [`super::OBJECT_STORE_REQUESTS_TOTAL`] sample seen by
     /// `snapshotter`, keyed by `"{op}/{surface}/{outcome}"`. Series that were

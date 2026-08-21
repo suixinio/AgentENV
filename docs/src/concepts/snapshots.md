@@ -127,6 +127,30 @@ template delete command with the snapshot ID or alias:
 aenv template delete <snapshot-id-or-name>
 ```
 
+For a snapshot whose sandbox is already gone, there is an operator route that
+says what it is:
+
+```bash
+curl -X DELETE -H "X-Admin-Token: $TOKEN" "$API/snapshots/<snapshot-id-or-name>"
+```
+
+It removes the catalog row from **every** catalog — under `write = "both"` that
+is PostgreSQL and object storage, one of them from the mirror queue if it cannot
+be reached now — then the alias bound to the snapshot, then the artifacts. Rows
+at every status, so a template that never built (`waiting`) or whose build
+failed (`error`) can be removed too. A snapshot no catalog holds answers 404
+rather than 204, so a mistyped id says so.
+
+Deleting a row straight out of PostgreSQL is not the same operation: it leaves
+object storage holding a snapshot the database does not, which is the population
+divergence the read-side switch refuses to move over. Use the API.
+
+Nothing calls this automatically, and it does not ask what depends on the
+snapshot. A paused sandbox's snapshot is that sandbox's only durable copy, and
+deleting it destroys the sandbox — the next resume finds nothing to rebuild
+from, drops the registry row and answers 404. Check that the snapshot is an
+orphan first.
+
 ## Optional P2P Visibility
 
 When `[p2p].enabled = true`, published snapshot artifacts are advertised

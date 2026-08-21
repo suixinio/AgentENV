@@ -2054,6 +2054,59 @@ paths:
           $ref: "#/components/responses/500"
 
   /snapshots/{snapshotID}:
+    delete:
+      summary: Delete snapshot
+      description: |
+        Delete one snapshot, permanently.
+
+        An operator lever, and the only path that removes a snapshot without
+        removing a sandbox. It is deliberately not wired into anything
+        automatic: every other delete in the system is a consequence of a
+        sandbox being deleted or a pause superseding an older snapshot, and this
+        one exists for what those leave behind — a snapshot whose sandbox is
+        gone, which nothing else can reach.
+
+        What it removes, in this order:
+
+          - the catalog row, from **every** catalog. Under `write = "both"` that
+            is PostgreSQL and object storage; a store that cannot be reached
+            takes the delete from the mirror queue instead, so the two never end
+            up disagreeing about whether the snapshot exists. Deleting a row
+            straight out of the database is not the same operation and leaves
+            exactly the population divergence the read-side guard exists to
+            detect.
+          - the alias bound to it, if it has one. The name is free immediately.
+          - the artifacts: memory image, rootfs layers, attached-drive layers.
+            Best effort, and a snapshot published back to a source registry
+            keeps whatever that registry holds.
+
+        Rows at every status, not just resolvable ones: a template that has
+        never built is `waiting` and a failed one is `error`, and neither could
+        be removed by a delete that could not see them.
+
+        Idempotent in the catalog and not in the response: a snapshot no catalog
+        holds answers 404, so an operator who mistypes an id hears about it
+        rather than getting a 204 over a snapshot that still exists.
+
+        **This does not ask what depends on the snapshot.** A paused sandbox's
+        snapshot is that sandbox's only durable copy, and deleting it destroys
+        the sandbox — the registry row is dropped by the next resume, which then
+        answers 404. Check the snapshot is an orphan before calling this.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      responses:
+        "204":
+          description: The snapshot was deleted successfully
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
     get:
       description: Get information about a single snapshot by its ID or alias
       tags: [snapshots]

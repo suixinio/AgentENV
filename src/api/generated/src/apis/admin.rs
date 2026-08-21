@@ -50,6 +50,20 @@ pub enum NodesNodeIdPostResponse {
     Status500_ServerError(models::Error),
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SnapshotsSnapshotIdDeleteResponse {
+    /// The snapshot was deleted successfully
+    Status204_TheSnapshotWasDeletedSuccessfully,
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
 /// Admin
 #[async_trait]
 #[allow(clippy::ptr_arg)]
@@ -97,4 +111,17 @@ pub trait Admin<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorHa
         query_params: &models::NodesNodeIdPostQueryParams,
         body: &models::NodeStatusChange,
     ) -> Result<NodesNodeIdPostResponse, E>;
+
+    /// Delete snapshot.
+    ///
+    /// SnapshotsSnapshotIdDelete - DELETE /snapshots/{snapshotID}
+    async fn snapshots_snapshot_id_delete(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdDeletePathParams,
+    ) -> Result<SnapshotsSnapshotIdDeleteResponse, E>;
 }

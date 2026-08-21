@@ -8,5 +8,5 @@ pub use composite::SnapshotRepository;
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
     ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
-    SnapshotListFilter, SnapshotRuntimeResolver,
+    SnapshotListFilter, SnapshotRuntimeResolver, StagedSnapshot,
 };

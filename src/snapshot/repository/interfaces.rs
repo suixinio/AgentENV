@@ -11,7 +11,7 @@ use crate::snapshot::types::{
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
-use crate::types::SandboxResources;
+use crate::types::{ExecutionId, SandboxResources};
 
 /// Snapshot record list filter.
 ///
@@ -148,6 +148,57 @@ impl SnapshotCommit {
                 disk_publications: imported.disk_publications,
             },
         }
+    }
+}
+
+/// One snapshot whose bytes are durable and whose row has not been announced.
+///
+/// This is the value that opens the seam §5.1 of the decomposition asks for:
+/// the byte half runs where the sandbox is, the row half runs where the
+/// database is, and this is everything the second half needs from the first.
+///
+/// 🔴 It is a pure value and must stay one. No `PathBuf`, no `Arc`, no
+/// temp-directory guard, no [`FirecrackerSnapshotManifest`] — that last one
+/// most of all. The manifest carries the local paths a capture wrote into, and
+/// every one of them is `#[serde(skip)]`, so a manifest that crossed a wire
+/// would arrive with empty paths and read as a manifest rather than as an
+/// error. `commit_staged` must not be able to reach back for a local file, and
+/// the way to guarantee that is for it never to be handed one.
+///
+/// What travels *instead* of the manifest is [`SnapshotCommit`], derived from
+/// it while the files were still there.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StagedSnapshot {
+    /// Identity plus the payload the row will carry.
+    pub commit: SnapshotCommit,
+    /// When the bytes finished landing, by the staging node's clock.
+    pub staged_at_unix_ms: i64,
+    /// The machine whose disk the bytes are on.
+    ///
+    /// 🔴 Decided by `stage`, not by the commit. Whether a snapshot is
+    /// `published` is something only the commit knows — it is the last write
+    /// and the one that can see whether shared storage took the bytes — but
+    /// *which node* holds them is a fact about where staging ran, and by the
+    /// time a remote committer is looking at this value there is nothing left
+    /// to ask.
+    pub origin_node_id: String,
+    /// Which incarnation staged this.
+    ///
+    /// 🔴 Written and never checked in this phase. It is here so the phase
+    /// where several processes may commit can add the predicate without a
+    /// migration that backfills a column onto rows already in flight; the
+    /// catalog column it feeds (`snapshots.publishing_execution_id`) exists for
+    /// the same reason and is written the same way.
+    pub execution_id: Option<ExecutionId>,
+}
+
+impl StagedSnapshot {
+    pub fn id(&self) -> &SnapshotId {
+        &self.commit.id
+    }
+
+    pub fn alias(&self) -> Option<&SnapshotAlias> {
+        self.commit.alias.as_ref()
     }
 }
 

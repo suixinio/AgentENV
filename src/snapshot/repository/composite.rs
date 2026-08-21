@@ -10,10 +10,15 @@
 //! That order is the point. Bytes first, row second, always:
 //!
 //! ```text
-//! artifacts.import_built_artifacts(..)  ->  ImportedSnapshotArtifacts   // bytes
-//! CommittedSnapshot { .. }                                              // pure
-//! catalog.publish_commit(..)            ->  SnapshotRecord              // the flip
+//! stage(..)          artifacts.import_built_artifacts(..)  // bytes
+//!                    StagedSnapshot { .. }                 // pure, travels
+//! commit_staged(..)  catalog.publish_commit(..)            // the flip
 //! ```
+//!
+//! `publish` is the two of them run back to back, and it is only a convenience:
+//! the seam between them is real. A `StagedSnapshot` can be serialised, sent to
+//! another process, and committed there, because `commit_staged` is handed a
+//! value and never asks the artifact store or the filesystem anything.
 //!
 //! Because the catalog is reached through `Arc<dyn SnapshotCatalog>`, the row
 //! half can be replaced — by a remote client, or by a wrapper that writes to
@@ -25,13 +30,14 @@ use std::sync::Arc;
 
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
-    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StagedSnapshot,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
     PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
     TemplateBuildErrorReason,
 };
+use crate::types::ExecutionId;
 
 /// Durable snapshot repository: a [`SnapshotCatalog`] and a
 /// [`SnapshotArtifactStore`], sequenced.
@@ -47,6 +53,9 @@ use crate::snapshot::types::{
 pub struct SnapshotRepository {
     catalog: Arc<dyn SnapshotCatalog>,
     artifacts: Arc<dyn SnapshotArtifactStore>,
+    /// The machine `stage` writes bytes onto, stamped into every
+    /// [`StagedSnapshot`] so a remote committer knows where they landed.
+    origin_node_id: String,
 }
 
 impl SnapshotRepository {
@@ -54,7 +63,20 @@ impl SnapshotRepository {
         catalog: Arc<dyn SnapshotCatalog>,
         artifacts: Arc<dyn SnapshotArtifactStore>,
     ) -> Self {
-        Self { catalog, artifacts }
+        Self::on_node(catalog, artifacts, crate::identity::local_node_id())
+    }
+
+    /// [`Self::new`] with the staging node named explicitly.
+    pub fn on_node(
+        catalog: Arc<dyn SnapshotCatalog>,
+        artifacts: Arc<dyn SnapshotArtifactStore>,
+        origin_node_id: String,
+    ) -> Self {
+        Self {
+            catalog,
+            artifacts,
+            origin_node_id,
+        }
     }
 
     /// The row half on its own, for callers that only read the catalog.
@@ -85,26 +107,77 @@ impl SnapshotRepository {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
+        let staged = self.stage(metadata, manifest, None).await?;
+        self.commit_staged(staged).await
+    }
+
+    /// Writes one snapshot's bytes and stops.
+    ///
+    /// 🔴 The half of `publish` that has to run where the sandbox is. It
+    /// establishes everything the row needs — every artifact reference, the
+    /// resources, the alias to bind — and announces none of it: until
+    /// [`Self::commit_staged`] runs, no reader can resolve this snapshot, and
+    /// nothing outside this process knows the bytes exist.
+    ///
+    /// On failure the artifacts are rolled back exactly as they were before the
+    /// split, including the registry publications a partial import had already
+    /// made.
+    ///
+    /// `execution_id` is recorded, never checked. See [`StagedSnapshot`].
+    pub async fn stage(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+        execution_id: Option<ExecutionId>,
+    ) -> RepositoryResult<StagedSnapshot> {
         validate_attached_drives(&manifest)?;
 
         // Held outside the fallible block so a rollback can still see the
         // publications a partial import already made.
         let mut publications: Vec<PersistedDiskImagePublication> = Vec::new();
-        let published = async {
-            let imported = self
-                .artifacts
-                .import_built_artifacts(&metadata, &manifest, &mut publications)
-                .await?;
-            self.catalog
-                .publish_commit(SnapshotCommit::new(&metadata, imported))
-                .await
-        }
-        .await;
+        let imported = self
+            .artifacts
+            .import_built_artifacts(&metadata, &manifest, &mut publications)
+            .await;
 
-        match published {
-            Ok(record) => Ok(record),
+        match imported {
+            Ok(imported) => Ok(StagedSnapshot {
+                commit: SnapshotCommit::new(&metadata, imported),
+                staged_at_unix_ms: now_unix_ms(),
+                origin_node_id: self.origin_node_id.clone(),
+                execution_id,
+            }),
             Err(error) => {
                 self.roll_back_publish(&metadata.id, &publications).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Announces a staged snapshot: the flip, and the only thing that performs
+    /// it.
+    ///
+    /// 🔴 Takes a value and nothing else. It cannot open a local file, cannot
+    /// consult the artifact store about what it wrote, and cannot tell whether
+    /// the bytes are on this machine — which is what makes it answerable by a
+    /// process that never saw them. A `commit_staged` that reached back for
+    /// anything local would compile today and fail the day the two halves are
+    /// separated, which is the failure the whole seam exists to make
+    /// impossible.
+    ///
+    /// On failure the artifacts are rolled back, unless the catalog says an
+    /// earlier commit still owns them.
+    pub async fn commit_staged(&self, staged: StagedSnapshot) -> RepositoryResult<SnapshotRecord> {
+        let id = staged.commit.id.clone();
+        // The publications are inside the payload by now: a commit that fails
+        // has to roll back the same registry references the import made, and
+        // the staged value is the only description of them it has.
+        let publications = staged.commit.committed.disk_publications.clone();
+
+        match self.catalog.publish_commit(staged.commit).await {
+            Ok(record) => Ok(record),
+            Err(error) => {
+                self.roll_back_publish(&id, &publications).await;
                 Err(error)
             }
         }
@@ -179,6 +252,13 @@ impl SnapshotRepository {
     }
 }
 
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// Rejects publish manifests whose attached drives cannot be committed.
 ///
 /// Both backends checked this identically before the split; it is a property of
@@ -219,6 +299,7 @@ mod tests {
         CommittedSnapshot, PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishSource,
         TemplateBuildStatus,
     };
+    use crate::types::ExecutionId;
 
     /// Every call either half receives, in order, so a test can assert that the
     /// bytes were written before the row and not merely that both happened.
@@ -544,6 +625,133 @@ mod tests {
             journal.entries(),
             vec!["catalog.get", "catalog.delete_record", "artifacts.delete[]"],
         );
+    }
+
+    /// P12, first half. `stage` establishes the bytes and says nothing to the
+    /// catalog — the snapshot exists and is unfindable, which is the state the
+    /// whole seam is built to produce.
+    #[tokio::test]
+    async fn stage_writes_the_bytes_and_tells_the_catalog_nothing() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::on_node(
+            Arc::new(FakeCatalog::new(Arc::clone(&journal))),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+            "node-a".to_string(),
+        );
+
+        let staged = repository
+            .stage(metadata(), manifest(), None)
+            .await
+            .expect("staging should work");
+
+        assert_eq!(journal.entries(), vec!["artifacts.import"]);
+        assert_eq!(staged.origin_node_id, "node-a");
+        assert_eq!(
+            staged.alias().map(SnapshotAlias::to_string),
+            Some("composed".to_string())
+        );
+    }
+
+    /// 🔴 P12. The staged value has to survive being written down and read back
+    /// somewhere else, because that is exactly what the phase after this one
+    /// does with it. Committing the *round-tripped* value — not the original —
+    /// is what makes this a test of the wire form rather than of a struct.
+    #[tokio::test]
+    async fn a_staged_snapshot_commits_after_a_serde_round_trip() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::on_node(
+            Arc::new(FakeCatalog::new(Arc::clone(&journal))),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+            "node-a".to_string(),
+        );
+
+        let staged = repository
+            .stage(metadata(), manifest(), Some(ExecutionId::new()))
+            .await
+            .expect("staging should work");
+        let encoded = serde_json::to_vec(&staged).expect("a staged snapshot must serialize");
+        let decoded: StagedSnapshot =
+            serde_json::from_slice(&encoded).expect("a staged snapshot must deserialize");
+
+        assert_eq!(decoded.commit.id, staged.commit.id);
+        assert_eq!(decoded.origin_node_id, staged.origin_node_id);
+        assert_eq!(decoded.execution_id, staged.execution_id);
+        assert_eq!(
+            decoded.commit.committed.disk_publications.len(),
+            staged.commit.committed.disk_publications.len(),
+            "the payload the row will carry must survive the round trip"
+        );
+
+        let record = repository
+            .commit_staged(decoded)
+            .await
+            .expect("a round-tripped staged snapshot must still commit");
+
+        assert!(record.committed.is_some());
+        assert_eq!(
+            journal.entries(),
+            vec!["artifacts.import", "catalog.publish_commit"],
+        );
+    }
+
+    /// The rollback still reaches the registry publications after the split,
+    /// even though the commit no longer has the import's out-parameter — it
+    /// reads them back out of the payload instead.
+    #[tokio::test]
+    async fn a_refused_commit_rolls_back_the_publications_inside_the_payload() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::on_node(
+            Arc::new(FakeCatalog {
+                journal: Arc::clone(&journal),
+                commit_fails: true,
+                retains_artifacts: false,
+            }),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+            "node-a".to_string(),
+        );
+
+        let staged = repository
+            .stage(metadata(), manifest(), None)
+            .await
+            .expect("staging should work");
+        repository
+            .commit_staged(staged)
+            .await
+            .expect_err("the commit was refused");
+
+        assert_eq!(
+            journal.entries(),
+            vec![
+                "artifacts.import",
+                "catalog.publish_commit",
+                "catalog.retains_artifacts",
+                "artifacts.delete[rootfs]",
+            ],
+        );
+    }
+
+    /// 🔴 Why [`StagedSnapshot`] carries a `CommittedSnapshot` and not the
+    /// manifest it was derived from. Every path in the manifest is
+    /// `#[serde(skip)]`, so a round trip yields a manifest that still *looks*
+    /// like one and points at nothing. A commit handed that would fail in a way
+    /// nobody can read; a commit that cannot be handed one at all cannot.
+    #[test]
+    fn a_round_tripped_manifest_loses_every_path_it_had() {
+        let original = manifest();
+        assert!(!original.vm_state.path.as_os_str().is_empty());
+
+        let decoded: FirecrackerSnapshotManifest = serde_json::from_slice(
+            &serde_json::to_vec(&original).expect("manifest should serialize"),
+        )
+        .expect("manifest should deserialize");
+
+        assert!(
+            decoded.vm_state.path.as_os_str().is_empty(),
+            "if this ever survives the round trip, StagedSnapshot's reason for \
+             excluding the manifest has changed and the exclusion must be re-argued"
+        );
+        assert!(decoded.rootfs.image_config_path.as_os_str().is_empty());
+        assert!(decoded.memory.image_config_path.as_os_str().is_empty());
     }
 
     #[tokio::test]

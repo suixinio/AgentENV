@@ -18,7 +18,15 @@ use super::version::SnapshotRuntimeVersions;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 
-#[derive(Clone, Debug)]
+/// 🔴 `Serialize`/`Deserialize` because phase 3 sends this *to* the node.
+///
+/// It is the request half of the bytes-then-commit seam: `stage` takes it,
+/// `commit_staged` does not. Once `--role api` exists, the process that
+/// receives the pause is not the process that holds the sandbox, so this
+/// struct crosses a wire in the opposite direction to [`StagedSnapshot`]. It
+/// derived neither before, and every member it holds already derived both —
+/// they are all inside `CommittedSnapshot` too.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
     pub alias: Option<SnapshotAlias>,

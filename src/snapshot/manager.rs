@@ -12,13 +12,14 @@ use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
-use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::SnapshotRepository;
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
     SnapshotRecord,
 };
+use crate::types::ExecutionId;
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
 const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;
@@ -38,6 +39,51 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
         .iter()
         .filter_map(|layer| layer.uuid.clone())
         .collect()
+}
+
+/// What a `stage` on this node produced: the value that travels, and the part
+/// that cannot.
+///
+/// 🔴 The split is the whole point. [`StagedSnapshot`] is pure and goes
+/// anywhere; [`LocalSnapshotStaging`] is files on this disk and goes nowhere.
+/// Keeping them in one struct with two accessors — rather than one struct with
+/// a `#[serde(skip)]` field — means a caller that only has the travelling half
+/// cannot accidentally be handed an empty local half that looks valid.
+pub struct StagedSnapshotHandle {
+    staged: StagedSnapshot,
+    local: LocalSnapshotStaging,
+}
+
+impl StagedSnapshotHandle {
+    /// The half that crosses a process boundary.
+    pub fn staged(&self) -> &StagedSnapshot {
+        &self.staged
+    }
+
+    pub fn into_parts(self) -> (StagedSnapshot, LocalSnapshotStaging) {
+        (self.staged, self.local)
+    }
+
+    /// Drops the local half, keeping only what travels.
+    ///
+    /// Releases the capture's temporary directory, so anything still needing
+    /// the files — the P2P advertisement — must already have run.
+    pub fn into_staged(self) -> StagedSnapshot {
+        self.staged
+    }
+}
+
+/// The residue a `stage` leaves on the node it ran on.
+///
+/// Only one thing consumes it: the post-commit P2P advertisement, which reads
+/// the manifest's local paths. It is not serialisable and must not become so —
+/// the manifest's paths are all `#[serde(skip)]`, so a serialised copy would
+/// arrive somewhere else looking complete and pointing at nothing.
+pub struct LocalSnapshotStaging {
+    manifest: FirecrackerSnapshotManifest,
+    /// Holds the capture's temporary artifact directory open. Never read;
+    /// dropping this is what reclaims it.
+    _capture: Option<CapturedSandboxSnapshot>,
 }
 
 #[derive(Clone)]
@@ -91,12 +137,8 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let record = self
-            .repository
-            .publish(metadata.clone(), manifest.clone())
-            .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        let handle = self.stage(metadata, manifest, None).await?;
+        self.commit_and_advertise(handle).await
     }
 
     #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
@@ -105,6 +147,24 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        let handle = self
+            .stage_captured(metadata, captured_snapshot, None)
+            .await?;
+        self.commit_and_advertise(handle).await
+    }
+
+    /// Writes one capture's bytes into durable storage without announcing them.
+    ///
+    /// 🔴 Consumes the capture. The handle it returns owns it from here, which
+    /// is what keeps the temporary artifact directory alive for exactly as long
+    /// as this node still has something to do with it — and no longer.
+    #[tracing::instrument(skip(self, metadata, captured_snapshot), fields(snapshot_id = %metadata.id))]
+    pub async fn stage_captured(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        captured_snapshot: CapturedSandboxSnapshot,
+        execution_id: Option<ExecutionId>,
+    ) -> crate::snapshot::RepositoryResult<StagedSnapshotHandle> {
         let manifest = captured_snapshot
             .downcast_ref::<FirecrackerCapturedSnapshot>()
             .map(|snapshot| snapshot.manifest().clone())
@@ -112,11 +172,87 @@ impl SnapshotManager {
                 feature: "publishing captured snapshots for this sandbox backend".to_string(),
             })?;
 
-        let record = self
+        let staged = self
             .repository
-            .publish(metadata.clone(), manifest.clone())
+            .stage(metadata, manifest.clone(), execution_id)
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
+
+        Ok(StagedSnapshotHandle {
+            staged,
+            local: LocalSnapshotStaging {
+                manifest,
+                _capture: Some(captured_snapshot),
+            },
+        })
+    }
+
+    /// [`Self::stage_captured`] for artifacts that were built rather than
+    /// captured, and so are not held alive by a capture guard.
+    #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
+    pub async fn stage(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+        execution_id: Option<ExecutionId>,
+    ) -> crate::snapshot::RepositoryResult<StagedSnapshotHandle> {
+        let staged = self
+            .repository
+            .stage(metadata, manifest.clone(), execution_id)
+            .await?;
+
+        Ok(StagedSnapshotHandle {
+            staged,
+            local: LocalSnapshotStaging {
+                manifest,
+                _capture: None,
+            },
+        })
+    }
+
+    /// Announces a staged snapshot. The flip, and nothing else.
+    ///
+    /// 🔴 Takes the pure value, not the handle. A caller that has one of these
+    /// and nothing else — which is every caller once `--role api` exists — can
+    /// still commit, and that is the property the seam is for. Serialising a
+    /// [`StagedSnapshot`], sending it, and committing it on the far side has to
+    /// work, so nothing here may consult the local half.
+    #[tracing::instrument(skip(self, staged), fields(snapshot_id = %staged.commit.id))]
+    pub async fn commit_staged(
+        &self,
+        staged: StagedSnapshot,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        self.repository.commit_staged(staged).await
+    }
+
+    /// Offers a committed snapshot's local bytes to the P2P transport.
+    ///
+    /// 🔴 After the commit, never before: publishing artifacts for a snapshot
+    /// whose row was never written would advertise something no reader can
+    /// resolve, and the convention that P2P only carries committed snapshots is
+    /// what lets a peer treat a hit as authoritative.
+    ///
+    /// 🔴 Node-local, and that is the piece the next phase has to move. It
+    /// reads files, so it can only run where the bytes are — while the commit
+    /// that must precede it will be running somewhere else. A commit performed
+    /// by `--role api` therefore needs a way to tell this node it happened;
+    /// until that exists, the two are in the same process and this ordering is
+    /// simply a statement order.
+    /// 🔴 Takes the residue by value, and the capture inside it goes out of
+    /// scope when this returns. A borrow would also have to be `Sync` to be
+    /// held across the awaits below, and the capture is deliberately not — it
+    /// is a `Box<dyn Any + Send>` owned by exactly one place at a time.
+    pub async fn advertise_committed(&self, record: &SnapshotRecord, local: LocalSnapshotStaging) {
+        self.publish_p2p_artifacts(record, &local.manifest).await;
+    }
+
+    /// stage -> commit -> advertise, in the one process that can do all three.
+    async fn commit_and_advertise(
+        &self,
+        handle: StagedSnapshotHandle,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        let (staged, local) = handle.into_parts();
+        let record = self.commit_staged(staged).await?;
+        self.advertise_committed(&record, local).await;
         Ok(record)
     }
 
@@ -372,6 +508,131 @@ mod tests {
         assert_eq!(runnable.record().id, snapshot_id);
         assert!(runnable.manifest().rootfs.image_config_path.exists());
         assert!(runnable.manifest().vm_state.path.exists());
+    }
+
+    /// 🔴 P12, second half, against a real backend rather than a fake catalog.
+    /// After `stage` and before `commit_staged` the artifacts are on disk and
+    /// neither read path can see the snapshot. The control is the commit: the
+    /// same two reads, run again after it, must both find it.
+    #[tokio::test]
+    async fn a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let manager = test_manager(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let workspace = TempDir::new().expect("tempdir should exist");
+        let (_, _, manifest) =
+            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+        let metadata = SnapshotPublishMetadata {
+            id: snapshot_id.clone(),
+            alias: Some(SnapshotAlias::parse("staged-only").expect("alias should parse")),
+            ..SnapshotPublishMetadata::mock()
+        };
+
+        let handle = manager
+            .stage(metadata, manifest, None)
+            .await
+            .expect("staging should work");
+
+        let artifacts = tempdir
+            .path()
+            .join("repository")
+            .join("snapshots")
+            .join(snapshot_id.to_string());
+        assert!(
+            artifacts.join("vm_state.bin").exists(),
+            "the bytes must be durable before the row exists"
+        );
+        assert!(
+            manager
+                .get(snapshot_id.to_string())
+                .await
+                .expect("get should work")
+                .is_none(),
+            "a staged snapshot must not be resolvable by id"
+        );
+        assert!(
+            manager
+                .resolve_committed_alias("staged-only")
+                .await
+                .expect("resolve should work")
+                .is_none(),
+            "a staged snapshot must not be resolvable by alias"
+        );
+        assert!(manager
+            .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+            .await
+            .expect("list should work")
+            .is_empty());
+
+        // The control: one more call flips all three answers.
+        let (staged, local) = handle.into_parts();
+        let record = manager
+            .commit_staged(staged)
+            .await
+            .expect("commit should work");
+        manager.advertise_committed(&record, local).await;
+
+        assert!(manager
+            .get(snapshot_id.to_string())
+            .await
+            .expect("get should work")
+            .is_some());
+        assert_eq!(
+            manager
+                .resolve_committed_alias("staged-only")
+                .await
+                .expect("resolve should work"),
+            Some(snapshot_id)
+        );
+        assert_eq!(
+            manager
+                .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+                .await
+                .expect("list should work")
+                .len(),
+            1
+        );
+    }
+
+    /// The staged value that reached the commit has to be the one that could
+    /// have travelled — so run the round trip through the manager's own API,
+    /// not just the repository's.
+    #[tokio::test]
+    async fn a_manager_staged_snapshot_commits_after_a_serde_round_trip() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let manager = test_manager(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let workspace = TempDir::new().expect("tempdir should exist");
+        let (_, _, manifest) =
+            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+        let metadata = SnapshotPublishMetadata {
+            id: snapshot_id.clone(),
+            alias: Some(SnapshotAlias::parse("round-tripped").expect("alias should parse")),
+            ..SnapshotPublishMetadata::mock()
+        };
+
+        let handle = manager
+            .stage(metadata, manifest, None)
+            .await
+            .expect("staging should work");
+        let encoded = serde_json::to_vec(handle.staged()).expect("staged value should serialize");
+        // 🔴 Dropped before the commit: the local half is gone, and the commit
+        // still has to work. That is the property `--role api` depends on.
+        drop(handle);
+
+        let decoded: StagedSnapshot =
+            serde_json::from_slice(&encoded).expect("staged value should deserialize");
+        let record = manager
+            .commit_staged(decoded)
+            .await
+            .expect("a round-tripped staged snapshot must commit");
+
+        assert_eq!(record.id, snapshot_id);
+        assert!(manager
+            .get("round-tripped")
+            .await
+            .expect("get should work")
+            .is_some());
     }
 
     #[tokio::test]

@@ -49,6 +49,18 @@ impl NodeIdentity {
     }
 }
 
+/// This machine's node id, as every other subsystem on it resolves it.
+///
+/// The snapshot repository needs it for one field — `StagedSnapshot::origin_node_id`,
+/// the node whose disk holds the bytes a commit is about to announce — and
+/// threading it through four backend constructors to get there would put a
+/// parameter on every one of them for a value none of them uses. The id is a
+/// property of the machine, not of the storage backend, so it is read from the
+/// same place the node/admin APIs read it.
+pub fn local_node_id() -> String {
+    NodeIdentity::from_config(&crate::cfg::ConfigManager::global_config().node_identity).id
+}
+
 fn parse_uuid_with_fallback(field: &str, config_value: &Option<String>) -> Uuid {
     match config_value {
         Some(raw) => match Uuid::parse_str(raw) {

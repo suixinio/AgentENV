@@ -378,7 +378,8 @@ impl ApiImpl {
                 warn!(
                     %sandbox_id,
                     %snapshot_id,
-                    "paused snapshot has a catalog row but no committed payload; leaving the                      registry row alone and failing this resume"
+                    "paused snapshot has a catalog row but no committed payload; leaving the \
+                     registry row alone and failing this resume"
                 );
                 self.release_claim(&sandbox_id, entry.generation).await;
 

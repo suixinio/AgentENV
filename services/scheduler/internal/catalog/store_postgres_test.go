@@ -1690,6 +1690,86 @@ func TestDeleteSnapshotRetiresTheRowAndReleasesItsName(t *testing.T) {
 	}
 }
 
+// 🔴 What a raw `count(*) FROM templates` is, and is not, evidence of.
+//
+// Reported from the dev cluster as a possible leak: 17 rows in `templates`
+// while object storage held 2 templates and every test template had been
+// deleted. It is not a leak. The catalog's delete is *soft* — a hard delete
+// would take the alias, and through it an image reference somebody exported to
+// a registry, with nothing left to trace — so a deleted template keeps its row
+// with `deleted_at_ms` set. The raw table therefore counts every template the
+// cluster has ever had; `active_templates` is the live view, and it is what a
+// count meant as "how many templates are there" has to read.
+//
+// The foreign key makes the other half of the answer structural: a `templates`
+// row cannot exist without its `snapshots` row, so there are no orphans to
+// leak. This holds all of that still, so the same reading does not get
+// re-reported as a defect.
+func TestDeletedTemplatesStayCountedInTheRawTableAndNotInTheView(t *testing.T) {
+	f := newFixture(t)
+
+	live := []*SnapshotRow{f.readyTemplate("kept-one"), f.readyTemplate("kept-two")}
+	retired := []*SnapshotRow{
+		f.readyTemplate("gone-one"),
+		f.readyTemplate("gone-two"),
+		f.readyTemplate("gone-three"),
+	}
+	// A sandbox snapshot for contrast: it never gets a `templates` row at all.
+	f.begin(BeginInput{SourceKind: SourceKindSandbox, SourceSandboxID: "sbx-1"})
+
+	for _, row := range retired {
+		if _, err := f.store.DeleteSnapshot(f.ctx, f.cluster, row.SnapshotID, time.Now().UnixMilli()); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	}
+
+	count := func(query string) int {
+		t.Helper()
+		var n int
+		if err := f.pool.QueryRow(f.ctx, query).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		return n
+	}
+
+	if raw := count(`SELECT count(*) FROM templates`); raw != len(live)+len(retired) {
+		t.Fatalf("templates rows = %d, want %d: the raw table keeps the history", raw, len(live)+len(retired))
+	}
+	if active := count(`SELECT count(*) FROM active_templates`); active != len(live) {
+		t.Fatalf("active_templates rows = %d, want %d", active, len(live))
+	}
+
+	// 🔴 No orphan, and no disagreement. Two soft-delete flags for one entity
+	// can drift, and the reader consulting the wrong one shows a deleted
+	// template; `snapshots.deleted_at_ms` is the authoritative one and this is
+	// what says the other still follows it.
+	if orphans := count(`
+SELECT count(*)
+  FROM templates t
+  LEFT JOIN snapshots s ON s.id = t.id
+ WHERE s.id IS NULL
+    OR (s.deleted_at_ms IS NULL) <> (t.deleted_at_ms IS NULL)`); orphans != 0 {
+		t.Fatalf("%d templates rows have no snapshots row or disagree with it about deletion", orphans)
+	}
+
+	// And a template row exists for exactly the template snapshots, so the raw
+	// count is the all-time template count rather than anything else.
+	if mismatched := count(`
+SELECT count(*)
+  FROM snapshots s
+ WHERE s.source_kind = 'template'
+   AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.id = s.id)`); mismatched != 0 {
+		t.Fatalf("%d template snapshots have no templates row", mismatched)
+	}
+	if sandboxes := count(`
+SELECT count(*)
+  FROM templates t
+  JOIN snapshots s ON s.id = t.id
+ WHERE s.source_kind <> 'template'`); sandboxes != 0 {
+		t.Fatalf("%d templates rows belong to snapshots that are not templates", sandboxes)
+	}
+}
+
 func TestDeleteSnapshotIsIdempotent(t *testing.T) {
 	f := newFixture(t)
 

@@ -1259,6 +1259,17 @@ impl AppConfig {
             // work, and dropping the object-store copy is the batch after that.
             // Refused by name so a deployment that sets it is told which batch
             // it is waiting for instead of quietly reading an empty table.
+            //
+            // 🔴 Opening this arm is not the whole switch. The batch that does
+            // it inherits a second refusal it has to satisfy rather than
+            // remove: `MirrorBacklog::guard_read_side` will not let a node move
+            // its reads onto PostgreSQL while PostgreSQL is behind, and
+            // "behind" includes the disagreements no replay can settle — in
+            // this build, every template, because `try_start_build` writes
+            // object storage alone. A cluster holding templates reads a mirror
+            // lag of zero and would otherwise be waved through into making all
+            // of them vanish from the API. See
+            // `agentenv_snapshot_catalog_mirror_diverged`.
             (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => bail!(
                 "snapshot.catalog: read = \"postgres\" is not served yet. The central catalog is \
                  written in this build and read in the next one; until then reads come from \

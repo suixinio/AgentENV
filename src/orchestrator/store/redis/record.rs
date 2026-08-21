@@ -242,6 +242,76 @@ impl StoredSandboxRecord {
     }
 }
 
+/// One active-state record, encoded for a node to hold on the api half's
+/// behalf.
+///
+/// # 🔴 The name, and why it is not `control_plane_config`
+///
+/// `ControlPlaneConfig` is the **ownership marker**: an opaque envelope the api
+/// half attaches at create time, whose presence is what makes a sandbox appear
+/// in `ListSandboxes`. This is what goes *inside* that envelope. Two different
+/// questions — *do we own this sandbox?* and *what did our record of it say?* —
+/// and one field carrying both would eventually have to answer one of them
+/// wrongly. Putting this on `SandboxMetadata` would be worse still: the payload
+/// is an encoding of the record that contains `SandboxMetadata`, so a field on
+/// it would contain its own container.
+///
+/// # What it is for
+///
+/// Exactly one thing: rebuilding the store after it is lost. This deployment
+/// cannot make Redis highly available — two machines, every volume pinned to
+/// one of them — so "the store is gone, rebuild it from the nodes" is the main
+/// path rather than a fallback, and a main path that has never been run is the
+/// same thing as no path at all.
+///
+/// It therefore has to carry **the whole record**, not a hand-picked subset. A
+/// summary of the identifiers cannot reconstruct `resources`, `max_lifetime`,
+/// `network_policy`, `custom_extension_params`, `runtime_versions`, `context`,
+/// `startup`, `image_configs`, `virtualization_mode`, `created_at`, or the
+/// placement fields — and a rebuilt record missing any of those is a sandbox
+/// the control plane can list and cannot correctly manage.
+///
+/// # Not a cross-language contract
+///
+/// The node stores these bytes and returns them; it never parses them. So this
+/// is the api half's contract with its own future self, versioned by
+/// [`RECORD_VERSION`] like every other record here, and a node never has to be
+/// upgraded in step with it.
+#[derive(Clone, Debug)]
+pub struct ActiveStateRecord(StoredSandboxRecord);
+
+impl ActiveStateRecord {
+    pub fn of(record: &StoredSandboxRecord) -> Self {
+        Self(record.clone())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.0.encode()
+    }
+
+    /// 🔴 Rejects a version it does not understand, exactly as a record read
+    /// from the store does. A blob that came back from a node running against a
+    /// newer api half is not a blank record.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Ok(Self(StoredSandboxRecord::decode(bytes)?))
+    }
+
+    pub fn metadata(&self) -> &SandboxMetadata {
+        &self.0.metadata
+    }
+
+    /// The record to insert during a rebuild.
+    ///
+    /// 🔴 The revision restarts at 1. The number counted writes against a
+    /// store that no longer exists, and carrying it forward would let a write
+    /// still in flight from before the loss compare-and-set successfully
+    /// against the rebuilt record.
+    pub fn into_record(mut self) -> StoredSandboxRecord {
+        self.0.rev = 1;
+        self.0
+    }
+}
+
 pub fn ensure_supported_version(version: u32) -> Result<()> {
     if version == 0 || version > RECORD_VERSION {
         return Err(StoreError::Backend {
@@ -395,6 +465,90 @@ mod tests {
             Some(started + Duration::from_secs(600)),
             "the deadline must stay anchored to the start of the run"
         );
+    }
+
+    /// 🔴 The seam with the node lane. `control_plane_config` lives on
+    /// `SandboxMetadata`, which is `#[serde(flatten)]`ed into the stored
+    /// record, so its encoding is this store's problem too — and it is a
+    /// `Vec<u8>`, which plain serde would render into a JSON array of
+    /// per-byte numbers inside every record.
+    #[test]
+    fn the_ownership_marker_survives_the_stored_record() {
+        use crate::orchestrator::store::ControlPlaneConfig;
+
+        let mut sandbox = metadata();
+        sandbox.control_plane_config = ControlPlaneConfig::from_bytes(vec![0, 1, 254, 255, 7]);
+
+        let encoded = StoredSandboxRecord::new(&sandbox, 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            json.get("control_plane_config")
+                .and_then(Value::as_str)
+                .is_some(),
+            "the marker must be a string in the record, not a byte array: {json}"
+        );
+
+        let decoded = StoredSandboxRecord::decode(&encoded).unwrap();
+        assert_eq!(
+            decoded.metadata.control_plane_config,
+            sandbox.control_plane_config
+        );
+    }
+
+    /// 🔴 The rolling-upgrade case. A record written by a replica that predates
+    /// the marker must still decode, or the first upgrade makes every existing
+    /// record unreadable at once.
+    #[test]
+    fn a_record_written_before_the_ownership_marker_existed_still_decodes() {
+        let encoded = StoredSandboxRecord::new(&metadata(), 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut json: Value = serde_json::from_slice(&encoded).unwrap();
+        json.as_object_mut().unwrap().remove("control_plane_config");
+        let raw = serde_json::to_vec(&json).unwrap();
+
+        let decoded = StoredSandboxRecord::decode(&raw).expect("an older record must still load");
+        assert!(decoded.metadata.control_plane_config.is_none());
+    }
+
+    /// The rebuild payload carries the whole record and restarts the revision.
+    #[test]
+    fn the_active_state_record_round_trips_and_restarts_the_revision() {
+        let mut sandbox = metadata();
+        sandbox.max_lifetime = Some(Duration::from_secs(600));
+        sandbox.running_since = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        sandbox.snapshot_id = "tpl-42".to_string();
+
+        let mut stored = StoredSandboxRecord::new(&sandbox, 97).unwrap();
+        stored.origin_node_id = Some("node-b".to_string());
+        stored.published = true;
+
+        let bytes = ActiveStateRecord::of(&stored).encode().unwrap();
+        let rebuilt = ActiveStateRecord::decode(&bytes).unwrap();
+        assert_eq!(rebuilt.metadata().snapshot_id, "tpl-42");
+        assert_eq!(rebuilt.metadata().running_since, sandbox.running_since);
+
+        let record = rebuilt.into_record();
+        assert_eq!(
+            record.rev, 1,
+            "the revision counted writes to a store that is gone"
+        );
+        assert_eq!(record.origin_node_id.as_deref(), Some("node-b"));
+        assert!(record.published);
+        assert_eq!(record.metadata.max_lifetime, Some(Duration::from_secs(600)));
+    }
+
+    /// A payload from a newer api half is refused, not read as a blank record.
+    #[test]
+    fn an_active_state_record_from_a_newer_build_is_refused() {
+        let stored = StoredSandboxRecord::new(&metadata(), 1).unwrap();
+        let mut json: Value = serde_json::from_slice(&stored.encode().unwrap()).unwrap();
+        json["version"] = serde_json::json!(RECORD_VERSION + 1);
+        assert!(ActiveStateRecord::decode(&serde_json::to_vec(&json).unwrap()).is_err());
     }
 
     #[test]

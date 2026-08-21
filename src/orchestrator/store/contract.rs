@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use super::{MetadataStore, SandboxListFilter, SandboxMetadata, StoreError};
+use super::{MetadataStore, PausedHandle, SandboxListFilter, SandboxMetadata, StoreError};
 use crate::orchestrator::SandboxState;
 use crate::types::SandboxId;
 
@@ -411,6 +411,56 @@ pub(crate) async fn the_lifetime_clock_is_reconciled_after_every_write<S: Metada
     assert!(resumed.running_since.is_some());
 }
 
+/// 🔴 The one thing both backends must agree on about paused state, even
+/// though they answer it with different variants.
+///
+/// The two answers differ — an in-process store hands back the handle, a shared
+/// store hands back a reference to the node that holds the bytes — but neither
+/// may say `NotPaused` about a sandbox that is paused. That confusion is what
+/// makes a resume fail with a message describing a state the sandbox is not in,
+/// and it is the same shape as a read that conflated "not yet" with "never".
+pub(crate) async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: &S) {
+    #[derive(Debug)]
+    struct FakePausedState;
+
+    impl crate::sandbox::PausedSandboxState for FakePausedState {
+        fn encode(&self) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"fake": true}))
+        }
+
+        fn runtime_artifacts(&self) -> crate::sandbox::RuntimeArtifactSet {
+            crate::sandbox::RuntimeArtifactSet::default()
+        }
+    }
+
+    let paused = SandboxId::new();
+    let mut metadata = running(paused);
+    metadata.state = crate::orchestrator::SandboxState::Paused;
+    metadata.paused_state = Some(std::sync::Arc::new(FakePausedState));
+    store.add(metadata).await.unwrap();
+
+    let handle = store.paused_handle(&paused).await.unwrap();
+    assert!(
+        !matches!(handle, PausedHandle::NotPaused),
+        "a paused sandbox reported as having no paused state: {handle:?}"
+    );
+
+    // The control: a running sandbox really has none, and says so.
+    let live = SandboxId::new();
+    store.add(running(live)).await.unwrap();
+    assert!(matches!(
+        store.paused_handle(&live).await.unwrap(),
+        PausedHandle::NotPaused
+    ));
+
+    // And a sandbox that is not there at all is neither of those.
+    let error = store.paused_handle(&SandboxId::new()).await.unwrap_err();
+    assert!(
+        matches!(error, StoreError::SandboxNotFound { .. }),
+        "{error:?}"
+    );
+}
+
 /// Names every contract assertion, so a backend's suite is one line per test
 /// and a new assertion cannot be added to one backend only.
 macro_rules! metadata_store_contract_suite {
@@ -447,6 +497,7 @@ macro_rules! metadata_store_contract {
             waiting_wakes_when_the_state_settles,
             waiting_returns_none_when_the_record_is_removed,
             the_lifetime_clock_is_reconciled_after_every_write,
+            a_paused_sandbox_never_answers_not_paused,
         );
     };
 }

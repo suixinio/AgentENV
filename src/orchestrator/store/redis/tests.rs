@@ -12,8 +12,8 @@ use redis::AsyncCommands;
 use uuid::Uuid;
 
 use super::super::{
-    MetadataStore, Reservation, SandboxMetadata, StoreError, TransitionEffect, TransitionOutcome,
-    TransitionRequest, TransitionSettlement,
+    MetadataStore, PausedHandle, Reservation, SandboxMetadata, StoreError, TransitionEffect,
+    TransitionOutcome, TransitionRequest, TransitionSettlement,
 };
 use super::harness::{raw, sibling, store_or_skip};
 use super::keys::{ExpiryMember, TransitionMember};
@@ -142,6 +142,41 @@ async fn a_paused_handle_survives_the_store_as_a_reference() {
     assert!(read_back.paused_state.is_none());
 }
 
+/// 🔴 On a shared store the answer is `Remote`, carrying the reference and the
+/// node whose disk the bytes are on — never `NotPaused`.
+///
+/// A `--role api` replica has no backend factory and should not have one; it
+/// forwards this. A `--role all` process decodes it with its own. Both need to
+/// be told which of those they are looking at, and `Option<Arc<dyn ..>>` read
+/// through `get` cannot tell them.
+#[tokio::test]
+async fn a_shared_store_answers_remote_for_a_paused_sandbox_never_not_paused() {
+    let store =
+        store_or_skip!("a_shared_store_answers_remote_for_a_paused_sandbox_never_not_paused");
+    let id = SandboxId::new();
+    let mut metadata = running(id);
+    metadata.state = SandboxState::Paused;
+    metadata.paused_state = Some(Arc::new(FakePausedState(serde_json::json!({"vm": 1}))));
+    store.add(metadata).await.unwrap();
+
+    match store.paused_handle(&id).await.unwrap() {
+        PausedHandle::Remote { reference, .. } => {
+            assert_eq!(reference.state, serde_json::json!({"vm": 1}));
+        }
+        other => panic!("a shared store cannot hand back a handle; expected Remote, got {other:?}"),
+    }
+
+    // 🔴 And the plain read still returns `None`, which is exactly the reading
+    // this method exists to stop anyone acting on.
+    assert!(store
+        .get(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .paused_state
+        .is_none());
+}
+
 /// A write that does not know about placement must not erase it.
 #[tokio::test]
 async fn a_state_change_does_not_erase_the_paused_reference() {
@@ -245,26 +280,63 @@ async fn an_uncapped_sandbox_has_no_record_ttl() {
 /// sandbox that is still sitting perfectly alive on a node's disk — and a
 /// record that vanishes under a live sandbox is what makes it an orphan.
 #[tokio::test]
-async fn pausing_extends_the_record_ttl_because_paused_time_is_free() {
-    let store = store_or_skip!("pausing_extends_the_record_ttl_because_paused_time_is_free");
-    let id = SandboxId::new();
+async fn a_paused_records_ttl_stops_shrinking_while_a_running_ones_does_not() {
+    let store =
+        store_or_skip!("a_paused_records_ttl_stops_shrinking_while_a_running_ones_does_not");
+
+    // The subject: paused before the interval, and written again after it.
+    let paused_id = SandboxId::new();
     store
-        .add(capped(id, Duration::from_secs(600)))
+        .add(capped(paused_id, Duration::from_secs(600)))
         .await
         .unwrap();
-    let while_running = record_pttl(&store, &id).await;
-
-    tokio::time::sleep(Duration::from_millis(60)).await;
     store
-        .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Running])
+        .update_state_if_state(&paused_id, SandboxState::Paused, &[SandboxState::Running])
         .await
         .unwrap();
-    let while_paused = record_pttl(&store, &id).await;
+    let paused_before = record_pttl(&store, &paused_id).await;
 
+    // The control: identical in every way except that it keeps running.
+    let running_id = SandboxId::new();
+    store
+        .add(capped(running_id, Duration::from_secs(600)))
+        .await
+        .unwrap();
+    let running_before = record_pttl(&store, &running_id).await;
+
+    // 🔴 Comfortably wider than the whole-second granularity the TTL is
+    // derived at, so the running record's value has to have moved.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+    store
+        .update_if_state(&paused_id, &[SandboxState::Paused], |metadata| {
+            metadata.snapshot_id = "touched".to_string();
+        })
+        .await
+        .unwrap();
+    store
+        .update_if_state(&running_id, &[SandboxState::Running], |metadata| {
+            metadata.snapshot_id = "touched".to_string();
+        })
+        .await
+        .unwrap();
+
+    let paused_after = record_pttl(&store, &paused_id).await;
+    let running_after = record_pttl(&store, &running_id).await;
+
+    // 🔴 The property, stated where it cannot be confused with a rounding
+    // boundary: a paused sandbox spends nothing, so its deadline recedes with
+    // the clock and its record's TTL holds. A frozen TTL would eventually
+    // delete the record of a sandbox still sitting alive on a node's disk —
+    // and a record that vanishes under a live sandbox makes it an orphan.
     assert!(
-        while_paused >= while_running,
-        "a paused record's key must not be on the clock its running self was on: \
-         {while_running} -> {while_paused}"
+        paused_after >= paused_before - 1_000,
+        "a paused record's TTL kept draining: {paused_before} -> {paused_after}"
+    );
+    assert!(
+        running_after <= running_before - 1_000,
+        "a running record's deadline is pinned, so its TTL must drain: \
+         {running_before} -> {running_after}"
     );
 }
 
@@ -480,7 +552,12 @@ async fn a_callback_within_its_budget_is_written() {
     let store = store_or_skip!(
         "a_callback_within_its_budget_is_written",
         |config: &mut super::RedisStoreConfig| {
-            config.closure_budget = Duration::from_millis(200);
+            // 🔴 The pair varies the *budget*, not the callback: both arms sleep
+            // for the same 200ms. Making the control's callback fast instead
+            // would have made it a race against whatever else the machine is
+            // doing, which is a control that fails for reasons unrelated to
+            // what it is controlling for.
+            config.closure_budget = Duration::from_secs(5);
         }
     );
     let id = SandboxId::new();
@@ -489,7 +566,7 @@ async fn a_callback_within_its_budget_is_written() {
 
     store
         .update_if_state(&id, &[SandboxState::Running], |metadata| {
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(200));
             metadata.snapshot_id = "landed".to_string();
         })
         .await

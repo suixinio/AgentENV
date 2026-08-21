@@ -63,7 +63,7 @@ use super::{Result, SandboxMetadata, StoreError};
 use crate::types::SandboxId;
 
 pub use config::{RedisStoreConfig, RedisStoreConfigError, DEFAULT_KEY_PREFIX};
-pub use record::{PausedStateRef, StoredSandboxRecord, RECORD_VERSION};
+pub use record::{ActiveStateRecord, PausedStateRef, StoredSandboxRecord, RECORD_VERSION};
 
 use keys::KeySpace;
 use lock::LockManager;

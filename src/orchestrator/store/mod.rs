@@ -21,7 +21,7 @@ pub use metadata::{
     SandboxTimeoutAction,
 };
 pub use redis::{
-    PausedStateRef, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,
+    ActiveStateRecord, PausedStateRef, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,
     StoredSandboxRecord, DEFAULT_KEY_PREFIX as DEFAULT_STORE_KEY_PREFIX,
     RECORD_VERSION as STORE_RECORD_VERSION,
 };
@@ -302,6 +302,53 @@ impl Drop for TransitionGuard {
     }
 }
 
+/// Where a paused sandbox's runtime state can be got from.
+///
+/// # 🔴 Three answers, because two of them look identical as `None`
+///
+/// `SandboxMetadata::paused_state` is `#[serde(skip)]`, so any store that
+/// serialises a record hands it back empty. Read through `get`, that empty
+/// value means two different things — *this sandbox is not paused* and *this
+/// store cannot give you handles, the bytes are on another machine* — and
+/// `resume_sandbox` answers the first by failing with "missing paused state".
+/// Under `--role api` that is the right refusal for the wrong reason; under
+/// `--role all` on a shared store it is a 500 on every resume, and the message
+/// describes a state the sandbox is not in.
+///
+/// So the question is asked separately, and the answer has the three states the
+/// question has. A store may not answer [`PausedHandle::NotPaused`] for a
+/// record that carries a reference.
+pub enum PausedHandle {
+    /// This store is holding the handle in this process. Pass it to the
+    /// backend factory directly.
+    Local(Arc<dyn crate::sandbox::PausedSandboxState>),
+    /// The bytes are on `origin_node_id`'s disk and the reference decodes
+    /// there. An `api` replica forwards this; a node decodes it with its own
+    /// factory.
+    Remote {
+        reference: PausedStateRef,
+        /// 🔴 `PausedStateRef::artifact_root` is a path on one particular
+        /// machine, so without this a caller holds a path and no idea whose.
+        origin_node_id: Option<String>,
+    },
+    /// The sandbox has no paused state, and that is a fact rather than a
+    /// limitation of the store that was asked.
+    NotPaused,
+}
+
+impl std::fmt::Debug for PausedHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PausedHandle::Local(_) => f.write_str("PausedHandle::Local(..)"),
+            PausedHandle::Remote { origin_node_id, .. } => f
+                .debug_struct("PausedHandle::Remote")
+                .field("origin_node_id", origin_node_id)
+                .finish_non_exhaustive(),
+            PausedHandle::NotPaused => f.write_str("PausedHandle::NotPaused"),
+        }
+    }
+}
+
 /// What a joiner learns about a transition it did not start.
 ///
 /// 🔴 Three answers, not two. "The transition key is gone and no result was
@@ -560,6 +607,25 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<TransitionOutcome> {
         Err(StoreError::UnsupportedByBackend {
             method: "start_transition",
+        })
+    }
+
+    /// Where this sandbox's paused runtime state can be got from.
+    ///
+    /// The default reads it out of the record, which is the true answer for a
+    /// store that keeps handles in process. A store that serialises records
+    /// must override it — returning `NotPaused` for a record that has a
+    /// reference would be the ambiguity this method exists to remove.
+    async fn paused_handle(&self, sandbox_id: &SandboxId) -> Result<PausedHandle> {
+        let metadata = self
+            .get(sandbox_id)
+            .await?
+            .ok_or(StoreError::SandboxNotFound {
+                sandbox_id: *sandbox_id,
+            })?;
+        Ok(match metadata.paused_state {
+            Some(handle) => PausedHandle::Local(handle),
+            None => PausedHandle::NotPaused,
         })
     }
 

@@ -8,8 +8,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use super::super::{
-    MetadataRows, MetadataStore, MetadataUpdateResult, Reservation, Result, SandboxListFilter,
-    SandboxMetadata, StoreError, TransitionOutcome, TransitionRequest, TransitionSettlement,
+    MetadataRows, MetadataStore, MetadataUpdateResult, PausedHandle, Reservation, Result,
+    SandboxListFilter, SandboxMetadata, StoreError, TransitionOutcome, TransitionRequest,
+    TransitionSettlement,
 };
 use super::keys::{routing, ExpiryMember};
 use super::record::{to_unix_millis, StoredSandboxRecord};
@@ -725,6 +726,25 @@ impl MetadataStore for RedisMetadataStore {
         request: TransitionRequest,
     ) -> Result<TransitionOutcome> {
         super::transition::start_transition(self.inner(), sandbox_id, request).await
+    }
+
+    /// 🔴 Never `NotPaused` for a record that carries a reference.
+    ///
+    /// This store cannot produce a handle at all — the bytes are on the node
+    /// that paused the sandbox and only its factory can decode them — so the
+    /// honest answer is `Remote`, carrying the reference and the node it means.
+    /// Answering `NotPaused` instead would let a caller conclude the sandbox
+    /// was never paused, which is the reading that turns a resume into a 500
+    /// describing a state the sandbox is not in.
+    async fn paused_handle(&self, sandbox_id: &SandboxId) -> Result<PausedHandle> {
+        let record = self.inner().require_record(sandbox_id).await?;
+        Ok(match record.paused_state_ref {
+            Some(reference) => PausedHandle::Remote {
+                reference,
+                origin_node_id: record.origin_node_id,
+            },
+            None => PausedHandle::NotPaused,
+        })
     }
 
     async fn transition_settlement(

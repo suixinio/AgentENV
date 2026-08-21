@@ -30,8 +30,8 @@ pub use persistence::{
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{
-    configured_max_sandbox_lifetime, is_allowed_transition, ControlPlaneConfig,
-    InMemoryMetadataStore, MetadataRows, MetadataStore, NewTimeout, PausedStateRef,
+    configured_max_sandbox_lifetime, is_allowed_transition, ActiveStateRecord, ControlPlaneConfig,
+    InMemoryMetadataStore, MetadataRows, MetadataStore, NewTimeout, PausedHandle, PausedStateRef,
     RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError, Reservation, ReservationGuard,
     SandboxListFilter, SandboxMetadata, SandboxTimeoutAction, StartWaiter, StoreError,
     StoredSandboxRecord, TransitionEffect, TransitionGuard, TransitionOutcome, TransitionRequest,

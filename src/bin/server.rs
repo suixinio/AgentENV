@@ -2,11 +2,17 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agentenv::api::{server, ApiImpl, PausedSandboxWiring, StaleReleaseOutcome};
+use agentenv::cfg::{AppConfig, PausedRegistryBackendKind};
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
-use agentenv::orchestrator::{build_paused_registry, Orchestrator};
+use agentenv::orchestrator::{
+    build_paused_registry, DisabledPausedSandboxRegistry, FileBackedSandboxPersister,
+    InMemoryMetadataStore, Orchestrator, SandboxOrchestration,
+};
 use agentenv::overlaybd::OverlaybdP2pRuntime;
+use agentenv::p2p::P2pTransport;
+use agentenv::role::ServerRole;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
@@ -28,9 +34,21 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "malloc_conf"]
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true\0";
 
+/// The orchestrator a machine-local role assembles: this node's own ledger,
+/// this node's Firecracker, this node's files.
+type LocalOrchestrator =
+    Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, FileBackedSandboxPersister>;
+
 #[derive(Debug, Parser)]
 #[command(name = "agentenv server")]
 struct ServerCli {
+    /// Which half of the split this process runs: api, node, or all.
+    ///
+    /// Defaults to `all` — one process holding both halves, which is what has
+    /// always run. Also readable from AENV_ROLE; an explicit --role wins.
+    #[arg(long, value_enum)]
+    role: Option<ServerRole>,
+
     /// Run setup/provisioning only, then exit.
     #[arg(long)]
     setup_only: bool,
@@ -52,18 +70,93 @@ struct ServerCli {
     config: Option<std::path::PathBuf>,
 }
 
+/// What an assembled role hands back to `main`: the router it serves and the
+/// four things the shutdown path has to stand down, in that order.
+struct Assembly {
+    app: axum::Router,
+    /// The orchestration surface this process drives. Which concrete
+    /// `Orchestrator` is behind it is the role's decision.
+    orchestration: Arc<dyn SandboxOrchestration>,
+    /// Background tasks to stop before the shutdown pauses start.
+    upkeep: Vec<tokio::task::JoinHandle<()>>,
+    /// The heartbeat sender, for roles that report themselves as a machine.
+    reporter: Option<ObservabilityReporter>,
+    /// The machine-local runtime, for roles that brought one up.
+    runtime: Option<NodeRuntime>,
+}
+
+/// The machine-local runtime a sandbox-running role owns: the two P2P pieces it
+/// holds by value, plus the process-wide Firecracker pool and ublk daemon it
+/// reaches through their globals.
+///
+/// 🔴 Held as a whole rather than as four independent handles so that the
+/// teardown order — pool, ublk, overlaybd P2P, transport — stays in one place.
+struct NodeRuntime {
+    overlaybd_p2p: OverlaybdP2pRuntime,
+    p2p_transport: Arc<dyn P2pTransport>,
+}
+
+impl NodeRuntime {
+    async fn shutdown(self) {
+        if let Some(pool) = FirecrackerPool::global() {
+            info!(target: "agentenv", "shutting down firecracker pool");
+            if let Err(err) = pool.shutdown().await {
+                warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
+            }
+        }
+        info!(target: "agentenv", "shutting down ublk daemon");
+        if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
+            warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
+        }
+        info!(target: "agentenv", "shutting down overlaybd p2p runtime");
+        if let Err(err) = self.overlaybd_p2p.shutdown().await {
+            warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
+        }
+        info!(target: "agentenv", "shutting down p2p transport");
+        if let Err(err) = self.p2p_transport.shutdown().await {
+            warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
+        }
+    }
+}
+
+/// Everything a machine-local role builds before the question of who owns a
+/// paused sandbox comes up.
+///
+/// 🔴 `--role node` and `--role all` share this, deliberately: it is the part
+/// where the two are *supposed* to be identical, and a second copy of it would
+/// be a second thing to keep in step with the first. What the two roles differ
+/// on comes after, in `assemble_node` and `assemble_all`.
+struct NodeCore {
+    orchestrator: Arc<LocalOrchestrator>,
+    snapshot_manager: Arc<SnapshotManager>,
+    template_builder: Arc<TemplateBuilder>,
+    image_resolver: Arc<ImageResolver>,
+    observability: Option<Arc<ObservabilityService>>,
+    reporter: Option<ObservabilityReporter>,
+    /// The identity the paused-registry wiring needs after the observability
+    /// service has taken ownership of the original.
+    identity: NodeIdentity,
+    runtime: NodeRuntime,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
     let cli = ServerCli::parse();
+    let role = ServerRole::resolve(cli.role)?;
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
         agentenv::cfg::ConfigManager::init_global()?
     };
     let config = config_manager.config();
+
+    // Before either provisioning path runs, not after: the point of the check
+    // is that the process was pointed at the wrong workload, and provisioning a
+    // host on the way to finding that out helps nobody.
+    role.check_setup_flags(cli.setup_only, cli.setup_host)?;
 
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
@@ -77,10 +170,105 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    info!(target: "agentenv", role = role.as_str(), "assembling server");
+    let Assembly {
+        app,
+        orchestration,
+        upkeep,
+        mut reporter,
+        runtime,
+    } = match role {
+        ServerRole::All => assemble_all(config).await?,
+        ServerRole::Node => assemble_node(config).await?,
+        ServerRole::Api => assemble_api(config).await?,
+    };
+
+    let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
+    let shutdown_orchestration = Arc::clone(&orchestration);
+    let drain_orchestration = Arc::clone(&orchestration);
+    let drains_on_shutdown = role.drains_on_shutdown();
+    let drain_propagation =
+        Duration::from_secs(config.orchestrator.shutdown_drain_propagation_secs);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
+    // With Nagle left on, the frame after the first one waits for the client's
+    // delayed ACK, adding a ~40ms floor to every short-lived command.
+    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(target: "agentenv", error = %err, "failed to set TCP_NODELAY on incoming connection");
+        }
+    });
+    info!(target: "agentenv", addr = %addr, "API server listening");
+
+    let shutdown_cleanup = tokio::spawn(async move {
+        if let Ok(()) = shutdown_rx.await {
+            if let Some(mut handle) = reporter.take() {
+                info!(target: "agentenv", "stopping observability reporter before process exit");
+                if let Err(err) = handle.shutdown().await {
+                    warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
+                }
+            }
+            // Stop reconciling before the shutdown pauses start: those write
+            // paused records these tasks would otherwise be racing to inspect.
+            for task in &upkeep {
+                task.abort();
+            }
+            info!(target: "agentenv", "stopping sandboxes before process exit");
+            if let Err(err) = shutdown_orchestration.shutdown().await {
+                warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
+            }
+            if let Some(runtime) = runtime {
+                runtime.shutdown().await;
+            }
+        }
+    });
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+
+            // Take the node out of rotation before tearing anything down, and
+            // give the scheduler time to hear about it. Without this pause a
+            // sandbox can be placed here in the moments after the signal and be
+            // paused again before the caller has finished starting it.
+            //
+            // Isolation set through the admin API is left alone: it is already
+            // the state we want, and re-announcing it would reset the timestamp
+            // an operator is watching.
+            //
+            // 🔴 Only a role that can be scheduled onto has anything to
+            // withdraw; an API replica is not a placement target.
+            if drains_on_shutdown && drain_orchestration.set_scheduling_disabled(true) {
+                info!(
+                    target: "agentenv",
+                    wait_secs = drain_propagation.as_secs(),
+                    "isolated the node for shutdown; waiting for the scheduler to notice"
+                );
+                if !drain_propagation.is_zero() {
+                    tokio::time::sleep(drain_propagation).await;
+                }
+            }
+
+            let _ = shutdown_tx.send(());
+        })
+        .await?;
+
+    shutdown_cleanup.await?;
+
+    Ok(())
+}
+
+/// Brings up everything a role that runs sandboxes on this machine needs.
+async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Result<NodeCore> {
+    // Both roles that reach here run the machine and report it as one; the API
+    // half never does, and never calls this.
+    debug_assert!(role.runs_sandbox_runtime());
+    debug_assert!(role.sends_heartbeats());
+
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
-    let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
     // `identity` is moved into the observability service below; the registry
     // wiring needs the same node/cluster identity afterwards.
@@ -155,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(
             ObservabilityService::new(
                 identity,
-                Arc::clone(&orchestrator),
+                Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>,
                 config.resolved_cpu_template_helper(),
                 cluster_cpu_arc,
             )
@@ -164,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let mut reporter = if let Some(service) = observability.as_ref() {
+    let reporter = if let Some(service) = observability.as_ref() {
         let mut reporter = ObservabilityReporter::new(
             Arc::clone(service),
             &observability_config.scheduler_report,
@@ -179,26 +367,54 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let paused_registry = build_paused_registry(
-        &config.orchestrator.paused_registry,
-        &config.cluster,
-        &identity_for_registry,
-    )
-    .await?;
-    let paused_wiring = PausedSandboxWiring::new(
-        paused_registry,
-        Arc::clone(&snapshot_manager),
-        &identity_for_registry,
-    );
-    // The orchestrator publishes every pause it performs, including the ones no
-    // API request asked for (expiry, shutdown).
-    orchestrator.set_paused_publisher(paused_wiring.publisher());
-    let api_impl = Arc::new(ApiImpl::new(
-        Arc::clone(&orchestrator),
+    Ok(NodeCore {
+        orchestrator,
         snapshot_manager,
         template_builder,
         image_resolver,
         observability,
+        reporter,
+        identity: identity_for_registry,
+        runtime: NodeRuntime {
+            overlaybd_p2p,
+            p2p_transport,
+        },
+    })
+}
+
+/// `--role all`: both halves in one process, which is what has always run.
+///
+/// 🔴 This is the rollback target, so it is defined as *today's behaviour* and
+/// not as the union of `api` and `node`. Nothing belongs here that was not
+/// here before the split.
+async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
+    let role = ServerRole::All;
+    let core = assemble_node_core(config, role).await?;
+
+    debug_assert!(role.arbitrates_paused_sandbox_ownership());
+    let paused_registry = build_paused_registry(
+        &config.orchestrator.paused_registry,
+        &config.cluster,
+        &core.identity,
+    )
+    .await?;
+    let paused_wiring = PausedSandboxWiring::new(
+        paused_registry,
+        Arc::clone(&core.snapshot_manager),
+        &core.identity,
+    );
+    // The orchestrator publishes every pause it performs, including the ones no
+    // API request asked for (expiry, shutdown).
+    core.orchestrator
+        .set_paused_publisher(paused_wiring.publisher());
+    let orchestration: Arc<dyn SandboxOrchestration> =
+        Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
+    let api_impl = Arc::new(ApiImpl::new(
+        Arc::clone(&orchestration),
+        core.snapshot_manager,
+        core.template_builder,
+        core.image_resolver,
+        core.observability,
         paused_wiring,
         config.sandbox_proxy.domains.clone(),
     ));
@@ -229,91 +445,112 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
-    let app = server::new(api_impl);
-    let shutdown_orchestrator = Arc::clone(&orchestrator);
-    let drain_orchestrator = Arc::clone(&orchestrator);
-    let drain_propagation =
-        Duration::from_secs(config.orchestrator.shutdown_drain_propagation_secs);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    Ok(Assembly {
+        app: server::new(api_impl),
+        orchestration,
+        upkeep: paused_upkeep,
+        reporter: core.reporter,
+        runtime: Some(core.runtime),
+    })
+}
 
-    // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
-    // With Nagle left on, the frame after the first one waits for the client's
-    // delayed ACK, adding a ~40ms floor to every short-lived command.
-    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            warn!(target: "agentenv", error = %err, "failed to set TCP_NODELAY on incoming connection");
-        }
-    });
-    info!(target: "agentenv", addr = %addr, "API server listening");
+/// `--role node`: the half that runs sandboxes, and decides nothing about who
+/// owns them.
+///
+/// What it drops relative to `all` is one thing, arrived at from one rule: a
+/// node executes, the API decides. So the cluster paused registry, the three
+/// startup passes over it and the four upkeep tasks that keep this node's claim
+/// on a paused sandbox alive are all gone; the API half holds those records now.
+///
+/// 🔴 What that leaves is a node that never takes a lease it will not renew.
+/// The registry it wires in is the disabled one regardless of configuration,
+/// which is the fail-closed direction: a node that claimed rows in a shared
+/// registry and then never renewed them would have other nodes waiting out a
+/// TTL for sandboxes nobody was coming back for.
+///
+/// 🔴 Not yet here, and each is its own slice: the node gRPC service the API
+/// half drives it through, the RoleGate that stops user-facing REST being
+/// served from this port, and the startup reclaim of host leftovers. Until the
+/// first of those lands, nothing drives this role — see the report on this
+/// batch for what that means for how far it has been exercised.
+async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
+    let role = ServerRole::Node;
+    let core = assemble_node_core(config, role).await?;
 
-    let shutdown_cleanup = tokio::spawn(async move {
-        if let Ok(()) = shutdown_rx.await {
-            if let Some(mut handle) = reporter.take() {
-                info!(target: "agentenv", "stopping observability reporter before process exit");
-                if let Err(err) = handle.shutdown().await {
-                    warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
-                }
-            }
-            // Stop reconciling before the shutdown pauses start: those write
-            // paused records these tasks would otherwise be racing to inspect.
-            for task in &paused_upkeep {
-                task.abort();
-            }
-            info!(target: "agentenv", "stopping sandboxes before process exit");
-            if let Err(err) = shutdown_orchestrator.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
-            }
-            if let Some(pool) = FirecrackerPool::global() {
-                info!(target: "agentenv", "shutting down firecracker pool");
-                if let Err(err) = pool.shutdown().await {
-                    warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
-                }
-            }
-            info!(target: "agentenv", "shutting down ublk daemon");
-            if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
-            }
-            info!(target: "agentenv", "shutting down overlaybd p2p runtime");
-            if let Err(err) = overlaybd_p2p.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
-            }
-            info!(target: "agentenv", "shutting down p2p transport");
-            if let Err(err) = p2p_transport.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
-            }
-        }
-    });
+    debug_assert!(!role.arbitrates_paused_sandbox_ownership());
+    let configured_backend = config.orchestrator.paused_registry.backend;
+    if !matches!(configured_backend, PausedRegistryBackendKind::Local) {
+        warn!(
+            target: "agentenv",
+            configured = ?configured_backend,
+            "--role node ignores the configured paused-sandbox registry: cluster-wide records \
+             belong to the API half. Paused sandboxes stay resumable on this node."
+        );
+    }
+    // `ApiImpl` needs a coordinator either way; this one is wired to a registry
+    // that answers nothing and records nothing, so every cluster-facing call
+    // through it is a no-op. Publishing the *bytes* of a pause still happens —
+    // that is the node's job — and only the cluster bookkeeping is dropped.
+    let paused_wiring = PausedSandboxWiring::new(
+        Arc::new(DisabledPausedSandboxRegistry),
+        Arc::clone(&core.snapshot_manager),
+        &core.identity,
+    );
+    core.orchestrator
+        .set_paused_publisher(paused_wiring.publisher());
+    let orchestration: Arc<dyn SandboxOrchestration> =
+        Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
+    let api_impl = Arc::new(ApiImpl::new(
+        Arc::clone(&orchestration),
+        core.snapshot_manager,
+        core.template_builder,
+        core.image_resolver,
+        core.observability,
+        paused_wiring,
+        config.sandbox_proxy.domains.clone(),
+    ));
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+    Ok(Assembly {
+        app: server::new(api_impl),
+        orchestration,
+        // 🔴 No upkeep: renewing a lease and reconciling local records against
+        // the cluster are both decisions, and this role takes none.
+        upkeep: Vec::new(),
+        reporter: core.reporter,
+        runtime: Some(core.runtime),
+    })
+}
 
-            // Take the node out of rotation before tearing anything down, and
-            // give the scheduler time to hear about it. Without this pause a
-            // sandbox can be placed here in the moments after the signal and be
-            // paused again before the caller has finished starting it.
-            //
-            // Isolation set through the admin API is left alone: it is already
-            // the state we want, and re-announcing it would reset the timestamp
-            // an operator is watching.
-            if drain_orchestrator.set_scheduling_disabled(true) {
-                info!(
-                    target: "agentenv",
-                    wait_secs = drain_propagation.as_secs(),
-                    "isolated the node for shutdown; waiting for the scheduler to notice"
-                );
-                if !drain_propagation.is_zero() {
-                    tokio::time::sleep(drain_propagation).await;
-                }
-            }
-
-            let _ = shutdown_tx.send(());
-        })
-        .await?;
-
-    shutdown_cleanup.await?;
-
-    Ok(())
+/// `--role api`: the deciding half.
+///
+/// 🔴 Not assemblable yet, and it says so rather than starting something that
+/// resembles it. Two pieces are missing, both of them the substance of later
+/// slices rather than details:
+///
+/// - the cluster `MetadataStore` this role's `Orchestrator` reads and writes.
+///   The in-memory store is one process's private ledger; an API replica that
+///   used it would hold an opinion about sandboxes no other replica shared.
+/// - the backend factory that drives sandboxes on other machines over the node
+///   gRPC service. Without it the only factory available is the Firecracker
+///   one, which would have this process reach for `/dev/kvm` on a Pod that has
+///   none — and, worse, succeed on a host where it does.
+///
+/// Everything else this role wants exists already and is listed here so the
+/// next slice does not have to rediscover it: `ConfigManager`, `NodeIdentity`,
+/// the Prometheus recorder, `SnapshotManager` (the commit side), `ImageResolver`,
+/// `TemplateBuilder` (the scheduling side), the full `ApiImpl` and route set,
+/// and the paused-sandbox wiring — which for this role is the real registry,
+/// not the disabled one.
+///
+/// It constructs none of `require_runtime_capabilities`, the P2P transport,
+/// `setup::ensure_environment`, `UblkDeviceManager`, `FirecrackerPool`,
+/// `FirecrackerSandboxFactory` or the heartbeat reporter.
+async fn assemble_api(_config: &AppConfig) -> anyhow::Result<Assembly> {
+    anyhow::bail!(
+        "--role api cannot be assembled yet: it needs a cluster metadata store and a remote \
+         sandbox backend factory, and neither has landed. Run --role all (the default) until \
+         they have."
+    )
 }
 
 /// Keeps this node's standing in the cluster registry current, in both
@@ -394,5 +631,56 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!(target: "agentenv", "received SIGTERM, starting graceful shutdown");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_cli_parses_and_defaults_the_role() {
+        ServerCli::command().debug_assert();
+
+        let bare = ServerCli::parse_from(["server"]);
+        assert_eq!(bare.role, None, "no --role means fall through to AENV_ROLE");
+        assert_eq!(
+            ServerRole::from_env(None).unwrap(),
+            ServerRole::All,
+            "and with no AENV_ROLE set, to the process that has always run"
+        );
+
+        for spelling in ["api", "node", "all"] {
+            let parsed = ServerCli::parse_from(["server", "--role", spelling]);
+            assert_eq!(parsed.role.unwrap().as_str(), spelling);
+        }
+
+        assert!(
+            ServerCli::try_parse_from(["server", "--role", "gateway"]).is_err(),
+            "an unknown role is refused at parse time"
+        );
+    }
+
+    /// 🔴 The refusal, pushed up rather than assumed.
+    ///
+    /// `--role api` is the one role this batch cannot assemble, and what it
+    /// does about that is the only behaviour it has. A version of it that
+    /// quietly fell back to the local orchestrator would be a process that
+    /// reaches for `/dev/kvm` on a replica that is supposed to hold none of a
+    /// machine's state — and on a host where that reach succeeded, it would
+    /// work well enough to be believed.
+    #[tokio::test]
+    async fn the_api_half_refuses_to_start_rather_than_starting_as_something_else() {
+        let config = AppConfig::default();
+        let err = match assemble_api(&config).await {
+            Ok(_) => panic!("--role api assembled something, and there is nothing for it to be"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("cluster metadata store"), "{err}");
+        assert!(err.contains("remote sandbox backend factory"), "{err}");
+        // And it says what to do instead, since the answer for now is the
+        // rollback shape rather than a workaround.
+        assert!(err.contains("--role all"), "{err}");
     }
 }

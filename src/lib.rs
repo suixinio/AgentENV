@@ -11,6 +11,7 @@ pub mod overlaybd;
 pub mod p2p;
 pub mod privileges;
 mod proto;
+pub mod role;
 pub mod sandbox;
 pub mod setup;
 pub mod snapshot;

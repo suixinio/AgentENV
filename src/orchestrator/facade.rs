@@ -287,6 +287,7 @@ orchestration_surface! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::OrchestratorError;
 
     /// Drives the facade through `Arc<dyn SandboxOrchestration>` rather than
     /// asserting that it compiles.
@@ -328,5 +329,110 @@ mod tests {
         assert!(orchestration.get_sandbox(&unknown).await.unwrap().is_none());
         assert!(orchestration.live_execution_id(&unknown).await.is_none());
         assert!(!orchestration.validate_envd_access_token(unknown, "nonsense"));
+    }
+
+    /// Every method the concrete orchestrator takes by `Arc`, driven once
+    /// through `dyn`.
+    ///
+    /// 🔴 This exists because of what a control probe measured. Breaking the
+    /// forwarding for this whole group of methods — create, pause, resume,
+    /// delete, fork, snapshot — turns only *three* of the crate's twelve
+    /// hundred unit tests red, and the orchestrator integration tests do not
+    /// close the gap: they hold a concrete `Orchestrator` and never cross this
+    /// layer at all. "The existing tests are green" is therefore not, by
+    /// itself, evidence about these twelve methods.
+    ///
+    /// `create_sandbox`, `restore_sandbox` and `fork_sandbox` want a live
+    /// sandbox to work from, and `shutdown` stops process-global runtime
+    /// managers and would take the rest of the test binary with it. The rest
+    /// answer here for a sandbox that does not exist, which is enough to show
+    /// that each one arrives somewhere and comes back.
+    #[tokio::test]
+    async fn every_by_arc_method_reaches_the_orchestrator_through_dyn() {
+        let orchestration: Arc<dyn SandboxOrchestration> =
+            Orchestrator::with_in_memory_store().await;
+        let unknown = SandboxId::new();
+
+        fn refuses<T: std::fmt::Debug>(what: &str, unknown: SandboxId, result: Result<T>) {
+            match result {
+                Err(OrchestratorError::SandboxNotFound(id)) => {
+                    assert_eq!(id, unknown, "{what} named the wrong sandbox")
+                }
+                other => panic!("{what} should not have found {unknown}; got {other:?}"),
+            }
+        }
+
+        refuses(
+            "delete_sandbox",
+            unknown,
+            Arc::clone(&orchestration).delete_sandbox(unknown).await,
+        );
+        refuses(
+            "pause_sandbox",
+            unknown,
+            Arc::clone(&orchestration).pause_sandbox(unknown).await,
+        );
+        refuses(
+            "capture_snapshot",
+            unknown,
+            Arc::clone(&orchestration).capture_snapshot(unknown).await,
+        );
+        refuses(
+            "replace_sandbox_network_policy",
+            unknown,
+            Arc::clone(&orchestration)
+                .replace_sandbox_network_policy(unknown, SandboxNetworkPolicy::default())
+                .await,
+        );
+        refuses(
+            "patch_sandbox_custom_extension_params",
+            unknown,
+            Arc::clone(&orchestration)
+                .patch_sandbox_custom_extension_params(unknown, serde_json::Map::new())
+                .await,
+        );
+        refuses(
+            "fork_sandbox",
+            unknown,
+            Arc::clone(&orchestration)
+                .fork_sandbox(unknown, 1, NewTimeout::UseExisting)
+                .await,
+        );
+        refuses(
+            "resume_sandbox",
+            unknown,
+            Arc::clone(&orchestration)
+                .resume_sandbox(
+                    unknown,
+                    NewTimeout::UseExisting,
+                    // 🔴 The in-crate constructor, not the `pub` one meant for
+                    // tests outside the crate: a guard in `launch_plan.rs`
+                    // fails the build if that one is so much as named under
+                    // `src/`, which is what keeps every production resume
+                    // going through the resume arbitration. Using this one
+                    // from a test adds no production path to a claim.
+                    ClaimedExecution::from_claim(ExecutionId::new()),
+                )
+                .await,
+        );
+
+        refuses(
+            "discard_superseded_sandbox",
+            unknown,
+            Arc::clone(&orchestration)
+                .discard_superseded_sandbox(unknown)
+                .await,
+        );
+
+        // The one exception, and it is deliberate: asking whether there is a
+        // local paused record to drop is a question, and "there was not one"
+        // is an answer to it rather than a failure.
+        assert!(
+            !Arc::clone(&orchestration)
+                .discard_local_paused_record(unknown)
+                .await
+                .expect("asking about a record this node never had is not an error"),
+            "there was no local paused record to discard"
+        );
     }
 }

@@ -485,9 +485,7 @@ mod tests {
 
     use super::*;
     use crate::snapshot::repository::interfaces::SnapshotListFilter;
-    use crate::snapshot::types::{
-        CommittedSnapshot, SnapshotAlias, SnapshotPublishSource, TemplateBuildStatus,
-    };
+    use crate::snapshot::types::{CommittedSnapshot, SnapshotAlias, SnapshotPublishSource};
     use crate::types::SandboxResources;
 
     /// A catalog that answers however a test tells it to, and writes down what

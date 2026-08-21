@@ -573,6 +573,41 @@ pub async fn publish_captured(&self, metadata, captured_snapshot: CapturedSandbo
 不存在就先补，因为**它决定的是 proto 的 `StagedSnapshot` 长什么样**，
 而 proto 一旦发出去就改不动了。
 
+#### 4.4.1 阶段 2b 交付时留下的两条，阶段 3 必须处理（不要重新发现）
+
+`stage / commit_staged` 这一对已经在阶段 2b 交付了（`src/snapshot/repository/composite.rs`）。
+QA 在验收 2b 时挖出两条**在 2b 里无害、在 `--role api` 下变成 bug** 的东西，
+经判断都属于阶段 3 的活，故留在这里而不是就地修掉。
+
+**① `StagedSnapshot::origin_node_id` 过了线就被丢掉。**
+
+`stage` 把它填成本机 node id（`composite.rs:147`），
+值随 `StagedSnapshot` 序列化过 gRPC，`commit_staged` 收到它——然后**不用**。
+中心目录的写入自己算一个：`begin_snapshot` / `commit_snapshot` 里
+`origin_node_id` 取的是 `self.node_id`
+（`backends/central/mod.rs:295-297`、`:361-363`），也就是**发起提交的那台机器**。
+
+2b 里两者是同一台，所以看不出来。`--role api` 之后 stage 在 node、commit 在 api，
+写进去的就是 api 进程的 id ——
+而 §3.1 把这一列当作硬 pin 的依据，§5.5 明说「origin 由 stage 决定」。
+⇒ **拆角色的那一批必须让 `commit_snapshot` 用 staged 值里的 origin，而不是客户端自己的 node id。**
+这同时意味着 `CommitSnapshotRequest.origin_node_id` 的语义要在 proto 上写清楚是「谁 stage 的」。
+
+**② `commit_staged` 的文档承诺比它做的事窄。**
+
+它的注释说自己 "cannot consult the artifact store about what it wrote"
+（`composite.rs:159-165`），而它的 `Err` 分支就在下面调 `roll_back_publish`
+（`:180`），后者走 `self.artifacts.delete_artifacts`（`:250`）。
+2b 里这没造成问题——同进程，字节就在手边——但**它正是那句注释想要挡住的形态**：
+一个只有 `StagedSnapshot` 的 api 进程，回滚时会去删一批它根本看不见的文件。
+⇒ 拆角色时要么把回滚挪回 node（由 node 在收到 commit 失败的回执后做），
+要么让 `commit_staged` 明确返回「该回滚了」而不是自己动手。
+不要靠改注释了事。
+
+**③ （小）P3 的并发形态在 2b 补齐了，别再当缺口。**
+`tests/snapshot_catalog.rs::two_commits_racing_for_one_name_produce_exactly_one_winner`
+现在真的把两个 `publish_commit` 同时挂在飞行中，靠服务端的唯一索引决胜负。
+
 ---
 
 ## 5. D. `proxy_routes` 与 `SandboxHandle` 分家

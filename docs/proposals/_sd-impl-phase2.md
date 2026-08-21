@@ -1353,6 +1353,48 @@ I5 是让父提案「回退是把读侧开关切回对象存储，**零数据损
 `committed_payload` 完整重建（那正是它今天的内容），反向不成立（PG 有 `status_group`、
 `heartbeat_at_ms`、`published` 这些对象存储里没有的东西）。
 
+> #### 🔴 2b 交付时对 I2 / I4 的修订（已实施，见 `src/snapshot/repository/mirror/`）
+>
+> **I2 反过来了：中心目录*不可达*不再让操作失败。** 上面这条写的是「PG 事务失败 ⇒
+> 整个操作失败」，2b 按字面实现之后 QA 打出了它的代价：一次 pause 遇上 scheduler 不可达
+> ⇒ `commit_staged` 返回 `Err` ⇒ `roll_back_publish` ⇒ 问
+> `retains_artifacts_on_publish_failure`（答案来自**从未被写过**的对象存储，所以是 `false`）
+> ⇒ **删掉用户刚暂停的沙箱的字节**。「镜像挂了」不是销毁工作区的理由。
+>
+> 现在的分工：**目录*答复了*并说不（refusal）仍然让写失败**——别名被占、本 build 读不懂的
+> 拒绝码，照旧 fatal，也照旧不写对象存储；**没人能*够到*目录**则记账、继续、由补偿器重放。
+> 对象存储侧原样不变。
+>
+> **I4 的「只朝一个方向」随之作废。** 原理由「对象存储的行可以从 PG 重建、反向不成立」讲的是
+> **靠 diff 状态重建一行**；待补队列从来不做这件事——它记的是**操作**
+> （`MirrorOp`，整条 `SnapshotRecord` / `SnapshotCommit` 都在里面）并重放，而一个操作对两边
+> 都是可重放的。队列因此带方向标签，补偿器两个方向都走。旧格式（无方向）的条目解码成对象存储
+> 欠账，回退时照样还得上。
+>
+> **`catalog_mirror_lag` 带 `direction` 标签了**，因为它守的是两个不同的开关：
+> 切回 `object_store` 只在对象存储不欠账时无损，切到 `postgres` 只在中心目录不欠账时无损。
+> 不带标签地求和是**更保守**的读法，不会更松。
+>
+> #### 🔴 lag == 0 从来不等于「两边一致」——§9.3 的出场条件要改
+>
+> `try_start_build` 在 2b 只写对象存储（构建准入是 2c），所以**每一个模板**的 PG 行都停在
+> `waiting`，而对象存储的已经走了；`commit_snapshot` 的栅栏要求 `building`，于是回
+> `StatusMismatch`，被归类成 Diverged、计数、放行。真机 PG 上量过：对象存储
+> `committed=true/Ready`，PG `committed=false/Waiting`，**待补 lag = 0**。
+>
+> ⇒ 只看 `catalog_mirror_lag == 0` 就切 `read = postgres`，会让集群里所有模板快照
+> **从 API 上消失**，而所有数字都说镜像是干净的。
+>
+> 2b 已补：无法重放的分歧**落盘**记在待补队列旁边，导出
+> `agentenv_snapshot_catalog_mirror_diverged{direction}`；`guard_read_side` 同时读这两个数，
+> 并补上了它一直缺的对称分支——**切到 `postgres` 时，PG 侧欠账或分歧非零则拒绝启动**，
+> 与切回 `object_store` 的规则一模一样。每个开关只按**要切过去那一侧**的欠账判定。
+>
+> ⇒ **§9.3 第 2 条与 2c 的出场判据改为**：
+> `agentenv_snapshot_catalog_mirror_lag{direction="central"}` **与**
+> `agentenv_snapshot_catalog_mirror_diverged{direction="central"}` 连续 7 天同时为 0。
+> 只满足前者不构成放行——而这正是 2c 之前打算读的那个数。
+
 ### 9.3 什么时候拆掉双写
 
 父提案：**阶段 3 上线并稳定之后**。翻译成可判定的条件：

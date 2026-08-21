@@ -1672,3 +1672,192 @@ async fn a_permanently_rejected_admission_does_not_start_the_build() {
         "nor queued a replay of an admission that will be rejected again forever"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Whether an absence is the last word
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 🔴 One caller in the tree destroys something when the catalog cannot find a
+// snapshot: a cross-node resume drops the paused sandbox's registry row, which
+// is the cluster's only record that the sandbox exists. These tests hold the
+// question it asks apart from the read it used to ask instead.
+
+/// 🔴 The measured one. A pause's *entire* catalog write is one call, and it
+/// is skipped outright when the opening statement found the scheduler
+/// unreachable — so PostgreSQL holds no row at all, and a node reading it sees
+/// a snapshot that never existed. The queue is the only thing that disagrees.
+#[tokio::test]
+async fn a_pause_whose_whole_catalog_write_is_queued_is_not_a_snapshot_that_never_existed() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.unreachable_on(CentralCall::Begin);
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, None))
+        .await
+        .expect("a pause whose bytes are durable succeeds whatever the scheduler is doing");
+
+    assert!(
+        fixture.central.holds(&id).is_none(),
+        "the premise: the commit was skipped with the opening statement, so no row was written"
+    );
+    assert_eq!(
+        fixture.backlog.lag_toward(MirrorDirection::Central),
+        1,
+        "and the whole operation is sitting in the queue"
+    );
+
+    let reading_central = fixture.reading_from_central();
+    assert!(
+        reading_central
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("the read side answers")
+            .is_none(),
+        "a read at any scope truthfully reports nothing — which is why the read is not the \
+         question to destroy a registry row over"
+    );
+    assert!(
+        matches!(
+            reading_central
+                .absence_of(&id)
+                .await
+                .expect("the queue and both stores can be asked"),
+            SnapshotAbsence::Unsettled { .. }
+        ),
+        "🔴 the assertion. This snapshot's bytes are in object storage and its commit is in the \
+         queue; calling it gone destroys the paused sandbox that owns it"
+    );
+}
+
+/// Neither store took the write and both owe it. Nothing holds a row anywhere,
+/// and the queue is the only description of the snapshot there is.
+#[tokio::test]
+async fn a_snapshot_neither_store_took_is_known_only_to_the_queue() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.unreachable_on(CentralCall::Begin);
+    fixture.object_store.break_it();
+
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, None))
+        .await
+        .expect("the queue is durable and holds the whole commit, so the operation succeeded");
+
+    assert!(fixture.central.holds(&id).is_none());
+    assert!(fixture.object_store.holds(&id).is_none());
+    assert!(
+        matches!(
+            fixture
+                .dual
+                .absence_of(&id)
+                .await
+                .expect("the queue can be asked"),
+            SnapshotAbsence::Unsettled { .. }
+        ),
+        "no store can contradict this absence, so the queue has to"
+    );
+}
+
+/// The cross-node half, and the one the local queue cannot answer: the node
+/// deciding has never owed anything about this snapshot. What carries it there
+/// is that object storage is shared and the read side is not the only store.
+#[tokio::test]
+async fn an_absence_the_other_store_contradicts_is_not_settled() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.object_store.hold(&id);
+
+    assert_eq!(
+        fixture.backlog.lag(),
+        0,
+        "the premise: this node owes nothing about it — the pause happened somewhere else"
+    );
+    assert!(
+        matches!(
+            fixture
+                .reading_from_central()
+                .absence_of(&id)
+                .await
+                .expect("both stores answer"),
+            SnapshotAbsence::Unsettled { .. }
+        ),
+        "the read side is behind, and the store that is not behind says so"
+    );
+}
+
+/// 🔴 The control, and it has to keep passing. A snapshot no store holds and no
+/// write is owed about really is gone, and a resume that reported otherwise
+/// would fail for ever over a sandbox nothing can rebuild.
+#[tokio::test]
+async fn a_snapshot_nothing_holds_and_nothing_owes_is_settled() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+
+    assert_eq!(
+        fixture
+            .dual
+            .absence_of(&id)
+            .await
+            .expect("both stores answer"),
+        SnapshotAbsence::Settled,
+        "absence that nothing contradicts is a fact, and the caller is entitled to act on it"
+    );
+}
+
+/// A store nobody could reach has not said the snapshot is gone. It has said
+/// nothing, and the caller's error path is the retryable one.
+#[tokio::test]
+async fn a_store_that_cannot_be_reached_is_not_an_absence() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.object_store.break_reads();
+
+    assert!(
+        fixture.dual.absence_of(&id).await.is_err(),
+        "an unreachable store must not be read as an empty one"
+    );
+}
+
+/// The delete has to leave the answer settled, or a snapshot an operator
+/// removed on purpose keeps its paused sandbox's registry row alive for ever.
+#[tokio::test]
+async fn a_deleted_snapshot_settles_once_the_queue_drains() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.unreachable_on(CentralCall::Delete);
+    fixture.object_store.hold(&id);
+
+    fixture
+        .dual
+        .delete_record(&committed_record(&id))
+        .await
+        .expect("a delete succeeds whatever the scheduler is doing");
+
+    assert!(
+        matches!(
+            fixture.dual.absence_of(&id).await.expect("stores answer"),
+            SnapshotAbsence::Unsettled { .. }
+        ),
+        "while the delete is queued the two stores are still mid-flight about it"
+    );
+
+    fixture.central.reachable_again();
+    fixture
+        .backlog
+        .drain_once(&fixture.targets())
+        .await
+        .expect("the queue drains");
+
+    assert_eq!(
+        fixture
+            .dual
+            .absence_of(&id)
+            .await
+            .expect("both stores answer"),
+        SnapshotAbsence::Settled,
+        "and once it has landed, the snapshot is gone and saying so is correct"
+    );
+}

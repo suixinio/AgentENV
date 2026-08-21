@@ -58,8 +58,8 @@ use crate::snapshot::repository::backends::central::{
     CatalogWrite, STATUS_BUILDING,
 };
 use crate::snapshot::repository::interfaces::{
-    CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
-    StartedBuild,
+    CatalogReadScope, SnapshotAbsence, SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotListPage, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotAlias, SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
@@ -954,6 +954,76 @@ impl SnapshotCatalog for DualWriteCatalog {
             self.central.get_any_status(&id.to_string()).await,
             Ok(Some(record)) if record.committed.is_some()
         ))
+    }
+
+    /// 🔴 Every store, and the queue behind them.
+    ///
+    /// The read side answering "no such snapshot" is one store's answer at one
+    /// moment, and this is the phase where that is at its least conclusive: two
+    /// catalogs hold the truth between them and a durable queue holds the
+    /// writes neither has taken yet. The caller destroys a paused sandbox's
+    /// registry row over this answer, so it gets asked of all three.
+    ///
+    /// The two failures it exists for, both reproduced on a cluster:
+    ///
+    ///   - `publish_commit`'s opening statement finds the central catalog
+    ///     unreachable, so the commit is skipped and the whole operation is
+    ///     queued. The object store took it; PostgreSQL holds **no row at
+    ///     all**. A node reading PostgreSQL sees a snapshot that never existed.
+    ///   - Neither store took the write and both owe it. Nothing holds a row
+    ///     anywhere, and the queue is the only description of the snapshot
+    ///     there is.
+    ///
+    /// 🔴 The queue is asked first and it is node-local, which bounds what this
+    /// can promise: the second case is only knowable on the node that owes the
+    /// write. The cross-store reads are what carry the first case to any node,
+    /// because object storage is shared. Between them they cover every shape
+    /// where a store's absence is contradicted by evidence this node can reach.
+    ///
+    /// A store that cannot be reached propagates as an error rather than as
+    /// absence. The caller's error path is retryable and its absence path is
+    /// not, and this is not a question to answer optimistically.
+    async fn absence_of(&self, id: &SnapshotId) -> RepositoryResult<SnapshotAbsence> {
+        match self.backlog.owes_a_write_about(id).await {
+            Ok(Some(because)) => return Ok(SnapshotAbsence::Unsettled { because }),
+            Ok(None) => {}
+            Err(error) => {
+                // Not an error to the caller and not a settled absence either:
+                // "I could not read the queue" is the strongest reason there is
+                // to leave the row alone.
+                warn!(
+                    snapshot_id = %id,
+                    %error,
+                    "could not read the catalog mirror backlog while deciding whether a snapshot \
+                     is really gone; treating its absence as unsettled"
+                );
+                return Ok(SnapshotAbsence::unsettled(
+                    "the catalog mirror backlog could not be read",
+                ));
+            }
+        }
+
+        if self
+            .object_store
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await?
+            .is_some()
+        {
+            return Ok(SnapshotAbsence::unsettled(
+                "the object-store catalog holds a row for it",
+            ));
+        }
+        if self
+            .central
+            .get_any_status(&id.to_string())
+            .await?
+            .is_some()
+        {
+            return Ok(SnapshotAbsence::unsettled(
+                "the central catalog holds a row for it",
+            ));
+        }
+        Ok(SnapshotAbsence::Settled)
     }
 }
 

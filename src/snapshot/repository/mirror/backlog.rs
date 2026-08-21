@@ -1328,6 +1328,78 @@ impl MirrorBacklog {
         persisted
     }
 
+    /// Why the queue says `id` is not settled, or `None` if it says nothing.
+    ///
+    /// 🔴 The one question a store cannot answer about itself. A write that has
+    /// been accepted and not yet replayed is a snapshot on its way into a
+    /// catalog that does not hold it yet, and the queue is the only thing that
+    /// knows the difference between that and a snapshot that never existed.
+    /// The case that makes it load-bearing: `publish_commit` finds the central
+    /// catalog unreachable on its opening statement, skips the commit, and
+    /// queues the whole operation — so PostgreSQL holds no row *at all* for a
+    /// pause whose bytes are already durable, and a read of either store
+    /// truthfully reports nothing.
+    ///
+    /// Both directions, not the read side's. A queue entry means the two
+    /// catalogs are mid-flight about this snapshot whichever way the debt runs,
+    /// and the caller is deciding whether to destroy something.
+    ///
+    /// 🔴 A linear scan of the queue. It is bounded by the lag — normally zero
+    /// — and the only caller is a resume that is about to drop a paused
+    /// sandbox's registry row, which is rare and can afford it. A secondary
+    /// index keyed by snapshot would be a second thing to keep consistent with
+    /// the queue, and getting *that* wrong reintroduces exactly this defect.
+    ///
+    /// Answers from [`DirectionCounters::unrecorded`] too, and deliberately
+    /// without a snapshot id: a write nobody could write down is owed by some
+    /// snapshot this process can no longer name. What that costs is real and
+    /// bounded — until this process restarts, absence stops being provable and
+    /// a genuinely dangling registry row is left alone rather than dropped —
+    /// and it is the recoverable direction of a choice whose other direction
+    /// destroys a workspace.
+    pub(super) async fn owes_a_write_about(
+        &self,
+        id: &SnapshotId,
+    ) -> anyhow::Result<Option<String>> {
+        if let Some(direction) = MirrorDirection::ALL
+            .into_iter()
+            .find(|direction| self.counters(*direction).unrecorded.load(Ordering::Acquire) > 0)
+        {
+            return Ok(Some(format!(
+                "a catalog write this process could not record is owed to {}, and it may be this \
+                 snapshot's",
+                direction.store_name()
+            )));
+        }
+
+        let owed = self
+            .store
+            .scan_prefix(vec![OWED_PREFIX])
+            .await
+            .context("read the snapshot catalog mirror backlog")?;
+        for (_, value) in &owed {
+            // 🔴 An entry nobody can decode counts as being about this
+            // snapshot. It is a write somebody owes about *something*, and a
+            // caller that destroys state on absence must not be told the queue
+            // is clear because the queue could not be read.
+            let Ok(entry) = OwedWrite::decode(value) else {
+                return Ok(Some(
+                    "the queue holds an entry this build cannot decode, and it may be this \
+                     snapshot's"
+                        .to_string(),
+                ));
+            };
+            if entry.op.snapshot_id() == id {
+                return Ok(Some(format!(
+                    "{} is owed a '{}' for it",
+                    entry.direction.store_name(),
+                    entry.op.name()
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     /// Records that the two catalogs disagree about one snapshot, permanently.
     ///
     /// Keyed by snapshot and direction, so the same disagreement discovered

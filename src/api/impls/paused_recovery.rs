@@ -25,7 +25,7 @@ use crate::orchestrator::{
     PausedRegistryState, PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter,
     SandboxMetadata, SandboxState,
 };
-use crate::snapshot::CatalogReadScope;
+use crate::snapshot::{CatalogReadScope, SnapshotAbsence};
 use crate::types::{ExecutionId, SandboxId};
 
 /// 本节点既没有本地副本、又没拿到认领权时，一次 resume 该怎么收场。
@@ -387,6 +387,53 @@ impl ApiImpl {
                 );
             }
             Ok(None) => {
+                // 🔴 Not yet. A read answers what one store holds; the branch
+                // below destroys the cluster's only record of this sandbox. The
+                // two are only the same question once nothing else can
+                // contradict the absence — the other catalog, and the queue of
+                // writes neither of them has taken yet.
+                //
+                // What the scope fixed above was a row that exists and is not
+                // `ready`. What it could not see is a pause whose *entire*
+                // catalog write is still owed: `publish_commit` makes two
+                // central calls and skips the second when the first found the
+                // scheduler unreachable, so PostgreSQL holds no row at all
+                // while the bytes sit in object storage, intact. Read at any
+                // scope, that snapshot is missing. Only the backlog knows it is
+                // on its way.
+                match self.snapshot_manager.absence_of(&snapshot_id).await {
+                    Ok(SnapshotAbsence::Settled) => {}
+                    Ok(SnapshotAbsence::Unsettled { because }) => {
+                        warn!(
+                            %sandbox_id,
+                            %snapshot_id,
+                            because,
+                            "the read side does not hold this paused snapshot but its absence is \
+                             contradicted; leaving the registry row alone and failing this resume"
+                        );
+                        self.release_claim(&sandbox_id, entry.generation).await;
+
+                        return CrossNodeResume::Failed(
+                            "paused snapshot has not reached this node's catalog yet".to_string(),
+                        );
+                    }
+                    Err(err) => {
+                        // A question nobody answered is not an absence.
+                        warn!(
+                            error = ?err,
+                            %sandbox_id,
+                            %snapshot_id,
+                            "could not settle whether this paused snapshot is really gone; \
+                             leaving the registry row alone and failing this resume"
+                        );
+                        self.release_claim(&sandbox_id, entry.generation).await;
+
+                        return CrossNodeResume::Failed(format!(
+                            "failed to settle whether the paused snapshot still exists: {err}"
+                        ));
+                    }
+                }
+
                 // The registry names a snapshot the repository no longer has.
                 // Releasing the claim would just make the next resume fail the
                 // same way, so drop the record and report it as unknown.
@@ -2065,7 +2112,8 @@ mod cross_node_resume_scope_tests {
         RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
     };
     use crate::snapshot::{
-        SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
+        SnapshotAbsence, SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource,
+        TemplateBuildErrorReason,
     };
     use crate::template::TemplateBuilder;
 
@@ -2075,6 +2123,10 @@ mod cross_node_resume_scope_tests {
     struct UncommittedSnapshotCatalog {
         row: Option<SnapshotRecord>,
         scoped_reads: Arc<AtomicUsize>,
+        /// What the catalog says when asked whether an absence is the last
+        /// word. `None` is a catalog with nothing behind it, which answers from
+        /// the row like the trait's default does.
+        absence: Option<RepositoryResult<SnapshotAbsence>>,
     }
 
     #[async_trait]
@@ -2132,6 +2184,20 @@ mod cross_node_resume_scope_tests {
         ) -> RepositoryResult<()> {
             Ok(())
         }
+
+        async fn absence_of(&self, _id: &SnapshotId) -> RepositoryResult<SnapshotAbsence> {
+            match &self.absence {
+                Some(Ok(absence)) => Ok(absence.clone()),
+                Some(Err(_)) => Err(RepositoryError::Backend {
+                    message: "the catalog mirror cannot be asked".to_string(),
+                    source: None,
+                }),
+                None if self.row.is_some() => {
+                    Ok(SnapshotAbsence::unsettled("the catalog holds a row for it"))
+                }
+                None => Ok(SnapshotAbsence::Settled),
+            }
+        }
     }
 
     /// An uncommitted sandbox row for `id`: the shape a pause has between its
@@ -2154,10 +2220,19 @@ mod cross_node_resume_scope_tests {
         row: Option<SnapshotRecord>,
         registry: Arc<CountingRegistry>,
     ) -> (Arc<ApiImpl>, Arc<AtomicUsize>) {
+        api_with_absence(row, None, registry).await
+    }
+
+    async fn api_with_absence(
+        row: Option<SnapshotRecord>,
+        absence: Option<RepositoryResult<SnapshotAbsence>>,
+        registry: Arc<CountingRegistry>,
+    ) -> (Arc<ApiImpl>, Arc<AtomicUsize>) {
         let scoped_reads = Arc::new(AtomicUsize::new(0));
         let catalog = Arc::new(UncommittedSnapshotCatalog {
             row,
             scoped_reads: Arc::clone(&scoped_reads),
+            absence,
         });
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
@@ -2241,6 +2316,75 @@ mod cross_node_resume_scope_tests {
             scoped_reads.load(Ordering::SeqCst),
             1,
             "and the question has to be asked at the scope that can tell the two states apart"
+        );
+    }
+
+    /// 🔴 The other half, and the one the scope alone could not reach.
+    ///
+    /// A pause's *entire* catalog write is one call, and it is skipped outright
+    /// when the opening statement found the scheduler unreachable — so the
+    /// central catalog holds no row at all and every read of it, at every
+    /// scope, truthfully reports nothing. Reproduced on a cluster: the resume
+    /// answered 404, the registry row went to zero, the origin node's local
+    /// record was reconciled away behind it, and the sandbox was gone for good
+    /// while its bytes sat in object storage, intact.
+    #[tokio::test]
+    async fn a_snapshot_whose_publish_is_still_queued_does_not_drop_the_registry_row() {
+        let snapshot_id = SnapshotId::generate();
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let (api, _) = api_with_absence(
+            // Absent at every scope — there is no row anywhere to find.
+            None,
+            Some(Ok(SnapshotAbsence::unsettled(
+                "the central catalog is owed a 'publish_commit' for it",
+            ))),
+            Arc::clone(&registry),
+        )
+        .await;
+
+        let outcome = api
+            .restore_claimed_sandbox(claimed_entry(snapshot_id), NewTimeout::None)
+            .await;
+
+        assert!(
+            matches!(outcome, CrossNodeResume::Failed(_)),
+            "a publish still on its way is a retryable failure, not a sandbox that does not exist"
+        );
+        assert_eq!(
+            registry.remove_calls(),
+            0,
+            "🔴 the assertion. The read side holds nothing and it is still not proof: the write \
+             is queued, the bytes are durable, and dropping this row loses the sandbox for good"
+        );
+    }
+
+    /// A question nobody answered is not an absence either.
+    #[tokio::test]
+    async fn a_catalog_that_cannot_settle_an_absence_does_not_drop_the_registry_row() {
+        let snapshot_id = SnapshotId::generate();
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let (api, _) = api_with_absence(
+            None,
+            Some(Err(RepositoryError::Backend {
+                message: "unreachable".to_string(),
+                source: None,
+            })),
+            Arc::clone(&registry),
+        )
+        .await;
+
+        let outcome = api
+            .restore_claimed_sandbox(claimed_entry(snapshot_id), NewTimeout::None)
+            .await;
+
+        assert!(
+            matches!(outcome, CrossNodeResume::Failed(_)),
+            "a store nobody could reach has not said the snapshot is gone"
+        );
+        assert_eq!(
+            registry.remove_calls(),
+            0,
+            "and the row must survive a failure to look at least as well as it survives a look"
         );
     }
 

@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
-    CatalogReadScope, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
-    SnapshotListPage, StagedSnapshot, StartedBuild,
+    CatalogReadScope, SnapshotAbsence, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
+    SnapshotListFilter, SnapshotListPage, StagedSnapshot, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -206,6 +206,15 @@ impl SnapshotRepository {
         scope: CatalogReadScope,
     ) -> RepositoryResult<Option<SnapshotRecord>> {
         self.catalog.get_scoped(id_or_alias, scope).await
+    }
+
+    /// Whether a snapshot's absence from the catalog is the last word on it.
+    ///
+    /// See [`SnapshotCatalog::absence_of`]: this is not [`Self::get_scoped`]
+    /// answering `None`, and only a caller that destroys something over the
+    /// answer should be asking.
+    pub async fn absence_of(&self, id: &SnapshotId) -> RepositoryResult<SnapshotAbsence> {
+        self.catalog.absence_of(id).await
     }
 
     /// Lists every snapshot record matching the provided filter.

@@ -13,7 +13,7 @@ use crate::sandbox::{
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
-use crate::snapshot::repository::{CatalogReadScope, SnapshotRepository};
+use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
@@ -365,6 +365,21 @@ impl SnapshotManager {
                     id_or_alias.as_ref()
                 )
             })
+    }
+
+    /// Whether a snapshot's absence is the last word on it.
+    ///
+    /// 🔴 Not [`Self::get_scoped`] answering `None`. That is one store's answer
+    /// at one scope; this is whether anything the node can consult still holds
+    /// the snapshot or still owes a write that would produce it. Ask it only
+    /// where absence is about to destroy something —
+    /// [`SnapshotCatalog::absence_of`](crate::snapshot::repository::SnapshotCatalog::absence_of)
+    /// says why the two questions are not the same one.
+    pub async fn absence_of(&self, id: &SnapshotId) -> anyhow::Result<SnapshotAbsence> {
+        self.repository
+            .absence_of(id)
+            .await
+            .with_context(|| format!("settle whether snapshot '{id}' is really gone"))
     }
 
     /// Lists every snapshot record that matches the given filter.

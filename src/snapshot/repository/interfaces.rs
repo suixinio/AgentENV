@@ -496,6 +496,40 @@ impl CatalogReadScope {
     }
 }
 
+/// Whether "no such snapshot" is the last word on one snapshot.
+///
+/// 🔴 This exists for the one caller in the tree that *destroys* something on
+/// absence: a cross-node resume drops the paused sandbox's registry row — the
+/// cluster's only record that the sandbox exists — when the catalog cannot
+/// find the snapshot it names. Every other reader treats absence as a 404 and
+/// moves on, which costs a retry; this one costs the workspace.
+///
+/// A read answers what one store holds *now*. That is not the same question as
+/// whether the snapshot is gone, because a write that has been accepted and
+/// not yet replayed is a snapshot on its way into a store that does not hold it
+/// yet. [`SnapshotCatalog::absence_of`] is the question with that gap closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotAbsence {
+    /// Nothing this node can consult holds the snapshot, and nothing owes a
+    /// write that would produce it. Absence is a fact.
+    Settled,
+    /// Absence is not the last word, and `because` says what contradicted it.
+    Unsettled { because: String },
+}
+
+impl SnapshotAbsence {
+    /// Absence contradicted, for a reason worth logging.
+    pub fn unsettled(because: impl Into<String>) -> Self {
+        Self::Unsettled {
+            because: because.into(),
+        }
+    }
+
+    pub fn is_settled(&self) -> bool {
+        matches!(self, Self::Settled)
+    }
+}
+
 #[async_trait]
 /// The rows: snapshot records, template build state, and alias bindings.
 ///
@@ -662,6 +696,36 @@ pub trait SnapshotCatalog: Send + Sync {
         _id: &SnapshotId,
     ) -> RepositoryResult<bool> {
         Ok(false)
+    }
+
+    /// Whether this catalog's not holding `id` is the last word on it.
+    ///
+    /// 🔴 Asked only by a caller that is about to destroy something over the
+    /// answer, and it is a different question from [`Self::get_scoped`]
+    /// answering `None`. A read reports what one store holds at one scope; this
+    /// reports whether anything else this node can consult still holds the
+    /// snapshot or still owes a write that would produce it.
+    ///
+    /// The default is the honest answer for a catalog that is the only copy
+    /// there is: it holds the row or it does not, and there is no queue behind
+    /// it and no second store to disagree. It reads at
+    /// [`CatalogReadScope::AnyStatus`] because a row that exists and is not
+    /// `ready` is a snapshot that exists — the distinction the resolvable
+    /// reading cannot make, and the one this call is for.
+    ///
+    /// An error is never an absence. Implementations must propagate a store
+    /// they could not reach rather than reporting [`SnapshotAbsence::Settled`]
+    /// from a question nobody answered.
+    async fn absence_of(&self, id: &SnapshotId) -> RepositoryResult<SnapshotAbsence> {
+        Ok(
+            match self
+                .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                .await?
+            {
+                Some(_) => SnapshotAbsence::unsettled("the catalog holds a row for it"),
+                None => SnapshotAbsence::Settled,
+            },
+        )
     }
 }
 

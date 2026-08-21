@@ -1136,6 +1136,7 @@ fn create_request(
         env_vars: None,
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
+        control_plane_config: None,
         auto_resume: false,
         secure: false,
     }
@@ -1198,6 +1199,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             env_vars: None,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
+            control_plane_config: None,
             auto_resume: false,
             secure: false,
         })
@@ -3150,7 +3152,11 @@ async fn a_forked_child_does_not_inherit_the_parents_spent_budget() -> Result<()
     orchestrator.store.update(parent).await?;
 
     let children = orchestrator
-        .fork_sandbox(sandbox_id, 1, NewTimeout::Set(Duration::from_secs(120)))
+        .fork_sandbox(
+            sandbox_id,
+            ForkChildren::Fresh(1),
+            NewTimeout::Set(Duration::from_secs(120)),
+        )
         .await?;
     let child = children
         .into_iter()
@@ -4905,6 +4911,106 @@ async fn create_sandbox_reports_build_failure_and_leaves_store_empty() -> Result
     Ok(())
 }
 
+/// A fork never lets a child inherit its parent's ownership marker.
+///
+/// 🔴 The marker is the control plane's record *of the parent*, and it names
+/// the parent. A child that carried it would report itself to the control
+/// plane under its parent's identity, so the reconcile that reads those
+/// listings would be told the same sandbox is running twice — and the record
+/// it rebuilt from the child would describe the wrong machine.
+///
+/// The control probe is the `Fresh` half: the parent is deliberately given a
+/// marker, so a forwarding that copied the parent's metadata wholesale would
+/// show up here as a child with one.
+#[tokio::test]
+async fn a_forked_child_never_inherits_its_parents_owner() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(MockOperation::Build, MockAction::Succeed);
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let mut request = create_request(Some(60), &[("team", "fork-ownership")]);
+    request.control_plane_config = ControlPlaneConfig::from_bytes(b"the-parents-record".to_vec());
+    let source = orchestrator.create_sandbox(request).await?;
+    assert!(
+        source.control_plane_config.is_some(),
+        "the source must be owned, or this test cannot fail"
+    );
+
+    let outcomes = orchestrator
+        .fork_sandbox(source.id, ForkChildren::Fresh(2), NewTimeout::UseExisting)
+        .await?;
+    for child in outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()? {
+        assert_eq!(
+            child.control_plane_config, None,
+            "a fork nobody claimed produced an owned child"
+        );
+    }
+    Ok(())
+}
+
+/// An assigned fork gives each child the marker that was assigned to *it*.
+///
+/// 🔴 Position is the whole contract: `SandboxBackend::fork` returns one result
+/// per spec in the same order, and this rides on that. A rotation by one would
+/// still produce the right number of markers and the right set of them, so the
+/// assertion has to pair each child's marker with that child's id.
+#[tokio::test]
+async fn an_assigned_fork_pairs_each_child_with_its_own_owner() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(MockOperation::Build, MockAction::Succeed);
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "fork-assigned")]))
+        .await?;
+
+    // The marker names the child it belongs to, which is the reason the caller
+    // has to decide the child's id: it cannot write this before it knows one.
+    let assigned = (0..3)
+        .map(|_| {
+            let sandbox_id = SandboxId::new();
+            ForkChildAssignment {
+                sandbox_id,
+                control_plane_config: ControlPlaneConfig::from_bytes(
+                    format!("record-for-{sandbox_id}").into_bytes(),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let outcomes = orchestrator
+        .fork_sandbox(
+            source.id,
+            ForkChildren::Assigned(assigned.clone()),
+            NewTimeout::UseExisting,
+        )
+        .await?;
+    let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
+
+    assert_eq!(children.len(), assigned.len());
+    for (child, wanted) in children.iter().zip(&assigned) {
+        assert_eq!(
+            child.id, wanted.sandbox_id,
+            "children came back out of order"
+        );
+        // 🔴 The incarnation is the node's to mint, and each child's must be
+        // its own: the record it is cloned from carries the parent's.
+        assert_ne!(child.execution_id, source.execution_id);
+        assert_eq!(
+            child.control_plane_config.as_ref().map(|c| c.as_bytes()),
+            Some(format!("record-for-{}", child.id).as_bytes()),
+            "child {} got another child's record",
+            child.id
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     setup();
@@ -4928,7 +5034,7 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     );
 
     let outcomes = orchestrator
-        .fork_sandbox(source.id, 3, NewTimeout::UseExisting)
+        .fork_sandbox(source.id, ForkChildren::Fresh(3), NewTimeout::UseExisting)
         .await?;
     let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
 
@@ -4995,7 +5101,11 @@ async fn fork_sandbox_keeps_successful_siblings_when_one_start_fails() -> Result
     behavior.push_action(MockOperation::ForkChild, MockAction::Succeed);
 
     let outcomes = orchestrator
-        .fork_sandbox(source.id, 3, NewTimeout::Set(Duration::from_secs(30)))
+        .fork_sandbox(
+            source.id,
+            ForkChildren::Fresh(3),
+            NewTimeout::Set(Duration::from_secs(30)),
+        )
         .await?;
 
     assert_eq!(outcomes.len(), 3);
@@ -5082,7 +5192,11 @@ async fn fork_sandbox_recoverable_failure_cleans_up_metrics() -> Result<()> {
     );
 
     let err = orchestrator
-        .fork_sandbox(source.id, 3, NewTimeout::Set(Duration::from_secs(15)))
+        .fork_sandbox(
+            source.id,
+            ForkChildren::Fresh(3),
+            NewTimeout::Set(Duration::from_secs(15)),
+        )
         .await
         .expect_err("fork should fail when backend fork fails");
     assert!(matches!(
@@ -5137,7 +5251,11 @@ async fn fork_sandbox_terminal_failure_removes_source_and_cleans_up_metrics() ->
     );
 
     let err = orchestrator
-        .fork_sandbox(source.id, 3, NewTimeout::Set(Duration::from_secs(15)))
+        .fork_sandbox(
+            source.id,
+            ForkChildren::Fresh(3),
+            NewTimeout::Set(Duration::from_secs(15)),
+        )
         .await
         .expect_err("fork should fail terminally when backend fork is terminal");
     assert!(matches!(
@@ -5180,7 +5298,11 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
     }));
 
     let outcomes = orchestrator
-        .fork_sandbox(source.id, 2, NewTimeout::Set(Duration::from_secs(15)))
+        .fork_sandbox(
+            source.id,
+            ForkChildren::Fresh(2),
+            NewTimeout::Set(Duration::from_secs(15)),
+        )
         .await?;
     assert_eq!(outcomes.len(), 2);
     assert!(matches!(
@@ -5509,7 +5631,7 @@ async fn an_isolated_node_refuses_new_sandboxes_and_keeps_serving_its_own() -> R
     assert!(matches!(create_err, OrchestratorError::NotAcceptingNewWork));
 
     let fork_err = Arc::clone(&orchestrator)
-        .fork_sandbox(created.id, 1, NewTimeout::UseExisting)
+        .fork_sandbox(created.id, ForkChildren::Fresh(1), NewTimeout::UseExisting)
         .await
         .expect_err("a fork puts another sandbox on this node, so it is new work");
     assert!(matches!(fork_err, OrchestratorError::NotAcceptingNewWork));
@@ -5710,7 +5832,7 @@ async fn forking_leaves_the_parent_execution_alone() -> Result<()> {
         .expect("a running sandbox has a backend");
 
     let outcomes = orchestrator
-        .fork_sandbox(source.id, 2, NewTimeout::UseExisting)
+        .fork_sandbox(source.id, ForkChildren::Fresh(2), NewTimeout::UseExisting)
         .await?;
     let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
 
@@ -5755,7 +5877,7 @@ async fn every_fork_child_gets_its_own_execution() -> Result<()> {
         .expect("a running sandbox has a backend");
 
     let outcomes = orchestrator
-        .fork_sandbox(source.id, 3, NewTimeout::UseExisting)
+        .fork_sandbox(source.id, ForkChildren::Fresh(3), NewTimeout::UseExisting)
         .await?;
     let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
     assert_eq!(children.len(), 3);

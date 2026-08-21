@@ -30,16 +30,17 @@ pub use persistence::{
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{
-    configured_max_sandbox_lifetime, is_allowed_transition, InMemoryMetadataStore, MetadataRows,
-    MetadataStore, NewTimeout, PausedStateRef, RedisMetadataStore, RedisStoreConfig,
-    RedisStoreConfigError, Reservation, ReservationGuard, SandboxListFilter, SandboxMetadata,
-    SandboxTimeoutAction, StartWaiter, StoreError, StoredSandboxRecord, TransitionEffect,
-    TransitionGuard, TransitionOutcome, TransitionRequest, TransitionSettlement, WaitForStart,
-    DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
+    configured_max_sandbox_lifetime, is_allowed_transition, ControlPlaneConfig,
+    InMemoryMetadataStore, MetadataRows, MetadataStore, NewTimeout, PausedStateRef,
+    RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError, Reservation, ReservationGuard,
+    SandboxListFilter, SandboxMetadata, SandboxTimeoutAction, StartWaiter, StoreError,
+    StoredSandboxRecord, TransitionEffect, TransitionGuard, TransitionOutcome, TransitionRequest,
+    TransitionSettlement, WaitForStart, DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
 };
 pub use types::{
-    CreateSandboxRequest, PauseOutcome, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, ForkChildAssignment, ForkChildren, PauseOutcome, SandboxLaunchSource,
+    SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxRosterEntry, SandboxState,
+    SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -125,6 +126,16 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         deadline: SystemTime,
     },
+
+    /// The caller asked for something that cannot be built, decided before any
+    /// of it is attempted.
+    ///
+    /// 🔴 Distinct from [`OrchestratorError::InternalError`] on purpose: this
+    /// one is the caller's fault and is answered with a 400, so a request that
+    /// pairs the wrong number of things together is refused rather than
+    /// reported as a fault in the node.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 
     #[error("internal error: {0}")]
     InternalError(String),

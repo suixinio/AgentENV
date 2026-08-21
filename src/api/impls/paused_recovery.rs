@@ -1278,6 +1278,9 @@ fn restore_request(
         network_policy: metadata.network_policy.clone(),
         secure: metadata.secure,
         custom_extension_params: metadata.custom_extension_params.clone(),
+        // Carried over like everything else here: a restore is the same
+        // sandbox, so whoever owned the record still owns it.
+        control_plane_config: metadata.control_plane_config.clone(),
     }
 }
 

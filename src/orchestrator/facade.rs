@@ -57,7 +57,8 @@ use super::store::{MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata
 #[cfg(test)]
 use super::types::SandboxState;
 use super::types::{
-    CreateSandboxRequest, SandboxLifecycleEvent, SandboxRosterEntry, SnapshotCaptureResult,
+    CreateSandboxRequest, ForkChildren, SandboxLifecycleEvent, SandboxRosterEntry,
+    SnapshotCaptureResult,
 };
 use super::{Result, SandboxForkOutcome};
 
@@ -165,12 +166,14 @@ orchestration_surface! {
             sandbox_id: SandboxId,
             request: CreateSandboxRequest,
         ) -> Result<SandboxMetadata>;
-        /// Forks one running sandbox into `count` running children.
+        /// Forks one running sandbox into running children.
         ///
-        /// One outcome per requested child, in order.
+        /// One outcome per requested child, in order. `children` decides both
+        /// how many and — when the caller is the control plane — their
+        /// identities and ownership; none of that is inherited from the source.
         fn fork_sandbox(
             source_sandbox_id: SandboxId,
-            count: u32,
+            children: ForkChildren,
             new_timeout: NewTimeout,
         ) -> Result<Vec<SandboxForkOutcome>>;
         /// Tears a sandbox down and forgets it, cluster record included.
@@ -395,7 +398,7 @@ mod tests {
             "fork_sandbox",
             unknown,
             Arc::clone(&orchestration)
-                .fork_sandbox(unknown, 1, NewTimeout::UseExisting)
+                .fork_sandbox(unknown, ForkChildren::Fresh(1), NewTimeout::UseExisting)
                 .await,
         );
         refuses(

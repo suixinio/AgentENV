@@ -33,8 +33,9 @@ use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, S
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, PauseOutcome, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
+    SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxRosterEntry,
+    SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -421,6 +422,7 @@ where
             network_policy,
             custom_extension_params,
             secure,
+            control_plane_config,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
@@ -476,6 +478,7 @@ where
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     secure,
+                    control_plane_config,
                     max_lifetime: configured_max_sandbox_lifetime(),
                     ..Default::default()
                 };
@@ -537,6 +540,7 @@ where
                     network_policy,
                     custom_extension_params,
                     secure,
+                    control_plane_config,
                     max_lifetime: configured_max_sandbox_lifetime(),
                     ..Default::default()
                 };
@@ -574,12 +578,12 @@ where
     pub async fn fork_sandbox(
         self: &Arc<Self>,
         source_sandbox_id: SandboxId,
-        count: u32,
+        children: ForkChildren,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
-            this.fork_sandbox_inner(source_sandbox_id, count, new_timeout)
+            this.fork_sandbox_inner(source_sandbox_id, children, new_timeout)
                 .await
         })
         .await
@@ -593,10 +597,12 @@ where
     async fn fork_sandbox_inner(
         self: Arc<Self>,
         source_sandbox_id: SandboxId,
-        count: u32,
+        children: ForkChildren,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         self.ensure_accepting_new_work()?;
+
+        let count = children.count();
 
         info!("forking sandboxes");
 
@@ -624,20 +630,31 @@ where
             })?
             .previous;
 
-        let children_spec = (0..count)
-            .map(|_| {
-                let sandbox_id = SandboxId::new();
-                SandboxForkSpec {
-                    sandbox_id,
-                    // A fork child is a brand-new sandbox, so it is a brand-new
-                    // incarnation. Minted in the same expression as its id
-                    // because the two are born together and the child's
-                    // metadata below is a clone of the parent's.
-                    execution_id: ExecutionId::new(),
-                    envd_access_token: source_metadata
-                        .secure
-                        .then(|| self.access_tokens.generate(sandbox_id)),
-                }
+        // 🔴 One entry per child, and the ownership marker is carried alongside
+        // the identity rather than derived from the source: the clone of the
+        // parent's metadata below would otherwise hand every child the
+        // parent's own record.
+        let children: Vec<ForkChildAssignment> = match children {
+            ForkChildren::Fresh(count) => (0..count)
+                .map(|_| ForkChildAssignment {
+                    sandbox_id: SandboxId::new(),
+                    control_plane_config: None,
+                })
+                .collect(),
+            ForkChildren::Assigned(children) => children,
+        };
+        let children_spec = children
+            .iter()
+            .map(|child| SandboxForkSpec {
+                sandbox_id: child.sandbox_id,
+                // A fork child is a brand-new sandbox, so it is a brand-new
+                // incarnation. Minted here, next to the child's metadata below
+                // being a clone of the parent's, because that clone is what
+                // would otherwise carry the parent's.
+                execution_id: ExecutionId::new(),
+                envd_access_token: source_metadata
+                    .secure
+                    .then(|| self.access_tokens.generate(child.sandbox_id)),
             })
             .collect::<Vec<_>>();
 
@@ -695,7 +712,8 @@ where
         let mut outcomes = Vec::with_capacity(children_spec.len());
         let mut successes = 0u64;
         let now = SystemTime::now();
-        for (child, backend) in children_spec.into_iter().zip(forked_backends) {
+        for ((child, spec), backend) in children.into_iter().zip(children_spec).zip(forked_backends)
+        {
             let sandbox_id = child.sandbox_id;
             let backend = match backend {
                 Ok(backend) => backend,
@@ -711,7 +729,13 @@ where
             // 🔴 The clone above carries the parent's incarnation. Leaving it
             // would give two live VMs one identity, with nothing to warn about
             // it: fencing would read them as the same run and refuse neither.
-            metadata.execution_id = child.execution_id;
+            metadata.execution_id = spec.execution_id;
+            // 🔴 And the ownership marker, for the same reason one line up: the
+            // clone carries the *parent's* record of the parent, and a child
+            // reporting itself under that record would have the control plane
+            // rebuild it as its parent. `Unowned` clears it, which is the
+            // fail-closed direction — a child nobody claims is left alone.
+            metadata.control_plane_config = child.control_plane_config;
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
             // 🔴 And the lifetime clock with it. The clone above carries the
@@ -833,6 +857,81 @@ where
         filter: SandboxListFilter,
     ) -> Result<Vec<SandboxMetadata>> {
         Ok(self.store.list_filtered(filter).await?)
+    }
+
+    /// The sandboxes this node is actually running.
+    ///
+    /// # 🔴 Membership comes from the handles, attributes come from the records
+    ///
+    /// [`list_sandboxes`][Self::list_sandboxes] answers from the metadata
+    /// store, which is this node's *account* of what it holds. This one answers
+    /// from the table of live sandbox handles, which is what it holds. Anything
+    /// reconciling a cluster's idea of a sandbox against the machine running it
+    /// needs the second: comparing an account against an account cannot find a
+    /// discrepancy between them.
+    ///
+    /// # 🔴 Never waits on a busy handle
+    ///
+    /// Reading the live facts needs the handle's lock, and that lock is held
+    /// for the whole of a pause, a fork or a teardown. Waiting for it would
+    /// make this call as slow as the slowest operation on the node, and the
+    /// caller is deciding whether sandboxes still exist — so a busy handle
+    /// contributes its membership and whatever its record knows, marked
+    /// [`LiveSandbox::facts_from_handle`] `false`. What it must never do is
+    /// drop the sandbox from the list: "not here" is the answer that gets a
+    /// live VM torn down.
+    pub async fn list_live_sandboxes(&self) -> Result<Vec<LiveSandbox>> {
+        // Snapshot the handle table and let go of its lock before touching the
+        // store: the store may be a network round trip away, and holding the
+        // table's read lock across one blocks every create and teardown on the
+        // node.
+        let handles: Vec<(SandboxId, SandboxHandle)> = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes
+                .iter()
+                .map(|(id, handle)| (*id, Arc::clone(handle)))
+                .collect()
+        };
+        if handles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<SandboxId> = handles.iter().map(|(id, _)| *id).collect();
+        // 🔴 A read that fails is an error, not an empty set of attributes. A
+        // caller told "these sandboxes have no records" would conclude
+        // something very different from what "I could not read the records"
+        // means.
+        let records = self.store.get_many(&ids).await?;
+
+        let mut live = Vec::with_capacity(handles.len());
+        for (sandbox_id, handle) in handles {
+            let record = records.entries.get(&sandbox_id);
+            let mut entry = LiveSandbox {
+                sandbox_id,
+                execution_id: record.map(|record| record.execution_id),
+                facts_from_handle: false,
+                host_interaction_ip: None,
+                rootfs_virtual_size: None,
+                created_at: record.map(|record| record.created_at),
+                expires_at: record.and_then(|record| record.expires_at),
+                resources: record.map(|record| record.resources),
+                control_plane_config: record.and_then(|record| record.control_plane_config.clone()),
+            };
+
+            if let Ok(sandbox) = handle.try_lock() {
+                entry.facts_from_handle = true;
+                // 🔴 The handle's incarnation wins over the record's. The
+                // record says which run this node filed; the handle is the run
+                // that is up, and that is the one an orphan check compares.
+                entry.execution_id = Some(sandbox.execution_id());
+                entry.host_interaction_ip = sandbox.host_interaction_ip();
+                entry.rootfs_virtual_size = sandbox.runtime_info().rootfs_virtual_size;
+            }
+
+            live.push(entry);
+        }
+
+        Ok(live)
     }
 
     pub fn get_envd_access_token(&self, metadata: &SandboxMetadata) -> Option<EnvdAccessToken> {

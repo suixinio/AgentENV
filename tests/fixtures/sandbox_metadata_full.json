@@ -24,6 +24,7 @@
     ],
     "workdir": "/home/user"
   },
+  "control_plane_config": "AAH+/293bmVk",
   "created_at": {
     "nanos_since_epoch": 123456789,
     "secs_since_epoch": 1755561600

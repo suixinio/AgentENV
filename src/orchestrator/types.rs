@@ -36,6 +36,118 @@ pub struct CreateSandboxRequest {
     pub secure: bool,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// The control plane's record of this sandbox, to be stored verbatim.
+    ///
+    /// 🔴 `None` for every user-facing create. Only the node gRPC surface — the
+    /// one the API half drives — supplies one, and its presence is the *only*
+    /// thing that marks a sandbox as the control plane's. See
+    /// [`ControlPlaneConfig`][crate::orchestrator::ControlPlaneConfig].
+    pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
+}
+
+/// One sandbox this node is *running*, as against one it has a record of.
+///
+/// # 🔴 Why the two are not the same list
+///
+/// The record store is what a node claims to be holding; the table of live
+/// sandbox handles is what it holds. They come apart exactly when something has
+/// gone wrong — a create that half-failed, a teardown that did not finish — and
+/// those are the cases anything reconciling a cluster against its nodes exists
+/// to find. Answering from the store would be reconciling one ledger against
+/// another.
+///
+/// So membership here comes from the handle table and nothing else. The record
+/// store contributes attributes, and the fields it contributes are `Option`
+/// because a live sandbox with no record is a real thing that must still be
+/// reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSandbox {
+    pub sandbox_id: SandboxId,
+    /// The run that is live, taken from the handle when the handle could be
+    /// read and from the record otherwise.
+    ///
+    /// 🔴 `None` only when neither had one, which means the sandbox has no
+    /// record and its handle was busy. Such a sandbox necessarily has no
+    /// ownership marker either — the marker lives in the record — so it is not
+    /// one any control plane is looking for.
+    pub execution_id: Option<ExecutionId>,
+    /// Whether the facts below were read from the live handle.
+    ///
+    /// 🔴 `false` means the handle was mid-operation and was not waited on. A
+    /// listing that blocked behind a pause would take as long as the slowest
+    /// operation on the node, and the thing waiting for it is deciding whether
+    /// sandboxes still exist — so it reports what the record knows and says so,
+    /// rather than either stalling or leaving the sandbox out.
+    pub facts_from_handle: bool,
+    pub host_interaction_ip: Option<std::net::Ipv4Addr>,
+    pub rootfs_virtual_size: Option<u64>,
+    pub created_at: Option<std::time::SystemTime>,
+    pub expires_at: Option<std::time::SystemTime>,
+    pub resources: Option<SandboxResources>,
+    /// The control plane's record of this sandbox, when it has one.
+    ///
+    /// 🔴 Reported, not filtered on. Whether a caller wants only the sandboxes
+    /// some control plane owns is a property of the surface being served, not
+    /// of this list: the same list also answers "what is running on this
+    /// machine at all", and a filter baked in here would quietly give that
+    /// question the other one's answer.
+    pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
+}
+
+/// The children a fork is being asked to produce.
+///
+/// 🔴 Identity and ownership travel together, and both are the *caller's* to
+/// decide when the caller is the control plane. Two reasons they cannot be
+/// split:
+///
+/// - A child's record is built by cloning its parent's, so anything the child
+///   must not inherit has to be overwritten from here. The incarnation was
+///   already such a field; the ownership marker is the second.
+/// - The marker is the control plane's whole record of the sandbox, and a
+///   record names the sandbox it is about. A node that minted the child's id
+///   would therefore be handing back a marker written before anyone knew which
+///   sandbox it described.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForkChildren {
+    /// Mint `count` fresh identities here. No child carries an ownership
+    /// marker: this is the user-facing fork, and the control plane did not ask
+    /// for these sandboxes.
+    Fresh(u32),
+    /// One entry per child, in request order.
+    ///
+    /// 🔴 The order is the contract [`SandboxBackend::fork`] already states for
+    /// its results — one result per spec, same order — and the outcomes this
+    /// produces line up with it entry for entry.
+    ///
+    /// [`SandboxBackend::fork`]: crate::sandbox::SandboxBackend::fork
+    Assigned(Vec<ForkChildAssignment>),
+}
+
+/// One fork child whose identity the caller has already decided.
+///
+/// 🔴 The identity here is the sandbox id and not the incarnation. Minting an
+/// incarnation stays with the node, as it does for a create: a caller-supplied
+/// one would be a second place a run can be authorised from, and the caller
+/// learns the child's incarnation from the outcome anyway. What the caller must
+/// decide is the sandbox id, because its own record of the child names it and
+/// that record is written before the child exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkChildAssignment {
+    pub sandbox_id: SandboxId,
+    /// The control plane's record of this child, or `None` when it has none.
+    pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
+}
+
+impl ForkChildren {
+    /// How many children this asks for.
+    pub fn count(&self) -> u32 {
+        match self {
+            Self::Fresh(count) => *count,
+            // A fork request cannot carry more children than a u32 counts, and
+            // the API surface it arrives through is bounded far below that.
+            Self::Assigned(children) => children.len().try_into().unwrap_or(u32::MAX),
+        }
+    }
 }
 
 /// One sandbox as the heartbeat reports it: which sandbox, which incarnation,

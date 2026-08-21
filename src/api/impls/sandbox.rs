@@ -13,8 +13,8 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxListFilter,
-    SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxLaunchSource,
+    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -101,6 +101,7 @@ impl From<OrchestratorError> for models::Error {
                 ),
             ),
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::InvalidRequest(_) => Self::new(400, err.to_string()),
             other => ApiImpl::internal_error(&other),
         }
     }
@@ -545,6 +546,10 @@ impl Sandboxes<()> for ApiImpl {
             network_policy,
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
+            // 🔴 Never set from the user-facing REST surface: what marks a
+            // sandbox as the control plane's is the node gRPC create, and
+            // nothing else.
+            control_plane_config: None,
         };
 
         match timer
@@ -683,6 +688,10 @@ impl Sandboxes<()> for ApiImpl {
             network_policy,
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
+            // 🔴 Never set from the user-facing REST surface: what marks a
+            // sandbox as the control plane's is the node gRPC create, and
+            // nothing else.
+            control_plane_config: None,
         };
 
         match timer
@@ -960,7 +969,12 @@ impl Sandboxes<()> for ApiImpl {
             .time(
                 "fork",
                 self.orchestrator()
-                    .fork_sandbox(sandbox_id, count, new_timeout),
+                    // 🔴 `Fresh`: a fork over the user-facing REST surface
+                    // produces sandboxes the control plane did not ask for and
+                    // does not own, so no child carries a marker. Inheriting
+                    // the source's is what would put a child into the control
+                    // plane's listing under its parent's record.
+                    .fork_sandbox(sandbox_id, ForkChildren::Fresh(count), new_timeout),
             )
             .await
         {

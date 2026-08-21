@@ -17,7 +17,8 @@ use crate::types::{ExecutionId, SandboxId};
 
 pub use in_memory::InMemoryMetadataStore;
 pub use metadata::{
-    configured_max_sandbox_lifetime, NewTimeout, SandboxMetadata, SandboxTimeoutAction,
+    configured_max_sandbox_lifetime, ControlPlaneConfig, NewTimeout, SandboxMetadata,
+    SandboxTimeoutAction,
 };
 pub use redis::{
     PausedStateRef, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,

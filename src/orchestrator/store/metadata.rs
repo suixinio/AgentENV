@@ -19,6 +19,139 @@ pub enum SandboxTimeoutAction {
     Delete,
 }
 
+/// The control plane's own record of a sandbox, as the node holds it.
+///
+/// # What it is for
+///
+/// It answers one question — *does the control plane own this sandbox?* — and
+/// it answers it by being present. The node gRPC surface reports a sandbox on
+/// [`ListSandboxes`][crate::node_server] only when the sandbox carries one of
+/// these, so a sandbox created by any other path is structurally absent from
+/// the answer the API half reconciles against.
+///
+/// # Why it is a blob
+///
+/// 🔴 **The node never looks inside.** It stores the bytes the API half sent
+/// with the create and returns the same bytes; it does not parse, validate,
+/// re-encode or generate them. That is not laziness about the format — it is
+/// the property that makes the marker safe to change. The contents are the API
+/// half's versioned encoding of its own record of the sandbox, which exists so
+/// that a control plane whose store was lost can rebuild every running
+/// sandbox's record from what the nodes hand back. A node that understood the
+/// format would be a second place that has to be upgraded in step with it.
+///
+/// So this is a contract between the API half and its *future self*, not a
+/// cross-language wire contract, and nothing on the node may come to depend on
+/// its shape.
+///
+/// # Empty is not a value
+///
+/// 🔴 There is no empty `ControlPlaneConfig`. The wire type is protobuf
+/// `bytes`, which has no null, so "no marker" arrives as zero bytes — and a
+/// `Some(<zero bytes>)` would be a third state meaning neither *owned* nor
+/// *not owned*. [`ControlPlaneConfig::from_bytes`] collapses it into `None`
+/// instead, at the one boundary where the ambiguity can appear, so that
+/// `Option<ControlPlaneConfig>` has exactly the two states the ownership
+/// question has.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneConfig(Vec<u8>);
+
+impl ControlPlaneConfig {
+    /// The marker for `bytes`, or `None` when there are none.
+    ///
+    /// 🔴 Fallible on purpose, and the fallible direction is the safe one: an
+    /// empty blob becomes "the control plane does not own this", which keeps
+    /// the sandbox out of the listing rather than putting it in with a marker
+    /// that says nothing.
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Option<Self> {
+        let bytes = bytes.into();
+        (!bytes.is_empty()).then_some(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false`; see the type's note on why there is no empty marker.
+    /// Present because `len` without it draws a clippy lint, and answering it
+    /// honestly is better than allowing the lint.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// Prints the size and not the contents.
+///
+/// 🔴 Deliberate. The blob is a whole sandbox record; a derived `Debug` would
+/// put one in every log line that formats [`SandboxMetadata`], including the
+/// user metadata inside it.
+impl std::fmt::Debug for ControlPlaneConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ControlPlaneConfig({} bytes)", self.0.len())
+    }
+}
+
+/// Base64, because the records this rides in are JSON — in Redis and on disk —
+/// and serde renders `Vec<u8>` there as an array of numbers, one per byte.
+impl Serialize for ControlPlaneConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        serializer.serialize_str(&STANDARD.encode(&self.0))
+    }
+}
+
+/// Reads what [`Serialize`] wrote, for a field that is present.
+///
+/// The absent and empty cases are handled by
+/// [`deserialize_optional_control_plane_config`], which is what the field
+/// actually uses; this impl exists so the type round-trips on its own.
+impl<'de> Deserialize<'de> for ControlPlaneConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        decode_control_plane_config::<D>(&encoded)?
+            .ok_or_else(|| serde::de::Error::custom("empty control plane config"))
+    }
+}
+
+fn decode_control_plane_config<'de, D: serde::Deserializer<'de>>(
+    encoded: &str,
+) -> Result<Option<ControlPlaneConfig>, D::Error> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|err| serde::de::Error::custom(format!("control plane config: {err}")))?;
+    Ok(ControlPlaneConfig::from_bytes(bytes))
+}
+
+/// Decodes the ownership marker, mapping both "absent" and "present but empty"
+/// onto `None`.
+///
+/// 🔴 Malformed base64 is still an error. The two failures are not the same
+/// one: a field nobody wrote is a sandbox the control plane does not own, while
+/// a field somebody wrote and got wrong is a corrupt record, and silently
+/// reading the second as the first would let a mangled record pass for an
+/// ordinary unowned sandbox.
+fn deserialize_optional_control_plane_config<'de, D>(
+    deserializer: D,
+) -> Result<Option<ControlPlaneConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    decode_control_plane_config::<D>(&encoded)
+}
+
 /// The configured slack added to a routing projection's TTL.
 ///
 /// Read once: it is a deployment-wide constant, and every response header and
@@ -100,6 +233,33 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
+    /// The control plane's own record of this sandbox, stored verbatim.
+    ///
+    /// 🔴 **This is the ownership marker, and it is explicit on purpose.**
+    /// `Some(_)` means the control plane created this sandbox and owns the
+    /// cluster-wide record of it; `None` means it does not. Nothing infers
+    /// ownership from where a create came from, from which port it arrived on,
+    /// or from what else is on the node — those are all inferences that hold
+    /// today and stop holding the first time someone adds a second caller.
+    ///
+    /// 🔴 **Opaque to this node.** The node stores what the API half sent with
+    /// the create and hands the same bytes back on
+    /// [`SandboxOrchestration::list_live_sandboxes`][crate::orchestrator::SandboxOrchestration::list_live_sandboxes].
+    /// It never parses, validates or generates one. See [`ControlPlaneConfig`].
+    ///
+    /// 🔴 `#[serde(default)]`, unlike `execution_id` above, and in the opposite
+    /// direction: a record from before this field existed — or one written by a
+    /// path that does not set it — decodes to `None`, which reads as *not owned
+    /// by the control plane*. That is fail-closed. The consumer of this field
+    /// filters sandboxes **out** of a listing when it is absent, and a listing
+    /// that omits a sandbox costs nothing, while a listing that includes one it
+    /// should not is how something else comes to delete a live VM.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_control_plane_config"
+    )]
+    pub control_plane_config: Option<ControlPlaneConfig>,
     /// The lifetime ceiling this sandbox was created under, or `None` when the
     /// node had no ceiling configured.
     ///
@@ -181,6 +341,10 @@ impl Default for SandboxMetadata {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,
+            // 🔴 Not owned by the control plane. A `Default` record is a test
+            // fixture, and a fixture that arrived pre-owned would make every
+            // ownership test pass for the wrong reason.
+            control_plane_config: None,
             max_lifetime: None,
             running_elapsed: Duration::ZERO,
             running_since: None,
@@ -325,6 +489,122 @@ impl SandboxMetadata {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    /// The ownership marker, on its own.
+    ///
+    /// 🔴 These are the tests that decide whether a sandbox appears in the
+    /// answer `node_reclaim`'s counterpart reconciles against, so each one
+    /// states which direction its failure goes.
+    mod ownership_marker {
+        use serde_json::Value;
+
+        use super::*;
+
+        fn record_with(field: Value) -> Value {
+            let mut value = serde_json::to_value(SandboxMetadata::default()).expect("encode");
+            value
+                .as_object_mut()
+                .expect("an object")
+                .insert("control_plane_config".to_string(), field);
+            value
+        }
+
+        #[test]
+        fn zero_bytes_is_not_a_marker() {
+            // 🔴 The wire type is protobuf `bytes`, which cannot distinguish
+            // "no marker" from "an empty one". Collapsing them here is what
+            // stops `Some(<zero bytes>)` existing as a third answer to a
+            // two-valued question.
+            assert_eq!(ControlPlaneConfig::from_bytes(Vec::new()), None);
+            assert_eq!(ControlPlaneConfig::from_bytes(""), None);
+            assert!(ControlPlaneConfig::from_bytes(vec![0u8]).is_some());
+        }
+
+        #[test]
+        fn the_bytes_come_back_exactly_as_they_went_in() {
+            // The node stores what it was sent. Anything that normalises,
+            // re-encodes or trims would break the only consumer there is: a
+            // control plane decoding its own record.
+            for bytes in [vec![0u8], vec![0xff, 0x00, 0xff], b"{}".to_vec()] {
+                let marker = ControlPlaneConfig::from_bytes(bytes.clone()).expect("non-empty");
+                assert_eq!(marker.as_bytes(), &bytes[..]);
+
+                let encoded = serde_json::to_string(&marker).expect("encode");
+                let decoded: ControlPlaneConfig = serde_json::from_str(&encoded).expect("decode");
+                assert_eq!(decoded.into_bytes(), bytes);
+            }
+        }
+
+        #[test]
+        fn it_survives_a_record_round_trip() {
+            let mut metadata = SandboxMetadata::default();
+            metadata.control_plane_config = ControlPlaneConfig::from_bytes(vec![1, 2, 3, 0xfe]);
+
+            let encoded = serde_json::to_string(&metadata).expect("encode");
+            let decoded: SandboxMetadata = serde_json::from_str(&encoded).expect("decode");
+
+            assert_eq!(
+                decoded
+                    .control_plane_config
+                    .map(ControlPlaneConfig::into_bytes),
+                Some(vec![1, 2, 3, 0xfe])
+            );
+        }
+
+        #[test]
+        fn an_absent_or_null_or_empty_field_means_unowned() {
+            // 🔴 All three are fail-closed: the sandbox is left out of the
+            // control plane's listing, which costs nothing, rather than put
+            // into it carrying a marker that says nothing.
+            for field in [
+                Value::Null,
+                Value::String(String::new()),
+                // base64 of zero bytes is also the empty string, so this is
+                // the same case reached the other way.
+                Value::String("".to_string()),
+            ] {
+                let decoded: SandboxMetadata =
+                    serde_json::from_value(record_with(field)).expect("decode");
+                assert!(decoded.control_plane_config.is_none());
+            }
+
+            let mut without = serde_json::to_value(SandboxMetadata::default()).expect("encode");
+            without
+                .as_object_mut()
+                .expect("an object")
+                .remove("control_plane_config");
+            let decoded: SandboxMetadata = serde_json::from_value(without).expect("decode");
+            assert!(decoded.control_plane_config.is_none());
+        }
+
+        #[test]
+        fn a_mangled_marker_is_an_error_and_not_an_absence() {
+            // 🔴 The opposite direction from the test above, and deliberately
+            // so. A field nobody wrote is a sandbox nobody owns; a field
+            // somebody wrote and got wrong is a corrupt record, and reading
+            // the second as the first would let corruption pass for an
+            // ordinary unowned sandbox.
+            let err = serde_json::from_value::<SandboxMetadata>(record_with(Value::String(
+                "not base64!!".to_string(),
+            )))
+            .expect_err("mangled base64 must not decode");
+            assert!(
+                err.to_string().contains("control plane config"),
+                "the error should name the field: {err}"
+            );
+        }
+
+        #[test]
+        fn debug_prints_the_size_and_not_the_contents() {
+            // The blob is a whole sandbox record, user metadata included, and
+            // `SandboxMetadata` is formatted into logs.
+            let marker =
+                ControlPlaneConfig::from_bytes(b"secret-workspace".to_vec()).expect("non-empty");
+            let rendered = format!("{marker:?}");
+            assert_eq!(rendered, "ControlPlaneConfig(16 bytes)");
+            assert!(!rendered.contains("secret"));
+        }
+    }
 
     #[test]
     fn metadata_timeout_work() {
@@ -837,7 +1117,15 @@ mod golden {
 
     /// Fields written only when they carry something, so a valid document may
     /// or may not have them. Both shapes have a fixture.
-    const OMISSIBLE_FIELDS: [&str; 2] = ["image_configs", "custom_extension_params"];
+    const OMISSIBLE_FIELDS: [&str; 3] = [
+        "image_configs",
+        "custom_extension_params",
+        // 🔴 Absent means "the control plane does not own this sandbox", which
+        // is why it belongs here and not among the required fields: the whole
+        // point of the marker is that a record without one is still a valid
+        // record, describing a sandbox nobody claims.
+        "control_plane_config",
+    ];
 
     /// The file REQUIRED_FIELDS is published in, so the other side can check
     /// itself against the list rather than against a restatement of it.
@@ -960,6 +1248,12 @@ mod golden {
             ),
             custom_extension_params: Some(custom_extension_params),
             secure: true,
+            // The bytes are nonsense on purpose: the node stores whatever the
+            // control plane sent, so a fixture that held valid JSON would
+            // invite someone to start reading it.
+            control_plane_config: ControlPlaneConfig::from_bytes(vec![
+                0x00, 0x01, 0xfe, 0xff, b'o', b'w', b'n', b'e', b'd',
+            ]),
             max_lifetime: Some(Duration::new(86_400, 0)),
             running_elapsed: Duration::new(5_400, 0),
             // Not written: `#[serde(skip)]`, and this record is paused anyway.

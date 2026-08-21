@@ -2,9 +2,9 @@ use crate::common;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::orchestrator::{
-    ClaimedExecution, CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore,
-    NewTimeout, Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState,
-    SandboxTimeoutAction,
+    ClaimedExecution, CreateSandboxRequest, FileBackedSandboxPersister, ForkChildren,
+    InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxLaunchSource,
+    SandboxState, SandboxTimeoutAction,
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
@@ -92,6 +92,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             network_policy: SandboxNetworkPolicy::default(),
             auto_resume: false,
             custom_extension_params: None,
+            control_plane_config: None,
             secure: true,
         };
 
@@ -121,7 +122,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert_envd_process_list_succeeds(&target, access_token.expose()).await?;
 
         let child = orchestrator
-            .fork_sandbox(sandbox_id, 1, NewTimeout::UseExisting)
+            .fork_sandbox(sandbox_id, ForkChildren::Fresh(1), NewTimeout::UseExisting)
             .await?
             .pop()
             .expect("one fork result")?;
@@ -254,6 +255,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 network_policy: SandboxNetworkPolicy::default(),
                 auto_resume: false,
                 custom_extension_params: None,
+                control_plane_config: None,
                 secure: false,
             })
             .await?;
@@ -348,6 +350,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 network_policy: SandboxNetworkPolicy::default(),
                 auto_resume: false,
                 custom_extension_params: None,
+                control_plane_config: None,
                 secure: false,
             })
             .await?;

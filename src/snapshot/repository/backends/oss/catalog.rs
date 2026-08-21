@@ -619,6 +619,48 @@ mod tests {
         }
     }
 
+    /// 🔴 A name belongs to one template at a time, and this is the object
+    /// store saying so.
+    ///
+    /// `POST /v3/templates` under a name that is already taken answers 400
+    /// "cannot rebind". That refusal is *this* rule and not the central
+    /// catalog's: it is what the object-store catalog has always done, so a
+    /// node on `write = "object_store"` — the configuration that predates the
+    /// central catalog entirely — refuses it the same way. Asserted here so the
+    /// attribution does not have to be re-derived from history the next time it
+    /// is reported.
+    #[tokio::test]
+    async fn a_second_template_cannot_take_a_name_that_is_already_bound() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        let alias = SnapshotAlias::parse("taken").expect("alias parses");
+        let first = SnapshotId::generate();
+        catalog
+            .create(SnapshotRecord::template_waiting(
+                first.clone(),
+                Some(alias.clone()),
+                SandboxResources::default(),
+            ))
+            .await
+            .expect("the first template takes the name");
+
+        let refused = catalog
+            .create(SnapshotRecord::template_waiting(
+                SnapshotId::generate(),
+                Some(alias),
+                SandboxResources::default(),
+            ))
+            .await
+            .expect_err("the name is not free");
+        match refused {
+            RepositoryError::AliasConflict { existing, .. } => assert_eq!(
+                existing, first,
+                "the refusal has to name the template still holding it"
+            ),
+            other => panic!("an alias conflict, got {other:?}"),
+        }
+    }
+
     /// Today a single `GET /snapshots` costs one LIST of `catalog/records/`
     /// plus one GET per record. Pin that `1 + N` down now, while it is still
     /// non-zero: a counter that reads zero both before and after the catalog

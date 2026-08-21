@@ -96,6 +96,26 @@ aenv start my-base
 aenv template delete my-service
 ```
 
+#### A name belongs to one template at a time
+
+Creating a second template under a name that is already taken is refused with
+`400 alias '<name>' already points to '<id>', cannot rebind to '<new-id>'`.
+`POST /v3/templates` creates a *new* template, and a name that is already bound
+would have to be taken off the template holding it to be given to the new one —
+so it is refused rather than moved silently.
+
+To build again under the same name, either build the existing template by its
+id or name:
+
+```bash
+aenv build ./Dockerfile --name my-service   # first time
+aenv template delete my-service             # release the name
+aenv build ./Dockerfile --name my-service   # build again under it
+```
+
+or give the new template a different name. This is long-standing behaviour and
+is the same on every repository backend.
+
 ## Manage Templates
 
 ### List templates

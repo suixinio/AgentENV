@@ -2567,3 +2567,107 @@ async fn a_template_whose_build_failed_can_be_built_again() {
         "and the retry is on it"
     );
 }
+
+/// 🔴 The template surface, against the server that hides the rows.
+///
+/// A template is created `waiting` and stays there until its first build
+/// commits, and the resolvable reading is `status_group = 'ready'`. So on a
+/// node reading PostgreSQL the whole template surface asked about rows the
+/// query refuses to return: the get 404s, both listings omit it, the alias
+/// does not resolve, and the build start that would have moved it out of
+/// `waiting` 404s too — which is why it could never become resolvable either.
+///
+/// The unscoped halves below are the control. They are what every launch path
+/// still uses, and they must go on refusing: a snapshot whose bytes are still
+/// uploading must not start a VM.
+#[tokio::test]
+async fn a_template_that_has_never_been_built_is_readable_only_at_the_scoped_reading() {
+    let concrete = catalog!();
+    // 🔴 Through the trait, not the concrete client. `CentralSnapshotCatalog`
+    // has inherent `*_scoped` methods with the same names, and inherent methods
+    // win method resolution — so a test written against the concrete type
+    // exercises those and says nothing about the `SnapshotCatalog` impl, which
+    // is the one the mirror and the repository call and the one the whole
+    // defect was in. Written this way the test fails when the override is
+    // dropped; written the other way it does not.
+    let catalog: &dyn SnapshotCatalog = concrete.as_ref();
+    let id = SnapshotId::generate();
+    let alias = unique_alias("pending-template");
+
+    catalog
+        .create(template_record(id.clone(), Some(&alias)))
+        .await
+        .expect("creating a template should work");
+
+    // The control: the reading a launch reaches.
+    assert!(
+        catalog
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_none(),
+        "a template with no committed build is not something to launch"
+    );
+    assert!(
+        catalog
+            .resolve_alias(&alias)
+            .await
+            .expect("resolving should work")
+            .is_none(),
+        "nor is its name"
+    );
+
+    // And the reading every endpoint under /templates now uses.
+    let seen = catalog
+        .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+        .await
+        .expect("reading should work")
+        .expect("a template must be visible to the surface that manages it");
+    assert_eq!(seen.id, id);
+    assert_eq!(
+        template_build_status(&seen),
+        TemplateBuildStatus::Waiting,
+        "and it must read as waiting, which is the state the surface reports"
+    );
+
+    assert_eq!(
+        catalog
+            .resolve_alias_scoped(&alias, CatalogReadScope::AnyStatus)
+            .await
+            .expect("resolving should work"),
+        Some(id.clone()),
+        "`aenv` turns every id-or-name argument into this lookup"
+    );
+
+    // 🔴 The listing, through the keyset page the endpoint actually calls
+    // rather than through `list`: it is a different statement, with the ready
+    // predicate spliced in at a different place, so agreeing about one says
+    // nothing about the other.
+    let page = catalog
+        .list_page_scoped(SnapshotListFilter::templates(), CatalogReadScope::AnyStatus)
+        .await
+        .expect("listing should work");
+    assert!(
+        page.items.iter().any(|row| row.id == id),
+        "a listing that cannot see `waiting` cannot see a newly created template"
+    );
+    let resolvable = catalog
+        .list_page_scoped(
+            SnapshotListFilter::templates(),
+            CatalogReadScope::Resolvable,
+        )
+        .await
+        .expect("listing should work");
+    assert!(
+        !resolvable.items.iter().any(|row| row.id == id),
+        "the control: the resolvable listing still hides it"
+    );
+}
+
+/// The build status of a template row, or a panic if it is not one.
+fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
+    match &record.source {
+        SnapshotSource::Template { build } => build.status,
+        other => panic!("a template record, got {other:?}"),
+    }
+}

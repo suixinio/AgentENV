@@ -157,13 +157,27 @@ func main() {
 			// applied. Until then every catalog RPC answers UNAVAILABLE — a
 			// refusal a caller can act on, where an empty page would read as
 			// "this cluster has no snapshots".
-			catalogStore := catalog.NewStoreWithPool(registryWriter.Pool(), catalog.StoreConfig{
-				Logger: logger,
-				Paused: scheduler.NewPausedHalfAdapter(registryWriter),
-			})
-			schedulerv1.RegisterSnapshotCatalogServer(g, scheduler.NewSnapshotCatalogService(
+			catalogStore := catalog.NewStoreWithPool(registryWriter.Pool(),
+				catalogStoreConfig(logger, cfg, scheduler.NewPausedHalfAdapter(registryWriter)))
+			catalogSvc := scheduler.NewSnapshotCatalogService(
 				logger, catalogStore, registryGrace, cfg.Scheduler.Registry.ClusterID,
-			))
+			)
+			schedulerv1.RegisterSnapshotCatalogServer(g, catalogSvc)
+
+			// 🔴 Started here rather than inside the scoped branch below, and
+			// not optional. `builds_one_active_per_template` turns one build
+			// whose process died into a template nobody can ever build again,
+			// so serving StartBuild without running this converts today's leak
+			// into an outage for that template — which makes "the reaper runs
+			// wherever the catalog is served" the invariant worth having, over
+			// a condition somebody has to remember to mirror. Its own refusals
+			// live in RunBuildReaper, which says so at error level and returns
+			// rather than looping.
+			go catalogSvc.RunBuildReaper(sigCtx,
+				cfg.Scheduler.Catalog.BuildReapInterval,
+				cfg.Scheduler.Catalog.BuildHeartbeatTTL,
+			)
+			announceBuildQueue(logger, cfg)
 
 			// 🔴 Registered either way, and left cold when there is no cluster
 			// scope. Not registering would answer Unimplemented, which reads as
@@ -288,6 +302,46 @@ func main() {
 // heartbeats and no discovery, so it has no standing to decide any node has
 // gone — and the gauge stays at zero there, which is the truth about that
 // process rather than a copy of the primary's setting.
+// catalogStoreConfig is the catalog store's configuration, in one place a test
+// can reach.
+//
+// 🔴 Extracted for the ceiling. A MaxConcurrentBuilds that never leaves the
+// config is not an error anywhere: the store falls back to its own default and
+// runs, so a cluster configured for four builds quietly admits twenty, and the
+// only trace is the twenty-first refusal.
+func catalogStoreConfig(logger *zap.Logger, cfg config.Config, paused catalog.PausedHalf) catalog.StoreConfig {
+	return catalog.StoreConfig{
+		Logger:              logger,
+		Paused:              paused,
+		MaxConcurrentBuilds: cfg.Scheduler.Catalog.MaxConcurrentBuilds,
+	}
+}
+
+// announceBuildQueue says what the build queue's bounds resolved to, and warns
+// about the one combination that is legal and still a bad idea.
+//
+// 🔴 Printed rather than left to be inferred, because these two numbers decide
+// whether a user's build is refused and whether one that is running is thrown
+// away, and neither answer is visible anywhere else until it happens.
+func announceBuildQueue(logger *zap.Logger, cfg config.Config) {
+	catalogCfg := cfg.Scheduler.Catalog
+	fields := []zap.Field{
+		zap.Int("max_concurrent_builds", catalogCfg.MaxConcurrentBuilds),
+		zap.Duration("build_heartbeat_ttl", catalogCfg.BuildHeartbeatTTL),
+		zap.Duration("build_reap_interval", catalogCfg.BuildReapInterval),
+	}
+	if catalogCfg.MaxConcurrentBuilds < 0 {
+		// 🔴 Legal, and it takes writing a negative number, so it is a
+		// deliberate choice. It is still worth one line saying what was chosen:
+		// with no ceiling the only thing bounding concurrent builds is how many
+		// VMs the fleet can boot, and the first symptom is nodes running out of
+		// memory rather than a refusal anybody can read.
+		logger.Warn("scheduler snapshot catalog build queue has no cluster-wide ceiling: nothing but the fleet's capacity limits how many builds run at once", fields...)
+		return
+	}
+	logger.Info("scheduler snapshot catalog build queue enabled", fields...)
+}
+
 func announceBindingSweep(logger *zap.Logger, cfg config.Config) {
 	enabled := cfg.Scheduler.Routing.BindingSweep
 	silence := cfg.Scheduler.BindingSweepSilence

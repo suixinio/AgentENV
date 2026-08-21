@@ -21,6 +21,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -908,6 +910,89 @@ func TestTheReaperRefusesToRunWithoutSomethingToScopeItTo(t *testing.T) {
 			case <-done:
 			case <-time.After(2 * reaperTestTTL):
 				t.Fatal("the reaper kept looping over a configuration it cannot run")
+			}
+		})
+	}
+}
+
+// TestEveryBuildPathLooksAtTheClockItWasSent covers the call sites, which the
+// test below cannot: it exercises noteClockSkew directly, so removing either
+// call would leave it passing.
+//
+// 🔴 Both paths, because they see different fleets. StartBuild is reached once
+// per build and RenewBuildLease every few minutes for as long as one runs, so a
+// node whose clock is wrong shows up on the second long before anybody notices
+// the first — and the version of this code that lost work read the value on
+// both.
+func TestEveryBuildPathLooksAtTheClockItWasSent(t *testing.T) {
+	faraway := time.Now().Add(-2 * time.Hour).UnixMilli()
+
+	t.Run("StartBuild", func(t *testing.T) {
+		core, logs := observer.New(zapcore.WarnLevel)
+		id := serviceUUID(t)
+		store := &stubCatalogStore{build: catalog.StartBuildOutcome{
+			Build:    &catalog.BuildRow{BuildID: id},
+			Snapshot: &catalog.SnapshotRow{SnapshotID: id},
+		}}
+		svc := NewSnapshotCatalogService(zap.New(core), store, stubGate{}, serviceCluster)
+
+		if _, err := svc.StartBuild(context.Background(), &schedulerv1.StartBuildRequest{
+			ClusterId: serviceCluster, NodeId: "node-a", BuildId: id, TemplateId: id,
+			HeartbeatAtUnixMs: faraway,
+		}); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		if logs.Len() == 0 {
+			t.Fatal("an admission from a node two hours out of step said nothing")
+		}
+	})
+
+	t.Run("RenewBuildLease", func(t *testing.T) {
+		core, logs := observer.New(zapcore.WarnLevel)
+		svc := NewSnapshotCatalogService(zap.New(core), &stubCatalogStore{live: true}, stubGate{}, serviceCluster)
+
+		if _, err := svc.RenewBuildLease(context.Background(), &schedulerv1.RenewBuildLeaseRequest{
+			ClusterId: serviceCluster, NodeId: "node-a", BuildId: serviceUUID(t),
+			HeartbeatAtUnixMs: faraway,
+		}); err != nil {
+			t.Fatalf("renew: %v", err)
+		}
+		if logs.Len() == 0 {
+			t.Fatal("a heartbeat from a node two hours out of step said nothing")
+		}
+	})
+}
+
+// TestABuildHeartbeatFromAFarawayClockIsReported.
+//
+// 🔴 What this replaces. The heartbeat used to be stored as the node stamped it
+// and judged against whoever ran the reaping pass, so a node whose clock was
+// minutes off had its builds ended while they were still running — and nothing
+// anywhere compared the two clocks, so the only symptom was builds dying. Both
+// ends are the database's now, which means the skew no longer decides anything;
+// this is what stops it from going back to being invisible.
+func TestABuildHeartbeatFromAFarawayClockIsReported(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		at     int64
+		report bool
+	}{
+		{name: "an hour behind", at: time.Now().Add(-time.Hour).UnixMilli(), report: true},
+		{name: "an hour ahead", at: time.Now().Add(time.Hour).UnixMilli(), report: true},
+		{name: "this moment", at: time.Now().UnixMilli(), report: false},
+		// 🔴 Not reported. Zero is "the caller sent nothing", and a build path
+		// that stops sending the field must not read as every node in the fleet
+		// having a clock set to 1970.
+		{name: "nothing sent", at: 0, report: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.WarnLevel)
+			svc := NewSnapshotCatalogService(zap.New(core), &stubCatalogStore{}, stubGate{}, serviceCluster)
+
+			svc.noteClockSkew("RenewBuildLease", "node-a", tc.at)
+
+			if got := logs.Len() > 0; got != tc.report {
+				t.Fatalf("reported = %v, want %v (entries: %+v)", got, tc.report, logs.All())
 			}
 		})
 	}

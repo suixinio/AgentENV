@@ -44,6 +44,7 @@ mod backlog;
 mod central;
 mod compensator;
 mod metrics;
+mod population;
 #[cfg(test)]
 pub(crate) mod test_doubles;
 
@@ -57,7 +58,7 @@ use crate::snapshot::repository::backends::central::{
     CatalogWrite, STATUS_BUILDING,
 };
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotAlias, SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
@@ -67,6 +68,7 @@ pub use backlog::{
 };
 pub use central::CentralCatalogWrites;
 pub use compensator::{MirrorCompensator, DEFAULT_COMPENSATOR_INTERVAL};
+pub use population::{admit_read_side, CatalogCensus, CatalogPopulations, ObjectStoreCensus};
 
 use backlog::MirrorOp;
 use metrics::{
@@ -177,6 +179,25 @@ pub struct DualWriteCatalog {
     central: Arc<dyn CentralCatalogWrites>,
     object_store: Arc<dyn SnapshotCatalog>,
     backlog: Arc<MirrorBacklog>,
+    reads: CatalogReads,
+}
+
+/// Which of the two catalogs answers a read.
+///
+/// 🔴 Reads move as one. `get`, `list`, `list_page` and `resolve_alias` all
+/// answer the same question — does this snapshot exist and what is it — and a
+/// deployment that took half of them from one store and half from the other
+/// would report a snapshot as present to one endpoint and absent to another,
+/// which is worse than either side being wrong on its own.
+///
+/// 🔴 The reading side is the *whole* `SnapshotCatalog` surface, not the narrow
+/// [`CentralCatalogWrites`] the double write uses. That is deliberate: reading
+/// through the ordinary trait is what makes the central catalog's resolvable
+/// scope — `status_group = 'ready'` — the default here too, without this module
+/// restating a predicate it does not own.
+enum CatalogReads {
+    ObjectStore,
+    Central(Arc<dyn SnapshotCatalog>),
 }
 
 impl DualWriteCatalog {
@@ -189,6 +210,26 @@ impl DualWriteCatalog {
             central,
             object_store,
             backlog,
+            reads: CatalogReads::ObjectStore,
+        }
+    }
+
+    /// Moves reads onto the central catalog.
+    ///
+    /// 🔴 Only legal once the central catalog holds what the object store does,
+    /// which is not something this type can check — [`MirrorBacklog::guard_read_side`]
+    /// and the population comparison that runs beside it are what refuse the
+    /// switch, and they run before this is called.
+    pub fn reading_from_central(mut self, central: Arc<dyn SnapshotCatalog>) -> Self {
+        self.reads = CatalogReads::Central(central);
+        self
+    }
+
+    /// The catalog reads are answered from.
+    fn read_catalog(&self) -> &dyn SnapshotCatalog {
+        match &self.reads {
+            CatalogReads::ObjectStore => self.object_store.as_ref(),
+            CatalogReads::Central(central) => central.as_ref(),
         }
     }
 
@@ -556,11 +597,24 @@ impl SnapshotCatalog for DualWriteCatalog {
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.object_store.get(id_or_alias).await
+        self.read_catalog().get(id_or_alias).await
     }
 
+    /// 🔴 The unbounded listing stays on the object store whichever side serves
+    /// reads.
+    ///
+    /// Its two callers are the history backfill and the comparison that guards
+    /// the read-side switch, and both are asking *about* the object store:
+    /// "everything it holds" is the question, and answering it from the other
+    /// catalog would make the backfill queue the central catalog's own rows
+    /// back to itself and make the comparison compare PostgreSQL with
+    /// PostgreSQL — a check that passes by construction.
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
         self.object_store.list(filter).await
+    }
+
+    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
+        self.read_catalog().list_page(filter).await
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
@@ -607,7 +661,7 @@ impl SnapshotCatalog for DualWriteCatalog {
     }
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        self.object_store.resolve_alias(alias).await
+        self.read_catalog().resolve_alias(alias).await
     }
 
     /// 🔴 Object store only, on purpose, and the one write that is not doubled.

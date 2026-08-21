@@ -788,6 +788,15 @@ struct DirectionCounters {
     unrecorded: AtomicU64,
     /// Snapshots recorded as permanently disagreeing.
     diverged: AtomicU64,
+    /// Owed writes this process has since replayed successfully.
+    ///
+    /// 🔴 In-process and therefore zero at startup, which is exactly why it is
+    /// evidence and not a gate. The number that tells "the backfill ran" apart
+    /// from "the backfill never had anything to do" is this one *after* the
+    /// compensator has had a pass, read off `/metrics` — a check at startup
+    /// would read zero in both cases, which is the failure this whole family of
+    /// numbers keeps producing.
+    repaired: AtomicU64,
 }
 
 /// The durable queue of owed catalog writes, and the disagreements nothing can
@@ -932,6 +941,29 @@ impl MirrorBacklog {
         self.counters(direction).diverged.load(Ordering::Acquire)
     }
 
+    /// How many owed writes this process has replayed onto `direction`.
+    ///
+    /// Corroboration, never a condition: see the field it reads.
+    pub fn repaired_toward(&self, direction: MirrorDirection) -> u64 {
+        self.counters(direction).repaired.load(Ordering::Acquire)
+    }
+
+    /// Which store the last process to run here answered reads from.
+    ///
+    /// `None` on a store that has never recorded one — a first start, or a
+    /// mirror directory that was cleared. 🔴 Read *before* the guard records
+    /// the configured side, because it is what tells a switch from a restart,
+    /// and every check that only applies to a switch needs the answer while it
+    /// is still true.
+    pub async fn recorded_read_side(&self) -> anyhow::Result<Option<CatalogReadSide>> {
+        Ok(self
+            .store
+            .get(READ_SIDE_KEY.to_vec())
+            .await
+            .context("read the catalog mirror's recorded read side")?
+            .and_then(|raw| CatalogReadSide::parse(&raw)))
+    }
+
     /// Everything owed, in either direction.
     pub fn lag(&self) -> u64 {
         MirrorDirection::ALL
@@ -974,13 +1006,19 @@ impl MirrorBacklog {
     /// [`Self::queue_history_toward_central`] has run, the marker is on disk
     /// for good, so refusing here cannot strand a node that was serving
     /// PostgreSQL reads a moment ago.
+    /// 🔴 Checks only. Recording the side is [`Self::record_read_side`], and
+    /// they are separate because something else has to run between them: the
+    /// direct comparison of what each catalog holds. Recording here would mean
+    /// a comparison that refused *after* the key was written, and the next
+    /// start would then read "not a switch" and skip the check that had just
+    /// said no.
+    ///
+    /// The order is deliberate the other way too. These three checks are local
+    /// and free; the comparison costs a full listing of both catalogs. A node
+    /// whose mirror is simply behind should be told so immediately rather than
+    /// after enumerating ten thousand rows.
     pub async fn guard_read_side(&self, configured: CatalogReadSide) -> anyhow::Result<()> {
-        let previous = self
-            .store
-            .get(READ_SIDE_KEY.to_vec())
-            .await
-            .context("read the catalog mirror's recorded read side")?
-            .and_then(|raw| CatalogReadSide::parse(&raw));
+        let previous = self.recorded_read_side().await?;
 
         if configured == CatalogReadSide::Postgres && !self.history_is_queued().await? {
             anyhow::bail!(
@@ -1022,6 +1060,15 @@ impl MirrorBacklog {
             }
         }
 
+        Ok(())
+    }
+
+    /// Records the side this process is serving reads from.
+    ///
+    /// 🔴 Last, after every refusal has had its say. What it buys is the
+    /// ability to tell a switch from a restart, and it is only true if nothing
+    /// that could still refuse runs after it.
+    pub async fn record_read_side(&self, configured: CatalogReadSide) -> anyhow::Result<()> {
         self.store
             .put(READ_SIDE_KEY.to_vec(), configured.as_bytes().to_vec())
             .await
@@ -1520,6 +1567,9 @@ impl MirrorBacklog {
                     }
                     self.drop_owed(direction);
                     record_mirror_repaired(direction, op.name());
+                    self.counters(direction)
+                        .repaired
+                        .fetch_add(1, Ordering::AcqRel);
                     pass.repaired += 1;
                 }
                 RepairVerdict::Diverged => {
@@ -2733,7 +2783,7 @@ mod tests {
 
         // And it pins the switch, which is the point of counting it.
         backlog
-            .guard_read_side(CatalogReadSide::Postgres)
+            .record_read_side(CatalogReadSide::Postgres)
             .await
             .expect("recording the side should work");
         backlog
@@ -2786,7 +2836,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let backlog = backlog(&dir).await;
         backlog
-            .guard_read_side(CatalogReadSide::ObjectStore)
+            .record_read_side(CatalogReadSide::ObjectStore)
             .await
             .expect("the first start records the side");
         backlog
@@ -2811,7 +2861,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let backlog = backlog(&dir).await;
         backlog
-            .guard_read_side(CatalogReadSide::Postgres)
+            .record_read_side(CatalogReadSide::Postgres)
             .await
             .expect("recording the side should work");
         backlog
@@ -2854,7 +2904,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let backlog = backlog(&dir).await;
         backlog
-            .guard_read_side(CatalogReadSide::ObjectStore)
+            .record_read_side(CatalogReadSide::ObjectStore)
             .await
             .expect("recording the side should work");
         backlog
@@ -2879,7 +2929,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let backlog = backlog(&dir).await;
         backlog
-            .guard_read_side(CatalogReadSide::ObjectStore)
+            .record_read_side(CatalogReadSide::ObjectStore)
             .await
             .expect("recording the side should work");
         backlog

@@ -273,8 +273,26 @@ impl SnapshotCatalog for ScriptedCatalog {
         Ok(())
     }
 
-    async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        Ok(None)
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        self.note(format!("resolve_alias:{alias}"));
+        if self.get_fails.load(Ordering::SeqCst) || self.broken.load(Ordering::SeqCst) {
+            return Err(RepositoryError::Backend {
+                message: "cannot read".to_string(),
+                source: None,
+            });
+        }
+        Ok(self
+            .rows
+            .lock()
+            .expect("rows")
+            .values()
+            .find(|record| {
+                record
+                    .alias
+                    .as_ref()
+                    .is_some_and(|held| held.to_string() == alias)
+            })
+            .map(|record| record.id.clone()))
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {

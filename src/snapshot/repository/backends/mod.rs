@@ -15,10 +15,11 @@ use crate::cfg::{
 use crate::image::cache::local_image_services_from_app_config;
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::mirror::{
-    CatalogReadSide, CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorCompensator,
-    MirrorDirection, MirrorTargets,
+    admit_read_side, CatalogReadSide, CentralCatalogWrites, DualWriteCatalog, MirrorBacklog,
+    MirrorCompensator, MirrorDirection, MirrorTargets, ObjectStoreCensus,
 };
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogReadScope, CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
@@ -48,6 +49,18 @@ pub async fn build_snapshot_backend(
     let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
 
     let Some(central) = build_central_catalog(config)? else {
+        // 🔴 A node told to read PostgreSQL with no central catalog wired would
+        // otherwise serve every read from object storage while its
+        // configuration says otherwise — the quietest possible version of the
+        // failure the whole matrix exists to prevent.
+        if config.snapshot.catalog.read == SnapshotCatalogRead::Postgres {
+            anyhow::bail!(
+                "snapshot.catalog.read = \"postgres\" was configured but no central catalog was \
+                 built, so reads would silently come from object storage. Set \
+                 snapshot.catalog.write = \"both\" with a scheduler endpoint, or set read = \
+                 \"object_store\"."
+            );
+        }
         let compensator = drain_a_rolled_back_mirror(
             &config.snapshot.catalog.mirror_backlog_path,
             std::time::Duration::from_secs(
@@ -90,15 +103,34 @@ pub async fn build_snapshot_backend(
         );
     }
 
+    let configured_read = match config.snapshot.catalog.read {
+        SnapshotCatalogRead::ObjectStore => CatalogReadSide::ObjectStore,
+        SnapshotCatalogRead::Postgres => CatalogReadSide::Postgres,
+    };
+
     // 🔴 Before anything is served. A node whose read side has just been moved
-    // back onto a store that is behind would answer "absent" for every snapshot
-    // the mirror still owes, and absence is an instruction downstream.
-    backlog
-        .guard_read_side(match config.snapshot.catalog.read {
-            SnapshotCatalogRead::ObjectStore => CatalogReadSide::ObjectStore,
-            SnapshotCatalogRead::Postgres => CatalogReadSide::Postgres,
-        })
-        .await?;
+    // onto a store that does not hold everything would answer "absent" for
+    // every snapshot the other one has, and absence is an instruction
+    // downstream: callers delete artifacts and refuse resumes on it.
+    let populations = admit_read_side(
+        configured_read,
+        &backlog,
+        &ObjectStoreCensus(object_store_catalog.as_ref()),
+        central.as_ref(),
+    )
+    .await?;
+    if configured_read == CatalogReadSide::Postgres {
+        tracing::info!(
+            target: "agentenv",
+            catalog_rows = populations.central_rows,
+            object_store_rows = populations.object_store_rows,
+            mirror_lag = backlog.lag_toward(MirrorDirection::Central),
+            mirror_diverged = backlog.diverged_toward(MirrorDirection::Central),
+            "reads are served from the central catalog. The admission compared identity, not \
+             content: two rows sharing an id and disagreeing about anything else pass it, and \
+             rows both stores took on the live path are compared field by field by nothing"
+        );
+    }
 
     let compensator = MirrorCompensator::spawn(
         Arc::clone(&backlog),
@@ -107,20 +139,41 @@ pub async fn build_snapshot_backend(
         std::time::Duration::from_secs(config.snapshot.catalog.mirror_compensator_interval_secs),
     );
 
-    let dual = Arc::new(DualWriteCatalog::new(
-        central as Arc<dyn CentralCatalogWrites>,
+    let dual = DualWriteCatalog::new(
+        Arc::clone(&central) as Arc<dyn CentralCatalogWrites>,
         object_store_catalog,
         backlog,
-    ));
+    );
+    let dual = Arc::new(match configured_read {
+        CatalogReadSide::ObjectStore => dual,
+        // 🔴 The whole `SnapshotCatalog` surface, so the resolvable scope the
+        // central client already applies — `status_group = 'ready'` — comes
+        // with it. Reading through the narrower write trait would have meant
+        // restating that predicate here, one layer away from the queries that
+        // own it.
+        CatalogReadSide::Postgres => {
+            dual.reading_from_central(Arc::clone(&central) as Arc<dyn SnapshotCatalog>)
+        }
+    });
     let artifacts = repository.artifacts();
     let node_id = crate::identity::local_node_id();
-    tracing::info!(
-        target: "agentenv",
-        catalog_write = "both",
-        catalog_read = "object_store",
-        node_id = %node_id,
-        "snapshot catalog is double-written; object storage still answers reads"
-    );
+    match configured_read {
+        CatalogReadSide::ObjectStore => tracing::info!(
+            target: "agentenv",
+            catalog_write = "both",
+            catalog_read = "object_store",
+            node_id = %node_id,
+            "snapshot catalog is double-written; object storage still answers reads"
+        ),
+        CatalogReadSide::Postgres => tracing::info!(
+            target: "agentenv",
+            catalog_write = "both",
+            catalog_read = "postgres",
+            node_id = %node_id,
+            "snapshot catalog is double-written; the central catalog answers reads, and object \
+             storage is the way back"
+        ),
+    }
 
     Ok(AssembledSnapshotBackend {
         repository: Arc::new(SnapshotRepository::on_node(dual, artifacts, node_id)),

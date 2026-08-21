@@ -19,6 +19,12 @@ struct Fixture {
     _dir: tempfile::TempDir,
     central: Arc<ScriptedCentral>,
     object_store: Arc<ScriptedCatalog>,
+    /// The central catalog as a *read* surface.
+    ///
+    /// 🔴 A second double rather than the same one, because the point of every
+    /// read-side test is that the two stores can answer differently. A fixture
+    /// where they shared state would pass whichever side the read came from.
+    central_reads: Arc<ScriptedCatalog>,
     backlog: Arc<MirrorBacklog>,
     dual: DualWriteCatalog,
 }
@@ -47,9 +53,20 @@ impl Fixture {
             _dir: dir,
             central,
             object_store,
+            central_reads: Arc::new(ScriptedCatalog::default()),
             backlog,
             dual,
         }
+    }
+
+    /// The same double write with its reads moved onto the central catalog.
+    fn reading_from_central(&self) -> DualWriteCatalog {
+        DualWriteCatalog::new(
+            Arc::clone(&self.central) as Arc<dyn CentralCatalogWrites>,
+            Arc::clone(&self.object_store) as Arc<dyn SnapshotCatalog>,
+            Arc::clone(&self.backlog),
+        )
+        .reading_from_central(Arc::clone(&self.central_reads) as Arc<dyn SnapshotCatalog>)
     }
 
     fn targets(&self) -> MirrorTargets {
@@ -921,7 +938,7 @@ async fn moving_reads_to_postgres_is_refused_while_the_central_catalog_disagrees
     let fixture = Fixture::new().await;
     fixture
         .backlog
-        .guard_read_side(CatalogReadSide::ObjectStore)
+        .record_read_side(CatalogReadSide::ObjectStore)
         .await
         .expect("the first start records the side");
 
@@ -1133,4 +1150,143 @@ fn every_refusal_reason_has_its_own_label() {
     .map(CatalogRefusal::as_metric_label)
     .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(labels.len(), 9);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The read side, and which store answers what
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Two stores, deliberately disagreeing: whichever row comes back names the
+/// side the read was answered from. Nothing here is about correctness of the
+/// data; it is about the routing being real.
+fn a_row_named(alias: &str) -> SnapshotRecord {
+    let mut record = committed_record(&SnapshotId::generate());
+    record.alias = Some(crate::snapshot::types::SnapshotAlias::parse(alias).expect("alias"));
+    record
+}
+
+#[tokio::test]
+async fn a_read_comes_from_the_central_catalog_once_the_read_side_has_moved() {
+    let fixture = Fixture::new().await;
+    let object_store_row = a_row_named("in-object-storage");
+    let central_row = a_row_named("in-postgres");
+    fixture.object_store.seed(object_store_row.clone());
+    fixture.central_reads.seed(central_row.clone());
+
+    let dual = fixture.reading_from_central();
+
+    let found = dual
+        .get(&central_row.id.to_string())
+        .await
+        .expect("the read should work")
+        .expect("the central catalog holds it");
+    assert_eq!(found.id, central_row.id);
+
+    assert!(
+        dual.get(&object_store_row.id.to_string())
+            .await
+            .expect("the read should work")
+            .is_none(),
+        "a row only object storage holds must not be answered from the central catalog"
+    );
+}
+
+/// 🔴 The listing endpoints' read, which is the one the batch exists for. A
+/// page has to come from the same side `get` does, or the same snapshot is
+/// present to one endpoint and absent to another.
+#[tokio::test]
+async fn a_listing_page_comes_from_the_side_that_answers_reads() {
+    let fixture = Fixture::new().await;
+    let object_store_row = a_row_named("in-object-storage");
+    let central_row = a_row_named("in-postgres");
+    let object_store =
+        Arc::new(ScriptedCatalog::default().with_history(vec![object_store_row.clone()]));
+    let central_reads =
+        Arc::new(ScriptedCatalog::default().with_history(vec![central_row.clone()]));
+
+    let dual = || {
+        DualWriteCatalog::new(
+            Arc::clone(&fixture.central) as Arc<dyn CentralCatalogWrites>,
+            Arc::clone(&object_store) as Arc<dyn SnapshotCatalog>,
+            Arc::clone(&fixture.backlog),
+        )
+    };
+    let page_ids =
+        |page: SnapshotListPage| page.items.into_iter().map(|row| row.id).collect::<Vec<_>>();
+
+    let from_object_store = dual()
+        .list_page(SnapshotListFilter::matches_all())
+        .await
+        .expect("the listing should work");
+    assert_eq!(page_ids(from_object_store), vec![object_store_row.id]);
+
+    let from_central = dual()
+        .reading_from_central(Arc::clone(&central_reads) as Arc<dyn SnapshotCatalog>)
+        .list_page(SnapshotListFilter::matches_all())
+        .await
+        .expect("the listing should work");
+    assert_eq!(page_ids(from_central), vec![central_row.id]);
+}
+
+#[tokio::test]
+async fn resolving_a_name_comes_from_the_side_that_answers_reads() {
+    let fixture = Fixture::new().await;
+    let object_store_row = a_row_named("shared-name");
+    let mut central_row = a_row_named("shared-name");
+    central_row.id = SnapshotId::generate();
+    fixture.object_store.seed(object_store_row.clone());
+    fixture.central_reads.seed(central_row.clone());
+
+    assert_eq!(
+        fixture
+            .dual
+            .resolve_alias("shared-name")
+            .await
+            .expect("resolving should work"),
+        Some(object_store_row.id.clone())
+    );
+    assert_eq!(
+        fixture
+            .reading_from_central()
+            .resolve_alias("shared-name")
+            .await
+            .expect("resolving should work"),
+        Some(central_row.id.clone())
+    );
+}
+
+/// 🔴 The unbounded listing does *not* move, and this is the test that says so.
+///
+/// Its two callers are the history backfill and the comparison that guards the
+/// switch, and both are asking a question *about the object store*. Answering
+/// them from the central catalog would make the backfill queue PostgreSQL's own
+/// rows back to itself, and would make the gate compare PostgreSQL with
+/// PostgreSQL — a check that passes by construction, over the exact state it
+/// exists to catch.
+#[tokio::test]
+async fn the_unbounded_listing_stays_on_the_object_store_after_the_switch() {
+    let fixture = Fixture::new().await;
+    let history = vec![a_row_named("older-than-the-mirror")];
+    let object_store = Arc::new(ScriptedCatalog::default().with_history(history.clone()))
+        as Arc<dyn SnapshotCatalog>;
+    let central_reads = Arc::new(ScriptedCatalog::default().with_history(vec![]));
+
+    let dual = DualWriteCatalog::new(
+        Arc::clone(&fixture.central) as Arc<dyn CentralCatalogWrites>,
+        object_store,
+        Arc::clone(&fixture.backlog),
+    )
+    .reading_from_central(central_reads as Arc<dyn SnapshotCatalog>);
+
+    let listed = dual
+        .list(SnapshotListFilter::matches_all())
+        .await
+        .expect("the listing should work");
+
+    assert_eq!(
+        listed.len(),
+        1,
+        "the unbounded listing must still describe object storage, whatever answers reads"
+    );
+    assert_eq!(listed[0].id, history[0].id);
 }

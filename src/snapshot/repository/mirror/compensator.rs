@@ -235,7 +235,12 @@ mod tests {
                 return;
             }
             tokio::time::advance(Duration::from_millis(1_100)).await;
-            for _ in 0..20 {
+            // 🔴 Generous on purpose. The loop's work lands through
+            // `spawn_blocking`, so the number of yields it takes to see a tick
+            // through depends on how loaded the machine is — and a budget tuned
+            // to an idle run turns into a test that fails only when the rest of
+            // the suite is running beside it.
+            for _ in 0..200 {
                 tokio::task::yield_now().await;
             }
         }

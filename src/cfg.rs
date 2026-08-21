@@ -1254,38 +1254,33 @@ impl AppConfig {
                  nothing writes any more, so every snapshot published since the switch reads as \
                  absent. Set read = \"postgres\" in the same change."
             ),
-            // Legal in the arrangement this is heading for, and not yet built:
-            // the read path against the central catalog is the next batch's
-            // work, and dropping the object-store copy is the batch after that.
-            // Refused by name so a deployment that sets it is told which batch
-            // it is waiting for instead of quietly reading an empty table.
-            //
-            // 🔴 Opening this arm is not the whole switch. The batch that does
-            // it inherits a second refusal it has to satisfy rather than
-            // remove: `MirrorBacklog::guard_read_side` will not let a node move
-            // its reads onto PostgreSQL while PostgreSQL is behind, and
-            // "behind" means three separate things there.
+            // 🔴 The read switch, and passing here is not the switch being
+            // allowed — it is only this layer having nothing left to say about
+            // it. Four more refusals sit below, and every one of them is about
+            // whether PostgreSQL actually holds what object storage does:
             //
             //   1. Owed writes — `mirror_lag{direction="central"}`.
             //   2. Disagreements no replay can settle —
-            //      `mirror_diverged{direction="central"}`. In this build that
-            //      is every template, because `try_start_build` writes object
-            //      storage alone. A cluster holding templates reads a mirror
-            //      lag of zero and would otherwise be waved through into making
-            //      all of them vanish from the API.
-            //   3. 🔴 The snapshots that predate the double write. Neither
-            //      number says anything about those — both count writes the
-            //      mirror *saw* — so on the cluster this was measured on, the
-            //      instant `write = "both"` was switched on read `lag = 0,
-            //      diverged = 0` over thirty-two snapshots PostgreSQL had never
-            //      heard of. `MirrorBacklog::queue_history_toward_central` puts
-            //      them into the queue at startup and the guard refuses the
+            //      `mirror_diverged{direction="central"}`. Until build
+            //      admission is wired that is every template, because
+            //      `try_start_build` writes object storage alone. A cluster
+            //      holding templates reads a mirror lag of zero and would
+            //      otherwise be waved through into making all of them vanish
+            //      from the API.
+            //   3. The snapshots that predate the double write. Neither number
+            //      says anything about those — both count writes the mirror
+            //      *saw* — so on the cluster this was measured on, the instant
+            //      `write = "both"` was switched on read `lag = 0, diverged =
+            //      0` over thirty-two snapshots PostgreSQL had never heard of.
+            //      `MirrorBacklog::queue_history_toward_central` puts them into
+            //      the queue at startup and `guard_read_side` refuses the
             //      switch until it has run.
-            (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => bail!(
-                "snapshot.catalog: read = \"postgres\" is not served yet. The central catalog is \
-                 written in this build and read in the next one; until then reads come from \
-                 object storage. Set read = \"object_store\"."
-            ),
+            //   4. 🔴 And because all three of those describe the *queue*
+            //      rather than the two catalogs, a direct comparison of what
+            //      each one holds runs beside them —
+            //      `compare_catalog_populations`. It is the only one of the
+            //      four that needs no marker and no gauge to be right.
+            (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => Ok(()),
             (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::Postgres) => bail!(
                 "snapshot.catalog: write = \"postgres\" drops the object-store copy, which is the \
                  only way back from the central catalog. It is allowed once the read side has \
@@ -1909,10 +1904,14 @@ mod tests {
                 SnapshotCatalogRead::ObjectStore,
                 Some("reads a store nothing writes any more"),
             ),
+            // 🔴 Legal as of the read switch, and this layer having nothing to
+            // say about it is not the switch being safe: `guard_read_side` and
+            // the population comparison run below it, on a store this function
+            // cannot see.
             (
                 SnapshotCatalogWrite::Both,
                 SnapshotCatalogRead::Postgres,
-                Some("is not served yet"),
+                None,
             ),
             (
                 SnapshotCatalogWrite::Postgres,
@@ -1941,6 +1940,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 🔴 This layer no longer answers for the one below it.
+    ///
+    /// `read = "postgres"` used to be refused here, one layer *above*
+    /// `MirrorBacklog::guard_read_side` — so everything that guard refuses on
+    /// had never executed anywhere but a unit test of the guard itself. Opening
+    /// the arm is not the same as those refusals working, and this test is the
+    /// seam: the configuration that now passes here goes straight on to meet
+    /// them, and is refused by them.
+    ///
+    /// The control is the second half: with the same configuration and two
+    /// catalogs that agree, the same call is allowed.
+    #[tokio::test]
+    async fn a_legal_postgres_read_still_has_to_get_past_the_mirror() {
+        use crate::snapshot::repository::mirror::{
+            admit_read_side, CatalogCensus, CatalogReadSide, MirrorBacklog, MirrorDirection,
+        };
+        use crate::snapshot::repository::RepositoryResult;
+        use crate::snapshot::SnapshotId;
+
+        struct Census(Vec<SnapshotId>);
+
+        #[async_trait::async_trait]
+        impl CatalogCensus for Census {
+            async fn every_snapshot_id(&self) -> RepositoryResult<Vec<SnapshotId>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let mut config = AppConfig::default();
+        config.snapshot.catalog.write = SnapshotCatalogWrite::Both;
+        config.snapshot.catalog.read = SnapshotCatalogRead::Postgres;
+        config
+            .validate_snapshot_catalog()
+            .expect("the read switch is a legal configuration now");
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = MirrorBacklog::open(dir.path().join("mirror"))
+            .await
+            .expect("the backlog should open");
+
+        // 1. The history the double write never saw. Refused before either
+        //    catalog is even asked.
+        let error = admit_read_side(
+            CatalogReadSide::Postgres,
+            &backlog,
+            &Census(Vec::new()),
+            &Census(Vec::new()),
+        )
+        .await
+        .expect_err("a mirror that never enumerated the object store's history refuses");
+        assert!(error.to_string().contains("never been queued"), "{error}");
+
+        backlog
+            .queue_history_toward_central(
+                &crate::snapshot::repository::mirror::test_doubles::ScriptedCatalog::default(),
+            )
+            .await
+            .expect("an empty object store has no history to queue");
+        backlog
+            .record_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("the node starts out reading object storage");
+
+        // 2. The two catalogs holding different snapshots — the refusal no
+        //    gauge can express, and the one this batch added.
+        let held: Vec<SnapshotId> = (0..3).map(|_| SnapshotId::generate()).collect();
+        let error = admit_read_side(
+            CatalogReadSide::Postgres,
+            &backlog,
+            &Census(held.clone()),
+            &Census(Vec::new()),
+        )
+        .await
+        .expect_err("object storage holds snapshots the central catalog has never heard of");
+        assert!(error.to_string().contains("3 row(s)"), "{error}");
+        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
+        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 0);
+
+        // The control.
+        admit_read_side(
+            CatalogReadSide::Postgres,
+            &backlog,
+            &Census(held.clone()),
+            &Census(held),
+        )
+        .await
+        .expect("two catalogs holding the same snapshots may switch");
     }
 
     /// The default is the arrangement that exists today: one catalog, in

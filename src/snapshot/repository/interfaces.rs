@@ -643,7 +643,7 @@ mod pagination_tests {
     /// Newest first, and a tie inside one millisecond broken by ascending id.
     #[test]
     fn the_listing_order_is_newest_first_then_ascending_id() {
-        let mut rows = vec![
+        let mut rows = [
             record(100, id(9)),
             record(200, id(5)),
             record(100, id(1)),

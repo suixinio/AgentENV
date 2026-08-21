@@ -50,7 +50,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::snapshot::repository::backends::central::{
@@ -1354,7 +1354,7 @@ impl MirrorBacklog {
             }
             self.drop_diverged(direction);
             record_mirror_divergence_retired(direction);
-            warn!(
+            info!(
                 direction = direction.as_str(),
                 snapshot_id = %id,
                 "retired a catalog mirror divergence: neither catalog holds this snapshot any \
@@ -1363,7 +1363,13 @@ impl MirrorBacklog {
             sweep.retired += 1;
         }
 
-        *self.sweep_cursor.lock().expect("sweep cursor") = last_examined;
+        // 🔴 Only when something was actually looked at. A sweep that skipped
+        // everything — the whole page mid-flight, say — learned nothing about
+        // where to carry on from, and clearing the cursor there would send the
+        // next one back to the same first page it has already read.
+        if last_examined.is_some() {
+            *self.sweep_cursor.lock().expect("sweep cursor") = last_examined;
+        }
         self.publish_gauges();
         sweep.remaining = MirrorDirection::ALL
             .into_iter()
@@ -1607,6 +1613,15 @@ impl MirrorBacklog {
         if counters.owed.fetch_sub(1, Ordering::AcqRel) == 0 {
             counters.owed.store(0, Ordering::Release);
         }
+    }
+
+    /// Where the last sweep stopped. Test-only: the cursor's effect is
+    /// otherwise visible only across three sweeps of a set larger than one
+    /// page, which is a test about arithmetic rather than about the rule it is
+    /// holding still.
+    #[cfg(test)]
+    fn sweep_cursor(&self) -> Option<Vec<u8>> {
+        self.sweep_cursor.lock().expect("sweep cursor").clone()
     }
 
     fn drop_diverged(&self, direction: MirrorDirection) {
@@ -2518,6 +2533,68 @@ mod tests {
         assert_eq!(
             backlog.diverged_toward(MirrorDirection::Central),
             ids.len() as u64 - 1
+        );
+    }
+
+    /// A sweep that looked at nothing does not send the next one back to the
+    /// start. A queue that stays busy would otherwise pin every sweep to the
+    /// same first page for as long as it stayed busy.
+    #[tokio::test]
+    async fn a_sweep_that_examined_nothing_keeps_the_cursor_it_had() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let ids = [SnapshotId::generate(), SnapshotId::generate()];
+        for id in &ids {
+            backlog
+                .note_divergence(
+                    MirrorDirection::Central,
+                    id,
+                    "try_start_build",
+                    "why".into(),
+                )
+                .await;
+        }
+
+        // Both are still real, so the first sweep keeps them and leaves a
+        // cursor behind.
+        let object_store = Arc::new(ScriptedCatalog::default());
+        for id in &ids {
+            object_store.seed(record_for(id));
+        }
+        let central = Arc::new(ScriptedCentral::default());
+        let targets = both_targets(&object_store, &central);
+
+        let first = backlog
+            .retire_settled_divergences(&targets)
+            .await
+            .expect("the sweep should run");
+        assert_eq!(first.examined, 2);
+        let cursor = backlog
+            .sweep_cursor()
+            .expect("a sweep that looked leaves a cursor");
+
+        // Now every one of them is mid-flight, so the next sweep looks at none.
+        for id in &ids {
+            backlog
+                .record(
+                    MirrorDirection::Central,
+                    MirrorOp::Create {
+                        record: record_for(id),
+                    },
+                )
+                .await;
+        }
+        let second = backlog
+            .retire_settled_divergences(&targets)
+            .await
+            .expect("the sweep should run");
+
+        assert_eq!(second.examined, 0);
+        assert_eq!(second.skipped, 2);
+        assert_eq!(
+            backlog.sweep_cursor(),
+            Some(cursor),
+            "a sweep that learned nothing must not forget where the last one got to"
         );
     }
 

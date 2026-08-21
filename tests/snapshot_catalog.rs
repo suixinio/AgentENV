@@ -1949,6 +1949,16 @@ mod bytes_then_commit {
         let decoded: StagedSnapshot =
             serde_json::from_slice(&encoded).expect("the staged value should decode");
 
+        // 🔴 A gap the clock can see. Without one, staging and committing land
+        // in the same millisecond and "the row records the staged instant" and
+        // "the row records whenever the flip ran" are the same number — which
+        // is a test that cannot fail, not a test that passes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            now_unix_ms() > staged_at_unix_ms,
+            "the two instants have to be distinguishable for the assertions below to mean anything"
+        );
+
         let record = manager
             .commit_staged(decoded)
             .await

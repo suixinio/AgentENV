@@ -1580,3 +1580,95 @@ async fn a_scoped_read_reaches_the_side_that_answers_reads_still_scoped() {
         "and a listing that cannot see `waiting` cannot see a newly created template"
     );
 }
+
+/// 🔴 An admission the object store then refuses has to be given back.
+///
+/// The central catalog admits first, and admission is not free: the `builds`
+/// row it inserts holds a slot of the cluster-wide ceiling and, through
+/// `builds_one_active_per_template`, the template itself. Leaving it in flight
+/// when the operation fails means the caller is told its build failed and then
+/// refused every retry for a full heartbeat TTL — by the exclusion its own
+/// failed attempt is holding.
+#[tokio::test]
+async fn an_admission_the_object_store_refuses_is_given_back() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.seed(record_for(&id));
+    fixture.object_store.seed(record_for(&id));
+    // The object store will not take this one.
+    fixture.object_store.fail(&id, false);
+
+    let refused = fixture.dual.try_start_build(&id).await;
+    assert!(
+        refused.is_err(),
+        "the operation failed and the caller has to hear so"
+    );
+
+    let calls = fixture.central.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &format!("start_build:{id}")),
+        "the control: the admission was taken, {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| call == &format!("fail:{id}")),
+        "and it has to be given back, or the template stays held until the reaper's TTL: {calls:?}"
+    );
+
+    // 🔴 `error` and not still `building`: it is the state the next admission
+    // accepts on both sides, so the retry the caller is about to make can
+    // succeed.
+    match fixture
+        .central
+        .holds(&id)
+        .expect("the central catalog still holds the row")
+        .source
+    {
+        crate::snapshot::types::SnapshotSource::Template { build } => assert_eq!(
+            build.status,
+            crate::snapshot::TemplateBuildStatus::Error,
+            "a build nobody is running must not be left looking like one that is"
+        ),
+        other => panic!("a template record, got {other:?}"),
+    }
+}
+
+/// 🔴 A central catalog that rejected the admission *permanently* is not a
+/// central catalog nobody could reach.
+///
+/// The two arrive differently — a refusal carries a `CatalogRefusal`, a
+/// permanent rejection only a status code — and `central_write` has told them
+/// apart since it was written. This call did not, so it filed the rejection as
+/// unreachability and started the build anyway: unadmitted, holding no `builds`
+/// row, counted against neither the cluster ceiling nor the per-template
+/// exclusion, which are the only two things the transition exists to enforce.
+#[tokio::test]
+async fn a_permanently_rejected_admission_does_not_start_the_build() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture.central.seed(record_for(&id));
+    fixture.object_store.seed(record_for(&id));
+    fixture
+        .central
+        .reject_permanently_on(super::test_doubles::CentralCall::StartBuild);
+
+    let rejected = fixture.dual.try_start_build(&id).await;
+    assert!(
+        rejected.is_err(),
+        "a build the catalog rejected must not be reported as started"
+    );
+
+    let calls = fixture.object_store.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == &format!("try_start_build:{id}")),
+        "and it must not have moved the object store's row either: {calls:?}"
+    );
+    assert_eq!(
+        fixture.backlog.lag_toward(MirrorDirection::Central),
+        0,
+        "nor queued a replay of an admission that will be rejected again forever"
+    );
+}

@@ -10,7 +10,9 @@ use serde::Serialize;
 use tokio::task;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
-use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
+use crate::snapshot::repository::interfaces::{
+    build_may_start_from, SnapshotCatalog, SnapshotCommit,
+};
 use crate::snapshot::repository::metrics::{
     record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
@@ -324,9 +326,13 @@ impl PosixFsCatalogStore {
                 reason: format!("snapshot '{id}' is not a template build"),
             });
         };
-        if build.status != TemplateBuildStatus::Waiting {
+        if !build_may_start_from(build.status) {
             return Err(RepositoryError::InvalidRequest {
-                reason: format!("template build '{id}' is not in waiting state"),
+                reason: format!(
+                    "template build '{id}' cannot start from {:?}: only a template that has \
+                     never been built or whose last build failed may be built",
+                    build.status
+                ),
             });
         }
         build.status = TemplateBuildStatus::Building;
@@ -895,9 +901,73 @@ mod tests {
     use crate::snapshot::repository::SnapshotCommit;
     use crate::snapshot::{
         CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishSource,
-        SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
+        SnapshotRecord, SnapshotSource, SnapshotSourceKind, TemplateBuildStatus,
     };
     use crate::types::SandboxResources;
+
+    /// 🔴 The second attempt at a failed build, which is the ordinary case.
+    ///
+    /// A template whose last build failed sits at `error`, and a build is what
+    /// a caller does about that. Refusing it here — while the central
+    /// catalog's `markSnapshotBuildingSQL` takes `status IN ('waiting',
+    /// 'error')` — is what made a retry on a node writing to both stores fail
+    /// with a 400 that had nonetheless admitted a build centrally, leaving it
+    /// holding the template and a slot of the cluster ceiling for a full
+    /// heartbeat TTL.
+    #[test]
+    fn a_build_can_be_retried_after_the_last_one_failed() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        let id = SnapshotId::generate();
+        store
+            .create_sync(SnapshotRecord::template_waiting(
+                id.clone(),
+                None,
+                SandboxResources::default(),
+            ))
+            .expect("create should work");
+
+        store.try_start_sync(&id).expect("the first build starts");
+        store
+            .mark_error_sync(&id, crate::snapshot::TemplateBuildErrorReason::new("boom"))
+            .expect("the first build fails");
+
+        let retried = store
+            .try_start_sync(&id)
+            .expect("a template whose last build failed must be buildable again");
+        match retried.source {
+            SnapshotSource::Template { build } => {
+                assert_eq!(build.status, TemplateBuildStatus::Building);
+                assert!(
+                    build.error_reason.is_none(),
+                    "the retry clears the reason the last attempt failed with"
+                );
+            }
+            other => panic!("a template record, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same rule: a build already in flight is refused,
+    /// which is the exclusion the transition exists for.
+    #[test]
+    fn a_build_already_in_flight_is_still_refused() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        let id = SnapshotId::generate();
+        store
+            .create_sync(SnapshotRecord::template_waiting(
+                id.clone(),
+                None,
+                SandboxResources::default(),
+            ))
+            .expect("create should work");
+
+        store.try_start_sync(&id).expect("the first build starts");
+        assert!(
+            store.try_start_sync(&id).is_err(),
+            "two builders in one template is what the transition refuses"
+        );
+    }
 
     /// A catalog read must be *visible* as object-store traffic: one LIST for
     /// the records directory plus one GET per record. The whole point of the

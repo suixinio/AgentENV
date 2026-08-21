@@ -51,7 +51,7 @@ pub(crate) mod test_doubles;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::snapshot::repository::backends::central::{
     alias_conflict, commit_opening_record, is_permanent_failure, opening_status, CatalogRefusal,
@@ -332,6 +332,64 @@ impl DualWriteCatalog {
                      and will be replayed"
                 );
                 Ok(CentralWrite::Owed)
+            }
+        }
+    }
+
+    /// Ends the build this call admitted, after the object store refused it.
+    ///
+    /// 🔴 `fail` and not a delete, because `fail_active_build` is the one
+    /// statement that moves the `builds` row out of `pending`/`in_progress` —
+    /// which is what the cluster ceiling and the per-template exclusion both
+    /// count. The template row goes to `error` with it, and that is honest:
+    /// no build is running, and `error` is a state the next admission accepts
+    /// on both sides.
+    ///
+    /// Best effort. A central catalog that cannot be reached to take the
+    /// release back gets it as ordinary debt, and the caller's error is the
+    /// object store's either way — telling it about a second failure it can do
+    /// nothing about would only bury the first.
+    async fn give_back_the_admission(&self, id: &SnapshotId, cause: &RepositoryError) {
+        let reason = TemplateBuildErrorReason::new(format!(
+            "the build was admitted by the central catalog and then refused by object storage: \
+             {cause}"
+        ));
+        match self.central.fail(id, &reason, now_unix_ms()).await {
+            Ok(CatalogWrite::Applied(_)) => {
+                record_central_request("give_back_the_admission", CentralOutcome::Ok);
+                info!(
+                    snapshot_id = %id,
+                    "gave back a build admission the object store refused; the template and its \
+                     slot of the cluster ceiling are free again"
+                );
+            }
+            Ok(CatalogWrite::Refused(refusal)) => {
+                record_central_request("give_back_the_admission", CentralOutcome::Refused);
+                warn!(
+                    snapshot_id = %id,
+                    %refusal,
+                    "could not give back a build admission the object store refused; the \
+                     template stays held until the reaper's TTL expires"
+                );
+            }
+            Err(error) => {
+                record_central_request("give_back_the_admission", CentralOutcome::Error);
+                record_mirror_failed(MirrorDirection::Central, "give_back_the_admission");
+                warn!(
+                    snapshot_id = %id,
+                    %error,
+                    "could not reach the central catalog to give back a build admission the \
+                     object store refused; the release is recorded and will be replayed"
+                );
+                self.backlog
+                    .record(
+                        MirrorDirection::Central,
+                        MirrorOp::MarkBuildError {
+                            id: id.clone(),
+                            reason,
+                        },
+                    )
+                    .await;
             }
         }
     }
@@ -761,6 +819,21 @@ impl SnapshotCatalog for DualWriteCatalog {
                     reason: format!("build '{id}' was not admitted: {refusal}"),
                 });
             }
+            // 🔴 Answered, and the answer was no — it just arrived as a status
+            // code rather than as a `CatalogRefusal`, because the wire has no
+            // room for one on this path. `central_write` has told the two
+            // apart since it was written and this call did not, so a central
+            // catalog that rejected the admission *permanently* was filed as
+            // one nobody could reach: the build started unadmitted, holding no
+            // `builds` row, counted against neither the cluster ceiling nor
+            // the per-template exclusion — the two guarantees the whole
+            // transition exists for — and a replay that could never succeed
+            // was queued behind it.
+            Err(error) if is_permanent_failure(&error) => {
+                record_central_request("try_start_build", CentralOutcome::Error);
+                record_central_refused("try_start_build", "permanent_rejection");
+                return Err(error);
+            }
             Err(error) => {
                 record_central_request("try_start_build", CentralOutcome::Error);
                 record_mirror_failed(MirrorDirection::Central, "try_start_build");
@@ -775,13 +848,31 @@ impl SnapshotCatalog for DualWriteCatalog {
             }
         };
 
-        // 🔴 If the object store refuses after the catalog admitted, the build
-        // row stays in flight and holds the template until the reaper's TTL.
-        // That is the designed outcome rather than a gap: the operation failed,
-        // so no heartbeat will renew it, and the reaper is what collects a
-        // build nobody is running. Undoing it here would mean failing a
-        // template row that may already belong to the admission that won.
-        let started = self.object_store.try_start_build(id).await?;
+        // 🔴 An object store that refuses after the catalog admitted has to
+        // give the admission back, and this is where.
+        //
+        // It used to be left in flight on the reasoning that the reaper
+        // collects a build nobody is running. It does — five minutes later,
+        // and in the meantime that `builds` row holds a slot of the cluster
+        // ceiling and, through `builds_one_active_per_template`, the template
+        // itself. The caller has just been told its build failed with a 400,
+        // so it retries, and every retry inside the TTL is refused by the
+        // exclusion its own failed attempt is holding.
+        //
+        // Failing the row rather than deleting it is safe against the race the
+        // old comment was worried about: `builds_one_active_per_template`
+        // means the build this call admitted is the only one that can be in
+        // flight for this template, so there is no other admission to take the
+        // release away from.
+        let started = match self.object_store.try_start_build(id).await {
+            Ok(started) => started,
+            Err(error) => {
+                if !central_owed {
+                    self.give_back_the_admission(id, &error).await;
+                }
+                return Err(error);
+            }
+        };
 
         self.owe_central(central_owed, || MirrorOp::TryStartBuild {
             id: id.clone(),

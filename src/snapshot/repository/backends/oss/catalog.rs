@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StartedBuild,
+    build_may_start_from, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::{
@@ -239,9 +239,13 @@ impl SnapshotCatalog for OssSnapshotCatalog {
                 reason: format!("snapshot '{id}' is not a template build"),
             });
         };
-        if build.status != TemplateBuildStatus::Waiting {
+        if !build_may_start_from(build.status) {
             return Err(RepositoryError::InvalidRequest {
-                reason: format!("template build '{id}' is not in waiting state"),
+                reason: format!(
+                    "template build '{id}' cannot start from {:?}: only a template that has \
+                     never been built or whose last build failed may be built",
+                    build.status
+                ),
             });
         }
         build.status = TemplateBuildStatus::Building;
@@ -561,6 +565,57 @@ mod tests {
             resources: SandboxResources::default(),
             created_at_unix_ms: None,
             committed: CommittedSnapshot::mock(),
+        }
+    }
+
+    /// 🔴 The same rule as the POSIX backend and as the central catalog's
+    /// `markSnapshotBuildingSQL`: a template whose last build failed is
+    /// buildable again, and one with a build in flight is not.
+    ///
+    /// The three used to disagree — this one took `Waiting` alone — and on a
+    /// node writing to both stores that disagreement is what turned an
+    /// ordinary retry into a 400 that had already admitted a build centrally.
+    #[tokio::test]
+    async fn a_build_can_be_retried_after_the_last_one_failed() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        let id = SnapshotId::generate();
+        catalog
+            .create(SnapshotRecord::template_waiting(
+                id.clone(),
+                None,
+                SandboxResources::default(),
+            ))
+            .await
+            .expect("create should work");
+
+        catalog
+            .try_start_build(&id)
+            .await
+            .expect("the first build starts");
+        assert!(
+            catalog.try_start_build(&id).await.is_err(),
+            "two builders in one template is what the transition refuses"
+        );
+
+        catalog
+            .mark_build_error(&id, TemplateBuildErrorReason::new("boom"))
+            .await
+            .expect("the first build fails");
+
+        let retried = catalog
+            .try_start_build(&id)
+            .await
+            .expect("a template whose last build failed must be buildable again");
+        match retried.record.source {
+            SnapshotSource::Template { build } => {
+                assert_eq!(build.status, TemplateBuildStatus::Building);
+                assert!(
+                    build.error_reason.is_none(),
+                    "the retry clears the reason the last attempt failed with"
+                );
+            }
+            other => panic!("a template record, got {other:?}"),
         }
     }
 

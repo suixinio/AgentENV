@@ -432,6 +432,31 @@ impl StartedBuild {
     }
 }
 
+/// Whether a template in this state may be moved under a new build.
+///
+/// 🔴 `Waiting` and `Error`, and deliberately both. A template nobody has
+/// built yet is `Waiting`; one whose last build failed — or was reaped — is
+/// `Error`, and a retry of that is the ordinary case rather than an exception.
+/// `Building` is refused because that exclusion is what the transition exists
+/// for, and `Ready` because a published template is rebuilt under a new id
+/// rather than in place.
+///
+/// 🔴 Identical, statement for statement, to the central catalog's
+/// `markSnapshotBuildingSQL` (`status IN ('waiting', 'error')`). It was not:
+/// this side took `Waiting` alone, so on a node writing to both, PostgreSQL
+/// admitted the retry and inserted a heartbeat-bearing `builds` row, this side
+/// then refused it, and the caller got a 400 over a build the cluster had
+/// already counted against its ceiling and its per-template exclusion — held
+/// there until the reaper's TTL expired. The second attempt at a failed build
+/// is the case the whole retry path is for, and it was the one case neither
+/// store could complete.
+pub(crate) fn build_may_start_from(status: TemplateBuildStatus) -> bool {
+    matches!(
+        status,
+        TemplateBuildStatus::Waiting | TemplateBuildStatus::Error
+    )
+}
+
 /// Whether a read may see rows that are not resolvable yet.
 ///
 /// 🔴 There is deliberately no `Default`, and the enum is deliberately not a

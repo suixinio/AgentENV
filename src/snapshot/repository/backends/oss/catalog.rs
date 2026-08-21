@@ -803,6 +803,40 @@ mod tests {
     /// row that is already there rather than mint a new one. Folding is what
     /// preserves the template's identity — its creation time and its build
     /// reaching `Ready` rather than appearing from nowhere as a fresh record.
+    /// 🔴 A commit that states when its snapshot was created is believed.
+    ///
+    /// The stores each used to stamp their own `now`, which made two catalogs
+    /// mirroring one publish differ by an RPC's latency — and made a *replayed*
+    /// publish record the replay's clock, which is how a backfill rewrote 32
+    /// rows' creation times to the moment it ran.
+    #[tokio::test]
+    async fn publish_commit_records_the_creation_time_the_commit_states() {
+        let addr = spawn_fake_s3(BTreeMap::new()).await;
+        let catalog = OssSnapshotCatalog::new(fake_s3_client(addr));
+        // 2023-07-22: no clock read could produce it by accident.
+        let created_at = 1_690_000_000_000;
+
+        let record = catalog
+            .publish_commit(SnapshotCommit {
+                created_at_unix_ms: Some(created_at),
+                ..commit(None)
+            })
+            .await
+            .expect("commit should work");
+
+        assert_eq!(record.created_at_unix_ms, created_at);
+        assert_eq!(
+            catalog
+                .get(&record.id.to_string())
+                .await
+                .expect("get should work")
+                .expect("record should exist")
+                .created_at_unix_ms,
+            created_at,
+            "the stored row has to carry it, not just the returned value"
+        );
+    }
+
     #[tokio::test]
     async fn publish_commit_folds_into_a_pre_created_template_record() {
         let addr = spawn_fake_s3(BTreeMap::new()).await;

@@ -973,6 +973,38 @@ mod tests {
         );
     }
 
+    /// The POSIX half of the same rule the OSS catalog holds: a commit that
+    /// states when its snapshot was created is believed, so a replay hours
+    /// later does not make an old snapshot look new.
+    #[test]
+    fn commit_records_the_creation_time_the_commit_states() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        let created_at = 1_690_000_000_000;
+
+        let record = store
+            .publish_commit_sync(SnapshotCommit {
+                created_at_unix_ms: Some(created_at),
+                ..committed_metadata(
+                    SnapshotId::generate(),
+                    "dated",
+                    SnapshotPublishSource::Template,
+                )
+            })
+            .expect("commit should work");
+
+        assert_eq!(record.created_at_unix_ms, created_at);
+        assert_eq!(
+            store
+                .get_sync(&record.id.to_string())
+                .expect("get should work")
+                .expect("snapshot should exist")
+                .created_at_unix_ms,
+            created_at,
+            "the stored row has to carry it, not just the returned value"
+        );
+    }
+
     fn committed_metadata(
         id: SnapshotId,
         alias: &str,

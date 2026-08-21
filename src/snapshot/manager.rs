@@ -430,6 +430,17 @@ impl SnapshotManager {
         self.repository.try_start_build(id).await
     }
 
+    /// Says this node is still running `build_id`.
+    ///
+    /// 🔴 `false` means the template has been handed to somebody else and this
+    /// build must stop. See [`SnapshotCatalog::renew_build_lease`].
+    pub async fn renew_build_lease(
+        &self,
+        build_id: &SnapshotId,
+    ) -> crate::snapshot::RepositoryResult<bool> {
+        self.repository.renew_build_lease(build_id).await
+    }
+
     /// Marks one template build as failed.
     pub async fn mark_build_error(
         &self,

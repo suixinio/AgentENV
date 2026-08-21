@@ -355,15 +355,16 @@ impl MirrorTarget for CentralTarget {
                     self.0.commit(commit, true, now_unix_ms()).await?,
                 )
             }
-            // Never recorded toward the central catalog: the transition is
-            // build admission, which this batch does not wire, so there is no
-            // write to owe. The arm exists because the enum is shared.
-            MirrorOp::TryStartBuild { id } => Err(RepositoryError::Unsupported {
-                feature: format!(
-                    "replaying a build start for '{id}' into the central catalog: the transition \
-                     is build admission, which is not wired"
-                ),
-            }),
+            // 🔴 Replayed like any other write now that admission is wired.
+            // The build it re-admits is one this node started while the catalog
+            // was unreachable, and `already_reflects` short-circuits the case
+            // where the row has since moved on by itself — so a replay that
+            // arrives after the build finished settles rather than re-opening
+            // a queue slot nothing will ever release.
+            MirrorOp::TryStartBuild { id } => Self::settled(
+                "try_start_build",
+                self.0.start_build(id, now_unix_ms()).await?,
+            ),
             MirrorOp::MarkBuildError { id, reason } => Self::settled(
                 "mark_build_error",
                 self.0.fail(id, reason, now_unix_ms()).await?,

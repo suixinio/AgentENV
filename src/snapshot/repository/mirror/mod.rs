@@ -103,10 +103,17 @@ fn policy_for(refusal: &CatalogRefusal) -> RefusalPolicy {
         // it, and on the template path the row was created when the template
         // was — this is the ordinary answer, not a problem.
         CatalogRefusal::AlreadyExists => RefusalPolicy::Satisfied,
-        // 🔴 The known gap. The catalog's `waiting -> building` transition is
-        // build admission, which this batch does not wire, so a template row
-        // here is still `waiting` when the commit arrives and the commit's
-        // fence refuses it. See `CentralSnapshotCatalog::try_start_build`.
+        // 🔴 This used to be the known gap, and it was the reason every
+        // template diverged permanently: `try_start_build` wrote object storage
+        // alone, so a template row here was still `waiting` when the commit
+        // arrived and the commit's fence refused it. Build admission is wired
+        // now, so the row is `building` and the fence passes.
+        //
+        // The arm stays, and stays `Diverged`, for the writes that reach it by
+        // some other road — a row the catalog never got because its opening was
+        // owed, a template failed by the reaper while this node was still
+        // building it. Those are real disagreements to record, and none of them
+        // is a reason to fail a publish whose bytes are already durable.
         CatalogRefusal::StatusMismatch { .. }
         | CatalogRefusal::NotFound
         | CatalogRefusal::BuildInProgress { .. }
@@ -679,18 +686,77 @@ impl SnapshotCatalog for DualWriteCatalog {
     /// what stops the switch to reading PostgreSQL from being authorised on a
     /// cluster whose every template would vanish from the API the moment it
     /// took effect.
+    /// 🔴 The central catalog decides, and this closes the one invariant the
+    /// double write never had.
+    ///
+    /// I1 says every catalog write reaches both stores. This transition was the
+    /// exception: it wrote object storage alone, because admitting a build
+    /// centrally without a reaper to release it would have held the first
+    /// crashed build's template shut for good. That exception is why every
+    /// template diverged permanently, and why `mirror_lag == 0` had to be
+    /// taught not to mean "the catalogs agree". The reaper runs now, so the
+    /// exception goes.
+    ///
+    /// A refusal is **fatal to the operation**, unlike everywhere else in this
+    /// file. Elsewhere the object store is the side that answers reads and a
+    /// central refusal is a disagreement to record; here the refusal *is* the
+    /// answer — the per-template exclusion and the cluster ceiling are the
+    /// whole reason to ask, and admitting a build the catalog said no to is
+    /// precisely the two-builders-in-one-template it exists to prevent.
+    ///
+    /// A catalog nobody can *reach* is still not a refusal: the write is owed
+    /// and the build goes ahead, on the same reasoning as every other write
+    /// here. What it costs is bounded and worth stating — that build holds no
+    /// central `builds` row, so nothing counts it against the ceiling and its
+    /// heartbeat has nothing to renew until the replay lands.
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        let admitted = self.central.start_build(id, now_unix_ms()).await;
+        let central_owed = match admitted {
+            Ok(CatalogWrite::Applied(_)) => {
+                record_central_request("try_start_build", CentralOutcome::Ok);
+                false
+            }
+            Ok(CatalogWrite::Refused(refusal)) => {
+                record_central_request("try_start_build", CentralOutcome::Refused);
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("build '{id}' was not admitted: {refusal}"),
+                });
+            }
+            Err(error) => {
+                record_central_request("try_start_build", CentralOutcome::Error);
+                record_mirror_failed(MirrorDirection::Central, "try_start_build");
+                warn!(
+                    catalog_op = "try_start_build",
+                    snapshot_id = %id,
+                    %error,
+                    "the central snapshot catalog could not be reached to admit this build; it \
+                     is starting unadmitted and the transition will be replayed"
+                );
+                true
+            }
+        };
+
+        // 🔴 If the object store refuses after the catalog admitted, the build
+        // row stays in flight and holds the template until the reaper's TTL.
+        // That is the designed outcome rather than a gap: the operation failed,
+        // so no heartbeat will renew it, and the reaper is what collects a
+        // build nobody is running. Undoing it here would mean failing a
+        // template row that may already belong to the admission that won.
         let record = self.object_store.try_start_build(id).await?;
-        record_central_diverged("try_start_build", "build_admission_not_wired");
-        self.backlog
-            .note_divergence(
-                MirrorDirection::Central,
-                id,
-                "try_start_build",
-                "build admission is not wired, so the central row stays waiting".to_string(),
-            )
+
+        self.owe_central(central_owed, || MirrorOp::TryStartBuild { id: id.clone() })
             .await;
         Ok(record)
+    }
+
+    /// Only the central catalog has a lease to renew.
+    ///
+    /// The object store has no admission and therefore nothing that could take
+    /// a build away, so asking it would always answer "still yours" — which is
+    /// the trait's default and exactly what a node with no central catalog
+    /// gets.
+    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
+        self.central.renew_build_lease(build_id).await
     }
 
     async fn mark_build_error(

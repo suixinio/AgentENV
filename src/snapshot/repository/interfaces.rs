@@ -488,6 +488,20 @@ pub trait SnapshotCatalog: Send + Sync {
     /// no longer waiting.
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
 
+    /// Says this node is still running `build_id`.
+    ///
+    /// 🔴 `false` means the build is no longer the live one — its lease lapsed
+    /// and the template was handed to somebody else — and the builder must
+    /// **stop**, not retry. It must also write nothing about the template: by
+    /// the time it hears this, whatever holds that row belongs to its
+    /// successor.
+    ///
+    /// The default is `true`, which is the honest answer for a backend with no
+    /// admission: nothing there can take a build away, so nothing can have.
+    async fn renew_build_lease(&self, _build_id: &SnapshotId) -> RepositoryResult<bool> {
+        Ok(true)
+    }
+
     /// Marks one template build as failed.
     ///
     /// Backends should preserve the existing record identity, alias, resources,

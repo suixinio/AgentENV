@@ -656,148 +656,355 @@ impl Templates<()> for ApiImpl {
         let api = self.clone();
         tokio::spawn(async move {
             info!(build_id = %build_id, "template build started");
-            match base_source {
-                source @ (TemplateBuildStartBaseSource::DefaultImage
-                | TemplateBuildStartBaseSource::Image(_)) => {
-                    let requested_image = match source {
-                        TemplateBuildStartBaseSource::Image(image) => Some(image),
-                        _ => None,
-                    };
-                    let resolved_rootfs =
-                        match resolve_template_rootfs_image(&api, requested_image.as_deref()).await
-                        {
-                            Ok(resolved) => resolved,
-                            Err(err) => {
-                                warn!(
-                                    build_id = %build_id,
-                                    reason = %err.message,
-                                    "template build failed while resolving the base image"
-                                );
-                                mark_v2_build_error(
-                                    &api,
-                                    &build_id,
-                                    TemplateBuildErrorReason::new(err.message),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                    debug!(
-                        build_id = %build_id,
-                        requested_image,
-                        "template build base image resolved"
-                    );
-                    let mut image_configs = ImageConfigs::new();
-                    if let Some(config) = &resolved_rootfs.raw_config {
-                        image_configs.add(None::<String>, "/", config.clone());
-                    }
-                    let base = resolved_rootfs.base_context;
-                    let base_context =
-                        CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                            .with_user(base.user)
-                            .with_exposed_ports(base.exposed_ports)
-                            .with_entrypoint(base.entrypoint)
-                            .with_cmd(base.cmd)
-                            .with_volumes(base.volumes)
-                            .with_labels(base.labels);
-                    let spec = spec
-                        .with_resolved_overlaybd_image(
-                            resolved_rootfs.overlaybd_config_path,
-                            image_configs,
-                        )
-                        .with_base_context(base_context);
-                    match api
-                        .template_builder
-                        .build_and_publish_with_id(
-                            api.snapshot_manager.as_ref(),
-                            build_id.clone(),
-                            spec,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(build_id = %build_id, "template build completed");
-                        }
-                        Err(error) => {
-                            let reason = handle_v2_pipeline_error(&build_id, None, &error);
-                            mark_v2_build_error(&api, &build_id, reason).await;
-                        }
-                    }
-                }
-                TemplateBuildStartBaseSource::Template(alias) => {
-                    let base_runnable =
-                        match api.snapshot_manager.load_runnable(alias.as_ref()).await {
-                            Ok(Some(runnable)) => runnable,
-                            Ok(None) => {
-                                warn!(
-                                    build_id = %build_id,
-                                    base_template = %alias,
-                                    reason = "base template alias not found",
-                                    "template build failed while resolving the base template"
-                                );
-                                mark_v2_build_error(
-                                    &api,
-                                    &build_id,
-                                    TemplateBuildErrorReason::new(format!(
-                                        "template alias not found: {alias}"
-                                    )),
-                                )
-                                .await;
-                                return;
-                            }
-                            Err(err) => {
-                                warn!(
-                                    build_id = %build_id,
-                                    base_template = %alias,
-                                    error = %format_args!("{err:#}"),
-                                    "template build failed while loading the base template"
-                                );
-                                mark_v2_build_error(
-                                    &api,
-                                    &build_id,
-                                    TemplateBuildErrorReason::new(
-                                        Self::snapshot_manager_error(&err).message,
-                                    ),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                    debug!(
-                        build_id = %build_id,
-                        base_template = %alias,
-                        base_snapshot_id = %base_runnable.record().id,
-                        "template build base template resolved"
-                    );
-                    match api
-                        .template_builder
-                        .build_from_snapshot_and_publish(
-                            api.snapshot_manager.as_ref(),
-                            spec,
-                            build_id.clone(),
-                            &base_runnable,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(build_id = %build_id, "template build completed");
-                        }
-                        Err(error) => {
-                            let reason = handle_v2_pipeline_error(&build_id, Some(&alias), &error);
-                            mark_v2_build_error(&api, &build_id, reason).await;
-                        }
-                    }
-                }
-            }
+            let lease_build_id = build_id.clone();
+            let lease_api = api.clone();
+            let build = run_the_build(api, build_id, base_source, spec);
+            hold_the_build_lease(&lease_api, &lease_build_id, build).await;
         });
 
         Ok(V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status202_TheBuildHasStarted)
     }
 }
 
+/// Runs a build while telling the catalog this node is still on it.
+///
+/// 🔴 Two things a build needs that the build itself cannot do. The catalog's
+/// reaper ends a build it has not heard from within the heartbeat TTL, so
+/// without the renewals below every build longer than the TTL is taken away
+/// mid-run and its template handed to whoever asks next. And when the lease
+/// *is* lost, the renewal's answer is the only notice this process gets — so it
+/// has to act on it here, because nothing downstream will.
+async fn hold_the_build_lease(
+    api: &ApiImpl,
+    build_id: &SnapshotId,
+    build: impl std::future::Future<Output = ()>,
+) {
+    let interval = std::time::Duration::from_secs(
+        crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .catalog
+            .build_heartbeat_interval_secs
+            .max(1),
+    );
+    hold_a_lease(build_id, interval, build, || {
+        api.snapshot_manager.renew_build_lease(build_id)
+    })
+    .await
+}
+
+/// [`hold_the_build_lease`] with the renewal passed in.
+///
+/// 🔴 Split out so the decision can be tested without an `ApiImpl` behind it.
+/// What has to be held still here is which of three answers stops a build, and
+/// that is exactly the part a test built around a whole API implementation
+/// cannot reach: the interesting case is a catalog answering `false`, which no
+/// real catalog does on demand.
+async fn hold_a_lease<Renew, Answer>(
+    build_id: &SnapshotId,
+    interval: std::time::Duration,
+    build: impl std::future::Future<Output = ()>,
+    mut renew: Renew,
+) where
+    Renew: FnMut() -> Answer,
+    Answer: std::future::Future<Output = crate::snapshot::RepositoryResult<bool>>,
+{
+    tokio::pin!(build);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is immediate; the catalog stamped a heartbeat when it
+    // admitted the build, so there is nothing to say yet.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            () = &mut build => return,
+            _ = ticker.tick() => match renew().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // 🔴 Stop, and write nothing. The template this build was
+                    // holding has already been handed to somebody else — the
+                    // reaper freed it and recorded why, or another build now
+                    // owns it — so marking it failed from here would either
+                    // overwrite that reason or fail a build that is not this
+                    // one. Dropping the future is what stops it.
+                    warn!(
+                        build_id = %build_id,
+                        "this build's lease is gone: the catalog has handed its template to \
+                         somebody else, so the build is being stopped. Nothing is written about \
+                         the template — whatever holds it now is not this build"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    // A scheduler nobody can reach is not a reason to throw
+                    // away a build that is running. If the outage outlasts the
+                    // TTL the reaper takes the template and the next renewal
+                    // says so, which is the branch above.
+                    warn!(
+                        build_id = %build_id,
+                        error = %format_args!("{error:#}"),
+                        "could not renew this build's lease; carrying on, but the catalog will \
+                         reap the build if this lasts longer than its heartbeat TTL"
+                    );
+                }
+            },
+        }
+    }
+}
+
+async fn run_the_build(
+    api: ApiImpl,
+    build_id: SnapshotId,
+    base_source: TemplateBuildStartBaseSource,
+    spec: crate::template::TemplateBuildSpec,
+) {
+    match base_source {
+        source @ (TemplateBuildStartBaseSource::DefaultImage
+        | TemplateBuildStartBaseSource::Image(_)) => {
+            let requested_image = match source {
+                TemplateBuildStartBaseSource::Image(image) => Some(image),
+                _ => None,
+            };
+            let resolved_rootfs =
+                match resolve_template_rootfs_image(&api, requested_image.as_deref()).await {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        warn!(
+                            build_id = %build_id,
+                            reason = %err.message,
+                            "template build failed while resolving the base image"
+                        );
+                        mark_v2_build_error(
+                            &api,
+                            &build_id,
+                            TemplateBuildErrorReason::new(err.message),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            debug!(
+                build_id = %build_id,
+                requested_image,
+                "template build base image resolved"
+            );
+            let mut image_configs = ImageConfigs::new();
+            if let Some(config) = &resolved_rootfs.raw_config {
+                image_configs.add(None::<String>, "/", config.clone());
+            }
+            let base = resolved_rootfs.base_context;
+            let base_context = CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
+                .with_user(base.user)
+                .with_exposed_ports(base.exposed_ports)
+                .with_entrypoint(base.entrypoint)
+                .with_cmd(base.cmd)
+                .with_volumes(base.volumes)
+                .with_labels(base.labels);
+            let spec = spec
+                .with_resolved_overlaybd_image(resolved_rootfs.overlaybd_config_path, image_configs)
+                .with_base_context(base_context);
+            match api
+                .template_builder
+                .build_and_publish_with_id(api.snapshot_manager.as_ref(), build_id.clone(), spec)
+                .await
+            {
+                Ok(_) => {
+                    info!(build_id = %build_id, "template build completed");
+                }
+                Err(error) => {
+                    let reason = handle_v2_pipeline_error(&build_id, None, &error);
+                    mark_v2_build_error(&api, &build_id, reason).await;
+                }
+            }
+        }
+        TemplateBuildStartBaseSource::Template(alias) => {
+            let base_runnable = match api.snapshot_manager.load_runnable(alias.as_ref()).await {
+                Ok(Some(runnable)) => runnable,
+                Ok(None) => {
+                    warn!(
+                        build_id = %build_id,
+                        base_template = %alias,
+                        reason = "base template alias not found",
+                        "template build failed while resolving the base template"
+                    );
+                    mark_v2_build_error(
+                        &api,
+                        &build_id,
+                        TemplateBuildErrorReason::new(format!("template alias not found: {alias}")),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        build_id = %build_id,
+                        base_template = %alias,
+                        error = %format_args!("{err:#}"),
+                        "template build failed while loading the base template"
+                    );
+                    mark_v2_build_error(
+                        &api,
+                        &build_id,
+                        TemplateBuildErrorReason::new(
+                            ApiImpl::snapshot_manager_error(&err).message,
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            debug!(
+                build_id = %build_id,
+                base_template = %alias,
+                base_snapshot_id = %base_runnable.record().id,
+                "template build base template resolved"
+            );
+            match api
+                .template_builder
+                .build_from_snapshot_and_publish(
+                    api.snapshot_manager.as_ref(),
+                    spec,
+                    build_id.clone(),
+                    &base_runnable,
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!(build_id = %build_id, "template build completed");
+                }
+                Err(error) => {
+                    let reason = handle_v2_pipeline_error(&build_id, Some(&alias), &error);
+                    mark_v2_build_error(&api, &build_id, reason).await;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::pipeline_build_error;
+    use super::{hold_a_lease, SnapshotId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const TICK: Duration = Duration::from_secs(100);
+
+    /// A build that runs until told to stop, and says whether it finished.
+    ///
+    /// 🔴 The distinction the lease tests turn on is "did the build get to
+    /// run to the end", so it has to be a distinction the fixture can express
+    /// in both directions. A build future that always completes immediately
+    /// would make every one of these tests pass whatever the loop did.
+    async fn a_build(seconds: u64, finished: Arc<AtomicUsize>) {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        finished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The control for every test below: a build that outlives several ticks
+    /// keeps running, and each tick is one renewal.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_lease_lets_the_build_run_to_the_end() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&renewals);
+
+        hold_a_lease(
+            &SnapshotId::generate(),
+            TICK,
+            a_build(350, Arc::clone(&finished)),
+            move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "the build finished");
+        assert_eq!(
+            renewals.load(Ordering::SeqCst),
+            3,
+            "a build spanning three intervals renews three times"
+        );
+    }
+
+    /// 🔴 A lease that is gone stops the build. The template has been handed to
+    /// somebody else, and this is the only notice this process gets.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_the_build() {
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        hold_a_lease(
+            &SnapshotId::generate(),
+            TICK,
+            a_build(350, Arc::clone(&finished)),
+            || async { Ok(false) },
+        )
+        .await;
+
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            0,
+            "the build must not have run to the end: its template is somebody else's now"
+        );
+    }
+
+    /// A catalog nobody can reach is not a lost lease. Throwing away a build
+    /// that is running perfectly well because the scheduler is restarting is
+    /// the failure the renewal exists to avoid, not one to add.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_catalog_does_not_stop_the_build() {
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        hold_a_lease(
+            &SnapshotId::generate(),
+            TICK,
+            a_build(350, Arc::clone(&finished)),
+            || async {
+                Err(crate::snapshot::RepositoryError::Backend {
+                    message: "the scheduler is restarting".to_string(),
+                    source: None,
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "a build must survive a catalog it cannot reach"
+        );
+    }
+
+    /// A build shorter than one interval never renews. The catalog stamped a
+    /// heartbeat when it admitted it, so there is nothing to say.
+    #[tokio::test(start_paused = true)]
+    async fn a_build_shorter_than_the_interval_never_renews() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&renewals);
+
+        hold_a_lease(
+            &SnapshotId::generate(),
+            TICK,
+            a_build(1, Arc::clone(&finished)),
+            move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+        assert_eq!(renewals.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn pipeline_build_error_maps_invalid_input_to_bad_request() {

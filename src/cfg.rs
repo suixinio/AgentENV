@@ -432,6 +432,17 @@ pub struct SnapshotCatalogConfig {
     /// How often owed object-store writes are replayed.
     #[config(default = 30u64)]
     pub mirror_compensator_interval_secs: u64,
+    /// How often a running build tells the catalog it is still alive.
+    ///
+    /// 🔴 Must stay comfortably below the scheduler's
+    /// `scheduler.catalog.build_heartbeat_ttl` (5 minutes by default), because
+    /// the reaper ends a build that has gone unheard from for that long and
+    /// hands its template to whoever asks next. A third of the TTL is the usual
+    /// margin: two renewals may be lost — to a scheduler rollout, a slow
+    /// network — before a build that is running perfectly well is taken away
+    /// from it.
+    #[config(default = 100u64)]
+    pub build_heartbeat_interval_secs: u64,
     /// Where the owed writes are kept.
     ///
     /// Node-local and durable: what it holds is the difference between "the two
@@ -1229,6 +1240,12 @@ impl AppConfig {
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
         self.validate_snapshot_catalog()?;
+        if self.snapshot.catalog.build_heartbeat_interval_secs == 0 {
+            bail!(
+                "snapshot.catalog.build_heartbeat_interval_secs must be > 0; a build that never \
+                 says it is alive is ended by the catalog's reaper while it is still running"
+            );
+        }
         Ok(())
     }
 

@@ -234,6 +234,11 @@ impl SnapshotRepository {
         self.catalog.resolve_alias(alias).await
     }
 
+    /// Says this node is still running `build_id`. `false` means stop.
+    pub async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
+        self.catalog.renew_build_lease(build_id).await
+    }
+
     /// Atomically transitions one template build from waiting to building.
     pub async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
         self.catalog.try_start_build(id).await

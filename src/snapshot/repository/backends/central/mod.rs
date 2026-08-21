@@ -479,10 +479,14 @@ impl CentralSnapshotCatalog {
                 build_error_json: encode_build_error(reason)?,
                 updated_at_unix_ms,
                 paused_transition: None,
-                // 🔴 False, in this batch. Ending a build row is only correct
-                // for a build this client admitted, and it admits none: build
-                // admission is not wired here. See `try_start_build`.
-                fail_active_build: false,
+                // 🔴 True, and it has to be. This client admits builds now, and
+                // a failed build that left its row `in_progress` would hold the
+                // template behind `builds_one_active_per_template` until the
+                // reaper's TTL expired — a leak turned into an outage by the
+                // very index that makes admission exclusive. Harmless for a
+                // snapshot with no build in flight, which every pause is: it is
+                // one probe of a partial index that matches nothing.
+                fail_active_build: true,
             }))
             .await
             .map_err(|status| Self::unreachable("fail_snapshot", status))?
@@ -500,6 +504,89 @@ impl CentralSnapshotCatalog {
                 "neither a failed row nor a refusal",
             )),
         }
+    }
+
+    /// Admits one build: the cluster-wide ceiling, the per-template exclusion
+    /// and the `waiting -> building` transition, in one transaction.
+    ///
+    /// 🔴 The refusals are the answer, not a failure. A template somebody else
+    /// is building and a cluster at its ceiling are both things the caller acts
+    /// on, and both are exactly what asking is for.
+    ///
+    /// `build_id` and `template_id` are the same value because the API forces
+    /// them equal today. They are sent separately anyway: the table keeps them
+    /// in different columns precisely so that stops being true without a
+    /// migration.
+    pub async fn start_build(
+        &self,
+        id: &SnapshotId,
+        started_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+        let response = self
+            .client()
+            .start_build(self.request(pb::StartBuildRequest {
+                cluster_id: self.cluster_id.to_string(),
+                node_id: self.node_id.clone(),
+                build_id: id.to_string(),
+                template_id: id.to_string(),
+                started_at_unix_ms,
+                // 🔴 Advisory. The server stamps the first heartbeat from the
+                // database's clock and ignores this, because the reaper judges
+                // that value against a clock too and the two have to be the
+                // same one — a node running a few minutes slow otherwise had
+                // every build it ran ended while it was still running, with an
+                // error blaming a lapse that never happened. What the field is
+                // still for is telling an operator the clocks disagree, so it
+                // is sent honestly rather than left at zero.
+                heartbeat_at_unix_ms: started_at_unix_ms,
+            }))
+            .await
+            .map_err(|status| Self::unreachable("start_build", status))?
+            .into_inner();
+
+        match response.outcome {
+            Some(pb::start_build_response::Outcome::Started(started)) => {
+                let row = started.snapshot.ok_or_else(|| {
+                    Self::malformed("start_build", "an admitted build without its template row")
+                })?;
+                Ok(CatalogWrite::Applied(decode_row(row, self.cluster_id)?))
+            }
+            Some(pb::start_build_response::Outcome::Rejected(rejected)) => {
+                Ok(CatalogWrite::Refused(CatalogRefusal::from_proto(rejected)))
+            }
+            None => Err(Self::malformed(
+                "start_build",
+                "neither an admitted build nor a refusal",
+            )),
+        }
+    }
+
+    /// Says this node is still running `build_id`.
+    ///
+    /// 🔴 `false` means the build is no longer the live one — reaped for a
+    /// lapsed heartbeat, or finished by somebody else — and the builder must
+    /// **stop**, not retry. Nothing else tells it. Without that, the reaper
+    /// frees the template, a second build starts, and two builders publish into
+    /// the same one.
+    pub async fn renew_build_lease(
+        &self,
+        build_id: &SnapshotId,
+        heartbeat_at_unix_ms: i64,
+    ) -> RepositoryResult<bool> {
+        let response = self
+            .client()
+            .renew_build_lease(self.request(pb::RenewBuildLeaseRequest {
+                cluster_id: self.cluster_id.to_string(),
+                node_id: self.node_id.clone(),
+                build_id: build_id.to_string(),
+                // Advisory, as on `start_build`.
+                heartbeat_at_unix_ms,
+            }))
+            .await
+            .map_err(|status| Self::unreachable("renew_build_lease", status))?
+            .into_inner();
+
+        Ok(response.live)
     }
 
     /// Soft-deletes one row. Idempotent: nothing to delete is a success.
@@ -739,11 +826,29 @@ fn encode_filter(filter: &SnapshotListFilter) -> pb::SnapshotFilter {
     }
 }
 
-fn now_unix_ms() -> i64 {
+pub(crate) fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// How a refused build admission reaches the user.
+///
+/// 🔴 `InvalidRequest`, which the API layer renders as a 400, because every one
+/// of these is something the caller can do something about: wait for the build
+/// that holds the template, wait for the cluster to drain, or look at why the
+/// row is not waiting. A `Backend` error would render as a 500 and tell them to
+/// retry something that will be refused identically.
+fn build_refusal(id: &SnapshotId, refusal: CatalogRefusal) -> RepositoryError {
+    match refusal {
+        CatalogRefusal::NotFound => RepositoryError::SnapshotNotFound {
+            lookup: id.to_string(),
+        },
+        other => RepositoryError::InvalidRequest {
+            reason: format!("build '{id}' was not admitted: {other}"),
+        },
+    }
 }
 
 fn refused(operation: &'static str, refusal: CatalogRefusal) -> RepositoryError {
@@ -846,30 +951,24 @@ impl SnapshotCatalog for CentralSnapshotCatalog {
             .await
     }
 
-    /// 🔴 Not wired in this batch, and refusing is not an option either.
+    /// The `waiting -> building` transition, which here is build admission:
+    /// the cluster-wide ceiling, the per-template unique index, and a `builds`
+    /// row only a heartbeat and a reaper release.
     ///
-    /// The catalog's `waiting -> building` transition is `StartBuild`, which is
-    /// build admission: the cluster-wide ceiling, the per-template unique index
-    /// and a `builds` row that only a heartbeat and a reaper can ever release.
-    /// Neither of those is running, so admitting a build here would make the
-    /// first crashed builds hold their templates shut forever, and the
-    /// twentieth would hold the whole cluster shut. That is precisely the
-    /// failure the design warns about when it says the index and the reaper
-    /// must ship together.
-    ///
-    /// So this reports success without writing. What it costs is stated where
-    /// it can be seen rather than hidden: a template row in the catalog stays
-    /// `waiting` while the object store's has moved on, and the commit that
-    /// follows finds a row it cannot flip. The double-write wrapper classifies
-    /// that as a mirror divergence and counts it; it does not fail the publish,
-    /// because the object store is still the side that answers reads.
+    /// 🔴 A refusal is reported to the caller rather than swallowed. Admitting
+    /// a build the catalog said no to is the "two builders publishing into one
+    /// template" the exclusion exists to prevent, and a caller told its build
+    /// started when it did not would wait for a result nobody is producing.
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        Err(RepositoryError::Unsupported {
-            feature: format!(
-                "starting build '{id}' through the central catalog: the transition is build \
-                 admission, which needs the heartbeat and the reaper that are not wired yet"
-            ),
-        })
+        match self.start_build(id, now_unix_ms()).await? {
+            CatalogWrite::Applied(row) => Ok(row),
+            CatalogWrite::Refused(refusal) => Err(build_refusal(id, refusal)),
+        }
+    }
+
+    /// See [`Self::renew_build_lease`]. `false` means stop.
+    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
+        CentralSnapshotCatalog::renew_build_lease(self, build_id, now_unix_ms()).await
     }
 
     async fn mark_build_error(

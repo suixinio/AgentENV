@@ -1253,12 +1253,18 @@ mod dual_write {
             .is_none());
     }
 
-    /// 🔴 The batch's one known gap, asserted rather than left to be
-    /// discovered. `try_start_build` is the catalog's build-admission
-    /// transition, which is not wired here, so the write goes to object storage
-    /// alone and the central row stays where the create left it.
+    /// 🔴 I1 closed, against the real catalog: **every** catalog write reaches
+    /// both stores, this transition included.
+    ///
+    /// It was the one exception, and the exception is why every template
+    /// diverged permanently — the central row stayed `waiting` while the object
+    /// store's moved to `building`, so the commit that followed hit the fence
+    /// and was recorded as a disagreement nothing could replay. That is the
+    /// reason `mirror_lag == 0` had to be taught not to mean "the two catalogs
+    /// agree". Both rows move together now, the commit's fence passes, and
+    /// nothing is recorded.
     #[tokio::test]
-    async fn starting_a_build_writes_object_storage_only() {
+    async fn starting_a_build_reaches_both_catalogs() {
         let central = catalog!();
         let both = both(central).await;
         let id = SnapshotId::generate();
@@ -1270,47 +1276,127 @@ mod dual_write {
         both.dual
             .try_start_build(&id)
             .await
-            .expect("starting the build should work through object storage");
+            .expect("the catalog should admit the build");
 
-        let object_store_row = both
-            .object_store
-            .get(&id.to_string())
-            .await
-            .expect("reading should work")
-            .expect("the row should be there");
-        assert!(matches!(
-            object_store_row.source,
-            SnapshotSource::Template { ref build }
-                if build.status == agentenv::snapshot::TemplateBuildStatus::Building
-        ));
-
-        let central_row = both
-            .central
-            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
-            .await
-            .expect("reading should work")
-            .expect("the row should be there");
-        assert!(
-            matches!(
-                central_row.source,
-                SnapshotSource::Template { ref build }
-                    if build.status == agentenv::snapshot::TemplateBuildStatus::Waiting
+        for (which, row) in [
+            (
+                "object storage",
+                both.object_store
+                    .get(&id.to_string())
+                    .await
+                    .expect("reading should work"),
             ),
-            "the central row is expected to stay behind here; if this starts \
-             failing, build admission has been wired and the divergence \
-             counter it feeds should go with it"
-        );
+            (
+                "the central catalog",
+                both.central
+                    .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                    .await
+                    .expect("reading should work"),
+            ),
+        ] {
+            let row = row.unwrap_or_else(|| panic!("{which} should hold the row"));
+            assert!(
+                matches!(
+                    row.source,
+                    SnapshotSource::Template { ref build }
+                        if build.status == agentenv::snapshot::TemplateBuildStatus::Building
+                ),
+                "{which} should have moved the template to building"
+            );
+        }
+
+        assert_eq!(both.backlog.lag(), 0, "nothing is owed");
         assert_eq!(
-            both.backlog.lag(),
+            both.backlog.diverged_toward(MirrorDirection::Central),
             0,
-            "the gap is not an owed write: nothing the compensator can replay would close it"
+            "and nothing disagrees; this transition used to be why everything did"
+        );
+
+        // And the whole point of it: the commit that follows finds a
+        // `building` row, so its fence passes.
+        let mut commit = sandbox_commit(id.clone(), None, "built");
+        commit.source = SnapshotPublishSource::Template;
+        commit.resources.disk_size_mib = 8192;
+        both.dual
+            .publish_commit(commit)
+            .await
+            .expect("the built template should commit");
+        assert_eq!(
+            both.backlog.diverged_toward(MirrorDirection::Central),
+            0,
+            "the commit's fence passes because admission moved the row"
+        );
+    }
+
+    /// 🔴 A refusal is the answer, not a disagreement to record — against the
+    /// real per-template exclusion.
+    ///
+    /// Admitting a second build for a template somebody is already building is
+    /// the two-builders-in-one-template the unique index exists to prevent, and
+    /// the object store must not be asked at all.
+    #[tokio::test]
+    async fn a_second_build_for_one_template_is_refused() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+
+        both.dual
+            .create(template_record(id.clone(), None))
+            .await
+            .expect("creating should work");
+        both.dual
+            .try_start_build(&id)
+            .await
+            .expect("the first build is admitted");
+
+        let error = both
+            .dual
+            .try_start_build(&id)
+            .await
+            .expect_err("the second must not be");
+        assert!(
+            matches!(error, RepositoryError::InvalidRequest { .. }),
+            "a rule the catalog stated must not look like an outage: {error:?}"
         );
         assert_eq!(
             both.backlog.diverged_toward(MirrorDirection::Central),
-            1,
-            "🔴 but it is a disagreement, and something other than the lag has to say so — \
-             a switch to reading PostgreSQL authorised on a lag of zero would make this \
-             template vanish from the API"
+            0,
+            "a refusal is an answer, not a disagreement between the two catalogs"
+        );
+    }
+
+    /// 🔴 The lease, against the real reaper's data. A build the catalog knows
+    /// about renews; one it has never heard of does not — which is the answer a
+    /// reaped builder gets, and the only notice it gets.
+    #[tokio::test]
+    async fn only_a_live_build_can_renew_its_lease() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+
+        both.dual
+            .create(template_record(id.clone(), None))
+            .await
+            .expect("creating should work");
+        both.dual
+            .try_start_build(&id)
+            .await
+            .expect("the catalog should admit the build");
+
+        assert!(
+            both.dual
+                .renew_build_lease(&id)
+                .await
+                .expect("renewing should work"),
+            "a live build holds its lease"
+        );
+        assert!(
+            !both
+                .dual
+                .renew_build_lease(&SnapshotId::generate())
+                .await
+                .expect("renewing should work"),
+            "a build the catalog has no row for must be told it is not the live one"
         );
     }
 
@@ -1706,18 +1792,11 @@ mod dual_write {
         let both = both(central).await;
         let id = SnapshotId::generate();
 
-        both.dual
-            .create(template_record(id.clone(), None))
-            .await
-            .expect("creating should work");
-        both.dual
-            .try_start_build(&id)
-            .await
-            .expect("starting the build should work through object storage");
+        diverge_about_a_template(&both, &id).await;
         assert_eq!(
             both.backlog.diverged_toward(MirrorDirection::Central),
             1,
-            "build admission is not wired, so this records a divergence"
+            "the two catalogs disagree about this template"
         );
 
         let record = both
@@ -1748,6 +1827,34 @@ mod dual_write {
         );
     }
 
+    /// Manufactures one recorded divergence about a template.
+    ///
+    /// 🔴 Not through `try_start_build` any more: that transition reaches the
+    /// central catalog now, so it no longer disagrees about anything — which
+    /// was the point of wiring it, and is why the two tests below had to find
+    /// another way. What still disagrees is the shape the old gap produced:
+    /// object storage moves the template to `building` on its own, the central
+    /// row stays `waiting`, and the commit that follows is refused by the
+    /// fence.
+    async fn diverge_about_a_template(both: &Both, id: &SnapshotId) {
+        both.dual
+            .create(template_record(id.clone(), None))
+            .await
+            .expect("creating should work");
+        // Object storage alone, deliberately going around the double write.
+        both.object_store
+            .try_start_build(id)
+            .await
+            .expect("the object store should move its own row");
+        let mut commit = sandbox_commit(id.clone(), None, "diverged");
+        commit.source = SnapshotPublishSource::Template;
+        commit.resources.disk_size_mib = 8192;
+        both.dual
+            .publish_commit(commit)
+            .await
+            .expect("a central refusal the object store will take is not fatal");
+    }
+
     /// The control, and the one that keeps the fix above from being a way to
     /// clear a number by forgetting it: while either catalog still holds the
     /// snapshot, the disagreement is still real and the record stays.
@@ -1757,14 +1864,8 @@ mod dual_write {
         let both = both(central).await;
         let id = SnapshotId::generate();
 
-        both.dual
-            .create(template_record(id.clone(), None))
-            .await
-            .expect("creating should work");
-        both.dual
-            .try_start_build(&id)
-            .await
-            .expect("starting the build should work through object storage");
+        diverge_about_a_template(&both, &id).await;
+        assert_eq!(both.backlog.diverged_toward(MirrorDirection::Central), 1);
 
         let sweep = both
             .backlog

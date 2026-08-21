@@ -20,7 +20,7 @@
 use async_trait::async_trait;
 
 use crate::snapshot::repository::backends::central::{
-    CatalogReadScope, CatalogWrite, CentralSnapshotCatalog,
+    now_unix_ms, CatalogReadScope, CatalogWrite, CentralSnapshotCatalog,
 };
 use crate::snapshot::repository::interfaces::SnapshotCommit;
 use crate::snapshot::repository::RepositoryResult;
@@ -44,6 +44,16 @@ pub trait CentralCatalogWrites: Send + Sync {
         published: bool,
         updated_at_unix_ms: i64,
     ) -> RepositoryResult<CatalogWrite<SnapshotRecord>>;
+
+    /// Admits one build. A refusal is the answer, not a mirror problem.
+    async fn start_build(
+        &self,
+        id: &SnapshotId,
+        started_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>>;
+
+    /// Says this node is still running the build. `false` means stop.
+    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool>;
 
     /// Moves a row to `error` with a reason.
     async fn fail(
@@ -88,6 +98,18 @@ impl CentralCatalogWrites for CentralSnapshotCatalog {
     ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
         self.commit_snapshot(commit, published, updated_at_unix_ms)
             .await
+    }
+
+    async fn start_build(
+        &self,
+        id: &SnapshotId,
+        started_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+        CentralSnapshotCatalog::start_build(self, id, started_at_unix_ms).await
+    }
+
+    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
+        CentralSnapshotCatalog::renew_build_lease(self, build_id, now_unix_ms()).await
     }
 
     async fn fail(

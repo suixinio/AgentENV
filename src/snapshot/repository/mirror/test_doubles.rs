@@ -334,6 +334,7 @@ pub(crate) enum CentralCall {
     Commit,
     Fail,
     Delete,
+    StartBuild,
 }
 
 impl CentralCall {
@@ -343,6 +344,7 @@ impl CentralCall {
             Self::Commit => "commit",
             Self::Fail => "fail",
             Self::Delete => "delete",
+            Self::StartBuild => "start_build",
         }
     }
 }
@@ -361,6 +363,13 @@ pub(crate) struct ScriptedCentral {
     unreachable: Mutex<Vec<CentralCall>>,
     rejected: Mutex<Vec<CentralCall>>,
     refusals: Mutex<Vec<(CentralCall, CatalogRefusal)>>,
+    /// Builds this double has admitted and not yet had taken away.
+    ///
+    /// 🔴 Held so `renew_build_lease` can answer `false` for a build the
+    /// reaper took. A double that always said "still yours" would make the one
+    /// notice a builder gets untestable — and the bug it prevents, two builders
+    /// publishing into one template, is not one anybody finds afterwards.
+    live_builds: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ScriptedCentral {
@@ -370,6 +379,14 @@ impl ScriptedCentral {
 
     fn note(&self, entry: impl Into<String>) {
         self.calls.lock().expect("calls").push(entry.into());
+    }
+
+    /// Takes a build away, as the reaper does when a heartbeat lapses.
+    pub(crate) fn reap_build(&self, id: &SnapshotId) {
+        self.live_builds
+            .lock()
+            .expect("live builds")
+            .remove(&id.to_string());
     }
 
     /// Makes one call fail as if nothing answered.
@@ -394,6 +411,15 @@ impl ScriptedCentral {
             .lock()
             .expect("refusals")
             .push((call, refusal));
+    }
+
+    /// Stops one call refusing, so a test can arrange a disagreement and then
+    /// go on using the double for something else.
+    pub(crate) fn stop_refusing(&self, call: CentralCall) {
+        self.refusals
+            .lock()
+            .expect("refusals")
+            .retain(|(scripted, _)| *scripted != call);
     }
 
     /// Puts a row in without going through a write, so a test can arrange a
@@ -478,6 +504,41 @@ impl CentralCatalogWrites for ScriptedCentral {
         }
         rows.insert(opened.id.to_string(), opened.clone());
         Ok(CatalogWrite::Applied(opened))
+    }
+
+    /// Admission, as much of it as a double can be: it moves the row to
+    /// `building` and remembers which build is live, so a lease renewal can
+    /// answer something other than a constant.
+    async fn start_build(
+        &self,
+        id: &SnapshotId,
+        _started_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+        self.note(format!("start_build:{id}"));
+        if let Some(scripted) = self.scripted(CentralCall::StartBuild) {
+            return scripted;
+        }
+        let mut rows = self.rows.lock().expect("rows");
+        let Some(row) = rows.get_mut(&id.to_string()) else {
+            return Ok(CatalogWrite::Refused(CatalogRefusal::NotFound));
+        };
+        if let crate::snapshot::types::SnapshotSource::Template { build } = &mut row.source {
+            build.status = TemplateBuildStatus::Building;
+        }
+        self.live_builds
+            .lock()
+            .expect("live builds")
+            .insert(id.to_string());
+        Ok(CatalogWrite::Applied(row.clone()))
+    }
+
+    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
+        self.note(format!("renew_build_lease:{build_id}"));
+        Ok(self
+            .live_builds
+            .lock()
+            .expect("live builds")
+            .contains(&build_id.to_string()))
     }
 
     async fn commit(

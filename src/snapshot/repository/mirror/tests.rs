@@ -74,6 +74,28 @@ impl Fixture {
             .with_central(Arc::clone(&self.central) as Arc<dyn CentralCatalogWrites>)
     }
 
+    /// Manufactures one recorded divergence about `id`.
+    ///
+    /// 🔴 Not through `try_start_build` any more. That transition reaches the
+    /// central catalog now, so it no longer disagrees about anything — which
+    /// was the whole point of wiring it, and is why three tests that used it as
+    /// a convenient divergence factory had to find another one. What still
+    /// disagrees is a commit the catalog refuses on its fence, which is what a
+    /// row whose opening was owed looks like once the publish catches up.
+    async fn diverge_about(&self, id: &SnapshotId) {
+        self.central.refuse(
+            CentralCall::Commit,
+            CatalogRefusal::StatusMismatch {
+                observed: "waiting".to_string(),
+            },
+        );
+        self.dual
+            .publish_commit(commit_for(id, None))
+            .await
+            .expect("a central refusal the object store will take is not fatal");
+        self.central.stop_refusing(CentralCall::Commit);
+    }
+
     fn owed_to_central(&self) -> u64 {
         self.backlog.lag_toward(MirrorDirection::Central)
     }
@@ -808,11 +830,17 @@ async fn artifacts_nobody_committed_are_not_retained() {
 // F-1: lag zero is not agreement
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 🔴 The batch's permanent gap, recorded rather than only counted.
-/// `try_start_build` writes object storage alone, so the central row stays
-/// `waiting` while this one moves to `building` — for good, with nothing owed.
+/// 🔴 I1, finally true: **every** catalog write reaches both stores.
+///
+/// This transition was the one exception, and the exception was expensive. It
+/// wrote object storage alone, so every template's central row stayed `waiting`
+/// while the object store's moved on; the commit's fence then refused, which
+/// was counted as a permanent divergence; and that is why `mirror_lag == 0` had
+/// to be taught not to mean "the two catalogs agree". Nothing here diverges any
+/// more, and that — not the assertion about the status — is what this test is
+/// for.
 #[tokio::test]
-async fn starting_a_build_records_the_divergence_it_creates() {
+async fn starting_a_build_reaches_both_catalogs() {
     let fixture = Fixture::new().await;
     let id = SnapshotId::generate();
     fixture
@@ -825,22 +853,152 @@ async fn starting_a_build_records_the_divergence_it_creates() {
         .dual
         .try_start_build(&id)
         .await
-        .expect("the object store decides");
+        .expect("the catalog admits it");
     assert!(matches!(
         record.source,
         crate::snapshot::types::SnapshotSource::Template { ref build }
             if build.status == TemplateBuildStatus::Building
     ));
 
-    assert_eq!(
-        fixture.backlog.lag(),
-        0,
-        "nothing the compensator could replay would close it"
+    assert!(
+        fixture
+            .central
+            .calls()
+            .contains(&format!("start_build:{id}")),
+        "the central catalog is the one that admits a build: {:?}",
+        fixture.central.calls()
     );
+    assert_eq!(fixture.backlog.lag(), 0, "nothing is owed");
     assert_eq!(
         fixture.backlog.diverged_toward(MirrorDirection::Central),
-        1,
-        "and something other than the lag has to know that"
+        0,
+        "and nothing disagrees; this transition used to be why everything did"
+    );
+
+    // The publish that follows now finds a `building` row and its fence
+    // passes — which is the divergence this closes, stated end to end.
+    fixture
+        .dual
+        .publish_commit(commit_for(&id, None))
+        .await
+        .expect("publishing should work");
+    assert_eq!(
+        fixture.backlog.diverged_toward(MirrorDirection::Central),
+        0,
+        "the commit's fence passes because admission moved the row"
+    );
+}
+
+/// 🔴 A refusal is the answer, not a disagreement to record.
+///
+/// The per-template exclusion and the cluster ceiling are the whole reason to
+/// ask. Admitting a build the catalog said no to is the two-builders-in-one-
+/// template the exclusion exists to prevent, and the object store must not be
+/// asked at all.
+#[tokio::test]
+async fn a_build_the_catalog_refuses_does_not_start() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture
+        .dual
+        .create(record_for(&id))
+        .await
+        .expect("creating should work");
+    fixture.central.refuse(
+        CentralCall::StartBuild,
+        CatalogRefusal::BuildInProgress {
+            active_build_id: "somebody-else".to_string(),
+        },
+    );
+
+    let error = fixture
+        .dual
+        .try_start_build(&id)
+        .await
+        .expect_err("a refused admission must fail the request");
+    assert!(
+        error.to_string().contains("somebody-else"),
+        "the caller has to be told which build holds the template: {error}"
+    );
+    assert!(
+        !fixture
+            .object_store
+            .calls()
+            .contains(&format!("try_start_build:{id}")),
+        "the object store must not admit a build the catalog refused: {:?}",
+        fixture.object_store.calls()
+    );
+}
+
+/// A catalog nobody can reach is still not a refusal: the build goes ahead and
+/// the transition is owed, on the same reasoning as every other write here.
+#[tokio::test]
+async fn a_build_started_against_an_unreachable_catalog_is_owed() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture
+        .dual
+        .create(record_for(&id))
+        .await
+        .expect("creating should work");
+    fixture.central.unreachable_on(CentralCall::StartBuild);
+
+    fixture
+        .dual
+        .try_start_build(&id)
+        .await
+        .expect("a scheduler nobody can reach must not stop a build");
+
+    assert_eq!(fixture.owed_to_central(), 1, "the transition is owed");
+    assert_eq!(fixture.backlog.diverged_toward(MirrorDirection::Central), 0);
+
+    // And the compensator replays it, which is what the queue is for.
+    fixture.central.reachable_again();
+    let pass = fixture
+        .backlog
+        .drain_once(&fixture.targets())
+        .await
+        .expect("the pass should run");
+    assert_eq!(pass.repaired, 1);
+    assert_eq!(fixture.owed_to_central(), 0);
+}
+
+/// 🔴 The one notice a builder gets that its template was handed to somebody
+/// else. It must be able to answer `false`, or the failure it prevents — two
+/// builders publishing into one template — has nothing standing against it.
+#[tokio::test]
+async fn a_reaped_build_is_told_its_lease_is_gone() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture
+        .dual
+        .create(record_for(&id))
+        .await
+        .expect("creating should work");
+    fixture
+        .dual
+        .try_start_build(&id)
+        .await
+        .expect("the catalog admits it");
+
+    assert!(
+        fixture
+            .dual
+            .renew_build_lease(&id)
+            .await
+            .expect("renewing should work"),
+        "a live build holds its lease"
+    );
+
+    fixture.central.reap_build(&id);
+
+    assert!(
+        !fixture
+            .dual
+            .renew_build_lease(&id)
+            .await
+            .expect("renewing should work"),
+        "a build the reaper took must be told so"
     );
 }
 
@@ -948,7 +1106,7 @@ async fn moving_reads_to_postgres_is_refused_while_the_central_catalog_disagrees
         .create(record_for(&id))
         .await
         .expect("creating should work");
-    fixture.dual.try_start_build(&id).await.expect("starting");
+    fixture.diverge_about(&id).await;
     assert_eq!(fixture.backlog.lag(), 0, "the lag alone would allow it");
 
     let error = fixture
@@ -996,7 +1154,7 @@ async fn a_central_divergence_does_not_refuse_the_rollback_to_object_storage() {
         .create(record_for(&id))
         .await
         .expect("creating");
-    fixture.dual.try_start_build(&id).await.expect("starting");
+    fixture.diverge_about(&id).await;
     assert_eq!(fixture.backlog.diverged_toward(MirrorDirection::Central), 1);
 
     fixture
@@ -1017,7 +1175,7 @@ async fn deleting_a_snapshot_clears_what_the_catalogs_disagreed_about() {
         .create(record_for(&id))
         .await
         .expect("creating");
-    fixture.dual.try_start_build(&id).await.expect("starting");
+    fixture.diverge_about(&id).await;
     assert_eq!(fixture.backlog.diverged_toward(MirrorDirection::Central), 1);
 
     fixture

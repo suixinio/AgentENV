@@ -2462,6 +2462,65 @@ mod tests {
         assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 0);
     }
 
+    /// 🔴 And a sweep resumes where the last one stopped, rather than
+    /// re-reading the same first page forever.
+    ///
+    /// The cap only bounds the work if the *next* sweep gets past what the last
+    /// one already looked at. Without the cursor, a set larger than one page
+    /// whose first page is all still-live divergences hides everything behind
+    /// it permanently — including the one record that has settled and should be
+    /// retired, which is the state B-2 is about.
+    #[tokio::test]
+    async fn a_sweep_resumes_where_the_last_one_stopped() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+
+        // Sorted, so "the last by key" is the one the sweep reaches last.
+        let mut ids: Vec<SnapshotId> = (0..(MAX_DIVERGENCES_PER_SWEEP + 5))
+            .map(|_| SnapshotId::generate())
+            .collect();
+        ids.sort_by_key(|id| id.to_string());
+        for id in &ids {
+            backlog
+                .note_divergence(
+                    MirrorDirection::Central,
+                    id,
+                    "try_start_build",
+                    "why".into(),
+                )
+                .await;
+        }
+
+        // Every one of them is still real except the last, whose snapshot both
+        // catalogs have stopped holding.
+        let object_store = Arc::new(ScriptedCatalog::default());
+        for id in &ids[..ids.len() - 1] {
+            object_store.seed(record_for(id));
+        }
+        let central = Arc::new(ScriptedCentral::default());
+        let targets = both_targets(&object_store, &central);
+
+        let first = backlog
+            .retire_settled_divergences(&targets)
+            .await
+            .expect("the sweep should run");
+        assert_eq!(first.retired, 0, "the first page is all still-live records");
+        assert_eq!(first.examined, MAX_DIVERGENCES_PER_SWEEP);
+
+        let second = backlog
+            .retire_settled_divergences(&targets)
+            .await
+            .expect("the sweep should run");
+        assert_eq!(
+            second.retired, 1,
+            "the second sweep has to get past the first page to the record that has settled"
+        );
+        assert_eq!(
+            backlog.diverged_toward(MirrorDirection::Central),
+            ids.len() as u64 - 1
+        );
+    }
+
     /// One snapshot's disagreement, discovered twice, is one divergence.
     #[tokio::test]
     async fn the_same_disagreement_discovered_twice_is_counted_once() {

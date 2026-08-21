@@ -1943,6 +1943,7 @@ mod bytes_then_commit {
             .is_none());
 
         // 🔴 Down the wire and back before it is used.
+        let staged_at_unix_ms = handle.staged().staged_at_unix_ms;
         let encoded = serde_json::to_vec(handle.staged()).expect("the staged value should encode");
         drop(handle);
         let decoded: StagedSnapshot =
@@ -1953,6 +1954,26 @@ mod bytes_then_commit {
             .await
             .expect("a round-tripped staged snapshot must commit");
         assert_eq!(record.id, id);
+
+        // 🔴 One instant, decided where the bytes were staged, and the same one
+        // in both catalogs. Left to each store's own clock the two rows differ
+        // by an RPC's latency on every publish — and a commit that crossed a
+        // process boundary would record whenever the *other* process got round
+        // to it, which is the failure the backfill made visible at scale.
+        assert_eq!(
+            record.created_at_unix_ms, staged_at_unix_ms,
+            "the row must record when the snapshot was staged, not when the flip ran"
+        );
+        assert_eq!(
+            central
+                .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                .await
+                .expect("reading should work")
+                .expect("the row should be there")
+                .created_at_unix_ms,
+            staged_at_unix_ms,
+            "and the catalog in the other process must record the same instant"
+        );
 
         // Both catalogs now have it — the second one in a different process.
         assert!(object_store

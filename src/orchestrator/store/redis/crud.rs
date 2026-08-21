@@ -312,7 +312,7 @@ impl StoreInner {
     /// 🔴 The existence check is inside the script. Checking here and removing
     /// afterwards would let a lockless `add` land in between and have its
     /// brand-new sandbox removed from the membership set.
-    async fn sweep_index_member(&self, sandbox_id: &SandboxId) -> Result<()> {
+    pub(super) async fn sweep_index_member(&self, sandbox_id: &SandboxId) -> Result<()> {
         let mut connection = self.connection();
         let removed: i64 = scripts::sweep_index_member()
             .key(self.keys().index())

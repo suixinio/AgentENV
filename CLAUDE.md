@@ -14,8 +14,19 @@ make test                     # full test suite (agent + envd + ublk)
 make test-unit                # unit tests only
 make test-agent-integration   # integration tests (tests/integration/*.rs)
 make bench                    # snapshot benchmarks
+make test-with-redis          # the orchestrator metadata store against a real redis-server
 make start-server             # build and run the API server (auto-provisions dependencies)
 ```
+
+`make test-with-redis` runs `src/orchestrator/store/`'s suite with
+`AENV_REDIS_TEST_REQUIRED=1`, which turns "no `redis-server` on this machine"
+into a failure rather than a skip, and fails the target if any test printed a
+`SKIPPED[redis]` line. Set `REDIS_SERVER_BIN` to use a particular binary. The
+suite is part of `cargo test -p agentenv --lib`, so `make test-unit` runs it too
+— but only that target makes a missing dependency an error. **Anything that
+changes `InMemoryMetadataStore` has to run it**: the two backends share one
+contract suite (`src/orchestrator/store/contract.rs`) and a change made to one
+and forgotten for the other is invisible anywhere else.
 
 Dev/CI tooling via `cargo adev` (delegated from Makefile):
 ```bash

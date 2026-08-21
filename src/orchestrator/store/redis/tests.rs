@@ -1481,6 +1481,35 @@ async fn a_membership_entry_with_no_record_is_swept_from_the_roster() {
     assert!(members.is_empty());
 }
 
+/// 🔴 The sweep's predicate, tested directly rather than through a race.
+///
+/// The membership entry may only be dropped when the record really is gone,
+/// and the check has to be inside the script: a check made in Rust and an
+/// `SREM` issued afterwards lets a lockless `add` land in between and have its
+/// brand-new sandbox unindexed. A test that only sweeps an entry whose record
+/// is already gone cannot tell the two arrangements apart, so this one asks the
+/// sweep to remove an entry whose record is very much present.
+#[tokio::test]
+async fn the_sweep_refuses_to_unindex_a_record_that_exists() {
+    let store = store_or_skip!("the_sweep_refuses_to_unindex_a_record_that_exists");
+    let id = SandboxId::new();
+    store.add(running(id)).await.unwrap();
+
+    store.inner().sweep_index_member(&id).await.unwrap();
+
+    let mut connection = raw(&store);
+    let members: Vec<String> = connection
+        .smembers(store.inner().keys().index())
+        .await
+        .unwrap();
+    assert_eq!(
+        members,
+        vec![id.to_string()],
+        "the sweep unindexed a sandbox whose record is still there"
+    );
+    assert_eq!(store.list_ids().await.unwrap(), vec![id]);
+}
+
 /// Coverage across several chunks, which is where a truncation would hide.
 #[tokio::test]
 async fn coverage_is_reported_across_chunk_boundaries() {

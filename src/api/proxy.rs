@@ -2126,6 +2126,159 @@ mod tests {
         assert!(!is_send_request_failure_text(&"client error (Connect)"));
     }
 
+    /// 🔴 The role gate against the **real** assembled router.
+    ///
+    /// Every other test of it uses a stand-in for the generated router, because
+    /// the generated one needs a whole `ApiImpl`. This one has one, so it is
+    /// the only place the layer, the generated route table and the merged data
+    /// plane are exercised together — and the failure it exists to catch is
+    /// exactly the one a stand-in cannot show: a gate that takes the port down
+    /// instead of taking three route groups away.
+    ///
+    /// Four faces, and the middle two are the ones that matter. Without the
+    /// `--role all` comparison, a `POST /sandboxes` that 404s because the route
+    /// is broken passes. Without the data-plane call, a gate that refused
+    /// everything on the port passes.
+    #[tokio::test]
+    async fn a_node_refuses_user_rest_while_its_sandbox_data_plane_keeps_answering() {
+        let create = || {
+            Request::builder()
+                .method("POST")
+                .uri("/sandboxes")
+                .header("x-api-key", "test-key")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let node = server::new(build_api().await, ServerRole::Node);
+        assert_eq!(
+            node.clone().oneshot(create()).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a node must answer the user-facing create as if the route were not there"
+        );
+
+        // ...and the same request on the rollback role reaches the handler, so
+        // the 404 above is the role and not a broken route.
+        let all = server::new(build_api().await, ServerRole::All);
+        assert_ne!(
+            all.oneshot(create()).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "under --role all the create route still exists"
+        );
+
+        // 🔴 The port is not what was taken away: the sandbox data plane on the
+        // same router still answers, from its own handler.
+        let response = node
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/proxy/hello")
+                    .header("x-api-key", "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            body,
+            Bytes::from_static(b"missing sandbox routing header"),
+            "the data plane answered, which is what makes the 404 above specific"
+        );
+
+        // And kubelet can still tell whether this pod is alive.
+        assert_ne!(
+            node.oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::NOT_FOUND,
+            "gating /health would stop the pod ever becoming ready"
+        );
+    }
+
+    /// 🔴 A refused route and a route that was never there are the same
+    /// response.
+    ///
+    /// This is the comparison `_sd-impl-phase3-role.md` §15.4 asks for, and it
+    /// can only be made here: the thing being compared against is the data
+    /// plane's fallback, which no stand-in router has. It also caught the
+    /// version of this that shipped first — an empty-bodied 404, which is
+    /// nothing like what an absent route on this server produces, and which no
+    /// JSON client can parse.
+    ///
+    /// Status, content type and body, with only the path differing.
+    #[tokio::test]
+    async fn a_refused_route_is_indistinguishable_from_one_that_never_existed() {
+        let node = server::new(build_api().await, ServerRole::Node);
+        let answer = |path: &'static str| {
+            let node = node.clone();
+            async move {
+                let response = node
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("x-api-key", "test-key")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .map(|value| value.to_str().unwrap().to_string());
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (
+                    status,
+                    content_type,
+                    String::from_utf8(body.to_vec()).unwrap(),
+                )
+            }
+        };
+
+        // A route the generated router has, that this role refuses.
+        let refused = answer("/sandboxes").await;
+        // A path no router on this process has ever had.
+        let absent = answer("/definitely-not-a-route").await;
+
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        assert_eq!(refused.0, absent.0);
+        assert_eq!(refused.1, absent.1);
+        assert_eq!(
+            refused.2.replace("/sandboxes", "<path>"),
+            absent.2.replace("/definitely-not-a-route", "<path>"),
+            "a node's refusal must not be tellable from a route that never existed"
+        );
+
+        // The probe has resolution: the same route on the rollback role is not
+        // a 404 at all, so the equality above is about the role.
+        let all = server::new(build_api().await, ServerRole::All);
+        assert_ne!(
+            all.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sandboxes")
+                    .header("x-api-key", "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
     #[tokio::test]
     async fn proxy_requires_routing_headers() {
         let app = server::new(build_api().await, ServerRole::All);

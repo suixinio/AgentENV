@@ -51,6 +51,15 @@
 //! the wrong question: this sweep is about a machine, and that marker is about
 //! a sandbox.
 //!
+//! # What this is not
+//!
+//! It is not reconciliation, and the two must not grow into each other. The API
+//! half's reconciliation compares what a node reports against what the control
+//! plane believes and settles the difference; it can only ever see what the node
+//! knows about. This sweep handles the complement — what the node itself does
+//! not know is there — which is why it works from `/proc` and a directory
+//! listing rather than from any ledger. Neither covers the other's case.
+//!
 //! # What is swept, and what is deliberately not
 //!
 //! | e2b `startupreclaim` | here | |

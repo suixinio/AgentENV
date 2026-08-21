@@ -56,6 +56,7 @@ use axum::{
     extract::{Request, State},
     http::{Method, Response, StatusCode},
     middleware::{self, Next},
+    response::IntoResponse,
     Router,
 };
 use tracing::debug;
@@ -202,14 +203,30 @@ async fn refuse_outside_role(
         "refusing a route this role does not serve"
     );
 
-    // 🔴 404 with an empty body, not 403 and not 405. The goal is that a node
-    // is indistinguishable from a process where this route was never compiled
-    // in; a 403 advertises that it exists, and a 405 advertises which methods
-    // it has.
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::empty())
-        .expect("static not-found response is valid")
+    not_found(request.method(), request.uri().path())
+}
+
+/// The answer a node gives for a route it does not serve.
+///
+/// 🔴 404, not 403 and not 405: a 403 advertises that the route exists and
+/// invites a retry with credentials that would not help, and a 405 advertises
+/// which methods it has.
+///
+/// 🔴 And **byte-for-byte what an unattached route already produces**. A path
+/// that no generated route claims falls through to `proxy::proxy_via_fallback`,
+/// which answers 404 with this exact envelope, for a reason that applies here
+/// unchanged: it returns "the API error envelope so JSON clients surface 'route
+/// not found' instead of failing to parse an empty 404 body". An empty body
+/// here would break those clients *and* leave a node's refusal distinguishable
+/// from a route that was never compiled in — which is the one property the
+/// choice of 404 was for.
+/// `a_refused_route_is_indistinguishable_from_one_that_never_existed` runs that
+/// comparison against the real router.
+fn not_found(method: &Method, path: &str) -> Response<Body> {
+    let error =
+        agentenv_http_server::models::Error::new(404, format!("route not found: {method} {path}"));
+
+    (StatusCode::NOT_FOUND, axum::Json(error)).into_response()
 }
 
 #[cfg(test)]
@@ -459,13 +476,18 @@ mod tests {
         }
     }
 
-    /// 🔴 T-RG-7. A refusal carries no body.
+    /// 🔴 T-RG-7. A refusal says exactly what an absent route says.
     ///
-    /// The point of answering 404 rather than 403 is that a node should look
-    /// like a process this route was never compiled into. A body explaining the
-    /// refusal would undo that in the first line of it.
+    /// "A node should look like a process this route was never compiled into"
+    /// is a claim about the whole response, not only its status. An unattached
+    /// path on this server does not produce a bare 404 — it falls through to
+    /// the data plane's fallback, which answers with the API error envelope —
+    /// so a refusal with an empty body would be distinguishable from an absent
+    /// route, and would break the JSON clients that envelope exists for.
+    /// `a_refused_route_is_indistinguishable_from_one_that_never_existed` runs
+    /// the comparison against the real router; this pins the shape.
     #[tokio::test]
-    async fn a_refusal_says_nothing_about_why() {
+    async fn a_refusal_says_only_what_an_absent_route_says() {
         let response = attach(stand_in_generated(), ServerRole::Node)
             .oneshot(
                 HttpRequest::builder()
@@ -478,17 +500,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(
+        assert_eq!(
             response
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
-                .is_none(),
-            "a refusal that names a content type is a refusal that says something"
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "the refusal must carry the envelope a JSON client can parse"
         );
-        let body = axum::body::to_bytes(response.into_body(), 64)
+        let body = axum::body::to_bytes(response.into_body(), 256)
             .await
             .unwrap();
-        assert!(body.is_empty(), "the refusal body must be empty: {body:?}");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 404);
+        assert_eq!(body["message"], "route not found: POST /sandboxes");
     }
 
     /// 🔴 T-RG-8. `--role all` gets no layer at all.

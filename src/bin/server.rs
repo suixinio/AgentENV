@@ -400,6 +400,10 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     let core = assemble_node_core(config, role).await?;
 
     debug_assert!(role.arbitrates_paused_sandbox_ownership());
+    // The rollback target serves everything it ever served: no RoleGate is
+    // attached for this role at all (`crate::api::role_gate::attach`).
+    debug_assert!(role.serves_user_facing_rest());
+    debug_assert!(!role.reclaims_host_leftovers_at_startup());
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
         &config.cluster,
@@ -486,6 +490,12 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     let core = assemble_node_core(config, role).await?;
 
     debug_assert!(!role.arbitrates_paused_sandbox_ownership());
+    // Both are `role`'s to decide and both are read from it below rather than
+    // spelled out again: the user-facing REST surface is refused by the layer
+    // `server::new` attaches, and the host sweep already ran inside
+    // `assemble_node_core`.
+    debug_assert!(!role.serves_user_facing_rest());
+    debug_assert!(role.reclaims_host_leftovers_at_startup());
     let configured_backend = config.orchestrator.paused_registry.backend;
     let cluster_registry_configured =
         !matches!(configured_backend, PausedRegistryBackendKind::Local);

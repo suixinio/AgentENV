@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::proto::scheduler as pb;
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -575,43 +575,93 @@ impl CentralSnapshotCatalog {
             .map_err(|_| Self::malformed("resolve_alias", "an alias target that is not a uuid"))
     }
 
+    /// Reads one keyset page, with the page bounds carried by the filter.
+    ///
+    /// 🔴 This is the pushdown, and the cost it removes is the whole point of
+    /// the batch: an object-store catalog answers `?limit=5` by listing every
+    /// object and reading every one of them, so the page size buys nothing.
+    /// Here the `limit` and the cursor reach the `WHERE` and the `LIMIT`, and a
+    /// small page is a small query.
+    pub async fn list_page_scoped(
+        &self,
+        filter: SnapshotListFilter,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        // 🔴 A caller asking for no rows is answered without a round trip: on
+        // the wire `limit = 0` means "the server's default", so forwarding it
+        // would turn a request for nothing into a request for a hundred rows.
+        if filter.effective_limit() == 0 {
+            return Ok(SnapshotListPage::single(Vec::new()));
+        }
+        self.list_one_page(
+            &encode_filter(&filter),
+            filter.cursor.as_ref().map(encode_cursor),
+            filter.effective_limit(),
+            scope,
+        )
+        .await
+    }
+
+    async fn list_one_page(
+        &self,
+        filter: &pb::SnapshotFilter,
+        cursor: Option<pb::SnapshotCursor>,
+        limit: u32,
+        scope: CatalogReadScope,
+    ) -> RepositoryResult<SnapshotListPage> {
+        let response = self
+            .client()
+            .list_snapshots(self.request(pb::ListSnapshotsRequest {
+                cluster_id: self.cluster_id.to_string(),
+                filter: Some(filter.clone()),
+                cursor,
+                limit,
+                allow_any_status: scope.allow_any_status(),
+                with_build: true,
+            }))
+            .await
+            .map_err(|status| Self::unreachable("list_snapshots", status))?
+            .into_inner();
+
+        let mut items = Vec::with_capacity(response.rows.len());
+        for row in response.rows {
+            items.push(decode_row(row, self.cluster_id)?);
+        }
+        let next = response
+            .next_cursor
+            .map(|next| {
+                decode_cursor(&next).ok_or_else(|| {
+                    Self::malformed("list_snapshots", "a next cursor whose id is not a uuid")
+                })
+            })
+            .transpose()?;
+
+        Ok(SnapshotListPage { items, next })
+    }
+
     /// Walks every page of a listing.
     ///
-    /// 🔴 Keyset pagination is pushed down to the server, but the *trait* still
-    /// returns every matching row, so this drains the cursor rather than
-    /// answering with one page. Handing back a single page here would silently
-    /// truncate every caller — and the callers are listing endpoints, so the
-    /// truncation would read as "the cluster has this many snapshots".
-    /// Surfacing the cursor to the API layer is the next batch's work.
+    /// 🔴 The unbounded read, and it stays unbounded: its callers are the
+    /// mirror's history backfill and the comparison that guards the read-side
+    /// switch, both of which are counting *everything* and would read a
+    /// truncated answer as agreement. Anything answering a user request calls
+    /// [`Self::list_page_scoped`] instead.
     pub async fn list_scoped(
         &self,
         filter: SnapshotListFilter,
         scope: CatalogReadScope,
     ) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let filter = encode_filter(&filter);
+        let filter = encode_filter(&filter.without_pagination());
         let mut cursor: Option<pb::SnapshotCursor> = None;
         let mut records = Vec::new();
 
         for _ in 0..LIST_PAGE_LIMIT {
-            let response = self
-                .client()
-                .list_snapshots(self.request(pb::ListSnapshotsRequest {
-                    cluster_id: self.cluster_id.to_string(),
-                    filter: Some(filter.clone()),
-                    cursor: cursor.clone(),
-                    limit: LIST_PAGE_SIZE,
-                    allow_any_status: scope.allow_any_status(),
-                    with_build: true,
-                }))
-                .await
-                .map_err(|status| Self::unreachable("list_snapshots", status))?
-                .into_inner();
+            let page = self
+                .list_one_page(&filter, cursor.clone(), LIST_PAGE_SIZE, scope)
+                .await?;
+            records.extend(page.items);
 
-            for row in response.rows {
-                records.push(decode_row(row, self.cluster_id)?);
-            }
-
-            match response.next_cursor {
+            match page.next.as_ref().map(encode_cursor) {
                 None => return Ok(records),
                 Some(next) => {
                     // A cursor that did not move would walk the same page for
@@ -635,6 +685,25 @@ impl CentralSnapshotCatalog {
             "a listing that did not end within the page bound",
         ))
     }
+}
+
+/// 🔴 The id travels as text, and the server compares it as text.
+///
+/// The public token orders by the id's string form, and a UUID's binary order
+/// is not its text order in general — comparing the wrong one drops rows at a
+/// page boundary with no error anywhere. Rendering it here and comparing it
+/// there is what keeps the two ends comparing the same thing.
+fn encode_cursor(cursor: &SnapshotCursor) -> pb::SnapshotCursor {
+    pb::SnapshotCursor {
+        created_at_unix_ms: cursor.created_at_unix_ms,
+        snapshot_id: cursor.snapshot_id.to_string(),
+    }
+}
+
+fn decode_cursor(cursor: &pb::SnapshotCursor) -> Option<SnapshotCursor> {
+    SnapshotId::parse(&cursor.snapshot_id)
+        .ok()
+        .map(|id| SnapshotCursor::new(cursor.created_at_unix_ms, id))
 }
 
 fn encode_filter(filter: &SnapshotListFilter) -> pb::SnapshotFilter {
@@ -750,6 +819,12 @@ impl SnapshotCatalog for CentralSnapshotCatalog {
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
         self.list_scoped(filter, CatalogReadScope::Resolvable).await
+    }
+
+    /// See [`Self::get`] on why this is the resolvable reading.
+    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
+        self.list_page_scoped(filter, CatalogReadScope::Resolvable)
+            .await
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {

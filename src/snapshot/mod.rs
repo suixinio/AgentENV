@@ -9,7 +9,9 @@ pub(crate) mod runtime_support;
 mod types;
 
 pub use manager::SnapshotManager;
-pub use repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
+pub use repository::{
+    RepositoryError, RepositoryResult, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
+};
 pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,

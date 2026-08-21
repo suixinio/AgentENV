@@ -30,7 +30,8 @@ use std::sync::Arc;
 
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
-    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StagedSnapshot,
+    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
+    StagedSnapshot,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -195,9 +196,17 @@ impl SnapshotRepository {
         self.catalog.get(id_or_alias).await
     }
 
-    /// Lists snapshot records matching the provided filter.
+    /// Lists every snapshot record matching the provided filter.
     pub async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
         self.catalog.list(filter).await
+    }
+
+    /// Lists one page of snapshot records, newest first.
+    pub async fn list_page(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> RepositoryResult<SnapshotListPage> {
+        self.catalog.list_page(filter).await
     }
 
     /// Deletes one snapshot by id or alias. Idempotent.

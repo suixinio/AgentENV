@@ -14,7 +14,7 @@ use crate::sandbox::{
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::SnapshotRepository;
-use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
+use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
     SnapshotRecord,
@@ -353,12 +353,24 @@ impl SnapshotManager {
             })
     }
 
-    /// Lists snapshot records that match the given filter.
+    /// Lists every snapshot record that matches the given filter.
     pub async fn list(&self, filter: SnapshotListFilter) -> anyhow::Result<Vec<SnapshotRecord>> {
         self.repository
             .list(filter)
             .await
             .context("list committed snapshots through repository")
+    }
+
+    /// Lists one page of snapshot records, newest first.
+    ///
+    /// What every listing endpoint calls: the page bounds ride on the filter so
+    /// that a catalog able to push them into its storage does, and one that
+    /// cannot still answers the same page.
+    pub async fn list_page(&self, filter: SnapshotListFilter) -> anyhow::Result<SnapshotListPage> {
+        self.repository
+            .list_page(filter)
+            .await
+            .context("list one page of committed snapshots through repository")
     }
 
     /// Deletes a snapshot by id or alias.

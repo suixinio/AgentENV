@@ -8,6 +8,7 @@ pub mod mirror;
 pub use composite::SnapshotRepository;
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
-    ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
-    SnapshotListFilter, SnapshotRuntimeResolver, StagedSnapshot,
+    paginate_records, ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog,
+    SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage, SnapshotRuntimeResolver,
+    StagedSnapshot, DEFAULT_LIST_PAGE_LIMIT, MAX_LIST_PAGE_LIMIT,
 };

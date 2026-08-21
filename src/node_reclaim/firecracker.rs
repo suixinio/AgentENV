@@ -203,6 +203,16 @@ fn plan_for_candidate(
 /// 🔴 Every branch that is not `KillGroup` is a refusal, and each one exists
 /// because turning it into a group kill would signal something other than that
 /// one VMM.
+///
+/// 🔴 The order matters, and two of the refusals only bite where the last one
+/// does not. `pgid != pid` already covers most of the ground — a group whose
+/// leader is not this process is somebody else's — so the two guards above it
+/// are reached exactly when the leader *is* this process and the group is
+/// still not safe: `pgid == pid == 1` (`kill(-1)` is every process on the
+/// machine) and `pgid == pid == own_pgid` (this server's own group). Those two
+/// cases are where the catastrophic mistakes live, so they are tested directly
+/// against this function rather than through `plan`, where the `pgid != pid`
+/// arm would answer first and the guards would look redundant.
 fn plan_for_owned(pid: i32, process_dir: &Path, own_pgid: i32) -> Action {
     let Some(pgid) = read_pgid(process_dir) else {
         // Ownership is settled; only the blast radius is not. Signal the one
@@ -602,6 +612,87 @@ mod tests {
         fixture.proc.process(7003, "firecracker", Some(&ours), 7003);
         let plans = fixture.plan();
         assert_eq!(plans[2].action, Action::KillGroup(7003));
+    }
+
+    /// A `/proc`-shaped directory carrying just a `stat` line, for driving
+    /// [`plan_for_owned`] directly.
+    fn stat_dir(pid: i32, pgid: i32) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("stat"),
+            format!("{pid} (firecracker) S 1 {pgid} {pgid} 0 -1 4194304"),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// 🔴 T-NR-4b. **`kill(-1)` is every process on the machine.**
+    ///
+    /// Driven straight at [`plan_for_owned`], because that is the only place
+    /// the guard is reachable: through `plan`, a process whose group id is 1
+    /// almost always fails `pgid == pid` first and is signalled alone anyway,
+    /// so a test at that level passes with the guard deleted. The one arrangement
+    /// where the guard is what stands between here and `kill(-1, SIGKILL)` is a
+    /// group leader whose id is 1 — which is exactly what a shifted `stat` field
+    /// or a truncated read produces.
+    ///
+    /// Found by mutation: deleting the guard left every `plan`-level test green.
+    #[test]
+    fn a_group_leader_with_id_one_is_never_signalled_as_a_group() {
+        let dir = stat_dir(1, 1);
+        assert_eq!(
+            plan_for_owned(1, dir.path(), 4242),
+            Action::KillProcess(1),
+            "kill(-1, SIGKILL) signals every process this node is allowed to signal"
+        );
+
+        let dir = stat_dir(0, 0);
+        assert_eq!(
+            plan_for_owned(0, dir.path(), 4242),
+            Action::KillProcess(0),
+            "kill(-0, SIGKILL) signals the caller's own process group"
+        );
+
+        // The control face: an ordinary group leader is signalled as a group,
+        // so the two above are about the values 0 and 1.
+        let dir = stat_dir(7003, 7003);
+        assert_eq!(
+            plan_for_owned(7003, dir.path(), 4242),
+            Action::KillGroup(7003)
+        );
+    }
+
+    /// 🔴 T-NR-5b. The sweep never signals its own group, in the one
+    /// arrangement where saying so costs something.
+    ///
+    /// Same story as above: reached only when the leader of our own group is
+    /// the candidate, which `pgid != pid` cannot catch.
+    #[test]
+    fn the_leader_of_our_own_group_is_never_signalled_as_a_group() {
+        let own_pgid = 31337;
+        let dir = stat_dir(own_pgid, own_pgid);
+        assert_eq!(
+            plan_for_owned(own_pgid, dir.path(), own_pgid),
+            Action::KillProcess(own_pgid),
+            "signalling our own group kills this server on the way past"
+        );
+
+        // ...and the same process under a different group is a group kill.
+        assert_eq!(
+            plan_for_owned(own_pgid, dir.path(), 9),
+            Action::KillGroup(own_pgid)
+        );
+    }
+
+    /// T-NR-6b. An unreadable `stat` settles nothing about the group, so only
+    /// the one process that was identified is signalled.
+    #[test]
+    fn an_unreadable_stat_narrows_the_signal_to_one_process() {
+        let empty = TempDir::new().unwrap();
+        assert_eq!(
+            plan_for_owned(4242, empty.path(), 9),
+            Action::KillProcess(4242)
+        );
     }
 
     /// 🔴 T-NR-5. The sweep never signals the group it is a member of.

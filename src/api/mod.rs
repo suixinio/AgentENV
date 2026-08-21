@@ -11,6 +11,7 @@ mod impls;
 pub use impls::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
 mod isolation;
 mod proxy;
+mod role_gate;
 pub mod server;
 
 pub use impls::{ApiImpl, PausedSandboxWiring, StaleReleaseOutcome};

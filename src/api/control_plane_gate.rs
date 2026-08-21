@@ -72,6 +72,20 @@ pub(crate) const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 ///
 /// ⚠️ Only the reads are exempt. `POST /sandboxes` creates a sandbox and stays
 /// behind the gate.
+///
+/// 🔴 **The `/sandboxes` half is dead code on a `--role node` process, and
+/// deleting it is still not this batch's job.** [`super::role_gate`] runs ahead
+/// of this gate and answers both listing routes with 404 there, so the fan-out
+/// this exemption exists for gets 404s from such a node and the cluster listing
+/// — which is all-or-nothing — becomes a 502. That is the intended end state
+/// (`_sd-impl-phase3-role.md` §7.4: after phase 2 the listing is one query
+/// against the catalog and the fan-out goes away), but the order is fixed and
+/// runs the other way: **stop the fan-out first, delete this exemption second**.
+/// Deleting it while `services/gateway/internal/cluster_list.go` still calls
+/// `fetchNodeClusterList` — which it does today — turns every one of those calls
+/// into a 403 on nodes that are still `--role all`, which is the same outage a
+/// release earlier. `a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts`
+/// holds both halves of that in one place.
 fn is_exempt(method: &Method, path: &str) -> bool {
     if path == "/health" {
         return true;
@@ -385,14 +399,31 @@ mod tests {
             .expect("preStop is followed by postStart")
             .0;
 
-        let calls = pre_stop.matches("curl ").count();
-        let credentials = pre_stop.matches(CONTROL_PLANE_HEADER).count();
+        // 🔴 An invocation is a `curl` that names the node's own API, not
+        // every occurrence of the word. Counting the word made the assertion
+        // fire on a comment that mentioned `curl`, which is a failure that
+        // teaches the next person to reword their comment rather than to look
+        // at their hook.
+        let calls: Vec<&str> = pre_stop
+            .split("curl ")
+            .skip(1)
+            .filter(|call| call.contains("http://localhost:8000"))
+            .collect();
+        let credentials = calls
+            .iter()
+            .filter(|call| call.contains(CONTROL_PLANE_HEADER))
+            .count();
 
-        assert!(calls > 0, "the preStop hook still calls the node's API");
+        assert!(
+            !calls.is_empty(),
+            "the preStop hook still calls the node's API"
+        );
         assert_eq!(
-            credentials, calls,
+            credentials,
+            calls.len(),
             "every preStop call to the node's API must carry the control-plane credential; \
-             found {calls} call(s) and {credentials} credential header(s)"
+             found {} call(s) and {credentials} credential header(s)",
+            calls.len()
         );
 
         // ...and the file it reads the credential from is the one the server

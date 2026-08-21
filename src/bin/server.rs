@@ -269,6 +269,14 @@ async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Res
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    // 🔴 First, before anything else this process constructs, and in
+    // particular before `setup::ensure_environment` — which unlinks every
+    // stale network namespace, and a namespace must not be unlinked while a
+    // VMM is still running inside it. The sweep is sound only while this
+    // process holds nothing on the machine, and that window is widest here.
+    // See `src/node_reclaim/` for the whole argument.
+    agentenv::node_reclaim::run(role, config).await;
+
     let identity = NodeIdentity::from_config(&config.node_identity);
     // `identity` is moved into the observability service below; the registry
     // wiring needs the same node/cluster identity afterwards.
@@ -446,7 +454,7 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     }
 
     Ok(Assembly {
-        app: server::new(api_impl),
+        app: server::new(api_impl, role),
         orchestration,
         upkeep: paused_upkeep,
         reporter: core.reporter,
@@ -479,12 +487,45 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 
     debug_assert!(!role.arbitrates_paused_sandbox_ownership());
     let configured_backend = config.orchestrator.paused_registry.backend;
-    if !matches!(configured_backend, PausedRegistryBackendKind::Local) {
+    let cluster_registry_configured =
+        !matches!(configured_backend, PausedRegistryBackendKind::Local);
+    // Published either way, so "this node has holdings nobody is going to
+    // release" is answerable from a scrape rather than from a log line that
+    // scrolled past during startup.
+    metrics::gauge!("agentenv_node_unreleased_cluster_holdings").set(
+        if cluster_registry_configured {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    if cluster_registry_configured {
+        // 🔴 Two consequences, and the second is the one that is easy to miss.
+        //
+        // Forward: this process claims nothing, so it can never fail to renew
+        // a lease. That is the fail-closed direction and it is why the
+        // disabled registry is wired in regardless of configuration.
+        //
+        // Backward: whatever *the previous process on this machine* claimed
+        // while it ran as `--role all` stays claimed. `--role all` calls
+        // `release_stale_node_holdings` at startup to hand those back; this
+        // role does not, and deliberately — releasing rows by node identity is
+        // a statement about who owns a paused sandbox, which is the one thing
+        // `ServerRole::Node` answers `false` to
+        // (`arbitrates_paused_sandbox_ownership`). Putting it back here would
+        // reintroduce exactly the split this role exists to end.
+        //
+        // The successor for it is the API half's reconciliation, which has a
+        // proof this process does not: it can see from the scheduler that this
+        // node is gone. Until that lands, an `all` → `node` switch strands the
+        // previous process's rows until their leases lapse.
         warn!(
             target: "agentenv",
             configured = ?configured_backend,
             "--role node ignores the configured paused-sandbox registry: cluster-wide records \
-             belong to the API half. Paused sandboxes stay resumable on this node."
+             belong to the API half. Paused sandboxes stay resumable on this node, and this \
+             process claims nothing new — but anything this machine was holding from a previous \
+             --role all process is not released by this one and stays held until its lease lapses."
         );
     }
     // `ApiImpl` needs a coordinator either way; this one is wired to a registry
@@ -511,7 +552,10 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     ));
 
     Ok(Assembly {
-        app: server::new(api_impl),
+        // 🔴 The role is what attaches the RoleGate: the user-facing REST
+        // surface is still compiled in and still routed, and is answered with
+        // 404 on this half. See `src/api/role_gate.rs`.
+        app: server::new(api_impl, role),
         orchestration,
         // 🔴 No upkeep: renewing a lease and reconciling local records against
         // the cluster are both decisions, and this role takes none.

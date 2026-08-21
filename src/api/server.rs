@@ -3,12 +3,21 @@ use std::sync::Arc;
 use axum::{middleware, routing::get, Router};
 
 use super::control_plane_gate::{require_control_plane, ControlPlaneGate};
+use super::role_gate;
 use super::{isolation, proxy, ApiImpl};
 use crate::observability::prometheus;
+use crate::role::ServerRole;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
 
-pub fn new<I, A, E, C>(api_impl: I) -> Router
+/// Builds the router this process serves.
+///
+/// 🔴 `role` is a parameter rather than something read from a global because
+/// the failure mode of getting it wrong is a layer that is silently absent —
+/// a node serving the full user-facing REST surface, which is exactly the
+/// state `--role node` exists to end. Every caller has to say which half it is
+/// assembling.
+pub fn new<I, A, E, C>(api_impl: I, role: ServerRole) -> Router
 where
     I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
     A: apis::admin::Admin<E, Claims = C>
@@ -31,6 +40,7 @@ where
         agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone()),
         proxy::router(api_impl.clone()),
         Arc::new(ControlPlaneGate::from_global_config()),
+        role,
     )
     .route("/metrics", get(metrics_handler))
     // Runs ahead of the generated resume handler: an isolated node answers
@@ -59,10 +69,26 @@ where
 /// it, the data plane silently ends up behind the gate and every sandbox on the
 /// node stops answering. `the_gate_covers_the_control_plane_router_and_nothing_merged_after_it`
 /// is the only thing standing between that and a very confusing outage.
-fn assemble(generated: Router, data_plane: Router, gate: Arc<ControlPlaneGate>) -> Router {
-    generated
-        .layer(middleware::from_fn_with_state(gate, require_control_plane))
-        .merge(data_plane)
+///
+/// 🔴 The role gate is attached *after* the control-plane gate and therefore
+/// runs *before* it. Both are on the same router and both refuse; the order
+/// decides which refusal a caller sees. A node asked for `POST /sandboxes`
+/// without a credential must answer 404 — "no such route here" — and not 403,
+/// which would say the route exists and invite a retry with credentials that
+/// still would not make it a node's route. `crate::api::role_gate` documents
+/// the choice; `the_role_gate_answers_before_the_control_plane_gate_does` is
+/// what keeps the two `.layer` calls in this order.
+fn assemble(
+    generated: Router,
+    data_plane: Router,
+    gate: Arc<ControlPlaneGate>,
+    role: ServerRole,
+) -> Router {
+    role_gate::attach(
+        generated.layer(middleware::from_fn_with_state(gate, require_control_plane)),
+        role,
+    )
+    .merge(data_plane)
 }
 
 #[cfg(test)]
@@ -102,10 +128,15 @@ mod tests {
     }
 
     fn gated(tokens: Vec<String>, token_file: &str) -> Router {
+        assemble_as(ServerRole::All, tokens, token_file)
+    }
+
+    fn assemble_as(role: ServerRole, tokens: Vec<String>, token_file: &str) -> Router {
         assemble(
             stand_in_control_plane(),
             stand_in_data_plane(),
             Arc::new(ControlPlaneGate::new(tokens, token_file)),
+            role,
         )
     }
 
@@ -177,6 +208,100 @@ mod tests {
             StatusCode::FORBIDDEN,
             "the fallback carries host-routed sandbox traffic and must not be gated"
         );
+    }
+
+    /// 🔴 T-A4-10. The role gate answers before the control-plane gate does.
+    ///
+    /// Both layers sit on the generated router and both refuse. Under
+    /// `--role node` a user-facing route must come back 404 whether or not the
+    /// caller has a credential — the route is not part of a node's surface, and
+    /// a 403 would say it is, only locked. Getting the two `.layer` calls in the
+    /// wrong order does not fail to compile and does not fail any other test
+    /// here; it just quietly turns every one of these into a 403.
+    ///
+    /// Both faces, because a gate that 404s everything would pass the first
+    /// three assertions on its own.
+    #[tokio::test]
+    async fn the_role_gate_answers_before_the_control_plane_gate_does() {
+        let node = || assemble_as(ServerRole::Node, vec![TOKEN.to_string()], "");
+        let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
+
+        for presented in [None, Some(TOKEN), Some("wrong")] {
+            assert_eq!(
+                status(node(), Method::POST, sandbox_path, presented).await,
+                StatusCode::NOT_FOUND,
+                "a node must refuse a user-facing route as absent, not as forbidden, \
+                 whatever credential is presented ({presented:?})"
+            );
+        }
+
+        // The control face: the same assembly still runs the control-plane gate
+        // on the routes a node does serve, so the 404s above are the role gate
+        // answering rather than the control-plane gate having been dropped.
+        assert_eq!(
+            status(node(), Method::GET, "/health", None).await,
+            StatusCode::OK,
+            "kubelet's probe stays reachable on a node"
+        );
+        assert_eq!(
+            status(
+                assemble_as(ServerRole::All, vec![TOKEN.to_string()], ""),
+                Method::POST,
+                sandbox_path,
+                None
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "under --role all the same route is still gated on the credential, \
+             which is what makes the 404s above a statement about the role"
+        );
+    }
+
+    /// 🔴 T-A4-11. What `--role node` costs the gateway's cluster listing, said
+    /// out loud in the one place that can say it.
+    ///
+    /// `control_plane_gate::is_exempt` lets `GET /sandboxes` and
+    /// `GET /v2/sandboxes` through without a credential because the gateway
+    /// fans out to every node with its own HTTP client to build the cluster
+    /// -wide list. The role gate runs *first* and refuses both on a node, so on
+    /// a `--role node` fleet that fan-out gets 404s and the listing — which is
+    /// all-or-nothing — turns into a 502.
+    ///
+    /// That is intended (`_sd-impl-phase3-role.md` §7.4: after phase 2 the list
+    /// is one SQL query and the fan-out goes away), and the exemption is left in
+    /// place until the fan-out is deleted, in that order — deleting the
+    /// exemption first would 403 a fan-out that is still running. This test is
+    /// not a preference about either; it is here so that whoever flips a
+    /// DaemonSet to `--role node` learns this from a test name rather than from
+    /// a 502.
+    #[tokio::test]
+    async fn a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts() {
+        for path in ["/sandboxes", "/v2/sandboxes"] {
+            assert_eq!(
+                status(
+                    assemble_as(ServerRole::All, vec![TOKEN.to_string()], ""),
+                    Method::GET,
+                    path,
+                    None
+                )
+                .await,
+                StatusCode::OK,
+                "under --role all the fan-out is exempt and reaches the handler: {path}"
+            );
+            assert_eq!(
+                status(
+                    assemble_as(ServerRole::Node, vec![TOKEN.to_string()], ""),
+                    Method::GET,
+                    path,
+                    None
+                )
+                .await,
+                StatusCode::NOT_FOUND,
+                "under --role node the same fan-out is refused before the exemption \
+                 is ever consulted: {path}. Stop the gateway fan-out before rolling \
+                 a node to --role node."
+            );
+        }
     }
 
     /// T-A4-2. The credential is checked, not merely counted.
@@ -297,6 +422,7 @@ mod tests {
                 stand_in_control_plane(),
                 stand_in_data_plane(),
                 Arc::clone(&gate),
+                ServerRole::All,
             )
         };
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
@@ -349,6 +475,7 @@ mod tests {
                 stand_in_control_plane(),
                 stand_in_data_plane(),
                 Arc::clone(&gate),
+                ServerRole::All,
             )
         };
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";

@@ -1556,6 +1556,7 @@ mod tests {
         cfg::AppConfig,
         image::ImageResolver,
         orchestrator::{FileBackedSandboxPersister, Orchestrator},
+        role::ServerRole,
         snapshot::mock::mock_snapshot_manager,
         template::TemplateBuilder,
     };
@@ -1977,7 +1978,7 @@ mod tests {
             .set_auto_resume_for_test(sandbox_id, auto_resume)
             .await
             .unwrap();
-        server::new(api)
+        server::new(api, ServerRole::All)
     }
 
     async fn proxy_app_for_sandbox(sandbox_id: &SandboxId) -> axum::Router {
@@ -2001,7 +2002,7 @@ mod tests {
                 crate::orchestrator::SandboxState::Running,
             )
             .await;
-        server::new(api)
+        server::new(api, ServerRole::All)
     }
 
     async fn proxy_app_for_running_sandbox_without_route(sandbox_id: &SandboxId) -> axum::Router {
@@ -2013,7 +2014,7 @@ mod tests {
         api.orchestrator()
             .remove_proxy_route_for_test(sandbox_id)
             .await;
-        server::new(api)
+        server::new(api, ServerRole::All)
     }
 
     async fn start_proxy_server(sandbox_id: &SandboxId) -> SocketAddr {
@@ -2127,7 +2128,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_requires_routing_headers() {
-        let app = server::new(build_api().await);
+        let app = server::new(build_api().await, ServerRole::All);
 
         let response = app
             .clone()
@@ -2240,7 +2241,7 @@ mod tests {
             .orchestrator()
             .get_envd_access_token(&metadata)
             .expect("secure paused sandbox token");
-        let app = server::new(api);
+        let app = server::new(api, ServerRole::All);
 
         for token in [None, Some("incorrect")] {
             let mut request = Request::builder()
@@ -2760,7 +2761,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_fallback_returns_not_found_without_routing_header() {
-        let app = server::new(build_api().await);
+        let app = server::new(build_api().await, ServerRole::All);
 
         let response = app
             .oneshot(
@@ -3239,6 +3240,7 @@ mod execution_fencing_tests {
 
     use crate::api::server;
     use crate::orchestrator::{ProxyTarget, SandboxState};
+    use crate::role::ServerRole;
 
     use super::tests::{build_api, spawn_upstream};
 
@@ -3264,7 +3266,7 @@ mod execution_fencing_tests {
         api.orchestrator()
             .set_live_execution_for_test(sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), live)
             .await;
-        server::new(api)
+        server::new(api, ServerRole::All)
     }
 
     fn proxy_request(sandbox_id: SandboxId, port: u16, expect: Option<ExecutionId>) -> Request {
@@ -3377,7 +3379,7 @@ mod execution_fencing_tests {
         let sandbox_id = SandboxId::new();
         let app = {
             let api = build_api().await;
-            server::new(api)
+            server::new(api, ServerRole::All)
         };
 
         let response = app
@@ -3412,7 +3414,7 @@ mod execution_fencing_tests {
                 .set_auto_resume_for_test(&sandbox_id, true)
                 .await
                 .unwrap();
-            server::new(api)
+            server::new(api, ServerRole::All)
         };
 
         let response = app

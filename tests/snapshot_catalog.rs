@@ -1575,6 +1575,206 @@ mod dual_write {
     /// 🔴 And once the history is queued, the same collision is refused by the
     /// central catalog's own unique index rather than by an undo — which is the
     /// difference between a race that is handled and one that cannot happen.
+    /// 🔴 B-1, against the real catalog. A backfilled snapshot keeps the
+    /// creation time object storage already held for it.
+    ///
+    /// Measured on the cluster: every one of the 32 backfilled rows recorded
+    /// the instant the *backfill* ran. `created_at_ms` is what the listing
+    /// orders by and what `createdAt` is served from, so PostgreSQL returned
+    /// them in a completely different order from object storage and would have
+    /// told every caller the wrong date — while `lag == 0` reported agreement.
+    #[tokio::test]
+    async fn a_backfilled_snapshot_keeps_the_creation_time_object_storage_held() {
+        let central = catalog!();
+        let both = both(central).await;
+        let seeded = SnapshotId::generate();
+        // Far enough in the past that no clock read could produce it by
+        // accident: 2023-07-22.
+        let created_at = 1_690_000_000_000;
+
+        both.object_store
+            .publish_commit(sandbox_commit_created_at(
+                seeded.clone(),
+                None,
+                "seed",
+                created_at,
+            ))
+            .await
+            .expect("seeding the object store should work");
+        assert_eq!(
+            both.object_store
+                .get(&seeded.to_string())
+                .await
+                .expect("reading should work")
+                .expect("the row should be there")
+                .created_at_unix_ms,
+            created_at,
+            "the object store has to hold the stated instant for the rest of this to mean \
+             anything"
+        );
+
+        both.backlog
+            .queue_history_toward_central(both.object_store.as_ref() as &dyn SnapshotCatalog)
+            .await
+            .expect("the history should queue");
+        let pass = both
+            .backlog
+            .drain_once(&both.targets())
+            .await
+            .expect("the pass should run");
+        assert_eq!(pass.repaired, 1);
+
+        let row = both
+            .central
+            .get_scoped(&seeded.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("reading should work")
+            .expect("the backfilled row should be there");
+        assert_eq!(
+            row.created_at_unix_ms, created_at,
+            "a replayed publish must record the snapshot's creation time, not the replay's"
+        );
+    }
+
+    /// 🔴 B-1's second half, against the real catalog: `lag == 0` now means the
+    /// two catalogs' rows *say the same thing*, not merely that both stores
+    /// took the write.
+    ///
+    /// The central catalog is given the row first, with a creation time five
+    /// seconds off what the create about to be replayed carries. Object storage
+    /// then takes that create exactly as it always did — and the entry is still
+    /// counted as debt, because the two rows disagree.
+    #[tokio::test]
+    async fn a_row_the_store_took_but_that_disagrees_is_still_counted() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+        let record = template_record(id.clone(), None);
+
+        let mut drifted = record.clone();
+        drifted.created_at_unix_ms -= 5_000;
+        both.central
+            .begin_snapshot(&drifted, "waiting", true)
+            .await
+            .expect("opening the central row should work");
+
+        // Object storage is away, so the create is owed to it and to nothing
+        // else — the central catalog answers `AlreadyExists`, which is settled.
+        both.object_store.break_it();
+        both.dual
+            .create(record)
+            .await
+            .expect("an object store that is away must not fail the write");
+        assert_eq!(both.backlog.lag_toward(MirrorDirection::ObjectStore), 1);
+        both.object_store.fix_it();
+
+        let pass = both
+            .backlog
+            .drain_once(&both.targets())
+            .await
+            .expect("the pass should run");
+
+        assert!(
+            both.object_store
+                .get(&id.to_string())
+                .await
+                .expect("reading should work")
+                .is_some(),
+            "the write itself still lands"
+        );
+        assert_eq!(pass.repaired, 0, "but the two catalogs do not agree");
+        assert_eq!(
+            both.backlog.lag_toward(MirrorDirection::ObjectStore),
+            1,
+            "and the lag must not reach zero over rows that say different things"
+        );
+    }
+
+    /// 🔴 B-2, against the real catalog. A divergence must not outlive the
+    /// snapshot it is about.
+    ///
+    /// `clear_divergences` runs on delete, and the gateway routes the delete —
+    /// measured as 13 deletes split 6/8 across two nodes, leaving one node's
+    /// `mirror_diverged{central}` pinned at 1 over a snapshot that no longer
+    /// existed anywhere, with no API call able to clear it. Here the delete
+    /// happens the way another node's would: straight against both stores,
+    /// without this node's `delete_record` ever running.
+    #[tokio::test]
+    async fn a_divergence_does_not_outlive_the_snapshot_when_another_node_deletes_it() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+
+        both.dual
+            .create(template_record(id.clone(), None))
+            .await
+            .expect("creating should work");
+        both.dual
+            .try_start_build(&id)
+            .await
+            .expect("starting the build should work through object storage");
+        assert_eq!(
+            both.backlog.diverged_toward(MirrorDirection::Central),
+            1,
+            "build admission is not wired, so this records a divergence"
+        );
+
+        let record = both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .expect("the row should be there");
+        both.central
+            .delete_snapshot(&id.to_string(), 1)
+            .await
+            .expect("deleting from the central catalog should work");
+        both.object_store
+            .delete_record(&record)
+            .await
+            .expect("deleting from object storage should work");
+
+        let sweep = both
+            .backlog
+            .retire_settled_divergences(&both.targets())
+            .await
+            .expect("the sweep should run");
+        assert_eq!(sweep.retired, 1);
+        assert_eq!(
+            both.backlog.diverged_toward(MirrorDirection::Central),
+            0,
+            "nothing is left for the two catalogs to disagree about"
+        );
+    }
+
+    /// The control, and the one that keeps the fix above from being a way to
+    /// clear a number by forgetting it: while either catalog still holds the
+    /// snapshot, the disagreement is still real and the record stays.
+    #[tokio::test]
+    async fn a_divergence_about_a_live_snapshot_survives_the_sweep() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+
+        both.dual
+            .create(template_record(id.clone(), None))
+            .await
+            .expect("creating should work");
+        both.dual
+            .try_start_build(&id)
+            .await
+            .expect("starting the build should work through object storage");
+
+        let sweep = both
+            .backlog
+            .retire_settled_divergences(&both.targets())
+            .await
+            .expect("the sweep should run");
+        assert_eq!(sweep.retired, 0);
+        assert_eq!(sweep.kept, 1);
+        assert_eq!(both.backlog.diverged_toward(MirrorDirection::Central), 1);
+    }
+
     #[tokio::test]
     async fn a_queued_history_makes_the_hijack_impossible_rather_than_undone() {
         let central = catalog!();

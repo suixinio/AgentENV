@@ -543,3 +543,474 @@ async fn a_staged_snapshot_commits_into_the_central_catalog_after_a_round_trip()
         .expect("a round-tripped commit must still commit");
     assert_eq!(record.id, id);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The double write, against the same real catalog
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod dual_write {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use agentenv::snapshot::repository::mirror::{DualWriteCatalog, MirrorBacklog};
+    use agentenv::snapshot::repository::RepositoryResult;
+
+    /// A real object-store catalog with a switch that takes it away.
+    ///
+    /// 🔴 Wraps the POSIX backend rather than replacing it, so the "healthy"
+    /// half of every test below is a store that actually reads and writes
+    /// files. A fake on both sides would let the double write agree with itself.
+    struct BreakableCatalog {
+        inner: Arc<dyn SnapshotCatalog>,
+        broken: AtomicBool,
+    }
+
+    impl BreakableCatalog {
+        fn new(inner: Arc<dyn SnapshotCatalog>) -> Self {
+            Self {
+                inner,
+                broken: AtomicBool::new(false),
+            }
+        }
+
+        fn break_it(&self) {
+            self.broken.store(true, Ordering::SeqCst);
+        }
+
+        fn fix_it(&self) {
+            self.broken.store(false, Ordering::SeqCst);
+        }
+
+        fn refuse<T>(&self) -> Option<RepositoryResult<T>> {
+            self.broken.load(Ordering::SeqCst).then(|| {
+                Err(RepositoryError::Backend {
+                    message: "object storage is unreachable".to_string(),
+                    source: None,
+                })
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotCatalog for BreakableCatalog {
+        async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.create(record).await,
+            }
+        }
+
+        async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.publish_commit(commit).await,
+            }
+        }
+
+        async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.get(id_or_alias).await,
+            }
+        }
+
+        async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.list(filter).await,
+            }
+        }
+
+        async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.delete_record(record).await,
+            }
+        }
+
+        async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.resolve_alias(alias).await,
+            }
+        }
+
+        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.try_start_build(id).await,
+            }
+        }
+
+        async fn mark_build_error(
+            &self,
+            id: &SnapshotId,
+            reason: TemplateBuildErrorReason,
+        ) -> RepositoryResult<()> {
+            match self.refuse() {
+                Some(refusal) => refusal,
+                None => self.inner.mark_build_error(id, reason).await,
+            }
+        }
+    }
+
+    struct Both {
+        _workspace: tempfile::TempDir,
+        central: Arc<CentralSnapshotCatalog>,
+        object_store: Arc<BreakableCatalog>,
+        backlog: Arc<MirrorBacklog>,
+        dual: DualWriteCatalog,
+    }
+
+    /// Builds the double write over the real catalog and a real POSIX store.
+    ///
+    /// The POSIX backend builds its runtime resolver from the global config, so
+    /// one has to exist. Idempotent — the first test through wins.
+    async fn both(central: Arc<CentralSnapshotCatalog>) -> Both {
+        agentenv::cfg::ConfigManager::init_global().expect("a config should load");
+        let workspace = tempfile::TempDir::new().expect("tempdir should exist");
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: workspace.path().join("repository"),
+            cache_root: Some(workspace.path().join("cache")),
+            runtime_cache_root: Some(workspace.path().join("cache").join("runtime")),
+        })
+        .expect("the POSIX backend should build");
+        let object_store = Arc::new(BreakableCatalog::new(backend.repository().catalog()));
+        let backlog = MirrorBacklog::open(workspace.path().join("mirror"))
+            .await
+            .expect("the backlog should open");
+        let dual = DualWriteCatalog::new(
+            Arc::clone(&central),
+            Arc::clone(&object_store) as Arc<dyn SnapshotCatalog>,
+            Arc::clone(&backlog),
+        );
+
+        Both {
+            _workspace: workspace,
+            central,
+            object_store,
+            backlog,
+            dual,
+        }
+    }
+
+    /// I1, and P7 for one row: one publish, two catalogs, the same snapshot in
+    /// both — checked by reading each of them directly rather than through the
+    /// wrapper that wrote them.
+    #[tokio::test]
+    async fn one_publish_lands_in_both_catalogs() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+        let alias = unique_alias("dual");
+
+        let record = both
+            .dual
+            .publish_commit(sandbox_commit(id.clone(), Some(&alias), "in-both"))
+            .await
+            .expect("the double write should succeed");
+        assert_eq!(record.id, id);
+        assert_eq!(both.backlog.lag(), 0, "nothing should be owed");
+
+        let central_row = both
+            .central
+            .get(&id.to_string())
+            .await
+            .expect("reading the central catalog should work")
+            .expect("the central catalog should have the row");
+        let object_store_row = both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading object storage should work")
+            .expect("object storage should have the row");
+
+        assert_eq!(central_row.id, object_store_row.id);
+        assert_eq!(
+            central_row
+                .committed
+                .expect("central payload")
+                .context
+                .env_vars,
+            object_store_row
+                .committed
+                .expect("object-store payload")
+                .context
+                .env_vars,
+            "the same snapshot must be described the same way in both catalogs"
+        );
+        assert_eq!(
+            both.object_store
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(id.clone())
+        );
+        assert_eq!(
+            both.central
+                .resolve_alias(&alias)
+                .await
+                .expect("resolving should work"),
+            Some(id)
+        );
+    }
+
+    /// 🔴 I2. The central catalog fails, and the object store is never touched.
+    /// A row object storage held that the catalog did not would be the one
+    /// direction the compensator cannot walk back.
+    #[tokio::test]
+    async fn a_central_failure_fails_the_write_and_leaves_the_object_store_alone() {
+        let Some(_) = fixture() else { return };
+        // Nothing is listening here; the client is lazy, so this fails on use.
+        let unreachable = Arc::new(
+            CentralSnapshotCatalog::connect_lazy(
+                "http://127.0.0.1:1",
+                Uuid::now_v7(),
+                "test-node-a".to_string(),
+            )
+            .expect("the endpoint should parse")
+            .with_call_timeout(std::time::Duration::from_millis(500)),
+        );
+        let both = both(unreachable).await;
+        let id = SnapshotId::generate();
+
+        both.dual
+            .publish_commit(sandbox_commit(id.clone(), None, "never-written"))
+            .await
+            .expect_err("a central failure must fail the whole write");
+
+        assert!(
+            both.object_store
+                .get(&id.to_string())
+                .await
+                .expect("reading should work")
+                .is_none(),
+            "object storage must not hold a row the central catalog refused"
+        );
+        assert_eq!(
+            both.backlog.lag(),
+            0,
+            "a write that never reached the central catalog is not owed to anybody"
+        );
+    }
+
+    /// 🔴 I3 and P8. Object storage fails after the central catalog took the
+    /// write. The publish still succeeds — making it fail would put publishing
+    /// behind an AND of two systems — and the lag says exactly how far behind
+    /// object storage now is.
+    #[tokio::test]
+    async fn an_object_store_failure_leaves_the_publish_successful_and_the_write_owed() {
+        let central = catalog!();
+        let both = both(central).await;
+        both.object_store.break_it();
+
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let id = SnapshotId::generate();
+            both.dual
+                .publish_commit(sandbox_commit(id.clone(), None, &format!("owed-{index}")))
+                .await
+                .expect("a broken mirror must not fail a real publish");
+            ids.push(id);
+        }
+
+        assert_eq!(both.backlog.lag(), 3, "every failed mirror write is owed");
+        for id in &ids {
+            assert!(
+                both.central
+                    .get(&id.to_string())
+                    .await
+                    .expect("reading should work")
+                    .is_some(),
+                "the central catalog took every one of them"
+            );
+        }
+
+        // 🔴 I4, and P8's control. Object storage comes back and the
+        // compensator's pass clears the debt — the same switch that was
+        // refused a moment ago is then allowed.
+        both.object_store.fix_it();
+        let pass = both
+            .backlog
+            .drain_once(both.object_store.as_ref())
+            .await
+            .expect("the repair pass should run");
+        assert_eq!(pass.repaired, 3);
+        assert_eq!(both.backlog.lag(), 0);
+
+        for id in &ids {
+            assert!(
+                both.object_store
+                    .get(&id.to_string())
+                    .await
+                    .expect("reading should work")
+                    .is_some(),
+                "the repair must have put the row into object storage"
+            );
+        }
+    }
+
+    /// A template row is created in both, and failed in both.
+    #[tokio::test]
+    async fn creating_and_failing_a_template_reaches_both_catalogs() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+        let alias = unique_alias("dual-tmpl");
+
+        both.dual
+            .create(template_record(id.clone(), Some(&alias)))
+            .await
+            .expect("creating should work");
+
+        assert!(both
+            .central
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("reading should work")
+            .is_some());
+        assert!(both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_some());
+
+        both.dual
+            .mark_build_error(&id, TemplateBuildErrorReason::new("no"))
+            .await
+            .expect("failing the build should work");
+
+        let central_row = both
+            .central
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("reading should work")
+            .expect("the row should be there");
+        assert!(matches!(
+            central_row.source,
+            SnapshotSource::Template { ref build }
+                if build.status == agentenv::snapshot::TemplateBuildStatus::Error
+        ));
+        let object_store_row = both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .expect("the row should be there");
+        assert!(matches!(
+            object_store_row.source,
+            SnapshotSource::Template { ref build }
+                if build.status == agentenv::snapshot::TemplateBuildStatus::Error
+        ));
+    }
+
+    /// Deleting removes the row from both.
+    #[tokio::test]
+    async fn deleting_reaches_both_catalogs() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+
+        let record = both
+            .dual
+            .publish_commit(sandbox_commit(id.clone(), None, "doomed"))
+            .await
+            .expect("publishing should work");
+        both.dual
+            .delete_record(&record)
+            .await
+            .expect("deleting should work");
+
+        assert!(both
+            .central
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_none());
+        assert!(both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .is_none());
+    }
+
+    /// 🔴 The batch's one known gap, asserted rather than left to be
+    /// discovered. `try_start_build` is the catalog's build-admission
+    /// transition, which is not wired here, so the write goes to object storage
+    /// alone and the central row stays where the create left it.
+    #[tokio::test]
+    async fn starting_a_build_writes_object_storage_only() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+
+        both.dual
+            .create(template_record(id.clone(), None))
+            .await
+            .expect("creating should work");
+        both.dual
+            .try_start_build(&id)
+            .await
+            .expect("starting the build should work through object storage");
+
+        let object_store_row = both
+            .object_store
+            .get(&id.to_string())
+            .await
+            .expect("reading should work")
+            .expect("the row should be there");
+        assert!(matches!(
+            object_store_row.source,
+            SnapshotSource::Template { ref build }
+                if build.status == agentenv::snapshot::TemplateBuildStatus::Building
+        ));
+
+        let central_row = both
+            .central
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("reading should work")
+            .expect("the row should be there");
+        assert!(
+            matches!(
+                central_row.source,
+                SnapshotSource::Template { ref build }
+                    if build.status == agentenv::snapshot::TemplateBuildStatus::Waiting
+            ),
+            "the central row is expected to stay behind here; if this starts \
+             failing, build admission has been wired and the divergence \
+             counter it feeds should go with it"
+        );
+        assert_eq!(
+            both.backlog.lag(),
+            0,
+            "the gap is not an owed write: nothing the compensator can replay would close it"
+        );
+    }
+
+    /// Reads come from object storage in this phase, and only from it.
+    #[tokio::test]
+    async fn reads_come_from_the_object_store() {
+        let central = catalog!();
+        let both = both(central).await;
+        let id = SnapshotId::generate();
+        both.dual
+            .publish_commit(sandbox_commit(id.clone(), None, "readable"))
+            .await
+            .expect("publishing should work");
+
+        both.object_store.break_it();
+        both.dual.get(&id.to_string()).await.expect_err(
+            "a read must fail with object storage rather than fall back to the catalog",
+        );
+        both.dual
+            .list(SnapshotListFilter::matches_all())
+            .await
+            .expect_err("so must a listing");
+    }
+}

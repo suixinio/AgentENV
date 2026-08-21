@@ -338,3 +338,102 @@ fn now_unix_ms() -> i64 {
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🔴 The one refusal that must fail the write. Somebody else holds the
+    /// name; letting it through would commit a snapshot the user cannot reach
+    /// by the name they asked for, which is the defect the central catalog's
+    /// unique index exists to remove.
+    #[test]
+    fn a_taken_alias_fails_the_write() {
+        assert!(matches!(
+            policy_for(&CatalogRefusal::AliasTaken {
+                holder: "somebody".to_string()
+            }),
+            RefusalPolicy::Fatal
+        ));
+    }
+
+    /// 🔴 A refusal this build cannot read must not be assumed harmless. It
+    /// means the catalog is answering something this client did not ask, and
+    /// treating that as "the mirror is a little behind" would let an unknown
+    /// class of failure through as a success.
+    #[test]
+    fn a_refusal_this_build_cannot_read_fails_the_write() {
+        for refusal in [
+            CatalogRefusal::Unknown(4242),
+            CatalogRefusal::ExecutionSuperseded,
+            CatalogRefusal::GenerationMismatch { observed: Some(7) },
+        ] {
+            assert!(
+                matches!(policy_for(&refusal), RefusalPolicy::Fatal),
+                "{refusal} must not be waved through"
+            );
+        }
+    }
+
+    /// `publish_commit` opens a row before flipping it, and on the template
+    /// path the row already exists. That is the ordinary answer.
+    #[test]
+    fn an_existing_row_is_what_opening_one_was_for() {
+        assert!(matches!(
+            policy_for(&CatalogRefusal::AlreadyExists),
+            RefusalPolicy::Satisfied
+        ));
+    }
+
+    /// 🔴 The batch's known gap. Build admission is not wired, so the central
+    /// row for a template is still `waiting` when the commit arrives and the
+    /// commit's fence refuses it. Counted and carried on with — object storage
+    /// is still the side that answers reads, so failing here would fail a
+    /// publish nothing is actually wrong with.
+    #[test]
+    fn a_row_the_catalog_could_not_advance_is_a_divergence_and_not_a_failure() {
+        for refusal in [
+            CatalogRefusal::StatusMismatch {
+                observed: "waiting".to_string(),
+            },
+            CatalogRefusal::NotFound,
+            CatalogRefusal::BuildInProgress {
+                active_build_id: "b".to_string(),
+            },
+            CatalogRefusal::BuildQueueFull,
+        ] {
+            assert!(
+                matches!(policy_for(&refusal), RefusalPolicy::Diverged),
+                "{refusal} should be counted, not fatal"
+            );
+        }
+    }
+
+    /// Every refusal has a metric label, and no two share one — a reason that
+    /// silently merged into another would make the divergence counter unable
+    /// to say what happened.
+    #[test]
+    fn every_refusal_reason_has_its_own_label() {
+        let labels = [
+            CatalogRefusal::NotFound,
+            CatalogRefusal::StatusMismatch {
+                observed: String::new(),
+            },
+            CatalogRefusal::AliasTaken {
+                holder: String::new(),
+            },
+            CatalogRefusal::GenerationMismatch { observed: None },
+            CatalogRefusal::ExecutionSuperseded,
+            CatalogRefusal::BuildInProgress {
+                active_build_id: String::new(),
+            },
+            CatalogRefusal::BuildQueueFull,
+            CatalogRefusal::AlreadyExists,
+            CatalogRefusal::Unknown(0),
+        ]
+        .iter()
+        .map(CatalogRefusal::as_metric_label)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(labels.len(), 9);
+    }
+}

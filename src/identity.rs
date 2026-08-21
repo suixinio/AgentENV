@@ -58,7 +58,19 @@ impl NodeIdentity {
 /// property of the machine, not of the storage backend, so it is read from the
 /// same place the node/admin APIs read it.
 pub fn local_node_id() -> String {
-    NodeIdentity::from_config(&crate::cfg::ConfigManager::global_config().node_identity).id
+    // 🔴 Asks for the config without insisting on it. This is reached from a
+    // plain constructor — `SnapshotRepository::new` — which is built in tests
+    // and tools that never load a config, and a node id has a perfectly good
+    // fallback of its own. Panicking here would make a value with a default
+    // into a startup requirement.
+    if let Some(config) = crate::cfg::ConfigManager::try_global_config() {
+        return NodeIdentity::from_config(&config.node_identity).id;
+    }
+    std::env::var("AENV_NODE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(read_hostname)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn parse_uuid_with_fallback(field: &str, config_value: &Option<String>) -> Uuid {

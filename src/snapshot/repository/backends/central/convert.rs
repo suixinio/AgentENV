@@ -275,3 +275,226 @@ fn decode_committed(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::types::{SnapshotSource, TemplateBuildInfo};
+
+    fn cluster() -> Uuid {
+        Uuid::parse_str("0198f0a1-0000-7000-8000-0000000c0ffe").expect("a fixed cluster id")
+    }
+
+    fn row() -> pb::SnapshotRow {
+        pb::SnapshotRow {
+            snapshot_id: SnapshotId::generate().to_string(),
+            cluster_id: cluster().to_string(),
+            source_kind: SOURCE_KIND_TEMPLATE.to_string(),
+            source_sandbox_id: String::new(),
+            cpu_count: 2,
+            memory_mib: 512,
+            disk_size_mib: 2048,
+            status: STATUS_WAITING.to_string(),
+            status_group: "pending".to_string(),
+            alias: String::new(),
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_001,
+            sandbox_started_at_unix_ms: None,
+            committed_payload: Vec::new(),
+            committed_schema: None,
+            build_error_json: Vec::new(),
+            build_started_at_unix_ms: None,
+            build_finished_at_unix_ms: None,
+            published: true,
+            origin_node_id: String::new(),
+        }
+    }
+
+    fn ready_row() -> pb::SnapshotRow {
+        pb::SnapshotRow {
+            status: STATUS_READY.to_string(),
+            status_group: "ready".to_string(),
+            committed_payload: encode_committed(&CommittedSnapshot::mock())
+                .expect("a payload should encode"),
+            committed_schema: Some(COMMITTED_PAYLOAD_SCHEMA),
+            ..row()
+        }
+    }
+
+    #[test]
+    fn a_ready_row_decodes_with_its_payload() {
+        let decoded = decode_row(ready_row(), cluster()).expect("a ready row should decode");
+        assert!(decoded.committed.is_some());
+        assert!(matches!(
+            decoded.source,
+            SnapshotSource::Template {
+                build: TemplateBuildInfo {
+                    status: TemplateBuildStatus::Ready,
+                    ..
+                }
+            }
+        ));
+    }
+
+    /// 🔴 A value this build has not heard of must reach the caller as a
+    /// refusal, not be flattened onto the nearest one it does know. The column's
+    /// CHECK belongs to whoever migrates the database, so a status appearing
+    /// here means the two sides have drifted — and guessing which of the four
+    /// it resembles is how a `building` row gets launched.
+    #[test]
+    fn an_unknown_status_is_refused_rather_than_guessed() {
+        let error = decode_row(
+            pb::SnapshotRow {
+                status: "snapshotting".to_string(),
+                ..row()
+            },
+            cluster(),
+        )
+        .expect_err("an unknown status must not decode");
+        assert!(format!("{error}").contains("unknown status 'snapshotting'"));
+    }
+
+    #[test]
+    fn an_unknown_source_kind_is_refused_rather_than_guessed() {
+        let error = decode_row(
+            pb::SnapshotRow {
+                source_kind: "workspace".to_string(),
+                ..row()
+            },
+            cluster(),
+        )
+        .expect_err("an unknown source kind must not decode");
+        assert!(format!("{error}").contains("unknown source kind 'workspace'"));
+    }
+
+    /// 🔴 The scope check. Every statement already carries the cluster, but a
+    /// request can only *ask* for one — this is what rules out a controller
+    /// answering for a different cluster.
+    #[test]
+    fn a_row_from_another_cluster_is_refused() {
+        let error = decode_row(row(), Uuid::now_v7()).expect_err("a foreign row must not decode");
+        assert!(format!("{error}").contains("but this node is in cluster"));
+    }
+
+    /// 🔴 The payload's version is checked, not assumed. serde would take a
+    /// payload written by a build whose `CommittedSnapshot` has since changed
+    /// and quietly drop the fields it did not recognise — handing back a
+    /// snapshot missing its memory layers.
+    #[test]
+    fn a_payload_this_build_cannot_read_is_refused() {
+        let error = decode_row(
+            pb::SnapshotRow {
+                committed_schema: Some(COMMITTED_PAYLOAD_SCHEMA + 1),
+                ..ready_row()
+            },
+            cluster(),
+        )
+        .expect_err("an unknown payload version must not decode");
+        assert!(format!("{error}").contains("is not one this build reads"));
+    }
+
+    #[test]
+    fn a_payload_without_a_version_and_a_version_without_a_payload_are_both_refused() {
+        decode_row(
+            pb::SnapshotRow {
+                committed_schema: None,
+                ..ready_row()
+            },
+            cluster(),
+        )
+        .expect_err("a payload with no version must not decode");
+
+        decode_row(
+            pb::SnapshotRow {
+                committed_payload: Vec::new(),
+                committed_schema: Some(COMMITTED_PAYLOAD_SCHEMA),
+                status: STATUS_BUILDING.to_string(),
+                ..row()
+            },
+            cluster(),
+        )
+        .expect_err("a version with no payload must not decode");
+    }
+
+    /// The table says `status <> 'ready' OR committed_payload IS NOT NULL`.
+    /// Said again here, because a `ready` row with nothing in it is a snapshot
+    /// a resume would try to launch from nothing.
+    #[test]
+    fn a_ready_row_with_no_payload_is_refused() {
+        let error = decode_row(
+            pb::SnapshotRow {
+                status: STATUS_READY.to_string(),
+                ..row()
+            },
+            cluster(),
+        )
+        .expect_err("a ready row with no payload must not decode");
+        assert!(format!("{error}").contains("carries no committed payload"));
+    }
+
+    #[test]
+    fn a_sandbox_row_that_names_no_sandbox_is_refused() {
+        decode_row(
+            pb::SnapshotRow {
+                source_kind: SOURCE_KIND_SANDBOX.to_string(),
+                source_sandbox_id: String::new(),
+                ..row()
+            },
+            cluster(),
+        )
+        .expect_err("a sandbox row must name its sandbox");
+    }
+
+    /// 🔴 A row opens at `waiting` or `building` and never at `ready` — the
+    /// server refuses anything else, so a record whose build has already
+    /// finished or failed must not ask for its own status back.
+    #[test]
+    fn a_row_only_ever_opens_at_waiting_or_building() {
+        for status in [
+            TemplateBuildStatus::Waiting,
+            TemplateBuildStatus::Building,
+            TemplateBuildStatus::Ready,
+            TemplateBuildStatus::Error,
+        ] {
+            let record = SnapshotRecord {
+                id: SnapshotId::generate(),
+                alias: None,
+                source: SnapshotSource::Template {
+                    build: TemplateBuildInfo {
+                        status,
+                        started_at_unix_ms: None,
+                        finished_at_unix_ms: None,
+                        error_reason: None,
+                    },
+                },
+                resources: SandboxResources::default(),
+                created_at_unix_ms: 0,
+                updated_at_unix_ms: 0,
+                committed: None,
+            };
+            let opening = opening_status(&record);
+            assert!(
+                opening == STATUS_WAITING || opening == STATUS_BUILDING,
+                "{status:?} opened a row at '{opening}'"
+            );
+        }
+    }
+
+    /// A build failure crosses as an object, never as the bare string its
+    /// deserialiser also accepts: the server refuses anything that is not an
+    /// object, because a JSON scalar stores and then fails to decode.
+    #[test]
+    fn a_build_error_is_encoded_as_an_object() {
+        let encoded = encode_build_error(&TemplateBuildErrorReason::with_step("boom", "RUN"))
+            .expect("a reason should encode");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("it should be JSON");
+        assert!(value.is_object(), "got {value}");
+        assert_eq!(value["message"], "boom");
+
+        let decoded = decode_build_error("row", &encoded)
+            .expect("it should decode")
+            .expect("and be present");
+        assert_eq!(decoded.message, "boom");
+        assert_eq!(decoded.step.as_deref(), Some("RUN"));
+    }
+}

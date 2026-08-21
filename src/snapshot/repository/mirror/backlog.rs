@@ -476,3 +476,462 @@ fn decode_seq(key: &[u8]) -> Option<u64> {
     }
     seq.try_into().ok().map(u64::from_be_bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::snapshot::repository::interfaces::SnapshotListFilter;
+    use crate::snapshot::types::{
+        CommittedSnapshot, SnapshotAlias, SnapshotPublishSource, TemplateBuildStatus,
+    };
+    use crate::types::SandboxResources;
+
+    /// A catalog that answers however a test tells it to, and writes down what
+    /// it was asked.
+    #[derive(Default)]
+    struct ScriptedCatalog {
+        calls: Mutex<Vec<String>>,
+        /// Ids whose writes fail, and how.
+        failing: Mutex<Vec<(SnapshotId, bool)>>,
+        /// Ids the catalog claims to already hold.
+        holding: Mutex<Vec<SnapshotId>>,
+        /// When set, `get` itself fails.
+        get_fails: bool,
+    }
+
+    impl ScriptedCatalog {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        fn record(&self, entry: impl Into<String>) {
+            self.calls.lock().expect("calls").push(entry.into());
+        }
+
+        /// `retryable` picks which error kind the write fails with.
+        fn fail(&self, id: &SnapshotId, retryable: bool) {
+            self.failing
+                .lock()
+                .expect("failing")
+                .push((id.clone(), retryable));
+        }
+
+        fn hold(&self, id: &SnapshotId) {
+            self.holding.lock().expect("holding").push(id.clone());
+        }
+
+        fn outcome(&self, id: &SnapshotId) -> RepositoryResult<()> {
+            let failing = self.failing.lock().expect("failing");
+            match failing.iter().find(|(failing, _)| failing == id) {
+                Some((_, true)) => Err(RepositoryError::Backend {
+                    message: "the store is unreachable".to_string(),
+                    source: None,
+                }),
+                Some((_, false)) => Err(RepositoryError::InvalidRequest {
+                    reason: "the store will not take this".to_string(),
+                }),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotCatalog for ScriptedCatalog {
+        async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+            self.record(format!("create:{}", record.id));
+            self.outcome(&record.id).map(|()| record)
+        }
+
+        async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+            self.record(format!("publish_commit:{}", commit.id));
+            self.outcome(&commit.id)?;
+            let mut record = SnapshotRecord::template_waiting(
+                commit.id.clone(),
+                commit.alias.clone(),
+                commit.resources,
+            );
+            record.mark_committed(
+                commit.alias,
+                commit.resources,
+                commit.committed,
+                commit.source,
+                0,
+            );
+            Ok(record)
+        }
+
+        async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+            self.record(format!("get:{id_or_alias}"));
+            if self.get_fails {
+                return Err(RepositoryError::Backend {
+                    message: "cannot read".to_string(),
+                    source: None,
+                });
+            }
+            let held = self
+                .holding
+                .lock()
+                .expect("holding")
+                .iter()
+                .any(|id| id.to_string() == id_or_alias);
+            if !held {
+                return Ok(None);
+            }
+            let id = SnapshotId::parse(id_or_alias).expect("a held id parses");
+            let mut record =
+                SnapshotRecord::template_waiting(id, None, SandboxResources::default());
+            record.mark_committed(
+                None,
+                SandboxResources::default(),
+                committed(),
+                SnapshotPublishSource::Template,
+                0,
+            );
+            Ok(Some(record))
+        }
+
+        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+            self.record(format!("delete_record:{}", record.id));
+            self.outcome(&record.id)
+        }
+
+        async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+            Ok(None)
+        }
+
+        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+            self.record(format!("try_start_build:{id}"));
+            self.outcome(id)?;
+            Ok(SnapshotRecord::template_waiting(
+                id.clone(),
+                None,
+                SandboxResources::default(),
+            ))
+        }
+
+        async fn mark_build_error(
+            &self,
+            id: &SnapshotId,
+            _reason: TemplateBuildErrorReason,
+        ) -> RepositoryResult<()> {
+            self.record(format!("mark_build_error:{id}"));
+            self.outcome(id)
+        }
+    }
+
+    fn committed() -> CommittedSnapshot {
+        CommittedSnapshot::mock()
+    }
+
+    fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit {
+        SnapshotCommit {
+            id: id.clone(),
+            alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias parses")),
+            source: SnapshotPublishSource::Template,
+            resources: SandboxResources::default(),
+            committed: committed(),
+        }
+    }
+
+    fn record_for(id: &SnapshotId) -> SnapshotRecord {
+        SnapshotRecord::template_waiting(id.clone(), None, SandboxResources::default())
+    }
+
+    async fn backlog(dir: &tempfile::TempDir) -> Arc<MirrorBacklog> {
+        MirrorBacklog::open(dir.path().join("mirror"))
+            .await
+            .expect("the backlog should open")
+    }
+
+    // ── the repair decision ─────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_replay_is_repaired() {
+        assert_eq!(verdict_for(&Ok(()), None), RepairVerdict::Repaired);
+    }
+
+    /// 🔴 The lost-acknowledgement case. The first attempt landed and only its
+    /// answer went missing, so the replay is refused — and the target, asked
+    /// directly, already has it. Reading this as anything but repaired leaves
+    /// an entry nothing can ever clear.
+    #[test]
+    fn a_replay_the_target_already_reflects_is_repaired() {
+        let refused: RepositoryResult<()> = Err(RepositoryError::InvalidRequest {
+            reason: "already exists".to_string(),
+        });
+        assert_eq!(verdict_for(&refused, Some(true)), RepairVerdict::Repaired);
+    }
+
+    /// 🔴 A probe that failed says nothing either way, so the failure of the
+    /// replay says nothing either. Calling this diverged would abandon a write
+    /// over a store that was merely unreachable for a moment.
+    #[test]
+    fn an_unanswerable_probe_is_retried() {
+        let refused: RepositoryResult<()> = Err(RepositoryError::InvalidRequest {
+            reason: "already exists".to_string(),
+        });
+        assert_eq!(verdict_for(&refused, None), RepairVerdict::Retry);
+    }
+
+    #[test]
+    fn a_transport_failure_the_target_does_not_reflect_is_retried() {
+        let unreachable: RepositoryResult<()> = Err(RepositoryError::Backend {
+            message: "connection refused".to_string(),
+            source: None,
+        });
+        assert_eq!(verdict_for(&unreachable, Some(false)), RepairVerdict::Retry);
+    }
+
+    /// 🔴 The one that must not be retried forever. The store stated a rule —
+    /// the name is taken — and asking again in thirty seconds gets the same
+    /// answer while everything behind it stops.
+    #[test]
+    fn a_refusal_the_target_does_not_reflect_is_diverged() {
+        for refusal in [
+            RepositoryError::AliasConflict {
+                alias: "taken".to_string(),
+                existing: SnapshotId::generate(),
+                new_id: SnapshotId::generate(),
+            },
+            RepositoryError::InvalidRequest {
+                reason: "no".to_string(),
+            },
+            RepositoryError::Unsupported {
+                feature: "no".to_string(),
+            },
+        ] {
+            let refused: RepositoryResult<()> = Err(refusal);
+            assert_eq!(
+                verdict_for(&refused, Some(false)),
+                RepairVerdict::Diverged,
+                "a rule the store stated must not be retried forever"
+            );
+        }
+    }
+
+    // ── the pass ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_recorded_write_raises_the_lag_and_a_repaired_one_lowers_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+
+        assert_eq!(backlog.lag(), 0);
+        backlog
+            .record(MirrorOp::PublishCommit {
+                commit: commit_for(&id, None),
+            })
+            .await;
+        assert_eq!(backlog.lag(), 1);
+
+        let target = ScriptedCatalog::default();
+        let pass = backlog
+            .drain_once(&target)
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(pass.remaining, 0);
+        assert_eq!(backlog.lag(), 0);
+        assert_eq!(target.calls(), vec![format!("publish_commit:{id}")]);
+    }
+
+    /// 🔴 Per-snapshot ordering. A commit replayed before the create it depends
+    /// on is a different outcome, so one snapshot's stuck entry holds the rest
+    /// of *its own* queue — and nothing else's.
+    #[tokio::test]
+    async fn a_stuck_snapshot_holds_only_its_own_queue() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let stuck = SnapshotId::generate();
+        let healthy = SnapshotId::generate();
+
+        backlog
+            .record(MirrorOp::Create {
+                record: record_for(&stuck),
+            })
+            .await;
+        backlog
+            .record(MirrorOp::PublishCommit {
+                commit: commit_for(&stuck, None),
+            })
+            .await;
+        backlog
+            .record(MirrorOp::Create {
+                record: record_for(&healthy),
+            })
+            .await;
+
+        let target = ScriptedCatalog::default();
+        target.fail(&stuck, true);
+
+        let pass = backlog
+            .drain_once(&target)
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.retry, 1, "the stuck snapshot's first entry retries");
+        assert_eq!(pass.skipped, 1, "its second entry is not attempted");
+        assert_eq!(pass.repaired, 1, "the other snapshot's entry is repaired");
+        assert_eq!(backlog.lag(), 2);
+        assert!(
+            !target.calls().contains(&format!("publish_commit:{stuck}")),
+            "the second write for a snapshot whose first is stuck must not be attempted: {:?}",
+            target.calls()
+        );
+        assert!(target.calls().contains(&format!("create:{healthy}")));
+    }
+
+    /// A diverged entry stays counted. It is a real disagreement between the
+    /// two stores, and the lag is what keeps the read side from being moved
+    /// over the top of it.
+    #[tokio::test]
+    async fn a_diverged_entry_keeps_counting_against_the_lag() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .record(MirrorOp::Create {
+                record: record_for(&id),
+            })
+            .await;
+
+        let target = ScriptedCatalog::default();
+        target.fail(&id, false);
+
+        let pass = backlog
+            .drain_once(&target)
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.diverged, 1);
+        assert_eq!(pass.repaired, 0);
+        assert_eq!(backlog.lag(), 1);
+    }
+
+    /// The lost-acknowledgement case end to end: the replay is refused, the
+    /// target turns out to have it, and the entry clears.
+    #[tokio::test]
+    async fn an_entry_the_target_already_holds_clears_without_being_rewritten() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        let id = SnapshotId::generate();
+        backlog
+            .record(MirrorOp::PublishCommit {
+                commit: commit_for(&id, None),
+            })
+            .await;
+
+        let target = ScriptedCatalog::default();
+        target.fail(&id, false);
+        target.hold(&id);
+
+        let pass = backlog
+            .drain_once(&target)
+            .await
+            .expect("the pass should run");
+
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(backlog.lag(), 0);
+    }
+
+    /// 🔴 The whole reason this is on disk. A process that crashed holding
+    /// owed writes must come back still owing them.
+    #[tokio::test]
+    async fn owed_writes_survive_the_process_that_recorded_them() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = SnapshotId::generate();
+        {
+            let backlog = backlog(&dir).await;
+            backlog
+                .record(MirrorOp::PublishCommit {
+                    commit: commit_for(&id, None),
+                })
+                .await;
+            assert_eq!(backlog.lag(), 1);
+        }
+
+        let reopened = backlog(&dir).await;
+        assert_eq!(reopened.lag(), 1, "a restart must not forget what is owed");
+
+        let target = ScriptedCatalog::default();
+        let pass = reopened
+            .drain_once(&target)
+            .await
+            .expect("the pass should run");
+        assert_eq!(pass.repaired, 1);
+        assert_eq!(target.calls(), vec![format!("publish_commit:{id}")]);
+    }
+
+    // ── the read-side guard ─────────────────────────────────────────────
+
+    /// 🔴 The guard fires on the switch, not on the start. A node that crashed
+    /// while already reading the object store has to come back; refusing there
+    /// would turn a mirror that is behind into a node that is down.
+    #[tokio::test]
+    async fn an_ordinary_restart_on_the_object_store_is_allowed_with_a_backlog() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("the first start records the side");
+        backlog
+            .record(MirrorOp::Create {
+                record: record_for(&SnapshotId::generate()),
+            })
+            .await;
+
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("a restart on the same side must be allowed");
+    }
+
+    /// 🔴 Moving reads back onto a store that is behind would report every
+    /// owed snapshot as absent, and absence is an instruction downstream.
+    #[tokio::test]
+    async fn moving_reads_back_to_the_object_store_is_refused_while_it_is_behind() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = backlog(&dir).await;
+        backlog
+            .guard_read_side(CatalogReadSide::Postgres)
+            .await
+            .expect("recording the side should work");
+        backlog
+            .record(MirrorOp::Create {
+                record: record_for(&SnapshotId::generate()),
+            })
+            .await;
+
+        let error = backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect_err("the switch must be refused while writes are owed");
+        assert!(
+            error.to_string().contains("behind by 1 write"),
+            "the refusal must say how far behind: {error}"
+        );
+
+        // The control: with nothing owed, the same switch is allowed.
+        let target = ScriptedCatalog::default();
+        backlog
+            .drain_once(&target)
+            .await
+            .expect("the pass should run");
+        assert_eq!(backlog.lag(), 0);
+        backlog
+            .guard_read_side(CatalogReadSide::ObjectStore)
+            .await
+            .expect("a drained mirror must let the switch through");
+    }
+}

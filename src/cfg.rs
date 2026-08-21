@@ -1534,6 +1534,18 @@ impl ConfigManager {
         Self::global().config()
     }
 
+    /// The global config if one has been loaded, and `None` otherwise.
+    ///
+    /// 🔴 For the handful of callers that must not take a process down by
+    /// asking. [`Self::global`] panics outside the crate's own tests when
+    /// nothing initialised it, which is right for the server's own paths — a
+    /// node running on defaults nobody chose is worse than one that will not
+    /// start — but wrong for a value that has a perfectly good fallback of its
+    /// own, such as this machine's name.
+    pub fn try_global_config() -> Option<&'static AppConfig> {
+        GLOBAL_CONFIG_MANAGER.get().map(Self::config)
+    }
+
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
     }
@@ -1845,6 +1857,86 @@ mod tests {
                 None => result.expect("supported memory snapshot options should be valid"),
             }
         }
+    }
+
+    /// 🔴 The legal pairs, and the four illegal ones by name.
+    ///
+    /// Every rejected combination fails the same quiet way if it is allowed
+    /// through — a read that answers "no such snapshot" rather than an error —
+    /// and absence is what callers delete artifacts and refuse resumes on.
+    #[test]
+    fn the_snapshot_catalog_matrix_allows_only_the_pairs_that_are_served() {
+        let cases: [(SnapshotCatalogWrite, SnapshotCatalogRead, Option<&str>); 6] = [
+            (
+                SnapshotCatalogWrite::ObjectStore,
+                SnapshotCatalogRead::ObjectStore,
+                None,
+            ),
+            (
+                SnapshotCatalogWrite::Both,
+                SnapshotCatalogRead::ObjectStore,
+                None,
+            ),
+            (
+                SnapshotCatalogWrite::ObjectStore,
+                SnapshotCatalogRead::Postgres,
+                Some("reads a table nothing writes"),
+            ),
+            (
+                SnapshotCatalogWrite::Postgres,
+                SnapshotCatalogRead::ObjectStore,
+                Some("reads a store nothing writes any more"),
+            ),
+            (
+                SnapshotCatalogWrite::Both,
+                SnapshotCatalogRead::Postgres,
+                Some("is not served yet"),
+            ),
+            (
+                SnapshotCatalogWrite::Postgres,
+                SnapshotCatalogRead::Postgres,
+                Some("drops the object-store copy"),
+            ),
+        ];
+
+        for (write, read, expected) in cases {
+            let mut config = AppConfig::default();
+            config.snapshot.catalog.write = write;
+            config.snapshot.catalog.read = read;
+
+            match expected {
+                None => config
+                    .validate_snapshot_catalog()
+                    .unwrap_or_else(|error| panic!("{write:?}/{read:?} should be legal: {error}")),
+                Some(expected) => {
+                    let error = config
+                        .validate_snapshot_catalog()
+                        .expect_err(&format!("{write:?}/{read:?} should be refused"));
+                    assert!(
+                        error.to_string().contains(expected),
+                        "{write:?}/{read:?}: expected {expected:?}, got: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The default is the arrangement that exists today: one catalog, in
+    /// object storage. Anything else has to be asked for.
+    #[test]
+    fn the_snapshot_catalog_defaults_to_the_single_store_it_has_always_had() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.snapshot.catalog.write,
+            SnapshotCatalogWrite::ObjectStore
+        );
+        assert_eq!(
+            config.snapshot.catalog.read,
+            SnapshotCatalogRead::ObjectStore
+        );
+        config
+            .validate()
+            .expect("the default configuration must be valid");
     }
 
     #[test]

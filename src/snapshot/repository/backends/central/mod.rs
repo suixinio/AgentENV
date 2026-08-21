@@ -809,3 +809,81 @@ fn alias_conflict(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🔴 The inversion, in the one place it happens.
+    ///
+    /// The wire field is `allow_any_status` so that its zero value — what a
+    /// caller that never heard of it sends — keeps the predicate that stops a
+    /// half-uploaded snapshot from starting a VM. This side keeps the positive
+    /// reading, and this is the seam between them. A `Resolvable` scope that
+    /// sent `true` would resolve exactly the rows the field exists to hide.
+    #[test]
+    fn the_resolvable_scope_never_asks_for_any_status() {
+        assert!(!CatalogReadScope::Resolvable.allow_any_status());
+        assert!(CatalogReadScope::AnyStatus.allow_any_status());
+    }
+
+    /// The row `publish_commit` opens carries no alias: the commit binds it, in
+    /// the same transaction as the flip. Binding it twice would make a rename
+    /// look like a collision with itself.
+    #[test]
+    fn the_opening_row_leaves_the_alias_to_the_commit() {
+        let commit = SnapshotCommit {
+            id: SnapshotId::generate(),
+            alias: Some(
+                crate::snapshot::types::SnapshotAlias::parse("named").expect("alias parses"),
+            ),
+            source: crate::snapshot::types::SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "sbx".to_string(),
+            },
+            resources: crate::types::SandboxResources::default(),
+            committed: crate::snapshot::types::CommittedSnapshot::mock(),
+        };
+
+        let opening = commit_opening_record(&commit);
+        assert!(opening.alias.is_none());
+        assert_eq!(opening.id, commit.id);
+        assert!(matches!(
+            opening.source,
+            SnapshotSource::Sandbox { ref source_sandbox_id } if source_sandbox_id == "sbx"
+        ));
+        assert_eq!(opening_status(&opening), STATUS_BUILDING);
+    }
+
+    /// 🔴 The alias a refused publish reports is the one the caller asked for.
+    /// It used to be read off the derived opening record, which deliberately
+    /// has none, so a user whose publish lost a name was told the empty name
+    /// had collided.
+    #[test]
+    fn a_refused_alias_is_reported_by_the_name_the_caller_asked_for() {
+        let holder = SnapshotId::generate();
+        let mine = SnapshotId::generate();
+        let alias = crate::snapshot::types::SnapshotAlias::parse("contested").expect("parses");
+
+        match alias_conflict(Some(&alias), &mine, holder.to_string()) {
+            RepositoryError::AliasConflict {
+                alias: reported,
+                existing,
+                new_id,
+            } => {
+                assert_eq!(reported, "contested");
+                assert_eq!(existing, holder);
+                assert_eq!(new_id, mine);
+            }
+            other => panic!("expected an alias conflict, got {other:?}"),
+        }
+    }
+
+    /// A holder id that will not parse still means the name is taken. Reporting
+    /// it as a decode failure would turn a refusal the caller can act on into
+    /// one it cannot.
+    #[test]
+    fn an_unreadable_holder_still_reports_the_name_as_taken() {
+        let error = alias_conflict(None, &SnapshotId::generate(), "not-a-uuid".to_string());
+        assert!(format!("{error}").contains("refused an alias binding"));
+    }
+}

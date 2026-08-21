@@ -537,8 +537,10 @@ mod tests {
 
         #[test]
         fn it_survives_a_record_round_trip() {
-            let mut metadata = SandboxMetadata::default();
-            metadata.control_plane_config = ControlPlaneConfig::from_bytes(vec![1, 2, 3, 0xfe]);
+            let metadata = SandboxMetadata {
+                control_plane_config: ControlPlaneConfig::from_bytes(vec![1, 2, 3, 0xfe]),
+                ..Default::default()
+            };
 
             let encoded = serde_json::to_string(&metadata).expect("encode");
             let decoded: SandboxMetadata = serde_json::from_str(&encoded).expect("decode");

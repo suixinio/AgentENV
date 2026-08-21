@@ -93,6 +93,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             auto_resume: false,
             custom_extension_params: None,
             control_plane_config: None,
+            execution_id: None,
             secure: true,
         };
 
@@ -256,6 +257,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 control_plane_config: None,
+                execution_id: None,
                 secure: false,
             })
             .await?;
@@ -351,6 +353,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 control_plane_config: None,
+                execution_id: None,
                 secure: false,
             })
             .await?;

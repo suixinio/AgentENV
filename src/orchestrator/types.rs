@@ -43,6 +43,16 @@ pub struct CreateSandboxRequest {
     /// thing that marks a sandbox as the control plane's. See
     /// [`ControlPlaneConfig`][crate::orchestrator::ControlPlaneConfig].
     pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
+    /// The incarnation this create must run under, when the caller has already
+    /// minted one.
+    ///
+    /// 🔴 `None` everywhere a user asks for a sandbox, and that is the case
+    /// that mints. `Some` exists for one caller: a node running a create on
+    /// behalf of the orchestrator that owns the sandbox, which minted the
+    /// incarnation before it asked and has already written it into its own
+    /// record. Two records of one sandbox naming two different runs is what
+    /// this prevents, and fencing compares exactly that value.
+    pub execution_id: Option<ExecutionId>,
 }
 
 /// One sandbox this node is *running*, as against one it has a record of.
@@ -124,16 +134,18 @@ pub enum ForkChildren {
 }
 
 /// One fork child whose identity the caller has already decided.
-///
-/// 🔴 The identity here is the sandbox id and not the incarnation. Minting an
-/// incarnation stays with the node, as it does for a create: a caller-supplied
-/// one would be a second place a run can be authorised from, and the caller
-/// learns the child's incarnation from the outcome anyway. What the caller must
-/// decide is the sandbox id, because its own record of the child names it and
-/// that record is written before the child exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkChildAssignment {
+    /// 🔴 The caller's to choose, because its own record of the child names it
+    /// and that record is written before the child exists.
     pub sandbox_id: SandboxId,
+    /// The incarnation this child must run under, when the caller has already
+    /// minted one.
+    ///
+    /// 🔴 Same rule as [`CreateSandboxRequest::execution_id`]: `None` mints
+    /// here, and `Some` is for the one caller that is itself the orchestrator
+    /// that owns the child and has already recorded the value.
+    pub execution_id: Option<ExecutionId>,
     /// The control plane's record of this child, or `None` when it has none.
     pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
 }

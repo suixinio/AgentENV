@@ -550,6 +550,9 @@ impl Sandboxes<()> for ApiImpl {
             // sandbox as the control plane's is the node gRPC create, and
             // nothing else.
             control_plane_config: None,
+            // A user asking for a sandbox is not an orchestrator quoting an
+            // incarnation it already recorded, so this one is minted.
+            execution_id: None,
         };
 
         match timer
@@ -692,6 +695,9 @@ impl Sandboxes<()> for ApiImpl {
             // sandbox as the control plane's is the node gRPC create, and
             // nothing else.
             control_plane_config: None,
+            // A user asking for a sandbox is not an orchestrator quoting an
+            // incarnation it already recorded, so this one is minted.
+            execution_id: None,
         };
 
         match timer

@@ -1,0 +1,413 @@
+syntax = "proto3";
+
+package agentenv.node.v1;
+
+// The commands one AgentENV node accepts from the API half of the split, and
+// the one question it answers about itself.
+//
+// 🔴 **This service is the whole remoteable surface, and `SandboxBackend` is
+// not part of it.** Three of that trait's return types hold live local state —
+// `PausedSandboxCapture`, `CapturedSandboxSnapshot` and `RuntimeArtifactSet` —
+// and two of them keep a temporary directory alive. Nothing here returns a
+// handle: every reply is an identifier or a fact, and where the local trait
+// hands back something that owns bytes, this one hands back where the bytes
+// already are.
+//
+// 🔴 **No Go consumer, on purpose.** `services/Makefile` compiles an explicit
+// list of protos for Go and this file is deliberately not on it: both ends of
+// this service are Rust, so generating a `.pb.go` nobody imports would only add
+// a second artifact to keep in step. That is also what makes it defensible for
+// a few fields here to carry Rust serde encodings rather than mirrored proto
+// messages — see `SerializedValue`.
+service NodeSandboxService {
+  // Builds one sandbox and starts it, in one call.
+  //
+  // 🔴 `SandboxBackend` splits this into `build` + `start`/`start_nowait` +
+  // `wait_for_ready`, and that split does not cross a process boundary:
+  // "constructed but not started" is an in-process intermediate state, and
+  // exposing it here would mean giving it a remote lifetime — an owner, a
+  // timeout, and a way to be abandoned — that nothing needs.
+  rpc Create (SandboxCreateRequest) returns (SandboxCreateResponse);
+
+  // Tears the sandbox down on this node and forgets it.
+  rpc Delete (SandboxDeleteRequest) returns (SandboxDeleteResponse);
+
+  // Pauses the sandbox, stops it, and returns what is needed to bring it back
+  // — here or, when it was published, anywhere.
+  rpc Pause (SandboxPauseRequest) returns (SandboxPauseResponse);
+
+  // Captures a snapshot of a running sandbox and leaves it running.
+  rpc Checkpoint (SandboxCheckpointRequest) returns (SandboxCheckpointResponse);
+
+  // Forks one running sandbox into running children on this same node.
+  rpc Fork (SandboxForkRequest) returns (SandboxForkResponse);
+
+  // Replaces a running sandbox's egress policy.
+  rpc UpdateNetwork (SandboxNetworkRequest) returns (SandboxNetworkResponse);
+
+  // Assigns already-approved custom extension params to a running sandbox.
+  rpc UpdateParams (SandboxParamsRequest) returns (SandboxParamsResponse);
+
+  // What this node is actually running, of the sandboxes the control plane
+  // owns.
+  //
+  // 🔴 The membership of the answer comes from the node's table of live
+  // sandbox handles and not from its metadata store. The store is what the
+  // node *claims* to hold; the handle table is what it *holds*. Reconciling a
+  // claim against a claim is how a discrepancy stays invisible.
+  //
+  // 🔴 A node that cannot answer must fail the call. There is no reply that
+  // means "I could not look": an empty list means this node is running none of
+  // the control plane's sandboxes, and it is consumed as evidence for deciding
+  // that a sandbox is an orphan.
+  rpc ListSandboxes (ListSandboxesRequest) returns (SandboxListResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Shared shapes
+// ---------------------------------------------------------------------------
+
+// A Rust value carried as its serde encoding, with the version of the schema
+// that produced it.
+//
+// 🔴 A deliberate, bounded exception to "model it in proto". It is used only
+// for values that are already defined as serialisable Rust types with their own
+// compatibility rules, where a mirrored proto message would be a second
+// definition of the same schema that has to be kept in step by hand. Both ends
+// of this service are Rust and are deployed from one image.
+//
+// 🔴 `schema_version` is not decoration. A receiver that does not recognise it
+// must refuse the message rather than attempt the decode: serde is perfectly
+// happy to decode a document that has lost a field it has a default for, and a
+// silent partial decode of a sandbox's paused state is a sandbox that resumes
+// wrong.
+message SerializedValue {
+  uint32 schema_version = 1;
+  // JSON, as `serde_json` writes it.
+  bytes json = 2;
+}
+
+// What a sandbox is worth in scheduling terms.
+message SandboxResources {
+  uint32 cpu_count = 1;
+  uint32 memory_mib = 2;
+  uint32 disk_size_mib = 3;
+}
+
+// What should happen when a sandbox's timeout elapses.
+enum TimeoutAction {
+  // 🔴 Not a default anyone should get by omission: proto3 gives every enum a
+  // zero value, so this one names the mistake rather than picking a policy.
+  // The node refuses a request carrying it.
+  TIMEOUT_ACTION_UNSPECIFIED = 0;
+  TIMEOUT_ACTION_PAUSE = 1;
+  TIMEOUT_ACTION_DELETE = 2;
+}
+
+// One snapshot whose bytes are durable on the node and whose catalog row has
+// not been announced.
+//
+// 🔴 The payload is the `StagedSnapshot` value itself, not a summary of it.
+// An earlier design carried three fields — id, manifest digest, repository —
+// and that is not enough to commit a row: the value also carries the commit
+// payload, the staging clock, the node the bytes are on, and the incarnation
+// that staged them. A proto that shipped the summary would have had to be
+// changed after the first commit was attempted, and this one cannot be changed
+// after it ships.
+message StagedSnapshot {
+  SerializedValue value = 1;
+}
+
+// The paused state of one sandbox, as the pausing node encoded it.
+//
+// 🔴 Two fields and both are needed. `artifact_root` is a path on the *node*
+// that produced it, so it is meaningless to the API half on its own — which is
+// exactly why the API half must also record which node that was. Handing this
+// back to a different machine reopens nothing.
+message PausedState {
+  // The directory on the origin node holding the paused sandbox's artifacts.
+  string artifact_root = 1;
+  // The backend's own encoding of its paused state.
+  SerializedValue state = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Create
+// ---------------------------------------------------------------------------
+
+// A sandbox to start from a committed snapshot.
+//
+// 🔴 The id, and not a resolved snapshot. Resolving a snapshot yields local
+// artifact paths and an open image, and both belong to the machine that will
+// run the VM. The API half decides *which* snapshot; the node decides what
+// that means on its disk.
+message SnapshotSource {
+  string snapshot_id = 1;
+}
+
+// A sandbox to start from an OCI image, cold.
+//
+// 🔴 Same rule as SnapshotSource: this is the user's reference, before
+// resolution. The node resolves it into overlaybd on its own disk.
+message ImageSource {
+  string image_ref = 1;
+  SandboxResources resources = 2;
+  repeated AttachedDrive attached_drives = 3;
+  // Appended to the kernel command line, subject to the node's allowlist.
+  string extra_boot_args = 4;
+}
+
+message AttachedDrive {
+  string image_ref = 1;
+  string mount_path = 2;
+  string drive_id = 3;
+  bool read_only = 4;
+}
+
+message SandboxCreateRequest {
+  // 🔴 Chosen by the API half, not by the node. The control plane's record of
+  // the sandbox exists before the sandbox does — that record is what
+  // `control_plane_config` carries — and a record cannot name a sandbox whose
+  // id has not been decided yet.
+  string sandbox_id = 1;
+
+  // The single run of the sandbox this call starts.
+  //
+  // 🔴 Sent by the caller, and not because a create needs fencing — there is
+  // nothing yet to fence against. It is here because the caller is itself an
+  // orchestrator: by the time it asks a node to create a sandbox it has already
+  // minted the incarnation and written it into its own record, and a node that
+  // minted a second one would leave two records of one sandbox naming two
+  // different runs. Fencing compares exactly that value.
+  //
+  // 🔴 Empty means "you choose", which is what a caller that keeps no record of
+  // its own sends. A node that cannot run under the incarnation it was given
+  // must fail the call rather than substitute its own: the substitution is
+  // silent, and the failure is not.
+  string execution_id = 2;
+
+  oneof source {
+    SnapshotSource snapshot = 3;
+    ImageSource image = 4;
+  }
+
+  // 0 means "the node's configured default", never "no timeout".
+  uint64 timeout_ms = 5;
+  TimeoutAction timeout_action = 6;
+  bool auto_resume = 7;
+  // Whether envd requires this sandbox's derived access token.
+  bool secure = 8;
+  map<string, string> user_metadata = 9;
+  map<string, string> env_vars = 10;
+  // The sandbox's egress policy, as `SandboxNetworkPolicy` serialises.
+  SerializedValue network_policy = 11;
+  // Opaque user JSON for the custom extension hooks. Absent and empty mean the
+  // same thing, as they do everywhere else this value appears.
+  SerializedValue custom_extension_params = 12;
+
+  // 🔴 **The ownership marker.** Its presence — and nothing else — is what
+  // makes this sandbox one the control plane owns, and therefore one that
+  // `ListSandboxes` reports.
+  //
+  // Opaque to the node: it is stored exactly as sent and handed back exactly as
+  // stored. The node does not parse, validate, re-encode or generate it, and
+  // nothing on the node may come to depend on its shape. It is the control
+  // plane's record of this sandbox, so that a control plane that lost its store
+  // can rebuild every running sandbox's record from what the nodes hand back —
+  // which makes it a contract between the API half and its future self rather
+  // than a wire contract between two languages.
+  //
+  // 🔴 Zero bytes means *no marker*, not an empty one: proto3 `bytes` cannot
+  // tell those apart, so the node collapses them into "not owned by the
+  // control plane". Sending an empty marker therefore produces a sandbox the
+  // control plane will not see in its own listing — which is the safe
+  // direction, because the unsafe one is a listing that reports a sandbox
+  // something else then deletes.
+  bytes control_plane_config = 13;
+}
+
+// What the node knows about a sandbox once it is running.
+message SandboxCreateResponse {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  // The address the sandbox reaches the host on, empty when it has none.
+  string host_interaction_ip = 3;
+  // 0 when the backend does not report one.
+  uint64 rootfs_virtual_size = 4;
+  SandboxResources resources = 5;
+  int64 started_at_ms = 6;
+  // 0 means the sandbox has no expiry.
+  int64 expires_at_ms = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Delete / Pause / Checkpoint
+// ---------------------------------------------------------------------------
+
+message SandboxDeleteRequest {
+  string sandbox_id = 1;
+  // 🔴 The incarnation the caller believes it is deleting. A delete that
+  // arrives after the sandbox has been resumed elsewhere names the run it was
+  // written for, and the node refuses it rather than tearing down a run the
+  // caller has never seen.
+  string execution_id = 2;
+}
+
+message SandboxDeleteResponse {}
+
+message SandboxPauseRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  // Whether the capture should also be staged for publication, so that a node
+  // other than this one can rebuild the sandbox.
+  bool publish = 3;
+}
+
+message SandboxPauseResponse {
+  PausedState paused_state = 1;
+  // Present only when `publish` was asked for and the backend could offer a
+  // publishable capture.
+  StagedSnapshot staged = 2;
+}
+
+message SandboxCheckpointRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+}
+
+message SandboxCheckpointResponse {
+  StagedSnapshot staged = 1;
+}
+
+// Why a capture failed, told apart the way the node's own code tells it apart.
+//
+// 🔴 Carried in the gRPC `Status` details and **not** in its code: `Internal`
+// is used by both kinds and by the transport itself, so a caller reading the
+// code alone cannot tell them apart. Getting the direction wrong costs a user's
+// workspace one way and leaves a zombie VM the other:
+//
+//   - not terminal — the runtime was restored before the error was returned,
+//     so the caller rolls the sandbox back to running;
+//   - terminal — the capture mutated the live runtime past safe resume, so the
+//     caller must tear the sandbox down.
+//
+// 🔴 A missing detail is read as *terminal*. An error whose classification did
+// not arrive is an error whose classification is unknown, and the safe reading
+// of "unknown" is the one that does not keep running a VM that may have been
+// mutated out from under itself.
+message SandboxCaptureFailure {
+  bool terminal = 1;
+  string reason = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Fork
+// ---------------------------------------------------------------------------
+
+// One child a fork is asked to produce.
+//
+// 🔴 The id is decided by the caller, for the same reason it is on `Create`:
+// the child's `control_plane_config` is the control plane's record of the
+// child, and a record names the sandbox it describes. A node that minted the
+// id would be handing back a record written before anyone knew which sandbox it
+// was about.
+message ForkChildSpec {
+  string sandbox_id = 1;
+  // The incarnation this child must run under, or empty for "you choose".
+  // Same rule as SandboxCreateRequest.execution_id.
+  string execution_id = 2;
+  // The ownership marker for this child. Zero bytes means the child is not
+  // owned by the control plane; see SandboxCreateRequest.control_plane_config.
+  //
+  // 🔴 Never inherited from the source sandbox. The source's marker is the
+  // control plane's record *of the source*, and a child carrying it would
+  // report itself under its parent's identity.
+  bytes control_plane_config = 3;
+}
+
+message SandboxForkRequest {
+  string source_sandbox_id = 1;
+  string source_execution_id = 2;
+  repeated ForkChildSpec children = 3;
+  // 0 means the children keep the source's timeout.
+  uint64 timeout_ms = 4;
+}
+
+message SandboxForkResponse {
+  // 🔴 One result per requested child, in request order, whatever happened to
+  // any of them. That is the contract the node's own fork already states, and
+  // a caller pairing markers with children depends on it.
+  repeated ForkChildResult children = 1;
+}
+
+message ForkChildResult {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  oneof outcome {
+    SandboxCreateResponse started = 3;
+    string error = 4;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+message SandboxNetworkRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  // The replacement policy, as `SandboxNetworkPolicy` serialises. Absent
+  // clears the policy.
+  SerializedValue network_policy = 3;
+}
+
+message SandboxNetworkResponse {}
+
+message SandboxParamsRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  // 🔴 The *approved* value, already agreed with the custom extension by the
+  // caller. The node assigns it; it does not run the hook and cannot refuse.
+  SerializedValue custom_extension_params = 3;
+}
+
+message SandboxParamsResponse {}
+
+// ---------------------------------------------------------------------------
+// ListSandboxes
+// ---------------------------------------------------------------------------
+
+// 🔴 A message of its own rather than `google.protobuf.Empty`. Empty has no
+// fields and never will, so a surface that used it could never grow a filter,
+// a cursor or a scope — and this one is a listing, which is the shape that
+// grows all three.
+message ListSandboxesRequest {}
+
+message SandboxListResponse {
+  // Every sandbox this node is running that carries an ownership marker.
+  //
+  // 🔴 An empty list is an answer, and it is the answer that lets a caller
+  // conclude a sandbox is gone. It is only ever produced by a node that looked.
+  repeated NodeSandbox sandboxes = 1;
+}
+
+// One live sandbox, as the node that is running it sees it.
+message NodeSandbox {
+  string sandbox_id = 1;
+  // 🔴 Required, and taken from the live handle rather than from the node's
+  // record: an orphan is decided by comparing incarnations, and the point of
+  // this listing is to report what is running rather than what is filed.
+  string execution_id = 2;
+  string node_id = 3;
+  int64 started_at_ms = 4;
+  // 0 means the sandbox has no expiry.
+  int64 expires_at_ms = 5;
+  uint32 vcpu = 6;
+  uint64 ram_mb = 7;
+  string host_interaction_ip = 8;
+  uint64 rootfs_virtual_size = 9;
+  // 🔴 Never empty in a response. A sandbox whose marker is absent is not the
+  // control plane's, and is left out of the listing entirely rather than
+  // reported with an empty one.
+  bytes control_plane_config = 10;
+}

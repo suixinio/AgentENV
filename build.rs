@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
+    println!("cargo:rerun-if-changed=services/api/proto/node.proto");
     emit_git_rerun_inputs();
 
     // The server stubs exist for the in-process fake controller the registry
@@ -14,10 +15,17 @@ fn main() {
         .build_server(true)
         .build_client(true)
         .compile_protos(
-            &["services/api/proto/scheduler.proto"],
+            &[
+                "services/api/proto/scheduler.proto",
+                // 🔴 Deliberately not added to `services/Makefile`'s explicit
+                // proto list: both ends of the node service are Rust, and a
+                // `.pb.go` nobody imports is one more generated artifact to
+                // keep in step.
+                "services/api/proto/node.proto",
+            ],
             &["services/api/proto"],
         )
-        .expect("failed to compile scheduler proto for Rust gRPC client");
+        .expect("failed to compile the scheduler and node protos for Rust gRPC");
 
     let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");

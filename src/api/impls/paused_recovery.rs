@@ -1281,6 +1281,10 @@ fn restore_request(
         // Carried over like everything else here: a restore is the same
         // sandbox, so whoever owned the record still owns it.
         control_plane_config: metadata.control_plane_config.clone(),
+        // 🔴 *Not* carried over. A restore is a new run of the sandbox, and
+        // reusing the incarnation the record was paused under would give the
+        // new run the identity of the one that ended.
+        execution_id: None,
     }
 }
 

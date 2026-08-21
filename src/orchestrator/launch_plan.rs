@@ -97,18 +97,35 @@ pub(super) enum LaunchPlan {
 }
 
 impl LaunchPlan {
+    /// Builds the plan for a create.
+    ///
+    /// # 🔴 `run_as`, and why it is not a second mint site
+    ///
+    /// `None` mints here, which is what every user-facing create does. `Some`
+    /// runs under an incarnation the caller already minted, and there is
+    /// exactly one caller that may do that: a node executing a create on behalf
+    /// of the orchestrator that owns the sandbox. In the split, that
+    /// orchestrator is a different process — but it is still *the* orchestrator,
+    /// it minted the incarnation in this same constructor, and it has already
+    /// written that value into its own record of the sandbox.
+    ///
+    /// The alternative is worse than it looks: if the node minted its own, the
+    /// two records of one sandbox would name two different runs, and fencing —
+    /// which compares exactly that value — would refuse writes from the sandbox
+    /// that is actually running.
     pub(super) fn for_create_from_snapshot(
         sandbox_id: SandboxId,
         snapshot: Box<RunnableSnapshot>,
         launch_config: SandboxLaunchConfig,
         mut metadata: SandboxMetadata,
         timeout: NewTimeout,
+        run_as: Option<ExecutionId>,
     ) -> Self {
         // Creating from a snapshot is a create, not a resume. The backend below
         // it boots through `LaunchMode::Resume`, which is why the decision is
         // taken on the plan variant here and never on the launch mode or the
         // hook kind further down.
-        let execution_id = ExecutionId::new();
+        let execution_id = run_as.unwrap_or_else(ExecutionId::new);
         // Stamped onto the record here rather than at the call site so the two
         // cannot drift: the plan and the metadata it carries name one run.
         metadata.execution_id = execution_id;
@@ -128,8 +145,9 @@ impl LaunchPlan {
         launch_config: SandboxLaunchConfig,
         mut metadata: SandboxMetadata,
         timeout: NewTimeout,
+        run_as: Option<ExecutionId>,
     ) -> Self {
-        let execution_id = ExecutionId::new();
+        let execution_id = run_as.unwrap_or_else(ExecutionId::new);
         metadata.execution_id = execution_id;
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,

@@ -768,6 +768,7 @@ fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
         SandboxLaunchConfig::default(),
         transitional_metadata,
         NewTimeout::Set(Duration::from_secs(15)),
+        None,
     )
 }
 
@@ -1137,6 +1138,7 @@ fn create_request(
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
         control_plane_config: None,
+        execution_id: None,
         auto_resume: false,
         secure: false,
     }
@@ -1200,6 +1202,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             control_plane_config: None,
+            execution_id: None,
             auto_resume: false,
             secure: false,
         })
@@ -4976,6 +4979,7 @@ async fn an_assigned_fork_pairs_each_child_with_its_own_owner() -> Result<()> {
             let sandbox_id = SandboxId::new();
             ForkChildAssignment {
                 sandbox_id,
+                execution_id: None,
                 control_plane_config: ControlPlaneConfig::from_bytes(
                     format!("record-for-{sandbox_id}").into_bytes(),
                 ),

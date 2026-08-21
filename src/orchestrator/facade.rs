@@ -57,7 +57,7 @@ use super::store::{MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata
 #[cfg(test)]
 use super::types::SandboxState;
 use super::types::{
-    CreateSandboxRequest, ForkChildren, SandboxLifecycleEvent, SandboxRosterEntry,
+    CreateSandboxRequest, ForkChildren, LiveSandbox, SandboxLifecycleEvent, SandboxRosterEntry,
     SnapshotCaptureResult,
 };
 use super::{Result, SandboxForkOutcome};
@@ -217,6 +217,13 @@ orchestration_surface! {
         fn list_sandboxes() -> Result<Vec<SandboxMetadata>>;
         /// The ids of every sandbox this orchestrator has a record of.
         fn list_sandbox_ids() -> Result<Vec<SandboxId>>;
+        /// The sandboxes this node is *running*, from its live handles rather
+        /// than from its records.
+        ///
+        /// 🔴 Not filtered by ownership. Which sandboxes a caller may see is a
+        /// property of the surface it is being served through, not of this
+        /// list — see [`LiveSandbox::control_plane_config`].
+        fn list_live_sandboxes() -> Result<Vec<LiveSandbox>>;
         /// The heartbeat roster: what this node claims to be holding.
         fn list_sandbox_roster() -> Result<Vec<SandboxRosterEntry>>;
         /// Sandbox metadata narrowed by a filter.

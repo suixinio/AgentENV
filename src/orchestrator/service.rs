@@ -423,6 +423,7 @@ where
             custom_extension_params,
             secure,
             control_plane_config,
+            execution_id,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
@@ -489,6 +490,7 @@ where
                     launch_config,
                     transitional_metadata,
                     NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    execution_id,
                 ))
                 .await
             }
@@ -551,6 +553,7 @@ where
                     launch_config,
                     transitional_metadata,
                     NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    execution_id,
                 ))
                 .await
             }
@@ -638,6 +641,7 @@ where
             ForkChildren::Fresh(count) => (0..count)
                 .map(|_| ForkChildAssignment {
                     sandbox_id: SandboxId::new(),
+                    execution_id: None,
                     control_plane_config: None,
                 })
                 .collect(),
@@ -650,8 +654,9 @@ where
                 // A fork child is a brand-new sandbox, so it is a brand-new
                 // incarnation. Minted here, next to the child's metadata below
                 // being a clone of the parent's, because that clone is what
-                // would otherwise carry the parent's.
-                execution_id: ExecutionId::new(),
+                // would otherwise carry the parent's — unless the caller has
+                // already minted one and recorded it.
+                execution_id: child.execution_id.unwrap_or_else(ExecutionId::new),
                 envd_access_token: source_metadata
                     .secure
                     .then(|| self.access_tokens.generate(child.sandbox_id)),

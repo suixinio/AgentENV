@@ -69,6 +69,34 @@
 //! out from under it while it is still running. Calling [`run`] before
 //! `ensure_environment` is what puts those two back in e2b's order.
 //!
+//! # 🔴 Which half of this earns its keep where
+//!
+//! On the Kubernetes DaemonSet, **the process sweep finds nothing, and that is
+//! correct rather than broken.** The container's ENTRYPOINT is `/server`
+//! (`deploy/docker/Dockerfile.agentenv`), the pod sets neither `hostPID` nor
+//! `shareProcessNamespace`, so the server is PID 1 of its own PID namespace —
+//! and when the init process of a PID namespace exits, the kernel `SIGKILL`s
+//! everything left in it (`man 7 pid_namespaces`). A leftover Firecracker
+//! cannot outlive the process that started it there. What *does* outlive it is
+//! everything on the `hostPath` volume: the work directories, and the network
+//! namespace files `prepare_runtime` already unlinks.
+//!
+//! So on that deployment the file sweep is the half that fires and the process
+//! sweep reports three zeroes. 🔴 Read that reading correctly: it is "there
+//! were no Firecrackers on this host", which the `left_alone` counter tells
+//! apart from "there were, and they were someone else's", and which
+//! `failed` tells apart from "there were, and I could not classify them".
+//! `_sd-impl-phase3-role.md` §12 P2 expects a mid-build restart to push
+//! `reclaimed_total{resource_type="firecracker"}` above zero; on a pod with its
+//! own PID namespace it will not, and the work-directory counter is where that
+//! probe has to look instead.
+//!
+//! The process sweep is load-bearing anywhere the server is *not* the init of
+//! its PID namespace: a bare-metal or systemd install, `make start-server`, a
+//! development host, or a container deliberately run with `hostPID: true`. It
+//! is written for those, and it is the half whose mistakes are expensive, which
+//! is why its refusals are where the tests are concentrated.
+//!
 //! 🔴 **Leaked ublk devices are out of scope, on purpose.** Deciding whether a
 //! ublk device is abandoned means reading `ublksrv_pid` back through the
 //! io_uring control ring, and the mistake direction is deleting a block device

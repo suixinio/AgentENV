@@ -81,6 +81,133 @@ const (
 	defaultSchedulerRegistryDiscardMaxRatio     = 0.10
 )
 
+// The snapshot catalog's build queue. Three numbers, and the relationship
+// between two of them is what keeps the queue from becoming an outage.
+const (
+	// defaultSchedulerCatalogMaxConcurrentBuilds is the cluster-wide ceiling.
+	// e2b hangs the equivalent off its tier table at 20; we have no tenants to
+	// hang it off, so the subject of the quota is the cluster and the number is
+	// the same one.
+	defaultSchedulerCatalogMaxConcurrentBuilds = 20
+
+	// defaultSchedulerCatalogBuildHeartbeatTTL is how long a build may go
+	// without being heard from before it is treated as gone.
+	//
+	// Five minutes because a build legitimately takes a long time — it boots a
+	// VM and runs the user's steps — while its heartbeat is a tick that has no
+	// reason to stop for five minutes unless the process running it has. The
+	// number this is really paired with lives on the node: the builder renews
+	// at a third of this, so two consecutive misses still leave a margin.
+	defaultSchedulerCatalogBuildHeartbeatTTL = 5 * time.Minute
+
+	// defaultSchedulerCatalogBuildReapInterval is how often the pass runs. Far
+	// below the TTL, because it decides how long a template stays shut *after*
+	// the build holding it is already known to be gone, and that wait costs a
+	// user a refused build for no further benefit.
+	defaultSchedulerCatalogBuildReapInterval = 30 * time.Second
+
+	// schedulerCatalogBuildHeartbeatTTLFloor is the shortest TTL this process
+	// will run a reaper against.
+	//
+	// 🔴 A floor and not a default, because the two directions are not
+	// symmetrical. A TTL too long leaks a template until somebody notices; a
+	// TTL too short ends builds that are still running, over and over, and the
+	// error the user sees says the heartbeat lapsed when it did not. One
+	// mistyped unit — 30 for 30 seconds where 30s was meant, or milliseconds
+	// where a duration was meant — lands on the second side, so it is refused
+	// at start-up rather than run.
+	schedulerCatalogBuildHeartbeatTTLFloor = 30 * time.Second
+)
+
+// SchedulerCatalogConfig bounds the snapshot catalog's build queue.
+//
+// It is read only where the catalog is served, which is where the registry's
+// write surface is: the catalog shares that pool, because the two halves of a
+// pause have to be able to reach one transaction.
+type SchedulerCatalogConfig struct {
+	// MaxConcurrentBuilds is the cluster-wide ceiling on builds that are
+	// pending or in progress. Zero takes the default. 🔴 A negative value
+	// removes the ceiling — and with it the advisory lock and the count that
+	// exist only to enforce one — which is a thing to do knowingly and never by
+	// leaving a field unset, hence negative rather than zero.
+	MaxConcurrentBuilds int `json:"max_concurrent_builds"`
+
+	// BuildHeartbeatTTL is how long a build may go unheard from before the
+	// reaper ends it.
+	//
+	// 🔴 This number is half of a pair whose other half is on the node. The
+	// builder renews on a cadence derived from it; a TTL shorter than that
+	// cadence reaps every build in the cluster on schedule. The floor above is
+	// what catches the unit slip that produces one.
+	BuildHeartbeatTTL time.Duration `json:"build_heartbeat_ttl"`
+
+	// BuildReapInterval is how often the reaping pass runs.
+	BuildReapInterval time.Duration `json:"build_reap_interval"`
+}
+
+func (s *SchedulerCatalogConfig) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		MaxConcurrentBuilds *int            `json:"max_concurrent_builds"`
+		BuildHeartbeatTTL   json.RawMessage `json:"build_heartbeat_ttl"`
+		BuildReapInterval   json.RawMessage `json:"build_reap_interval"`
+	}
+
+	parsed := wire{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	if parsed.MaxConcurrentBuilds != nil {
+		s.MaxConcurrentBuilds = *parsed.MaxConcurrentBuilds
+	}
+	if len(bytes.TrimSpace(parsed.BuildHeartbeatTTL)) > 0 {
+		d, err := parseSchedulerDuration(parsed.BuildHeartbeatTTL, "scheduler.catalog.build_heartbeat_ttl")
+		if err != nil {
+			return err
+		}
+		s.BuildHeartbeatTTL = d
+	}
+	if len(bytes.TrimSpace(parsed.BuildReapInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.BuildReapInterval, "scheduler.catalog.build_reap_interval")
+		if err != nil {
+			return err
+		}
+		s.BuildReapInterval = d
+	}
+	return nil
+}
+
+// validateSchedulerCatalog checks the build queue's bounds.
+//
+// 🔴 Checked whether or not the catalog is switched on, unlike the registry
+// block. Every field has a default, so an invalid value takes somebody writing
+// one, and the one that costs work — a TTL below the floor — is worth refusing
+// at start-up on a process that has not yet been given a DSN as much as on one
+// that has.
+func validateSchedulerCatalog(c SchedulerCatalogConfig) error {
+	if c.BuildHeartbeatTTL <= 0 {
+		return errors.New("scheduler.catalog.build_heartbeat_ttl must be greater than zero")
+	}
+	if c.BuildHeartbeatTTL < schedulerCatalogBuildHeartbeatTTLFloor {
+		return fmt.Errorf(
+			"scheduler.catalog.build_heartbeat_ttl is %s, below the floor of %s: a TTL this short ends builds that are still running",
+			c.BuildHeartbeatTTL, schedulerCatalogBuildHeartbeatTTLFloor)
+	}
+	if c.BuildReapInterval <= 0 {
+		return errors.New("scheduler.catalog.build_reap_interval must be greater than zero")
+	}
+	// 🔴 The one relation between the two, and it is not cosmetic. The reaper
+	// holds itself back for a full TTL after it can first hear a heartbeat, so
+	// an interval longer than the TTL means the first pass after that window
+	// opens is one whole interval later still — and a template stays shut for
+	// that long after everyone already knows its build is gone.
+	if c.BuildReapInterval > c.BuildHeartbeatTTL {
+		return fmt.Errorf(
+			"scheduler.catalog.build_reap_interval (%s) must not exceed scheduler.catalog.build_heartbeat_ttl (%s)",
+			c.BuildReapInterval, c.BuildHeartbeatTTL)
+	}
+	return nil
+}
+
 type Node struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
@@ -313,6 +440,7 @@ type SchedulerConfig struct {
 	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
 	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
 	Registry                SchedulerRegistryConfig  `json:"registry"`
+	Catalog                 SchedulerCatalogConfig   `json:"catalog"`
 	Routing                 SchedulerRoutingConfig   `json:"routing"`
 }
 
@@ -337,6 +465,11 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		// so a config that names only one registry key keeps the defaults
 		// for the others instead of zeroing them.
 		Registry json.RawMessage `json:"registry"`
+		// Decoded into the existing value for the same reason the registry
+		// block is: a config naming one catalog key must keep the defaults for
+		// the others, and one of those others is a TTL whose zero value would
+		// be refused at start-up.
+		Catalog json.RawMessage `json:"catalog"`
 		// Nested one pointer deep on each side, so a config file that names
 		// the block without naming the key inside it leaves the default alone
 		// rather than blanking it.
@@ -382,6 +515,11 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 
 	if len(bytes.TrimSpace(parsed.Registry)) > 0 {
 		if err := json.Unmarshal(parsed.Registry, &s.Registry); err != nil {
+			return err
+		}
+	}
+	if len(bytes.TrimSpace(parsed.Catalog)) > 0 {
+		if err := json.Unmarshal(parsed.Catalog, &s.Catalog); err != nil {
 			return err
 		}
 	}
@@ -857,6 +995,11 @@ func defaultConfig(service string) Config {
 			// state, and starting a release on observe is release discipline.
 			// A default of observe leaves clusters parked there with nobody
 			// aware they were never flipped.
+			Catalog: SchedulerCatalogConfig{
+				MaxConcurrentBuilds: defaultSchedulerCatalogMaxConcurrentBuilds,
+				BuildHeartbeatTTL:   defaultSchedulerCatalogBuildHeartbeatTTL,
+				BuildReapInterval:   defaultSchedulerCatalogBuildReapInterval,
+			},
 			Routing:              SchedulerRoutingConfig{ExecutionArbitration: SchedulerExecutionArbitrationEnforce},
 			MaxProjectionTTL:     defaultSchedulerMaxProjectionTTL,
 			BindingSweepSilence:  defaultSchedulerBindingSweepSilence,
@@ -933,6 +1076,34 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_REGISTRY_RECLAIM_INTERVAL %q: %w", v, err)
 		}
 		cfg.Scheduler.Registry.ReclaimInterval = d
+	}
+
+	// The catalog's build queue. Overridable from the environment for the
+	// reason recon gives about the ConfigMap: a value edited in the file is
+	// rolled back by the next apply, and the two numbers below are the ones an
+	// operator reaches for during an incident.
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS %q: %w", v, err)
+		}
+		cfg.Scheduler.Catalog.MaxConcurrentBuilds = n
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_CATALOG_BUILD_HEARTBEAT_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_CATALOG_BUILD_HEARTBEAT_TTL %q: %w", v, err)
+		}
+		cfg.Scheduler.Catalog.BuildHeartbeatTTL = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_CATALOG_BUILD_REAP_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_CATALOG_BUILD_REAP_INTERVAL %q: %w", v, err)
+		}
+		cfg.Scheduler.Catalog.BuildReapInterval = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_SANDBOX_PROXY_DOMAINS")); v != "" {
@@ -1302,6 +1473,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		// given the same registry reader, so a bad registry config has to fail
 		// there too rather than only on the primary.
 		if err := validateSchedulerRegistry(c.Scheduler.Registry); err != nil {
+			return err
+		}
+		// Before the query-only early return as well: a replica is given the
+		// same config, and a TTL below the floor is a typo somebody should be
+		// told about wherever it is read.
+		if err := validateSchedulerCatalog(c.Scheduler.Catalog); err != nil {
 			return err
 		}
 		if schedulerQueryOnly {

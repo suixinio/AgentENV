@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::{
@@ -226,7 +226,7 @@ impl SnapshotCatalog for OssSnapshotCatalog {
         Ok(Some(id))
     }
 
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
         let mut record =
             self.read_record(id)
                 .await?
@@ -249,7 +249,7 @@ impl SnapshotCatalog for OssSnapshotCatalog {
         build.error_reason = None;
         record.updated_at_unix_ms = now;
         self.write_record(&record).await?;
-        Ok(record)
+        Ok(StartedBuild::untracked(record))
     }
 
     async fn mark_build_error(

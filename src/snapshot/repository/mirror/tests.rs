@@ -855,7 +855,7 @@ async fn starting_a_build_reaches_both_catalogs() {
         .await
         .expect("the catalog admits it");
     assert!(matches!(
-        record.source,
+        record.record.source,
         crate::snapshot::types::SnapshotSource::Template { ref build }
             if build.status == TemplateBuildStatus::Building
     ));
@@ -975,31 +975,74 @@ async fn a_reaped_build_is_told_its_lease_is_gone() {
         .create(record_for(&id))
         .await
         .expect("creating should work");
-    fixture
+    let started = fixture
         .dual
         .try_start_build(&id)
         .await
         .expect("the catalog admits it");
 
+    // 🔴 The build's own id, which is not the template's. A test that renewed
+    // the template id would answer `false` from the first call and pass for
+    // entirely the wrong reason.
+    assert_ne!(
+        started.build_id, id,
+        "a build is a new thing each time it is admitted"
+    );
     assert!(
         fixture
             .dual
-            .renew_build_lease(&id)
+            .renew_build_lease(&started.build_id)
             .await
             .expect("renewing should work"),
         "a live build holds its lease"
     );
 
-    fixture.central.reap_build(&id);
+    fixture.central.reap_build(&started.build_id);
 
     assert!(
         !fixture
             .dual
-            .renew_build_lease(&id)
+            .renew_build_lease(&started.build_id)
             .await
             .expect("renewing should work"),
         "a build the reaper took must be told so"
     );
+}
+
+/// 🔴 A template can be built more than once.
+///
+/// The build id used to be the template's, which the HTTP layer forces them to
+/// look like — and the catalog keys a build row by it, so the second admission
+/// collided with the first build row that ever existed. That is what retrying a
+/// failed build is, and it was refused with "a row with this id already
+/// exists".
+#[tokio::test]
+async fn a_second_build_of_one_template_gets_its_own_identity() {
+    let fixture = Fixture::new().await;
+    let id = SnapshotId::generate();
+    fixture
+        .dual
+        .create(record_for(&id))
+        .await
+        .expect("creating should work");
+
+    let first = fixture
+        .dual
+        .try_start_build(&id)
+        .await
+        .expect("the first build is admitted");
+    let second = fixture
+        .dual
+        .try_start_build(&id)
+        .await
+        .expect("and so is a later one");
+
+    assert_ne!(
+        first.build_id, second.build_id,
+        "two admissions of one template must not claim the same build row"
+    );
+    assert_eq!(first.record.id, id);
+    assert_eq!(second.record.id, id);
 }
 
 /// A build start the object store itself refused is not a divergence: neither

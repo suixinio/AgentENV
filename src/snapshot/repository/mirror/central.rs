@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use crate::snapshot::repository::backends::central::{
     now_unix_ms, CatalogReadScope, CatalogWrite, CentralSnapshotCatalog,
 };
-use crate::snapshot::repository::interfaces::SnapshotCommit;
+use crate::snapshot::repository::interfaces::{SnapshotCommit, StartedBuild};
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
@@ -49,8 +49,9 @@ pub trait CentralCatalogWrites: Send + Sync {
     async fn start_build(
         &self,
         id: &SnapshotId,
+        build_id: &SnapshotId,
         started_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>>;
+    ) -> RepositoryResult<CatalogWrite<StartedBuild>>;
 
     /// Says this node is still running the build. `false` means stop.
     async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool>;
@@ -103,9 +104,10 @@ impl CentralCatalogWrites for CentralSnapshotCatalog {
     async fn start_build(
         &self,
         id: &SnapshotId,
+        build_id: &SnapshotId,
         started_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
-        CentralSnapshotCatalog::start_build(self, id, started_at_unix_ms).await
+    ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
+        CentralSnapshotCatalog::start_build(self, id, build_id, started_at_unix_ms).await
     }
 
     async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {

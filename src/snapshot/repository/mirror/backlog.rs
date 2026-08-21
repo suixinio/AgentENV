@@ -129,6 +129,15 @@ pub(super) enum MirrorOp {
     },
     TryStartBuild {
         id: SnapshotId,
+        /// The build this node admitted, so a replay re-admits *that* build
+        /// rather than inventing one the running builder is not renewing.
+        ///
+        /// 🔴 Optional because entries written before build admission was wired
+        /// carry no build id — and there is no right answer for those, so a
+        /// replay falls back to the template's. Nothing is renewing them
+        /// either.
+        #[serde(default)]
+        build_id: Option<SnapshotId>,
     },
     MarkBuildError {
         id: SnapshotId,
@@ -159,7 +168,7 @@ impl MirrorOp {
         match self {
             Self::Create { record } | Self::DeleteRecord { record } => &record.id,
             Self::PublishCommit { commit } => &commit.id,
-            Self::TryStartBuild { id } | Self::MarkBuildError { id, .. } => id,
+            Self::TryStartBuild { id, .. } | Self::MarkBuildError { id, .. } => id,
         }
     }
 }
@@ -301,7 +310,7 @@ impl MirrorTarget for ObjectStoreTarget {
             MirrorOp::PublishCommit { commit } => {
                 self.0.publish_commit(commit.clone()).await.map(|_| ())
             }
-            MirrorOp::TryStartBuild { id } => self.0.try_start_build(id).await.map(|_| ()),
+            MirrorOp::TryStartBuild { id, .. } => self.0.try_start_build(id).await.map(|_| ()),
             MirrorOp::MarkBuildError { id, reason } => {
                 self.0.mark_build_error(id, reason.clone()).await
             }
@@ -361,9 +370,11 @@ impl MirrorTarget for CentralTarget {
             // where the row has since moved on by itself — so a replay that
             // arrives after the build finished settles rather than re-opening
             // a queue slot nothing will ever release.
-            MirrorOp::TryStartBuild { id } => Self::settled(
+            MirrorOp::TryStartBuild { id, build_id } => Self::settled(
                 "try_start_build",
-                self.0.start_build(id, now_unix_ms()).await?,
+                self.0
+                    .start_build(id, build_id.as_ref().unwrap_or(id), now_unix_ms())
+                    .await?,
             ),
             MirrorOp::MarkBuildError { id, reason } => Self::settled(
                 "mark_build_error",

@@ -402,6 +402,36 @@ impl StagedSnapshot {
     }
 }
 
+/// One admitted build: the template row it moved, and the build's own identity.
+///
+/// 🔴 The two ids are separate, and this is the type that stops them being
+/// assumed equal. The HTTP layer forces `templateID == buildID` today, but the
+/// catalog keys a build row by the *build* id, so reusing the template's meant
+/// a template could be built exactly once ever — the second admission was
+/// refused because a row with that id already existed, which is what a rebuild
+/// after a failed build is. A build is a new thing each time it is admitted,
+/// and the id it carries is the one a lease renewal has to quote.
+#[derive(Clone, Debug)]
+pub struct StartedBuild {
+    /// The template row as the transition left it: building.
+    pub record: SnapshotRecord,
+    /// The admitted build, to be quoted when renewing its lease.
+    ///
+    /// Equal to the template id for a backend with no build rows, which has
+    /// nothing to renew either.
+    pub build_id: SnapshotId,
+}
+
+impl StartedBuild {
+    /// The answer from a backend that has no separate notion of a build.
+    pub fn untracked(record: SnapshotRecord) -> Self {
+        Self {
+            build_id: record.id.clone(),
+            record,
+        }
+    }
+}
+
 #[async_trait]
 /// The rows: snapshot records, template build state, and alias bindings.
 ///
@@ -486,7 +516,7 @@ pub trait SnapshotCatalog: Send + Sync {
     ///
     /// Backends should reject non-template records and template records that are
     /// no longer waiting.
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild>;
 
     /// Says this node is still running `build_id`.
     ///

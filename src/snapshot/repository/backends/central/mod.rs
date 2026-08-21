@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::proto::scheduler as pb;
 use crate::snapshot::repository::interfaces::{
     SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
+    StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -520,14 +521,15 @@ impl CentralSnapshotCatalog {
     pub async fn start_build(
         &self,
         id: &SnapshotId,
+        build_id: &SnapshotId,
         started_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+    ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
         let response = self
             .client()
             .start_build(self.request(pb::StartBuildRequest {
                 cluster_id: self.cluster_id.to_string(),
                 node_id: self.node_id.clone(),
-                build_id: id.to_string(),
+                build_id: build_id.to_string(),
                 template_id: id.to_string(),
                 started_at_unix_ms,
                 // 🔴 Advisory. The server stamps the first heartbeat from the
@@ -549,7 +551,10 @@ impl CentralSnapshotCatalog {
                 let row = started.snapshot.ok_or_else(|| {
                     Self::malformed("start_build", "an admitted build without its template row")
                 })?;
-                Ok(CatalogWrite::Applied(decode_row(row, self.cluster_id)?))
+                Ok(CatalogWrite::Applied(StartedBuild {
+                    record: decode_row(row, self.cluster_id)?,
+                    build_id: build_id.clone(),
+                }))
             }
             Some(pb::start_build_response::Outcome::Rejected(rejected)) => {
                 Ok(CatalogWrite::Refused(CatalogRefusal::from_proto(rejected)))
@@ -587,6 +592,32 @@ impl CentralSnapshotCatalog {
             .into_inner();
 
         Ok(response.live)
+    }
+
+    /// Whether `build_id` is still on the queue.
+    ///
+    /// `None` when the catalog has no build row for it at all. `Some(true)`
+    /// means `pending` or `in_progress`: it is counted against the cluster
+    /// ceiling and holds its template behind the per-template exclusion.
+    ///
+    /// 🔴 Read at the one scope §5.3 names as having to be *without* the
+    /// resolvable predicate. This is the reading that exists to look at builds
+    /// that are still running or have failed; a `ready`-only reading of it
+    /// would answer "no such build" for every build worth asking about.
+    pub async fn build_is_active(&self, build_id: &SnapshotId) -> RepositoryResult<Option<bool>> {
+        let response = self
+            .client()
+            .get_build(self.request(pb::GetBuildRequest {
+                cluster_id: self.cluster_id.to_string(),
+                build_id: build_id.to_string(),
+            }))
+            .await
+            .map_err(|status| Self::unreachable("get_build", status))?
+            .into_inner();
+
+        Ok(response
+            .build
+            .map(|build| matches!(build.status_group.as_str(), "pending" | "in_progress")))
     }
 
     /// Soft-deletes one row. Idempotent: nothing to delete is a success.
@@ -959,9 +990,17 @@ impl SnapshotCatalog for CentralSnapshotCatalog {
     /// a build the catalog said no to is the "two builders publishing into one
     /// template" the exclusion exists to prevent, and a caller told its build
     /// started when it did not would wait for a result nobody is producing.
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        match self.start_build(id, now_unix_ms()).await? {
-            CatalogWrite::Applied(row) => Ok(row),
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+        // 🔴 A new id every time, never the template's. The catalog keys a
+        // build row by the build id, so reusing the template's made the second
+        // admission collide with the first row that ever existed — which is
+        // what retrying a failed build is. The table has kept the two ids in
+        // separate columns from the start for exactly this.
+        match self
+            .start_build(id, &SnapshotId::generate(), now_unix_ms())
+            .await?
+        {
+            CatalogWrite::Applied(started) => Ok(started),
             CatalogWrite::Refused(refusal) => Err(build_refusal(id, refusal)),
         }
     }

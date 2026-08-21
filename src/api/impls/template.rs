@@ -636,8 +636,8 @@ impl Templates<()> for ApiImpl {
             Err(err) => return Ok(v2_start_build_error(err)),
         };
 
-        match self.snapshot_manager.try_start_build(&build_id).await {
-            Ok(_) => {}
+        let started = match self.snapshot_manager.try_start_build(&build_id).await {
+            Ok(started) => started,
             Err(crate::snapshot::RepositoryError::SnapshotNotFound { .. }) => {
                 return Ok(
                     V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(
@@ -651,12 +651,15 @@ impl Templates<()> for ApiImpl {
             Err(err) => {
                 return Ok(v2_start_build_error(Self::repository_error(&err)));
             }
-        }
+        };
 
         let api = self.clone();
         tokio::spawn(async move {
             info!(build_id = %build_id, "template build started");
-            let lease_build_id = build_id.clone();
+            // 🔴 The build's own id, not the template's. The catalog keys a
+            // build row by it, and they are only equal for a backend that has
+            // no build rows to renew against.
+            let lease_build_id = started.build_id;
             let lease_api = api.clone();
             let build = run_the_build(api, build_id, base_source, spec);
             hold_the_build_lease(&lease_api, &lease_build_id, build).await;
@@ -715,11 +718,31 @@ async fn hold_a_lease<Renew, Answer>(
     // admitted the build, so there is nothing to say yet.
     ticker.tick().await;
 
+    // Whether the catalog has ever confirmed this build is ours. See the arm
+    // below that reads it.
+    let mut held_once = false;
+
     loop {
         tokio::select! {
             () = &mut build => return,
             _ = ticker.tick() => match renew().await {
-                Ok(true) => {}
+                Ok(true) => held_once = true,
+                // 🔴 Only once a renewal has succeeded. Before that, "not the
+                // live build" means the catalog has no row for it — which is
+                // what an admission the catalog was unreachable for looks like
+                // until the compensator replays it, and stopping the build over
+                // that would make a scheduler blip destroy work. It cannot hide
+                // a real reaping: the admitting statement stamps a heartbeat,
+                // so a build can only be reaped a full TTL after it starts, by
+                // which time renewals at a third of the TTL have long since
+                // succeeded.
+                Ok(false) if !held_once => {
+                    warn!(
+                        build_id = %build_id,
+                        "the catalog has no row for this build yet; carrying on, because an \
+                         admission it could not take is replayed rather than lost"
+                    );
+                }
                 Ok(false) => {
                     // 🔴 Stop, and write nothing. The template this build was
                     // holding has already been handed to somebody else — the
@@ -934,8 +957,51 @@ mod tests {
 
     /// 🔴 A lease that is gone stops the build. The template has been handed to
     /// somebody else, and this is the only notice this process gets.
+    ///
+    /// The first renewal has to succeed for the loss to count — see the test
+    /// below — so this one holds the lease once and then loses it.
     #[tokio::test(start_paused = true)]
     async fn a_lost_lease_stops_the_build() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&renewals);
+
+        hold_a_lease(
+            &SnapshotId::generate(),
+            TICK,
+            a_build(350, Arc::clone(&finished)),
+            move || {
+                let counted = Arc::clone(&counted);
+                async move { Ok(counted.fetch_add(1, Ordering::SeqCst) == 0) }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            0,
+            "the build must not have run to the end: its template is somebody else's now"
+        );
+        assert_eq!(
+            renewals.load(Ordering::SeqCst),
+            2,
+            "it held the lease once and stopped on the renewal that lost it"
+        );
+    }
+
+    /// 🔴 A build whose admission the catalog could not take must not be
+    /// stopped by the catalog not knowing about it.
+    ///
+    /// An unreachable catalog leaves the admission queued rather than lost, so
+    /// until the compensator replays it every renewal answers "not the live
+    /// build" — which is the same answer a reaped build gets. Treating them the
+    /// same would make a scheduler blip during admission destroy the build it
+    /// admitted. They are told apart by whether a renewal has ever succeeded,
+    /// and that is safe because the admitting statement stamps a heartbeat: a
+    /// real reaping cannot happen before a full TTL, by which time renewals at
+    /// a third of the TTL have succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn a_build_the_catalog_has_not_heard_of_yet_keeps_running() {
         let finished = Arc::new(AtomicUsize::new(0));
 
         hold_a_lease(
@@ -948,8 +1014,8 @@ mod tests {
 
         assert_eq!(
             finished.load(Ordering::SeqCst),
-            0,
-            "the build must not have run to the end: its template is somebody else's now"
+            1,
+            "a build the catalog has never confirmed must not be stopped by that"
         );
     }
 

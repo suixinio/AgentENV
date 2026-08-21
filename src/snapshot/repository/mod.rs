@@ -10,5 +10,5 @@ pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
     paginate_records, ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog,
     SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage, SnapshotRuntimeResolver,
-    StagedSnapshot, DEFAULT_LIST_PAGE_LIMIT, MAX_LIST_PAGE_LIMIT,
+    StagedSnapshot, StartedBuild, DEFAULT_LIST_PAGE_LIMIT, MAX_LIST_PAGE_LIMIT,
 };

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use crate::snapshot::repository::backends::central::{CatalogRefusal, CatalogWrite};
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -295,7 +295,7 @@ impl SnapshotCatalog for ScriptedCatalog {
             .map(|record| record.id.clone()))
     }
 
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
         self.note(format!("try_start_build:{id}"));
         self.outcome(id)?;
         let mut record = self.holds(id).unwrap_or_else(|| record_for(id));
@@ -303,7 +303,7 @@ impl SnapshotCatalog for ScriptedCatalog {
             build.status = TemplateBuildStatus::Building;
         }
         self.keep(record.clone());
-        Ok(record)
+        Ok(StartedBuild::untracked(record))
     }
 
     async fn mark_build_error(
@@ -512,8 +512,9 @@ impl CentralCatalogWrites for ScriptedCentral {
     async fn start_build(
         &self,
         id: &SnapshotId,
+        build_id: &SnapshotId,
         _started_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+    ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
         self.note(format!("start_build:{id}"));
         if let Some(scripted) = self.scripted(CentralCall::StartBuild) {
             return scripted;
@@ -528,8 +529,11 @@ impl CentralCatalogWrites for ScriptedCentral {
         self.live_builds
             .lock()
             .expect("live builds")
-            .insert(id.to_string());
-        Ok(CatalogWrite::Applied(row.clone()))
+            .insert(build_id.to_string());
+        Ok(CatalogWrite::Applied(StartedBuild {
+            record: row.clone(),
+            build_id: build_id.clone(),
+        }))
     }
 
     async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {

@@ -137,7 +137,7 @@ mod tests {
 
     use super::*;
     use crate::snapshot::repository::interfaces::{
-        SnapshotCatalog, SnapshotCommit, SnapshotListFilter,
+        SnapshotCatalog, SnapshotCommit, SnapshotListFilter, StartedBuild,
     };
     use crate::snapshot::repository::mirror::backlog::{MirrorDirection, MirrorOp};
     use crate::snapshot::repository::{RepositoryError, RepositoryResult};
@@ -201,7 +201,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<StartedBuild> {
             unreachable!("this test only replays creates")
         }
 

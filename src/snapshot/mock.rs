@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::repository::{
     ImportedSnapshotArtifacts, RepositoryError, RepositoryResult, SnapshotArtifactStore,
     SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotRepository,
-    SnapshotRuntimeResolver,
+    SnapshotRuntimeResolver, StartedBuild,
 };
 use super::{
     PersistedDiskImagePublication, RunnableSnapshot, SnapshotId, SnapshotManager,
@@ -53,7 +53,7 @@ impl SnapshotCatalog for MockSnapshotCatalog {
         Err(Self::unsupported())
     }
 
-    async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+    async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<StartedBuild> {
         Err(Self::unsupported())
     }
 

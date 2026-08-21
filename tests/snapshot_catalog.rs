@@ -47,7 +47,9 @@ use agentenv::api::{snapshot_cursor_from_token, snapshot_next_token};
 use agentenv::sandbox::FirecrackerSnapshotManifest;
 use agentenv::snapshot::repository::backends::{CatalogReadScope, CentralSnapshotCatalog};
 use agentenv::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
-use agentenv::snapshot::repository::{RepositoryError, SnapshotCursor, SnapshotListFilter};
+use agentenv::snapshot::repository::{
+    RepositoryError, SnapshotCursor, SnapshotListFilter, StartedBuild,
+};
 use agentenv::snapshot::{
     CommandContext, CommittedSnapshot, ManagedLayer, SnapshotAlias, SnapshotId,
     SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
@@ -859,7 +861,7 @@ mod dual_write {
             }
         }
 
-        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
             match self.refuse() {
                 Some(refusal) => refusal,
                 None => self.inner.try_start_build(id).await,
@@ -1378,14 +1380,22 @@ mod dual_write {
             .create(template_record(id.clone(), None))
             .await
             .expect("creating should work");
-        both.dual
+        let started = both
+            .dual
             .try_start_build(&id)
             .await
             .expect("the catalog should admit the build");
 
+        // 🔴 The build's own id, which is not the template's. Renewing the
+        // template id would answer `false` from the first call and pass this
+        // test for entirely the wrong reason.
+        assert_ne!(
+            started.build_id, id,
+            "a build is a new thing each time it is admitted"
+        );
         assert!(
             both.dual
-                .renew_build_lease(&id)
+                .renew_build_lease(&started.build_id)
                 .await
                 .expect("renewing should work"),
             "a live build holds its lease"
@@ -2445,5 +2455,114 @@ async fn the_unbounded_listing_walks_past_its_first_page() {
         ROWS,
         "the listing stopped early; a walk that ends at its first page reports a smaller \
          catalog than there is"
+    );
+}
+
+/// 🔴 A failed build must release the template it was holding.
+///
+/// `builds_one_active_per_template` is what makes admission exclusive, and it
+/// counts `pending`/`in_progress` rows — so a build that failed and *said so*
+/// leaves a row that blocks the template for good unless the failure ends it
+/// too. The reaper covers the builder that died without a word; nothing is
+/// waiting on the one that reported.
+#[tokio::test]
+async fn a_failed_build_releases_the_template_it_held() {
+    let catalog = catalog!();
+    let id = SnapshotId::generate();
+    catalog
+        .create(template_record(id.clone(), None))
+        .await
+        .expect("creating should work");
+    let failed = catalog
+        .try_start_build(&id)
+        .await
+        .expect("the catalog should admit the build");
+    catalog
+        .mark_build_error(&id, TemplateBuildErrorReason::new("the build failed"))
+        .await
+        .expect("failing should work");
+
+    let other = SnapshotId::generate();
+    catalog
+        .create(template_record(other.clone(), None))
+        .await
+        .expect("creating should work");
+    let running = catalog
+        .try_start_build(&other)
+        .await
+        .expect("a failed build must not hold the queue");
+
+    assert_eq!(
+        catalog
+            .build_is_active(&failed.build_id)
+            .await
+            .expect("reading the build should work"),
+        Some(false),
+        "the failed build must be off the queue, or its template is blocked for good"
+    );
+    // The control: a build that is still running is still on it, so the
+    // assertion above is about this build's failure rather than about the
+    // question always answering `false`.
+    assert_eq!(
+        catalog
+            .build_is_active(&running.build_id)
+            .await
+            .expect("reading the build should work"),
+        Some(true)
+    );
+}
+
+/// 🔴 A failed build can be retried, against the real primary key.
+///
+/// The build id was the template's — which is what the HTTP layer forces them
+/// to look like — and the catalog keys a build row by it, so the second
+/// admission collided with the first build row that ever existed. Measured on
+/// this server before the fix: `a row with this id already exists`, arriving as
+/// a 400 on the retry of every failed build. A template could be built exactly
+/// once, ever.
+///
+/// The control is the second admission succeeding *and* naming a different
+/// build: succeeding alone could be a catalog that quietly reused the row.
+#[tokio::test]
+async fn a_template_whose_build_failed_can_be_built_again() {
+    let catalog = catalog!();
+    let id = SnapshotId::generate();
+    catalog
+        .create(template_record(id.clone(), None))
+        .await
+        .expect("creating should work");
+    let first = catalog
+        .try_start_build(&id)
+        .await
+        .expect("the first build is admitted");
+    catalog
+        .mark_build_error(&id, TemplateBuildErrorReason::new("the build failed"))
+        .await
+        .expect("failing should work");
+
+    let second = catalog
+        .try_start_build(&id)
+        .await
+        .expect("a template whose build failed must be buildable again");
+
+    assert_ne!(
+        first.build_id, second.build_id,
+        "the retry must be its own build, not the first one's row reused"
+    );
+    assert_eq!(
+        catalog
+            .build_is_active(&first.build_id)
+            .await
+            .expect("reading the build should work"),
+        Some(false),
+        "the failed build is off the queue"
+    );
+    assert_eq!(
+        catalog
+            .build_is_active(&second.build_id)
+            .await
+            .expect("reading the build should work"),
+        Some(true),
+        "and the retry is on it"
     );
 }

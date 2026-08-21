@@ -142,6 +142,18 @@ CATALOG_TEST_DIR     ?= $(CURDIR)/target/catalog-test
 # AENV_SNAPSHOT_CATALOG_TEST_REQUIRED turns a missing endpoint into a failure
 # rather than back into green skips, for the same reason
 # SCHEDULER_REGISTRY_TEST_REQUIRED does on the Go side.
+#
+# 🔴 Two waits, not one, and the second one fails rather than gives up. The gRPC
+# listener comes up *before* the catalog migration has run — the migration is a
+# retrying goroutine behind it — so a run that only waited for the socket raced
+# it. Waiting on the tables themselves is the check with no gap in it: the thing
+# the tests need is the thing being waited for.
+#
+# Giving up quietly was worse than not waiting. A scheduler left listening by an
+# earlier run makes this one exit with "address already in use", the tests then
+# talk to the *old* process against a database it never migrated, and the
+# result is thirty tests failing with `relation "snapshots" does not exist` —
+# which reads as a broken change rather than as a stale process.
 test-snapshot-catalog:
 	@command -v docker >/dev/null 2>&1 || { echo "docker not found: the catalog tests need a throwaway PostgreSQL"; exit 1; }
 	@command -v go >/dev/null 2>&1 || { echo "go not found: the catalog tests need the scheduler built from services/"; exit 1; }
@@ -164,6 +176,20 @@ test-snapshot-catalog:
 		grep -q "scheduler gRPC server listening" $(CATALOG_TEST_DIR)/scheduler.log 2>/dev/null && break; \
 		sleep 1; \
 	done; \
+	migrated=0; \
+	for i in $$(seq 1 60); do \
+		docker exec $(CATALOG_TEST_PG) psql -U postgres -d aenv_registry -tAc \
+			"select to_regclass('public.snapshots') is not null and to_regclass('public.builds') is not null" \
+			2>/dev/null | grep -q '^t$$' && { migrated=1; break; }; \
+		sleep 1; \
+	done; \
+	if [ "$$migrated" != "1" ]; then \
+		echo "the catalog migration never ran; see $(CATALOG_TEST_DIR)/scheduler.log"; \
+		echo "(a scheduler left listening on $(CATALOG_TEST_GRPC) by an earlier run makes this one exit with 'address already in use')"; \
+		kill $$scheduler_pid 2>/dev/null; \
+		docker rm -f $(CATALOG_TEST_PG) >/dev/null 2>&1; \
+		exit 1; \
+	fi; \
 	AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT="http://$(CATALOG_TEST_GRPC)" \
 	AENV_SNAPSHOT_CATALOG_TEST_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
 	AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1 \

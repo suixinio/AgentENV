@@ -58,7 +58,7 @@ use crate::snapshot::repository::backends::central::{
     CatalogWrite, STATUS_BUILDING,
 };
 use crate::snapshot::repository::interfaces::{
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
+    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotAlias, SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
@@ -709,8 +709,16 @@ impl SnapshotCatalog for DualWriteCatalog {
     /// here. What it costs is bounded and worth stating — that build holds no
     /// central `builds` row, so nothing counts it against the ceiling and its
     /// heartbeat has nothing to renew until the replay lands.
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        let admitted = self.central.start_build(id, now_unix_ms()).await;
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+        // 🔴 Minted here rather than inside the client, because the same id has
+        // to reach three places: the catalog that admits it, the queue entry
+        // that replays the admission if the catalog was unreachable, and the
+        // caller whose heartbeat renews it. Reusing the template's id — which
+        // is what the HTTP layer forces the two to look like — meant a template
+        // could be built exactly once, because the second admission collided
+        // with the first build row that ever existed.
+        let build_id = SnapshotId::generate();
+        let admitted = self.central.start_build(id, &build_id, now_unix_ms()).await;
         let central_owed = match admitted {
             Ok(CatalogWrite::Applied(_)) => {
                 record_central_request("try_start_build", CentralOutcome::Ok);
@@ -742,11 +750,17 @@ impl SnapshotCatalog for DualWriteCatalog {
         // so no heartbeat will renew it, and the reaper is what collects a
         // build nobody is running. Undoing it here would mean failing a
         // template row that may already belong to the admission that won.
-        let record = self.object_store.try_start_build(id).await?;
+        let started = self.object_store.try_start_build(id).await?;
 
-        self.owe_central(central_owed, || MirrorOp::TryStartBuild { id: id.clone() })
-            .await;
-        Ok(record)
+        self.owe_central(central_owed, || MirrorOp::TryStartBuild {
+            id: id.clone(),
+            build_id: Some(build_id.clone()),
+        })
+        .await;
+        Ok(StartedBuild {
+            record: started.record,
+            build_id,
+        })
     }
 
     /// Only the central catalog has a lease to renew.

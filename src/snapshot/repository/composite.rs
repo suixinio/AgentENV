@@ -31,7 +31,7 @@ use std::sync::Arc;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
     SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
-    StagedSnapshot,
+    StagedSnapshot, StartedBuild,
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
@@ -240,7 +240,7 @@ impl SnapshotRepository {
     }
 
     /// Atomically transitions one template build from waiting to building.
-    pub async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+    pub async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
         self.catalog.try_start_build(id).await
     }
 
@@ -419,13 +419,13 @@ mod tests {
             Ok(None)
         }
 
-        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
             self.journal.record("catalog.try_start_build");
-            Ok(SnapshotRecord::template_waiting(
+            Ok(StartedBuild::untracked(SnapshotRecord::template_waiting(
                 id.clone(),
                 None,
                 Default::default(),
-            ))
+            )))
         }
 
         async fn mark_build_error(

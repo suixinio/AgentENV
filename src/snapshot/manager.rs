@@ -426,7 +426,7 @@ impl SnapshotManager {
     pub async fn try_start_build(
         &self,
         id: &SnapshotId,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::snapshot::RepositoryResult<crate::snapshot::repository::StartedBuild> {
         self.repository.try_start_build(id).await
     }
 

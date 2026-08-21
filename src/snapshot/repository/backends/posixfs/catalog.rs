@@ -14,7 +14,7 @@ use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
 use crate::snapshot::repository::metrics::{
     record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
-use crate::snapshot::repository::SnapshotListFilter;
+use crate::snapshot::repository::{SnapshotListFilter, StartedBuild};
 use crate::snapshot::{
     RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId, SnapshotPublishSource,
     SnapshotRecord, SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason,
@@ -832,10 +832,12 @@ impl SnapshotCatalog for PosixFsCatalogStore {
         .await
     }
 
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
         let store = self.clone();
         let id = id.clone();
-        run_catalog_blocking("start template build", move || store.try_start_sync(&id)).await
+        run_catalog_blocking("start template build", move || store.try_start_sync(&id))
+            .await
+            .map(StartedBuild::untracked)
     }
 
     async fn mark_build_error(

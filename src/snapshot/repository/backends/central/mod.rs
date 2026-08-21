@@ -261,10 +261,66 @@ impl CentralSnapshotCatalog {
     /// the snapshot being absent — absence is an empty field in a successful
     /// response. `UNAVAILABLE` while the migration has not run arrives the same
     /// way, and means the same thing to a caller: nothing was learned.
+    ///
+    /// 🔴 But "nothing was learned" is not true of every code, and treating it
+    /// as if it were is what made a permanent rejection immortal. A status the
+    /// server will produce again for the same request is not an outage: it is
+    /// the server stating a rule, over a wire that has no room for a
+    /// [`CatalogRefusal`]. [`Self::will_answer_the_same_way`] separates them,
+    /// and the two halves become two different repository errors — which is
+    /// what the double write and its compensator branch on.
     fn unreachable(operation: &'static str, status: tonic::Status) -> RepositoryError {
+        let code = status.code();
+        if Self::will_answer_the_same_way(code) {
+            return RepositoryError::InvalidRequest {
+                reason: format!(
+                    "the snapshot catalog rejected '{operation}' permanently: {code}: {}",
+                    status.message()
+                ),
+            };
+        }
         RepositoryError::backend(
             format!("snapshot catalog '{operation}' failed"),
-            anyhow!("{}: {}", status.code(), status.message().to_owned()),
+            anyhow!("{}: {}", code, status.message().to_owned()),
+        )
+    }
+
+    /// Whether asking again with the same request gets the same answer.
+    ///
+    /// 🔴 The measured defect this exists for: the node sent every template
+    /// row with `disk_size_mib = 0`, the controller refused it with
+    /// `INVALID_ARGUMENT`, that became a `Backend` error, `Backend` is the one
+    /// error the repair pass retries — and twenty entries were replayed every
+    /// thirty seconds forever while `mirror_lag{direction="central"}` sat
+    /// frozen. A number that can never reach zero is not a gate; the batch
+    /// after this one is gated on exactly that number.
+    ///
+    /// The three codes here are the ones `catalogErrorCode` in
+    /// `services/scheduler/internal/catalog_service.go` produces for a request
+    /// the store will not accept: `ErrInvalidArgument` (a field is wrong),
+    /// `ErrInvalidRecord` and `ErrNoPausedHalf` (`FAILED_PRECONDITION` — the
+    /// comment there says it in as many words: "an operator with a psql
+    /// prompt, not a retry"), and `OUT_OF_RANGE` for the same class of reason.
+    ///
+    /// 🔴 What is deliberately *not* here, and why:
+    ///
+    /// - `UNAVAILABLE` is the default arm on that side, chosen so that
+    ///   whatever the controller failed at is never mistaken for the table's
+    ///   answer. It is the retryable case, and it is the common one.
+    /// - `NOT_FOUND` never comes from the catalog service — absence travels as
+    ///   an empty field in a successful response. Reaching one means something
+    ///   between here and there produced it, which says nothing about whether
+    ///   the write would land next time.
+    /// - `UNIMPLEMENTED` is a controller too old for this RPC. A rollout fixes
+    ///   it, so abandoning the write over one would turn a version skew of a
+    ///   few minutes into a permanent disagreement. It stays retryable, and
+    ///   the attempt cap in [`super::super::mirror`] is what bounds it.
+    fn will_answer_the_same_way(code: tonic::Code) -> bool {
+        matches!(
+            code,
+            tonic::Code::InvalidArgument
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::OutOfRange
         )
     }
 
@@ -788,7 +844,7 @@ pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
 /// record that deliberately carries no alias — the commit binds it — so passing
 /// that record here reported an empty name to a user whose publish was refused
 /// over a name they had asked for.
-fn alias_conflict(
+pub(crate) fn alias_conflict(
     alias: Option<&SnapshotAlias>,
     id: &SnapshotId,
     holder: String,
@@ -808,6 +864,21 @@ fn alias_conflict(
             anyhow!("the alias is held by '{holder}'"),
         ),
     }
+}
+
+/// Whether a failure this client produced will come back the same next time.
+///
+/// 🔴 The seam between [`CentralSnapshotCatalog::will_answer_the_same_way`] and
+/// everything that has to act on the distinction. Stated as a function over the
+/// error rather than left as a `matches!` at each call site, because there are
+/// three of them — the forward write, the repair pass's verdict, and the tests
+/// that hold both still — and three copies of one rule is three places for it
+/// to drift.
+///
+/// Scoped to errors that came *out of this module*. A caller applying it to an
+/// error from somewhere else is asking a question it does not answer.
+pub(crate) fn is_permanent_failure(error: &RepositoryError) -> bool {
+    matches!(error, RepositoryError::InvalidRequest { .. })
 }
 
 #[cfg(test)]
@@ -885,5 +956,47 @@ mod tests {
     fn an_unreadable_holder_still_reports_the_name_as_taken() {
         let error = alias_conflict(None, &SnapshotId::generate(), "not-a-uuid".to_string());
         assert!(format!("{error}").contains("refused an alias binding"));
+    }
+
+    /// 🔴 A status the controller will produce again is not an outage. Reading
+    /// it as one is what made every template create's rejection into debt that
+    /// was replayed every thirty seconds forever while the lag sat frozen — and
+    /// the lag is what the read-side switch is gated on.
+    #[test]
+    fn a_status_the_controller_will_repeat_is_not_reported_as_unreachable() {
+        for status in [
+            tonic::Status::invalid_argument("disk_size_mib must be positive"),
+            tonic::Status::failed_precondition("this row predates the check"),
+            tonic::Status::out_of_range("that page does not exist"),
+        ] {
+            let code = status.code();
+            let error = CentralSnapshotCatalog::unreachable("begin_snapshot", status);
+            assert!(
+                is_permanent_failure(&error),
+                "{code} is the controller stating a rule, not a transport fault: {error}"
+            );
+        }
+    }
+
+    /// The control face, and the one that matters more: everything else stays
+    /// retryable. Reading a restarting scheduler as a permanent rejection would
+    /// abandon writes the compensator would have landed a minute later.
+    #[test]
+    fn everything_else_is_still_reported_as_unreachable() {
+        for status in [
+            tonic::Status::unavailable("the scheduler is rolling"),
+            tonic::Status::deadline_exceeded("ten seconds"),
+            tonic::Status::unimplemented("this controller is older than this node"),
+            tonic::Status::not_found("something between here and there produced this"),
+            tonic::Status::internal("the controller fell over"),
+        ] {
+            let code = status.code();
+            let error = CentralSnapshotCatalog::unreachable("commit_snapshot", status);
+            assert!(
+                !is_permanent_failure(&error),
+                "{code} says nothing about whether the write would land next time: {error}"
+            );
+            assert!(matches!(error, RepositoryError::Backend { .. }));
+        }
     }
 }

@@ -27,6 +27,21 @@ fn resolve_resources(
     Ok(SandboxResources {
         cpu_count,
         memory_mib,
+        // 🔴 Not a placeholder that somebody forgot to fill in: a v3 template
+        // build request has no disk size in it. `TemplateBuildRequestV3` carries
+        // `name`, `tags`, `cpuCount` and `memoryMB` and nothing else, and the
+        // real number is not knowable here — it is the virtual size of the
+        // rootfs the build produces, read off the manifest and written onto the
+        // record by `TemplateBuilder::execute_and_publish` when the build is
+        // done. `0` is this codebase's word for that: `TemplateBuildSpec` says
+        // so where it sets the same field, and the Firecracker factory reads it
+        // back as "no explicit size — take the image's own".
+        //
+        // 🔴 The central catalog used to refuse the row over it, which failed
+        // every template create against PostgreSQL while the user was told 202.
+        // The rule now lives where it is true — a row nobody can launch has no
+        // disk size to state, and `snapshots_ready_has_disk_size` applies it at
+        // the one statement that produces a launchable row.
         disk_size_mib: 0,
     })
 }

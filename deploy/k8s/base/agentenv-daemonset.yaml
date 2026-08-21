@@ -160,22 +160,74 @@ spec:
                       && echo "preStop: node set to draining" \
                       || echo "preStop: failed to drain node, continuing"
                     echo "preStop: waiting for sandboxes to drain..."
+                    # 🔴 Bounded, and the bound is the whole point of this
+                    # loop's shape. kubelet does not send SIGTERM until preStop
+                    # returns, so a hook that never returns is not a hook that
+                    # waits patiently — it is a hook that stops the server's own
+                    # graceful shutdown from ever starting. That shutdown is
+                    # what *pauses and persists* every sandbox still here; with
+                    # it skipped, the grace period simply expires and everything
+                    # is SIGKILLed. An unbounded wait does not protect
+                    # sandboxes, it destroys them, and it does so on every
+                    # single pod deletion: set image, rollout restart, delete
+                    # pod, drain, node reboot.
+                    #
+                    # 🔴 Reads /nodes, not /sandboxes. Under `--role node` the
+                    # sandboxes routes answer 404 (src/api/role_gate.rs), so the
+                    # old `curl -sf … /sandboxes` would fail every time,
+                    # `continue` forever, and hang the pod in Terminating for
+                    # the full 3600s grace.
+                    #
+                    # 🔴 /nodes and not /nodes/{id}, which is what one would
+                    # reach for first. Three disjoint counters have to be summed
+                    # to answer "is anything still here" — sandboxCount covers
+                    # only the states where the VM is up (Running, Pausing,
+                    # Snapshotting, Forking, Killing), sandboxStartingCount
+                    # covers Creating and Resuming, sandboxPausedCount covers
+                    # Paused — and the NodeDetail schema that /nodes/{id}
+                    # returns **has no sandboxStartingCount field at all**. A
+                    # node polled through /nodes/{id} therefore cannot see a
+                    # sandbox that is being created on it, and would call itself
+                    # drained while one was starting. /nodes returns this node
+                    # as a one-element array of Node, which carries all three.
+                    #
+                    # 🔴 X-Admin-Token, not X-API-Key: both node endpoints are
+                    # declared with AdminApiKeyAuth and the wrong header is a
+                    # 401, which `-f` turns into the same silent failure.
+                    #
+                    # 🔴 And a non-number is never a zero. `jq -e` exits
+                    # non-zero on a missing field, a non-numeric one, or an
+                    # empty array — which is what this endpoint returns when
+                    # observability is switched off — so "the server did not
+                    # answer" and "the server said none" stay different answers.
+                    # The first retries and then gives up loudly; only the
+                    # second ends the wait.
+                    DRAIN_DEADLINE=$(( $(date +%s) + ${AENV_PRESTOP_DRAIN_TIMEOUT_SECONDS:-900} ))
+                    DRAIN_READ_FAILURES=0
                     while true; do
-                      # GET /sandboxes is exempt from the gate (the gateway's
-                      # cluster listing fans out to it without the credential),
-                      # but send it anyway: the exemption is a property of the
-                      # gate's list, not of this caller.
-                      count=$(curl -sf -H 'X-API-Key: preStop' \
+                      count=$(curl -sf -H 'X-Admin-Token: preStop' \
                         -H "x-agentenv-control-plane: ${CONTROL_PLANE_TOKEN}" \
-                        http://localhost:8000/sandboxes | jq 'length') || count=""
+                        "http://localhost:8000/nodes" \
+                        | jq -e 'if length == 1 then .[0] else null end | if . != null and (.sandboxCount|type)=="number" and (.sandboxStartingCount|type)=="number" and (.sandboxPausedCount|type)=="number" then .sandboxCount + .sandboxStartingCount + .sandboxPausedCount else null end') || count=""
+                      case "$count" in ''|*[!0-9]*) count="" ;; esac
                       if [ -z "$count" ]; then
-                        echo "preStop: failed to query sandbox count, retrying..."
+                        DRAIN_READ_FAILURES=$(( DRAIN_READ_FAILURES + 1 ))
+                        if [ "$DRAIN_READ_FAILURES" -ge 10 ]; then
+                          echo "preStop: cannot read this node's sandbox count after $DRAIN_READ_FAILURES tries; handing over to the server's own shutdown, which pauses what is still here"
+                          break
+                        fi
+                        echo "preStop: failed to read sandbox count ($DRAIN_READ_FAILURES), retrying..."
                         sleep 3
                         continue
                       fi
-                      echo "preStop: $count sandbox(es) remaining"
+                      DRAIN_READ_FAILURES=0
+                      echo "preStop: $count sandbox(es) remaining (running + starting + paused)"
                       if [ "$count" = "0" ]; then
                         echo "preStop: all sandboxes drained, exiting"
+                        break
+                      fi
+                      if [ "$(date +%s)" -ge "$DRAIN_DEADLINE" ]; then
+                        echo "preStop: drain deadline reached with $count sandbox(es) still here; handing over to the server's own shutdown, which pauses them"
                         break
                       fi
                       sleep 3

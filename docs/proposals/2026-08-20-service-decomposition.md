@@ -515,6 +515,29 @@ api  侧   在 PG 里写目录行 —— 这一步才是「这个快照生效了
 > ＋ `commit_staged`（api）两个可分别调用的半。不加，阶段 3 的远程 pause 无处落地，
 > 而失败点会在 node proto 定稿之后才暴露。登记在 §13 P4。
 
+> 🔧 **v7 销案（2026-08-21，阶段 2b 交付之后复核）：这条已经交付，而且形状与上文预设的不同。**
+> `SnapshotRepository` **不再是 trait** —— 2b 把它拆成了 `SnapshotCatalog`（行）
+> ＋ `SnapshotArtifactStore`（字节）两个 trait，`SnapshotRepository` 本身成了组合两者的
+> **结构体**（`src/snapshot/repository/mod.rs:8` `pub use composite::SnapshotRepository`）。
+> ⇒ 上文引的 `interfaces.rs:124-142` 那份「同一个调用既读本机产物又提交目录行」的 trait 契约
+> **已经不存在**，引用它的地方要改引下面这三处：
+>
+> | 交付物 | 实际落点 | 与上文预设的差 |
+> |---|---|---|
+> | `stage_artifacts`（node） | `SnapshotRepository::stage`（`src/snapshot/repository/composite.rs:128`）；捕获态入口 `SnapshotManager::stage_captured`（`src/snapshot/manager.rs:170`） | 名字是 `stage` 不是 `stage_artifacts`；downcast 到 `FirecrackerCapturedSnapshot` 移进了 `stage_captured`（`manager.rs:177`），**即它现在跑在 node 上** |
+> | `commit_staged`（api） | `SnapshotRepository::commit_staged`（`composite.rs:178`）／`SnapshotManager::commit_staged`（`manager.rs:228`） | 同名。文档注释逐字写明它「cannot open a local file, cannot consult the artifact store about what it wrote」 |
+> | 过线的那个值 | `StagedSnapshot`（`src/snapshot/repository/interfaces.rs:371`），`Serialize + Deserialize` 的**纯值**：`commit: SnapshotCommit` ＋ `staged_at_unix_ms` ＋ `origin_node_id` ＋ `execution_id` | **不是**「snapshot id ＋ 字节在哪」的摘要。它自带一条硬约束（`:359-366`）：不许含 `PathBuf` / `Arc` / 临时目录 guard / `FirecrackerSnapshotManifest` |
+>
+> 🔴 **仍然欠着的两条，归阶段 3**（不是 2b 的漏，是拆角色才会显形的）：
+> ① `commit_snapshot` 写目录行时 `origin_node_id` 取的是**发起提交的那台机器**
+> （`src/snapshot/repository/backends/central/mod.rs:389-392`，`begin_snapshot` 同形于 `:323-326`），
+> 而不是 `StagedSnapshot::origin_node_id` 里 stage 那台的值 —— 同进程时两者相同，
+> 拆开之后写进去的是 `api` 副本的 id，而那一列正是 pin/prefer 的依据。
+> ② P2P 广告（`SnapshotManager::advertise_committed`，`manager.rs:252`）读本机文件 ⇒ 只能在 node 上跑，
+> 而它必须排在 commit 之后 —— 今天这个顺序只是同一个函数里的语句顺序
+> （`commit_and_advertise`，`manager.rs:257`），拆开之后需要一条**从 api 回到 node 的「已提交」信号**。
+> 该函数的文档注释已经逐字把这条登记为「the piece the next phase has to move」。
+
 e2b `pause_instance.go:71-82`：orchestrator 的 `Pause` RPC 成功之后，API 才写
 `UpdateEnvBuildStatus(Success)`。**而未翻牌的 build 选不中** —— `status_group = 'ready'`
 这个谓词在快照与模板的解析查询里（`get_snapshots_with_cursor.sql:26`、
@@ -522,6 +545,39 @@ e2b `pause_instance.go:71-82`：orchestrator 的 `Pause` RPC 成功之后，API 
 不在 `sandbox_resume.go` 里。
 
 > ⚠️ v1 把这个谓词说成是 resume 路径的直接性质。结论不变、机理写错了。登记在 §10 F5。
+
+> 🔧 **v7（2026-08-21，阶段 2c 上线之后）：这个谓词我们也照抄了，而抄的粒度错了一次，值得单列成一条规矩。**
+> 2c 把中心目录 `SnapshotCatalog` 的**整个读面**钉死在
+> `CatalogReadScope::Resolvable` ⇒ `status_group = 'ready'`
+> （`src/snapshot/repository/backends/central/mod.rs:942` `:947` `:973`；SQL 侧
+> `services/scheduler/internal/catalog/queries_resolved.go:26` 的 `readyPredicate`，
+> 用在 `:116` 与 `:236`）。
+> **对快照这是对的** —— 它挡住一个字节还在上传的快照被拿去开 VM。
+> 但**模板行从创建到首次构建提交为止一直是 `waiting`，永远到不了 `ready`**，
+> 于是 `read = "postgres"` 一上线，模板整体消失：`GET /templates/{id}` 404、两个列表里都没有、
+> `POST …/builds/{id}` 404、按名字解析不出来、delete 找不到行还回 204（`251c839`）。
+>
+> 🔴 **规矩：读作用域是「面」的属性，不是后端的属性，也不是客户端的属性。**
+> 修法是**按调用点传**：模板端点要 `AnyStatus`，一切「解析出一个快照去跑」的路径
+> （从模板建沙箱、构建的基础镜像、跨节点 resume、快照 API）保持 resolvable。
+> 🔴 **推论，给阶段 3**：任何**在否定答案上执行删除**的分支，需要的作用域必须分得清
+> 「还没到」和「从来没有」—— 见下一条 v7 注。
+
+> 🔧 **v7 续（同日）：作用域收窄不够，「不存在」这个答案本身要三态。**
+> 同一条 resolvable 规矩在另一处造成了更贵的事故：**跨节点 resume 读登记表指名的那个快照，
+> 读不到就删掉登记行** —— 而那一行是集群里唯一记着这台暂停沙箱存在的东西。
+> 在 resolvable 作用域下，「读不到」把「真的没了」和「行在、只是还没翻成 ready」混成了一个答案；
+> 一面短暂落后的镜像因此销毁了一台暂停沙箱的集群记录，而它的字节在对象存储里完好无损
+> （`c2904bd` 缩窄了作用域，`dbd6fa9` 才是真正的修法）。
+>
+> 🔴 **最终形状：那条销毁分支不再问「读」。** `SnapshotCatalog::absence_of`
+> （`src/snapshot/repository/interfaces.rs:719`，语义定义在 `:499-517` 的 `SnapshotAbsence`）
+> 问的是**「不存在」是不是最终答案**，答案来自**本节点欠着的持久写队列**与**两个 store**，
+> 返回 `Settled` / `Unsettled { because }` 两态 —— 加上第三种可能：
+> 🔴 **一个够不着的 store 以错误传播，绝不表现为「不存在」**（trait 注释逐字：
+> "An error is never an absence"）。
+> ⇒ 阶段 3 要给 `api` 装一整套新的远程读面（`ListSandboxes`、Redis store、node gRPC），
+> **这条形状要照搬**：读答「谁现在持有」，销毁问「不持有是不是定论」，够不着答「不知道」。
 
 ⇒ **要拆进程，`api` 必须先有一个可以原子提交的地方。而今天没有** ——
 快照目录在对象存储里，`src/snapshot/repository/backends/oss/repository.rs` 的 `bind_alias`
@@ -941,6 +997,11 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 —— 论证在 §5.1 的 v6 注。放在阶段 2 是因为它和建表是同一次接口改动；
 拖到阶段 3 会在 node proto 定稿之后才暴露。
 
+🔧 **v7：✅ 已交付（阶段 2b）。** 落点是 `SnapshotRepository::stage`（`composite.rs:128`）
+＋ `commit_staged`（`:178`），过线的值是 `StagedSnapshot`（`interfaces.rs:371`）。
+名字与形状都与上面预设的不同，逐条对照写在 §5.1 的 v7 注里，
+**阶段 3 的 proto 要按实际交付的那个形状定，不要按这段的措辞定**。
+
 🔴 **建表时就要定的两件**：
 1. **暂停态的落点**（§4.2.1）：v5 的目标是消掉 `local_only` —— 它是唯一让原节点从
    「偏好」变成「必需」的东西。
@@ -971,8 +1032,11 @@ scheduler 缩到 0 **持续 5 分钟**（远超 binding TTL），运行中沙箱
 （§4.2.1 的 v6 注）。**记录结构一旦建起来改不动，所以这两个字段要在建结构时就在。**
 ⇒ 本阶段按「有条件接管」排期，不要再留悬置。
 
-🔴 **外加一条本仓前置**：阶段 2 的 `stage_artifacts` / `commit_staged` 劈分（§5.1 的 v6 注）。
-不劈开，远程 pause 无处落地。
+~~🔴 **外加一条本仓前置**：阶段 2 的 `stage_artifacts` / `commit_staged` 劈分（§5.1 的 v6 注）。
+不劈开，远程 pause 无处落地。~~
+🔧 **v7：✅ 已满足 —— 阶段 2b 交付了这一对**（`composite.rs:128` `:178`）。
+🔴 **但它留下两条只有拆角色才会显形的活，归本阶段**：commit 侧写错 `origin_node_id`，
+以及 commit 之后的 P2P 广告需要一条从 `api` 回到 node 的信号。两条都在 §5.1 的 v7 注里。
 
 🔴 **这三件事是同一批，不能拆。** 理由是 §0 的第二条硬约束：只有 `api` 持有 Redis 凭据。
 先搬活跃态、后拆 role，等于把 Redis 凭据发到每台跑用户代码的 KVM 机器上，
@@ -1398,7 +1462,8 @@ roster 回落不能丢；阶段 1 ② 的两件不能省；§6.1–6.2 的全部
 | 🔧 **v6 更正：API 层今天还不能独立装配** —— 首字段是裸 `Arc<Orchestrator>`，默认类型参数含 `FirecrackerSandboxFactory` | `src/api/impls/mod.rs:65` `:66`、`src/orchestrator/service.rs:93-97` |
 | 🔴 `MetadataStore` / `SandboxPersister` **不是对象安全的**（泛型方法） | `src/orchestrator/store/mod.rs:75` `:86`、`src/orchestrator/persistence/mod.rs:85` |
 | 🔴 构建沙箱不进句柄表 ⇒ 陷阱 4 在 `ListSandboxes` 侧是假警报 | `src/template/runner.rs:165` `:189`；`src/orchestrator/service.rs:101` |
-| 🔴 `publish` 一步同时读本机产物与提交目录行 ⇒ bytes-then-commit 尚未劈开 | `src/snapshot/manager.rs:101-119`、`src/snapshot/repository/interfaces.rs:124-142` |
+| 🔧 **v7 销案**：`publish` 已劈成 `stage` ＋ `commit_staged`（阶段 2b）。`SnapshotRepository` 不再是 trait，成了组合结构体 | `src/snapshot/repository/composite.rs:128` `:178`、`interfaces.rs:371`、`src/snapshot/repository/mod.rs:8` |
+| 🔴 **v7 新增**：中心目录整个读面钉死 resolvable ⇒ 模板不可见；且销毁分支不能靠「读」判定不存在 | `backends/central/mod.rs:942` `:947` `:973`、`services/scheduler/internal/catalog/queries_resolved.go:26`；`interfaces.rs:499-517` `:719` |
 | 🔴 pin / prefer 两档落点**今天已经在生产路径上**，不能只删不搬 | `services/scheduler/internal/lookup.go:261`（prefer）、`:271-318`（pin：`:293` `:302` `:317`） |
 | 🔴 `--role all` 回退的关键路径是 DaemonSet 串行滚动 ＋ 3600 秒 grace | `deploy/k8s/base/agentenv-daemonset.yaml:21-23` `:29` |
 | 🔴 `ReportSandboxEvent` 收到就丢弃 | `services/scheduler/internal/service.go:425-432` |

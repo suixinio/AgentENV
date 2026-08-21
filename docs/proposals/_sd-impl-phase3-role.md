@@ -50,6 +50,12 @@
 
 外加一条 D7 的收窄（§14.6）和一条部署侧的静默死锁（§7.3）。
 
+> 🔧 **2026-08-21 回填：本文写在阶段 2 开工之前，2a/2b/2c 落地之后有一节新增与七处订正 —— 见 §15。**
+> 最要紧的三条：**读作用域是「面」的属性**（§15.1）、**「不存在」这个答案要三态**（§15.2）、
+> **先落地后接线的代码在接线前要过一次审计**（§15.3）。
+> 就地写错的七处汇总在 §15.5，其中 §7.3 的 preStop 修法与 §4.1／§4.2 的 `StagedSnapshot` 形状
+> **按本文原样做会做错**。
+
 > 🔴 **一条被本文按「不可用」处理的上游依赖。** 拆分方案 §4.2.1 的整个论证
 > （「折叠之后没有需要接管的东西」）依赖主仓的 pause-publish-durability 消掉 `local_only`，
 > 它自己标注为**跨仓**（「不在本 submodule 内」）。本文**不把它列为前置，也不设计成等它** ——
@@ -86,6 +92,10 @@
 | `:219` | `server::new(api_impl)` | ✅ | ✅ | 路由集合不同 |
 | `:286-295` | `set_scheduling_disabled(true)` ＋ drain 传播 | ❌ | ✅ | 节点退出轮换 |
 | `:236-272` | 关停顺序（reporter → upkeep → orchestrator → pool → ublk → overlaybd p2p → p2p） | 裁剪 | ✅ | api 的关停只有 orchestrator 一项 |
+
+> 🔧 **2026-08-21：本表引的 `src/bin/server.rs` 行号在阶段 1／2 之后整体下移。**
+> 对照表在 §15.5 末尾（`:139` → `:152`、`:169-182` → `:181-195`、`:202-217` → `:215-231`…）。
+> 各项的**归属**与**理由**不变，只有行号变了。
 
 **读法**：右两列同为 ✅ 的行，就是「同一个二进制两个角色」这句话的成本 ——
 它们不是共享代码，是**两份配置不同的同名构造**。同为 ❌ / ✅ 的行才是真正被拆掉的东西。
@@ -388,7 +398,7 @@ sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,   // SandboxHandle = Arc<M
 | 语义 | **不透明**。node 不解析、不校验、不生成。`api` 在 `Create` 请求里下发什么，`ListSandboxes` 就原样回什么 |
 | 判定 | `Some(_)` ⇒ 控制面拥有；`None` ⇒ 不拥有，**永不出现在 `ListSandboxes` 响应里** |
 | 谁能置位 | 只有 node gRPC 的 `Create` / `Fork`。用户级 REST（`--role all` 下）**永远置 `None`** |
-| 内容 | 阶段 3 里放 `api` 重建自己那份记录所需的最小集：`{execution_id, snapshot_id, timeout_action, expires_at, auto_resume, secure, user_metadata}` 的紧凑编码。**node 不需要知道这里面是什么** |
+| 内容 | ~~阶段 3 里放 `api` 重建自己那份记录所需的最小集：`{execution_id, snapshot_id, timeout_action, expires_at, auto_resume, secure, user_metadata}` 的紧凑编码。~~ 🔧 **2026-08-21 更正（§15.5 第 6 条）：这七项不够，必须是 `SandboxMetadata` 本体的版本化 serde 编码（去掉 `paused_state`）** —— 它是 Redis 全丢之后重建路径的唯一数据源（[R] §13.3）。**node 不需要知道这里面是什么**，这一性质不变 |
 
 🔴 **`#[serde(default)]` 而不是必填**，与 `execution_id` 相反（`metadata.rs:33-42` 那段注释
 论证了 `execution_id` 为什么不能有默认值）。这里可以有默认值，而且**必须**有：
@@ -454,6 +464,12 @@ e2b 的坑成立，是因为它的构建沙箱和 API 沙箱**共用同一张 `s
 | `CapturedSandboxSnapshot` | 同上 `StagedSnapshot` | —— |
 | `RuntimeArtifactSet` | **不暴露** | image-liveness 是 node 独有的关切。api 侧的 `RuntimeArtifactSet::empty()`（`backend.rs:111`） |
 | `SandboxRuntimeInfo`（`:132-136`） | 只过 `rootfs_virtual_size` | 它的另一个字段就是 `runtime_artifacts` |
+
+> 🔧 **2026-08-21：上表与下表里的 `StagedSnapshot { snapshot_id, staged_manifest_digest, repository_uri }`
+> 是本文发明的形状，而阶段 2b 已经交付了一个不长这样的。** 实际的 `StagedSnapshot`
+> （`src/snapshot/repository/interfaces.rs:371`）是 `commit: SnapshotCommit` ＋ `staged_at_unix_ms`
+> ＋ `origin_node_id` ＋ `execution_id` 的 `Serialize + Deserialize` 纯值。
+> 🔴 **proto 要承载这个值本身，不是三字段摘要** —— 详见 §15.5 第 3 条。
 
 ### 4.2 两个 trait 面
 
@@ -536,6 +552,14 @@ RemoteSandboxStub::startup_artifacts() -> RuntimeArtifactSet::empty()
 
 这是本文找到的**最硬的一条跨阶段依赖**，父提案没有写。
 
+> 🔧 **2026-08-21：✅ 阶段 2b 已交付这一对，本节的结论成立、论证要改引。**
+> `SnapshotRepository` **不再是 trait**（2b 拆成 `SnapshotCatalog` ＋ `SnapshotArtifactStore`，
+> 它本身成了组合两者的结构体）⇒ 下面引的 `interfaces.rs:138-142` 那份契约**已经不存在**，
+> 改引 `composite.rs:128`（`stage`）与 `:178`（`commit_staged`）。
+> 🔴 **推论 2（「`--role api` 之后每次 pause 都会在 downcast 上失败」）也不再成立** ——
+> downcast 现在在 `SnapshotManager::stage_captured`（`manager.rs:177`），**那是 node 侧**。
+> 逐条见 §15.5 第 1／2 条。**下文按历史保留，不改写。**
+
 ```rust
 // src/snapshot/manager.rs:102-119
 pub async fn publish_captured(&self, metadata, captured_snapshot: CapturedSandboxSnapshot) -> ... {
@@ -574,6 +598,10 @@ pub async fn publish_captured(&self, metadata, captured_snapshot: CapturedSandbo
 而 proto 一旦发出去就改不动了。
 
 #### 4.4.1 阶段 2b 交付时留下的两条，阶段 3 必须处理（不要重新发现）
+
+> 🔧 **2026-08-21 复核：下面两条仍然全部开着**，行号已漂移，且**还漏了第三条**。
+> 更新后的行号，以及新增的那条（commit 之后的 P2P 广告需要一条从 `api` 回到 node 的「已提交」信号），
+> 在 §15.5 第 4／5 条。
 
 `stage / commit_staged` 这一对已经在阶段 2b 交付了（`src/snapshot/repository/composite.rs`）。
 QA 在验收 2b 时挖出两条**在 2b 里无害、在 `--role api` 下变成 bug** 的东西，
@@ -942,6 +970,13 @@ generated
 
 ### 7.3 🔴 同批必须改的一件事：preStop 会静默死锁
 
+> 🔧 **2026-08-21：本节的诊断对，射程写窄了，而它给的修法会做错。**
+> ① 卡住的不是 rollout，是 **preStop 钩子本身** —— **任何一次 node Pod 删除都会跑它**
+> （set image / rollout restart / delete pod / drain / 节点重启），循环里没有超时也没有逃生口。
+> ② 🔴 下面提的 `GET /nodes/{id}` 的 `sandboxCount` **只数 VM 还活着的那几个状态**，
+> 暂停的记在另一个字段 `sandboxPausedCount` ⇒ 判据必须是**两者之和**。
+> 实测：pause 掉一台之后 `sandboxCount` 读 1、`/v2/sandboxes` 读 2。逐条见 §15.5 第 7 条。
+
 `deploy/k8s/base/agentenv-daemonset.yaml` 的 preStop 脚本，drain 循环逐字：
 
 ```sh
@@ -1295,6 +1330,9 @@ Ok(ProxyLookupResult::Paused { .. }) => return Err(proxy_error_response(&Sandbox
 
 ## 12. K. 验证探针 —— 每条自带控制面
 
+> 🔧 **2026-08-21：阶段 2 又顶出五条验证手法上的教训，本节六组探针要逐条继承 —— 见 §15.4，
+> 那里还给了一组新增的 P7（休眠拒绝分支的顶起来）。**
+
 沿用 `_sd-recon-env.md` §8 的四条方法论。🔴 尤其是第 2 条：
 「**某指标恒 0 本身不是证据** —— 必须先把它顶起来一次，证明 0 是事实而不是探针瞎了。」
 以及那次真实翻车：合成行在任何相位都认领不了，`409` 看着像被拒，实则毫无分辨力。
@@ -1588,6 +1626,204 @@ auto-resume 迁走之后，那条「必须跑在前面」的理由消失了，�
 ⇒ **阶段 3 结束状态：gateway / api / scheduler / node 四个进程。**
 不是错误，是一个没写出来的中间态 —— 但它影响容量规划、告警面和 §12 探针的取样点，
 应当在排期文档里显式画出来。
+
+---
+
+## 15. 🔧 阶段 2 落地之后回填的事实与订正（2026-08-21）
+
+> 本文写在阶段 2 开工之前。2a（目录 schema ＋ 服务）、2b（trait 拆分、`stage` / `commit_staged`、双写）、
+> 2c（`read = postgres`，今天在 dev 集群上跑着）在验收与 QA 里挖出的东西**改变了本文的若干前提**。
+> 本节回填，**不重写前面**：每条要么给一条新规矩，要么就地点名一处过时（订正汇总在 §15.5）。
+
+### 15.1 🔴 读作用域是**面**的属性，不是后端的、也不是客户端的
+
+**发生了什么。** 2c 把中心目录 `SnapshotCatalog` 的**整个读面**钉死成
+`CatalogReadScope::Resolvable` ⇒ `status_group = 'ready'`
+（`src/snapshot/repository/backends/central/mod.rs:942` `:947` `:973`；
+SQL 侧 `services/scheduler/internal/catalog/queries_resolved.go:26` 的 `readyPredicate`，
+用在 `:116` 与 `:236`）。
+
+**这条规则对快照是对的** —— 它挡住一个字节还在上传的快照被拿去开 VM。
+**它被套到别的面上，造成了两次性质不同的失败：**
+
+| # | 失败 | 机理 |
+|---|---|---|
+| 1 | **模板整体不可见**：`GET /templates/{id}` 404、两个列表里都没有、`POST …/builds/{id}` 连着 404 二十次、按名字解析不出来、delete 找不到行还回一个客气的 204 | 模板行从创建到首次构建提交为止一直是 `waiting`，**永远到不了 `ready`**。修法是**按调用点传作用域**：模板端点要 `AnyStatus`，一切「解析出一个快照去跑」的路径保持 resolvable（`251c839`） |
+| 2 | 🔴 **一台暂停沙箱的集群记录被销毁** | 跨节点 resume 读登记表指名的那个快照，**读不到就删掉登记行** —— 而那一行是集群里唯一记着这台沙箱存在的东西。在 resolvable 作用域下，「读不到」把**真的没了**和**行在、只是还没翻成 ready** 混成了同一个答案。一面短暂落后的镜像因此销毁了记录，而它的字节在对象存储里完好无损 |
+
+🔴 **规矩（本半要照着用）：**
+
+> **读作用域是「面」的属性。** 同一个后端、同一个客户端，在不同的面上要答不同的问题：
+> 「这个快照能不能拿去开 VM」和「这个快照存不存在」不是一个问题，
+> 而把前者的谓词当默认值装在后端上，就等于让每一个问后者的调用点悄悄拿到前者的答案。
+> 🔴 **任何在否定答案上执行删除的分支，需要的作用域必须分得清「还没到」和「从来没有」。**
+
+**为什么这条对本半特别重要：阶段 3 给 `api` 装的是一整套新的读面**，
+而其中好几处的否定答案后面挂着销毁动作：
+
+| 本文的新读面 | 否定答案意味着什么 | 挂在后面的动作 |
+|---|---|---|
+| `ListSandboxes`（§3） | 「这台 node 上没有这个沙箱」 | 🔴 `api` 对账 ⇒ `KillOrphan`（§8.4） |
+| `control_plane_config == None` 的过滤（§3.4） | 「这台 VM 不属于控制面」 | **不碰它** —— 这一处方向是对的，fail-closed |
+| `node_reclaim` 的宿主机扫描（§8） | 「这份残留没人认领」 | 杀进程 / 拆 netns / 删目录 |
+| 收窄后的 `proxy_lookup_for`（§5） | `RouteMissing` | 🔴 **只表示「本机路由表没有」**，不表示沙箱不存在 —— §5 已经写对了，这里补一句它为什么重要：把 `RouteMissing` 读成「没这个沙箱」，就是上表第 2 行的形状换了个位置 |
+
+🔴 **⇒ 本半的每一处「读不到 ⇒ 动手」，在写之前先回答一个问题：这个否定答案，
+分得清「还没到」和「从来没有」吗？** 分不清就换问法 —— 换法在 §15.2。
+
+### 15.2 🔴 「不存在」这个答案需要三态，不是两态
+
+**2c 的最终修法（`dbd6fa9`）不是把作用域调宽，是让那条销毁分支根本不问「读」。**
+理由逐字：**两边都没有行的时候，任何读都分不清「一次还没落地的写」与「一个从来不存在的快照」。**
+
+落成的形状（`SnapshotCatalog::absence_of`，`src/snapshot/repository/interfaces.rs:719`；
+语义类型 `SnapshotAbsence` 在 `:499-517`）：
+
+```
+absence_of(id) -> Settled                     // 不存在，而且这是定论
+              -> Unsettled { because }        // 有东西反驳了它（队列里欠着一笔写，或另一个 store 持有）
+              -> Err(..)                      // 🔴 够不着的 store 以错误传播，绝不表现为「不存在」
+```
+
+三条要点，**本半新增的每一个远程读都照搬**：
+
+1. **答案来自两个来源，缺一不可**：本节点**欠着的持久写队列**（只有它知道一笔两个 store 都没收下的写）
+   ＋ **两个 store 的交叉读**（把对象存储已经持有的东西带给一个从没欠过它的节点）。
+2. 🔴 **错误不是不存在。** trait 注释逐字：`An error is never an absence`。
+   这就是 §15.1 那条混淆**上升一层**的样子 —— 那边混的是「还没到 / 从来没有」，
+   这边混的是「我不知道 / 没有」。
+3. **读与销毁问的是两个问题。** 读答「谁现在持有」；销毁问「不持有是不是定论」。
+
+**本半的三个落点（现在就要按这个形状写，不要事后补）：**
+
+| 落点 | 🔴 必须做到 |
+|---|---|
+| `ListSandboxes`（§3）→ `api` 对账（§8.4） | **一台 gRPC 调不通的 node，不等于这台 node 上没有沙箱。** 一轮对账里只要有一台 node 的 `ListSandboxes` 失败，**整轮放弃**，不许按「拿到的那部分」判孤儿。这与 [R] §9.2 第 3 条（`get_many` 报错 ⇒ 整轮跳过）是**同一条规矩的两端**：一端是 node 侧的事实读不到，另一端是 store 侧的账读不到 |
+| `KillOrphan`（本半写它，[R] §10.3 给判定表） | 判定要能同时消费「记录不存在」与「记录还在创建中」（pending）两种否定，**而不是把它们都读成孤儿** |
+| `RemoteSandboxStub` 的每一次 gRPC（§4.3） | 超时／不可达 ⇒ **错误**，不是「沙箱没了」。特别是 `Delete` 与 `Pause`：把一次不可达读成「已经没了」，就是在一台还活着的 VM 上撤掉集群对它的记账 |
+
+### 15.3 🔴 惰性代码不是正确的代码 —— 本半有四样东西会先落地、后接线
+
+**2a 的实例。** 2a 提前交付了 `StartBuild` / `RenewBuildLease` / `ReapExpiredBuilds`，
+一道 QA 门**正确地**判定它们无害 —— 理由是**没有任何东西在调它们**。
+2c 把驱动接上之后，这三样里有**三个真缺陷**，每一个都以别的样子出现：
+
+| 缺陷 | 症状 | 现在的落点 |
+|---|---|---|
+| 心跳由**节点**盖戳、拿去和**reaper 的时钟**比 | 一台走慢的节点，它跑的每一个构建都在半途被杀，而错误说的是「心跳失效」—— 一件从没发生过的事 | 两端都取数据库的时钟；两个输入类型**根本没有地方放第二个时钟**（`services/scheduler/internal/catalog/store.go:364-378` `:380-392`，`ReapInput` 收的是**时长**不是时刻） |
+| **成功不把构建移出队列** | 每个**成功**的构建继续占着一个名额；攒够天花板那么多次成功之后，全集群拒绝一切新构建，而当时**没有任何东西在构建** | `CommitSnapshot` 在翻牌的同一个事务里结束构建 |
+| reaper **没有预热** | 一次滚动让所有心跳同时看起来陈旧（不是因为构建停了，是因为没人在听），第一轮把它们全杀了 | 闸门打开后先按住一整个 TTL；闸门再关就重新计时 |
+
+外加 `69c131d`：`start_build` 把同一个 id 同时当 `build_id` 和 `template_id` 发出去，
+而 `builds.id` 是主键 ⇒ **一个模板一辈子只能构建一次**（第二次撞上第一条构建行，回一个
+「a row with this id already exists」的 400，而那正是「重试一次失败的构建」的样子）。
+🔴 **而如果它没有撞上**，两个共用 id 的构建会**互相续对方的租约**。
+
+**⇒ 规矩：**
+
+> 🔴 **一样东西「还没有人调它」，只证明它现在无害，不证明它是对的。**
+> 提前落地的代码在**接上驱动之前**要过一次审计，而不是接的时候翻一个开关就算数。
+
+**本半按这条要审的四样（都是本文自己安排的「先落地、后接线」）：**
+
+| # | 东西 | 什么时候才第一次真的跑 | 🔴 接线前要审什么 |
+|---|---|---|---|
+| 1 | `--role all` 下保留的**两条 store 路径**（§11.3） | Redis 那条在 `--role api` 上线之前**一行都不会执行** | 接线前跑一遍 [R] §11.2 的 L1 契约套**对着两个后端**，而不是只对着 in-memory |
+| 2 | 休眠的**读侧闸门** | —— | 🔴 **这一条现在就有活样本**：`guard_read_side` 的三条拒绝分支**除了单元测试之外从未执行过**；`(both, postgres)` 那一支里 `diverged > 0` 这个析取项**至今仍未执行过**。⇒ 本半新增的任何「拒绝启动」分支，验收里必须有一发**把它顶起来** |
+| 3 | `ListSandboxes` 的所有权标记 `control_plane_config`（§3.4） | 标记从第一天就写进每条记录，但**只有 `api` 对账时才被消费** | §12 P2 的第二发（node_reclaim 那一发）就是为它写的；另加一发：**故意置空**一台 node 的标记，断言那台上的沙箱被判为「不属于控制面」而**不是被杀掉**（[R] §14 R7 对照面 2 与这一发是同一发） |
+| 4 | `RemoteSandboxStub` / `RemoteSandboxBackendFactory`（§4） | 只有 `Orchestrator<RedisMetadataStore, …>` 装配起来才有意义 | 它的每个方法都是「本机语义的远程替身」；接线前逐个对照 §4.2 的映射表核一遍，特别是 §4.2 末尾那条**结构化的 `SandboxCaptureError` 分类**——判错方向就是丢一个工作区或留一台僵尸 VM |
+
+### 15.4 🔧 验证手法：本半探针要继承的五条
+
+`_sd-recon-env.md` §8 的四条仍然全部适用。阶段 2 又加了五条，**每条都是被真事顶出来的**：
+
+**① 跳过的测试报成 `ok`，而且是整批。**
+`make -C services test` 曾经**静默跳过 152 个测试**并报绿，
+其中包括**唯一两个**抓到 `KEEPTTL` 被改回去的测试。
+`-count=1` 现在写在 `services/gateway/Makefile:19` 与 `services/scheduler/Makefile:19`
+（顶层 `services/Makefile:29-32` 靠委派继承它，自己那一行上没有写；
+`report-skipped-suites` 会在输出末尾把**这一轮跳过了什么**说出来）。
+🔴 **本半的对应物**：任何需要外部依赖的新测试面，缺依赖时必须**失败**而不是跳过
+（`AENV_*_TEST_REQUIRED=1` 的形状），并且**要有一个 CI job 真的跑它**。
+
+**② 一个 1,100 行的套件可以从来没被 CI 跑过。**
+`tests/snapshot_catalog.rs`（发现时 1,161 行，现在 2,673 行）是**唯一**演练双写的地方，
+而它**不在任何一个 CI workflow 里**，且没有环境变量时**提前返回并打印 `ok`**。
+现在挂在 `.github/workflows/integration-tests.yml:52-66`，带 `AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1`。
+🔴 **本半的对应物**：§12 的六组探针，逐条问一遍「谁会跑它、跑不跑得起来、跑不起来时是红还是绿」。
+
+**③ 🔴 一个恒 0 的计数器，「做过了」和「从来没做」读起来一模一样。**
+镜像回填在这套集群上约 **100 ms** 跑完 ⇒ 「切读侧之前先看 `mirror_lag` 归零」这条判据，
+在「跑过并结清」与「根本没跑」两种相位下**给出完全相同的读数**（实测撞过两次）。
+**定下来的做法：判据钉在「直接总体比对」上，用 `mirror_repaired_total` 佐证，不拿 lag 当主判据。**
+🔴 **已在集群上证过它有分辨力**：PG 31 / 对象存储 32 时，四个 gauge 全读 0，
+总体判据照样拒绝，并把缺的那个 id 点了名。
+⇒ **本半凡是写「某计数器为 0」的判据，都要先回答：这个 0，是「事情做了且结清」还是「事情没发生」？**
+
+**④ 🔴 指标是**每节点**的，而集群级的判据要求和，产品里没有任何东西在求这个和。**
+一台节点离场，会把它那份欠账**从总和里带走，不留痕迹**。
+⇒ 本半的 §12 P3 控制面 B（gateway 与 api 的计数逐条相等）、
+P1 的「其余节点 `Create` 计数增量为 0」、§15.3 表里第 3 行的对账探针，
+**全部要显式说清楚：谁在求和，求和的那一刻有几台在报。**
+
+**⑤ 两个落在同一毫秒里的时间戳，让一条测试变得不可能失败。**
+本轮抓到一个断言，它要区分的两个时刻由两次紧邻的取时产生，在快机器上落在同一毫秒 ⇒ 恒绿。
+🔴 **任何基于时间先后的断言，都要由测试自己制造一个可靠大于时钟粒度的间隔**，
+不能指望执行耗时把它们分开。§12 P6 的「pause → resume → 比对落点」正是这种形状，逐条检查。
+
+**对 §12 的具体增补：**
+
+| 探针 | 增补 |
+|---|---|
+| **P1** | 控制面 C 已经排除「整个端口关了」。🔴 再加一条：`POST /sandboxes` 打 node 的 404，与「路由压根不存在」**必须不可区分** —— 用一条**从未定义过**的路径（如 `/does-not-exist`）做对照，两者响应体应当一致 |
+| **P2** | 「顶起来」那一发写成**长期回归测试**这条不变。🔴 补 §15.3 表第 3 行那一发：**故意置空标记 ⇒ 不属于控制面 ⇒ 不出现在列表里，而不是被杀掉** |
+| **P3** | 控制面 B 的「两侧逐条相等」🔴 要按 ④ 写清楚求和口径 |
+| **P4** | seed 指纹 gauge 也是**每节点**的 ⇒ 判据是「把所有副本的指纹**收齐**并去重后只剩一个」，不是「随便抓两个相同」。🔴 并且要说清楚收齐的那一刻有几个副本 |
+| **P5** | 门面重构的对照面（故意把 `pause_sandbox` 转发到 `delete_sandbox`）保留 |
+| **P6** | 🔴 按 ⑤ 检查：pin/prefer 的判据里若含「哪次更晚」，要显式制造时间间隔 |
+| **🆕 P7** | 🔴 **休眠拒绝分支的顶起来**：本半新增的每一条「拒绝启动 / 拒绝接管」分支（§2.1 规则 3 的 `bail!`、§9.3 第 1 条的 seed 必填、admission 的容量拒绝），各要有一发**制造它拒绝的那个条件**并断言它真的拒绝。理由是 §15.3 第 2 行那个活样本 |
+
+### 15.5 🔧 就地订正：本文里现在写错或过时的七处
+
+| # | 位置 | 现在的事实 |
+|---|---|---|
+| **1** | §4.4 引的「`SnapshotRepository::publish` 的契约（`interfaces.rs:138-142`）同时要求读本机产物与提交目录行」 | 🔴 **该 trait 已经不存在。** 2b 把它拆成 `SnapshotCatalog`（行）＋ `SnapshotArtifactStore`（字节），`SnapshotRepository` 变成组合两者的**结构体**（`src/snapshot/repository/mod.rs:8`）。§4.4 的**结论**（字节与翻牌必须分开）已经兑现，**论证里引的那段契约要改引** `composite.rs:128`（`stage`）与 `:178`（`commit_staged`） |
+| **2** | §4.4 推论 2：「`--role api` 之后每一次 pause/snapshot 都会在 `manager.rs:106` 的 downcast 上失败」 | 🔴 **不再成立，而且方向反了。** downcast 现在在 `SnapshotManager::stage_captured` 里（`manager.rs:177`），**那是 node 侧**。`--role api` 根本不调它。这条推论描述的失败形态已经被 2b 消掉了 |
+| **3** | 🔴 §4.1 / §4.2 里发明的 `StagedSnapshot { snapshot_id, staged_manifest_digest, repository_uri }` | **实际交付的 `StagedSnapshot` 不长这样**（`src/snapshot/repository/interfaces.rs:371`）：`commit: SnapshotCommit` ＋ `staged_at_unix_ms` ＋ `origin_node_id` ＋ `execution_id`，是一个 `Serialize + Deserialize` 的**纯值**，自带一条硬约束（`:359-366`）：不许含 `PathBuf` / `Arc` / 临时目录 guard / `FirecrackerSnapshotManifest`。⇒ 🔴 **`node.proto` 里的 `StagedSnapshot` 要承载这个值本身**（编码后的字节，或与它逐字段对应的 message），**不是一份三字段摘要**。§4.4 自己说过「proto 一旦发出去就改不动」，这一条就是它警告的那种改不动 |
+| **4** | 🔴 §4.4.1 之外**新增的一条 2b 遗留**（本文没有） | `SnapshotManager::advertise_committed`（`manager.rs:252`）读本机文件 ⇒ 只能在 node 上跑，而它**必须排在 commit 之后**。今天这个顺序只是 `commit_and_advertise`（`manager.rs:257`）里的**语句顺序**；拆开之后需要一条**从 `api` 回到 node 的「已提交」信号**。该函数注释已经逐字把这条登记为「the piece the next phase has to move」。⇒ **本半的 `Pause` / `Checkpoint` RPC 要么带一个提交回执，要么 P2P 广告改成由 node 轮询目录**，二选一，现在就要选 |
+| **5** | §4.4.1 ① 与 ② 的行号 | ① `stage` 填 origin：`composite.rs:154`（原写 `:147`）；中心侧仍取 `self.node_id`：`central/mod.rs:389-392`（`commit_snapshot`）与 `:323-326`（`begin_snapshot`）（原写 `:361-363` / `:295-297`）。🔴 **这条缺陷仍然开着**，本半必须修。② `commit_staged` 的注释在 `composite.rs:164-172`，`Err` 分支的 `roll_back_publish` 在 `:188`，它走的 `delete_artifacts` 在 `:330`（原写 `:159-165` / `:180` / `:250`）。🔴 **这条也仍然开着** |
+| **6** | 🔴 §3.4 表格「内容」一行：`control_plane_config` 装七个字段的紧凑编码 | **不够。** [R]（`_sd-impl-phase3-redis.md` §2.1 末尾与其附录第一条）从重建路径倒推出：它必须是 **`SandboxMetadata` 本体的版本化 serde 编码**（去掉 `paused_state`）。七个字段重建不出 `resources` / `created_at` / `max_lifetime` / `network_policy` / `custom_extension_params` / `runtime_versions` / `image_configs` / `virtualization_mode` 等十余项。**本半接受这条更正**；「对 node 不透明」这一性质不变 —— 它是 `api` 与**未来的自己**的契约 |
+| **7** | 🔴 §7.3 提的 preStop 修法：改读 `GET /nodes/{id}` 的 `sandboxCount` | **这个修法会把一个已知会漏的读法写进钩子里。** `sandboxCount` **只数 VM 还活着的那几个状态**，暂停的记在另一个字段 `sandboxPausedCount`（`src/api/openapi.yml:1232` `:1250`；`NodeDetail` 侧 `:1290` `:1309`；两个 schema 里**都是 required**：`:1203` `:1208` / `:1261` `:1265`。§7.3 原引的 `:1190` `:1219` `:1248` `:1277` 已漂移）。实测：pause 掉一台之后 `sandboxCount` 读 1、`/v2/sandboxes` 读 2。⇒ 🔴 **判据改成两个字段之和**：`.sandboxCount + .sandboxPausedCount`。<br>🔴 **而且 §7.3 把这件事的射程写窄了**：卡住的不是 rollout，是 **preStop 钩子本身**，**任何一次 node Pod 删除都会跑它**（set image / rollout restart / delete pod / drain / 节点重启），而循环里没有超时也没有逃生口。⇒ §7.3 的「否则每台卡 3600s」要改成「**否则每一次删 node Pod 都会卡满 grace**」 |
+
+**外加一条不算错、但会误导排期的**：§1 的装配全景表引的 `src/bin/server.rs` 行号
+在阶段 1／2 之后整体下移了。对照（表里的 → 实际）：
+`:139` → **`:152`**（`Orchestrator`）、`:140-153` → **`:154-166`**（`ObservabilityService`）、
+`:154-167` → **`:167-180`**（`ObservabilityReporter`）、`:169-182` → **`:181-195`**（`build_paused_registry` ＋ `PausedSandboxWiring`）、
+`:183-191` → **`:196-213`**（`ApiImpl::new`）、`:202-217` → **`:215-231`**（四个 upkeep）、
+`:219` → **`:232`**（`server::new`）。`:80-81` / `:83` / `:84` / `:88-91` / `:93` / `:96` / `:102` / `:110` / `:111-133` / `:134-138` 未变。
+🔴 沿用 [R] §16.10 的规矩：**引用时带符号名，不要只带行号** —— 这些文件正在被多个人同时改。
+（另：§0 与附录里「`grep -rn "role" src/bin/server.rs` 零命中」**今天仍然成立**，已复核。）
+
+### 15.6 🔧 当前集群基线（阶段 3 从这里开始）
+
+| 项 | 值 |
+|---|---|
+| 运行中的一批 | `sd2c-*` |
+| `snapshot.catalog.write` / `read` | **`both`** / **`postgres`** |
+| 目录总体 | 30 条 `p0-seed-*` ＋ 2 条模板 = **N = 32**（两侧一致） |
+| `mirror_lag` / `mirror_diverged` | 两台 node 上**都是 0**（🔴 按 §15.4 ③，这不是一致的证据） |
+| 三个路由投影开关 | **全 on** |
+| F4 sweep 开关 | **off** |
+| 镜像 store | **空** |
+
+🔴 **三条从这份基线直接来的部署纪律**（详见 `_sd-recon-env.md` §11.8）：
+
+1. **删任何一个 node Pod 之前，`/v2/sandboxes` 必须读 0** —— 不只是滚动，任何一次删除都算。
+2. **要造「中心不可达」，探针必须走 node 直连** —— `scheduler` 副本数归零会把 gateway 一起废掉，
+   那一发测到的是 gateway 502，不是节点在中心不可达时的行为。
+3. **快照删除现在有操作员路径了**（`DELETE /snapshots/{snapshotID}`，admin 鉴权，走目录，按 `AnyStatus` 读）——
+   在此之前它是 405，dev 集群上因此攒了三条孤儿。
+   🔴 **它不接任何自动路径、也不问谁依赖这个快照**：一台暂停沙箱的快照就是那台沙箱唯一的耐久副本。
 
 ---
 

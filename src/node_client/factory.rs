@@ -110,9 +110,9 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
                 .map(|params| wire::serialize(params, "custom extension params"))
                 .transpose()?,
             // 🔴 Empty here, and that is correct rather than an omission. The
-            // ownership marker is the *control plane's record* of the sandbox,
-            // and this factory is a mechanism the control plane uses rather
-            // than the thing that holds that record. Whatever assembles the
+            // ownership marker is how a control plane recognises its own
+            // sandbox, and this factory is a mechanism a control plane uses
+            // rather than the thing that owns anything. Whatever assembles the
             // deciding half attaches it.
             control_plane_config: Vec::new(),
         };

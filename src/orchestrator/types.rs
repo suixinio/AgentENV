@@ -36,7 +36,7 @@ pub struct CreateSandboxRequest {
     pub secure: bool,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
-    /// The control plane's record of this sandbox, to be stored verbatim.
+    /// The control plane's ownership marker for this sandbox, stored verbatim.
     ///
     /// 🔴 `None` for every user-facing create. Only the node gRPC surface — the
     /// one the API half drives — supplies one, and its presence is the *only*
@@ -94,7 +94,7 @@ pub struct LiveSandbox {
     pub created_at: Option<std::time::SystemTime>,
     pub expires_at: Option<std::time::SystemTime>,
     pub resources: Option<SandboxResources>,
-    /// The control plane's record of this sandbox, when it has one.
+    /// The control plane's ownership marker for this sandbox, when it has one.
     ///
     /// 🔴 Reported, not filtered on. Whether a caller wants only the sandboxes
     /// some control plane owns is a property of the surface being served, not
@@ -113,10 +113,10 @@ pub struct LiveSandbox {
 /// - A child's record is built by cloning its parent's, so anything the child
 ///   must not inherit has to be overwritten from here. The incarnation was
 ///   already such a field; the ownership marker is the second.
-/// - The marker is the control plane's whole record of the sandbox, and a
-///   record names the sandbox it is about. A node that minted the child's id
-///   would therefore be handing back a marker written before anyone knew which
-///   sandbox it described.
+/// - The marker is how the control plane recognises its own sandbox, so it is
+///   written before the sandbox exists and names it. A node that minted the
+///   child's id would therefore be handing back a marker written before anyone
+///   knew which sandbox it described.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ForkChildren {
     /// Mint `count` fresh identities here. No child carries an ownership
@@ -146,7 +146,7 @@ pub struct ForkChildAssignment {
     /// here, and `Some` is for the one caller that is itself the orchestrator
     /// that owns the child and has already recorded the value.
     pub execution_id: Option<ExecutionId>,
-    /// The control plane's record of this child, or `None` when it has none.
+    /// The control plane's ownership marker for this child, or `None`.
     pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
 }
 

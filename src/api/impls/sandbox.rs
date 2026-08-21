@@ -979,7 +979,7 @@ impl Sandboxes<()> for ApiImpl {
                     // produces sandboxes the control plane did not ask for and
                     // does not own, so no child carries a marker. Inheriting
                     // the source's is what would put a child into the control
-                    // plane's listing under its parent's record.
+                    // plane's listing under its parent's identity.
                     .fork_sandbox(sandbox_id, ForkChildren::Fresh(count), new_timeout),
             )
             .await

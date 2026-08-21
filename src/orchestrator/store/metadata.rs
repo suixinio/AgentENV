@@ -34,15 +34,21 @@ pub enum SandboxTimeoutAction {
 /// 🔴 **The node never looks inside.** It stores the bytes the API half sent
 /// with the create and returns the same bytes; it does not parse, validate,
 /// re-encode or generate them. That is not laziness about the format — it is
-/// the property that makes the marker safe to change. The contents are the API
-/// half's versioned encoding of its own record of the sandbox, which exists so
-/// that a control plane whose store was lost can rebuild every running
-/// sandbox's record from what the nodes hand back. A node that understood the
+/// the property that makes the marker safe to change. Whatever the control
+/// plane needs to recognise its own sandbox goes in; a node that understood the
 /// format would be a second place that has to be upgraded in step with it.
 ///
 /// So this is a contract between the API half and its *future self*, not a
 /// cross-language wire contract, and nothing on the node may come to depend on
 /// its shape.
+///
+/// 🔴 **It is a marker, not a backup.** Keep it small: what it answers is
+/// *whose is this*. A separate concern — rebuilding a control plane's records
+/// after its store is lost — wants a versioned encoding of the whole sandbox
+/// record, and that is a different object under a different name. Do not let
+/// one field carry both: a blob that contains its own container either recurses
+/// or is quietly a smaller, different thing, and the two have different
+/// lifetimes, different sizes and different readers.
 ///
 /// # Empty is not a value
 ///
@@ -90,9 +96,9 @@ impl ControlPlaneConfig {
 
 /// Prints the size and not the contents.
 ///
-/// 🔴 Deliberate. The blob is a whole sandbox record; a derived `Debug` would
-/// put one in every log line that formats [`SandboxMetadata`], including the
-/// user metadata inside it.
+/// 🔴 Deliberate. The contents are the control plane's business and may carry
+/// anything it puts there; a derived `Debug` would print all of it into every
+/// log line that formats [`SandboxMetadata`].
 impl std::fmt::Debug for ControlPlaneConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ControlPlaneConfig({} bytes)", self.0.len())
@@ -598,8 +604,8 @@ mod tests {
 
         #[test]
         fn debug_prints_the_size_and_not_the_contents() {
-            // The blob is a whole sandbox record, user metadata included, and
-            // `SandboxMetadata` is formatted into logs.
+            // The contents belong to the control plane and may carry anything,
+            // and `SandboxMetadata` is formatted into logs.
             let marker =
                 ControlPlaneConfig::from_bytes(b"secret-workspace".to_vec()).expect("non-empty");
             let rendered = format!("{marker:?}");

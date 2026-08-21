@@ -736,10 +736,10 @@ where
             // it: fencing would read them as the same run and refuse neither.
             metadata.execution_id = spec.execution_id;
             // 🔴 And the ownership marker, for the same reason one line up: the
-            // clone carries the *parent's* record of the parent, and a child
-            // reporting itself under that record would have the control plane
-            // rebuild it as its parent. `Unowned` clears it, which is the
-            // fail-closed direction — a child nobody claims is left alone.
+            // clone carries the marker that names the *parent*, and a child
+            // reporting itself under it would be a second sandbox answering to
+            // one identity. `Fresh` clears it, which is the fail-closed
+            // direction — a child nobody claims is left alone.
             metadata.control_plane_config = child.control_plane_config;
             metadata.state = SandboxState::Running;
             metadata.created_at = now;

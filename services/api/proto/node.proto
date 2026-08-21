@@ -211,11 +211,14 @@ message SandboxCreateRequest {
   //
   // Opaque to the node: it is stored exactly as sent and handed back exactly as
   // stored. The node does not parse, validate, re-encode or generate it, and
-  // nothing on the node may come to depend on its shape. It is the control
-  // plane's record of this sandbox, so that a control plane that lost its store
-  // can rebuild every running sandbox's record from what the nodes hand back —
-  // which makes it a contract between the API half and its future self rather
-  // than a wire contract between two languages.
+  // nothing on the node may come to depend on its shape. That makes it a
+  // contract between the API half and its future self rather than a wire
+  // contract between two languages.
+  //
+  // 🔴 A marker, not a backup. It answers *whose is this* and should stay
+  // small. Rebuilding a control plane's records after its store is lost is a
+  // different problem wanting a different, larger object under a different
+  // name; one field must not carry both.
   //
   // 🔴 Zero bytes means *no marker*, not an empty one: proto3 `bytes` cannot
   // tell those apart, so the node collapses them into "not owned by the

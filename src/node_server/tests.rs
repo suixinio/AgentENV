@@ -358,6 +358,187 @@ async fn the_listing_names_the_run_that_is_live() {
     assert_ne!(sandboxes[0].execution_id, "");
 }
 
+/// 🔴 The listing reports the run that is *up*, not the run that is *filed*.
+///
+/// Everywhere else in this file the two agree, so nothing here can tell which
+/// one an entry came from — mutation testing put an implementation that
+/// preferred the record into the tree and every test still passed. This one
+/// makes them disagree on purpose, with a factory that builds a backend under
+/// an incarnation other than the one it was asked for.
+///
+/// The property matters because an orphan check compares incarnations. Told
+/// the filed one, a control plane comparing against what it believes would
+/// find agreement and conclude everything is fine — about a machine running a
+/// different run than the one it thinks it is.
+#[tokio::test]
+async fn the_listing_reports_the_incarnation_the_handle_is_running() {
+    use crate::sandbox::{
+        EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend,
+        SandboxBackendFactory, SandboxLaunchConfig,
+    };
+
+    /// Builds every backend under a fresh incarnation, ignoring the one it was
+    /// given. Stands in for a node whose handle and record have come apart.
+    struct Drifting {
+        inner: MockBackendFactory,
+        drifted: Arc<std::sync::Mutex<Vec<ExecutionId>>>,
+    }
+
+    impl SandboxBackendFactory for Drifting {
+        fn build(
+            &self,
+            build_spec: FreshSandboxBuildSpec,
+            launch_config: SandboxLaunchConfig,
+            _execution_id: ExecutionId,
+        ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+            let drifted = ExecutionId::new();
+            self.drifted.lock().expect("lock").push(drifted);
+            self.inner.build(build_spec, launch_config, drifted)
+        }
+        fn build_from_snapshot(
+            &self,
+            snapshot: &RunnableSnapshot,
+            launch_config: SandboxLaunchConfig,
+            _execution_id: ExecutionId,
+        ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+            let drifted = ExecutionId::new();
+            self.drifted.lock().expect("lock").push(drifted);
+            self.inner
+                .build_from_snapshot(snapshot, launch_config, drifted)
+        }
+        fn decode_paused_state(
+            &self,
+            artifact_root: std::path::PathBuf,
+            state: serde_json::Value,
+        ) -> anyhow::Result<Arc<dyn PausedSandboxState>> {
+            self.inner.decode_paused_state(artifact_root, state)
+        }
+        fn build_from_paused_state(
+            &self,
+            sandbox_id: SandboxId,
+            execution_id: ExecutionId,
+            state: &dyn PausedSandboxState,
+            envd_access_token: Option<EnvdAccessToken>,
+        ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+            self.inner
+                .build_from_paused_state(sandbox_id, execution_id, state, envd_access_token)
+        }
+    }
+
+    crate::logging::init_for_tests();
+    let drifted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        Drifting {
+            inner: MockBackendFactory::new(),
+            drifted: Arc::clone(&drifted),
+        },
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(mock_snapshot_manager()),
+        NODE.to_string(),
+    );
+
+    let record = start(&orchestration, Some(b"owned")).await;
+    let running = *drifted.lock().expect("lock").first().expect("one backend");
+    assert_ne!(
+        record.execution_id, running,
+        "the record and the handle must disagree, or this test proves nothing"
+    );
+
+    let sandboxes = listed(&service).await;
+    assert_eq!(sandboxes.len(), 1);
+    assert_eq!(
+        sandboxes[0].execution_id,
+        running.to_string(),
+        "the listing named the filed run rather than the one that is up"
+    );
+}
+
+/// 🔴 A sandbox whose handle is busy is still reported.
+///
+/// Reading the live facts needs the handle's lock, and a long operation holds
+/// it. Waiting would make the listing as slow as the slowest thing on the node;
+/// *skipping* would tell the control plane a running sandbox is not there, and
+/// "not there" is the answer that gets a live VM torn down. So it is reported
+/// from its record, and only the facts only the handle knows go missing.
+///
+/// Mutation testing is why this exists: an implementation that dropped busy
+/// handles passed every other test here, because nothing else in this file ever
+/// makes one busy.
+#[tokio::test]
+async fn a_sandbox_whose_handle_is_busy_is_still_reported() {
+    use crate::sandbox::mock::{MockAction, MockBehavior, MockOperation};
+
+    crate::logging::init_for_tests();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(mock_snapshot_manager()),
+        NODE.to_string(),
+    );
+
+    let busy = start(&orchestration, Some(b"busy")).await;
+    let idle = start(&orchestration, Some(b"idle")).await;
+
+    // A fork holds the source's handle for the whole operation and leaves it in
+    // the table while it runs, which is exactly the shape being tested: the
+    // sandbox is there and cannot be read.
+    behavior.push_action(
+        MockOperation::Fork,
+        MockAction::SucceedAfter(Duration::from_secs(3)),
+    );
+    let forking = tokio::spawn({
+        let orchestration = Arc::clone(&orchestration);
+        async move {
+            orchestration
+                .fork_sandbox(busy.id, ForkChildren::Fresh(1), NewTimeout::UseExisting)
+                .await
+        }
+    });
+    // Long enough for the fork to have taken the lock, short enough that it is
+    // still holding it. The fork's own delay is what makes this reliable rather
+    // than the sleep length.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let sandboxes = listed(&service).await;
+    let reported: Vec<&str> = sandboxes
+        .iter()
+        .map(|sandbox| sandbox.sandbox_id.as_str())
+        .collect();
+    assert!(
+        reported.contains(&busy.id.to_string().as_str()),
+        "a sandbox mid-operation was dropped from the listing: {reported:?}"
+    );
+    assert!(
+        reported.contains(&idle.id.to_string().as_str()),
+        "the idle sandbox went missing too: {reported:?}"
+    );
+
+    // And the record still supplied what it could: the incarnation is there
+    // even though the handle could not be read.
+    let busy_entry = sandboxes
+        .iter()
+        .find(|sandbox| sandbox.sandbox_id == busy.id.to_string())
+        .expect("the busy sandbox");
+    assert_eq!(busy_entry.execution_id, busy.execution_id.to_string());
+
+    let _ = forking.await;
+}
+
 /// A marker sent as zero bytes is no marker, and the sandbox is left out of the
 /// listing rather than killed.
 ///

@@ -19,7 +19,7 @@ use super::proxy::{build_proxy_client, ProxyClient};
 use crate::identity::NodeIdentity;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
-use crate::orchestrator::{Orchestrator, PausedSandboxPublisher, PausedSandboxRegistry};
+use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
@@ -64,7 +64,11 @@ impl PausedSandboxWiring {
 
 #[derive(Clone)]
 pub struct ApiImpl {
-    orchestrator: Arc<Orchestrator>,
+    /// 🔴 The orchestration surface, not an `Orchestrator`. Which concrete
+    /// orchestrator is behind it is the role's decision, taken once at startup;
+    /// see `crate::orchestrator::facade` for why it cannot be taken one type
+    /// parameter at a time.
+    orchestrator: Arc<dyn SandboxOrchestration>,
     snapshot_manager: Arc<SnapshotManager>,
     /// Cluster-wide bookkeeping for paused sandboxes. With the default `local`
     /// registry backend every call is a no-op and pause/resume stay node-local.
@@ -78,7 +82,7 @@ pub struct ApiImpl {
 
 impl ApiImpl {
     pub fn new(
-        orchestrator: Arc<Orchestrator>,
+        orchestrator: Arc<dyn SandboxOrchestration>,
         snapshot_manager: Arc<SnapshotManager>,
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
@@ -98,7 +102,7 @@ impl ApiImpl {
         }
     }
 
-    pub(crate) fn orchestrator(&self) -> Arc<Orchestrator> {
+    pub(crate) fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {
         Arc::clone(&self.orchestrator)
     }
 

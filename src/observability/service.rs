@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::Result;
 use tokio::sync::broadcast;
 
-use crate::orchestrator::{Orchestrator, SandboxLifecycleEvent};
+use crate::orchestrator::{SandboxLifecycleEvent, SandboxOrchestration};
 
 use super::host::HostMetricsCollector;
 use super::machine::detect_machine_info;
@@ -22,7 +22,7 @@ use crate::identity::NodeIdentity;
 /// Configuration can disable this service entirely at the server wiring layer.
 #[derive(Clone)]
 pub struct ObservabilityService {
-    orchestrator: Arc<Orchestrator>,
+    orchestrator: Arc<dyn SandboxOrchestration>,
     identity: NodeIdentity,
     machine_info: MachineInfo,
     host_metrics: HostMetricsCollector,
@@ -33,7 +33,7 @@ pub struct ObservabilityService {
 impl ObservabilityService {
     pub async fn new(
         identity: NodeIdentity,
-        orchestrator: Arc<Orchestrator>,
+        orchestrator: Arc<dyn SandboxOrchestration>,
         cpu_template_helper: Option<PathBuf>,
         cluster_cpu_arc: Arc<RwLock<Option<String>>>,
     ) -> Self {

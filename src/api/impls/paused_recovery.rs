@@ -482,7 +482,11 @@ impl ApiImpl {
 
         let request = restore_request(&metadata, snapshot, timeout);
 
-        match self.orchestrator.restore_sandbox(sandbox_id, request).await {
+        match self
+            .orchestrator()
+            .restore_sandbox(sandbox_id, request)
+            .await
+        {
             Ok(metadata) => {
                 // The sandbox lives here now. Repointing the row is what tells
                 // its former node that its copy is stale, and keeps the
@@ -811,7 +815,7 @@ impl ApiImpl {
             );
 
             match self
-                .orchestrator
+                .orchestrator()
                 .discard_superseded_sandbox(sandbox_id)
                 .await
             {
@@ -899,7 +903,7 @@ impl ApiImpl {
             };
 
             match self
-                .orchestrator
+                .orchestrator()
                 .discard_local_paused_record(sandbox_id)
                 .await
             {
@@ -957,7 +961,7 @@ impl ApiImpl {
         };
 
         match self
-            .orchestrator
+            .orchestrator()
             .discard_local_paused_record(sandbox_id)
             .await
         {

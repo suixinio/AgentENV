@@ -548,7 +548,10 @@ impl Sandboxes<()> for ApiImpl {
         };
 
         match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
+            .time(
+                "create_sandbox",
+                self.orchestrator().create_sandbox(request),
+            )
             .await
         {
             Ok(metadata) => {
@@ -683,7 +686,10 @@ impl Sandboxes<()> for ApiImpl {
         };
 
         match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
+            .time(
+                "create_sandbox",
+                self.orchestrator().create_sandbox(request),
+            )
             .await
         {
             Ok(metadata) => {
@@ -821,7 +827,7 @@ impl Sandboxes<()> for ApiImpl {
 
         // try to resume the sandbox
         match self
-            .orchestrator
+            .orchestrator()
             .resume_sandbox(
                 sandbox_id,
                 NewTimeout::Set(Duration::from_secs(body.timeout as u64)),
@@ -904,7 +910,7 @@ impl Sandboxes<()> for ApiImpl {
         // something this node actually owns.
         self.discard_if_superseded(sandbox_id).await;
 
-        match self.orchestrator.delete_sandbox(sandbox_id).await {
+        match self.orchestrator().delete_sandbox(sandbox_id).await {
             // The orchestrator drops the cluster record and its snapshot as
             // part of the delete.
             Ok(_) => {
@@ -953,7 +959,7 @@ impl Sandboxes<()> for ApiImpl {
         match timer
             .time(
                 "fork",
-                self.orchestrator
+                self.orchestrator()
                     .fork_sandbox(sandbox_id, count, new_timeout),
             )
             .await
@@ -1060,7 +1066,7 @@ impl Sandboxes<()> for ApiImpl {
         };
 
         match self
-            .orchestrator
+            .orchestrator()
             .replace_sandbox_network_policy(sandbox_id, network)
             .await
         {
@@ -1139,7 +1145,7 @@ impl Sandboxes<()> for ApiImpl {
         let patch = params_model_to_map(body);
 
         match self
-            .orchestrator
+            .orchestrator()
             .patch_sandbox_custom_extension_params(sandbox_id, patch)
             .await
         {
@@ -1192,7 +1198,7 @@ impl Sandboxes<()> for ApiImpl {
         };
         let timer = SandboxStageTimer::new("pause");
         match timer
-            .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
+            .time("pause", self.orchestrator().pause_sandbox(sandbox_id))
             .await
         {
             // The orchestrator publishes and registers the pause itself, so
@@ -1248,7 +1254,7 @@ impl Sandboxes<()> for ApiImpl {
         };
 
         let capture = match timer
-            .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
+            .time("capture", self.orchestrator().capture_snapshot(sandbox_id))
             .await
         {
             Ok(capture) => capture,
@@ -1451,7 +1457,7 @@ impl Sandboxes<()> for ApiImpl {
         match timer
             .time(
                 "resume",
-                self.orchestrator
+                self.orchestrator()
                     .resume_sandbox(sandbox_id, NewTimeout::Set(timeout), claimed),
             )
             .await

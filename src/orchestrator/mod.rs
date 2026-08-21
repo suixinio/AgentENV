@@ -1,3 +1,4 @@
+mod facade;
 mod launch_plan;
 
 mod metrics;
@@ -13,6 +14,7 @@ use std::time::SystemTime;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
+pub use facade::SandboxOrchestration;
 pub use launch_plan::ClaimedExecution;
 pub use metrics::OrchestratorMetrics;
 pub use paused_registry::{

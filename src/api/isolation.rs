@@ -24,7 +24,7 @@ use axum::{
 use tracing::{info, warn};
 
 use super::ApiImpl;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::SandboxOrchestration;
 use crate::types::SandboxId;
 
 /// Asks the gateway to hand this request to a different node. Only ever sent
@@ -93,7 +93,10 @@ fn resume_target(path: &str) -> Option<SandboxId> {
 /// Only a record that was announced to the registry qualifies. A local-only
 /// record names artifacts that exist on this node and nowhere else, so handing
 /// it to another node would produce a confident 404 instead of a sandbox.
-async fn recoverable_elsewhere(orchestrator: &Arc<Orchestrator>, sandbox_id: SandboxId) -> bool {
+async fn recoverable_elsewhere(
+    orchestrator: &Arc<dyn SandboxOrchestration>,
+    sandbox_id: SandboxId,
+) -> bool {
     use crate::orchestrator::ClusterRegistration;
 
     match orchestrator

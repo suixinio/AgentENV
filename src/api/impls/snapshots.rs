@@ -1,5 +1,3 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use async_trait::async_trait;
 use axum_extra::extract::CookieJar;
 use headers::Host;
@@ -8,9 +6,11 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
-use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{SnapshotListFilter, SnapshotRecord, SnapshotSource};
 
-use super::pagination::PaginationCursor;
+use super::pagination::{
+    snapshot_cursor_from_token, snapshot_next_token, system_time_from_unix_ms,
+};
 use super::ApiImpl;
 
 impl From<SnapshotRecord> for models::SnapshotInfo {
@@ -39,14 +39,6 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
     }
 }
 
-fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {
-    if unix_ms >= 0 {
-        UNIX_EPOCH + Duration::from_millis(unix_ms as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_millis(unix_ms.unsigned_abs())
-    }
-}
-
 #[async_trait]
 impl Snapshots<()> for ApiImpl {
     type Claims = super::Claims;
@@ -59,9 +51,15 @@ impl Snapshots<()> for ApiImpl {
         _claims: &Self::Claims,
         query_params: &models::SnapshotsGetQueryParams,
     ) -> Result<SnapshotsGetResponse, ()> {
+        // 🔴 No cursor means "start at the newest row", and it is expressed by
+        // its absence rather than by a sentinel at `now`. The sentinel had a
+        // failure only a fast cluster shows: its instant carries nanoseconds
+        // while a row's carries milliseconds, so a snapshot created during the
+        // current millisecond ties with it and loses the id comparison against
+        // the maximum UUID — and falls off the first page it should have led.
         let cursor = match query_params.next_token.as_deref() {
-            Some(token) => match PaginationCursor::<SnapshotId>::parse(token) {
-                Ok(cursor) => cursor,
+            Some(token) => match snapshot_cursor_from_token(token) {
+                Ok(cursor) => Some(cursor),
                 Err(err) => {
                     return Ok(SnapshotsGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -69,43 +67,28 @@ impl Snapshots<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SnapshotId::max()),
+            None => None,
         };
 
-        let summaries = match self
-            .snapshot_manager
-            .list(crate::snapshot::SnapshotListFilter::sandbox_snapshots(
-                query_params.sandbox_id.clone(),
-                query_params.name.clone(),
-            ))
-            .await
-        {
-            Ok(summaries) => summaries,
+        // 🔴 The page bounds travel *with* the filter, and that is the whole
+        // change: a catalog that can push them into its storage does, and one
+        // that cannot answers the same page from a scan. Before this the
+        // listing was read whole and sliced up here, so `?limit=5` cost exactly
+        // what `?limit=100` did.
+        let filter = SnapshotListFilter::sandbox_snapshots(
+            query_params.sandbox_id.clone(),
+            query_params.name.clone(),
+        )
+        .paginated(query_params.limit, cursor);
+
+        let page = match self.snapshot_manager.list_page(filter).await {
+            Ok(page) => page,
             Err(err) => {
                 return Ok(SnapshotsGetResponse::Status500_ServerError(
                     Self::snapshot_manager_error(&err),
                 ));
             }
         };
-
-        let page = cursor.paginate_sorted(
-            summaries,
-            query_params.limit,
-            |record, cursor| {
-                PaginationCursor::compare_desc(
-                    system_time_from_unix_ms(record.created_at_unix_ms),
-                    &record.id,
-                    cursor.time(),
-                    cursor.value(),
-                )
-            },
-            |record| {
-                PaginationCursor::new(
-                    system_time_from_unix_ms(record.created_at_unix_ms),
-                    record.id.clone(),
-                )
-            },
-        );
 
         Ok(
             SnapshotsGetResponse::Status200_SuccessfullyReturnedSnapshots {
@@ -114,7 +97,7 @@ impl Snapshots<()> for ApiImpl {
                     .into_iter()
                     .map(models::SnapshotInfo::from)
                     .collect(),
-                x_next_token: page.next_token,
+                x_next_token: page.next.as_ref().map(snapshot_next_token),
             },
         )
     }

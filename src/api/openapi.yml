@@ -2159,6 +2159,11 @@ paths:
   /templates:
     get:
       summary: List templates
+      # Paginated as of the catalog move. Both parameters are optional and the
+      # header is only sent when another page exists, so a client that ignores
+      # all three still gets a valid, and now bounded, response. Unbounded was
+      # never a contract worth keeping: this endpoint read the whole catalog
+      # into memory and is the first one a large one takes down.
       description: List all templates
       deprecated: true
       tags: [templates]
@@ -2176,15 +2181,24 @@ paths:
           schema:
             type: string
             description: Identifier of the team
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
       responses:
         "200":
           description: Successfully returned all templates
+          headers:
+            X-Next-Token:
+              description: Cursor to fetch the next page of results, if more exist
+              schema:
+                type: string
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/Template"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "500":

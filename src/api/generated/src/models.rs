@@ -249,6 +249,15 @@ pub struct TemplatesGetQueryParams {
     #[serde(rename = "teamID")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
+    /// Cursor to start the list from
+    #[serde(rename = "nextToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+    /// Maximum number of items to return per page
+    #[serde(rename = "limit")]
+    #[validate(range(min = 1u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]

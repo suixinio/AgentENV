@@ -29,7 +29,12 @@ pub enum TemplatesAliasesAliasGetResponse {
 #[allow(clippy::large_enum_variant)]
 pub enum TemplatesGetResponse {
     /// Successfully returned all templates
-    Status200_SuccessfullyReturnedAllTemplates(Vec<models::Template>),
+    Status200_SuccessfullyReturnedAllTemplates {
+        body: Vec<models::Template>,
+        x_next_token: Option<String>,
+    },
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Server error

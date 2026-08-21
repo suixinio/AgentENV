@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
 use std::fmt::Display;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE, Engine};
 use thiserror::Error;
+
+use crate::snapshot::{SnapshotCursor, SnapshotId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaginationCursor<T> {
@@ -146,6 +148,68 @@ where
     ) -> Ordering {
         b_time.cmp(&a_time).then_with(|| a_value.cmp(b_value))
     }
+}
+
+/// A snapshot record's `created_at` as an instant.
+pub fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {
+    if unix_ms >= 0 {
+        UNIX_EPOCH + Duration::from_millis(unix_ms as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_millis(unix_ms.unsigned_abs())
+    }
+}
+
+/// An instant as whole milliseconds, rounded **up**.
+///
+/// 🔴 The direction is the point. Catalog rows carry whole milliseconds and
+/// every token this service mints is rendered from one, so for any token that
+/// came from here this is exact. A token carrying a finer instant did not come
+/// from here, and the two ways of handling it are not symmetric: rounding down
+/// moves the cursor back past rows in the same millisecond that the page before
+/// it already returned, and — because the tie inside a millisecond is broken by
+/// id — those rows are then *excluded* rather than repeated. Rounding up can at
+/// worst repeat a row, which a reader can see. Silently skipping one it cannot.
+fn unix_ms_ceil(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => {
+            let ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+            if elapsed.subsec_nanos() % 1_000_000 == 0 {
+                ms
+            } else {
+                ms.saturating_add(1)
+            }
+        }
+        // Before the epoch, truncating the magnitude toward zero already is the
+        // ceiling of the negative instant.
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .unwrap_or(i64::MAX)
+            .saturating_neg(),
+    }
+}
+
+/// The listing position a client's `nextToken` names.
+///
+/// 🔴 The token's shape — base64url of an RFC3339 instant, `__`, the id — is
+/// public API, and this is the only place it is read. The catalog never sees
+/// it: it gets the two values, and a remote catalog gets them on the wire as
+/// two fields. That is what keeps a token minted before a read-side switch
+/// readable after one, and it is why the rendering did not move when the
+/// paging did.
+pub fn snapshot_cursor_from_token(token: &str) -> Result<SnapshotCursor, PaginationError> {
+    let parsed = PaginationCursor::<SnapshotId>::parse(token)?;
+    Ok(SnapshotCursor::new(
+        unix_ms_ceil(parsed.time()),
+        parsed.value().clone(),
+    ))
+}
+
+/// The public `x-next-token` for a position in a snapshot listing.
+pub fn snapshot_next_token(cursor: &SnapshotCursor) -> String {
+    PaginationCursor::new(
+        system_time_from_unix_ms(cursor.created_at_unix_ms),
+        cursor.snapshot_id.clone(),
+    )
+    .encode()
 }
 
 #[cfg(test)]
@@ -325,6 +389,126 @@ mod tests {
 
         assert_eq!(out.items.len(), 2);
         assert_eq!(out.next_token, None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // The public token, which did not move when the paging did
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn snapshot_id(text: &str) -> SnapshotId {
+        SnapshotId::parse(text).expect("a fixed snapshot id")
+    }
+
+    /// 🔴 The wire format, pinned to the byte.
+    ///
+    /// `x-next-token` is a response header on an OpenAPI endpoint. Changing its
+    /// shape breaks clients holding one, and — worse for this batch — makes the
+    /// read-side rollback lossy, because a token minted while reads came from
+    /// PostgreSQL has to be readable after they come from object storage again.
+    /// The rendering is base64url of `{RFC3339 with nanoseconds}__{id}`, and
+    /// this test exists so that changing it is a decision rather than an
+    /// accident.
+    #[test]
+    fn the_public_token_is_base64url_of_an_rfc3339_instant_and_the_id() {
+        let id = snapshot_id("0198f0a1-0000-7000-8000-0000000c0ffe");
+        let token = snapshot_next_token(&SnapshotCursor::new(1_767_225_600_123, id.clone()));
+
+        let decoded = String::from_utf8(URL_SAFE.decode(&token).expect("base64url")).unwrap();
+        assert_eq!(
+            decoded,
+            "2026-01-01T00:00:00.123000000Z__0198f0a1-0000-7000-8000-0000000c0ffe"
+        );
+    }
+
+    /// A token this service minted decodes to exactly the position it named.
+    /// 🔴 Exactly: the instant is carried as whole milliseconds on the wire to
+    /// the catalog, so any rounding at all here would move a page boundary.
+    #[test]
+    fn a_token_this_service_minted_round_trips_to_the_same_position() {
+        let cursor = SnapshotCursor::new(
+            1_767_225_600_123,
+            snapshot_id("0198f0a1-0000-7000-8000-0000000c0ffe"),
+        );
+
+        let round_tripped =
+            snapshot_cursor_from_token(&snapshot_next_token(&cursor)).expect("it should parse");
+
+        assert_eq!(round_tripped, cursor);
+    }
+
+    /// 🔴 A token minted by the build *before* the paging moved into the
+    /// catalog. Written out by hand rather than produced by this code, because
+    /// a round trip through one implementation cannot tell whether the format
+    /// changed underneath it.
+    #[test]
+    fn a_token_minted_before_the_paging_moved_still_decodes() {
+        let token =
+            URL_SAFE.encode("2026-01-01T00:00:00.123000000Z__0198f0a1-0000-7000-8000-0000000c0ffe");
+
+        let cursor = snapshot_cursor_from_token(&token).expect("an older token must still parse");
+
+        assert_eq!(cursor.created_at_unix_ms, 1_767_225_600_123);
+        assert_eq!(
+            cursor.snapshot_id.to_string(),
+            "0198f0a1-0000-7000-8000-0000000c0ffe"
+        );
+    }
+
+    #[test]
+    fn a_token_that_is_not_a_cursor_is_reported_rather_than_guessed_at() {
+        assert!(matches!(
+            snapshot_cursor_from_token("not-base64"),
+            Err(PaginationError::DecodeCursor(_))
+        ));
+        assert_eq!(
+            snapshot_cursor_from_token(&URL_SAFE.encode("2026-01-01T00:00:00Z-only")),
+            Err(PaginationError::InvalidCursorFormat)
+        );
+        assert!(matches!(
+            snapshot_cursor_from_token(&URL_SAFE.encode("2026-01-01T00:00:00Z__not-a-uuid")),
+            Err(PaginationError::InvalidCursorValue(_))
+        ));
+    }
+
+    /// 🔴 A finer-than-millisecond instant rounds **up**, and the direction is
+    /// load-bearing.
+    ///
+    /// Rounding down moves the cursor back into the millisecond the previous
+    /// page already returned; because the tie inside a millisecond is broken by
+    /// ascending id, the rows there then compare as *already returned* and are
+    /// dropped — a silent skip. Rounding up can at worst repeat a row, which a
+    /// reader can see.
+    #[test]
+    fn a_sub_millisecond_instant_rounds_up_so_no_row_is_skipped() {
+        let exact = UNIX_EPOCH + Duration::from_millis(1_000);
+        assert_eq!(unix_ms_ceil(exact), 1_000, "a whole millisecond is exact");
+
+        let finer = UNIX_EPOCH + Duration::from_nanos(1_000_000_001);
+        assert_eq!(unix_ms_ceil(finer), 1_001);
+
+        let before_epoch = UNIX_EPOCH - Duration::from_nanos(1_000_700_000);
+        assert_eq!(
+            unix_ms_ceil(before_epoch),
+            -1_000,
+            "toward zero is already the ceiling on the far side of the epoch"
+        );
+    }
+
+    /// The control for the rounding above, stated as the behaviour rather than
+    /// the arithmetic: a cursor at a finer instant must still return the rows
+    /// sharing its millisecond that it has not already passed.
+    #[test]
+    fn a_sub_millisecond_token_does_not_drop_the_rows_it_ties_with() {
+        let token =
+            URL_SAFE.encode("2026-01-01T00:00:00.123400000Z__ffffffff-ffff-ffff-ffff-ffffffffffff");
+
+        let cursor = snapshot_cursor_from_token(&token).expect("it should parse");
+
+        assert_eq!(
+            cursor.created_at_unix_ms, 1_767_225_600_124,
+            "a cursor rounded down to …123 would tie with every row in that millisecond and, \
+             losing to the maximum uuid, exclude all of them"
+        );
     }
 
     #[test]

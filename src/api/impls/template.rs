@@ -3,14 +3,13 @@ use axum_extra::extract::CookieJar;
 use chrono::TimeZone;
 use headers::Host;
 use http::Method;
-use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 use agentenv_http_server::apis::templates::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
-use super::pagination::PaginationCursor;
+use super::pagination::{snapshot_cursor_from_token, snapshot_next_token};
 use super::template_helpers::{
     template_build_record_from_v3_request, template_build_spec_from_start_request,
     template_build_start_base_source, TemplateBuildStartBaseSource,
@@ -319,20 +318,42 @@ impl Templates<()> for ApiImpl {
         }
     }
 
+    /// 🔴 Paginated as of this batch, where it never was.
+    ///
+    /// It is the deprecated listing, and it was also the only one that read the
+    /// whole catalog with nothing bounding it — so on a large catalog it is the
+    /// first endpoint to fall over, while the acceptance criterion everyone
+    /// watches is on `GET /snapshots`. Both parameters are optional and the
+    /// header only appears when there is another page, so a client that ignores
+    /// all three still gets a valid response; what it no longer gets is every
+    /// row.
     async fn templates_get(
         &self,
         _method: &Method,
         _host: &Host,
         _cookies: &CookieJar,
         _claims: &Self::Claims,
-        _query_params: &models::TemplatesGetQueryParams,
+        query_params: &models::TemplatesGetQueryParams,
     ) -> Result<TemplatesGetResponse, ()> {
-        let records = match self
+        let cursor = match query_params.next_token.as_deref() {
+            Some(token) => match snapshot_cursor_from_token(token) {
+                Ok(cursor) => Some(cursor),
+                Err(err) => {
+                    return Ok(TemplatesGetResponse::Status400_BadRequest(Self::error(
+                        400,
+                        format!("invalid next token: {err}"),
+                    )));
+                }
+            },
+            None => None,
+        };
+
+        let page = match self
             .snapshot_manager
-            .list(SnapshotListFilter::templates())
+            .list_page(SnapshotListFilter::templates().paginated(query_params.limit, cursor))
             .await
         {
-            Ok(records) => records,
+            Ok(page) => page,
             Err(err) => {
                 return Ok(TemplatesGetResponse::Status500_ServerError(
                     Self::snapshot_manager_error(&err),
@@ -340,9 +361,12 @@ impl Templates<()> for ApiImpl {
             }
         };
 
-        let out = records.into_iter().map(models::Template::from).collect();
-
-        Ok(TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates(out))
+        Ok(
+            TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates {
+                body: page.items.into_iter().map(models::Template::from).collect(),
+                x_next_token: page.next.as_ref().map(snapshot_next_token),
+            },
+        )
     }
 
     async fn v2_templates_get(
@@ -354,8 +378,8 @@ impl Templates<()> for ApiImpl {
         query_params: &models::V2TemplatesGetQueryParams,
     ) -> Result<V2TemplatesGetResponse, ()> {
         let cursor = match query_params.next_token.as_deref() {
-            Some(token) => match PaginationCursor::<SnapshotId>::parse(token) {
-                Ok(cursor) => cursor,
+            Some(token) => match snapshot_cursor_from_token(token) {
+                Ok(cursor) => Some(cursor),
                 Err(err) => {
                     return Ok(V2TemplatesGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -363,15 +387,15 @@ impl Templates<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SnapshotId::max()),
+            None => None,
         };
 
-        let records = match self
+        let page = match self
             .snapshot_manager
-            .list(SnapshotListFilter::templates())
+            .list_page(SnapshotListFilter::templates().paginated(query_params.limit, cursor))
             .await
         {
-            Ok(records) => records,
+            Ok(page) => page,
             Err(err) => {
                 return Ok(V2TemplatesGetResponse::Status500_ServerError(
                     Self::snapshot_manager_error(&err),
@@ -379,29 +403,10 @@ impl Templates<()> for ApiImpl {
             }
         };
 
-        let page = cursor.paginate_sorted(
-            records,
-            query_params.limit,
-            |record, cursor| {
-                PaginationCursor::compare_desc(
-                    SystemTime::from(datetime_from_unix_ms(record.created_at_unix_ms)),
-                    &record.id,
-                    cursor.time(),
-                    cursor.value(),
-                )
-            },
-            |record| {
-                PaginationCursor::new(
-                    SystemTime::from(datetime_from_unix_ms(record.created_at_unix_ms)),
-                    record.id.clone(),
-                )
-            },
-        );
-
         Ok(
             V2TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates {
                 body: page.items.into_iter().map(models::Template::from).collect(),
-                x_next_token: page.next_token,
+                x_next_token: page.next.as_ref().map(snapshot_next_token),
             },
         )
     }

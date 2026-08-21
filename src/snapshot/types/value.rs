@@ -33,11 +33,6 @@ impl SnapshotId {
             .map_err(|e| anyhow::anyhow!("invalid snapshot ID '{}': {e}", input))?;
         Ok(Self(uuid))
     }
-
-    /// Returns the max-UUID sentinel used exclusively for open-ended pagination cursors.
-    pub(crate) fn max() -> Self {
-        Self(Uuid::max())
-    }
 }
 
 impl Display for SnapshotId {

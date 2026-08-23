@@ -138,6 +138,40 @@ spec:
                   name: routing-projection-config
                   key: GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE
                   optional: true
+            # 阶段 3a's two switches, both empty until an operator sets them.
+            #
+            # 🔴 Declared here, from the start, while both are still off — the
+            # same reasoning as GATEWAY_REDIS_ADDR above and the opposite
+            # failure. A switch that has to be *added* to this list before it
+            # can be flipped makes turning 3a on a manifest change, and turning
+            # it off again a manifest change under incident pressure. With both
+            # declared, each direction is one `kubectl set env` on this
+            # Deployment, which rolls it and is loud, or one edit to
+            # api-upstream-config followed by a restart.
+            #
+            # REST_UPSTREAM_ADDR is where user-facing REST goes: empty fans it
+            # out to whichever node the scheduler names, which is what shipped;
+            # `http://agentenv-api:8000` sends it to the deciding half instead.
+            # RESUME_ADDR is who wakes a paused sandbox the routing projection
+            # cannot place: empty leaves that to the node the request lands on,
+            # `agentenv-api:8002` asks the api half over gRPC.
+            #
+            # 🔴 The two are independent and may be flipped in either order.
+            # REST first is the ordinary one — it is the half with a rollback
+            # nobody has to think about, since the nodes are still `--role all`
+            # and still serving REST the whole time.
+            - name: GATEWAY_REST_UPSTREAM_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: api-upstream-config
+                  key: GATEWAY_REST_UPSTREAM_ADDR
+                  optional: true
+            - name: GATEWAY_RESUME_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: api-upstream-config
+                  key: GATEWAY_RESUME_ADDR
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

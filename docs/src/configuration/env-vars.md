@@ -97,6 +97,8 @@ These variables apply to both the gateway and scheduler processes.
 | `GATEWAY_REQUEST_TIMEOUT` | `30s` | Override the gateway's HTTP request timeout (for example, `1m30s`) |
 | `GATEWAY_SANDBOX_PROXY_DOMAINS` | from config | Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like `{port}-{sandboxID}.{domain}`. Empty or unset keeps `gateway.sandbox_proxy_domains`. |
 | `GATEWAY_DEBUG_MODE` | `false` | Enable gateway debug mode |
+| `GATEWAY_REST_UPSTREAM_ADDR` | from config | Where user-facing REST — the sandbox, snapshot and template routes — is sent. `gateway.rest_upstream_addr` empty means the scheduler places each call and a node serves it, which is the behaviour that shipped; `http://agentenv-api:8000` (a bare `host:port` is read as http) sends those calls to the api half instead. Never carries data-plane traffic, which always goes to the node holding the sandbox. An address that cannot be used stops the gateway at startup. 🔴 Setting this variable to the empty string does not turn the switch off — an empty value is ignored and the config file's value stands — so keep the file's value empty and drive the switch from here. |
+| `GATEWAY_RESUME_ADDR` | from config | The api half's gRPC wake-up surface, asked when the routing projection cannot place a sandbox. `gateway.resume_addr` empty leaves waking to whichever node the request lands on, which is the behaviour that shipped; `agentenv-api:8002` asks the api half. An api half that cannot be reached delays the request rather than failing it: the gateway falls back to the scheduler. The same 🔴 note as above applies to turning it off. |
 
 ## Scheduler
 

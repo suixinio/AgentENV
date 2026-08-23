@@ -4,6 +4,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
     println!("cargo:rerun-if-changed=services/api/proto/node.proto");
+    println!("cargo:rerun-if-changed=services/api/proto/apiproxy/apiproxy.proto");
     emit_git_rerun_inputs();
 
     // The server stubs exist for the in-process fake controller the registry
@@ -22,10 +23,15 @@ fn main() {
                 // `.pb.go` nobody imports is one more generated artifact to
                 // keep in step.
                 "services/api/proto/node.proto",
+                // 🔴 The opposite call to the one above: this proto *is* on
+                // `services/Makefile`'s `PROTO_SRC`, because the gateway is
+                // written in Go and is the only caller of the service it
+                // describes. Both generators have to be re-run when it changes.
+                "services/api/proto/apiproxy/apiproxy.proto",
             ],
             &["services/api/proto"],
         )
-        .expect("failed to compile the scheduler and node protos for Rust gRPC");
+        .expect("failed to compile the scheduler, node and apiproxy protos for Rust gRPC");
 
     let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");

@@ -1,7 +1,7 @@
 PROTOC    ?= protoc
 GO        ?= go
 GOBIN_DIR := $(shell $(GO) env GOPATH)/bin
-PROTO_SRC := api/proto/scheduler.proto
+PROTO_SRC := api/proto/scheduler.proto api/proto/apiproxy/apiproxy.proto
 
 # Throwaway PostgreSQL for `test-with-postgres`. The port matches the one the
 # registry suite's own documentation uses, and is overridable so the target can

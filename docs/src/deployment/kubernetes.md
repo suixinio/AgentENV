@@ -103,6 +103,52 @@ The runtime DaemonSet injects scheduler-report wiring for each node Pod:
 
 The P2P listen address must be reachable Pod-to-Pod; use a concrete container port or a Pod-reachable address if your cluster policy does not allow dialing ephemeral ports.
 
+## The API Half
+
+`agentenv-api` is the deciding half of the split control plane: user-facing REST,
+sandbox ownership, placement. It runs the same `agentenv-runtime` image as the
+node DaemonSet with `--role api`, on an ordinary Deployment with no `/dev/kvm`,
+no host paths and no privileges. It needs
+`agentenv-runtime-secrets/sandbox-access-token-hash-seed` to exist — the
+reference is not optional, because an API replica that invents its own seed
+mints envd tokens the other replica cannot derive, and that failure is silent.
+
+Bringing the Deployment up does not move any traffic. Three switches do, and
+they do not cost the same:
+
+| Switch | Read by | Flipping it costs |
+|--------|---------|-------------------|
+| `AENV_NODE_SERVICE_ENABLED` (`node-service-config`) | every node | a serial DaemonSet roll, one machine at a time, each waiting out its drain |
+| `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
+| `GATEWAY_RESUME_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
+
+Switch them on in that order, and leave time between the first and the rest.
+The first lets a node that is still `--role all` serve the gRPC surface the API
+half drives it through; while the gateway still points at the nodes, nothing
+dials that listener, so it is a preparatory step that can be taken and observed
+on its own. Only then point the gateway at `http://agentenv-api:8000` and
+`agentenv-api:8002`.
+
+🔴 **Rolling back reverses only the two gateway switches.** Emptying them puts
+every REST call back on the nodes, which never stopped being able to serve them,
+and the API half stops driving machines the moment it stops receiving REST — so
+the rollback is one ConfigMap and one gateway roll, seconds, with the DaemonSet
+untouched. Turning `AENV_NODE_SERVICE_ENABLED` back off is only for abandoning
+the arrangement, not for pausing it: a bound socket nobody dials costs nothing,
+and turning it off is the expensive roll all over again.
+
+🔴 **Do not turn a gateway switch on by editing `config/gateway.json`.** An
+environment variable set to the empty string is ignored by the loader, so a
+value that lives in the file cannot be cleared from the environment — and the
+rollback above would stop working. Keep the file's values empty and drive both
+switches from `api-upstream-config` or `kubectl set env`.
+
+The API half reaches a node's gRPC service by substituting
+`AENV_NODE_SERVICE_PORT` into the address the scheduler gives it, which is the
+node Pod's own IP. No Service fronts that port, and none should: every one of
+those calls is addressed to one named machine, and a ClusterIP would
+load-balance them across the fleet.
+
 ## Cluster-wide Paused Sandboxes
 
 By default a paused sandbox is resumable only on the node that paused it. Pointing the nodes at the cluster-wide registry makes a pause publish its snapshot to the shared repository as well, so any node can resume the sandbox under its original ID.

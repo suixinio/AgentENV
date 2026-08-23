@@ -161,6 +161,23 @@ spec:
             # scheduler. That is the safe direction: latency, not availability.
             - name: AENV_API_GRPC_ADDR
               value: "0.0.0.0:8002"
+            # The port this half dials a machine's node sandbox service on.
+            #
+            # 🔴 A port and not an address, and no Service name anywhere: the
+            # host comes from the scheduler, which names a node as
+            # `http://<pod ip>:8000` off the agentenv-nodes EndpointSlice
+            # (`kubernetes_discovery.go`). This half substitutes this port into
+            # that answer, so the dial is Pod to Pod. A ClusterIP Service in
+            # front of the node service would load-balance calls that are each
+            # addressed to one named machine — a create meant for node-a
+            # arriving at node-b, silently.
+            #
+            # Set explicitly at its own default so it can be compared against
+            # AENV_NODE_SERVICE_ADDR on the DaemonSet. The two disagreeing is
+            # this half dialling a closed port on every machine in the fleet,
+            # and there is a test that reads both files.
+            - name: AENV_NODE_SERVICE_PORT
+              value: "8001"
             # 🔴 The replica's identity, and it must be the Pod's name rather
             # than the machine's.
             #

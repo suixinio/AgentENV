@@ -156,6 +156,28 @@ configMapGenerator:
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=
       - GATEWAY_RESUME_ADDR=
+  # 阶段 3a's third switch, kept apart from the two above because it does not
+  # cost what they cost.
+  #
+  # It lets `--role all` serve the node sandbox service, which is what gives the
+  # api half a machine to drive while the DaemonSet is still `--role all`. The
+  # two keys above are read by the gateway: a single Deployment, rolled in
+  # seconds, in either direction. This one is read by every node in the fleet,
+  # and a process reads its environment once — so changing it is a serial
+  # DaemonSet roll with a drain per machine, whatever form the value takes.
+  #
+  # 🔴 Merged into api-upstream-config, an operator flipping "the 3a switches"
+  # would flip this one too and discover the price afterwards. Two ConfigMaps is
+  # the cheapest way to say that one of these is not like the others.
+  #
+  # Order: this one first, on its own, as a planned step while the gateway still
+  # points at the nodes and nothing dials the new listener. Then the two above,
+  # which are the switch that actually moves traffic. Rolling back reverses only
+  # the two above — see the note on this key in agentenv-daemonset.yaml for why
+  # leaving this one on is correct.
+  - name: node-service-config
+    literals:
+      - AENV_NODE_SERVICE_ENABLED=false
 
 images:
   - name: agentenv-gateway

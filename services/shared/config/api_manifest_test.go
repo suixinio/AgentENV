@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -400,5 +401,113 @@ func TestTheManifestsThisPhaseTouchesParseStrictly(t *testing.T) {
 	if err := k8syaml.UnmarshalStrict(misspelled, &appsv1.Deployment{}); err == nil {
 		t.Fatal("the strict decoder accepted a field that does not exist; the checks above are " +
 			"measuring nothing")
+	}
+}
+
+// 🔴 The node-side gate is present on the DaemonSet and generated off.
+//
+// Present-and-off and absent are different claims. `--role all` is today's
+// process verbatim and does not serve the node sandbox service, so 阶段 3a — in
+// which the DaemonSet stays `--role all` — needs a seam that lets it, and the
+// seam has to be in the manifest before it is needed. A key that has to be
+// added first makes switching 3a on a YAML edit against a live fleet.
+//
+// Off is the release decision, and here it is also the safe default twice over:
+// with the gate off this process is byte-identical to the one running now, and
+// nothing dials a listener that is not bound.
+func TestTheNodeServiceGateIsDeclaredAndOff(t *testing.T) {
+	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
+
+	gate, ok := envValue(nodeContainer, "AENV_NODE_SERVICE_ENABLED")
+	if !ok {
+		t.Fatal("the node DaemonSet does not declare AENV_NODE_SERVICE_ENABLED. Without it, giving " +
+			"the api half a machine to drive during 阶段 3a means editing this manifest — and " +
+			"during 3a the DaemonSet is the object whose every change is a serial roll")
+	}
+	if gate.ValueFrom == nil || gate.ValueFrom.ConfigMapKeyRef == nil {
+		t.Fatalf("AENV_NODE_SERVICE_ENABLED is not read from a ConfigMap key (%+v)", gate)
+	}
+	ref := gate.ValueFrom.ConfigMapKeyRef
+	if ref.Optional == nil || !*ref.Optional {
+		t.Fatal("AENV_NODE_SERVICE_ENABLED is a required ConfigMap key; a cluster that has not " +
+			"created that ConfigMap would fail to start every node over a switch that is off")
+	}
+
+	// 🔴 Generated, and generated to a value that reads as off. "The key is
+	// absent from the generator" and "the key is there and says false" are the
+	// two states this has to tell apart: the first leaves the behaviour to a
+	// code default nothing in this repository pins, the second is the manifest
+	// saying it.
+	value := generatedLiteral(t, ref.Name, ref.Key)
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "false", "off", "0":
+	default:
+		t.Fatalf("%s/%s is generated as %q; 3a ships with the node service off, and turning it on "+
+			"is a planned DaemonSet roll rather than something that arrives with an image",
+			ref.Name, ref.Key, value)
+	}
+
+	// 🔴 Kept out of the ConfigMap the gateway's two switches live in, on
+	// purpose. Those are a Deployment rolled in seconds; this one is every node
+	// in the fleet, serially, with a drain each. An operator flipping "the 3a
+	// switches" in one object would pay that price without having chosen it.
+	if ref.Name == "api-upstream-config" {
+		t.Fatal("the node service gate shares a ConfigMap with the gateway's switches; they do not " +
+			"cost the same to flip, and one edit should not be able to move both")
+	}
+
+	// The api half never binds this listener, so it must not carry the gate —
+	// with the DaemonSet's copy above as the control that the name is right.
+	apiContainer := onlyContainer(t, "the api Deployment", apiDeployment(t).Spec.Template.Spec.Containers)
+	if _, ok := envValue(apiContainer, "AENV_NODE_SERVICE_ENABLED"); ok {
+		t.Fatal("the api Deployment carries the node service gate; that half drives machines, it is " +
+			"not one, and a listener bound there would be a node service with no node behind it")
+	}
+}
+
+// 🔴 Both ends of the node gRPC hop, read out of two files.
+//
+// The api half dials a machine by substituting its own AENV_NODE_SERVICE_PORT
+// into the address the scheduler gave it — the Pod's own IP, from the
+// agentenv-nodes EndpointSlice. Nothing in between resolves or corrects that
+// number: no Service, no DNS name. If it disagrees with what the node listens
+// on, every call the api half makes is a connection refused, on every machine,
+// starting the moment 3a is switched on.
+func TestTheApiHalfDialsThePortTheNodeListensOn(t *testing.T) {
+	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
+	apiContainer := onlyContainer(t, "the api Deployment", apiDeployment(t).Spec.Template.Spec.Containers)
+
+	listen, ok := envValue(nodeContainer, "AENV_NODE_SERVICE_ADDR")
+	if !ok {
+		t.Fatal("the node DaemonSet does not say where its node service listens, so the port the " +
+			"api half dials has nothing to be checked against")
+	}
+	listens := listenPort(t, listen.Value)
+
+	dial, ok := envValue(apiContainer, "AENV_NODE_SERVICE_PORT")
+	if !ok {
+		t.Fatal("the api Deployment does not set AENV_NODE_SERVICE_PORT; it would take the code " +
+			"default, and nothing here could tell whether that matched the node's listener")
+	}
+	dials, err := strconv.Atoi(strings.TrimSpace(dial.Value))
+	if err != nil {
+		t.Fatalf("the api Deployment's AENV_NODE_SERVICE_PORT is not a number: %q", dial.Value)
+	}
+
+	if int32(dials) != listens {
+		t.Fatalf("the api half dials %d and the node listens on %d", dials, listens)
+	}
+
+	// ...and the node declares it as a container port, so the listener is
+	// visible to somebody reading the workload rather than only to somebody
+	// reading its environment.
+	declared := false
+	for _, port := range nodeContainer.Ports {
+		if port.ContainerPort == listens {
+			declared = true
+		}
+	}
+	if !declared {
+		t.Fatalf("the node DaemonSet listens on %d and declares ports %v", listens, nodeContainer.Ports)
 	}
 }

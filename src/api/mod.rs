@@ -1,4 +1,5 @@
 mod control_plane_gate;
+pub mod grpc;
 mod impls;
 /// The public pagination token's codec.
 ///
@@ -14,4 +15,4 @@ mod proxy;
 mod role_gate;
 pub mod server;
 
-pub use impls::{ApiImpl, PausedSandboxWiring, StaleReleaseOutcome};
+pub use impls::{ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};

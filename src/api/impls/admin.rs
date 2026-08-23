@@ -542,6 +542,10 @@ mod operator_snapshot_delete_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
+            // 🔴 `All` and not a default: these fixtures predate the split and
+            // assert today's behaviour, which is what `all` is defined as.
+            crate::role::ServerRole::All,
+            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
 
         Surface {

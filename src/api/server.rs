@@ -33,6 +33,20 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
+    // 🔴 The role now has two carriers: this parameter, which the role gate
+    // reads, and the `ApiImpl`, which the data plane's auto-resume arm reads
+    // (`crate::api::proxy::resolve_proxy_request`). Every assembly in
+    // `src/bin/server.rs` passes one variable to both, and this catches the day
+    // one of them stops doing so — a router gated as `node` whose `ApiImpl`
+    // still believes it is `all` would refuse user REST while going on waking
+    // sandboxes on its own initiative, which is the precise half-landed state
+    // `--role node` exists to end, and nothing else would notice.
+    debug_assert_eq!(
+        role,
+        AsRef::<ApiImpl>::as_ref(&api_impl).role(),
+        "the role this router is gated on and the role its ApiImpl holds must agree"
+    );
+
     // Keep the generated control-plane API as the primary router, then merge in
     // the hand-written `/proxy/*` entrypoints needed for the temporary reverse
     // proxy contract.

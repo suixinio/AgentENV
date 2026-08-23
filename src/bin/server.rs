@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use agentenv::api::{server, ApiImpl, PausedSandboxWiring, StaleReleaseOutcome};
+use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
 use agentenv::cfg::{AppConfig, PausedRegistryBackendKind};
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
@@ -429,6 +429,17 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
         core.observability,
         paused_wiring,
         config.sandbox_proxy.domains.clone(),
+        role,
+        // 🔴 The real placement source, even though nothing serves the wake-up
+        // gRPC surface on this role today. `all` is the one role that both
+        // answers wake decisions and runs the sandboxes, so if that surface is
+        // ever exposed here it must arrive with the pin check already wired:
+        // an unpublished pause woken on the wrong machine does not fail, it
+        // rebuilds from an older snapshot and loses the last pause silently.
+        //
+        // Costs nothing at startup — `connect_lazy` opens no socket — and the
+        // startup-sequence gate accounts for it by name.
+        ResumeWiring::from_config(&core.identity.id)?,
     ));
     // All three run before the listener opens, and the order is load-bearing.
     //
@@ -559,6 +570,12 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         core.observability,
         paused_wiring,
         config.sandbox_proxy.domains.clone(),
+        role,
+        // 🔴 No placement source, and that is the role showing through rather
+        // than an omission: `serves_wake_decisions()` is false here, so nothing
+        // on this process may consult a placement. Handing it one would be
+        // handing it the means to decide something it must not decide.
+        ResumeWiring::node_local(&core.identity.id),
     ));
 
     Ok(Assembly {

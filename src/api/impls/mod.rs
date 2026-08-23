@@ -5,6 +5,7 @@ mod pagination;
 pub use pagination::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
 mod paused_coordinator;
 mod paused_recovery;
+mod resume_surface;
 mod sandbox;
 mod snapshots;
 mod template;
@@ -20,6 +21,7 @@ use crate::identity::NodeIdentity;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
+use crate::role::ServerRole;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
@@ -27,7 +29,20 @@ use agentenv_http_server::{apis, models};
 pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
 // The data-plane auto-resume takes the same decision the REST resume does; both
 // reach it through this one point.
+//
+// 🔴 Still true after the wake-up decision moved to `resume_surface`, and it is
+// what makes the move safe: the gRPC surface the gateway calls, the REST resume
+// route, and the local reverse proxy's `try_auto_resume` all arbitrate here.
+// Three callers, one place a resume can acquire the right to start.
 pub(in crate::api) use paused_recovery::ResumeArbitration;
+pub use resume_surface::ResumeWiring;
+pub(in crate::api) use resume_surface::{
+    DataPlaneResume, DataPlaneResumeRequest, PinRefusalReason,
+};
+#[cfg(test)]
+pub(in crate::api) use resume_surface::{
+    PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource, WakeSite,
+};
 
 #[derive(Clone, Debug)]
 pub struct Claims;
@@ -78,9 +93,25 @@ pub struct ApiImpl {
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
+    /// Which half of the split this process runs.
+    ///
+    /// 🔴 Held rather than read from a global for the same reason
+    /// `crate::api::server::new` takes it as a parameter: the failure mode of
+    /// getting it wrong is a node that quietly goes on deciding when sandboxes
+    /// should be alive, which is the one thing `--role node` exists to end.
+    role: ServerRole,
+    /// What the data-plane wake-up path needs beyond the above: where the
+    /// cluster says a sandbox may be woken, and whether this process wakes them
+    /// itself.
+    resume_wiring: ResumeWiring,
 }
 
 impl ApiImpl {
+    // Nine, and each one is a distinct subsystem this surface needs rather than
+    // a parameter that could be folded into another. The two newest — the role
+    // and the wake-up wiring — are deliberately separate: the role is read on
+    // the data plane's proxy path, the wiring only on the cold path.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<dyn SandboxOrchestration>,
         snapshot_manager: Arc<SnapshotManager>,
@@ -89,6 +120,8 @@ impl ApiImpl {
         observability: Option<Arc<ObservabilityService>>,
         paused: PausedSandboxWiring,
         sandbox_proxy_domains: Vec<String>,
+        role: ServerRole,
+        resume_wiring: ResumeWiring,
     ) -> Self {
         Self {
             orchestrator,
@@ -99,7 +132,14 @@ impl ApiImpl {
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
+            role,
+            resume_wiring,
         }
+    }
+
+    /// Which half of the split this process runs.
+    pub(crate) fn role(&self) -> ServerRole {
+        self.role
     }
 
     pub(crate) fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {

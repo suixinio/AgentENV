@@ -1,0 +1,25 @@
+# Keeps a voluntary disruption from taking the whole api half away at once.
+#
+# With two replicas this permits one to be evicted — a node drain, a cluster
+# upgrade — and blocks the second while the first has not come back. Once the
+# gateway's REST upstream points here, every user-facing REST call in the
+# cluster arrives through this Deployment, so "both replicas gone at the same
+# moment" is a control-plane outage rather than a slow request.
+#
+# 🔴 Unlike the scheduler's, this budget does not block `kubectl drain` on a
+# healthy cluster: minAvailable 1 of 2 leaves one eviction available. It becomes
+# blocking exactly when it should, which is when only one replica is up.
+#
+# To drain past it anyway, delete this object, drain, and re-apply it — the same
+# escape hatch scheduler-pdb.yaml documents.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agentenv-api
+  labels:
+    app.kubernetes.io/name: agentenv-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentenv-api

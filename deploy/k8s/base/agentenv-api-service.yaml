@@ -1,0 +1,32 @@
+# The two addresses the gateway knows the api half by.
+#
+# 🔴 A ClusterIP with a stable name, not the headless Service the nodes have.
+# `agentenv-nodes` is headless because the scheduler names individual machines
+# and traffic has to reach the one named; here the opposite is true — any
+# replica can answer for any sandbox, because the ledger is in Redis — so load
+# balancing across the replicas is the whole point.
+#
+# Both ports carry 阶段 3a's two switches:
+#   · `http` is what `gateway.rest_upstream_addr` points at.
+#   · `grpc` is what `gateway.resume_addr` points at.
+# Neither switch can be flipped before this object exists, which is why it is a
+# separate manifest from the Deployment and applied with it rather than after.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-api
+  labels:
+    app.kubernetes.io/name: agentenv-api
+spec:
+  selector:
+    app.kubernetes.io/name: agentenv-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+    # ResumeSandbox. Matches `[cluster].api_grpc_addr` — the Deployment sets
+    # AENV_API_GRPC_ADDR to the same port explicitly so the three agree in one
+    # readable step rather than through a default nobody looks up.
+    - name: grpc
+      port: 8002
+      targetPort: grpc

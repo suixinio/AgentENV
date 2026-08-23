@@ -1,0 +1,329 @@
+# The deciding half of the split control plane: user-facing REST, sandbox
+# ownership, placement. Same image as the node DaemonSet, told which half it is
+# by `--role api` (`src/role.rs`).
+#
+# 🔴 This is the workload 阶段 3a brings up while the DaemonSet stays on
+# `--role all`. Bringing it up is not what turns 3a on — the gateway's
+# `rest_upstream_addr` is (see gateway-deployment.yaml). That separation is the
+# whole of 3a's rollback story: an api Deployment that is running but that
+# nothing is pointed at costs two idle pods, and pointing the gateway back at
+# the nodes is one value change and a gateway roll, seconds, without touching
+# the DaemonSet. 3b — the DaemonSet moving to `--role node` — is the expensive
+# one to reverse, and nothing here may borrow from it
+# (`_sd-impl-phase3-role.md` §11.1, §11.2).
+#
+# 🔴 `--role api` does not assemble yet. `src/bin/server.rs::assemble_api` bails
+# with a message naming what is missing (the cluster metadata store and the
+# remote backend factory are both written and neither is wired; neither new
+# gRPC listener is bound in any role). Applying this before that lands is a
+# CrashLoopBackOff whose logs say exactly that. It is checked in now because the
+# manifest was itself one of the named gaps, and because a workload that appears
+# for the first time during an incident is a workload nobody has read.
+#
+# 🔴 It also has one precondition no other workload in this tree has: the
+# `agentenv-runtime-secrets` Secret must carry `sandbox-access-token-hash-seed`,
+# because the reference below is `optional: false`. On a cluster without it the
+# Pods stop at CreateContainerConfigError instead of starting. That is the
+# intended behaviour and the reason is under the env var itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentenv-api
+  labels:
+    app.kubernetes.io/name: agentenv-api
+spec:
+  # Two, because the point of this half is that no single replica owns a
+  # sandbox: the ledger is in Redis and any replica can answer for any sandbox.
+  # One replica would make every restart a control-plane outage while proving
+  # none of that.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentenv-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentenv-api
+    spec:
+      # 🔴 60, not the DaemonSet's 3600. That number buys a node time to pause
+      # and persist every sandbox it is running; this half runs none. Copying it
+      # would make every api rollout take an hour to finish for no reason at
+      # all, and would hide a hung shutdown behind a wait nobody watches.
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/os: linux
+      affinity:
+        podAntiAffinity:
+          # Preferred and not required: a single-node dev cluster must still be
+          # able to place both replicas, and a hard rule there leaves one
+          # Pending forever with the second replica's whole point — surviving
+          # the loss of one machine — unavailable anyway.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: agentenv-api
+      containers:
+        - name: agentenv
+          # 🔴 The same image as agentenv-daemonset.yaml, deliberately. One
+          # binary, two roles: an api image that could drift from the node image
+          # would mean the node gRPC contract has two sides built from two
+          # commits, and nothing would report it.
+          image: agentenv-runtime:latest
+          imagePullPolicy: IfNotPresent
+          # 🔴 The role travels as an argument rather than as AENV_ROLE, and the
+          # asymmetry with the DaemonSet is intentional. `--role` wins over the
+          # environment (`ServerRole::resolve`), so a Pod that must never be
+          # anything else says so where an env edit cannot reach — and this Pod
+          # must never be anything else: `--role all` here would run
+          # `require_runtime_capabilities` and reach for /dev/kvm on a container
+          # that has neither. The role that has to stay flippable is the
+          # DaemonSet's (3b's rollback), and that one is not set here.
+          args:
+            - --role
+            - api
+          env:
+            - name: AENV_CONFIG_PATH
+              value: /workspace/config/agentenv.toml
+            # 🔴 optional: false, and this is the one place in the tree where a
+            # missing key must stop a Pod from starting.
+            #
+            # envd access tokens are HMAC(seed, sandbox_id). With no seed
+            # configured the process invents a node-local one, which is
+            # survivable for a single machine and silently corrupting for a
+            # replicated half: replica A mints a token, the user holds it,
+            # replica B derives a different one on the next GET or the next
+            # resume, and the user's token stops working with no error, no log
+            # and no metric anywhere (`_sd-impl-phase3-role.md` §9.2). A Pod
+            # that will not start is the only failure mode of that fault that
+            # anybody sees.
+            #
+            # The same Secret and the same key the DaemonSet reads, so one value
+            # covers the cluster. `optional: true` there is deliberate and stays
+            # that way: a single-node deployment with a generated seed works.
+            - name: AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-runtime-secrets
+                  key: sandbox-access-token-hash-seed
+                  optional: false
+            # Where this replica's own ledger of active sandboxes lives.
+            #
+            # 🔴 Written out here rather than read from a ConfigMap the way the
+            # node reads its paused-registry backend, because the two choices
+            # are not alike. A node may legitimately be `local`/`in_memory` —
+            # its records describe the machine it is on. An api replica may not:
+            # `in_memory` would give each replica a private opinion about
+            # sandboxes the others also answer for. `--role api` refuses to
+            # start on `in_memory` rather than starting like that, and these two
+            # lines are what it wants instead.
+            - name: AENV_ORCHESTRATOR_STORE_BACKEND
+              value: "redis"
+            # 🔴 The one place in this tree that carries shared-store addressing
+            # into an AgentENV process, and it is on purpose that it is this
+            # workload. §0's second hard constraint of the split proposal:
+            # the `node` role holds no shared-storage credentials. Every machine
+            # that runs user code would otherwise hold the address and the
+            # credentials of the cluster's ledger. Do not copy this line, or
+            # AENV_ORCHESTRATOR_STORE_REDIS_URL in any form, into
+            # agentenv-daemonset.yaml.
+            #
+            # The same Redis the scheduler's bindings and the gateway's routing
+            # projection use (redis.yaml), under a key prefix of its own
+            # (`agentenv:api`) that the store refuses to start with if it
+            # overlaps `agentenv:scheduler:bindings:*`.
+            - name: AENV_ORCHESTRATOR_STORE_REDIS_URL
+              value: redis://agentenv-redis:6379
+            # The cluster-wide registry of paused sandboxes, which this half
+            # arbitrates: it claims rows, renews their leases, reconciles them
+            # and discards them. `central` reaches it through the scheduler, so
+            # no database credential lands here either.
+            #
+            # Not a configMapKeyRef, for the same reason as the store above: the
+            # node's copy of this key may fall back to `local` and still be
+            # correct, and this one may not. An api replica running a node-local
+            # paused registry would arbitrate a registry only it can see.
+            - name: AENV_PAUSED_REGISTRY_BACKEND
+              value: "central"
+            - name: API_ADDR
+              value: "0.0.0.0:8000"
+            # The data plane's wake-up surface (ResumeSandbox), which the
+            # gateway's cold path calls when the routing projection has no
+            # answer. Set explicitly at its own default so the containerPort
+            # below has a visible source and the two cannot drift.
+            #
+            # 🔴 Nothing binds this listener yet — `api::grpc::serve` is written
+            # and uncalled in every role — so until that lands the gateway's
+            # `resume_addr` pointed here gets a connection refused, which the
+            # resume client reads as VerdictUndecided and falls back to the
+            # scheduler. That is the safe direction: latency, not availability.
+            - name: AENV_API_GRPC_ADDR
+              value: "0.0.0.0:8002"
+            # 🔴 The replica's identity, and it must be the Pod's name rather
+            # than the machine's.
+            #
+            # This half releases, renews and reconciles paused-registry rows by
+            # node identity, and the rows are keyed by the machine that holds
+            # the sandbox. An api replica reporting `spec.nodeName` would share
+            # an identity with the node DaemonSet Pod on that same machine, and
+            # its startup pass would release that machine's live holdings out
+            # from under it — the same family of fault as two servers sweeping
+            # one host, reached by a different mistake.
+            - name: AENV_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # The same cluster name both sides of the registry read. See the
+            # note on this ConfigMap in kustomization.yaml.
+            - name: AENV_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-identity-config
+                  key: CLUSTER_ID
+                  optional: true
+            # 🔴 false. A heartbeat reports a machine — its CPU, its memory, the
+            # sandboxes on it — and this replica is not one. Reporting itself
+            # would put a node in the scheduler's table that can never run
+            # anything, and the scheduler would place sandboxes on it.
+            #
+            # Set explicitly even though `false` is the code default: this is a
+            # line somebody would otherwise copy from the DaemonSet, where it is
+            # `true`, without noticing what it means here.
+            - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
+              value: "false"
+            # Still needed, and not for heartbeats: the `central` paused
+            # registry above speaks to the scheduler over this endpoint.
+            - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
+              value: http://agentenv-scheduler:9090
+            # Where this half's control-plane credential is read from, re-read
+            # while the process runs. A volume rather than a secretKeyRef for
+            # the reason the DaemonSet gives: kubelet refreshes volumes and does
+            # not refresh env.
+            #
+            # 🔴 A key of its own (`api-gate-token`), not the node's. One Secret
+            # carries the gateway's stamp under `token` and each gate's copy
+            # under its own key, so that creating or extending the Secret lights
+            # one participant at a time. Projecting the node's key here would
+            # mean the step that opens the node's gate also opens this one — and
+            # if the gateway were not yet stamping, that single act would refuse
+            # every REST request in the cluster at once.
+            - name: AENV_API_CONTROL_PLANE_TOKEN_FILE
+              value: /etc/agentenv/control-plane/token
+            # The domain sandbox URLs are built from. Not node state: this half
+            # answers `GET /sandboxes/{id}`, and `sandbox.domain` in that answer
+            # comes from this value. An api half without it answers `null` and
+            # every SDK client builds the wrong URL.
+            - name: AENV_SANDBOX_PROXY_DOMAINS
+              valueFrom:
+                configMapKeyRef:
+                  name: sandbox-proxy-config
+                  key: SANDBOX_PROXY_DOMAINS
+                  optional: true
+            # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and
+            # everywhere else in this tree. It makes a process sweep the host
+            # for another process's leftover VMs, which is sound for `--role
+            # node` — where it defaults to on — and destructive anywhere two
+            # servers can share a machine. This half has no host to sweep.
+          ports:
+            - name: http
+              containerPort: 8000
+            # The wake-up surface. Named `grpc` rather than `resume` because it
+            # is the whole gRPC listener of this half, of which ResumeSandbox is
+            # today the only method.
+            - name: grpc
+              containerPort: 8002
+            # 🔴 No metrics port. This half serves Prometheus on `/metrics` of
+            # the HTTP port above (`src/api/server.rs`), unlike the gateway and
+            # the scheduler which have listeners of their own — and unlike the
+            # node, whose second port belongs to the ublk daemon this half does
+            # not run.
+          resources:
+            requests:
+              # 🔴 Unmeasured. A control-plane process that proxies and talks to
+              # Redis, sized so it is not BestEffort — the failure this guards
+              # is an api Pod being the first thing evicted from a machine whose
+              # node Pod has asked for 8Gi. Revise from real numbers once this
+              # half has served traffic; do not read these as measurements.
+              cpu: 100m
+              memory: 512Mi
+            # No limits, deliberately. A CPU limit on a request-proxying process
+            # turns a busy moment into throttling that looks like an upstream
+            # being slow, and this half is on the path of every REST call.
+          securityContext:
+            # 🔴 The inverse of the DaemonSet's `privileged: true`, and stated
+            # rather than left out. This half touches no /dev/kvm, creates no
+            # network namespace and opens no ublk device; `ServerRole` is what
+            # keeps it from constructing any of that, and this is the deployment
+            # saying the same thing in the place a reader of the manifest looks.
+            # If either statement is ever wrong, the Pod fails loudly here
+            # instead of quietly acquiring a privilege it was never meant to
+            # hold.
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            # 60s. The node's 240s covers downloading Firecracker, the kernel
+            # and the tools drive, and priming a VMM pool; this half does none
+            # of it and a slow start here is a fault rather than a warm-up.
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: agentenv-config
+              mountPath: /workspace/config/agentenv.toml
+              subPath: agentenv.toml
+              readOnly: true
+            - name: scratch
+              mountPath: /workspace/env
+            - name: control-plane-token
+              mountPath: /etc/agentenv/control-plane
+              readOnly: true
+      volumes:
+        # 🔴 The config ConfigMap, an emptyDir and one projected Secret key —
+        # and nothing else. In particular **no `hostPath: /var/lib/aenv` and no
+        # `hostPath: /dev`**, both of which the DaemonSet has and both of which
+        # would hand this half write access to a machine's local sandbox state
+        # and to its devices. There is no arrangement in which this process
+        # should touch either.
+        - name: agentenv-config
+          configMap:
+            name: agentenv-k8s-config
+        # The image sets AENV_HOME_PATH=/workspace/env, and the process creates
+        # caches under it. On the node that path is the machine's hostPath; here
+        # it is scratch with the Pod's own lifetime. If anything this half writes
+        # there ever needs to survive a restart, that is a bug in the api half —
+        # its durable state belongs in the shared store — and not a missing
+        # volume.
+        - name: scratch
+          emptyDir: {}
+        # optional: an absent Secret, or a Secret without this key, mounts
+        # nothing, this half reads no credential, and its gate stays off — which
+        # is the state this ships in. Rolling the gate back is setting
+        # `api-gate-token` to the empty string, never deleting the key: a failed
+        # read deliberately keeps the last credential, and a deleted key is a
+        # failed read (`src/api/control_plane_gate.rs`).
+        - name: control-plane-token
+          secret:
+            secretName: agentenv-control-plane-token
+            optional: true
+            items:
+              - key: api-gate-token
+                path: token

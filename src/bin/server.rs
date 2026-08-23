@@ -1128,12 +1128,36 @@ mod tests {
 
         // 🔴 The control. Without it this test passes just as well against a
         // function that refuses every configuration, including the right one.
+        //
+        // 🔴 Every value set here differs from what `RedisStoreConfig::default()`
+        // would supply, and that is the point rather than arbitrary. Only three
+        // of that struct's ~twenty fields come from configuration; the rest
+        // arrive through `..Default::default()`, so a field this function
+        // forgot to carry would silently take the default — and if the test
+        // used the default value, the assertion would agree with it.
         config.orchestrator.store.backend = MetadataStoreBackendKind::Redis;
         config.orchestrator.store.redis_url = "redis://cluster-redis:6379".to_string();
+        config.orchestrator.store.redis_key_prefix = "agentenv:probe".to_string();
+        config.orchestrator.store.redis_distributed_lock_enabled = false;
+
+        let defaults = agentenv::orchestrator::RedisStoreConfig::default();
+        assert_ne!(defaults.url, config.orchestrator.store.redis_url);
+        assert_ne!(
+            defaults.key_prefix,
+            config.orchestrator.store.redis_key_prefix
+        );
+        assert!(defaults.distributed_lock_enabled);
+
         let store = cluster_store_config(&config.orchestrator.store)
             .expect("the cluster store is what this role is for");
         assert_eq!(store.url, "redis://cluster-redis:6379");
-        assert_eq!(store.key_prefix, config.orchestrator.store.redis_key_prefix);
+        assert_eq!(store.key_prefix, "agentenv:probe");
+        assert!(!store.distributed_lock_enabled);
+        // The settings that are deliberately *not* configurable still arrive,
+        // and arrive at the values whose ordering `validate` checks.
+        store
+            .validate()
+            .expect("the defaults this function leans on must be a valid combination");
     }
 
     // 🔴 `#[tokio::test]` rather than `#[test]`: the control probe at the end

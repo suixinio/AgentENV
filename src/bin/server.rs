@@ -595,16 +595,34 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 /// `--role api`: the deciding half.
 ///
 /// 🔴 Not assemblable yet, and it says so rather than starting something that
-/// resembles it. Two pieces are missing, both of them the substance of later
-/// slices rather than details:
+/// resembles it. Two pieces are missing — and "missing" now means *unwired*
+/// rather than *absent*, which is a materially different distance and is worth
+/// stating precisely, because the message below used to say neither had landed
+/// and both since have:
 ///
 /// - the cluster `MetadataStore` this role's `Orchestrator` reads and writes.
 ///   The in-memory store is one process's private ledger; an API replica that
 ///   used it would hold an opinion about sandboxes no other replica shared.
+///   `RedisMetadataStore` exists and passes the shared store contract; nothing
+///   constructs it, and no configuration selects it.
 /// - the backend factory that drives sandboxes on other machines over the node
 ///   gRPC service. Without it the only factory available is the Firecracker
 ///   one, which would have this process reach for `/dev/kvm` on a Pod that has
 ///   none — and, worse, succeed on a host where it does.
+///   `RemoteSandboxBackendFactory` exists; nothing outside its own tests
+///   constructs it, and two of its arms still refuse (a cold create, and a
+///   resume of a capture held on another machine).
+///
+/// 🔴 And two more things this role needs that are not in this function at all,
+/// recorded here because a reader arriving at "why can 阶段 3a not be deployed"
+/// will otherwise find only the two above:
+///
+/// - **nothing binds either new gRPC listener.** `node_server::serve` and
+///   `api::grpc::serve` are both written and both uncalled, in every role.
+/// - **there is no `agentenv-api` manifest** anywhere under `deploy/`, base or
+///   overlay. §11.2's 3a is "the DaemonSet stays on `--role all`, bring up
+///   `agentenv-api --role api` ×2"; the first half is what runs today and the
+///   second half has nothing to apply.
 ///
 /// Everything else this role wants exists already and is listed here so the
 /// next slice does not have to rediscover it: `ConfigManager`, `NodeIdentity`,
@@ -618,9 +636,9 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 /// `FirecrackerSandboxFactory` or the heartbeat reporter.
 async fn assemble_api(_config: &AppConfig) -> anyhow::Result<Assembly> {
     anyhow::bail!(
-        "--role api cannot be assembled yet: it needs a cluster metadata store and a remote \
-         sandbox backend factory, and neither has landed. Run --role all (the default) until \
-         they have."
+        "--role api cannot be assembled yet: the cluster metadata store and the remote sandbox \
+         backend factory both exist, and neither is wired into this function — nor is either \
+         new gRPC listener bound, in any role. Run --role all (the default) until they are."
     )
 }
 

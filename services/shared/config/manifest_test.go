@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -260,4 +261,70 @@ func nodeIdentityClusterID(t *testing.T) string {
 	}
 	t.Fatal("config/default.toml has no [node_identity].cluster_id; the node's fallback cannot be compared against the ConfigMap")
 	return ""
+}
+
+// 🔴 阶段 3a's switch is present in the mounted ConfigMap and set to off.
+//
+// Two halves, and the second is the one worth having. That the key is *there*
+// is what makes turning 3a on a value change and turning it back off a value
+// change — seconds, and a gateway restart (`_sd-impl-phase3-role.md` §11.1,
+// §11.2). A key that has to be added first makes the rollback a manifest edit
+// under incident pressure, and the rollback is the thing 3a is staged behind.
+//
+// That it is set to *off* is the release decision: the shadow phase leaves
+// every projection miss falling through to the scheduler, with the node the
+// request lands on waking the sandbox itself, which is today's behaviour
+// exactly. Turning it on is a deliberate act by an operator who has read the
+// runbook, and never a default that arrived with an image.
+func TestGatewayResumeAddrIsDeclaredAndOff(t *testing.T) {
+	t.Setenv("GATEWAY_RESUME_ADDR", "")
+
+	raw, err := os.ReadFile(filepath.Join(manifestDir, "config", "gateway.json"))
+	if err != nil {
+		t.Fatalf("reading the mounted gateway config failed: %v", err)
+	}
+	var mounted struct {
+		Gateway map[string]json.RawMessage `json:"gateway"`
+	}
+	if err := json.Unmarshal(raw, &mounted); err != nil {
+		t.Fatalf("the mounted gateway config is not valid JSON: %v", err)
+	}
+	if _, declared := mounted.Gateway["resume_addr"]; !declared {
+		t.Fatalf("the mounted gateway config does not name resume_addr, so enabling 阶段 3a " +
+			"— or rolling it back — means editing the manifest rather than a value")
+	}
+
+	cfg, err := Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway")
+	if err != nil {
+		t.Fatalf("loading the mounted gateway config failed: %v", err)
+	}
+	if cfg.Gateway.ResumeAddr != "" {
+		t.Fatalf("the mounted gateway config sends wake-ups to %q; the shadow phase ships with "+
+			"this off", cfg.Gateway.ResumeAddr)
+	}
+
+	// Resolution: the same loader does carry a value through, so the empty
+	// string above is the manifest's decision and not a key nothing reads.
+	path := filepath.Join(t.TempDir(), "gateway.json")
+	if err := os.WriteFile(path, []byte(`{"gateway":{"resume_addr":"agentenv-api:9090"}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err = Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Gateway.ResumeAddr != "agentenv-api:9090" {
+		t.Fatalf("resume_addr in a config file came out as %q", cfg.Gateway.ResumeAddr)
+	}
+
+	// ...and so does the environment, which is how one gateway is flipped
+	// without editing the ConfigMap every other gateway shares.
+	t.Setenv("GATEWAY_RESUME_ADDR", "agentenv-api-canary:9090")
+	cfg, err = Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Gateway.ResumeAddr != "agentenv-api-canary:9090" {
+		t.Fatalf("the environment did not override the manifest: got %q", cfg.Gateway.ResumeAddr)
+	}
 }

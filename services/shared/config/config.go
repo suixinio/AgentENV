@@ -1122,6 +1122,7 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
 	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
+	set("GATEWAY_RESUME_ADDR", &cfg.Gateway.ResumeAddr)
 	set("GATEWAY_REDIS_ADDR", &cfg.Gateway.RedisAddr)
 	// A shared secret, so it arrives the same way the DSN does and never through
 	// the ConfigMap.

@@ -820,6 +820,37 @@ pub struct ClusterConfig {
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint: Option<String>,
+    /// Where `--role node` serves the node sandbox service — the gRPC surface
+    /// the API half drives a machine through (`crate::node_server`).
+    ///
+    /// 🔴 A second listener rather than a route on the HTTP port, because the
+    /// two have different audiences: this one is spoken to only by the API
+    /// half, and a deployment has to be able to expose them differently.
+    /// `--role api` and `--role all` never bind it — see `ServerRole` for why
+    /// `all` in particular must not.
+    #[config(default = "0.0.0.0:8001", env = "AENV_NODE_SERVICE_ADDR")]
+    pub node_service_addr: String,
+    /// Where `--role api` serves the data plane's wake-up surface
+    /// (`crate::api::grpc`).
+    ///
+    /// Separate from the HTTP port for the same reason as above: the gateway's
+    /// cold path is the only caller.
+    #[config(default = "0.0.0.0:8002", env = "AENV_API_GRPC_ADDR")]
+    pub api_grpc_addr: String,
+    /// The port the API half reaches a node's [`node_service_addr`] on.
+    ///
+    /// 🔴 A port and not an address, because the *host* is not this process's
+    /// to choose: it comes from the scheduler, which names a node as
+    /// `http://<addr>:<http-port>` (`kubernetes_discovery.go`, and the static
+    /// discovery list). That is the node's user-facing HTTP address, and the
+    /// node service is on a different port of the same machine — so the API
+    /// half substitutes this port into the answer rather than being configured
+    /// with a second endpoint list that would have to be kept in step with the
+    /// first.
+    ///
+    /// [`node_service_addr`]: ClusterConfig::node_service_addr
+    #[config(default = 8001u16, env = "AENV_NODE_SERVICE_PORT")]
+    pub node_service_port: u16,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -891,6 +922,83 @@ pub struct OrchestratorConfig {
     pub shutdown_drain_propagation_secs: u64,
     #[config(nested)]
     pub paused_registry: PausedRegistryConfig,
+    #[config(nested)]
+    pub store: OrchestratorStoreConfig,
+}
+
+/// Where a process's orchestrator keeps its active-state records.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataStoreBackendKind {
+    /// This process's own ledger, lost when it exits.
+    ///
+    /// 🔴 Correct for a machine-local role and *only* for one. A node's records
+    /// describe the sandboxes on that machine, and a machine that is gone has
+    /// no sandboxes; an API replica's records describe sandboxes on other
+    /// machines, and a replica that used this would hold an opinion about them
+    /// that no other replica shared.
+    InMemory,
+    /// The cluster's shared store, so every API replica reads and writes one
+    /// ledger.
+    Redis,
+}
+
+impl MetadataStoreBackendKind {
+    /// The name a deployment writes into `AENV_ORCHESTRATOR_STORE_BACKEND`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InMemory => "in_memory",
+            Self::Redis => "redis",
+        }
+    }
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct OrchestratorStoreConfig {
+    /// 🔴 Settable from the environment for the same reason
+    /// [`PausedRegistryConfig::backend`] is: `deploy/k8s/run.sh` overwrites the
+    /// deployed `config/default.toml` on every apply, so a store selected by
+    /// editing that ConfigMap would silently revert — and revert to the
+    /// per-process ledger, which reports nothing and simply forgets other
+    /// replicas' sandboxes.
+    ///
+    /// The default is what `--role all` and `--role node` want. `--role api`
+    /// refuses to start with it rather than starting a replica whose ledger
+    /// nobody else can see.
+    #[config(default = "in_memory", env = "AENV_ORCHESTRATOR_STORE_BACKEND")]
+    pub backend: MetadataStoreBackendKind,
+    /// `redis://host:port[/db]`, read only when `backend = "redis"`.
+    #[config(
+        default = "redis://127.0.0.1:6379",
+        env = "AENV_ORCHESTRATOR_STORE_REDIS_URL",
+        parse_env = parse_trimmed_string
+    )]
+    pub redis_url: String,
+    /// Prefix for every key the Redis store owns.
+    ///
+    /// 🔴 Must not overlap `agentenv:scheduler:bindings:*`, which is the
+    /// routing projection and belongs to a different subsystem with a
+    /// different lifetime. `RedisStoreConfig::validate` refuses an overlapping
+    /// value at startup rather than letting two owners share a keyspace.
+    #[config(
+        default = "agentenv:api",
+        env = "AENV_ORCHESTRATOR_STORE_KEY_PREFIX",
+        parse_env = parse_trimmed_string
+    )]
+    pub redis_key_prefix: String,
+    /// Whether contended record updates queue behind a distributed lock or
+    /// fail fast.
+    ///
+    /// 🔴 A throughput switch, not a correctness switch: with it off, a
+    /// contended `update_if_state` answers `ConcurrentUpdate` instead of
+    /// waiting, and nothing is corrupted either way. It is exposed because it
+    /// is the one knob whose right value depends on the deployment's replica
+    /// count rather than on the code.
+    #[config(
+        default = true,
+        env = "AENV_ORCHESTRATOR_STORE_DISTRIBUTED_LOCK_ENABLED"
+    )]
+    pub redis_distributed_lock_enabled: bool,
 }
 
 /// Custom extension service integration.
@@ -2587,12 +2695,18 @@ mod tests {
     fn cluster_normalize_trims_and_drops_blank_scheduler_endpoint() {
         let mut config = ClusterConfig {
             scheduler_endpoint: Some("  ".to_string()),
+            node_service_addr: "0.0.0.0:8001".to_string(),
+            api_grpc_addr: "0.0.0.0:8002".to_string(),
+            node_service_port: 8001,
         };
         config.normalize();
         assert_eq!(config.scheduler_endpoint, None);
 
         let mut config = ClusterConfig {
             scheduler_endpoint: Some("  http://scheduler:9090  ".to_string()),
+            node_service_addr: "0.0.0.0:8001".to_string(),
+            api_grpc_addr: "0.0.0.0:8002".to_string(),
+            node_service_port: 8001,
         };
         config.normalize();
         assert_eq!(

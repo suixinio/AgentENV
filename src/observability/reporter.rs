@@ -536,6 +536,9 @@ mod tests {
     fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
             scheduler_endpoint: endpoint.map(|s| s.to_string()),
+            node_service_addr: "0.0.0.0:8001".to_string(),
+            api_grpc_addr: "0.0.0.0:8002".to_string(),
+            node_service_port: 8001,
         }
     }
 

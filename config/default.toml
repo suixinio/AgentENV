@@ -155,6 +155,29 @@ peer_discovery_refresh_interval_secs = 5
 # Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
 
+# Where `--role node` serves the node sandbox service: the gRPC surface the API
+# half drives a machine through. A second listener rather than a route on the
+# HTTP port below, because the two have different audiences — this one is
+# spoken to only by the API half.
+#
+# 🔴 Bound by `--role node` only. `--role all` deliberately does not open it:
+# `all` is the rollback target and is defined as the process that ran before
+# the split, so anything it gains stops it from being that.
+node_service_addr = "0.0.0.0:8001"
+
+# Where `--role api` serves the data plane's wake-up surface. Bound by
+# `--role api` only; the gateway's cold path is its only caller.
+api_grpc_addr = "0.0.0.0:8002"
+
+# The port the API half reaches a node's `node_service_addr` on.
+#
+# 🔴 A port and not an address. The host is not this process's to choose: it
+# comes from the scheduler, which names a node by its user-facing HTTP address.
+# The node service sits on a different port of that same machine, so the API
+# half substitutes this port into the scheduler's answer rather than being
+# given a second endpoint list to keep in step with the first.
+node_service_port = 8001
+
 [api]
 # Credentials that prove a control-plane call arrived through the gateway.
 # Empty (together with control_plane_token_file) leaves the node's user-facing
@@ -245,6 +268,38 @@ projection_ttl_grace_secs = 60
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
 # Cluster-wide registry of paused sandboxes.
+# Where this process's orchestrator keeps its active-state records.
+#
+#   backend = "in_memory"  this process's own ledger, lost when it exits. What
+#                          `--role all` and `--role node` want: their records
+#                          describe the sandboxes on this machine, and a
+#                          machine that is gone has no sandboxes.
+#   backend = "redis"      the cluster's shared store, so every API replica
+#                          reads and writes one ledger.
+#
+# 🔴 `--role api` refuses to start on "in_memory" rather than starting a
+# replica whose ledger no other replica can see. `--role all` never reads this
+# section at all — it is the rollback target and keeps the store it always had.
+#
+# 🔴 Selected through AENV_ORCHESTRATOR_STORE_BACKEND, not by editing the copy
+# of this file that lands in the cluster ConfigMap; see the note below.
+#
+# Only the four settings here are configurable. The Redis store has around
+# twenty further timing parameters, and they are left at the values
+# `RedisStoreConfig::default()` states a reason for — a knob whose right value
+# is derived from the others is a knob that can be set to an invalid
+# combination, and `RedisStoreConfig::validate` would then refuse to start.
+[orchestrator.store]
+backend = "in_memory"
+redis_url = "redis://127.0.0.1:6379"
+# Must not overlap `agentenv:scheduler:bindings:*`, which belongs to the
+# routing projection. An overlapping prefix is refused at startup.
+redis_key_prefix = "agentenv:api"
+# Whether contended record updates queue behind a distributed lock (true) or
+# fail fast with a conflict (false). A throughput switch, not a correctness
+# one: nothing is corrupted either way.
+redis_distributed_lock_enabled = true
+
 #
 # 🔴 This section must stay in this file even when every value is a default.
 # `deploy/k8s/run.sh` copies this file verbatim over the cluster's

@@ -168,26 +168,28 @@ async fn serve_api(resume_wiring: ResumeWiring) -> RunningApi {
     crate::logging::init_for_tests();
     let api = build_api(resume_wiring).await;
 
-    // Take a port from the OS and let it go: `serve_with_shutdown` wants an
-    // address rather than a listener. Same trick as `src/node_client/tests.rs`.
-    let addr: SocketAddr = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port");
-        probe.local_addr().expect("the bound address")
-    };
+    // 🔴 Bound here and handed to `serve_on`, which is the entry point
+    // `assemble_api` uses. Two things follow: there is no window in which
+    // another test in this binary can take the port, and these tests exercise
+    // the function a binary calls rather than a sibling of it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let addr: SocketAddr = listener.local_addr().expect("the bound address");
     let (tx, rx) = oneshot::channel();
 
     let served = Arc::clone(&api);
     tokio::spawn(async move {
-        let _ = super::serve(addr, served, async {
+        let _ = super::serve_on(listener, served, async {
             let _ = rx.await;
         })
         .await;
     });
 
-    // 🔴 Wait for the bind. A connect that raced it comes back as "connection
-    // refused", which is exactly the failure some of these tests are about.
+    // 🔴 Still waited for, and for a narrower reason: the socket is bound, but
+    // the accept loop is in a task that may not have been polled. A connect
+    // that raced it comes back as "connection refused", which is exactly the
+    // failure some of these tests are about.
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             break;

@@ -57,29 +57,34 @@ async fn serve<S>(service: S, orchestration: Option<Arc<dyn SandboxOrchestration
 where
     S: NodeSandboxService,
 {
-    // Take a port from the OS, then let it go: `serve_with_shutdown` wants an
-    // address rather than a listener, and the alternative is a hard-coded port
-    // that collides with whatever else the test binary is running.
-    let addr: SocketAddr = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port");
-        probe.local_addr().expect("the bound address")
-    };
+    // 🔴 Bound here and handed over, rather than bound-probed-and-released.
+    // Two reasons, and the second is why it is worth the extra line: there is
+    // no window in which another test in this binary can take the port, and
+    // the listener is accepting before this function returns — so the loop
+    // that used to wait for the bind, and could time out while a test looked
+    // like a wire failure, is gone.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let addr: SocketAddr = listener.local_addr().expect("the bound address");
     let (tx, rx) = oneshot::channel();
 
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(NodeSandboxServiceServer::new(service))
-            .serve_with_shutdown(addr, async {
-                let _ = rx.await;
-            })
+            .serve_with_incoming_shutdown(
+                tonic::transport::server::TcpIncoming::from(listener),
+                async {
+                    let _ = rx.await;
+                },
+            )
             .await;
     });
 
-    // 🔴 Wait for it. A connect that raced the bind would fail as
-    // "connection refused", which is indistinguishable from the failure half
-    // of these tests are about.
+    // 🔴 Still waited for, and for a narrower reason than before: the socket is
+    // bound, but the accept loop is in a task that may not have been polled.
+    // A connect that raced it comes back as "connection refused", which is
+    // indistinguishable from the failure half of these tests are about.
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             break;
@@ -958,5 +963,86 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
     assert!(
         crate::node_server::owned_by_control_plane(&live).is_empty(),
         "a sandbox nobody claimed must not be offered up for reconciliation"
+    );
+}
+
+/// The node service, stood up the way a binary stands it up.
+///
+/// 🔴 Through `node_server::serve_on` rather than through this file's own
+/// `serve` helper, because that is the function `assemble_node` calls and it
+/// is the one nothing had ever run: the harness above builds its own tonic
+/// server so it can serve scripted services, so it proves the *service*
+/// works and says nothing about the entry point. This also exercises the
+/// shutdown channel, which is what `main` sends on SIGTERM.
+#[tokio::test]
+async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
+    crate::logging::init_for_tests();
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let addr = listener.local_addr().expect("the bound address");
+    let (stop, stopped) = oneshot::channel::<()>();
+
+    let served = Arc::clone(&orchestration);
+    let serving = tokio::spawn(async move {
+        crate::node_server::serve_on(
+            listener,
+            served,
+            Arc::new(resolvable_snapshot_manager()),
+            "node-under-test".to_string(),
+            async {
+                let _ = stopped.await;
+            },
+        )
+        .await
+    });
+
+    let placement = Arc::new(FixedNodePlacement::new(NodeEndpoint {
+        node_id: "node-under-test".to_string(),
+        endpoint: format!("http://{addr}"),
+    }));
+    let factory = RemoteSandboxBackendFactory::new(placement);
+    let config = SandboxLaunchConfig {
+        control_plane_config: Some(b"a marker".to_vec()),
+        ..launch_config()
+    };
+    let sandbox_id = config.sandbox_id;
+
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+        .expect("build a stub");
+    backend
+        .start()
+        .await
+        .expect("the entry point a binary uses serves the same service");
+
+    let live = orchestration
+        .list_live_sandboxes()
+        .await
+        .expect("the node can list what it is running");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].sandbox_id, sandbox_id);
+
+    // 🔴 And it stops when told. `main` sends on this channel from the
+    // graceful-shutdown closure; a surface that ignored it would keep the port
+    // bound and hold the process open past the Pod's termination grace.
+    drop(stop);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+        .await
+        .expect("the surface stops when the shutdown signal fires")
+        .expect("the serving task did not panic");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "the port is still bound after the surface was told to stop"
     );
 }

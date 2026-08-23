@@ -4,17 +4,14 @@
 //! [`resume`] for what it decides and `services/api/proto/apiproxy/apiproxy.proto`
 //! for the contract.
 //!
-//! # 🔴 Not served by any binary yet
+//! # 🔴 Served by `--role api`, and by nothing else
 //!
-//! `--role api` cannot be assembled — it needs a cluster metadata store and the
-//! remote backend factory, and neither has landed (`src/bin/server.rs`,
-//! `assemble_api`) — and `--role all` deliberately does not open a second
-//! listener, because it is the rollback target and is defined as today's
-//! behaviour verbatim. So [`serve`] exists and is exercised by tests over a
-//! real socket; nothing in `src/bin/` calls it.
-//!
-//! That is the same position `src/node_server/` was landed in, and for the same
-//! reason: the transport is the last thing to be wired, not the first.
+//! `assemble_api` binds [`serve_on`] on `[cluster].api_grpc_addr`.
+//! `--role all` deliberately does not open a second listener: it is the
+//! rollback target and is defined as the process that ran before the split.
+//! Under `--role all` the wake-up decision is still taken where it always was —
+//! `try_auto_resume` on the local reverse proxy's request path — which is what
+//! makes rolling back to it a ConfigMap change rather than a code change.
 
 mod resume;
 
@@ -55,10 +52,36 @@ pub async fn serve<I>(
 where
     I: AsRef<ApiImpl> + Send + Sync + 'static,
 {
-    info!(target: "agentenv", %addr, "serving the sandbox resume service");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind the sandbox resume service to {addr}"))?;
+    serve_on(listener, api_impl, shutdown).await
+}
+
+/// Serves the wake-up surface on a listener somebody else bound.
+///
+/// 🔴 The variant a binary uses; see `crate::node_server::serve_on` for why the
+/// bind belongs to the assembly and not to a spawned task. It matters more here
+/// than there: this surface is the *only* way the gateway's cold path can wake
+/// a paused sandbox, and a replica that came up without it answers every
+/// wake-up with a connection refused that the gateway reads as a control plane
+/// that is merely slow.
+pub async fn serve_on<I>(
+    listener: tokio::net::TcpListener,
+    api_impl: I,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()>
+where
+    I: AsRef<ApiImpl> + Send + Sync + 'static,
+{
+    let addr = listener.local_addr().ok();
+    info!(target: "agentenv", ?addr, "serving the sandbox resume service");
     tonic::transport::Server::builder()
         .add_service(server(api_impl))
-        .serve_with_shutdown(addr, shutdown)
+        .serve_with_incoming_shutdown(
+            tonic::transport::server::TcpIncoming::from(listener),
+            shutdown,
+        )
         .await
-        .with_context(|| format!("serve the sandbox resume service on {addr}"))
+        .with_context(|| format!("serve the sandbox resume service on {addr:?}"))
 }

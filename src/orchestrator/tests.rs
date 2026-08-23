@@ -5987,3 +5987,229 @@ async fn a_paused_record_carries_the_execution_that_produced_it() -> Result<()> 
     orchestrator.delete_sandbox(created.id).await?;
     Ok(())
 }
+
+/// A factory that answers the ownership-marker question the way a remote one
+/// does, and keeps the launch configs it was handed.
+///
+/// 🔴 A wrapper rather than a change to `MockBackendFactory`: the question this
+/// factory answers differently is the whole subject of the tests below, and a
+/// shared mock that answered it `true` would make every other test in this file
+/// exercise the stamping path without saying so.
+struct StampingFactory {
+    inner: MockBackendFactory,
+    stamps: bool,
+    seen: Arc<StdMutex<Vec<SandboxLaunchConfig>>>,
+}
+
+impl StampingFactory {
+    fn new(stamps: bool) -> Self {
+        Self {
+            inner: MockBackendFactory::new(),
+            stamps,
+            seen: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    fn seen(&self) -> Arc<StdMutex<Vec<SandboxLaunchConfig>>> {
+        Arc::clone(&self.seen)
+    }
+}
+
+impl SandboxBackendFactory for StampingFactory {
+    fn stamps_control_plane_ownership(&self) -> bool {
+        self.stamps
+    }
+
+    fn build(
+        &self,
+        build_spec: crate::sandbox::FreshSandboxBuildSpec,
+        launch_config: SandboxLaunchConfig,
+        execution_id: crate::types::ExecutionId,
+    ) -> anyhow::Result<Box<dyn crate::sandbox::SandboxBackend>> {
+        self.seen.lock().unwrap().push(launch_config.clone());
+        self.inner.build(build_spec, launch_config, execution_id)
+    }
+
+    fn build_from_snapshot(
+        &self,
+        snapshot: &RunnableSnapshot,
+        launch_config: SandboxLaunchConfig,
+        execution_id: crate::types::ExecutionId,
+    ) -> anyhow::Result<Box<dyn crate::sandbox::SandboxBackend>> {
+        self.seen.lock().unwrap().push(launch_config.clone());
+        self.inner
+            .build_from_snapshot(snapshot, launch_config, execution_id)
+    }
+
+    fn decode_paused_state(
+        &self,
+        artifact_root: PathBuf,
+        state: serde_json::Value,
+    ) -> anyhow::Result<Arc<dyn PausedSandboxState>> {
+        self.inner.decode_paused_state(artifact_root, state)
+    }
+
+    fn build_from_paused_state(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: crate::types::ExecutionId,
+        state: &dyn PausedSandboxState,
+        envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+    ) -> anyhow::Result<Box<dyn crate::sandbox::SandboxBackend>> {
+        self.inner
+            .build_from_paused_state(sandbox_id, execution_id, state, envd_access_token)
+    }
+}
+
+/// The marker the record carries and the marker the backend is handed are the
+/// same bytes, and they decode back to the record they describe.
+///
+/// 🔴 Three separate assertions and not one, because each failure is different
+/// and only one of them is visible from the outside. A record with no marker is
+/// a sandbox the control plane will not recognise as its own; a launch config
+/// with no marker is a *node* that will not report it; and a marker that
+/// decodes to a different sandbox is a rebuild that produces a plausible record
+/// of something else.
+#[tokio::test]
+async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
+    setup();
+    let factory = StampingFactory::new(true);
+    let seen = factory.seen();
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        factory,
+        DisabledSandboxPersister,
+        test_runtime_image_refs(),
+    )
+    .await
+    .expect("orchestrator");
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case", "stamped")]))
+        .await
+        .expect("create");
+
+    let marker = created
+        .control_plane_config
+        .as_ref()
+        .expect("the record carries the control plane's marker");
+
+    let on_the_wire = seen.lock().unwrap();
+    let on_the_wire = on_the_wire
+        .first()
+        .expect("the factory was handed a launch config")
+        .control_plane_config
+        .clone()
+        .expect("the launch config carries the same marker");
+    assert_eq!(
+        on_the_wire,
+        marker.as_bytes(),
+        "the node would store a different marker from the one the record names"
+    );
+
+    let decoded = marker.decode_record().expect("the marker decodes");
+    assert_eq!(decoded.id, created.id);
+    // 🔴 The incarnation in particular. It is minted below the surface that
+    // decided to create anything, so a marker built any earlier would name a
+    // run that had not been chosen — and fencing compares exactly this value.
+    assert_eq!(decoded.execution_id, created.execution_id);
+    assert_eq!(
+        decoded.user_metadata, created.user_metadata,
+        "the marker is the record, not a summary of it"
+    );
+    assert!(
+        decoded.control_plane_config.is_none(),
+        "the marker must not contain a copy of itself"
+    );
+}
+
+/// 🔴 The control probe for the test above, and the one that keeps `--role all`
+/// honest. Everything is identical except the factory's answer to one question;
+/// if the stamping were unconditional, the test above would still pass and the
+/// user-facing REST surface would start producing sandboxes that claim to
+/// belong to a control plane.
+#[tokio::test]
+async fn a_machine_local_orchestrator_stamps_nothing() {
+    setup();
+    let factory = StampingFactory::new(false);
+    let seen = factory.seen();
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        factory,
+        DisabledSandboxPersister,
+        test_runtime_image_refs(),
+    )
+    .await
+    .expect("orchestrator");
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case", "unstamped")]))
+        .await
+        .expect("create");
+
+    assert!(
+        created.control_plane_config.is_none(),
+        "a user-facing create must not look like the control plane's"
+    );
+    let on_the_wire = seen.lock().unwrap();
+    let launch_config = on_the_wire
+        .first()
+        .expect("the factory was handed a launch config");
+    assert!(
+        launch_config.control_plane_config.is_none(),
+        "nothing may reach a backend that would make a node call this sandbox the control \
+         plane's"
+    );
+    // 🔴 And the evidence that this create happened at all, so the two
+    // emptiness assertions above are not both satisfied by a create that never
+    // ran (§15.4: an assertion that something is empty is only evidence if
+    // something else in the same test is not).
+    assert_eq!(launch_config.sandbox_id, created.id);
+    assert_eq!(created.state, SandboxState::Running);
+}
+
+/// A marker supplied by a caller is kept, not overwritten.
+///
+/// 🔴 This is the node service's create: the marker arrived from the control
+/// plane and this process is not it. An orchestrator that re-stamped would hand
+/// the control plane back a record it never wrote, under its own sandbox's id.
+#[tokio::test]
+async fn a_marker_the_caller_supplied_survives_the_stamp() {
+    setup();
+    let factory = StampingFactory::new(true);
+    let seen = factory.seen();
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        factory,
+        DisabledSandboxPersister,
+        test_runtime_image_refs(),
+    )
+    .await
+    .expect("orchestrator");
+
+    let supplied = ControlPlaneConfig::from_bytes(b"somebody else's record".to_vec())
+        .expect("a non-empty marker");
+    let created = orchestrator
+        .create_sandbox(CreateSandboxRequest {
+            control_plane_config: Some(supplied.clone()),
+            ..create_request(Some(60), &[])
+        })
+        .await
+        .expect("create");
+
+    assert_eq!(
+        created
+            .control_plane_config
+            .as_ref()
+            .expect("the supplied marker")
+            .as_bytes(),
+        supplied.as_bytes()
+    );
+    assert_eq!(
+        seen.lock().unwrap()[0]
+            .control_plane_config
+            .as_deref()
+            .expect("the supplied marker on the wire"),
+        supplied.as_bytes()
+    );
+}

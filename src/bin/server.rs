@@ -2,13 +2,15 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
-use agentenv::cfg::{AppConfig, PausedRegistryBackendKind};
+use agentenv::cfg::{AppConfig, MetadataStoreBackendKind, PausedRegistryBackendKind};
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
+use agentenv::node_client::{RemoteSandboxBackendFactory, SchedulerNodePlacement};
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::{
-    build_paused_registry, DisabledPausedSandboxRegistry, FileBackedSandboxPersister,
-    InMemoryMetadataStore, Orchestrator, SandboxOrchestration,
+    build_paused_registry, DisabledPausedSandboxRegistry, DisabledSandboxPersister,
+    FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, RedisMetadataStore,
+    SandboxOrchestration,
 };
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::p2p::P2pTransport;
@@ -16,6 +18,7 @@ use agentenv::role::ServerRole;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
+use anyhow::Context as _;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
@@ -83,6 +86,18 @@ struct Assembly {
     reporter: Option<ObservabilityReporter>,
     /// The machine-local runtime, for roles that brought one up.
     runtime: Option<NodeRuntime>,
+    /// The gRPC surface this role serves alongside the HTTP one, already
+    /// accepting: the task serving it, and the channel that stops it.
+    ///
+    /// 🔴 Already bound by the time this is built. A listener that binds inside
+    /// a spawned task turns "the port is taken" into a task that quietly ended,
+    /// and the process goes on serving HTTP with a gRPC surface nobody can
+    /// reach — which is indistinguishable from a surface nobody is calling.
+    ///
+    /// 🔴 `None` for `--role all`, and that is the rollback showing through
+    /// rather than an omission. `all` is defined as the process that ran before
+    /// the split, and that process listened on one port.
+    grpc: Option<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)>,
 }
 
 /// The machine-local runtime a sandbox-running role owns: the two P2P pieces it
@@ -177,10 +192,18 @@ async fn main() -> anyhow::Result<()> {
         upkeep,
         mut reporter,
         runtime,
+        grpc,
     } = match role {
         ServerRole::All => assemble_all(config).await?,
         ServerRole::Node => assemble_node(config).await?,
         ServerRole::Api => assemble_api(config).await?,
+    };
+
+    // Split so the stop signal can travel into the graceful-shutdown closure
+    // while the task stays here to be joined after it.
+    let (grpc_task, grpc_shutdown) = match grpc {
+        Some((task, shutdown)) => (Some(task), Some(shutdown)),
+        None => (None, None),
     };
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
@@ -250,9 +273,22 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Stops accepting on the second listener at the same moment the
+            // HTTP one stops: both carry work that the teardown below is about
+            // to make impossible to finish.
+            if let Some(shutdown) = grpc_shutdown {
+                let _ = shutdown.send(());
+            }
+
             let _ = shutdown_tx.send(());
         })
         .await?;
+
+    if let Some(task) = grpc_task {
+        if let Err(err) = task.await {
+            warn!(target: "agentenv", error = %err, "the gRPC surface did not stop cleanly");
+        }
+    }
 
     shutdown_cleanup.await?;
 
@@ -474,6 +510,11 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
         upkeep: paused_upkeep,
         reporter: core.reporter,
         runtime: Some(core.runtime),
+        // 🔴 Not "not yet": never. This role is the rollback target and is
+        // defined as the process that ran before the split, which listened on
+        // one port. The node service belongs to `--role node`; see
+        // `assemble_node`.
+        grpc: None,
     })
 }
 
@@ -562,6 +603,34 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         .set_paused_publisher(paused_wiring.publisher());
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
+
+    // The half the API half drives this machine through, bound before the
+    // `ApiImpl` below takes ownership of the snapshot manager it needs.
+    //
+    // 🔴 Bound here rather than inside the task that serves it, so a port
+    // already in use stops this process instead of leaving it serving HTTP and
+    // unreachable to the control plane — which looks, from the control plane,
+    // exactly like a node with nothing on it.
+    let grpc = {
+        let orchestration = Arc::clone(&orchestration);
+        let snapshots = Arc::clone(&core.snapshot_manager);
+        let node_id = core.identity.id.clone();
+        spawn_grpc_surface(
+            &config.cluster.node_service_addr,
+            "node sandbox service",
+            move |listener, shutdown| {
+                agentenv::node_server::serve_on(
+                    listener,
+                    orchestration,
+                    snapshots,
+                    node_id,
+                    shutdown,
+                )
+            },
+        )
+        .await?
+    };
+
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestration),
         core.snapshot_manager,
@@ -589,58 +658,319 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         upkeep: Vec::new(),
         reporter: core.reporter,
         runtime: Some(core.runtime),
+        grpc: Some(grpc),
     })
 }
 
 /// `--role api`: the deciding half.
 ///
-/// 🔴 Not assemblable yet, and it says so rather than starting something that
-/// resembles it. Two pieces are missing — and "missing" now means *unwired*
-/// rather than *absent*, which is a materially different distance and is worth
-/// stating precisely, because the message below used to say neither had landed
-/// and both since have:
+/// It owns sandboxes and runs none of them. Everything it constructs is either
+/// a decision (the cluster store, the paused registry, placement) or a surface
+/// (the full REST route set, the wake-up gRPC); everything a machine needs is
+/// absent, and absent because this role answers `false` to
+/// [`ServerRole::runs_sandbox_runtime`].
 ///
-/// - the cluster `MetadataStore` this role's `Orchestrator` reads and writes.
-///   The in-memory store is one process's private ledger; an API replica that
-///   used it would hold an opinion about sandboxes no other replica shared.
-///   `RedisMetadataStore` exists and passes the shared store contract; nothing
-///   constructs it, and no configuration selects it.
-/// - the backend factory that drives sandboxes on other machines over the node
-///   gRPC service. Without it the only factory available is the Firecracker
-///   one, which would have this process reach for `/dev/kvm` on a Pod that has
-///   none — and, worse, succeed on a host where it does.
-///   `RemoteSandboxBackendFactory` exists; nothing outside its own tests
-///   constructs it, and two of its arms still refuse (a cold create, and a
-///   resume of a capture held on another machine).
+/// # 🔴 What it refuses to start without, and why each refusal is loud
 ///
-/// 🔴 And two more things this role needs that are not in this function at all,
-/// recorded here because a reader arriving at "why can 阶段 3a not be deployed"
-/// will otherwise find only the two above:
+/// Three settings have no safe default here, and each of them fails startup
+/// rather than degrading:
 ///
-/// - **nothing binds either new gRPC listener.** `node_server::serve` and
-///   `api::grpc::serve` are both written and both uncalled, in every role.
-/// - **there is no `agentenv-api` manifest** anywhere under `deploy/`, base or
-///   overlay. §11.2's 3a is "the DaemonSet stays on `--role all`, bring up
-///   `agentenv-api --role api` ×2"; the first half is what runs today and the
-///   second half has nothing to apply.
+/// - **a cluster metadata store.** The in-memory one is a single process's
+///   private ledger. A replica using it would hold an opinion about sandboxes
+///   no other replica shared, and the two would not disagree visibly — each
+///   would simply answer 404 for the other's sandboxes.
+/// - **a scheduler endpoint.** A create has to be placed and a wake-up has to
+///   be located, and there is no local machine to fall back to. Worse than
+///   having nowhere to put a sandbox: with no placement source every placement
+///   answers `Unconstrained`, so a sandbox pinned to one machine's disk would
+///   be woken on another — which succeeds, by rebuilding it from an older
+///   snapshot.
+/// - **the wake-up listener's port.** Bound at assembly, because the gateway's
+///   cold path is the only way a paused sandbox comes back, and a replica
+///   serving HTTP with no gRPC surface refuses every wake-up with a connection
+///   error the gateway reads as "try again later".
 ///
-/// Everything else this role wants exists already and is listed here so the
-/// next slice does not have to rediscover it: `ConfigManager`, `NodeIdentity`,
-/// the Prometheus recorder, `SnapshotManager` (the commit side), `ImageResolver`,
-/// `TemplateBuilder` (the scheduling side), the full `ApiImpl` and route set,
-/// and the paused-sandbox wiring — which for this role is the real registry,
-/// not the disabled one.
+/// # 🔴 What it constructs that a machine-local role does not
 ///
-/// It constructs none of `require_runtime_capabilities`, the P2P transport,
-/// `setup::ensure_environment`, `UblkDeviceManager`, `FirecrackerPool`,
-/// `FirecrackerSandboxFactory` or the heartbeat reporter.
-async fn assemble_api(_config: &AppConfig) -> anyhow::Result<Assembly> {
-    anyhow::bail!(
-        "--role api cannot be assembled yet: the cluster metadata store and the remote sandbox \
-         backend factory both exist, and neither is wired into this function — nor is either \
-         new gRPC listener bound, in any role. Run --role all (the default) until they are."
+/// [`RemoteSandboxBackendFactory`], which is what makes an `Orchestrator`
+/// written entirely in terms of local backends drive sandboxes on other
+/// machines — and which is also the thing that puts this control plane's
+/// ownership marker on every create it sends
+/// (`SandboxBackendFactory::stamps_control_plane_ownership`).
+///
+/// # 🔴 What is here and does not work yet
+///
+/// - **A cold create.** `RemoteSandboxBackendFactory::build` refuses: the build
+///   spec it is handed has already been resolved into paths on a local disk and
+///   the user's image reference is gone by then. Creating from a snapshot or a
+///   template works; `POST /sandboxes-cold` does not.
+/// - **Resuming a paused sandbox that another machine holds the capture for.**
+///   `build_from_paused_state` refuses, and deliberately: bringing it back means
+///   asking *that* machine to reopen its capture, and the node service has no
+///   call that does so. It is left refusing rather than stubbed into something
+///   that looks like it works.
+/// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
+///   directly, outside the orchestrator entirely, so a build here would reach
+///   for `/dev/kvm` in a Pod that has none. It fails, which is the safe
+///   direction, but it fails late.
+async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
+    let role = ServerRole::Api;
+    // The four this role answers `false` to, stated where somebody adding a
+    // line to this function will read them.
+    debug_assert!(!role.runs_sandbox_runtime());
+    debug_assert!(!role.sends_heartbeats());
+    debug_assert!(!role.reclaims_host_leftovers_at_startup());
+    debug_assert!(!role.drains_on_shutdown());
+    // And the three it answers `true` to.
+    debug_assert!(role.arbitrates_paused_sandbox_ownership());
+    debug_assert!(role.serves_user_facing_rest());
+    debug_assert!(role.serves_wake_decisions());
+
+    let identity = NodeIdentity::from_config(&config.node_identity);
+    let identity_for_registry = identity.clone();
+
+    // 🔴 Both settings are read and refused *before* anything is connected, and
+    // the order is the point rather than tidiness: a replica misconfigured in
+    // two ways should be told about the one it can see from its own config
+    // rather than about the Redis it could not reach on the way to finding out.
+    // It is also what makes each refusal testable without a service running —
+    // and an untested refusal branch is the shape this programme has already
+    // paid for twice.
+    let store_config = cluster_store_config(&config.orchestrator.store)?;
+    let placement = cluster_placement(&config.cluster)?;
+    let store = RedisMetadataStore::connect(store_config)
+        .await
+        .context("connect the cluster metadata store")?;
+    // 🔴 The persister is `Disabled` and not file-backed. A file-backed one
+    // would write paused-sandbox artifacts to this Pod's disk for sandboxes
+    // whose bytes are on other machines, and then load them back at startup as
+    // sandboxes this replica believes it can resume. The durable record of a
+    // paused sandbox is the cluster store's row and the registry's, not a file
+    // here.
+    let orchestrator = Orchestrator::new(
+        store,
+        RemoteSandboxBackendFactory::new(placement),
+        DisabledSandboxPersister,
     )
+    .await?;
+    let orchestration: Arc<dyn SandboxOrchestration> =
+        Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
+
+    // The commit side of snapshots, the resolver, and the builder's scheduling
+    // half. None of the three needs a machine; what they need is the
+    // repository, which is shared.
+    //
+    // 🔴 No P2P transport is passed, and `[snapshot].p2p_enabled` is not
+    // consulted: P2P moves bytes between machines that hold them, and this
+    // process holds none.
+    let snapshot_manager = Arc::new(SnapshotManager::new(None).await?);
+    let template_builder = Arc::new(TemplateBuilder::new());
+    let image_resolver = Arc::new(ImageResolver::new(config));
+
+    // 🔴 The receiving side only. `ObservabilityReporter` is not started: a
+    // heartbeat reports a machine, and this replica is not one — reporting
+    // itself would put a node in the scheduler's table that can never run
+    // anything, and the scheduler would place sandboxes on it.
+    //
+    // `cpu_template_helper` is `None` rather than the configured path: the
+    // helper is one of the downloaded runtime assets, this Pod has none of
+    // them, and the CPUID intersection it feeds is about the machines that
+    // boot microVMs.
+    let observability = if config.observability.enabled {
+        Some(Arc::new(
+            ObservabilityService::new(
+                identity,
+                Arc::clone(&orchestration),
+                None,
+                Arc::new(RwLock::new(None)),
+            )
+            .await,
+        ))
+    } else {
+        None
+    };
+
+    let paused_registry = build_paused_registry(
+        &config.orchestrator.paused_registry,
+        &config.cluster,
+        &identity_for_registry,
+    )
+    .await?;
+    let paused_wiring = PausedSandboxWiring::new(
+        paused_registry,
+        Arc::clone(&snapshot_manager),
+        &identity_for_registry,
+    );
+    orchestrator.set_paused_publisher(paused_wiring.publisher());
+
+    let api_impl = Arc::new(ApiImpl::new(
+        Arc::clone(&orchestration),
+        snapshot_manager,
+        template_builder,
+        image_resolver,
+        observability,
+        paused_wiring,
+        config.sandbox_proxy.domains.clone(),
+        role,
+        // 🔴 `WakeSite::Remote`: the pin is honoured by the orchestration
+        // surface below, which places the wake-up on the machine the paused
+        // state names, rather than by a same-machine check this process cannot
+        // make. Requires a scheduler endpoint and says so if it has none.
+        ResumeWiring::cluster_from_config()?,
+    ));
+
+    // The same three passes, in the same order, and for the same reasons as
+    // `assemble_all` — with one difference worth naming. There, "this process
+    // holds nothing yet" is a statement about a machine; here it is a statement
+    // about a replica, and it holds because a replica's identity is its own
+    // (`AENV_NODE_ID` is the Pod's name). Two replicas sharing one identity
+    // would make the release below hand back the *other* replica's live
+    // holdings.
+    let stale_release = api_impl.release_stale_node_holdings().await;
+    api_impl.renew_paused_leases().await;
+    api_impl.reconcile_local_records().await;
+    let mut paused_upkeep = spawn_paused_record_upkeep(
+        Arc::clone(&api_impl),
+        config.orchestrator.paused_registry.reconcile_interval(),
+    );
+    if stale_release == StaleReleaseOutcome::Failed {
+        let retrier = Arc::clone(&api_impl);
+        paused_upkeep.push(tokio::spawn(async move {
+            retrier.retry_stale_node_holdings_release().await;
+        }));
+    }
+
+    let grpc = {
+        let served = Arc::clone(&api_impl);
+        spawn_grpc_surface(
+            &config.cluster.api_grpc_addr,
+            "sandbox resume service",
+            move |listener, shutdown| agentenv::api::grpc::serve_on(listener, served, shutdown),
+        )
+        .await?
+    };
+
+    Ok(Assembly {
+        // 🔴 No RoleGate: this half serves the whole user-facing surface. The
+        // gate exists to stop a *node* answering it.
+        app: server::new(api_impl, role),
+        orchestration,
+        upkeep: paused_upkeep,
+        reporter: None,
+        runtime: None,
+        grpc: Some(grpc),
+    })
 }
+
+/// The store settings this replica shares with the others, or why there are
+/// none.
+///
+/// 🔴 The in-memory store is refused rather than accepted with a warning. A
+/// warning at startup is read once, by whoever was watching; the failure it
+/// would be warning about is two replicas each answering 404 for the other's
+/// sandboxes, which is indistinguishable from a sandbox that was deleted.
+fn cluster_store_config(
+    config: &agentenv::cfg::OrchestratorStoreConfig,
+) -> anyhow::Result<agentenv::orchestrator::RedisStoreConfig> {
+    if !matches!(config.backend, MetadataStoreBackendKind::Redis) {
+        anyhow::bail!(
+            "--role api needs [orchestrator.store].backend = \"redis\" \
+             (AENV_ORCHESTRATOR_STORE_BACKEND), and this process is configured for {:?}. The \
+             in-memory store is one process's private ledger: an API replica using it would hold \
+             an opinion about sandboxes no other replica shares, and the two would not disagree \
+             visibly — each would simply answer 404 for the other's",
+            config.backend.as_str()
+        );
+    }
+    // 🔴 Four settings from configuration and the rest from the store's own
+    // defaults, which is a decision and not laziness. `RedisStoreConfig` has
+    // around twenty timing parameters whose *relationships* carry correctness
+    // — `transition_key_ttl > wait_transition_timeout > lock_ttl`,
+    // `stale_cutoff > transition_key_ttl`, `record_ttl_grace >
+    // transition_key_ttl` — and `validate` refuses a combination that breaks
+    // them. Exposing them individually would let a deployment set one and be
+    // refused at startup for a reason about a different one.
+    Ok(agentenv::orchestrator::RedisStoreConfig {
+        url: config.redis_url.clone(),
+        key_prefix: config.redis_key_prefix.clone(),
+        distributed_lock_enabled: config.redis_distributed_lock_enabled,
+        ..Default::default()
+    })
+}
+
+/// The scheduler-backed placement this half asks where sandboxes go.
+fn cluster_placement(
+    config: &agentenv::cfg::ClusterConfig,
+) -> anyhow::Result<Arc<dyn agentenv::node_client::NodePlacement>> {
+    let endpoint = config
+        .scheduler_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--role api needs [cluster].scheduler_endpoint \
+                 (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not run, so \
+                 every create has to be placed by the scheduler and there is no machine here to \
+                 fall back to"
+            )
+        })?;
+    Ok(Arc::new(SchedulerNodePlacement::connect_lazy(
+        endpoint,
+        config.node_service_port,
+    )?))
+}
+
+/// Binds a gRPC listener and spawns the server that answers on it.
+///
+/// 🔴 The bind happens here, in the assembly, and not inside the spawned task.
+/// A `serve(addr, ..)` that binds inside its own future turns "the port is
+/// already in use" into a task that ended: the process goes on serving HTTP,
+/// the surface is unreachable, and from the outside that is the same picture as
+/// a surface nobody is calling. See §15.4 ③ — a reading of zero that means two
+/// different things.
+async fn spawn_grpc_surface<F, Fut>(
+    addr: &str,
+    surface: &'static str,
+    serve: F,
+) -> anyhow::Result<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)>
+where
+    F: FnOnce(tokio::net::TcpListener, GrpcShutdown) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind the {surface} to {addr}"))?;
+    let bound = listener.local_addr().ok();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serving = serve(
+        listener,
+        Box::pin(async move {
+            let _ = shutdown_rx.await;
+        }),
+    );
+    let task = tokio::spawn(async move {
+        if let Err(err) = serving.await {
+            // 🔴 `error`, not `warn`. Reaching here means the surface stopped
+            // answering while the process kept running, which is the state this
+            // whole arrangement exists to make impossible to reach quietly.
+            tracing::error!(
+                target: "agentenv",
+                surface,
+                error = %format_args!("{err:#}"),
+                "a gRPC surface stopped serving"
+            );
+        }
+    });
+    info!(target: "agentenv", surface, addr = ?bound, "gRPC surface listening");
+    Ok((task, shutdown_tx))
+}
+
+/// The stop signal a gRPC surface waits on.
+///
+/// Boxed so that [`spawn_grpc_surface`] can hand the same concrete type to
+/// every `serve_on`, each of which takes an opaque `impl Future`.
+type GrpcShutdown = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Keeps this node's standing in the cluster registry current, in both
 /// directions.
@@ -751,25 +1081,136 @@ mod tests {
         );
     }
 
-    /// 🔴 The refusal, pushed up rather than assumed.
+    /// 🔴 The two refusals `--role api` takes on its own configuration, each
+    /// pushed up rather than assumed.
     ///
-    /// `--role api` is the one role this batch cannot assemble, and what it
-    /// does about that is the only behaviour it has. A version of it that
-    /// quietly fell back to the local orchestrator would be a process that
-    /// reaches for `/dev/kvm` on a replica that is supposed to hold none of a
-    /// machine's state — and on a host where that reach succeeded, it would
-    /// work well enough to be believed.
+    /// Both are read before anything is connected, which is what makes them
+    /// testable at all — and an untested refusal branch is the shape §15.3
+    /// records: `guard_read_side`'s three refusals never ran outside a unit
+    /// test, and one disjunct in one of them has never run at all.
+    ///
+    /// A version of this role that quietly fell back to the local orchestrator
+    /// would be a process that reaches for `/dev/kvm` on a replica supposed to
+    /// hold none of a machine's state — and on a host where that reach
+    /// succeeded, it would work well enough to be believed.
+    #[test]
+    fn the_api_half_refuses_a_ledger_no_other_replica_can_see() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            config.orchestrator.store.backend,
+            MetadataStoreBackendKind::InMemory,
+            "the default is the machine-local store, which is what makes this refusal necessary"
+        );
+
+        let err = cluster_store_config(&config.orchestrator.store)
+            .expect_err("the in-memory store is one process's private ledger");
+        let err = err.to_string();
+        // The setting, the environment variable that overrides it, and what
+        // goes wrong — an operator reading this in a CrashLoopBackOff has the
+        // log line and nothing else.
+        assert!(err.contains("orchestrator.store"), "{err}");
+        assert!(err.contains("AENV_ORCHESTRATOR_STORE_BACKEND"), "{err}");
+        assert!(err.contains("in-memory"), "{err}");
+
+        // 🔴 The control. Without it this test passes just as well against a
+        // function that refuses every configuration, including the right one.
+        config.orchestrator.store.backend = MetadataStoreBackendKind::Redis;
+        config.orchestrator.store.redis_url = "redis://cluster-redis:6379".to_string();
+        let store = cluster_store_config(&config.orchestrator.store)
+            .expect("the cluster store is what this role is for");
+        assert_eq!(store.url, "redis://cluster-redis:6379");
+        assert_eq!(store.key_prefix, config.orchestrator.store.redis_key_prefix);
+    }
+
+    // 🔴 `#[tokio::test]` rather than `#[test]`: the control probe at the end
+    // builds a real lazy channel, and `connect_lazy` installs a hyper executor
+    // that panics outside a runtime. Without the control the test would pass as
+    // a plain `#[test]` — and would pass equally against a function that
+    // refused every endpoint.
     #[tokio::test]
-    async fn the_api_half_refuses_to_start_rather_than_starting_as_something_else() {
-        let config = AppConfig::default();
-        let err = match assemble_api(&config).await {
-            Ok(_) => panic!("--role api assembled something, and there is nothing for it to be"),
+    async fn the_api_half_refuses_to_place_sandboxes_with_nothing_to_ask() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            config.cluster.scheduler_endpoint, None,
+            "the default is no endpoint, which is what makes this refusal necessary"
+        );
+
+        let err = match cluster_placement(&config.cluster) {
+            Ok(_) => panic!("there is no machine here to fall back to"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("cluster metadata store"), "{err}");
-        assert!(err.contains("remote sandbox backend factory"), "{err}");
-        // And it says what to do instead, since the answer for now is the
-        // rollback shape rather than a workaround.
-        assert!(err.contains("--role all"), "{err}");
+        assert!(err.contains("scheduler_endpoint"), "{err}");
+        assert!(
+            err.contains("AENV_OBSERVABILITY_SCHEDULER_ENDPOINT"),
+            "{err}"
+        );
+
+        // 🔴 Blank is the same answer as absent, and separately so: a
+        // ConfigMap that carries the key with an empty value is not naming an
+        // endpoint, and treating it as one would produce a placement source
+        // that fails on every call instead of a process that refuses to start.
+        config.cluster.scheduler_endpoint = Some("   ".to_string());
+        assert!(
+            cluster_placement(&config.cluster).is_err(),
+            "a blank endpoint is not an endpoint"
+        );
+
+        // 🔴 The control, again: a real endpoint resolves, so the two refusals
+        // above are about what was missing.
+        config.cluster.scheduler_endpoint = Some("http://scheduler:9090".to_string());
+        assert!(
+            cluster_placement(&config.cluster).is_ok(),
+            "a configured endpoint is what this role runs on"
+        );
+    }
+
+    /// 🔴 `--role all` opens one listener, and this is the assertion that says
+    /// so where somebody adding a second one will trip over it.
+    ///
+    /// The rollback target is defined as the process that ran before the split.
+    /// A second socket is not a behaviour that can be argued inert: it is a
+    /// port bound on every node in the fleet, and the startup-sequence gate
+    /// would have to grow an entry claiming otherwise.
+    #[test]
+    fn only_the_split_roles_bind_a_second_listener() {
+        let source = include_str!("server.rs");
+        let body = |name: &str| {
+            let start = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+            let open = source[start..].find('{').expect("a body") + start;
+            let mut depth = 0usize;
+            for (offset, byte) in source[open..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return source[open..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{name} has no closing brace");
+        };
+
+        assert!(
+            !body("async fn assemble_all(").contains("spawn_grpc_surface"),
+            "--role all binds a second listener. It is the rollback target and is defined as \
+             today's behaviour verbatim; the node service belongs to --role node"
+        );
+        // 🔴 The control probe. Both halves of the split do bind one, so the
+        // assertion above is about `all` rather than about a helper that has
+        // been renamed out from under this test.
+        assert!(
+            body("async fn assemble_node(").contains("spawn_grpc_surface"),
+            "--role node no longer serves the node sandbox service, and nothing else does"
+        );
+        assert!(
+            body("async fn assemble_api(").contains("spawn_grpc_surface"),
+            "--role api no longer serves the wake-up surface, and the gateway's cold path has \
+             nowhere to ask"
+        );
     }
 }

@@ -854,3 +854,109 @@ fn the_blank_ownership_marker_outlives_only_an_api_role_that_cannot_start() {
          that decides what that record is, not from a constant here"
     );
 }
+
+/// The marker the orchestrator put on the launch config is the marker the node
+/// stores and hands back.
+///
+/// 🔴 End to end over a socket, and over the *real* node service, because every
+/// place this could be lost is between the two: the factory could drop it, the
+/// proto could carry it in a field nothing reads, the node could parse it
+/// instead of storing it. A test that called the trait directly would prove
+/// none of that.
+#[tokio::test]
+async fn the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire() {
+    let node = real_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    // 🔴 The factory answers `true` to this, which is what makes the
+    // orchestrator above it fill the field the rest of this test follows. If
+    // it ever answered `false`, every assertion below would still hold — on a
+    // launch config a test wrote by hand — while production sent nothing.
+    assert!(
+        factory.stamps_control_plane_ownership(),
+        "a factory whose sandboxes run elsewhere has to ask for the marker"
+    );
+
+    let marker = b"the control plane's record of this sandbox".to_vec();
+    let config = SandboxLaunchConfig {
+        control_plane_config: Some(marker.clone()),
+        ..launch_config()
+    };
+    let sandbox_id = config.sandbox_id;
+
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+
+    let live = node
+        .orchestration
+        .as_ref()
+        .expect("a real node")
+        .list_live_sandboxes()
+        .await
+        .expect("the node can list what it is running");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].sandbox_id, sandbox_id);
+    assert_eq!(
+        live[0]
+            .control_plane_config
+            .as_ref()
+            .expect("the node stored the marker")
+            .as_bytes(),
+        marker,
+        "the node handed back different bytes from the ones it was sent"
+    );
+    assert_eq!(
+        crate::node_server::owned_by_control_plane(&live).len(),
+        1,
+        "a sandbox the control plane created must be one the control plane recognises"
+    );
+}
+
+/// 🔴 The control probe, and the one that says what an unmarked sandbox is
+/// *for*: it is left alone, not killed.
+///
+/// A create that reached a node without a marker is a sandbox no control plane
+/// claims. The direction that costs nothing is to leave it out of the listing
+/// the reconciliation reads; the direction that ends a user's session is to
+/// treat it as an orphan. Same node, same service, same call as the test above
+/// — one field different.
+#[tokio::test]
+async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
+    let node = real_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    assert!(
+        config.control_plane_config.is_none(),
+        "this is the case being tested, so it has to be the case being set up"
+    );
+
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+
+    let live = node
+        .orchestration
+        .as_ref()
+        .expect("a real node")
+        .list_live_sandboxes()
+        .await
+        .expect("the node can list what it is running");
+
+    // 🔴 The sandbox is running. Without this the two emptiness assertions
+    // below would be satisfied by a create that never happened.
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].sandbox_id, sandbox_id);
+    assert!(
+        live[0].control_plane_config.is_none(),
+        "an empty marker on the wire must not become a marker on the node"
+    );
+    assert!(
+        crate::node_server::owned_by_control_plane(&live).is_empty(),
+        "a sandbox nobody claimed must not be offered up for reconciliation"
+    );
+}

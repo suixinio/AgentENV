@@ -92,6 +92,97 @@ impl ControlPlaneConfig {
     pub fn is_empty(&self) -> bool {
         false
     }
+
+    /// The marker the control plane attaches to a sandbox it is creating on
+    /// another machine: its own record of that sandbox, encoded.
+    ///
+    /// # 🔴 Why the whole record and not a summary
+    ///
+    /// The first draft of this was seven fields — incarnation, snapshot,
+    /// timeout action, expiry, auto-resume, secure, user metadata — and it is
+    /// not enough. This blob is the only copy of the control plane's record
+    /// that survives the control plane's own store being lost, and rebuilding
+    /// from it means rebuilding `resources`, `created_at`, `max_lifetime`,
+    /// `network_policy`, `custom_extension_params`, `runtime_versions`,
+    /// `image_configs` and `virtualization_mode` as well. A summary that
+    /// covered seven of those and silently defaulted the rest would produce a
+    /// record that looks complete and describes a different sandbox.
+    ///
+    /// # 🔴 Versioned, because it is read by a future build
+    ///
+    /// The writer and the reader are the same component at two points in
+    /// time — a replica writes this today and a replica of some later build
+    /// reads it back after a store loss. serde decodes a document that has
+    /// lost a field it has a default for without complaint, so the version is
+    /// checked on the way in rather than inferred from what parsed.
+    ///
+    /// The node never reads any of this. It stores the bytes and hands the
+    /// same bytes back; see the type's note.
+    ///
+    /// Returns `None` only if the record cannot be encoded at all, which for a
+    /// value made of owned data means a serde impl has been changed to be
+    /// fallible. The caller treats that as "no marker" — fail-closed, the same
+    /// direction as every other absent-marker case.
+    pub fn for_record(record: &SandboxMetadata) -> Option<Self> {
+        // `paused_state` and `running_since` are `#[serde(skip)]` on the
+        // record, so what goes in here is already the record minus the two
+        // fields that name live local state rather than the sandbox.
+        let envelope = OwnershipMarker {
+            version: OWNERSHIP_MARKER_VERSION,
+            record,
+        };
+        match serde_json::to_vec(&envelope) {
+            Ok(bytes) => Self::from_bytes(bytes),
+            Err(error) => {
+                tracing::error!(
+                    target: "agentenv",
+                    sandbox_id = %record.id,
+                    %error,
+                    "could not encode the control plane's own record as an ownership marker; \
+                     the sandbox will be created without one and will not be recognised as the \
+                     control plane's"
+                );
+                None
+            }
+        }
+    }
+
+    /// Reads back what [`for_record`](Self::for_record) wrote.
+    ///
+    /// 🔴 Refuses a version this build does not write, rather than letting
+    /// serde fill in defaults for whatever moved. A record rebuilt from a
+    /// half-understood marker is worse than no rebuild: it is a plausible
+    /// record of a sandbox that does not match the one running.
+    pub fn decode_record(&self) -> anyhow::Result<SandboxMetadata> {
+        let envelope: OwnedOwnershipMarker = serde_json::from_slice(&self.0)?;
+        anyhow::ensure!(
+            envelope.version == OWNERSHIP_MARKER_VERSION,
+            "ownership marker is version {}, and this build reads version {}",
+            envelope.version,
+            OWNERSHIP_MARKER_VERSION
+        );
+        Ok(envelope.record)
+    }
+}
+
+/// The schema version [`ControlPlaneConfig::for_record`] writes, and the only
+/// one [`ControlPlaneConfig::decode_record`] accepts.
+pub const OWNERSHIP_MARKER_VERSION: u32 = 1;
+
+/// The envelope, borrowing on the way out.
+#[derive(Serialize)]
+struct OwnershipMarker<'a> {
+    version: u32,
+    record: &'a SandboxMetadata,
+}
+
+/// The same envelope, owning on the way in. Two types because the borrowed one
+/// cannot deserialize and a single owned one would mean cloning the record to
+/// encode it.
+#[derive(Deserialize)]
+struct OwnedOwnershipMarker {
+    version: u32,
+    record: SandboxMetadata,
 }
 
 /// Prints the size and not the contents.
@@ -1071,6 +1162,80 @@ mod tests {
         // only way an open interval could reach the wire is a run this process
         // never closed — reading it back would charge the whole outage.
         assert_eq!(decoded.running_since, None);
+    }
+
+    /// The marker is the record, and reading it back gives the record.
+    ///
+    /// 🔴 Field by field rather than by comparing two encodings. A round trip
+    /// that only checks `to_vec(decode(bytes)) == bytes` passes for a schema
+    /// that dropped a field on both sides at once, which is the exact failure
+    /// this marker exists to prevent: it is the only copy of the control
+    /// plane's record that survives the control plane's store being lost.
+    #[test]
+    fn the_marker_carries_the_record_and_not_a_summary() {
+        let mut record = SandboxMetadata {
+            snapshot_id: "snapshot-a".to_string(),
+            secure: true,
+            max_lifetime: Some(Duration::from_secs(3600)),
+            running_elapsed: Duration::from_secs(90),
+            ..Default::default()
+        };
+        record.execution_id = ExecutionId::new();
+        record.user_metadata = Some(HashMap::from([("owner".to_string(), "team".to_string())]));
+
+        let marker = ControlPlaneConfig::for_record(&record).expect("a record encodes");
+        let decoded = marker.decode_record().expect("and decodes");
+
+        assert_eq!(decoded.id, record.id);
+        assert_eq!(decoded.execution_id, record.execution_id);
+        assert_eq!(decoded.snapshot_id, record.snapshot_id);
+        assert_eq!(decoded.resources, record.resources);
+        assert_eq!(decoded.virtualization_mode, record.virtualization_mode);
+        assert_eq!(decoded.secure, record.secure);
+        assert_eq!(decoded.max_lifetime, record.max_lifetime);
+        assert_eq!(decoded.running_elapsed, record.running_elapsed);
+        assert_eq!(decoded.user_metadata, record.user_metadata);
+        assert_eq!(decoded.state, record.state);
+
+        // 🔴 The two fields that are `#[serde(skip)]` on the record name live
+        // local state rather than the sandbox, and must not be in here — the
+        // machine that would own them is not the machine reading this back.
+        assert!(decoded.paused_state.is_none());
+        assert!(decoded.running_since.is_none());
+    }
+
+    /// A marker from a schema this build does not write is refused.
+    ///
+    /// 🔴 The refusal is the point. serde fills in defaults for whatever moved
+    /// without complaining, so a marker read across a schema change would
+    /// decode into a record that looks complete and describes a different
+    /// sandbox — and the caller reading it is a rebuild after a store loss,
+    /// which has nothing to compare it against.
+    #[test]
+    fn a_marker_from_another_schema_is_refused_rather_than_defaulted() {
+        let marker =
+            ControlPlaneConfig::for_record(&SandboxMetadata::default()).expect("a record encodes");
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(marker.as_bytes()).expect("the envelope is JSON");
+        assert_eq!(
+            envelope["version"], OWNERSHIP_MARKER_VERSION,
+            "the version this build writes"
+        );
+
+        envelope["version"] = serde_json::json!(OWNERSHIP_MARKER_VERSION + 1);
+        let future =
+            ControlPlaneConfig::from_bytes(serde_json::to_vec(&envelope).expect("re-encode"))
+                .expect("a non-empty marker");
+        let err = future
+            .decode_record()
+            .expect_err("a version this build does not write")
+            .to_string();
+        assert!(err.contains("version"), "{err}");
+
+        // 🔴 The control: the untouched marker decodes, so the refusal above is
+        // about the version rather than about `decode_record` refusing
+        // everything.
+        assert!(marker.decode_record().is_ok());
     }
 }
 

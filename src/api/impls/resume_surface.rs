@@ -193,7 +193,9 @@ pub(in crate::api) enum WakeSite {
     /// `a_pin_is_enforced_here_only_when_this_process_is_the_one_placing_the_wake_up`,
     /// so the branch is wrong in a test rather than in production on the day
     /// the factory is wired.
-    #[allow(dead_code)]
+    ///
+    /// 🔧 That day has come: `ResumeWiring::cluster_from_config` constructs it,
+    /// and `--role api` is the caller.
     Remote,
 }
 
@@ -262,6 +264,39 @@ impl ResumeWiring {
         Ok(Self {
             placement: Some(Arc::new(SchedulerPlacementSource::new(channel))),
             wake_site: WakeSite::Local(node_id),
+        })
+    }
+
+    /// The wiring for a process that owns sandboxes it does not run: every
+    /// wake-up is placed by the cluster, and this process performs it on
+    /// whichever machine the placement named.
+    ///
+    /// 🔴 Requires a scheduler endpoint, where [`from_config`](Self::from_config)
+    /// degrades to node-local without one. The degradation is right for a
+    /// single-node deployment, which genuinely has nothing to ask; it is wrong
+    /// here, because a process with no local machine and no placement source
+    /// would answer `Unconstrained` for every sandbox and then have nowhere to
+    /// wake it. The failure would not look like a missing setting — it would
+    /// look like resumes that fail for no stated reason.
+    pub fn cluster_from_config() -> anyhow::Result<Self> {
+        let config = ConfigManager::global_config();
+        let endpoint = configured_placement_endpoint(config.cluster.scheduler_endpoint.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--role api needs [cluster].scheduler_endpoint \
+                     (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not run, \
+                     so every wake-up and every create has to be placed by the scheduler, and \
+                     there is no machine here to fall back to"
+                )
+            })?;
+        let channel = Endpoint::from_shared(qualified_endpoint(endpoint))?.connect_lazy();
+        Ok(Self {
+            placement: Some(Arc::new(SchedulerPlacementSource::new(channel))),
+            // 🔴 The pin is honoured by the orchestration surface below this
+            // one — the remote backend factory places the wake-up on the node
+            // the paused state names — rather than by a check here, which is
+            // what `WakeSite::Local` means and what this process cannot do.
+            wake_site: WakeSite::Remote,
         })
     }
 }

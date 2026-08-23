@@ -72,6 +72,23 @@ pub struct SandboxLaunchConfig {
     /// Runtime-only credential used by envd. The token is never serialized and
     /// its Debug representation is redacted.
     pub envd_access_token: Option<EnvdAccessToken>,
+    /// The control plane's ownership marker for this sandbox, when the
+    /// orchestrator above is one that stamps them.
+    ///
+    /// 🔴 Opaque here, and opaque on the machine it lands on. This layer moves
+    /// the bytes and never reads them — the same contract the node service
+    /// keeps (`crate::orchestrator::ControlPlaneConfig`), which is why the
+    /// field is bytes rather than that type: the sandbox layer has no business
+    /// knowing what a control plane's record looks like, and does not depend
+    /// on the orchestrator for anything else.
+    ///
+    /// 🔴 `None` and `Some(vec![])` are not the same thing anywhere else in
+    /// this system — an empty marker means *not owned*, which is the direction
+    /// that leaves a sandbox alone — so nothing may put an empty vector here.
+    /// The only producer is `ControlPlaneConfig::as_bytes`, which cannot be
+    /// empty by construction, and `Orchestrator::stamp_control_plane_ownership`
+    /// is the only writer.
+    pub control_plane_config: Option<Vec<u8>>,
 }
 
 impl SandboxLaunchConfig {
@@ -84,6 +101,7 @@ impl SandboxLaunchConfig {
             extra_mmds: serde_json::Map::new(),
             custom_extension_params: None,
             envd_access_token: None,
+            control_plane_config: None,
         }
     }
 

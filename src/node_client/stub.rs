@@ -359,9 +359,27 @@ impl SandboxBackend for RemoteSandboxStub {
                         // it into the child's record, so the node has to run
                         // under it rather than choose its own.
                         execution_id: child.execution_id.to_string(),
-                        // The caller has not attached a control plane record to
-                        // these children; the orchestrator above does that when
-                        // it writes their metadata.
+                        // 🔴 A fork child reaches the node unmarked, and that
+                        // is a known gap rather than a decision.
+                        //
+                        // A create is stamped by
+                        // `Orchestrator::stamp_control_plane_ownership`,
+                        // which works because the sandbox's record exists —
+                        // as a launch plan — before the backend is built. A
+                        // fork child's record does not: it is a clone of the
+                        // parent's, taken *after* the node has answered, so
+                        // there is nothing to encode at this point.
+                        // `ForkChildAssignment` already has the field for it,
+                        // and filling it belongs to the surface that decides
+                        // what a child's record is.
+                        //
+                        // The direction this fails in is the safe one: an
+                        // unmarked child is a sandbox no control plane claims,
+                        // so reconciliation leaves it alone rather than tearing
+                        // it down. What it costs is that a fork child started
+                        // by the API half is absent from `ListSandboxes`, and
+                        // would be leaked rather than reclaimed if the control
+                        // plane's record of it were lost.
                         control_plane_config: Vec::new(),
                     })
                     .collect(),

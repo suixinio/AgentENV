@@ -332,6 +332,24 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>>;
 
+    /// Whether the sandboxes this factory builds need the control plane's
+    /// ownership marker sent with them.
+    ///
+    /// 🔴 `false` for a factory that builds sandboxes on this machine, and the
+    /// default is that answer rather than the other one. A machine-local
+    /// orchestrator's records and its sandboxes are the same process's; the
+    /// marker exists for the case where they are not, and stamping one on a
+    /// local sandbox would mean the user-facing REST surface producing
+    /// sandboxes that claim to belong to a control plane — the exact inference
+    /// `ControlPlaneConfig` was made explicit to end.
+    ///
+    /// A factory that answers `true` is one whose sandboxes run somewhere
+    /// else, and the marker is how the machine they run on can hand the record
+    /// back to whoever owns it.
+    fn stamps_control_plane_ownership(&self) -> bool {
+        false
+    }
+
     /// Decode backend-specific paused state loaded from persistence.
     fn decode_paused_state(
         &self,

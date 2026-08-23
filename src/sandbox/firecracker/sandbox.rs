@@ -2365,6 +2365,7 @@ mod tests {
             extra_mmds: serde_json::Map::new(),
             custom_extension_params: None,
             envd_access_token: None,
+            control_plane_config: None,
         };
 
         let snapshot_config =

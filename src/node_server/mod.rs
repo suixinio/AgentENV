@@ -17,13 +17,17 @@
 //! this wire is identifiers and facts, and where the local trait hands back
 //! something holding bytes, this one hands back where the bytes already are.
 //!
-//! # 🔴 Not wired into any binary yet
+//! # 🔴 Served by `--role node`, and by nothing else
 //!
-//! `--role node` does not serve this. The role gate that stops a node's HTTP
-//! port answering user-facing REST, and the startup reclaim of host leftovers,
-//! land before a node is deployable at all — so a listener here would be a way
-//! to turn the split on early. [`serve`] exists and is exercised by tests;
-//! nothing in `src/bin/` calls it.
+//! `assemble_node` binds [`serve_on`] on `[cluster].node_service_addr`.
+//! `--role all` deliberately does not: it is the rollback target and is defined
+//! as the process that ran before the split, which listened on one port.
+//!
+//! 🔴 That has a consequence for the shadow phase, and it is not a small one.
+//! §11.2's 3a keeps the DaemonSet on `--role all` while the API half drives it
+//! through this service — and a `--role all` node does not serve this service.
+//! So the API half can decide, and can serve the wake-up surface, but has no
+//! machine it can drive until the DaemonSet moves to `--role node`.
 
 mod convert;
 mod ownership;
@@ -43,6 +47,16 @@ use crate::proto::node::node_sandbox_service_server::NodeSandboxServiceServer;
 use crate::snapshot::SnapshotManager;
 
 pub use service::NodeSandboxService;
+
+/// Reachable from `crate::node_client`'s tests, which drive a create through
+/// the wire and then ask this side whether the sandbox came out owned.
+///
+/// 🔴 Test-only, because the production consumer is `service.rs` next door and
+/// a crate-wide export would invite a second one — and "who counts as the
+/// control plane's" having two callers is how the answer comes to differ
+/// between them.
+#[cfg(test)]
+pub(crate) use ownership::owned_by_control_plane;
 
 /// Builds the tonic server for one node's orchestrator.
 pub(crate) fn server(
@@ -66,10 +80,36 @@ pub async fn serve(
     node_id: String,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    info!(target: "agentenv", %addr, "serving the node sandbox service");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind the node sandbox service to {addr}"))?;
+    serve_on(listener, orchestration, snapshots, node_id, shutdown).await
+}
+
+/// Serves the node service on a listener somebody else bound.
+///
+/// 🔴 The variant a binary uses, and the reason it exists is where the bind
+/// failure lands. `serve` binds inside the future, so an assembly that spawns
+/// it learns nothing: the port being taken shows up as a task that ended, and
+/// the process goes on running with a surface the API half cannot reach —
+/// which from the outside is indistinguishable from an API half that has
+/// nothing to say. Binding at assembly time makes that a process that does not
+/// start.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    orchestration: Arc<dyn SandboxOrchestration>,
+    snapshots: Arc<SnapshotManager>,
+    node_id: String,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let addr = listener.local_addr().ok();
+    info!(target: "agentenv", ?addr, "serving the node sandbox service");
     tonic::transport::Server::builder()
         .add_service(server(orchestration, snapshots, node_id))
-        .serve_with_shutdown(addr, shutdown)
+        .serve_with_incoming_shutdown(
+            tonic::transport::server::TcpIncoming::from(listener),
+            shutdown,
+        )
         .await
-        .with_context(|| format!("serve the node sandbox service on {addr}"))
+        .with_context(|| format!("serve the node sandbox service on {addr:?}"))
 }

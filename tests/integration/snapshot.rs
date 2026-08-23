@@ -378,6 +378,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
             extra_mmds: serde_json::Map::new(),
             custom_extension_params: None,
             envd_access_token: None,
+            control_plane_config: None,
         };
         let mut child =
             FirecrackerSandbox::from_snapshot(runnable, &launch_config, ExecutionId::new())?;
@@ -580,6 +581,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         extra_mmds: serde_json::Map::new(),
                         custom_extension_params: None,
                         envd_access_token: None,
+                        control_plane_config: None,
                     };
                     let mut sandbox = FirecrackerSandbox::from_snapshot(
                         &runnable,

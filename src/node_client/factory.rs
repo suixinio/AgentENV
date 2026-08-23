@@ -57,6 +57,15 @@ impl RemoteSandboxBackendFactory {
 }
 
 impl SandboxBackendFactory for RemoteSandboxBackendFactory {
+    /// 🔴 Yes: every sandbox this factory builds runs on a machine that is not
+    /// this process, so the machine has to be told whose sandbox it is. Without
+    /// this the node stores no marker, `ListSandboxes` reports nothing, and the
+    /// reconciliation that decides which bindings are still live sees an empty
+    /// cluster — which reads exactly like a cluster with nothing running on it.
+    fn stamps_control_plane_ownership(&self) -> bool {
+        true
+    }
+
     /// 🔴 Refused; see reason 3 on the type.
     fn build(
         &self,
@@ -109,28 +118,25 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
                 .as_ref()
                 .map(|params| wire::serialize(params, "custom extension params"))
                 .transpose()?,
-            // 🔴 Empty here, and that is a placeholder with a date on it
-            // rather than an omission or a decision.
+            // The control plane's own record of this sandbox, put on the
+            // launch config by `Orchestrator::stamp_control_plane_ownership`
+            // because that is where the record becomes complete.
             //
-            // The ownership marker is *per sandbox* — it is the control plane's
-            // own record of this sandbox, written before the sandbox exists and
-            // naming it (`ForkChildAssignment::control_plane_config`) — so it
-            // cannot be a property of this factory, and there is nothing on the
-            // launch config to carry it. It belongs to a caller that decides
-            // what a sandbox's record is, and that caller is `--role api`,
-            // which `assemble_api` refuses to build at all.
+            // 🔴 Not built here, and the reason is that this factory has no
+            // per-sandbox knowledge: the marker names one sandbox and is
+            // written before it exists, so a constant on a factory shared by
+            // every create could never be it.
             //
-            // 🔴 So the consequence is worth stating plainly, because a grep
-            // for who sets the marker comes back empty and that reads like a
-            // defect: **no sandbox anywhere carries an ownership marker
-            // today**, because the only half that would attach one cannot
-            // start. `ListSandboxes` therefore admits nothing on a real
-            // cluster, and the shadow-phase probe that expects to see a
-            // sandbox pushed up through it cannot be run yet.
-            // `the_blank_ownership_marker_outlives_only_an_api_role_that_cannot_start`
-            // ties those two facts together so they stop being true at the same
-            // time.
-            control_plane_config: Vec::new(),
+            // 🔴 `unwrap_or_default` produces an empty vector, and an empty
+            // marker is *not* a marker — the node reads it back as "no control
+            // plane owns this" and leaves the sandbox out of `ListSandboxes`.
+            // That is the fail-closed direction and the right one for a create
+            // that somehow arrived unstamped: a sandbox the control plane does
+            // not recognise is left running, where a sandbox wrongly claimed
+            // would be reconciled away. `the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire`
+            // pins that an ordinary create is stamped, so the empty case stays
+            // the exception it is meant to be.
+            control_plane_config: launch_config.control_plane_config.unwrap_or_default(),
         };
 
         Ok(Box::new(RemoteSandboxStub::pending(

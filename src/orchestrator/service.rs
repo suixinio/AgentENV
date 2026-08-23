@@ -461,6 +461,9 @@ where
                     extra_mmds,
                     custom_extension_params: effective_custom_extension_params.clone(),
                     envd_access_token: envd_access_token.clone(),
+                    // Filled in by `stamp_control_plane_ownership` once the
+                    // record this marker encodes is complete; see there.
+                    control_plane_config: None,
                 };
 
                 let transitional_metadata = SandboxMetadata {
@@ -518,6 +521,7 @@ where
                     extra_mmds,
                     custom_extension_params: custom_extension_params.clone(),
                     envd_access_token,
+                    control_plane_config: None,
                 };
                 let build_spec = FreshSandboxBuildSpec {
                     image_config_path: overlaybd_config_path,
@@ -2451,9 +2455,57 @@ where
         });
     }
 
+    /// Puts this orchestrator's own record of a sandbox onto the create that
+    /// is about to be sent to the machine that will run it.
+    ///
+    /// # 🔴 Why here and not at the API surface
+    ///
+    /// The marker is the control plane's record of *this* sandbox, and a
+    /// record is only complete once the incarnation is minted — which happens
+    /// in [`LaunchPlan::for_create_from_snapshot`], below the surface that
+    /// decided to create anything. A marker written earlier would name a run
+    /// that had not been chosen yet, and fencing compares exactly that value.
+    ///
+    /// # 🔴 Why it is a no-op almost everywhere
+    ///
+    /// Only a factory whose sandboxes run on other machines asks for one
+    /// ([`SandboxBackendFactory::stamps_control_plane_ownership`]), so on
+    /// `--role all` and `--role node` this returns on its first line. That is
+    /// the property that keeps `None` meaning what it has always meant on the
+    /// user-facing REST surface: not that a marker went missing, but that no
+    /// control plane owns this sandbox.
+    ///
+    /// A caller that supplied its own marker keeps it: that is the node
+    /// service's create, where the marker arrived from the control plane and
+    /// this process is not it.
+    fn stamp_control_plane_ownership(&self, plan: &mut LaunchPlan) {
+        if !self.factory.stamps_control_plane_ownership() {
+            return;
+        }
+        let LaunchPlan::Create(plan) = plan else {
+            // A resume drives a sandbox that already exists, and its marker was
+            // written when it was created.
+            return;
+        };
+        if plan.metadata.control_plane_config.is_none() {
+            plan.metadata.control_plane_config = ControlPlaneConfig::for_record(&plan.metadata);
+        }
+        plan.launch_config.control_plane_config = plan
+            .metadata
+            .control_plane_config
+            .as_ref()
+            .map(|marker| marker.as_bytes().to_vec());
+    }
+
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
+
+        // Before the record is written and before the backend is built: both
+        // of those consume the marker, and they must consume the same one.
+        let mut plan = plan;
+        self.stamp_control_plane_ownership(&mut plan);
+        let plan = plan;
 
         let sandbox_id = plan.sandbox_id();
         let transitional_state = plan.transitional_state();

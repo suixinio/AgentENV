@@ -11,10 +11,19 @@
 //! It is not a remote form of the REST resume route. That route serves a user
 //! who asked for a resume and can be told "409, try again"; this one serves a
 //! request that is already in flight towards a sandbox. The difference shows up
-//! in exactly one place — the timeout the woken sandbox gets, which here is the
-//! auto-resume floor rather than a caller-supplied lifetime — and nowhere else.
-//! Both go through `ApiImpl::arbitrate_resume`, which is the single point a
-//! resume can acquire the right to start.
+//! in two places, both inherited from the local reverse proxy's
+//! `try_auto_resume` rather than from the REST route:
+//!
+//! - the lifetime the woken sandbox gets is the auto-resume floor, not a
+//!   caller-supplied one;
+//! - the wake-up is bounded by `proxy::auto_resume_deadline()`, and the claim
+//!   is handed back when that bound is hit — a request already in flight cannot
+//!   wait indefinitely, and a claim left behind blocks the next attempt from
+//!   anywhere.
+//!
+//! Everything else is the same path. Both go through
+//! `ApiImpl::arbitrate_resume`, which is the single point a resume can acquire
+//! the right to start.
 
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};

@@ -240,21 +240,74 @@ impl ResumeWiring {
     /// process.
     pub fn from_config(node_id: impl Into<String>) -> anyhow::Result<Self> {
         let node_id = node_id.into();
-        let Some(endpoint) = ConfigManager::global_config()
-            .cluster
-            .scheduler_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|endpoint| !endpoint.is_empty())
+        let config = ConfigManager::global_config();
+        let Some(endpoint) =
+            configured_placement_endpoint(config.cluster.scheduler_endpoint.as_deref())
         else {
+            announce_unenforced_placement(config.orchestrator.paused_registry.backend);
             return Ok(Self::node_local(node_id));
         };
 
+        // 🔴 A hard failure and not a degradation, deliberately. Falling back to
+        // `node_local` here would leave `placement` as `None`, every placement
+        // would answer `Unconstrained`, and `refuse_unhonourable_pin` would
+        // never fire for any sandbox in the fleet — so one typo in one config
+        // line would silently switch pin enforcement off. The failure that
+        // follows from that is not an error the operator sees: it is a
+        // sandbox whose only copy lived on another disk being rebuilt from an
+        // older snapshot and answering 200, with the user's last session gone.
+        // Refusing to start is loud; the alternative is silent and
+        // irreversible.
         let channel = Endpoint::from_shared(qualified_endpoint(endpoint))?.connect_lazy();
         Ok(Self {
             placement: Some(Arc::new(SchedulerPlacementSource::new(channel))),
             wake_site: WakeSite::Local(node_id),
         })
+    }
+}
+
+/// The placement endpoint a configuration names, if it names one.
+///
+/// Blank and absent are the same answer, because a config file that carries the
+/// key with an empty value is not naming an endpoint. Split out from
+/// [`ResumeWiring::from_config`] because that function reads a global and this
+/// decision is worth being able to state a test about: inverting it would drop
+/// every configured endpoint on the floor and turn pin enforcement off exactly
+/// where it is needed.
+fn configured_placement_endpoint(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|endpoint| !endpoint.is_empty())
+}
+
+/// Says out loud that no placement source is configured, and therefore that
+/// nothing in this process will refuse a pin.
+///
+/// 🔴 Said rather than left implicit. With no endpoint every placement is
+/// `Unconstrained`, so this process will wake any sandbox anywhere it is asked
+/// to — which is correct for a single-node deployment and is a capability gap
+/// on a cluster. The gap is invisible from the outside: the resumes still
+/// succeed. That is the exact shape this programme keeps paying for — a metric
+/// at 0 that reads the same whether nothing happened or nothing was watching —
+/// so it gets a log line rather than a silence.
+///
+/// The level carries the judgement. A `central` paused registry only exists in
+/// a clustered deployment, so it is the one signal available here that
+/// distinguishes "correctly unconstrained" from "quietly unenforced".
+fn announce_unenforced_placement(backend: crate::cfg::PausedRegistryBackendKind) {
+    let clustered = matches!(backend, crate::cfg::PausedRegistryBackendKind::Central);
+    if clustered {
+        warn!(
+            paused_registry_backend = backend.as_str(),
+            "no [cluster].scheduler_endpoint is configured, so this process will not refuse \
+             to wake a sandbox pinned to another node; the scheduler's LookupNode is the only \
+             thing still enforcing that, and an unpublished pause woken here would be rebuilt \
+             from an older snapshot"
+        );
+    } else {
+        debug!(
+            paused_registry_backend = backend.as_str(),
+            "no [cluster].scheduler_endpoint is configured; placement is unconstrained, which \
+             is what a single-node deployment expects"
+        );
     }
 }
 
@@ -447,6 +500,26 @@ enum EnvdAuthorization {
     Unknown,
 }
 
+impl EnvdAuthorization {
+    /// Whether the cluster row still has to be consulted before this caller is
+    /// let through.
+    ///
+    /// 🔴 Only `Unknown`, and getting this backwards is an authorization
+    /// bypass rather than a stricter check. `Unknown` is precisely the case
+    /// where this process held no record to check the token against — the
+    /// ordinary case on the cold path, since the whole point of that path is
+    /// being asked about sandboxes this process has never run. A build that
+    /// skipped the second pass for `Unknown` would wake any secure sandbox it
+    /// did not already know about for a caller presenting nothing at all.
+    ///
+    /// `Authorized` must *not* be re-checked: it was already decided against a
+    /// real record, and re-deciding it against a different one would let a
+    /// stale cluster row overturn a valid token.
+    fn needs_cluster_record(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
 impl ApiImpl {
     /// Wakes a paused sandbox on behalf of the data plane.
     ///
@@ -524,7 +597,7 @@ impl ApiImpl {
 
         // The rest of the credential check, now that the cluster row may have
         // supplied the record this process did not have.
-        if authorized == EnvdAuthorization::Unknown {
+        if authorized.needs_cluster_record() {
             let from_entry = entry.as_ref().and_then(|entry| entry.metadata.as_ref());
             if self.authorize_envd(&request, from_entry) == EnvdAuthorization::Rejected {
                 if let Some(generation) = held {
@@ -1066,6 +1139,88 @@ mod tests {
         assert_eq!(quoted_node_id("no quotes here"), None);
         assert_eq!(quoted_node_id("one \"unterminated"), None);
         assert_eq!(quoted_node_id("empty \"\" name"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 🔴 The two decisions that switch enforcement off when inverted
+    // -----------------------------------------------------------------------
+
+    /// 🔴 A configured endpoint must survive, and a blank one must not become
+    /// one.
+    ///
+    /// Both directions matter and they fail differently. Dropping a real
+    /// endpoint leaves `placement` as `None`, every placement answers
+    /// `Unconstrained`, and no pin is ever refused — fleet-wide, silently.
+    /// Accepting a blank one sends `Endpoint::from_shared("http://")` a URI
+    /// with no authority and stops the process instead.
+    #[test]
+    fn a_configured_placement_endpoint_survives_and_a_blank_one_does_not_become_one() {
+        assert_eq!(
+            configured_placement_endpoint(Some("scheduler:9090")),
+            Some("scheduler:9090"),
+            "🔴 dropping a configured endpoint switches pin enforcement off for \
+             every sandbox in the fleet, and nothing reports it"
+        );
+        assert_eq!(
+            configured_placement_endpoint(Some("  scheduler:9090  ")),
+            Some("scheduler:9090"),
+            "a config file's whitespace is not part of the address"
+        );
+
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                configured_placement_endpoint(blank),
+                None,
+                "a key carrying no value is not naming an endpoint: {blank:?}"
+            );
+        }
+    }
+
+    /// 🔴 Which authorization outcome still needs the cluster's record.
+    ///
+    /// Inverting this is not a stricter check, it is a bypass. `Unknown` is
+    /// exactly the case where this process held no record to check a token
+    /// against — the ordinary case on the cold path — so skipping the second
+    /// pass there wakes any secure sandbox this process has not run for a
+    /// caller presenting nothing.
+    ///
+    /// The other direction is a bug too, in the opposite way: re-checking an
+    /// `Authorized` verdict against a different record lets a stale cluster row
+    /// overturn a token that was already validated against a real one.
+    #[test]
+    fn only_an_unknown_authorization_still_needs_the_cluster_record() {
+        assert!(
+            EnvdAuthorization::Unknown.needs_cluster_record(),
+            "🔴 the cold path is asked about sandboxes this process has never \
+             run; skipping the second pass there is an authorization bypass"
+        );
+        assert!(
+            !EnvdAuthorization::Authorized.needs_cluster_record(),
+            "already decided against a real record; a second look could only \
+             overturn it with a worse one"
+        );
+        assert!(
+            !EnvdAuthorization::Rejected.needs_cluster_record(),
+            "a rejection has already returned by this point"
+        );
+    }
+
+    /// The woken sandbox's timeout floor is the local reverse proxy's, not zero.
+    ///
+    /// Shared rather than duplicated so a wake-up that came through the gateway
+    /// and one that came through a node's own proxy cannot leave the sandbox
+    /// with different lifetimes. A zero floor would hand every woken sandbox
+    /// whatever it had left, which for a sandbox that was paused past its
+    /// deadline is nothing.
+    #[test]
+    fn the_wake_up_timeout_floor_is_the_one_the_local_proxy_uses() {
+        let floor = auto_resume_min_sandbox_timeout();
+        assert_eq!(floor, crate::api::proxy::auto_resume_min_sandbox_timeout());
+        assert!(
+            !floor.is_zero(),
+            "a zero floor raises nothing, so a sandbox woken at the end of its \
+             life would be evicted again immediately"
+        );
     }
 
     // -----------------------------------------------------------------------

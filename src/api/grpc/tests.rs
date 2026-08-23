@@ -466,6 +466,47 @@ async fn a_successful_wake_up_names_the_node_it_woke_on_not_the_one_that_was_pre
     );
 }
 
+/// 🔴 The address is handed out only when the placement is talking about this
+/// machine.
+///
+/// The pair with `a_successful_wake_up_names_the_node_it_woke_on_...`, which
+/// covers the other half: there the placement names another node and the
+/// address must come back empty. Here it names *this* node and the address must
+/// come back. Without both, "always empty" and "always the placement's" each
+/// pass one of them — and "always empty" costs the gateway a second lookup on
+/// every wake-up while looking exactly like correct behaviour.
+#[tokio::test]
+async fn a_placement_naming_this_node_hands_back_its_address() {
+    let api = serve_api(wiring(Ok(ResumePlacement::Preferred {
+        node: placed(THIS_NODE),
+        origin_node_id: THIS_NODE.to_string(),
+    })))
+    .await;
+    let sandbox_id = SandboxId::new();
+
+    api.api
+        .orchestrator()
+        .set_proxy_target_for_test(
+            sandbox_id,
+            ProxyTarget::new(Ipv4Addr::LOCALHOST),
+            SandboxState::Running,
+        )
+        .await;
+
+    let woken = api
+        .resume(&sandbox_id.to_string(), None, None)
+        .await
+        .expect("a running sandbox is a successful wake-up");
+
+    assert_eq!(woken.node_id, THIS_NODE);
+    assert_eq!(
+        woken.node_address,
+        format!("http://{THIS_NODE}:8000"),
+        "🔴 the placement named this machine, so its address is this machine's \
+         and the gateway can forward without looking the node up again"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 🔴 Three-state absence: "could not ask" is never "does not exist"
 // ---------------------------------------------------------------------------
@@ -732,5 +773,102 @@ fn every_outcome_of_the_wake_up_surface_is_published_before_the_first_request() 
         published, expected,
         "every outcome this surface can record must exist as a zeroed series \
          before the first request, or the acceptance probe cannot tell 0 from absent"
+    );
+}
+
+/// 🔴 The counter's label is the same string as the refusal trailer.
+///
+/// §12 P3's control B joins the gateway's log, this half's log and the scrape
+/// with one grep, and it only works if the refusal a caller reads and the label
+/// an operator scrapes are spelled identically. Nothing else in this file
+/// observes a counter *moving* — the zero-publication test above proves the
+/// series exist, which is a different claim — so without this the label could
+/// be any string at all.
+///
+/// The successful half is asserted in the same run: four refusals recorded
+/// under the right names prove nothing if a wake-up that worked recorded
+/// nothing, or recorded a refusal.
+#[tokio::test]
+async fn the_metric_label_is_the_same_string_the_refusal_trailer_carries() {
+    use crate::proto::apiproxy::sandbox_resume_service_server::SandboxResumeService as ServiceTrait;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    async fn counters(
+        placement: Result<ResumePlacement, PlacementRefusal>,
+        seed_running: bool,
+    ) -> Vec<(String, u64)> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // 🔴 A thread-local recorder held across the await, which works only
+        // because `#[tokio::test]` runs a current-thread runtime: every poll of
+        // the future below happens on this thread. Calling the service directly
+        // rather than over the socket keeps it that way — a tonic server would
+        // be free to poll the handler somewhere else.
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let api = build_api(wiring(placement)).await;
+        let sandbox_id = SandboxId::new();
+        if seed_running {
+            api.orchestrator()
+                .set_proxy_target_for_test(
+                    sandbox_id,
+                    ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                    SandboxState::Running,
+                )
+                .await;
+        }
+        let service = super::resume::SandboxResumeService::new(Arc::clone(&api));
+        let _ = ServiceTrait::resume_sandbox(
+            &service,
+            tonic::Request::new(pb::SandboxResumeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }),
+        )
+        .await;
+        drop(guard);
+
+        let mut moved = Vec::new();
+        for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
+            let key = composite.key();
+            if key.name() != "agentenv_api_resume_grpc_total" {
+                continue;
+            }
+            if let DebugValue::Counter(count) = value {
+                if count == 0 {
+                    continue;
+                }
+                if let Some(label) = key.labels().find(|label| label.key() == "result") {
+                    moved.push((label.value().to_string(), count));
+                }
+            }
+        }
+        moved
+    }
+
+    let refused = counters(
+        Err(PlacementRefusal::Pinned {
+            reason: crate::api::impls::PinRefusalReason::OriginNotReporting,
+            origin_node_id: OTHER_NODE.to_string(),
+            detail: "sandbox is local_only on node \"node-elsewhere\", which is not reporting"
+                .to_string(),
+        }),
+        false,
+    )
+    .await;
+    assert_eq!(
+        refused,
+        vec![("origin_not_reporting".to_string(), 1)],
+        "🔴 the label must be the refusal's own wire spelling — the same string \
+         that travelled in the trailer — or the gateway's log and this scrape \
+         cannot be joined"
+    );
+
+    let woken = counters(Ok(ResumePlacement::Unconstrained), true).await;
+    assert_eq!(
+        woken,
+        vec![("ok".to_string(), 1)],
+        "and a wake-up that worked must record exactly one success: without this \
+         the assertion above would also hold for a build that recorded a refusal \
+         for everything"
     );
 }

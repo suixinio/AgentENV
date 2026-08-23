@@ -1018,6 +1018,24 @@ mod tests {
         assert!(enabled_for(ServerRole::Node, None));
     }
 
+    /// Whether a manifest *sets* `var`, as against mentioning it.
+    ///
+    /// 🔴 Comment lines are not a loophole. A manifest that names this variable
+    /// in order to say it is deliberately absent is doing the thing the scan
+    /// wants; a predicate that could not tell the two apart would push that
+    /// explanation out of the file — and the explanation is what stops somebody
+    /// copying the line from a workload where it is right.
+    ///
+    /// What is still caught is the variable on every line a deployment tool
+    /// reads. There are three such forms and the scan below checks all three: a
+    /// `- name:` entry in a container's `env:`, a `KEY: value` under a
+    /// ConfigMap's `data:`, and a `KEY=value` kustomize literal.
+    fn manifest_sets(contents: &str, var: &str) -> bool {
+        contents
+            .lines()
+            .any(|line| line.contains(var) && !line.trim_start().starts_with('#'))
+    }
+
     /// 🔴 T-NR-37. No deployment manifest turns the sweep on.
     ///
     /// `AENV_STARTUP_RECLAIM_ENABLED=true` on a `--role all` node makes the
@@ -1028,44 +1046,42 @@ mod tests {
     ///
     /// The startup warning in [`enabled_for`] covers the operator who types it.
     /// This covers the one who commits it, which nothing at runtime can.
-    /// Whether a manifest *sets* `var`, as against mentioning it.
     ///
-    /// 🔴 Comment lines are not a loophole. A manifest that names this variable
-    /// in order to say it is deliberately absent is doing the thing the scan
-    /// wants; a predicate that could not tell the two apart would push that
-    /// explanation out of the file — and the explanation is what stops somebody
-    /// copying the line from a workload where it is right.
-    ///
-    /// What is still caught is the variable on any line a deployment tool
-    /// reads: a `name:`, a ConfigMap literal, an arg.
-    fn manifest_sets(contents: &str, var: &str) -> bool {
-        contents
-            .lines()
-            .any(|line| line.contains(var) && !line.trim_start().starts_with('#'))
-    }
-
-    /// 🔴 The control probe for the scan below, and it is not optional: a
-    /// predicate that answered `false` for everything would make that scan pass
-    /// against a manifest that turns the sweep on across the whole fleet.
-    #[test]
-    fn the_manifest_scan_can_tell_a_setting_from_a_note_about_one() {
-        const VAR: &str = "AENV_STARTUP_RECLAIM_ENABLED";
-
-        assert!(manifest_sets(
-            &format!("            - name: {VAR}\n              value: \"true\"\n"),
-            VAR
-        ));
-        assert!(manifest_sets(&format!("      - {VAR}=true\n"), VAR));
-        assert!(!manifest_sets(
-            &format!("            # {VAR} is deliberately absent, here and everywhere\n"),
-            VAR
-        ));
-        assert!(!manifest_sets("            - name: AENV_ROLE\n", VAR));
-    }
-
+    /// 🔴 The scan's whole result is an absence, so the proof that it *would*
+    /// find a setting lives in this same test rather than in a sibling one. A
+    /// separate control can be filtered out of a run, deleted on its own, or
+    /// simply not noticed, and what is left then passes identically against a
+    /// scanner that reads nothing at all — the shape this programme has now
+    /// paid for five or six times.
     #[test]
     fn no_deployment_manifest_turns_the_startup_sweep_on() {
         const VAR: &str = "AENV_STARTUP_RECLAIM_ENABLED";
+
+        // 🔴 The non-empty half, ahead of the scan rather than beside it.
+        // These are the three forms a manifest in this tree can express the
+        // setting in; the predicate has to catch all three before the absence
+        // the scan reports means anything.
+        for (form, shape) in [
+            (
+                format!("            - name: {VAR}\n              value: \"true\""),
+                "a container env: entry",
+            ),
+            (format!("  {VAR}: \"true\""), "a ConfigMap data: key"),
+            (format!("      - {VAR}=true"), "a kustomize literal"),
+        ] {
+            assert!(
+                manifest_sets(&form, VAR),
+                "the scan cannot see {VAR} written as {shape}, so the sweep could be turned on \
+                 in that form and this test would still pass"
+            );
+        }
+        // And the direction the narrowing exists for, plus a line that merely
+        // resembles one: neither is a setting.
+        assert!(!manifest_sets(
+            &format!("            # {VAR} is deliberately absent, here and everywhere"),
+            VAR
+        ));
+        assert!(!manifest_sets("            - name: AENV_ROLE", VAR));
 
         // 🔴 Resolution: the name below has to be the name the config actually
         // reads, or this scan looks for a string nothing would ever contain and
@@ -1078,6 +1094,11 @@ mod tests {
 
         let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy");
         let mut checked = 0;
+        // One real file from the walk, kept so the predicate can be shown to
+        // have teeth against an actual manifest and not only against the
+        // fragments above — a whole file has comments, blank lines, block
+        // scalars and indentation that a three-line literal does not.
+        let mut sample: Option<(std::path::PathBuf, String)> = None;
         let mut stack = vec![deploy.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1100,8 +1121,23 @@ mod tests {
                      belongs on a --role node workload and this test needs to say so",
                     path.display()
                 );
+                if sample.is_none() && contents.contains('\n') {
+                    sample = Some((path.clone(), contents));
+                }
             }
         }
+
+        // 🔴 The same assertion the walk just made, on the same file, with one
+        // setting line added — so "no manifest sets it" is a fact about the
+        // tree rather than about the scan. Whichever file this is, it passed
+        // above and must fail here.
+        let (sampled_path, sampled) =
+            sample.expect("the walk read no file with more than one line");
+        assert!(
+            manifest_sets(&format!("{sampled}\n  {VAR}: \"true\"\n"), VAR),
+            "adding a real setting to {} did not make the scan notice it",
+            sampled_path.display()
+        );
         assert!(
             checked > 10,
             "only {checked} files under {} were read; a scan that reads nothing passes \

@@ -112,6 +112,25 @@ impl ServerRole {
         matches!(self, Self::Api | Self::All)
     }
 
+    /// Whether this role decides, on its own initiative, that a paused sandbox
+    /// should be brought back to life.
+    ///
+    /// 🔴 This is what the data plane's auto-resume hangs on. A `node` forwards
+    /// bytes and refuses traffic addressed to a superseded incarnation; what it
+    /// no longer does is notice that the sandbox is paused and start it. That
+    /// decision belongs to the half that owns sandboxes, and the data plane
+    /// reaches it through the gateway's cold path
+    /// (`crate::api::grpc::resume`) rather than through whichever node the
+    /// traffic happened to land on.
+    ///
+    /// 🔴 `all` answers yes, and that is the whole rollback: the four decision
+    /// arms in `try_auto_resume` are still compiled and still reached, because
+    /// deleting them would mean `--role all` is no longer the thing that was
+    /// running before (`_sd-impl-phase3-role.md` §11.3).
+    pub fn serves_wake_decisions(self) -> bool {
+        matches!(self, Self::Api | Self::All)
+    }
+
     /// Whether this role sweeps the host for what a previous process on this
     /// machine left behind: leftover Firecracker VMMs, their work directories,
     /// their serial logs.
@@ -253,6 +272,7 @@ mod tests {
         assert!(all.sends_heartbeats());
         assert!(all.drains_on_shutdown());
         assert!(all.serves_user_facing_rest());
+        assert!(all.serves_wake_decisions());
         // 🔴 The one gate `all` answers *no* to, and it is not a capability
         // being taken away — it is a behaviour `all` never had. Sweeping the
         // host at startup is new, and turning it on for the rollback target
@@ -274,6 +294,7 @@ mod tests {
         // and it is the half that answers users.
         assert!(api.arbitrates_paused_sandbox_ownership());
         assert!(api.serves_user_facing_rest());
+        assert!(api.serves_wake_decisions());
     }
 
     #[test]
@@ -284,6 +305,11 @@ mod tests {
         assert!(node.drains_on_shutdown());
         assert!(!node.arbitrates_paused_sandbox_ownership());
         assert!(!node.serves_user_facing_rest());
+        // 🔴 The predicate the local reverse proxy's auto-resume arm is gated
+        // on. A node that answered `true` here would go on starting sandboxes
+        // on its own initiative, and the topology change would be a no-op that
+        // looked like it had landed.
+        assert!(!node.serves_wake_decisions());
         assert!(node.reclaims_host_leftovers_at_startup());
     }
 

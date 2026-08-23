@@ -98,6 +98,15 @@ type ServerOptions struct {
 	// a ConfigMap change, so it has to be a configuration switch and never a
 	// deploy-time one.
 	ResumeClient *resume.Client
+
+	// RestUpstreamAddr sends user-facing REST to the api half instead of
+	// fanning it out to the nodes. The empty string is the switch off and is
+	// today's behaviour exactly. Parsed in NewServer, so an address that cannot
+	// be used stops the process rather than becoming a 502 per request.
+	//
+	// 🔴 3a's other rollback lever, and the same rule applies: it has to be a
+	// configuration switch, never a deploy-time one. See rest_upstream.go.
+	RestUpstreamAddr string
 }
 
 type Server struct {
@@ -124,6 +133,11 @@ type Server struct {
 	projectionAuthoritative bool
 	// Nil when no wake-up endpoint is configured. See ServerOptions.
 	resumeClient *resume.Client
+	// Empty when user-facing REST still fans out to the nodes. Normalised to a
+	// base URL once, at construction, for the reason executionFencing is: a
+	// string re-read and re-interpreted at each call site is how one switch
+	// ends up meaning two things.
+	restUpstream string
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -133,6 +147,11 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	}
 
 	executionFencing, err := config.ParseGatewayExecutionFencing(options.ExecutionFencing)
+	if err != nil {
+		return nil, err
+	}
+
+	restUpstream, err := config.ParseRestUpstream(options.RestUpstreamAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -156,6 +175,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		projectionReader:        options.ProjectionReader,
 		projectionAuthoritative: options.ProjectionAuthoritative,
 		resumeClient:            options.ResumeClient,
+		restUpstream:            restUpstream,
 	}, nil
 }
 
@@ -276,6 +296,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		routeSource = routeSourceSchedule
 	}
 	setGatewayRouteSource(w, routeSource)
+
+	// 阶段 3a. The two calls are adjacent so that the counter and the decision
+	// cannot drift: every user-facing REST exchange is counted exactly once,
+	// against the upstream that is about to serve it, and the "node" arm is
+	// what makes a flat zero on the "api" arm — or the other way round — mean
+	// anything at all. See rest_upstream.go.
+	if isUserFacingRestRequest(r, hostRoute, routeSource) {
+		if s.restUpstream != "" {
+			recordRestUpstream(restUpstreamAPI)
+			s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
+			return
+		}
+		recordRestUpstream(restUpstreamNode)
+	}
+
 	var node *schedulerv1.Node
 	// How the scheduler arrived at that node. Anything other than BOUND means
 	// the node does not hold the sandbox yet, which is what decides whether the

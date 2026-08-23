@@ -104,6 +104,19 @@ func main() {
 		logger.Info("no api resume surface configured; paused sandboxes are woken by the node the request lands on")
 	}
 
+	// 🔴 Said out loud in both positions, following the resume surface above and
+	// for the same reason: with no address configured every user-facing REST
+	// call is placed by the scheduler and served by a node, which is correct
+	// before 阶段 3a and wrong after it, and the difference is invisible from
+	// the outside because the calls succeed either way.
+	if cfg.Gateway.RestUpstreamAddr != "" {
+		logger.Info("sending user-facing rest to the api half",
+			zap.String("addr", cfg.Gateway.RestUpstreamAddr),
+		)
+	} else {
+		logger.Info("no api rest upstream configured; user-facing rest is served by the node the scheduler names")
+	}
+
 	serverOptions := gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
@@ -113,6 +126,7 @@ func main() {
 		ExecutionFencing:         string(cfg.Gateway.Routing.ExecutionFencing),
 		ControlPlaneToken:        cfg.Gateway.ControlPlaneToken,
 		ProjectionAuthoritative:  cfg.Gateway.Routing.ProjectionAuthoritative,
+		RestUpstreamAddr:         cfg.Gateway.RestUpstreamAddr,
 	}
 	// 🔴 Assigned through the branch rather than passed inline: a typed nil
 	// pointer stored in an interface field is not a nil interface, and the read
@@ -133,6 +147,8 @@ func main() {
 		zap.String("metrics_addr", cfg.Gateway.MetricsListenAddr),
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
+		zap.String("rest_upstream", cfg.Gateway.RestUpstreamAddr),
+		zap.String("resume_addr", cfg.Gateway.ResumeAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 		zap.String("execution_fencing", string(cfg.Gateway.Routing.ExecutionFencing)),
 		zap.Bool("routing_projection_read", cfg.Gateway.Routing.ProjectionRead),

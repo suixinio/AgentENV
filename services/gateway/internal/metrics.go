@@ -115,6 +115,22 @@ var (
 		},
 		[]string{"result"},
 	)
+	// Which upstream served a user-facing REST call: the api half, or a node
+	// the scheduler named.
+	//
+	// 🔴 Two arms, always, and the second one is why this series is worth
+	// having. 阶段 3a's acceptance criterion is that no node serves user REST
+	// any more, and "a counter that stays at zero" is not evidence of that on
+	// its own — an idle gateway produces the same picture. One scrape carrying
+	// both arms carries its own control: node flat at zero means something
+	// precisely when api in the same scrape is climbing.
+	gatewayRestUpstream = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_rest_upstream_total",
+			Help: "User-facing REST exchanges by which upstream served them: the api half, or a node the scheduler named.",
+		},
+		[]string{"upstream"},
+	)
 	// Duplicate sandbox rows seen while merging the cluster listing, by how the
 	// winner was chosen.
 	//
@@ -338,6 +354,13 @@ func recordResumeAttempt(result resume.Result) {
 
 func recordRouteResolution(source string) {
 	gatewayRouteResolution.WithLabelValues(source).Inc()
+}
+
+// recordRestUpstream counts one user-facing REST exchange against the upstream
+// about to serve it. The label set is closed by its two callers, both of which
+// live in the same branch of handleProxy.
+func recordRestUpstream(upstream string) {
+	gatewayRestUpstream.WithLabelValues(upstream).Inc()
 }
 
 // gatewaySandboxLocationLabel keeps the label set closed. An enum value this

@@ -14,7 +14,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::{getpgrp, Pid};
 use tracing::{debug, info, warn};
 
-use super::{ReclaimCounts, ReclaimPaths};
+use super::{owner, ReclaimCounts, ReclaimPaths};
 
 /// The `comm` of the process this sweep is looking for.
 ///
@@ -31,13 +31,27 @@ pub(super) const WORK_DIR_PREFIX: &str = "agentenv-fc-";
 /// What the sweep concluded about one candidate process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ownership {
-    /// Started by a previous AgentENV process on this machine: it is
-    /// Firecracker, and its working directory is a sandbox work directory
-    /// under this deployment's own work base.
+    /// Started by a previous AgentENV process on this machine, and that
+    /// process is gone: it is Firecracker, its working directory is a sandbox
+    /// work directory under this deployment's own work base, and the owner
+    /// stamp in that directory names a process that is no longer running.
+    ///
+    /// 🔴 "And that process is gone" is the half that used to be assumed. See
+    /// [`super::owner`].
     Ours,
     /// Someone else's. A Firecracker, but running somewhere this deployment
     /// never puts one.
     Foreign,
+    /// 🔴 Started by an AgentENV server that is **still running**, named by the
+    /// owner stamp in its work directory.
+    ///
+    /// Ours in the sense [`Ownership::Ours`] means it — it is a Firecracker in
+    /// one of this deployment's work directories — and emphatically not ours to
+    /// kill. This is the answer that separates "a leftover" from "a live
+    /// sandbox on a machine we are sharing", which is a distinction the two
+    /// host-wide premise checks in [`super::premise_holds`] can only make when
+    /// they happen to be right. See [`super::owner`].
+    LiveOwner(i32),
     /// It went away while it was being read. Not an answer about ownership,
     /// and not a failure — it is the state the sweep was trying to reach.
     Vanished,
@@ -139,7 +153,13 @@ pub(super) fn plan(paths: &ReclaimPaths) -> Vec<ProcessPlan> {
             continue;
         }
 
-        plans.push(plan_for_candidate(pid, &process_dir, &work_base, own_pgid));
+        plans.push(plan_for_candidate(
+            pid,
+            &process_dir,
+            &paths.proc_dir,
+            &work_base,
+            own_pgid,
+        ));
     }
 
     plans.sort_by_key(|plan| plan.pid);
@@ -160,16 +180,30 @@ fn is_candidate(process_dir: &Path) -> bool {
 fn plan_for_candidate(
     pid: i32,
     process_dir: &Path,
+    proc_dir: &Path,
     work_base: &Path,
     own_pgid: i32,
 ) -> ProcessPlan {
     let ownership = match std::fs::read_link(process_dir.join("cwd")) {
         Ok(cwd) => {
-            let cwd = resolve(&strip_deleted_marker(&cwd));
-            if is_sandbox_work_dir(&cwd, work_base) {
+            let (stripped, work_dir_unlinked) = strip_deleted_marker(&cwd);
+            let cwd = resolve(&stripped);
+            if !is_sandbox_work_dir(&cwd, work_base) {
+                Ownership::Foreign
+            } else if work_dir_unlinked {
+                // 🔴 The one place a missing stamp still means "leftover", and
+                // it is not a guess: the directory this VMM needs has been
+                // unlinked, so it cannot be serving anybody. Leaving it alone
+                // would leak it permanently — its stamp is gone with the
+                // directory, so no later sweep could conclude anything about it
+                // either.
                 Ownership::Ours
             } else {
-                Ownership::Foreign
+                match owner::owner_of(&cwd, proc_dir) {
+                    owner::Owner::Gone => Ownership::Ours,
+                    owner::Owner::Alive(owner_pid) => Ownership::LiveOwner(owner_pid),
+                    owner::Owner::Unknown(reason) => Ownership::Undetermined(reason),
+                }
             }
         }
         // The process exited between the directory listing and this read. That
@@ -280,13 +314,19 @@ fn read_pgid(process_dir: &Path) -> Option<i32> {
 /// `/proc/<pid>/cwd` for a process whose working directory has been unlinked
 /// reads back as `"<path> (deleted)"`. It is still that path, and the process
 /// is still ours.
-fn strip_deleted_marker(path: &Path) -> PathBuf {
+///
+/// 🔴 Returns whether the marker was there, because that is load-bearing in two
+/// places rather than cosmetic in one: a Firecracker whose work directory has
+/// been unlinked has no owner stamp left to read, and a second copy of this
+/// server whose binary was replaced on disk reads back this way from
+/// `/proc/<pid>/exe`.
+pub(super) fn strip_deleted_marker(path: &Path) -> (PathBuf, bool) {
     match path
         .to_str()
         .and_then(|path| path.strip_suffix(" (deleted)"))
     {
-        Some(stripped) => PathBuf::from(stripped),
-        None => path.to_path_buf(),
+        Some(stripped) => (PathBuf::from(stripped), true),
+        None => (path.to_path_buf(), false),
     }
 }
 
@@ -341,6 +381,21 @@ pub(super) async fn reclaim(paths: &ReclaimPaths, exit_wait: Duration) -> Reclai
             }
             (Ownership::Foreign, _) => {
                 debug!(target: "agentenv", pid = plan.pid, "leaving a Firecracker this deployment did not start");
+                counts.left_alone += 1;
+            }
+            (Ownership::LiveOwner(owner_pid), _) => {
+                // 🔴 `info`, not `debug`, and not silent. This is a sandbox
+                // belonging to a server that is up while this one is starting,
+                // which means the premise the sweep rests on is false and the
+                // two host-wide checks above did not catch it. Reclaiming this
+                // host is not what should happen next, and an operator has to
+                // be able to see that it did not.
+                info!(
+                    target: "agentenv",
+                    pid = plan.pid,
+                    owner_pid = *owner_pid,
+                    "leaving a Firecracker whose server process is still running"
+                );
                 counts.left_alone += 1;
             }
             (Ownership::Vanished, _) => {}
@@ -460,9 +515,32 @@ mod tests {
 
         /// A sandbox work directory of ours, created for real so `cwd` can
         /// point at it.
+        /// A work directory left behind by a server that has exited, which is
+        /// what every leftover in this suite is.
         fn sandbox_work_dir(&self, name: &str) -> PathBuf {
             let dir = self.work_base().join(name);
             std::fs::create_dir_all(&dir).unwrap();
+            owner::stamp_as_leftover(&dir);
+            dir
+        }
+
+        /// A work directory whose server process is *still running*, laid out
+        /// in this fixture's forged `/proc` so the stamp can be checked against
+        /// it.
+        fn work_dir_of_a_live_server(&self, name: &str, server_pid: i32) -> PathBuf {
+            let dir = self.work_base().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            owner::stamp_for_test(&dir, server_pid, 77_000, None);
+            let process = self.proc.dir().join(server_pid.to_string());
+            std::fs::create_dir_all(&process).unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!(
+                    "{server_pid} (server) S 1 {server_pid} {server_pid} 0 -1 0 0 0 0 0 0 0 0 0 \
+                     20 0 1 0 77000"
+                ),
+            )
+            .unwrap();
             dir
         }
 
@@ -484,6 +562,80 @@ mod tests {
     }
 
     // ── The refusals ────────────────────────────────────────────────────────
+
+    /// 🔴 T-NR-46. **The refusal this module was missing.**
+    ///
+    /// Two Firecrackers, side by side in the same work base, indistinguishable
+    /// in every way the old sweep could see: same name, same parent directory,
+    /// same prefix. The only difference is that one's work directory names a
+    /// server process that is in this host's `/proc` and the other's does not.
+    ///
+    /// One is a leftover and one is a running user's sandbox, and before the
+    /// owner stamp both were `Ours` and both were killed.
+    #[test]
+    fn a_firecracker_whose_server_is_still_running_is_not_a_leftover() {
+        const SERVER: i32 = 7200;
+
+        let fixture = Fixture::new();
+        let live = fixture.work_dir_of_a_live_server("agentenv-fc-live", SERVER);
+        let dead = fixture.sandbox_work_dir("agentenv-fc-dead");
+        fixture
+            .proc
+            .process(4101, "firecracker", Some(&live), 4101)
+            .process(4102, "firecracker", Some(&dead), 4102);
+
+        let plans = fixture.plan();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            plans[0],
+            ProcessPlan {
+                pid: 4101,
+                ownership: Ownership::LiveOwner(SERVER),
+                action: Action::Nothing,
+            },
+            "a sandbox of a server that is up must never be signalled"
+        );
+        // The other face, in the same run and the same work base: a leftover
+        // whose server is gone is still reclaimed, so the refusal above is a
+        // decision rather than the sweep having been turned off.
+        assert_eq!(
+            plans[1],
+            ProcessPlan {
+                pid: 4102,
+                ownership: Ownership::Ours,
+                action: Action::KillGroup(4102),
+            }
+        );
+    }
+
+    /// 🔴 T-NR-47. A work directory that is there but says nothing about who
+    /// made it is "cannot tell", and "cannot tell" does not kill.
+    ///
+    /// Distinct from T-NR-11, where the directory has been *unlinked* — there
+    /// the VMM's files are gone, it cannot be serving anyone, and no later
+    /// sweep could ever conclude anything about it either.
+    #[test]
+    fn a_firecracker_whose_work_directory_carries_no_stamp_is_left_alone() {
+        let fixture = Fixture::new();
+        let unstamped = fixture.work_base().join("agentenv-fc-unstamped");
+        std::fs::create_dir_all(&unstamped).unwrap();
+        let stamped = fixture.sandbox_work_dir("agentenv-fc-stamped");
+        fixture
+            .proc
+            .process(4201, "firecracker", Some(&unstamped), 4201)
+            .process(4202, "firecracker", Some(&stamped), 4202);
+
+        let plans = fixture.plan();
+        assert_eq!(plans[0].action, Action::Nothing);
+        assert!(
+            matches!(plans[0].ownership, Ownership::Undetermined(_)),
+            "{:?}",
+            plans[0]
+        );
+        // Resolution: the stamped one beside it is reclaimed.
+        assert_eq!(plans[1].ownership, Ownership::Ours);
+        assert_eq!(plans[1].action, Action::KillGroup(4202));
+    }
 
     /// 🔴 T-NR-1. **The refusal, and the reason this module can exist at all.**
     ///

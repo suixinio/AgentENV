@@ -312,8 +312,14 @@ impl FirecrackerCommonConfig {
     }
 }
 
+/// Creates the directory one sandbox's Firecracker runs in.
+///
+/// 🔴 The only place a `agentenv-fc-*` directory is made, and therefore the
+/// only place the startup sweep's owner stamp can be written. `node_reclaim`
+/// reads that stamp to tell a leftover from a sandbox belonging to a server
+/// that is still running; a directory without one is never reclaimed.
 pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {
-    match work_dir {
+    let dir = match work_dir {
         Some(parent) => {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create firecracker work_dir {}", parent.display()))?;
@@ -322,11 +328,28 @@ pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<Tem
                     "create firecracker sandbox work directory under {}",
                     parent.display()
                 )
-            })
+            })?
         }
         None => TempDir::with_prefix("agentenv-fc-")
-            .context("create firecracker sandbox work directory"),
+            .context("create firecracker sandbox work directory")?,
+    };
+
+    // 🔴 Warned about rather than fatal. A sandbox that runs perfectly well
+    // must not be refused because a startup sweep it will probably never meet
+    // would have liked a marker; the cost of the missing stamp is that a later
+    // sweep declines to reclaim this directory, which is the safe direction and
+    // is counted in `agentenv_node_reclaim_failed_total`.
+    if let Err(error) = crate::node_reclaim::stamp_work_dir(dir.path()) {
+        tracing::warn!(
+            target: "agentenv",
+            path = %dir.path().display(),
+            %error,
+            "could not record which process owns this sandbox work directory; a startup sweep \
+             will leave it in place rather than reclaim it"
+        );
     }
+
+    Ok(dir)
 }
 
 // ── FirecrackerSandboxConfig ────────────────────────────────────────────────

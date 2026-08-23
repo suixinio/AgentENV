@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use super::firecracker::WORK_DIR_PREFIX;
-use super::{is_within, ReclaimCounts, ReclaimPaths};
+use super::{is_within, owner, ReclaimCounts, ReclaimPaths};
 
 /// One directory under the work base, and what the sweep decided about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,15 @@ pub(crate) enum Verdict {
     /// Left alone, and why. Never a silent skip: a directory that is not
     /// removed and not explained is one nobody will ever look at again.
     Keep(&'static str),
+    /// 🔴 Whose it is could not be worked out, so it is left alone *and*
+    /// counted as a failure.
+    ///
+    /// Kept apart from [`Verdict::Keep`] for the reason [`ReclaimCounts`] gives
+    /// for its third counter: "I decided not to" and "I could not tell" produce
+    /// the same action and must not produce the same reading. Every directory
+    /// created before the owner stamp existed lands here, which is a bounded,
+    /// loud, one-off leak per host — and is the direction to be wrong in.
+    Undetermined(&'static str),
 }
 
 /// Decides what to do with each entry directly under the work base.
@@ -82,6 +91,30 @@ pub(super) fn plan(
                 path,
                 verdict: Verdict::Keep("overlaps the paused-sandbox store"),
             });
+            continue;
+        }
+
+        // 🔴 Asked before the blanket veto below, so the reason recorded is
+        // the specific one. A directory whose creating server is still up is
+        // not "unaccounted for": it is somebody's live sandbox, and deleting
+        // the files under a running VMM leaves it running and broken — the
+        // exact failure the veto exists to prevent, arriving through the half
+        // of the sweep that has no process to look at.
+        let verdict = match owner::owner_of(&path, &paths.proc_dir) {
+            owner::Owner::Alive(pid) => {
+                warn!(
+                    target: "agentenv",
+                    path = %path.display(),
+                    owner_pid = pid,
+                    "keeping a sandbox work directory whose server process is still running"
+                );
+                Some(Verdict::Keep("the server that created it is still running"))
+            }
+            owner::Owner::Unknown(reason) => Some(Verdict::Undetermined(reason)),
+            owner::Owner::Gone => None,
+        };
+        if let Some(verdict) = verdict {
+            plans.push(WorkDirPlan { path, verdict });
             continue;
         }
 
@@ -143,6 +176,16 @@ pub(super) fn reclaim(
                 debug!(target: "agentenv", path = %plan.path.display(), reason, "keeping a directory under the work base");
                 counts.left_alone += 1;
             }
+            Verdict::Undetermined(reason) => {
+                warn!(
+                    target: "agentenv",
+                    path = %plan.path.display(),
+                    reason,
+                    "cannot tell which process owns a sandbox work directory; leaving it in \
+                     place. Nothing will free it until something can say whose it is"
+                );
+                counts.failed += 1;
+            }
         }
     }
 
@@ -182,11 +225,96 @@ mod tests {
             }
         }
 
+        /// A directory under the work base, stamped as belonging to a server
+        /// that has exited — which is what a leftover is.
         fn dir(&self, name: &str) -> PathBuf {
+            let path = self.dir_without_a_stamp(name);
+            super::owner::stamp_as_leftover(&path);
+            path
+        }
+
+        /// A directory whose server process is still running, laid out in this
+        /// fixture's forged `/proc` so the stamp can be checked against it.
+        fn dir_of_a_live_server(&self, name: &str, server_pid: i32) -> PathBuf {
+            let path = self.dir_without_a_stamp(name);
+            super::owner::stamp_for_test(&path, server_pid, 77_000, None);
+            let process = self.proc.path().join(server_pid.to_string());
+            std::fs::create_dir_all(&process).unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!(
+                    "{server_pid} (server) S 1 {server_pid} {server_pid} 0 -1 0 0 0 0 0 0 0 0 0 \
+                     20 0 1 0 77000"
+                ),
+            )
+            .unwrap();
+            path
+        }
+
+        /// A directory with no owner stamp: one made by a build before the
+        /// stamp existed, or one whose stamp could not be written.
+        fn dir_without_a_stamp(&self, name: &str) -> PathBuf {
             let path = self.work.path().join(name);
             std::fs::create_dir_all(&path).unwrap();
             path
         }
+    }
+
+    /// 🔴 T-NR-48. A directory whose server process is still running is kept,
+    /// and kept for that reason rather than by the blanket veto.
+    ///
+    /// The file half has no process to look at — on the DaemonSet that is the
+    /// only half that ever fires — so without the stamp its only protection is
+    /// a veto that a clean process sweep switches off. A live server's work
+    /// directory deleted out from under it leaves its VMM running and broken,
+    /// which is the exact failure the veto exists to prevent.
+    #[test]
+    fn a_directory_whose_server_is_still_running_is_kept() {
+        const SERVER: i32 = 7300;
+
+        let fixture = Fixture::new();
+        let live = fixture.dir_of_a_live_server("agentenv-fc-live", SERVER);
+        let leftover = fixture.dir("agentenv-fc-dead");
+
+        let counts = reclaim(&fixture.paths(), true);
+        assert!(live.exists(), "a live server's work directory was deleted");
+        // Both faces, one run: the leftover beside it went, so the line above
+        // is the stamp and not a sweep that deletes nothing.
+        assert!(!leftover.exists());
+        assert_eq!(counts.reclaimed, 1);
+        assert_eq!(counts.left_alone, 1);
+        assert_eq!(
+            counts.failed, 0,
+            "a live owner is a decision, not a failure"
+        );
+
+        assert_eq!(
+            plan(&fixture.paths(), true)
+                .into_iter()
+                .find(|entry| entry.path == live)
+                .map(|entry| entry.verdict),
+            Some(Verdict::Keep("the server that created it is still running")),
+            "kept for the specific reason, not by the blanket veto"
+        );
+    }
+
+    /// 🔴 T-NR-49. A directory with no stamp is kept *and* counted as a
+    /// failure, because nothing can say whose it is.
+    #[test]
+    fn a_directory_with_no_stamp_is_a_failure_rather_than_a_decision() {
+        let fixture = Fixture::new();
+        let unstamped = fixture.dir_without_a_stamp("agentenv-fc-unstamped");
+        let leftover = fixture.dir("agentenv-fc-dead");
+
+        let counts = reclaim(&fixture.paths(), true);
+        assert!(unstamped.exists());
+        assert_eq!(counts.failed, 1);
+        // 🔴 And not counted as `left_alone`: "I could not tell" and "it is not
+        // mine" must not read the same, or a sweep that has gone blind reports
+        // the same clean numbers as one with nothing to do.
+        assert_eq!(counts.left_alone, 0);
+        assert_eq!(counts.reclaimed, 1, "the probe has resolution");
+        assert!(!leftover.exists());
     }
 
     /// 🔴 T-NR-20. **The refusal that keeps a restart from being data loss.**

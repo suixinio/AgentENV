@@ -9,21 +9,48 @@
 //! directory is `agentenv-fc-XXXXXX`. Neither says which sandbox it was, who
 //! created it, or whether anyone is coming back for it.
 //!
-//! # 🔴 Why "reclaim everything" is safe, and what makes it safe
+//! # 🔴 What makes the sweep safe: when it runs, *and* what it asks
 //!
-//! Not the ability to tell leftovers apart — there is none, and this module
-//! deliberately does not pretend otherwise. What makes it safe is **when it
-//! runs**:
+//! Two independent things, and the second one was missing.
+//!
+//! ## 1. When it runs
 //!
 //! > The sweep runs before the listener opens and before `FirecrackerPool` is
 //! > primed, on the premise that **the previous process on this machine is
 //! > gone**. At that instant nothing on this host belongs to this process:
-//! > not a user sandbox, not a template build, not a warm pool VMM. So
-//! > "reclaim everything of ours" and "reclaim precisely the leftovers" have
-//! > the same result, and the second one is not implementable anyway.
+//! > not a user sandbox, not a template build, not a warm pool VMM.
 //!
-//! Two things already in the tree hold that premise up, and neither was put
-//! there for this module:
+//! ## 2. 🔴 What it asks about each candidate
+//!
+//! The premise above is held up by two *whole-host* probes ([`premise_holds`]):
+//! is another copy of this executable running, and does the ublk daemon socket
+//! still answer. Each is a heuristic, and each has a shape of host it is wrong
+//! about — a binary replaced on disk under a running server, two servers with
+//! different `AENV_HOME` and a shared `[firecracker].work_dir`. When one of
+//! them is wrong, the cost is not a leak: it is this process killing another
+//! server's running VMs and deleting the directories they are running in.
+//!
+//! So a whole-host premise is no longer the only thing between the sweep and a
+//! live machine. Every sandbox work directory now carries a stamp naming the
+//! server process that created it, and **every candidate is asked
+//! individually whether its creator is still running** ([`owner`]). A
+//! Firecracker whose server is up is left alone and said out loud; a directory
+//! whose server is up is left alone; and anything the stamp cannot settle is
+//! left alone and counted as a failure, never as a leftover.
+//!
+//! 🔴 What that does *not* claim, because the distinction is worth being exact
+//! about: it does not make a still-running VMM of a **dead** server safe from
+//! the sweep, and nothing could. A sandbox whose server process is gone is
+//! already unreachable in this codebase — its route table, its handle and its
+//! in-memory record died with the process, nothing adopts it, and
+//! `sandbox::network::prepare_runtime` unlinks its namespace on the next
+//! startup whether this module runs or not. "Leftover" and "live sandbox of a
+//! process that no longer exists" are the same thing here. What the stamp
+//! rules out is the case that is *not* the same thing: a sandbox belonging to a
+//! server that is still up.
+//!
+//! Two things already in the tree hold the timing premise up, and neither was
+//! put there for this module:
 //!
 //! 1. `deploy/k8s/base/agentenv-daemonset.yaml` pins `maxSurge: 0`, and says
 //!    why in a comment that is this same premise, written for the paused
@@ -35,12 +62,19 @@
 //!    here" is already a startup failure, not a state this process runs in.
 //!
 //! 🔴 **The consequence to be explicit about**: a template build caught by a
-//! restart *is* reclaimed, and that is correct rather than tolerated. §8.3's
+//! restart *is* reclaimed — its server is gone, so its stamp says so — and that
+//! is correct rather than tolerated. §8.3's
 //! argument is that at the moment of the sweep the build's VMM should not
 //! exist — not that it deserves to be spared. `_sd-impl-phase3-role.md` §12 P2
 //! makes exactly that assertion, that a mid-build restart drives
 //! `agentenv_node_reclaim_reclaimed_total{resource_type="firecracker"}` above
 //! zero.
+//!
+//! # 🔴 The ownership marker is a different question, and is not consulted
+//!
+//! Not to be confused with the owner stamp above, which is about *which server
+//! process* made a directory on this machine. This one is about which control
+//! plane owns a sandbox, and it has no business here.
 //!
 //! 🔴 **The ownership marker is not consulted here, and must not be wired in.**
 //! `SandboxMetadata::control_plane_config` says whether the API half owns a
@@ -139,7 +173,10 @@
 //! refusal to start.
 
 mod firecracker;
+mod owner;
 mod work_dirs;
+
+pub(crate) use owner::stamp_work_dir;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -226,7 +263,9 @@ pub struct ReclaimCounts {
     /// Leftovers of ours that were retired.
     pub reclaimed: u64,
     /// Candidates that were examined and deliberately not touched: another
-    /// tenant's Firecracker, a directory that is not one of ours.
+    /// tenant's Firecracker, a directory that is not one of ours, or — the
+    /// answer this counter exists to make visible — a Firecracker whose own
+    /// server process is still running.
     pub left_alone: u64,
     /// 🔴 Candidates whose ownership could not be determined, plus reclaims
     /// that were attempted and did not work. Never reclaimed and never counted
@@ -432,6 +471,13 @@ fn another_server_instance(proc_dir: &Path, own_exe: &Path, own_pid: i32) -> Opt
         let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
             continue;
         };
+        // 🔴 A running server whose binary was replaced on disk reads back as
+        // `"<path> (deleted)"`, which matches nothing. That is not an exotic
+        // case: it is what an in-place upgrade looks like, and what `cargo
+        // build` over a running `make start-server` looks like — the two
+        // situations where a second server on the host is most likely and this
+        // check is most needed.
+        let (exe, _) = firecracker::strip_deleted_marker(&exe);
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         if exe == own_exe {
             return Some(pid);
@@ -621,19 +667,26 @@ mod tests {
             }
         }
 
-        /// What a sandbox leaves behind once its VMM is gone: the directory.
+        /// What a sandbox leaves behind once both its VMM and the server that
+        /// started it are gone: the directory, stamped with a process that is
+        /// not in this host's `/proc`.
         fn leftover(&self, name: &str) -> std::path::PathBuf {
+            let work_dir = self.work_dir(name);
+            owner::stamp_as_leftover(&work_dir);
+            work_dir
+        }
+
+        /// A directory under the work base with no owner stamp at all: one
+        /// created by a build from before the stamp existed.
+        fn work_dir(&self, name: &str) -> std::path::PathBuf {
             let work_dir = self.root.path().join("firecracker-work").join(name);
             std::fs::create_dir_all(&work_dir).unwrap();
             work_dir
         }
 
-        /// A live sandbox exactly as one looks on the host: a Firecracker whose
-        /// working directory is one of ours, and that directory.
-        ///
-        /// For `plan` only — see the note on [`Host`].
-        fn live_sandbox(&self, name: &str, pid: i32) -> std::path::PathBuf {
-            let work_dir = self.leftover(name);
+        /// A Firecracker in this host's forged `/proc` whose working directory
+        /// is `work_dir`.
+        fn firecracker(&self, pid: i32, work_dir: &Path) {
             let process = self.root.path().join("proc").join(pid.to_string());
             std::fs::create_dir_all(&process).unwrap();
             std::fs::write(process.join("comm"), "firecracker\n").unwrap();
@@ -642,7 +695,45 @@ mod tests {
                 format!("{pid} (firecracker) S 1 {pid} {pid} 0 -1 4194304"),
             )
             .unwrap();
-            std::os::unix::fs::symlink(&work_dir, process.join("cwd")).unwrap();
+            std::os::unix::fs::symlink(work_dir, process.join("cwd")).unwrap();
+        }
+
+        /// A sandbox left by a server that has exited: a Firecracker, its work
+        /// directory, and a stamp naming a process that is gone.
+        ///
+        /// For `plan` only — see the note on [`Host`].
+        fn sandbox_of_a_dead_server(&self, name: &str, pid: i32) -> std::path::PathBuf {
+            let work_dir = self.leftover(name);
+            self.firecracker(pid, &work_dir);
+            work_dir
+        }
+
+        /// 🔴 A sandbox of a server that is **still running**: the same two
+        /// things on the host, plus a stamp naming a process this fixture also
+        /// puts in `/proc`.
+        ///
+        /// Safe to drive the whole `sweep` against, unlike the case above,
+        /// precisely because of what this test asserts: nothing here is ever
+        /// signalled.
+        fn sandbox_of_a_live_server(
+            &self,
+            name: &str,
+            pid: i32,
+            server_pid: i32,
+        ) -> std::path::PathBuf {
+            let work_dir = self.work_dir(name);
+            owner::stamp_for_test(&work_dir, server_pid, 77_000, None);
+            self.firecracker(pid, &work_dir);
+            let process = self.root.path().join("proc").join(server_pid.to_string());
+            std::fs::create_dir_all(&process).unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!(
+                    "{server_pid} (server) S 1 {server_pid} {server_pid} 0 -1 0 0 0 0 0 0 0 0 0 \
+                     20 0 1 0 77000"
+                ),
+            )
+            .unwrap();
             work_dir
         }
 
@@ -768,42 +859,73 @@ mod tests {
     }
 
     /// 🔴 T-NR-33. **What a node full of live sandboxes looks like to this
-    /// sweep, said plainly.**
+    /// sweep — and what saves it.**
     ///
-    /// Throughout the shadow phase the DaemonSet stays on `--role all`, and in
-    /// that role every sandbox a user creates leaves `control_plane_config` as
-    /// `None`. `None` is therefore not the exceptional case on a node — it is
-    /// the majority case, and every one of those is a live user sandbox that
-    /// the API half simply does not own.
+    /// This is the case the whole module turns on, and until the owner stamp
+    /// landed the answer was "the sweep takes everything". The host below is
+    /// laid out as a running node with three sandboxes, and the two whole-host
+    /// premise checks both come back clear: there is no second copy of this
+    /// executable in `/proc` (the running server is a different binary, or its
+    /// own has been replaced on disk), and nothing answers the ublk socket.
+    /// That is precisely the state in which the old sweep killed three live
+    /// VMs and deleted the directories they were running in.
     ///
-    /// 🔴 This sweep cannot spare them, and this test says so rather than
-    /// implying a protection that does not exist. A live sandbox and a leftover
-    /// are the same two things on the host — a Firecracker under the work base,
-    /// and a directory — and the marker is not on the host at all. Pointed at a
-    /// running node, the sweep takes everything.
-    ///
-    /// What keeps it from being pointed at one is the two tests above and the
-    /// one below: the premise is checked before anything is touched, and the
-    /// role that runs during the shadow phase does not sweep at all.
+    /// 🔴 Both faces in one run, against hosts that differ in exactly one
+    /// thing: whether the process the stamp names is in `/proc`. Without the
+    /// second half the first would pass against a sweep that had been switched
+    /// off entirely.
     #[tokio::test]
-    async fn a_host_laid_out_like_a_running_node_is_swept_wholesale() {
-        let host = Host::new();
-        for index in 0..3 {
-            host.live_sandbox(&format!("agentenv-fc-live{index}"), 6000 + index);
+    async fn a_node_whose_server_is_still_running_is_left_entirely_alone() {
+        const SERVER: i32 = 7100;
+
+        let live = Host::new();
+        let live_dirs: Vec<_> = (0..3)
+            .map(|index| {
+                live.sandbox_of_a_live_server(
+                    &format!("agentenv-fc-live{index}"),
+                    6000 + index,
+                    SERVER,
+                )
+            })
+            .collect();
+
+        // The premise checks find nothing wrong: this is a sweep that believes
+        // it has the machine to itself.
+        assert!(premise_holds(&live.paths()).is_ok());
+
+        // Safe to run end to end, because the point is that nothing is
+        // signalled: every plan below is `Nothing`.
+        for plan in firecracker::plan(&live.paths()) {
+            assert_eq!(plan.ownership, firecracker::Ownership::LiveOwner(SERVER));
+            assert_eq!(plan.action, firecracker::Action::Nothing, "{plan:?}");
+        }
+        let report = sweep(&live.paths()).await;
+        assert_eq!(report.firecracker.reclaimed, 0, "a live node was swept");
+        assert_eq!(report.firecracker.left_alone, 3);
+        assert_eq!(report.work_dirs.reclaimed, 0);
+        assert_eq!(report.work_dirs.left_alone, 3);
+        for work_dir in &live_dirs {
+            assert!(work_dir.exists(), "a live sandbox's files were deleted");
         }
 
-        // The process half, through `plan`, which decides without signalling.
-        let plans = firecracker::plan(&host.paths());
+        // 🔴 The other face: the same three sandboxes, whose server has exited.
+        // The process half through `plan`, which decides without signalling —
+        // see the note on `Host`.
+        let dead = Host::new();
+        for index in 0..3 {
+            dead.sandbox_of_a_dead_server(&format!("agentenv-fc-live{index}"), 6000 + index);
+        }
+        let plans = firecracker::plan(&dead.paths());
         assert_eq!(plans.len(), 3);
         for plan in &plans {
             assert_eq!(
                 plan.ownership,
                 firecracker::Ownership::Ours,
-                "a live user sandbox is indistinguishable from a leftover here: {plan:?}"
+                "a leftover of a server that is gone: {plan:?}"
             );
         }
 
-        // The file half, end to end, once the VMMs are gone — which on the
+        // And the file half end to end, once the VMMs are gone — which on the
         // DaemonSet the pod's own PID namespace has already done.
         let files_only = Host::new();
         let dirs: Vec<_> = (0..3)
@@ -813,6 +935,69 @@ mod tests {
         for work_dir in &dirs {
             assert!(!work_dir.exists());
         }
+    }
+
+    /// 🔴 T-NR-38. A directory nothing can account for is left in place, and
+    /// counted as a failure rather than as a decision.
+    ///
+    /// This is what every work directory on a host looks like immediately after
+    /// this build is installed over one that did not write stamps. Leaking them
+    /// costs disk until an operator clears them; reclaiming them on the old
+    /// rule would, on a host where the premise checks were wrong, cost VMs.
+    #[tokio::test]
+    async fn a_work_directory_with_no_owner_stamp_is_never_reclaimed() {
+        let host = Host::new();
+        let unstamped = host.work_dir("agentenv-fc-fromanolderbuild");
+        let leftover = host.leftover("agentenv-fc-A1");
+
+        let report = sweep(&host.paths()).await;
+        assert!(
+            unstamped.exists(),
+            "a directory nobody could account for was deleted"
+        );
+        assert_eq!(report.work_dirs.failed, 1);
+
+        // Resolution, in the same run: the stamped leftover beside it *was*
+        // reclaimed, so the line above is the refusal and not an inert sweep.
+        assert_eq!(report.work_dirs.reclaimed, 1);
+        assert!(!leftover.exists());
+    }
+
+    /// 🔴 T-NR-39. A second server whose binary was replaced on disk is still a
+    /// second server.
+    ///
+    /// `/proc/<pid>/exe` for a running process whose file has been unlinked
+    /// reads back as `"<path> (deleted)"`. Compared literally it matches
+    /// nothing, so the premise check said "the machine is ours" in exactly the
+    /// two situations where it most likely is not: an in-place upgrade, and a
+    /// `cargo build` over a running `make start-server`.
+    #[test]
+    fn a_second_server_whose_binary_was_replaced_is_still_found() {
+        let host = Host::new();
+        let proc_dir = host.root.path().join("proc");
+        let own_exe = host.root.path().join("server");
+
+        let process = proc_dir.join("6100");
+        std::fs::create_dir_all(&process).unwrap();
+        std::os::unix::fs::symlink(
+            format!("{} (deleted)", own_exe.display()),
+            process.join("exe"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            another_server_instance(&proc_dir, &own_exe, 1),
+            Some(6100),
+            "a running server whose binary was replaced went unnoticed"
+        );
+
+        // Resolution: a *different* binary that was also replaced is still not
+        // us, so the match above is the path and not the suffix.
+        let other = proc_dir.join("6101");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink("/bin/sh (deleted)", other.join("exe")).unwrap();
+        std::fs::remove_dir_all(&process).unwrap();
+        assert_eq!(another_server_instance(&proc_dir, &own_exe, 1), None);
     }
 
     /// 🔴 T-NR-34. The role that runs during the shadow phase does not sweep.
@@ -919,6 +1104,7 @@ mod tests {
         for (name, source) in [
             ("mod.rs", include_str!("mod.rs")),
             ("firecracker.rs", include_str!("firecracker.rs")),
+            ("owner.rs", include_str!("owner.rs")),
             ("work_dirs.rs", include_str!("work_dirs.rs")),
         ] {
             // Production code only. The prose above this line names the marker

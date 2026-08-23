@@ -134,10 +134,21 @@ pub(crate) fn stamp_work_dir(work_dir: &Path) -> std::io::Result<()> {
         }
     };
 
+    // 🔴 Refused rather than defaulted, for the same reason as the start time
+    // above. A pid that does not fit this field is a stamp naming a process that
+    // is not this one, and every later reader would answer a definite thing
+    // about the wrong process — or, with the obvious `-1`, about a number that
+    // means "no such process" to nobody.
+    let Ok(pid) = i32::try_from(std::process::id()) else {
+        return Err(std::io::Error::other(
+            "this process's id does not fit the field an owner stamp records",
+        ));
+    };
+
     let stamp = OwnerStamp {
         version: STAMP_VERSION,
         boot_id: boot_id(proc_dir),
-        pid: i32::try_from(std::process::id()).unwrap_or(-1),
+        pid,
         starttime,
     };
     let encoded = serde_json::to_vec(&stamp).map_err(std::io::Error::other)?;
@@ -392,23 +403,42 @@ mod tests {
 
     /// 🔴 T-NR-43. Every way of not knowing answers `Unknown`, and `Unknown` is
     /// never `Gone`.
+    ///
+    /// 🔴 The reasons are asserted verbatim, not merely `matches!`. They are
+    /// the only thing that separates the ordinary case — a directory made
+    /// before stamps existed, which an operator should ignore — from a stamp or
+    /// a `/proc` this process was not allowed to read, which is a host that has
+    /// gone blind and where the sweep will now decline everything forever. A
+    /// test that accepted any `Unknown` lets those collapse into one, and
+    /// mutation showed exactly that: the guards telling them apart survived it.
     #[test]
     fn everything_that_cannot_be_read_is_unknown_rather_than_a_leftover() {
         let fixture = Fixture::new();
 
         // Nothing was ever written — a directory from a build before the stamp
         // existed, or one whose stamp could not be written.
-        assert!(matches!(
+        assert_eq!(
             owner_of(&fixture.work(), &fixture.proc()),
-            Owner::Unknown(_)
-        ));
+            Owner::Unknown("no owner stamp")
+        );
+
+        // 🔴 A stamp that is there and cannot be read, which is a different
+        // fact and has to read differently: a directory in its place stands in
+        // for the permission and I/O failures that produce it.
+        std::fs::create_dir(stamp_path(&fixture.work())).unwrap();
+        assert_eq!(
+            owner_of(&fixture.work(), &fixture.proc()),
+            Owner::Unknown("owner stamp unreadable"),
+            "a stamp that could not be read must not read as one that was never written"
+        );
+        std::fs::remove_dir(stamp_path(&fixture.work())).unwrap();
 
         // Written, but not something this build can read.
         std::fs::write(stamp_path(&fixture.work()), b"{ not json").unwrap();
-        assert!(matches!(
+        assert_eq!(
             owner_of(&fixture.work(), &fixture.proc()),
-            Owner::Unknown(_)
-        ));
+            Owner::Unknown("owner stamp unparseable")
+        );
 
         // A format from another build.
         fixture.write_stamp(&OwnerStamp {
@@ -418,23 +448,31 @@ mod tests {
             starttime: 99_000,
         });
         fixture.process(4242, 99_000);
-        assert!(
-            matches!(
-                owner_of(&fixture.work(), &fixture.proc()),
-                Owner::Unknown(_)
-            ),
+        assert_eq!(
+            owner_of(&fixture.work(), &fixture.proc()),
+            Owner::Unknown("owner stamp written in a format this build does not know"),
             "a stamp this build cannot interpret must not be interpreted"
         );
 
         // The owner's process entry exists and its stat does not.
         fixture.stamp(4242, 99_000, Some("boot-one"));
         std::fs::remove_file(fixture.proc().join("4242").join("stat")).unwrap();
-        assert!(matches!(
+        assert_eq!(
             owner_of(&fixture.work(), &fixture.proc()),
-            Owner::Unknown(_)
-        ));
+            Owner::Unknown("the owner's process entry has no readable stat")
+        );
 
-        // Resolution for all four: the same fixture, made readable, answers a
+        // 🔴 ...and its stat being there and unreadable, which reaches the
+        // other side of the same guard. Without this the two are told apart by
+        // a branch nothing ever takes.
+        std::fs::create_dir(fixture.proc().join("4242").join("stat")).unwrap();
+        assert_eq!(
+            owner_of(&fixture.work(), &fixture.proc()),
+            Owner::Unknown("the owner's process entry could not be read")
+        );
+        std::fs::remove_dir(fixture.proc().join("4242").join("stat")).unwrap();
+
+        // Resolution for all six: the same fixture, made readable, answers a
         // definite thing.
         fixture.process(4242, 99_000);
         assert_eq!(

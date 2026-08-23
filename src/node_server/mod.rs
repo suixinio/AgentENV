@@ -36,7 +36,6 @@ mod service;
 #[cfg(test)]
 mod tests;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -67,34 +66,21 @@ pub(crate) fn server(
     NodeSandboxServiceServer::new(NodeSandboxService::new(orchestration, snapshots, node_id))
 }
 
-/// Serves the node service on `addr` until `shutdown` resolves.
+/// Serves the node service on a listener somebody else bound, until `shutdown`
+/// resolves.
 ///
 /// 🔴 A separate listener from the HTTP one, rather than a route on it. The two
 /// have different audiences — this one is spoken to only by the API half, and
 /// the HTTP port is spoken to by users and by the gateway — and a deployment
 /// has to be able to expose them differently.
-pub async fn serve(
-    addr: SocketAddr,
-    orchestration: Arc<dyn SandboxOrchestration>,
-    snapshots: Arc<SnapshotManager>,
-    node_id: String,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind the node sandbox service to {addr}"))?;
-    serve_on(listener, orchestration, snapshots, node_id, shutdown).await
-}
-
-/// Serves the node service on a listener somebody else bound.
 ///
-/// 🔴 The variant a binary uses, and the reason it exists is where the bind
-/// failure lands. `serve` binds inside the future, so an assembly that spawns
-/// it learns nothing: the port being taken shows up as a task that ended, and
-/// the process goes on running with a surface the API half cannot reach —
-/// which from the outside is indistinguishable from an API half that has
-/// nothing to say. Binding at assembly time makes that a process that does not
-/// start.
+/// 🔴 The listener is bound by the caller, and there is deliberately no
+/// variant that takes an address and binds here. Binding inside this future
+/// means an assembly that spawns it learns nothing: the port being taken shows
+/// up as a task that ended, and the process goes on running with a surface the
+/// API half cannot reach — which from the outside is indistinguishable from an
+/// API half that has nothing to say. Bound by the assembly, that is a process
+/// that does not start.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     orchestration: Arc<dyn SandboxOrchestration>,

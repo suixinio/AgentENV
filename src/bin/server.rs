@@ -1111,6 +1111,20 @@ mod tests {
         assert!(err.contains("orchestrator.store"), "{err}");
         assert!(err.contains("AENV_ORCHESTRATOR_STORE_BACKEND"), "{err}");
         assert!(err.contains("in-memory"), "{err}");
+        // 🔴 And the spelling a deployment would have to write, quoted from
+        // `as_str` rather than from prose. An operator reading this message has
+        // to be able to copy the value out of it; a message that named the
+        // backend in words only would be telling them what is wrong without
+        // telling them what to type.
+        assert!(
+            err.contains(MetadataStoreBackendKind::InMemory.as_str()),
+            "{err}"
+        );
+        assert_ne!(
+            MetadataStoreBackendKind::InMemory.as_str(),
+            MetadataStoreBackendKind::Redis.as_str(),
+            "the two backends must not answer to the same name"
+        );
 
         // 🔴 The control. Without it this test passes just as well against a
         // function that refuses every configuration, including the right one.

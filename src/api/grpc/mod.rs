@@ -18,8 +18,6 @@ mod resume;
 #[cfg(test)]
 mod tests;
 
-use std::net::SocketAddr;
-
 use anyhow::Context;
 use tracing::info;
 
@@ -37,35 +35,21 @@ where
     SandboxResumeServiceServer::new(SandboxResumeService::new(api_impl))
 }
 
-/// Serves the wake-up surface on `addr` until `shutdown` resolves.
+/// Serves the wake-up surface on a listener somebody else bound, until
+/// `shutdown` resolves.
 ///
 /// 🔴 A separate listener from the HTTP one, for the same reason the node
 /// service is: the two have different audiences. This one is spoken to only by
 /// the gateway's cold path, and a deployment has to be able to expose them
 /// differently — the HTTP port carries user traffic, this one carries a
 /// decision.
-pub async fn serve<I>(
-    addr: SocketAddr,
-    api_impl: I,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> anyhow::Result<()>
-where
-    I: AsRef<ApiImpl> + Send + Sync + 'static,
-{
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind the sandbox resume service to {addr}"))?;
-    serve_on(listener, api_impl, shutdown).await
-}
-
-/// Serves the wake-up surface on a listener somebody else bound.
 ///
-/// 🔴 The variant a binary uses; see `crate::node_server::serve_on` for why the
-/// bind belongs to the assembly and not to a spawned task. It matters more here
-/// than there: this surface is the *only* way the gateway's cold path can wake
-/// a paused sandbox, and a replica that came up without it answers every
-/// wake-up with a connection refused that the gateway reads as a control plane
-/// that is merely slow.
+/// 🔴 The listener is bound by the caller; see `crate::node_server::serve_on`
+/// for why the bind belongs to the assembly and not to a spawned task. It
+/// matters more here than there: this surface is the *only* way the gateway's
+/// cold path can wake a paused sandbox, and a replica that came up without it
+/// answers every wake-up with a connection refused that the gateway reads as a
+/// control plane that is merely slow.
 pub async fn serve_on<I>(
     listener: tokio::net::TcpListener,
     api_impl: I,

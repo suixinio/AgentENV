@@ -1028,6 +1028,41 @@ mod tests {
     ///
     /// The startup warning in [`enabled_for`] covers the operator who types it.
     /// This covers the one who commits it, which nothing at runtime can.
+    /// Whether a manifest *sets* `var`, as against mentioning it.
+    ///
+    /// 🔴 Comment lines are not a loophole. A manifest that names this variable
+    /// in order to say it is deliberately absent is doing the thing the scan
+    /// wants; a predicate that could not tell the two apart would push that
+    /// explanation out of the file — and the explanation is what stops somebody
+    /// copying the line from a workload where it is right.
+    ///
+    /// What is still caught is the variable on any line a deployment tool
+    /// reads: a `name:`, a ConfigMap literal, an arg.
+    fn manifest_sets(contents: &str, var: &str) -> bool {
+        contents
+            .lines()
+            .any(|line| line.contains(var) && !line.trim_start().starts_with('#'))
+    }
+
+    /// 🔴 The control probe for the scan below, and it is not optional: a
+    /// predicate that answered `false` for everything would make that scan pass
+    /// against a manifest that turns the sweep on across the whole fleet.
+    #[test]
+    fn the_manifest_scan_can_tell_a_setting_from_a_note_about_one() {
+        const VAR: &str = "AENV_STARTUP_RECLAIM_ENABLED";
+
+        assert!(manifest_sets(
+            &format!("            - name: {VAR}\n              value: \"true\"\n"),
+            VAR
+        ));
+        assert!(manifest_sets(&format!("      - {VAR}=true\n"), VAR));
+        assert!(!manifest_sets(
+            &format!("            # {VAR} is deliberately absent, here and everywhere\n"),
+            VAR
+        ));
+        assert!(!manifest_sets("            - name: AENV_ROLE\n", VAR));
+    }
+
     #[test]
     fn no_deployment_manifest_turns_the_startup_sweep_on() {
         const VAR: &str = "AENV_STARTUP_RECLAIM_ENABLED";
@@ -1059,7 +1094,7 @@ mod tests {
                 };
                 checked += 1;
                 assert!(
-                    !contents.contains(VAR),
+                    !manifest_sets(&contents, VAR),
                     "{} sets {VAR}. On --role all that makes the rollback target sweep the \
                      host, which the pre-split process never did. If this is deliberate, it \
                      belongs on a --role node workload and this test needs to say so",

@@ -109,11 +109,27 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
                 .as_ref()
                 .map(|params| wire::serialize(params, "custom extension params"))
                 .transpose()?,
-            // 🔴 Empty here, and that is correct rather than an omission. The
-            // ownership marker is how a control plane recognises its own
-            // sandbox, and this factory is a mechanism a control plane uses
-            // rather than the thing that owns anything. Whatever assembles the
-            // deciding half attaches it.
+            // 🔴 Empty here, and that is a placeholder with a date on it
+            // rather than an omission or a decision.
+            //
+            // The ownership marker is *per sandbox* — it is the control plane's
+            // own record of this sandbox, written before the sandbox exists and
+            // naming it (`ForkChildAssignment::control_plane_config`) — so it
+            // cannot be a property of this factory, and there is nothing on the
+            // launch config to carry it. It belongs to a caller that decides
+            // what a sandbox's record is, and that caller is `--role api`,
+            // which `assemble_api` refuses to build at all.
+            //
+            // 🔴 So the consequence is worth stating plainly, because a grep
+            // for who sets the marker comes back empty and that reads like a
+            // defect: **no sandbox anywhere carries an ownership marker
+            // today**, because the only half that would attach one cannot
+            // start. `ListSandboxes` therefore admits nothing on a real
+            // cluster, and the shadow-phase probe that expects to see a
+            // sandbox pushed up through it cannot be run yet.
+            // `the_blank_ownership_marker_outlives_only_an_api_role_that_cannot_start`
+            // ties those two facts together so they stop being true at the same
+            // time.
             control_plane_config: Vec::new(),
         };
 

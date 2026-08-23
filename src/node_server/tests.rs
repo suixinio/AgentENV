@@ -124,14 +124,38 @@ async fn a_node_running_nothing_the_control_plane_owns_reports_nothing() {
         listed(&service).await.is_empty(),
         "unmarked sandboxes reached the control plane's listing"
     );
+
+    // 🔴 And the resolution, in this run rather than in the test above it.
+    // An emptiness that is only ever compared against another emptiness is
+    // satisfied by a listing that has stopped working altogether — which is a
+    // node reporting a clean "I hold nothing" while it holds three sandboxes,
+    // and is the reading that makes a control plane retire live bindings.
+    let owned = start(&orchestration, Some(b"the-fourth-one")).await;
+    let sandboxes = listed(&service).await;
+    assert_eq!(sandboxes.len(), 1, "reported: {sandboxes:?}");
+    assert_eq!(sandboxes[0].sandbox_id, owned.id.to_string());
 }
 
 /// The empty answer a node with nothing running gives is an answer, not a
 /// failure, and it is the one a caller may act on.
 #[tokio::test]
 async fn a_node_running_nothing_at_all_answers_with_an_empty_list() {
-    let (_orchestration, service) = service().await;
+    let (orchestration, service) = service().await;
     assert!(listed(&service).await.is_empty());
+
+    // 🔴 The same probe, on the same service, with something to find. Without
+    // it "empty" here is indistinguishable from a listing that could not answer
+    // at all — and those two must never read the same, because one of them says
+    // the fleet holds nothing.
+    let owned = start(&orchestration, Some(b"now-there-is-one")).await;
+    assert_eq!(
+        listed(&service)
+            .await
+            .into_iter()
+            .map(|reported| reported.sandbox_id)
+            .collect::<Vec<_>>(),
+        vec![owned.id.to_string()]
+    );
 }
 
 /// 🔴 Membership comes from the live handles, not from the record store.
@@ -581,6 +605,15 @@ async fn a_create_carrying_an_empty_marker_produces_an_unowned_sandbox() {
         "an empty blob became a marker"
     );
     assert!(listed(&service).await.is_empty());
+
+    // 🔴 Resolution: one byte is a marker, and the same listing finds it. The
+    // assertion above is about the *empty* blob, and on its own it would pass
+    // against a node whose listing admitted nothing at all.
+    let owned = start(&orchestration, Some(b"\0")).await;
+    let sandboxes = listed(&service).await;
+    assert_eq!(sandboxes.len(), 1, "reported: {sandboxes:?}");
+    assert_eq!(sandboxes[0].sandbox_id, owned.id.to_string());
+    assert_eq!(sandboxes[0].control_plane_config, b"\0");
 }
 
 /// A create the caller identified is created under that id.

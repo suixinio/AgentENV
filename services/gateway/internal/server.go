@@ -17,6 +17,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
@@ -25,11 +26,14 @@ import (
 )
 
 const (
-	headerSandboxID     = "x-agentenv-sandbox-id"
-	headerE2BSandboxID  = "e2b-sandbox-id"
-	headerTargetPort    = "x-agentenv-target-port"
-	headerE2BTargetPort = "e2b-sandbox-port"
-	headerNodeID        = "x-agentenv-node-id"
+	headerSandboxID    = "x-agentenv-sandbox-id"
+	headerE2BSandboxID = "e2b-sandbox-id"
+	headerTargetPort   = "x-agentenv-target-port"
+	// The caller's envd access token. The gateway does not check it — it has no
+	// record to check against — it forwards it to the half that does.
+	headerEnvdAccessToken = "x-access-token"
+	headerE2BTargetPort   = "e2b-sandbox-port"
+	headerNodeID          = "x-agentenv-node-id"
 	// headerProjectionTTLSecs is the node's own budget for how long the routing
 	// projection of the sandbox it just started should live, in whole seconds.
 	//
@@ -83,6 +87,17 @@ type ServerOptions struct {
 	// node reports are forwarded to the scheduler. Off forwards neither, which
 	// is a projection write identical to today's.
 	ProjectionAuthoritative bool
+
+	// ResumeClient asks the API half to wake a paused sandbox when the routing
+	// projection has no answer. Nil is the switch off, and off means the
+	// gateway behaves exactly as it did before the wake-up decision moved:
+	// every projection miss falls through to the scheduler.
+	//
+	// 🔴 That nil is 3a's rollback lever. `_sd-impl-phase3-role.md` §11.2 buys
+	// 3a's "seconds, and does not touch the DaemonSet" rollback by making this
+	// a ConfigMap change, so it has to be a configuration switch and never a
+	// deploy-time one.
+	ResumeClient *resume.Client
 }
 
 type Server struct {
@@ -107,6 +122,8 @@ type Server struct {
 	// switch is off" is a state a reader of this code can see.
 	projectionReader        projectionReader
 	projectionAuthoritative bool
+	// Nil when no wake-up endpoint is configured. See ServerOptions.
+	resumeClient *resume.Client
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -138,6 +155,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		controlPlaneToken:       strings.TrimSpace(options.ControlPlaneToken),
 		projectionReader:        options.ProjectionReader,
 		projectionAuthoritative: options.ProjectionAuthoritative,
+		resumeClient:            options.ResumeClient,
 	}, nil
 }
 
@@ -301,12 +319,59 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			// which node holds the sandbox, which node should rebuild it, and
 			// whether it exists at all — so there is nothing here to
 			// second-guess or retry against a different node.
+			// 🔴 The cold path. The projection had no answer, so the sandbox
+			// is paused, gone, or somewhere the projection has not caught up
+			// with — and only the half that owns sandboxes can tell which.
+			// Before this, the gateway asked the scheduler for a node and the
+			// node woke the sandbox itself; that is the arrangement `--role
+			// node` exists to end (§6.1).
+			//
+			// 🔴 Three states, and the third is why this is not a two-way
+			// branch. "The API half says there is no such sandbox" ends the
+			// request at 404. "The API half could not be asked" says nothing
+			// about the sandbox at all, and falls through to exactly what this
+			// gateway did before the wake-up client existed — so an api that
+			// is down costs latency and not availability.
+			if s.resumeClient != nil {
+				woke := s.resumeClient.Wake(routingCtx, resume.Request{
+					SandboxID:       sandboxID,
+					TargetPort:      resumeTargetPort(r, hostRoute),
+					EnvdAccessToken: r.Header.Get(headerEnvdAccessToken),
+				})
+				recordResumeAttempt(woke)
+				switch woke.Verdict {
+				case resume.VerdictWoken:
+					s.logger.Info("woke a paused sandbox through the api half",
+						zap.String("sandbox_id", sandboxID),
+						zap.String("node_id", woke.NodeID),
+						zap.String("execution_id", woke.ExecutionID),
+					)
+					resp = woke.LookupResponse()
+					source = routeResolutionResumeWoken
+				case resume.VerdictGone, resume.VerdictRefused:
+					s.writeResumeError(w, sandboxID, woke)
+					return
+				case resume.VerdictUndecided:
+					// Deliberately nothing. The scheduler call below is the
+					// fallback, and it is the same call this gateway made for
+					// every projection miss before this branch existed.
+					s.logger.Warn("could not ask the api half to wake a sandbox; falling back to the scheduler",
+						zap.String("sandbox_id", sandboxID),
+						zap.String("resume_error", s.resumeReason(woke)),
+					)
+					recordRouteResolution(routeResolutionResumeUndecided)
+				}
+			}
+		}
+
+		if resp == nil {
 			rpcStart := time.Now()
 			var err error
 			resp, err = s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 			recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
 			if err != nil {
-				// 🔴 Still the only source of a 404 or a 503 in this package.
+				// 🔴 Still the only source of a 404 or a 503 on the scheduler
+				// path in this package.
 				s.writeSchedulerError(w, err)
 				return
 			}
@@ -1339,4 +1404,89 @@ func projectionTTLSecsFromHeaders(h http.Header) uint32 {
 		return math.MaxUint32
 	}
 	return uint32(value)
+}
+
+// resumeTargetPort is the port the data-plane request was addressed to, as it
+// appeared on the wire.
+//
+// 🔴 Forwarded as text, unparsed. The API half treats an unparseable port the
+// same as an absent one — as *possibly* envd traffic, which is the strict
+// direction for the credential check — and re-deciding that here would put one
+// decision in two places that could disagree. A gateway that "helpfully"
+// dropped a malformed port would hand a caller the skip it was reaching for.
+func resumeTargetPort(r *http.Request, route *hostRoute) string {
+	if route != nil {
+		return strconv.Itoa(route.targetPort)
+	}
+	if value, ok := targetPortFromHeaders(r.Header); ok {
+		return value
+	}
+	return ""
+}
+
+// writeResumeError turns the API half's refusal into a status code.
+//
+// 🔴 The distinctions here are the same ones writeSchedulerError guards, and
+// they matter for the same reason. A 404 on a resume is the end of that sandbox
+// as far as any client is concerned — the platform's contract for it is
+// "rebuild from the template", which resets the user's workspace — so it is
+// spent only on a verdict that positively says the sandbox is gone.
+//
+// 🔴 A FailedPrecondition is a 503 and never a retry against another node. For
+// a sandbox whose snapshot never reached shared storage there is no second copy
+// to try: waking it elsewhere would not fail, it would succeed, by rebuilding
+// from an older snapshot and losing the last pause. Retry-After tells the
+// client to wait for the machine that has the bytes, which is the only correct
+// thing to wait for.
+func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, result resume.Result) {
+	reason := s.resumeReason(result)
+	code := codes.Unknown
+	if result.Status != nil {
+		code = result.Status.Code()
+	}
+
+	s.logger.Warn("the api half refused to wake a sandbox",
+		zap.String("sandbox_id", sandboxID),
+		zap.String("verdict", result.Verdict.String()),
+		zap.String("code", code.String()),
+		zap.String("refusal", result.Reason),
+		zap.String("origin_node_id", result.OriginNodeID),
+	)
+
+	switch code {
+	case codes.NotFound:
+		http.Error(w, reason, http.StatusNotFound)
+	case codes.PermissionDenied:
+		http.Error(w, reason, http.StatusForbidden)
+	case codes.FailedPrecondition, codes.ResourceExhausted:
+		// Retry-After on the transient one only. `transition_in_progress`
+		// clears in a moment; a pin refusal clears when a machine comes back,
+		// which may be never, and a small Retry-After on that would have the
+		// client hammering a node that is not coming.
+		if result.Reason == resumeReasonTransitionInProgress {
+			w.Header().Set("Retry-After", "1")
+		}
+		http.Error(w, reason, http.StatusServiceUnavailable)
+	case codes.InvalidArgument:
+		http.Error(w, reason, http.StatusBadRequest)
+	default:
+		// 🔴 Unimplemented lands here, and that is load-bearing: §12 P3's
+		// control C stubs this RPC out with Unimplemented and requires the data
+		// plane to *fail*. If it fell through to the scheduler the probe would
+		// pass while a second wake-up path was quietly doing the work, which is
+		// the exact thing the control is designed to detect.
+		http.Error(w, "sandbox wake-up failed", http.StatusBadGateway)
+	}
+}
+
+// resumeReason is what of the API half's answer a caller may see.
+//
+// Runs through the same redaction as the scheduler's, because the same hazard
+// applies: a status produced by a failed dial names the cluster's internal
+// addressing, and it is not the API half speaking.
+func (s *Server) resumeReason(result resume.Result) string {
+	if result.Status == nil {
+		return "the api half could not be reached"
+	}
+	return s.schedulerReason(result.Status)
 }

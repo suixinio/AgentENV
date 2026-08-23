@@ -14,6 +14,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 	gateway "agentenv/services/gateway/internal"
+	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/config"
 	"agentenv/services/shared/logging"
 	"agentenv/services/shared/routing"
@@ -77,6 +78,32 @@ func main() {
 		defer projectionReader.Close()
 	}
 
+	// 🔴 Built only when an address is configured, following the projection
+	// reader above: "the switch is off" has to be a nil client rather than a
+	// live connection nothing uses. Unlike the projection reader this does not
+	// dial here — grpc.NewClient is lazy — because an api half that is briefly
+	// down must delay a wake-up, not stop the gateway from starting.
+	var resumeClient *resume.Client
+	if cfg.Gateway.ResumeAddr != "" {
+		resumeConn, err := newSchedulerConn(cfg.Gateway.ResumeAddr)
+		if err != nil {
+			logger.Fatal("connect api resume surface failed", zap.Error(err), zap.String("addr", cfg.Gateway.ResumeAddr))
+		}
+		defer resumeConn.Close()
+		resumeClient = resume.New(resumeConn, cfg.Gateway.RequestTimeout)
+		logger.Info("waking paused sandboxes through the api half",
+			zap.String("addr", cfg.Gateway.ResumeAddr),
+		)
+	} else {
+		// 🔴 Said out loud, because the alternative is a capability that is
+		// silently absent. With no address the gateway never asks anyone to
+		// wake a sandbox: every projection miss goes to the scheduler and
+		// whichever node the request lands on wakes it itself. That is correct
+		// before 阶段 3a and wrong after it, and the difference is invisible
+		// from the outside — the requests still succeed.
+		logger.Info("no api resume surface configured; paused sandboxes are woken by the node the request lands on")
+	}
+
 	serverOptions := gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
@@ -94,6 +121,7 @@ func main() {
 	if projectionReader != nil {
 		serverOptions.ProjectionReader = projectionReader
 	}
+	serverOptions.ResumeClient = resumeClient
 
 	s, err := gateway.NewServer(logger, schedulerClient, serverOptions)
 	if err != nil {

@@ -867,6 +867,16 @@ type GatewayConfig struct {
 	MetricsListenAddr      string `json:"metrics_listen_addr"`
 	SchedulerAddr          string `json:"scheduler_addr"`
 	QueryOnlySchedulerAddr string `json:"query_only_scheduler_addr"`
+	// ResumeAddr is the api half's wake-up surface, asked when the routing
+	// projection has no answer for a sandbox.
+	//
+	// 🔴 Empty is the switch off, and off is today's behaviour exactly: every
+	// projection miss falls through to the scheduler, and the node the request
+	// lands on wakes the sandbox itself. That is what makes 阶段 3a's rollback a
+	// ConfigMap change and a gateway restart — seconds — rather than a
+	// DaemonSet roll, which is an hour multiplied by the node count
+	// (`_sd-impl-phase3-role.md` §11.1, §11.2).
+	ResumeAddr string `json:"resume_addr"`
 	// RedisAddr is where the routing projection lives. Read-only from here:
 	// the gateway never writes a record, and the scheduler is the only process
 	// that arbitrates one.
@@ -897,6 +907,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		MetricsListenAddr      *string         `json:"metrics_listen_addr"`
 		SchedulerAddr          *string         `json:"scheduler_addr"`
 		QueryOnlySchedulerAddr *string         `json:"query_only_scheduler_addr"`
+		ResumeAddr             *string         `json:"resume_addr"`
 		RedisAddr              *string         `json:"redis_addr"`
 		RequestTimeout         json.RawMessage `json:"request_timeout"`
 		ForwardResponseSize    *int64          `json:"forward_response_size"`
@@ -928,6 +939,9 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.QueryOnlySchedulerAddr != nil {
 		g.QueryOnlySchedulerAddr = *parsed.QueryOnlySchedulerAddr
+	}
+	if parsed.ResumeAddr != nil {
+		g.ResumeAddr = *parsed.ResumeAddr
 	}
 	if parsed.RedisAddr != nil {
 		g.RedisAddr = *parsed.RedisAddr

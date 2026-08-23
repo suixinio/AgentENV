@@ -10,10 +10,12 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/observability"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc/codes"
 )
 
 var (
@@ -92,6 +94,26 @@ var (
 			Help: "Resolved sandbox routes by where the answer came from: a routing projection hit, a miss, a projection read error, or the scheduler.",
 		},
 		[]string{"source"},
+	)
+	// Wake-up attempts against the API half, by outcome.
+	//
+	// 🔴 The label vocabulary is deliberately the API half's own
+	// (`agentenv_api_resume_grpc_total{result}`), so the two series can be
+	// compared label-for-label. §12 P3's control B asserts them 逐条相等, and
+	// that check only means something if both sides spell the same outcome the
+	// same way — otherwise a disagreement reads as a naming difference and gets
+	// waved through.
+	//
+	// 🔴 The set is closed by resumeResultLabel. The label's value arrives over
+	// the wire from another process, and a label value an attacker or a newer
+	// build can choose is an unbounded time series, which is a memory leak in
+	// this process and in Prometheus.
+	gatewayResumeAttempts = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_resume_total",
+			Help: "Wake-up attempts against the api half, by outcome, using the api half's own result vocabulary.",
+		},
+		[]string{"result"},
 	)
 	// Duplicate sandbox rows seen while merging the cluster listing, by how the
 	// winner was chosen.
@@ -237,7 +259,82 @@ const (
 	routeResolutionRedisMiss  = "redis_miss"
 	routeResolutionRedisError = "redis_error"
 	routeResolutionScheduler  = "scheduler"
+	// A route the api half produced by waking the sandbox.
+	routeResolutionResumeWoken = "resume_woken"
+	// A wake-up nobody could be asked about, which fell through to the
+	// scheduler. Like redis_error, this is not a failure mode of the request:
+	// it is the count of times the fallback earned its place. Alert on its
+	// rate, never on its existence.
+	routeResolutionResumeUndecided = "resume_undecided"
 )
+
+// The refusal reasons the api half can send, as a closed set.
+//
+// Kept in step with `PinRefusalReason::as_str` and `REASON_TRANSITION_IN_PROGRESS`
+// in `src/api/grpc/resume.rs`. A reason this build does not recognise is
+// counted as "other" rather than as itself — see resumeResultLabel.
+const (
+	resumeReasonTransitionInProgress = "transition_in_progress"
+	resumeReasonOriginNotReporting   = "origin_not_reporting"
+	resumeReasonOriginNotAccepting   = "origin_not_accepting_work"
+	resumeReasonOriginNotReachable   = "origin_not_reachable_from_here"
+	resumeReasonOriginUnclassified   = "origin_unclassified"
+)
+
+var knownResumeReasons = map[string]struct{}{
+	resumeReasonTransitionInProgress: {},
+	resumeReasonOriginNotReporting:   {},
+	resumeReasonOriginNotAccepting:   {},
+	resumeReasonOriginNotReachable:   {},
+	resumeReasonOriginUnclassified:   {},
+}
+
+// The gRPC codes this build maps to a label, spelled as the api half spells
+// them. Anything else is "other".
+var resumeCodeLabels = map[codes.Code]string{
+	codes.OK:                "ok",
+	codes.NotFound:          "not_found",
+	codes.PermissionDenied:  "permission_denied",
+	codes.ResourceExhausted: "resource_exhausted",
+	codes.Unavailable:       "unavailable",
+	codes.DeadlineExceeded:  "unavailable",
+	codes.Canceled:          "unavailable",
+	codes.InvalidArgument:   "invalid_argument",
+	codes.Internal:          "internal",
+	codes.Unimplemented:     "unimplemented",
+}
+
+// resumeResultLabel names one wake-up outcome, from a closed set.
+//
+// 🔴 The refusal reason wins over the code when there is one, because that is
+// the distinction that matters: three of the reasons share
+// FAILED_PRECONDITION and mean completely different waits. Falling back to the
+// code would merge "somebody else is mid-resume, try in a second" with "the
+// only machine holding these bytes is gone, and may never come back".
+func resumeResultLabel(result resume.Result) string {
+	if result.Verdict == resume.VerdictWoken {
+		return "ok"
+	}
+	if result.Reason != "" {
+		if _, ok := knownResumeReasons[result.Reason]; ok {
+			return result.Reason
+		}
+		// A reason this build does not know. Counted, but not as itself: see
+		// the note on gatewayResumeAttempts.
+		return "other"
+	}
+	if result.Status == nil {
+		return "unavailable"
+	}
+	if label, ok := resumeCodeLabels[result.Status.Code()]; ok {
+		return label
+	}
+	return "other"
+}
+
+func recordResumeAttempt(result resume.Result) {
+	gatewayResumeAttempts.WithLabelValues(resumeResultLabel(result)).Inc()
+}
 
 func recordRouteResolution(source string) {
 	gatewayRouteResolution.WithLabelValues(source).Inc()

@@ -922,7 +922,7 @@ enum TransitionKind {
 | 不做 | 在哪做 | 为什么不在这里 |
 |---|---|---|
 | **发布权集中**（e2b `pause_instance.go:71-77` 那一形态：节点无自主 pause 权、翻牌只由中央做）| **B6** | controller 今天是纯被动 RPC 服务端，**没有下行命令通道**（`grep -E 'http\.Client\|http\.NewRequest\|Dial\(' services/scheduler` 零命中）。做它要先有命令下发面 |
-| 存储层写锁 | 长期项 | 两家零先例；且踩在已知最不稳的 rustfs 上（并发 multipart ≥3 必 503）|
+| 存储层写锁 | 长期项 | e2b 中零先例；且踩在已知最不稳的 rustfs 上（并发 multipart ≥3 必 503）|
 | envd token 绑 execution | `secure` 沙箱加强项，seed 统一后 | 只覆盖 `secure` 一半 |
 | node API 收窄 | **A4**（同批，但独立 PR）| 边界画在哪要等 R1 结论 |
 | 路由层拒旧化身 | **A5** | 保护的是可恢复的交互流量，不是不可逆的工作区 |

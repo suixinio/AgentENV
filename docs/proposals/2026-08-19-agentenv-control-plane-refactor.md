@@ -1,7 +1,7 @@
 # AgentENV 中央控制面重构方案
 
 > 2026-08-19 · 实施方案（v3，**阶段 0 / 1 / 2 已实施并通过 pve-sg dev 集群验证**）
-> 背景与三家架构对照见 [`aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
+> 背景与架构对照见 [`aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
 > 实施收口、闸门 B 决策材料与遗留项清单见
 > [`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md)
 >
@@ -15,7 +15,7 @@
 > | §4 阶段 1 | 「查 roster 兜底」当时**没有数据源** | 同上 §1.2 |
 > | §4 阶段 2 | 13 → 5 个 RPC **已实施**，实际形状见订正块 | `_impl-plan-control-plane-phase2.md` §3.3 |
 > | §7 | 🚦 **闸门 A 已通过**（2026-08-19 用户裁决） | `_impl-plan-control-plane-phase2.md` 抬头 |
-> | §4 阶段 3-C | fencing 三候选的判断要改，**且主次对调**（写路径 fencing 才是本体）| 2026-08-19 e2b / Cube 源码考古 |
+> | §4 阶段 3-C | fencing 三候选的判断要改，**且主次对调**（写路径 fencing 才是本体）| 2026-08-19 e2b 源码考古 |
 > | §4 阶段 3 | **不需要向后兼容** ⇒ schema 重画、RPC 直接重写、execution 内部必填 | 用户裁决 2026-08-19 |
 > | §4 阶段 4 | **并入阶段 3**，不再"拖到最后" | 同上考古（fencing 从"检查"降级成"拓扑"）|
 > | §5.3 | ExecutionID 是**内部** token；跨仓契约**退出阶段 3 关键路径** | 范围裁决 2026-08-19 |
@@ -36,7 +36,7 @@
 
 ## 0. 一句话
 
-把 `scheduler` 从"无状态选节点器"升级成 **controller**（e2b `api` / Cube `CubeMaster` 的角色）：
+把 `scheduler` 从"无状态选节点器"升级成 **controller**（对应 e2b `api` 的角色）：
 唯一持有 PG 的进程、唯一的状态裁判；node 退回纯执行器；gateway 退回纯入口。
 
 **但顺序反过来走**：先建**观测面**，再收**读路径**，最后才动**写路径与裁决权**。
@@ -89,12 +89,12 @@ resp, err := s.scheduler.Schedule(ctx, &schedulerv1.ScheduleRequest{})   // 空 
 ```
                      ┌──────────────────────────────────────┐
    客户端 / SDK ────► │ gateway（Go）                        │  ← e2b client-proxy + api 入口
-                     │ REST 入口 / 鉴权 / 数据面直连沙箱     │  ← Cube CubeAPI + CubeProxy
+                     │ REST 入口 / 鉴权 / 数据面直连沙箱     │
                      └───────┬───────────────────┬──────────┘
                 控制面 gRPC  │                   │ 数据面 HTTP（直连，不经 controller）
                              ▼                   │
                      ┌──────────────────────┐    │
-                     │ controller（Go）      │    │   ← e2b api / Cube CubeMaster
+                     │ controller（Go）      │    │   ← e2b api
    ┌── PostgreSQL ──►│ 状态机 · placement    │    │
    │  （唯一持有者） │ reconcile · evictor   │    │
    │      Redis     │ catalog               │    │
@@ -102,7 +102,7 @@ resp, err := s.scheduler.Schedule(ctx, &schedulerv1.ScheduleRequest{})   // 空 
                   内部 gRPC  │                   │
                              ▼                   ▼
                      ┌──────────────────────────────────────┐
-                     │ node（Rust，DaemonSet）               │  ← e2b orchestrator / Cube Cubelet
+                     │ node（Rust，DaemonSet）               │  ← e2b orchestrator
                      │ VM 生命周期 · 块设备 · 网络           │
                      │ 本地 store（只记本机 artifacts 事实） │
                      │ 🔴 无 PG · 最多 Redis（订阅态）       │
@@ -115,14 +115,13 @@ resp, err := s.scheduler.Schedule(ctx, &schedulerv1.ScheduleRequest{})   // 空 
 | **scheduler → controller** | 内存/Redis binding + 只会"选节点" | 唯一持 PG；沙箱全生命周期状态机、placement、中央 reconcile、evictor、catalog |
 | **node** | 完整用户级 REST + 直连 PG + 自己续租/抢占/驱逐 | 内部接口，只接受 controller 调用；本地 registry 只记"本机有哪些 artifacts" |
 
-### 2.1 数据分层：这是**第三种**形态，不是"对齐 e2b"
+### 2.1 数据分层：这是**不同的**形态，不是"对齐 e2b"
 
 必须说清楚，否则后面每个决策都会拿错参照：
 
 | | live 沙箱 | paused 沙箱 |
 |---|---|---|
 | **e2b** | Redis catalog（`AllowedTransitions` 里只有 running/pausing/killing/snapshotting，**没有 paused**，`sandboxtypes/states.go:93`）| PG `snapshots` 表（带 `origin_node_id`）|
-| **Cube** | Redis（元数据 + 生命周期事件唯一可信源）| MySQL/PG `snapshot_runtime_ref` |
 | **本方案** | **PG**（由 `paused_sandboxes` 演进成 `sandboxes`）| **PG**（同一张表）|
 
 选 PG 承载全生命周期是**刻意偏离**，理由只有一条，但足够：
@@ -150,11 +149,11 @@ scheduler **强制要求 `scheduler.redis_addr`**，`services/scheduler/internal
 ⇒ **Redis 从阶段 1 就在链路里，不是阶段 3 的可选项。** 尤其预览多端口（`{port}-{sandboxID}`）
 每个 HTTP 请求都要一次 sandbox→node 解析，把它压到 PG 上是错的。
 
-### 2.3 node 的 Redis 边界（与两家一致）
+### 2.3 node 的 Redis 边界（与 e2b 一致）
 
 允许：订阅事件流、P2P peer registry 这类**短 TTL 软状态**。
 禁止：任何"丢了就影响集群一致性"的东西。
-> e2b orchestrator 的 Redis 可以直接 disabled（`ErrRedisDisabled`）；Cubelet 只**订阅** redis stream。
+> e2b orchestrator 的 Redis 可以直接 disabled（`ErrRedisDisabled`）。
 
 ---
 
@@ -560,9 +559,8 @@ e2b 敢直接裁决，是因为它接受泄漏（孤儿等节点回来再杀）+
 把「存储层写锁」列为长期项。**在选定之前，`running`/`resuming` 永不可抢这条不许放宽。**
 
 > 🔧 **实施订正（2026-08-19 源码考古）：三个候选的判断要改，而且主次对调。**
-> 证据来自对 e2b（`/home/debian/e2b-infra` @ `6938cbb`）与 CubeSandbox
-> （`/home/debian/CubeSandbox-latest` @ `50d9a3e7`，比另一份检出新 660 commits）的逐调用点考古。
-> **结论：两家都没有"解决"这个问题 —— 它们各自靠一条我们不具备的业务前提把问题消解掉了。**
+> 证据来自对 e2b（`/home/debian/e2b-infra` @ `6938cbb`）的逐调用点考古。
+> **结论：e2b 没有用这三个候选解决问题，而是靠一条我们不具备的业务前提消解它。**
 >
 > **e2b 的四条硬事实**
 >
@@ -596,17 +594,11 @@ e2b 敢直接裁决，是因为它接受泄漏（孤儿等节点回来再杀）+
 > `status_group = 'ready'` 的最新 build。⇒ **分区旧节点就算把快照字节传完，没有中央翻牌，
 > 这份数据永远进不了快照链。**
 >
-> **CubeSandbox**：**根本没有跨节点 resume**（roadmap 未来项，`docs/zh/guide/lifecycle.md:259`
-> 逐字「后续版本将支持跨节点恢复」），沙箱身份终身钉死单节点、快照落本地 cubecow reflink 盘
-> ⇒ fencing 降维成 cubelet **进程内** per-sandbox 互斥锁（`services/cubebox/update.go:77`）——
-> 因为一个沙箱的全部生命周期操作都汇聚到唯一节点，**这把进程锁就是全局锁**。
-> 全仓 grep `fencing|fence|epoch` **零命中**。
->
 > **⇒ 修订后的三候选判断**
 >
 > | 候选 | 修订判断 |
 > |---|---|
-> | 1 存储层写锁 | **两家零先例** —— 连把快照放中央对象存储的 e2b 都没做条件写。维持长期项的结论更有底气 |
+> | 1 存储层写锁 | **e2b 零先例** —— 连把快照放中央对象存储的 e2b 都没做条件写。维持长期项的结论更有底气 |
 > | 2 envd token 绑 execution | **e2b 也没做**。维持「`secure` 沙箱加强项、seed 统一后再补」 |
 > | 3 路由层拒旧 execution | 方向被 e2b **半**验证：它把路由缓存刻意删成每请求实时查 catalog（PR #2636 / #2315），买的就是收敛速度 —— 但它只做**收敛**，不做**拒绝** |
 >
@@ -738,8 +730,7 @@ node 的用户级 REST（`/sandboxes` POST/DELETE、`/pause`、`/resume`、`/for
 ### 5.5 一个方案原本漏掉的必要输入：层局部性
 
 中央 placement 一旦不知道"哪台机器有哪些层"，跨节点 resume 就要从 OSS 全量拉。
-Cube 为此有 `artifact_node_placement` / `template_replica` 两张表；
-我们其实**已经有原料** —— `services/api/proto/scheduler.proto:16-18` 的
+我们已经有记录放置关系的原料 —— `services/api/proto/scheduler.proto:16-18` 的
 `RecordP2pArtifact` / `ForgetP2pArtifact` / `LookupP2pArtifact`，但 `Schedule` 不消费它。
 
 ⇒ 阶段 3 的 placement 必须把 P2P artifact registry 接进打分，否则中央化会**换来一次性能倒退**。
@@ -813,9 +804,9 @@ Cube 为此有 `artifact_node_placement` / `template_replica` 两张表；
 
 ### 🔴 写进任务书的两条反面教材
 
-1. **绝不"跳过 RPC 直删元数据"** —— Cube 的 `sandbox_remove.go:180-204`：节点不在内存缓存里就跳过
-   Destroy RPC、直接抹掉 Redis 元数据 ⇒ 中央认为已删、分区节点上 VM 还在跑还在写盘，
-   且 cubelet 无本地 TTL 自杀，孤儿跑到人工干预为止。这正是我们护栏哲学（"我不知道"≠"不存在"）要防的。
+1. **绝不"跳过 RPC 直删元数据"** —— 节点不可达时若直接抹掉中央记录，
+   分区节点上的 VM 仍可能运行并写盘，而控制面已经失去追踪入口。
+   这正是我们护栏哲学（"我不知道"≠"不存在"）要防的。
 2. **分区期间 fail-closed 等待，不抄 e2b 的"清库不等 ack"**（`delete_instance.go:104-105`
    无条件 `defer Remove`）—— e2b 敢这么做是因为沙箱可弃，我们的是用户工作区。
 
@@ -845,6 +836,3 @@ Cube 为此有 `artifact_node_placement` / `template_replica` 两张表；
 - `packages/api/internal/orchestrator/delete_instance.go:104`（无条件 `defer Remove`）
 - `packages/client-proxy/internal/proxy/proxy.go:76`（数据面每请求查 catalog）、`:109`（miss → resume）
 - `spec/openapi.yml`（**零处** execution id）
-
-**CubeSandbox**
-- `docs/zh/architecture/overview.md`、`CubeMaster/pkg/base/db/models/snapshot_runtime_ref.go`、`Cubelet/go.mod`（无 CubeDB）

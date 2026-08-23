@@ -66,7 +66,7 @@
 > **🔴 上集群执行的人另加一份必读：§6.0（部署方式与漂移）。**
 > 权威方案：[`2026-08-19-agentenv-control-plane-refactor.md`](2026-08-19-agentenv-control-plane-refactor.md)（§4 阶段 3 / §8 清单）
 > 决策材料：[`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md) §3
-> 三家对照：[`2026-08-19-aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
+> 架构对照：[`2026-08-19-aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
 
 ---
 
@@ -1544,9 +1544,8 @@ binding 若在 Redis 里，滚 scheduler 就不会丢它、也就没有那个窗
 
 ## 7. 已知陷阱（写在前面，别再踩一遍）
 
-1. **绝不"跳过 RPC 直删元数据"** —— Cube 的 `sandbox_remove.go:180-204`：节点不在内存缓存里就跳过
-   Destroy RPC、直接抹 Redis 元数据 ⇒ 中央认为已删、分区节点上 VM 还在跑还在写盘，
-   且 cubelet 无本地 TTL 自杀，孤儿跑到人工干预为止。
+1. **绝不"跳过 RPC 直删元数据"** —— 节点不可达时若直接抹掉中央记录，
+   分区节点上的 VM 仍可能运行并写盘，而控制面已经失去追踪入口。
 2. **分区期间 fail-closed 等待**，不抄 e2b 的"清库不等 ack"（`delete_instance.go:104-105` 无条件
    `defer Remove`）—— e2b 敢这么做是因为沙箱可弃，我们的是用户工作区。
 3. **我们的 reclaim 比 e2b 激进**：e2b 的 Running 记录**永不自动释放**（`UnreachableSince` 零消费者），

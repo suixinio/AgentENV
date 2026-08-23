@@ -8,11 +8,11 @@ init_suite "14_code_interpreter"
 
 log "Suite: Code Interpreter Compatibility"
 
-# TODO: sandbox-code image was rebuilt (2026-05-17) and switched from Jupyter to a
-# subprocess-based server; re-enable once the image is restored or a compatible
-# replacement is pushed to GHCR.
+# The public image replacement is configured by code_interpreter_compat.py
+# (`CODE_INTERPRETER_IMAGE` overrides it), but has not yet passed this suite
+# against AgentENV. Re-enable only after a manual compatibility run succeeds.
 warn "code interpreter suite temporarily disabled; skipping"
-_pass "skipped code interpreter checks (image incompatible — see TODO above)"
+_pass "skipped code interpreter checks (replacement image not yet validated)"
 suite_summary "14_code_interpreter"
 exit 0
 

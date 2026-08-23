@@ -73,6 +73,22 @@ both the gateway routing allowlist and runtime nodes' sandbox response metadata.
 The domain must resolve to the gateway Ingress or LoadBalancer, usually through
 wildcard DNS for `*.sandbox.example.com`.
 
+The three AgentENV images are named in `kustomization.yaml` without a registry
+and on the `latest` tag, which is right for a local cluster that loads images
+directly and wrong for one that pulls them. Set either or both of
+`IMAGE_REGISTRY` and `IMAGE_TAG` when rendering or applying, and the render
+rewrites all three:
+
+```bash
+IMAGE_REGISTRY=registry.example.com:5000 IMAGE_TAG=sd3a-9a9de13 make k8s-render
+```
+
+`IMAGE_REGISTRY` prefixes the image names; `IMAGE_TAG` replaces the tags. One
+tag covers all three because they are built together from one commit. Both
+substitutions verify themselves and fail the render if they did not take —
+without them the symptom is `ImagePullBackOff` on every Pod, one step away from
+its cause.
+
 The default overlay is `deploy/k8s/overlays/default`, targeting the `agentenv-system` namespace. The gateway is exposed as ClusterIP by default. Add your own Ingress or LoadBalancer for external access.
 
 The make targets build a temporary Kustomize context so runtime Pods mount the repository's `config/default.toml` rather than a separate checked-in copy.

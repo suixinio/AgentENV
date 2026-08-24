@@ -82,6 +82,127 @@ async fn listed(service: &NodeSandboxService) -> Vec<pb::NodeSandbox> {
         .sandboxes
 }
 
+/// The in-memory store, with a switch that makes single-record reads fail.
+///
+/// 🔴 It fails rather than answers empty, which is the whole point: `get`
+/// returning `Ok(None)` and `get` returning an error are the two things this
+/// service must never flatten, and nothing else in this file can produce the
+/// second.
+struct FlakyRecords {
+    inner: InMemoryMetadataStore,
+    reads_fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FlakyRecords {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryMetadataStore::new(),
+            reads_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn unreachable<T>(&self) -> Result<T, crate::orchestrator::StoreError> {
+        Err(crate::orchestrator::StoreError::Backend {
+            source: anyhow::anyhow!("the records could not be reached"),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::orchestrator::MetadataStore for FlakyRecords {
+    /// The one override.
+    async fn get(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
+        if self.reads_fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.unreachable();
+        }
+        self.inner.get(sandbox_id).await
+    }
+
+    async fn add(&self, metadata: SandboxMetadata) -> Result<(), crate::orchestrator::StoreError> {
+        self.inner.add(metadata).await
+    }
+    async fn update(
+        &self,
+        metadata: SandboxMetadata,
+    ) -> Result<(), crate::orchestrator::StoreError> {
+        self.inner.update(metadata).await
+    }
+    async fn update_state_if_state(
+        &self,
+        sandbox_id: &SandboxId,
+        new_state: crate::orchestrator::SandboxState,
+        expected_states: &[crate::orchestrator::SandboxState],
+    ) -> Result<crate::orchestrator::SandboxState, crate::orchestrator::StoreError> {
+        self.inner
+            .update_state_if_state(sandbox_id, new_state, expected_states)
+            .await
+    }
+    async fn update_if_state<F>(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_states: &[crate::orchestrator::SandboxState],
+        update: F,
+    ) -> Result<crate::orchestrator::MetadataUpdateResult, crate::orchestrator::StoreError>
+    where
+        F: FnOnce(&mut SandboxMetadata) + Send,
+    {
+        self.inner
+            .update_if_state(sandbox_id, expected_states, update)
+            .await
+    }
+    async fn remove(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
+        self.inner.remove(sandbox_id).await
+    }
+    async fn list(&self) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
+        self.inner.list().await
+    }
+    async fn list_with_callback<F>(
+        &self,
+        callback: F,
+    ) -> Result<(), crate::orchestrator::StoreError>
+    where
+        F: FnMut(&SandboxMetadata) + Send,
+    {
+        self.inner.list_with_callback(callback).await
+    }
+    async fn list_filtered(
+        &self,
+        filter: crate::orchestrator::SandboxListFilter,
+    ) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
+        self.inner.list_filtered(filter).await
+    }
+    async fn list_expired(
+        &self,
+        now: std::time::SystemTime,
+    ) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
+        self.inner.list_expired(now).await
+    }
+    async fn list_ids(&self) -> Result<Vec<SandboxId>, crate::orchestrator::StoreError> {
+        self.inner.list_ids().await
+    }
+    async fn get_many(
+        &self,
+        ids: &[SandboxId],
+    ) -> Result<crate::orchestrator::MetadataRows, crate::orchestrator::StoreError> {
+        self.inner.get_many(ids).await
+    }
+    async fn wait_while_in_states(
+        &self,
+        sandbox_id: &SandboxId,
+        transitional_states: &[crate::orchestrator::SandboxState],
+    ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
+        self.inner
+            .wait_while_in_states(sandbox_id, transitional_states)
+            .await
+    }
+}
+
 /// 🔴 The load-bearing one. Only sandboxes carrying an ownership marker are
 /// reported, and the marker comes back byte for byte.
 #[tokio::test]
@@ -957,5 +1078,294 @@ async fn assigned_children_reach_the_orchestrator_unchanged() {
     assert_eq!(
         child.control_plane_config.as_ref().map(|c| c.as_bytes()),
         Some(&b"child"[..])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resume
+// ---------------------------------------------------------------------------
+
+/// Pauses a sandbox this node is running and hands back the run it was paused
+/// under.
+async fn pause(orchestration: &Arc<dyn SandboxOrchestration>, marker: &[u8]) -> SandboxMetadata {
+    let sandbox = start(orchestration, Some(marker)).await;
+    let paused = Arc::clone(orchestration)
+        .pause_sandbox(sandbox.id)
+        .await
+        .expect("the mock backend pauses");
+    assert_eq!(
+        paused.execution_id, sandbox.execution_id,
+        "a pause changed the run the sandbox had been running"
+    );
+    paused
+}
+
+fn resume_request(
+    sandbox_id: SandboxId,
+    execution_id: ExecutionId,
+    resumed_execution_id: ExecutionId,
+    timeout_ms: u64,
+) -> pb::SandboxResumeRequest {
+    pb::SandboxResumeRequest {
+        sandbox_id: sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        resumed_execution_id: resumed_execution_id.to_string(),
+        timeout_ms,
+    }
+}
+
+/// A resume reopens the capture this node is holding, under the run the caller
+/// claimed and fenced on the run it was paused under.
+///
+/// 🔴 The control face is the swap. `execution_id` and `resumed_execution_id`
+/// are two strings in one message, and nothing in this project's mutation
+/// testing covers a `.proto`: exchanging them compiles, resumes the sandbox
+/// under the identity it had just been paused with, and fences against a run
+/// that has not happened. So the same call is made twice with the two values
+/// exchanged, and the exchanged one has to be refused.
+#[tokio::test]
+async fn a_resume_reopens_the_capture_under_the_run_the_caller_claimed() {
+    let (orchestration, service) = service().await;
+    let paused = pause(&orchestration, b"owned").await;
+    let claimed = ExecutionId::new();
+    assert_ne!(claimed, paused.execution_id);
+    assert!(
+        listed(&service).await.is_empty(),
+        "a paused sandbox is live"
+    );
+
+    // 🔴 Swapped: the fence names the run that has not happened, and the run to
+    // start is the one the capture is of.
+    let err = service
+        .resume(Request::new(resume_request(
+            paused.id,
+            claimed,
+            paused.execution_id,
+            0,
+        )))
+        .await
+        .expect_err("a resume whose two incarnations were exchanged");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(
+        listed(&service).await.is_empty(),
+        "a refused resume brought the sandbox back anyway"
+    );
+
+    // The same call, the two values the right way round.
+    let started = service
+        .resume(Request::new(resume_request(
+            paused.id,
+            paused.execution_id,
+            claimed,
+            0,
+        )))
+        .await
+        .expect("resume")
+        .into_inner()
+        .started
+        .expect("a resume that succeeded says what it started");
+
+    assert_eq!(started.sandbox_id, paused.id.to_string());
+    assert_eq!(
+        started.execution_id,
+        claimed.to_string(),
+        "the node brought the sandbox back under a run nobody claimed"
+    );
+
+    let sandboxes = listed(&service).await;
+    assert_eq!(sandboxes.len(), 1, "reported: {sandboxes:?}");
+    assert_eq!(sandboxes[0].sandbox_id, paused.id.to_string());
+    assert_eq!(sandboxes[0].execution_id, claimed.to_string());
+    assert_eq!(
+        sandboxes[0].control_plane_config, b"owned",
+        "the sandbox came back without the record that says whose it is"
+    );
+}
+
+/// A resume for a capture this node is not holding is `NotFound`, and a resume
+/// for one it is holding is not.
+///
+/// 🔴 The caller acts on this answer by concluding the only copy of the sandbox
+/// is gone — rebuilding it from a published snapshot, or giving it up. So the
+/// answer has to be produced by a node that looked and found nothing, which is
+/// what the second half of this test establishes the node can tell apart.
+#[tokio::test]
+async fn a_resume_for_a_capture_this_node_does_not_hold_is_not_found() {
+    let (orchestration, service) = service().await;
+    let paused = pause(&orchestration, b"owned").await;
+
+    let err = service
+        .resume(Request::new(resume_request(
+            SandboxId::new(),
+            paused.execution_id,
+            ExecutionId::new(),
+            0,
+        )))
+        .await
+        .expect_err("a resume for a sandbox that was never here");
+    assert_eq!(err.code(), Code::NotFound, "{err}");
+
+    // 🔴 The control face: the same call about the sandbox this node *is*
+    // holding a capture for succeeds, so `NotFound` is an answer rather than
+    // this method's only outcome.
+    service
+        .resume(Request::new(resume_request(
+            paused.id,
+            paused.execution_id,
+            ExecutionId::new(),
+            0,
+        )))
+        .await
+        .expect("a resume for the capture this node holds");
+}
+
+/// 🔴 A node that could not read its own records does not answer `NotFound`.
+///
+/// The two are one `Option` apart in the code and opposite in consequence: the
+/// caller reads `NotFound` as "the only copy of this sandbox is gone" and acts
+/// on it, and a store that was merely unreachable would have it discard a
+/// sandbox whose capture is intact on this disk. One store, one flag, and the
+/// same call on both sides of it.
+#[tokio::test]
+async fn a_resume_whose_records_could_not_be_read_is_not_an_absence() {
+    crate::logging::init_for_tests();
+    let store = FlakyRecords::new();
+    let breaker = store.reads_fail.clone();
+    let orchestrator = Orchestrator::new(
+        ServerRole::All,
+        store,
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(mock_snapshot_manager()),
+        NODE.to_string(),
+    );
+
+    let request = || resume_request(SandboxId::new(), ExecutionId::new(), ExecutionId::new(), 0);
+
+    // Reads work: a sandbox that is not here is not here, and that is a fact.
+    let err = service
+        .resume(Request::new(request()))
+        .await
+        .expect_err("a resume for a sandbox that was never here");
+    assert_eq!(err.code(), Code::NotFound, "{err}");
+
+    // 🔴 The same call, one flag different.
+    breaker.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = service
+        .resume(Request::new(request()))
+        .await
+        .expect_err("a resume this node could not answer");
+    assert_ne!(
+        err.code(),
+        Code::NotFound,
+        "a store this node could not read was reported as a sandbox that is not here: {err}"
+    );
+    assert_eq!(err.code(), Code::Internal, "{err}");
+}
+
+/// A resume that would run under the incarnation the sandbox was paused under
+/// is refused, and one that starts a new run is not.
+///
+/// 🔴 A resume starts a new run. Reusing the paused run's identity would leave
+/// commands written before the pause indistinguishable from commands written
+/// after it — which is exactly what the incarnation on every call here exists
+/// to tell apart — and it would do it without any call failing.
+#[tokio::test]
+async fn a_resume_into_the_run_it_is_replacing_is_refused() {
+    let (orchestration, service) = service().await;
+    let paused = pause(&orchestration, b"owned").await;
+
+    let err = service
+        .resume(Request::new(resume_request(
+            paused.id,
+            paused.execution_id,
+            paused.execution_id,
+            0,
+        )))
+        .await
+        .expect_err("a resume into the run it is replacing");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(listed(&service).await.is_empty());
+
+    // 🔴 And an empty one is refused rather than read as "you choose". A create
+    // with no incarnation is a caller that keeps no record; a resume with none
+    // is a resume nobody licensed.
+    let err = service
+        .resume(Request::new(pb::SandboxResumeRequest {
+            resumed_execution_id: String::new(),
+            ..resume_request(paused.id, paused.execution_id, ExecutionId::new(), 0)
+        }))
+        .await
+        .expect_err("a resume that named no run to start");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(listed(&service).await.is_empty());
+
+    // The control face: a run of its own is accepted.
+    service
+        .resume(Request::new(resume_request(
+            paused.id,
+            paused.execution_id,
+            ExecutionId::new(),
+            0,
+        )))
+        .await
+        .expect("a resume under a run of its own");
+    assert_eq!(listed(&service).await.len(), 1);
+}
+
+/// 🔴 A zero timeout keeps the deadline the sandbox was paused with; a non-zero
+/// one replaces it.
+///
+/// The two are told apart by an hour, not by whatever the clock did between two
+/// statements: a difference the length of one call would be satisfied by an
+/// implementation that ignored the field entirely.
+#[tokio::test]
+async fn a_zero_timeout_keeps_the_deadline_the_sandbox_was_paused_with() {
+    const AN_HOUR_MS: u64 = 60 * 60 * 1_000;
+    let (orchestration, service) = service().await;
+
+    // `launch()` creates both of these with a sixty-second timeout.
+    let kept = pause(&orchestration, b"kept").await;
+    let replaced = pause(&orchestration, b"replaced").await;
+
+    let resume = |sandbox: &SandboxMetadata, timeout_ms| {
+        let request = resume_request(
+            sandbox.id,
+            sandbox.execution_id,
+            ExecutionId::new(),
+            timeout_ms,
+        );
+        async { service.resume(Request::new(request)).await }
+    };
+
+    let kept = resume(&kept, 0)
+        .await
+        .expect("resume keeping the paused deadline")
+        .into_inner()
+        .started
+        .expect("started");
+    let replaced = resume(&replaced, AN_HOUR_MS)
+        .await
+        .expect("resume with a new deadline")
+        .into_inner()
+        .started
+        .expect("started");
+
+    // 🔴 Neither is zero: zero is what this field carries for a sandbox with no
+    // expiry at all, and two zeroes would satisfy the comparison below by
+    // saying nothing.
+    assert!(kept.expires_at_ms > 0, "{kept:?}");
+    assert!(replaced.expires_at_ms > 0, "{replaced:?}");
+    assert!(
+        replaced.expires_at_ms - kept.expires_at_ms > 3_000_000,
+        "the timeout on the request did not reach the sandbox: kept {}, replaced {}",
+        kept.expires_at_ms,
+        replaced.expires_at_ms
     );
 }

@@ -35,6 +35,32 @@ impl ClaimedExecution {
         Self(execution_id)
     }
 
+    /// Adopts the incarnation an orchestrator in **another process** already
+    /// claimed for this resume.
+    ///
+    /// # 🔴 Not a second mint site, and the distinction is the whole argument
+    ///
+    /// [`from_claim`](Self::from_claim) mints: it turns a decision into an
+    /// incarnation nobody had before. This one mints nothing. It is called on
+    /// the node service, by a machine executing a resume that the orchestrator
+    /// which *owns* the sandbox has already decided on and already written into
+    /// its own record — the same relationship `LaunchPlan::for_create_from_*`'s
+    /// `run_as` argument has with a create.
+    ///
+    /// So "every resume went through an arbitration" stays true; what changes
+    /// is that the arbitration and the machine are no longer the same process.
+    /// The alternative is worse than it looks: a node that minted its own would
+    /// bring the sandbox back under a run the cluster's record of it does not
+    /// name, and fencing — which compares exactly that value — would then
+    /// refuse every command the owner sent about the sandbox it just started.
+    ///
+    /// 🔴 One call site, guarded by
+    /// `the_adopted_claim_token_is_only_taken_where_a_remote_claim_arrives`
+    /// below.
+    pub(crate) fn adopted_from_remote_claim(execution_id: ExecutionId) -> Self {
+        Self(execution_id)
+    }
+
     /// A token for tests that drive [`Orchestrator::resume_sandbox`] directly.
     ///
     /// 🔴 Never callable from production code, and that is enforced rather
@@ -270,6 +296,59 @@ mod tests {
             offenders.is_empty(),
             "the test-only claim token was minted inside the crate, which is a resume path that \
              never asked the cluster whether it may run: {offenders:?}"
+        );
+    }
+
+    /// 🔴 The adopted claim token is taken where a remote claim arrives, and
+    /// nowhere else.
+    ///
+    /// `adopted_from_remote_claim` is the one constructor that produces a
+    /// licence without deciding anything, so its safety is entirely a property
+    /// of *who calls it*: the node service, acting on a decision another
+    /// process already took and already recorded. A second call site would be a
+    /// resume that started because some code had an `ExecutionId` in hand.
+    #[test]
+    fn the_adopted_claim_token_is_only_taken_where_a_remote_claim_arrives() {
+        const TOKEN: &str = "adopted_from_remote_claim";
+        let allowed = std::path::Path::new("node_server").join("service.rs");
+
+        fn visit(dir: &std::path::Path, token: &str, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("src is readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    visit(&path, token, found);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                if path.ends_with("orchestrator/launch_plan.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("source is utf-8");
+                if source.contains(token) {
+                    found.push(path);
+                }
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        visit(&src, TOKEN, &mut found);
+
+        // 🔴 The half that gives the scan its resolution. Without it this test
+        // passes on a tree where the constructor was renamed and nothing calls
+        // it any more — a scan that finds nothing looks exactly like a scan
+        // that found only what it was allowed to find.
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly the node service to take an adopted claim, found {found:?}"
+        );
+        assert!(
+            found[0].ends_with(&allowed),
+            "an adopted claim token is taken outside the node service, which is a resume that \
+             started because something had an incarnation in hand rather than a licence: {found:?}"
         );
     }
 }

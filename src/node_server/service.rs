@@ -24,8 +24,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
 use crate::orchestrator::{
-    CreateSandboxRequest, ForkChildAssignment, ForkChildren, NewTimeout, OrchestratorError,
-    SandboxLaunchSource, SandboxOrchestration,
+    ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, NewTimeout,
+    OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOrchestration,
 };
 use crate::proto::node as pb;
 use crate::sandbox::{CustomExtensionParams, SandboxNetworkPolicy};
@@ -100,6 +100,54 @@ impl NodeSandboxService {
             None => Err(Status::not_found(format!(
                 "sandbox {sandbox_id} is not on this node"
             ))),
+        }
+    }
+
+    /// What a caller learns about a sandbox this node has just brought up.
+    ///
+    /// Shared by `create` and `resume` because the two answer the same
+    /// question — *what is running now, and under which run* — and a second
+    /// copy of it is a second place for a field to be forgotten.
+    ///
+    /// The two facts a record cannot supply — the address the sandbox reaches
+    /// the host on, and the size the rootfs turned out to be — are only
+    /// knowable from the live handle, and this is the one call that reaches
+    /// one.
+    ///
+    /// It costs a scan of everything running on this node. That is a real cost
+    /// and it is the right trade here: the call it is inside has just booted a
+    /// virtual machine, and the alternative is a second accessor on the
+    /// orchestration surface that exists to serve one field.
+    ///
+    /// 🔴 `.ok()` and not `?`: an operation that *succeeded* must not be
+    /// reported as a failure because the follow-up read did not work. The
+    /// sandbox is running either way, and a caller told it failed would leak
+    /// it.
+    async fn running_sandbox(&self, metadata: &SandboxMetadata) -> pb::SandboxCreateResponse {
+        let sandbox_id = metadata.id;
+        let live = self.orchestration.list_live_sandboxes().await.ok();
+        let facts = live.as_ref().and_then(|live| {
+            live.iter()
+                .find(|candidate| candidate.sandbox_id == sandbox_id)
+        });
+
+        pb::SandboxCreateResponse {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: metadata.execution_id.to_string(),
+            host_interaction_ip: facts
+                .and_then(|facts| facts.host_interaction_ip)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            rootfs_virtual_size: facts
+                .and_then(|facts| facts.rootfs_virtual_size)
+                .unwrap_or_default(),
+            resources: Some(pb::SandboxResources {
+                cpu_count: metadata.resources.cpu_count,
+                memory_mib: metadata.resources.memory_mib,
+                disk_size_mib: metadata.resources.disk_size_mib,
+            }),
+            started_at_ms: convert::unix_millis(Some(metadata.created_at)),
+            expires_at_ms: convert::unix_millis(metadata.expires_at),
         }
     }
 }
@@ -224,44 +272,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
-        // The two facts a record cannot supply — the address the sandbox
-        // reaches the host on, and the size the rootfs turned out to be — are
-        // only knowable from the live handle, and this is the one call that
-        // reaches one.
-        //
-        // It costs a scan of everything running on this node. That is a real
-        // cost and it is the right trade here: the call it is inside has just
-        // booted a virtual machine, and the alternative is a second accessor on
-        // the orchestration surface that exists to serve one field.
-        //
-        // 🔴 `.ok()` and not `?`: a create that *succeeded* must not be
-        // reported as a failure because the follow-up read did not work. The
-        // sandbox is running either way, and a caller told the create failed
-        // would leak it.
-        let live = self.orchestration.list_live_sandboxes().await.ok();
-        let facts = live.as_ref().and_then(|live| {
-            live.iter()
-                .find(|candidate| candidate.sandbox_id == sandbox_id)
-        });
-
-        Ok(Response::new(pb::SandboxCreateResponse {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: metadata.execution_id.to_string(),
-            host_interaction_ip: facts
-                .and_then(|facts| facts.host_interaction_ip)
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
-            rootfs_virtual_size: facts
-                .and_then(|facts| facts.rootfs_virtual_size)
-                .unwrap_or_default(),
-            resources: Some(pb::SandboxResources {
-                cpu_count: metadata.resources.cpu_count,
-                memory_mib: metadata.resources.memory_mib,
-                disk_size_mib: metadata.resources.disk_size_mib,
-            }),
-            started_at_ms: convert::unix_millis(Some(metadata.created_at)),
-            expires_at_ms: convert::unix_millis(metadata.expires_at),
-        }))
+        Ok(Response::new(self.running_sandbox(&metadata).await))
     }
 
     async fn delete(
@@ -328,6 +339,94 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             false,
             "the node did not touch the sandbox",
         ))
+    }
+
+    /// Reopens the capture this node is holding.
+    ///
+    /// # 🔴 Why nothing about the capture arrives with the request
+    ///
+    /// The bytes never left. `Pause` handed the caller a path on this node's
+    /// disk and this node's own encoding of its backend state, and the caller
+    /// stored those so it could tell *which machine* to come back to — not so
+    /// it could hand them back as an input. What reopens the sandbox is the
+    /// record this node already has: the paused metadata, the persisted
+    /// artifacts, and the paused-state handle its own factory decoded. So this
+    /// call carries an identity, a fence, and the run to start, and everything
+    /// else would be a second source of truth for a question that already has
+    /// one.
+    ///
+    /// # 🔴 The three answers, and why they may not be flattened
+    ///
+    /// - the record is here and names the run being resumed: proceed;
+    /// - **there is no record**: `NotFound`, which tells the caller the only
+    ///   copy of this sandbox is not on this machine — a conclusion it acts on
+    ///   by rebuilding from a published snapshot, or by giving the sandbox up;
+    /// - **the records could not be read**, or the node is not taking work:
+    ///   anything but `NotFound`. A caller that read those as absence would
+    ///   discard a sandbox whose bytes are sitting intact on this disk.
+    ///
+    /// The first two come out of [`fenced`](Self::fenced), which a paused
+    /// sandbox reaches through its record because it has no live handle.
+    async fn resume(
+        &self,
+        request: Request<pb::SandboxResumeRequest>,
+    ) -> Result<Response<pb::SandboxResumeResponse>, Status> {
+        let request = request.into_inner();
+        let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
+        let paused_execution_id = convert::execution_id(&request.execution_id)?;
+        // 🔴 Required, and not `optional_execution_id`. An empty value on a
+        // create means "you choose", because a caller that keeps no record of
+        // its own has nothing to impose; a resume has no such caller. The only
+        // way to obtain the incarnation a resume runs under is the arbitration
+        // that decided the sandbox may come back, so a request that carries
+        // none is a resume nobody licensed.
+        let resumed_execution_id = convert::execution_id(&request.resumed_execution_id)?;
+        if resumed_execution_id == paused_execution_id {
+            // 🔴 Refused rather than treated as a no-op. A resume starts a new
+            // run; one that reused the paused run's identity would leave every
+            // command written before the pause indistinguishable from one
+            // written after it, which is precisely what the incarnation on
+            // every other call here exists to tell apart.
+            return Err(Status::invalid_argument(format!(
+                "sandbox {sandbox_id} cannot be resumed as the same run it was paused under \
+                 ({paused_execution_id}): a resume starts a new one"
+            )));
+        }
+
+        self.fenced(sandbox_id, paused_execution_id).await?;
+
+        let timeout = match convert::timeout(request.timeout_ms) {
+            Some(timeout) => NewTimeout::Set(timeout),
+            // 🔴 The sandbox keeps what it was paused with, rather than picking
+            // up this node's configured default. The deadline belongs to the
+            // record the caller holds, and a node that substituted its own
+            // would move a deadline nobody agreed to move.
+            None => NewTimeout::UseExisting,
+        };
+
+        let metadata = Arc::clone(&self.orchestration)
+            .resume_sandbox(
+                sandbox_id,
+                timeout,
+                // 🔴 Adopted, not minted. The decision was taken by the
+                // orchestrator that owns this sandbox and is already in its
+                // record; a node that minted here would start a run the
+                // cluster's record does not name.
+                ClaimedExecution::adopted_from_remote_claim(resumed_execution_id),
+            )
+            .await
+            .map_err(|err| orchestrator_status(&err))?;
+
+        // 🔴 Reported rather than asserted. A resume that arrived for a sandbox
+        // this node had already brought back is answered by
+        // `resume_sandbox` with the run that is *up*, which is not the one that
+        // was asked for — and the caller, which holds the record, is the one
+        // that decides what to do about the disagreement. Refusing here would
+        // turn a node's honest answer into a failure of an operation that did
+        // not happen.
+        Ok(Response::new(pb::SandboxResumeResponse {
+            started: Some(self.running_sandbox(&metadata).await),
+        }))
     }
 
     async fn fork(

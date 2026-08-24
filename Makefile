@@ -369,9 +369,11 @@ k8s-redeploy:
 	$(KUBECTL) rollout restart deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart ds/agentenv-node -n $(K8S_NAMESPACE)
+	$(KUBECTL) rollout restart deploy/agentenv-api -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status ds/agentenv-node -n $(K8S_NAMESPACE)
+	$(KUBECTL) rollout status deploy/agentenv-api -n $(K8S_NAMESPACE)
 
 k8s-load-dev:
 	$(DOCKER) save $(K8S_RUNTIME_IMAGE) | $(K3S_CTR) images import -

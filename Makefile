@@ -114,10 +114,32 @@ coverage:
 
 test: test-agent test-envd test-ublk
 
+# 🔴 `--lib --bins`, not `--lib`. A test target that names `--lib` only is
+# naming the crate's library and nothing else, and the difference was not
+# theoretical: `src/bin/server.rs` holds the tests that guard the `--role`
+# split, and this target filtered every one of them out. The run printed
+# `running 0 tests ... 1487 passed; 1491 filtered out` and reported ok.
+#
+# What that hid: `only_the_split_roles_bind_a_second_listener` asserts that
+# `assemble_all` never reaches for `spawn_grpc_surface`, because `--role all`
+# is the rollback target and is defined as the pre-split process verbatim.
+# A `spawn_grpc_surface` mention planted inside `assemble_all` passed
+# `make test-unit` green. Those tests read `src/bin/server.rs`'s own source
+# text, so moving them into the library would only make them read a sibling
+# file — the target selection is the thing that was wrong, not their address.
+#
+# 🔴 `-p aenv -p adev` for the same reason, one step further along: both are
+# bin-only crates, so `--lib` could not have reached them however the package
+# list was written, and no other target in this file or in `.github/workflows/`
+# names either one. 68 tests that ran nowhere — `make clippy` compiles them
+# (`--workspace --all-targets`), so they were type-checked on every PR and
+# executed on none. Among them: `aenv download` not overwriting an existing
+# file without `--force`, and `aenv upload`'s directory walk refusing to
+# follow symlinks out of the tree.
 test-unit:
-	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
+	$(CARGO) test -p agentenv -p envd -p linux-cap -p aenv -p adev --lib --bins
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib --bins -- --ignored
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib --bins
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
 

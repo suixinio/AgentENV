@@ -11,12 +11,23 @@ make                          # build the workspace
 make fmt                      # rustfmt check (agentenv, envd, uvm-ublk, uvm-ublk-daemon)
 make clippy                   # clippy with -D warnings
 make test                     # full test suite (agent + envd + ublk)
-make test-unit                # unit tests only
+make test-unit                # unit tests only (library *and* bin targets)
 make test-agent-integration   # integration tests (tests/integration/*.rs)
 make bench                    # snapshot benchmarks
 make test-with-redis          # the orchestrator metadata store against a real redis-server
 make start-server             # build and run the API server (auto-provisions dependencies)
 ```
+
+`make test-unit` selects `--lib --bins` over `agentenv`, `envd`, `linux-cap`,
+`aenv`, `adev`, `uvm-ublk`, and `uvm-ublk-daemon`, and it is what CI's
+`unit-tests` job runs. **Tests that live in a `main.rs` or under `src/bin/` are
+part of daily validation, so put them where they belong rather than where the
+runner can see them.** Several of them have to live there: the tests guarding
+the `--role` split read `src/bin/server.rs`'s own source text (`--role all` is
+the rollback target and must stay byte-for-byte the pre-split process, which is
+asserted by scanning `assemble_all` for `spawn_grpc_surface`), and `aenv` and
+`adev` are bin-only crates with no library to move anything into. Naming
+`--lib` alone once filtered all of that out and reported ok.
 
 `make test-with-redis` runs `src/orchestrator/store/`'s suite with
 `AENV_REDIS_TEST_REQUIRED=1`, which turns "no `redis-server` on this machine"

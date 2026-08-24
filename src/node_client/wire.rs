@@ -9,6 +9,7 @@ use tonic::Status;
 use crate::proto::node as pb;
 use crate::proto::node::SERIALIZED_VALUE_VERSION;
 use crate::sandbox::SandboxCaptureError;
+use crate::types::SandboxId;
 
 /// Turns a gRPC failure into an ordinary error.
 ///
@@ -58,6 +59,96 @@ pub(super) fn into_capture_error(status: Status) -> SandboxCaptureError {
         }
         Ok(failure) => SandboxCaptureError::terminal(anyhow!("{message} ({})", failure.reason)),
         Err(_) => unclassified(),
+    }
+}
+
+/// Why a paused sandbox was not reopened on the node that holds its capture.
+///
+/// # 🔴 Three answers, because two of them end the same way and mean opposite
+/// things
+///
+/// A resume that did not happen leaves the caller with a decision to take, and
+/// the decision differs by *why*:
+///
+/// - [`CaptureAbsent`][Self::CaptureAbsent] — the node looked and is not
+///   holding this sandbox's capture. The only copy is not there, so the caller
+///   must rebuild the sandbox from a published snapshot or give it up; asking
+///   again will not change the answer.
+/// - [`NodeUnreachable`][Self::NodeUnreachable] — nobody answered, or the node
+///   answered that it is not taking work. The capture is presumed intact and
+///   the right move is to ask again later.
+/// - [`Refused`][Self::Refused] — the node answered and said no for a reason of
+///   its own: the fence named a run it is not holding, the request was
+///   malformed, something failed inside.
+///
+/// 🔴 The whole point of the type is that these cannot be collapsed. Reading an
+/// unreachable node as an absent capture discards a sandbox whose bytes are
+/// sitting intact on a disk that is merely offline — which is the same mistake,
+/// one layer up, as reading a failed store read as "the record is not there".
+/// Nothing above this layer acts on the difference *yet*, because the wake-up
+/// surface that will is still being assembled; what it must never do is arrive
+/// to find the difference already thrown away in a string.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RemoteResumeFailure {
+    #[error("node {node_id} is not holding a paused capture for sandbox {sandbox_id}: {detail}")]
+    CaptureAbsent {
+        node_id: String,
+        sandbox_id: SandboxId,
+        detail: String,
+    },
+    #[error("node {node_id} could not be reached about sandbox {sandbox_id}: {detail}")]
+    NodeUnreachable {
+        node_id: String,
+        sandbox_id: SandboxId,
+        detail: String,
+    },
+    #[error("node {node_id} refused to reopen sandbox {sandbox_id}'s capture: {detail}")]
+    Refused {
+        node_id: String,
+        sandbox_id: SandboxId,
+        detail: String,
+    },
+}
+
+impl RemoteResumeFailure {
+    /// Classifies what a node said about a resume.
+    ///
+    /// 🔴 `Unavailable` covers both a transport that never delivered the call
+    /// and a node that delivered it and said it is not taking work, and they
+    /// are one class on purpose: both mean *the capture is still there, ask
+    /// again*, which is the only thing the caller does differently.
+    pub(super) fn from_status(node_id: &str, sandbox_id: SandboxId, status: Status) -> Self {
+        let node_id = node_id.to_string();
+        let detail = format!("{}: {}", status.code(), status.message());
+        match status.code() {
+            tonic::Code::NotFound => Self::CaptureAbsent {
+                node_id,
+                sandbox_id,
+                detail,
+            },
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => Self::NodeUnreachable {
+                node_id,
+                sandbox_id,
+                detail,
+            },
+            _ => Self::Refused {
+                node_id,
+                sandbox_id,
+                detail,
+            },
+        }
+    }
+
+    /// A node this process could not open a connection to.
+    ///
+    /// 🔴 Never [`CaptureAbsent`][Self::CaptureAbsent]. A refused connection is
+    /// the one failure with no answer in it at all.
+    pub(super) fn unreachable(node_id: &str, sandbox_id: SandboxId, detail: String) -> Self {
+        Self::NodeUnreachable {
+            node_id: node_id.to_string(),
+            sandbox_id,
+            detail,
+        }
     }
 }
 
@@ -111,6 +202,79 @@ pub(super) fn host_ip(raw: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 The three answers a resume can come back with stay three.
+    ///
+    /// One call shape, one value different — the status code — and the
+    /// classification has to move with it. The pair that matters is the first
+    /// two: `NotFound` says the only copy of a sandbox is gone and licenses
+    /// throwing the sandbox away, and `Unavailable` says a machine is down and
+    /// licenses nothing at all.
+    #[test]
+    fn an_unreachable_node_is_not_a_capture_that_is_gone() {
+        let sandbox_id = SandboxId::new();
+        let classify = |status| RemoteResumeFailure::from_status("node-a", sandbox_id, status);
+
+        assert!(matches!(
+            classify(Status::not_found("no paused capture here")),
+            RemoteResumeFailure::CaptureAbsent { .. }
+        ));
+        assert!(matches!(
+            classify(Status::unavailable("the node is restarting")),
+            RemoteResumeFailure::NodeUnreachable { .. }
+        ));
+        assert!(matches!(
+            classify(Status::deadline_exceeded("the node did not answer")),
+            RemoteResumeFailure::NodeUnreachable { .. }
+        ));
+        assert!(matches!(
+            classify(Status::failed_precondition("that run is not the one here")),
+            RemoteResumeFailure::Refused { .. }
+        ));
+        // 🔴 And the default arm is a refusal rather than an absence: a node
+        // that failed inside has not told anyone the capture is gone.
+        assert!(matches!(
+            classify(Status::internal("something went wrong")),
+            RemoteResumeFailure::Refused { .. }
+        ));
+
+        // A connection that was never opened carries no answer at all.
+        assert!(matches!(
+            RemoteResumeFailure::unreachable("node-a", sandbox_id, "connection refused".into()),
+            RemoteResumeFailure::NodeUnreachable { .. }
+        ));
+    }
+
+    /// The classification survives being carried as an ordinary error, which is
+    /// how it reaches the layer that acts on it.
+    #[test]
+    fn the_classification_survives_the_error_it_travels_in() {
+        let sandbox_id = SandboxId::new();
+        let err = anyhow::Error::new(RemoteResumeFailure::from_status(
+            "node-a",
+            sandbox_id,
+            Status::unavailable("the node is restarting"),
+        ))
+        .context("resume sandbox on node node-a");
+
+        assert!(matches!(
+            err.downcast_ref::<RemoteResumeFailure>(),
+            Some(RemoteResumeFailure::NodeUnreachable { .. })
+        ));
+        // 🔴 The control face: the same wrapping around the other answer comes
+        // back as the other answer, so this is not a downcast that matches
+        // whatever it is handed.
+        let absent = anyhow::Error::new(RemoteResumeFailure::from_status(
+            "node-a",
+            sandbox_id,
+            Status::not_found("no paused capture here"),
+        ))
+        .context("resume sandbox on node node-a");
+        assert!(matches!(
+            absent.downcast_ref::<RemoteResumeFailure>(),
+            Some(RemoteResumeFailure::CaptureAbsent { .. })
+        ));
+    }
 
     #[test]
     fn a_classified_failure_comes_back_with_its_classification() {

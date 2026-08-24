@@ -704,11 +704,13 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   spec it is handed has already been resolved into paths on a local disk and
 ///   the user's image reference is gone by then. Creating from a snapshot or a
 ///   template works; `POST /sandboxes-cold` does not.
-/// - **Resuming a paused sandbox that another machine holds the capture for.**
-///   `build_from_paused_state` refuses, and deliberately: bringing it back means
-///   asking *that* machine to reopen its capture, and the node service has no
-///   call that does so. It is left refusing rather than stubbed into something
-///   that looks like it works.
+/// - **Pausing a sandbox on another machine.** The node service declares
+///   `Pause` and answers `Unimplemented`: the orchestrator does not hand back
+///   the artifact directory a capture was written into, and staging a
+///   publishable capture on the node is not wired up. Resuming one *is* served
+///   — `build_from_paused_state` sends the node service's `Resume`, which asks
+///   the machine holding the capture to reopen it — so the round trip is
+///   blocked at the pause rather than at the wake-up.
 /// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
 ///   directly, outside the orchestrator entirely, so a build here would reach
 ///   for `/dev/kvm` in a Pod that has none. It fails, which is the safe

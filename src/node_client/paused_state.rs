@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet};
+use crate::types::ExecutionId;
 
 /// The paused state of a sandbox that was paused on another machine.
 ///
@@ -22,18 +23,36 @@ use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet};
 /// is on. A record that carried the path and not the machine would be a resume
 /// request that could be sent to the wrong node and would fail there in a way
 /// that looks like corruption rather than like misrouting.
+///
+/// # 🔴 Why the incarnation is part of it
+///
+/// The origin node says *which machine* to ask; this says *which capture* to
+/// ask it for. A node keeps its paused record until something tells it the
+/// cluster has moved on, so a sandbox paused here, resumed elsewhere and paused
+/// there leaves a stale record behind — and a resume that named only the
+/// sandbox would reopen the run the user abandoned two runs ago while their
+/// newer work sat on another disk. It travels as the fence on the resume call,
+/// which is how every other command on that service says which run it means.
 #[derive(Clone, Debug)]
 pub struct RemotePausedState {
     origin_node_id: String,
     artifact_root: String,
+    /// The run the capture is *of*, not the run a resume will start.
+    paused_execution_id: ExecutionId,
     state: Value,
 }
 
 impl RemotePausedState {
-    pub fn new(origin_node_id: String, artifact_root: String, state: Value) -> Self {
+    pub fn new(
+        origin_node_id: String,
+        artifact_root: String,
+        paused_execution_id: ExecutionId,
+        state: Value,
+    ) -> Self {
         Self {
             origin_node_id,
             artifact_root,
+            paused_execution_id,
             state,
         }
     }
@@ -45,6 +64,11 @@ impl RemotePausedState {
 
     pub fn artifact_root(&self) -> &str {
         &self.artifact_root
+    }
+
+    /// The run this capture was taken from.
+    pub fn paused_execution_id(&self) -> ExecutionId {
+        self.paused_execution_id
     }
 
     /// The backend's own encoding, to be handed back to that backend's factory
@@ -65,6 +89,7 @@ impl PausedSandboxState for RemotePausedState {
         Ok(json!({
             "origin_node_id": self.origin_node_id,
             "artifact_root": self.artifact_root,
+            "execution_id": self.paused_execution_id.to_string(),
             "state": self.state,
         }))
     }
@@ -87,21 +112,52 @@ mod tests {
 
     #[test]
     fn the_encoding_carries_the_machine_the_bytes_are_on() {
+        let paused_execution_id = ExecutionId::new();
         let state = RemotePausedState::new(
             "node-a".to_string(),
             "/var/lib/agentenv/paused/abc".to_string(),
+            paused_execution_id,
             json!({"memory": "mem.json"}),
         );
 
         let encoded = state.encode().expect("encode");
         assert_eq!(encoded["origin_node_id"], "node-a");
         assert_eq!(encoded["artifact_root"], "/var/lib/agentenv/paused/abc");
+        assert_eq!(encoded["execution_id"], paused_execution_id.to_string());
         assert_eq!(encoded["state"]["memory"], "mem.json");
+    }
+
+    /// 🔴 The encoding says which run it captured, and it is the run that was
+    /// paused rather than any other one in scope.
+    ///
+    /// The control face is a second state that differs from the first in that
+    /// one value and in nothing else: if `encode` ever wrote a constant, an
+    /// empty string, or the wrong field, the two encodings would agree here.
+    #[test]
+    fn the_encoding_says_which_run_it_captured() {
+        let one = ExecutionId::new();
+        let other = ExecutionId::new();
+        assert_ne!(one, other, "two mints produced one incarnation");
+
+        let encode_with = |execution_id| {
+            RemotePausedState::new("node-a".into(), "/tmp/x".into(), execution_id, json!({}))
+                .encode()
+                .expect("encode")
+        };
+
+        assert_eq!(encode_with(one)["execution_id"], one.to_string());
+        assert_eq!(encode_with(other)["execution_id"], other.to_string());
+        assert_ne!(encode_with(one), encode_with(other));
     }
 
     #[test]
     fn it_pins_no_local_artifacts() {
-        let state = RemotePausedState::new("node-a".into(), "/tmp/x".into(), json!({}));
+        let state = RemotePausedState::new(
+            "node-a".into(),
+            "/tmp/x".into(),
+            ExecutionId::new(),
+            json!({}),
+        );
         assert!(state.runtime_artifacts().is_empty());
     }
 }

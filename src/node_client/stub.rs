@@ -7,7 +7,7 @@
 //!
 //! | in process | over the wire | why |
 //! |---|---|---|
-//! | `PausedSandboxCapture.state` — a live object a resume reopens | [`RemotePausedState`] — the node's own encoding plus the path and the machine it is on | the encoding already exists: `PausedSandboxState::encode` is what the node writes to its own disk |
+//! | `PausedSandboxCapture.state` — a live object a resume reopens | [`RemotePausedState`] — the node's own encoding plus the path, the machine it is on, and the run it captured | the encoding already exists: `PausedSandboxState::encode` is what the node writes to its own disk. What this half adds is what makes the capture *addressable*: which machine to ask, and which of its captures to ask for |
 //! | `PausedSandboxCapture.publishable` / `CapturedSandboxSnapshot` — a value keeping a temporary directory alive until publication finishes | a staged snapshot: the bytes are already durable on the node, and what comes back is the row that has not been announced yet | there is nothing left to keep alive by the time the reply is written |
 //! | `RuntimeArtifactSet` — the local overlaybd configs a running sandbox has open | empty | it is the input to image-liveness, which keeps *local* layers from being reclaimed. The deciding half has none. That is a fact about it, not a gap |
 //!
@@ -36,7 +36,7 @@ use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::paused_state::RemotePausedState;
 use super::placement::{NodeEndpoint, NodePlacement};
-use super::wire;
+use super::wire::{self, RemoteResumeFailure};
 
 use std::sync::Arc;
 
@@ -49,6 +49,16 @@ use std::sync::Arc;
 pub(super) enum PendingLaunch {
     FromSnapshot {
         request: Box<pb::SandboxCreateRequest>,
+    },
+    /// A paused sandbox to be reopened on the machine that holds its capture.
+    ///
+    /// 🔴 The origin node is kept beside the request rather than inside it. The
+    /// node does not need telling which machine it is; this half needs it to
+    /// decide whether the machine placement named is the one that can answer at
+    /// all.
+    Resume {
+        request: Box<pb::SandboxResumeRequest>,
+        origin_node_id: String,
     },
     /// A child of a fork that has already happened: the node started it, so
     /// there is nothing left to launch.
@@ -117,6 +127,114 @@ impl RemoteSandboxStub {
         }
     }
 
+    /// Asks the machine holding this sandbox's capture to reopen it.
+    ///
+    /// # 🔴 `place_existing`, never `place_new`
+    ///
+    /// A create asks *which machine has room*; this asks *where this sandbox
+    /// may go*, and the answers are not interchangeable. A resume sent to a
+    /// machine chosen for its free capacity lands somewhere the bytes are not.
+    ///
+    /// # 🔴 And the answer is checked against the machine the capture is on
+    ///
+    /// Placement can legitimately name another node — that is what it does for
+    /// a paused sandbox whose capture was published to shared storage, which
+    /// any machine can rebuild. This call cannot do that: it reopens a local
+    /// capture and nothing else. So a placement that named a different machine
+    /// is refused here rather than sent, because sending it produces a
+    /// `NotFound` from a node that has simply never seen the sandbox — an
+    /// answer that reads exactly like "the only copy is gone".
+    async fn reopen(
+        &mut self,
+        request: pb::SandboxResumeRequest,
+        origin_node_id: String,
+    ) -> Result<()> {
+        let sandbox_id = self.sandbox_id;
+        let node = self
+            .placement
+            .place_existing(sandbox_id)
+            .await
+            .with_context(|| format!("locate the machine holding sandbox {sandbox_id}"))?;
+        if node.node_id != origin_node_id {
+            bail!(
+                "sandbox {sandbox_id}'s capture is on node {origin_node_id} and placement chose \
+                 node {}: reopening a capture happens on the machine holding it, and rebuilding \
+                 this sandbox somewhere else is a create from a published snapshot rather than \
+                 this call",
+                node.node_id
+            );
+        }
+
+        let mut client = Self::connect(&node.endpoint).await.map_err(|err| {
+            anyhow::Error::new(RemoteResumeFailure::unreachable(
+                &node.node_id,
+                sandbox_id,
+                format!("{err:#}"),
+            ))
+        })?;
+
+        let response = client
+            .resume(request)
+            .await
+            .map_err(|status| {
+                anyhow::Error::new(RemoteResumeFailure::from_status(
+                    &node.node_id,
+                    sandbox_id,
+                    status,
+                ))
+            })?
+            .into_inner();
+
+        // 🔴 An empty reply is a failure and not an empty answer. The node said
+        // the resume succeeded, which means a VM is up over there; a reply that
+        // does not say which run it is running leaves this half unable to fence
+        // anything it sends next.
+        let started = response.started.ok_or_else(|| {
+            anyhow!(
+                "node {} reopened sandbox {sandbox_id} and said nothing about the run it started",
+                node.node_id
+            )
+        })?;
+
+        // 🔴 The node has to be running the incarnation the resume claim
+        // allocated, and — unlike a create — a mismatch is *not* followed by a
+        // teardown. A create that went wrong can be undone because the sandbox
+        // did not exist before the call; this sandbox did, its capture has just
+        // been consumed by whatever the node started, and deleting it over a
+        // protocol disagreement would destroy the user's only copy of their
+        // work. So it fails loudly and leaves the sandbox where it is.
+        if started.execution_id != self.execution_id.to_string() {
+            bail!(
+                "node {} reopened sandbox {sandbox_id} as execution {}, and this resume claimed \
+                 execution {}",
+                node.node_id,
+                started.execution_id,
+                self.execution_id
+            );
+        }
+
+        // 🔴 Learned from the reply rather than carried in. A resume stub is
+        // built from a paused state, which says what the sandbox *was*, not
+        // what it is worth: `SandboxBackendFactory::build_from_paused_state` is
+        // handed no resources. The node's record has them, and this is where
+        // they arrive.
+        if let Some(resources) = started.resources.as_ref() {
+            self.resources = SandboxResources {
+                cpu_count: resources.cpu_count,
+                memory_mib: resources.memory_mib,
+                disk_size_mib: resources.disk_size_mib,
+            };
+        }
+        self.placed = Some(Placed {
+            node,
+            client,
+            host_interaction_ip: wire::host_ip(&started.host_interaction_ip),
+            rootfs_virtual_size: (started.rootfs_virtual_size > 0)
+                .then_some(started.rootfs_virtual_size),
+        });
+        Ok(())
+    }
+
     fn placed(&self) -> Result<&Placed> {
         self.placed.as_ref().ok_or_else(|| {
             anyhow!(
@@ -156,6 +274,14 @@ impl SandboxBackend for RemoteSandboxStub {
         let request = match &self.pending {
             PendingLaunch::AlreadyStarted => return Ok(()),
             PendingLaunch::FromSnapshot { request } => (**request).clone(),
+            PendingLaunch::Resume {
+                request,
+                origin_node_id,
+            } => {
+                let request = (**request).clone();
+                let origin_node_id = origin_node_id.clone();
+                return self.reopen(request, origin_node_id).await;
+            }
         };
 
         let node = self
@@ -264,7 +390,17 @@ impl SandboxBackend for RemoteSandboxStub {
             .unwrap_or(serde_json::Value::Null);
 
         Ok(PausedSandboxCapture {
-            state: Arc::new(RemotePausedState::new(node_id, paused.artifact_root, state)),
+            // 🔴 The incarnation is this stub's own, and it is the run that was
+            // just paused rather than anything the node said. It is what a
+            // later resume fences on, so a value read back from the reply would
+            // let a node hand back a capture of some other run and have this
+            // half record it as a capture of this one.
+            state: Arc::new(RemotePausedState::new(
+                node_id,
+                paused.artifact_root,
+                execution_id,
+                state,
+            )),
             // 🔴 Always `None`, and it is not a gap. `publishable` exists so
             // that a caller holding live capture artifacts can hand them to a
             // repository before they are reclaimed. By the time this reply

@@ -12,7 +12,7 @@ use crate::sandbox::{
     SandboxBackendFactory, SandboxLaunchConfig,
 };
 use crate::snapshot::RunnableSnapshot;
-use crate::types::{ExecutionId, SandboxId};
+use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::paused_state::RemotePausedState;
 use super::placement::NodePlacement;
@@ -177,6 +177,21 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("paused state has no artifact root"))?
             .to_string();
+        // 🔴 Required, and refused rather than defaulted to "whatever that node
+        // is holding". This is the fence a resume carries: without it the call
+        // says only *which sandbox*, and a node that kept a stale paused record
+        // — one whose sandbox was resumed elsewhere and paused there — would
+        // reopen a run the user abandoned, with their newer work left on
+        // another disk. Defaulting it would make that the normal path.
+        let paused_execution_id = state
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("paused state does not say which run it captured"))
+            .and_then(|raw| {
+                ExecutionId::parse_str(raw).map_err(|err| {
+                    anyhow!("paused state names {raw:?} as the run it captured: {err}")
+                })
+            })?;
         let inner = state
             .get("state")
             .cloned()
@@ -185,34 +200,110 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
         Ok(Arc::new(RemotePausedState::new(
             origin_node_id,
             artifact_root,
+            paused_execution_id,
             inner,
         )))
     }
 
-    /// 🔴 Refused, because a resume is not something this half does to a
-    /// backend.
+    /// Builds a stub that will ask the machine holding the capture to reopen
+    /// it.
     ///
-    /// Locally this rebuilds the sandbox from state the same machine captured.
-    /// Remotely there is no such thing: the state names a machine, and bringing
-    /// the sandbox back means asking *that* machine to create it again from the
-    /// capture it is holding. That is a create with a different source, and it
-    /// needs a `Resume` on the node service to carry it — which the node does
-    /// not serve yet, because nothing on the node side stages or reopens a
-    /// capture across this boundary.
+    /// # 🔴 Locally this rebuilds a sandbox; here it addresses a machine
+    ///
+    /// The local factory is handed live state its own process captured and
+    /// turns it back into a running VM. This one is handed a *reference*: a
+    /// path on somebody else's disk, that machine's own encoding of its backend
+    /// state, and — the two fields that make it addressable — which machine and
+    /// which run. Nothing here can reopen anything, and nothing needs to: the
+    /// bytes never moved, so what the node is sent is an identity, a fence and
+    /// the run to start.
+    ///
+    /// 🔴 This is the *pinned* arm only. A paused sandbox whose capture reached
+    /// shared storage can be rebuilt on any machine, and that is a create from
+    /// a published snapshot — a different call, taken by the surface that knows
+    /// whether the capture was published. Nothing here silently falls back to
+    /// it: a stub that quietly rebuilt from an older snapshot when the capture
+    /// could not be found would answer 200 and hand the user back a sandbox
+    /// missing everything they had done since.
+    ///
+    /// # 🔴 What this half still cannot produce for itself
+    ///
+    /// Two things upstream of here are not wired up, and neither is a defect in
+    /// this method — but a reader who finds this served and concludes the
+    /// pause/resume round trip works from the API half would be wrong:
+    ///
+    /// - the node's `Pause` answers `Unimplemented`, so a pause driven from
+    ///   here produces no paused record to come back to;
+    /// - `Orchestrator::resume_sandbox` reads the paused state out of
+    ///   `SandboxMetadata::paused_state`, which is `#[serde(skip)]` and so is
+    ///   always absent on a store that serialises its records. The store
+    ///   surface that answers this properly already exists
+    ///   (`MetadataStore::paused_handle` and its `Remote` arm); nothing calls
+    ///   it yet.
     fn build_from_paused_state(
         &self,
         sandbox_id: SandboxId,
-        _execution_id: ExecutionId,
+        execution_id: ExecutionId,
         state: &dyn PausedSandboxState,
+        // 🔴 Ignored, and not dropped on the floor: the node derives this
+        // sandbox's envd token itself, from the cluster-wide seed both halves
+        // are configured with. Sending one would put a credential on a wire to
+        // set a value the receiver was going to compute anyway — and would make
+        // a resume fail confusingly if the two seeds ever disagreed, instead of
+        // failing where the disagreement is.
         _envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
-        let origin = state
-            .downcast_ref::<RemotePausedState>()
-            .map(|state| state.origin_node_id().to_string())
-            .unwrap_or_else(|| "an unknown node".to_string());
-        bail!(
-            "sandbox {sandbox_id} cannot be resumed from here: its capture is on {origin}, and \
-             the node service has no call that reopens one"
-        )
+        let state = state.downcast_ref::<RemotePausedState>().ok_or_else(|| {
+            // 🔴 Refused rather than sent to whichever node placement points
+            // at. A paused state this factory did not produce says nothing
+            // about which machine holds the bytes, and a resume sent on that
+            // basis fails on the far side in a way that looks like the capture
+            // is corrupt.
+            anyhow!(
+                "sandbox {sandbox_id} cannot be resumed from here: its paused state was not \
+                 produced by this factory, so nothing in it says which machine holds the capture"
+            )
+        })?;
+
+        let paused_execution_id = state.paused_execution_id();
+        if paused_execution_id == execution_id {
+            bail!(
+                "sandbox {sandbox_id} would be resumed as the same run it was paused under \
+                 ({paused_execution_id}): a resume starts a new one, and reusing the paused \
+                 run's identity leaves commands written before the pause indistinguishable from \
+                 commands written after it"
+            );
+        }
+
+        let request = pb::SandboxResumeRequest {
+            sandbox_id: sandbox_id.to_string(),
+            // The run the capture is of. The node checks it against its own
+            // record before reopening anything.
+            execution_id: paused_execution_id.to_string(),
+            // The run the resume claim allocated, which the node must adopt
+            // rather than mint its own.
+            resumed_execution_id: execution_id.to_string(),
+            // 🔴 Left at "keep what it was paused with", for the same reason a
+            // create leaves the node's default alone: the sandbox's deadline is
+            // decided by the orchestrator above this factory and written into
+            // its own record, and it does not reach a backend.
+            timeout_ms: 0,
+        };
+
+        Ok(Box::new(RemoteSandboxStub::pending(
+            sandbox_id,
+            execution_id,
+            // 🔴 A placeholder until the node answers, and it is never used to
+            // place anything: a resume goes to the machine holding the capture,
+            // so nothing here asks which machine has room. The real values come
+            // back on the reply — this trait method is handed no resources, and
+            // the node's record is what has them.
+            SandboxResources::default(),
+            Arc::clone(&self.placement),
+            PendingLaunch::Resume {
+                request: Box::new(request),
+                origin_node_id: state.origin_node_id().to_string(),
+            },
+        )))
     }
 }

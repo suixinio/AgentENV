@@ -14,10 +14,18 @@
 //! two halves as two processes yet.
 //!
 //! The gaps that are known are written on [`RemoteSandboxBackendFactory`] and
-//! on the methods that refuse. Two are worth naming here because a reader
-//! looking for "what does the API half not do" will otherwise find them one at
-//! a time: **a cold create refuses**, and **resuming a paused sandbox held on
-//! another machine refuses**. Both are refusals rather than stubs.
+//! on the methods that refuse. One is worth naming here because a reader
+//! looking for "what does the API half not do" will otherwise find it a piece
+//! at a time: **a cold create refuses**, and it is a refusal rather than a
+//! stub.
+//!
+//! Resuming a paused sandbox held on another machine no longer refuses: it
+//! sends [`node.proto`'s `Resume`][crate::node_server], which asks the machine
+//! holding the capture to reopen it. What still cannot be reached from here is
+//! the *other* half of that round trip — the node does not serve `Pause` yet,
+//! so nothing driven from this side produces the paused record a resume
+//! consumes. See `build_from_paused_state`'s note on
+//! [`RemoteSandboxBackendFactory`].
 
 mod factory;
 mod paused_state;

@@ -35,6 +35,7 @@ use crate::snapshot::{
 use crate::types::ExecutionId;
 
 use super::factory::RemoteSandboxBackendFactory;
+use super::paused_state::RemotePausedState;
 use super::placement::{FixedNodePlacement, NodeEndpoint};
 use super::wire;
 
@@ -198,8 +199,10 @@ struct ScriptedNode {
     checkpoint: Mutex<Option<Result<pb::SandboxCheckpointResponse, Status>>>,
     fork: Mutex<Option<Result<pb::SandboxForkResponse, Status>>>,
     delete: Mutex<Option<Result<pb::SandboxDeleteResponse, Status>>>,
+    resume: Mutex<Option<Result<pb::SandboxResumeResponse, Status>>>,
     seen_create: Mutex<Vec<pb::SandboxCreateRequest>>,
     seen_delete: Mutex<Vec<pb::SandboxDeleteRequest>>,
+    seen_resume: Mutex<Vec<pb::SandboxResumeRequest>>,
 }
 
 impl ScriptedNode {
@@ -252,6 +255,17 @@ impl NodeSandboxService for Arc<ScriptedNode> {
         _request: Request<pb::SandboxCheckpointRequest>,
     ) -> Result<Response<pb::SandboxCheckpointResponse>, Status> {
         ScriptedNode::take(&self.checkpoint, "checkpoint")
+    }
+
+    async fn resume(
+        &self,
+        request: Request<pb::SandboxResumeRequest>,
+    ) -> Result<Response<pb::SandboxResumeResponse>, Status> {
+        self.seen_resume
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
+        ScriptedNode::take(&self.resume, "resume")
     }
 
     async fn fork(
@@ -810,6 +824,7 @@ async fn a_paused_state_without_a_node_is_refused() {
             serde_json::json!({
                 "origin_node_id": "node-a",
                 "artifact_root": "/var/lib/x",
+                "execution_id": ExecutionId::new().to_string(),
                 "state": {},
             }),
         )
@@ -1048,4 +1063,489 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
         tokio::net::TcpStream::connect(addr).await.is_err(),
         "the port is still bound after the surface was told to stop"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reopening a capture the node is holding
+// ---------------------------------------------------------------------------
+
+/// A paused sandbox comes back on the machine whose disk its capture is on, and
+/// under the run the resume claimed.
+///
+/// 🔴 End to end over a socket and over the *real* node service, because every
+/// place this could go wrong is between the two halves: the factory could send
+/// the wrong incarnation, the proto could carry the fence in a field nothing
+/// reads, the node could mint its own run. A test that called the trait
+/// directly would prove none of it.
+///
+/// The refusal comes first and the success second, on purpose. The refusal's
+/// evidence is that the node is running nothing — and "running nothing" is what
+/// a node that never started anything also looks like, so the second half is
+/// what gives the first half its resolution.
+#[tokio::test]
+async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
+    let node = real_node().await;
+    let orchestration = node.orchestration.as_ref().expect("a real node").clone();
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    let paused_execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+
+    // The node pauses it through its own orchestrator, which is what the
+    // `Pause` RPC will drive once it is served: what matters here is that the
+    // capture and the record end up on the node.
+    Arc::clone(&orchestration)
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect("the node pauses its own sandbox");
+    assert!(
+        orchestration
+            .list_live_sandboxes()
+            .await
+            .expect("list")
+            .is_empty(),
+        "a paused sandbox is still running"
+    );
+
+    let resumed_execution_id = ExecutionId::new();
+    let capture_on = |node_id: &str| {
+        RemotePausedState::new(
+            node_id.to_string(),
+            "/var/lib/agentenv/paused/7".to_string(),
+            paused_execution_id,
+            serde_json::json!({}),
+        )
+    };
+
+    // 🔴 A capture the placement answer does not match is refused here rather
+    // than sent. Sent, it would come back `NotFound` from a machine that has
+    // simply never seen this sandbox — which reads exactly like "the only copy
+    // is gone".
+    let elsewhere = capture_on("node-that-holds-nothing");
+    let mut wrong = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, &elsewhere, None)
+        .expect("build a stub");
+    let err = wrong
+        .start()
+        .await
+        .expect_err("a capture on another machine was reopened here");
+    assert!(
+        format!("{err:#}").contains("node-that-holds-nothing"),
+        "the refusal did not say where the capture actually is: {err:#}"
+    );
+    assert!(
+        orchestration
+            .list_live_sandboxes()
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused resume started something anyway"
+    );
+
+    // 🔴 The same call, one value different: the machine the capture is on.
+    let here = capture_on("node-under-test");
+    let mut backend = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, &here, None)
+        .expect("build a stub");
+    backend.start().await.expect("reopen on the node");
+    assert_eq!(backend.execution_id(), resumed_execution_id);
+
+    let live = orchestration.list_live_sandboxes().await.expect("list");
+    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
+    assert_eq!(live[0].sandbox_id, sandbox_id);
+    assert_eq!(
+        live[0].execution_id,
+        Some(resumed_execution_id),
+        "the node brought the sandbox back under a run nobody claimed"
+    );
+    assert_ne!(
+        live[0].execution_id,
+        Some(paused_execution_id),
+        "the node reopened the capture as the run it was paused under"
+    );
+}
+
+/// The resume says which run it is reopening and which run it is starting, in
+/// that order, in those fields.
+///
+/// 🔴 A test rather than a reading of the proto. Field names are not covered by
+/// this project's mutation testing — a `.proto` is generated code by the time
+/// anything mutates — so a swap of these two would type-check, compile, and
+/// resume a sandbox under the run it had just been paused under while fencing
+/// against the run that has not happened yet. The control face is the swap
+/// itself: the two values are different, and each is asserted absent from the
+/// other's field.
+#[tokio::test]
+async fn the_resume_names_the_run_it_reopens_and_the_run_it_starts() {
+    let (script, node) = scripted_node().await;
+    let paused_execution_id = ExecutionId::new();
+    let resumed_execution_id = ExecutionId::new();
+    assert_ne!(paused_execution_id, resumed_execution_id);
+    let sandbox_id = launch_config().sandbox_id;
+
+    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
+        started: Some(pb::SandboxCreateResponse {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: resumed_execution_id.to_string(),
+            host_interaction_ip: "10.4.5.6".to_string(),
+            rootfs_virtual_size: 4096,
+            resources: Some(pb::SandboxResources {
+                cpu_count: 4,
+                memory_mib: 2048,
+                disk_size_mib: 10240,
+            }),
+            ..Default::default()
+        }),
+    }));
+
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let state = RemotePausedState::new(
+        "node-under-test".to_string(),
+        "/var/lib/agentenv/paused/7".to_string(),
+        paused_execution_id,
+        serde_json::json!({}),
+    );
+    let mut backend = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
+        .expect("build a stub");
+    backend.start().await.expect("reopen");
+
+    let seen = script.seen_resume.lock().expect("lock").clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].sandbox_id, sandbox_id.to_string());
+    assert_eq!(
+        seen[0].execution_id,
+        paused_execution_id.to_string(),
+        "the fence named a run other than the one the capture is of"
+    );
+    assert_eq!(
+        seen[0].resumed_execution_id,
+        resumed_execution_id.to_string(),
+        "the node was told to start a run other than the one the claim allocated"
+    );
+    // 🔴 The swap, ruled out from both directions.
+    assert_ne!(seen[0].execution_id, resumed_execution_id.to_string());
+    assert_ne!(
+        seen[0].resumed_execution_id,
+        paused_execution_id.to_string()
+    );
+    // 🔴 Zero, meaning "keep what it was paused with". A deadline is the
+    // orchestrator's to decide and it does not reach a backend.
+    assert_eq!(seen[0].timeout_ms, 0);
+
+    // And what the node reported is what this half now holds.
+    assert_eq!(
+        backend.host_interaction_ip(),
+        Some(std::net::Ipv4Addr::new(10, 4, 5, 6))
+    );
+    assert_eq!(backend.runtime_info().rootfs_virtual_size, Some(4096));
+}
+
+/// 🔴 A node that could not be reached is not a capture that is gone.
+///
+/// One call shape, one value different — what the node answered — and the two
+/// answers license opposite moves: `NotFound` says the only copy of this
+/// sandbox is not on that machine, which is grounds for rebuilding it from a
+/// published snapshot or giving it up, and `Unavailable` says a machine is
+/// down, which is grounds for nothing at all.
+#[tokio::test]
+async fn a_node_that_could_not_be_reached_is_not_a_capture_that_is_gone() {
+    let paused_execution_id = ExecutionId::new();
+    let resumed_execution_id = ExecutionId::new();
+    let sandbox_id = launch_config().sandbox_id;
+
+    async fn attempt(
+        status: Status,
+        sandbox_id: crate::types::SandboxId,
+        paused_execution_id: ExecutionId,
+        resumed_execution_id: ExecutionId,
+    ) -> anyhow::Error {
+        let (script, node) = scripted_node().await;
+        *script.resume.lock().expect("lock") = Some(Err(status));
+        let factory = RemoteSandboxBackendFactory::new(node.placement());
+        let state = RemotePausedState::new(
+            "node-under-test".to_string(),
+            "/var/lib/agentenv/paused/7".to_string(),
+            paused_execution_id,
+            serde_json::json!({}),
+        );
+        let mut backend = factory
+            .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
+            .expect("build a stub");
+        backend
+            .start()
+            .await
+            .expect_err("the node refused the resume")
+    }
+
+    let absent = attempt(
+        Status::not_found("no paused capture for that sandbox here"),
+        sandbox_id,
+        paused_execution_id,
+        resumed_execution_id,
+    )
+    .await;
+    assert!(
+        matches!(
+            absent.downcast_ref::<wire::RemoteResumeFailure>(),
+            Some(wire::RemoteResumeFailure::CaptureAbsent { .. })
+        ),
+        "{absent:#}"
+    );
+
+    let unreachable = attempt(
+        Status::unavailable("the node is restarting"),
+        sandbox_id,
+        paused_execution_id,
+        resumed_execution_id,
+    )
+    .await;
+    assert!(
+        matches!(
+            unreachable.downcast_ref::<wire::RemoteResumeFailure>(),
+            Some(wire::RemoteResumeFailure::NodeUnreachable { .. })
+        ),
+        "an unreachable node was read as a capture that is gone: {unreachable:#}"
+    );
+}
+
+/// A node that reported a resume and said nothing about the run it started is a
+/// failure, not a success with fields missing.
+///
+/// 🔴 The sandbox is up over there either way. What this half loses is the
+/// ability to fence anything it sends next, so accepting the reply would leave
+/// it addressing a VM it cannot name.
+#[tokio::test]
+async fn a_resume_that_named_no_run_is_a_failure() {
+    let (script, node) = scripted_node().await;
+    let sandbox_id = launch_config().sandbox_id;
+    let paused_execution_id = ExecutionId::new();
+    let resumed_execution_id = ExecutionId::new();
+    let state = RemotePausedState::new(
+        "node-under-test".to_string(),
+        "/var/lib/agentenv/paused/7".to_string(),
+        paused_execution_id,
+        serde_json::json!({}),
+    );
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse { started: None }));
+    let mut backend = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
+        .expect("build a stub");
+    let err = backend
+        .start()
+        .await
+        .expect_err("a reply with no run in it must not look like a success");
+    assert!(format!("{err:#}").contains("said nothing"), "{err:#}");
+
+    // 🔴 The control face: the same reply carrying the run does start.
+    let (script, node) = scripted_node().await;
+    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
+        started: Some(pb::SandboxCreateResponse {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: resumed_execution_id.to_string(),
+            ..Default::default()
+        }),
+    }));
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let mut backend = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
+        .expect("build a stub");
+    backend.start().await.expect("a reply that named the run");
+}
+
+/// A node that brought the sandbox back under some other run fails the start,
+/// and — unlike a create — the sandbox is *not* torn down.
+///
+/// 🔴 The asymmetry is the point. A create that went wrong can be undone
+/// because the sandbox did not exist before the call; this one did, its capture
+/// has just been consumed by whatever the node started, and a teardown would
+/// destroy the user's only copy of their work over a protocol disagreement.
+#[tokio::test]
+async fn a_node_that_reopened_another_run_fails_the_start_and_is_not_told_to_delete() {
+    let (script, node) = scripted_node().await;
+    let sandbox_id = launch_config().sandbox_id;
+    let claimed = ExecutionId::new();
+    let started = ExecutionId::new();
+    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
+        started: Some(pb::SandboxCreateResponse {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: started.to_string(),
+            ..Default::default()
+        }),
+    }));
+
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let state = RemotePausedState::new(
+        "node-under-test".to_string(),
+        "/var/lib/agentenv/paused/7".to_string(),
+        ExecutionId::new(),
+        serde_json::json!({}),
+    );
+    let mut backend = factory
+        .build_from_paused_state(sandbox_id, claimed, &state, None)
+        .expect("build a stub");
+
+    let err = backend.start().await.expect_err("the node ran another run");
+    assert!(format!("{err:#}").contains(&started.to_string()), "{err:#}");
+    assert!(
+        script.seen_delete.lock().expect("lock").is_empty(),
+        "a resume that disagreed about the run tore the user's sandbox down"
+    );
+
+    // 🔴 The control face for the emptiness above: the same node, the same
+    // scripted delete, and a resume that *did* agree about the run — stopped,
+    // it produces exactly the delete the run above did not. Without this half
+    // an empty log would be evidence about the harness rather than about the
+    // resume.
+    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
+        started: Some(pb::SandboxCreateResponse {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: claimed.to_string(),
+            ..Default::default()
+        }),
+    }));
+    let mut agreed = factory
+        .build_from_paused_state(sandbox_id, claimed, &state, None)
+        .expect("build a stub");
+    agreed.start().await.expect("reopen");
+    agreed.stop().await.expect("stop");
+    let deletes = script.seen_delete.lock().expect("lock").clone();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].execution_id, claimed.to_string());
+}
+
+/// A paused state that does not say which run it captured is refused.
+///
+/// 🔴 It is the fence a resume carries. Without it the call says only *which
+/// sandbox*, and a node still holding a stale paused record — one whose sandbox
+/// was resumed elsewhere and paused there — would reopen the run the user
+/// abandoned two runs ago while their newer work sat on another disk.
+#[tokio::test]
+async fn a_paused_state_that_does_not_say_which_run_it_captured_is_refused() {
+    let (_script, node) = scripted_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let execution_id = ExecutionId::new();
+
+    let err = factory
+        .decode_paused_state(
+            std::path::PathBuf::from("/ignored"),
+            serde_json::json!({
+                "origin_node_id": "node-a",
+                "artifact_root": "/var/lib/x",
+                "state": {},
+            }),
+        )
+        .expect_err("a paused state with no run on it was accepted");
+    assert!(err.to_string().contains("which run"), "{err:#}");
+
+    // A value that is present but is not an incarnation is refused too, rather
+    // than becoming one.
+    let err = factory
+        .decode_paused_state(
+            std::path::PathBuf::from("/ignored"),
+            serde_json::json!({
+                "origin_node_id": "node-a",
+                "artifact_root": "/var/lib/x",
+                "execution_id": "the-last-one",
+                "state": {},
+            }),
+        )
+        .expect_err("a paused state naming something that is not a run");
+    assert!(err.to_string().contains("the-last-one"), "{err:#}");
+
+    // 🔴 The control face: the same document with a real incarnation decodes,
+    // and decodes to *that* incarnation.
+    let decoded = factory
+        .decode_paused_state(
+            std::path::PathBuf::from("/ignored"),
+            serde_json::json!({
+                "origin_node_id": "node-a",
+                "artifact_root": "/var/lib/x",
+                "execution_id": execution_id.to_string(),
+                "state": {},
+            }),
+        )
+        .expect("a paused state that says which run it captured");
+    assert_eq!(
+        decoded
+            .downcast_ref::<RemotePausedState>()
+            .expect("a remote paused state")
+            .paused_execution_id(),
+        execution_id
+    );
+}
+
+/// A resume that would run under the incarnation the sandbox was paused under
+/// is refused before anything is sent.
+///
+/// 🔴 A resume starts a new run. One that reused the paused run's identity
+/// would leave every command written before the pause indistinguishable from
+/// one written after it, which is the whole thing the incarnation on every call
+/// exists to tell apart.
+#[tokio::test]
+async fn a_resume_that_would_reuse_the_paused_run_is_refused() {
+    let (_script, node) = scripted_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let sandbox_id = launch_config().sandbox_id;
+    let paused_execution_id = ExecutionId::new();
+    let state = RemotePausedState::new(
+        "node-under-test".to_string(),
+        "/var/lib/agentenv/paused/7".to_string(),
+        paused_execution_id,
+        serde_json::json!({}),
+    );
+
+    let err = factory
+        .build_from_paused_state(sandbox_id, paused_execution_id, &state, None)
+        .err()
+        .expect("a resume into the run it is replacing");
+    assert!(err.to_string().contains("starts a new one"), "{err:#}");
+
+    // 🔴 The control face: a different run builds, so this is not a method that
+    // refuses everything.
+    factory
+        .build_from_paused_state(sandbox_id, ExecutionId::new(), &state, None)
+        .expect("a resume under a run of its own");
+}
+
+/// A paused state some other factory produced is refused rather than sent
+/// wherever placement points.
+#[tokio::test]
+async fn a_paused_state_this_factory_did_not_produce_is_refused() {
+    let (_script, node) = scripted_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let sandbox_id = launch_config().sandbox_id;
+
+    let err = factory
+        .build_from_paused_state(
+            sandbox_id,
+            ExecutionId::new(),
+            &crate::sandbox::mock::MockSnapshot,
+            None,
+        )
+        .err()
+        .expect("a local paused state was accepted by the remote factory");
+    assert!(err.to_string().contains("which machine"), "{err:#}");
+
+    // 🔴 The control face: one this factory did produce builds.
+    factory
+        .build_from_paused_state(
+            sandbox_id,
+            ExecutionId::new(),
+            &RemotePausedState::new(
+                "node-under-test".to_string(),
+                "/var/lib/agentenv/paused/7".to_string(),
+                ExecutionId::new(),
+                serde_json::json!({}),
+            ),
+            None,
+        )
+        .expect("a paused state from this factory");
 }

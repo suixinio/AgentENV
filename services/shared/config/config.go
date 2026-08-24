@@ -29,6 +29,19 @@ const defaultSchedulerArtifactStoreCapacity = 1_000_000
 // second copy would drift and the drift would look exactly like a cold cache.
 const defaultSchedulerMaxProjectionTTL = 25 * time.Hour
 
+// defaultGatewaySchedulerFallbackTimeout bounds the query-only-scheduler
+// LookupNode call a projection miss and an undecided wake-up both fall
+// through to (services/gateway/internal/server.go's lookupNodeFallback).
+//
+// 🔴 Mirrors gateway.defaultSchedulerFallbackTimeout, the value NewServer
+// falls back to when a caller constructs ServerOptions directly (every test,
+// and any embedder that does not go through config.Load). This package
+// cannot import the gateway package to share one constant, so the two are
+// declared independently and must be kept equal by hand — if they drift,
+// config.Load's callers see one value and a caller building ServerOptions
+// directly sees the other.
+const defaultGatewaySchedulerFallbackTimeout = 3 * time.Second
+
 // The heartbeat-timeout sweep's two cadences.
 //
 // 🔴 defaultSchedulerBindingSweepSilence is how long a node may say nothing
@@ -999,6 +1012,22 @@ type GatewayConfig struct {
 	// gateway stamps nothing and the node's gate stays open, which is what makes
 	// the rollout config-driven instead of deploy-driven.
 	ControlPlaneToken string `json:"-"`
+	// SchedulerFallbackDisabled turns off the query-only-scheduler LookupNode
+	// call that a projection miss and an undecided wake-up both fall through
+	// to. False — the default, and today's behaviour exactly — still asks the
+	// scheduler on that cold path.
+	//
+	// 🔴 Phase 4's decommissioning lever for that one call, in the same shape
+	// as ResumeAddr and RestUpstreamAddr above: a ConfigMap edit and a
+	// restart, not a code change. See gateway/internal/server.go's
+	// ServerOptions.SchedulerFallbackDisabled.
+	SchedulerFallbackDisabled bool `json:"scheduler_fallback_disabled"`
+	// SchedulerFallbackTimeout bounds that same call on its own, separately
+	// from RequestTimeout, so a scheduler that is merely unreachable cannot
+	// hold it open for whatever of the request's overall budget is left. Zero
+	// (the default when unset) is resolved to a fixed fallback inside
+	// gateway.NewServer, never left as "no timeout".
+	SchedulerFallbackTimeout time.Duration `json:"scheduler_fallback_timeout"`
 }
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
@@ -1022,6 +1051,8 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			ProjectionRead          *bool   `json:"projection_read"`
 			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
 		} `json:"routing"`
+		SchedulerFallbackDisabled *bool           `json:"scheduler_fallback_disabled"`
+		SchedulerFallbackTimeout  json.RawMessage `json:"scheduler_fallback_timeout"`
 	}
 
 	parsed := wire{}
@@ -1080,26 +1111,44 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		}
 		g.RequestTimeout = d
 	}
+	if parsed.SchedulerFallbackDisabled != nil {
+		g.SchedulerFallbackDisabled = *parsed.SchedulerFallbackDisabled
+	}
+	if len(bytes.TrimSpace(parsed.SchedulerFallbackTimeout)) > 0 {
+		d, err := parseGatewayDuration("gateway.scheduler_fallback_timeout", parsed.SchedulerFallbackTimeout)
+		if err != nil {
+			return err
+		}
+		g.SchedulerFallbackTimeout = d
+	}
 
 	return nil
 }
 
 func parseGatewayRequestTimeout(raw json.RawMessage) (time.Duration, error) {
+	return parseGatewayDuration("gateway.request_timeout", raw)
+}
+
+// parseGatewayDuration parses a gateway duration field carried through
+// UnmarshalJSON as json.RawMessage, so a config file may write a bare
+// duration string ("30s") and a numeric value is rejected with a message
+// naming the field rather than becoming a silently-wrong nanosecond count.
+func parseGatewayDuration(field string, raw json.RawMessage) (time.Duration, error) {
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
 		d, parseErr := time.ParseDuration(strings.TrimSpace(asString))
 		if parseErr != nil {
-			return 0, fmt.Errorf("gateway.request_timeout must be a duration string like \"30s\": %w", parseErr)
+			return 0, fmt.Errorf("%s must be a duration string like \"30s\": %w", field, parseErr)
 		}
 		return d, nil
 	}
 
 	var asNumber json.Number
 	if err := json.Unmarshal(raw, &asNumber); err == nil {
-		return 0, fmt.Errorf("gateway.request_timeout must be a duration string like \"30s\", got numeric value %s", asNumber.String())
+		return 0, fmt.Errorf("%s must be a duration string like \"30s\", got numeric value %s", field, asNumber.String())
 	}
 
-	return 0, errors.New("gateway.request_timeout must be a duration string like \"30s\"")
+	return 0, fmt.Errorf("%s must be a duration string like \"30s\"", field)
 }
 
 type Config struct {
@@ -1195,12 +1244,13 @@ func defaultConfig(service string) Config {
 			BindingSweepInterval: defaultSchedulerBindingSweepInterval,
 		},
 		Gateway: GatewayConfig{
-			HTTPListenAddr:      ":8080",
-			MetricsListenAddr:   ":9102",
-			SchedulerAddr:       "127.0.0.1:9090",
-			RequestTimeout:      30 * time.Second,
-			ForwardResponseSize: 4 << 20,
-			SandboxProxyDomains: []string{},
+			HTTPListenAddr:           ":8080",
+			MetricsListenAddr:        ":9102",
+			SchedulerAddr:            "127.0.0.1:9090",
+			RequestTimeout:           30 * time.Second,
+			ForwardResponseSize:      4 << 20,
+			SandboxProxyDomains:      []string{},
+			SchedulerFallbackTimeout: defaultGatewaySchedulerFallbackTimeout,
 			// The default points at the end state rather than at the cautious
 			// first step. Starting a release on observe is release discipline,
 			// which belongs in the runbook; putting it in the default leaves
@@ -1363,6 +1413,27 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_DEBUG_MODE %q: %w", v, err)
 		}
 		cfg.Gateway.DebugMode = b
+	}
+
+	// 🔴 Phase 4's decommissioning lever — see GatewayConfig.
+	// SchedulerFallbackDisabled — so it follows GATEWAY_DEBUG_MODE's shape
+	// rather than the mounted-file pattern the projection switches use below:
+	// this one is meant to be flipped by `kubectl set env` and a restart, the
+	// same way ResumeAddr and RestUpstreamAddr are.
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_SCHEDULER_FALLBACK_DISABLED")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_SCHEDULER_FALLBACK_DISABLED %q: %w", v, err)
+		}
+		cfg.Gateway.SchedulerFallbackDisabled = b
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_SCHEDULER_FALLBACK_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_SCHEDULER_FALLBACK_TIMEOUT %q: %w", v, err)
+		}
+		cfg.Gateway.SchedulerFallbackTimeout = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_WRITE_FENCING")); v != "" {

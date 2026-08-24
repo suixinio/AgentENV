@@ -172,6 +172,26 @@ spec:
                   name: api-upstream-config
                   key: GATEWAY_RESUME_ADDR
                   optional: true
+            # 阶段 4 slice 1's lever for the same cold path's last resort: the
+            # query-only-scheduler LookupNode call an undecided wake-up (or a
+            # nil ResumeClient) falls through to. See scheduler-fallback-config
+            # in kustomization.yaml for what each key does and why both are
+            # declared at the code default rather than left off this list —
+            # `optional: true` here is what lets that ConfigMap be edited and
+            # this Deployment restarted, instead of this file, once phase 4
+            # actually retires the scheduler.
+            - name: GATEWAY_SCHEDULER_FALLBACK_DISABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: scheduler-fallback-config
+                  key: GATEWAY_SCHEDULER_FALLBACK_DISABLED
+                  optional: true
+            - name: GATEWAY_SCHEDULER_FALLBACK_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: scheduler-fallback-config
+                  key: GATEWAY_SCHEDULER_FALLBACK_TIMEOUT
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

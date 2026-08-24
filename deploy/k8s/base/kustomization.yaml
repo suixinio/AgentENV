@@ -230,6 +230,39 @@ configMapGenerator:
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000
       - GATEWAY_RESUME_ADDR=agentenv-api:8002
+  # 阶段 4 slice 1's lever, and it is declared here at the code default —
+  # fallback *on*, capped at 3s — not turned off. The scheduler is still this
+  # cluster's system of record for the cold LookupNode path a projection miss
+  # and an undecided wake-up both fall through to (agentenv-scheduler is a
+  # live Deployment, not scaled to zero), so disabling that fallback today
+  # would trade an api-half outage's graceful degradation (falls back to
+  # asking the scheduler directly) for a hard 503 — a regression, not a step
+  # towards phase 4.
+  #
+  # 🔴 What each key is for:
+  #   · GATEWAY_SCHEDULER_FALLBACK_DISABLED — the actual decommissioning
+  #     lever. Only meant to be flipped to `true` once nothing user-facing
+  #     still depends on a live `agentenv-scheduler` (the point phase 4 as a
+  #     whole is working towards), at which point it turns "the scheduler
+  #     Deployment is scaled to zero" from a slow, hanging failure on this
+  #     cold path into an immediate, classified one with zero network calls.
+  #   · GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — bounds that same call on its own
+  #     regardless of the switch above, so an *unreachable-but-not-yet-
+  #     decommissioned* scheduler (a bad rollout, a brief outage) cannot hold
+  #     this path open for gRPC's own connection backoff. Safe to lower once
+  #     this cluster's real LookupNode p99 is known; 3s is deliberately far
+  #     above it and far below GATEWAY_REQUEST_TIMEOUT's 30s.
+  #
+  # Both values match `services/shared/config`'s own defaults, so losing this
+  # ConfigMap is safe rather than a quiet change — the same reasoning
+  # `execution-fencing-config` above gives for doing this instead of leaving
+  # the keys undeclared. `gateway-deployment.yaml` references both with
+  # `optional: true`, so flipping the lever later is one literal added here
+  # and a restart, never a Deployment edit.
+  - name: scheduler-fallback-config
+    literals:
+      - GATEWAY_SCHEDULER_FALLBACK_DISABLED=false
+      - GATEWAY_SCHEDULER_FALLBACK_TIMEOUT=3s
   # 🔴 There was a third switch here — node-service-config, carrying
   # AENV_NODE_SERVICE_ENABLED — and it is gone rather than set to `false`. It
   # was meant to let `--role all` serve the node sandbox service, but nothing in

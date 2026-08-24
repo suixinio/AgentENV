@@ -118,15 +118,21 @@ func main() {
 	}
 
 	serverOptions := gateway.ServerOptions{
-		RequestTimeout:           cfg.Gateway.RequestTimeout,
-		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
-		DebugMode:                cfg.Gateway.DebugMode,
-		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
-		QueryOnlySchedulerClient: queryOnlySchedulerClient,
-		ExecutionFencing:         string(cfg.Gateway.Routing.ExecutionFencing),
-		ControlPlaneToken:        cfg.Gateway.ControlPlaneToken,
-		ProjectionAuthoritative:  cfg.Gateway.Routing.ProjectionAuthoritative,
-		RestUpstreamAddr:         cfg.Gateway.RestUpstreamAddr,
+		RequestTimeout:            cfg.Gateway.RequestTimeout,
+		MaxResponseSize:           cfg.Gateway.ForwardResponseSize,
+		DebugMode:                 cfg.Gateway.DebugMode,
+		SandboxProxyDomains:       cfg.Gateway.SandboxProxyDomains,
+		QueryOnlySchedulerClient:  queryOnlySchedulerClient,
+		ExecutionFencing:          string(cfg.Gateway.Routing.ExecutionFencing),
+		ControlPlaneToken:         cfg.Gateway.ControlPlaneToken,
+		ProjectionAuthoritative:   cfg.Gateway.Routing.ProjectionAuthoritative,
+		RestUpstreamAddr:          cfg.Gateway.RestUpstreamAddr,
+		SchedulerFallbackDisabled: cfg.Gateway.SchedulerFallbackDisabled,
+		SchedulerFallbackTimeout:  cfg.Gateway.SchedulerFallbackTimeout,
+	}
+	if cfg.Gateway.SchedulerFallbackDisabled {
+		logger.Info("query-only scheduler fallback is disabled; a projection miss or an " +
+			"undecided wake-up answers unavailable instead of asking the scheduler")
 	}
 	// 🔴 Assigned through the branch rather than passed inline: a typed nil
 	// pointer stored in an interface field is not a nil interface, and the read

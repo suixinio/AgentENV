@@ -115,6 +115,25 @@ var (
 		},
 		[]string{"result"},
 	)
+	// Cold-path query-only-scheduler fallback outcomes that never reached a
+	// normal LookupNode answer — recorded in addition to, not instead of,
+	// gatewaySchedulerRPCDuration.
+	//
+	// 🔴 Only two outcomes are ever recorded here: "disabled" (the fallback is
+	// switched off by configuration, so no RPC was attempted at all — this is
+	// phase 4's decommissioning lever) and "timeout" (the fallback-specific cap
+	// fired before the RPC returned, distinct from the RPC simply failing with
+	// an ordinary gRPC error, which gatewaySchedulerRPCDuration already counts
+	// by status). A success or an ordinary RPC failure is not double-counted
+	// here — this series exists only to answer "did the short-circuit fire",
+	// which the RPC-status series cannot answer on its own.
+	gatewaySchedulerFallback = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_scheduler_fallback_total",
+			Help: "Cold-path query-only-scheduler LookupNode fallback attempts that never reached the scheduler: by configuration (disabled) or by the fallback-specific timeout (timeout).",
+		},
+		[]string{"outcome"},
+	)
 	// Which upstream served a user-facing REST call: the api half, or a node
 	// the scheduler named.
 	//
@@ -350,6 +369,16 @@ func resumeResultLabel(result resume.Result) string {
 
 func recordResumeAttempt(result resume.Result) {
 	gatewayResumeAttempts.WithLabelValues(resumeResultLabel(result)).Inc()
+}
+
+// The closed set of gatewaySchedulerFallback outcomes.
+const (
+	schedulerFallbackOutcomeDisabled = "disabled"
+	schedulerFallbackOutcomeTimeout  = "timeout"
+)
+
+func recordSchedulerFallbackOutcome(outcome string) {
+	gatewaySchedulerFallback.WithLabelValues(outcome).Inc()
 }
 
 func recordRouteResolution(source string) {

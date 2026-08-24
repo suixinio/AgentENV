@@ -166,6 +166,95 @@ func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	}
 }
 
+// TestDefaultConfigLeavesTheSchedulerFallbackOn pins the byte-for-byte
+// preservation this setting exists to guarantee: an unconfigured gateway must
+// still ask the scheduler on the LookupNode fallback path, exactly as it did
+// before SchedulerFallbackDisabled existed.
+func TestDefaultConfigLeavesTheSchedulerFallbackOn(t *testing.T) {
+	cfg := defaultConfig("gateway")
+	if cfg.Gateway.SchedulerFallbackDisabled {
+		t.Fatal("expected the scheduler fallback to default to enabled")
+	}
+	if cfg.Gateway.SchedulerFallbackTimeout != defaultGatewaySchedulerFallbackTimeout {
+		t.Fatalf("expected scheduler fallback timeout %s, got %s",
+			defaultGatewaySchedulerFallbackTimeout, cfg.Gateway.SchedulerFallbackTimeout)
+	}
+}
+
+func TestLoadParsesGatewaySchedulerFallbackFromFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"gateway": {
+			"scheduler_fallback_disabled": true,
+			"scheduler_fallback_timeout": "5s"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if !cfg.Gateway.SchedulerFallbackDisabled {
+		t.Fatal("expected scheduler_fallback_disabled to be true")
+	}
+	if cfg.Gateway.SchedulerFallbackTimeout != 5*time.Second {
+		t.Fatalf("expected scheduler fallback timeout 5s, got %s", cfg.Gateway.SchedulerFallbackTimeout)
+	}
+}
+
+func TestLoadRejectsNumericGatewaySchedulerFallbackTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"gateway": {
+			"scheduler_fallback_timeout": 5
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	if _, err := Load(path, "gateway"); err == nil {
+		t.Fatal("expected load to fail for numeric scheduler_fallback_timeout")
+	}
+}
+
+func TestLoadAppliesGatewaySchedulerFallbackEnv(t *testing.T) {
+	t.Setenv("GATEWAY_SCHEDULER_FALLBACK_DISABLED", "true")
+	t.Setenv("GATEWAY_SCHEDULER_FALLBACK_TIMEOUT", "7s")
+
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if !cfg.Gateway.SchedulerFallbackDisabled {
+		t.Fatal("expected GATEWAY_SCHEDULER_FALLBACK_DISABLED=true to disable the fallback")
+	}
+	if cfg.Gateway.SchedulerFallbackTimeout != 7*time.Second {
+		t.Fatalf("expected scheduler fallback timeout 7s, got %s", cfg.Gateway.SchedulerFallbackTimeout)
+	}
+}
+
+func TestLoadRejectsInvalidGatewaySchedulerFallbackDisabledEnv(t *testing.T) {
+	t.Setenv("GATEWAY_SCHEDULER_FALLBACK_DISABLED", "not-a-bool")
+
+	if _, err := Load("", "gateway"); err == nil {
+		t.Fatal("expected load to fail for invalid GATEWAY_SCHEDULER_FALLBACK_DISABLED")
+	}
+}
+
+func TestLoadRejectsInvalidGatewaySchedulerFallbackTimeoutEnv(t *testing.T) {
+	t.Setenv("GATEWAY_SCHEDULER_FALLBACK_TIMEOUT", "5x")
+
+	if _, err := Load("", "gateway"); err == nil {
+		t.Fatal("expected load to fail for invalid GATEWAY_SCHEDULER_FALLBACK_TIMEOUT")
+	}
+}
+
 func TestLoadDefaultsSchedulerDiscoveryToStaticWhenUnset(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")

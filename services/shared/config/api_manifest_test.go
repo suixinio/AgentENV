@@ -511,3 +511,137 @@ func TestTheApiHalfDialsThePortTheNodeListensOn(t *testing.T) {
 		t.Fatalf("the node DaemonSet listens on %d and declares ports %v", listens, nodeContainer.Ports)
 	}
 }
+
+// 🔴 The envd access-token seed is the one value in this tree whose absence has
+// to stop a Pod from starting.
+//
+// Tokens are HMAC(seed, sandbox_id). A replica with no seed configured invents a
+// node-local one, and the two api replicas then disagree about what every
+// sandbox's token is: the user is handed one by whichever replica the load
+// balancer picked, and it stops working the moment the other answers — no error,
+// no log, no metric (`_sd-impl-phase3-role.md` §9.2). `--role api` refuses to
+// start without it (`src/sandbox/access.rs`), and `optional: false` is what
+// makes the Pod stop before the process even gets to say so.
+//
+// The DaemonSet's `optional: true` is this test's control, and it is not a
+// weaker version of the same assertion: a node's managed seed is node-local
+// state and always has been, so a single-machine deployment with no Secret at
+// all still boots. Read through the same decoder in the same test, "the api half
+// requires it" means something exactly because "the node half does not" is
+// checked beside it — and both must name the same Secret and the same key, or
+// one value does not cover the cluster.
+func TestOnlyTheApiHalfRefusesToStartWithoutTheSharedAccessTokenSeed(t *testing.T) {
+	const (
+		envName    = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED"
+		secretName = "agentenv-runtime-secrets"
+		secretKey  = "sandbox-access-token-hash-seed"
+	)
+
+	apiContainer := onlyContainer(t, "the api Deployment", apiDeployment(t).Spec.Template.Spec.Containers)
+	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
+
+	apiRef := secretKeyRef(t, "the api Deployment", apiContainer, envName)
+	nodeRef := secretKeyRef(t, "the node DaemonSet", nodeContainer, envName)
+
+	for _, tc := range []struct {
+		where string
+		ref   *corev1.SecretKeySelector
+	}{
+		{"the api Deployment", apiRef},
+		{"the node DaemonSet", nodeRef},
+	} {
+		if tc.ref.Name != secretName || tc.ref.Key != secretKey {
+			t.Fatalf("%s reads %s from %s/%s, want %s/%s; the two halves must read one value or "+
+				"they derive different tokens from different seeds",
+				tc.where, envName, tc.ref.Name, tc.ref.Key, secretName, secretKey)
+		}
+	}
+
+	if apiRef.Optional == nil || *apiRef.Optional {
+		t.Fatalf("the api Deployment reads %s with optional=%s; a missing key would let the replica "+
+			"invent a seed its sibling cannot derive, and that fault is invisible until a user's "+
+			"token stops working", envName, describeOptional(apiRef.Optional))
+	}
+	if nodeRef.Optional == nil || !*nodeRef.Optional {
+		t.Fatalf("the node DaemonSet reads %s with optional=%s; that is this test's control, and "+
+			"without it a cluster that keeps every seed node-local no longer starts", envName,
+			describeOptional(nodeRef.Optional))
+	}
+}
+
+func describeOptional(optional *bool) string {
+	if optional == nil {
+		return "unset"
+	}
+	return strconv.FormatBool(*optional)
+}
+
+func secretKeyRef(t *testing.T, where string, container corev1.Container, name string) *corev1.SecretKeySelector {
+	t.Helper()
+	entry, ok := envValue(container, name)
+	if !ok {
+		t.Fatalf("%s does not set %s at all", where, name)
+	}
+	if entry.ValueFrom == nil || entry.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("%s sets %s to a literal (%q) rather than reading it from a Secret", where, name, entry.Value)
+	}
+	return entry.ValueFrom.SecretKeyRef
+}
+
+// The claim the api Deployment's own comment makes — "the one place in the tree
+// where a missing key must stop a Pod from starting" — as an assertion.
+//
+// It is a scan for an absence everywhere but one file, so it carries its control
+// with it twice: the walk has to find the one `optional: false` it expects, and
+// it has to find `optional: true` somewhere as well. Without the second, a walk
+// that read no manifests at all would report the same "nothing else requires a
+// Secret" this test is meant to establish.
+func TestNothingElseInTheTreeMakesASecretMandatory(t *testing.T) {
+	entries, err := os.ReadDir(manifestDir)
+	if err != nil {
+		t.Fatalf("reading the base layer failed: %v", err)
+	}
+
+	required := map[string]int{}
+	optionalSeen := 0
+	scanned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(manifestDir, entry.Name()))
+		if err != nil {
+			t.Fatalf("reading %s failed: %v", entry.Name(), err)
+		}
+		scanned++
+		// Prose explaining why a reference is or is not optional is not a
+		// reference; only a line that sets the field counts.
+		for _, line := range strings.Split(string(raw), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			switch trimmed {
+			case "optional: false":
+				required[entry.Name()]++
+			case "optional: true":
+				optionalSeen++
+			}
+		}
+	}
+
+	if scanned < 5 {
+		t.Fatalf("only %d manifests were scanned; this test is reading the wrong directory", scanned)
+	}
+	if optionalSeen == 0 {
+		t.Fatal("the scan found no `optional: true` either, so finding one `optional: false` says " +
+			"nothing about what the manifests declare")
+	}
+
+	want := map[string]int{"agentenv-api-deployment.yaml": 1}
+	if len(required) != len(want) || required["agentenv-api-deployment.yaml"] != want["agentenv-api-deployment.yaml"] {
+		t.Fatalf("mandatory Secret/ConfigMap references are %v, want %v; a second one means some "+
+			"other workload now refuses to start on a missing key, and whoever added it should say "+
+			"so here", required, want)
+	}
+}

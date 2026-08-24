@@ -573,6 +573,10 @@ fn is_within(candidate: &Path, root: &Path) -> bool {
 mod tests {
     use super::*;
 
+    use tracing::Level;
+
+    use crate::logging::capture::Recorder;
+
     #[test]
     fn the_role_decides_only_when_configuration_has_not() {
         // 🔴 The three states, each distinct. The middle one is the one a
@@ -1016,6 +1020,328 @@ mod tests {
         // The role that does sweep, whose startup is the one moment at which
         // the premise holds.
         assert!(enabled_for(ServerRole::Node, None));
+    }
+
+    /// 🔴 T-NR-53. An operator who turned the sweep on for a role that does not
+    /// sweep is told so, and one who turned it on for a role that does is not.
+    ///
+    /// The warning is the whole of that decision — `enabled_for` returns the
+    /// same `true` either way, and the gauge it sets is the same `1`. So the
+    /// only thing that distinguishes "this is the ordinary configuration" from
+    /// "somebody has taken §11.3's rollback target and pointed it at the host"
+    /// is the line, and a test that does not read the line cannot tell a
+    /// predicate over two operands from one that is always true.
+    #[test]
+    fn enabling_the_sweep_for_a_role_that_does_not_sweep_says_so() {
+        const ANNOUNCEMENT: &str = "AENV_STARTUP_RECLAIM_ENABLED";
+
+        // Enabled, by a role that would not have swept: the two operands
+        // disagree, which is the case this line exists for.
+        let overridden = Recorder::default();
+        let guard = overridden.install();
+        assert!(enabled_for(ServerRole::All, Some(true)));
+        drop(guard);
+        assert!(
+            overridden.saw(Level::WARN, ANNOUNCEMENT),
+            "the rollback target was pointed at the host and nothing said so: {:?}",
+            overridden.events()
+        );
+
+        // 🔴 The same `enabled`, a role that sweeps by default. Nothing unusual
+        // has happened and there is nothing to say — and this is the half a
+        // predicate reading `||` where it says `&&` gets wrong.
+        let ordinary = Recorder::default();
+        let guard = ordinary.install();
+        assert!(enabled_for(ServerRole::Node, Some(true)));
+        drop(guard);
+        assert!(
+            !ordinary.saw(Level::WARN, ANNOUNCEMENT),
+            "an ordinary node was warned about its own default: {:?}",
+            ordinary.events()
+        );
+
+        // ...and the other operand alone: the role that does not sweep, left
+        // alone. Not enabled, so again nothing to say.
+        let untouched = Recorder::default();
+        let guard = untouched.install();
+        assert!(!enabled_for(ServerRole::All, None));
+        drop(guard);
+        assert!(
+            !untouched.saw(Level::WARN, ANNOUNCEMENT),
+            "a role that is simply not sweeping was warned about an override nobody set: {:?}",
+            untouched.events()
+        );
+    }
+
+    /// 🔴 T-NR-54. Each refusal is recorded under the reason it actually is.
+    ///
+    /// The label goes on `agentenv_node_reclaim_refused_total`, and the three
+    /// reasons are three different operator actions: another server running
+    /// this same binary, a process that cannot name its own executable, and a
+    /// ublk daemon that still answers. They are one alert and one dashboard,
+    /// and collapsed into a single value — or into the empty string — that
+    /// alert says a node refused to sweep and cannot say why.
+    ///
+    /// Four sweeps, and the fourth is the non-empty half: with the premise
+    /// established there is no refusal to label, and the sweep does real work.
+    #[tokio::test]
+    async fn each_refusal_is_recorded_under_the_reason_it_actually_is() {
+        let host = Host::new();
+        let work_dir = host.leftover("agentenv-fc-A1");
+
+        host.second_server(4002);
+        let (report, reasons) = refusal_reasons(&host.paths()).await;
+        assert_eq!(report, ReclaimReport::default());
+        assert_eq!(reasons, ["another_server_instance"]);
+
+        let blind = ReclaimPaths {
+            server_exe: None,
+            ..host.paths()
+        };
+        let (_, reasons) = refusal_reasons(&blind).await;
+        assert_eq!(reasons, ["own_binary_unknown"]);
+
+        std::fs::remove_dir_all(host.root.path().join("proc").join("4002")).unwrap();
+        let socket = host.root.path().join("ublk.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (_, reasons) = refusal_reasons(&host.paths()).await;
+        assert_eq!(reasons, ["another_server_owns_this_host"]);
+
+        // Nothing left to refuse the sweep, so nothing is labelled and the
+        // leftover goes.
+        drop(listener);
+        let (report, reasons) = refusal_reasons(&host.paths()).await;
+        assert!(
+            reasons.is_empty(),
+            "a sweep that was not refused recorded a refusal: {reasons:?}"
+        );
+        assert_eq!(report.work_dirs.reclaimed, 1);
+        assert!(!work_dir.exists());
+    }
+
+    /// The `reason` labels a sweep put on `agentenv_node_reclaim_refused_total`.
+    async fn refusal_reasons(paths: &ReclaimPaths) -> (ReclaimReport, Vec<String>) {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let report = sweep(paths).await;
+        drop(guard);
+
+        let mut reasons: Vec<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _unit, _description, _value)| {
+                composite.key().name() == "agentenv_node_reclaim_refused_total"
+            })
+            .map(|(composite, _unit, _description, _value)| {
+                composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "reason")
+                    .map_or_else(
+                        || "<no reason label>".to_owned(),
+                        |label| label.value().to_owned(),
+                    )
+            })
+            .collect();
+        reasons.sort();
+        (report, reasons)
+    }
+
+    /// A host laid out for the two suites that drive [`run`], which takes an
+    /// `AppConfig` rather than a [`ReclaimPaths`].
+    ///
+    /// 🔴 `ReclaimPaths::from_config` hardcodes `/proc`, so unlike every other
+    /// suite in this file these two read the machine they are running on. That
+    /// is bounded, and it is the only way to cover `run` at all. `plan`
+    /// considers a process only if its `comm` is `firecracker` **and** its
+    /// working directory is directly under the work base, and the work base
+    /// here is a temporary directory that did not exist when any process on
+    /// this machine started. Nothing real can be classified as ours and nothing
+    /// real is signalled.
+    ///
+    /// What the machine can still do is make the sweep *refuse* — a second copy
+    /// of this test binary running at the same instant is a second server
+    /// instance, and declining is the correct answer. The assertions below say
+    /// what they expected rather than reading a refusal as a pass.
+    struct ConfiguredHost {
+        _root: tempfile::TempDir,
+        config: AppConfig,
+    }
+
+    impl ConfiguredHost {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let work_base = root.path().join("firecracker-work");
+            std::fs::create_dir_all(&work_base).unwrap();
+            let persisted = root.path().join("persisted-sandboxes");
+            std::fs::create_dir_all(&persisted).unwrap();
+
+            let mut config = AppConfig::default();
+            config.firecracker.work_dir = Some(work_base);
+            config.orchestrator.persisted_sandbox_store_path = persisted;
+            // A path with nothing listening on it, which is a leftover socket
+            // rather than a server that still owns this host.
+            config.ublk.daemon_socket_path = root.path().join("ublk.sock");
+            // Nobody has said anything, so the role decides.
+            config.orchestrator.startup_reclaim_enabled = None;
+
+            Self {
+                _root: root,
+                config,
+            }
+        }
+
+        fn work_base(&self) -> PathBuf {
+            self.config
+                .firecracker
+                .work_dir
+                .clone()
+                .expect("this fixture sets the work base")
+        }
+
+        /// A sandbox work directory stamped as belonging to a server that has
+        /// exited.
+        ///
+        /// 🔴 Stamped from a *different boot* rather than with a pid nothing is
+        /// using, which is what every other fixture here does. Those run against
+        /// a forged `/proc` where the fixture decides which pids exist; this one
+        /// runs against the real one, where `999001` is an ordinary pid — this
+        /// machine's `pid_max` is over four million — and a real process wearing
+        /// it while the sweep looks makes the stamp read as
+        /// [`owner::Owner::Unknown`] rather than `Gone`. That was a flake at
+        /// roughly one run in twenty-five. A boot id that is not this boot's is
+        /// settled before any pid is consulted at all.
+        fn leftover(&self, name: &str) -> PathBuf {
+            let work_dir = self.work_dir(name);
+            owner::stamp_for_test(
+                &work_dir,
+                owner::DEAD_OWNER_PID,
+                1,
+                Some("a-boot-this-machine-has-not-had"),
+            );
+            work_dir
+        }
+
+        /// A directory under the work base with no owner stamp at all, which is
+        /// the shape of "nothing can say whose this is".
+        fn work_dir(&self, name: &str) -> PathBuf {
+            let work_dir = self.work_base().join(name);
+            std::fs::create_dir_all(&work_dir).unwrap();
+            work_dir
+        }
+    }
+
+    /// 🔴 T-NR-55. `run` is where the decision becomes a sweep, and it is the
+    /// only call `main` makes.
+    ///
+    /// Everything else in this file drives `sweep`, one level below the
+    /// enablement check — so a `run` that returned an empty report and did
+    /// nothing, for every role, on every host, would leave all of it green.
+    /// Both directions are asserted against the same host: the role that does
+    /// not sweep leaves the leftover where it is, and the role that does
+    /// retires it.
+    #[tokio::test]
+    async fn run_turns_the_decision_into_a_sweep_for_the_role_that_sweeps() {
+        let host = ConfiguredHost::new();
+        let leftover = host.leftover("agentenv-fc-A1");
+
+        // §11.3's rollback target. "Does not sweep" has to mean the host is
+        // untouched, not merely that the report came back empty.
+        assert_eq!(
+            run(ServerRole::All, &host.config).await,
+            ReclaimReport::default()
+        );
+        assert!(
+            leftover.exists(),
+            "--role all reclaimed a host it is defined not to touch"
+        );
+
+        // The same host, the same configuration, the role that does sweep.
+        let report = run(ServerRole::Node, &host.config).await;
+        assert_eq!(
+            report.firecracker.failed, 0,
+            "a Firecracker on this machine could not be classified, which vetoes the file \
+             sweep; this suite reads the real /proc and needs one it can account for"
+        );
+        assert_eq!(
+            report.work_dirs.reclaimed, 1,
+            "--role node swept nothing; if the premise was refused, something else on this \
+             machine is running this same test binary"
+        );
+        assert!(!leftover.exists());
+    }
+
+    /// 🔴 T-NR-56. A sweep that could not account for everything it looked at
+    /// says so, and one that accounted for everything does not.
+    ///
+    /// The counters are already in the report; this line is what an operator
+    /// sees without one. A node holding a directory nothing will ever free
+    /// looks exactly like a healthy node in every other respect, and the two
+    /// halves below are the two operands of the predicate that decides between
+    /// them.
+    #[tokio::test]
+    async fn a_sweep_that_could_not_account_for_everything_says_so() {
+        const ANNOUNCEMENT: &str = "could not account for everything it looked at";
+
+        let host = ConfiguredHost::new();
+        let leftover = host.leftover("agentenv-fc-A1");
+        // Nothing can say whose this one is, which is a failure rather than a
+        // decision — and the only half of the report a test can move without a
+        // forged `/proc`.
+        let nameless = host.work_dir("agentenv-fc-Nameless");
+
+        let unaccounted = Recorder::default();
+        let guard = unaccounted.install();
+        let report = run(ServerRole::Node, &host.config).await;
+        drop(guard);
+
+        assert_eq!(
+            report.firecracker.failed, 0,
+            "see T-NR-55 on the real /proc"
+        );
+        assert_eq!(report.work_dirs.failed, 1, "the unstamped directory");
+        assert_eq!(report.work_dirs.reclaimed, 1, "and the leftover beside it");
+        assert!(!leftover.exists());
+        assert!(nameless.exists());
+        assert!(
+            unaccounted.saw(Level::WARN, ANNOUNCEMENT),
+            "a node holding a directory nothing will free said nothing: {:?}",
+            unaccounted.events()
+        );
+
+        // 🔴 The same sweep over a host with nothing wrong with it. Both
+        // counters are zero, and a predicate that is always true — or that
+        // reads either counter the wrong way round — warns here anyway.
+        let clean = ConfiguredHost::new();
+        let settled = clean.leftover("agentenv-fc-B2");
+        let accounted = Recorder::default();
+        let guard = accounted.install();
+        let report = run(ServerRole::Node, &clean.config).await;
+        drop(guard);
+
+        assert_eq!(
+            report.firecracker.failed, 0,
+            "see T-NR-55 on the real /proc"
+        );
+        assert_eq!(
+            report.work_dirs,
+            ReclaimCounts {
+                reclaimed: 1,
+                left_alone: 0,
+                failed: 0,
+            },
+            "the probe has resolution: this sweep did retire something"
+        );
+        assert!(!settled.exists());
+        assert!(
+            !accounted.saw(Level::WARN, ANNOUNCEMENT),
+            "a sweep that accounted for everything reported that it had not: {:?}",
+            accounted.events()
+        );
     }
 
     /// Whether a manifest *sets* `var`, as against mentioning it.

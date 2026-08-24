@@ -201,10 +201,12 @@ struct ScriptedNode {
     fork: Mutex<Option<Result<pb::SandboxForkResponse, Status>>>,
     delete: Mutex<Option<Result<pb::SandboxDeleteResponse, Status>>>,
     resume: Mutex<Option<Result<pb::SandboxResumeResponse, Status>>>,
+    describe: Mutex<Option<Result<pb::SandboxDescribeResponse, Status>>>,
     seen_create: Mutex<Vec<pb::SandboxCreateRequest>>,
     seen_pause: Mutex<Vec<pb::SandboxPauseRequest>>,
     seen_delete: Mutex<Vec<pb::SandboxDeleteRequest>>,
     seen_resume: Mutex<Vec<pb::SandboxResumeRequest>>,
+    seen_describe: Mutex<Vec<pb::SandboxDescribeRequest>>,
 }
 
 impl ScriptedNode {
@@ -293,6 +295,27 @@ impl NodeSandboxService for Arc<ScriptedNode> {
         _request: Request<pb::SandboxParamsRequest>,
     ) -> Result<Response<pb::SandboxParamsResponse>, Status> {
         Ok(Response::new(pb::SandboxParamsResponse {}))
+    }
+
+    /// 🔴 `NOT_FOUND` when nothing was scripted, not `unimplemented`. A
+    /// scripted node runs what a test told it to run and nothing else, and
+    /// "this node is running nothing under that id" is the honest answer for a
+    /// node that was told nothing — it is also the answer the attach path has
+    /// to keep working through.
+    async fn describe(
+        &self,
+        request: Request<pb::SandboxDescribeRequest>,
+    ) -> Result<Response<pb::SandboxDescribeResponse>, Status> {
+        let request = request.into_inner();
+        let sandbox_id = request.sandbox_id.clone();
+        self.seen_describe.lock().expect("lock").push(request);
+        match self.describe.lock().expect("lock").take() {
+            Some(Ok(value)) => Ok(Response::new(value)),
+            Some(Err(status)) => Err(status),
+            None => Err(Status::not_found(format!(
+                "sandbox {sandbox_id} is not running on this node"
+            ))),
+        }
     }
 
     async fn list_sandboxes(
@@ -2704,5 +2727,262 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
         blank.runtime_info().rootfs_virtual_size,
         None,
         "a fork child the node gave no rootfs size for was given one anyway"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Attaching to a sandbox this process did not start
+// ---------------------------------------------------------------------------
+
+/// A backend for a sandbox this replica did not start, built exactly the way
+/// `Orchestrator::absent_handle` builds one.
+///
+/// 🔴 The factory call and the `start` that follows are that method's two
+/// lines. The orchestrator does not hand back the backend it adopts, and
+/// repeating the two calls here is closer to the path under test than adding an
+/// accessor to production code for a test to read.
+async fn adopted(
+    node: &RunningNode,
+    sandbox: &crate::orchestrator::SandboxMetadata,
+) -> Box<dyn SandboxBackend> {
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let mut backend = factory
+        .adopt_running(sandbox.id, sandbox.execution_id, sandbox.resources)
+        .expect("a remote factory can say where its sandboxes live")
+        .expect("a remote factory's sandboxes outlive the process that started them");
+    backend
+        .start()
+        .await
+        .expect("attaching starts nothing; it finds the machine");
+    backend
+}
+
+/// A replica that did not start a sandbox says the same address for it as the
+/// replica that did.
+///
+/// # 🔴 The gap this closes
+///
+/// `--role api` runs several replicas behind a Service with no session
+/// affinity, so a call about a sandbox usually lands on a replica that did not
+/// start it. That replica adopts the sandbox — and the adopted stub used to be
+/// placed with its address and rootfs size left as `None`, on the reasoning
+/// that this half never made the call that would have reported them.
+///
+/// `None` is not a neutral value here. It is what a node reports for a sandbox
+/// that has no address, and the orchestrator above turns that into
+/// *sandbox missing host interaction IP after start* and tears the sandbox
+/// down — which is exactly the production failure `1d5cd05` fixed for fork
+/// children. The blank did not read as "nobody asked"; it read as a verdict
+/// about a healthy sandbox.
+///
+/// # 🔴 The faces, one node and one round
+///
+/// * **the replica that started it against the one that did not.** Both must
+///   answer, and both must answer the *same* address — it is one sandbox. A
+///   build where the second answers `None` fails, and so does one where the
+///   first stopped answering.
+/// * **three addresses, all different.** A source and its two fork children
+///   each get their own network slot on the node. A constant, or a value copied
+///   from a sibling, fails all three equalities at once.
+/// * **two of the three carry no ownership marker.** A fork child driven by
+///   this half reaches the node unmarked, and `ListSandboxes` leaves an
+///   unmarked sandbox out entirely. The adopting replica answers for all three,
+///   which is what says these facts did not come from that listing.
+#[tokio::test]
+async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one_that_did() {
+    let node = real_node().await;
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let owner = api_replica(&node, &ledger).await;
+
+    let source = Arc::clone(&owner)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("a replica creates a sandbox");
+    let children = Arc::clone(&owner)
+        .fork_sandbox(
+            source.id,
+            crate::orchestrator::ForkChildren::Fresh(2),
+            crate::orchestrator::NewTimeout::UseExisting,
+        )
+        .await
+        .expect("the fork ran")
+        .into_iter()
+        .map(|outcome| outcome.expect("a fork child whose VM started on the node"))
+        .collect::<Vec<_>>();
+
+    let sandboxes = [source, children[0].clone(), children[1].clone()];
+
+    let mut published = Vec::new();
+    let mut adopted_addresses = Vec::new();
+    for sandbox in &sandboxes {
+        published.push(routed_to(&owner, sandbox.id).await);
+        adopted_addresses.push(
+            adopted(&node, sandbox)
+                .await
+                .host_interaction_ip()
+                .expect("🔴 a replica that did not start this sandbox could not say where it is"),
+        );
+    }
+
+    assert_eq!(
+        adopted_addresses, published,
+        "the replica that adopted these sandboxes and the one that started them do not agree on \
+         where they are"
+    );
+
+    assert_ne!(
+        adopted_addresses[0], adopted_addresses[1],
+        "a sandbox and its fork child were adopted at one address"
+    );
+    assert_ne!(
+        adopted_addresses[1], adopted_addresses[2],
+        "two fork children were adopted at one address"
+    );
+    assert_ne!(
+        adopted_addresses[0], adopted_addresses[2],
+        "a sandbox and its fork child were adopted at one address"
+    );
+
+    // And the machine agrees all three are up, so nothing above is satisfied by
+    // an address for a VM that is not there.
+    let mut running = sandboxes
+        .iter()
+        .map(|sandbox| sandbox.id)
+        .collect::<Vec<_>>();
+    running.sort();
+    assert_eq!(
+        running_on(&node).await,
+        running,
+        "the machine is not running what this half just said it could reach"
+    );
+}
+
+/// A machine that could not be asked and a machine that is not running the
+/// sandbox are two different answers.
+///
+/// # 🔴 One value apart, and it is the status
+///
+/// Both faces reach the machine and both get a reply. In the first the machine
+/// says it is running nothing under that id — an answer, and the one a delete
+/// exists to act on: its whole job is to reconcile a record against a machine
+/// that no longer has the sandbox, so failing there would leave such a record
+/// undeletable. In the second the machine could not tell, and that is a
+/// failure. Folding the second into the first is how a replica concludes a
+/// running sandbox has no address because a node was busy — and, one caller up,
+/// how a delete decides a VM is gone because nobody could answer.
+///
+/// 🔴 Deliberately not written as "shut the socket down": a dead socket fails
+/// in `connect`, a round trip before the branch under test, so a build that
+/// folded every status into "no such sandbox" would pass it.
+#[tokio::test]
+async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
+    let (script, node) = scripted_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    let stranger = crate::types::SandboxId::new();
+    let resources = crate::types::SandboxResources {
+        cpu_count: 1,
+        memory_mib: 256,
+        disk_size_mib: 1024,
+    };
+
+    // The scripted node answers `NOT_FOUND` when it was told to run nothing.
+    let mut answered = factory
+        .adopt_running(stranger, ExecutionId::new(), resources)
+        .expect("a remote factory can say where its sandboxes live")
+        .expect("a remote factory's sandboxes are on other machines");
+    answered
+        .start()
+        .await
+        .expect("a machine that says it is running nothing under this id has answered");
+    assert_eq!(
+        answered.host_interaction_ip(),
+        None,
+        "the machine said it is running nothing under this id, and an address appeared anyway"
+    );
+    assert_eq!(
+        answered.runtime_info().rootfs_virtual_size,
+        None,
+        "the machine said it is running nothing under this id, and a rootfs size appeared anyway"
+    );
+
+    // The same call, to the same machine, one value different.
+    *script.describe.lock().expect("lock") = Some(Err(Status::unavailable(
+        "the node could not look right now",
+    )));
+    let mut unanswered = factory
+        .adopt_running(stranger, ExecutionId::new(), resources)
+        .expect("a remote factory can say where its sandboxes live")
+        .expect("a remote factory's sandboxes are on other machines");
+    let err = unanswered
+        .start()
+        .await
+        .expect_err("🔴 a machine that could not answer was read as one with no such sandbox");
+    assert!(
+        format!("{err:#}").contains(&stranger.to_string()),
+        "the failure did not name the sandbox it could not ask about: {err:#}"
+    );
+}
+
+/// An address the node did not read off a live handle is refused rather than
+/// recorded.
+///
+/// 🔴 Two faces one bit apart, in the same reply shape: the node reports an
+/// address and a rootfs size, and says whether it read them from the sandbox's
+/// live handle or from its record. Its record holds neither field, so a `false`
+/// there means both values are blanks wearing the shape of facts. The bit has
+/// to be what decides: a build that took the values regardless would pass the
+/// second face here and quietly record a busy sandbox's blanks as its address.
+#[tokio::test]
+async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded() {
+    let (script, node) = scripted_node().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let sandbox_id = crate::types::SandboxId::new();
+    let execution_id = ExecutionId::new();
+    let resources = crate::types::SandboxResources {
+        cpu_count: 1,
+        memory_mib: 256,
+        disk_size_mib: 1024,
+    };
+    let reply = |facts_from_handle: bool| pb::SandboxDescribeResponse {
+        execution_id: execution_id.to_string(),
+        host_interaction_ip: "10.7.7.7".to_string(),
+        rootfs_virtual_size: 4096,
+        facts_from_handle,
+    };
+
+    *script.describe.lock().expect("lock") = Some(Ok(reply(false)));
+    let mut from_a_record = factory
+        .adopt_running(sandbox_id, execution_id, resources)
+        .expect("a remote factory can say where its sandboxes live")
+        .expect("a remote factory's sandboxes are on other machines");
+    let err = from_a_record
+        .start()
+        .await
+        .expect_err("🔴 a blank the node could not fill was taken as this sandbox's address");
+    assert!(
+        format!("{err:#}").contains("busy"),
+        "the failure did not say why the facts were not facts: {err:#}"
+    );
+
+    // The same reply, one bit different.
+    *script.describe.lock().expect("lock") = Some(Ok(reply(true)));
+    let mut from_a_handle = factory
+        .adopt_running(sandbox_id, execution_id, resources)
+        .expect("a remote factory can say where its sandboxes live")
+        .expect("a remote factory's sandboxes are on other machines");
+    from_a_handle
+        .start()
+        .await
+        .expect("facts the node read off the handle are facts");
+    assert_eq!(
+        from_a_handle.host_interaction_ip(),
+        Some(std::net::Ipv4Addr::new(10, 7, 7, 7)),
+        "the address the node read off the live handle did not reach this half"
+    );
+    assert_eq!(
+        from_a_handle.runtime_info().rootfs_virtual_size,
+        Some(4096),
+        "the rootfs size the node read off the live handle did not reach this half"
     );
 }

@@ -112,6 +112,17 @@ struct Placed {
     rootfs_virtual_size: Option<u64>,
 }
 
+/// What a machine reports about a sandbox it is running.
+///
+/// 🔴 Both fields `None` is an answer here and not an absence: it is what a
+/// machine that is running nothing under this id reports. See
+/// [`RemoteSandboxStub::live_facts`].
+#[derive(Default)]
+struct LiveFacts {
+    host_interaction_ip: Option<Ipv4Addr>,
+    rootfs_virtual_size: Option<u64>,
+}
+
 impl RemoteSandboxStub {
     pub(super) fn pending(
         sandbox_id: SandboxId,
@@ -204,6 +215,11 @@ impl RemoteSandboxStub {
     /// node refuses a call that names a run it is not running. Checking here as
     /// well would be a second answer to the same question, taken a round trip
     /// earlier.
+    ///
+    /// 🔴 And it asks the machine what it is running, rather than placing the
+    /// stub with the two fields only a live handle knows left blank. See
+    /// [`live_facts`](Self::live_facts) for why a blank was the wrong shape of
+    /// silence.
     async fn attach(&mut self) -> Result<()> {
         let sandbox_id = self.sandbox_id;
         let node = self
@@ -211,23 +227,102 @@ impl RemoteSandboxStub {
             .place_existing(sandbox_id)
             .await
             .with_context(|| format!("locate the machine running sandbox {sandbox_id}"))?;
-        let client = Self::connect(&node.endpoint)
+        let mut client = Self::connect(&node.endpoint)
             .await
             .with_context(|| format!("reach node {} for sandbox {sandbox_id}", node.node_id))?;
+
+        // 🔴 Before the stub is placed, not after. `placed` is what every other
+        // method on this type reads its address out of, and a stub that were
+        // placed first and enriched second would have a window — and, if this
+        // failed, a permanent state — where it is placed and answers `None` to
+        // a question it never asked.
+        let facts = Self::live_facts(&mut client, &node.node_id, sandbox_id).await?;
 
         self.placed = Some(Placed {
             node,
             client,
-            // 🔴 Both unknown, and left unknown rather than guessed. They are
-            // learned from the reply to the call that started the sandbox, and
-            // this process did not make that call. A caller that needs the
-            // address — publishing a proxy route, say — must read it from
-            // somewhere that has it; inventing one here would route a user's
-            // traffic at an address nothing is listening on.
-            host_interaction_ip: None,
-            rootfs_virtual_size: None,
+            host_interaction_ip: facts.host_interaction_ip,
+            rootfs_virtual_size: facts.rootfs_virtual_size,
         });
         Ok(())
+    }
+
+    /// The live facts for a sandbox this process did not start, read off the
+    /// machine that is running it.
+    ///
+    /// # 🔴 Asked for, because there is no reply lying around that has them
+    ///
+    /// Every other way a stub becomes [`Placed`] is a reply to a call that
+    /// started something: a create's ack, a resume's `started`, a fork child's
+    /// ack. Each carries the address the sandbox reaches the host on and the
+    /// size its rootfs turned out to be, because only the live handle on the
+    /// node knows either. An attach has no such call — it finds a sandbox that
+    /// was already up — so it asks, and that keeps the invariant this type
+    /// depends on: **a `Placed` is only ever built out of an answer from the
+    /// machine.**
+    ///
+    /// This used to be left as `None`, on the reasoning that guessing an
+    /// address is worse than admitting to none. That is true and it is not the
+    /// whole choice: `None` is *also* what a node reports for a sandbox it has
+    /// no address for, and that value is a loud refusal —
+    /// `proxy_target_from_sandbox` turns it into "sandbox missing host
+    /// interaction IP after start" and the caller tears the sandbox down. So
+    /// the blank did not read as "nobody asked"; it read as a verdict about a
+    /// healthy sandbox, waiting for the first caller to consult it.
+    ///
+    /// # 🔴 Three answers, kept apart
+    ///
+    /// * the facts — the node looked at its live handle and reported them;
+    /// * `NOT_FOUND` — the node looked and is running nothing under this id.
+    ///   There is no address because there is no sandbox there, and that is a
+    ///   fact about the machine rather than a gap in this reply. It is **not**
+    ///   an error: the caller above may well be a delete, whose whole job is
+    ///   to reconcile a record with a machine that no longer has the sandbox,
+    ///   and failing here would leave such a record undeletable.
+    /// * anything else, including no answer at all — the node could not be
+    ///   asked. That is an error, for the reason written at the top of this
+    ///   file: an unreachable machine is not an absent sandbox.
+    async fn live_facts(
+        client: &mut NodeSandboxServiceClient<Channel>,
+        node_id: &str,
+        sandbox_id: SandboxId,
+    ) -> Result<LiveFacts> {
+        let response = match client
+            .describe(pb::SandboxDescribeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            })
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                return Ok(LiveFacts::default())
+            }
+            Err(status) => {
+                return Err(wire::into_error(status)).with_context(|| {
+                    format!("ask node {node_id} what it is running for sandbox {sandbox_id}")
+                })
+            }
+        };
+
+        // 🔴 The node answered from its record because the sandbox's handle was
+        // mid-operation, and its record holds neither of these fields. Taking
+        // the blanks would be the thing this whole method exists to stop, one
+        // round trip further along: a sandbox that is up, described as having
+        // no address. The sandbox is not going anywhere and a retry costs one
+        // call, so this says so instead.
+        if !response.facts_from_handle {
+            bail!(
+                "node {node_id} could not read sandbox {sandbox_id}'s live facts: its handle was \
+                 busy, so the address and rootfs size it answered with are blanks rather than \
+                 that sandbox's"
+            );
+        }
+
+        Ok(LiveFacts {
+            host_interaction_ip: wire::host_ip(&response.host_interaction_ip),
+            rootfs_virtual_size: (response.rootfs_virtual_size > 0)
+                .then_some(response.rootfs_virtual_size),
+        })
     }
 
     /// Asks the machine holding this sandbox's capture to reopen it.

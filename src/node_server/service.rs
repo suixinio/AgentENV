@@ -766,6 +766,69 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         ))
     }
 
+    /// What this node is running under one sandbox id.
+    ///
+    /// # 🔴 Why this is not `list_sandboxes` with a filter
+    ///
+    /// The listing exists to be reconciled against, so it reports only the
+    /// sandboxes carrying the control plane's ownership marker — an unmarked
+    /// sandbox is nobody's and is left out entirely. A fork child started
+    /// through the API half is unmarked (`ForkChildSpec::control_plane_config`
+    /// arrives empty), so filtering the listing by id would answer `NOT_FOUND`
+    /// for precisely the sandboxes a caller most needs this for.
+    ///
+    /// This call answers a different question, and the difference is who is
+    /// asking: a caller that already holds the record for an id, wanting to
+    /// know what this machine is running under it. Ownership is not part of
+    /// that question.
+    ///
+    /// # 🔴 A read that fails must fail
+    ///
+    /// [`live_facts`](Self::live_facts) swallows the error with `.ok()`,
+    /// because there the read is a follow-up to a VM that has *already*
+    /// booted, and reporting a successful create as a failure would leak it.
+    /// Here the read is the whole call: an answer that could not look must not
+    /// come back shaped like one that looked and found nothing.
+    async fn describe(
+        &self,
+        request: Request<pb::SandboxDescribeRequest>,
+    ) -> Result<Response<pb::SandboxDescribeResponse>, Status> {
+        let request = request.into_inner();
+        let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
+
+        let live = self
+            .orchestration
+            .list_live_sandboxes()
+            .await
+            .map_err(|err| orchestrator_status(&err))?;
+
+        // 🔴 `NOT_FOUND` is an answer and it is this one: the node looked at
+        // what it is running and there is nothing under that id. It is not the
+        // answer for a node that could not look — that left above.
+        let sandbox = live
+            .iter()
+            .find(|candidate| candidate.sandbox_id == sandbox_id)
+            .ok_or_else(|| {
+                Status::not_found(format!("sandbox {sandbox_id} is not running on this node"))
+            })?;
+
+        Ok(Response::new(pb::SandboxDescribeResponse {
+            execution_id: sandbox
+                .execution_id
+                .map(|execution_id| execution_id.to_string())
+                .unwrap_or_default(),
+            host_interaction_ip: sandbox
+                .host_interaction_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            rootfs_virtual_size: sandbox.rootfs_virtual_size.unwrap_or_default(),
+            // 🔴 Reported rather than turned into a `NOT_FOUND`. The sandbox is
+            // running; what the node could not do is read its live facts right
+            // now. Those are different, and the caller acts on the difference.
+            facts_from_handle: sandbox.facts_from_handle,
+        }))
+    }
+
     async fn list_sandboxes(
         &self,
         _request: Request<pb::ListSandboxesRequest>,

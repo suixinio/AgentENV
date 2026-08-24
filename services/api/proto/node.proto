@@ -80,6 +80,24 @@ service NodeSandboxService {
   // Assigns already-approved custom extension params to a running sandbox.
   rpc UpdateParams (SandboxParamsRequest) returns (SandboxParamsResponse);
 
+  // What this node is running for one sandbox, named by id.
+  //
+  // 🔴 A point lookup, and deliberately not `ListSandboxes` with a filter.
+  // That listing answers *which of the control plane's sandboxes are on this
+  // node*, and to answer it it drops every sandbox carrying no ownership
+  // marker. A fork child started through the API half carries none, so a
+  // listing is the one shape guaranteed to be missing exactly the sandboxes
+  // this call exists for. The question here is a different one: the caller
+  // already holds the record for this id and is asking the machine what it is
+  // running under it.
+  //
+  // 🔴 Three answers, and they stay three. The facts; `NOT_FOUND`, which means
+  // the node looked and is running nothing under that id; and any other status
+  // — or no answer at all — which means the node could not be asked. Only the
+  // first two are claims about the sandbox, and a caller that folded the third
+  // into the second would read a slow network as a sandbox that had gone.
+  rpc Describe (SandboxDescribeRequest) returns (SandboxDescribeResponse);
+
   // What this node is actually running, of the sandboxes the control plane
   // owns.
   //
@@ -531,6 +549,40 @@ message SandboxParamsRequest {
 }
 
 message SandboxParamsResponse {}
+
+// ---------------------------------------------------------------------------
+// Describe
+// ---------------------------------------------------------------------------
+
+message SandboxDescribeRequest {
+  string sandbox_id = 1;
+}
+
+// The two things about a running sandbox that only its live handle knows,
+// plus the run they were read from.
+//
+// 🔴 No incarnation on the request, matching the rest of this service's reads:
+// every *command* the caller goes on to send carries `execution_id` and the
+// node refuses one that names a run it is not running. What travels back is
+// the run the node is running, so a caller that wants to compare can, and one
+// that does not has not been handed a fence it might forget to check.
+message SandboxDescribeResponse {
+  // The run this node is running under that id.
+  string execution_id = 1;
+  // Empty means this sandbox has no host interaction address — and it means
+  // that only when `facts_from_handle` is true.
+  string host_interaction_ip = 2;
+  // 0 means the same thing, under the same condition.
+  uint64 rootfs_virtual_size = 3;
+  // 🔴 Whether the two fields above were read from the live handle.
+  //
+  // `false` means the handle was mid-operation and was not waited on, so the
+  // node answered from its record — which holds neither field. Both are then
+  // blanks rather than facts. Without this bit a caller could not tell *this
+  // sandbox has no address* from *nobody looked*, and the whole point of this
+  // call is that the caller has no other way to learn the difference.
+  bool facts_from_handle = 4;
+}
 
 // ---------------------------------------------------------------------------
 // ListSandboxes

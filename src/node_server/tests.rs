@@ -1295,6 +1295,216 @@ async fn assigned_children_reach_the_orchestrator_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
+// Describe
+// ---------------------------------------------------------------------------
+
+const ROOTFS_WHEN_IT_STARTED: u64 = 3 * 1024 * 1024;
+const ROOTFS_BY_THE_TIME_IT_WAS_ASKED: u64 = 11 * 1024 * 1024;
+
+async fn describe(
+    service: &NodeSandboxService,
+    sandbox_id: SandboxId,
+) -> Result<pb::SandboxDescribeResponse, Status> {
+    service
+        .describe(Request::new(pb::SandboxDescribeRequest {
+            sandbox_id: sandbox_id.to_string(),
+        }))
+        .await
+        .map(|response| response.into_inner())
+}
+
+/// `Describe` answers for a sandbox the listing leaves out, with that
+/// sandbox's own live facts.
+///
+/// # 🔴 The faces, one node and one round apart by a single value each
+///
+/// * **marked against unmarked.** Both sandboxes are running on this node and
+///   they differ in one thing: whether the create that started them carried an
+///   ownership marker. `ListSandboxes` reports one of the two — that is its
+///   job — and `Describe` answers for both. A build that answered this call out
+///   of the listing would be `NOT_FOUND` on the unmarked half, which is exactly
+///   the half an API-driven fork child lands in.
+/// * **one address against the other.** The two answers carry different
+///   addresses, and each one is non-empty. A constant, or a value copied from
+///   the other sandbox, fails both halves of that at once.
+/// * **the size moves.** The backend reports a different rootfs size by the
+///   time it is asked than it did when the sandbox started. The answer has to
+///   be the new one: a size taken from the node's record — which does not hold
+///   one — or carried over from the create would fail on that value.
+#[tokio::test]
+async fn describe_answers_for_a_sandbox_the_listing_leaves_out() {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_runtime_info(SandboxRuntimeInfo {
+        rootfs_virtual_size: Some(ROOTFS_WHEN_IT_STARTED),
+        runtime_artifacts: RuntimeArtifactSet::empty(),
+    });
+    let (orchestration, service) =
+        service_with(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
+
+    let marked = start(&orchestration, Some(b"owned")).await;
+
+    // A fork child driven by the API half reaches a node with no marker on it,
+    // which is what keeps it out of the listing below.
+    let unmarked = SandboxId::new();
+    service
+        .fork(Request::new(pb::SandboxForkRequest {
+            source_sandbox_id: marked.id.to_string(),
+            source_execution_id: marked.execution_id.to_string(),
+            children: vec![pb::ForkChildSpec {
+                sandbox_id: unmarked.to_string(),
+                execution_id: ExecutionId::new().to_string(),
+                control_plane_config: Vec::new(),
+            }],
+            timeout_ms: 0,
+        }))
+        .await
+        .expect("the fork ran");
+
+    let listing = listed(&service).await;
+    assert_eq!(
+        listing
+            .iter()
+            .map(|sandbox| sandbox.sandbox_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![marked.id.to_string().as_str()],
+        "the listing is not the surface this test thinks it is"
+    );
+
+    // 🔴 Moved after both sandboxes started and before either is described.
+    behavior.set_runtime_info(SandboxRuntimeInfo {
+        rootfs_virtual_size: Some(ROOTFS_BY_THE_TIME_IT_WAS_ASKED),
+        runtime_artifacts: RuntimeArtifactSet::empty(),
+    });
+
+    let described_marked = describe(&service, marked.id)
+        .await
+        .expect("a node running this sandbox can say so");
+    let described_unmarked = describe(&service, unmarked)
+        .await
+        .expect("🔴 a sandbox nobody claims is still a sandbox this node is running");
+
+    for (what, described) in [
+        ("the marked sandbox", &described_marked),
+        ("the unmarked sandbox", &described_unmarked),
+    ] {
+        assert!(
+            described.facts_from_handle,
+            "{what} was described from a record rather than from its handle"
+        );
+        assert!(
+            !described.host_interaction_ip.is_empty(),
+            "{what} is running and was described with no address"
+        );
+        assert_eq!(
+            described.rootfs_virtual_size, ROOTFS_BY_THE_TIME_IT_WAS_ASKED,
+            "{what}'s rootfs size was not read from its handle at the time of asking"
+        );
+    }
+
+    assert_ne!(
+        described_marked.host_interaction_ip, described_unmarked.host_interaction_ip,
+        "two sandboxes on one node were described with one address"
+    );
+    assert_eq!(
+        described_marked.execution_id,
+        marked.execution_id.to_string(),
+        "the run reported for a sandbox is not the run it is running"
+    );
+}
+
+/// A sandbox this node is not running is `NOT_FOUND`, and one it is running is
+/// not.
+///
+/// 🔴 One node, one round, one value apart: which id was asked about. The
+/// `NOT_FOUND` half is what a caller reads as *the machine looked and there is
+/// nothing there*, and it has to be reachable — a build that answered every
+/// `Describe` with facts would pass the other test in this section and this
+/// one's control face, and fail here.
+#[tokio::test]
+async fn describe_says_not_found_for_a_sandbox_this_node_is_not_running() {
+    let (orchestration, service) = service().await;
+    let running = start(&orchestration, Some(b"owned")).await;
+
+    describe(&service, running.id)
+        .await
+        .expect("the control face: a sandbox this node is running");
+
+    let status = describe(&service, SandboxId::new())
+        .await
+        .expect_err("a node running nothing under that id has an answer, not facts");
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+}
+
+/// A sandbox whose handle is busy is described as one nobody could read, not as
+/// one with no address.
+///
+/// # 🔴 Why the bit exists at all
+///
+/// The node answers a busy handle from its record, and its record holds neither
+/// the address nor the rootfs size. Both fields then come back as the blanks
+/// proto3 cannot tell from *unset* — and the caller for this call is attaching
+/// to a sandbox precisely because it has no other way to learn either. Reading
+/// those blanks as facts would put "this running sandbox has no address" into a
+/// stub, which is the one value that makes the orchestrator above tear a
+/// healthy sandbox down.
+///
+/// The faces are the two sandboxes in this one round: one held by a fork that
+/// is still running, one idle.
+#[tokio::test]
+async fn a_busy_handle_is_described_as_read_from_no_handle() {
+    use crate::sandbox::mock::{MockAction, MockOperation};
+
+    crate::logging::init_for_tests();
+    let behavior = Arc::new(MockBehavior::new());
+    let (orchestration, service) =
+        service_with(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
+
+    let busy = start(&orchestration, Some(b"busy")).await;
+    let idle = start(&orchestration, Some(b"idle")).await;
+
+    // A fork holds the source's handle for the whole operation and leaves it in
+    // the table while it runs.
+    behavior.push_action(
+        MockOperation::Fork,
+        MockAction::SucceedAfter(Duration::from_secs(3)),
+    );
+    let forking = tokio::spawn({
+        let orchestration = Arc::clone(&orchestration);
+        async move {
+            orchestration
+                .fork_sandbox(busy.id, ForkChildren::Fresh(1), NewTimeout::UseExisting)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let described_busy = describe(&service, busy.id)
+        .await
+        .expect("a sandbox mid-operation is still a sandbox this node is running");
+    let described_idle = describe(&service, idle.id).await.expect("the control face");
+
+    assert!(
+        !described_busy.facts_from_handle,
+        "a sandbox whose handle could not be read was described as if it had been"
+    );
+    assert!(
+        described_busy.host_interaction_ip.is_empty(),
+        "the node invented an address for a handle it could not read"
+    );
+
+    assert!(
+        described_idle.facts_from_handle,
+        "an idle sandbox's handle was not read, so this test compares nothing"
+    );
+    assert!(
+        !described_idle.host_interaction_ip.is_empty(),
+        "an idle sandbox was described with no address"
+    );
+
+    let _ = forking.await;
+}
+
+// ---------------------------------------------------------------------------
 // Resume
 // ---------------------------------------------------------------------------
 

@@ -332,10 +332,21 @@ pub trait SandboxBackend: Send + 'static {
 
     /// Update the custom extension params held by the sandbox runtime.
     ///
-    /// Plain assignment of an already-approved value: the custom extension
+    /// Assignment of an already-approved value: the custom extension
     /// patch-params hook is invoked by the caller (orchestrator layer), not
-    /// by the backend. Cannot fail.
-    fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>);
+    /// by the backend. Fallible like [`update_network_policy`], and for the
+    /// same reason: a local backend's assignment is a plain field write and
+    /// cannot fail, but a remote one is a round trip to the node actually
+    /// running the sandbox, and that can time out or the node can refuse it.
+    /// Callers must not update any durable record of the new value until this
+    /// returns `Ok` — an error here means the running sandbox never saw the
+    /// value, and a store that disagreed would be lying to the next `GET`.
+    ///
+    /// [`update_network_policy`]: SandboxBackend::update_network_policy
+    async fn update_custom_extension_params(
+        &mut self,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()>;
 }
 
 /// Factory interface for creating and restoring sandbox backend instances.

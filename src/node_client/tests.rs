@@ -23,8 +23,11 @@ use crate::proto::node::node_sandbox_service_server::{
     NodeSandboxService, NodeSandboxServiceServer,
 };
 use crate::role::ServerRole;
-use crate::sandbox::mock::MockBackendFactory;
-use crate::sandbox::{SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig};
+use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
+use crate::sandbox::{
+    CustomExtensionParams, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
+    SandboxLaunchConfig,
+};
 use crate::snapshot::mock::MockSnapshotArtifactStore;
 use crate::snapshot::repository::{
     RepositoryResult, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotRepository,
@@ -105,11 +108,18 @@ where
 /// A node backed by the real service, over a real orchestrator with mock
 /// sandboxes.
 async fn real_node() -> RunningNode {
+    real_node_with_factory(MockBackendFactory::new()).await
+}
+
+/// Like [`real_node`], but with a caller-supplied backend factory — so a test
+/// can hold the `MockBehavior` and read back what the *runtime* actually
+/// received, not only what the node's own metadata store echoes.
+async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
+        factory,
         DisabledSandboxPersister,
     )
     .await
@@ -199,11 +209,13 @@ struct ScriptedNode {
     delete: Mutex<Option<Result<pb::SandboxDeleteResponse, Status>>>,
     resume: Mutex<Option<Result<pb::SandboxResumeResponse, Status>>>,
     describe: Mutex<Option<Result<pb::SandboxDescribeResponse, Status>>>,
+    update_params: Mutex<Option<Result<pb::SandboxParamsResponse, Status>>>,
     seen_create: Mutex<Vec<pb::SandboxCreateRequest>>,
     seen_pause: Mutex<Vec<pb::SandboxPauseRequest>>,
     seen_delete: Mutex<Vec<pb::SandboxDeleteRequest>>,
     seen_resume: Mutex<Vec<pb::SandboxResumeRequest>>,
     seen_describe: Mutex<Vec<pb::SandboxDescribeRequest>>,
+    seen_update_params: Mutex<Vec<pb::SandboxParamsRequest>>,
 }
 
 impl ScriptedNode {
@@ -289,9 +301,17 @@ impl NodeSandboxService for Arc<ScriptedNode> {
 
     async fn update_params(
         &self,
-        _request: Request<pb::SandboxParamsRequest>,
+        request: Request<pb::SandboxParamsRequest>,
     ) -> Result<Response<pb::SandboxParamsResponse>, Status> {
-        Ok(Response::new(pb::SandboxParamsResponse {}))
+        self.seen_update_params
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
+        match self.update_params.lock().expect("lock").take() {
+            Some(Ok(value)) => Ok(Response::new(value)),
+            Some(Err(status)) => Err(status),
+            None => Ok(Response::new(pb::SandboxParamsResponse {})),
+        }
     }
 
     /// 🔴 `NOT_FOUND` when nothing was scripted, not `unimplemented`. A
@@ -383,6 +403,93 @@ async fn a_sandbox_built_here_starts_on_the_node() {
         live[0].execution_id,
         Some(execution_id),
         "the node ran a different incarnation from the one it was asked for"
+    );
+}
+
+/// A custom extension params update sent through the stub lands in the real
+/// node's own record of the sandbox — not merely in whatever this half
+/// believes happened.
+///
+/// # 🔴 Why the real node and not a script
+///
+/// `custom_extension_params_update_is_a_real_round_trip` proves the stub
+/// sends a real RPC and surfaces a real failure. This proves the other half
+/// of the old lie: with a real `NodeSandboxService` behind the wire — the
+/// same one `--role node` runs — the value the stub sent is the value the
+/// node's own orchestrator now has on file for this sandbox, read back
+/// through the node's own `get_sandbox`, which is the node-local analogue of
+/// what a `GET` on the API half would answer. `None` and `Some(..)` in
+/// succession is the contrasting pair: a build that only ever wrote the
+/// first value, or only ever cleared it, fails one direction of this.
+#[tokio::test]
+async fn custom_extension_params_update_lands_in_the_real_node() {
+    let behavior = Arc::new(MockBehavior::new());
+    let node =
+        real_node_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+        .expect("building a stub should not fail");
+    backend.start().await.expect("start on the node");
+
+    let orchestration = node.orchestration.as_ref().expect("a real node");
+    assert_eq!(
+        orchestration
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("read")
+            .expect("sandbox metadata should exist")
+            .custom_extension_params,
+        None,
+        "nothing has been applied yet"
+    );
+
+    let mut params: CustomExtensionParams = serde_json::Map::new();
+    params.insert("mode".to_string(), serde_json::json!("fast"));
+    backend
+        .update_custom_extension_params(Some(params.clone()))
+        .await
+        .expect("the node applied the value");
+    // The runtime itself, not only the node's store echo of it — this is the
+    // check that would have stayed green through the original bug, where the
+    // store updated and the mock backend never saw the call at all.
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(Some(params.clone())),
+        "the node's own backend must have actually been asked to hold this value"
+    );
+    assert_eq!(
+        orchestration
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("read")
+            .expect("sandbox metadata should exist")
+            .custom_extension_params,
+        Some(params),
+        "the node's own record must hold exactly the value that was sent"
+    );
+
+    backend
+        .update_custom_extension_params(None)
+        .await
+        .expect("the node applied the clear");
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(None),
+        "the node's own backend must have actually been asked to clear the value"
+    );
+    assert_eq!(
+        orchestration
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("read")
+            .expect("sandbox metadata should exist")
+            .custom_extension_params,
+        None,
+        "clearing the value must reach the node too, not just setting it"
     );
 }
 
@@ -523,6 +630,90 @@ async fn the_create_tells_the_node_that_this_half_keeps_the_deadline() {
     assert!(
         creates[0].expiry.is_some(),
         "the field was left unset, which the node refuses"
+    );
+}
+
+/// A custom extension params update is a real round trip now, not a
+/// fire-and-forget task: the node sees exactly the value that was sent, and a
+/// node refusal comes back to the caller as an error rather than a log line
+/// nobody but that Pod can read.
+///
+/// # 🔴 Why this test exists
+///
+/// `RemoteSandboxStub::update_custom_extension_params` used to spawn a task
+/// and return before the RPC was even sent — a caller could not tell success
+/// from failure, both looked exactly like `()`, and the only trace of a
+/// refusal was an `error!` line on a different process. The faces here, all
+/// in one round:
+///
+/// * two different values sent in succession each reach the node as
+///   themselves — not as each other and not as a stale copy of the first —
+///   proving the wire payload tracks the call rather than something fixed;
+/// * a node refusal is returned to the caller as `Err` and carries the
+///   node's own message, rather than being swallowed.
+#[tokio::test]
+async fn custom_extension_params_update_is_a_real_round_trip() {
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let mut backend =
+        match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        {
+            Ok(backend) => backend,
+            Err(err) => panic!("building a stub should not fail: {err:#}"),
+        };
+    backend.start().await.expect("start");
+
+    let mut first: CustomExtensionParams = serde_json::Map::new();
+    first.insert("mode".to_string(), serde_json::json!("fast"));
+    backend
+        .update_custom_extension_params(Some(first.clone()))
+        .await
+        .expect("the node accepted the first value");
+
+    let mut second: CustomExtensionParams = serde_json::Map::new();
+    second.insert("mode".to_string(), serde_json::json!("slow"));
+    backend
+        .update_custom_extension_params(Some(second.clone()))
+        .await
+        .expect("the node accepted the second value");
+
+    let seen = script.seen_update_params.lock().expect("lock").clone();
+    assert_eq!(seen.len(), 2, "both calls must have reached the node");
+    let decoded_first: Option<CustomExtensionParams> =
+        wire::serialized(seen[0].custom_extension_params.as_ref(), "params")
+            .expect("decode the first request");
+    let decoded_second: Option<CustomExtensionParams> =
+        wire::serialized(seen[1].custom_extension_params.as_ref(), "params")
+            .expect("decode the second request");
+    assert_eq!(
+        decoded_first,
+        Some(first),
+        "the node did not see the first value as sent"
+    );
+    assert_eq!(
+        decoded_second,
+        Some(second),
+        "the second call must not repeat the first"
+    );
+
+    // A node refusal is now something the caller can see, instead of being
+    // logged on a Pod nobody making the call is looking at.
+    *script.update_params.lock().expect("lock") = Some(Err(Status::unimplemented(
+        "update_params is not served on this node",
+    )));
+    let err = backend
+        .update_custom_extension_params(None)
+        .await
+        .expect_err("a node refusal must surface as an error, not a silent success");
+    assert!(
+        format!("{err:#}").contains("not served"),
+        "the failure lost what the node said: {err:#}"
     );
 }
 

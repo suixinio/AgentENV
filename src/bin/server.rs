@@ -766,15 +766,23 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   rather than tearing it down: the caller gets an error and keeps the
 ///   sandbox. Unlike the two door refusals in this list it is not caught here —
 ///   the request goes to the node and the answer comes back.
-/// - **Patching custom extension params.** `PATCH
-///   /sandboxes/{id}/custom-extension-params` answers the caller and the
-///   running sandbox never learns the new value.
-///   `SandboxBackend::update_custom_extension_params` is infallible by
-///   signature — it is an assignment, the hook having already approved the
-///   value — so the stub can only forward it from a spawned task, and the node
-///   answers `Unimplemented` there. The store row is updated, so `GET` reports
-///   the patched value; what does not happen is the node's own copy changing,
-///   and the only account of that is an `error!` line on this Pod.
+/// - **Patching custom extension params — retired.** This bullet used to say
+///   `PATCH /sandboxes/{id}/custom-extension-params` answered the caller and
+///   updated the store while the running sandbox never learned the new
+///   value, because `SandboxBackend::update_custom_extension_params` was
+///   infallible by signature and the stub could only forward it from a
+///   spawned task, fire-and-forget, into a node that answered `Unimplemented`.
+///   Kept here rather than deleted so it is not re-derived from the same
+///   reasoning. It no longer holds: the method is now `async ... ->
+///   Result<()>` like every other property update on this backend
+///   (`RemoteSandboxStub::update_custom_extension_params`, mirroring
+///   `update_network_policy`), the node answers for real
+///   (`NodeSandboxService::update_params` ->
+///   `Orchestrator::replace_sandbox_custom_extension_params`, the same
+///   assign-then-persist tail `patch_sandbox_custom_extension_params` already
+///   used locally), and a failure on either side is returned to the `PATCH`
+///   caller with the metadata store left untouched — see
+///   `Orchestrator::apply_custom_extension_params`.
 /// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
 ///   directly, outside the orchestrator entirely, so a build here would reach
 ///   for `/dev/kvm` in a Pod that has none. It is now refused at the door

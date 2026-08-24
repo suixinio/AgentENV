@@ -23,7 +23,7 @@ use std::net::Ipv4Addr;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
@@ -1115,54 +1115,35 @@ impl SandboxBackend for RemoteSandboxStub {
         Ok(())
     }
 
-    /// 🔴 The one method on this trait that cannot be honoured over a wire, and
-    /// it is worth being explicit about rather than quietly approximating.
-    ///
-    /// Locally this is a plain assignment and cannot fail, which is why the
-    /// signature has no error to return. Remotely it is a round trip that can
-    /// time out, and there is nowhere to say so: the caller has already told
-    /// the custom extension that the new value is in force. The value is
-    /// therefore sent in the background and a failure is logged loudly, and the
-    /// real fix is for the surface above to have a fallible assignment.
-    fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
+    /// 🔴 This used to be the one method on this trait answered from a spawned
+    /// task instead of a round trip: locally it is a plain assignment and
+    /// cannot fail, so the trait had no error to return, and the fix chosen
+    /// here — rather than fire the RPC and forget it — is the same one
+    /// `update_network_policy` already uses for the same shape of problem: an
+    /// `async fn ... -> Result<()>` that awaits the reply. A caller that gets
+    /// `Err` now knows the running sandbox never saw the value, instead of
+    /// finding out from an `error!` line on a different Pod after `GET` had
+    /// already started reporting it.
+    async fn update_custom_extension_params(
+        &mut self,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
-        let Some(placed) = self.placed.as_mut() else {
-            error!(
-                %sandbox_id,
-                "custom extension params were assigned to a sandbox that is not running anywhere"
-            );
-            return;
-        };
-        let node_id = placed.node.node_id.clone();
-        let mut client = placed.client.clone();
         let encoded = params
             .map(|params| wire::serialize(&params, "custom extension params"))
-            .transpose();
+            .transpose()?;
+        let placed = self.placed_mut()?;
 
-        tokio::spawn(async move {
-            let encoded = match encoded {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    error!(%sandbox_id, error = %err, "failed to encode custom extension params");
-                    return;
-                }
-            };
-            if let Err(status) = client
-                .update_params(pb::SandboxParamsRequest {
-                    sandbox_id: sandbox_id.to_string(),
-                    execution_id: execution_id.to_string(),
-                    custom_extension_params: encoded,
-                })
-                .await
-            {
-                error!(
-                    %sandbox_id,
-                    %node_id,
-                    error = %status,
-                    "custom extension params were accepted here and never reached the node"
-                );
-            }
-        });
+        placed
+            .client
+            .update_params(pb::SandboxParamsRequest {
+                sandbox_id: sandbox_id.to_string(),
+                execution_id: execution_id.to_string(),
+                custom_extension_params: encoded,
+            })
+            .await
+            .map_err(wire::into_error)?;
+        Ok(())
     }
 }

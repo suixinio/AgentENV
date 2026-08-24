@@ -56,6 +56,7 @@ pub enum MockOperation {
     ForkChild,
     Stop,
     UpdateNetwork,
+    UpdateCustomExtensionParams,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +99,16 @@ pub struct MockBehavior {
     /// the wrong value, and the value is what decides whether a *remote* pause
     /// spends a durable write.
     pause_committer_waiting: Mutex<Option<bool>>,
+    /// What this backend's `update_custom_extension_params` most recently
+    /// applied, or `None` if it has never been called successfully.
+    ///
+    /// 🔴 Written only when the call succeeds — see
+    /// `MockSandboxBackend::update_custom_extension_params` — so this is
+    /// evidence of what the *runtime* holds, not of what was merely asked for.
+    /// A test that injects a failure and then reads this back proves the
+    /// runtime kept its old value rather than adopting one it never actually
+    /// received.
+    last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
     /// Whether captures come back as something a snapshot repository can stage.
     ///
     /// 🔴 Off by default, and the default is the interesting half. A capture
@@ -141,6 +152,16 @@ impl MockBehavior {
             .pause_committer_waiting
             .lock()
             .expect("pause_committer_waiting mutex poisoned")
+    }
+
+    /// What `update_custom_extension_params` last applied successfully, or
+    /// `None` if it never has. See the field doc for why this is not updated
+    /// on a failed call.
+    pub fn last_custom_extension_params(&self) -> Option<Option<CustomExtensionParams>> {
+        self.last_custom_extension_params
+            .lock()
+            .expect("last_custom_extension_params mutex poisoned")
+            .clone()
     }
 
     pub fn set_on_operation(&self, operation: MockOperation, hook: Arc<dyn Fn() + Send + Sync>) {
@@ -473,7 +494,21 @@ impl SandboxBackend for MockSandboxBackend {
             .await
     }
 
-    fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}
+    async fn update_custom_extension_params(
+        &mut self,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()> {
+        self.behavior
+            .apply_async(MockOperation::UpdateCustomExtensionParams)
+            .await?;
+        // Only reached on success — see `last_custom_extension_params`'s doc.
+        *self
+            .behavior
+            .last_custom_extension_params
+            .lock()
+            .expect("last_custom_extension_params mutex poisoned") = Some(params);
+        Ok(())
+    }
 }
 
 // ── MockBackendFactory ────────────────────────────────────────────────────────

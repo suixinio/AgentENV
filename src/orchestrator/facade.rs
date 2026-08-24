@@ -212,6 +212,19 @@ orchestration_surface! {
             sandbox_id: SandboxId,
             patch: serde_json::Map<String, serde_json::Value>,
         ) -> Result<Option<CustomExtensionParams>>;
+        /// Assigns an already-approved custom extension params value to a
+        /// running sandbox, with no hook involved.
+        ///
+        /// The node-reachable half of
+        /// [`patch_sandbox_custom_extension_params`][Self::patch_sandbox_custom_extension_params]:
+        /// the deciding half runs the patch-params hook and then calls this to
+        /// apply what the hook approved; a node's RPC handler calls this
+        /// directly, because by the time a request reaches it the hook has
+        /// already run once, on the caller's side.
+        fn replace_sandbox_custom_extension_params(
+            sandbox_id: SandboxId,
+            params: Option<CustomExtensionParams>,
+        ) -> Result<()>;
     }
     borrowed {
         /// One sandbox's metadata, or `None` when this orchestrator has no
@@ -428,6 +441,13 @@ mod tests {
             unknown,
             Arc::clone(&orchestration)
                 .patch_sandbox_custom_extension_params(unknown, serde_json::Map::new())
+                .await,
+        );
+        refuses(
+            "replace_sandbox_custom_extension_params",
+            unknown,
+            Arc::clone(&orchestration)
+                .replace_sandbox_custom_extension_params(unknown, None)
                 .await,
         );
         refuses(

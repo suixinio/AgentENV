@@ -19,7 +19,7 @@ use crate::orchestrator::{
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
 use crate::role::ServerRole;
-use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
+use crate::sandbox::mock::{MockAction, MockBackendFactory, MockBehavior, MockOperation};
 use crate::sandbox::{
     PausedSandboxState, RuntimeArtifactSet, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
@@ -1049,25 +1049,15 @@ async fn a_forked_child_with_no_marker_is_not_reported() {
 /// something plausible would be exactly the "shipped early, wired later" shape
 /// that has already cost this project three defects.
 ///
-/// 🔴 `pause` and `checkpoint` are both deliberately absent from this list now.
-/// Each is served, and each is pinned by a test that would fail if it went back
-/// to refusing — `a_pause_leaves_the_capture_where_the_node_put_it` and
-/// `a_checkpoint_answers_with_a_row_nobody_has_announced` — so a method
+/// 🔴 `pause`, `checkpoint` and `update_params` are all deliberately absent
+/// from this list now. Each is served, and each is pinned by a test that
+/// would fail if it went back to refusing — `a_pause_leaves_the_capture_where_the_node_put_it`,
+/// `a_checkpoint_answers_with_a_row_nobody_has_announced`, and
+/// `update_params_reaches_the_sandbox_and_is_fenced` — so a method
 /// reappearing here would break those rather than this.
 #[tokio::test]
 async fn the_unserved_calls_say_so_rather_than_answering() {
-    let (orchestration, service) = service().await;
-    let sandbox = start(&orchestration, Some(b"owned")).await;
-
-    let err = service
-        .update_params(Request::new(pb::SandboxParamsRequest {
-            sandbox_id: sandbox.id.to_string(),
-            execution_id: sandbox.execution_id.to_string(),
-            custom_extension_params: None,
-        }))
-        .await
-        .expect_err("update_params is not served");
-    assert_eq!(err.code(), Code::Unimplemented);
+    let (_orchestration, service) = service().await;
 
     let err = service
         .create(Request::new(pb::SandboxCreateRequest {
@@ -1118,6 +1108,128 @@ async fn update_network_reaches_the_sandbox_and_is_fenced() {
         .await
         .expect_err("a policy change naming another run");
     assert_eq!(err.code(), Code::FailedPrecondition);
+}
+
+/// A custom extension params update reaches the running sandbox, is fenced
+/// like every other property update, and a backend failure never reaches the
+/// metadata store.
+///
+/// # 🔴 Why this test exists
+///
+/// This RPC used to answer `Unimplemented` unconditionally, which turned
+/// `PATCH /sandboxes/{id}/custom-extension-params` into a call that told its
+/// caller "done" and updated the metadata store while the running sandbox
+/// kept its old value — a control plane lying to a `GET` that followed. Three
+/// faces here, all in one round, each differing in exactly one value:
+///
+/// * **success changes what the mock backend actually holds**, read back
+///   through `MockBehavior::last_custom_extension_params` — not just that
+///   `update_params` returned `Ok`. `GET`-equivalent evidence (the metadata
+///   store's row) is checked too, but never alone.
+/// * **fencing on the wrong execution id is refused before anything is
+///   touched**: both the runtime and the store keep the value the successful
+///   call above applied.
+/// * **a backend failure is reported as an error**, and both the runtime and
+///   the store keep the last value that actually applied rather than
+///   adopting the value the failed call carried. This is the property the
+///   old `Unimplemented` handler broke: a failure must not let the store and
+///   the runtime disagree.
+#[tokio::test]
+async fn update_params_reaches_the_sandbox_and_is_fenced() {
+    let behavior = Arc::new(MockBehavior::new());
+    let (orchestration, service) =
+        service_with(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
+    let sandbox = start(&orchestration, Some(b"owned")).await;
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        None,
+        "nothing has been applied to the runtime yet"
+    );
+
+    let mut first = serde_json::Map::new();
+    first.insert("mode".to_string(), serde_json::json!("fast"));
+
+    service
+        .update_params(Request::new(pb::SandboxParamsRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: sandbox.execution_id.to_string(),
+            custom_extension_params: Some(
+                crate::proto::node::encode_value(&first).expect("encode"),
+            ),
+        }))
+        .await
+        .expect("update_params");
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(Some(first.clone())),
+        "the runtime must hold exactly the value that was sent"
+    );
+    let stored = orchestration
+        .get_sandbox(&sandbox.id)
+        .await
+        .expect("read")
+        .expect("sandbox metadata should exist")
+        .custom_extension_params;
+    assert_eq!(stored, Some(first.clone()));
+
+    // Fencing: naming a different run than the one currently live is refused
+    // before the runtime or the store are touched.
+    let mut wrong_run = serde_json::Map::new();
+    wrong_run.insert("mode".to_string(), serde_json::json!("wrong-run"));
+    let err = service
+        .update_params(Request::new(pb::SandboxParamsRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: ExecutionId::new().to_string(),
+            custom_extension_params: Some(
+                crate::proto::node::encode_value(&wrong_run).expect("encode"),
+            ),
+        }))
+        .await
+        .expect_err("a params change naming another run");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(Some(first.clone())),
+        "a fenced-out call must not reach the runtime"
+    );
+
+    // A backend failure is reported, and the runtime and the store both keep
+    // the last value that actually applied.
+    behavior.push_action(
+        MockOperation::UpdateCustomExtensionParams,
+        MockAction::Fail {
+            message: "extension runtime unreachable".to_string(),
+        },
+    );
+    let mut second = serde_json::Map::new();
+    second.insert("mode".to_string(), serde_json::json!("slow"));
+    let err = service
+        .update_params(Request::new(pb::SandboxParamsRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: sandbox.execution_id.to_string(),
+            custom_extension_params: Some(
+                crate::proto::node::encode_value(&second).expect("encode"),
+            ),
+        }))
+        .await
+        .expect_err("the injected backend failure must surface");
+    assert_ne!(err.code(), Code::Unimplemented);
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(Some(first.clone())),
+        "a failed assignment must not leave the runtime holding a value it never accepted"
+    );
+    let stored = orchestration
+        .get_sandbox(&sandbox.id)
+        .await
+        .expect("read")
+        .expect("sandbox metadata should exist")
+        .custom_extension_params;
+    assert_eq!(
+        stored,
+        Some(first.clone()),
+        "the metadata store must not adopt a value the runtime never received"
+    );
 }
 
 /// A fork asked for with no children is refused rather than treated as a

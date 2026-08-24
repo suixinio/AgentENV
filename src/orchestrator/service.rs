@@ -2570,16 +2570,113 @@ where
                 source,
             })?;
 
-        {
-            let mut sandbox = sandbox.lock().await;
-            sandbox.update_custom_extension_params(new_params.clone());
+        self.apply_custom_extension_params(sandbox_id, &sandbox, new_params.clone())
+            .await?;
+
+        Ok(new_params)
+    }
+
+    /// Assigns an already-approved custom extension params value to a
+    /// running sandbox, with no hook involved.
+    ///
+    /// The node-reachable half of
+    /// [`patch_sandbox_custom_extension_params`](Self::patch_sandbox_custom_extension_params):
+    /// the deciding half runs the patch-params hook and then calls this to
+    /// apply what the hook approved; a node's `update_params` RPC handler
+    /// calls this directly, because by the time a request reaches it the hook
+    /// has already run once, on the caller's side, and running it again would
+    /// be a second chance for the extension to change its mind about a value
+    /// the caller has already recorded.
+    pub async fn replace_sandbox_custom_extension_params(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("replace_custom_extension_params", sandbox_id, async move {
+            this.replace_sandbox_custom_extension_params_inner(sandbox_id, params)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "replace_sandbox_custom_extension_params",
+        skip(self, params),
+        fields(sandbox_id = %sandbox_id))
+    ]
+    async fn replace_sandbox_custom_extension_params_inner(
+        &self,
+        sandbox_id: SandboxId,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()> {
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
         }
+
+        let sandbox = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&sandbox_id).cloned()
+        };
+        let sandbox = match sandbox {
+            Some(handle) => handle,
+            None => match self.absent_handle(sandbox_id).await? {
+                AbsentHandle::Adopted(handle) => handle,
+                AbsentHandle::RuntimeGone => {
+                    return Err(OrchestratorError::SandboxOperationConflict {
+                        sandbox_id,
+                        operation: SandboxOperation::PatchCustomExtensionParams,
+                    })
+                }
+                AbsentHandle::NoRecord => {
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id))
+                }
+            },
+        };
+
+        self.apply_custom_extension_params(sandbox_id, &sandbox, params)
+            .await
+    }
+
+    /// The assign-then-persist tail shared by
+    /// [`patch_sandbox_custom_extension_params_inner`](Self::patch_sandbox_custom_extension_params_inner)
+    /// and
+    /// [`replace_sandbox_custom_extension_params_inner`](Self::replace_sandbox_custom_extension_params_inner).
+    ///
+    /// The backend assignment is tried first and its failure is returned
+    /// without touching the metadata store: a caller that gets `Err` here
+    /// must not also see `GET` report a value the running sandbox never
+    /// received — the store staying stale on failure is the point, not a
+    /// side effect.
+    async fn apply_custom_extension_params(
+        &self,
+        sandbox_id: SandboxId,
+        sandbox: &SandboxHandle,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()> {
+        let update_result = {
+            let mut sandbox = sandbox.lock().await;
+            sandbox.update_custom_extension_params(params.clone()).await
+        };
+        update_result.map_err(|source| OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::PatchCustomExtensionParams,
+            source,
+        })?;
 
         // NOTE: a concurrent pause may have transitioned the sandbox since the entry check,
         // so this may fail. But it's acceptable since extension state should be transient like network policy
         self.store
             .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                metadata.custom_extension_params = new_params.clone();
+                metadata.custom_extension_params = params.clone();
             })
             .await
             .map_err(|err| match err {
@@ -2596,7 +2693,7 @@ where
                 other => OrchestratorError::from(other),
             })?;
 
-        Ok(new_params)
+        Ok(())
     }
 
     /// Returns the current orchestrator metrics snapshot.

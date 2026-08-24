@@ -260,7 +260,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
-		if isClusterListRequest(r) {
+		if s.fansOutClusterList(r) {
+			// The other position of this same predicate claims nothing: a
+			// cluster-list request with an api half configured falls out of
+			// this block and is forwarded — and counted — by the REST upstream
+			// decision below, exactly as `POST /sandboxes` is. See
+			// cluster_list.go.
+			recordRestUpstream(restUpstreamNode)
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleClusterList(w, r, routingCtx)
 			return
@@ -302,6 +308,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// against the upstream that is about to serve it, and the "node" arm is
 	// what makes a flat zero on the "api" arm — or the other way round — mean
 	// anything at all. See rest_upstream.go.
+	//
+	// The cluster listing is counted the same way from its own branch above,
+	// which is the one user-facing REST route this process can serve out of the
+	// nodes without forwarding anything. Counted there rather than left out, so
+	// that a fleet on `--role node` with this switch rolled back — where the
+	// listing is fanned out to nodes and 404s — cannot read as "no node serves
+	// REST any more".
 	if isUserFacingRestRequest(r, hostRoute, routeSource) {
 		if s.restUpstream != "" {
 			recordRestUpstream(restUpstreamAPI)

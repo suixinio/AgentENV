@@ -44,11 +44,21 @@ import (
 //     the path, because a data-plane request can be addressed to any path at
 //     all — including `/sandboxes/...` — and the routing headers are the only
 //     thing that says what it is.
-//   - **The gateway's own aggregations.** `GET /sandboxes`, `GET /v2/sandboxes`,
-//     `GET /nodes`, `GET /registry/sandboxes` are answered by this process out
-//     of the scheduler and have already returned before this decision is
-//     reached. Pointing them at the api half would change the cluster-listing
-//     read path, which is a different release with a switch of its own.
+//   - **The gateway's own aggregations over the control plane.**
+//     `GET /nodes` and `GET /registry/sandboxes` are answered by this process
+//     out of the scheduler — the observed-node state and the paused registry —
+//     and have already returned before this decision is reached. The api half
+//     holds neither, so this switch does not move them and no position of it
+//     ever will.
+//
+//     🔴 `GET /sandboxes` and `GET /v2/sandboxes` are *not* in that list, and
+//     used not to be in this one either. They are aggregations over the nodes
+//     rather than over the scheduler, and the api half owns the cluster ledger
+//     they aggregate, so they move with this value: off, the fan-out in
+//     cluster_list.go answers them out of every node; on, they are forwarded
+//     here like any other REST call. They have to move with it rather than on
+//     a switch of their own — 阶段 3b answers both of those routes with 404 on
+//     a node, and the fan-out is all-or-nothing.
 
 // restUpstreamTarget labels which upstream served a REST call.
 //

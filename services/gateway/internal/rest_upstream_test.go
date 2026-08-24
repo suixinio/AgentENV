@@ -289,40 +289,33 @@ func TestTheRestUpstreamNeverTakesDataPlaneTraffic(t *testing.T) {
 	}
 }
 
-// The gateway answers some paths itself out of the scheduler. Those are a
-// different read path with a switch of its own, and this one does not move them.
-func TestTheGatewaysOwnAggregationsAreNotSentToTheApiHalf(t *testing.T) {
-	for _, path := range []string{"/v2/sandboxes", "/sandboxes", "/nodes"} {
-		t.Run(path, func(t *testing.T) {
-			api := newRecordingUpstream(t)
-			// One counter for two different RPCs: the cluster listing walks the
-			// nodes the scheduler knows, the node listing reads the observed
-			// ones. Which of them answered is not this test's subject — that
-			// the gateway answered at all is.
-			answeredHere := 0
-			scheduler := stubSchedulerClient{
-				listNodesFunc: func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-					answeredHere++
-					return &schedulerv1.ListNodesResponse{}, nil
-				},
-				listObservedFunc: func(context.Context, *schedulerv1.ListObservedNodesRequest, ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error) {
-					answeredHere++
-					return &schedulerv1.ListObservedNodesResponse{}, nil
-				},
-			}
+// The gateway answers `/nodes` out of the scheduler's observed-node state, which
+// no position of this switch moves: the api half does not hold it.
+//
+// 🔴 The sandbox listings used to be asserted here alongside it and are not any
+// more — they aggregate the *nodes*, not the scheduler, and the api half owns
+// the ledger they aggregate, so they move with this value. Their two positions
+// are in TestTheRestUpstreamSwitchDecidesWhoAnswersTheClusterSandboxList.
+func TestTheGatewaysSchedulerAggregationsAreNotSentToTheApiHalf(t *testing.T) {
+	api := newRecordingUpstream(t)
+	answeredHere := 0
+	scheduler := stubSchedulerClient{
+		listObservedFunc: func(context.Context, *schedulerv1.ListObservedNodesRequest, ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error) {
+			answeredHere++
+			return &schedulerv1.ListObservedNodesResponse{}, nil
+		},
+	}
 
-			server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withRestUpstream(api.server.URL))
-			resp := serve(t, server, httptest.NewRequest(http.MethodGet, path, nil))
-			defer resp.Body.Close()
+	server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withRestUpstream(api.server.URL))
+	resp := serve(t, server, httptest.NewRequest(http.MethodGet, "/nodes", nil))
+	defer resp.Body.Close()
 
-			if api.hits() != 0 {
-				t.Fatalf("api hits = %d, want 0: %s is answered by the gateway itself", api.hits(), path)
-			}
-			if answeredHere == 0 {
-				t.Fatalf("%s did not reach the gateway's own aggregation either; this test is "+
-					"asserting an absence with nothing to compare it against", path)
-			}
-		})
+	if api.hits() != 0 {
+		t.Fatalf("api hits = %d, want 0: /nodes is answered by the gateway itself", api.hits())
+	}
+	if answeredHere == 0 {
+		t.Fatal("/nodes did not reach the gateway's own aggregation either; this test is " +
+			"asserting an absence with nothing to compare it against")
 	}
 }
 

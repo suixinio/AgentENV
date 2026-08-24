@@ -68,7 +68,7 @@ pub(crate) const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 ///   when it builds the cluster-wide list. That fan-out uses the gateway's own
 ///   HTTP client, not the reverse proxy, so it never passes through the hook
 ///   that stamps the credential — and the endpoint is all-or-nothing, so one
-///   refusal turns the whole cluster listing into a 502.
+///   refusal turns the whole cluster listing into that refusal's own status.
 ///
 /// ⚠️ Only the reads are exempt. `POST /sandboxes` creates a sandbox and stays
 /// behind the gate.
@@ -76,16 +76,27 @@ pub(crate) const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 /// 🔴 **The `/sandboxes` half is dead code on a `--role node` process, and
 /// deleting it is still not this batch's job.** [`super::role_gate`] runs ahead
 /// of this gate and answers both listing routes with 404 there, so the fan-out
-/// this exemption exists for gets 404s from such a node and the cluster listing
-/// — which is all-or-nothing — becomes a 502. That is the intended end state
-/// (`_sd-impl-phase3-role.md` §7.4: after phase 2 the listing is one query
-/// against the catalog and the fan-out goes away), but the order is fixed and
-/// runs the other way: **stop the fan-out first, delete this exemption second**.
-/// Deleting it while `services/gateway/internal/cluster_list.go` still calls
-/// `fetchNodeClusterList` — which it does today — turns every one of those calls
-/// into a 403 on nodes that are still `--role all`, which is the same outage a
-/// release earlier. `a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts`
+/// this exemption exists for gets 404s from such a node — and because the
+/// listing is all-or-nothing and `handleClusterList` passes a 4xx through
+/// verbatim, the user's `GET /sandboxes` is that 404, not a 502. That is the
+/// intended end state (`_sd-impl-phase3-role.md` §7.4: after phase 2 the
+/// listing is one query against the catalog and the fan-out goes away), but the
+/// order is fixed and runs the other way: **stop the fan-out first, delete this
+/// exemption second**. Deleting it while
+/// `services/gateway/internal/cluster_list.go` can still call
+/// `fetchNodeClusterList` turns every one of those calls into a 403 on nodes
+/// that are still `--role all`, which is the same outage a release earlier.
+/// `a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts`
 /// holds both halves of that in one place.
+///
+/// 🔴 The gateway now *skips* that fan-out whenever `rest_upstream_addr` is set,
+/// forwarding both listing routes to the api half instead
+/// (`Server.fansOutClusterList`). That is not the same thing as the fan-out
+/// being gone, and it is not yet licence to delete this: the empty value is the
+/// documented rollback position, and in it the fan-out runs exactly as before
+/// and needs this exemption on every `--role all` node. What retires this
+/// exemption is deleting `fetchNodeClusterList` — the off position ceasing to
+/// exist — not any deployment happening to have the switch on.
 fn is_exempt(method: &Method, path: &str) -> bool {
     if path == "/health" {
         return true;

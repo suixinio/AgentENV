@@ -278,16 +278,20 @@ mod tests {
     /// `GET /v2/sandboxes` through without a credential because the gateway
     /// fans out to every node with its own HTTP client to build the cluster
     /// -wide list. The role gate runs *first* and refuses both on a node, so on
-    /// a `--role node` fleet that fan-out gets 404s and the listing — which is
-    /// all-or-nothing — turns into a 502.
+    /// a `--role node` fleet that fan-out gets the 404s below — and since the
+    /// listing is all-or-nothing and the gateway passes a 4xx through verbatim,
+    /// the user's `GET /sandboxes` is that same 404.
     ///
     /// That is intended (`_sd-impl-phase3-role.md` §7.4: after phase 2 the list
     /// is one SQL query and the fan-out goes away), and the exemption is left in
     /// place until the fan-out is deleted, in that order — deleting the
-    /// exemption first would 403 a fan-out that is still running. This test is
-    /// not a preference about either; it is here so that whoever flips a
+    /// exemption first would 403 a fan-out that is still running. The gateway
+    /// now skips the fan-out whenever `rest_upstream_addr` is set, which is what
+    /// keeps a `--role node` fleet answering this route at all; the empty value
+    /// still fans out, so these 404s are what that rollback position costs. This
+    /// test is not a preference about either; it is here so that whoever flips a
     /// DaemonSet to `--role node` learns this from a test name rather than from
-    /// a 502.
+    /// a 404 on the first listing.
     #[tokio::test]
     async fn a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts() {
         for path in ["/sandboxes", "/v2/sandboxes"] {
@@ -385,7 +389,9 @@ mod tests {
 
     /// T-A4-7. 🔴 The cluster listing is a fan-out the gateway makes with its
     /// own client, so it never carries the credential — and it is
-    /// all-or-nothing, so one refusal is a 502 for the whole cluster.
+    /// all-or-nothing, so one node's refusal is the whole cluster's answer: the
+    /// gateway passes a 4xx from any node through verbatim, so a 403 here would
+    /// be a 403 on the user's listing.
     ///
     /// The second half is the control group: without it, exempting the entire
     /// `/sandboxes` prefix would pass.

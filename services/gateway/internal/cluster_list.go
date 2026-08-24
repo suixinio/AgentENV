@@ -72,6 +72,33 @@ func isClusterListRequest(r *http.Request) bool {
 	}
 }
 
+// fansOutClusterList reports whether this gateway still builds the cluster-wide
+// sandbox listing itself, by asking every node for its own rows.
+//
+// 🔴 One value decides it, and it is the same value that decides every other
+// user-facing REST call: `rest_upstream_addr`. Unset, this fan-out is the only
+// thing in the cluster that can answer `GET /sandboxes` — no single process
+// holds every node's sandboxes — so it stays exactly as it was, down to the
+// merge, the deduplication and the pagination below. Set, the api half owns the
+// cluster ledger and answers the same list from one read, so a cluster-list
+// request is claimed by nothing here and falls through to
+// `forwardToRestUpstream` with the rest of the REST surface.
+//
+// 🔴 Why the listing moves with that value rather than getting a switch of its
+// own. 阶段 3b flips the DaemonSet to `--role node`, and the role gate answers
+// `GET /sandboxes` and `GET /v2/sandboxes` with 404 there — those are exactly
+// the two routes this fan-out calls. The fan-out is all-or-nothing
+// (`fetchClusterList` cancels the rest on the first failure) and
+// `handleClusterList` passes a 4xx through verbatim, so a node fleet on
+// `--role node` turns the user's `GET /sandboxes` into a bare 404 rather than
+// into a degraded list. A separate switch would mean 3b's correctness depended
+// on two values being flipped in the right order; with one, the position that
+// takes REST off the nodes is the position that stops asking nodes for this
+// list, and emptying it puts both back together.
+func (s *Server) fansOutClusterList(r *http.Request) bool {
+	return isClusterListRequest(r) && s.restUpstream == ""
+}
+
 func canonicalClusterListPath(path string) string {
 	trimmed := strings.TrimRight(strings.TrimSpace(path), "/")
 	if trimmed == "" {

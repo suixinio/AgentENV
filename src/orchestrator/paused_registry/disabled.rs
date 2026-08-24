@@ -87,6 +87,7 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         &self,
         _sandbox_id: &SandboxId,
         _node_id: &str,
+        _holder_node_id: &str,
         _execution_id: ExecutionId,
         _expires_at: Option<std::time::SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {

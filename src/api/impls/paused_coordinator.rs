@@ -667,8 +667,20 @@ impl PausedSandboxCoordinator {
     /// restore — because both end with a sandbox the registry still describes
     /// as parked somewhere else being live on some machine again.
     ///
-    /// `holding_node_id` is that machine, as read off the backend that just
-    /// started it — see [`SandboxBackend::holding_node_id`][crate::sandbox::SandboxBackend::holding_node_id].
+    /// # 🔴 Two identities out, one `self.node_id` used only once
+    ///
+    /// The registry write takes a claimant and a holder — see
+    /// [`PausedSandboxRegistry::mark_running`]'s doc for why they must never be
+    /// the same *parameter*, only sometimes the same *value*. The claimant is
+    /// always `self.node_id`, unconditionally: it is the CAS guard, and it must
+    /// be the exact identity `ApiImpl::arbitrate_resume` claimed under for this
+    /// resume, which is that method's own `self.paused.node_id()` — never a
+    /// value read out of shared state, for the same reason arbitration's
+    /// self-comparison needs a process-unique identity.
+    ///
+    /// `holding_node_id` is the holder — that machine, as read off the backend
+    /// that just started it, see
+    /// [`SandboxBackend::holding_node_id`][crate::sandbox::SandboxBackend::holding_node_id].
     /// `None` covers every backend that runs the VM in this same process,
     /// which is the correct, common answer and the reason the fallback below
     /// is silent rather than a warning: on the roles this holds for, `None` is
@@ -680,9 +692,13 @@ impl PausedSandboxCoordinator {
     ///
     /// A confirmed write is also what enrols the sandbox in
     /// [`running_registration`](Self::running_registration) — under the
-    /// identity the row was actually written with, because that identity, not
-    /// this process's own, is what reconciliation later compares the row
-    /// against. Only a confirmed write does: an unacknowledged one is no
+    /// **holder**, not the claimant. `origin_node_id` is what the row now
+    /// holds and what reconciliation (`running_supersession`) later compares a
+    /// registration against; recording the claimant there would make every
+    /// reconciliation pass on a cross-node resume read `entry.origin_node_id
+    /// != registered_as` as true and tear the sandbox down as "held
+    /// elsewhere" — the opposite of the fix this exists to make durable. Only
+    /// a confirmed write registers anything: an unacknowledged one is no
     /// evidence that the row says what was just written, and reconciliation
     /// acts on that evidence. A refusal or an error leaves any earlier
     /// confirmation standing — it remains true that the cluster once named
@@ -698,11 +714,17 @@ impl PausedSandboxCoordinator {
         // Before the write: see `note_taking_sandbox_live`.
         self.note_taking_sandbox_live().await;
 
-        let node_id = holding_node_id.unwrap_or_else(|| self.node_id.clone());
+        let holder = holding_node_id.unwrap_or_else(|| self.node_id.clone());
 
         let confirmed = match self
             .registry
-            .mark_running(&sandbox_id, &node_id, execution_id, expires_at)
+            .mark_running(
+                &sandbox_id,
+                &self.node_id,
+                &holder,
+                execution_id,
+                expires_at,
+            )
             .await
         {
             Ok(MarkRunningOutcome::HeldElsewhere) => {
@@ -735,7 +757,7 @@ impl PausedSandboxCoordinator {
         };
 
         self.running_registrations
-            .observe(sandbox_id, &node_id, confirmed);
+            .observe(sandbox_id, &holder, confirmed);
     }
 
     /// The identity this node was confirmed as the holder of `sandbox_id`
@@ -1491,26 +1513,56 @@ mod tests {
             Ok(ReclaimedHoldings::default())
         }
 
+        /// Mirrors `markRunningFencedSQL`'s three branches closely enough to
+        /// give the guard/write split real discriminating power in a Rust
+        /// test: `node_id` (claimant) gates every branch exactly as the real
+        /// guard does, `holder_node_id` only ever lands in `origin_node_id`
+        /// (branch ③ excepted, matching the real statement — see that
+        /// statement's own note on why). A fake that always adopted, the way
+        /// this one did before, cannot fail the way a0487f0 failed: quoting
+        /// the holder where the claimant belongs would still succeed here,
+        /// which is exactly the shape of bug this exists to catch.
         async fn mark_running(
             &self,
             sandbox_id: &SandboxId,
             node_id: &str,
+            holder_node_id: &str,
             _execution_id: ExecutionId,
             _expires_at: Option<SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {
-            // Mirrors `markRunningFencedSQL`: `origin_node_id = $2`, and never
-            // creates a row a pause did not already leave behind.
             let mut rows = self.rows.lock().unwrap();
-            match rows.get_mut(sandbox_id) {
-                Some(row) => {
-                    row.origin_node_id = node_id.to_string();
-                    row.claimed_by_node_id = None;
-                    row.state = PausedRegistryState::Running;
+            let Some(row) = rows.get_mut(sandbox_id) else {
+                return Ok(MarkRunningOutcome::Untracked);
+            };
 
-                    Ok(MarkRunningOutcome::Adopted)
+            let eligible = match row.state {
+                // ① cross-node: this write's claimant must be the one the
+                // claim was taken under.
+                PausedRegistryState::Resuming => row.claimed_by_node_id.as_deref() == Some(node_id),
+                // ② local reopen: no claim was ever taken, so the claimant
+                // must already be the row's origin.
+                PausedRegistryState::Paused
+                | PausedRegistryState::Publishing
+                | PausedRegistryState::LocalOnly => {
+                    row.origin_node_id == node_id && row.claimed_by_node_id.is_none()
                 }
-                None => Ok(MarkRunningOutcome::Untracked),
+                // ③ a retried write: compared against the holder, since that
+                // is what branch ① or ② already wrote into origin_node_id —
+                // see markRunningFencedSQL's note on why this is the one
+                // branch that reads holder_node_id instead of node_id.
+                PausedRegistryState::Running => row.origin_node_id == holder_node_id,
+            };
+
+            if !eligible {
+                return Ok(MarkRunningOutcome::HeldElsewhere);
             }
+
+            row.origin_node_id = holder_node_id.to_string();
+            row.claimed_by_node_id = None;
+            row.state = PausedRegistryState::Running;
+            row.generation += 1;
+
+            Ok(MarkRunningOutcome::Adopted)
         }
 
         async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
@@ -2103,7 +2155,16 @@ mod tests {
     /// `mark_sandbox_running` never had a place to receive the real machine at
     /// all. What pins it here is the row: a build that quietly went back to
     /// writing `&self.node_id` compiles and passes every other test in this
-    /// file, and only fails the two assertions below.
+    /// file, and only fails the assertions below.
+    ///
+    /// 🔴 Also pins a0487f0's failure mode, from the opposite direction: a
+    /// build that sends the *holder* where `mark_sandbox_running` must send
+    /// the claimant (`self.node_id`) has `RecordingRegistry`'s guard refuse
+    /// the write outright — `origin_node_id` stays whatever `publish` left it
+    /// at, state never reaches `running`, generation never moves, and
+    /// `claimed_by_node_id` is never cleared. `origin_node_id` alone cannot
+    /// tell that apart from a healthy write that happens to land on the same
+    /// value; the conjunction below can.
     #[tokio::test]
     async fn a_resumed_row_names_the_machine_that_ran_it_not_the_replica_that_wrote_it() {
         let registry = Arc::new(RecordingRegistry::default());
@@ -2120,6 +2181,14 @@ mod tests {
         coordinator
             .publish(pause_outcome(resumed_here, true, None))
             .await;
+
+        // Captured before mark_running, so the conjunction below can tell "the
+        // generation actually moved" apart from "the row happens to already
+        // look like this".
+        let generation_before = registry
+            .row(&resumed_elsewhere)
+            .expect("publish left a row behind")
+            .generation;
 
         // `--role api`: the resume claim landed on a machine, and the backend
         // that drove it knows which one.
@@ -2144,9 +2213,32 @@ mod tests {
             .row(&resumed_here)
             .expect("mark_running updates the row a pause left behind");
 
+        // 🔴 Four assertions in conjunction, not one. A write the registry
+        // *refused* — exactly a0487f0's shape, guard compared against the
+        // wrong identity — also leaves an inspectable row behind: whatever
+        // `publish` wrote is still sitting there, generation untouched. Only
+        // `origin_node_id` alone cannot tell "adopted, and correctly" apart
+        // from "refused, and the row is unchanged" — state, generation and
+        // claimed_by_node_id have to move too, or this test would pass on a
+        // build that silently dropped every mark_running on the floor.
+        assert_eq!(
+            remote_row.state,
+            PausedRegistryState::Running,
+            "a refused write leaves the row in whatever state publish left it, never running"
+        );
+        assert_eq!(
+            remote_row.generation,
+            generation_before + 1,
+            "the write must have actually landed, not merely left the row looking unchanged"
+        );
         assert_eq!(
             remote_row.origin_node_id, "node-203",
             "the row must name the machine the VM actually started on"
+        );
+        assert!(
+            remote_row.claimed_by_node_id.is_none(),
+            "an adopted write clears the claim; a lingering claimed_by_node_id is the row a \
+             refused mark_running leaves behind, still 'resuming'-shaped"
         );
         assert_ne!(
             remote_row.origin_node_id, THIS_REPLICA,
@@ -2519,6 +2611,7 @@ pub(super) mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _node_id: &str,
+            _holder_node_id: &str,
             _execution_id: ExecutionId,
             _expires_at: Option<std::time::SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {

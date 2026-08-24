@@ -195,23 +195,25 @@ impl ApiImpl {
         // whenever the answer comes back.
         self.paused.note_taking_sandbox_live().await;
 
-        // 🔴 The machine this resume will actually run on, when that is already
-        // knowable — and it is, whenever this process still holds a local
-        // record naming where the capture is: `RemoteSandboxStub::reopen`
-        // refuses to land anywhere but that machine, so the claim can name it
-        // before the work even starts rather than only after `mark_running`
-        // learns it. A cross-node rebuild has no such record yet — nothing has
-        // placed it — and falls back to this process's own identity, exactly
-        // as `mark_running` does once placement resolves the value it could
-        // not have here. See `Orchestrator::paused_origin_node_id` for why
-        // that fallback, not an error, is the right answer for a claim the
-        // cluster still has to grant regardless.
-        let self_id = self.paused.node_id();
-        let claimant = self
-            .orchestrator
-            .paused_origin_node_id(&sandbox_id)
-            .await
-            .unwrap_or_else(|| self_id.to_string());
+        // 🔴 Always this process's own identity, and deliberately never the
+        // real machine `Orchestrator::paused_origin_node_id` can sometimes
+        // name up front. `claimed_by_node_id` exists for mutual exclusion and
+        // self-recognition (`arbitration`'s "is this answer naming *me*"
+        // check below), and both of those require an identity unique to *this
+        // deciding process* — a value read out of shared cluster state fails
+        // that: two different api replicas resuming the same sandbox can read
+        // the identical "real machine" hint from the same shared record, both
+        // claim under it, and the loser's self-comparison would then read the
+        // winner's claim as its own. A process's own identity cannot collide
+        // that way.
+        //
+        // This was briefly the real machine (a0487f0), which is also what made
+        // `mark_running`'s guard reject the claim it was supposed to confirm:
+        // the row's `claimed_by_node_id` named this process, but the write
+        // quoted the real machine instead. Reverted for that reason — see
+        // `PausedSandboxCoordinator::mark_sandbox_running` for how the real
+        // machine still reaches `origin_node_id`, just not through here.
+        let claimant = self.paused.node_id().to_string();
 
         let claim = match self
             .paused
@@ -238,11 +240,11 @@ impl ApiImpl {
             }
         };
 
-        // 🔴 The same identity the claim was just taken under, not
-        // `self.paused.node_id()` again: an answer naming *this claim's own
-        // claimant* is not a refusal (see `arbitration`'s doc), and the two
-        // have to agree or a node resuming its own sandbox — the case that
-        // matters most here — would read its own claim as somebody else's.
+        // The same identity the claim was just taken under: an answer naming
+        // *this claim's own claimant* is not a refusal (see `arbitration`'s
+        // doc), and the two have to agree or a node resuming its own sandbox
+        // — the case that matters most here — would read its own claim as
+        // somebody else's.
         arbitration(claim, &claimant, proposed)
     }
 
@@ -1650,71 +1652,33 @@ mod tests {
         ))
     }
 
-    /// 🔴 The claim `arbitrate_resume` takes has to name the machine this
-    /// resume will actually run on, when that machine is already on record —
-    /// not this replica's own identity. On the api half "this replica" is a
-    /// Pod that never heartbeats as a node, and a claim naming it pins the
-    /// `resuming` row to an identity the scheduler can never resolve for as
-    /// long as the resume takes.
+    /// 🔴 The regression guard for the double-live risk found while
+    /// reviewing a0487f0's own claimant change (reverted above), not a
+    /// hypothetical.
     ///
-    /// 🔴 What pins this: reverting the claimant back to `self.paused.node_id()`
-    /// compiles, and every other test in this file still passes — they never
-    /// seed a store that can answer `Remote`. Only this test, and the ones
-    /// paired with it below, would notice.
-    #[tokio::test]
-    async fn a_claim_names_the_machine_the_capture_already_points_at() {
-        let store = RemoteOriginStore::new();
-        let sandbox_id = SandboxId::new();
-        store.name_remote_origin(sandbox_id, Some("node-203"));
-        let registry = Arc::new(CountingRegistry::new(0, false));
-        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
-
-        api.arbitrate_resume(sandbox_id).await;
-
-        assert_eq!(
-            registry.claimed_as(),
-            vec!["node-203".to_string()],
-            "the claim must name the machine the capture already points at"
-        );
-        assert_ne!(
-            registry.claimed_as(),
-            vec![api.paused.node_id().to_string()],
-            "this replica's own identity is not a machine the scheduler can ever resolve"
-        );
-    }
-
-    /// The control for the test above: a sandbox this store has never heard of
-    /// has no machine to name yet, and the claim falls back to this process's
-    /// own identity — exactly today's behaviour, unchanged.
-    #[tokio::test]
-    async fn a_claim_with_no_known_origin_falls_back_to_this_process() {
-        let store = RemoteOriginStore::new();
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(CountingRegistry::new(0, false));
-        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
-
-        api.arbitrate_resume(sandbox_id).await;
-
-        assert_eq!(
-            registry.claimed_as(),
-            vec![api.paused.node_id().to_string()]
-        );
-    }
-
-    /// 🔴 The claimant written to the registry and the identity `arbitration`
-    /// checks the registry's answer against have to be the *same* value, or a
-    /// node resuming its own claim reads its own answer as somebody else's.
+    /// a0487f0 claimed under `Orchestrator::paused_origin_node_id` when a
+    /// store could name the sandbox's real machine — "node-203" here, exactly
+    /// what a store shared across api replicas (Redis, or any backend that
+    /// serialises and reads records back rather than keeping live handles)
+    /// answers identically to *every* replica that asks, because it is
+    /// cluster state, not process state. Two different api replicas racing to
+    /// resume the same sandbox would then both compute the identical
+    /// claimant and both call `claim_for_resume("node-203", ...)`; the loser
+    /// reads back `Conflict{origin_node_id: "node-203"}`, compares it against
+    /// its own claimant — also "node-203" — and `arbitration`'s "is this
+    /// naming me" check reads that as `Proceed`, exactly as it must for the
+    /// winner. Both replicas go on to resume the same sandbox.
     ///
-    /// `NotFound` — what the two tests above exercise — never reaches that
-    /// comparison; only `Conflict`/`NotReady` do, which is why this test
-    /// configures the registry to answer with one, naming the same machine the
-    /// store already pointed the claim at. If `arbitrate_resume` claimed under
-    /// that machine but then compared the answer against this replica's own
-    /// identity instead, "node-203 == node-203" would read as
-    /// "node-203 == api-replica-1" — false — and a node resuming a sandbox its
-    /// own earlier claim already owns would refuse itself as `Blocked`.
+    /// The registry here answers every claim with `Conflict{"node-203"}` —
+    /// the shape either replica's *own* claim, or the other replica's claim
+    /// taken under the same shared hint, looks like from this side. The only
+    /// thing that can tell them apart is whether this call's own claimant is
+    /// "node-203" too. It must not be: `self.paused.node_id()` is this
+    /// process's own identity, unique to this deciding process, however many
+    /// other replicas the shared store answers "node-203" to.
     #[tokio::test]
-    async fn the_claim_and_the_answer_are_checked_against_the_same_identity() {
+    async fn two_replicas_reading_the_same_origin_hint_do_not_mistake_each_others_claim_for_their_own(
+    ) {
         let store = RemoteOriginStore::new();
         let sandbox_id = SandboxId::new();
         store.name_remote_origin(sandbox_id, Some("node-203"));
@@ -1724,8 +1688,89 @@ mod tests {
         let arbitration = api.arbitrate_resume(sandbox_id).await;
 
         assert!(
+            matches!(arbitration, ResumeArbitration::Blocked { .. }),
+            "a conflict naming the shared origin hint must block this replica, not read as \
+             its own claim — proceeding here is the double-live bug"
+        );
+        assert_eq!(
+            registry.claimed_as(),
+            vec![api.paused.node_id().to_string()],
+            "the claim itself must be taken under this process's own identity, never the \
+             shared origin hint — quoting the hint here is what makes the misjudgement above \
+             possible in the first place"
+        );
+        assert_ne!(
+            registry.claimed_as(),
+            vec!["node-203".to_string()],
+            "control: the claimant must not equal the shared hint this store also answers to \
+             every other replica"
+        );
+    }
+
+    /// Every claim — with a known real-machine hint on record, or none at all
+    /// — is taken under this process's own identity. `RemoteOriginStore`'s two
+    /// states (a chosen sandbox names a machine, everything else answers
+    /// `NotPaused`) are exercised together so a build that claims under the
+    /// hint in one case but not the other has nowhere to hide.
+    #[tokio::test]
+    async fn a_claim_is_always_taken_under_this_process_never_the_shared_origin_hint() {
+        let store = RemoteOriginStore::new();
+        let named = SandboxId::new();
+        let unnamed = SandboxId::new();
+        store.name_remote_origin(named, Some("node-203"));
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
+
+        api.arbitrate_resume(named).await;
+        api.arbitrate_resume(unnamed).await;
+
+        assert_eq!(
+            registry.claimed_as(),
+            vec![
+                api.paused.node_id().to_string(),
+                api.paused.node_id().to_string(),
+            ],
+            "both claims — one for a sandbox whose real machine is on record, one for a \
+             sandbox nobody has heard of — must name this process, and only this process"
+        );
+    }
+
+    /// The self-comparison in `arbitration` must still recognise this
+    /// process's *own* earlier claim: `Conflict`/`NotReady` naming
+    /// `self.paused.node_id()` itself is not a refusal. `NotFound` — what the
+    /// tests above exercise — never reaches that comparison, so this
+    /// configures the registry to answer a conflict directly, naming exactly
+    /// the identity a claim from this same process is taken under.
+    #[tokio::test]
+    async fn a_conflict_naming_this_process_own_identity_is_not_a_refusal() {
+        // One throwaway instance just to learn this test's own node identity —
+        // deterministic (hostname-derived, see NodeIdentity::from_config), so
+        // reusing it to program the registry below is exact, not a guess.
+        let self_id = api_with_remote_origin(
+            RemoteOriginStore::new(),
+            Arc::new(CountingRegistry::new(0, false)),
+        )
+        .await
+        .paused
+        .node_id()
+        .to_string();
+
+        let store = RemoteOriginStore::new();
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(CountingRegistry::answering_conflict(&self_id));
+        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
+        assert_eq!(
+            api.paused.node_id(),
+            self_id,
+            "sanity: same process identity"
+        );
+
+        let arbitration = api.arbitrate_resume(sandbox_id).await;
+
+        assert!(
             matches!(arbitration, ResumeArbitration::Proceed(_)),
-            "a conflict naming the same machine the claim was just taken under is not a refusal"
+            "a conflict naming this process's own identity is this process's own claim, not \
+             a refusal"
         );
     }
 

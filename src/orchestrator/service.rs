@@ -1557,17 +1557,30 @@ where
     /// The real machine a paused sandbox will reopen on, when that machine is
     /// already knowable — before anything has tried to resume it.
     ///
-    /// # 🔴 What this exists for
+    /// # 🔴 Read-only. Never a claimant, never a self-comparison
     ///
-    /// A cross-node resume claim has to name a claimant before it knows where
-    /// the resume will land, and on the api half "where" is not this process:
-    /// this process only decides, it never runs a VM. For a sandbox whose
-    /// capture this store still points at a specific machine, though, the
-    /// answer is not a guess — [`RemoteSandboxStub::reopen`] refuses to land
-    /// anywhere but that machine — so the claim can name it up front instead
-    /// of quoting this process's own identity and leaving the row briefly
-    /// wrong. See `mark_running`'s sibling fix for the other half of the same
-    /// question, asked after placement instead of before it.
+    /// It is tempting to use this as the identity a cross-node resume claims
+    /// under, so that `claimed_by_node_id` names the real machine instead of
+    /// this process's own pod identity while a resume is in flight. a0487f0 tried
+    /// exactly that and it is wrong twice over. First, mechanically: the
+    /// claim's identity is also `mark_running`'s CAS guard, and quoting the
+    /// real machine there while `mark_running` still had to name it *after*
+    /// placement made every claim this method could answer fail its own
+    /// confirmation. Second, and the reason this stays read-only even now
+    /// that the guard is fixed: this value comes from *shared* cluster state,
+    /// not from this process. Two different api replicas resuming the same
+    /// sandbox concurrently can both read the identical answer here, both
+    /// claim under it, and the loser's "is this claim mine" self-comparison
+    /// (`arbitration`'s doc) would then read the winner's claim as its own —
+    /// a value has to be unique to the *deciding process* to stand in for
+    /// "was this decided by me", and this one is not. `self.paused.node_id()`
+    /// is; use that for any claim or self-comparison, always.
+    ///
+    /// So: read-only, and specifically for a caller with no better answer for
+    /// *where a sandbox will end up running* — the one shape that is safe is
+    /// [`PausedSandboxPublisher::mark_running`]'s `holding_node_id`, which
+    /// only ever lands in `origin_node_id`, a plain write with no comparison
+    /// anywhere near it.
     ///
     /// # 🔴 Why `paused_handle`, not `SandboxMetadata::paused_state`
     ///

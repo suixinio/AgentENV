@@ -227,7 +227,30 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// Only when nobody has renewed for a full lease does the cluster step in.
     async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings>;
 
-    /// Records that the sandbox is live on `node_id` again.
+    /// Records that the sandbox is live again, brought up by `node_id` and
+    /// physically running on `holder_node_id`.
+    ///
+    /// # 🔴 Two identities, two jobs, never swapped
+    ///
+    /// `node_id` is the CAS guard: it must be the exact identity
+    /// [`claim_for_resume`](Self::claim_for_resume) was called with for this
+    /// resume (or, on the local-reopen path where no claim was taken, this
+    /// process's own identity — see that method's implementations). It is
+    /// compared against the row, never written anywhere but the predicate.
+    ///
+    /// `holder_node_id` is the opposite: a plain write, participating in no
+    /// comparison at all. It becomes `origin_node_id`, which is what every
+    /// later lookup, heartbeat comparison and reconciliation pass judges the
+    /// row against — so it must be the real machine the sandbox is running
+    /// on, which on an api replica is never `node_id` (a pod identity the
+    /// scheduler's heartbeats do not track).
+    ///
+    /// Passing the same value for both is correct and is what every backend
+    /// that runs its own sandboxes does — `node_id` already names the real
+    /// machine there. Passing `holder_node_id` where `node_id` belongs is the
+    /// mistake a0487f0 made: it turned the CAS guard into a comparison against a
+    /// value [`claim_for_resume`](Self::claim_for_resume) never wrote, so
+    /// every cross-node `mark_running` matched zero rows.
     ///
     /// The row survives the resume rather than being deleted, still naming the
     /// snapshot it came back from. Two things depend on that: losing `node_id`
@@ -238,7 +261,7 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// Never creates a row — a sandbox the cluster does not already track stays
     /// untracked.
     ///
-    /// Returns whether a row now names `node_id` as the holder. `false` covers
+    /// Returns whether a row now names this write's holder. `false` covers
     /// both "the cluster does not track this sandbox" and "someone else holds
     /// the claim", and the caller must not treat the registry as having
     /// anything to say about the sandbox in either case: reconciliation reads
@@ -253,6 +276,7 @@ pub trait PausedSandboxRegistry: Send + Sync {
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        holder_node_id: &str,
         execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome>;

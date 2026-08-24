@@ -377,6 +377,7 @@ impl CentralPausedSandboxRegistry {
             snapshot_id,
             execution_id,
             None,
+            None,
         )
         .await
     }
@@ -398,6 +399,13 @@ impl CentralPausedSandboxRegistry {
         // the client: "which run is writing" is a property of the write.
         execution_id: Option<ExecutionId>,
         sandbox_expires_at_unix_micros: Option<i64>,
+        // mark_running only: the real machine the sandbox is running on,
+        // written into `origin_node_id` and never compared against anything.
+        // `node_id` above stays the CAS guard. `None` on every other kind, and
+        // on an older controller that has never heard of the field this is
+        // simply absent — which the controller reads as "same as node_id",
+        // its own pre-split behaviour.
+        holder_node_id: Option<&str>,
     ) -> RegistryResult<pb::TransitionSandboxResponse> {
         // 🔴 The lease travels with every transition that stamps one, which is
         // all of them but `remove`: a row that is being deleted has no lease
@@ -422,6 +430,7 @@ impl CentralPausedSandboxRegistry {
                 snapshot_id,
                 sandbox_expires_at_unix_micros,
                 execution_id: execution_id.map(|id| id.to_string()).unwrap_or_default(),
+                holder_node_id: holder_node_id.unwrap_or_default().to_string(),
             }))
             .await
             .map_err(|status| {
@@ -785,6 +794,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
+        holder_node_id: &str,
         execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {
@@ -799,6 +809,7 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
                 String::new(),
                 Some(execution_id),
                 expires_at.map(micros_since_epoch),
+                Some(holder_node_id),
             )
             .await?;
 
@@ -1735,7 +1746,7 @@ mod tests {
             .unwrap();
         harness
             .registry
-            .mark_running(&sandbox_id, OTHER, ExecutionId::new(), None)
+            .mark_running(&sandbox_id, OTHER, OTHER, ExecutionId::new(), None)
             .await
             .unwrap();
         harness
@@ -1806,7 +1817,7 @@ mod tests {
             .unwrap();
         harness
             .registry
-            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+            .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
             .await
             .unwrap();
         harness
@@ -2098,7 +2109,7 @@ mod tests {
             assert_eq!(
                 harness
                     .registry
-                    .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+                    .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
                     .await
                     .unwrap(),
                 expected
@@ -2121,7 +2132,7 @@ mod tests {
 
         harness
             .registry
-            .mark_running(&sandbox_id, NODE, ExecutionId::new(), Some(deadline))
+            .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), Some(deadline))
             .await
             .expect("mark running");
 
@@ -2137,7 +2148,7 @@ mod tests {
         // first alone forever. A zero here would be a deadline in 1970.
         harness
             .registry
-            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+            .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
             .await
             .expect("mark running");
         let seen = harness.fake.seen_transition.lock().unwrap().clone();
@@ -2183,7 +2194,7 @@ mod tests {
         *harness.fake.transition.lock().unwrap() = Some(Err(Status::aborted("unexpected")));
         let failure = harness
             .registry
-            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+            .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
             .await
             .expect_err("an aborted transition is a failure");
         assert!(
@@ -2210,7 +2221,7 @@ mod tests {
         )));
         let failure = harness
             .registry
-            .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+            .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
             .await
             .expect_err("a refused transition is a failure");
         assert!(
@@ -2425,7 +2436,7 @@ mod tests {
             assert_eq!(
                 harness
                     .registry
-                    .mark_running(&sandbox_id, NODE, ExecutionId::new(), None)
+                    .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
                     .await
                     .unwrap(),
                 expected

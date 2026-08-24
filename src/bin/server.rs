@@ -532,11 +532,22 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
 /// registry and then never renewed them would have other nodes waiting out a
 /// TTL for sandboxes nobody was coming back for.
 ///
-/// 🔴 Not yet here, and each is its own slice: the node gRPC service the API
-/// half drives it through, the RoleGate that stops user-facing REST being
-/// served from this port, and the startup reclaim of host leftovers. Until the
-/// first of those lands, nothing drives this role — see the report on this
-/// batch for what that means for how far it has been exercised.
+/// 🔴 The three slices this comment used to list as missing have all landed,
+/// and each of them is constructed or asserted a few lines below rather than
+/// described here — read the code, not this paragraph:
+///
+/// - the **node gRPC service** the API half drives it through is bound by
+///   `spawn_grpc_surface` before `ApiImpl` takes the snapshot manager, and
+///   returned as `grpc: Some(..)`;
+/// - the **RoleGate** that stops user-facing REST being served from this port
+///   is attached by `server::new(api_impl, role)` (`src/api/role_gate.rs`),
+///   which is what `debug_assert!(!role.serves_user_facing_rest())` is naming;
+/// - the **startup reclaim of host leftovers** already ran, inside
+///   `assemble_node_core`, which is what
+///   `debug_assert!(role.reclaims_host_leftovers_at_startup())` is naming.
+///
+/// So this role is driven, and what it cannot do is now a property of the API
+/// half rather than of this one — see the list on [`assemble_api`].
 async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::Node;
     let core = assemble_node_core(config, role).await?;
@@ -728,11 +739,42 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   holding the capture to reopen it. What is not served is the *published*
 ///   arm: staging a captured snapshot on the node is not wired up, so this half
 ///   sends `publish: false` and a node asked to publish refuses rather than
-///   answering with nothing. Two consequences worth reading twice: **a sandbox
+///   answering with nothing. The consequence worth reading twice: **a sandbox
 ///   paused through this half is resumable only on the machine that paused
-///   it**, so losing that machine loses the sandbox; and deleting a paused
-///   sandbox leaves its capture on the node, because a delete reaches a backend
-///   only through a live handle and a paused sandbox has none.
+///   it**, so losing that machine loses the sandbox.
+///
+///   🔴 This bullet carried a second consequence — that deleting a paused
+///   sandbox left its capture on the node, "because a delete reaches a backend
+///   only through a live handle and a paused sandbox has none". That is no
+///   longer true, and it is retired here rather than silently dropped so it is
+///   not re-derived from the same reasoning. A delete that finds no local
+///   handle now goes through `Orchestrator::absent_handle`, which adopts the
+///   sandbox as an attaching `RemoteSandboxStub`; `attach` places the stub even
+///   when `Describe` answers `NotFound` — which is exactly what a node answers
+///   for a sandbox it is holding paused, because `Describe` reports what is
+///   *live* — so `stop` finds a placed, unpaused stub and sends `Delete`. On
+///   the node, `fenced` reads the incarnation off the record when there is no
+///   live handle, and the delete takes the paused record and its artifacts with
+///   it (`delete_record_and_artifacts`).
+/// - **A snapshot.** `RemoteSandboxStub::snapshot` sends `Checkpoint` and the
+///   node answers `Unimplemented`: *checkpoint is not served yet: staging a
+///   captured snapshot on the node is not wired up*. Same missing piece as the
+///   published arm above, reached from the other direction — a checkpoint's
+///   whole product is the staged snapshot, so there is nothing else the call
+///   could return. The refusal is classified non-terminal, so
+///   `Orchestrator::capture_snapshot` rolls the sandbox back to `Running`
+///   rather than tearing it down: the caller gets an error and keeps the
+///   sandbox. Unlike the two door refusals in this list it is not caught here —
+///   the request goes to the node and the answer comes back.
+/// - **Patching custom extension params.** `PATCH
+///   /sandboxes/{id}/custom-extension-params` answers the caller and the
+///   running sandbox never learns the new value.
+///   `SandboxBackend::update_custom_extension_params` is infallible by
+///   signature — it is an assignment, the hook having already approved the
+///   value — so the stub can only forward it from a spawned task, and the node
+///   answers `Unimplemented` there. The store row is updated, so `GET` reports
+///   the patched value; what does not happen is the node's own copy changing,
+///   and the only account of that is an `error!` line on this Pod.
 /// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
 ///   directly, outside the orchestrator entirely, so a build here would reach
 ///   for `/dev/kvm` in a Pod that has none. It is now refused at the door

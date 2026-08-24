@@ -398,7 +398,29 @@ pub struct SnapshotConfig {
         default = "$AENV_HOME/snapshot-local-cache"
     )]
     pub local_cache_path: PathBuf,
-    #[config(default = "posix_fs")]
+    /// 🔴 Settable from the environment for the reason `paused_registry.backend`
+    /// and `catalog.write`/`catalog.read` are: `deploy/k8s/run.sh` copies
+    /// `config/default.toml` over the cluster's `agentenv-k8s-config` ConfigMap
+    /// on every apply (run.sh:30), so a cluster that said `oss` only in that
+    /// ConfigMap loses it on the next `make k8s-apply`.
+    ///
+    /// And it loses it in the quiet direction. `posix_fs` is a backend that
+    /// starts: the node comes up serving an empty local filesystem while the
+    /// snapshots and templates it used to answer for sit untouched in a bucket
+    /// it no longer looks at. Nothing fails, nothing is logged at `error`, and
+    /// the catalog rows still point at artifacts the process can no longer
+    /// fetch. That is the failure this override exists to remove.
+    ///
+    /// 🔴 Setting this to `oss` is only half of it. `[backend.oss]` — the
+    /// endpoint, bucket and credentials — is *not* reachable from the
+    /// environment (see `no_env_binding_is_declared_where_confique_cannot_read_it`),
+    /// so a cluster that sets this variable and lets the apply take its
+    /// `[backend.oss]` section away does not start at all: both
+    /// `write_generated_overlaybd_global_config` and the repository builder
+    /// stop with "backend.oss config is required when repository_backend =
+    /// oss". Loud, and therefore survivable — but it is not a working cluster,
+    /// and the section still has to reach the node some other way.
+    #[config(default = "posix_fs", env = "AENV_SNAPSHOT_REPOSITORY_BACKEND")]
     pub repository_backend: SnapshotRepositoryBackendKind,
     /// When true, snapshot artifacts are published to and fetched from the P2P
     /// transport after each commit. Has no effect unless `[p2p].enabled` is also true.
@@ -1974,6 +1996,265 @@ mod tests {
                 .backend,
             PausedRegistryBackendKind::Local,
             "the file's value must stand when the environment says nothing"
+        );
+    }
+
+    /// The repository backend a deployment actually runs has to be settable
+    /// from outside the file, for the same reason the paused registry's is: the
+    /// file is overwritten on every apply, and losing this one is silent.
+    ///
+    /// 🔴 The two halves are each other's control and live in one test on
+    /// purpose. "The environment set it to `oss`" proves nothing on its own —
+    /// a loader that ignored the variable and a config that already said `oss`
+    /// are the same observation. What makes it evidence is that the *same*
+    /// file, read in the same test, answers `posix_fs` when the variable is
+    /// unset. Two tests could not say that: the environment variable is
+    /// process-global and nothing else in this crate touches it, so a second
+    /// test setting it would race this one under the default parallel runner.
+    #[test]
+    fn the_snapshot_repository_backend_is_settable_from_the_environment() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bundled = workspace.join("config/default.toml");
+
+        // The control. This is the value the repository ships and the value
+        // every `make k8s-apply` puts back into the cluster ConfigMap.
+        assert_eq!(
+            ConfigManager::new_from_path(&bundled)
+                .expect("load without the override")
+                .config()
+                .snapshot
+                .repository_backend,
+            SnapshotRepositoryBackendKind::PosixFs,
+            "the file's value must stand when the environment says nothing"
+        );
+
+        // Every backend has to be reachable this way, or the one that is not
+        // can only be selected by editing the file the next apply overwrites.
+        for (value, expected) in [
+            ("oss", SnapshotRepositoryBackendKind::Oss),
+            ("posix_fs", SnapshotRepositoryBackendKind::PosixFs),
+        ] {
+            std::env::set_var("AENV_SNAPSHOT_REPOSITORY_BACKEND", value);
+            let overridden = ConfigManager::new_from_path(&bundled);
+            std::env::remove_var("AENV_SNAPSHOT_REPOSITORY_BACKEND");
+
+            assert_eq!(
+                overridden
+                    .unwrap_or_else(|err| panic!("load with backend={value}: {err}"))
+                    .config()
+                    .snapshot
+                    .repository_backend,
+                expected,
+                "AENV_SNAPSHOT_REPOSITORY_BACKEND={value} did not reach the config"
+            );
+        }
+
+        // 🔴 A value nothing recognises stops the node instead of leaving it on
+        // `posix_fs`. The override exists because the backend cannot be chosen
+        // in the ConfigMap the next apply overwrites, and that is worth nothing
+        // if a typo in the replacement is answered by a node that starts
+        // serving an empty local filesystem and says so nowhere.
+        for typo in ["OSS", "oss ", "s3", "object_storage", "posixfs"] {
+            std::env::set_var("AENV_SNAPSHOT_REPOSITORY_BACKEND", typo);
+            let loaded = ConfigManager::new_from_path(&bundled);
+            std::env::remove_var("AENV_SNAPSHOT_REPOSITORY_BACKEND");
+
+            assert!(
+                loaded.is_err(),
+                "backend={typo:?} was accepted; a misspelled backend must not silently leave the \
+                 node on `posix_fs` with a bucket full of snapshots it will never look at"
+            );
+        }
+    }
+
+    /// The three local-disk budgets are per-machine numbers, and the file they
+    /// would otherwise be set in is one file for the whole fleet — and is
+    /// overwritten by every apply. Two of the three are reachable from the
+    /// environment; this pins that they are, and that they are *not* already
+    /// the values being set.
+    #[test]
+    fn the_image_cache_budgets_are_settable_from_the_environment() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bundled = workspace.join("config/default.toml");
+
+        // The control, read from the same file in the same test. The bundled
+        // config's own numbers, which are what an apply restores.
+        let shipped = ConfigManager::new_from_path(&bundled).expect("load without the override");
+        let shipped_capacity = shipped.config().image.cache.capacity_gb;
+        let shipped_remote = shipped.config().image.cache.remote_blocks.max_size_gb;
+
+        // 🔴 The overrides below have to be values the file does not already
+        // carry, or the assertion passes against a loader that ignores the
+        // environment entirely.
+        assert_ne!(
+            shipped_capacity,
+            Some(24),
+            "the shipped capacity is already the value this test overrides to; the override arm \
+             would prove nothing"
+        );
+        assert_ne!(
+            shipped_remote, 12,
+            "the shipped remote-block budget is already the value this test overrides to"
+        );
+
+        std::env::set_var("AENV_IMAGE_CACHE_CAPACITY_GB", "24");
+        std::env::set_var("AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB", "12");
+        let overridden = ConfigManager::new_from_path(&bundled);
+        std::env::remove_var("AENV_IMAGE_CACHE_CAPACITY_GB");
+        std::env::remove_var("AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB");
+
+        let overridden = overridden.expect("load with the budget overrides");
+        assert_eq!(
+            overridden.config().image.cache.capacity_gb,
+            Some(24),
+            "AENV_IMAGE_CACHE_CAPACITY_GB did not reach the config"
+        );
+        assert_eq!(
+            overridden.config().image.cache.remote_blocks.max_size_gb,
+            12,
+            "AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB did not reach the config"
+        );
+
+        // And back to the file's own numbers once the environment is quiet, in
+        // the same test, so "the override worked" cannot be a leaked value.
+        let after = ConfigManager::new_from_path(&bundled).expect("load after the override");
+        assert_eq!(after.config().image.cache.capacity_gb, shipped_capacity);
+        assert_eq!(
+            after.config().image.cache.remote_blocks.max_size_gb,
+            shipped_remote
+        );
+    }
+
+    /// Every struct named in this file, by name, with its body.
+    fn struct_bodies(source: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut rest = source;
+        while let Some(at) = rest.find("\npub struct ") {
+            let after = &rest[at + "\npub struct ".len()..];
+            let name: String = after
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            // The body runs to the first line that is exactly a closing brace,
+            // which is what rustfmt guarantees for an item at column 0.
+            let body_start = match after.find('{') {
+                Some(brace) => brace,
+                None => break,
+            };
+            let body = match after[body_start..].find("\n}") {
+                Some(end) => &after[body_start..body_start + end],
+                None => &after[body_start..],
+            };
+            out.push((name, body.to_string()));
+            rest = after;
+        }
+        out
+    }
+
+    /// 🔴 An `env =` attribute on a field confique never reads is worse than no
+    /// attribute at all: it is a promise, and `docs/src/configuration/` repeats
+    /// it to operators as a supported variable.
+    ///
+    /// confique walks into a struct's fields only through a field marked
+    /// `#[config(nested)]`, and `nested` may not be `Option<_>` — the derive
+    /// rejects it outright. So a config struct reached as a bare
+    /// `Option<Something>` is deserialized by serde from the file and nothing
+    /// else: its `env =` attributes are dead, silently, and the file always
+    /// wins.
+    ///
+    /// `[backend]` is where this bites. `BackendConfig` is `nested`, but both
+    /// of its fields are `Option<_>`, so nothing under `[backend.posix_fs]` or
+    /// `[backend.oss]` can be set from the environment. That is why the OSS
+    /// endpoint, bucket and credentials this cluster runs on cannot simply be
+    /// given `env =` attributes and a `secretKeyRef`.
+    ///
+    /// This test pins the offenders that exist rather than pretending there are
+    /// none: `AENV_SNAPSHOT_STORE` is declared, documented, and dead. What it
+    /// stops is the *next* one — an `env =` added to `OssBackendConfig` by
+    /// somebody who reasonably assumes it will work.
+    #[test]
+    fn no_new_env_binding_is_declared_where_confique_cannot_read_it() {
+        let source =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cfg.rs"))
+                .expect("read src/cfg.rs");
+
+        let bodies = struct_bodies(&source);
+        let known: std::collections::HashSet<&str> =
+            bodies.iter().map(|(name, _)| name.as_str()).collect();
+
+        // 🔴 The non-empty half, ahead of the scan. A parser that found no
+        // structs, or no fields, reports the same clean result as a tree with
+        // no dead bindings — so prove it can see both before believing it.
+        assert!(
+            known.contains("OssBackendConfig") && known.contains("BackendConfig"),
+            "the struct scan did not find the structs this test is about"
+        );
+
+        // Fields of the shape `pub name: Option<SomeConfigStruct>,` whose
+        // attributes do not say `nested` — the unreachable ones.
+        let mut unreachable: Vec<String> = Vec::new();
+        for (_, body) in &bodies {
+            let lines: Vec<&str> = body.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                let inner = match trimmed
+                    .split_once(": Option<")
+                    .and_then(|(_, rest)| rest.split_once('>'))
+                {
+                    Some((inner, _)) => inner,
+                    None => continue,
+                };
+                if !known.contains(inner) {
+                    continue;
+                }
+                // Walk back over this field's attribute lines.
+                let mut nested = false;
+                for prev in lines[..idx].iter().rev() {
+                    let prev = prev.trim();
+                    if prev.is_empty() || prev.starts_with("///") {
+                        continue;
+                    }
+                    if prev.starts_with('#') || prev.starts_with(')') || prev.ends_with(',') {
+                        if prev.contains("nested") {
+                            nested = true;
+                        }
+                        if prev.starts_with("#[config(") || prev.starts_with('#') {
+                            continue;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                if !nested {
+                    unreachable.push(inner.to_string());
+                }
+            }
+        }
+
+        assert!(
+            unreachable.contains(&"OssBackendConfig".to_string())
+                && unreachable.contains(&"PosixFsBackendConfig".to_string()),
+            "the scan lost sight of the two [backend] structs it exists to guard; found {unreachable:?}"
+        );
+
+        // Which of those actually declare an `env =`.
+        let mut dead: Vec<String> = Vec::new();
+        for (name, body) in &bodies {
+            if unreachable.contains(name) && body.contains("env =") {
+                dead.push(name.clone());
+            }
+        }
+        dead.sort();
+        dead.dedup();
+
+        assert_eq!(
+            dead,
+            vec!["PosixFsBackendConfig".to_string()],
+            "the set of config structs declaring an `env =` that confique cannot read has changed. \
+             `PosixFsBackendConfig` is the known one (AENV_SNAPSHOT_STORE, dead since it was \
+             written). Anything else here is a new dead promise — most likely an `env =` added to \
+             `OssBackendConfig` in the belief that a secretKeyRef would reach it. It will not: \
+             `[backend.oss]` is deserialized from the file only."
         );
     }
 

@@ -133,43 +133,35 @@ spec:
               value: "true"
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
               value: http://agentenv-scheduler:9090
-            # 🔴 阶段 3a's node-side gate, and it ships off.
+            # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no
+            # ConfigMap generating one. It was a seam for a design that was not
+            # taken: letting `--role all` serve the node sandbox service too, so
+            # the api half had a machine to drive while the DaemonSet stayed on
+            # `--role all`. HEAD decides the other way and asserts it —
+            # `only_the_split_roles_bind_a_second_listener` in `src/bin/server.rs`
+            # fails if `assemble_all` ever grows `spawn_grpc_surface`, and
+            # `config/default.toml` says the same over `node_service_addr`. The
+            # node sandbox service belongs to `--role node`; `--role all` is the
+            # rollback target and is the pre-split process verbatim.
             #
-            # `--role node` always serves the node sandbox service — the gRPC
-            # surface the api half drives a machine through. `--role all` is
-            # today's process verbatim and therefore does not, which left 3a
-            # with an api half and nothing for it to drive: during 3a the
-            # DaemonSet stays on `--role all`. This switch is the seam. Off, the
-            # listener is never bound and this process is byte-identical to the
-            # one running now; on, `--role all` serves it too and the api half
-            # can drive this machine while it goes on serving its own REST.
+            # 🔴 So the switch was never read by anything: no Rust code has ever
+            # looked the variable up. Setting it changed nothing while costing a
+            # serial DaemonSet roll with a drain per machine — a price two
+            # runbooks told operators to pay for a no-op. Naming it here is what
+            # stops it being reintroduced from those runbooks; the scan in
+            # `no_manifest_sets_a_node_service_gate_nothing_reads`
+            # (`src/cfg.rs`) skips comment lines so this explanation can live in
+            # the file it is about. Giving the api half a machine to drive means
+            # moving the DaemonSet to `--role node`, which is a roll that buys
+            # something.
             #
-            # 🔴 Turning it on is a DaemonSet roll, and no form of this value
-            # avoids that. The process reads its environment once, at startup:
-            # editing the ConfigMap changes nothing until a Pod restarts, and
-            # `kubectl set env` restarts them — serially, one machine at a time,
-            # each waiting out its drain. So this is a **planned preparatory
-            # step**, taken while the gateway is still pointed at the nodes and
-            # nothing dials the new listener, and never an incident lever.
-            #
-            # 🔴 And rolling 3a back does not mean turning this off. A bound
-            # socket nobody dials costs nothing, and the api half stops driving
-            # machines the moment the gateway stops sending it REST. Leaving
-            # this on through a rollback is what keeps the rollback where §11.2
-            # puts it: one gateway value, seconds, this DaemonSet untouched.
-            # Turn it off only when 3a is being abandoned rather than paused.
-            - name: AENV_NODE_SERVICE_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: node-service-config
-                  key: AENV_NODE_SERVICE_ENABLED
-                  optional: true
-            # Where that listener sits when the gate above is on. Set explicitly
-            # at its own default so the container port declared below has a
-            # visible source, and so the api half's AENV_NODE_SERVICE_PORT has
-            # something in this file to be compared against — a mismatch there
-            # is the api half dialling a closed port on every machine, and the
-            # symptom arrives at the moment 3a is switched on.
+            # Where that listener sits on a `--role node` machine. Set
+            # explicitly at its own default so the container port declared below
+            # has a visible source, and so the api half's
+            # AENV_NODE_SERVICE_PORT has something in this file to be compared
+            # against — a mismatch there is the api half dialling a closed port
+            # on every machine, and the symptom arrives at the moment the
+            # DaemonSet moves to `--role node`.
             - name: AENV_NODE_SERVICE_ADDR
               value: "0.0.0.0:8001"
             # Where the control-plane credential is read from, re-read while
@@ -189,12 +181,11 @@ spec:
           ports:
             - name: http
               containerPort: 8000
-            # The node sandbox service, declared while the gate above is still
-            # off. Declaring it now costs nothing — a containerPort is a
-            # statement, not a binding — and it means switching the gate on is
-            # one `kubectl set env` rather than an env change plus a YAML edit
-            # on a live cluster. Both would ride the same roll, but only one of
-            # them is a command an operator can be handed in a runbook.
+            # The node sandbox service, declared while this DaemonSet is still
+            # `--role all` and therefore does not bind it. Declaring it now
+            # costs nothing — a containerPort is a statement, not a binding —
+            # and it means moving to `--role node` is an argument change rather
+            # than that plus a YAML edit on a live cluster.
             #
             # 🔴 No Service fronts this port, deliberately. The api half reaches
             # a machine by substituting its own AENV_NODE_SERVICE_PORT into the

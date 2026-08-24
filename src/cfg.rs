@@ -2793,4 +2793,149 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// Whether a manifest *sets* `var`, as against mentioning it.
+    ///
+    /// 🔴 Comment lines are not a loophole, and here that is the whole point:
+    /// both manifests that used to carry this key now name it in order to say
+    /// it is deliberately absent. A predicate that could not tell a comment
+    /// from a setting would push those explanations out of the files — and the
+    /// explanation is the only thing standing between the next operator and a
+    /// runbook that still tells them to flip it.
+    ///
+    /// What is still caught is the variable on every line a deployment tool
+    /// reads: a `- name:` entry in a container's `env:`, a `KEY: value` under a
+    /// ConfigMap's `data:`, and a `KEY=value` kustomize literal.
+    fn manifest_sets(contents: &str, var: &str) -> bool {
+        contents
+            .lines()
+            .any(|line| line.contains(var) && !line.trim_start().starts_with('#'))
+    }
+
+    /// 🔴 No deployment manifest declares a node-service gate nothing reads.
+    ///
+    /// `AENV_NODE_SERVICE_ENABLED` was a seam for a design this tree decided
+    /// against: letting `--role all` serve the node sandbox service. Nothing in
+    /// the Rust tree ever read it, and `only_the_split_roles_bind_a_second_listener`
+    /// in `src/bin/server.rs` fails if `assemble_all` ever grows the listener —
+    /// so setting the variable could not change behaviour even in principle.
+    ///
+    /// What it did cost was real. Being read by every node in the fleet, two
+    /// runbooks costed flipping it at a serial DaemonSet roll with a drain per
+    /// machine, and billed it as the *first* step of the cutover. That is a
+    /// fleet-wide roll bought for a no-op, and a dead switch in a manifest is
+    /// exactly the thing that gets copied forward by someone who assumes the
+    /// manifest knows something they do not.
+    ///
+    /// 🔴 The scan's whole result is an absence, so the proof that it *would*
+    /// find a setting lives in this same test rather than in a sibling one. A
+    /// separate control can be filtered out of a run or deleted on its own, and
+    /// what is left then passes identically against a scanner that reads
+    /// nothing at all.
+    #[test]
+    fn no_manifest_sets_a_node_service_gate_nothing_reads() {
+        const VAR: &str = "AENV_NODE_SERVICE_ENABLED";
+
+        // 🔴 The non-empty half, ahead of the scan rather than beside it.
+        // These are the three forms a manifest in this tree can express the
+        // setting in; the predicate has to catch all three before the absence
+        // the scan reports means anything.
+        for (form, shape) in [
+            (
+                format!("            - name: {VAR}\n              value: \"true\""),
+                "a container env: entry",
+            ),
+            (format!("  {VAR}: \"true\""), "a ConfigMap data: key"),
+            (format!("      - {VAR}=true"), "a kustomize literal"),
+        ] {
+            assert!(
+                manifest_sets(&form, VAR),
+                "the scan cannot see {VAR} written as {shape}, so the gate could be reintroduced \
+                 in that form and this test would still pass"
+            );
+        }
+        // And the direction the narrowing exists for, plus a line that merely
+        // resembles one: neither is a setting.
+        assert!(!manifest_sets(
+            &format!("            # {VAR} is deliberately absent, and here is why"),
+            VAR
+        ));
+        assert!(!manifest_sets(
+            "            - name: AENV_NODE_SERVICE_ADDR",
+            VAR
+        ));
+
+        // 🔴 Resolution, inverted from the usual direction. Elsewhere a scan
+        // like this proves the name it looks for is the one the config reads.
+        // Here the claim is that *nothing* reads it, so this asserts the
+        // absence of a reader — with the live neighbour as the control that
+        // `env = "..."` is the shape a reader takes in this file. Without that
+        // control the assertion would also pass in a file that had never used
+        // the attribute at all.
+        let cfg = include_str!("cfg.rs");
+        assert!(
+            cfg.contains("env = \"AENV_NODE_SERVICE_ADDR\""),
+            "`env = \"...\"` is no longer how this file binds an environment \
+             variable, so the check below is looking for the wrong shape"
+        );
+        assert!(
+            !cfg.contains(&format!("env = \"{VAR}\"")),
+            "{VAR} is now read by the config. It was removed from the manifests \
+             precisely because nothing read it; if it has become a real setting, \
+             this test is the wrong shape and the manifests need it back"
+        );
+
+        let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy");
+        let mut checked = 0;
+        // One real file from the walk, kept so the predicate can be shown to
+        // have teeth against an actual manifest and not only against the
+        // fragments above — a whole file has comments, blank lines, block
+        // scalars and indentation that a three-line literal does not.
+        let mut sample: Option<(std::path::PathBuf, String)> = None;
+        let mut stack = vec![deploy.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                checked += 1;
+                assert!(
+                    !manifest_sets(&contents, VAR),
+                    "{} sets {VAR}. No AgentENV process reads it, so this buys a serial \
+                     DaemonSet roll across the fleet and changes nothing. Serving the node \
+                     sandbox service is what `--role node` is for",
+                    path.display()
+                );
+                if sample.is_none() && contents.contains('\n') {
+                    sample = Some((path.clone(), contents));
+                }
+            }
+        }
+
+        // 🔴 The same assertion the walk just made, on the same file, with one
+        // setting line added — so "no manifest sets it" is a fact about the
+        // tree rather than about the scan. Whichever file this is, it passed
+        // above and must fail here.
+        let (sampled_path, sampled) =
+            sample.expect("the walk read no file with more than one line");
+        assert!(
+            manifest_sets(&format!("{sampled}\n  {VAR}: \"true\"\n"), VAR),
+            "adding a real setting to {} did not make the scan notice it",
+            sampled_path.display()
+        );
+        assert!(
+            checked > 10,
+            "only {checked} files under {} were read; a scan that reads nothing passes \
+             everything",
+            deploy.display()
+        );
+    }
 }

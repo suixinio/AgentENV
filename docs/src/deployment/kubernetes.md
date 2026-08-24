@@ -128,29 +128,34 @@ report the same label. Two replicas each configured with a *different* non-empty
 seed pass every startup check there is, so comparing this label across the
 replicas is the only place that divergence shows up.
 
-Bringing the Deployment up does not move any traffic. Three switches do, and
-they do not cost the same:
+Bringing the Deployment up does not move any traffic. Two switches do, and both
+are read by the gateway:
 
 | Switch | Read by | Flipping it costs |
 |--------|---------|-------------------|
-| `AENV_NODE_SERVICE_ENABLED` (`node-service-config`) | every node | a serial DaemonSet roll, one machine at a time, each waiting out its drain |
 | `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
 | `GATEWAY_RESUME_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
 
-Switch them on in that order, and leave time between the first and the rest.
-The first lets a node that is still `--role all` serve the gRPC surface the API
-half drives it through; while the gateway still points at the nodes, nothing
-dials that listener, so it is a preparatory step that can be taken and observed
-on its own. Only then point the gateway at `http://agentenv-api:8000` and
-`agentenv-api:8002`.
+Point the gateway at `http://agentenv-api:8000` and `agentenv-api:8002`. Both
+live in one ConfigMap and ride one gateway roll, so there is no ordering to get
+right and no preparatory step to take first.
 
-🔴 **Rolling back reverses only the two gateway switches.** Emptying them puts
-every REST call back on the nodes, which never stopped being able to serve them,
-and the API half stops driving machines the moment it stops receiving REST — so
-the rollback is one ConfigMap and one gateway roll, seconds, with the DaemonSet
-untouched. Turning `AENV_NODE_SERVICE_ENABLED` back off is only for abandoning
-the arrangement, not for pausing it: a bound socket nobody dials costs nothing,
-and turning it off is the expensive roll all over again.
+🔴 **There is no node-side switch to throw beforehand.** Earlier revisions of
+this page opened with `AENV_NODE_SERVICE_ENABLED` (`node-service-config`), billed
+as the first step and costed at a serial DaemonSet roll with a drain per machine.
+No AgentENV code has ever read that variable, so setting it changed nothing; the
+ConfigMap and the DaemonSet reference are both gone, and
+`no_manifest_sets_a_node_service_gate_nothing_reads` (`src/cfg.rs`) fails if
+either comes back. What the switch was supposed to buy — a node serving the gRPC
+surface the API half drives it through — comes from running the DaemonSet with
+`--role node`. `--role all` deliberately does not bind that listener: it is the
+rollback target and is defined as the pre-split process verbatim, which
+`only_the_split_roles_bind_a_second_listener` (`src/bin/server.rs`) asserts.
+
+🔴 **Rolling back is the two gateway switches.** Emptying them puts every REST
+call back on the nodes, which never stopped being able to serve them, and the API
+half stops driving machines the moment it stops receiving REST — so the rollback
+is one ConfigMap and one gateway roll, seconds, with the DaemonSet untouched.
 
 🔴 **Do not turn a gateway switch on by editing `config/gateway.json`.** An
 environment variable set to the empty string is ignored by the loader, so a

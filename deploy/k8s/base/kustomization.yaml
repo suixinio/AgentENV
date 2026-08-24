@@ -156,28 +156,19 @@ configMapGenerator:
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=
       - GATEWAY_RESUME_ADDR=
-  # 阶段 3a's third switch, kept apart from the two above because it does not
-  # cost what they cost.
-  #
-  # It lets `--role all` serve the node sandbox service, which is what gives the
-  # api half a machine to drive while the DaemonSet is still `--role all`. The
-  # two keys above are read by the gateway: a single Deployment, rolled in
-  # seconds, in either direction. This one is read by every node in the fleet,
-  # and a process reads its environment once — so changing it is a serial
-  # DaemonSet roll with a drain per machine, whatever form the value takes.
-  #
-  # 🔴 Merged into api-upstream-config, an operator flipping "the 3a switches"
-  # would flip this one too and discover the price afterwards. Two ConfigMaps is
-  # the cheapest way to say that one of these is not like the others.
-  #
-  # Order: this one first, on its own, as a planned step while the gateway still
-  # points at the nodes and nothing dials the new listener. Then the two above,
-  # which are the switch that actually moves traffic. Rolling back reverses only
-  # the two above — see the note on this key in agentenv-daemonset.yaml for why
-  # leaving this one on is correct.
-  - name: node-service-config
-    literals:
-      - AENV_NODE_SERVICE_ENABLED=false
+  # 🔴 There was a third switch here — node-service-config, carrying
+  # AENV_NODE_SERVICE_ENABLED — and it is gone rather than set to `false`. It
+  # was meant to let `--role all` serve the node sandbox service, but nothing in
+  # the Rust tree ever read the variable, and HEAD decides against that design
+  # outright (`only_the_split_roles_bind_a_second_listener` in
+  # `src/bin/server.rs`). Because it was read by every node in the fleet, the
+  # runbooks costed flipping it at a serial DaemonSet roll with a drain per
+  # machine — paid for a behaviour change that could not happen. Its absence is
+  # scanned for by `no_manifest_sets_a_node_service_gate_nothing_reads`
+  # (`src/cfg.rs`); `deploy/k8s/base/agentenv-daemonset.yaml` carries the long
+  # form of why. Giving the api half a machine to drive is a `--role node`
+  # DaemonSet, not a ConfigMap key.
+
   # 阶段 2c's two knobs: which catalog the node writes, and which one it reads.
   #
   # 🔴 These values are the cluster's *current, verified* state, not an off

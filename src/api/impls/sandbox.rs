@@ -441,6 +441,59 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        // 🔴 First, ahead of the image resolver, because the resolver is what
+        // was answering instead. A cold start's first act is to resolve
+        // `body.image` on the machine serving this call: `regctl` fetches the
+        // manifest, pulls the blobs and converts them into a local overlaybd
+        // image, which is then handed to a local Firecracker VM. The `api` Pod
+        // installs no `regctl` — by design, that is a node's tooling — so the
+        // very first step failed with `regctl is required for OCI registry
+        // access: {deps}/regctl/.../regctl` and returned, and the caller was
+        // told a registry tool was missing rather than that this half cannot
+        // cold-start at all.
+        //
+        // Worse, the refusal that *does* say it — the one in
+        // `RemoteSandboxBackendFactory::build`, which is where a cold create
+        // runs out of road because the build spec it is handed no longer
+        // carries the user's image reference — sits behind that resolve and so
+        // was structurally unreachable on `--role api`. This gate is what makes
+        // the answer the role's rather than the toolchain's; that `bail!` stays
+        // as the backstop for any caller that gets there another way.
+        //
+        // Nothing has been resolved, allocated or created at this point, so
+        // there is nothing to roll back.
+        if !self.role().runs_sandbox_runtime() {
+            warn!(
+                image = %body.image,
+                role = self.role().as_str(),
+                "refused a cold sandbox create: this role runs no sandbox runtime"
+            );
+            return Ok(SandboxesColdPostResponse::Status500_ServerError(
+                Self::error(
+                    // 🔴 500 because it is the only code this operation
+                    // declares that means "this server, not your request"
+                    // (`src/api/openapi.yml`: 201/400/401/500). The request is
+                    // well-formed and would work verbatim against the other
+                    // half, so 400 would blame the caller for the deployment's
+                    // shape; 501 and 503 say it better and neither is in the
+                    // schema. The cost is that this refusal and a genuine
+                    // resolve failure share a status code — which is why the
+                    // test below discriminates on whether the image resolver
+                    // ran, not on the code.
+                    500,
+                    "cold sandbox creation is not available on --role api: a cold start resolves \
+                     the OCI image on the machine that serves this call — regctl pulls and \
+                     converts the layers into a local overlaybd image, which is then handed to a \
+                     local Firecracker VM — and this process has no regctl, no /dev/kvm and no \
+                     ublk. Create the sandbox from a template or snapshot with POST /sandboxes, \
+                     which this half does place on a node; for a cold start, run this call \
+                     against a server started with --role all. A --role node server answers this \
+                     route with 404, so there is no node for this one to forward it to. Nothing \
+                     was created.",
+                ),
+            ));
+        }
+
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
         // TODO: Move cold-start image resolution into an async create operation
@@ -2123,5 +2176,276 @@ mod execution_exposure_tests {
             "the incarnation must never be accepted as input, but these request shapes take it: \
              {offenders:?}"
         );
+    }
+}
+
+/// 🔴 What `--role api` answers when it is asked to cold-start a sandbox.
+///
+/// A cold start is the one create path whose first act is to resolve an OCI
+/// image *here*: `regctl` fetches the manifest and converts the layers into a
+/// local overlaybd image for a local Firecracker VM. The `api` Pod installs no
+/// `regctl` — that is a node's tooling — so the call died on step one with
+/// `regctl is required for OCI registry access`, and the refusal that actually
+/// names the problem (`RemoteSandboxBackendFactory::build`) sat behind that
+/// resolve and was never reached. The operator was told a tool was missing;
+/// the truth was that this half cannot cold-start at all.
+#[cfg(all(test, unix))]
+mod cold_start_role_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+    use http::Method;
+
+    use agentenv_http_server::apis::sandboxes::*;
+    use agentenv_http_server::models;
+
+    use super::ApiImpl;
+    use crate::cfg::AppConfig;
+    use crate::identity::NodeIdentity;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{
+        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
+        Orchestrator,
+    };
+    use crate::role::ServerRole;
+    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::template::TemplateBuilder;
+
+    /// The image every fixture here asks for.
+    ///
+    /// Fully qualified on purpose: an unqualified name is expanded across
+    /// `image.resolver.search_registries` into one candidate per registry, and
+    /// the fake `regctl` below would then be run once per candidate. One
+    /// candidate makes "was the resolver reached" a single, unambiguous fact.
+    /// `.invalid` is reserved by RFC 6761 and can never resolve, so a fixture
+    /// that stopped installing the fake `regctl` would fail rather than reach
+    /// a real registry.
+    const IMAGE: &str = "registry.invalid/agentenv/cold-start:pinned";
+
+    /// One API surface, plus the place the fake `regctl` leaves its evidence.
+    struct Surface {
+        api: Arc<ApiImpl>,
+        /// `{deps_path}/regctl/{version}/`: the directory the fake `regctl` is
+        /// symlinked into, and therefore the one it writes `argv` into.
+        regctl_dir: PathBuf,
+    }
+
+    /// A surface differing from every other one here in exactly one value:
+    /// which half of the split the process serving it runs as.
+    ///
+    /// 🔴 The orchestrator stays `All` in every case, for the reason
+    /// `template_read_scope_tests::surface_as` gives: the cold-start route asks
+    /// `ApiImpl::role()`, not the orchestrator's, and an `Orchestrator` built
+    /// as `Api` has construction-time demands of its own that would make the
+    /// refusing half of this test fail on the fixture instead of on the gate.
+    async fn surface_as(role: ServerRole) -> Surface {
+        let root = tempfile::tempdir().expect("a temp dir");
+
+        // A fake `regctl` that answers every lookup with a registry 404. The
+        // 404 matters twice over: `run_regctl` treats `[http 404]` as final and
+        // skips its five-attempt retry budget, so the test neither sleeps nor
+        // spawns more than once, and `ImageError::NotFound` is a *user* error,
+        // so the road not refused ends in a 400 that could never be mistaken
+        // for the 500 the refusal uses.
+        //
+        // 🔴 Symlinked from the repository rather than written out here: while
+        // any thread in this process holds a write fd on an executable, every
+        // concurrent `fork` inherits it and the following `execve` is refused
+        // with `ETXTBSY`. Symlinking never opens the target for writing.
+        let deps_path = root.path().join("deps");
+        let regctl = crate::cfg::regctl_path(&deps_path);
+        let regctl_dir = regctl
+            .parent()
+            .expect("the regctl path has a parent")
+            .to_path_buf();
+        std::fs::create_dir_all(&regctl_dir).expect("create the fake regctl's directory");
+        std::fs::write(regctl_dir.join("stdout"), "").expect("write the stdout fixture");
+        std::fs::write(
+            regctl_dir.join("stderr"),
+            format!("failed to get manifest {IMAGE}: request failed: not found [http 404]: {{}}\n"),
+        )
+        .expect("write the stderr fixture");
+        std::fs::write(regctl_dir.join("exit_code"), "1\n").expect("write the exit code fixture");
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/regctl-recorder.sh"),
+            &regctl,
+        )
+        .expect("link the fake regctl");
+
+        // The only field that matters: `resolved_regctl_binary()` is derived
+        // from it, so this is what points the resolver at the fake.
+        let config = AppConfig {
+            deps_path,
+            ..Default::default()
+        };
+
+        let orchestrator = Orchestrator::new(
+            ServerRole::All,
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
+        )
+        .await
+        .expect("an orchestrator");
+
+        let snapshot_manager = Arc::new(crate::snapshot::mock::mock_snapshot_manager());
+
+        let api = Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&config)),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(DisabledPausedSandboxRegistry),
+                Arc::clone(&snapshot_manager),
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+            // 🔴 The one value this fixture varies.
+            role,
+            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+        ));
+
+        // Held for the process's lifetime: the persister above goes on reading
+        // it, and the fake `regctl` is under it too.
+        std::mem::forget(root);
+
+        Surface { api, regctl_dir }
+    }
+
+    fn claims() -> super::super::Claims {
+        super::super::Claims
+    }
+
+    fn host() -> Host {
+        Host::from(http::uri::Authority::from_static("localhost"))
+    }
+
+    /// `POST /sandboxes-cold`, with the one body every fixture here sends.
+    async fn cold_start(s: &Surface) -> SandboxesColdPostResponse {
+        s.api
+            .sandboxes_cold_post(
+                &Method::POST,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::NewColdSandbox::new(IMAGE.to_string()),
+            )
+            .await
+            .expect("the handler answers")
+    }
+
+    /// The message a role refusal carries, or `None` when the handler did not
+    /// refuse on the role.
+    ///
+    /// 🔴 The status code cannot tell the two apart, and that is a fact about
+    /// the API rather than about this helper: `/sandboxes-cold` declares
+    /// 201/400/401/500 and nothing else, so the refusal reuses 500 — which is
+    /// also what an unresolvable image or a failed create answers.
+    fn role_refusal(response: &SandboxesColdPostResponse) -> Option<&str> {
+        match response {
+            SandboxesColdPostResponse::Status500_ServerError(error)
+                if error.message.contains("--role api") =>
+            {
+                Some(error.message.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// The argv of the fake `regctl`'s last run, or `None` if it never ran.
+    ///
+    /// 🔴 This is the discriminator. "Did this call reach the image resolver"
+    /// is the question the defect is about, and it is answerable only as a
+    /// side effect: the resolver's first act is to shell out to `regctl`, and
+    /// the fake records what it was asked for. A status code cannot answer it.
+    fn regctl_argv(s: &Surface) -> Option<Vec<String>> {
+        std::fs::read_to_string(s.regctl_dir.join("argv"))
+            .ok()
+            .map(|raw| raw.lines().map(ToString::to_string).collect())
+    }
+
+    /// 🔴 The same call on each half of the split, and the point is that the
+    /// three do not answer alike.
+    ///
+    /// Both faces in one test, because either alone is satisfied by a constant:
+    /// "api is refused" passes on a gate that is always true, "all and node are
+    /// not" passes on one that is always false. And the discriminator is
+    /// whether `regctl` ran rather than the status code, because the refusal
+    /// and an unresolvable image are both answered by this route — only one of
+    /// them got as far as asking a registry anything.
+    ///
+    /// `Node` is asserted alongside `All` even though a node never reaches this
+    /// handler in production — `RoleGate` answers `POST /sandboxes-cold` with
+    /// 404 there (`crate::api::role_gate`) — because the gate under test is
+    /// `runs_sandbox_runtime`, and a node runs one. That 404 is also why the
+    /// refusal tells the caller there is no node to forward to.
+    #[tokio::test]
+    async fn a_cold_start_is_refused_by_the_half_that_runs_no_sandbox_runtime_and_attempted_by_the_halves_that_do(
+    ) {
+        let s = surface_as(ServerRole::Api).await;
+        let response = cold_start(&s).await;
+        let refusal = role_refusal(&response).unwrap_or_else(|| {
+            panic!(
+                "--role api has no regctl and no /dev/kvm to cold-start on, and answering \
+                 anything but a refusal here is what made the operator read a missing-tool error \
+                 instead of a wrong-half one, got {response:?}"
+            )
+        });
+        assert!(
+            refusal.contains("--role all"),
+            "a refusal that does not say where a cold start can be run is a dead end, got \
+             {refusal:?}"
+        );
+        assert!(
+            refusal.contains("POST /sandboxes"),
+            "the create path this half *does* serve is the actionable half of the answer, got \
+             {refusal:?}"
+        );
+        assert!(
+            refusal.contains("404"),
+            "a caller told only 'not here' will ask which node to send it to; a --role node \
+             server answers this route with 404, so the answer is 'none', got {refusal:?}"
+        );
+        assert_eq!(
+            regctl_argv(&s),
+            None,
+            "🔴 and it must refuse before the image resolver: resolution is the first thing this \
+             route does, so a refusal placed after it is a refusal no --role api caller can ever \
+             reach"
+        );
+
+        for role in [ServerRole::All, ServerRole::Node] {
+            let s = surface_as(role).await;
+            let response = cold_start(&s).await;
+            assert!(
+                role_refusal(&response).is_none(),
+                "--role {} runs a sandbox runtime, so this create takes the road it always took, \
+                 got {response:?}",
+                role.as_str()
+            );
+            let argv = regctl_argv(&s).unwrap_or_else(|| {
+                panic!(
+                    "--role {} must still resolve the image itself, and the resolver's first act \
+                     is to run regctl; it never ran, so this create was cut short somewhere it \
+                     never used to be, got {response:?}",
+                    role.as_str()
+                )
+            });
+            assert!(
+                argv.iter().any(|arg| arg == IMAGE),
+                "the road being taken is the image resolver's, which is more than a status code \
+                 that merely is not the refusal's, got argv {argv:?}"
+            );
+            assert!(
+                matches!(response, SandboxesColdPostResponse::Status400_BadRequest(_)),
+                "the fake registry answers 404, so this create ends where image resolution ends \
+                 and the caller is told about the image rather than about the server, got \
+                 {response:?}"
+            );
+        }
     }
 }

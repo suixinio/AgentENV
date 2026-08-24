@@ -703,7 +703,15 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 /// - **A cold create.** `RemoteSandboxBackendFactory::build` refuses: the build
 ///   spec it is handed has already been resolved into paths on a local disk and
 ///   the user's image reference is gone by then. Creating from a snapshot or a
-///   template works; `POST /sandboxes-cold` does not.
+///   template works; `POST /sandboxes-cold` does not. It is now refused at the
+///   door instead of failing on the way there: the route reads
+///   `ServerRole::runs_sandbox_runtime` before it resolves anything
+///   (`crate::api::impls`), because resolution comes first on that path and
+///   this Pod has no `regctl` — so what a caller used to be told was that a
+///   registry tool was missing, and the factory's refusal, which is the one
+///   that says *this half cannot cold-start*, was never reached. The
+///   capability is still missing; what changed is that its absence is now
+///   something the caller is told.
 /// - **Publishing a pause.** Pausing and resuming a sandbox on another machine
 ///   both work — `Pause` leaves the capture on the node and a reference in the
 ///   cluster store, `Orchestrator::resume_sandbox` reads that reference back

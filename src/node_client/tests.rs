@@ -37,7 +37,7 @@ use crate::types::ExecutionId;
 
 use super::factory::RemoteSandboxBackendFactory;
 use super::paused_state::RemotePausedState;
-use super::placement::{FixedNodePlacement, NodeEndpoint};
+use super::placement::{FixedNodePlacement, NodeEndpoint, NodePlacement};
 use super::wire;
 
 // ---------------------------------------------------------------------------
@@ -96,10 +96,7 @@ where
     }
 
     RunningNode {
-        endpoint: NodeEndpoint {
-            node_id: "node-under-test".to_string(),
-            endpoint: format!("http://{addr}"),
-        },
+        endpoint: NodeEndpoint::same_address("node-under-test", format!("http://{addr}")),
         _shutdown: tx,
         orchestration,
     }
@@ -1121,10 +1118,10 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
         .await
     });
 
-    let placement = Arc::new(FixedNodePlacement::new(NodeEndpoint {
-        node_id: "node-under-test".to_string(),
-        endpoint: format!("http://{addr}"),
-    }));
+    let placement = Arc::new(FixedNodePlacement::new(NodeEndpoint::same_address(
+        "node-under-test",
+        format!("http://{addr}"),
+    )));
     let factory = RemoteSandboxBackendFactory::new(placement);
     let config = SandboxLaunchConfig {
         control_plane_config: Some(b"a marker".to_vec()),
@@ -3044,4 +3041,648 @@ async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded(
         Some(4096),
         "the rootfs size the node read off the live handle did not reach this half"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The window between a create and the cluster hearing about it
+// ---------------------------------------------------------------------------
+//
+// 🔴 What this section is for, stated once.
+//
+// A binding is the cluster's answer to *which machine is this sandbox on*.
+// Nothing in this process used to write one. The gateway did — it read the node
+// off the create it had just routed — and it stopped being able to the day
+// user-facing REST began going to the API half, which is the deployment this
+// module exists for. Its own comment says so and names this half as the owner
+// of the write it gave up (`services/gateway/internal/rest_upstream.go`).
+//
+// The only thing left that wrote a binding was the node's heartbeat roster, one
+// interval behind. While a sandbox is running that is invisible: the replica
+// holding the handle never asks anyone where the sandbox is. A pause drops the
+// handle, and from that instant every call has to ask — so a sandbox created and
+// paused inside one heartbeat interval could be neither deleted nor resumed, and
+// both answered 500 until a heartbeat landed.
+//
+// Every test below is written as faces differing in one value — whether the
+// write happened, whether a heartbeat has landed, which machine the cluster
+// names — because the failure is an *absence*, and an assertion with one face
+// passes on a build that never asks anybody anything.
+
+/// What a placement source answers when asked where a sandbox is.
+#[derive(Clone)]
+enum LookupAnswer {
+    /// The binding store decides. A bound sandbox resolves to the node; an
+    /// unbound one is `Ok(None)`, which is the scheduler's `NOT_FOUND`.
+    FromBindings,
+    /// The cluster names some other machine as the holder — a binding, a
+    /// heartbeat roster, or a registry row in `running`/`resuming` that points
+    /// somewhere else.
+    Holder(NodeEndpoint),
+    /// The placement source could not be consulted at all.
+    Unavailable,
+}
+
+/// A stand-in for the cluster scheduler's placement surface.
+///
+/// 🔴 It has a binding store, and the store starts *empty* — which is the whole
+/// point. `FixedNodePlacement` answers every question about every sandbox
+/// without being told anything, so it can express neither the window this
+/// section is about nor the write that closes it.
+struct ClusterPlacement {
+    node: NodeEndpoint,
+    bindings: Mutex<std::collections::HashSet<crate::types::SandboxId>>,
+    /// Whether `record_placement` writes a binding. Off is the world before
+    /// this change: the call existed on the wire and nothing in `src/` made it.
+    records: bool,
+    /// Whether `record_placement` refuses. A cluster can say no, and a create
+    /// must not fail because it did.
+    record_fails: bool,
+    lookup: LookupAnswer,
+    /// What `resolve_node` answers, whatever it is asked about. `None` refuses.
+    resolves: Option<NodeEndpoint>,
+    recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)>>,
+    resolve_calls: Mutex<usize>,
+}
+
+impl ClusterPlacement {
+    /// A cluster this half tells where sandboxes went.
+    fn recording(node: NodeEndpoint) -> Arc<Self> {
+        Arc::new(Self {
+            bindings: Mutex::new(Default::default()),
+            records: true,
+            record_fails: false,
+            lookup: LookupAnswer::FromBindings,
+            resolves: Some(node.clone()),
+            recorded: Mutex::new(Vec::new()),
+            resolve_calls: Mutex::new(0),
+            node,
+        })
+    }
+
+    /// The same cluster, told nothing. This is the shape of the deployment the
+    /// bug was reproduced on.
+    fn silent(node: NodeEndpoint) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::recording(node))
+            .ok()
+            .expect("sole owner");
+        placement.records = false;
+        Arc::new(placement)
+    }
+
+    fn refusing_records(node: NodeEndpoint) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::recording(node))
+            .ok()
+            .expect("sole owner");
+        placement.record_fails = true;
+        Arc::new(placement)
+    }
+
+    fn answering(node: NodeEndpoint, lookup: LookupAnswer) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::silent(node))
+            .ok()
+            .expect("sole owner");
+        placement.lookup = lookup;
+        Arc::new(placement)
+    }
+
+    fn resolving_to(node: NodeEndpoint, resolves: Option<NodeEndpoint>) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::silent(node))
+            .ok()
+            .expect("sole owner");
+        placement.resolves = resolves;
+        Arc::new(placement)
+    }
+
+    /// The node's heartbeat roster landing: every sandbox it holds becomes
+    /// bound. This is the repair path the cluster has always had, and the one
+    /// interval of it is what the field reproduction measured.
+    fn heartbeat(&self, ids: &[crate::types::SandboxId]) {
+        let mut bindings = self.bindings.lock().expect("lock");
+        for id in ids {
+            bindings.insert(*id);
+        }
+    }
+
+    fn is_bound(&self, id: crate::types::SandboxId) -> bool {
+        self.bindings.lock().expect("lock").contains(&id)
+    }
+
+    fn recorded(&self) -> Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)> {
+        self.recorded.lock().expect("lock").clone()
+    }
+
+    fn resolve_calls(&self) -> usize {
+        *self.resolve_calls.lock().expect("lock")
+    }
+}
+
+#[async_trait]
+impl NodePlacement for ClusterPlacement {
+    async fn place_new(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _resources: crate::types::SandboxResources,
+    ) -> anyhow::Result<NodeEndpoint> {
+        Ok(self.node.clone())
+    }
+
+    async fn place_existing(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+    ) -> anyhow::Result<Option<NodeEndpoint>> {
+        match &self.lookup {
+            LookupAnswer::FromBindings => Ok(self.is_bound(sandbox_id).then(|| self.node.clone())),
+            LookupAnswer::Holder(holder) => Ok(Some(holder.clone())),
+            LookupAnswer::Unavailable => {
+                anyhow::bail!("the scheduler could not locate {sandbox_id}: unavailable")
+            }
+        }
+    }
+
+    async fn resolve_node(&self, node_id: &str) -> anyhow::Result<NodeEndpoint> {
+        *self.resolve_calls.lock().expect("lock") += 1;
+        self.resolves
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the scheduler could not say where node {node_id} is"))
+    }
+
+    async fn record_placement(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        execution_id: ExecutionId,
+        node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        self.recorded
+            .lock()
+            .expect("lock")
+            .push((sandbox_id, execution_id, node.clone()));
+        if self.record_fails {
+            anyhow::bail!("the scheduler refused an assignment for {sandbox_id}");
+        }
+        if self.records {
+            self.bindings.lock().expect("lock").insert(sandbox_id);
+        }
+        Ok(())
+    }
+}
+
+/// One replica of the deciding half, over a placement source a test controls.
+async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {
+    Orchestrator::new(
+        ServerRole::All,
+        ledger.clone(),
+        RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("a replica of the deciding half")
+}
+
+/// A create tells the cluster which machine the sandbox went to, with the
+/// address the cluster names that machine by.
+///
+/// 🔴 The address is the load-bearing half and it is asserted against its own
+/// control. A `NodeEndpoint` carries two: the one this process dials, which is
+/// the node service's port, and the one the placement source named, which is
+/// where user traffic goes. The scheduler compares the address on a
+/// `RecordAssignment` byte-for-byte against its discovery entry
+/// (`AtomicNodeRegistry.Contains`) and refuses anything else — so a write that
+/// carried the dialled address would be rejected on every single create, and
+/// rejected as *an unknown node*, which reads like a discovery fault. The two
+/// addresses differ here on purpose, and both are asserted.
+///
+/// 🔴 Two sandboxes, so the incarnation is a control rather than a constant: a
+/// build that recorded a fixed value, an empty string, or the first sandbox's
+/// run for both would agree with itself and fail this.
+#[tokio::test]
+async fn a_create_tells_the_cluster_which_machine_the_sandbox_is_on() {
+    let node = real_node().await;
+    let dialled = node.endpoint.endpoint.clone();
+    let advertised = "http://10.0.0.7:8000".to_string();
+    assert_ne!(
+        dialled, advertised,
+        "the test's two addresses have to differ for it to be able to tell them apart"
+    );
+    let placement = ClusterPlacement::recording(NodeEndpoint {
+        node_id: node.endpoint.node_id.clone(),
+        endpoint: dialled.clone(),
+        advertised_endpoint: advertised.clone(),
+    });
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+
+    let mut started = Vec::new();
+    for _ in 0..2 {
+        let config = launch_config();
+        let sandbox_id = config.sandbox_id;
+        let execution_id = ExecutionId::new();
+        let mut backend = factory
+            .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+            .expect("build a stub");
+        backend.start().await.expect("start on the node");
+        started.push((sandbox_id, execution_id));
+    }
+    assert_ne!(
+        started[0].1, started[1].1,
+        "two mints produced one incarnation"
+    );
+
+    let recorded = placement.recorded();
+    assert_eq!(recorded.len(), 2, "a create told the cluster nothing");
+    for (index, (sandbox_id, execution_id)) in started.iter().enumerate() {
+        let (recorded_id, recorded_execution, recorded_node) = &recorded[index];
+        assert_eq!(recorded_id, sandbox_id);
+        assert_eq!(
+            recorded_execution, execution_id,
+            "the assignment named a run other than the one the node acknowledged"
+        );
+        assert_eq!(recorded_node.node_id, node.endpoint.node_id);
+        assert_eq!(
+            recorded_node.advertised_endpoint, advertised,
+            "the assignment carried an address the scheduler would refuse as an unknown node"
+        );
+        assert_ne!(
+            recorded_node.advertised_endpoint, dialled,
+            "the assignment carried the node-service address instead of the advertised one"
+        );
+        assert!(
+            placement.is_bound(*sandbox_id),
+            "the cluster still cannot say where this sandbox is"
+        );
+    }
+}
+
+/// A cluster that refuses the assignment does not cost the user their sandbox.
+///
+/// 🔴 The two faces differ in exactly one value — whether the placement source
+/// accepts the write — and both must produce a running sandbox. The refusal is
+/// *reached* in the first face, which is what stops this passing on a build that
+/// simply stopped making the call: an untried write and a rejected one both
+/// leave the binding absent, and only the attempt count tells them apart.
+#[tokio::test]
+async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
+    let node = real_node().await;
+
+    // Face 1: the cluster says no.
+    let refusing = ClusterPlacement::refusing_records(node.endpoint.clone());
+    let refused = {
+        let factory =
+            RemoteSandboxBackendFactory::new(Arc::clone(&refusing) as Arc<dyn NodePlacement>);
+        let config = launch_config();
+        let sandbox_id = config.sandbox_id;
+        let mut backend = factory
+            .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+            .expect("build a stub");
+        backend
+            .start()
+            .await
+            .expect("a refused assignment failed a create that had already succeeded");
+        sandbox_id
+    };
+    assert_eq!(
+        refusing.recorded().len(),
+        1,
+        "the create did not even try to tell the cluster"
+    );
+    assert!(
+        !refusing.is_bound(refused),
+        "a refused write left a binding behind"
+    );
+
+    // Face 2: the same create against a cluster that accepts. One value
+    // different, and the observable difference is the binding.
+    let accepting = ClusterPlacement::recording(node.endpoint.clone());
+    let accepted = {
+        let factory =
+            RemoteSandboxBackendFactory::new(Arc::clone(&accepting) as Arc<dyn NodePlacement>);
+        let config = launch_config();
+        let sandbox_id = config.sandbox_id;
+        let mut backend = factory
+            .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+            .expect("build a stub");
+        backend.start().await.expect("start on the node");
+        sandbox_id
+    };
+    assert_eq!(accepting.recorded().len(), 1);
+    assert!(
+        accepting.is_bound(accepted),
+        "an accepted write recorded nothing"
+    );
+
+    // 🔴 And both VMs are up on the machine. Without this the test passes on a
+    // build where `start` returned `Ok` without creating anything.
+    assert_eq!(running_on(&node).await.len(), 2, "a create started no VM");
+}
+
+/// A resume tells the cluster the sandbox is live again, under the run it woke
+/// it as.
+///
+/// 🔴 The control is the paused run, which is in scope and is the value a build
+/// that recorded the wrong incarnation would most plausibly record: it is the
+/// one the resume request carries as its fence. Recording it would point the
+/// gateway's fencing at a run that is over.
+#[tokio::test]
+async fn a_resume_tells_the_cluster_the_sandbox_is_live_again() {
+    let node = real_node().await;
+    let placement = ClusterPlacement::recording(node.endpoint.clone());
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+
+    let paused_execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+    let capture = backend.pause(None, false).await.expect("pause on the node");
+    backend.stop().await.expect("stop after the pause");
+
+    let restored = factory
+        .decode_paused_state(
+            std::path::PathBuf::from("/ignored"),
+            capture.state.encode().expect("encode"),
+        )
+        .expect("decode");
+    let resumed_execution_id = ExecutionId::new();
+    assert_ne!(resumed_execution_id, paused_execution_id);
+    let mut back = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, restored.as_ref(), None)
+        .expect("build a stub");
+    back.start().await.expect("reopen on the node that has it");
+
+    let recorded = placement.recorded();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the create and the resume did not both tell the cluster: {recorded:?}"
+    );
+    assert_eq!(recorded[0].1, paused_execution_id, "the create's run");
+    assert_eq!(
+        recorded[1].1, resumed_execution_id,
+        "the resume told the cluster about a run other than the one it started"
+    );
+    assert_ne!(
+        recorded[1].1, paused_execution_id,
+        "the resume recorded the run it reopened instead of the run it started"
+    );
+}
+
+/// A sandbox created and paused inside one heartbeat interval can still be
+/// deleted.
+///
+/// This is the reproduction, with the heartbeat made explicit instead of waited
+/// for. On the cluster it read: a delete 0.2 seconds after a pause answered 500,
+/// and the same delete on the same sandbox a minute later answered 204.
+///
+/// 🔴 Three faces over one value — what the cluster has been told. The second is
+/// the world before this change and must still fail, or the first passes on a
+/// build that has stopped consulting placement at all; the third is the same
+/// world one heartbeat later and must succeed, which is what proves the second
+/// face failed over the *absence* rather than over the sandbox.
+#[tokio::test]
+async fn a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it() {
+    let node = real_node().await;
+    let on_the_node = node.orchestration.as_ref().expect("a real node").clone();
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+
+    // Face 1: the write this change adds. No heartbeat anywhere in this face.
+    let told = ClusterPlacement::recording(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&told), &ledger).await;
+    let sandbox = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    assert!(
+        told.is_bound(sandbox.id),
+        "the create left the cluster unable to say where the sandbox is"
+    );
+    Arc::clone(&replica)
+        .pause_sandbox(sandbox.id)
+        .await
+        .expect("pause");
+    Arc::clone(&replica)
+        .delete_sandbox(sandbox.id)
+        .await
+        .expect("🔴 a sandbox paused before its first heartbeat could not be deleted");
+    assert!(
+        ledger
+            .0
+            .get(&sandbox.id)
+            .await
+            .expect("read the ledger")
+            .is_none(),
+        "a completed delete left the record behind"
+    );
+    assert!(
+        on_the_node
+            .get_sandbox(&sandbox.id)
+            .await
+            .expect("the node's own record")
+            .is_none(),
+        "the delete answered success without telling the machine"
+    );
+
+    // Face 2: the same three calls against a cluster nothing tells. This is
+    // exactly what shipped, and it must still refuse.
+    let untold = ClusterPlacement::silent(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&untold), &ledger).await;
+    let stranded = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    assert!(
+        !untold.is_bound(stranded.id),
+        "the silent face bound the sandbox anyway, so it is not the control it claims to be"
+    );
+    Arc::clone(&replica)
+        .pause_sandbox(stranded.id)
+        .await
+        .expect("pause");
+    let err = Arc::clone(&replica)
+        .delete_sandbox(stranded.id)
+        .await
+        .expect_err("a delete completed against a cluster that could not name the machine");
+    assert!(
+        format!("{err}").contains("could not be reached") || format!("{err}").contains("no record"),
+        "the refusal did not say why: {err}"
+    );
+    assert_eq!(
+        ledger
+            .0
+            .get(&stranded.id)
+            .await
+            .expect("read the ledger")
+            .expect("🔴 a delete that reached no machine forgot the sandbox anyway")
+            .state,
+        crate::orchestrator::SandboxState::Paused,
+        "a refused delete left the record somewhere other than where it found it"
+    );
+
+    // Face 3: one heartbeat later, nothing else changed. The same delete on the
+    // same sandbox through the same replica now succeeds — which is what says
+    // face 2 failed over the missing binding and not over the sandbox.
+    untold.heartbeat(&[stranded.id]);
+    Arc::clone(&replica)
+        .delete_sandbox(stranded.id)
+        .await
+        .expect("a heartbeat landed and the delete still could not reach the machine");
+    assert!(
+        on_the_node
+            .get_sandbox(&stranded.id)
+            .await
+            .expect("the node's own record")
+            .is_none(),
+        "the delete answered success without telling the machine"
+    );
+}
+
+/// A capture is reopened on the machine holding it when the cluster has no
+/// record of the sandbox — and on no other machine, for any other answer.
+///
+/// 🔴 This is the fencing argument, asserted. The fallback is entered on
+/// *absence* only, and the three faces that must still refuse are the three
+/// shapes of "not absence": the cluster names another holder, the cluster could
+/// not be consulted, and the fallback itself answered about another machine.
+/// Each refusal is checked against the node running nothing afterwards, and each
+/// wrong answer carries the *real* node's address — so a build that dropped the
+/// identity check would not merely fail to refuse, it would succeed, and these
+/// assertions would go red rather than staying silent.
+///
+/// The three refusals come before the success on purpose: "the node is running
+/// nothing" is also what a build that can reopen nothing at all looks like.
+#[tokio::test]
+async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record() {
+    let node = real_node().await;
+    let setup = RemoteSandboxBackendFactory::new(node.placement());
+
+    let paused_execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = setup
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+    let capture = backend.pause(None, false).await.expect("pause on the node");
+    backend.stop().await.expect("stop after the pause");
+    let encoded = capture.state.encode().expect("encode");
+    assert_eq!(encoded["origin_node_id"], node.endpoint.node_id.as_str());
+    assert!(
+        running_on(&node).await.is_empty(),
+        "the pause left the VM running"
+    );
+
+    let resumed_execution_id = ExecutionId::new();
+    let reopen = |placement: Arc<ClusterPlacement>| {
+        let encoded = encoded.clone();
+        async move {
+            let factory = RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>);
+            let state = factory
+                .decode_paused_state(std::path::PathBuf::from("/ignored"), encoded)
+                .expect("decode");
+            let mut backend = factory
+                .build_from_paused_state(sandbox_id, resumed_execution_id, state.as_ref(), None)
+                .expect("build a stub");
+            backend.start().await
+        }
+    };
+
+    // A machine that is not the origin, wearing the origin's *address*: if the
+    // identity check went, this would be reopened successfully.
+    let impostor = NodeEndpoint {
+        node_id: "node-that-holds-nothing".to_string(),
+        endpoint: node.endpoint.endpoint.clone(),
+        advertised_endpoint: node.endpoint.advertised_endpoint.clone(),
+    };
+
+    // Face 1: the cluster names another holder. An answer, so it is refused.
+    let named_elsewhere = ClusterPlacement::answering(
+        node.endpoint.clone(),
+        LookupAnswer::Holder(impostor.clone()),
+    );
+    reopen(Arc::clone(&named_elsewhere))
+        .await
+        .expect_err("a capture was reopened although the cluster named another holder");
+    assert!(
+        running_on(&node).await.is_empty(),
+        "a refused resume started something anyway"
+    );
+
+    // Face 2: the cluster could not be consulted. Not an absence, so not a
+    // fallback — an error.
+    let unavailable = ClusterPlacement::answering(node.endpoint.clone(), LookupAnswer::Unavailable);
+    reopen(Arc::clone(&unavailable))
+        .await
+        .expect_err("a capture was reopened although the placement source could not be asked");
+    assert_eq!(
+        unavailable.resolve_calls(),
+        0,
+        "an unreadable placement source was treated as an absent record"
+    );
+    assert!(running_on(&node).await.is_empty());
+
+    // Face 3: no record, and the fallback answers about a different machine.
+    let misdirected = ClusterPlacement::resolving_to(node.endpoint.clone(), Some(impostor.clone()));
+    reopen(Arc::clone(&misdirected))
+        .await
+        .expect_err("a capture was reopened on a machine the fallback misnamed");
+    assert_eq!(
+        misdirected.resolve_calls(),
+        1,
+        "the fallback was not reached, so the refusal above is about something else"
+    );
+    assert!(running_on(&node).await.is_empty());
+
+    // Face 4: no record, and the fallback answers about the machine the capture
+    // names. The one case the fallback exists for.
+    let absent = ClusterPlacement::silent(node.endpoint.clone());
+    reopen(Arc::clone(&absent))
+        .await
+        .expect("🔴 a capture could not be reopened because the cluster had never heard of it");
+    assert_eq!(
+        absent.resolve_calls(),
+        1,
+        "the resume did not go through the fallback"
+    );
+    let live = node
+        .orchestration
+        .as_ref()
+        .expect("a real node")
+        .list_live_sandboxes()
+        .await
+        .expect("list");
+    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
+    assert_eq!(live[0].sandbox_id, sandbox_id);
+    assert_eq!(live[0].execution_id, Some(resumed_execution_id));
+
+    // 🔴 And the fallback belongs to the resume alone. The same placement
+    // source, the same missing binding, and an attach — which holds a sandbox
+    // id and nothing that names a machine — must refuse rather than reach for
+    // it. The resolve count is the evidence, and it is meaningful because the
+    // face above pushed it to one in this same round.
+    let attaching = setup_attach(Arc::clone(&absent), sandbox_id, resumed_execution_id).await;
+    assert!(
+        attaching.is_err(),
+        "an attach invented a machine for a sandbox the cluster could not place"
+    );
+    assert_eq!(
+        absent.resolve_calls(),
+        1,
+        "an attach took the resume's fallback"
+    );
+}
+
+/// Starts an attaching stub — what a delete, a pause or a snapshot builds when
+/// the handle is not in this process — and reports what `start` said.
+async fn setup_attach(
+    placement: Arc<ClusterPlacement>,
+    sandbox_id: crate::types::SandboxId,
+    execution_id: ExecutionId,
+) -> anyhow::Result<()> {
+    let factory = RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .adopt_running(sandbox_id, execution_id, Default::default())
+        .expect("a remote factory adopts every sandbox")
+        .expect("a remote factory never answers that the runtime is gone");
+    backend.start().await
 }

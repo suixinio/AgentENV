@@ -23,7 +23,7 @@ use std::net::Ipv4Addr;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
@@ -226,7 +226,25 @@ impl RemoteSandboxStub {
             .placement
             .place_existing(sandbox_id)
             .await
-            .with_context(|| format!("locate the machine running sandbox {sandbox_id}"))?;
+            .with_context(|| format!("locate the machine running sandbox {sandbox_id}"))?
+            // 🔴 An error, and there is no fallback here — unlike
+            // [`reopen`](Self::reopen), which has one. The difference is what
+            // the two calls hold: a resume is built from a paused state that
+            // names the machine its bytes are on, so "the cluster has no record
+            // of this sandbox" still leaves exactly one machine it could be
+            // talking about. An attach holds a sandbox id and nothing else, and
+            // the record it came from carries no node. Picking a machine from
+            // that would be guessing which host a running VM is on, and the two
+            // ways of guessing wrong are a teardown sent to a stranger and a
+            // teardown that never reaches the VM at all.
+            .ok_or_else(|| {
+                anyhow!(
+                    "the placement source has no record of sandbox {sandbox_id}, so there is no \
+                     machine to drive it on: a create records the assignment as soon as the node \
+                     acknowledges it, and the node's heartbeat roster re-seeds it every interval, \
+                     so this is a retry rather than a verdict"
+                )
+            })?;
         let mut client = Self::connect(&node.endpoint)
             .await
             .with_context(|| format!("reach node {} for sandbox {sandbox_id}", node.node_id))?;
@@ -342,26 +360,116 @@ impl RemoteSandboxStub {
     /// is refused here rather than sent, because sending it produces a
     /// `NotFound` from a node that has simply never seen the sandbox — an
     /// answer that reads exactly like "the only copy is gone".
+    ///
+    /// # 🔴 An absent record is not an answer, and is not treated as one
+    ///
+    /// The check above accepts exactly one node — `origin_node_id`, which this
+    /// call was *handed* — and refuses every other. It follows that a placement
+    /// source with no record of the sandbox cannot be answering the question:
+    /// there is nothing for it to disagree with. It used to fail the resume
+    /// anyway, and on a cluster that meant a sandbox created and paused inside
+    /// one heartbeat interval could not be woken until a heartbeat had listed
+    /// it — the placement source had never been told the sandbox existed, and
+    /// this half asked it to confirm a value it was already holding.
+    ///
+    /// So `Ok(None)` falls back to resolving `origin_node_id`'s address and
+    /// reopening there. **Why that cannot wake a sandbox in two places:**
+    ///
+    /// 1. It never reaches a machine this call would otherwise have refused.
+    ///    The set of acceptable nodes is one node wide either way, and the
+    ///    fallback produces that same node. Nothing about *which* machine is
+    ///    decided differently — only whether the call happens at all.
+    /// 2. It is entered on absence and on nothing else. Every answer naming
+    ///    another holder — a binding, a heartbeat roster, or a registry row in
+    ///    `running`/`resuming` — is an answer, and is still refused above.
+    ///    Every outcome where the source could not be consulted is still an
+    ///    error: `place_existing` maps `NOT_FOUND` alone to `Ok(None)`, and the
+    ///    scheduler reaches `NOT_FOUND` only after the bindings, the rosters
+    ///    and the paused registry have each been read and each held no row.
+    /// 3. It is not where the fence lives, and could not be. This comparison is
+    ///    against a value the caller already holds, so it can never detect a
+    ///    second waker on the *same* machine — which is the only shape a double
+    ///    wake of a pinned capture can take. What actually prevents one is, in
+    ///    order: the paused registry's `claim_for_resume`, which grants one
+    ///    resume at a time across the cluster and mints the incarnation this
+    ///    call carries; the store's `Paused -> Resuming` compare-and-set; and
+    ///    the node's own check that `execution_id` names a capture it still
+    ///    holds — a capture that has already been reopened is gone, and the
+    ///    node answers `CaptureAbsent` rather than starting a second copy.
+    ///
+    /// The resolved address is checked against `origin_node_id` again before it
+    /// is dialled, so a placement source that answered about some other machine
+    /// is refused rather than followed.
+    ///
+    /// # 🔴 Which `origin_node_id` this is
+    ///
+    /// There is more than one value by that name in this system and they do not
+    /// all come from the same place. This one is
+    /// [`RemotePausedState::origin_node_id`], written by [`pause`](Self::pause)
+    /// from `Placed::node.node_id` — the machine this stub was driving when it
+    /// took the capture, as the placement source named it at the time. It is
+    /// *not* the paused registry row's `origin_node_id`, and it is not any
+    /// process's reading of its own identity: nothing here consults
+    /// `crate::identity`, `NodeIdentity`, or the API half's own node id. So the
+    /// fallback below names the machine that actually ran the VM, which is the
+    /// machine whose disk the bytes are on, whatever any other record of that
+    /// question happens to say.
     async fn reopen(
         &mut self,
         request: pb::SandboxResumeRequest,
         origin_node_id: String,
     ) -> Result<()> {
         let sandbox_id = self.sandbox_id;
-        let node = self
+        let placed = self
             .placement
             .place_existing(sandbox_id)
             .await
             .with_context(|| format!("locate the machine holding sandbox {sandbox_id}"))?;
-        if node.node_id != origin_node_id {
-            bail!(
-                "sandbox {sandbox_id}'s capture is on node {origin_node_id} and placement chose \
-                 node {}: reopening a capture happens on the machine holding it, and rebuilding \
-                 this sandbox somewhere else is a create from a published snapshot rather than \
-                 this call",
-                node.node_id
-            );
-        }
+        let node = match placed {
+            Some(node) => {
+                if node.node_id != origin_node_id {
+                    bail!(
+                        "sandbox {sandbox_id}'s capture is on node {origin_node_id} and placement \
+                         chose node {}: reopening a capture happens on the machine holding it, \
+                         and rebuilding this sandbox somewhere else is a create from a published \
+                         snapshot rather than this call",
+                        node.node_id
+                    );
+                }
+                node
+            }
+            None => {
+                debug!(
+                    %sandbox_id,
+                    %origin_node_id,
+                    "the placement source has no record of this sandbox; reopening its capture on \
+                     the machine the capture names"
+                );
+                let node = self
+                    .placement
+                    .resolve_node(&origin_node_id)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "find the address of node {origin_node_id}, which holds sandbox \
+                             {sandbox_id}'s capture"
+                        )
+                    })?;
+                // 🔴 The same equality the answered branch enforces, applied to
+                // the fallback's answer. Without it the guarantee above would
+                // rest on every `NodePlacement` implementation being careful,
+                // rather than on this call refusing anything that is not the
+                // one machine it is allowed to talk to.
+                if node.node_id != origin_node_id {
+                    bail!(
+                        "sandbox {sandbox_id}'s capture is on node {origin_node_id} and the \
+                         placement source answered with node {}",
+                        node.node_id
+                    );
+                }
+                node
+            }
+        };
 
         let mut client = Self::connect(&node.endpoint).await.map_err(|err| {
             anyhow::Error::new(RemoteResumeFailure::unreachable(
@@ -423,6 +531,15 @@ impl RemoteSandboxStub {
                 disk_size_mib: resources.disk_size_mib,
             };
         }
+        // 🔴 A resume needs this as much as a create does, and for a reason a
+        // create does not have: a pause takes the sandbox off the node's
+        // *running* set but leaves it in the node's record store, so the
+        // heartbeat roster goes on carrying it and the binding survives. What
+        // does not survive is a binding that was never written — and the
+        // sandbox this call is waking is, by construction, one whose handle
+        // this process no longer had.
+        self.announce_placement(&node).await;
+
         self.placed = Some(Placed {
             node,
             client,
@@ -447,6 +564,52 @@ impl RemoteSandboxStub {
         self.placed
             .as_mut()
             .ok_or_else(|| anyhow!("sandbox {sandbox_id} has not been started on any node yet"))
+    }
+
+    /// Tells the placement source which machine this sandbox ended up on.
+    ///
+    /// # 🔴 Logged and swallowed, and that is the whole contract
+    ///
+    /// By the time this runs the node has acknowledged the sandbox: it is up
+    /// over there whatever the placement source says next. Failing the
+    /// operation here would tear down a working sandbox to keep a cache
+    /// honest, and answering the user an error for a sandbox that exists is
+    /// worse than the window this write exists to close.
+    ///
+    /// # 🔴 Why the write exists at all
+    ///
+    /// Nothing in this process used to make it. The gateway did, by reading the
+    /// node off the create it had just routed — and it stopped being able to
+    /// the day user-facing REST began going to the API half, which is the
+    /// deployment this whole module is for. Its own comment says so and names
+    /// this half as the owner of the write it gave up
+    /// (`services/gateway/internal/rest_upstream.go`).
+    ///
+    /// What that cost, measured on a cluster: for the interval between a create
+    /// and the node's next heartbeat, the cluster could not say where the new
+    /// sandbox was. A replica still holding the handle never noticed, because
+    /// it never asks. The moment the handle went — a pause — every call that
+    /// has to ask failed: a delete 0.2 seconds after a pause answered 500 and
+    /// the same delete a minute later answered 204, and a resume did the same.
+    async fn announce_placement(&self, node: &NodeEndpoint) {
+        if let Err(error) = self
+            .placement
+            .record_placement(self.sandbox_id, self.execution_id, node)
+            .await
+        {
+            // 🔴 `warn`, not `error`: this is recoverable without anyone doing
+            // anything. The node's next heartbeat roster carries the sandbox
+            // and re-seeds the binding, so what was lost is one heartbeat
+            // interval of routability rather than the sandbox.
+            warn!(
+                sandbox_id = %self.sandbox_id,
+                node_id = %node.node_id,
+                execution_id = %self.execution_id,
+                error = %error,
+                "could not tell the cluster which machine this sandbox is on; it stays \
+                 unroutable until the node's next heartbeat says so"
+            );
+        }
     }
 
     pub(super) async fn connect(endpoint: &str) -> Result<NodeSandboxServiceClient<Channel>> {
@@ -524,6 +687,12 @@ impl SandboxBackend for RemoteSandboxStub {
                 self.execution_id
             );
         }
+
+        // 🔴 After the incarnation check above and not before it. The check can
+        // still tear this sandbox down, and a binding written for a sandbox
+        // that is about to be deleted would point the cluster at a VM that is
+        // going away.
+        self.announce_placement(&node).await;
 
         self.placed = Some(Placed {
             node,

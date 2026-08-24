@@ -11,17 +11,64 @@
 //! Both are answered by the cluster scheduler in the assembled system. The
 //! trait is here so that the piece which drives sandboxes over the wire does
 //! not also have to know how placement is decided.
+//!
+//! # 🔴 And one statement, which is not a question at all
+//!
+//! [`NodePlacement::record_placement`] tells the placement source where a
+//! sandbox *went*. Until it existed, nothing in this process ever told the
+//! cluster that — the gateway used to, by reading the node off the create it
+//! had just routed, and it stopped being able to the day user-facing REST
+//! started going to the API half instead (`forwardToRestUpstream`, which names
+//! this half as the owner of the write it can no longer make). The cost of
+//! leaving it unowned is a window after every create in which the cluster
+//! cannot say where the new sandbox is, and every call that has to ask —
+//! delete, pause, snapshot and resume once the handle is gone — fails inside
+//! it.
 
 use async_trait::async_trait;
 
-use crate::types::{SandboxId, SandboxResources};
+use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 /// One node this client can talk to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeEndpoint {
     pub node_id: String,
-    /// The gRPC address of the node service, as a URI.
+    /// The gRPC address of the node service, as a URI. This is what this client
+    /// dials.
     pub endpoint: String,
+    /// The address the placement source names this node by, kept exactly as it
+    /// said it.
+    ///
+    /// 🔴 A second address rather than a second port, and the difference
+    /// matters in one direction only. `endpoint` above is this string with the
+    /// node service's port substituted in — a *derived* value, and a lossy one:
+    /// the substitution parses and re-renders the URI, so `10.0.0.7:8000`
+    /// becomes `http://10.0.0.7:8001/` and there is no way back to the original
+    /// spelling. The scheduler compares the address on a `RecordAssignment`
+    /// byte-for-byte against the one discovery holds for that node
+    /// (`AtomicNodeRegistry.Contains`) and refuses an assignment naming
+    /// anything else, so a write that sent the derived address would be
+    /// rejected as *an unknown node* — which reads like a discovery problem and
+    /// is not one.
+    ///
+    /// It is also the address the rest of the cluster routes user traffic to,
+    /// which is what a binding is for.
+    pub advertised_endpoint: String,
+}
+
+impl NodeEndpoint {
+    /// A node whose two addresses are the same string.
+    ///
+    /// For a placement source that names nodes by the address they are dialled
+    /// on, which is every source except the cluster scheduler.
+    pub fn same_address(node_id: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        Self {
+            node_id: node_id.into(),
+            advertised_endpoint: endpoint.clone(),
+            endpoint,
+        }
+    }
 }
 
 #[async_trait]
@@ -38,7 +85,57 @@ pub trait NodePlacement: Send + Sync + 'static {
     /// 🔴 Separate from [`place_new`](Self::place_new) because the answer may
     /// be pinned rather than preferred. A caller that used the other one here
     /// would send a resume to a machine that does not have the bytes.
-    async fn place_existing(&self, sandbox_id: SandboxId) -> anyhow::Result<NodeEndpoint>;
+    ///
+    /// # 🔴 `Ok(None)` and `Err` are not the same absence
+    ///
+    /// `Ok(None)` is the placement source saying, from a complete read, that it
+    /// holds no record of this sandbox. `Err` is every other outcome, including
+    /// every one where the source could not be asked — and the two lead callers
+    /// to opposite conclusions, which is why they are separate here rather than
+    /// flattened into one error the way they used to be.
+    ///
+    /// The scheduler goes to some length to keep this distinction on the wire:
+    /// `lookupAbsent` is the only place it produces `NOT_FOUND`, and it is
+    /// reached only after the bindings, the heartbeat rosters and the paused
+    /// registry have each been read and each answered "no row". Anything that
+    /// could not be consulted comes back `Unavailable` instead. Collapsing the
+    /// two here threw that away one layer above the wire.
+    async fn place_existing(&self, sandbox_id: SandboxId) -> anyhow::Result<Option<NodeEndpoint>>;
+
+    /// The current address of a node whose identity the caller already holds.
+    ///
+    /// 🔴 Not a placement decision, and it must never be used as one. This
+    /// answers *where is node N*, which is a discovery question with one
+    /// answer; the two methods above answer *which node*, which is a decision.
+    /// A caller that has not already established which machine it is entitled
+    /// to talk to has no business here.
+    async fn resolve_node(&self, node_id: &str) -> anyhow::Result<NodeEndpoint>;
+
+    /// Tells the placement source that a sandbox is now on this node.
+    ///
+    /// # 🔴 Best-effort by contract, and the contract is the caller's
+    ///
+    /// The sandbox is already up on the node by the time this is called — that
+    /// is what makes the statement true — so failing the operation over it
+    /// would tear down a working sandbox to keep a cache honest. Every caller
+    /// therefore logs and carries on, and the repair path is the node's own
+    /// heartbeat roster, which re-seeds the binding within one interval.
+    ///
+    /// What this buys is that interval. Without it a sandbox is unroutable and
+    /// undrivable-by-anyone-but-its-creator until the first heartbeat after it
+    /// exists.
+    ///
+    /// 🔴 It returns a `Result` rather than swallowing failures itself so that
+    /// "the write was attempted and refused" is visible to the caller's logs
+    /// and to a test. An implementation that reported success unconditionally
+    /// would make the difference between a working write and a rejected one
+    /// invisible everywhere.
+    async fn record_placement(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        node: &NodeEndpoint,
+    ) -> anyhow::Result<()>;
 }
 
 /// Sends everything to one node.
@@ -65,7 +162,36 @@ impl NodePlacement for FixedNodePlacement {
         Ok(self.node.clone())
     }
 
-    async fn place_existing(&self, _sandbox_id: SandboxId) -> anyhow::Result<NodeEndpoint> {
+    /// Always an answer, and never `None`.
+    ///
+    /// 🔴 A fixed placement has one machine and therefore no way to *not* know
+    /// where a sandbox is: there is nowhere else it could be. `None` here would
+    /// claim a read happened and came up empty, which is a claim this type is
+    /// not in a position to make about anything.
+    async fn place_existing(&self, _sandbox_id: SandboxId) -> anyhow::Result<Option<NodeEndpoint>> {
+        Ok(Some(self.node.clone()))
+    }
+
+    /// The one node, whatever was asked for.
+    ///
+    /// 🔴 The id is not checked here, and the caller checks it instead. This
+    /// type exists to stand in for a cluster in tests and in a single-node
+    /// deployment; the safety property — *a resume reaches the machine holding
+    /// its bytes and no other* — belongs to the caller that has an origin to
+    /// compare against, and putting a copy of it here would leave the real
+    /// placement source's answer unchecked.
+    async fn resolve_node(&self, _node_id: &str) -> anyhow::Result<NodeEndpoint> {
         Ok(self.node.clone())
+    }
+
+    /// Nothing to tell: this placement is a constant, and a constant learns
+    /// nothing from being told where a sandbox went.
+    async fn record_placement(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+        _node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }

@@ -112,16 +112,22 @@ func isUserFacingRestRequest(r *http.Request, hostRoute *hostRoute, source route
 //     one, and writing this address into a binding would send the next
 //     data-plane request for that sandbox to a process that cannot serve it.
 //
-//     🔴 That has a visible consequence, and it is the one to watch for on a
-//     cluster. A create forwarded here writes no binding, so the sandbox is
-//     routable only once the node holding it says so — its next heartbeat
-//     roster, or its ReportSandboxEvent, whichever lands first. Before this
+//     🔴 That had a visible consequence, and the owner has since taken it up.
+//     A create forwarded here writes no binding, so the sandbox used to be
+//     routable only once the node holding it said so — its next heartbeat
+//     roster, or its ReportSandboxEvent, whichever landed first. Before this
 //     switch the gateway closed that window itself, because it knew the node:
 //     it had just picked it. Now it does not, and the only party that does is
-//     the api half. So this is an omission with an owner rather than a gap —
-//     but until that owner records the assignment, expect a sub-heartbeat
-//     window after every create in which a data-plane request for the new
-//     sandbox falls through to the scheduler's roster path.
+//     the api half.
+//
+//     🔴 The api half now makes the call: `NodePlacement::record_placement`,
+//     from the stub that has just had a create or a resume acknowledged
+//     (`src/node_client/scheduler_placement.rs`). It is best-effort there, so
+//     the heartbeat roster is still the repair path — but the window is no
+//     longer the normal case. What it cost while it was: a sandbox created and
+//     paused inside one heartbeat interval could be neither deleted nor
+//     resumed, because a pause drops the api half's handle and every call after
+//     it has to ask the scheduler where the sandbox is.
 //
 //   - No fencing plan, because no lookup was made and so no authoritative
 //     incarnation exists to compare against. The zero plan stamps nothing and

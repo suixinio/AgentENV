@@ -338,6 +338,48 @@ configMapGenerator:
     literals:
       - AENV_SNAPSHOT_REPOSITORY_BACKEND=oss
       - AENV_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml
+  # The two node-local image-cache budgets, in GiB, sized for the *smaller*
+  # machine in the fleet.
+  #
+  # 🔴 These are the third thing `deploy/k8s/run.sh` overwrites, and the only
+  # one whose loss is completely silent. run.sh copies config/default.toml over
+  # config/agentenv.toml on every apply (run.sh:30), and default.toml ships
+  # `capacity_gb = 100` / `remote_blocks.max_size_gb = 100`. This cluster runs
+  # 24 / 12, set by hand in the live ConfigMap with a note explaining why — so
+  # every `make k8s-apply` has been raising both budgets by roughly 4x and 8x
+  # with nothing to report it.
+  #
+  # 🔴 Raising them is not a no-op that merely wastes disk, it *disables the
+  # eviction*. What a node may put on its root disk is capacity_gb +
+  # remote_blocks.max_size_gb + [backend.oss].cache_max_size_gb, and capacity
+  # eviction only starts at `capacity_gb * high_watermark_ratio` (0.95). At
+  # 100/100/8 that ceiling is 208 GiB and the trip point is 95 GiB of commits —
+  # on aenv-master-01, which has a 96 GiB root disk, neither is reachable: the
+  # disk fills first and the budget never trips. A budget that cannot be
+  # reached reports nothing at all. At 24/12/8 the ceiling is 44 GiB and the
+  # trip point is 22.8 GiB, both comfortably inside the smaller disk.
+  #
+  # 🔴 Sized for master, not worker, because both nodes mount one ConfigMap and
+  # `image.cache.*` has no per-node override. aenv-master-01 has 96 GiB total
+  # (~82 GiB free); aenv-worker-01 has 290 GiB (~99 GiB free). 44 GiB is safe on
+  # both; 208 GiB is safe on neither.
+  #
+  # 🔴 Environment, not `config/agentenv.toml`, for the reason
+  # AENV_PAUSED_REGISTRY_BACKEND and the catalog pair are — that file does not
+  # survive an apply. `src/cfg/image.rs` carries the same note on both
+  # `#[config(env = …)]` attributes, which is what makes this reachable at all.
+  #
+  # 🔴 A separate ConfigMap from snapshot-storage-config on purpose. That one is
+  # built so that losing a key fails startup loudly; losing these two falls back
+  # to default.toml's 100/100 and starts fine. Mixing the two rollbacks into one
+  # object would mean an operator clearing the overlay path could not avoid also
+  # resetting the disk budgets. Both references are `optional: true`, so losing
+  # this ConfigMap is the same old 100/100 regression rather than an outage —
+  # which is exactly why `image_cache_manifest_test.go` pins the values here.
+  - name: image-cache-config
+    literals:
+      - AENV_IMAGE_CACHE_CAPACITY_GB=24
+      - AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB=12
 
 images:
   - name: agentenv-gateway

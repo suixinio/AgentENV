@@ -208,6 +208,25 @@ spec:
                   name: snapshot-storage-config
                   key: AENV_CONFIG_OVERLAY_PATH
                   optional: true
+            # The two node-local disk budgets, in GiB, read from a ConfigMap
+            # because `config/agentenv.toml` does not survive an apply and
+            # because they are sized for the smallest root disk in the fleet
+            # (96 GiB on aenv-master-01), not for this machine. Losing them
+            # falls back to config/default.toml's 100/100, which on that disk is
+            # a budget the GC can never reach — see the note on
+            # image-cache-config in kustomization.yaml.
+            - name: AENV_IMAGE_CACHE_CAPACITY_GB
+              valueFrom:
+                configMapKeyRef:
+                  name: image-cache-config
+                  key: AENV_IMAGE_CACHE_CAPACITY_GB
+                  optional: true
+            - name: AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB
+              valueFrom:
+                configMapKeyRef:
+                  name: image-cache-config
+                  key: AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB
+                  optional: true
             - name: API_ADDR
               value: "0.0.0.0:8000"
             # The data plane's wake-up surface (ResumeSandbox), which the

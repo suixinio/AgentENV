@@ -1048,6 +1048,13 @@ func (s *PostgresStore) ReleaseClaim(ctx context.Context, clusterID, sandboxID s
 // Branch ③ now requires the incarnation to match, and `running` is absent from
 // branch ②, so neither reaches a row belonging to another VM.
 //
+// 🔴 Two identities, not one, as of this fix. $2 is the claimant — the identity
+// claim_for_resume was called under, node-scoped mutual exclusion, compared in
+// every branch below exactly as it always was. $7 is the holder — the real
+// machine the sandbox is running on — and it is written, never compared,
+// except in branch ③ (see the note on that branch for why it is the one
+// exception).
+//
 // 🔴 execution_started_at is NOT re-stamped on branch ③, which is a deliberate
 // departure from the design's literal statement (`_design-phase3-scheduler.md`
 // §3.3, corrected there under this adjudication). The whole reason the column
@@ -1072,9 +1079,26 @@ func (s *PostgresStore) ReleaseClaim(ctx context.Context, clusterID, sandboxID s
 // excludes `running` and branch ① requires `resuming`. The execution_id clause
 // is redundant against the WHERE and kept anyway so the expression states its
 // own precondition instead of borrowing one from thirty lines below.
+//
+// 🔴 Branch ③ compares against $7 (holder), not $2 (claimant) — the one place
+// this statement reads the holder instead of only writing it. Two callers on
+// the node side write the same running row twice on an ordinary successful
+// resume (the orchestrator's own mark_running, and the resume surface's
+// idempotent follow-up once a claim was taken — see
+// `PausedSandboxCoordinator::mark_sandbox_running`'s callers), and by the time
+// the second call lands, branch ① or ② has already repointed origin_node_id at
+// the holder. A retry guarded on the claimant would then never match whenever
+// claimant and holder differ — every cross-node resume on the api half — and
+// mark_running would answer held_elsewhere about a row this call itself just
+// wrote, on every single one of them. Comparing against the holder is safe
+// specifically *because* branch ③ never installs an incarnation on its own —
+// execution_id is still the fencing token that decides whether a row may be
+// touched at all, exactly as it is for every other write on this interface;
+// this clause only decides whether a call that has already cleared that fence
+// recognises the row as the one it (or its own retry) just wrote.
 const markRunningFencedSQL = `
 UPDATE paused_sandboxes
-   SET state = 'running', origin_node_id = $2, claimed_by_node_id = NULL,
+   SET state = 'running', origin_node_id = $7, claimed_by_node_id = NULL,
        execution_id = $6::uuid,
        execution_started_at = CASE
            WHEN state = 'running' AND execution_id = $6::uuid
@@ -1092,7 +1116,7 @@ UPDATE paused_sandboxes
       OR (state IN ('paused', 'publishing', 'local_only')
                              AND origin_node_id = $2
                              AND claimed_by_node_id IS NULL)
-      OR (state = 'running'  AND origin_node_id = $2
+      OR (state = 'running'  AND origin_node_id = $7
                              AND execution_id = $6::uuid)
        )`
 
@@ -1120,9 +1144,16 @@ UPDATE paused_sandboxes
 // execution_id = $6::uuid` reads the pre-update row and says "this row already
 // names the incarnation the caller is declaring", which is a retry under either
 // setting. A takeover names a different incarnation and still stamps.
+//
+// 🔴 $7 (holder) only in the SET, same as the fenced statement — see that one's
+// note on the two identities. This statement's guard has no branch ③ to speak
+// of (fencing is off, so there is nothing here for a retry to fail against in
+// the first place: `claimed_by_node_id IS NULL OR = $2` matches a running row
+// unconditionally), so unlike the fenced statement there is no comparison to
+// redirect onto the holder here at all.
 const markRunningUnfencedSQL = `
 UPDATE paused_sandboxes
-   SET state = 'running', origin_node_id = $2, claimed_by_node_id = NULL,
+   SET state = 'running', origin_node_id = $7, claimed_by_node_id = NULL,
        execution_id = $6::uuid,
        execution_started_at = CASE
            WHEN state = 'running' AND execution_id = $6::uuid
@@ -1136,7 +1167,22 @@ UPDATE paused_sandboxes
    AND cluster_id = $4::uuid
    AND (claimed_by_node_id IS NULL OR claimed_by_node_id = $2)`
 
-// MarkRunning records that a sandbox is live on nodeID.
+// MarkRunning records that a sandbox is live, claimed under nodeID and
+// physically running on holderNodeID.
+//
+// 🔴 Two identities, two jobs — see markRunningFencedSQL for the long version.
+// nodeID is the CAS guard, compared against every branch of the statement; it
+// must be the exact identity ClaimForResume was called under for this resume
+// (or, on a local reopen with no claim taken, the caller's own identity —
+// nodeID and holderNodeID are then the same value, which is also what every
+// pre-split caller sent and is why that shape stays correct unchanged).
+// holderNodeID is a plain write into origin_node_id, participating in no
+// comparison except the one noted on branch ③ above.
+//
+// holderNodeID empty means "same as nodeID" — an older node built before this
+// axis existed, or a caller with nothing more precise to say. That is exactly
+// nodeID's own pre-split job, so falling back to it here is not a degraded case,
+// it is what every non-cross-node caller has always done.
 //
 // 🔴 No insert, and that is the important half: a sandbox the cluster was never
 // told about must stay that way, otherwise every resume on a node with a
@@ -1147,7 +1193,7 @@ UPDATE paused_sandboxes
 // in-flight one. Without it a blind write here would clear claimed_by_node_id
 // mid-claim, and both nodes would go on to bring the same sandbox up believing
 // they held it.
-func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error) {
+func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, holderNodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error) {
 	cluster, err := requireUUID("cluster_id", clusterID)
 	if err != nil {
 		return MarkRunningUntracked, err
@@ -1158,6 +1204,10 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	}
 	if strings.TrimSpace(nodeID) == "" {
 		return MarkRunningUntracked, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
+	}
+	holder := strings.TrimSpace(holderNodeID)
+	if holder == "" {
+		holder = nodeID
 	}
 	execution, err := requireExecutionUUID(executionID)
 	if err != nil {
@@ -1179,7 +1229,7 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	tag, err := tx.Exec(ctx, s.markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster, expiresAt, execution)
+	tag, err := tx.Exec(ctx, s.markRunningSQL, sandbox, nodeID, s.ttlSeconds(), cluster, expiresAt, execution, holder)
 	if err != nil {
 		return MarkRunningUntracked, fmt.Errorf("registry mark_running: %w", err)
 	}
@@ -1214,13 +1264,17 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	// carrying an incarnation clause, so a row eligible for either can have
 	// failed on nothing else. Branch ② has no such clause — if it were eligible
 	// the UPDATE would have matched.
+	//
+	// 🔴 Branch ③'s half of this compares against holder, not nodeID, mirroring
+	// which identity that branch's WHERE clause reads.
 	staleIncarnation := (entry.State == StateResuming && entry.ClaimedByNodeID == nodeID) ||
-		(entry.State == StateRunning && entry.OriginNodeID == nodeID)
+		(entry.State == StateRunning && entry.OriginNodeID == holder)
 	if staleIncarnation {
 		registryMarkRunningRefused.Inc()
 		s.log.Warn("refused to mark the sandbox running here: this node's incarnation is not the one on the row",
 			zap.String("sandbox_id", sandbox),
 			zap.String("node_id", nodeID),
+			zap.String("holder_node_id", holder),
 			zap.String("expected_execution_id", entry.ExecutionID),
 			zap.String("observed_execution_id", execution),
 			zap.String("fencing_stage", "registry_write"),
@@ -1233,6 +1287,7 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	s.log.Warn("refused to mark the sandbox running here: another node holds the resume claim",
 		zap.String("sandbox_id", sandbox),
 		zap.String("node_id", nodeID),
+		zap.String("holder_node_id", holder),
 		zap.String("claimed_by", entry.ClaimedByNodeID),
 	)
 	return MarkRunningHeldElsewhere, nil

@@ -686,7 +686,7 @@ func TestAFailedPublishKeepsTheSnapshotTheSandboxAlreadyHad(t *testing.T) {
 
 	// Resume it, then pause it again — and let that second pause fail before it
 	// publishes anything.
-	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, f.executionFor(id), nil); err != nil {
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, f.executionFor(id), nil); err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
 	second := f.beginPause(id, stNodeA)
@@ -1435,7 +1435,7 @@ func TestMarkingAnUntrackedSandboxRunningReportsThatItIsUntracked(t *testing.T) 
 	f := newStoreFixture(t)
 	id := sandboxUUID(43)
 
-	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA, f.executionFor(id), nil)
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, stNodeA, stNodeA, f.executionFor(id), nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1461,7 +1461,7 @@ func TestMarkingRunningCannotEraseAnotherNodesClaim(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(44),
 	})
 
-	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", f.executionFor(id), nil)
+	outcome, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", "node-c", f.executionFor(id), nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1491,7 +1491,7 @@ func TestMarkingATrackedSandboxRunningReportsTheNodeAsHolder(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(45),
 	})
 
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, f.executionFor(id), nil)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, stNodeB, f.executionFor(id), nil)
 	if err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
@@ -1529,7 +1529,7 @@ func TestMarkRunningStampsTheDeadlineReclamationNeeds(t *testing.T) {
 	}
 
 	deadline := f.dbNow().Add(2 * time.Hour)
-	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, f.executionFor(id), &deadline); err != nil || outcome != MarkRunningAdopted {
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, stNodeB, f.executionFor(id), &deadline); err != nil || outcome != MarkRunningAdopted {
 		t.Fatalf("mark_running failed: %v (%s)", err, outcome)
 	}
 
@@ -1554,7 +1554,7 @@ func TestMarkRunningLeavesAnAbsentDeadlineAbsent(t *testing.T) {
 		claimedBy: stNodeB, snapshotID: snapshotUUID(48),
 	})
 
-	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, f.executionFor(id), nil); err != nil {
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, stNodeB, f.executionFor(id), nil); err != nil {
 		t.Fatalf("mark_running failed: %v", err)
 	}
 	if row := f.raw(id); row.sandboxExpiry != nil {
@@ -1576,7 +1576,7 @@ func TestMarkRunningPropagatesARowItCannotDecode(t *testing.T) {
 	// re-read that follows has something to complain about.
 	f.seed(seedRow{sandboxID: id, state: "paused", originNode: stNodeA, claimedBy: stNodeB})
 
-	_, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", f.executionFor(id), nil)
+	_, err := f.store.MarkRunning(context.Background(), f.cluster, id, "node-c", "node-c", f.executionFor(id), nil)
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
 	}
@@ -2396,7 +2396,7 @@ func TestOneClusterCannotReachAnothersSandboxes(t *testing.T) {
 	if matched, err := f.store.ReleaseClaim(ctx, f.cluster, id, 3); err != nil || matched {
 		t.Fatalf("release_claim reached another cluster: %v, %v", matched, err)
 	}
-	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, f.executionFor(id), nil); err != nil || outcome != MarkRunningUntracked {
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, f.executionFor(id), nil); err != nil || outcome != MarkRunningUntracked {
 		t.Fatalf("mark_running reached another cluster: %v, %v", outcome, err)
 	}
 	if renewed, err := f.store.RenewLease(ctx, f.cluster, "node-z", []HeldSandbox{{SandboxID: id}}); err != nil || renewed != 0 {

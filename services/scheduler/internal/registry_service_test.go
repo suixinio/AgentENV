@@ -65,7 +65,12 @@ type fakeStore struct {
 	// test can assert the value reached the store rather than only that the
 	// call was accepted.
 	lastExecution string
-	reclaims      int
+	// lastNodeID and lastHolderNodeID are MarkRunning's two identities, kept
+	// apart so a test can prove the handler forwards the wire's holder_node_id
+	// as its own argument rather than collapsing it back onto node_id.
+	lastNodeID       string
+	lastHolderNodeID string
+	reclaims         int
 }
 
 func (f *fakeStore) record(name string) {
@@ -157,8 +162,10 @@ func (f *fakeStore) RenewParkedLeases(_ context.Context, _ string, holders []pau
 	return f.renewed, nil
 }
 
-func (f *fakeStore) MarkRunning(_ context.Context, _, _, _, executionID string, expiresAt *time.Time) (pausedregistry.MarkRunningOutcome, error) {
+func (f *fakeStore) MarkRunning(_ context.Context, _, _, nodeID, holderNodeID, executionID string, expiresAt *time.Time) (pausedregistry.MarkRunningOutcome, error) {
 	f.record("MarkRunning")
+	f.lastNodeID = nodeID
+	f.lastHolderNodeID = holderNodeID
 	f.lastExecution = executionID
 	f.lastExpiresAt = expiresAt
 	if f.err != nil {
@@ -628,6 +635,61 @@ func TestAnUntrackedSandboxIsASuccessfulAnswer(t *testing.T) {
 	}
 	if got := resp.GetMarkRunningOutcome(); got != schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_HELD_ELSEWHERE {
 		t.Fatalf("held-elsewhere must be distinguishable from untracked on the wire: got %v", got)
+	}
+}
+
+// TestMarkRunningForwardsBothIdentitiesSeparately proves the wire plumbing
+// this fix depends on: node_id and holder_node_id must reach the store as two
+// distinct arguments, in the order MarkRunning documents them (node_id, then
+// holder_node_id) — collapsing them back onto one is exactly a0487f0's
+// mistake, moved one layer up.
+func TestMarkRunningForwardsBothIdentitiesSeparately(t *testing.T) {
+	store := &fakeStore{markRunning: pausedregistry.MarkRunningAdopted}
+	svc := newTestRegistryService(t, store)
+
+	const holder = "aenv-master-01"
+	if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+		ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+		Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExecutionId: rsExecution,
+		HolderNodeId: holder,
+	}); err != nil {
+		t.Fatalf("mark_running was reported as a failure: %v", err)
+	}
+
+	if store.lastNodeID != rsNode {
+		t.Fatalf("node_id: got %q, want %q — the guard identity must reach the store unchanged", store.lastNodeID, rsNode)
+	}
+	if store.lastHolderNodeID != holder {
+		t.Fatalf("holder_node_id: got %q, want %q — quoting node_id here is the exact regression this test exists to catch", store.lastHolderNodeID, holder)
+	}
+	if store.lastHolderNodeID == store.lastNodeID {
+		t.Fatalf("node_id and holder_node_id must not have collapsed onto the same value: both were %q", store.lastNodeID)
+	}
+}
+
+// TestHolderNodeIDIsRefusedOnEveryOtherKind mirrors the execution_id and
+// generation checks: a field only mark_running writes must be refused, not
+// silently dropped, everywhere else — a caller that sent it believes it was
+// recorded.
+func TestHolderNodeIDIsRefusedOnEveryOtherKind(t *testing.T) {
+	store := &fakeStore{}
+	svc := newTestRegistryService(t, store)
+
+	kinds := []schedulerv1.TransitionKind{
+		schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE,
+		schedulerv1.TransitionKind_TRANSITION_KIND_COMPLETE_PAUSE,
+		schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY,
+		schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM,
+		schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE,
+	}
+	for _, kind := range kinds {
+		_, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind: kind, HolderNodeId: "aenv-master-01",
+		})
+		if codeOf(err) != codes.InvalidArgument {
+			t.Fatalf("%v: expected InvalidArgument for a holder_node_id it does not record, got %s (%v)", kind, codeOf(err), err)
+		}
 	}
 }
 

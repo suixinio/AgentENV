@@ -3564,7 +3564,27 @@ type TransitionSandboxRequest struct {
 	// every internal caller is "the controller decided, the node executes". An
 	// optional fencing token has to keep an "absent means allow" branch, and
 	// that branch is the entire attack surface.
-	ExecutionId   string `protobuf:"bytes,10,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	ExecutionId string `protobuf:"bytes,10,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	// mark_running only: the real machine the sandbox is running on, written
+	// into origin_node_id. node_id above stays the CAS guard — the identity
+	// claim_for_resume was called under — and is never itself written to
+	// origin_node_id by this RPC; the two used to be the same field and a node
+	// that conflated them made every cross-node mark_running match zero rows
+	// (a0487f0: node_id quoted the real machine at the guard, which is not what
+	// claim_for_resume had written to claimed_by_node_id).
+	//
+	// Empty means "same as node_id", which is both the correct value for any
+	// backend that runs its own sandboxes (node_id already names the real
+	// machine there) and this field's default for a caller built before it
+	// existed — an older node sends nothing here and the controller falls back
+	// to node_id exactly as it did when this was one field.
+	//
+	// 🔴 Not RegistrySandbox.holder_node_id below, despite the name. That one is
+	// derived and read-only — claimed_by_node_id while resuming, origin_node_id
+	// otherwise — which during a resume is the claimant, not the machine. This
+	// one is always the real machine, and only ever a write-time input. Deriving
+	// this field the way that one is derived is the exact mistake a0487f0 made.
+	HolderNodeId  string `protobuf:"bytes,11,opt,name=holder_node_id,json=holderNodeId,proto3" json:"holder_node_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3665,6 +3685,13 @@ func (x *TransitionSandboxRequest) GetSandboxExpiresAtUnixMicros() int64 {
 func (x *TransitionSandboxRequest) GetExecutionId() string {
 	if x != nil {
 		return x.ExecutionId
+	}
+	return ""
+}
+
+func (x *TransitionSandboxRequest) GetHolderNodeId() string {
+	if x != nil {
+		return x.HolderNodeId
 	}
 	return ""
 }
@@ -7111,7 +7138,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x14GetSandboxesResponse\x129\n" +
 	"\tsandboxes\x18\x01 \x03(\v2\x1b.scheduler.v1.RegistryEntryR\tsandboxes\x12.\n" +
 	"\x13covered_sandbox_ids\x18\x02 \x03(\tR\x11coveredSandboxIds\x12&\n" +
-	"\x0fnow_unix_micros\x18\x03 \x01(\x03R\rnowUnixMicros\"\xea\x03\n" +
+	"\x0fnow_unix_micros\x18\x03 \x01(\x03R\rnowUnixMicros\"\x90\x04\n" +
 	"\x18TransitionSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\x12\x1d\n" +
@@ -7126,7 +7153,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"snapshotId\x12G\n" +
 	"\x1esandbox_expires_at_unix_micros\x18\t \x01(\x03H\x01R\x1asandboxExpiresAtUnixMicros\x88\x01\x01\x12!\n" +
 	"\fexecution_id\x18\n" +
-	" \x01(\tR\vexecutionIdB\x14\n" +
+	" \x01(\tR\vexecutionId\x12$\n" +
+	"\x0eholder_node_id\x18\v \x01(\tR\fholderNodeIdB\x14\n" +
 	"\x12_expect_generationB!\n" +
 	"\x1f_sandbox_expires_at_unix_micros\"\x8f\x02\n" +
 	"\x19TransitionSandboxResponse\x12\x1e\n" +

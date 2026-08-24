@@ -118,7 +118,8 @@ type Store interface {
 	// column at all rather than by writing it correctly.
 	RenewParkedLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
 
-	// MarkRunning records that a sandbox is live on nodeID.
+	// MarkRunning records that a sandbox is live, claimed under nodeID and
+	// physically running on holderNodeID.
 	//
 	// 🔴 Never creates a row. A sandbox that has never been paused has no row
 	// by design, and MarkRunningUntracked says exactly that: this node holds
@@ -143,7 +144,18 @@ type Store interface {
 	// a node waking a sandbox parked on its own disk, with no claim involved —
 	// it is the incarnation this call installs. Anything else is refused with
 	// ErrExecutionFenced, which the caller must never retry.
-	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error)
+	//
+	// 🔴 nodeID and holderNodeID split what used to be one identity.
+	// nodeID is unchanged from before — the claimant, compared against
+	// claimed_by_node_id/origin_node_id in the guard, exactly as ClaimForResume
+	// was called under. holderNodeID is new: the real machine the sandbox is
+	// running on, written into origin_node_id and otherwise uncompared. Empty
+	// falls back to nodeID, which is both the pre-split behaviour and the correct
+	// value for any caller that runs its own sandboxes (nodeID already names
+	// the real machine there). See store_postgres.go's markRunningFencedSQL for
+	// why the two must never be swapped: quoting the real machine at the guard
+	// is a0487f0's bug, the one this split exists to close.
+	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, holderNodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error)
 
 	// ReleaseNodeHoldings frees the rows a previous process on this same
 	// machine was holding when it died.

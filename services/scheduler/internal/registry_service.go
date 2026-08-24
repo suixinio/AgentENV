@@ -256,7 +256,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 
 	switch req.GetKind() {
 	case schedulerv1.TransitionKind_TRANSITION_KIND_BEGIN_PAUSE:
-		if err := rejectFields(req, fieldGeneration|fieldSnapshot); err != nil {
+		if err := rejectFields(req, fieldGeneration|fieldSnapshot|fieldHolder); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		if len(req.GetMetadataJson()) == 0 {
@@ -283,7 +283,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		}, nil
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_COMPLETE_PAUSE:
-		if err := rejectFields(req, fieldMetadata|fieldExecution); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldExecution|fieldHolder); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -296,7 +296,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		return s.ok("TransitionSandbox")
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY:
-		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution|fieldHolder); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -309,7 +309,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		return s.ok("TransitionSandbox")
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM:
-		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution|fieldHolder); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -351,7 +351,9 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 			deadline := time.UnixMicro(req.GetSandboxExpiresAtUnixMicros()).UTC()
 			expiresAt = &deadline
 		}
-		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId(), execution, expiresAt)
+		// Empty (an older node, or a caller with nothing more precise) falls
+		// back to node_id inside the store — see MarkRunning's doc.
+		outcome, err := store.MarkRunning(ctx, req.GetClusterId(), req.GetSandboxId(), req.GetNodeId(), req.GetHolderNodeId(), execution, expiresAt)
 		if err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
@@ -372,7 +374,7 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 		}, nil
 
 	case schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE:
-		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution); err != nil {
+		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution|fieldHolder); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
 		}
 		generation, err := requireGeneration(req)
@@ -474,6 +476,7 @@ const (
 	fieldMetadata
 	fieldSnapshot
 	fieldExecution
+	fieldHolder
 )
 
 // rejectFields refuses a request that carries a field its kind never writes.
@@ -497,6 +500,10 @@ func rejectFields(req *schedulerv1.TransitionSandboxRequest, unused requestField
 	}
 	if unused&fieldExecution != 0 && strings.TrimSpace(req.GetExecutionId()) != "" {
 		return fmt.Errorf("%w: %v names an incarnation, which only begin_pause and mark_running are fenced on",
+			pausedregistry.ErrInvalidArgument, req.GetKind())
+	}
+	if unused&fieldHolder != 0 && strings.TrimSpace(req.GetHolderNodeId()) != "" {
+		return fmt.Errorf("%w: %v names a holder machine, which only mark_running records",
 			pausedregistry.ErrInvalidArgument, req.GetKind())
 	}
 	return nil

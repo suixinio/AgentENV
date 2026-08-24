@@ -102,7 +102,7 @@ func (f *storeFixture) liveRow(sandboxID, node string) string {
 	}
 	execution := f.executionFor(sandboxID)
 	deadline := time.Now().Add(time.Hour)
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, sandboxID, node, execution, &deadline)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, sandboxID, node, node, execution, &deadline)
 	if err != nil || outcome != MarkRunningAdopted {
 		f.t.Fatalf("mark %s running on %s: outcome %q err %v", sandboxID, node, outcome, err)
 	}
@@ -435,7 +435,7 @@ func TestOnlyBeginPauseEverInsertsARow(t *testing.T) {
 		return n
 	}
 
-	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, execution, nil); err != nil {
+	if _, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, execution, nil); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
 	if err := f.store.CompletePause(ctx, f.cluster, id, 1, snapshotUUID(70)); !errors.Is(err, ErrGenerationConflict) {
@@ -517,7 +517,7 @@ func TestAReclaimedSandboxCannotBePausedBackByItsOldNode(t *testing.T) {
 		t.Fatalf("B's claim: outcome %q err %v", claim.Outcome, err)
 	}
 	deadline := time.Now().Add(time.Hour)
-	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, executionB, &deadline); err != nil || outcome != MarkRunningAdopted {
+	if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, stNodeB, executionB, &deadline); err != nil || outcome != MarkRunningAdopted {
 		t.Fatalf("B's mark_running: outcome %q err %v", outcome, err)
 	}
 
@@ -701,7 +701,7 @@ func TestAStaleExecutionCannotStealARunningRow(t *testing.T) {
 	f.liveRow(id, stNodeB)
 	before := f.raw(id)
 
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, newExecutionID(), nil)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, newExecutionID(), nil)
 	if err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
@@ -724,12 +724,157 @@ func TestTheSameExecutionCanReassertItself(t *testing.T) {
 
 	execution := f.liveRow(id, stNodeA)
 
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, execution, nil)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, execution, nil)
 	if err != nil {
 		t.Fatalf("a retried mark_running was refused: %v", err)
 	}
 	if outcome != MarkRunningAdopted {
 		t.Fatalf("outcome %q, want %q — the same incarnation saying so twice is a retry, not a conflict", outcome, MarkRunningAdopted)
+	}
+}
+
+// TestMarkRunningWritesTheHolderNotTheClaimant is the registry-level
+// regression guard for a0487f0, reproduced at the exact SQL layer that commit
+// broke: the claimant (the identity claim_for_resume was called under) must
+// gate branch ① of markRunningFencedSQL, and the holder (the real machine,
+// resolved only after placement) must land in origin_node_id without ever
+// being compared against anything. a0487f0 sent the holder where the
+// claimant belonged; branch ①'s `claimed_by_node_id = $2` then compared the
+// holder against what claim_for_resume had actually written — the claimant —
+// found no match, and every cross-node mark_running answered
+// held_elsewhere or untracked instead of adopting the row.
+//
+// 🔴 Four assertions in conjunction, not one. A0487f0's refused write leaves
+// the row exactly where the claim left it: state 'resuming',
+// claimed_by_node_id still the claimant, generation from the claim alone.
+// origin_node_id by itself proves nothing here — a resuming row's
+// origin_node_id is the *previous* holder, untouched by either a correct or a
+// refused mark_running, so a test that only checked it would pass on a build
+// that dropped every cross-node resume on the floor. state, generation and
+// claimed_by_node_id all have to move together.
+func TestMarkRunningWritesTheHolderNotTheClaimant(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(200)
+
+	// origin_node_id names the machine that captured the sandbox — unaffected
+	// by any of this; begin_pause has always written it correctly.
+	began := f.beginPause(id, "aenv-master-01")
+	if err := f.store.CompletePause(ctx, f.cluster, id, began.Generation, snapshotUUID(50)); err != nil {
+		t.Fatalf("complete_pause: %v", err)
+	}
+
+	// The claimant is an api replica's own identity — never a machine the
+	// scheduler heartbeats — exactly what arbitrate_resume sends today.
+	const claimant = "agentenv-api-6c58dd86cb-2hw5f"
+	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, claimant, f.nextExecutionFor(id))
+	if err != nil || claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("claim: outcome %q err %v", claim.Outcome, err)
+	}
+
+	before := f.raw(id)
+	if before.state != "resuming" || before.claimedBy == nil || *before.claimedBy != claimant {
+		t.Fatalf("setup: claim did not land as expected: %+v", before)
+	}
+
+	// Placement resolves the real machine only after the claim — this is the
+	// moment mark_running is supposed to repoint origin_node_id at it, while
+	// still guarding on the identity the claim was taken under.
+	const holder = "aenv-master-01"
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, claimant, holder, f.executionFor(id), nil)
+	if err != nil {
+		t.Fatalf("mark_running: %v", err)
+	}
+	if outcome != MarkRunningAdopted {
+		t.Fatalf("outcome %q, want %q — this is a0487f0's exact failure shape: the guard "+
+			"compared holder_node_id against claimed_by_node_id and found no match, because "+
+			"claim_for_resume wrote the claimant there, not the holder", outcome, MarkRunningAdopted)
+	}
+
+	after := f.raw(id)
+	if after.state != "running" {
+		t.Fatalf("state: got %q, want running", after.state)
+	}
+	if after.generation != before.generation+1 {
+		t.Fatalf("generation: got %d, want %d — the write must actually have landed", after.generation, before.generation+1)
+	}
+	if after.originNode != holder {
+		t.Fatalf("origin_node_id: got %q, want %q — the row must name the real machine, not the claimant that orchestrated the write", after.originNode, holder)
+	}
+	if after.claimedBy != nil {
+		t.Fatalf("claimed_by_node_id: got %q, want cleared", derefString(after.claimedBy))
+	}
+}
+
+// TestARetriedMarkRunningSucceedsEvenWhenClaimantAndHolderDiffer is branch ③'s
+// own regression guard, and it exists because of an ordinary thing the node
+// does on every cluster-arbitrated resume, not a hypothetical retry.
+//
+// Both the REST resume route and the data-plane auto-resume call
+// mark_running twice on an ordinary successful resume: once from inside the
+// orchestrator's own resume_sandbox right after the VM starts, and once more
+// from the resume surface's own follow-up, which exists to resolve a claim
+// that turned out to already be running (see PausedSandboxCoordinator::
+// mark_sandbox_running's callers in resume_surface.rs and sandbox.rs — the
+// comment "the orchestrator repoints the row for a resume it performed, but
+// not for one that found the sandbox already running" is what motivates the
+// second call, and it fires unconditionally, not only in that case).
+//
+// Both calls carry the same claimant (self.node_id) and the same holder
+// (read off the now-running backend, stable for the life of that VM). The
+// first call lands on branch ① or ②; by the time the second one runs,
+// origin_node_id already holds the *holder*, not the claimant — so if branch
+// ③ guarded on the claimant the way ① and ② do, this second, entirely
+// ordinary call would find no match whenever claimant and holder differ
+// (every cross-node resume on the api half) and answer held_elsewhere about
+// a row this same call just wrote. That would not corrupt the row — the
+// first call already succeeded — but it would make registryMarkRunningRefused
+// and "another node holds the resume claim" fire on every ordinary resume,
+// which defeats them as anomaly signals. This is why branch ③ is the one
+// exception to "the guard never reads the holder".
+func TestARetriedMarkRunningSucceedsEvenWhenClaimantAndHolderDiffer(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(201)
+
+	began := f.beginPause(id, "aenv-master-01")
+	if err := f.store.CompletePause(ctx, f.cluster, id, began.Generation, snapshotUUID(51)); err != nil {
+		t.Fatalf("complete_pause: %v", err)
+	}
+	const claimant = "agentenv-api-98f7d6c5b4-abcde"
+	const holder = "aenv-master-02"
+	claim, err := f.store.ClaimForResume(ctx, f.cluster, id, claimant, f.nextExecutionFor(id))
+	if err != nil || claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("claim: outcome %q err %v", claim.Outcome, err)
+	}
+	execution := f.executionFor(id)
+
+	// The first call — the orchestrator's own, right after the VM starts.
+	first, err := f.store.MarkRunning(ctx, f.cluster, id, claimant, holder, execution, nil)
+	if err != nil || first != MarkRunningAdopted {
+		t.Fatalf("first mark_running: outcome %q err %v", first, err)
+	}
+	afterFirst := f.raw(id)
+
+	// The second — the resume surface's unconditional follow-up. Same
+	// claimant, same holder, same execution: this must be recognised as the
+	// same write happening again, not refused.
+	second, err := f.store.MarkRunning(ctx, f.cluster, id, claimant, holder, execution, nil)
+	if err != nil {
+		t.Fatalf("the ordinary second mark_running of a resume was refused: %v", err)
+	}
+	if second != MarkRunningAdopted {
+		t.Fatalf("outcome %q, want %q — an ordinary resume's second mark_running must not be "+
+			"held_elsewhere; that fires on every cross-node resume where claimant and holder "+
+			"differ, and defeats the metric as an anomaly signal", second, MarkRunningAdopted)
+	}
+
+	after := f.raw(id)
+	if after.state != "running" || after.originNode != holder || after.claimedBy != nil {
+		t.Fatalf("the retry must leave the row exactly running under the holder: %+v", after)
+	}
+	if after.generation != afterFirst.generation+1 {
+		t.Fatalf("generation: got %d, want %d — the retry is still a write", after.generation, afterFirst.generation+1)
 	}
 }
 
@@ -790,7 +935,7 @@ func assertAReassertionDoesNotMoveTheStart(t *testing.T, f *storeFixture, id str
 	}
 	before := f.raw(id)
 
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, execution, nil)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, execution, nil)
 	if err != nil {
 		t.Fatalf("a retried mark_running was refused: %v", err)
 	}
@@ -833,7 +978,7 @@ func TestAStaleExecutionOnThisNodeIsFencedRatherThanHeldElsewhere(t *testing.T) 
 	before := f.raw(id)
 
 	stale := newExecutionID()
-	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stale, nil)
+	outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeA, stNodeA, stale, nil)
 	if !errors.Is(err, ErrExecutionFenced) {
 		t.Fatalf("a superseded incarnation on this very node was not fenced: outcome %q err %v", outcome, err)
 	}
@@ -979,7 +1124,7 @@ func TestTheVersionAxisMovesExactlyOncePerWrite(t *testing.T) {
 	// generation moves again here, and the incarnation does not. Collapsing the
 	// two columns would make this step contradict itself.
 	execution = step("mark_running", 3, false, execution, func() {
-		if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, claimed, nil); err != nil || outcome != MarkRunningAdopted {
+		if outcome, err := f.store.MarkRunning(ctx, f.cluster, id, stNodeB, stNodeB, claimed, nil); err != nil || outcome != MarkRunningAdopted {
 			t.Fatalf("mark running: outcome %q err %v", outcome, err)
 		}
 	})

@@ -333,12 +333,25 @@ func (e *contractEnv) markRunning(t *testing.T, cluster, sandboxID, node string)
 	return e.markRunningOutcome(t, cluster, sandboxID, node) == MarkRunningAdopted
 }
 
+// markRunningOutcome claims and holds under the same identity — every
+// existing caller of this helper is exercising the CAS guard, not the
+// claimant/holder split, and node was the one identity MarkRunning took
+// before that split existed.
 func (e *contractEnv) markRunningOutcome(t *testing.T, cluster, sandboxID, node string) MarkRunningOutcome {
 	t.Helper()
 
-	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node, e.executionOf(sandboxID), nil)
+	return e.markRunningOutcomeAs(t, cluster, sandboxID, node, node)
+}
+
+// markRunningOutcomeAs is markRunningOutcome with the claimant (node) and the
+// holder written into origin_node_id given separately, for the tests that
+// exist specifically to prove the two are never the same parameter.
+func (e *contractEnv) markRunningOutcomeAs(t *testing.T, cluster, sandboxID, node, holder string) MarkRunningOutcome {
+	t.Helper()
+
+	outcome, err := e.store.MarkRunning(context.Background(), cluster, sandboxID, node, holder, e.executionOf(sandboxID), nil)
 	if err != nil {
-		t.Fatalf("mark %s running on %s: %v", sandboxID, node, err)
+		t.Fatalf("mark %s running on %s (holder %s): %v", sandboxID, node, holder, err)
 	}
 
 	return outcome

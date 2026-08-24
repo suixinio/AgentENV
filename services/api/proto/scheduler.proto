@@ -698,6 +698,26 @@ message TransitionSandboxRequest {
   // optional fencing token has to keep an "absent means allow" branch, and
   // that branch is the entire attack surface.
   string execution_id = 10;
+  // mark_running only: the real machine the sandbox is running on, written
+  // into origin_node_id. node_id above stays the CAS guard — the identity
+  // claim_for_resume was called under — and is never itself written to
+  // origin_node_id by this RPC; the two used to be the same field and a node
+  // that conflated them made every cross-node mark_running match zero rows
+  // (a0487f0: node_id quoted the real machine at the guard, which is not what
+  // claim_for_resume had written to claimed_by_node_id).
+  //
+  // Empty means "same as node_id", which is both the correct value for any
+  // backend that runs its own sandboxes (node_id already names the real
+  // machine there) and this field's default for a caller built before it
+  // existed — an older node sends nothing here and the controller falls back
+  // to node_id exactly as it did when this was one field.
+  //
+  // 🔴 Not RegistrySandbox.holder_node_id below, despite the name. That one is
+  // derived and read-only — claimed_by_node_id while resuming, origin_node_id
+  // otherwise — which during a resume is the claimant, not the machine. This
+  // one is always the real machine, and only ever a write-time input. Deriving
+  // this field the way that one is derived is the exact mistake a0487f0 made.
+  string holder_node_id = 11;
 }
 
 message TransitionSandboxResponse {

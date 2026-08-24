@@ -3,8 +3,8 @@ use crate::common;
 use agentenv::cfg::ConfigManager;
 use agentenv::orchestrator::{
     ClaimedExecution, CreateSandboxRequest, FileBackedSandboxPersister, ForkChildren,
-    InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxLaunchSource,
-    SandboxState, SandboxTimeoutAction,
+    InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxExpiry,
+    SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
 use agentenv::role::ServerRole;
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
@@ -78,7 +78,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
 
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
-            timeout: Some(Duration::from_secs(30)),
+            expiry: SandboxExpiry::After(Duration::from_secs(30)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: Some(
                 [
@@ -251,7 +251,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let created = orchestrator
             .create_sandbox(CreateSandboxRequest {
                 source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
-                timeout: Some(Duration::from_secs(30)),
+                expiry: SandboxExpiry::After(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
                 user_metadata: None,
                 env_vars: None,
@@ -347,7 +347,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let relaunched = orchestrator
             .create_sandbox(CreateSandboxRequest {
                 source: SandboxLaunchSource::Snapshot(Box::new(captured_runnable)),
-                timeout: Some(Duration::from_secs(30)),
+                expiry: SandboxExpiry::After(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
                 user_metadata: None,
                 env_vars: None,

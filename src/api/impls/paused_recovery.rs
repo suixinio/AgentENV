@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 use super::{ApiImpl, StaleReleaseOutcome};
 use crate::orchestrator::{
     ClaimedExecution, ClusterRegistration, CreateSandboxRequest, HeldSandbox, NewTimeout,
-    PausedRegistryState, PausedSandboxEntry, ResumeClaim, SandboxLaunchSource, SandboxListFilter,
-    SandboxMetadata, SandboxState,
+    PausedRegistryState, PausedSandboxEntry, ResumeClaim, SandboxExpiry, SandboxLaunchSource,
+    SandboxListFilter, SandboxMetadata, SandboxState,
 };
 use crate::snapshot::{CatalogReadScope, SnapshotAbsence};
 use crate::types::{ExecutionId, SandboxId};
@@ -1266,10 +1266,22 @@ fn restore_request(
         source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
         // A restore is a resume: the request's timeout wins when it set one,
         // otherwise the sandbox keeps the timeout it was paused with.
-        timeout: match timeout {
-            NewTimeout::Set(duration) | NewTimeout::EnsureMinimum(duration) => Some(duration),
-            NewTimeout::UseExisting => metadata.timeout,
-            NewTimeout::None => None,
+        //
+        // 🔴 Never `AfterConfiguredDefault`. This orchestrator is restoring a
+        // sandbox whose deadline is already decided — by the request or by the
+        // record — so reaching for a configured default here would be inventing
+        // a deadline for a sandbox that came with one. A record that carries
+        // none carries none: `NotKeptHere` says "keep none", which is what the
+        // paused record says, and not "use fifteen seconds".
+        expiry: match timeout {
+            NewTimeout::Set(duration) | NewTimeout::EnsureMinimum(duration) => {
+                SandboxExpiry::After(duration)
+            }
+            NewTimeout::UseExisting => match metadata.timeout {
+                Some(duration) => SandboxExpiry::After(duration),
+                None => SandboxExpiry::NotKeptHere,
+            },
+            NewTimeout::None => SandboxExpiry::NotKeptHere,
         },
         timeout_action: metadata.timeout_action,
         auto_resume: metadata.auto_resume,

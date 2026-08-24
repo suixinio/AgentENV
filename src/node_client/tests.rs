@@ -444,6 +444,67 @@ async fn the_create_names_the_run_the_caller_minted() {
     assert!(backend.startup_artifacts().is_empty());
 }
 
+/// 🔴 The API half tells the node, in as many words, that it keeps this
+/// sandbox's deadline itself.
+///
+/// This is the half of the fix that lives on the sending side, and it is worth
+/// a test of its own because the failure it prevents is a *silence*: the field
+/// used to be a `uint64` left at its zero value, the node read that zero as
+/// "the caller named no deadline, use yours", and its
+/// `default_sandbox_timeout_secs` paused a VM this half went on reporting as
+/// running. Nothing logged a disagreement, because neither half knew there was
+/// one.
+///
+/// The two values it must not send are built here as well. Both are what a
+/// plausible edit produces — `node_kept_default` is literally the old
+/// behaviour, and a `node_kept_timeout_ms` is what "just send the timeout"
+/// produces — and neither is distinguishable from the right answer by anything
+/// else in this crate.
+#[tokio::test]
+async fn the_create_tells_the_node_that_this_half_keeps_the_deadline() {
+    use pb::sandbox_create_request::Expiry;
+
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+        .expect("building a stub should not fail");
+    backend.start().await.expect("start");
+
+    let creates = script.seen_create.lock().expect("lock").clone();
+    assert_eq!(creates.len(), 1);
+    assert_eq!(
+        creates[0].expiry,
+        Some(Expiry::CallerKept(pb::CallerKeptExpiry {})),
+        "the node was not told that this half keeps the sandbox's deadline"
+    );
+
+    // 🔴 The three answers this field has, and the two that are wrong here.
+    // `None` is the one that used to be sent, by way of a zero.
+    assert_ne!(
+        creates[0].expiry,
+        Some(Expiry::NodeKeptDefault(pb::NodeDefaultExpiry {})),
+        "the node was told to apply its own default, which is the outage"
+    );
+    assert!(
+        !matches!(creates[0].expiry, Some(Expiry::NodeKeptTimeoutMs(_))),
+        "the node was handed a deadline to keep, and it keeps none for this half's sandboxes"
+    );
+    assert!(
+        creates[0].expiry.is_some(),
+        "the field was left unset, which the node refuses"
+    );
+}
+
 /// 🔴 A node that cannot be reached is an error, never "the sandbox is gone".
 ///
 /// `stop` is where the temptation is strongest — both endings have nothing left

@@ -95,6 +95,29 @@ fn make_orchestrator_without_background_with_factory<
     )
 }
 
+/// What `[orchestrator].default_sandbox_timeout_secs` is worth to a test that
+/// does not care what it is.
+///
+/// 🔴 A test that cares says so with
+/// [`make_orchestrator_without_background_with_default_timeout`], because "the
+/// configured default" is one of the three answers
+/// [`SandboxExpiry`](crate::orchestrator::SandboxExpiry) has and an assertion
+/// about it has to be about a value the test chose.
+const TEST_DEFAULT_SANDBOX_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// An orchestrator whose configured default is short enough for a test to
+/// outlast on purpose.
+fn make_orchestrator_without_background_with_default_timeout(
+    default_sandbox_timeout: Duration,
+) -> Arc<TestOrchestrator> {
+    make_orchestrator_without_background_parts(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        default_sandbox_timeout,
+    )
+}
+
 fn make_orchestrator_without_background_with_factory_and_persister<
     S: MetadataStore + 'static,
     F: SandboxBackendFactory,
@@ -103,6 +126,24 @@ fn make_orchestrator_without_background_with_factory_and_persister<
     store: S,
     factory: F,
     persister: P,
+) -> Arc<TestOrchestrator<S, F, P>> {
+    make_orchestrator_without_background_parts(
+        store,
+        factory,
+        persister,
+        TEST_DEFAULT_SANDBOX_TIMEOUT,
+    )
+}
+
+fn make_orchestrator_without_background_parts<
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+>(
+    store: S,
+    factory: F,
+    persister: P,
+    default_sandbox_timeout: Duration,
 ) -> Arc<TestOrchestrator<S, F, P>> {
     let (sandbox_event_tx, _sandbox_event_rx) =
         tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
@@ -115,7 +156,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
         sandbox_event_tx,
-        default_sandbox_timeout: Duration::from_secs(15),
+        default_sandbox_timeout,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         scheduling_disabled: std::sync::atomic::AtomicBool::new(false),
         scheduling_disabled_changed_at_ms: std::sync::atomic::AtomicI64::new(0),
@@ -1136,7 +1177,15 @@ fn create_request(
 
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
-        timeout: timeout_secs.map(Duration::from_secs),
+        // 🔴 `None` here is the *client's* "I did not say", which is what
+        // `AfterConfiguredDefault` spells. It is deliberately not the other
+        // reading the old `Option<Duration>` also carried — see
+        // `SandboxExpiry` — and the tests that want that one say
+        // `SandboxExpiry::NotKeptHere` by name.
+        expiry: match timeout_secs {
+            Some(secs) => SandboxExpiry::After(Duration::from_secs(secs)),
+            None => SandboxExpiry::AfterConfiguredDefault,
+        },
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata,
         env_vars: None,
@@ -1200,7 +1249,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
                 extra_boot_args: None,
                 image_configs: Box::new(ImageConfigs::new()),
             },
-            timeout: Some(Duration::from_secs(60)),
+            expiry: SandboxExpiry::After(Duration::from_secs(60)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: None,
             env_vars: None,
@@ -3084,6 +3133,248 @@ async fn a_sandbox_that_has_spent_its_running_budget_is_still_evicted_after_a_re
     );
 
     orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+/// One create request, one field different, opposite answers from the evictor.
+///
+/// 🔴 **This is the fault the role split introduced, and the shape of it is
+/// that two intentions used to be one value.** The API half asks a node to run
+/// a sandbox whose record, whose expiry index and whose eviction loop are all
+/// on the API half; a user posting to `POST /sandboxes` without a `timeout`
+/// asks *this* orchestrator to pick one. Both used to arrive as `None`, so the
+/// node applied its own `default_sandbox_timeout_secs` — fifteen seconds on the
+/// cluster this was found on — and paused a VM the API half went on reporting
+/// as running.
+///
+/// 🔴 **The negative half is worthless on its own and is not left on its own.**
+/// "The caller-kept sandbox was not evicted" is satisfied by an evictor that
+/// did nothing at all, so the same pass has to take something: the sandbox that
+/// asked for the configured default is expired and paused in this very run, by
+/// this very call. And the third leg tells the two reasons for *not* being
+/// evicted apart — a deadline in the future is not the same as no deadline.
+#[tokio::test]
+async fn the_evictor_takes_the_deadlines_this_orchestrator_keeps_and_no_others() -> Result<()> {
+    setup();
+    // 🔴 Chosen here, and short, so that "after the default has passed" is an
+    // interval this test makes rather than one it hopes three creates took.
+    const CONFIGURED_DEFAULT: Duration = Duration::from_millis(20);
+    const LONGER_THAN_THE_WHOLE_TEST: Duration = Duration::from_secs(600);
+
+    let orchestrator =
+        make_orchestrator_without_background_with_default_timeout(CONFIGURED_DEFAULT);
+    let with = |expiry| CreateSandboxRequest {
+        expiry,
+        ..create_request(None, &[])
+    };
+
+    let caller_kept = orchestrator
+        .create_sandbox(with(SandboxExpiry::NotKeptHere))
+        .await?;
+    let node_default = orchestrator
+        .create_sandbox(with(SandboxExpiry::AfterConfiguredDefault))
+        .await?;
+    let node_named = orchestrator
+        .create_sandbox(with(SandboxExpiry::After(LONGER_THAN_THE_WHOLE_TEST)))
+        .await?;
+
+    // What each one wrote down. 🔴 The middle assertion names the value this
+    // test configured: an implementation that reached for some other default
+    // would still produce *a* deadline, and only naming the number catches it.
+    assert_eq!(caller_kept.timeout, None);
+    assert_eq!(
+        caller_kept.expires_at, None,
+        "a sandbox whose deadline the caller keeps must not be in this orchestrator's expiry index"
+    );
+    assert_eq!(node_default.timeout, Some(CONFIGURED_DEFAULT));
+    assert_eq!(node_named.timeout, Some(LONGER_THAN_THE_WHOLE_TEST));
+
+    // 🔴 The wait is the test's, and it is ten times the deadline it is waiting
+    // out — not "however long the statements above took", which is the version
+    // that passes on a fast machine and fails on a loaded one.
+    sleep(CONFIGURED_DEFAULT * 10).await;
+
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert_eq!(
+        evicted,
+        vec![node_default.id],
+        "exactly the sandbox whose deadline this orchestrator keeps, and it did pass"
+    );
+
+    let state = |id| {
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .get_sandbox(&id)
+                .await
+                .expect("read")
+                .expect("the sandbox is still tracked")
+                .state
+        }
+    };
+    assert_eq!(
+        state(node_default.id).await,
+        SandboxState::Paused,
+        "the timeout action is Pause, and this is the run that proves the evictor ran at all"
+    );
+    assert_eq!(
+        state(caller_kept.id).await,
+        SandboxState::Running,
+        "the node paused a sandbox whose deadline it was told it does not keep"
+    );
+    assert_eq!(
+        state(node_named.id).await,
+        SandboxState::Running,
+        "a deadline ten minutes out has not passed"
+    );
+
+    orchestrator.delete_sandbox(caller_kept.id).await?;
+    orchestrator.delete_sandbox(node_named.id).await?;
+    orchestrator.delete_sandbox(node_default.id).await?;
+    Ok(())
+}
+
+/// A fork of a sandbox with no deadline gives its children no deadline.
+///
+/// 🔴 The fork path reaches the node as `timeout_ms: 0`, which it reads as
+/// `NewTimeout::UseExisting` — so whether a fork child inherits a deadline
+/// nobody agreed to is decided entirely by what the *source's* create wrote
+/// down. That is why this is asserted here and not argued about: a create fixed
+/// in isolation would still leak fifteen-second deadlines into every child if
+/// `UseExisting` fell back to the default.
+///
+/// The non-empty half is the second fork, which asks for a deadline by name and
+/// gets one — and is the child the single eviction pass below takes.
+#[tokio::test]
+async fn a_fork_of_a_sandbox_with_no_deadline_gives_its_children_none() -> Result<()> {
+    setup();
+    const SHORT_ENOUGH_TO_OUTLAST: Duration = Duration::from_millis(20);
+
+    let orchestrator =
+        make_orchestrator_without_background_with_default_timeout(Duration::from_secs(15));
+    let source = orchestrator
+        .create_sandbox(CreateSandboxRequest {
+            expiry: SandboxExpiry::NotKeptHere,
+            ..create_request(None, &[])
+        })
+        .await?;
+    assert_eq!(source.expires_at, None);
+
+    let fork = |timeout| {
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .fork_sandbox(source.id, ForkChildren::Fresh(1), timeout)
+                .await
+                .expect("the fork ran")
+                .into_iter()
+                .next()
+                .expect("one child")
+                .expect("the child started")
+        }
+    };
+
+    let inherited = fork(NewTimeout::UseExisting).await;
+    let asked_for = fork(NewTimeout::Set(SHORT_ENOUGH_TO_OUTLAST)).await;
+
+    assert_eq!(
+        inherited.expires_at, None,
+        "a child of a sandbox with no deadline acquired one from somewhere"
+    );
+    assert_eq!(asked_for.timeout, Some(SHORT_ENOUGH_TO_OUTLAST));
+
+    sleep(SHORT_ENOUGH_TO_OUTLAST * 10).await;
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert_eq!(
+        evicted,
+        vec![asked_for.id],
+        "the child that asked for a deadline is the one the same pass takes"
+    );
+
+    for id in [source.id, inherited.id] {
+        assert_eq!(
+            orchestrator
+                .get_sandbox(&id)
+                .await?
+                .expect("still tracked")
+                .state,
+            SandboxState::Running
+        );
+    }
+
+    orchestrator.delete_sandbox(inherited.id).await?;
+    orchestrator.delete_sandbox(asked_for.id).await?;
+    orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+/// Resuming a sandbox with no deadline does not hand it one.
+///
+/// 🔴 Same reasoning as the fork above: a resume driven by the API half sends
+/// `timeout_ms: 0` and the node reads `NewTimeout::UseExisting`, so the answer
+/// is whatever the paused record says. The non-empty half is the second
+/// sandbox, resumed with a deadline it named and evicted in the same pass.
+#[tokio::test]
+async fn resuming_a_sandbox_with_no_deadline_does_not_hand_it_one() -> Result<()> {
+    setup();
+    const SHORT_ENOUGH_TO_OUTLAST: Duration = Duration::from_millis(20);
+
+    let orchestrator =
+        make_orchestrator_without_background_with_default_timeout(Duration::from_secs(15));
+    let start = || {
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .create_sandbox(CreateSandboxRequest {
+                    expiry: SandboxExpiry::NotKeptHere,
+                    ..create_request(None, &[])
+                })
+                .await
+                .expect("a sandbox with no deadline")
+                .id
+        }
+    };
+
+    let kept = start().await;
+    let replaced = start().await;
+    orchestrator.pause_sandbox(kept).await?;
+    orchestrator.pause_sandbox(replaced).await?;
+
+    let kept = orchestrator
+        .resume_sandbox(kept, NewTimeout::UseExisting, test_claim())
+        .await?;
+    let replaced = orchestrator
+        .resume_sandbox(
+            replaced,
+            NewTimeout::Set(SHORT_ENOUGH_TO_OUTLAST),
+            test_claim(),
+        )
+        .await?;
+
+    assert_eq!(
+        kept.expires_at, None,
+        "a resume gave a deadline to a sandbox that was paused without one"
+    );
+    assert_eq!(replaced.timeout, Some(SHORT_ENOUGH_TO_OUTLAST));
+
+    sleep(SHORT_ENOUGH_TO_OUTLAST * 10).await;
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert_eq!(
+        evicted,
+        vec![replaced.id],
+        "the resume that named a deadline is the one the same pass takes"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&kept.id)
+            .await?
+            .expect("still tracked")
+            .state,
+        SandboxState::Running
+    );
+
+    orchestrator.delete_sandbox(kept.id).await?;
+    orchestrator.delete_sandbox(replaced.id).await?;
     Ok(())
 }
 

@@ -202,6 +202,21 @@ message AttachedDrive {
   bool read_only = 4;
 }
 
+// Marker: the node keeps the deadline and the caller named none, so the node's
+// configured default applies.
+//
+// 🔴 Empty on purpose. The value lives in the node's configuration and putting
+// a copy of it on the wire would let a caller and a node disagree about what
+// "the default" is while both believed they had said the same thing.
+message NodeDefaultExpiry {}
+
+// Marker: the caller keeps this sandbox's deadline, so the node keeps none.
+//
+// 🔴 Empty on purpose, and a message rather than a `bool`: what it carries is
+// that it was sent at all, and a bool has a second value that would have to
+// mean something.
+message CallerKeptExpiry {}
+
 message SandboxCreateRequest {
   // 🔴 Chosen by the API half, not by the node. The control plane's record of
   // the sandbox exists before the sandbox does — that record is what
@@ -229,8 +244,54 @@ message SandboxCreateRequest {
     ImageSource image = 4;
   }
 
-  // 0 means "the node's configured default", never "no timeout".
-  uint64 timeout_ms = 5;
+  // 🔴 Was `uint64 timeout_ms`, whose zero meant two different things. See
+  // `expiry` below for what went wrong and why the replacement took new
+  // numbers instead of this one: a build that still speaks the old field must
+  // fail to be understood rather than be understood as one of the three.
+  reserved 5;
+  reserved "timeout_ms";
+
+  // 🔴 **Who keeps this sandbox's deadline is a three-answer question, which
+  // is why it is a oneof and not a number.**
+  //
+  // The three answers are "keep one this long", "keep one, and the caller
+  // named none so use yours" and "keep none: the caller keeps this sandbox's
+  // deadline in its own ledger". The first two are the node's to act on; the
+  // third forbids it to act at all.
+  //
+  // 🔴 The middle and the last one used to be the same value — a `0` in a
+  // `uint64 timeout_ms` — and that is what field 5 is reserved for having
+  // been. The API half sent 0 meaning the last and the node read it as the
+  // middle, so `[orchestrator].default_sandbox_timeout_secs` gave a sandbox
+  // the API half believed it owned a deadline nobody had agreed to, and the
+  // node's eviction loop paused the VM while the API half went on reporting it
+  // running. Nothing about that failure is loud: the two halves disagree in
+  // silence, and every later call on the sandbox fails for a reason that names
+  // something else.
+  //
+  // 🔴 An unset oneof is refused rather than defaulted. A sender that says
+  // nothing about expiry is a sender that has not been taught to, and picking
+  // one of the three on its behalf is exactly the guess that went wrong.
+  oneof expiry {
+    // The node keeps the deadline, and it is this many milliseconds from the
+    // start of the sandbox.
+    //
+    // 🔴 Zero is refused here, and is not a spelling of either of the other
+    // two arms: a sender that meant the node's default has `node_kept_default`
+    // to say so, and one that meant no deadline has `caller_kept`.
+    uint64 node_kept_timeout_ms = 14;
+    // The node keeps the deadline and the caller named none, so the node's own
+    // `default_sandbox_timeout_secs` is the answer.
+    NodeDefaultExpiry node_kept_default = 15;
+    // 🔴 The **caller** keeps this sandbox's deadline. The node records none,
+    // reports none, and never evicts the sandbox on its own initiative — the
+    // half that asked for it is the half that decides when its time is up, and
+    // a second deadline on the node would be a second ledger for one sandbox.
+    CallerKeptExpiry caller_kept = 16;
+  }
+  // 🔴 Read only when the node keeps the deadline, and still required: the
+  // caller that keeps expiry itself is the caller that will one day hand the
+  // sandbox back, and what it does then is not this node's to guess.
   TimeoutAction timeout_action = 6;
   bool auto_resume = 7;
   // Whether envd requires this sandbox's derived access token.

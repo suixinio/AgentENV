@@ -13,8 +13,8 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxExpiry,
+    SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -298,6 +298,21 @@ fn parse_metadata_filter(raw: &Option<String>) -> Option<HashMap<String, String>
 
 fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
+}
+
+/// What a user-facing create means by the `timeout` it did or did not send.
+///
+/// 🔴 Never [`SandboxExpiry::NotKeptHere`]. A user is a client, not a second
+/// orchestrator: it keeps no record of the sandbox, runs no expiry index and
+/// evicts nothing, so "said nothing" can only mean the configured default. The
+/// third answer belongs to the one caller that does keep all three — the API
+/// half asking a node — and it is sent by `RemoteSandboxBackendFactory`, a
+/// layer below this one.
+fn requested_expiry(timeout: Option<u32>) -> SandboxExpiry {
+    match duration_from_secs(timeout) {
+        Some(timeout) => SandboxExpiry::After(timeout),
+        None => SandboxExpiry::AfterConfiguredDefault,
+    }
 }
 
 fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
@@ -585,7 +600,7 @@ impl Sandboxes<()> for ApiImpl {
                 extra_boot_args: body.extra_boot_args.clone(),
                 image_configs: Box::new(image_configs),
             },
-            timeout: duration_from_secs(body.timeout),
+            expiry: requested_expiry(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
                 _ => SandboxTimeoutAction::Pause,
@@ -730,7 +745,7 @@ impl Sandboxes<()> for ApiImpl {
 
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-            timeout: duration_from_secs(body.timeout),
+            expiry: requested_expiry(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
                 _ => SandboxTimeoutAction::Pause,
@@ -1780,6 +1795,35 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 A user who sends no `timeout` gets this orchestrator's default, and
+    /// never "keep no deadline".
+    ///
+    /// The same absence means two different things depending on who is asking,
+    /// and this is the half where it means the default. The other half — the
+    /// API process asking a *node* — is `RemoteSandboxBackendFactory`, which
+    /// says `caller_kept` on the wire; the two must not converge, because the
+    /// sandbox would then be one nobody ever expires.
+    ///
+    /// The control face is the same call with a number in it: an implementation
+    /// that returned `AfterConfiguredDefault` for everything would satisfy the
+    /// first assertion on its own.
+    #[test]
+    fn a_user_that_named_no_timeout_gets_the_configured_default_and_not_none() {
+        assert_eq!(
+            requested_expiry(None),
+            SandboxExpiry::AfterConfiguredDefault
+        );
+        assert_ne!(
+            requested_expiry(None),
+            SandboxExpiry::NotKeptHere,
+            "a user is a client, not a second orchestrator keeping its own deadline"
+        );
+        assert_eq!(
+            requested_expiry(Some(600)),
+            SandboxExpiry::After(Duration::from_secs(600))
+        );
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

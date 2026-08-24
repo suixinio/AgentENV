@@ -42,8 +42,8 @@ pub use store::{
 };
 pub use types::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
-    SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxRosterEntry,
-    SandboxState, SnapshotCaptureResult,
+    SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
+    SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

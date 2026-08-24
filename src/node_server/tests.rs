@@ -13,7 +13,7 @@ use tonic::{Code, Request, Status};
 use crate::orchestrator::{
     ControlPlaneConfig, CreateSandboxRequest, DisabledSandboxPersister, ForkChildAssignment,
     ForkChildren, InMemoryMetadataStore, NewTimeout, Orchestrator, RecordingCall,
-    RecordingPersister, SandboxLaunchSource, SandboxMetadata, SandboxOrchestration,
+    RecordingPersister, SandboxExpiry, SandboxLaunchSource, SandboxMetadata, SandboxOrchestration,
     SandboxTimeoutAction,
 };
 use crate::proto::node as pb;
@@ -50,7 +50,7 @@ async fn service() -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
 fn launch(marker: Option<&[u8]>) -> CreateSandboxRequest {
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
-        timeout: Some(Duration::from_secs(60)),
+        expiry: SandboxExpiry::After(Duration::from_secs(60)),
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata: None,
         env_vars: None,
@@ -709,7 +709,9 @@ async fn a_create_carrying_an_empty_marker_produces_an_unowned_sandbox() {
                     snapshot_id: "mock".to_string(),
                 },
             )),
-            timeout_ms: 60_000,
+            expiry: Some(pb::sandbox_create_request::Expiry::NodeKeptTimeoutMs(
+                60_000,
+            )),
             timeout_action: pb::TimeoutAction::Pause as i32,
             control_plane_config: Vec::new(),
             ..Default::default()
@@ -743,6 +745,65 @@ async fn a_create_carrying_an_empty_marker_produces_an_unowned_sandbox() {
     assert_eq!(sandboxes[0].control_plane_config, b"\0");
 }
 
+/// 🔴 A create that does not say who keeps the sandbox's deadline is refused,
+/// and refused before the node goes looking for a snapshot.
+///
+/// One request shape, one field different, opposite answers — and both halves
+/// are non-empty, which is what makes the refusal mean anything. Without the
+/// control face below, "the create was refused" would be satisfied by a node
+/// that refuses every create, including for the reason the snapshot does not
+/// exist.
+///
+/// The *codes* are what the two halves are told apart by, and they say where
+/// the request got to: `InvalidArgument` is this node reading the message,
+/// `NotFound` is this node having gone to its snapshot resolver and come back.
+/// The silent create the split shipped went all the way to a running VM.
+#[tokio::test]
+async fn a_create_that_does_not_say_who_keeps_the_deadline_is_refused_before_the_resolver() {
+    let (orchestration, service) = service().await;
+    let request = |expiry| pb::SandboxCreateRequest {
+        sandbox_id: SandboxId::new().to_string(),
+        source: Some(pb::sandbox_create_request::Source::Snapshot(
+            pb::SnapshotSource {
+                snapshot_id: "no-such-snapshot".to_string(),
+            },
+        )),
+        expiry,
+        timeout_action: pb::TimeoutAction::Pause as i32,
+        control_plane_config: b"owned".to_vec(),
+        ..Default::default()
+    };
+
+    let silent = service
+        .create(Request::new(request(None)))
+        .await
+        .expect_err("a create that said nothing about expiry");
+    assert_eq!(silent.code(), Code::InvalidArgument, "{silent}");
+    assert!(silent.message().contains("expiry is required"), "{silent}");
+
+    // 🔴 The control face. Same request, expiry named, and now the refusal
+    // comes from the snapshot resolver — which is to say the message was
+    // understood and the call got further than the one above.
+    let answered = service
+        .create(Request::new(request(Some(
+            pb::sandbox_create_request::Expiry::CallerKept(pb::CallerKeptExpiry {}),
+        ))))
+        .await
+        .expect_err("the mock catalog has no snapshots");
+    assert!(
+        matches!(answered.code(), Code::NotFound | Code::Internal),
+        "{answered}"
+    );
+
+    // Neither left anything behind on the node.
+    assert!(listed(&service).await.is_empty());
+    assert!(Arc::clone(&orchestration)
+        .list_sandboxes()
+        .await
+        .expect("list")
+        .is_empty());
+}
+
 /// A create the caller identified is created under that id.
 #[tokio::test]
 async fn a_create_uses_the_id_the_caller_chose() {
@@ -760,7 +821,9 @@ async fn a_create_uses_the_id_the_caller_chose() {
                     snapshot_id: "no-such-snapshot".to_string(),
                 },
             )),
-            timeout_ms: 0,
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
             timeout_action: pb::TimeoutAction::Pause as i32,
             control_plane_config: b"owned".to_vec(),
             ..Default::default()
@@ -995,6 +1058,14 @@ async fn the_unserved_calls_say_so_rather_than_answering() {
                 ..Default::default()
             })),
             timeout_action: pb::TimeoutAction::Pause as i32,
+            // 🔴 Filled in so the refusal below is about the *source*. Anything
+            // a request can be refused for without touching the machine is
+            // refused before the source is looked at, so a request that also
+            // said nothing about expiry would be turned away for that instead
+            // and this assertion would stop being about a cold create.
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
             ..Default::default()
         }))
         .await

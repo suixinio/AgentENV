@@ -97,12 +97,21 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
                     snapshot_id: record.id.to_string(),
                 },
             )),
-            // 🔴 Left to the node's default rather than guessed at. The
-            // sandbox's timeout is decided by the orchestrator above this
-            // factory and written into its own record; it does not reach a
-            // backend, and inventing one here would give the node a deadline
-            // nobody agreed to.
-            timeout_ms: 0,
+            // 🔴 **Said out loud, because it used to be said by omission.**
+            // The sandbox's deadline is decided by the orchestrator above this
+            // factory and written into *its* record, together with the expiry
+            // index and the eviction loop that act on it. The node is to keep
+            // none.
+            //
+            // Sending nothing used to be how that was expressed, and the node
+            // read it as "the caller named no deadline, so use mine": a
+            // 15-second `default_sandbox_timeout_secs` then paused the VM while
+            // this half went on answering `running`, and every later call on
+            // the sandbox failed naming something else. There is now no way to
+            // leave the question open — see `SandboxCreateRequest.expiry`.
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
             timeout_action: pb::TimeoutAction::Pause as i32,
             auto_resume: false,
             secure: launch_config.envd_access_token.is_some(),
@@ -285,10 +294,11 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             // The run the resume claim allocated, which the node must adopt
             // rather than mint its own.
             resumed_execution_id: execution_id.to_string(),
-            // 🔴 Left at "keep what it was paused with", for the same reason a
-            // create leaves the node's default alone: the sandbox's deadline is
-            // decided by the orchestrator above this factory and written into
-            // its own record, and it does not reach a backend.
+            // 🔴 Zero, meaning "keep what it was paused with" — which for a
+            // sandbox this half created is no deadline at all, because the
+            // create said `caller_kept`. Unlike a create, this zero has only
+            // ever had one reading: a resume has an existing deadline to keep,
+            // so there was never a second meaning for it to be confused with.
             timeout_ms: 0,
         };
 

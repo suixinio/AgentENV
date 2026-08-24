@@ -35,8 +35,8 @@ use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
-    SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxRosterEntry,
-    SandboxState, SnapshotCaptureResult,
+    SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
+    SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -414,6 +414,24 @@ where
         .await
     }
 
+    /// What a create's [`SandboxExpiry`] means to the record this orchestrator
+    /// is about to write.
+    ///
+    /// 🔴 The one place the configured default is reached for on a create, and
+    /// the one place [`SandboxExpiry::NotKeptHere`] becomes
+    /// [`NewTimeout::None`]. A record with no `expires_at` is never in the
+    /// expiry index and so is never seen by
+    /// [`evict_expired_sandboxes`](Self::evict_expired_sandboxes) — which is
+    /// the whole of what "the caller keeps this deadline" buys, and the reason
+    /// this may not fall back to the default for any reason at all.
+    fn new_timeout_for(&self, expiry: SandboxExpiry) -> NewTimeout {
+        match expiry {
+            SandboxExpiry::After(timeout) => NewTimeout::Set(timeout),
+            SandboxExpiry::AfterConfiguredDefault => NewTimeout::Set(self.default_sandbox_timeout),
+            SandboxExpiry::NotKeptHere => NewTimeout::None,
+        }
+    }
+
     #[tracing::instrument(
         name = "create_sandbox",
         skip(self, request),
@@ -431,7 +449,7 @@ where
 
         let CreateSandboxRequest {
             source,
-            timeout,
+            expiry,
             timeout_action,
             user_metadata,
             env_vars,
@@ -443,7 +461,13 @@ where
             execution_id,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
-        info!(timeout = ?timeout, "creating sandbox");
+        // 🔴 The three-answer value, not a duration. What this line used to log
+        // was `timeout=None` for both "the caller named none" and "the caller
+        // keeps this one's deadline", which is exactly the pair that has to be
+        // told apart — and a split cluster's create is logged twice, once per
+        // half, so this is where the disagreement is visible or nowhere.
+        info!(?expiry, "creating sandbox");
+        let new_timeout = self.new_timeout_for(expiry);
 
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
@@ -509,7 +533,7 @@ where
                     snapshot,
                     launch_config,
                     transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    new_timeout,
                     execution_id,
                 ))
                 .await
@@ -573,7 +597,7 @@ where
                     build_spec,
                     launch_config,
                     transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    new_timeout,
                     execution_id,
                 ))
                 .await

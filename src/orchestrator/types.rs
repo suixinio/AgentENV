@@ -24,10 +24,60 @@ pub enum SandboxLaunchSource {
     },
 }
 
+/// Who keeps a new sandbox's deadline, and — when it is this orchestrator —
+/// what it is.
+///
+/// # 🔴 Three answers, not two
+///
+/// This used to be an `Option<Duration>`, and `None` was made to carry two
+/// unrelated instructions at once:
+///
+/// * *the caller named no deadline, so use the configured default* — which is
+///   what a user posting to `POST /sandboxes` without a `timeout` means; and
+/// * *the caller keeps this sandbox's deadline itself, so keep none* — which is
+///   what the API half means when it asks a node to run a sandbox whose record,
+///   whose expiry index and whose eviction loop all live in the API half.
+///
+/// One process answered both the same way and nothing noticed, because in a
+/// `--role all` server the second sender does not exist. Split the halves apart
+/// and it does: the API half sent "you do not own this deadline", the node read
+/// "use your own default", and `[orchestrator].default_sandbox_timeout_secs`
+/// then paused a running VM out from under an owner that went on reporting it
+/// as running. Every later call on that sandbox failed for a reason that named
+/// something else — `invalid state Paused` on a network update, 404 on a
+/// pause — so the one fact worth knowing was the one nothing said.
+///
+/// Making the caller pick one of three is what stops that from being
+/// expressible again: there is no value here that a sender can leave unset and
+/// have guessed at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxExpiry {
+    /// This orchestrator keeps the deadline, and it is this long.
+    After(Duration),
+    /// This orchestrator keeps the deadline and the caller named none, so
+    /// [`default_sandbox_timeout_secs`][crate::cfg::OrchestratorConfig::default_sandbox_timeout_secs]
+    /// is the answer.
+    ///
+    /// 🔴 The answer for a *client*, and only for a client. Something that
+    /// keeps its own record of the sandbox is not a caller that "did not say";
+    /// it is a caller that said [`NotKeptHere`](Self::NotKeptHere).
+    AfterConfiguredDefault,
+    /// This orchestrator keeps no deadline for the sandbox, and its eviction
+    /// loop will therefore never touch it.
+    ///
+    /// 🔴 Read it as *not mine to keep*, which covers both callers that send
+    /// it: the API half, which keeps the deadline in its own record and evicts
+    /// from there, and a restore whose record genuinely carries no deadline.
+    /// What both are saying is that this orchestrator deciding on its own that
+    /// the sandbox's time is up would be a second ledger for one sandbox.
+    NotKeptHere,
+}
+
 #[derive(Clone)]
 pub struct CreateSandboxRequest {
     pub source: SandboxLaunchSource,
-    pub timeout: Option<Duration>,
+    /// 🔴 Deliberately not an `Option<Duration>`; see [`SandboxExpiry`].
+    pub expiry: SandboxExpiry,
     pub timeout_action: super::SandboxTimeoutAction,
     pub auto_resume: bool,
     pub user_metadata: Option<HashMap<String, String>>,

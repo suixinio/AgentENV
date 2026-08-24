@@ -269,6 +269,12 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         // local artifacts, and doing that before noticing the request was
         // malformed spends a network round trip to arrive at the same answer.
         let timeout_action = convert::timeout_action(request.timeout_action)?;
+        // 🔴 Read here, with the rest of the "can be refused without touching
+        // the machine" group, and not down at the launch. A create whose sender
+        // did not say who keeps the deadline is refused before a snapshot is
+        // resolved, so the refusal costs a registry round trip less than the
+        // silent mis-reading it replaced.
+        let expiry = convert::create_expiry(request.expiry)?;
         let network_policy: SandboxNetworkPolicy =
             convert::serialized(request.network_policy.as_ref(), "network_policy")?
                 .unwrap_or_default();
@@ -320,7 +326,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
 
         let create = CreateSandboxRequest {
             source,
-            timeout: convert::timeout(request.timeout_ms),
+            expiry,
             timeout_action,
             auto_resume: request.auto_resume,
             user_metadata: (!request.user_metadata.is_empty()).then_some(request.user_metadata),
@@ -574,7 +580,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
 
         self.fenced(sandbox_id, paused_execution_id).await?;
 
-        let timeout = match convert::timeout(request.timeout_ms) {
+        let timeout = match convert::optional_timeout(request.timeout_ms) {
             Some(timeout) => NewTimeout::Set(timeout),
             // 🔴 The sandbox keeps what it was paused with, rather than picking
             // up this node's configured default. The deadline belongs to the
@@ -634,7 +640,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             })
             .collect::<Result<Vec<_>, Status>>()?;
 
-        let timeout = match convert::timeout(request.timeout_ms) {
+        let timeout = match convert::optional_timeout(request.timeout_ms) {
             Some(timeout) => NewTimeout::Set(timeout),
             None => NewTimeout::UseExisting,
         };

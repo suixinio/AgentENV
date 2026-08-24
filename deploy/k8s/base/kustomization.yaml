@@ -380,6 +380,58 @@ configMapGenerator:
     literals:
       - AENV_IMAGE_CACHE_CAPACITY_GB=24
       - AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB=12
+  # Which registries `regctl` may reach over plain HTTP — tracked the same way
+  # `config/oss-overlay.toml` above is: a credential-free, cluster-specific
+  # infrastructure fact, not a secret, so it belongs in a file in this
+  # repository rather than only in a live object.
+  #
+  # 🔴 `regctl` is the only tool every registry call in this tree shells out
+  # through (`src/setup/deps.rs::ensure_regctl`/`extract_ext4_from_ghcr`,
+  # `src/image/oci_image.rs::fetch_oci_manifest`), and AgentENV's own code
+  # passes it no `--tls-insecure` or equivalent flag. The only place `regctl`
+  # itself looks for "this host speaks plain HTTP" is `$HOME/.regctl/config.json`
+  # — absent that file, it defaults to TLS for every registry, including this
+  # cluster's own `10.10.10.204:5000`, and every manifest fetch, blob/layer
+  # download and tools-drive pull fails at the TLS handshake before anything
+  # else runs.
+  #
+  # 🔴 This ConfigMap, the volume mounting it at `/root/.regctl/config.json`
+  # (`subPath: config.json`) and the `HOME=/root` env var that makes `regctl`
+  # look there were all real, working objects on the live cluster —
+  # `ds/agentenv-node`'s own
+  # `kubectl.kubernetes.io/last-applied-configuration` names all three — and
+  # none of the three were ever in this repository. That combination is not
+  # merely undocumented, it is scheduled for deletion: a field present in
+  # `last-applied` and in the live object but absent from a new render is
+  # exactly what three-way merge removes on the next apply (`kubectl diff -k`
+  # already renders it as a `-` line). `deploy/k8s/run.sh` applies with
+  # `kubectl apply -k` and no `--prune`, so the ConfigMap object itself would
+  # survive as an orphan while the volume and env var vanished from the
+  # DaemonSet on the same apply — silently reintroducing the TLS failure above.
+  #
+  # `10.10.10.204:5000` is the value this cluster actually runs, not a
+  # placeholder — tracked in `config/regctl.json` the same way
+  # `oss-overlay.toml`'s endpoint is, and for the same reason: both
+  # `agentenv-runtime`'s own images (the `IMAGE_REGISTRY` `run.sh` injects into
+  # the `images:` block below) and every `userImage` template this cluster
+  # resolves live behind it. A deployment whose registries all speak real TLS
+  # needs none of this; an empty `hosts` map is the do-nothing-safe shape to
+  # ship instead, and is what a fork of this tree pointed at a different
+  # registry should replace this file's contents with.
+  #
+  # 🔴 Only the node reads it. `assemble_api` in `src/bin/server.rs` states
+  # outright that `--role api` "installs no regctl — by design, that is a
+  # node's tooling", and both call sites that would otherwise reach for one —
+  # `POST /sandboxes-cold` and a template build — refuse at the door on
+  # `!role.runs_sandbox_runtime()` before any image is resolved
+  # (`src/api/impls/sandbox.rs`, `src/api/impls/template.rs`). So
+  # `agentenv-api-deployment.yaml` carries neither this ConfigMap nor the env
+  # var; see the note on its `volumes:` block for the paired absence.
+  # `regctl_config_manifest_test.go` pins the generator, the DaemonSet's mount
+  # and env var, and that the api half carries none of it.
+  - name: regctl-config
+    files:
+      - config.json=config/regctl.json
 
 images:
   - name: agentenv-gateway

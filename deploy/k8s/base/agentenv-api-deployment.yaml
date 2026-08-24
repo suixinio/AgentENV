@@ -412,6 +412,18 @@ spec:
         # would hand this half write access to a machine's local sandbox state
         # and to its devices. There is no arrangement in which this process
         # should touch either.
+        #
+        # 🔴 Also no `regctl-config` volume and no `HOME` env var, unlike the
+        # DaemonSet (see the note on `regctl-config` in kustomization.yaml).
+        # Both exist only to make `regctl` find this cluster's plain-HTTP
+        # registry, and this half never calls `regctl`: the doc comment on
+        # `assemble_api` in `src/bin/server.rs` is explicit that `--role api`
+        # "installs no regctl — by design, that is a node's tooling", and the
+        # two routes that would otherwise resolve an image
+        # (`POST /sandboxes-cold`, a template build) refuse at the door on
+        # `!role.runs_sandbox_runtime()` before reaching it. Mounting the
+        # volume here would cost nothing and fix nothing — there is no call
+        # site left for it to unblock.
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config

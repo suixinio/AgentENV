@@ -19,23 +19,18 @@
 //! at a time: **a cold create refuses**, and it is a refusal rather than a
 //! stub.
 //!
-//! Pausing a sandbox held on another machine no longer refuses: a pause sends
-//! [`node.proto`'s `Pause`][crate::node_server] and keeps what comes back, and
-//! a resume sends `Resume`, which asks the machine holding the capture to
-//! reopen it.
+//! Pausing and resuming a sandbox held on another machine both work: a pause
+//! sends [`node.proto`'s `Pause`][crate::node_server] and keeps what comes
+//! back, and a resume sends `Resume`, which asks the machine holding the
+//! capture to reopen it.
 //!
-//! 🔴 Two things are still missing and neither is faked:
-//!
-//! - **publication.** `Pause` is sent with `publish: false`, because nothing
-//!   here commits a staged snapshot row, and a node asked to publish refuses
-//!   rather than answering with nothing. A sandbox paused from this half is
-//!   therefore resumable on the machine that holds it and nowhere else.
-//! - **the resume's read of the record.** `Orchestrator::resume_sandbox` reads
-//!   the paused state out of `SandboxMetadata::paused_state`, which is
-//!   `#[serde(skip)]` and so is always absent on a store that writes its
-//!   records out. Until that reads `MetadataStore::paused_handle` instead, the
-//!   record this half now writes cannot be read back by the resume that needs
-//!   it.
+//! 🔴 One arm of a pause is still missing and is refused rather than faked:
+//! **publication**. `Pause` is sent with `publish: false`, because nothing here
+//! commits a staged snapshot row, and a node asked to publish refuses. So a
+//! sandbox paused from this half is resumable on the machine that holds it and
+//! nowhere else — which is exactly the arm `Resume` implements, and it is a
+//! statement of what this build does rather than a silent absence. See
+//! `RemoteSandboxStub::pause`.
 
 mod factory;
 mod paused_state;

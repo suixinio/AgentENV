@@ -226,20 +226,22 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
     /// could not be found would answer 200 and hand the user back a sandbox
     /// missing everything they had done since.
     ///
-    /// # 🔴 What this half still cannot produce for itself
+    /// # 🔴 What reaches this method, and what it is still missing
     ///
-    /// Two things upstream of here are not wired up, and neither is a defect in
-    /// this method — but a reader who finds this served and concludes the
-    /// pause/resume round trip works from the API half would be wrong:
+    /// The round trip is closed: a pause driven from here leaves a record on
+    /// the node and a reference in the cluster store, and
+    /// `Orchestrator::resume_sandbox` reads that reference back through
+    /// `MetadataStore::paused_handle` and decodes it with this factory —
+    /// rather than through `SandboxMetadata::paused_state`, which is
+    /// `#[serde(skip)]` and is `None` on every store that writes its records
+    /// out.
     ///
-    /// - the node's `Pause` answers `Unimplemented`, so a pause driven from
-    ///   here produces no paused record to come back to;
-    /// - `Orchestrator::resume_sandbox` reads the paused state out of
-    ///   `SandboxMetadata::paused_state`, which is `#[serde(skip)]` and so is
-    ///   always absent on a store that serialises its records. The store
-    ///   surface that answers this properly already exists
-    ///   (`MetadataStore::paused_handle` and its `Remote` arm); nothing calls
-    ///   it yet.
+    /// What a sandbox paused from this half still does not have is a copy
+    /// anywhere but the origin node's disk: `Pause` is sent with
+    /// `publish: false` because nothing here commits a staged snapshot row. So
+    /// [`RemoteResumeFailure::CaptureAbsent`][super::wire] means the sandbox is
+    /// gone rather than "rebuild it from its published snapshot", and it will
+    /// go on meaning that until publication is wired up.
     fn build_from_paused_state(
         &self,
         sandbox_id: SandboxId,

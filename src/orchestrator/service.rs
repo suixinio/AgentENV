@@ -1749,15 +1749,91 @@ where
         Ok(paused_metadata)
     }
 
-    /// Resumes a paused sandbox from its snapshot.
+    /// Where this resume gets the runtime state it has to reopen.
+    ///
+    /// # 🔴 Not `SandboxMetadata::paused_state`, and the field is why
+    ///
+    /// That field is `#[serde(skip)]`. It survives inside the process that
+    /// captured it and comes back `None` from any store that writes a record
+    /// out and reads it in — which is every store the API half runs on. Read
+    /// through `get`, the resulting `None` says two opposite things at once:
+    /// *this sandbox was never paused*, and *this store cannot hand out
+    /// handles, the bytes are on another machine*. Answering the second with
+    /// the first is a 500 on every resume, describing a state the sandbox is
+    /// not in.
+    ///
+    /// [`MetadataStore::paused_handle`] is asked instead, and it has the three
+    /// answers the question has.
+    ///
+    /// # 🔴 Four ways this can end, and no two of them license the same move
+    ///
+    /// - the store could not be reached — [`OrchestratorError::StoreOperationFailed`],
+    ///   and the right move is to ask again;
+    /// - there is no record at all — [`OrchestratorError::SandboxNotFound`],
+    ///   which the resume surface acts on by rebuilding the sandbox from the
+    ///   cluster's published snapshot;
+    /// - there is a record and it carries no capture — the sandbox cannot be
+    ///   reopened from this record, and saying so is not the same as saying
+    ///   there is no record;
+    /// - there is a reference and this process cannot decode it — the bytes are
+    ///   somewhere, and this build is not the one that can reach them.
+    ///
+    /// The last two are both internal failures and are deliberately not one
+    /// message: the first is a record that lost its capture, the second is a
+    /// factory that does not understand a capture that is still there.
+    async fn paused_state_for_resume(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Arc<dyn PausedSandboxState>> {
+        match self.store.paused_handle(&sandbox_id).await? {
+            // The store kept the handle in this process; it is already the
+            // thing the factory wants.
+            PausedHandle::Local(state) => Ok(state),
+            // 🔴 Decoded by *this* factory, which is the seam that makes the
+            // reference mean something: on a node it turns back into local
+            // paths, and on the API half it turns into the machine and the run
+            // a `Resume` is addressed to. `artifact_root` is whatever the
+            // record carried — both in-tree factories read the location out of
+            // the encoded state itself and ignore the argument — so an absent
+            // one is passed on as such rather than refused.
+            PausedHandle::Remote {
+                reference,
+                origin_node_id,
+            } => {
+                let artifact_root = reference.artifact_root.clone().unwrap_or_default();
+                self.factory
+                    .decode_paused_state(artifact_root, reference.state)
+                    .map_err(|err| {
+                        warn!(
+                            %sandbox_id,
+                            origin_node_id = origin_node_id.as_deref().unwrap_or("unrecorded"),
+                            error = %format_args!("{err:#}"),
+                            "a paused sandbox's stored capture could not be decoded here"
+                        );
+                        OrchestratorError::InternalError(format!(
+                            "sandbox {sandbox_id}'s stored paused state could not be decoded by \
+                             this build: {err:#}"
+                        ))
+                    })
+            }
+            PausedHandle::NotPaused => {
+                warn!(%sandbox_id, "a sandbox recorded as paused carries no capture");
+                Err(OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} is recorded as paused and its record carries no capture \
+                     to reopen"
+                )))
+            }
+        }
+    }
+
+    /// Brings a paused sandbox back up under the incarnation its claim
+    /// allocated.
     ///
     /// If another `resume_sandbox` call is already in progress (`Resuming`
     /// state), this call waits for the ongoing resume to finish and then
     /// returns the actual outcome (either `Running` or an error) rather than
     /// duplicating the work. On success the sandbox is ready for use when this
     /// method returns.
-    /// Brings a paused sandbox back up under the incarnation its claim
-    /// allocated.
     ///
     /// 🔴 The [`ClaimedExecution`] is the resume's licence, not a parameter of
     /// convenience: the only way to obtain one is the resume arbitration, so
@@ -1830,6 +1906,14 @@ where
             });
         }
 
+        // 🔴 Before the sandbox is moved to `Resuming`, and that ordering is the
+        // whole of the fix. Read afterwards, a sandbox whose capture cannot be
+        // got at is left sitting in `Resuming` for ever — a transitional state
+        // with no owner, which every later resume, pause and delete waits on
+        // until the wait times out. Read here, the refusal leaves it `Paused`,
+        // which is what it still is.
+        let paused_state = self.paused_state_for_resume(sandbox_id).await?;
+
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
@@ -1874,17 +1958,12 @@ where
             )));
         }
 
-        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            warn!("missing paused state while resuming");
-            OrchestratorError::InternalError("missing paused state".to_string())
-        })?;
-
         let resumed_execution_id = claimed.execution_id();
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
                 sandbox_id,
                 claimed,
-                Arc::clone(paused_state),
+                paused_state,
                 timeout,
                 metadata.resources,
                 metadata

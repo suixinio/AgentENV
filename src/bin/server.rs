@@ -704,15 +704,18 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   spec it is handed has already been resolved into paths on a local disk and
 ///   the user's image reference is gone by then. Creating from a snapshot or a
 ///   template works; `POST /sandboxes-cold` does not.
-/// - **Resuming a sandbox this half paused.** `Pause` is served now: it leaves
-///   the capture on the node and a reference in the cluster store. `Resume` is
-///   served too. What sits between them is `Orchestrator::resume_sandbox`,
-///   which still reads the paused state out of `SandboxMetadata::paused_state`
-///   — `#[serde(skip)]`, and so always absent on this role's store.
-/// - **Publishing a pause.** Staging a captured snapshot on the node is not
-///   wired up, so this half sends `publish: false` and a node asked to publish
-///   refuses rather than answering with nothing. A sandbox paused through this
-///   half is resumable only on the machine that paused it.
+/// - **Publishing a pause.** Pausing and resuming a sandbox on another machine
+///   both work — `Pause` leaves the capture on the node and a reference in the
+///   cluster store, `Orchestrator::resume_sandbox` reads that reference back
+///   through `MetadataStore::paused_handle`, and `Resume` asks the machine
+///   holding the capture to reopen it. What is not served is the *published*
+///   arm: staging a captured snapshot on the node is not wired up, so this half
+///   sends `publish: false` and a node asked to publish refuses rather than
+///   answering with nothing. Two consequences worth reading twice: **a sandbox
+///   paused through this half is resumable only on the machine that paused
+///   it**, so losing that machine loses the sandbox; and deleting a paused
+///   sandbox leaves its capture on the node, because a delete reaches a backend
+///   only through a live handle and a paused sandbox has none.
 /// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
 ///   directly, outside the orchestrator entirely, so a build here would reach
 ///   for `/dev/kvm` in a Pod that has none. It is now refused at the door

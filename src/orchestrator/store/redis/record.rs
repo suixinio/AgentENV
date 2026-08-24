@@ -8,12 +8,13 @@
 //! pub paused_state: Option<Arc<dyn PausedSandboxState>>,
 //! ```
 //!
-//! `#[serde(skip)]` means the value encodes cleanly and comes back gone, and
-//! `resume_sandbox` depends on it verbatim — it errors out with "missing paused
-//! state" when the field is `None`. A store that simply serialised the struct
-//! would therefore make **every resume fail**, and would do it only when a
-//! resume was actually attempted, long after the type checked and the tests
-//! passed.
+//! `#[serde(skip)]` means the value encodes cleanly and comes back gone. A
+//! store that simply serialised the struct and left `resume_sandbox` reading
+//! that field would therefore make **every resume fail**, and would do it only
+//! when a resume was actually attempted, long after the type checked and the
+//! tests passed. `resume_sandbox` reads
+//! [`MetadataStore::paused_handle`](super::super::MetadataStore::paused_handle)
+//! instead, and [`PausedStateRef`] below is what this store answers it with.
 //!
 //! The fix already exists in this repository, in the file-backed persister:
 //! `PausedSandboxState::encode() -> Value` and
@@ -52,12 +53,15 @@ pub struct PausedStateRef {
     /// `origin_node_id` as well: an `api` replica holding this path has no way
     /// to know which machine it means.
     ///
-    /// 🔴 Nothing populates this yet. The store never sees an artifact root —
-    /// `pause_sandbox_inner` allocates it from the persister and hands it
-    /// straight to the backend, and both in-tree backends ignore the argument
-    /// when decoding. Whoever rewires the pause path to write through this
-    /// store has to supply it; until then it decodes as `None`, which is what
-    /// the current decode implementations already do with it.
+    /// 🔴 Nothing populates this, and a resume does not need it to. The store
+    /// never sees an artifact root — `pause_sandbox_inner` allocates it from
+    /// the persister and hands it straight to the backend — and both in-tree
+    /// factories read the location out of the encoded state itself and ignore
+    /// the argument when decoding. Under `--role api` the directory the node
+    /// named travels *inside* `state`, because `RemotePausedState` puts it
+    /// there along with the machine it is on. Whoever needs it at this level
+    /// has to supply it; until then it decodes as `None`, which
+    /// `Orchestrator::paused_state_for_resume` passes on as an empty path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_root: Option<PathBuf>,
     /// The backend's own encoding of its paused state.

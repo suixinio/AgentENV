@@ -6223,6 +6223,471 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Where a resume gets the capture it reopens
+// ---------------------------------------------------------------------------
+
+/// A paused state that carries a value, so two of them can be told apart.
+///
+/// 🔴 [`MockSnapshot`] encodes to `{}`. Every capture in this file therefore
+/// looks like every other one, and a test built on it cannot distinguish "the
+/// resume was handed the right capture" from "the resume was handed something".
+#[derive(Debug)]
+struct MarkedPausedState {
+    marker: String,
+}
+
+impl MarkedPausedState {
+    fn new(marker: &str) -> Self {
+        Self {
+            marker: marker.to_string(),
+        }
+    }
+
+    fn encoding(marker: &str) -> serde_json::Value {
+        json!({ "capture": marker })
+    }
+}
+
+impl PausedSandboxState for MarkedPausedState {
+    fn encode(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(Self::encoding(&self.marker))
+    }
+
+    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
+        RuntimeArtifactSet::empty()
+    }
+}
+
+/// What a store should answer when asked where a sandbox's capture is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PausedAnswer {
+    /// The reference the record holds — what a store that writes its records
+    /// out can offer, and all it can offer.
+    Reference,
+    /// 🔴 The wrong answer this whole wiring exists to stop being given: a
+    /// paused sandbox reported as never having been paused.
+    NotPaused,
+    /// The records could not be read.
+    Unreachable,
+}
+
+/// A store that loses `paused_state` the way serde does.
+///
+/// `SandboxMetadata::paused_state` is `#[serde(skip)]`, so every store that
+/// writes a record out and reads it back hands the handle back as `None` —
+/// which is the state `RedisMetadataStore` is in, and the reason
+/// `MetadataStore::paused_handle` exists. This double reproduces exactly that:
+/// the handle does not survive a write, and the encoding travels beside the
+/// record instead.
+struct SerialisingStore {
+    inner: InMemoryMetadataStore,
+    references: StdMutex<HashMap<SandboxId, PausedStateRef>>,
+    origin_node_id: Option<String>,
+    answer: StdMutex<PausedAnswer>,
+}
+
+impl SerialisingStore {
+    fn new(origin_node_id: Option<&str>) -> Self {
+        Self {
+            inner: InMemoryMetadataStore::new(),
+            references: StdMutex::new(HashMap::new()),
+            origin_node_id: origin_node_id.map(str::to_string),
+            answer: StdMutex::new(PausedAnswer::Reference),
+        }
+    }
+
+    fn answers(&self, answer: PausedAnswer) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    /// Strips the handle off the way a serialising round trip does, keeping its
+    /// encoding beside the record.
+    fn serialise(&self, mut metadata: SandboxMetadata) -> StdResult<SandboxMetadata, StoreError> {
+        if let Some(state) = metadata.paused_state.take() {
+            let encoded = state.encode().map_err(|source| StoreError::Backend {
+                source: source.context("failed to encode paused sandbox state"),
+            })?;
+            self.references.lock().unwrap().insert(
+                metadata.id,
+                PausedStateRef {
+                    artifact_root: None,
+                    state: encoded,
+                },
+            );
+        }
+        Ok(metadata)
+    }
+}
+
+#[async_trait]
+impl MetadataStore for SerialisingStore {
+    async fn add(&self, metadata: SandboxMetadata) -> StdResult<(), StoreError> {
+        self.inner.add(self.serialise(metadata)?).await
+    }
+
+    async fn update(&self, metadata: SandboxMetadata) -> StdResult<(), StoreError> {
+        self.inner.update(self.serialise(metadata)?).await
+    }
+
+    async fn update_state_if_state(
+        &self,
+        sandbox_id: &SandboxId,
+        new_state: SandboxState,
+        expected_states: &[SandboxState],
+    ) -> StdResult<SandboxState, StoreError> {
+        self.inner
+            .update_state_if_state(sandbox_id, new_state, expected_states)
+            .await
+    }
+
+    async fn update_if_state<F>(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_states: &[SandboxState],
+        update: F,
+    ) -> StdResult<MetadataUpdateResult, StoreError>
+    where
+        F: FnOnce(&mut SandboxMetadata) + Send,
+    {
+        self.inner
+            .update_if_state(sandbox_id, expected_states, update)
+            .await
+    }
+
+    async fn get(&self, sandbox_id: &SandboxId) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        self.inner.get(sandbox_id).await
+    }
+
+    async fn remove(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        self.references.lock().unwrap().remove(sandbox_id);
+        self.inner.remove(sandbox_id).await
+    }
+
+    async fn list(&self) -> StdResult<Vec<SandboxMetadata>, StoreError> {
+        self.inner.list().await
+    }
+
+    async fn list_with_callback<F>(&self, callback: F) -> StdResult<(), StoreError>
+    where
+        F: FnMut(&SandboxMetadata) + Send,
+    {
+        self.inner.list_with_callback(callback).await
+    }
+
+    async fn list_filtered(
+        &self,
+        filter: SandboxListFilter,
+    ) -> StdResult<Vec<SandboxMetadata>, StoreError> {
+        self.inner.list_filtered(filter).await
+    }
+
+    async fn list_expired(
+        &self,
+        now: std::time::SystemTime,
+    ) -> StdResult<Vec<SandboxMetadata>, StoreError> {
+        self.inner.list_expired(now).await
+    }
+
+    async fn list_ids(&self) -> StdResult<Vec<SandboxId>, StoreError> {
+        self.inner.list_ids().await
+    }
+
+    async fn wait_while_in_states(
+        &self,
+        sandbox_id: &SandboxId,
+        transitional_states: &[SandboxState],
+    ) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        self.inner
+            .wait_while_in_states(sandbox_id, transitional_states)
+            .await
+    }
+
+    async fn paused_handle(&self, sandbox_id: &SandboxId) -> StdResult<PausedHandle, StoreError> {
+        match *self.answer.lock().unwrap() {
+            PausedAnswer::Unreachable => Err(StoreError::Backend {
+                source: anyhow::anyhow!("the records could not be reached"),
+            }),
+            PausedAnswer::NotPaused => Ok(PausedHandle::NotPaused),
+            PausedAnswer::Reference => {
+                match self.references.lock().unwrap().get(sandbox_id).cloned() {
+                    Some(reference) => Ok(PausedHandle::Remote {
+                        reference,
+                        origin_node_id: self.origin_node_id.clone(),
+                    }),
+                    None => Ok(PausedHandle::NotPaused),
+                }
+            }
+        }
+    }
+}
+
+/// A factory that says what it was handed to decode, and can refuse.
+struct DecodeRecordingFactory {
+    inner: MockBackendFactory,
+    decoded: Arc<StdMutex<Vec<serde_json::Value>>>,
+    built_from: Arc<StdMutex<Vec<serde_json::Value>>>,
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DecodeRecordingFactory {
+    fn new() -> Self {
+        Self {
+            inner: MockBackendFactory::new(),
+            decoded: Arc::new(StdMutex::new(Vec::new())),
+            built_from: Arc::new(StdMutex::new(Vec::new())),
+            refuse: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl SandboxBackendFactory for DecodeRecordingFactory {
+    fn build(
+        &self,
+        build_spec: crate::sandbox::FreshSandboxBuildSpec,
+        launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        self.inner.build(build_spec, launch_config, execution_id)
+    }
+
+    fn build_from_snapshot(
+        &self,
+        snapshot: &RunnableSnapshot,
+        launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        self.inner
+            .build_from_snapshot(snapshot, launch_config, execution_id)
+    }
+
+    fn decode_paused_state(
+        &self,
+        _artifact_root: PathBuf,
+        state: serde_json::Value,
+    ) -> anyhow::Result<Arc<dyn PausedSandboxState>> {
+        self.decoded.lock().unwrap().push(state.clone());
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("this build does not understand that capture");
+        }
+        let marker = state
+            .get("capture")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(Arc::new(MarkedPausedState { marker }))
+    }
+
+    fn build_from_paused_state(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        state: &dyn PausedSandboxState,
+        envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        self.built_from
+            .lock()
+            .unwrap()
+            .push(state.encode().expect("a capture encodes"));
+        self.inner
+            .build_from_paused_state(sandbox_id, execution_id, state, envd_access_token)
+    }
+}
+
+/// Puts a sandbox into the store as paused, carrying a capture nothing else in
+/// this file produces.
+async fn paused_with_capture<S: MetadataStore + 'static, F: SandboxBackendFactory>(
+    orchestrator: &Arc<TestOrchestrator<S, F>>,
+    marker: &str,
+) -> anyhow::Result<SandboxId> {
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    // The pause wrote the mock backend's capture, which every sandbox in this
+    // file shares. Replace it with one that names this sandbox, through the
+    // store's ordinary write path.
+    let mut metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("a paused sandbox has a record");
+    metadata.paused_state = Some(Arc::new(MarkedPausedState::new(marker)));
+    orchestrator.store.update(metadata).await?;
+    Ok(created.id)
+}
+
+/// 🔴 A resume reads the capture the store kept, not the field a serialising
+/// store always hands back empty.
+///
+/// `SandboxMetadata::paused_state` is `#[serde(skip)]`. Read through `get`, it
+/// is `None` on every store that writes records out — so a resume that read it
+/// failed with "missing paused state" for every sandbox on such a store, and
+/// said so about sandboxes that were paused perfectly well.
+///
+/// The control face is a second sandbox whose stored capture differs in exactly
+/// one value: if the resume were handed a constant, an empty document, or the
+/// capture of whichever sandbox was paused last, the two would agree here.
+#[tokio::test]
+async fn a_resume_reopens_the_capture_the_store_kept_rather_than_the_field_serde_drops(
+) -> anyhow::Result<()> {
+    setup();
+    let factory = DecodeRecordingFactory::new();
+    let decoded = Arc::clone(&factory.decoded);
+    let built_from = Arc::clone(&factory.built_from);
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        SerialisingStore::new(Some("node-that-has-the-bytes")),
+        factory,
+    );
+
+    let alpha = paused_with_capture(&orchestrator, "alpha").await?;
+    let beta = paused_with_capture(&orchestrator, "beta").await?;
+
+    // 🔴 The field the old read used really is empty here, so what follows
+    // cannot be coming from it.
+    assert!(
+        orchestrator
+            .get_sandbox(&alpha)
+            .await?
+            .expect("record")
+            .paused_state
+            .is_none(),
+        "this store did not drop the handle, so it is not the store the fix is for"
+    );
+
+    let resumed = orchestrator
+        .resume_sandbox(alpha, NewTimeout::None, test_claim())
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert_eq!(
+        decoded.lock().unwrap().as_slice(),
+        &[MarkedPausedState::encoding("alpha")],
+        "the resume was handed a capture other than the one the store held"
+    );
+    assert_eq!(
+        built_from.lock().unwrap().as_slice(),
+        &[MarkedPausedState::encoding("alpha")],
+        "the capture the store held did not reach the backend that reopens it"
+    );
+
+    // The same call for the other sandbox: one value different, and it has to
+    // move.
+    orchestrator
+        .resume_sandbox(beta, NewTimeout::None, test_claim())
+        .await?;
+    assert_eq!(
+        decoded.lock().unwrap().as_slice(),
+        &[
+            MarkedPausedState::encoding("alpha"),
+            MarkedPausedState::encoding("beta")
+        ],
+        "the second resume reopened the first sandbox's capture"
+    );
+    Ok(())
+}
+
+/// 🔴 The three ways a resume can fail to find its capture are three answers,
+/// and none of them leaves the sandbox stranded mid-transition.
+///
+/// - the store could not be read — ask again;
+/// - the record is there and carries no capture — this record cannot reopen the
+///   sandbox;
+/// - the reference is there and this build cannot decode it — the bytes exist
+///   and this process is not the one that can reach them.
+///
+/// Reading the first as either of the others is the "I could not look" / "there
+/// is nothing there" collapse this codebase refuses everywhere else.
+///
+/// The control face for all three is the fourth call: the same sandbox, the
+/// same everything, with the store answering normally — which resumes. Without
+/// it, every assertion here is satisfied by a `resume_sandbox` that always
+/// fails.
+#[tokio::test]
+async fn a_resume_tells_a_capture_it_could_not_read_from_one_that_is_not_there(
+) -> anyhow::Result<()> {
+    setup();
+    let factory = DecodeRecordingFactory::new();
+    let refuse = Arc::clone(&factory.refuse);
+    let store = SerialisingStore::new(Some("node-that-has-the-bytes"));
+    let orchestrator = make_orchestrator_without_background_with_factory(store, factory);
+
+    let sandbox_id = paused_with_capture(&orchestrator, "alpha").await?;
+
+    let still_paused = |orchestrator: Arc<
+        TestOrchestrator<SerialisingStore, DecodeRecordingFactory>,
+    >| async move {
+        let state = orchestrator
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("read")
+            .expect("record")
+            .state;
+        assert_eq!(
+            state,
+            SandboxState::Paused,
+            "a refused resume left the sandbox mid-transition, where every later \
+             pause, resume and delete waits on it until the wait times out"
+        );
+    };
+
+    orchestrator.store.answers(PausedAnswer::Unreachable);
+    let unreachable = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::None, test_claim())
+        .await
+        .expect_err("a resume whose store could not be read");
+    assert!(
+        matches!(unreachable, OrchestratorError::StoreOperationFailed(_)),
+        "a store that could not be read was reported as {unreachable:?}"
+    );
+    still_paused(Arc::clone(&orchestrator)).await;
+
+    orchestrator.store.answers(PausedAnswer::NotPaused);
+    let absent = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::None, test_claim())
+        .await
+        .expect_err("a resume whose record carries no capture");
+    let absent = match absent {
+        OrchestratorError::InternalError(message) => message,
+        other => panic!("a record with no capture was reported as {other:?}"),
+    };
+    assert!(
+        absent.contains("carries no capture"),
+        "the refusal did not say what was missing: {absent}"
+    );
+    still_paused(Arc::clone(&orchestrator)).await;
+
+    orchestrator.store.answers(PausedAnswer::Reference);
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    let undecodable = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::None, test_claim())
+        .await
+        .expect_err("a resume whose capture this build cannot decode");
+    let undecodable = match undecodable {
+        OrchestratorError::InternalError(message) => message,
+        other => panic!("an undecodable capture was reported as {other:?}"),
+    };
+    assert!(
+        undecodable.contains("could not be decoded"),
+        "the refusal did not say what failed: {undecodable}"
+    );
+    assert_ne!(
+        undecodable, absent,
+        "a capture this build cannot read and a record with no capture gave the same answer"
+    );
+    still_paused(Arc::clone(&orchestrator)).await;
+
+    // 🔴 And the same sandbox resumes once nothing is in the way, which is what
+    // makes the three refusals above about their causes.
+    refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    let resumed = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::None, test_claim())
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    Ok(())
+}
+
 /// The artifact root a paused sandbox's capture went into is readable through
 /// the facade, and it is the one the persister holds.
 ///

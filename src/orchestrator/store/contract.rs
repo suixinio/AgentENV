@@ -419,13 +419,21 @@ pub(crate) async fn the_lifetime_clock_is_reconciled_after_every_write<S: Metada
 /// may say `NotPaused` about a sandbox that is paused. That confusion is what
 /// makes a resume fail with a message describing a state the sandbox is not in,
 /// and it is the same shape as a read that conflated "not yet" with "never".
+///
+/// 🔴 And the handle has to be *this sandbox's*. `resume_sandbox` takes what
+/// comes back here and hands it to the factory that rebuilds the sandbox, so a
+/// store that answered with some other record's capture would reopen the wrong
+/// sandbox's work under this sandbox's identity — a failure with no error in it
+/// anywhere. Two sandboxes paused with captures differing in one value are what
+/// gives the assertion its resolution: without them, "the answer is not
+/// `NotPaused`" is satisfied by a store that returns a constant.
 pub(crate) async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: &S) {
     #[derive(Debug)]
-    struct FakePausedState;
+    struct FakePausedState(&'static str);
 
     impl crate::sandbox::PausedSandboxState for FakePausedState {
         fn encode(&self) -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::json!({"fake": true}))
+            Ok(serde_json::json!({"fake": self.0}))
         }
 
         fn runtime_artifacts(&self) -> crate::sandbox::RuntimeArtifactSet {
@@ -433,16 +441,49 @@ pub(crate) async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(
         }
     }
 
-    let paused = SandboxId::new();
-    let mut metadata = running(paused);
-    metadata.state = crate::orchestrator::SandboxState::Paused;
-    metadata.paused_state = Some(std::sync::Arc::new(FakePausedState));
-    store.add(metadata).await.unwrap();
+    /// The capture a handle points at, whichever variant carries it.
+    fn capture(handle: &PausedHandle) -> serde_json::Value {
+        match handle {
+            PausedHandle::Local(state) => state.encode().expect("a capture encodes"),
+            PausedHandle::Remote { reference, .. } => reference.state.clone(),
+            PausedHandle::NotPaused => panic!("a paused sandbox answered NotPaused"),
+        }
+    }
 
+    async fn pause<S: MetadataStore>(store: &S, marker: &'static str) -> SandboxId {
+        let id = SandboxId::new();
+        let mut metadata = running(id);
+        metadata.state = crate::orchestrator::SandboxState::Paused;
+        metadata.paused_state = Some(std::sync::Arc::new(FakePausedState(marker)));
+        store.add(metadata).await.unwrap();
+        id
+    }
+
+    let paused = pause(store, "one").await;
     let handle = store.paused_handle(&paused).await.unwrap();
     assert!(
         !matches!(handle, PausedHandle::NotPaused),
         "a paused sandbox reported as having no paused state: {handle:?}"
+    );
+    assert_eq!(
+        capture(&handle),
+        serde_json::json!({"fake": "one"}),
+        "the handle points at something other than this sandbox's capture"
+    );
+
+    // 🔴 The same call for a second sandbox, whose capture differs in one
+    // value. A store answering from a constant, from the last record written,
+    // or from any record at all agrees with the assertion above and disagrees
+    // with this one.
+    let other = pause(store, "two").await;
+    assert_eq!(
+        capture(&store.paused_handle(&other).await.unwrap()),
+        serde_json::json!({"fake": "two"})
+    );
+    assert_eq!(
+        capture(&store.paused_handle(&paused).await.unwrap()),
+        serde_json::json!({"fake": "one"}),
+        "the first sandbox's capture changed when a second one was paused"
     );
 
     // The control: a running sandbox really has none, and says so.

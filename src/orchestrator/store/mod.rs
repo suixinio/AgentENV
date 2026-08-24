@@ -309,11 +309,13 @@ impl Drop for TransitionGuard {
 /// `SandboxMetadata::paused_state` is `#[serde(skip)]`, so any store that
 /// serialises a record hands it back empty. Read through `get`, that empty
 /// value means two different things — *this sandbox is not paused* and *this
-/// store cannot give you handles, the bytes are on another machine* — and
-/// `resume_sandbox` answers the first by failing with "missing paused state".
-/// Under `--role api` that is the right refusal for the wrong reason; under
-/// `--role all` on a shared store it is a 500 on every resume, and the message
-/// describes a state the sandbox is not in.
+/// store cannot give you handles, the bytes are on another machine* — and a
+/// `resume_sandbox` that read it answered the first by failing with "missing
+/// paused state" for every sandbox on such a store, which is a 500 describing a
+/// state the sandbox is not in.
+///
+/// 🔴 `Orchestrator::paused_state_for_resume` is the one caller, and it is the
+/// only path a resume takes to its capture.
 ///
 /// So the question is asked separately, and the answer has the three states the
 /// question has. A store may not answer [`PausedHandle::NotPaused`] for a

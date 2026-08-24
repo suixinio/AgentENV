@@ -115,6 +115,36 @@ spec:
                   name: snapshot-catalog-config
                   key: AENV_SNAPSHOT_CATALOG_READ
                   optional: true
+            # Which durable snapshot repository this node keeps, and where the
+            # half of its configuration that cannot be in this repository comes
+            # from. See the note on snapshot-storage-config in
+            # kustomization.yaml.
+            #
+            # 🔴 The same two keys the api Deployment reads, from the same
+            # ConfigMap, because the two halves must resolve snapshots out of
+            # the same bucket. A node on `posix_fs` while the api half is on
+            # `oss` reports nothing: it starts, serves an empty local store, and
+            # answers "no such snapshot" for artifacts sitting in the bucket.
+            #
+            # 🔴 This is also where the object-storage credentials stop being an
+            # environment variable's business. `[backend.oss]` cannot be reached
+            # from the environment at all — confique descends into a struct only
+            # through `#[config(nested)]` and `nested` may not be `Option<_>` —
+            # so the endpoint, bucket and credentials arrive as files listed in
+            # AENV_CONFIG_OVERLAY_PATH, the second of which is projected from
+            # the `rustfs-credentials` Secret.
+            - name: AENV_SNAPSHOT_REPOSITORY_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-storage-config
+                  key: AENV_SNAPSHOT_REPOSITORY_BACKEND
+                  optional: true
+            - name: AENV_CONFIG_OVERLAY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-storage-config
+                  key: AENV_CONFIG_OVERLAY_PATH
+                  optional: true
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
             - name: API_ADDR
@@ -375,6 +405,19 @@ spec:
               mountPath: /workspace/config/agentenv.toml
               subPath: agentenv.toml
               readOnly: true
+            # The tracked, credential-free half of `[backend.oss]`, from the
+            # same ConfigMap as the file above. 🔴 A `subPath` mount, which
+            # kubelet never refreshes — editing the ConfigMap changes nothing
+            # until the Pod is replaced, and replacing a node Pod pauses every
+            # sandbox on the machine.
+            - name: agentenv-config
+              mountPath: /workspace/config/oss-overlay.toml
+              subPath: oss-overlay.toml
+              readOnly: true
+            # The credentials, and the only place in this tree they come from.
+            - name: backend-credentials
+              mountPath: /etc/agentenv/backend
+              readOnly: true
             - name: host-dev
               mountPath: /dev
             - name: control-plane-token
@@ -388,6 +431,29 @@ spec:
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config
+        # 🔴 The object-storage credentials, as a mounted file rather than a
+        # `secretKeyRef` — not for refresh, but because no environment form of
+        # them exists: `[backend.oss]` is `Option<OssBackendConfig>` and
+        # confique reads a non-`nested` `Option` from a file and nothing else.
+        #
+        # Until this existed they were plaintext in the `agentenv-k8s-config`
+        # ConfigMap, which `deploy/k8s/run.sh` regenerates from
+        # `config/default.toml` on every apply — so they were simultaneously in
+        # the cluster and nowhere in this repository, and one apply from a clean
+        # tree would have taken them out from under every node.
+        #
+        # `optional: true` is not a way to run without them: an absent Secret
+        # mounts an empty directory, the file AENV_CONFIG_OVERLAY_PATH names is
+        # then missing, and the process refuses to start naming it. What it buys
+        # is that clearing AENV_CONFIG_OVERLAY_PATH is a complete rollback
+        # rather than leaving the Pod stuck at ContainerCreating.
+        - name: backend-credentials
+          secret:
+            secretName: rustfs-credentials
+            optional: true
+            items:
+              - key: backend-oss-credentials.toml
+                path: backend-oss.toml
         - name: host-dev
           hostPath:
             path: /dev

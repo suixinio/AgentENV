@@ -17,6 +17,34 @@ use crate::virtualization::VirtualizationMode;
 
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
+/// Extra TOML files layered on top of [`ENV_CONFIG_PATH`], separated by `:`.
+///
+/// 🔴 This exists because of one file that cannot be in this repository and
+/// cannot be reached from the environment either.
+///
+/// `deploy/k8s/run.sh` copies `config/default.toml` over the cluster's
+/// `agentenv-k8s-config` ConfigMap on every apply (run.sh:30), so anything a
+/// cluster says only in that ConfigMap is lost on the next `make k8s-apply`.
+/// For scalars the answer is an `env =` attribute, which an apply cannot
+/// reach — `AENV_SNAPSHOT_REPOSITORY_BACKEND` and the two image-cache budgets
+/// went that way. `[backend.oss]` cannot: confique descends into a struct only
+/// through `#[config(nested)]`, `nested` may not be `Option<_>`, and
+/// `backend.oss` is `Option<OssBackendConfig>` — so the endpoint, the bucket
+/// and the credentials are deserialized from a file and from nothing else.
+/// `no_new_env_binding_is_declared_where_confique_cannot_read_it` pins that.
+///
+/// A second file is the only way in, and it wants to be a *mounted* one: the
+/// credentials belong in a Secret, and kubelet refreshes volumes.
+///
+/// Unset — or set to nothing but separators — is the whole of the old
+/// behaviour: [`ConfigManager::load_config_file`] then runs confique's
+/// `.env().file(path)` untouched, and
+/// `no_overlay_is_byte_for_byte_the_old_load` compares a full dump of both.
+const ENV_CONFIG_OVERLAY_PATH: &str = "AENV_CONFIG_OVERLAY_PATH";
+
+/// Separates the entries of [`ENV_CONFIG_OVERLAY_PATH`], `PATH`-style.
+const OVERLAY_PATH_SEPARATOR: char = ':';
+
 #[cfg(test)]
 const TEST_ACCESS_TOKEN_HASH_SEED: &str = "agentenv-unit-test-access-token-seed";
 
@@ -190,11 +218,33 @@ pub struct BackendConfig {
 
 #[derive(Debug, Deserialize, Clone, Config)]
 pub struct PosixFsBackendConfig {
-    #[config(
-        default = "$AENV_HOME/snapshot-store",
-        env = "AENV_SNAPSHOT_STORE",
-        parse_env = parse_required_path
-    )]
+    /// Root directory of the posix_fs snapshot repository.
+    ///
+    /// 🔴 There is no environment binding here, and one must not be added
+    /// back. This field carried an `env` attribute naming AENV_SNAPSHOT_STORE
+    /// from the day it was written; `docs/src/configuration/env-vars.md`
+    /// promised that variable to operators for just as long, and confique
+    /// never once read it. `[backend.posix_fs]`
+    /// is reached as `Option<PosixFsBackendConfig>`, confique descends into a
+    /// struct only through `#[config(nested)]`, and `nested` may not be
+    /// `Option<_>` (`confique-macro/src/parse.rs:127`) — so this struct is
+    /// deserialized by serde from a file and by nothing else. An environment
+    /// binding on it is not an override, it is a promise the loader will not
+    /// keep, and a
+    /// promise is worse than an absence: somebody sets the variable, nothing
+    /// happens, and nothing says so.
+    ///
+    /// Making it real would mean giving `[backend]` two non-`Option` nested
+    /// fields, which changes what a config with `repository_backend = "oss"`
+    /// resolves to — `backend.posix_fs` would stop being `None` there, and
+    /// `sandbox/firecracker/overlaybd_snapshot.rs` reads exactly that. Not a
+    /// change to make on the way past.
+    ///
+    /// The supported way to set this from outside the file is
+    /// [`ENV_CONFIG_OVERLAY_PATH`], which is also the only way to reach
+    /// `[backend.oss]`. `no_new_env_binding_is_declared_where_confique_cannot_read_it`
+    /// fails if any environment binding reappears on this side of the seam.
+    #[config(default = "$AENV_HOME/snapshot-store")]
     pub snapshot_store: PathBuf,
 }
 
@@ -1741,12 +1791,72 @@ impl ConfigManager {
     }
 
     fn load_config_file(path: &Path) -> Result<AppConfig> {
+        Self::load_config_file_with_overlays(path, &Self::overlay_paths_from_env())
+    }
+
+    /// The overlay files named by [`ENV_CONFIG_OVERLAY_PATH`], in the order
+    /// they are applied — left to right, each one layered over what came
+    /// before it.
+    ///
+    /// 🔴 Empty segments are dropped rather than refused, and that is what
+    /// makes the switch flippable from a manifest. A Deployment writes
+    /// `$(A):$(B)` and turns one half off by clearing the ConfigMap key behind
+    /// it; if an empty segment were an error, or were read as the current
+    /// directory, turning half of it off would take a manifest edit instead of
+    /// a `kubectl set env`. A value that is nothing but separators is
+    /// therefore the same as unset, which is the same rule
+    /// [`Self::env_path`] applies to `AENV_CONFIG_PATH` itself.
+    fn overlay_paths_from_env() -> Vec<PathBuf> {
+        std::env::var(ENV_CONFIG_OVERLAY_PATH)
+            .ok()
+            .into_iter()
+            .flat_map(|raw| {
+                raw.split(OVERLAY_PATH_SEPARATOR)
+                    .map(|segment| segment.trim().to_string())
+                    .filter(|segment| !segment.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// 🔴 With no overlay this is confique's `.env().file(path)` and nothing
+    /// else — the same two lines it has always been. That branch is the
+    /// promise every existing deployment is owed: a tree that grew this
+    /// mechanism must parse identically on a cluster that never sets the
+    /// variable, and `no_overlay_is_byte_for_byte_the_old_load` compares a
+    /// full `{:#?}` of the loaded config to prove it rather than asserting it.
+    ///
+    /// With overlays the main file stops being a confique source and becomes
+    /// the bottom of a TOML document that is merged in this process first —
+    /// see [`overlaid_config_layer`] for why the merge cannot be left to
+    /// confique's own layering.
+    fn load_config_file_with_overlays(path: &Path, overlays: &[PathBuf]) -> Result<AppConfig> {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut config = AppConfig::builder()
-            .env()
-            .file(path)
-            .load()
-            .with_context(|| format!("load config {}", path.display()))?;
+        let mut config = if overlays.is_empty() {
+            AppConfig::builder()
+                .env()
+                .file(path)
+                .load()
+                .with_context(|| format!("load config {}", path.display()))?
+        } else {
+            let layer = overlaid_config_layer(path, overlays)?;
+            AppConfig::builder()
+                .env()
+                .preloaded(layer)
+                .load()
+                .with_context(|| {
+                    format!(
+                        "load config {} with overlays [{}]",
+                        path.display(),
+                        overlays
+                            .iter()
+                            .map(|overlay| overlay.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?
+        };
         config.normalize(config_dir)?;
         config.validate()?;
 
@@ -1759,6 +1869,113 @@ impl ConfigManager {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
+    }
+}
+
+/// The main config file and its overlays, merged into one confique layer.
+///
+/// # Merge semantics
+///
+/// One deep, key-by-key merge of TOML tables: the main file first, then each
+/// overlay in `AENV_CONFIG_OVERLAY_PATH` order. Where both sides hold a table
+/// the two are merged; anywhere else — a scalar, a string, an array — the
+/// later file replaces the earlier value whole. There is no way to *remove* a
+/// key, only to give it another value.
+///
+/// 🔴 The merge is done here rather than by handing confique a second `.file()`
+/// source, and the difference is the entire reason this function exists.
+/// confique merges *layers*, and a layer mirrors the config struct: it descends
+/// into a section only where the field is `#[config(nested)]`. `[backend.oss]`
+/// is `Option<OssBackendConfig>` — one serde value — so under confique's own
+/// layering a second file that mentioned `[backend.oss]` at all would replace
+/// the section entire, and the endpoint and the bucket would have to be in the
+/// same file as the credentials. They must not be: the credentials come from a
+/// Secret and the endpoint and bucket are ordinary deployment facts that belong
+/// in this repository where they can be read and reviewed. Merging the
+/// documents before either becomes a layer is what lets one `[backend.oss]`
+/// section be assembled out of a tracked ConfigMap file and a mounted Secret.
+///
+/// A consequence worth stating: the main file is merged the same way, so
+/// `AENV_CONFIG_PATH` reaches confique through
+/// `toml::Table` -> `Layer` here instead of through confique's own file source.
+/// `overlay_merge_leaves_the_main_file_alone` loads the bundled config both
+/// ways and compares the whole of the result.
+///
+/// # What is *not* merged here
+///
+/// The environment. It stays confique's top layer, above everything this
+/// function produces, exactly as it was above `.file(path)` before. An operator
+/// who reaches for `kubectl set env` in an incident still wins over every file
+/// on the node.
+fn overlaid_config_layer(
+    path: &Path,
+    overlays: &[PathBuf],
+) -> Result<<AppConfig as Config>::Layer> {
+    // Missing is empty, matching what confique's optional file source does with
+    // `AENV_CONFIG_PATH`. Adding an overlay must not also change what happens
+    // when the *main* file is absent.
+    let mut merged = read_config_toml(path, false)?;
+    for overlay in overlays {
+        merge_toml_tables(&mut merged, read_config_toml(overlay, true)?);
+    }
+
+    merged.try_into().map_err(|err| {
+        anyhow!(
+            "merged config ({} + [{}]) is not a valid AgentENV configuration: {err}",
+            path.display(),
+            overlays
+                .iter()
+                .map(|overlay| overlay.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+/// Reads one TOML document as a table.
+///
+/// 🔴 `required` is the difference between the main config file and an
+/// overlay, and a named overlay that is not on disk stops the process.
+///
+/// That is the opposite of what confique's own file source does, and it is
+/// deliberate. confique treats a missing file as an empty layer, which is
+/// right for "the operator may or may not have written a config" and wrong for
+/// every reason [`ENV_CONFIG_OVERLAY_PATH`] is ever set: the file is a mounted
+/// Secret carrying the object-storage endpoint and credentials, and a node
+/// that quietly started without it falls back to `posix_fs` — a backend that
+/// *works*. It starts, serves an empty local snapshot store, logs nothing
+/// above `info`, and the catalog goes on naming artifacts the process can no
+/// longer fetch. Naming a file is a statement that it is there.
+fn read_config_toml(path: &Path, required: bool) -> Result<toml::Table> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
+            return Ok(toml::Table::new())
+        }
+        Err(err) if required => {
+            return Err(anyhow!(
+                "read config overlay {}: {err}. {ENV_CONFIG_OVERLAY_PATH} names it, so it has \
+                 to be there — a node that started without it would fall back to whatever this \
+                 repository's own default.toml happens to say and report nothing",
+                path.display(),
+            ))
+        }
+        Err(err) => return Err(anyhow!("read config {}: {err}", path.display())),
+    };
+    toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))
+}
+
+/// Deep-merges `overlay` into `base`: tables recurse, everything else replaces.
+fn merge_toml_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_toml_tables(existing, incoming);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
 
@@ -1874,6 +2091,7 @@ mod tests {
 
     #[test]
     fn bundled_default_config_loads() -> Result<()> {
+        let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
@@ -1933,6 +2151,7 @@ mod tests {
     /// parallel runner.
     #[test]
     fn the_paused_registry_backend_is_settable_from_the_environment() {
+        let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
 
         // Every backend has to be reachable this way, or the one that is not
@@ -2013,6 +2232,7 @@ mod tests {
     /// test setting it would race this one under the default parallel runner.
     #[test]
     fn the_snapshot_repository_backend_is_settable_from_the_environment() {
+        let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         let bundled = workspace.join("config/default.toml");
 
@@ -2065,6 +2285,70 @@ mod tests {
                  node on `posix_fs` with a bucket full of snapshots it will never look at"
             );
         }
+
+        // 🔴 And it still wins over an overlay file that says the opposite.
+        //
+        // This is the priority order, pinned where the variable already has an
+        // owner: file, then AENV_CONFIG_OVERLAY_PATH, then the environment.
+        // The environment on top is not a preference, it is the rollback: the
+        // overlay is a mounted Secret an operator may not be able to rewrite
+        // in the middle of an incident, and `kubectl set env` has to be able to
+        // overrule it. Both directions are checked in the same loop, so
+        // "the environment won" cannot be an overlay that happened to agree.
+        let dir = tempdir().expect("tempdir");
+        let overlay = dir.path().join("overlay.toml");
+        for (env_value, overlay_value, overlay_expected, expected) in [
+            (
+                "oss",
+                "posix_fs",
+                SnapshotRepositoryBackendKind::PosixFs,
+                SnapshotRepositoryBackendKind::Oss,
+            ),
+            (
+                "posix_fs",
+                "oss",
+                SnapshotRepositoryBackendKind::Oss,
+                SnapshotRepositoryBackendKind::PosixFs,
+            ),
+        ] {
+            std::fs::write(
+                &overlay,
+                format!(
+                    "[snapshot]\nrepository_backend = \"{overlay_value}\"\n\n\
+                     [backend.oss]\nendpoint = \"http://rustfs:9000\"\nbucket = \"b\"\n"
+                ),
+            )
+            .expect("write overlay");
+
+            // The control, in the same iteration: with the environment quiet
+            // the overlay is what decides.
+            let from_overlay = ConfigManager::load_config_file_with_overlays(
+                &bundled,
+                std::slice::from_ref(&overlay),
+            )
+            .expect("load with the overlay alone");
+            assert_eq!(
+                from_overlay.snapshot.repository_backend, overlay_expected,
+                "the overlay must decide when the environment says nothing"
+            );
+
+            std::env::set_var("AENV_SNAPSHOT_REPOSITORY_BACKEND", env_value);
+            let overridden = ConfigManager::load_config_file_with_overlays(
+                &bundled,
+                std::slice::from_ref(&overlay),
+            );
+            std::env::remove_var("AENV_SNAPSHOT_REPOSITORY_BACKEND");
+
+            assert_eq!(
+                overridden
+                    .expect("load with both the overlay and the environment")
+                    .snapshot
+                    .repository_backend,
+                expected,
+                "the overlay said {overlay_value} and the environment said {env_value}; the \
+                 environment has to win or `kubectl set env` stops being a rollback"
+            );
+        }
     }
 
     /// The three local-disk budgets are per-machine numbers, and the file they
@@ -2074,6 +2358,7 @@ mod tests {
     /// the values being set.
     #[test]
     fn the_image_cache_budgets_are_settable_from_the_environment() {
+        let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         let bundled = workspace.join("config/default.toml");
 
@@ -2125,6 +2410,463 @@ mod tests {
         );
     }
 
+    /// 🔴 Serializes every test in this module that either sets one of the
+    /// `AENV_*` variables the loader reads or compares two loads against each
+    /// other.
+    ///
+    /// The variables are process-global and `cargo test` runs this module's
+    /// tests in parallel threads of one process. Without this, a test that
+    /// sets `AENV_SNAPSHOT_REPOSITORY_BACKEND` for a few microseconds can land
+    /// between the two loads another test is comparing, and the failure it
+    /// produces names neither test. The convention up to now has been one
+    /// owner per variable, which keeps the *setters* from fighting each other
+    /// but does nothing for a reader.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Deep merge, key by key, with the later document winning.
+    ///
+    /// 🔴 Every assertion here has its opposite in the same call: the merged
+    /// table is checked for what the *earlier* file said as well as for what
+    /// the later one changed. "The overlay won" and "the overlay replaced the
+    /// whole table" are the same observation if only the overridden key is
+    /// looked at, and they are the difference between being able to keep
+    /// `[backend.oss]`'s endpoint in this repository and having to put it in a
+    /// Secret alongside the credentials.
+    #[test]
+    fn merging_config_documents_is_deep_and_the_later_file_wins() {
+        let mut merged: toml::Table = toml::from_str(
+            r#"
+scalar = "from base"
+array = [1, 2]
+[backend.oss]
+endpoint = "http://base:9000"
+bucket = "base-bucket"
+[keep]
+untouched = "base"
+"#,
+        )
+        .expect("parse base");
+
+        merge_toml_tables(
+            &mut merged,
+            toml::from_str(
+                r#"
+[backend.oss]
+access_key_id = "from-first-overlay"
+endpoint = "http://first:9000"
+"#,
+            )
+            .expect("parse first overlay"),
+        );
+        merge_toml_tables(
+            &mut merged,
+            toml::from_str(
+                r#"
+scalar = "from second"
+array = [9]
+[backend.oss]
+endpoint = "http://second:9000"
+"#,
+            )
+            .expect("parse second overlay"),
+        );
+
+        let oss = merged["backend"]["oss"].as_table().expect("[backend.oss]");
+
+        // The point of the whole mechanism: a key only the base has survives a
+        // file that writes into the same table.
+        assert_eq!(
+            oss["bucket"].as_str(),
+            Some("base-bucket"),
+            "an overlay that mentions [backend.oss] replaced the section instead of merging \
+             into it; the endpoint and the bucket would then have to live in the same file as \
+             the credentials"
+        );
+        // ...and so does a key only an intermediate overlay has.
+        assert_eq!(
+            oss["access_key_id"].as_str(),
+            Some("from-first-overlay"),
+            "the second overlay dropped what the first one contributed"
+        );
+        // The counter-face: where they collide, the last file wins — twice
+        // over, so "later wins" is not "first wins" read the wrong way round.
+        assert_eq!(oss["endpoint"].as_str(), Some("http://second:9000"));
+        assert_eq!(merged["scalar"].as_str(), Some("from second"));
+        assert_eq!(
+            merged["keep"]["untouched"].as_str(),
+            Some("base"),
+            "a table no overlay mentioned was disturbed"
+        );
+
+        // 🔴 Arrays replace, they do not concatenate. Stated as a test because
+        // the alternative is defensible and somebody will assume it: a list of
+        // proxy domains or of allowed boot-arg prefixes that grew by one entry
+        // per layer would be a surprise nothing reports.
+        assert_eq!(
+            merged["array"].as_array().map(Vec::len),
+            Some(1),
+            "arrays must replace whole"
+        );
+        assert_eq!(merged["array"][0].as_integer(), Some(9));
+
+        // And a scalar giving way to a table (or the reverse) is a plain
+        // replacement rather than a panic or a silent keep.
+        let mut swapped: toml::Table = toml::from_str("value = 1\n[table]\nx = 1\n").expect("base");
+        merge_toml_tables(
+            &mut swapped,
+            toml::from_str("table = 2\n[value]\nx = 1\n").expect("overlay"),
+        );
+        assert_eq!(swapped["table"].as_integer(), Some(2));
+        assert!(swapped["value"].is_table());
+    }
+
+    /// 🔴 The promise every cluster that never sets the new variable is owed.
+    ///
+    /// With no overlay, `load_config_file` must be the two lines it always
+    /// was — confique's `.env().file(path)` — and produce a configuration that
+    /// is identical field for field. This compares a full `{:#?}` of the
+    /// result against the old expression written out by hand, over
+    /// `config/default.toml`, which is the file `deploy/k8s/run.sh` copies into
+    /// every cluster.
+    ///
+    /// 🔴 "The two dumps are equal" is also what a test comparing a value with
+    /// itself reports, so the comparison is shown to fail before it is
+    /// believed: one field is changed by hand and the same comparison has to
+    /// notice.
+    #[test]
+    fn no_overlay_is_byte_for_byte_the_old_load() {
+        let _env = env_guard();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bundled = workspace.join("config/default.toml");
+        let config_dir = bundled.parent().expect("config dir");
+
+        // The load as it was written before AENV_CONFIG_OVERLAY_PATH existed.
+        let mut old = AppConfig::builder()
+            .env()
+            .file(&bundled)
+            .load()
+            .expect("the pre-overlay load");
+        old.normalize(config_dir).expect("normalize");
+        old.validate().expect("validate");
+
+        let new = ConfigManager::load_config_file_with_overlays(&bundled, &[])
+            .expect("the current load with no overlay");
+
+        let old_dump = format!("{old:#?}");
+        let new_dump = format!("{new:#?}");
+        assert_eq!(
+            old_dump, new_dump,
+            "loading config/default.toml with no overlay no longer produces what the old \
+             .env().file(path) produced"
+        );
+
+        // 🔴 The self-check. A dump comparison that cannot fail proves nothing,
+        // and `{:#?}` skipping a field — `SandboxConfig` already has a Debug
+        // that redacts one — is exactly how it would silently stop being able
+        // to.
+        let mut planted = old;
+        planted.home_path = PathBuf::from("/planted-home-path");
+        assert_ne!(
+            format!("{planted:#?}"),
+            new_dump,
+            "the dump comparison cannot see a field that was changed by hand, so its verdict \
+             above means nothing"
+        );
+        assert!(
+            old_dump.contains("/var/lib/aenv") && old_dump.lines().count() > 200,
+            "the dump is not the whole config; it has {} lines",
+            old_dump.lines().count()
+        );
+    }
+
+    /// The main config file is merged the same way an overlay is, so with
+    /// overlays in play it reaches confique as a `toml::Table` rather than
+    /// through confique's own file source. That is a second code path over the
+    /// file every cluster runs, and this pins that it is not a second answer.
+    ///
+    /// The control is in the same test: an overlay that changes one value has
+    /// to produce a different dump, or "identical" would only mean the overlay
+    /// was never read.
+    #[test]
+    fn an_empty_overlay_leaves_the_main_file_alone() {
+        let _env = env_guard();
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let dir = tempdir().expect("tempdir");
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "# nothing but a comment\n").expect("write empty overlay");
+
+        let without = ConfigManager::load_config_file_with_overlays(&bundled, &[])
+            .expect("load with no overlay");
+        let with_empty =
+            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&empty))
+                .expect("load with an empty overlay");
+        assert_eq!(
+            format!("{without:#?}"),
+            format!("{with_empty:#?}"),
+            "routing config/default.toml through the overlay merge changed how it parses"
+        );
+
+        let changed = dir.path().join("changed.toml");
+        std::fs::write(&changed, "[firecracker]\nsocket_poll_ms = 7\n").expect("write overlay");
+        let with_change =
+            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&changed))
+                .expect("load with a real overlay");
+        assert_eq!(with_change.firecracker.socket_poll_ms, 7);
+        assert_ne!(
+            format!("{without:#?}"),
+            format!("{with_change:#?}"),
+            "an overlay that changes a value produced an identical dump; the comparison above \
+             is measuring nothing"
+        );
+    }
+
+    /// 🔴 The reason this mechanism exists, in the shape the cluster runs it.
+    ///
+    /// `[backend.oss]` cannot be reached from the environment at all, and the
+    /// file it would otherwise live in is overwritten by every
+    /// `make k8s-apply`. Here the section arrives from two overlay files that
+    /// neither the main config nor each other could supply alone: the
+    /// endpoint, bucket, region and cache budget from a file this repository
+    /// tracks, and the credentials from a mounted Secret.
+    #[test]
+    fn two_overlays_assemble_the_backend_section_no_environment_can_reach() {
+        let _env = env_guard();
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let dir = tempdir().expect("tempdir");
+
+        // The half that is safe to commit: everything except the credentials.
+        let public = dir.path().join("oss.toml");
+        std::fs::write(
+            &public,
+            "[snapshot]\nrepository_backend = \"oss\"\n\n\
+             [backend.oss]\nendpoint = \"http://rustfs:9000\"\nbucket = \"agentenv-snapshots\"\n\
+             region = \"us-east-1\"\nprefix = \"snapshots/\"\ncache_max_size_gb = 8\n",
+        )
+        .expect("write the public overlay");
+
+        // The half that only ever comes from a Secret.
+        let secret = dir.path().join("oss-credentials.toml");
+        std::fs::write(
+            &secret,
+            "[backend.oss]\naccess_key_id = \"planted-key-id\"\n\
+             access_key_secret = \"planted-key-secret\"\n",
+        )
+        .expect("write the secret overlay");
+
+        let config = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            &[public.clone(), secret.clone()],
+        )
+        .expect("load with both halves");
+        let oss = config
+            .backend
+            .oss
+            .as_ref()
+            .expect("[backend.oss] must arrive from the overlays");
+        assert_eq!(
+            config.snapshot.repository_backend,
+            SnapshotRepositoryBackendKind::Oss
+        );
+        assert_eq!(oss.endpoint, "http://rustfs:9000");
+        assert_eq!(oss.bucket, "agentenv-snapshots");
+        assert_eq!(oss.region.as_deref(), Some("us-east-1"));
+        assert_eq!(oss.prefix.as_deref(), Some("snapshots/"));
+        assert_eq!(oss.cache_max_size_gb, Some(8));
+        assert_eq!(oss.access_key_id.as_deref(), Some("planted-key-id"));
+        assert_eq!(oss.access_key_secret.as_deref(), Some("planted-key-secret"));
+
+        // 🔴 Control 1: the same main file, alone, has neither. This is what a
+        // cluster gets from an apply, and it is why the section has to come
+        // from somewhere the apply cannot reach.
+        let alone = ConfigManager::load_config_file_with_overlays(&bundled, &[])
+            .expect("load the main file alone");
+        assert!(alone.backend.oss.is_none());
+        assert_eq!(
+            alone.snapshot.repository_backend,
+            SnapshotRepositoryBackendKind::PosixFs
+        );
+
+        // 🔴 Control 2: neither half is sufficient, and they fail in opposite
+        // directions. The public half loads and leaves the credentials unset —
+        // which is the state a cluster whose Secret failed to mount would be
+        // in, if the mount were allowed to fail quietly. The credential half
+        // alone is not a valid section at all.
+        let public_only =
+            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&public))
+                .expect("the public half alone loads");
+        assert!(public_only
+            .backend
+            .oss
+            .expect("public half supplies the section")
+            .access_key_id
+            .is_none());
+        let secret_only =
+            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&secret));
+        assert!(
+            secret_only.is_err(),
+            "a [backend.oss] with credentials but no endpoint or bucket must be refused, not \
+             completed from somewhere"
+        );
+
+        // 🔴 Control 3: order decides where they collide, so the file listed
+        // last is the one that can overrule a mounted Secret — worth knowing
+        // before writing the list into a manifest.
+        let shadow = dir.path().join("shadow.toml");
+        std::fs::write(&shadow, "[backend.oss]\naccess_key_id = \"shadowed\"\n")
+            .expect("write shadow");
+        let secret_last = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            &[public.clone(), shadow.clone(), secret.clone()],
+        )
+        .expect("load");
+        let shadow_last =
+            ConfigManager::load_config_file_with_overlays(&bundled, &[public, secret, shadow])
+                .expect("load");
+        assert_eq!(
+            secret_last
+                .backend
+                .oss
+                .expect("section")
+                .access_key_id
+                .as_deref(),
+            Some("planted-key-id")
+        );
+        assert_eq!(
+            shadow_last
+                .backend
+                .oss
+                .expect("section")
+                .access_key_id
+                .as_deref(),
+            Some("shadowed")
+        );
+    }
+
+    /// 🔴 A named overlay that is not on disk stops the load.
+    ///
+    /// confique's own file source treats a missing file as an empty layer, and
+    /// inheriting that here would make the one failure this mechanism exists to
+    /// prevent silent: a Secret that failed to mount, a node that starts on
+    /// `posix_fs`, an empty local snapshot store, and a catalog still naming
+    /// artifacts nothing can fetch. The error has to name the file and the
+    /// variable, because the operator reading it did not necessarily write the
+    /// manifest.
+    #[test]
+    fn a_named_overlay_that_is_not_on_disk_stops_the_load() {
+        let _env = env_guard();
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let dir = tempdir().expect("tempdir");
+
+        // The control: the same call, with the file there, loads.
+        let present = dir.path().join("present.toml");
+        std::fs::write(&present, "[firecracker]\nsocket_poll_ms = 7\n").expect("write");
+        assert_eq!(
+            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&present))
+                .expect("an overlay that exists loads")
+                .firecracker
+                .socket_poll_ms,
+            7
+        );
+
+        let missing = dir.path().join("not-mounted.toml");
+        let err =
+            ConfigManager::load_config_file_with_overlays(&bundled, &[present, missing.clone()])
+                .expect_err("a missing overlay must not be treated as an empty layer");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&missing.display().to_string()),
+            "the error does not name the file that is missing: {text}"
+        );
+        assert!(
+            text.contains(ENV_CONFIG_OVERLAY_PATH),
+            "the error does not name the variable that asked for it: {text}"
+        );
+    }
+
+    /// 🔴 The one test that touches `AENV_CONFIG_OVERLAY_PATH`, because it is
+    /// process-global; everything else about overlays goes through
+    /// `load_config_file_with_overlays` directly.
+    ///
+    /// The overlay it mounts changes `firecracker.socket_poll_ms` and nothing
+    /// else, deliberately: while this test holds the variable set, any other
+    /// test in the process that loads a config sees the overlay too, and that
+    /// value is asserted on nowhere.
+    #[test]
+    fn the_overlay_variable_is_read_and_only_separators_means_unset() {
+        let _env = env_guard();
+
+        // The global is initialised here rather than left to whichever test
+        // gets there first, so it cannot be built while the variable below is
+        // set and carry a tempdir that is about to be deleted.
+        let _ = ConfigManager::global();
+
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
+        let dir = tempdir().expect("tempdir");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&overlay, "[firecracker]\nsocket_poll_ms = 7\n").expect("write overlay");
+
+        std::env::remove_var(ENV_CONFIG_OVERLAY_PATH);
+        assert!(ConfigManager::overlay_paths_from_env().is_empty());
+
+        // Unset, empty, and nothing-but-separators are the same thing. That is
+        // what lets a Deployment write "$(A):$(B)" and turn one half off by
+        // clearing a ConfigMap key instead of editing the manifest.
+        for quiet in ["", "   ", ":", " : ", "::"] {
+            std::env::set_var(ENV_CONFIG_OVERLAY_PATH, quiet);
+            let paths = ConfigManager::overlay_paths_from_env();
+            std::env::remove_var(ENV_CONFIG_OVERLAY_PATH);
+            assert!(
+                paths.is_empty(),
+                "{quiet:?} should mean no overlay, got {paths:?}"
+            );
+        }
+
+        // The counter-face: real entries are read, in order, and empty
+        // segments between them are skipped rather than becoming paths.
+        for (value, expected) in [
+            ("a.toml:b.toml", vec!["a.toml", "b.toml"]),
+            (":a.toml::b.toml:", vec!["a.toml", "b.toml"]),
+            (" a.toml : b.toml ", vec!["a.toml", "b.toml"]),
+            ("only.toml", vec!["only.toml"]),
+        ] {
+            std::env::set_var(ENV_CONFIG_OVERLAY_PATH, value);
+            let paths = ConfigManager::overlay_paths_from_env();
+            std::env::remove_var(ENV_CONFIG_OVERLAY_PATH);
+            assert_eq!(
+                paths,
+                expected.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                "{value:?} was not read as the list it names"
+            );
+        }
+
+        // End to end, through the entry point the server actually calls.
+        let quiet = ConfigManager::new_from_path(&bundled).expect("load with the variable unset");
+        assert_eq!(
+            quiet.config().firecracker.socket_poll_ms,
+            1,
+            "the file's own value must stand when the variable says nothing"
+        );
+
+        std::env::set_var(ENV_CONFIG_OVERLAY_PATH, overlay.display().to_string());
+        let mounted = ConfigManager::new_from_path(&bundled);
+        std::env::remove_var(ENV_CONFIG_OVERLAY_PATH);
+        assert_eq!(
+            mounted
+                .expect("load with the variable set")
+                .config()
+                .firecracker
+                .socket_poll_ms,
+            7,
+            "AENV_CONFIG_OVERLAY_PATH did not reach the loader"
+        );
+    }
+
     /// Every struct named in this file, by name, with its body.
     fn struct_bodies(source: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -2151,49 +2893,15 @@ mod tests {
         out
     }
 
-    /// 🔴 An `env =` attribute on a field confique never reads is worse than no
-    /// attribute at all: it is a promise, and `docs/src/configuration/` repeats
-    /// it to operators as a supported variable.
-    ///
-    /// confique walks into a struct's fields only through a field marked
-    /// `#[config(nested)]`, and `nested` may not be `Option<_>` — the derive
-    /// rejects it outright. So a config struct reached as a bare
-    /// `Option<Something>` is deserialized by serde from the file and nothing
-    /// else: its `env =` attributes are dead, silently, and the file always
-    /// wins.
-    ///
-    /// `[backend]` is where this bites. `BackendConfig` is `nested`, but both
-    /// of its fields are `Option<_>`, so nothing under `[backend.posix_fs]` or
-    /// `[backend.oss]` can be set from the environment. That is why the OSS
-    /// endpoint, bucket and credentials this cluster runs on cannot simply be
-    /// given `env =` attributes and a `secretKeyRef`.
-    ///
-    /// This test pins the offenders that exist rather than pretending there are
-    /// none: `AENV_SNAPSHOT_STORE` is declared, documented, and dead. What it
-    /// stops is the *next* one — an `env =` added to `OssBackendConfig` by
-    /// somebody who reasonably assumes it will work.
-    #[test]
-    fn no_new_env_binding_is_declared_where_confique_cannot_read_it() {
-        let source =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cfg.rs"))
-                .expect("read src/cfg.rs");
-
-        let bodies = struct_bodies(&source);
+    /// The names of config structs that are reached as a bare `Option<_>` —
+    /// the ones confique deserializes with serde and never visits from the
+    /// environment.
+    fn unreachable_config_structs(bodies: &[(String, String)]) -> Vec<String> {
         let known: std::collections::HashSet<&str> =
             bodies.iter().map(|(name, _)| name.as_str()).collect();
 
-        // 🔴 The non-empty half, ahead of the scan. A parser that found no
-        // structs, or no fields, reports the same clean result as a tree with
-        // no dead bindings — so prove it can see both before believing it.
-        assert!(
-            known.contains("OssBackendConfig") && known.contains("BackendConfig"),
-            "the struct scan did not find the structs this test is about"
-        );
-
-        // Fields of the shape `pub name: Option<SomeConfigStruct>,` whose
-        // attributes do not say `nested` — the unreachable ones.
         let mut unreachable: Vec<String> = Vec::new();
-        for (_, body) in &bodies {
+        for (_, body) in bodies {
             let lines: Vec<&str> = body.lines().collect();
             for (idx, line) in lines.iter().enumerate() {
                 let trimmed = line.trim();
@@ -2230,31 +2938,322 @@ mod tests {
                 }
             }
         }
+        unreachable.sort();
+        unreachable.dedup();
+        unreachable
+    }
 
-        assert!(
-            unreachable.contains(&"OssBackendConfig".to_string())
-                && unreachable.contains(&"PosixFsBackendConfig".to_string()),
-            "the scan lost sight of the two [backend] structs it exists to guard; found {unreachable:?}"
-        );
+    /// The unreachable structs that nevertheless declare an environment
+    /// binding — the dead promises.
+    ///
+    /// 🔴 Doc comments are stripped first. Explaining *why* a struct must not
+    /// carry an `env` attribute requires writing the attribute down, and a
+    /// scanner that counted the explanation would make the explanation
+    /// impossible to write.
+    fn dead_env_bindings(source: &str) -> Vec<String> {
+        let bodies = struct_bodies(source);
+        let unreachable = unreachable_config_structs(&bodies);
 
-        // Which of those actually declare an `env =`.
         let mut dead: Vec<String> = Vec::new();
         for (name, body) in &bodies {
-            if unreachable.contains(name) && body.contains("env =") {
+            if !unreachable.contains(name) {
+                continue;
+            }
+            let code_only: String = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("///"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if code_only.contains("env =") {
                 dead.push(name.clone());
             }
         }
         dead.sort();
         dead.dedup();
+        dead
+    }
+
+    /// The environment bindings confique actually reads: an `env` attribute on
+    /// a field of a struct it can reach.
+    ///
+    /// Doc comments are stripped for the reason [`dead_env_bindings`] strips
+    /// them — the prose has to be able to name an attribute without becoming
+    /// one.
+    fn live_env_bindings(source: &str) -> Vec<String> {
+        let bodies = struct_bodies(source);
+        let unreachable = unreachable_config_structs(&bodies);
+
+        let mut live: Vec<String> = Vec::new();
+        for (name, body) in &bodies {
+            if unreachable.contains(name) {
+                continue;
+            }
+            for line in body.lines() {
+                if line.trim_start().starts_with("///") {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(at) = rest.find("env = \"") {
+                    rest = &rest[at + "env = \"".len()..];
+                    match rest.split_once('"') {
+                        Some((value, tail)) => {
+                            live.push(value.to_string());
+                            rest = tail;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        live.sort();
+        live.dedup();
+        live
+    }
+
+    /// The `AENV_*` / `API_*` variables the `## Server` table of
+    /// `docs/src/configuration/env-vars.md` offers an operator.
+    ///
+    /// Rows whose name is struck through (`~~NAME~~`) are skipped: that is how
+    /// this file records a variable that has been removed, and a removal notice
+    /// is the opposite of a promise.
+    fn documented_server_env_vars(doc: &str) -> Vec<String> {
+        let section = match doc.split_once("\n## Server\n") {
+            Some((_, rest)) => rest.split("\n## ").next().unwrap_or(rest),
+            None => return Vec::new(),
+        };
+
+        let mut out: Vec<String> = Vec::new();
+        for line in section.lines() {
+            let trimmed = line.trim();
+            let Some(first_cell) = trimmed
+                .strip_prefix('|')
+                .and_then(|rest| rest.split('|').next())
+            else {
+                continue;
+            };
+            let first_cell = first_cell.trim();
+            if first_cell.starts_with("~~") {
+                continue;
+            }
+            let Some(name) = first_cell
+                .strip_prefix('`')
+                .and_then(|rest| rest.split('`').next())
+            else {
+                continue;
+            };
+            if name.starts_with("AENV_") || name.starts_with("API_") {
+                out.push(name.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// 🔴 Every variable the documentation offers is one the process reads.
+    ///
+    /// This is the half of the `AENV_SNAPSHOT_STORE` problem that lived outside
+    /// the code. The attribute was dead, but what made it *cost* something was
+    /// `docs/src/configuration/env-vars.md` listing it in the table an operator
+    /// reads when a cluster's snapshot store has to move — a supported override
+    /// that has never had any effect, with nothing anywhere to say so.
+    ///
+    /// The rule: a name in the `## Server` table is either bound on a field
+    /// confique can reach, or is in the list below, which says where it *is*
+    /// read. A name that is neither is a promise nothing keeps.
+    #[test]
+    fn every_documented_server_variable_is_one_the_process_reads() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = ["src/cfg.rs", "src/cfg/image.rs", "src/cfg/network.rs"]
+            .iter()
+            .map(|relative| {
+                std::fs::read_to_string(workspace.join(relative))
+                    .unwrap_or_else(|err| panic!("read {relative}: {err}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let doc = std::fs::read_to_string(workspace.join("docs/src/configuration/env-vars.md"))
+            .expect("read env-vars.md");
+
+        let bound = live_env_bindings(&sources);
+        let documented = documented_server_env_vars(&doc);
+
+        // 🔴 Both scanners are shown to work before their agreement is
+        // believed. Two empty lists agree perfectly.
+        assert!(
+            bound.contains(&"AENV_HOME_PATH".to_string())
+                && bound.contains(&"AENV_SNAPSHOT_REPOSITORY_BACKEND".to_string())
+                && bound.contains(&"AENV_IMAGE_CACHE_CAPACITY_GB".to_string()),
+            "the attribute scan did not find bindings that are certainly there (the last one \
+             lives in src/cfg/image.rs, so this also proves every source file was read); \
+             found {} names",
+            bound.len()
+        );
+        assert!(
+            !bound.contains(&"AENV_SNAPSHOT_STORE".to_string()),
+            "the attribute scan counts a binding on a struct confique cannot reach as live"
+        );
+        assert!(
+            documented.len() > 15 && documented.contains(&"AENV_HOME_PATH".to_string()),
+            "the documentation scan did not read the ## Server table; found {documented:?}"
+        );
+        assert!(
+            !documented.contains(&"AENV_SNAPSHOT_STORE".to_string()),
+            "AENV_SNAPSHOT_STORE is still offered as a supported override. It has never been \
+             read; the row must stay struck through"
+        );
+        assert!(
+            !documented.contains(&"E2B_API_URL".to_string()),
+            "the documentation scan ran past the ## Server table into the SDK's own variables"
+        );
+
+        // Read somewhere other than a confique attribute. Each one names where,
+        // so this list cannot quietly become a place to put a dead promise.
+        let read_elsewhere = [
+            ("AENV_CONFIG_PATH", "ENV_CONFIG_PATH, ConfigManager::new"),
+            (
+                "AENV_CONFIG_OVERLAY_PATH",
+                "ENV_CONFIG_OVERLAY_PATH, ConfigManager::overlay_paths_from_env",
+            ),
+            ("AENV_LOG_FORMAT", "src/logging.rs"),
+            ("AENV_LOG_SPAN_EVENTS", "src/logging.rs"),
+            ("AENV_FORCE_SYSCTL_TUNING", "src/setup/network_capacity.rs"),
+            ("API_ADDR", "src/bin/server.rs"),
+        ];
+
+        let unkept: Vec<&String> = documented
+            .iter()
+            .filter(|name| !bound.contains(name))
+            .filter(|name| {
+                !read_elsewhere
+                    .iter()
+                    .any(|(known, _)| *known == name.as_str())
+            })
+            .collect();
+        assert!(
+            unkept.is_empty(),
+            "docs/src/configuration/env-vars.md offers variables nothing reads: {unkept:?}. \
+             Either bind them on a field confique can reach, add them to `read_elsewhere` with \
+             the file that reads them, or strike the row through the way ~~AENV_SNAPSHOT_STORE~~ \
+             is. A documented variable that does nothing is how AENV_SNAPSHOT_STORE survived \
+             for years."
+        );
+
+        // 🔴 The counter-face for both scanners, on planted input: a binding
+        // that is only reachable by serde must not count as live, and a row
+        // that is not struck through must be read as a promise.
+        let planted_doc = "\n## Server\n\n| Variable | Default | Description |\n\
+                           |---|---|---|\n\
+                           | `AENV_PLANTED_DEAD` | — | offered |\n\
+                           | ~~`AENV_PLANTED_GONE`~~ | — | struck through |\n\
+                           \n## Something Else\n| `AENV_PLANTED_ELSEWHERE` | — | other table |\n";
+        assert_eq!(
+            documented_server_env_vars(planted_doc),
+            vec!["AENV_PLANTED_DEAD".to_string()],
+            "the documentation scan cannot tell an offered row from a struck-through one, or \
+             it ran past the end of the table"
+        );
+    }
+
+    /// 🔴 An `env` attribute on a field confique never reads is worse than no
+    /// attribute at all: it is a promise, and `docs/src/configuration/` repeats
+    /// it to operators as a supported variable.
+    ///
+    /// confique walks into a struct's fields only through a field marked
+    /// `#[config(nested)]`, and `nested` may not be `Option<_>` — the derive
+    /// rejects it outright (`confique-macro/src/parse.rs:127`). So a config
+    /// struct reached as a bare `Option<Something>` is deserialized by serde
+    /// from the file and nothing else: its environment bindings are dead,
+    /// silently, and the file always wins.
+    ///
+    /// `[backend]` is where this bites. `BackendConfig` is `nested`, but both
+    /// of its fields are `Option<_>`, so nothing under `[backend.posix_fs]` or
+    /// `[backend.oss]` can be set from the environment. That is why the OSS
+    /// endpoint, bucket and credentials this cluster runs on cannot simply be
+    /// given environment bindings and a `secretKeyRef`, and why
+    /// [`ENV_CONFIG_OVERLAY_PATH`] exists.
+    ///
+    /// 🔴 The expected set is now *empty*, and that is a change from when this
+    /// test was written. `AENV_SNAPSHOT_STORE` used to be here: declared on
+    /// `PosixFsBackendConfig::snapshot_store`, documented in
+    /// `docs/src/configuration/env-vars.md`, and never once read. It has been
+    /// removed rather than made to work — making it work means giving
+    /// `[backend]` non-`Option` nested fields, which changes what
+    /// `backend.posix_fs` resolves to under `repository_backend = "oss"`. The
+    /// overlay file is the supported replacement, and the documentation now
+    /// says so.
+    ///
+    /// An empty expected set is exactly the result a broken scanner reports, so
+    /// the scanner is run against a planted source first.
+    #[test]
+    fn no_new_env_binding_is_declared_where_confique_cannot_read_it() {
+        // 🔴 The non-empty half. A parser that found no structs, no fields, or
+        // no attributes reports the same clean result as a tree with no dead
+        // bindings — so make it find one that is deliberately there.
+        //
+        // 🔴 Written with a placeholder for the item keyword, because this
+        // scanner reads *this file*. Spelled out, the planted structs would be
+        // found by the real scan below and the test would fail on its own
+        // fixture.
+        let planted = r#"
+#[derive(Debug, Deserialize, Clone, Config)]
+@@ITEM@@ PlantedOuterConfig {
+    pub reachable_only_by_serde: Option<PlantedLeafConfig>,
+    #[config(nested)]
+    pub reachable_by_env: PlantedNestedConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Config)]
+@@ITEM@@ PlantedLeafConfig {
+    /// A doc comment that names env = "AENV_PLANTED_IN_A_COMMENT" and must not
+    /// count, or nothing could ever explain this rule in prose.
+    #[config(default = "x", env = "AENV_PLANTED_DEAD")]
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Config)]
+@@ITEM@@ PlantedNestedConfig {
+    #[config(default = "x", env = "AENV_PLANTED_LIVE")]
+    pub value: String,
+}
+"#
+        .replace("@@ITEM@@", concat!("pub ", "struct"));
+        let planted = planted.as_str();
+        let planted_bodies = struct_bodies(planted);
+        assert_eq!(
+            unreachable_config_structs(&planted_bodies),
+            vec!["PlantedLeafConfig".to_string()],
+            "the scan cannot tell a bare Option<_> field from a #[config(nested)] one; \
+             its verdict on the real tree means nothing"
+        );
+        assert_eq!(
+            dead_env_bindings(planted),
+            vec!["PlantedLeafConfig".to_string()],
+            "the scan does not report a dead binding that is deliberately there — either it \
+             cannot see the attribute, or it counted the one inside the doc comment as well"
+        );
+
+        let source =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cfg.rs"))
+                .expect("read src/cfg.rs");
+        let bodies = struct_bodies(&source);
+        let unreachable = unreachable_config_structs(&bodies);
+
+        assert!(
+            unreachable.contains(&"OssBackendConfig".to_string())
+                && unreachable.contains(&"PosixFsBackendConfig".to_string()),
+            "the scan lost sight of the two [backend] structs it exists to guard; found \
+             {unreachable:?}"
+        );
 
         assert_eq!(
-            dead,
-            vec!["PosixFsBackendConfig".to_string()],
-            "the set of config structs declaring an `env =` that confique cannot read has changed. \
-             `PosixFsBackendConfig` is the known one (AENV_SNAPSHOT_STORE, dead since it was \
-             written). Anything else here is a new dead promise — most likely an `env =` added to \
-             `OssBackendConfig` in the belief that a secretKeyRef would reach it. It will not: \
-             `[backend.oss]` is deserialized from the file only."
+            dead_env_bindings(&source),
+            Vec::<String>::new(),
+            "a config struct declares an environment binding confique cannot read. Most likely \
+             an `env` attribute added to `OssBackendConfig` in the belief that a secretKeyRef \
+             would reach it. It will not: `[backend.oss]` is deserialized from a file only. Put \
+             the value in a file named by AENV_CONFIG_OVERLAY_PATH instead — that is what it is \
+             for, and it is what the deployment already mounts."
         );
     }
 

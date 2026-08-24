@@ -1,0 +1,47 @@
+# The object-storage half of this cluster's configuration, layered over
+# `config/agentenv.toml` by AENV_CONFIG_OVERLAY_PATH.
+#
+# 🔴 This file exists because `deploy/k8s/run.sh` rewrites the other one.
+#
+# run.sh copies `config/default.toml` over `config/agentenv.toml` on every apply
+# (run.sh:30), and `config/default.toml` ships `repository_backend = "posix_fs"`
+# and no `[backend.oss]` at all — deliberately, because a checkout has no
+# business carrying one cluster's bucket. This cluster runs `oss` against a
+# RustFS bucket holding ~2.7k objects, and until this file existed that fact
+# lived nowhere except in the live ConfigMap, one `make k8s-apply` away from
+# being replaced by `posix_fs`. That direction is silent: the node starts,
+# serves an empty local snapshot store, and the catalog goes on naming
+# artifacts it can no longer fetch.
+#
+# 🔴 No credential is in this file, and none may ever be added. The two
+# credential fields come from the `rustfs-credentials` Secret, mounted as a
+# second overlay that is listed *after* this one — see the note on
+# snapshot-storage-config in `deploy/k8s/base/kustomization.yaml` for how to put
+# them there. `TestNoObjectStorageCredentialIsCommittedToTheRepository`
+# (`services/shared/config`) fails if `access_key_id`, `access_key_secret` or
+# `security_token` ever appears in a tracked file.
+#
+# The merge is a deep, key-by-key merge of TOML tables, so the section below and
+# the credential section in the Secret combine into one `[backend.oss]`. Neither
+# half is a complete section on its own, and neither can be: this one has no
+# credentials, and the Secret's has no endpoint or bucket and does not even
+# deserialize alone. Both failures are loud.
+
+[snapshot]
+# 🔴 Set here *and* as AENV_SNAPSHOT_REPOSITORY_BACKEND on both workloads, and
+# the redundancy is the point. Losing either one alone has to be loud:
+#   · overlay lost, environment still `oss` -> the section is missing and the
+#     node refuses to start ("backend.oss config is required when
+#     repository_backend = oss");
+#   · environment lost, overlay still mounted -> this line still says `oss`.
+# Only clearing both lands on `posix_fs`, which is the deliberate rollback and
+# not something a single mistake can reach.
+repository_backend = "oss"
+
+[backend.oss]
+endpoint = "http://rustfs.agentenv-system.svc.cluster.local:9000"
+bucket = "agentenv-snapshots"
+region = "us-east-1"
+prefix = "snapshots/"
+# Node-local artifact cache budget, in GiB.
+cache_max_size_gb = 8

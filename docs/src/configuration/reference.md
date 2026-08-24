@@ -8,6 +8,68 @@ export AENV_CONFIG_PATH=/path/to/config.toml
 cargo run --bin server -- --config /path/to/config.toml
 ```
 
+## Layered configuration files
+
+`AENV_CONFIG_OVERLAY_PATH` names extra TOML files that are layered over
+`AENV_CONFIG_PATH`, separated by `:` and applied left to right:
+
+```bash
+export AENV_CONFIG_OVERLAY_PATH=/etc/agentenv/overlay/oss.toml:/etc/agentenv/secret/oss-credentials.toml
+```
+
+**Unset is the default and changes nothing.** A value that is empty or contains
+nothing but separators is the same as unset, and empty segments in a real list
+are skipped — so a deployment can write `"$(A):$(B)"` and turn one half off by
+clearing the value behind it. A file that *is* named and is not on disk is a
+startup error, deliberately: the usual reason to name one is a mounted Secret,
+and a node that started quietly without it would fall back to the repository's
+own defaults and report nothing.
+
+Precedence, lowest to highest:
+
+1. Built-in defaults
+2. `AENV_CONFIG_PATH`
+3. Each `AENV_CONFIG_OVERLAY_PATH` entry, in order — later entries win
+4. Environment variables (`AENV_*`)
+
+The environment stays on top so `kubectl set env` remains a rollback for a value
+that arrived in a file nobody can rewrite quickly.
+
+### Merge semantics
+
+The main file and the overlays are merged as TOML documents, key by key, before
+any of it becomes configuration:
+
+- Where both sides hold a **table**, the two are merged. A section only the
+  earlier file mentions survives a later file that writes into the same section.
+- **Everything else replaces**: scalars, strings, and **arrays** — an array is
+  taken whole from the last file that sets it, never concatenated.
+- There is no way to *remove* a key, only to give it another value.
+
+Deep table merging is the point rather than a detail. It is what lets one
+`[backend.oss]` section be assembled out of two files, so that the endpoint,
+bucket, region and cache budget can live in a tracked ConfigMap while
+`access_key_id` and `access_key_secret` come from a mounted Secret and nowhere
+else.
+
+Relative paths inside an overlay are resolved the same way as in the main
+file — against the directory containing `AENV_CONFIG_PATH`, not the overlay's
+own directory. Prefer absolute paths or the `$AENV_HOME` placeholder.
+
+### When you need this
+
+Most settings can be overridden with an `AENV_*` variable and do not need a
+file. Two kinds cannot:
+
+- `[backend.oss]` and `[backend.posix_fs]`. They are reached as
+  `Option<...>`, confique descends into a struct only through
+  `#[config(nested)]`, and `nested` may not be `Option<_>` — so no environment
+  variable can reach a field inside either section. An overlay file is the only
+  way to set them from outside `AENV_CONFIG_PATH`.
+- Anything a deployment overwrites. `deploy/k8s/run.sh` regenerates the cluster
+  ConfigMap from `config/default.toml` on every apply, so a value that exists
+  only in that ConfigMap is lost on the next one.
+
 ## Global Settings
 
 | Key | Type | Default | Description |
@@ -408,9 +470,12 @@ POSIX filesystem-backed snapshot repository configuration. This section is used 
 |-----|------|---------|-------------|
 | `snapshot_store` | string | `"$AENV_HOME/snapshot-store"` | Root directory for durable committed snapshot repository state. Relative explicit paths are resolved against the config file directory. |
 
-Environment variable overrides:
-
-- `AENV_SNAPSHOT_STORE`
+No environment variable reaches this section. `[backend.posix_fs]` is
+`Option<PosixFsBackendConfig>` and confique never reads a non-`nested` `Option`
+from the environment, so `AENV_SNAPSHOT_STORE` — which was declared here and
+documented for years — never had any effect and has been removed. Use
+[an overlay file](#layered-configuration-files) to set `snapshot_store` from
+outside `AENV_CONFIG_PATH`.
 
 ## `[backend.oss]`
 
@@ -427,6 +492,13 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `security_token` | string | unset | Optional session token paired with static access key credentials |
 | `region` | string | none | Region passed to the S3-compatible object-store client; required for current OSS backend |
 | `cache_max_size_gb` | integer | `10` | Maximum size of the node-local OSS artifact cache in GiB |
+
+No environment variable reaches this section either, for the same reason as
+`[backend.posix_fs]` above — including the credentials, which is why there is no
+`secretKeyRef` form of them. Supply the section through
+[an overlay file](#layered-configuration-files); because the merge is deep, the
+endpoint, bucket, region and prefix can come from a tracked file while
+`access_key_id` and `access_key_secret` come from a separate mounted Secret.
 
 Notes:
 

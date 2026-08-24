@@ -62,6 +62,13 @@ configMapGenerator:
   - name: agentenv-k8s-config
     files:
       - config/agentenv.toml
+      # 🔴 config/oss-overlay.toml *is* in this repository, and that is the
+      # difference between the two files in this generator. agentenv.toml is
+      # written by run.sh from config/default.toml on every apply, so nothing a
+      # cluster says there survives; this one is tracked, reviewed, and layered
+      # on top by AENV_CONFIG_OVERLAY_PATH below. It carries the endpoint, the
+      # bucket, the region and the cache budget — never a credential.
+      - config/oss-overlay.toml
   - name: scheduler-k8s-config
     files:
       - config/scheduler.json
@@ -275,6 +282,62 @@ configMapGenerator:
     literals:
       - AENV_SNAPSHOT_CATALOG_WRITE=both
       - AENV_SNAPSHOT_CATALOG_READ=postgres
+  # Which durable snapshot repository this cluster keeps, and where the half of
+  # its configuration that cannot be in this repository is read from.
+  #
+  # 🔴 `[backend.oss]` is the one section no environment variable can reach.
+  # confique descends into a struct only through `#[config(nested)]`, `nested`
+  # may not be `Option<_>`, and `backend.oss` is `Option<OssBackendConfig>` — so
+  # the endpoint, the bucket and the credentials are read from a *file* and from
+  # nothing else. Until AENV_CONFIG_OVERLAY_PATH existed, the only file was the
+  # one run.sh overwrites, which is why this cluster's OSS settings — plaintext
+  # credentials and all — were sitting in the `agentenv-k8s-config` ConfigMap
+  # with no tracked copy anywhere.
+  #
+  # AENV_CONFIG_OVERLAY_PATH names extra TOML files layered over
+  # `config/agentenv.toml`, applied left to right, merged deeply table by table.
+  # Two of them here, and the split is the whole point:
+  #   · config/oss-overlay.toml — tracked in this repository, no credentials;
+  #   · backend-oss.toml — projected from the `rustfs-credentials` Secret,
+  #     credentials only, listed last so it wins where they overlap.
+  #
+  # 🔴 A file that is named and not on disk is a *startup error*, deliberately:
+  # the alternative is a node that quietly starts on `posix_fs` with an empty
+  # snapshot store. So this key and the Secret below must move together.
+  #
+  # 🔴 The Secret needs one key that is not there on a fresh cluster, and it is
+  # not created from this repository because it holds credentials. The cluster
+  # already keeps the same pair under RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY;
+  # add the TOML form beside them once, before rolling either workload:
+  #
+  #   NS=agentenv-system
+  #   AK=$(kubectl -n $NS get secret rustfs-credentials \
+  #        -o jsonpath='{.data.RUSTFS_ACCESS_KEY}' | base64 -d)
+  #   SK=$(kubectl -n $NS get secret rustfs-credentials \
+  #        -o jsonpath='{.data.RUSTFS_SECRET_KEY}' | base64 -d)
+  #   T=$(mktemp) && printf '[backend.oss]\naccess_key_id = "%s"\naccess_key_secret = "%s"\n' \
+  #        "$AK" "$SK" > "$T"
+  #   kubectl -n $NS patch secret rustfs-credentials --type merge \
+  #     -p "{\"data\":{\"backend-oss-credentials.toml\":\"$(base64 -w0 "$T")\"}}"
+  #   shred -u "$T"
+  #
+  # 🔴 And the pods have to be rolled for any of it to take effect: both files
+  # are `subPath` mounts, which kubelet never refreshes. Order matters — add the
+  # Secret key first, then apply, then roll. Rolling before the key exists is a
+  # node that will not start.
+  #
+  # Turning it off is one command and does not touch a manifest:
+  #   kubectl -n agentenv-system set env daemonset/agentenv-node \
+  #     deploy/agentenv-api AENV_CONFIG_OVERLAY_PATH=
+  # An environment variable set to the empty string is read as unset, so that
+  # clears it. It also lands the cluster on `posix_fs` unless
+  # AENV_SNAPSHOT_REPOSITORY_BACKEND is cleared too — which is why that one is
+  # separate, and why clearing only this key fails loudly instead of quietly
+  # serving an empty snapshot store.
+  - name: snapshot-storage-config
+    literals:
+      - AENV_SNAPSHOT_REPOSITORY_BACKEND=oss
+      - AENV_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml
 
 images:
   - name: agentenv-gateway

@@ -14,6 +14,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 |----------|---------|-------------|
 | `API_ADDR` | `0.0.0.0:8000` | Address and port the API server listens on |
 | `AENV_CONFIG_PATH` | `config/default.toml` | Path to the TOML configuration file |
+| `AENV_CONFIG_OVERLAY_PATH` | unset | Colon-separated list of extra TOML files layered over `AENV_CONFIG_PATH`, left to right. Unset — or a value that is nothing but separators — parses exactly as before this existed. A file that is named but not present is a startup error. See [Layered configuration files](reference.md#layered-configuration-files). |
 | `AENV_LOG_FORMAT` | `compact` | Server log output format: `compact`, `pretty`, or `json` |
 | `AENV_LOG_SPAN_EVENTS` | `off` | Tracing span lifecycle events to emit: `off`, `new`, `enter`, `exit`, `close`, `active`, or `full` |
 | `AENV_NODE_ID` | hostname-derived | Override the runtime node identifier used in observability/admin snapshots |
@@ -30,7 +31,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_DEPS_PATH` | `$AENV_HOME/deps` | Override root directory for auto-downloaded runtime assets (Firecracker, kernel, tools drive). |
 | `AENV_VIRTUALIZATION_MODE` | `kvm` | Select the node virtualization mode. Leave unset for normal installations; set to `pvm` only when following the [PVM Deployment](../deployment/pvm.md) guide. |
 | `AENV_SNAPSHOT_LOCAL_CACHE_PATH` | `$AENV_HOME/snapshot-local-cache` | Override the snapshot manager's node-local artifact/cache root |
-| `AENV_SNAPSHOT_STORE` | `$AENV_HOME/snapshot-store` | Override the posix_fs snapshot repository root directory |
+| ~~`AENV_SNAPSHOT_STORE`~~ | — | **Removed. It never worked.** It was declared on `[backend.posix_fs].snapshot_store` and documented here from the day it was written, and the config loader never read it once: confique reaches a field from the environment only through `#[config(nested)]`, `nested` may not be `Option<_>`, and `[backend.posix_fs]` is `Option<PosixFsBackendConfig>`. Set `snapshot_store` in a file named by `AENV_CONFIG_OVERLAY_PATH` instead. |
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |
 | `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR` | `0.0.0.0:9103` | Override ublk daemon Prometheus metrics listen address; empty string disables it |
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |

@@ -178,6 +178,36 @@ spec:
                   name: snapshot-catalog-config
                   key: AENV_SNAPSHOT_CATALOG_READ
                   optional: true
+            # Which durable snapshot repository this half reads and writes, and
+            # where the half of its configuration that cannot be in this
+            # repository comes from. Both keys, both workloads, one ConfigMap —
+            # see the note on snapshot-storage-config in kustomization.yaml.
+            #
+            # 🔴 The same value as the DaemonSet, and a configMapKeyRef rather
+            # than a literal for that reason: an api replica that resolved
+            # snapshots from a different repository than the nodes would answer
+            # "no such snapshot" for artifacts that are sitting in the bucket.
+            #
+            # 🔴 `optional: true` on both, and the pair is safe to lose
+            # *together*: the overlay path goes unset, the backend falls back to
+            # `config/agentenv.toml`'s `posix_fs`, and the Pod starts on an
+            # empty local store. That is the one silent direction, and it takes
+            # losing the whole ConfigMap. Losing either key alone is loud —
+            # backend without the overlay refuses to start for want of
+            # `[backend.oss]`, overlay without the backend still says `oss` in
+            # the overlay file itself.
+            - name: AENV_SNAPSHOT_REPOSITORY_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-storage-config
+                  key: AENV_SNAPSHOT_REPOSITORY_BACKEND
+                  optional: true
+            - name: AENV_CONFIG_OVERLAY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-storage-config
+                  key: AENV_CONFIG_OVERLAY_PATH
+                  optional: true
             - name: API_ADDR
               value: "0.0.0.0:8000"
             # The data plane's wake-up surface (ResumeSandbox), which the
@@ -339,6 +369,18 @@ spec:
               mountPath: /workspace/config/agentenv.toml
               subPath: agentenv.toml
               readOnly: true
+            # The tracked, credential-free half of `[backend.oss]`, from the
+            # same ConfigMap as the file above. 🔴 A `subPath` mount, which
+            # kubelet never refreshes — editing the ConfigMap changes nothing
+            # until the Pod is replaced.
+            - name: agentenv-config
+              mountPath: /workspace/config/oss-overlay.toml
+              subPath: oss-overlay.toml
+              readOnly: true
+            # The credentials, and the only place in this tree they come from.
+            - name: backend-credentials
+              mountPath: /etc/agentenv/backend
+              readOnly: true
             - name: scratch
               mountPath: /workspace/env
             - name: control-plane-token
@@ -354,6 +396,32 @@ spec:
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config
+        # 🔴 The object-storage credentials, as a mounted file rather than a
+        # `secretKeyRef`, and not because of refresh: `[backend.oss]` is
+        # `Option<OssBackendConfig>` and confique reads a non-`nested`
+        # `Option` from a file and from nothing else, so no environment form of
+        # these values exists to be referenced.
+        #
+        # They used to be plaintext in the `agentenv-k8s-config` ConfigMap,
+        # which is generated from `config/default.toml` — one apply from a
+        # working tree with a local edit, and they were in the cluster with no
+        # tracked copy and no way back.
+        #
+        # `optional: true`, deliberately, and it is not a way to run without
+        # them. An absent Secret mounts an empty directory, the file named by
+        # AENV_CONFIG_OVERLAY_PATH is then missing, and the process refuses to
+        # start naming it — which is the loud failure this needs. What
+        # `optional: true` buys is that clearing AENV_CONFIG_OVERLAY_PATH is a
+        # *complete* rollback: with `optional: false` the Pod would still be
+        # stuck at ContainerCreating on a Secret it no longer reads, and the
+        # rollback would take a manifest edit.
+        - name: backend-credentials
+          secret:
+            secretName: rustfs-credentials
+            optional: true
+            items:
+              - key: backend-oss-credentials.toml
+                path: backend-oss.toml
         # The image sets AENV_HOME_PATH=/workspace/env, and the process creates
         # caches under it. On the node that path is the machine's hostPath; here
         # it is scratch with the Pod's own lifetime. If anything this half writes

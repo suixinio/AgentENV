@@ -1,6 +1,31 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# 🔴 One precondition this overlay deliberately does not satisfy: the
+# `agentenv-runtime-secrets` Secret with a `sandbox-access-token-hash-seed` key.
+#
+# The api Deployment reads it with `optional: false`, so on a cluster without it
+# the api Pods stop at CreateContainerConfigError and never start. That is the
+# intended failure and not an oversight in this file: envd access tokens are
+# HMAC(seed, sandbox_id), so a seed generated per replica makes the two replicas
+# disagree about every sandbox's token, and the user only finds out when a token
+# they were handed stops working. A Pod that will not start is the only form of
+# that fault anybody sees (`_sd-impl-phase3-role.md` §9). `--role api` refuses
+# the same way from inside the process (`src/sandbox/access.rs`).
+#
+# There is no literal here because the value must not live in the repository:
+# one committed seed would be the same seed on every cluster that applied this.
+# Create it once, before the first apply, and keep it:
+#
+#   kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
+#     --from-literal=sandbox-access-token-hash-seed="$(openssl rand -hex 32)"
+#
+# Every replica and every node then reads that one value — the DaemonSet reads
+# the same Secret and the same key, `optional: true`, so nodes keep working on a
+# cluster that has not created it yet. Changing the value invalidates the access
+# tokens of every existing secure sandbox. `overlays/local-dev` generates a
+# fixed test-only seed instead; do not reuse that one anywhere else.
+
 resources:
   - ../../base
 

@@ -263,6 +263,10 @@ The managed seed is node-local persistent state and must be included in backups 
 
 Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every node when cross-node recovery of the same sandbox is required. Nodes use their own managed seed when it is unset.
 
+`--role api` does not have that choice: it refuses to start when no seed is configured, rather than generating one. An API replica that invented its own would mint envd tokens its siblings cannot derive, and nothing about that is visible — the user is handed a token by whichever replica answered and it stops working when another one does. `--role node` and `--role all` are unchanged and still generate a managed seed.
+
+Every role publishes `agentenv_access_token_seed_fingerprint{fingerprint="..."} 1` at startup, where the label is the first eight bytes of `SHA-256(seed)` in hex. It is what makes "every process in this cluster holds the same seed" answerable from a scrape: the required-seed check above catches a *missing* seed, but two replicas each configured with a different non-empty value pass every check and still disagree. Compare the label across processes; the seed itself never appears in a log or a metric.
+
 ## `[orchestrator]`
 
 Sandbox lifecycle management.

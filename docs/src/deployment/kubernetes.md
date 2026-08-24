@@ -112,6 +112,21 @@ no host paths and no privileges. It needs
 `agentenv-runtime-secrets/sandbox-access-token-hash-seed` to exist — the
 reference is not optional, because an API replica that invents its own seed
 mints envd tokens the other replica cannot derive, and that failure is silent.
+The `default` overlay does not create that Secret; create it once before the
+first apply, or the api Pods stop at `CreateContainerConfigError`:
+
+```bash
+kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
+  --from-literal=sandbox-access-token-hash-seed="$(openssl rand -hex 32)"
+```
+
+Whether the value actually reached every process is a separate question from
+whether it was set, and `agentenv_access_token_seed_fingerprint{fingerprint=...}`
+is where it is answered: every role publishes it at startup, the label is the
+first eight bytes of `SHA-256(seed)`, and two processes that hold the same seed
+report the same label. Two replicas each configured with a *different* non-empty
+seed pass every startup check there is, so comparing this label across the
+replicas is the only place that divergence shows up.
 
 Bringing the Deployment up does not move any traffic. Three switches do, and
 they do not cost the same:

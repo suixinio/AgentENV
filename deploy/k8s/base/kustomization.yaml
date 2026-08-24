@@ -78,6 +78,54 @@ configMapGenerator:
   - name: sandbox-proxy-config
     literals:
       - SANDBOX_PROXY_DOMAINS=
+  # Where every node's heartbeat reporter dials the scheduler — one value,
+  # consumed two ways by `agentenv-daemonset.yaml`: as the env var read once
+  # at process start, and as a mounted file the reporter re-reads once per
+  # heartbeat while the process runs.
+  #
+  # 🔴 It used to be a bare literal in that file, with not even the
+  # indirection every other cluster-specific value here already gets — so
+  # changing where a node heartbeats meant editing the DaemonSet inline and
+  # rolling it: exactly the "phase four rollback is a serial, hour-long
+  # DaemonSet roll" trap
+  # `docs/proposals/2026-08-20-service-decomposition.md`'s phase four section
+  # says a rollback must not depend on, since that section's rollback also
+  # requires moving this same target back in the same breath as the api
+  # half's own switch. 阶段四切片 0 closes that gap for the value itself: the
+  # DaemonSet mounts this ConfigMap **without** `subPath` (`subPath` mounts —
+  # `agentenv-config`'s two uses of it in that file — are never refreshed by
+  # kubelet; a whole-ConfigMap mount like this one is, on kubelet's ordinary
+  # sync period), so `SchedulerChannelSource`
+  # (`src/observability/reporter.rs`) notices an edit here within one
+  # heartbeat interval and dials the new address on the very next heartbeat —
+  # no `kubectl set env`, no Pod restart, no DaemonSet roll.
+  #
+  # 🔴 One key, read two ways, deliberately — not an "env" ConfigMap and a
+  # separate "file" ConfigMap. A process whose bootstrap value (env, read once
+  # at startup) and hot-reloadable value (file, re-read forever) named two
+  # different schedulers would dial one of them by accident depending on
+  # timing, and keeping them as one key removes that possibility rather than
+  # relying on an operator to edit both in step.
+  #
+  # 🔴 Both references in the DaemonSet are `optional: true`, matching every
+  # other generated ConfigMap here. Losing this one does not fail the Pod —
+  # it silently stops heartbeat reporting instead:
+  # `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` stays `true`, but
+  # `ReporterConfig::resolve` (`src/observability/reporter.rs`) sees an empty
+  # `[cluster].scheduler_endpoint`, logs a `warn!` naming exactly that, and
+  # never starts the reporter rather than failing to start the process. That
+  # is a real degradation — the node stops appearing in the scheduler's
+  # observed-node list, and the paused-registry `central` backend, which reads
+  # the same `[cluster].scheduler_endpoint`, has nothing to dial either — but
+  # it is a *loud*, discoverable one rather than a crash, the same trade
+  # `cluster-identity-config` above makes for `AENV_CLUSTER_ID`.
+  #
+  # `http://agentenv-scheduler:9090` is this cluster's real, running value —
+  # tracked here the same way `api-upstream-config`'s addresses are, not a
+  # placeholder.
+  - name: node-heartbeat-config
+    literals:
+      - AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-scheduler:9090
   # The three switches of the incarnation work, in one place because the
   # release sequence flips them one at a time and an operator has to be able to
   # see all three at once.

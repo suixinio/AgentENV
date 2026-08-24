@@ -883,6 +883,43 @@ pub struct ObservabilitySchedulerReportConfig {
     pub enabled: bool,
     #[config(default = 5u64, env = "AENV_OBSERVABILITY_REPORT_INTERVAL_SECS")]
     pub interval_secs: u64,
+    /// A file holding the same endpoint as `[cluster].scheduler_endpoint`,
+    /// re-read once per heartbeat tick while the process runs.
+    ///
+    /// 🔴 This is what makes changing the heartbeat target free of a
+    /// DaemonSet roll. `[cluster].scheduler_endpoint` is read once at process
+    /// startup and baked into one gRPC channel that lives for the rest of the
+    /// process; today, changing it means editing the DaemonSet's
+    /// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` and rolling every node — the
+    /// serial, hour-long-grace-period roll that
+    /// `docs/proposals/2026-08-20-service-decomposition.md`'s phase four
+    /// section warns a rollback must not depend on. Point this at a file
+    /// mounted from a ConfigMap **without** `subPath` — kubelet only
+    /// refreshes non-`subPath` volumes, so a `subPath` mount would silently
+    /// never update — and the reporter notices an edit within one heartbeat
+    /// interval, with no pod restart.
+    ///
+    /// Only this field's own consumer, [`crate::observability::reporter`],
+    /// reads it. It is not a second way to reach the scheduler for
+    /// `[cluster].scheduler_endpoint`'s other consumers (P2P, the paused
+    /// sandbox registry's `central` backend, resume placement) — those still
+    /// read the static value and still require a restart to change.
+    ///
+    /// 🔴 Not a union with the static value, unlike
+    /// `ApiConfig::control_plane_token_file`'s relationship to
+    /// `control_plane_tokens`: a heartbeat can only go to one place, so when
+    /// this is set and has been read successfully at least once, it
+    /// *overrides* `[cluster].scheduler_endpoint` outright rather than adding
+    /// to it. Unset — or set but never yet read successfully (not mounted
+    /// yet, briefly unreadable) — falls back to the static value, which is
+    /// today's behavior, byte-for-byte, for every deployment that has not
+    /// opted into this.
+    #[config(
+        default = "",
+        env = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE",
+        parse_env = parse_trimmed_string
+    )]
+    pub scheduler_endpoint_file: String,
 }
 
 #[derive(Debug, Config, Clone)]

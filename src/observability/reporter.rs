@@ -1,7 +1,8 @@
 use std::cmp;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, watch};
@@ -20,6 +21,13 @@ use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Metric name for [`SchedulerChannelSource::current`]'s file re-read
+/// outcome. Mirrors `agentenv_api_control_plane_token_reload_total`
+/// (`src/api/control_plane_gate.rs`) — same shape of problem, same shape of
+/// answer.
+const SCHEDULER_ENDPOINT_RELOAD_METRIC: &str =
+    "agentenv_observability_scheduler_endpoint_reload_total";
+
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
 /// list. Detected in the reporter loop to emit an `error!`-level log with an
@@ -31,13 +39,18 @@ struct HeartbeatNodeNotConfigured;
 #[derive(Clone)]
 struct ReporterConfig {
     scheduler_endpoint: String,
+    /// A file re-read once per heartbeat/event tick that, once read
+    /// successfully, overrides `scheduler_endpoint` — see
+    /// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`] for
+    /// why this exists and why it is not a union with the static value.
+    scheduler_endpoint_file: Option<PathBuf>,
     interval: Duration,
 }
 
 pub struct ObservabilityReporter {
     config: ReporterConfig,
     service: Arc<ObservabilityService>,
-    scheduler_channel: Channel,
+    channel_source: Arc<SchedulerChannelSource>,
     p2p_endpoint: Option<P2pEndpoint>,
     shutdown_tx: Option<watch::Sender<bool>>,
     heartbeat_join: Option<JoinHandle<()>>,
@@ -58,12 +71,15 @@ impl ObservabilityReporter {
         let Some(config) = ReporterConfig::resolve(config, cluster_config) else {
             return Ok(None);
         };
-        let scheduler_channel = Self::build_scheduler_channel(&config.scheduler_endpoint)?;
+        let channel_source = Arc::new(SchedulerChannelSource::new(
+            config.scheduler_endpoint.clone(),
+            config.scheduler_endpoint_file.clone(),
+        )?);
 
         Ok(Some(Self {
             config,
             service,
-            scheduler_channel,
+            channel_source,
             p2p_endpoint,
             shutdown_tx: None,
             heartbeat_join: None,
@@ -85,11 +101,10 @@ impl ObservabilityReporter {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = self.config.clone();
-        let event_config = self.config.clone();
         let service = Arc::clone(&self.service);
         let event_service = Arc::clone(&self.service);
-        let scheduler_channel = self.scheduler_channel.clone();
-        let event_scheduler_channel = self.scheduler_channel.clone();
+        let channel_source = Arc::clone(&self.channel_source);
+        let event_channel_source = Arc::clone(&self.channel_source);
         let ever_heartbeat_succeeded = Arc::clone(&self.ever_heartbeat_succeeded);
         let p2p_endpoint = self.p2p_endpoint.clone();
         let mut heartbeat_shutdown_rx = shutdown_rx.clone();
@@ -114,10 +129,18 @@ impl ObservabilityReporter {
                     }
                 }
 
+                // Resolved fresh on every iteration, deliberately — not once
+                // outside the loop. That is what makes a changed endpoint file
+                // take effect on the *next* heartbeat rather than the next
+                // restart: `current()` is where a hot-reloaded target actually
+                // becomes traffic instead of merely a value that changed
+                // somewhere.
+                let (scheduler_channel, current_endpoint) = channel_source.current();
+
                 match Self::send_heartbeat(
-                    &config,
                     &service,
                     &scheduler_channel,
+                    &current_endpoint,
                     &mut pending_cpu_config_json,
                     p2p_endpoint.as_ref(),
                 )
@@ -131,7 +154,7 @@ impl ObservabilityReporter {
                     Err(ref err) if err.is::<HeartbeatNodeNotConfigured>() => {
                         error!(
                             node_id = %service.node_id(),
-                            scheduler_endpoint = %config.scheduler_endpoint,
+                            scheduler_endpoint = %current_endpoint,
                             retry_after_secs = backoff.as_secs(),
                             "scheduler rejected heartbeat: this node is not in the \
                              scheduler's configured node list — ensure \
@@ -167,10 +190,17 @@ impl ObservabilityReporter {
                         let Some(events) = events else {
                             return;
                         };
+                        // Same reasoning as the heartbeat loop: fetched fresh
+                        // for this batch, not cached across batches, so a
+                        // hot-reloaded target applies to sandbox events too —
+                        // both share `channel_source`, so they always agree on
+                        // where "the scheduler" currently is.
+                        let (event_scheduler_channel, event_endpoint) =
+                            event_channel_source.current();
                         if let Err(err) = Self::send_sandbox_events(
-                            &event_config,
                             &event_service,
                             &event_scheduler_channel,
+                            &event_endpoint,
                             events,
                         ).await {
                             warn!(error = %err, "observability sandbox event batch report failed");
@@ -186,6 +216,7 @@ impl ObservabilityReporter {
 
         info!(
             scheduler_endpoint = %self.config.scheduler_endpoint,
+            scheduler_endpoint_file = ?self.config.scheduler_endpoint_file.as_deref(),
             interval_secs = self.config.interval.as_secs(),
             "observability reporter started"
         );
@@ -243,17 +274,10 @@ impl ObservabilityReporter {
         Ok(())
     }
 
-    fn build_scheduler_channel(scheduler_endpoint: &str) -> Result<Channel> {
-        let raw_endpoint = scheduler_endpoint.to_string();
-        let endpoint = Endpoint::from_shared(raw_endpoint.clone())
-            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
-        Ok(endpoint.connect_lazy())
-    }
-
     async fn send_heartbeat(
-        config: &ReporterConfig,
         service: &ObservabilityService,
         scheduler_channel: &Channel,
+        scheduler_endpoint: &str,
         cpu_config_json: &mut Option<String>,
         p2p_endpoint: Option<&P2pEndpoint>,
     ) -> Result<()> {
@@ -291,7 +315,7 @@ impl ObservabilityReporter {
 
         trace!(
             node_id = %node_id,
-            scheduler_endpoint = %config.scheduler_endpoint,
+            scheduler_endpoint = %scheduler_endpoint,
             "observability heartbeat sent"
         );
 
@@ -334,9 +358,9 @@ impl ObservabilityReporter {
     }
 
     async fn send_sandbox_events(
-        config: &ReporterConfig,
         service: &ObservabilityService,
         scheduler_channel: &Channel,
+        scheduler_endpoint: &str,
         events: Vec<SandboxLifecycleEvent>,
     ) -> Result<()> {
         if events.is_empty() {
@@ -354,7 +378,7 @@ impl ObservabilityReporter {
         trace!(
             node_id = %service.node_id(),
             event_count,
-            scheduler_endpoint = %config.scheduler_endpoint,
+            scheduler_endpoint = %scheduler_endpoint,
             "observability sandbox event batch sent"
         );
 
@@ -488,11 +512,212 @@ impl ObservabilityReporter {
             service_instance_id: self.service.service_instance_id().to_string(),
         });
         request.set_timeout(GRPC_CALL_TIMEOUT);
-        SchedulerClient::new(self.scheduler_channel.clone())
+        // Whichever scheduler this reporter is currently heartbeating, not
+        // necessarily the one it started on — a node that switched targets
+        // mid-life should unregister itself from the one that actually holds
+        // its binding.
+        let (channel, _endpoint) = self.channel_source.current();
+        SchedulerClient::new(channel)
             .unregister_node(request)
             .await
             .context("unregister node rpc failed")?;
         Ok(())
+    }
+}
+
+/// Where the reporter dials the scheduler right now, and how that can change
+/// while the process runs.
+///
+/// Two sources: [`ReporterConfig::scheduler_endpoint`], fixed for the life of
+/// the process, and an optional file
+/// ([`ReporterConfig::scheduler_endpoint_file`]) re-read once per
+/// heartbeat/event tick by [`current`](Self::current). They do **not**
+/// union — a heartbeat can only go to one place — so a file that has been
+/// read successfully at least once overrides the static value outright,
+/// rather than adding to it the way `ControlPlaneGate`'s two credential
+/// sources do (`src/api/control_plane_gate.rs`).
+///
+/// 🔴 When no file is configured, [`current`](Self::current) never touches
+/// the filesystem: it hands out clones of the one channel built at
+/// construction, forever — exactly what the reporter did before this existed.
+/// That is what keeps every deployment that has not opted into
+/// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` byte-for-byte unchanged.
+struct SchedulerChannelSource {
+    /// `None` when no file is configured — the off position, and the one
+    /// every deployment ships in today.
+    file: Option<PathBuf>,
+    state: Mutex<ChannelSourceState>,
+}
+
+struct ChannelSourceState {
+    /// Modification time and length of the file content backing `endpoint` /
+    /// `channel`. `None` until the file has been read successfully at least
+    /// once; used to skip re-parsing a file that stat says has not changed.
+    fingerprint: Option<(SystemTime, u64)>,
+    /// The endpoint currently backing `channel`. Starts as the static value
+    /// and is only ever replaced by a *successful* file read that also built
+    /// a working channel — see [`SchedulerChannelSource::current`].
+    endpoint: String,
+    channel: Channel,
+}
+
+impl SchedulerChannelSource {
+    /// Builds the initial channel from the static endpoint only — the file,
+    /// if any, is first consulted by the loop's first call to
+    /// [`current`](Self::current), not here. A file that is misconfigured or
+    /// not yet mounted must never fail process startup; only a bad *static*
+    /// endpoint does, which is unchanged from before this type existed.
+    fn new(static_endpoint: String, file: Option<PathBuf>) -> Result<Self> {
+        let channel = Self::build_channel(&static_endpoint)?;
+        Ok(Self {
+            file,
+            state: Mutex::new(ChannelSourceState {
+                fingerprint: None,
+                endpoint: static_endpoint,
+                channel,
+            }),
+        })
+    }
+
+    fn build_channel(endpoint: &str) -> Result<Channel> {
+        let raw_endpoint = endpoint.to_string();
+        let built = Endpoint::from_shared(raw_endpoint.clone())
+            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
+        Ok(built.connect_lazy())
+    }
+
+    /// The channel and endpoint to send the next RPC on.
+    ///
+    /// Infallible by design: any problem reading, parsing, or dialling a
+    /// candidate from the file is logged and metered, and the channel already
+    /// in force is returned unchanged. The file mechanism can only ever hand
+    /// out a channel it built successfully — it can never hand back "no
+    /// channel", and it can never leave a caller with a channel that was
+    /// discarded mid-swap. Building the replacement happens under the same
+    /// lock that publishes it, so a heartbeat and a sandbox-event batch
+    /// racing this at the same moment either both see the old target or both
+    /// see the new one, never a mix, and an in-flight RPC on the outgoing
+    /// channel is unaffected — it already holds its own clone and keeps
+    /// running to completion or failure on it; nothing here cancels it.
+    fn current(&self) -> (Channel, String) {
+        let Some(path) = self.file.as_ref() else {
+            let state = self
+                .state
+                .lock()
+                .expect("scheduler channel state is poisoned");
+            return (state.channel.clone(), state.endpoint.clone());
+        };
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("scheduler channel state is poisoned");
+
+        // Skip the read when the file is byte-for-byte the one already held.
+        // A heartbeat is rare enough that a stat per tick costs nothing, and
+        // this keeps the common case — nobody has touched the file — to
+        // exactly that.
+        let fingerprint = std::fs::metadata(path)
+            .and_then(|meta| Ok((meta.modified()?, meta.len())))
+            .ok();
+        if let (Some(fingerprint), Some(held)) = (fingerprint, state.fingerprint) {
+            if fingerprint == held {
+                metrics::counter!(SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "unchanged")
+                    .increment(1);
+                return (state.channel.clone(), state.endpoint.clone());
+            }
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let candidate = contents.trim();
+                if candidate.is_empty() {
+                    warn!(
+                        path = %path.display(),
+                        "scheduler endpoint file is empty; keeping the last endpoint that was \
+                         read successfully. An empty file is not a valid target — write a real \
+                         endpoint to change it, or stop mounting the file to fall back to the \
+                         static endpoint at the next restart"
+                    );
+                    metrics::counter!(
+                        SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "empty_kept_previous"
+                    )
+                    .increment(1);
+                    return (state.channel.clone(), state.endpoint.clone());
+                }
+
+                if candidate == state.endpoint {
+                    // Same target, different bytes on disk (e.g. a rewrite
+                    // with identical content, or added trailing whitespace).
+                    // Remember the new fingerprint so the next tick takes the
+                    // fast path above, but there is no channel to rebuild.
+                    state.fingerprint = fingerprint;
+                    metrics::counter!(
+                        SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "same_value"
+                    )
+                    .increment(1);
+                    return (state.channel.clone(), state.endpoint.clone());
+                }
+
+                match Self::build_channel(candidate) {
+                    Ok(channel) => {
+                        info!(
+                            previous_endpoint = %state.endpoint,
+                            new_endpoint = %candidate,
+                            "observability heartbeat target changed"
+                        );
+                        state.fingerprint = fingerprint;
+                        state.endpoint = candidate.to_string();
+                        state.channel = channel.clone();
+                        metrics::counter!(
+                            SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "switched"
+                        )
+                        .increment(1);
+                        (channel, candidate.to_string())
+                    }
+                    Err(err) => {
+                        // 🔴 Never fail open, and never fail *closed* either —
+                        // a malformed edit to the ConfigMap must not stop
+                        // heartbeating. Keep dialling the last endpoint that
+                        // parsed, and do not update the fingerprint: an
+                        // operator fixing the typo produces a new mtime/len,
+                        // which is picked up on the very next tick without
+                        // needing this branch to remember anything.
+                        error!(
+                            path = %path.display(),
+                            candidate_endpoint = candidate,
+                            error = %err,
+                            "scheduler endpoint file names an endpoint that cannot be dialled; \
+                             keeping the previous heartbeat target"
+                        );
+                        metrics::counter!(
+                            SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "invalid_kept_previous"
+                        )
+                        .increment(1);
+                        (state.channel.clone(), state.endpoint.clone())
+                    }
+                }
+            }
+            Err(err) => {
+                // 🔴 Same "never fail open" rule as
+                // `ControlPlaneGate::file_tokens`: a read error is not
+                // evidence the endpoint changed, it is evidence of nothing at
+                // all, and treating it as "fall back to the static value"
+                // would let a single disk hiccup silently redirect every
+                // future heartbeat.
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "cannot read the scheduler endpoint file; keeping the last endpoint that was \
+                     read successfully"
+                );
+                metrics::counter!(
+                    SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "error_kept_previous"
+                )
+                .increment(1);
+                (state.channel.clone(), state.endpoint.clone())
+            }
+        }
     }
 }
 
@@ -518,8 +743,13 @@ impl ReporterConfig {
             return None;
         };
 
+        let scheduler_endpoint_file = Some(config.scheduler_endpoint_file.trim())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+
         Some(ReporterConfig {
             scheduler_endpoint,
+            scheduler_endpoint_file,
             interval: Duration::from_secs(config.interval_secs.max(1)),
         })
     }
@@ -533,7 +763,7 @@ mod tests {
     use crate::orchestrator::SandboxRosterEntry;
     use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-    fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
+    pub(super) fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
             scheduler_endpoint: endpoint.map(|s| s.to_string()),
             node_service_addr: "0.0.0.0:8001".to_string(),
@@ -546,9 +776,18 @@ mod tests {
         enabled: Option<bool>,
         interval_secs: Option<u64>,
     ) -> ObservabilitySchedulerReportConfig {
+        make_report_config_with_file(enabled, interval_secs, None)
+    }
+
+    pub(super) fn make_report_config_with_file(
+        enabled: Option<bool>,
+        interval_secs: Option<u64>,
+        scheduler_endpoint_file: Option<&str>,
+    ) -> ObservabilitySchedulerReportConfig {
         ObservabilitySchedulerReportConfig {
             enabled: enabled.unwrap_or_default(),
             interval_secs: interval_secs.unwrap_or(5),
+            scheduler_endpoint_file: scheduler_endpoint_file.unwrap_or_default().to_string(),
         }
     }
 
@@ -734,5 +973,400 @@ mod tests {
             !err.is::<HeartbeatNodeNotConfigured>(),
             "generic errors must not be mistaken for HeartbeatNodeNotConfigured"
         );
+    }
+
+    #[test]
+    fn resolve_leaves_the_file_unset_by_default() {
+        let cluster = make_cluster_config(Some("http://scheduler:9090"));
+        let cfg = make_report_config(Some(true), None);
+        let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
+        assert_eq!(
+            result.scheduler_endpoint_file, None,
+            "no deployment has opted in yet; this must stay off by default"
+        );
+    }
+
+    #[test]
+    fn resolve_trims_and_picks_up_a_configured_endpoint_file() {
+        let cluster = make_cluster_config(Some("http://scheduler:9090"));
+        let cfg = make_report_config_with_file(
+            Some(true),
+            None,
+            Some("  /etc/agentenv/heartbeat/scheduler-endpoint  "),
+        );
+        let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
+        assert_eq!(
+            result.scheduler_endpoint_file,
+            Some(PathBuf::from("/etc/agentenv/heartbeat/scheduler-endpoint"))
+        );
+    }
+
+    #[test]
+    fn resolve_treats_a_blank_endpoint_file_as_unset() {
+        let cluster = make_cluster_config(Some("http://scheduler:9090"));
+        let cfg = make_report_config_with_file(Some(true), None, Some("   "));
+        let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
+        assert_eq!(result.scheduler_endpoint_file, None);
+    }
+
+    /// The behaviour this whole slice exists to add: a channel source with no
+    /// file configured is exactly what the reporter did before it, forever —
+    /// no stat, no re-read, no drift from the static endpoint.
+    #[tokio::test]
+    async fn channel_source_with_no_file_never_changes_its_endpoint() {
+        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), None)
+            .expect("a valid endpoint builds a source");
+
+        let (_channel, endpoint) = source.current();
+        assert_eq!(endpoint, "http://scheduler-a:9090");
+        // A second call must agree, and must not have gone looking for a file
+        // that was never configured.
+        let (_channel, endpoint) = source.current();
+        assert_eq!(endpoint, "http://scheduler-a:9090");
+    }
+
+    #[tokio::test]
+    async fn channel_source_adopts_a_new_endpoint_from_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scheduler-endpoint");
+        std::fs::write(&path, "http://scheduler-b:9090\n").expect("seed the file");
+
+        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
+            .expect("a valid static endpoint builds a source");
+
+        let (_channel, endpoint) = source.current();
+        assert_eq!(
+            endpoint, "http://scheduler-b:9090",
+            "a readable file must override the static endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_source_falls_back_to_the_static_endpoint_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist");
+
+        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
+            .expect("a valid static endpoint builds a source even if the file is absent");
+
+        let (_channel, endpoint) = source.current();
+        assert_eq!(
+            endpoint, "http://scheduler-a:9090",
+            "a file that was never read successfully must not blank the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_source_ignores_an_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scheduler-endpoint");
+        std::fs::write(&path, "").expect("write an empty file");
+
+        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
+            .expect("a valid static endpoint builds a source");
+
+        let (_channel, endpoint) = source.current();
+        assert_eq!(
+            endpoint, "http://scheduler-a:9090",
+            "an empty file is not a valid target and must not clear the endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_source_ignores_a_file_naming_an_endpoint_that_cannot_be_dialled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scheduler-endpoint");
+        std::fs::write(&path, "not a valid endpoint\twith control chars").expect("write junk");
+
+        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
+            .expect("a valid static endpoint builds a source");
+
+        let (_channel, endpoint) = source.current();
+        assert_eq!(
+            endpoint, "http://scheduler-a:9090",
+            "a candidate that fails to parse must keep the previous, working target"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_source_picks_up_a_second_edit_after_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scheduler-endpoint");
+        std::fs::write(&path, "http://scheduler-b:9090").expect("first write");
+
+        let source =
+            SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path.clone()))
+                .expect("a valid static endpoint builds a source");
+        assert_eq!(source.current().1, "http://scheduler-b:9090");
+
+        // A different length as well as different bytes: the fingerprint this
+        // relies on is (mtime, len), and two writes issued back to back on a
+        // filesystem with coarse mtime resolution could otherwise collide on
+        // both — this makes the length alone enough to tell them apart even
+        // if that ever happens.
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&path, "http://scheduler-charlie:9090").expect("second write");
+        assert_eq!(
+            source.current().1,
+            "http://scheduler-charlie:9090",
+            "the source must keep tracking the file across more than one edit"
+        );
+    }
+}
+
+/// The one test in this file that goes over a real socket rather than
+/// inspecting [`SchedulerChannelSource`]'s state directly.
+///
+/// 🔴 It exists because of what a real regression on this repository's dev
+/// cluster looked like: a config-reload change that read the new value fine,
+/// updated every place a human would check, passed every test that asserted
+/// on *values* — and never dialled anywhere else, because nothing rebuilt the
+/// channel. Every test above this one would pass under that bug, because they
+/// all call [`SchedulerChannelSource::current`] directly and that function
+/// was exactly what regressed. This test instead runs the reporter's real
+/// background loop against two real gRPC servers and asks the only question
+/// that matters: after the switch, which one receives the next heartbeat.
+#[cfg(test)]
+mod against_a_scheduler {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::{Duration as StdDuration, Instant};
+
+    use tokio::sync::oneshot;
+    use tonic::{Request, Response, Status};
+
+    use super::tests::{make_cluster_config, make_report_config_with_file};
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use crate::orchestrator::{Orchestrator, SandboxOrchestration};
+    use crate::proto::scheduler::scheduler_server::{Scheduler, SchedulerServer};
+
+    /// A scheduler that does nothing but answer `Heartbeat` and
+    /// `UnregisterNode`, counting the heartbeats it received. Enough to tell
+    /// "traffic reached this address" from "traffic did not" — which is the
+    /// only thing this test is about.
+    #[derive(Default)]
+    struct CountingScheduler {
+        heartbeats: AtomicUsize,
+    }
+
+    impl CountingScheduler {
+        fn heartbeat_count(&self) -> usize {
+            self.heartbeats.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Scheduler for Arc<CountingScheduler> {
+        async fn heartbeat(
+            &self,
+            _request: Request<scheduler::HeartbeatRequest>,
+        ) -> Result<Response<scheduler::HeartbeatResponse>, Status> {
+            self.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Response::new(scheduler::HeartbeatResponse::default()))
+        }
+        async fn unregister_node(
+            &self,
+            _request: Request<scheduler::UnregisterNodeRequest>,
+        ) -> Result<Response<scheduler::UnregisterNodeResponse>, Status> {
+            Ok(Response::new(scheduler::UnregisterNodeResponse::default()))
+        }
+        async fn record_assignment(
+            &self,
+            _request: Request<scheduler::RecordAssignmentRequest>,
+        ) -> Result<Response<scheduler::RecordAssignmentResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn lookup_node(
+            &self,
+            _request: Request<scheduler::LookupNodeRequest>,
+        ) -> Result<Response<scheduler::LookupNodeResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn get_node(
+            &self,
+            _request: Request<scheduler::GetNodeRequest>,
+        ) -> Result<Response<scheduler::GetNodeResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn schedule(
+            &self,
+            _request: Request<scheduler::ScheduleRequest>,
+        ) -> Result<Response<scheduler::ScheduleResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn list_nodes(
+            &self,
+            _request: Request<scheduler::ListNodesRequest>,
+        ) -> Result<Response<scheduler::ListNodesResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn report_sandbox_event(
+            &self,
+            _request: Request<scheduler::ReportSandboxEventRequest>,
+        ) -> Result<Response<scheduler::ReportSandboxEventResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn list_observed_nodes(
+            &self,
+            _request: Request<scheduler::ListObservedNodesRequest>,
+        ) -> Result<Response<scheduler::ListObservedNodesResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn list_p2p_peers(
+            &self,
+            _request: Request<scheduler::ListP2pPeersRequest>,
+        ) -> Result<Response<scheduler::ListP2pPeersResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn record_p2p_artifact(
+            &self,
+            _request: Request<scheduler::RecordP2pArtifactRequest>,
+        ) -> Result<Response<scheduler::RecordP2pArtifactResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn forget_p2p_artifact(
+            &self,
+            _request: Request<scheduler::ForgetP2pArtifactRequest>,
+        ) -> Result<Response<scheduler::ForgetP2pArtifactResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn lookup_p2p_artifact(
+            &self,
+            _request: Request<scheduler::LookupP2pArtifactRequest>,
+        ) -> Result<Response<scheduler::LookupP2pArtifactResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+        async fn list_registry_sandboxes(
+            &self,
+            _request: Request<scheduler::ListRegistrySandboxesRequest>,
+        ) -> Result<Response<scheduler::ListRegistrySandboxesResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// A counting scheduler on a real port, serving until its shutdown sender
+    /// is dropped or fired.
+    async fn scheduler_on_a_socket() -> (Arc<CountingScheduler>, SocketAddr, oneshot::Sender<()>) {
+        let scheduler = Arc::new(CountingScheduler::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let addr: SocketAddr = listener.local_addr().expect("the bound address");
+        let (tx, rx) = oneshot::channel();
+
+        let served = Arc::clone(&scheduler);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(SchedulerServer::new(served))
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await;
+        });
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+
+        (scheduler, addr, tx)
+    }
+
+    /// A cheap, real `ObservabilityService` — an in-memory orchestrator with
+    /// nothing in it. `node_snapshot()` over an empty orchestrator is exactly
+    /// as real as one holding sandboxes; this test is about where the
+    /// heartbeat goes, not what is in it.
+    async fn test_service() -> Arc<ObservabilityService> {
+        let orchestrator = Orchestrator::with_in_memory_store().await;
+        let orchestration: Arc<dyn SandboxOrchestration> = orchestrator as _;
+        Arc::new(
+            ObservabilityService::new(
+                NodeIdentity {
+                    id: "node-under-test".to_string(),
+                    cluster_id: uuid::Uuid::nil(),
+                    service_instance_id: "instance-under-test".to_string(),
+                    commit: "test".to_string(),
+                    version: "test".to_string(),
+                },
+                orchestration,
+                None,
+                Arc::new(std::sync::RwLock::new(None)),
+            )
+            .await,
+        )
+    }
+
+    async fn wait_until(timeout: StdDuration, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "condition not met within {timeout:?}"
+            );
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    }
+
+    /// T-P4-0. The reporter is pointed at scheduler A; the endpoint file is
+    /// rewritten to name scheduler B while the reporter keeps running; the
+    /// very next heartbeat must land on B, with no restart.
+    ///
+    /// This is the test the task's two required mutations must turn red:
+    /// dropping the channel rebuild, or dropping the change detection
+    /// entirely, both leave every heartbeat going to A forever, and this test
+    /// times out waiting for B to see one.
+    #[tokio::test]
+    async fn a_hot_reloaded_endpoint_actually_moves_the_traffic() {
+        let (scheduler_a, addr_a, _shutdown_a) = scheduler_on_a_socket().await;
+        let (scheduler_b, addr_b, _shutdown_b) = scheduler_on_a_socket().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("scheduler-endpoint");
+        std::fs::write(&file_path, format!("http://{addr_a}")).expect("seed the file with A");
+
+        let service = test_service().await;
+        let cluster = make_cluster_config(Some(&format!("http://{addr_a}")));
+        let report_config = make_report_config_with_file(
+            Some(true),
+            Some(1),
+            Some(file_path.to_str().expect("temp paths are valid utf-8")),
+        );
+
+        let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
+            .expect("a valid endpoint builds a reporter")
+            .expect("reporting is enabled and the endpoint is non-empty");
+        reporter.start();
+
+        wait_until(StdDuration::from_secs(5), || {
+            scheduler_a.heartbeat_count() >= 1
+        })
+        .await;
+        assert_eq!(
+            scheduler_b.heartbeat_count(),
+            0,
+            "nothing has told the reporter about B yet"
+        );
+
+        // The hot-reload moment: rewrite the file, touch nothing else. No
+        // restart, no reconstruction of the reporter.
+        std::fs::write(&file_path, format!("http://{addr_b}")).expect("rewrite the file to B");
+
+        wait_until(StdDuration::from_secs(10), || {
+            scheduler_b.heartbeat_count() >= 1
+        })
+        .await;
+
+        reporter
+            .shutdown()
+            .await
+            .expect("both schedulers answer UnregisterNode");
     }
 }

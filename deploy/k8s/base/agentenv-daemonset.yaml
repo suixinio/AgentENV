@@ -201,8 +201,31 @@ spec:
                   optional: true
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "true"
+            # 阶段四切片 0: the bootstrap value, read once at process start —
+            # same as before this ConfigMap existed, byte for byte. See
+            # `node-heartbeat-config` in kustomization.yaml for why it moved
+            # out of a literal and what changing it now costs (nothing, if
+            # AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE below is also set).
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
-              value: http://agentenv-scheduler:9090
+              valueFrom:
+                configMapKeyRef:
+                  name: node-heartbeat-config
+                  key: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
+                  optional: true
+            # 🔴 This is the whole point of the slice: a mounted file, not
+            # another env var, because kubelet refreshes non-`subPath`
+            # ConfigMap volumes and never refreshes environment variables —
+            # the same reason AENV_API_CONTROL_PLANE_TOKEN_FILE below is a
+            # file and not a `secretKeyRef`. `SchedulerChannelSource`
+            # (`src/observability/reporter.rs`) re-reads this file once per
+            # heartbeat tick and rebuilds the gRPC channel the moment its
+            # content changes, so editing `node-heartbeat-config` and letting
+            # kubelet sync the volume — no `kubectl set env`, no Pod restart —
+            # is enough to move every future heartbeat to the new address.
+            # Unset, or the file briefly unreadable, falls back to the static
+            # value above, which is exactly today's behaviour.
+            - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE
+              value: /etc/agentenv/heartbeat/scheduler-endpoint
             # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no
             # ConfigMap generating one. It was a seam for a design that was not
             # taken: letting `--role all` serve the node sandbox service too, so
@@ -462,6 +485,18 @@ spec:
             - name: control-plane-token
               mountPath: /etc/agentenv/control-plane
               readOnly: true
+            # 🔴 No `subPath`, unlike the `agentenv-config` mounts above — that
+            # is not an oversight, it is the entire mechanism. A `subPath`
+            # mount is a bind-mount of one file inside the ConfigMap's volume
+            # and kubelet never refreshes those; a whole-ConfigMap mount like
+            # this one *is* refreshed (kubelet's periodic sync, typically
+            # within about a minute), which is what lets an edit to
+            # `node-heartbeat-config` reach this file without a Pod restart.
+            # See `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` above and the
+            # `heartbeat-config` volume below.
+            - name: heartbeat-config
+              mountPath: /etc/agentenv/heartbeat
+              readOnly: true
       volumes:
         - name: workspace
           hostPath:
@@ -542,3 +577,21 @@ spec:
             items:
               - key: node-gate-token
                 path: token
+        # The hot-reloadable half of the heartbeat target. `items` names the
+        # one key this node reads, the same way `control-plane-token` above
+        # names its own key rather than projecting the whole Secret — so a
+        # future key added to `node-heartbeat-config` for some other purpose
+        # does not silently start appearing as a file here too.
+        #
+        # 🔴 `optional: true`, matching every other generated ConfigMap
+        # reference in this file: losing this ConfigMap must not fail the
+        # Pod. It degrades the same way the plain env var above already did
+        # before this file existed — see the note on `node-heartbeat-config`
+        # in kustomization.yaml for exactly what that degradation is.
+        - name: heartbeat-config
+          configMap:
+            name: node-heartbeat-config
+            optional: true
+            items:
+              - key: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
+                path: scheduler-endpoint

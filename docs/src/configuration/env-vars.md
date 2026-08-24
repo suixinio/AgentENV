@@ -21,7 +21,8 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_CLUSTER_ID` | nil UUID | Override the cluster UUID used for P2P peer discovery and scheduler grouping |
 | `AENV_SERVICE_INSTANCE_ID` | random UUIDv7 | Override the per-process service instance UUID included in heartbeats |
 | `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` | from config | Enable scheduler heartbeat reporting |
-| `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` | unset | Override scheduler heartbeat reporting endpoint |
+| `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` | unset | Override scheduler heartbeat reporting endpoint. Read once at process startup. |
+| `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` | unset | Optional file holding the same endpoint, re-read once per heartbeat tick while the process runs. When set and readable it overrides `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` outright (not a union); point it at a ConfigMap volume mounted **without** `subPath` to change the heartbeat target without a pod restart — kubelet does not refresh `subPath` mounts. Unset, or the file never read successfully, falls back to the static value above. |
 | `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS` | `5` | Override heartbeat reporting interval in seconds |
 | `AENV_CUSTOM_EXTENSION_URL` | unset | Override `[custom_extension].url`, the HTTP base URL of the custom extension service |
 | `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` | auto-generated under `$AENV_HOME/secrets` | Optional override for the secret used to derive secure sandbox envd access tokens. Configure the same value on every node when cross-node recovery of the same sandbox ID is required; otherwise each node uses its own managed seed. |

@@ -174,6 +174,16 @@ enum ClusterRecord {
     /// A row now describes this sandbox, under the node identity carried here.
     /// That identity is what the orchestrator stamps on the local record, and
     /// what reconciliation later compares the row against.
+    ///
+    /// 🔴 The same string the row's `origin_node_id` was written with, and it
+    /// has to be read from the same variable rather than re-derived. The stamp
+    /// is compared against that column by field equality
+    /// (`supersession` in `super::paused_recovery`: `entry.origin_node_id !=
+    /// *node_id` means "another node has paused this since, discard the local
+    /// copy"). Two expressions that happen to agree today would silently become
+    /// a rule that discards every local paused record the first time they stop
+    /// agreeing — which is exactly what a process whose own name is not the
+    /// name on the row would do.
     Registered(String),
     /// No row, and why not.
     Unrecorded(Unrecorded),
@@ -187,21 +197,28 @@ enum Unrecorded {
     /// at, and there never will be: this is the sandbox that really is
     /// recoverable nowhere but inside this process.
     NoDurableCapture,
-    /// The capture is durable, on the machine named here, and this half still
-    /// cannot record it.
+    /// The capture is durable, on the machine named here, and this pause has
+    /// nothing to commit from here.
     ///
-    /// 🔴 The `--role api` case, and the reason `paused_sandboxes` is empty on
-    /// a split cluster. The bytes are on the node that ran the sandbox, which
-    /// keeps its own record of them, so a row saying "parked on that node" is
-    /// exactly what the registry is for — but it cannot be written under the
-    /// identity this half would have to write it under. `begin_pause` names the
-    /// machine whose disk holds the artifacts
-    /// (`CentralPausedSandboxRegistry::begin_pause`), while the resume
-    /// arbitration on this half reads a row naming any node but its own as a
-    /// refusal (`arbitration` in `super::paused_recovery`, which answers
-    /// `NotReady`/`Blocked` and becomes a 409). Writing the row today would
-    /// therefore trade an empty registry for a resume path that refuses every
-    /// paused sandbox it just recorded. See the report on this batch.
+    /// 🔴 Corrected. This variant used to say that the row could not be
+    /// written because `begin_pause` "names the machine whose disk holds the
+    /// artifacts" and this half is not that machine. Both halves of that were
+    /// wrong. `CentralPausedSandboxRegistry::begin_pause` names whatever the
+    /// caller put in `PausedSandboxEntry::origin_node_id` — it states the
+    /// identity, it does not discover it — so the constraint was never "cannot
+    /// write", it was "would write the wrong name". And it did: the moment a
+    /// node started staging captures the early return here stopped being
+    /// reached, and every row the api half wrote carried the api Pod's name as
+    /// the machine holding the bytes. See [`PausedSandboxCoordinator::publish`]
+    /// for what that name costs a resume.
+    ///
+    /// What is left is the narrow case that was always the real one: the pause
+    /// produced no capture *to commit*, because the pause did not happen on
+    /// this call. A sandbox that was already paused, or a pause this call
+    /// joined, answers with no `publishable` — the capture belongs to the pause
+    /// that made it, and so does the row. Calling `begin_pause` again here
+    /// would take that row's completed pause back to `publishing` under a fresh
+    /// generation that nothing is going to complete.
     HeldByAnotherMachine(String),
     /// There is no cluster registry, so there is nothing a published snapshot
     /// could be referenced by — and nothing was published.
@@ -377,9 +394,11 @@ impl PausedSandboxCoordinator {
 
         let publishable = match outcome.publishable {
             Some(publishable) => publishable,
-            // The capture is on another machine, which keeps its own durable
-            // record of it. Nothing to commit from here, and — for now — no row
-            // either; `Unrecorded::HeldByAnotherMachine` carries why.
+            // The pause produced nothing to commit, which on this arm means the
+            // pause did not happen on this call — the sandbox was already
+            // paused, or this call joined one in flight. The capture, and the
+            // row, belong to the pause that made them.
+            // `Unrecorded::HeldByAnotherMachine` carries which machine that was.
             None => {
                 if let Some(holding_node) = holding_node {
                     return self
@@ -418,13 +437,45 @@ impl PausedSandboxCoordinator {
             return self.unrecorded(sandbox_id, Unrecorded::NoClusterRegistry);
         }
 
+        // 🔴 The machine whose disk the bytes are on, which is what
+        // `origin_node_id` means on this row — not the process that decided the
+        // pause. The two are the same on every role that runs its own
+        // sandboxes, and `holding_node` is `None` there precisely because a
+        // local capture has nothing to say about a machine other than this one
+        // (`PausedSandboxState::holding_node_id`). They part on `--role api`,
+        // and the wrong one of them costs the sandbox:
+        //
+        // - `publishing` and `local_only` have no copy in shared storage, so
+        //   the scheduler pins them to the named node and refuses anything else
+        //   (`lookup.go`, `SANDBOX_LOCATION_PINNED`). Named after an api Pod,
+        //   the pin resolves to a process that does not heartbeat — this half
+        //   reports no machine because it is not one — and the lookup is
+        //   answered `FailedPrecondition: node is not reporting`, on every node
+        //   there is.
+        //
+        //   🔴 What keeps that off most resumes is not this row: `lookup.go`
+        //   consults the holding node's own heartbeat roster first, and reaches
+        //   the registry only when no roster covers the sandbox. So the wrong
+        //   name here is invisible right up until the moment the registry is
+        //   the only thing left — a node that has just rolled, a roster gone
+        //   stale, or a sandbox being recovered onto a different machine, which
+        //   is the case this table exists for.
+        // - `paused` has a copy in shared storage, so the name is only a
+        //   locality preference — but it is the preference that decides whether
+        //   a resume reuses the layers already on disk or pulls the whole
+        //   snapshot back out of object storage.
+        //
+        // 🔴 Stated once and used twice. See [`ClusterRecord::Registered`] on
+        // why the value handed back has to be this same variable.
+        let origin_node_id = holding_node.unwrap_or_else(|| self.node_id.clone());
+
         let entry = PausedSandboxEntry {
             sandbox_id,
             // Filled in by the registry from its own configured cluster.
             cluster_id: uuid::Uuid::nil(),
             state: PausedRegistryState::Publishing,
             generation: 0,
-            origin_node_id: self.node_id.clone(),
+            origin_node_id: origin_node_id.clone(),
             claimed_by_node_id: None,
             snapshot_id: None,
             metadata: Some(outcome.metadata.clone()),
@@ -517,7 +568,7 @@ impl PausedSandboxCoordinator {
             }
         }
 
-        ClusterRecord::Registered(self.node_id.clone())
+        ClusterRecord::Registered(origin_node_id)
     }
 
     /// Says, once and at the right volume, that a pause left the cluster
@@ -543,9 +594,8 @@ impl PausedSandboxCoordinator {
             Unrecorded::HeldByAnotherMachine(holding_node) => info!(
                 %sandbox_id,
                 holding_node = %holding_node,
-                "paused sandbox is parked on another machine and has no cluster record: this half \
-                 cannot write a row naming a node it is not, so the sandbox is resumable only \
-                 through that machine"
+                "this pause produced nothing to commit: the sandbox was already parked on that \
+                 machine, and the row belongs to the pause that put it there"
             ),
             Unrecorded::NoClusterRegistry => info!(
                 %sandbox_id,
@@ -1941,6 +1991,122 @@ mod tests {
             record,
             ClusterRecord::Unrecorded(Unrecorded::HeldByAnotherMachine(THIS_REPLICA.to_string())),
             "the machine holding the bytes is not the replica that drove the pause"
+        );
+    }
+
+    /// 🔴 The regression `1e1bf93` shipped, pinned from the outside.
+    ///
+    /// Before a node could stage a capture, `publishable` was always `None` on
+    /// the api half and this pause left through the early return above. Staging
+    /// made it `Some`, the early return stopped being reached, and the write it
+    /// had been standing in front of finally happened — under
+    /// `self.node_id`, which on that half is the api Pod's name and not a
+    /// machine holding anything. `paused_sandboxes` went from empty to wrong,
+    /// and wrong is worse: an empty table left the origin node able to resume
+    /// its own sandbox, while a row pinned to a Pod that does not heartbeat is
+    /// answered `FailedPrecondition` on every node there is.
+    ///
+    /// Both halves run in one round through one coordinator, and differ in
+    /// exactly one value — whether the paused state names a machine other than
+    /// this process. The second half is the `--role all` rollback face: a
+    /// local capture answers `None`, so the row it writes is the same row that
+    /// build wrote, byte for byte.
+    #[tokio::test]
+    async fn a_row_names_the_machine_holding_the_bytes_not_the_replica_that_wrote_it() {
+        let registry = Arc::new(RecordingRegistry::default());
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        let staged_on_a_node = SandboxId::new();
+        let captured_here = SandboxId::new();
+
+        // `--role api`: the node staged the bytes and handed back a capture to
+        // commit, so both the holding machine and something to commit are
+        // present. That pair is what the early return above no longer catches.
+        let remote = coordinator
+            .publish(pause_outcome(staged_on_a_node, true, Some("node-203")))
+            .await;
+        // `--role all`: captured in this process, so the paused state names no
+        // other machine.
+        let local = coordinator
+            .publish(pause_outcome(captured_here, true, None))
+            .await;
+
+        let remote_row = registry
+            .row(&staged_on_a_node)
+            .expect("a capture this half can commit leaves a row");
+        let local_row = registry
+            .row(&captured_here)
+            .expect("a capture this half can commit leaves a row");
+
+        assert_eq!(
+            remote_row.origin_node_id, "node-203",
+            "the row must name the machine whose disk the bytes are on"
+        );
+        assert_ne!(
+            remote_row.origin_node_id, THIS_REPLICA,
+            "a row naming this replica pins the sandbox to a process that never heartbeats, \
+             and the scheduler refuses every resume of it"
+        );
+        assert_eq!(
+            local_row.origin_node_id, THIS_REPLICA,
+            "a capture taken in this process is held by this process, and the rollback target \
+             must keep writing exactly that"
+        );
+        assert_ne!(
+            remote_row.origin_node_id, local_row.origin_node_id,
+            "the two halves must not be able to agree: a build that stated one identity for \
+             both would pass every assertion above that is about only one of them"
+        );
+
+        assert_eq!(remote, ClusterRecord::Registered("node-203".to_string()));
+        assert_eq!(local, ClusterRecord::Registered(THIS_REPLICA.to_string()));
+    }
+
+    /// 🔴 The stamp and the column are one string, and this is what says so.
+    ///
+    /// `publish_paused` hands its answer to the orchestrator, which writes it
+    /// onto the local paused record; reconciliation then reads it back and
+    /// compares it to `origin_node_id` *by equality* — a row whose origin
+    /// differs from the stamp means "another node has paused this since,
+    /// discard the local copy" (`supersession` in `super::paused_recovery`).
+    /// So a build that made the row say one machine and the stamp say another
+    /// would not merely record something inaccurate: it would discard every
+    /// local paused record on the next reconcile pass, one machine's worth at
+    /// a time.
+    ///
+    /// Both halves again, because the equality has to hold for a value that
+    /// came off the paused state *and* for one that came off this process.
+    #[tokio::test]
+    async fn the_stamp_handed_back_is_the_identity_the_row_carries() {
+        let registry = Arc::new(RecordingRegistry::default());
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        let staged_on_a_node = SandboxId::new();
+        let captured_here = SandboxId::new();
+
+        let remote_stamp = coordinator
+            .publish_paused(pause_outcome(staged_on_a_node, true, Some("node-204")))
+            .await;
+        let local_stamp = coordinator
+            .publish_paused(pause_outcome(captured_here, true, None))
+            .await;
+
+        let remote_row = registry.row(&staged_on_a_node).expect("a row");
+        let local_row = registry.row(&captured_here).expect("a row");
+
+        assert_eq!(
+            remote_stamp.as_deref(),
+            Some(remote_row.origin_node_id.as_str()),
+            "the identity stamped on the local record must be the one the row carries"
+        );
+        assert_eq!(
+            local_stamp.as_deref(),
+            Some(local_row.origin_node_id.as_str()),
+            "and the same on the half where the two happen to be this process"
+        );
+        assert_ne!(
+            remote_stamp, local_stamp,
+            "the two stamps must differ, or neither assertion above is about the value under test"
         );
     }
 

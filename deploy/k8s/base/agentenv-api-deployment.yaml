@@ -12,13 +12,14 @@
 # one to reverse, and nothing here may borrow from it
 # (`_sd-impl-phase3-role.md` §11.1, §11.2).
 #
-# 🔴 `--role api` does not assemble yet. `src/bin/server.rs::assemble_api` bails
-# with a message naming what is missing (the cluster metadata store and the
-# remote backend factory are both written and neither is wired; neither new
-# gRPC listener is bound in any role). Applying this before that lands is a
-# CrashLoopBackOff whose logs say exactly that. It is checked in now because the
-# manifest was itself one of the named gaps, and because a workload that appears
-# for the first time during an incident is a workload nobody has read.
+# 🔴 `--role api` assembles now (`src/bin/server.rs::assemble_api`): the cluster
+# metadata store, the remote backend factory and both gRPC listeners are wired.
+# What it still refuses, and refuses loudly rather than half-doing, is a cold
+# create (`POST /sandboxes-cold`), resuming a paused sandbox whose capture lives
+# on a machine this replica cannot ask to reopen it, and building a template —
+# that one drives a Firecracker sandbox directly and would reach for a /dev/kvm
+# this Pod does not have. Everything the gateway is pointed at in 3a works;
+# those three are why 3a is a shadow rollout rather than the end of the split.
 #
 # 🔴 It also has one precondition no other workload in this tree has: the
 # `agentenv-runtime-secrets` Secret must carry `sandbox-access-token-hash-seed`,

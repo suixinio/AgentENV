@@ -290,12 +290,20 @@ func TestTheApiServiceCarriesTheTwoAddressesTheGatewayIsPointedAt(t *testing.T) 
 	}
 }
 
-// 🔴 3a is "the DaemonSet stays on `--role all`, and an api half comes up beside
-// it". Both halves of that sentence are checked here, because the expensive
-// mistake is doing 3b's half by accident: a DaemonSet that acquires `--role
-// node` stops serving REST on every machine at once, and putting that back is a
-// serial roll with an hour of grace per node.
-func TestTheApiDeploymentNamesItsRoleAndTheDaemonSetStillNamesNone(t *testing.T) {
+// 🔴 Both halves name the role they are. 3b has happened: the DaemonSet holds
+// `--role node` and the api Deployment holds `--role api`, and neither is
+// allowed to fall back to `--role all` by omission.
+//
+// This test used to assert the opposite of half of that — that the DaemonSet
+// named no role — because during 阶段 3a it stayed on `--role all` and kept
+// serving REST, which is what made rolling 3a back a gateway value change.
+// That is no longer the deployed shape, and the assertion was inverted
+// deliberately rather than deleted: `--role node` is a fleet-wide roll with an
+// hour of grace per machine in either direction, so it must not be arrived at
+// or departed from by accident. The pairing with the gateway's REST upstream —
+// the half that turns a role change into an outage — is pinned separately by
+// `TestTheRestUpstreamIsOnForAsLongAsTheDaemonSetTakesRoleNode`.
+func TestBothHalvesNameTheRoleTheyAre(t *testing.T) {
 	apiContainer := onlyContainer(t, "the api Deployment", apiDeployment(t).Spec.Template.Spec.Containers)
 
 	if got := strings.Join(apiContainer.Args, " "); !strings.Contains(got, "--role api") {
@@ -304,13 +312,13 @@ func TestTheApiDeploymentNamesItsRoleAndTheDaemonSetStillNamesNone(t *testing.T)
 	}
 
 	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
-	if got := strings.Join(nodeContainer.Args, " "); strings.Contains(got, "--role") {
-		t.Fatalf("the node DaemonSet passes %q. During 阶段 3a it stays on `--role all`: it keeps "+
-			"serving REST the whole time, which is what makes rolling 3a back a gateway value "+
-			"change instead of a fleet-wide roll", got)
+	if got := strings.Join(nodeContainer.Args, " "); !strings.Contains(got, "--role node") {
+		t.Fatalf("the node DaemonSet's args are %q; without `--role node` it assembles `--role "+
+			"all`, which re-serves user-facing REST on every machine and does not bind the node "+
+			"sandbox service the api half drives it through", got)
 	}
-	if role, ok := envValue(nodeContainer, "AENV_ROLE"); ok && strings.TrimSpace(role.Value) != "all" {
-		t.Fatalf("the node DaemonSet sets AENV_ROLE=%q, which is 3b and not 3a", role.Value)
+	if role, ok := envValue(nodeContainer, "AENV_ROLE"); ok && strings.TrimSpace(role.Value) != "node" {
+		t.Fatalf("the node DaemonSet sets AENV_ROLE=%q while its args say `--role node`", role.Value)
 	}
 }
 
@@ -343,21 +351,31 @@ func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T)
 				t.Fatalf("%s is a required ConfigMap key; a cluster that has not created that "+
 					"ConfigMap would fail to start its gateway over a switch that is off", name)
 			}
-			if value := generatedLiteral(t, ref.Name, ref.Key); value != "" {
-				t.Fatalf("%s/%s is generated as %q; both switches ship off, and turning them on is "+
-					"a deliberate act by an operator who has read the runbook rather than something "+
-					"that arrives with an image", ref.Name, ref.Key, value)
+			// 🔴 Both switches are *on*, and this assertion was flipped with
+			// them. They shipped empty through 阶段 3a because turning them on
+			// was meant to be a deliberate act rather than something that
+			// arrives with an image — and then it was deliberately done. The
+			// DaemonSet has since taken `--role node`, so the nodes answer 404
+			// on the sandboxes routes and an empty upstream here is no longer
+			// "3a off", it is a gateway with nowhere to send REST.
+			if value := generatedLiteral(t, ref.Name, ref.Key); value == "" {
+				t.Fatalf("%s/%s is generated empty. The node DaemonSet holds `--role node`, so REST "+
+					"has to reach the api half — an empty upstream sends it to nodes that 404",
+					ref.Name, ref.Key)
 			}
 		})
 	}
 
-	// The control for the two empties above: generatedLiteral does read values
-	// out of that file, and does tell "generated empty" from "not generated at
-	// all". Without this, both assertions would also pass against a lookup that
-	// silently returned "" for everything.
-	if value := generatedLiteral(t, "cluster-identity-config", "CLUSTER_ID"); value == "" {
-		t.Fatal("the generator lookup returns empty for a literal that is not empty; the two " +
-			"assertions above are measuring the lookup rather than the manifests")
+	// The control for the two values above: generatedLiteral does tell
+	// "generated empty" from "generated with something in it". Without this,
+	// both assertions would also pass against a lookup that returned a non-empty
+	// placeholder for everything, including keys that are not there.
+	//
+	// SANDBOX_PROXY_DOMAINS is the empty literal in this tree that is meant to
+	// be empty, so it is the one that proves the lookup can still say so.
+	if value := generatedLiteral(t, "sandbox-proxy-config", "SANDBOX_PROXY_DOMAINS"); value != "" {
+		t.Fatalf("the generator lookup returned %q for a literal that ships empty; the two "+
+			"assertions above are measuring the lookup rather than the manifests", value)
 	}
 }
 

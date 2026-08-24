@@ -14,10 +14,11 @@
       }
     },
     "registry": {
+      "write_enabled": true,
       "write_fencing": true
     },
     "routing": {
-      "execution_arbitration": "observe"
+      "execution_arbitration": "enforce"
     }
   }
 }

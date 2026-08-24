@@ -10,7 +10,7 @@
     "forward_response_size": 4194304,
     "sandbox_proxy_domains": [],
     "routing": {
-      "execution_fencing": "off"
+      "execution_fencing": "enforce"
     }
   }
 }

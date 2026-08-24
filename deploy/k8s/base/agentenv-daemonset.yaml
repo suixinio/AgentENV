@@ -33,6 +33,27 @@ spec:
         - name: agentenv
           image: agentenv-runtime:latest
           imagePullPolicy: IfNotPresent
+          # 阶段 3b: this machine serves the node sandbox service and nothing
+          # else. The user-facing REST routes answer 404 here
+          # (`src/api/role_gate.rs`); the gateway reaches them through the api
+          # half instead, which is what `api-upstream-config` in
+          # kustomization.yaml points at.
+          #
+          # 🔴 The order of those two is load-bearing. `api-upstream-config`
+          # must carry real addresses *before* this argument is applied, and
+          # must not be emptied while it stands: a gateway still fanning REST
+          # out to nodes that have taken `--role node` gets 404 from every one
+          # of them. The two live in different files, so an apply that reverted
+          # one and not the other is exactly that outage — which is why both are
+          # pinned together by `execution_switches_manifest_test.go`.
+          #
+          # 🔴 Rolling back is `--role all`, and it is a serial DaemonSet roll
+          # with an hour of grace per machine, not a value change. `all` is
+          # defined as the pre-split process verbatim
+          # (`only_the_split_roles_bind_a_second_listener` in
+          # `src/bin/server.rs`), so it re-serves REST on every node — point the
+          # gateway back at the nodes in the same step, or the 404s simply move.
+          args: ["--role", "node"]
           env:
             - name: AENV_CONFIG_PATH
               value: /workspace/config/agentenv.toml
@@ -141,8 +162,9 @@ spec:
             # `only_the_split_roles_bind_a_second_listener` in `src/bin/server.rs`
             # fails if `assemble_all` ever grows `spawn_grpc_surface`, and
             # `config/default.toml` says the same over `node_service_addr`. The
-            # node sandbox service belongs to `--role node`; `--role all` is the
-            # rollback target and is the pre-split process verbatim.
+            # node sandbox service belongs to `--role node`, which is what
+            # this DaemonSet now passes above; `--role all` is the rollback
+            # target and is the pre-split process verbatim.
             #
             # 🔴 So the switch was never read by anything: no Rust code has ever
             # looked the variable up. Setting it changed nothing while costing a
@@ -151,9 +173,9 @@ spec:
             # stops it being reintroduced from those runbooks; the scan in
             # `no_manifest_sets_a_node_service_gate_nothing_reads`
             # (`src/cfg.rs`) skips comment lines so this explanation can live in
-            # the file it is about. Giving the api half a machine to drive means
-            # moving the DaemonSet to `--role node`, which is a roll that buys
-            # something.
+            # the file it is about. Giving the api half a machine to drive was
+            # done the way it had to be — moving the DaemonSet to `--role node`,
+            # a roll that buys something — and not by reviving this key.
             #
             # Where that listener sits on a `--role node` machine. Set
             # explicitly at its own default so the container port declared below
@@ -181,11 +203,10 @@ spec:
           ports:
             - name: http
               containerPort: 8000
-            # The node sandbox service, declared while this DaemonSet is still
-            # `--role all` and therefore does not bind it. Declaring it now
-            # costs nothing — a containerPort is a statement, not a binding —
-            # and it means moving to `--role node` is an argument change rather
-            # than that plus a YAML edit on a live cluster.
+            # The node sandbox service. Declared before this DaemonSet took
+            # `--role node`, which is what made that move an argument change
+            # rather than that plus a YAML edit on a live cluster; now that the
+            # argument is set, the process actually binds it.
             #
             # 🔴 No Service fronts this port, deliberately. The api half reaches
             # a machine by substituting its own AENV_NODE_SERVICE_PORT into the

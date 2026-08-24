@@ -96,6 +96,28 @@ type Store interface {
 	// timeouts on live sandboxes all the time.
 	RenewLease(ctx context.Context, clusterID, nodeID string, held []HeldSandbox) (uint64, error)
 
+	// RenewParkedLeases extends lease_expires_at alone — never
+	// sandbox_expires_at — on publishing/local_only rows named in holders.
+	//
+	// Unlike RenewLease, this is not one node reporting its own roster under
+	// its own identity: holders is whatever the caller asserts, and the
+	// statement's WHERE clause is what actually decides whether that assertion
+	// matches the row's own origin_node_id. The scheduler's heartbeat-driven
+	// reconciliation is the one caller — see reconcile.go's
+	// WithHeartbeatLeaseRenewal — and it builds holders from a node's own
+	// fresh heartbeat roster, which is the one channel a node cannot forge
+	// something else's identity onto.
+	//
+	// 🔴 sandbox_expires_at is not part of this statement, not even re-read and
+	// rewritten. That deadline is the API half's to set — it is the one that
+	// serves the timeout-extension API — and a lease renewal proves only that
+	// a sandbox's bytes are still where the registry says they are, nothing
+	// about when it should be evicted. Mixing the two into one write is what
+	// renewLeaseSQL warns against doing carelessly; this statement is the
+	// other of the two ways to honour that warning, by never touching the
+	// column at all rather than by writing it correctly.
+	RenewParkedLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
+
 	// MarkRunning records that a sandbox is live on nodeID.
 	//
 	// 🔴 Never creates a row. A sandbox that has never been paused has no row
@@ -185,6 +207,18 @@ type Store interface {
 
 	// Close releases the underlying resources.
 	Close()
+}
+
+// ParkedLeaseRenewer is the one write the scheduler's heartbeat-driven
+// reconciliation needs: RenewParkedLeases alone, not the rest of Store.
+//
+// Named and exported the same way grace.go's LeaseExtender is, and for the
+// same reason — a caller that only ever needs one statement should not be
+// handed a seam wide enough to reach every other one. Any Store satisfies it
+// automatically; the point is the narrower promise the consumer's type makes,
+// not a new implementation to maintain.
+type ParkedLeaseRenewer interface {
+	RenewParkedLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
 }
 
 // Rows is a bulk read: the rows that exist, what was looked up, and when.
@@ -290,6 +324,24 @@ type BeganPause struct {
 type HeldSandbox struct {
 	SandboxID string
 	ExpiresAt *time.Time
+}
+
+// ParkedLeaseHolder names one row a heartbeat-driven renewal pass is refreshing
+// the lease on, and who it is asserting holds it.
+//
+// It travels the two together rather than as a bare sandbox id list because
+// RenewParkedLeases has no roster of its own to look the holder up in — the
+// caller already did that lookup (against a node's own fresh heartbeat
+// roster) to build this list in the first place, and the statement's WHERE
+// clause re-checks the assertion against the row rather than trusting it.
+type ParkedLeaseHolder struct {
+	// SandboxID is the row to renew.
+	SandboxID string
+	// NodeID must be the row's origin_node_id exactly as the table holds it —
+	// not an identity resolved onto today's discovery name. See reconcile.go's
+	// rawHolder for why the two can differ mid-upgrade, and why only the raw
+	// form can ever match.
+	NodeID string
 }
 
 // ReleasedHoldings counts what a release or reclamation did.

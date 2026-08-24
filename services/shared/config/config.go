@@ -396,6 +396,28 @@ type SchedulerRegistryConfig struct {
 	// may delete before it is refused outright. Both apply; the stricter wins.
 	DiscardMaxRows  int64   `json:"discard_max_rows"`
 	DiscardMaxRatio float64 `json:"discard_max_ratio"`
+
+	// HeartbeatLeaseRenewal turns on the scheduler's own renewal of
+	// publishing/local_only leases, driven by the same heartbeat rosters
+	// RunRegistryReconcile already reads: a row whose holder has a fresh
+	// roster that still lists the sandbox gets lease_expires_at pushed out
+	// directly by this process.
+	//
+	// 🔴 Off by default, and unlike WriteFencing that is not a rollback
+	// posture — it is the honest starting point. The api half's own renewal
+	// call (renew_paused_leases) keys its match on the calling process's own
+	// identity, which stopped being the row's holder for these two states once
+	// origin_node_id was changed to name the machine that actually holds the
+	// bytes; this switch is a second, independent way to keep those rows
+	// alive, added to a `paused_sandboxes` table both the EKS and the pve-sg
+	// trees still read from the same tree. Turning it on must be a value
+	// change an operator makes deliberately, on a build both sides are ready
+	// for — never a default an upgrade acquires on its own.
+	//
+	// It does nothing unless this process also has a write surface: no DSN,
+	// write_enabled=false, and every query-only replica all leave it inert
+	// however this is set, the same as WriteFencing.
+	HeartbeatLeaseRenewal bool `json:"heartbeat_lease_renewal"`
 }
 
 func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
@@ -407,14 +429,15 @@ func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
 		QueryTimeout      json.RawMessage `json:"query_timeout"`
 		LeaseWarnWindow   json.RawMessage `json:"lease_warn_window"`
 
-		WriteEnabled        *bool           `json:"write_enabled"`
-		WriteFencing        *bool           `json:"write_fencing"`
-		WriteMaxConnections *int32          `json:"write_max_connections"`
-		LeaseTTL            json.RawMessage `json:"lease_ttl"`
-		LeaseTTLFloor       json.RawMessage `json:"lease_ttl_floor"`
-		ReclaimInterval     json.RawMessage `json:"reclaim_interval"`
-		DiscardMaxRows      *int64          `json:"discard_max_rows"`
-		DiscardMaxRatio     *float64        `json:"discard_max_ratio"`
+		WriteEnabled          *bool           `json:"write_enabled"`
+		WriteFencing          *bool           `json:"write_fencing"`
+		WriteMaxConnections   *int32          `json:"write_max_connections"`
+		LeaseTTL              json.RawMessage `json:"lease_ttl"`
+		LeaseTTLFloor         json.RawMessage `json:"lease_ttl_floor"`
+		ReclaimInterval       json.RawMessage `json:"reclaim_interval"`
+		DiscardMaxRows        *int64          `json:"discard_max_rows"`
+		DiscardMaxRatio       *float64        `json:"discard_max_ratio"`
+		HeartbeatLeaseRenewal *bool           `json:"heartbeat_lease_renewal"`
 	}
 
 	parsed := wire{}
@@ -489,6 +512,9 @@ func (s *SchedulerRegistryConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.DiscardMaxRatio != nil {
 		s.DiscardMaxRatio = *parsed.DiscardMaxRatio
+	}
+	if parsed.HeartbeatLeaseRenewal != nil {
+		s.HeartbeatLeaseRenewal = *parsed.HeartbeatLeaseRenewal
 	}
 
 	return nil
@@ -1345,6 +1371,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_REGISTRY_WRITE_FENCING %q: %w", v, err)
 		}
 		cfg.Scheduler.Registry.WriteFencing = fencing
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_REGISTRY_HEARTBEAT_LEASE_RENEWAL")); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_REGISTRY_HEARTBEAT_LEASE_RENEWAL %q: %w", v, err)
+		}
+		cfg.Scheduler.Registry.HeartbeatLeaseRenewal = enabled
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ROUTING_EXECUTION_ARBITRATION")); v != "" {

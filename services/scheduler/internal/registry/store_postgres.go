@@ -1308,6 +1308,81 @@ func (s *PostgresStore) RenewLease(ctx context.Context, clusterID, nodeID string
 	return uint64(tag.RowsAffected()), nil
 }
 
+// renewParkedLeaseSQL is renewLeaseSQL's narrower sibling for the
+// scheduler's own heartbeat-driven reconciliation.
+//
+// Three differences from renewLeaseSQL, each load-bearing:
+//
+//  1. sandbox_expires_at is absent from the SET list entirely — not even
+//     re-read and rewritten to its own value. That deadline is the API
+//     half's authority; a heartbeat proves only that a node still has a
+//     sandbox's bytes, and this statement must not be the place a stale or
+//     absent opinion about the deadline leaks into the row.
+//  2. `running` and `resuming` are absent from the state list. Those rows'
+//     leases lapsing invites no takeover on a timer (see liveLeaseLapsed),
+//     and this statement exists only for the risk on the other two states —
+//     a takeover that rewinds a snapshot.
+//  3. The (sandbox, node) pairs are a caller-supplied list, not one node's
+//     own roster under its own identity — see ParkedLeaseHolder. The WHERE
+//     clause is what turns that from a bare assertion into a check: a pair
+//     whose node does not match the row's own origin_node_id renews nothing,
+//     exactly as renewLeaseSQL's own comment describes for its single-node
+//     form.
+//
+// `paused` stays absent for the reason renewLeaseSQL gives: nobody holds it,
+// so there is nothing to keep alive.
+const renewParkedLeaseSQL = `
+UPDATE paused_sandboxes AS p
+   SET lease_expires_at = now() + make_interval(secs => $1::double precision),
+       updated_at       = now()
+  FROM (SELECT unnest($3::uuid[]) AS sandbox_id,
+               unnest($4::text[]) AS node_id) AS v
+ WHERE p.sandbox_id = v.sandbox_id
+   AND p.cluster_id = $2::uuid
+   AND p.state IN ('publishing', 'local_only')
+   AND p.origin_node_id = v.node_id`
+
+// RenewParkedLeases implements Store.
+//
+// The lease length is this store's own — like RenewLease's, but here there is
+// no caller-reported TTL to prefer, because the caller is not the node that
+// set one: it is the scheduler's own reconciliation, working from a roster
+// that carries no lease length at all.
+func (s *PostgresStore) RenewParkedLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error) {
+	cluster, err := requireUUID("cluster_id", clusterID)
+	if err != nil {
+		return 0, err
+	}
+	if len(holders) == 0 {
+		// Nothing asserted, so nothing is asked — matches RenewLease's own
+		// empty-input handling.
+		return 0, nil
+	}
+
+	ids := make([]string, 0, len(holders))
+	nodeIDs := make([]string, 0, len(holders))
+	for _, h := range holders {
+		id, err := requireUUID("sandbox_id", h.SandboxID)
+		if err != nil {
+			return 0, err
+		}
+		if strings.TrimSpace(h.NodeID) == "" {
+			return 0, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
+		}
+		ids = append(ids, id)
+		nodeIDs = append(nodeIDs, h.NodeID)
+	}
+
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx, renewParkedLeaseSQL, s.ttlSeconds(), cluster, ids, nodeIDs)
+	if err != nil {
+		return 0, fmt.Errorf("registry renew_parked_leases: %w", err)
+	}
+	return uint64(tag.RowsAffected()), nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reclamation
 // ─────────────────────────────────────────────────────────────────────────────

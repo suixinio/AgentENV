@@ -442,6 +442,30 @@ impl SandboxPersister for FileBackedSandboxPersister {
         result
     }
 
+    /// 🔴 Read straight out of the key rather than through
+    /// [`Self::get_record`], because that helper turns a key that is not there
+    /// into an `InvalidRecord` error — which is the right answer for the calls
+    /// that must have a record and the wrong one here, where "this node holds
+    /// no paused record for that sandbox" is a fact a caller acts on. A record
+    /// that will not *decode* stays an error: that is damage, not absence.
+    async fn paused_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        let raw = self
+            .db()
+            .await?
+            .get(sandbox_id.to_string())
+            .await
+            .map_err(|source| {
+                SandboxPersistenceError::store("read paused sandbox record", source)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        Ok(Some(decode_record(&raw)?.artifact_root))
+    }
+
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "marking paused sandbox as resuming");
         let mut record = self.get_record(sandbox_id).await?;

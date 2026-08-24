@@ -34,6 +34,7 @@
 //! would look wrong. Adding a method to `Orchestrator` that callers outside the
 //! module need means adding one line to the list below.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -239,6 +240,9 @@ orchestration_surface! {
             timeout: Option<Duration>,
             allow_shorter: bool,
         ) -> Result<Option<SandboxMetadata>>;
+        /// Where on this machine's disk a paused sandbox's capture was
+        /// written, or `None` when this node holds no paused record for it.
+        fn paused_artifact_root(sandbox_id: &SandboxId) -> Result<Option<PathBuf>>;
         /// Whether a paused record was ever announced to a cluster registry,
         /// and under which node identity.
         fn paused_record_cluster_registration(

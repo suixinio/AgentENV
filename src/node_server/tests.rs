@@ -8,18 +8,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tonic::{Code, Request};
+use tonic::{Code, Request, Status};
 
 use crate::orchestrator::{
     ControlPlaneConfig, CreateSandboxRequest, DisabledSandboxPersister, ForkChildAssignment,
-    ForkChildren, InMemoryMetadataStore, NewTimeout, Orchestrator, SandboxLaunchSource,
-    SandboxMetadata, SandboxOrchestration, SandboxTimeoutAction,
+    ForkChildren, InMemoryMetadataStore, NewTimeout, Orchestrator, RecordingCall,
+    RecordingPersister, SandboxLaunchSource, SandboxMetadata, SandboxOrchestration,
+    SandboxTimeoutAction,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
 use crate::role::ServerRole;
 use crate::sandbox::mock::MockBackendFactory;
-use crate::sandbox::SandboxNetworkPolicy;
+use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{mock::mock_snapshot_manager, RunnableSnapshot};
 use crate::types::{ExecutionId, SandboxId};
 
@@ -950,26 +951,22 @@ async fn a_forked_child_with_no_marker_is_not_reported() {
         .is_some());
 }
 
-/// The three RPCs this build declares and does not serve refuse loudly.
+/// The RPCs this build declares and does not serve refuse loudly.
 ///
 /// 🔴 A test rather than a comment. `Unimplemented` is the one status a caller
 /// must not retry through, and a method that silently started answering with
 /// something plausible would be exactly the "shipped early, wired later" shape
 /// that has already cost this project three defects.
+///
+/// 🔴 `pause` is deliberately absent from this list now, and its presence in
+/// the one below — where the sandbox has to survive the refusal — is what keeps
+/// the two apart: a `pause` that answered `Unimplemented` again would fail
+/// `a_pause_leaves_the_capture_where_the_node_put_it`, and a `checkpoint` that
+/// started answering would fail this one.
 #[tokio::test]
 async fn the_unserved_calls_say_so_rather_than_answering() {
     let (orchestration, service) = service().await;
     let sandbox = start(&orchestration, Some(b"owned")).await;
-
-    let err = service
-        .pause(Request::new(pb::SandboxPauseRequest {
-            sandbox_id: sandbox.id.to_string(),
-            execution_id: sandbox.execution_id.to_string(),
-            publish: false,
-        }))
-        .await
-        .expect_err("pause is not served");
-    assert_eq!(err.code(), Code::Unimplemented);
 
     let err = service
         .checkpoint(Request::new(pb::SandboxCheckpointRequest {
@@ -1368,4 +1365,412 @@ async fn a_zero_timeout_keeps_the_deadline_the_sandbox_was_paused_with() {
         kept.expires_at_ms,
         replaced.expires_at_ms
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pause
+// ---------------------------------------------------------------------------
+
+/// Whether a status carries a capture classification, and which one.
+///
+/// 🔴 `None` and `Some(false)` are not the same answer and the tests below tell
+/// them apart: the caller reads a missing classification as *terminal*, so a
+/// refusal that meant to say "the sandbox is untouched" and forgot to say it
+/// reads as "tear the sandbox down".
+fn classification(status: &Status) -> Option<bool> {
+    use prost::Message as _;
+
+    if status.details().is_empty() {
+        return None;
+    }
+    pb::SandboxCaptureFailure::decode(status.details())
+        .ok()
+        .map(|failure| failure.terminal)
+}
+
+/// A node service whose persister answers for where captures went.
+async fn service_with_persister() -> (
+    Arc<dyn SandboxOrchestration>,
+    NodeSandboxService,
+    RecordingPersister,
+) {
+    crate::logging::init_for_tests();
+    let persister = RecordingPersister::default();
+    let orchestrator = Orchestrator::new(
+        ServerRole::All,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(mock_snapshot_manager()),
+        NODE.to_string(),
+    );
+    (orchestration, service, persister)
+}
+
+fn pause_request(sandbox: &SandboxMetadata, publish: bool) -> pb::SandboxPauseRequest {
+    pb::SandboxPauseRequest {
+        sandbox_id: sandbox.id.to_string(),
+        execution_id: sandbox.execution_id.to_string(),
+        publish,
+    }
+}
+
+/// A pause answers with the directory the capture went into and the node's own
+/// encoding of it — and the directory is the one the record names, not a blank.
+///
+/// 🔴 The control face is the same call against a persister that allocated no
+/// directory. Without it, "the reply carries the artifact root" is satisfied by
+/// an implementation that writes an empty string every time — which is exactly
+/// what this reply carried before it was served, and what the caller would then
+/// store as the permanent record of where the user's sandbox lives.
+#[tokio::test]
+async fn a_pause_says_where_the_capture_went() {
+    let (orchestration, service, persister) = service_with_persister().await;
+
+    // The half where the node kept nothing: no artifact root, so no directory
+    // to name.
+    let nowhere = start(&orchestration, Some(b"owned")).await;
+    let reply = service
+        .pause(Request::new(pause_request(&nowhere, false)))
+        .await
+        .expect("pause")
+        .into_inner()
+        .paused_state
+        .expect("a pause that succeeded says how to reopen the sandbox");
+    assert_eq!(
+        reply.artifact_root, "",
+        "a node that allocated no directory named one anyway"
+    );
+
+    // The same call, one value different: a persister that did allocate one.
+    persister.holds_capture_at("/var/lib/agentenv/paused/abc/7");
+    let somewhere = start(&orchestration, Some(b"owned")).await;
+    let reply = service
+        .pause(Request::new(pause_request(&somewhere, false)))
+        .await
+        .expect("pause")
+        .into_inner()
+        .paused_state
+        .expect("a pause that succeeded says how to reopen the sandbox");
+    assert_eq!(reply.artifact_root, "/var/lib/agentenv/paused/abc/7");
+
+    // And the backend's own encoding travels beside it, versioned, rather than
+    // being dropped because the directory was the interesting half.
+    let state = reply.state.expect("the backend's encoding of its capture");
+    assert_eq!(
+        state.schema_version,
+        crate::proto::node::SERIALIZED_VALUE_VERSION
+    );
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&state.json).expect("the encoding is the value the backend wrote");
+    assert_eq!(
+        decoded,
+        crate::sandbox::mock::MockSnapshot
+            .encode()
+            .expect("the mock backend encodes its capture"),
+        "the reply carried something other than the capture the backend made"
+    );
+
+    // 🔴 And both sandboxes are actually paused, so the two replies above are
+    // about pauses that happened rather than about a method that answers
+    // without doing anything.
+    for sandbox in [&nowhere, &somewhere] {
+        let record = orchestration
+            .get_sandbox(&sandbox.id)
+            .await
+            .expect("read")
+            .expect("the sandbox still has a record");
+        assert_eq!(record.state, crate::orchestrator::SandboxState::Paused);
+    }
+    assert!(
+        listed(&service).await.is_empty(),
+        "a paused sandbox is still running"
+    );
+}
+
+/// A read of the paused record that failed is a failed pause, not a pause with
+/// no directory.
+///
+/// 🔴 The two are one `Option` apart and opposite in consequence: the caller
+/// stores what this reply says and never asks again, so a blank written because
+/// a disk hiccuped is a permanent lie about where the user's sandbox lives.
+/// The control face is the same persister with the failure spent.
+#[tokio::test]
+async fn a_pause_whose_record_could_not_be_read_is_not_a_pause_without_a_directory() {
+    let (orchestration, service, persister) = service_with_persister().await;
+    persister.holds_capture_at("/var/lib/agentenv/paused/abc/7");
+
+    let unreadable = start(&orchestration, Some(b"owned")).await;
+    persister.fail_next(RecordingCall::PausedArtifactRoot);
+    let err = service
+        .pause(Request::new(pause_request(&unreadable, false)))
+        .await
+        .expect_err("a pause whose record could not be read");
+    assert_ne!(
+        err.code(),
+        Code::NotFound,
+        "a disk that could not be read was reported as an absence: {err}"
+    );
+
+    // The same call with nothing forced to fail comes back with the directory,
+    // so the refusal above is about the read and not about this node.
+    let readable = start(&orchestration, Some(b"owned")).await;
+    let reply = service
+        .pause(Request::new(pause_request(&readable, false)))
+        .await
+        .expect("pause")
+        .into_inner()
+        .paused_state
+        .expect("paused state");
+    assert_eq!(reply.artifact_root, "/var/lib/agentenv/paused/abc/7");
+}
+
+/// Asking for a pause to be published is refused, and refused before the
+/// sandbox is touched.
+///
+/// 🔴 Two assertions and both are load-bearing. The refusal itself keeps
+/// `staged: None` meaning "the backend had nothing publishable" rather than
+/// "this build cannot stage" — collapsing those is how a sandbox comes to be
+/// paused with nothing to rebuild it from anywhere, silently. And the sandbox
+/// still running afterwards is what makes it a refusal rather than a pause that
+/// threw its own result away.
+#[tokio::test]
+async fn asking_for_a_published_pause_is_refused_before_the_sandbox_is_touched() {
+    let (orchestration, service) = service().await;
+    let sandbox = start(&orchestration, Some(b"owned")).await;
+
+    let err = service
+        .pause(Request::new(pause_request(&sandbox, true)))
+        .await
+        .expect_err("publishing a pause is not served");
+    assert_eq!(err.code(), Code::Unimplemented, "{err}");
+    assert_eq!(
+        classification(&err),
+        Some(false),
+        "a refusal that touched nothing was not classified as such: {err}"
+    );
+    assert_eq!(
+        listed(&service).await.len(),
+        1,
+        "a refused pause stopped the sandbox anyway"
+    );
+
+    // 🔴 The control face: the same call, one flag different, and this one
+    // actually pauses. Without it the assertion above is satisfied by a `pause`
+    // that refuses everything.
+    service
+        .pause(Request::new(pause_request(&sandbox, false)))
+        .await
+        .expect("a pause that asks for nothing this build cannot do");
+    assert!(
+        listed(&service).await.is_empty(),
+        "the sandbox that was paused is still running"
+    );
+}
+
+/// A pause that failed says whether the sandbox survived it, and says the same
+/// thing the node's own orchestrator acted on.
+///
+/// 🔴 The pair is the point. "Terminal" tells the caller to tear the sandbox
+/// down and "recoverable" tells it to put the sandbox back; a classification
+/// that was constant would be right for one of these and destructive for the
+/// other. Both faces are driven through the same call, one backend action
+/// apart.
+#[tokio::test]
+async fn a_failed_pause_says_whether_the_sandbox_survived_it() {
+    for (action, expected_terminal) in [
+        (
+            crate::sandbox::mock::MockAction::Fail {
+                message: "the capture did not take".to_string(),
+            },
+            false,
+        ),
+        (
+            crate::sandbox::mock::MockAction::FailTerminal {
+                message: "the runtime was mutated".to_string(),
+            },
+            true,
+        ),
+    ] {
+        crate::logging::init_for_tests();
+        let behavior = Arc::new(crate::sandbox::mock::MockBehavior::new());
+        let orchestrator = Orchestrator::new(
+            ServerRole::All,
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+            DisabledSandboxPersister,
+        )
+        .await
+        .expect("an in-memory orchestrator");
+        let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+        let service = NodeSandboxService::new(
+            Arc::clone(&orchestration),
+            Arc::new(mock_snapshot_manager()),
+            NODE.to_string(),
+        );
+
+        let sandbox = start(&orchestration, Some(b"owned")).await;
+        behavior.push_action(crate::sandbox::mock::MockOperation::Pause, action);
+
+        let err = service
+            .pause(Request::new(pause_request(&sandbox, false)))
+            .await
+            .expect_err("a pause the backend refused");
+        assert_eq!(
+            classification(&err),
+            Some(expected_terminal),
+            "a {} pause was reported as {:?}: {err}",
+            if expected_terminal {
+                "terminal"
+            } else {
+                "recoverable"
+            },
+            classification(&err)
+        );
+    }
+}
+
+/// A pause whose request does not parse is refused, and the refusal says the
+/// sandbox was not touched.
+///
+/// 🔴 The caller reads a capture failure with no classification as *terminal*,
+/// meaning "tear the sandbox down". A malformed request never reaches the
+/// runtime, so leaving this one bare would have a caller destroy a running
+/// sandbox because of a string it got wrong. The control face is the same call
+/// with the field it needs.
+#[tokio::test]
+async fn a_pause_that_does_not_parse_is_refused_without_condemning_the_sandbox() {
+    let (orchestration, service) = service().await;
+    let sandbox = start(&orchestration, Some(b"owned")).await;
+
+    let err = service
+        .pause(Request::new(pb::SandboxPauseRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: String::new(),
+            publish: false,
+        }))
+        .await
+        .expect_err("a pause naming no run");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert_eq!(
+        classification(&err),
+        Some(false),
+        "a request that never reached the runtime condemned the sandbox: {err}"
+    );
+    assert_eq!(
+        listed(&service).await.len(),
+        1,
+        "a refused pause stopped the sandbox anyway"
+    );
+
+    // The same call with the run it left out.
+    service
+        .pause(Request::new(pause_request(&sandbox, false)))
+        .await
+        .expect("a pause that names the run it means");
+    assert!(listed(&service).await.is_empty());
+}
+
+/// A pause naming a run this node is not running is refused, and the refusal
+/// says the sandbox was not touched.
+///
+/// 🔴 The classification is the half worth having. The caller treats an
+/// unclassified capture failure as terminal — meaning "tear the sandbox down" —
+/// so a fence check that refused without saying so would delete a running
+/// sandbox because a pause arrived a moment after somebody else's resume. The
+/// control face is the same call under the run that *is* live.
+#[tokio::test]
+async fn a_pause_for_a_superseded_run_is_refused_without_condemning_the_sandbox() {
+    let (orchestration, service) = service().await;
+    let sandbox = start(&orchestration, Some(b"owned")).await;
+
+    let err = service
+        .pause(Request::new(pb::SandboxPauseRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: ExecutionId::new().to_string(),
+            publish: false,
+        }))
+        .await
+        .expect_err("a pause naming a run this node is not running");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert_eq!(
+        classification(&err),
+        Some(false),
+        "a fence check that never reached the runtime condemned the sandbox: {err}"
+    );
+    assert_eq!(
+        listed(&service).await.len(),
+        1,
+        "a refused pause stopped the sandbox anyway"
+    );
+
+    // The same call under the run that is live.
+    service
+        .pause(Request::new(pause_request(&sandbox, false)))
+        .await
+        .expect("a pause naming the run this node is running");
+    assert!(listed(&service).await.is_empty());
+}
+
+/// The round trip this half exists for: a sandbox paused through the `Pause`
+/// RPC is reopened through the `Resume` RPC, under a run the caller claimed.
+///
+/// 🔴 Both halves driven through the wire types rather than through the
+/// orchestrator, because that is the pair `--role api` uses and each was
+/// served in a different change. Nothing else in this file pauses through the
+/// RPC, so nothing else would notice a `Pause` that answered plausibly and left
+/// no record for a `Resume` to find.
+#[tokio::test]
+async fn a_sandbox_paused_through_the_rpc_is_reopened_through_the_rpc() {
+    let (orchestration, service) = service().await;
+    let sandbox = start(&orchestration, Some(b"owned")).await;
+    let claimed = ExecutionId::new();
+    assert_ne!(claimed, sandbox.execution_id);
+
+    service
+        .pause(Request::new(pause_request(&sandbox, false)))
+        .await
+        .expect("pause through the RPC");
+    assert!(
+        listed(&service).await.is_empty(),
+        "the sandbox the RPC paused is still running"
+    );
+
+    // 🔴 The control face for the resume below: a run this node never paused is
+    // refused, so "the resume succeeded" is about the record the pause wrote
+    // and not about a node that reopens whatever it is asked for.
+    let stale = service
+        .resume(Request::new(resume_request(
+            sandbox.id,
+            ExecutionId::new(),
+            claimed,
+            0,
+        )))
+        .await
+        .expect_err("a resume fenced on a run this node never paused");
+    assert_eq!(stale.code(), Code::FailedPrecondition, "{stale}");
+
+    let started = service
+        .resume(Request::new(resume_request(
+            sandbox.id,
+            sandbox.execution_id,
+            claimed,
+            0,
+        )))
+        .await
+        .expect("resume through the RPC")
+        .into_inner()
+        .started
+        .expect("a resume that succeeded says what it started");
+    assert_eq!(started.execution_id, claimed.to_string());
+
+    let live = listed(&service).await;
+    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
+    assert_eq!(live[0].execution_id, claimed.to_string());
 }

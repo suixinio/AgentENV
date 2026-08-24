@@ -103,6 +103,29 @@ pub trait SandboxPersister: Send + Sync {
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()>;
 
+    /// The directory this persister wrote a paused sandbox's capture into.
+    ///
+    /// # 🔴 Three answers, and the two that are not a path mean opposite
+    /// things
+    ///
+    /// - `Ok(Some(path))` — the capture is there;
+    /// - `Ok(None)` — there is no paused record here. For
+    ///   [`DisabledSandboxPersister`] that is the permanent answer: it writes
+    ///   nothing, so the backend kept the capture in temporaries it manages
+    ///   itself and there is no directory to name.
+    /// - `Err(..)` — the records could not be read. A caller that took this for
+    ///   `None` would report a sandbox as having no capture on the strength of
+    ///   a disk it could not reach.
+    ///
+    /// Read from the record rather than returned by `pause_sandbox`, because
+    /// the question is *where did this sandbox's capture go* and not *what did
+    /// this call do*: a second pause of an already-paused sandbox does no work
+    /// and must still be able to say where the bytes are.
+    async fn paused_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<Option<PathBuf>>;
+
     /// Mark a paused sandbox as resuming.
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
@@ -160,6 +183,16 @@ impl SandboxPersister for DisabledSandboxPersister {
         _paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
         Ok(())
+    }
+
+    /// 🔴 `None`, and it is a fact rather than a shrug: this persister
+    /// allocates no artifact root, so no capture it was told about was written
+    /// into one.
+    async fn paused_artifact_root(
+        &self,
+        _sandbox_id: &SandboxId,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        Ok(None)
     }
 
     async fn mark_cluster_registered(

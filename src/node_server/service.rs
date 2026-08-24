@@ -25,10 +25,11 @@ use tracing::{debug, warn};
 
 use crate::orchestrator::{
     ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, NewTimeout,
-    OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOrchestration,
+    OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
+    SandboxOrchestration,
 };
 use crate::proto::node as pb;
-use crate::sandbox::{CustomExtensionParams, SandboxNetworkPolicy};
+use crate::sandbox::{CustomExtensionParams, SandboxCaptureError, SandboxNetworkPolicy};
 use crate::snapshot::SnapshotManager;
 use crate::types::{ExecutionId, SandboxId};
 
@@ -150,6 +151,78 @@ impl NodeSandboxService {
             expires_at_ms: convert::unix_millis(metadata.expires_at),
         }
     }
+}
+
+/// Re-stamps a status raised before the backend was reached as one that did not
+/// touch the sandbox.
+///
+/// 🔴 The code and message are kept exactly as they were — a `NotFound` stays a
+/// `NotFound` — and only the classification is added. Without it the caller,
+/// which treats an unclassified capture failure as terminal, tears down a
+/// sandbox over a fence check that never reached the runtime.
+fn untouched(status: Status) -> Status {
+    crate::proto::node::capture_failure_status(
+        status.code(),
+        status.message().to_string(),
+        false,
+        "the node did not touch the sandbox",
+    )
+}
+
+/// What a caller must do about a pause that did not produce a capture.
+///
+/// # 🔴 Terminal is the default and each exception is named
+///
+/// "Terminal" tells the caller the live runtime was mutated past safe resume
+/// and has to be torn down; "recoverable" tells it the sandbox is still there
+/// and should go back to running. Guessing either way is expensive, so the only
+/// answers that claim the sandbox survived are the ones this node can prove:
+/// the orchestrator's own capture classification, and the errors raised before
+/// the backend was ever asked to pause.
+fn pause_failure_status(sandbox_id: SandboxId, err: &OrchestratorError) -> Status {
+    let status = orchestrator_status(err);
+    let terminal = match err {
+        // The backend answered, and its answer already says which of the two
+        // this is — the orchestrator acted on the same flag when it decided
+        // whether to put the sandbox back or tear it down.
+        //
+        // 🔴 `unwrap_or(true)` and not `false`: a source that is not a capture
+        // error is a failure this node cannot account for, and the fail-closed
+        // reading of "I do not know what happened to the runtime" is that it
+        // did not survive.
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Pause,
+            source,
+            ..
+        } => source
+            .downcast_ref::<SandboxCaptureError>()
+            .map(SandboxCaptureError::is_terminal)
+            .unwrap_or(true),
+        // Refused before the runtime was touched: the wrong state, another
+        // operation holding the sandbox, a node that is draining, a request
+        // that does not parse.
+        OrchestratorError::InvalidSandboxState { .. }
+        | OrchestratorError::SandboxOperationConflict { .. }
+        | OrchestratorError::SandboxLifetimeExceeded { .. }
+        | OrchestratorError::InvalidRequest(_)
+        | OrchestratorError::ShuttingDown
+        | OrchestratorError::NotAcceptingNewWork
+        | OrchestratorError::VirtualizationModeMismatch { .. } => false,
+        // 🔴 Allocating the artifact directory happens before the backend is
+        // asked for anything, and its failure puts the sandbox straight back to
+        // running.
+        OrchestratorError::SandboxPersistenceFailed(_) => false,
+        // 🔴 Including `SandboxNotFound`, which on this path means the pause
+        // found no sandbox to pause and removed the record — so the caller's
+        // record of it is the last one standing and must go too.
+        _ => true,
+    };
+    crate::proto::node::capture_failure_status(
+        status.code(),
+        format!("sandbox {sandbox_id}: {}", status.message()),
+        terminal,
+        err.to_string(),
+    )
 }
 
 fn superseded(sandbox_id: SandboxId, claimed: ExecutionId, actual: ExecutionId) -> Status {
@@ -291,38 +364,144 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         Ok(Response::new(pb::SandboxDeleteResponse {}))
     }
 
+    /// Pauses the sandbox and says where the capture it produced now sits.
+    ///
+    /// # 🔴 What travels back is a location, not a capture
+    ///
+    /// The bytes are written to this node's disk and stay there. What the
+    /// caller receives is the pair its own factory will hand back the day it
+    /// wants the sandbox reopened — the directory they went into and this
+    /// node's own encoding of its backend state — plus, from the reply's
+    /// envelope, which machine said it. Nothing here owns anything the caller
+    /// has to release.
+    ///
+    /// # 🔴 Every failure carries a classification, including the ones that
+    /// are not capture failures
+    ///
+    /// The caller reads an unclassified failure as *terminal* by design, and
+    /// terminal on this path means "tear the sandbox down". So a refusal that
+    /// left the sandbox untouched — the wrong state, a node that is draining, a
+    /// request that never reached the backend — must say so explicitly, or a
+    /// caller doing exactly what it was told to do will delete a running
+    /// sandbox because its pause arrived at an awkward moment. See
+    /// [`pause_failure_status`].
+    ///
+    /// # 🔴 `publish` is refused rather than answered with nothing
+    ///
+    /// Staging a publishable capture on the node is not wired up: the seam
+    /// exists (`SnapshotManager::stage_captured` / `commit_staged`) and the
+    /// orchestrator does not hand the publishable capture back out of
+    /// `pause_sandbox`, so there is nothing here to stage. Answering
+    /// `staged: None` would be indistinguishable from a backend that had no
+    /// publishable capture to offer — which is exactly how a sandbox comes to
+    /// be paused with nothing to rebuild it from anywhere, silently. A caller
+    /// that needs the published arm is told it cannot have it.
     async fn pause(
         &self,
-        _request: Request<pb::SandboxPauseRequest>,
+        request: Request<pb::SandboxPauseRequest>,
     ) -> Result<Response<pb::SandboxPauseResponse>, Status> {
-        // 🔴 Refused rather than approximated, and the reason is worth stating
-        // in full because a plausible-looking implementation is available and
-        // is worse than nothing.
-        //
-        // A pause produces two things this reply needs and the orchestrator
-        // does not currently hand back: the artifact directory the capture was
-        // written into — which is allocated inside `pause_sandbox` and never
-        // leaves it — and, when publishing was asked for, a staged snapshot,
-        // which needs the node side of the `stage`/`commit_staged` seam wired
-        // into the pause path. Answering with the paused state alone would look
-        // right and hand the caller a resume that cannot find its bytes;
-        // answering with `staged: None` would be indistinguishable from a
-        // backend that had no publishable capture to offer, which is how a
-        // sandbox comes to be paused with nothing to resume it from anywhere.
-        //
-        // 🔴 Classified as *not* terminal, and the classification matters even
-        // for a refusal: nothing was done to the sandbox, so the caller should
-        // put it back to running rather than tear it down. An unclassified
-        // failure is read as terminal by design, which for this one would be
-        // the wrong answer.
-        Err(crate::proto::node::capture_failure_status(
-            tonic::Code::Unimplemented,
-            "pause is not served yet: the orchestrator does not return the artifact root a \
-             capture was written into, and staging a publishable capture on the node is not \
-             wired up",
-            false,
-            "the node did not touch the sandbox",
-        ))
+        let request = request.into_inner();
+        // 🔴 Classified, like every other refusal on this call. A request that
+        // does not parse never reached the runtime, and the caller reads an
+        // unclassified capture failure as terminal — so leaving these two bare
+        // would have a malformed request tear down the sandbox it named.
+        let sandbox_id = convert::sandbox_id(&request.sandbox_id).map_err(untouched)?;
+        let execution_id = convert::execution_id(&request.execution_id).map_err(untouched)?;
+        if request.publish {
+            // 🔴 Before the fence and before the pause. A refusal that arrived
+            // after the VM was stopped would have destroyed the thing the
+            // caller was refused.
+            return Err(crate::proto::node::capture_failure_status(
+                tonic::Code::Unimplemented,
+                "publishing a pause is not served yet: staging a captured snapshot on the node is \
+                 not wired up, and answering with no staged row would be indistinguishable from a \
+                 backend that had nothing publishable to offer",
+                false,
+                "the node did not touch the sandbox",
+            ));
+        }
+        self.fenced(sandbox_id, execution_id)
+            .await
+            .map_err(untouched)?;
+
+        let metadata = Arc::clone(&self.orchestration)
+            .pause_sandbox(sandbox_id)
+            .await
+            .map_err(|err| pause_failure_status(sandbox_id, &err))?;
+
+        // 🔴 The handle the pause produced, from the record the pause wrote. A
+        // reply without it is not a pause with nothing to say: it is a stopped
+        // VM the caller has no way of reopening, and the caller has to be told
+        // that rather than handed a `paused_state` it will store and later find
+        // empty.
+        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
+            // 🔴 Not terminal. The sandbox *is* paused on this node and a later
+            // `Resume` addressed here will reopen it from this node's own
+            // record; what failed is this reply's ability to describe it. Of
+            // the two wrong readings available, "put it back to running" costs
+            // a reconciliation and "tear it down" costs the user's only copy.
+            crate::proto::node::capture_failure_status(
+                tonic::Code::Internal,
+                format!(
+                    "sandbox {sandbox_id} was paused on this node, but its record carries no \
+                     capture to describe"
+                ),
+                false,
+                "the sandbox is paused on this node and can still be reopened here",
+            )
+        })?;
+        let state = paused_state
+            .encode()
+            .map_err(|err| {
+                crate::proto::node::capture_failure_status(
+                    tonic::Code::Internal,
+                    format!("encode sandbox {sandbox_id}'s paused state: {err:#}"),
+                    false,
+                    "the sandbox is paused on this node and can still be reopened here",
+                )
+            })
+            .and_then(|state| {
+                crate::proto::node::encode_value(&state).map_err(|err| {
+                    crate::proto::node::capture_failure_status(
+                        tonic::Code::Internal,
+                        format!("encode sandbox {sandbox_id}'s paused state: {err}"),
+                        false,
+                        "the sandbox is paused on this node and can still be reopened here",
+                    )
+                })
+            })?;
+
+        // 🔴 A failed read fails the call rather than answering with an empty
+        // path. The caller stores this and never asks again, so a blank written
+        // into its record because a disk hiccuped is a permanent lie about
+        // where the user's sandbox lives.
+        let artifact_root = self
+            .orchestration
+            .paused_artifact_root(&sandbox_id)
+            .await
+            .map_err(|err| pause_failure_status(sandbox_id, &err))?;
+        if artifact_root.is_none() {
+            // Not a failure: a node whose persister allocates nothing captured
+            // into temporaries it manages itself, and there is no directory to
+            // name. Worth saying out loud because the caller's record of this
+            // sandbox will carry no location.
+            warn!(
+                %sandbox_id,
+                "paused a sandbox this node kept no artifact directory for"
+            );
+        }
+
+        Ok(Response::new(pb::SandboxPauseResponse {
+            paused_state: Some(pb::PausedState {
+                artifact_root: artifact_root
+                    .map(|root| root.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                state: Some(state),
+            }),
+            // 🔴 Always absent, and only reachable because `publish` was not
+            // asked for: the arm that would fill this is refused above.
+            staged: None,
+        }))
     }
 
     async fn checkpoint(

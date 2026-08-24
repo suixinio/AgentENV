@@ -17,6 +17,7 @@ pub(crate) enum RecordingCall {
     PersistPaused,
     MarkResuming,
     MarkClusterRegistered,
+    PausedArtifactRoot,
     RollbackResuming,
     DeleteRecord,
     DeleteRecordAndArtifacts,
@@ -30,6 +31,7 @@ impl RecordingCall {
             Self::PersistPaused => "persist_paused",
             Self::MarkResuming => "mark_resuming",
             Self::MarkClusterRegistered => "mark_cluster_registered",
+            Self::PausedArtifactRoot => "paused_artifact_root",
             Self::RollbackResuming => "rollback_resuming",
             Self::DeleteRecord => "delete_record",
             Self::DeleteRecordAndArtifacts => "delete_record_and_artifacts",
@@ -49,6 +51,7 @@ pub(crate) struct RecordingPersister {
     loaded: Arc<Mutex<Vec<SandboxMetadata>>>,
     persisted: Arc<Mutex<Vec<SandboxMetadata>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
+    artifact_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl RecordingPersister {
@@ -57,6 +60,14 @@ impl RecordingPersister {
             loaded: Arc::new(Mutex::new(loaded)),
             ..Default::default()
         }
+    }
+
+    /// Makes this persister answer `paused_artifact_root` with a directory.
+    ///
+    /// 🔴 Off by default, so a test that wants the "there is a path" half has
+    /// to say so and a test that wants the other half gets it without asking.
+    pub(crate) fn holds_capture_at(&self, artifact_root: impl Into<PathBuf>) {
+        *self.artifact_root.lock().unwrap() = Some(artifact_root.into());
     }
 
     pub(crate) fn calls(&self) -> Vec<RecordingCall> {
@@ -132,6 +143,17 @@ impl SandboxPersister for RecordingPersister {
         self.record(RecordingCall::PersistPaused);
         self.maybe_fail(RecordingCall::PersistPaused)?;
         Ok(())
+    }
+
+    /// Whatever [`RecordingPersister::holds_capture_at`] was told, and `None`
+    /// otherwise — which is what a persister that allocated no root answers.
+    async fn paused_artifact_root(
+        &self,
+        _sandbox_id: &SandboxId,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        self.record(RecordingCall::PausedArtifactRoot);
+        self.maybe_fail(RecordingCall::PausedArtifactRoot)?;
+        Ok(self.artifact_root.lock().unwrap().clone())
     }
 
     async fn mark_cluster_registered(

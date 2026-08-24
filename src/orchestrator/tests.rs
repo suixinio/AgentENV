@@ -6222,3 +6222,60 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
         supplied.as_bytes()
     );
 }
+
+/// The artifact root a paused sandbox's capture went into is readable through
+/// the facade, and it is the one the persister holds.
+///
+/// 🔴 Driven through `Arc<dyn SandboxOrchestration>` rather than the concrete
+/// type. The blanket impl forwards by naming `Orchestrator::<S, F, P>::name`,
+/// which resolves back into the trait when no inherent method shadows it — an
+/// infinite recursion that compiles, and that this project has now produced
+/// once for real while writing this method.
+///
+/// The control face is the same call before the persister holds anything: a
+/// forwarding that answered `None` unconditionally would satisfy half of this
+/// and is exactly what a node with persistence disabled legitimately answers.
+#[tokio::test]
+async fn the_artifact_root_a_capture_went_into_is_readable_through_the_facade() -> anyhow::Result<()>
+{
+    // 🔴 Imported inside the function, not at the top of the file. The trait's
+    // methods take `self: Arc<Self>` where the inherent ones take `&Arc<Self>`,
+    // so having it in scope for the whole module changes which method every
+    // other test in this file resolves to.
+    use crate::orchestrator::SandboxOrchestration;
+
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let orchestration: Arc<dyn SandboxOrchestration> = Arc::clone(&orchestrator) as _;
+    let sandbox_id = SandboxId::new();
+
+    assert_eq!(
+        orchestration.paused_artifact_root(&sandbox_id).await?,
+        None,
+        "a persister holding nothing named a directory"
+    );
+
+    persister.holds_capture_at("/var/lib/agentenv/paused/abc/7");
+    assert_eq!(
+        orchestration.paused_artifact_root(&sandbox_id).await?,
+        Some(PathBuf::from("/var/lib/agentenv/paused/abc/7")),
+    );
+
+    // 🔴 And a read that failed is not an absence: the caller stores this and
+    // never asks again.
+    persister.fail_next(RecordingCall::PausedArtifactRoot);
+    let err = orchestration
+        .paused_artifact_root(&sandbox_id)
+        .await
+        .expect_err("a record that could not be read");
+    assert!(
+        matches!(err, OrchestratorError::SandboxPersistenceFailed(_)),
+        "{err:?}"
+    );
+    Ok(())
+}

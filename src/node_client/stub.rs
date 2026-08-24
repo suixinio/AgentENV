@@ -74,6 +74,26 @@ pub struct RemoteSandboxStub {
     pending: PendingLaunch,
     /// Set once the sandbox is running somewhere.
     placed: Option<Placed>,
+    /// Set once this sandbox's capture has been taken and the node has stopped
+    /// the VM.
+    ///
+    /// # 🔴 What `stop` means changes when this is set, and getting it wrong
+    /// destroys the user's sandbox
+    ///
+    /// Locally, `pause` and `stop` are two different things done to one
+    /// machine: the capture is written to disk, and then the VM process is torn
+    /// down and the capture stays. Over a wire there is no call that means
+    /// "tear the VM down and keep everything" — the node already did that
+    /// inside its own pause — and the only teardown this service has is
+    /// `Delete`, which takes the paused record and its artifacts with it.
+    ///
+    /// `Orchestrator::pause_sandbox` calls `stop` on the backend immediately
+    /// after a successful pause, "to free up resources". Sent as a `Delete`,
+    /// that erases the capture the pause has just promised the user, moments
+    /// after the pause reported success — and the sandbox then comes back as
+    /// `NotFound` from the one machine that had it, which reads exactly like
+    /// "the only copy is gone".
+    paused: bool,
 }
 
 struct Placed {
@@ -98,6 +118,7 @@ impl RemoteSandboxStub {
             placement,
             pending,
             placed: None,
+            paused: false,
         }
     }
 
@@ -117,6 +138,7 @@ impl RemoteSandboxStub {
             resources,
             placement,
             pending: PendingLaunch::AlreadyStarted,
+            paused: false,
             placed: Some(Placed {
                 node,
                 client,
@@ -369,7 +391,17 @@ impl SandboxBackend for RemoteSandboxStub {
             .pause(pb::SandboxPauseRequest {
                 sandbox_id: sandbox_id.to_string(),
                 execution_id: execution_id.to_string(),
-                publish: true,
+                // 🔴 `false`, and asked for honestly rather than as an
+                // aspiration. Nothing on this side consumes a staged row yet:
+                // the reply's `staged` field is not read here, and
+                // `PauseOutcome::publishable` — which is what the publisher
+                // above this backend commits — is a captured snapshot this half
+                // cannot produce. Asking a node to stage a capture whose row
+                // would then be dropped would burn durable storage on a
+                // snapshot nobody commits, and `Pause` refuses the flag for the
+                // matching reason: an absent `staged` must keep meaning "the
+                // backend had nothing to publish".
+                publish: false,
             })
             .await
             .map_err(wire::into_capture_error)?
@@ -388,6 +420,10 @@ impl SandboxBackend for RemoteSandboxStub {
         let state = wire::serialized_value(paused.state.as_ref(), "paused state")
             .map_err(SandboxCaptureError::terminal)?
             .unwrap_or(serde_json::Value::Null);
+
+        // 🔴 Set before the value is handed back, because the very next thing
+        // the caller does with this backend is `stop` it.
+        self.paused = true;
 
         Ok(PausedSandboxCapture {
             // 🔴 The incarnation is this stub's own, and it is the run that was
@@ -583,9 +619,24 @@ impl SandboxBackend for RemoteSandboxStub {
             .collect())
     }
 
+    /// Tears the sandbox down on the node — unless it has just been paused
+    /// there.
+    ///
+    /// 🔴 The exception is not an optimisation. See
+    /// [`RemoteSandboxStub::paused`]: after a successful pause the node has
+    /// already stopped the VM and is holding the capture, and the only teardown
+    /// this service has would delete it.
+    ///
+    /// It is decided from this process's own state — this stub sent the pause
+    /// and read the reply — rather than from anything a node said, which is
+    /// what keeps it from being the "an unreachable node means the sandbox is
+    /// gone" mistake in another costume.
     async fn stop(&mut self) -> Result<()> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
+        if self.paused {
+            return Ok(());
+        }
         let Some(placed) = self.placed.as_mut() else {
             // Never started anywhere, so there is nothing to tear down. This is
             // the *only* branch that treats "no sandbox" as success, and it is

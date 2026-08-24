@@ -704,13 +704,15 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   spec it is handed has already been resolved into paths on a local disk and
 ///   the user's image reference is gone by then. Creating from a snapshot or a
 ///   template works; `POST /sandboxes-cold` does not.
-/// - **Pausing a sandbox on another machine.** The node service declares
-///   `Pause` and answers `Unimplemented`: the orchestrator does not hand back
-///   the artifact directory a capture was written into, and staging a
-///   publishable capture on the node is not wired up. Resuming one *is* served
-///   — `build_from_paused_state` sends the node service's `Resume`, which asks
-///   the machine holding the capture to reopen it — so the round trip is
-///   blocked at the pause rather than at the wake-up.
+/// - **Resuming a sandbox this half paused.** `Pause` is served now: it leaves
+///   the capture on the node and a reference in the cluster store. `Resume` is
+///   served too. What sits between them is `Orchestrator::resume_sandbox`,
+///   which still reads the paused state out of `SandboxMetadata::paused_state`
+///   — `#[serde(skip)]`, and so always absent on this role's store.
+/// - **Publishing a pause.** Staging a captured snapshot on the node is not
+///   wired up, so this half sends `publish: false` and a node asked to publish
+///   refuses rather than answering with nothing. A sandbox paused through this
+///   half is resumable only on the machine that paused it.
 /// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
 ///   directly, outside the orchestrator entirely, so a build here would reach
 ///   for `/dev/kvm` in a Pod that has none. It is now refused at the door

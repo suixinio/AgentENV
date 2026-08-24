@@ -34,6 +34,13 @@ service NodeSandboxService {
 
   // Pauses the sandbox, stops it, and returns what is needed to bring it back
   // — here or, when it was published, anywhere.
+  //
+  // 🔴 **Every failure on this call carries a capture classification**, and
+  // not only the ones that come from a capture. The caller reads an
+  // unclassified failure as terminal — meaning "the runtime was mutated past
+  // safe resume, tear it down" — so a refusal that never reached the runtime
+  // has to say so, or a fence check arriving a moment late deletes a running
+  // sandbox.
   rpc Pause (SandboxPauseRequest) returns (SandboxPauseResponse);
 
   // Captures a snapshot of a running sandbox and leaves it running.
@@ -151,6 +158,12 @@ message StagedSnapshot {
 // back to a different machine reopens nothing.
 message PausedState {
   // The directory on the origin node holding the paused sandbox's artifacts.
+  //
+  // 🔴 Empty when that node's persister allocated none — a node configured
+  // without paused-sandbox persistence captured into temporaries it manages
+  // itself, and there is no directory to name. Empty is therefore "no
+  // directory", never "the node did not say": a node that could not read where
+  // the capture went fails the call instead.
   string artifact_root = 1;
   // The backend's own encoding of its paused state.
   SerializedValue state = 2;
@@ -288,6 +301,14 @@ message SandboxPauseRequest {
   string execution_id = 2;
   // Whether the capture should also be staged for publication, so that a node
   // other than this one can rebuild the sandbox.
+  //
+  // 🔴 Not served yet, and **refused** rather than answered with an absent
+  // `staged`. A node that quietly returned nothing here would be
+  // indistinguishable from a node whose backend had nothing publishable to
+  // offer, and the difference is whether the sandbox has a copy anywhere but
+  // one machine's disk. The refusal is classified as non-terminal and is taken
+  // before the sandbox is touched, so asking for something this build cannot do
+  // costs nothing.
   bool publish = 3;
 }
 

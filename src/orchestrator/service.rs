@@ -1381,6 +1381,31 @@ where
             .map_err(|err| OrchestratorError::InternalError(err.to_string()))
     }
 
+    /// Where on this machine's disk a paused sandbox's capture was written.
+    ///
+    /// # 🔴 Why this is a read of its own rather than a value `pause_sandbox`
+    /// returns
+    ///
+    /// The directory is allocated inside the pause and handed to the backend,
+    /// and it is the *persisted record* that keeps it afterwards. A caller that
+    /// took it from the return value of one call could only ever learn it about
+    /// the pause it just performed — and a pause that found the sandbox already
+    /// paused does no work and has no directory to report, while the bytes are
+    /// sitting in one all the same.
+    ///
+    /// 🔴 `Ok(None)` means this node holds no paused record for the sandbox,
+    /// never "the disk could not be read": the persister keeps those apart and
+    /// so does this.
+    pub async fn paused_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<Option<std::path::PathBuf>> {
+        self.persister
+            .paused_artifact_root(sandbox_id)
+            .await
+            .map_err(OrchestratorError::from)
+    }
+
     /// Drops this node's local copy of a paused sandbox, leaving the sandbox
     /// itself alone.
     ///

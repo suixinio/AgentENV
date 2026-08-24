@@ -201,6 +201,7 @@ struct ScriptedNode {
     delete: Mutex<Option<Result<pb::SandboxDeleteResponse, Status>>>,
     resume: Mutex<Option<Result<pb::SandboxResumeResponse, Status>>>,
     seen_create: Mutex<Vec<pb::SandboxCreateRequest>>,
+    seen_pause: Mutex<Vec<pb::SandboxPauseRequest>>,
     seen_delete: Mutex<Vec<pb::SandboxDeleteRequest>>,
     seen_resume: Mutex<Vec<pb::SandboxResumeRequest>>,
 }
@@ -245,8 +246,12 @@ impl NodeSandboxService for Arc<ScriptedNode> {
 
     async fn pause(
         &self,
-        _request: Request<pb::SandboxPauseRequest>,
+        request: Request<pb::SandboxPauseRequest>,
     ) -> Result<Response<pb::SandboxPauseResponse>, Status> {
+        self.seen_pause
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
         ScriptedNode::take(&self.pause, "pause")
     }
 
@@ -1548,4 +1553,235 @@ async fn a_paused_state_this_factory_did_not_produce_is_refused() {
             None,
         )
         .expect("a paused state from this factory");
+}
+
+// ---------------------------------------------------------------------------
+// Pause, and what must not follow it
+// ---------------------------------------------------------------------------
+
+/// Scripts a create and a pause on a node, and returns a stub that has done
+/// both.
+async fn paused_stub(
+    script: &Arc<ScriptedNode>,
+    node: &RunningNode,
+) -> (Box<dyn SandboxBackend>, ExecutionId) {
+    let execution_id = ExecutionId::new();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
+        paused_state: Some(pb::PausedState {
+            artifact_root: "/var/lib/agentenv/paused/7".to_string(),
+            state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
+        }),
+        staged: None,
+    }));
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start");
+    (backend, execution_id)
+}
+
+/// 🔴 Stopping a sandbox that has just been paused does not delete it.
+///
+/// `Orchestrator::pause_sandbox` calls `stop` on the backend right after a
+/// successful pause, "to free up resources". Locally that tears down a VM
+/// process and leaves the capture on disk. Over this wire the only teardown is
+/// `Delete`, which takes the paused record and its artifacts with it — so a
+/// `stop` sent as a `Delete` erases the capture the pause has just promised the
+/// user, and the sandbox then comes back `NotFound` from the one machine that
+/// had it.
+///
+/// The control face is the same `stop` on a stub that was never paused, which
+/// *must* delete: without it this test passes on a `stop` that does nothing at
+/// all, which is how a cluster stops accounting for VMs that are still running.
+#[tokio::test]
+async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
+    let (script, node) = scripted_node().await;
+
+    let (mut paused, _) = paused_stub(&script, &node).await;
+    paused.pause(None).await.expect("pause");
+    paused.stop().await.expect("stop");
+    assert!(
+        script.seen_delete.lock().expect("lock").is_empty(),
+        "the capture was deleted by the stop that follows every pause: {:?}",
+        script.seen_delete.lock().expect("lock")
+    );
+
+    // The same call on a stub that was not paused: this one is a teardown and
+    // has to reach the node.
+    let (mut running, execution_id) = paused_stub(&script, &node).await;
+    running.stop().await.expect("stop");
+    let deletes = script.seen_delete.lock().expect("lock").clone();
+    assert_eq!(deletes.len(), 1, "a running sandbox was not torn down");
+    assert_eq!(deletes[0].execution_id, execution_id.to_string());
+}
+
+/// The pause this half sends does not ask for the arm the node refuses.
+///
+/// 🔴 Two assertions, and the second is what makes the first mean something. A
+/// `publish` flag is one bit and nothing in this project's mutation testing
+/// covers a `.proto` field, so "the request said false" on its own is a fact
+/// about a constant. Sending the same pause to the *real* node service — which
+/// refuses `publish: true` before it touches the sandbox — is what turns the
+/// bit into behaviour.
+#[tokio::test]
+async fn a_pause_sent_from_here_asks_for_nothing_the_node_refuses() {
+    let (script, node) = scripted_node().await;
+    let (mut backend, _) = paused_stub(&script, &node).await;
+    backend.pause(None).await.expect("pause");
+
+    let sent = script.seen_pause.lock().expect("lock").clone();
+    assert_eq!(sent.len(), 1, "the pause did not reach the node");
+    assert!(
+        !sent[0].publish,
+        "this half asked a node to stage a row it does not commit"
+    );
+
+    // The other half: the real service answers the request this half sends,
+    // and refuses the one it does not.
+    let real = real_node().await;
+    let orchestration = real.orchestration.as_ref().expect("a real node").clone();
+    let factory = RemoteSandboxBackendFactory::new(real.placement());
+    let execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+
+    let mut client =
+        crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient::connect(
+            real.endpoint.endpoint.clone(),
+        )
+        .await
+        .expect("connect");
+    let refused = client
+        .pause(pb::SandboxPauseRequest {
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: execution_id.to_string(),
+            publish: true,
+        })
+        .await
+        .expect_err("publishing a pause is not served");
+    assert_eq!(refused.code(), tonic::Code::Unimplemented, "{refused}");
+    assert!(
+        !orchestration
+            .list_live_sandboxes()
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused pause stopped the sandbox anyway"
+    );
+
+    backend
+        .pause(None)
+        .await
+        .expect("the pause this half sends");
+    assert!(
+        orchestration
+            .list_live_sandboxes()
+            .await
+            .expect("list")
+            .is_empty(),
+        "the pause this half sends did not pause anything"
+    );
+}
+
+/// The whole of it: a sandbox started from here, paused from here, and reopened
+/// from here on the machine that held its bytes.
+///
+/// 🔴 Nothing else in this file crosses both halves. The pause tests script the
+/// node's reply, and the resume tests pause the sandbox through the node's own
+/// orchestrator; either passes on a build whose `Pause` writes a record no
+/// `Resume` can find. This one takes the paused state the pause reply produced,
+/// puts it through the round trip a record makes it take, and hands the result
+/// back to the factory.
+///
+/// The control face is the machine: the same encoded state with a different
+/// origin node is refused rather than sent, and the refusal happens with the
+/// node still holding the capture — so "the resume worked" is about the machine
+/// that has the bytes and not about any machine.
+#[tokio::test]
+async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
+    let node = real_node().await;
+    let orchestration = node.orchestration.as_ref().expect("a real node").clone();
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    let paused_execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start on the node");
+
+    let capture = backend.pause(None).await.expect("pause on the node");
+    // 🔴 The stop the orchestrator sends after every successful pause. It is
+    // here rather than left out because leaving it out is what made this round
+    // trip look like it worked.
+    backend.stop().await.expect("stop after the pause");
+    assert!(
+        orchestration
+            .list_live_sandboxes()
+            .await
+            .expect("list")
+            .is_empty(),
+        "the paused sandbox is still running"
+    );
+
+    // Through the encoding a record forces on it, and back.
+    let encoded = capture.state.encode().expect("encode");
+    assert_eq!(encoded["origin_node_id"], "node-under-test");
+    assert_eq!(
+        encoded["execution_id"],
+        paused_execution_id.to_string(),
+        "the capture named a run other than the one it was taken from"
+    );
+    let restored = factory
+        .decode_paused_state(std::path::PathBuf::from("/ignored"), encoded.clone())
+        .expect("decode");
+
+    // 🔴 The control face: the same capture, one value different — the machine.
+    let mut elsewhere = encoded.clone();
+    elsewhere["origin_node_id"] = serde_json::json!("node-that-holds-nothing");
+    let elsewhere = factory
+        .decode_paused_state(std::path::PathBuf::from("/ignored"), elsewhere)
+        .expect("decode");
+    let resumed_execution_id = ExecutionId::new();
+    let mut wrong = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, elsewhere.as_ref(), None)
+        .expect("build a stub");
+    wrong
+        .start()
+        .await
+        .expect_err("a capture on another machine was reopened here");
+    assert!(
+        orchestration
+            .list_live_sandboxes()
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused resume started something anyway"
+    );
+
+    let mut back = factory
+        .build_from_paused_state(sandbox_id, resumed_execution_id, restored.as_ref(), None)
+        .expect("build a stub");
+    back.start().await.expect("reopen on the node that has it");
+
+    let live = orchestration.list_live_sandboxes().await.expect("list");
+    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
+    assert_eq!(live[0].sandbox_id, sandbox_id);
+    assert_eq!(live[0].execution_id, Some(resumed_execution_id));
+    assert_ne!(
+        live[0].execution_id,
+        Some(paused_execution_id),
+        "the sandbox came back as the run it was paused under"
+    );
 }

@@ -1080,4 +1080,200 @@ mod tests {
         // case.
         assert_eq!(counts.failed, 1);
     }
+
+    /// 🔴 T-NR-57. The signal goes to the **group**, not to the one process the
+    /// plan names.
+    ///
+    /// `Action::KillGroup(pgid)` is carried out as `kill(-pgid)`, and the sign
+    /// is the whole of it. Without it the leader dies and everything else in
+    /// its group is orphaned and left running — still holding the work
+    /// directory the file sweep is about to delete, which is precisely the
+    /// "VMM running with its files gone" that the ordering in `sweep` exists to
+    /// prevent. Nothing in the counters can tell the two apart: one process was
+    /// signalled either way, and `reclaimed` reads `1` either way.
+    ///
+    /// So the blast radius is read directly: a shell that puts itself in its
+    /// own group and leaves a second process in it, which is the smallest thing
+    /// that can distinguish `kill(-pgid)` from `kill(pgid)`.
+    #[tokio::test]
+    async fn the_whole_group_goes_not_just_the_process_the_plan_names() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let fixture = Fixture::new();
+        let ours = fixture.sandbox_work_dir("agentenv-fc-Group");
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & echo $!; wait")
+            .stdout(std::process::Stdio::piped());
+        // Its own group, the way `FirecrackerInstance` spawns a VMM.
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))?;
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let leader = i32::try_from(child.id()).unwrap();
+        let follower: i32 = {
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .unwrap();
+            line.trim()
+                .parse()
+                .expect("the shell prints its background job's pid")
+        };
+        assert_ne!(follower, leader);
+        // Said out loud rather than assumed: a shell that had put its
+        // background job in a different group would make this test pass for a
+        // reason that has nothing to do with the sign.
+        assert_eq!(
+            read_pgid(&PathBuf::from(format!("/proc/{follower}"))),
+            Some(leader),
+            "the second process is not in the leader's group"
+        );
+
+        fixture
+            .proc
+            .process(leader, "firecracker", Some(&ours), leader);
+        assert_eq!(fixture.plan()[0].action, Action::KillGroup(leader));
+
+        let counts = reclaim(&fixture.paths(), Duration::from_millis(200)).await;
+        assert_eq!(counts.reclaimed, 1);
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "the group leader must have been killed rather than have exited on its own"
+        );
+
+        // 🔴 The assertion this test exists for. Read before the cleanup, so a
+        // failing run does not leave a `sleep 60` behind on the machine.
+        let follower_gone = left_the_host(follower);
+        if !follower_gone {
+            let _ = kill(Pid::from_raw(follower), Signal::SIGKILL);
+        }
+        assert!(
+            follower_gone,
+            "the second process in the group outlived the kill: only its leader was signalled"
+        );
+    }
+
+    /// 🔴 T-NR-58. A leftover the sweep may not signal as a group is still
+    /// killed, and still counted as reclaimed.
+    ///
+    /// Every guard in `plan_for_owned` narrows a group kill to one process, and
+    /// four tests above assert that it decides to. None of them reaches the
+    /// branch that carries it out — a `KillProcess` that signalled nothing, or
+    /// that counted what it signalled as anything other than a reclaim, would
+    /// leave all four green.
+    #[tokio::test]
+    async fn a_leftover_that_may_not_be_signalled_as_a_group_is_still_killed() {
+        let fixture = Fixture::new();
+        let ours = fixture.sandbox_work_dir("agentenv-fc-Alone");
+
+        // No `setpgid`, so it is in this test process's own group — which is
+        // the one group the sweep may never signal, and so the plan narrows.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        fixture
+            .proc
+            .process(pid, "firecracker", Some(&ours), getpgrp().as_raw());
+
+        assert_eq!(fixture.plan()[0].action, Action::KillProcess(pid));
+
+        let counts = reclaim(&fixture.paths(), Duration::from_millis(200)).await;
+        assert_eq!(counts.reclaimed, 1, "a narrowed kill is still a reclaim");
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "the leftover must have been killed rather than have exited on its own"
+        );
+        // As above: the forged entry cannot show a process leaving, so the wait
+        // times out and says so.
+        assert_eq!(counts.failed, 1);
+    }
+
+    /// 🔴 T-NR-59. The wait ends when the process leaves, and not before.
+    ///
+    /// This is the last thing between a `SIGKILL` and the work-directory sweep,
+    /// and both ways of getting it wrong are silent. A deadline that has
+    /// already passed when the loop starts returns on the first look and
+    /// reports every process it signalled as a failure — which vetoes the file
+    /// sweep on every node, forever, on hosts where nothing was ever wrong. A
+    /// deadline that is never reached holds startup open instead. So both
+    /// halves assert a value **and** a duration; the value alone cannot tell
+    /// "it waited and the process left" from "it gave up immediately".
+    #[tokio::test]
+    async fn the_wait_ends_when_the_process_leaves_and_not_before() {
+        let proc = FakeProc::new();
+        proc.process(5001, "firecracker", None, 5001);
+        let entry = proc.dir().join("5001");
+
+        // Present when the wait starts and gone shortly after: a wait that did
+        // not outlast its own first look cannot see this happen.
+        let leaving = entry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            std::fs::remove_dir_all(&leaving).unwrap();
+        });
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_exit(&proc.dir(), &[5001], Duration::from_secs(5)).await,
+            0,
+            "the process left, so nothing outlived its SIGKILL"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "the wait returned before the process it was waiting for had left"
+        );
+        assert!(!entry.exists());
+
+        // The other half, on the same forged `/proc`: one that never leaves is
+        // reported rather than waited on forever — and not before its deadline.
+        proc.process(5002, "firecracker", None, 5002);
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_exit(&proc.dir(), &[5002], Duration::from_millis(200)).await,
+            1,
+            "a process still in /proc after its wait is a failure, not a success"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the deadline was not waited out"
+        );
+    }
+
+    /// Whether `pid` is gone from this host's real `/proc`, waiting a bounded
+    /// moment for it to get there.
+    ///
+    /// A zombie counts as gone: the process is dead and only its exit status is
+    /// still on the host, and whether anything reaps it is not this module's
+    /// business.
+    fn left_the_host(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return true,
+                Ok(stat) => {
+                    let state = stat
+                        .rfind(')')
+                        .and_then(|end| stat[end + 1..].split_whitespace().next());
+                    if state == Some("Z") {
+                        return true;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

@@ -843,7 +843,8 @@ impl ApiImpl {
         };
 
         for (sandbox_id, registered_as) in registered {
-            let Some(superseded) = running_supersession(rows.get(&sandbox_id), &registered_as)
+            let Some(superseded) =
+                running_supersession(rows.get(&sandbox_id), &registered_as, self.paused.node_id())
             else {
                 continue;
             };
@@ -1262,9 +1263,37 @@ fn record_supersession(kind: &'static str, outcome: &'static str) {
 /// unregistered sandbox — anything created here and never resumed from the
 /// cluster — `None` means nothing at all, and reading it as "gone" would tear
 /// down a sandbox seconds after it was created.
+///
+/// # 🔴 Two identities in, deliberately never the same argument
+///
+/// Mirrors the claimant/holder split [`live_elsewhere`] already makes for the
+/// delete path (819affc) — this is the same judgement made by the periodic
+/// reap instead of by a delete, and it needs the same two values for the same
+/// reason. `registered_as` is the **holder**: the real machine
+/// `running_registrations` recorded this sandbox under (`origin_node_id` is
+/// always a holder too, since 259d0de). `claimant_node_id` is always
+/// `self.paused.node_id()` — this process's own identity — and is what a
+/// `Resuming` row's `claimed_by_node_id` must be compared against, because
+/// that field is itself always a claimant, written by `claim_for_resume`'s
+/// guard.
+///
+/// Comparing `claimed_by_node_id` against `registered_as` instead (as this
+/// function once did) types-checks — both are `&str` — but compares a Pod
+/// name against a machine name on the api half, which are never equal even
+/// when the claim is this very process's own still-unconfirmed resume: a
+/// resume sets the local copy live (and `list_sandboxes_filtered` visible to
+/// this reap) *before* `mark_running` confirms and flips the row past
+/// `Resuming`, so every reap tick that lands in that window would have read
+/// its own in-flight resume as "claimed by someone else" and deleted the
+/// sandbox it had just brought up. On `--role all` this was never observable
+/// — one process is both claimant and holder, so the two arguments were
+/// always the same string — which is exactly why a test built on a single
+/// shared constant for both axes cannot catch it; see
+/// `our_own_claim_is_not_superseded_even_when_holder_and_claimant_differ`.
 fn running_supersession(
     entry: Option<&PausedSandboxEntry>,
     registered_as: &str,
+    claimant_node_id: &str,
 ) -> Option<Superseded> {
     let Some(entry) = entry else {
         return Some(Superseded::Gone);
@@ -1279,14 +1308,16 @@ fn running_supersession(
             .then(|| Superseded::HeldBy(entry.origin_node_id.clone())),
         // Someone is bringing it up. `origin_node_id` still names the node
         // whose disk holds the artifacts — which during a takeover is us — so
-        // only the claimer answers the question.
+        // only the claimer answers the question, and the claimer is a
+        // claimant: judge it against our own claimant identity, not the
+        // holder this running copy was registered under.
         PausedRegistryState::Resuming => {
             let claimer = entry
                 .claimed_by_node_id
                 .clone()
                 .unwrap_or_else(|| entry.origin_node_id.clone());
 
-            (claimer != registered_as).then_some(Superseded::ClaimedBy(claimer))
+            (claimer != claimant_node_id).then_some(Superseded::ClaimedBy(claimer))
         }
     }
 }
@@ -1363,6 +1394,13 @@ mod tests {
 
     const SELF: &str = "node-a";
     const OTHER: &str = "node-b";
+    /// A holder identity distinct from `SELF`/`OTHER`, standing in for the
+    /// real machine on the api half — where the holder a running copy is
+    /// registered under is a machine name, structurally never equal to the
+    /// claimant identity (`self.paused.node_id()`, a Pod name) any resume
+    /// claim is taken under. Only used by `running_supersession` tests that
+    /// must tell those two axes apart.
+    const HOLDER: &str = "aenv-worker-07";
 
     /// An API built over the given registry and nothing else that touches the
     /// host: enough to drive the startup-time release and its retry.
@@ -2194,6 +2232,7 @@ mod tests {
         let superseded = running_supersession(
             Some(&entry(PausedRegistryState::Running, OTHER, None)),
             SELF,
+            SELF,
         );
 
         assert!(matches!(superseded, Some(Superseded::HeldBy(node)) if node == OTHER));
@@ -2210,7 +2249,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    running_supersession(Some(&entry(state, OTHER, None)), SELF),
+                    running_supersession(Some(&entry(state, OTHER, None)), SELF, SELF),
                     Some(Superseded::HeldBy(_))
                 ),
                 "{state:?} on another node should supersede our running copy"
@@ -2225,6 +2264,7 @@ mod tests {
         let superseded = running_supersession(
             Some(&entry(PausedRegistryState::Resuming, SELF, Some(OTHER))),
             SELF,
+            SELF,
         );
 
         assert!(matches!(superseded, Some(Superseded::ClaimedBy(node)) if node == OTHER));
@@ -2234,23 +2274,70 @@ mod tests {
     /// Firing here would tear down a healthy sandbox on every reconcile.
     #[test]
     fn our_own_running_row_is_not_superseded() {
-        assert!(
-            running_supersession(Some(&entry(PausedRegistryState::Running, SELF, None)), SELF)
-                .is_none()
-        );
+        assert!(running_supersession(
+            Some(&entry(PausedRegistryState::Running, SELF, None)),
+            SELF,
+            SELF
+        )
+        .is_none());
     }
 
     /// This node claimed it and is bringing it back up. `origin_node_id` may
     /// still name the node the artifacts came from, so judging by origin alone
     /// would have this node tear down the sandbox it is in the middle of
     /// resuming.
+    ///
+    /// `registered_as` (the holder) happens to equal the claimant here, which
+    /// is the `--role all` shape — one process is both. That coincidence is
+    /// exactly what let this comparison ship broken: see the next test for
+    /// the shape that actually catches it.
     #[test]
     fn our_own_claim_is_not_superseded() {
         assert!(running_supersession(
             Some(&entry(PausedRegistryState::Resuming, OTHER, Some(SELF))),
-            SELF
+            SELF,
+            SELF,
         )
         .is_none());
+    }
+
+    /// The api-half shape of the same case: the running copy was confirmed
+    /// under a real machine (`HOLDER`), never a Pod name, and the claim is
+    /// still judged against the claimant (`SELF`) — the two arguments are
+    /// deliberately different strings.
+    ///
+    /// 🔴 This is the test that catches the bug the doc comment on
+    /// `running_supersession` describes. A version that compared
+    /// `claimed_by_node_id` against `registered_as` (as the function did
+    /// before this test existed) reads `SELF != HOLDER` as true and answers
+    /// `Superseded::ClaimedBy(SELF)` — this node discarding the very sandbox
+    /// it just resumed, in the confirmation window before `mark_running` has
+    /// flipped the row past `Resuming`. `our_own_claim_is_not_superseded`
+    /// above cannot catch that: it uses `SELF` for both axes, which is only
+    /// ever true on `--role all`.
+    #[test]
+    fn our_own_claim_is_not_superseded_even_when_holder_and_claimant_differ() {
+        assert!(running_supersession(
+            Some(&entry(PausedRegistryState::Resuming, OTHER, Some(SELF))),
+            HOLDER,
+            SELF,
+        )
+        .is_none());
+    }
+
+    /// The mirror image: a genuinely different claimant supersedes even when
+    /// the running copy's holder is a real machine, not a Pod name — the
+    /// comparison must still be claimant-vs-claimant, not holder-vs-claimant,
+    /// in the direction that does supersede too.
+    #[test]
+    fn a_claim_by_another_node_supersedes_our_live_copy_even_when_holder_and_claimant_differ() {
+        let superseded = running_supersession(
+            Some(&entry(PausedRegistryState::Resuming, SELF, Some(OTHER))),
+            HOLDER,
+            SELF,
+        );
+
+        assert!(matches!(superseded, Some(Superseded::ClaimedBy(node)) if node == OTHER));
     }
 
     /// A row this node was confirmed the holder of, now absent: the sandbox was
@@ -2258,7 +2345,7 @@ mod tests {
     #[test]
     fn a_vanished_row_supersedes_our_live_copy() {
         assert!(matches!(
-            running_supersession(None, SELF),
+            running_supersession(None, SELF, SELF),
             Some(Superseded::Gone)
         ));
     }

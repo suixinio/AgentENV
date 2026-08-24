@@ -63,5 +63,45 @@ jobs:
       - uses: ./.github/actions/rust-ci-setup
       - name: Configure ublk test host
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
+      # 🔴 `src/orchestrator/store/`'s suite runs inside `make test-unit` —
+      # it is part of `cargo test -p agentenv --lib` — and 67 of its tests ask
+      # `redis::harness::store_for` for a real server. Without one they print
+      # `SKIPPED[redis]` to stderr, return, and are counted as passes. Nothing
+      # in this job provided a server, so on every PR the store filter reported
+      # `175 passed; 0 failed` in 0.08s where the same filter against a real
+      # server takes 2.1s, and the 67 that carry the Redis half of the store
+      # contract had never run in CI at all.
+      #
+      # Same shape as the `--lib`-only selection this target was already fixed
+      # for, and as the Go side's `SCHEDULER_REDIS_TEST_REQUIRED`: the tests
+      # were compiled on every PR and executed on none.
+      - name: Install Redis server for the metadata store tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
       - name: Unit tests
+        env:
+          # Naming the binary is what makes a failed install fail this job:
+          # the harness otherwise falls back to `redis-server` on PATH and
+          # skips when it is absent, which is the green run this step exists
+          # to end.
+          REDIS_SERVER_BIN: /usr/bin/redis-server
+          # And the belt to that brace — the same pair services-ci.yml sets for
+          # the Go binding-store tests. This turns "no server" into a panic
+          # inside the harness however it was reached, including a package that
+          # installs but will not start.
+          AENV_REDIS_TEST_REQUIRED: "1"
         run: make test-unit PROFILE=debug
+      # 🔴 The step above is what makes those 67 run; this one is what keeps
+      # them running. `test-with-redis` is the target CLAUDE.md names as the one
+      # that must be run by anything touching either metadata store, and it
+      # checks two things the environment above cannot: that `redis-server` was
+      # present *before* the suite started, and that no `SKIPPED[redis]` line
+      # reached the log by some path other than `store_for`. It re-runs 175
+      # already-built tests against an already-warm target dir in about two
+      # seconds, which is the whole cost of having the documented target be
+      # something CI actually executes.
+      - name: Metadata store tests against a real Redis
+        env:
+          REDIS_SERVER_BIN: /usr/bin/redis-server
+        run: make test-with-redis

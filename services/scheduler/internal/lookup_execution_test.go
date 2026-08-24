@@ -148,8 +148,13 @@ func TestResumingRowReportsRegistryUnderPreallocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
-	if got := resp.GetNode().GetNodeId(); got != "node-b" {
-		t.Fatalf("a resuming row must route to its claimant, got %q", got)
+	// Holder() is always origin_node_id, never the claimant
+	// (claimed_by_node_id): the claimant is an api-replica process under
+	// --role api|node and structurally never reports a heartbeat, so routing
+	// on it would always fail. See lookup_test.go's
+	// TestLookupRoutesAResumingSandboxToItsOrigin for why.
+	if got := resp.GetNode().GetNodeId(); got != "node-a" {
+		t.Fatalf("a resuming row must route to its origin, got %q", got)
 	}
 	if got := resp.GetExecutionAuthority(); got != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY {
 		t.Fatalf("authority: got %v, want REGISTRY", got)

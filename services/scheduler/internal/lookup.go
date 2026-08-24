@@ -318,10 +318,14 @@ func lookupNode(ctx context.Context, deps lookupDeps, req *schedulerv1.LookupNod
 			"", schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_PENDING), nil
 
 	case pausedregistry.StateRunning, pausedregistry.StateResuming:
-		// 🔴 Holder(), not origin_node_id. A claim leaves origin pointing at
-		// whoever still holds the local artifacts, so a resuming row read by
-		// origin would route the caller to the node the sandbox is moving away
-		// from.
+		// Holder() (== origin_node_id): the real machine, never
+		// claimed_by_node_id. A resuming row's claimed_by_node_id is the
+		// claimant — the api-replica process that called claim_for_resume —
+		// which structurally never appears in a heartbeat roster, so routing
+		// on it always 503s with "not reporting". origin_node_id is the
+		// honest answer to "where is this sandbox right now": the machine the
+		// resume started from, until mark_running repoints it at the new
+		// holder.
 		holderID := entry.Holder()
 		holder, live := deps.placer.liveNode(holderID, now)
 		if !live {

@@ -455,6 +455,23 @@ fence := decideFencing(mode, routeSource, resp)   // 唯一决策函数
 | **S7** | **做**（`RegistrySandbox` 加 `execution_id`）| 双活时唯一能按行对账的地方 |
 | **S8** | **不许变**（`NotFound` 仍然且只能表示"登记表可读且无此行"）| 平台据此授权重建工作区 |
 
+> 🔧 **修订记注（2026-08-24，`services/scheduler/internal/registry/registry.go` 的
+> `Holder()` 修复）**：**S5 的原裁决作废，不是细节调整。** S5 与上面 S4/S5 那行的
+> "不满足的后果"都写着"`resuming` 行按 `entry.Holder()` 路由到认领者（`claimed_by_node_id`）"，
+> 这个裁决的隐含前提是**认领者本身就是那台会跑 VM、会上心跳的真实机器** —— 在
+> `--role all` 单进程模型下这总是成立（调用 `claim_for_resume` 的进程和将要跑 VM 的机器是
+> 同一个）。`--role api|node` 拆分后这个前提不再成立：`claimed_by_node_id` 变成了发起决策的
+> **api 副本 Pod 名**（如 `agentenv-api-57f67787-dj9th`），它结构性地不会出现在心跳表里，也
+> 从来不是"resume 要落到哪台机器"这个问题的答案 —— 那台机器直到 `mark_running`
+> 完成之前根本无人知晓（见 `259d0de`）。`Holder()` 因此改为恒等于 `origin_node_id`：
+> resuming 期间路由到**恢复开始前的那台真实机器**，而不是一个连地址都没有的 Pod 名。
+> 这也意味着 S5 描述的"resume 窗口内正常设防、路由到认领者的新化身"这个设计目标，在
+> `--role api|node` 下**目前没有对应的实现路径**（新机器的身份要等 `mark_running` 才存在）——
+> 本次修复的范围只是让读路径不再对着一个永不存在于心跳表里的字符串报错，S5 本身要不要、
+> 怎么重新设计不在这次改动范围内，留给下一次碰到 S5 相关问题的人接着裁决。
+> 详见 `Holder()` 的 doc comment 与 `services/scheduler/internal/lookup.go` 中
+> `StateRunning, StateResuming` 分支的注释。
+
 🔴 **归属提醒**：S1/S2/S3/S6 落在 `services/scheduler/internal/store.go` / `lookup.go`，
 **不在 `_design-phase3-scheduler.md` 的范围声明（registry + PausedRegistryService）之内** ——
 它们归 scheduler-A5 那份设计，别让它掉在两份文档中间。

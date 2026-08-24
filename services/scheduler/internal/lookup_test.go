@@ -365,20 +365,59 @@ func TestLookupPinResolvesAnOriginRecordedUnderItsPodName(t *testing.T) {
 	requireLookupNode(t, resp, err, "node-a", schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED)
 }
 
-// §3.5: a resuming row is routed to its claimer, never to its origin.
+// §3.5: a resuming row is routed to its real holder (origin_node_id), never to
+// its claimant (claimed_by_node_id).
 //
-// 🔴 A claim deliberately leaves origin_node_id pointing at whoever still holds
-// the local artifacts, so reading origin here would send the caller to the node
-// the sandbox is moving away from.
-func TestLookupRoutesAResumingSandboxToItsClaimer(t *testing.T) {
+// 🔴 The claimant fixture below is deliberately Pod-name-shaped
+// ("agentenv-api-57f67787-dj9th"), the way claimed_by_node_id is actually
+// written under --role api|node: the process that calls claim_for_resume is an
+// api replica, never a machine that reports a heartbeat. This test used to use
+// "node-b" here — a string indistinguishable from a real, live node name, and
+// in fact one of the two nodes this file's fixtures register and heartbeat.
+// That fixture could never fail the way production did: production's claimant
+// is structurally absent from the discovery/heartbeat table, so routing to it
+// always 503s ("sandbox is resuming on node \"agentenv-api-...\", which is not
+// reporting"), while "node-b" is right there in lookupTestNodes and answers
+// every time. The old test therefore asserted "routes to the claimer" and
+// passed, without ever exercising the case that broke the cluster.
+//
+// See TestLookupNeverRoutesAResumingSandboxToALiveClaimant below for the
+// complementary case: even when the claimant *does* happen to be a live,
+// discoverable node, a resuming row still must not route to it.
+func TestLookupRoutesAResumingSandboxToItsOrigin(t *testing.T) {
+	const claimant = "agentenv-api-57f67787-dj9th"
+	reader := &stubRegistryReader{listing: registryRow("sbx-1", pausedregistry.StateResuming, "node-a", claimant)}
+	svc := newLookupTestService(t, missingBindingStore{}, reader, testReportTTL)
+	allNodesReady(t, svc)
+
+	resp, err := lookup(t, svc, "sbx-1")
+	// 🔴 This is the exact production failure this fixture reproduces. With
+	// the old state-branching Holder(), this call fails with FailedPrecondition
+	// ("... which is not reporting") naming the claimant, because liveNode()
+	// can never find a heartbeat for a Pod name that was never a node. A retry
+	// against production "fixed" it only because the binding had become ready
+	// by the second attempt — the claimant never became reachable.
+	requireLookupNode(t, resp, err, "node-a", schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND)
+	if got := resp.GetOriginNodeId(); got != "node-a" {
+		t.Fatalf("expected the origin to be reported alongside the holder, got %q", got)
+	}
+}
+
+// The complementary case to the test above: the claimant here happens to also
+// be a live, discoverable node — the shape every claimant had before the
+// --role api|node split, when the process calling claim_for_resume was always
+// the machine that would run the VM. Even then, a resuming row must route to
+// its origin, not its claimant: Holder() must not branch on state at all, not
+// merely "usually" dodge the claimant because it is usually unreachable.
+func TestLookupNeverRoutesAResumingSandboxToALiveClaimant(t *testing.T) {
 	reader := &stubRegistryReader{listing: registryRow("sbx-1", pausedregistry.StateResuming, "node-a", "node-b")}
 	svc := newLookupTestService(t, missingBindingStore{}, reader, testReportTTL)
 	allNodesReady(t, svc)
 
 	resp, err := lookup(t, svc, "sbx-1")
-	requireLookupNode(t, resp, err, "node-b", schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND)
-	if got := resp.GetOriginNodeId(); got != "node-a" {
-		t.Fatalf("expected the origin to be reported alongside the claimer, got %q", got)
+	requireLookupNode(t, resp, err, "node-a", schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND)
+	if got := resp.GetNode().GetNodeId(); got == "node-b" {
+		t.Fatalf("routed to the claimant (node-b) instead of the origin (node-a)")
 	}
 }
 

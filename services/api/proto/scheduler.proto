@@ -449,11 +449,17 @@ message RegistrySandbox {
   // to an operator's screen, not be flattened to UNSPECIFIED.
   string state = 3;
   int64 generation = 4;
-  // The node holding the local artifacts. A claim deliberately leaves this
-  // pointing at the previous holder, so it is not the answer to "who owns this
-  // row now" — holder_node_id is.
+  // The real machine holding the local artifacts — always the answer to "who
+  // owns this row now". A claim deliberately leaves this pointing at the
+  // previous holder until mark_running repoints it at the new one, which is
+  // the honest continuation of "where the bytes are right now", not a stale
+  // value superseded by claimed_by_node_id.
   string origin_node_id = 5;
-  // The node bringing the sandbox back up. Only set while state is resuming.
+  // The claimant bringing the sandbox back up: the identity claim_for_resume
+  // was called under (an api-replica process, not necessarily a machine that
+  // reports a heartbeat). Only set while state is resuming. This is a
+  // mutual-exclusion identity, not a routing target — see origin_node_id /
+  // holder_node_id for where the sandbox actually is.
   string claimed_by_node_id = 6;
   // Empty while publishing, and while local_only after a failed upload.
   string snapshot_id = 7;
@@ -463,8 +469,16 @@ message RegistrySandbox {
   int64 lease_expires_at_unix_ms = 10;
   // 0 means the column is NULL, which never matches a reclaim condition.
   int64 sandbox_expires_at_unix_ms = 11;
-  // The node this row makes authoritative: claimed_by_node_id when resuming,
-  // origin_node_id otherwise. Derived, not stored.
+  // The node this row makes authoritative: always origin_node_id. Derived,
+  // not stored.
+  //
+  // This used to branch on state and answer claimed_by_node_id while
+  // resuming. That read as "the claimant is who owns this now", which holds
+  // only when the claimant and the holder are the same process — true under
+  // --role all, false under --role api|node, where claimed_by_node_id is an
+  // api-replica Pod name that never appears in a heartbeat roster. See the
+  // registry.go Holder() doc comment and the design-doc revision note at
+  // docs/proposals/_design-phase3-gateway.md §5-S5.
   string holder_node_id = 12;
   // The incarnation this row is fenced against. Empty when the row's state
   // pins the column to NULL. Read-only exposure: when one sandbox turns out to
@@ -712,11 +726,14 @@ message TransitionSandboxRequest {
   // existed — an older node sends nothing here and the controller falls back
   // to node_id exactly as it did when this was one field.
   //
-  // 🔴 Not RegistrySandbox.holder_node_id below, despite the name. That one is
-  // derived and read-only — claimed_by_node_id while resuming, origin_node_id
-  // otherwise — which during a resume is the claimant, not the machine. This
-  // one is always the real machine, and only ever a write-time input. Deriving
-  // this field the way that one is derived is the exact mistake a0487f0 made.
+  // 🔴 Same name as RegistrySandbox.holder_node_id above, and now the same
+  // meaning too (origin_node_id, always the real machine) — but this one is
+  // write-only input to mark_running, while that one is a derived, read-only
+  // view of the row. RegistrySandbox.holder_node_id briefly (between
+  // a0487f0 and this comment being written) answered claimed_by_node_id
+  // while resuming instead, i.e. the claimant, not the machine; deriving a
+  // holder that way was the exact mistake a0487f0 made, now fixed. Keep the
+  // two aligned — a future divergence would repeat it.
   string holder_node_id = 11;
 }
 

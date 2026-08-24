@@ -243,8 +243,12 @@ func TestPostgresReaderListReadsEveryStateWithLeases(t *testing.T) {
 	if resuming.OriginNodeID != "node-a" {
 		t.Fatalf("expected the claim to leave origin alone, got %q", resuming.OriginNodeID)
 	}
-	if resuming.Holder() != "node-b" {
-		t.Fatalf("expected the claimer to hold a resuming row, got %q", resuming.Holder())
+	// Holder() is always origin_node_id, including here: the claimant
+	// (claimed_by_node_id, "node-b" in this seed) is a mutual-exclusion
+	// identity, not a routing target, and under --role api|node it is an
+	// api-replica process that never reports a heartbeat.
+	if resuming.Holder() != "node-a" {
+		t.Fatalf("expected the origin to hold a resuming row, got %q", resuming.Holder())
 	}
 	if resuming.SandboxExpiresAt == nil {
 		t.Fatal("expected the sandbox deadline column to be read back")
@@ -296,7 +300,7 @@ func TestPostgresReaderGet(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a hit for a seeded sandbox")
 	}
-	if sandbox.Holder() != "node-b" {
+	if sandbox.Holder() != "node-a" {
 		t.Fatalf("unexpected holder %q", sandbox.Holder())
 	}
 

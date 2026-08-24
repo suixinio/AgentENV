@@ -135,8 +135,12 @@ func TestListRegistrySandboxesReturnsRowsSortedWithDerivedHolder(t *testing.T) {
 	}
 
 	resuming := resp.GetSandboxes()[0]
-	if resuming.GetHolderNodeId() != "node-b" {
-		t.Fatalf("expected a resuming row to be held by its claimer, got %q", resuming.GetHolderNodeId())
+	// Holder() is always origin_node_id, never claimed_by_node_id: the
+	// claimant (node-b here) is a mutual-exclusion identity, not a routing
+	// target, and under --role api|node is an api-replica process that never
+	// reports a heartbeat.
+	if resuming.GetHolderNodeId() != "node-a" {
+		t.Fatalf("expected a resuming row to be held by its origin, got %q", resuming.GetHolderNodeId())
 	}
 	if resuming.GetOriginNodeId() != "node-a" {
 		t.Fatalf("expected origin to be reported unchanged, got %q", resuming.GetOriginNodeId())
@@ -171,8 +175,9 @@ func TestListRegistrySandboxesFilters(t *testing.T) {
 		t.Fatalf("unexpected rows for the state filter: %v", byState.GetSandboxes())
 	}
 
-	// The node filter matches the holder, so a resuming row belongs to its
-	// claimer and not to the node that still has the artifacts.
+	// The node filter matches the holder (origin_node_id), so a resuming row
+	// (s1, origin node-a, claimant node-b) belongs to the node that still has
+	// the artifacts, not to its claimant — filtering by node-b must miss it.
 	byNode, err := svc.ListRegistrySandboxes(ctx, &schedulerv1.ListRegistrySandboxesRequest{NodeId: "node-b"})
 	if err != nil {
 		t.Fatalf("list by node failed: %v", err)
@@ -181,7 +186,7 @@ func TestListRegistrySandboxesFilters(t *testing.T) {
 	for _, sandbox := range byNode.GetSandboxes() {
 		ids = append(ids, sandbox.GetSandboxId())
 	}
-	if len(ids) != 2 || ids[0] != "s1" || ids[1] != "s2" {
+	if len(ids) != 1 || ids[0] != "s2" {
 		t.Fatalf("unexpected rows for the node filter: %v", ids)
 	}
 }

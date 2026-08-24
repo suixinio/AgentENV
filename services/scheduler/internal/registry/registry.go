@@ -104,17 +104,21 @@ type Sandbox struct {
 	ExecutionStartedAt *time.Time
 }
 
-// Holder returns the node this row makes authoritative for the sandbox.
+// Holder returns the node this row makes authoritative for the sandbox: the
+// real machine running (or, mid-resume, about to run) it. This is always
+// origin_node_id.
 //
-// Only a resuming row is held by its claimer; every other state is held by
-// origin_node_id. A claim deliberately leaves origin_node_id pointing at
-// whoever still has the local artifacts, so comparing origin_node_id against a
-// heartbeat roster gives the wrong answer for exactly the rows that are moving
-// between nodes.
+// It used to branch on state and return claimed_by_node_id while resuming.
+// That was wrong: claimed_by_node_id is the *claimant* — the identity
+// claim_for_resume was called under, an api-replica process, not a machine
+// that reports a heartbeat — while origin_node_id is written by mark_running
+// as the real *holder* machine (see 259d0de) and, mid-resume, is the honest
+// continuation of "where the bytes are right now": the machine the resume
+// started from, before the new holder confirms via mark_running. Routing (and
+// any comparison against a heartbeat/node roster) needs the holder, never the
+// claimant — see the design-doc revision note at
+// docs/proposals/_design-phase3-gateway.md §5-S5 for how this drifted.
 func (s Sandbox) Holder() string {
-	if s.State == StateResuming && s.ClaimedByNodeID != "" {
-		return s.ClaimedByNodeID
-	}
 	return s.OriginNodeID
 }
 

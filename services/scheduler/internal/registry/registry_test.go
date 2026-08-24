@@ -10,7 +10,26 @@ import (
 
 func timePtr(t time.Time) *time.Time { return &t }
 
-func TestHolderPrefersClaimerOnlyWhileResuming(t *testing.T) {
+// TestHolderIsAlwaysOriginNeverTheClaimant pins Holder() to origin_node_id in
+// every one of the five states, including resuming with a claimant set.
+//
+// 🔴 This used to branch: resuming with a non-empty claimed_by_node_id
+// answered the claimant, on the theory that a claim's origin_node_id "still
+// names whoever holds the local artifacts" and so is "the wrong answer for
+// exactly the rows that are moving" — true under --role all, where the
+// process that calls claim_for_resume is the same machine that will run the
+// VM, so the claimant is a legitimate routing target. Under --role api|node
+// the claimant is an api-replica process (a Pod name, e.g.
+// "agentenv-api-57f67787-dj9th") that structurally never reports a heartbeat,
+// so routing to it always fails; origin_node_id, meanwhile, is the honest
+// continuation of "where the bytes are right now" until mark_running repoints
+// it at the new holder. The resuming/claimer case below is deliberately given
+// a Pod-name-shaped claimant, not another origin-shaped string, so a
+// regression back to the old branch cannot pass by accident with a
+// same-shaped fixture.
+func TestHolderIsAlwaysOriginNeverTheClaimant(t *testing.T) {
+	const claimant = "agentenv-api-57f67787-dj9th"
+
 	cases := []struct {
 		name    string
 		sandbox Sandbox
@@ -18,36 +37,33 @@ func TestHolderPrefersClaimerOnlyWhileResuming(t *testing.T) {
 	}{
 		{
 			name:    "running is held by its origin",
-			sandbox: Sandbox{State: StateRunning, OriginNodeID: "node-a", ClaimedByNodeID: "node-b"},
-			want:    "node-a",
+			sandbox: Sandbox{State: StateRunning, OriginNodeID: "aenv-master-01", ClaimedByNodeID: claimant},
+			want:    "aenv-master-01",
 		},
 		{
-			// The claim deliberately leaves origin_node_id pointing at the node
-			// that still holds the local artifacts, so origin is the wrong
-			// answer for exactly the rows that are moving.
-			name:    "resuming is held by its claimer",
-			sandbox: Sandbox{State: StateResuming, OriginNodeID: "node-a", ClaimedByNodeID: "node-b"},
-			want:    "node-b",
+			name:    "resuming with a claimant is still held by its origin, not the claimant",
+			sandbox: Sandbox{State: StateResuming, OriginNodeID: "aenv-master-01", ClaimedByNodeID: claimant},
+			want:    "aenv-master-01",
 		},
 		{
-			name:    "resuming without a claimer falls back to origin",
-			sandbox: Sandbox{State: StateResuming, OriginNodeID: "node-a"},
-			want:    "node-a",
+			name:    "resuming without a claimant is held by its origin",
+			sandbox: Sandbox{State: StateResuming, OriginNodeID: "aenv-master-01"},
+			want:    "aenv-master-01",
 		},
 		{
 			name:    "paused is held by its origin",
-			sandbox: Sandbox{State: StatePaused, OriginNodeID: "node-a"},
-			want:    "node-a",
+			sandbox: Sandbox{State: StatePaused, OriginNodeID: "aenv-master-01"},
+			want:    "aenv-master-01",
 		},
 		{
 			name:    "local_only is held by its origin",
-			sandbox: Sandbox{State: StateLocalOnly, OriginNodeID: "node-a"},
-			want:    "node-a",
+			sandbox: Sandbox{State: StateLocalOnly, OriginNodeID: "aenv-master-01"},
+			want:    "aenv-master-01",
 		},
 		{
 			name:    "publishing is held by its origin",
-			sandbox: Sandbox{State: StatePublishing, OriginNodeID: "node-a"},
-			want:    "node-a",
+			sandbox: Sandbox{State: StatePublishing, OriginNodeID: "aenv-master-01"},
+			want:    "aenv-master-01",
 		},
 	}
 
@@ -55,6 +71,12 @@ func TestHolderPrefersClaimerOnlyWhileResuming(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.sandbox.Holder(); got != tc.want {
 				t.Fatalf("expected holder %q, got %q", tc.want, got)
+			}
+			// 🔴 The negative half: never the claimant, in the one state where
+			// the old code could return it.
+			if got := tc.sandbox.Holder(); tc.sandbox.ClaimedByNodeID != "" && got == tc.sandbox.ClaimedByNodeID {
+				t.Fatalf("Holder() returned the claimant %q — routing this would always fail, "+
+					"the claimant never reports a heartbeat", got)
 			}
 		})
 	}

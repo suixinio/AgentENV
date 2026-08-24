@@ -203,12 +203,14 @@ func TestReconcileTakeoverIsStaleCopyNotConflict(t *testing.T) {
 	if result.holderConflict != 0 {
 		t.Fatalf("expected an attributable takeover not to count as a conflict, got %d", result.holderConflict)
 	}
-	// node-a is the losing side because the row is held by its claimer.
-	if got := result.staleCopy["node-a"]; got != 1 {
-		t.Fatalf("expected 1 stale copy on node-a, got %d", got)
+	// node-b is the losing side: Holder() is always origin_node_id, so the row
+	// is attributed to node-a (the origin) even while it is resuming, never to
+	// node-b (the claimant in claimed_by_node_id).
+	if got := result.staleCopy["node-a"]; got != 0 {
+		t.Fatalf("expected no stale copy on node-a, got %d", got)
 	}
-	if got := result.staleCopy["node-b"]; got != 0 {
-		t.Fatalf("expected no stale copy on node-b, got %d", got)
+	if got := result.staleCopy["node-b"]; got != 1 {
+		t.Fatalf("expected 1 stale copy on node-b, got %d", got)
 	}
 }
 
@@ -541,9 +543,12 @@ func TestReconcileCountsRowsHeldByNodesWithNoRoster(t *testing.T) {
 		{SandboxID: "s2", State: pausedregistry.StateLocalOnly, OriginNodeID: "node-gone", SnapshotID: "snap", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, time.Hour)},
 		// Held by a node that is still here and reporting.
 		{SandboxID: "s3", State: pausedregistry.StateRunning, OriginNodeID: "node-a", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, time.Hour)},
-		// A resuming row is held by its claimer, so it is the claimer's silence
-		// that matters here, not the origin's.
-		{SandboxID: "s4", State: pausedregistry.StateResuming, OriginNodeID: "node-a", ClaimedByNodeID: "node-quiet", SnapshotID: "snap", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Holder() is always origin_node_id, so it is the origin's silence
+		// that matters here, never the claimant's — the claimant (node-a) is
+		// deliberately the fresh one below, so a reversion back to Holder()
+		// preferring the claimant while resuming would read this as "fresh"
+		// and miss it.
+		{SandboxID: "s4", State: pausedregistry.StateResuming, OriginNodeID: "node-quiet", ClaimedByNodeID: "node-a", SnapshotID: "snap", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, time.Hour)},
 	}
 	f.roster("node-a", time.Second, "s3")
 	// Still in discovery, but long past the freshness window.
@@ -555,7 +560,7 @@ func TestReconcileCountsRowsHeldByNodesWithNoRoster(t *testing.T) {
 		t.Fatalf("expected both of the departed node's rows to be counted, got %d", got)
 	}
 	if got := result.rowsWithoutRoster["node-quiet"]; got != 1 {
-		t.Fatalf("expected the resuming row to be counted against its claimer, got %d", got)
+		t.Fatalf("expected the resuming row to be counted against its origin, got %d", got)
 	}
 	// A node that is reporting is seeded at zero rather than left out, so the
 	// series exists before anything goes wrong.

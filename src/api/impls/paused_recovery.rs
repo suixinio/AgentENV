@@ -195,11 +195,28 @@ impl ApiImpl {
         // whenever the answer comes back.
         self.paused.note_taking_sandbox_live().await;
 
-        let node_id = self.paused.node_id();
+        // 🔴 The machine this resume will actually run on, when that is already
+        // knowable — and it is, whenever this process still holds a local
+        // record naming where the capture is: `RemoteSandboxStub::reopen`
+        // refuses to land anywhere but that machine, so the claim can name it
+        // before the work even starts rather than only after `mark_running`
+        // learns it. A cross-node rebuild has no such record yet — nothing has
+        // placed it — and falls back to this process's own identity, exactly
+        // as `mark_running` does once placement resolves the value it could
+        // not have here. See `Orchestrator::paused_origin_node_id` for why
+        // that fallback, not an error, is the right answer for a claim the
+        // cluster still has to grant regardless.
+        let self_id = self.paused.node_id();
+        let claimant = self
+            .orchestrator
+            .paused_origin_node_id(&sandbox_id)
+            .await
+            .unwrap_or_else(|| self_id.to_string());
+
         let claim = match self
             .paused
             .registry()
-            .claim_for_resume(&sandbox_id, node_id, proposed)
+            .claim_for_resume(&sandbox_id, &claimant, proposed)
             .await
         {
             Ok(claim) => claim,
@@ -221,7 +238,12 @@ impl ApiImpl {
             }
         };
 
-        arbitration(claim, node_id, proposed)
+        // 🔴 The same identity the claim was just taken under, not
+        // `self.paused.node_id()` again: an answer naming *this claim's own
+        // claimant* is not a refusal (see `arbitration`'s doc), and the two
+        // have to agree or a node resuming its own sandbox — the case that
+        // matters most here — would read its own claim as somebody else's.
+        arbitration(claim, &claimant, proposed)
     }
 
     /// Returns a claim after the resume it was taken for failed.
@@ -488,11 +510,21 @@ impl ApiImpl {
             .await
         {
             Ok(metadata) => {
-                // The sandbox lives here now. Repointing the row is what tells
-                // its former node that its copy is stale, and keeps the
-                // snapshot around as this sandbox's durable fallback.
+                // The sandbox is live again, wherever the rebuild actually
+                // placed it. Repointing the row is what tells its former node
+                // that its copy is stale, and keeps the snapshot around as
+                // this sandbox's durable fallback.
+                let holding_node_id = self
+                    .orchestrator()
+                    .sandbox_holding_node_id(&sandbox_id)
+                    .await;
                 self.paused
-                    .mark_sandbox_running(sandbox_id, metadata.execution_id, metadata.expires_at)
+                    .mark_sandbox_running(
+                        sandbox_id,
+                        metadata.execution_id,
+                        metadata.expires_at,
+                        holding_node_id,
+                    )
                     .await;
 
                 CrossNodeResume::Restored(Box::new(metadata))
@@ -1312,8 +1344,8 @@ mod tests {
     use crate::identity::NodeIdentity;
     use crate::image::ImageResolver;
     use crate::orchestrator::{
-        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
-        Orchestrator, PausedSandboxRegistry,
+        DisabledPausedSandboxRegistry, DisabledSandboxPersister, FileBackedSandboxPersister,
+        InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
     use crate::role::ServerRole;
     use crate::sandbox::FirecrackerSandboxFactory;
@@ -1412,6 +1444,289 @@ mod tests {
         }
 
         sandbox_id
+    }
+
+    /// A metadata store that can answer `paused_handle` with `Remote` for one
+    /// chosen sandbox, the way a store shared across api replicas does — by
+    /// reference, not by handle — without needing a real capture behind it:
+    /// `arbitrate_resume` only ever asks which machine the row names.
+    ///
+    /// Delegates everything else to an ordinary in-memory store, which cannot
+    /// produce `Remote` on its own — `SandboxMetadata::paused_state` is
+    /// `#[serde(skip)]`, but this store keeps records as live Rust values
+    /// rather than round-tripping them, so nothing ever strips the handle. A
+    /// store that could produce `Remote` honestly needs the same delegation
+    /// `SerialisingStore` (`orchestrator::tests`) uses for the same reason;
+    /// this one is a narrower, single-purpose copy local to this module, since
+    /// that one is private to its own.
+    struct RemoteOriginStore {
+        inner: InMemoryMetadataStore,
+        remote: std::sync::Mutex<Option<(SandboxId, Option<String>)>>,
+    }
+
+    impl RemoteOriginStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryMetadataStore::new(),
+                remote: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// Makes `paused_handle(sandbox_id)` answer `Remote { origin_node_id, .. }`.
+        fn name_remote_origin(&self, sandbox_id: SandboxId, origin_node_id: Option<&str>) {
+            *self.remote.lock().unwrap() = Some((sandbox_id, origin_node_id.map(str::to_string)));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::orchestrator::MetadataStore for RemoteOriginStore {
+        async fn add(
+            &self,
+            metadata: SandboxMetadata,
+        ) -> std::result::Result<(), crate::orchestrator::StoreError> {
+            self.inner.add(metadata).await
+        }
+
+        async fn update(
+            &self,
+            metadata: SandboxMetadata,
+        ) -> std::result::Result<(), crate::orchestrator::StoreError> {
+            self.inner.update(metadata).await
+        }
+
+        async fn update_state_if_state(
+            &self,
+            sandbox_id: &SandboxId,
+            new_state: crate::orchestrator::SandboxState,
+            expected_states: &[crate::orchestrator::SandboxState],
+        ) -> std::result::Result<crate::orchestrator::SandboxState, crate::orchestrator::StoreError>
+        {
+            self.inner
+                .update_state_if_state(sandbox_id, new_state, expected_states)
+                .await
+        }
+
+        async fn update_if_state<F>(
+            &self,
+            sandbox_id: &SandboxId,
+            expected_states: &[crate::orchestrator::SandboxState],
+            update: F,
+        ) -> std::result::Result<
+            crate::orchestrator::MetadataUpdateResult,
+            crate::orchestrator::StoreError,
+        >
+        where
+            F: FnOnce(&mut SandboxMetadata) + Send,
+        {
+            self.inner
+                .update_if_state(sandbox_id, expected_states, update)
+                .await
+        }
+
+        async fn get(
+            &self,
+            sandbox_id: &SandboxId,
+        ) -> std::result::Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn remove(
+            &self,
+            sandbox_id: &SandboxId,
+        ) -> std::result::Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
+            self.inner.remove(sandbox_id).await
+        }
+
+        async fn remove_if_execution(
+            &self,
+            sandbox_id: &SandboxId,
+            expected_execution_id: crate::types::ExecutionId,
+            expected_states: &[crate::orchestrator::SandboxState],
+        ) -> std::result::Result<crate::orchestrator::FencedRemoval, crate::orchestrator::StoreError>
+        {
+            self.inner
+                .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+                .await
+        }
+
+        async fn list(
+            &self,
+        ) -> std::result::Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
+            self.inner.list().await
+        }
+
+        async fn list_with_callback<F>(
+            &self,
+            callback: F,
+        ) -> std::result::Result<(), crate::orchestrator::StoreError>
+        where
+            F: FnMut(&SandboxMetadata) + Send,
+        {
+            self.inner.list_with_callback(callback).await
+        }
+
+        async fn list_filtered(
+            &self,
+            filter: crate::orchestrator::SandboxListFilter,
+        ) -> std::result::Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
+            self.inner.list_filtered(filter).await
+        }
+
+        async fn list_expired(
+            &self,
+            now: std::time::SystemTime,
+        ) -> std::result::Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
+            self.inner.list_expired(now).await
+        }
+
+        async fn list_ids(
+            &self,
+        ) -> std::result::Result<Vec<SandboxId>, crate::orchestrator::StoreError> {
+            self.inner.list_ids().await
+        }
+
+        async fn wait_while_in_states(
+            &self,
+            sandbox_id: &SandboxId,
+            transitional_states: &[crate::orchestrator::SandboxState],
+        ) -> std::result::Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
+            self.inner
+                .wait_while_in_states(sandbox_id, transitional_states)
+                .await
+        }
+
+        async fn paused_handle(
+            &self,
+            sandbox_id: &SandboxId,
+        ) -> std::result::Result<crate::orchestrator::PausedHandle, crate::orchestrator::StoreError>
+        {
+            if let Some((remote_id, origin_node_id)) = self.remote.lock().unwrap().clone() {
+                if remote_id == *sandbox_id {
+                    return Ok(crate::orchestrator::PausedHandle::Remote {
+                        reference: crate::orchestrator::PausedStateRef {
+                            artifact_root: None,
+                            state: serde_json::Value::Null,
+                        },
+                        origin_node_id,
+                    });
+                }
+            }
+
+            Ok(crate::orchestrator::PausedHandle::NotPaused)
+        }
+    }
+
+    /// An API over a store that can name a sandbox's real origin before any
+    /// resume of it has been attempted, and a registry that records the
+    /// identity every claim was taken under.
+    async fn api_with_remote_origin(
+        store: RemoteOriginStore,
+        registry: Arc<CountingRegistry>,
+    ) -> Arc<ApiImpl> {
+        let orchestrator = Orchestrator::new(
+            ServerRole::Api,
+            store,
+            FirecrackerSandboxFactory::new(),
+            DisabledSandboxPersister,
+        )
+        .await
+        .unwrap();
+        let snapshot_manager = Arc::new(mock_snapshot_manager());
+
+        Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                registry,
+                snapshot_manager,
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+            ServerRole::Api,
+            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+        ))
+    }
+
+    /// 🔴 The claim `arbitrate_resume` takes has to name the machine this
+    /// resume will actually run on, when that machine is already on record —
+    /// not this replica's own identity. On the api half "this replica" is a
+    /// Pod that never heartbeats as a node, and a claim naming it pins the
+    /// `resuming` row to an identity the scheduler can never resolve for as
+    /// long as the resume takes.
+    ///
+    /// 🔴 What pins this: reverting the claimant back to `self.paused.node_id()`
+    /// compiles, and every other test in this file still passes — they never
+    /// seed a store that can answer `Remote`. Only this test, and the ones
+    /// paired with it below, would notice.
+    #[tokio::test]
+    async fn a_claim_names_the_machine_the_capture_already_points_at() {
+        let store = RemoteOriginStore::new();
+        let sandbox_id = SandboxId::new();
+        store.name_remote_origin(sandbox_id, Some("node-203"));
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
+
+        api.arbitrate_resume(sandbox_id).await;
+
+        assert_eq!(
+            registry.claimed_as(),
+            vec!["node-203".to_string()],
+            "the claim must name the machine the capture already points at"
+        );
+        assert_ne!(
+            registry.claimed_as(),
+            vec![api.paused.node_id().to_string()],
+            "this replica's own identity is not a machine the scheduler can ever resolve"
+        );
+    }
+
+    /// The control for the test above: a sandbox this store has never heard of
+    /// has no machine to name yet, and the claim falls back to this process's
+    /// own identity — exactly today's behaviour, unchanged.
+    #[tokio::test]
+    async fn a_claim_with_no_known_origin_falls_back_to_this_process() {
+        let store = RemoteOriginStore::new();
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
+
+        api.arbitrate_resume(sandbox_id).await;
+
+        assert_eq!(
+            registry.claimed_as(),
+            vec![api.paused.node_id().to_string()]
+        );
+    }
+
+    /// 🔴 The claimant written to the registry and the identity `arbitration`
+    /// checks the registry's answer against have to be the *same* value, or a
+    /// node resuming its own claim reads its own answer as somebody else's.
+    ///
+    /// `NotFound` — what the two tests above exercise — never reaches that
+    /// comparison; only `Conflict`/`NotReady` do, which is why this test
+    /// configures the registry to answer with one, naming the same machine the
+    /// store already pointed the claim at. If `arbitrate_resume` claimed under
+    /// that machine but then compared the answer against this replica's own
+    /// identity instead, "node-203 == node-203" would read as
+    /// "node-203 == api-replica-1" — false — and a node resuming a sandbox its
+    /// own earlier claim already owns would refuse itself as `Blocked`.
+    #[tokio::test]
+    async fn the_claim_and_the_answer_are_checked_against_the_same_identity() {
+        let store = RemoteOriginStore::new();
+        let sandbox_id = SandboxId::new();
+        store.name_remote_origin(sandbox_id, Some("node-203"));
+        let registry = Arc::new(CountingRegistry::answering_conflict("node-203"));
+        let api = api_with_remote_origin(store, Arc::clone(&registry)).await;
+
+        let arbitration = api.arbitrate_resume(sandbox_id).await;
+
+        assert!(
+            matches!(arbitration, ResumeArbitration::Proceed(_)),
+            "a conflict naming the same machine the claim was just taken under is not a refusal"
+        );
     }
 
     /// 🔴 The narrow case, and the only one that changes. A copy this node

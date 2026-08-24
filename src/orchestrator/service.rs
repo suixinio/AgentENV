@@ -1554,6 +1554,56 @@ where
             .map_err(OrchestratorError::from)
     }
 
+    /// The real machine a paused sandbox will reopen on, when that machine is
+    /// already knowable — before anything has tried to resume it.
+    ///
+    /// # 🔴 What this exists for
+    ///
+    /// A cross-node resume claim has to name a claimant before it knows where
+    /// the resume will land, and on the api half "where" is not this process:
+    /// this process only decides, it never runs a VM. For a sandbox whose
+    /// capture this store still points at a specific machine, though, the
+    /// answer is not a guess — [`RemoteSandboxStub::reopen`] refuses to land
+    /// anywhere but that machine — so the claim can name it up front instead
+    /// of quoting this process's own identity and leaving the row briefly
+    /// wrong. See `mark_running`'s sibling fix for the other half of the same
+    /// question, asked after placement instead of before it.
+    ///
+    /// # 🔴 Why `paused_handle`, not `SandboxMetadata::paused_state`
+    ///
+    /// That field is `#[serde(skip)]` and comes back `None` from any store
+    /// that serialises a record and reads it back in — which on the api half
+    /// is every store, since replicas share state through one. Reading `None`
+    /// as "not paused here" would make this always fall back, silently
+    /// reintroducing the bug this method exists to close. `paused_handle` is
+    /// the question with the answers this needs: see its own doc for the
+    /// three-way split.
+    ///
+    /// `None` covers every case that is not "a remote record names a
+    /// machine" — no record, a local record (this process already knows the
+    /// answer, itself), a remote record with no machine attached, and a store
+    /// that could not be read. Callers must fall back to their own identity
+    /// for all of those, exactly as this call's own caller does.
+    pub async fn paused_origin_node_id(&self, sandbox_id: &SandboxId) -> Option<String> {
+        match self.store.paused_handle(sandbox_id).await {
+            Ok(PausedHandle::Remote { origin_node_id, .. }) => origin_node_id,
+            _ => None,
+        }
+    }
+
+    /// The real machine currently running `sandbox_id`, straight from the
+    /// live backend.
+    ///
+    /// `None` on a backend that runs the VM in this same process — which is
+    /// the correct, common answer everywhere but the api half — and on a
+    /// sandbox this process holds no handle for at all. See
+    /// [`SandboxBackend::holding_node_id`] for the convention this reads.
+    pub async fn sandbox_holding_node_id(&self, sandbox_id: &SandboxId) -> Option<String> {
+        let handle = self.sandboxes.read().await.get(sandbox_id).cloned()?;
+        let sandbox = handle.lock().await;
+        sandbox.holding_node_id().map(str::to_string)
+    }
+
     /// Drops this node's local copy of a paused sandbox, leaving the sandbox
     /// itself alone.
     ///
@@ -2245,7 +2295,7 @@ where
                 metadata.execution_id,
                 metadata.resources,
             );
-            // Tell the cluster the sandbox is live here. Its snapshot stays
+            // Tell the cluster the sandbox is live again. Its snapshot stays
             // behind as the sandbox's durable fallback until the next pause
             // replaces it.
             if let Some(publisher) = self.paused_publisher() {
@@ -2256,8 +2306,21 @@ where
                 // 🔴 The incarnation the claim allocated, not a fresh one.
                 // The registry's cross-node branch matches on exactly this
                 // value, so minting here would fail every cross-node resume.
+                //
+                // 🔴 The real machine, read off the backend `launch_sandbox`
+                // just started, not this process's own identity. `None` on
+                // every backend that runs the VM in this same process — the
+                // publisher falls back to its own identity for exactly that
+                // case, mirroring `publish_paused`'s identical fallback for
+                // the paused half of the same question.
+                let holding_node_id = self.sandbox_holding_node_id(&sandbox_id).await;
                 publisher
-                    .mark_running(sandbox_id, resumed_execution_id, metadata.expires_at)
+                    .mark_running(
+                        sandbox_id,
+                        resumed_execution_id,
+                        metadata.expires_at,
+                        holding_node_id,
+                    )
                     .await;
             }
         }

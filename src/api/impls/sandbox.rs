@@ -922,11 +922,18 @@ impl Sandboxes<()> for ApiImpl {
                 // sandbox already running, and a claim nobody confirms sits in
                 // `resuming` until its lease lapses.
                 if connect_held.is_some() {
+                    // The machine the resume actually landed on, not this
+                    // process's own identity.
+                    let holding_node_id = self
+                        .orchestrator()
+                        .sandbox_holding_node_id(&sandbox_id)
+                        .await;
                     self.paused
                         .mark_sandbox_running(
                             sandbox_id,
                             resumed_metadata.execution_id,
                             resumed_metadata.expires_at,
+                            holding_node_id,
                         )
                         .await;
                 }
@@ -1548,11 +1555,18 @@ impl Sandboxes<()> for ApiImpl {
                 // again here is idempotent and keeps a claim from sitting in
                 // `resuming` until its lease lapses.
                 if held.is_some() {
+                    // The machine the resume actually landed on, not this
+                    // process's own identity.
+                    let holding_node_id = self
+                        .orchestrator()
+                        .sandbox_holding_node_id(&sandbox_id)
+                        .await;
                     self.paused
                         .mark_sandbox_running(
                             sandbox_id,
                             metadata.execution_id,
                             metadata.expires_at,
+                            holding_node_id,
                         )
                         .await;
                 }

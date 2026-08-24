@@ -6164,9 +6164,10 @@ fn disabled_registry_is_not_cluster_backed() {
 /// a pause reached it without standing up a registry.
 struct RecordingPublisher {
     published: StdMutex<Vec<(SandboxId, ExecutionId)>>,
-    /// Both halves of the write, because "which sandbox" and "which run of it"
-    /// are separate facts and only the second one can be got wrong.
-    marked_running: StdMutex<Vec<(SandboxId, ExecutionId)>>,
+    /// All three facts of the write: "which sandbox", "which run of it", and
+    /// "which machine reported it live" — the third being the one
+    /// `resume_sandbox_inner` has to read off the backend rather than assume.
+    marked_running: StdMutex<Vec<(SandboxId, ExecutionId, Option<String>)>>,
     forgotten: StdMutex<Vec<SandboxId>>,
     /// What this publisher answers when asked whether it would commit a
     /// publishable capture. Defaults to yes, matching every cluster-backed
@@ -6188,7 +6189,7 @@ impl RecordingPublisher {
             .collect()
     }
 
-    fn marked_running(&self) -> Vec<(SandboxId, ExecutionId)> {
+    fn marked_running(&self) -> Vec<(SandboxId, ExecutionId, Option<String>)> {
         self.marked_running.lock().unwrap().clone()
     }
 
@@ -6197,7 +6198,7 @@ impl RecordingPublisher {
             .lock()
             .unwrap()
             .iter()
-            .map(|(sandbox_id, _)| *sandbox_id)
+            .map(|(sandbox_id, ..)| *sandbox_id)
             .collect()
     }
 
@@ -6241,11 +6242,12 @@ impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         _expires_at: Option<std::time::SystemTime>,
+        holding_node_id: Option<String>,
     ) {
         self.marked_running
             .lock()
             .unwrap()
-            .push((sandbox_id, execution_id));
+            .push((sandbox_id, execution_id, holding_node_id));
     }
 
     async fn forget(&self, sandbox_id: SandboxId) {
@@ -6768,7 +6770,61 @@ async fn a_resume_reports_the_execution_it_actually_started() -> Result<()> {
     assert_ne!(started, before);
 
     let reported = publisher.marked_running();
-    assert_eq!(reported, vec![(created.id, allocated)]);
+    assert_eq!(
+        reported,
+        vec![(created.id, allocated, None)],
+        "a mock backend runs in this process, so it has no machine of its own to report — \
+         `None` is what this process's own identity fills in for"
+    );
+
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+/// T-A1-6b. The sibling of the test above: when the backend that just started
+/// *does* know which machine it is running on — the way `RemoteSandboxStub`
+/// does once it has been placed — `mark_running` has to be told, not left to
+/// assume this process is the answer.
+///
+/// 🔴 What this pins: `resume_sandbox_inner` reading
+/// `sandbox_holding_node_id` off the live handle it just started, rather than
+/// leaving the fourth argument `None` and letting `mark_sandbox_running`'s own
+/// fallback quietly supply this process's identity instead. Revert that read
+/// and this is the one test in the file that notices — everything else here
+/// runs on a backend that has nothing to report either way.
+#[tokio::test]
+async fn a_resume_on_a_named_machine_reports_that_machine_not_this_process() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let publisher = Arc::new(RecordingPublisher::default());
+    orchestrator.set_paused_publisher(
+        Arc::clone(&publisher) as Arc<dyn crate::orchestrator::PausedSandboxPublisher>
+    );
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    // From here on, every backend this factory builds answers as though it
+    // were placed on `node-203` — the way `RemoteSandboxStub` does once a
+    // resume has actually landed somewhere.
+    behavior.set_holding_node_id(Some("node-203"));
+
+    let claimed = test_claim();
+    let allocated = claimed.execution_id();
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting, claimed)
+        .await?;
+
+    assert_eq!(
+        publisher.marked_running(),
+        vec![(created.id, allocated, Some("node-203".to_string()))],
+        "the report must name the machine the backend says it is running on, not this process"
+    );
 
     orchestrator.delete_sandbox(created.id).await?;
     Ok(())
@@ -7412,6 +7468,42 @@ async fn a_resume_reopens_the_capture_the_store_kept_rather_than_the_field_serde
         ],
         "the second resume reopened the first sandbox's capture"
     );
+    Ok(())
+}
+
+/// 🔴 `paused_origin_node_id` exists for exactly this store shape: a resume
+/// claim has to name the machine it will land on *before* it starts, and on
+/// the api half `SandboxMetadata::paused_state` cannot answer that — it is
+/// `#[serde(skip)]`, so a serialising store like this one always hands it back
+/// `None`. `paused_handle`'s `Remote` variant is the question asked the way
+/// this store can actually answer it, and this is the one test that would
+/// notice a caller going back to reading the field serde drops.
+#[tokio::test]
+async fn paused_origin_node_id_reads_the_reference_a_serialising_store_kept() -> anyhow::Result<()>
+{
+    setup();
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        SerialisingStore::new(Some("node-that-has-the-bytes")),
+        DecodeRecordingFactory::new(),
+    );
+
+    let alpha = paused_with_capture(&orchestrator, "alpha").await?;
+
+    assert_eq!(
+        orchestrator.paused_origin_node_id(&alpha).await,
+        Some("node-that-has-the-bytes".to_string()),
+        "a claim taken before this resume starts must be able to name the machine \
+         `RemoteSandboxStub::reopen` will insist on later"
+    );
+
+    // The control: a sandbox with no record at all has no machine to name,
+    // and the answer must say so rather than fail or invent one.
+    assert_eq!(
+        orchestrator.paused_origin_node_id(&SandboxId::new()).await,
+        None,
+        "an untracked sandbox has no origin to report"
+    );
+
     Ok(())
 }
 

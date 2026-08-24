@@ -264,6 +264,12 @@ orchestration_surface! {
         fn paused_record_cluster_registration(
             sandbox_id: SandboxId,
         ) -> Result<ClusterRegistration>;
+        /// The real machine a paused sandbox will reopen on, when that is
+        /// already knowable — before anything has tried to resume it.
+        fn paused_origin_node_id(sandbox_id: &SandboxId) -> Option<String>;
+        /// The real machine currently running a sandbox, straight from its
+        /// live backend.
+        fn sandbox_holding_node_id(sandbox_id: &SandboxId) -> Option<String>;
         /// Runtime counters and derived resource totals, sampled now.
         fn metrics_snapshot() -> Result<OrchestratorMetrics>;
 

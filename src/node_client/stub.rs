@@ -1095,6 +1095,21 @@ impl SandboxBackend for RemoteSandboxStub {
         RuntimeArtifactSet::empty()
     }
 
+    /// The node this stub is actually driving.
+    ///
+    /// 🔴 `self.placed`, not `self.placement` or anything derived from this
+    /// process's own identity: this backend's entire reason to exist is that
+    /// the sandbox runs somewhere else, and once `start`/`reopen` have
+    /// answered, that somewhere is exactly `placed.node.node_id`. `None` before
+    /// placement — a backend nobody has started yet has no machine to name —
+    /// which callers must not read as "runs locally": the default this
+    /// overrides means that, this override never does.
+    fn holding_node_id(&self) -> Option<&str> {
+        self.placed
+            .as_ref()
+            .map(|placed| placed.node.node_id.as_str())
+    }
+
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;

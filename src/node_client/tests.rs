@@ -386,9 +386,18 @@ async fn a_sandbox_built_here_starts_on_the_node() {
     // network, so a stub that had already placed the sandbox would mean the
     // seam does not actually hold.
     assert!(backend.host_interaction_ip().is_none());
+    assert!(
+        backend.holding_node_id().is_none(),
+        "a stub nobody has started has no machine to name yet"
+    );
 
     backend.start().await.expect("start on the node");
     assert_eq!(backend.execution_id(), execution_id);
+    // 🔴 The one fact `mark_running`'s fix depends on: once placed, this
+    // backend must answer with the real node — not `None`, which the paused
+    // sandbox registry's write path would silently read as "this process is
+    // the machine", the exact bug this backend exists to not reproduce.
+    assert_eq!(backend.holding_node_id(), Some("node-under-test"));
 
     let live = node
         .orchestration

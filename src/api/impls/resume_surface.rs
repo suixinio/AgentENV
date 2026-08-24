@@ -693,11 +693,20 @@ impl ApiImpl {
                 // running. Saying it again is idempotent and keeps a claim from
                 // sitting in `resuming` until its lease lapses.
                 if held.is_some() {
+                    // The machine the resume actually landed on, not this
+                    // process's own identity — `mark_sandbox_running` falls
+                    // back to that only when the backend has nothing else to
+                    // report.
+                    let holding_node_id = self
+                        .orchestrator()
+                        .sandbox_holding_node_id(&sandbox_id)
+                        .await;
                     self.paused
                         .mark_sandbox_running(
                             sandbox_id,
                             metadata.execution_id,
                             metadata.expires_at,
+                            holding_node_id,
                         )
                         .await;
                 }

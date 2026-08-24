@@ -324,6 +324,24 @@ pub trait SandboxBackend: Send + 'static {
     /// Return runtime facts that are only known after the backend has started.
     fn runtime_info(&self) -> SandboxRuntimeInfo;
 
+    /// The real machine this sandbox is running on, when that is not the
+    /// machine this process is running on.
+    ///
+    /// 🔴 `None` — the default, and the answer for every backend that runs the
+    /// VM in this same process — means *this machine*, mirroring the exact
+    /// convention [`PausedSandboxState::holding_node_id`] already uses for the
+    /// paused half of the same question. `Some` only from a backend that
+    /// drives the sandbox over the wire, once it has learned which machine
+    /// accepted it. A caller that needs a cluster-visible node identity for a
+    /// running sandbox — the paused-sandbox registry's `origin_node_id` is the
+    /// one this exists for — must ask here rather than assume its own
+    /// identity is the answer; see the doc on
+    /// [`PausedSandboxState::holding_node_id`] for why the assumption is wrong
+    /// on exactly the role this backend is for.
+    fn holding_node_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Local runtime artifacts this sandbox opens on start.
     fn startup_artifacts(&self) -> RuntimeArtifactSet;
 

@@ -660,32 +660,49 @@ impl PausedSandboxCoordinator {
         }
     }
 
-    /// Records that the sandbox is live on this node.
+    /// Records that the sandbox is live on the machine that actually brought
+    /// it up.
     ///
     /// Called on both resume paths — the local fast path and a cross-node
-    /// restore — because both end with this node holding a sandbox the registry
-    /// still describes as parked somewhere else.
+    /// restore — because both end with a sandbox the registry still describes
+    /// as parked somewhere else being live on some machine again.
+    ///
+    /// `holding_node_id` is that machine, as read off the backend that just
+    /// started it — see [`SandboxBackend::holding_node_id`][crate::sandbox::SandboxBackend::holding_node_id].
+    /// `None` covers every backend that runs the VM in this same process,
+    /// which is the correct, common answer and the reason the fallback below
+    /// is silent rather than a warning: on the roles this holds for, `None` is
+    /// not a degraded case, it is *the* case, on every resume they ever serve.
+    /// It mirrors exactly the fallback [`publish`](Self::publish) uses for the
+    /// paused half of the same question, for the same reason — see that
+    /// method's note on why a role that runs its own sandboxes answering
+    /// `None` here is not the failure this fallback exists to paper over.
     ///
     /// A confirmed write is also what enrols the sandbox in
-    /// [`running_registration`](Self::running_registration), and only a
-    /// confirmed one: an unacknowledged write is no evidence that the row says
-    /// what this node thinks it says, and reconciliation acts on that evidence.
-    /// A refusal or an error leaves any earlier confirmation standing — it
-    /// remains true that the cluster once named this node the holder, which is
-    /// precisely the premise reconciliation needs to notice that it no longer
-    /// does.
+    /// [`running_registration`](Self::running_registration) — under the
+    /// identity the row was actually written with, because that identity, not
+    /// this process's own, is what reconciliation later compares the row
+    /// against. Only a confirmed write does: an unacknowledged one is no
+    /// evidence that the row says what was just written, and reconciliation
+    /// acts on that evidence. A refusal or an error leaves any earlier
+    /// confirmation standing — it remains true that the cluster once named
+    /// that identity the holder, which is precisely the premise reconciliation
+    /// needs to notice that it no longer does.
     pub async fn mark_sandbox_running(
         &self,
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
+        holding_node_id: Option<String>,
     ) {
         // Before the write: see `note_taking_sandbox_live`.
         self.note_taking_sandbox_live().await;
 
+        let node_id = holding_node_id.unwrap_or_else(|| self.node_id.clone());
+
         let confirmed = match self
             .registry
-            .mark_running(&sandbox_id, &self.node_id, execution_id, expires_at)
+            .mark_running(&sandbox_id, &node_id, execution_id, expires_at)
             .await
         {
             Ok(MarkRunningOutcome::HeldElsewhere) => {
@@ -718,7 +735,7 @@ impl PausedSandboxCoordinator {
         };
 
         self.running_registrations
-            .observe(sandbox_id, &self.node_id, confirmed);
+            .observe(sandbox_id, &node_id, confirmed);
     }
 
     /// The identity this node was confirmed as the holder of `sandbox_id`
@@ -885,8 +902,9 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
+        holding_node_id: Option<String>,
     ) {
-        self.mark_sandbox_running(sandbox_id, execution_id, expires_at)
+        self.mark_sandbox_running(sandbox_id, execution_id, expires_at, holding_node_id)
             .await;
     }
 
@@ -1291,7 +1309,7 @@ mod tests {
         let coordinator = coordinator(Arc::clone(&registry));
 
         coordinator
-            .mark_sandbox_running(SandboxId::new(), ExecutionId::new(), None)
+            .mark_sandbox_running(SandboxId::new(), ExecutionId::new(), None, None)
             .await;
 
         assert_eq!(
@@ -1315,7 +1333,7 @@ mod tests {
         let coordinator = coordinator(Arc::clone(&registry));
 
         coordinator
-            .mark_sandbox_running(SandboxId::new(), ExecutionId::new(), None)
+            .mark_sandbox_running(SandboxId::new(), ExecutionId::new(), None, None)
             .await;
         coordinator.retain_running_registrations(&HashSet::new());
 
@@ -1475,12 +1493,24 @@ mod tests {
 
         async fn mark_running(
             &self,
-            _sandbox_id: &SandboxId,
-            _node_id: &str,
+            sandbox_id: &SandboxId,
+            node_id: &str,
             _execution_id: ExecutionId,
             _expires_at: Option<SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {
-            Ok(MarkRunningOutcome::Untracked)
+            // Mirrors `markRunningFencedSQL`: `origin_node_id = $2`, and never
+            // creates a row a pause did not already leave behind.
+            let mut rows = self.rows.lock().unwrap();
+            match rows.get_mut(sandbox_id) {
+                Some(row) => {
+                    row.origin_node_id = node_id.to_string();
+                    row.claimed_by_node_id = None;
+                    row.state = PausedRegistryState::Running;
+
+                    Ok(MarkRunningOutcome::Adopted)
+                }
+                None => Ok(MarkRunningOutcome::Untracked),
+            }
         }
 
         async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
@@ -2062,6 +2092,93 @@ mod tests {
         assert_eq!(local, ClusterRecord::Registered(THIS_REPLICA.to_string()));
     }
 
+    /// The resume-side twin of the regression above. A resume that lands on
+    /// another machine has to name *that* machine when it reports itself
+    /// running, not this replica — the same wrong-half-of-the-split mistake,
+    /// on the write `mark_running` makes instead of the one `begin_pause`
+    /// makes.
+    ///
+    /// 🔴 Unlike the pause side, this one has no `1e1bf93`-shaped regression to
+    /// pin: the bug this closes shipped from the start, because
+    /// `mark_sandbox_running` never had a place to receive the real machine at
+    /// all. What pins it here is the row: a build that quietly went back to
+    /// writing `&self.node_id` compiles and passes every other test in this
+    /// file, and only fails the two assertions below.
+    #[tokio::test]
+    async fn a_resumed_row_names_the_machine_that_ran_it_not_the_replica_that_wrote_it() {
+        let registry = Arc::new(RecordingRegistry::default());
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        let resumed_elsewhere = SandboxId::new();
+        let resumed_here = SandboxId::new();
+
+        // Seed a row for each sandbox the way a pause would — `mark_running`
+        // never creates one, matching the real registry's contract.
+        coordinator
+            .publish(pause_outcome(resumed_elsewhere, true, None))
+            .await;
+        coordinator
+            .publish(pause_outcome(resumed_here, true, None))
+            .await;
+
+        // `--role api`: the resume claim landed on a machine, and the backend
+        // that drove it knows which one.
+        coordinator
+            .mark_sandbox_running(
+                resumed_elsewhere,
+                ExecutionId::new(),
+                None,
+                Some("node-203".to_string()),
+            )
+            .await;
+        // `--role all`: the backend ran in this process, so it has nothing to
+        // report but `None` — which this process's own identity answers for.
+        coordinator
+            .mark_sandbox_running(resumed_here, ExecutionId::new(), None, None)
+            .await;
+
+        let remote_row = registry
+            .row(&resumed_elsewhere)
+            .expect("mark_running updates the row a pause left behind");
+        let local_row = registry
+            .row(&resumed_here)
+            .expect("mark_running updates the row a pause left behind");
+
+        assert_eq!(
+            remote_row.origin_node_id, "node-203",
+            "the row must name the machine the VM actually started on"
+        );
+        assert_ne!(
+            remote_row.origin_node_id, THIS_REPLICA,
+            "a row naming this replica pins the sandbox to a process that never heartbeats, \
+             and the scheduler refuses every resume of it"
+        );
+        assert_eq!(
+            local_row.origin_node_id, THIS_REPLICA,
+            "a sandbox this process ran itself is correctly named by this process's own \
+             identity, and the rollback target must keep writing exactly that"
+        );
+        assert_ne!(
+            remote_row.origin_node_id, local_row.origin_node_id,
+            "the two halves must not be able to agree: a build that stated one identity for \
+             both would pass every assertion above that is about only one of them"
+        );
+
+        // The registration used for reconciliation must be the same identity
+        // the row was actually written under, or `reap_superseded_running_sandboxes`
+        // compares the row against a value it can never match — see
+        // `running_supersession` in `super::paused_recovery`.
+        assert_eq!(
+            coordinator.running_registration(&resumed_elsewhere),
+            Some("node-203".to_string()),
+            "the confirmed registration must be the machine the row names, not this replica"
+        );
+        assert_eq!(
+            coordinator.running_registration(&resumed_here),
+            Some(THIS_REPLICA.to_string())
+        );
+    }
+
     /// 🔴 The stamp and the column are one string, and this is what says so.
     ///
     /// `publish_paused` hands its answer to the orchestrator, which writes it
@@ -2173,8 +2290,9 @@ pub(super) mod test_support {
     use async_trait::async_trait;
 
     use crate::orchestrator::{
-        BeganPause, HeldSandbox, MarkRunningOutcome, PausedRegistryError, PausedSandboxEntry,
-        PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+        BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
+        PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult,
+        ReleasedHoldings, ResumeClaim,
     };
     use crate::snapshot::SnapshotId;
     use crate::types::{ExecutionId, SandboxId};
@@ -2194,6 +2312,16 @@ pub(super) mod test_support {
         renew_calls: AtomicUsize,
         renewals_to_fail: usize,
         remove_calls: AtomicUsize,
+        /// Every `node_id` a `claim_for_resume` call was made under, in order.
+        ///
+        /// This is the value a test needs to tell "this node's own identity"
+        /// apart from "the machine the claim actually names" — the whole
+        /// question `arbitrate_resume`'s fix is about.
+        claimed_as: std::sync::Mutex<Vec<String>>,
+        /// When set, `claim_for_resume` answers `Conflict` naming this node
+        /// instead of `NotFound` — so a test can drive `arbitration`'s
+        /// self-comparison branch, which `NotFound` never reaches.
+        conflict_origin: Option<String>,
     }
 
     /// What a programmed `get` should answer.
@@ -2218,6 +2346,17 @@ pub(super) mod test_support {
                 renew_calls: AtomicUsize::new(0),
                 renewals_to_fail: 0,
                 remove_calls: AtomicUsize::new(0),
+                claimed_as: std::sync::Mutex::new(Vec::new()),
+                conflict_origin: None,
+            }
+        }
+
+        /// Answers every `claim_for_resume` with a `Conflict` naming
+        /// `origin_node_id`, instead of `NotFound`.
+        pub(crate) fn answering_conflict(origin_node_id: &str) -> Self {
+            Self {
+                conflict_origin: Some(origin_node_id.to_string()),
+                ..Self::new(0, false)
             }
         }
 
@@ -2263,6 +2402,11 @@ pub(super) mod test_support {
 
         pub(crate) fn get_calls(&self) -> usize {
             self.get_calls.load(Ordering::SeqCst)
+        }
+
+        /// Every `node_id` a `claim_for_resume` call was made under, in order.
+        pub(crate) fn claimed_as(&self) -> Vec<String> {
+            self.claimed_as.lock().unwrap().clone()
         }
     }
 
@@ -2331,11 +2475,20 @@ pub(super) mod test_support {
         async fn claim_for_resume(
             &self,
             _sandbox_id: &SandboxId,
-            _node_id: &str,
+            node_id: &str,
             _execution_id: ExecutionId,
         ) -> RegistryResult<ResumeClaim> {
+            self.claimed_as.lock().unwrap().push(node_id.to_string());
+
             if self.claim_fails {
                 return Err(unreachable_backend("claim_for_resume"));
+            }
+
+            if let Some(origin_node_id) = &self.conflict_origin {
+                return Ok(ResumeClaim::Conflict {
+                    origin_node_id: origin_node_id.clone(),
+                    reason: ConflictReason::Unspecified,
+                });
             }
 
             Ok(ResumeClaim::NotFound)

@@ -117,6 +117,12 @@ pub struct MockBehavior {
     /// attempted rely on that being the shape a plain mock hands back. Turning
     /// it on is how a test says "and this one really could have been staged".
     captures_are_stageable: AtomicBool,
+    /// What `holding_node_id` answers. `None` — the default — matches every
+    /// backend that runs in this process, which is what this mock stands in
+    /// for by default. A test names a `&'static str` (a literal is always
+    /// enough) to make this backend answer the way `RemoteSandboxStub` does
+    /// once it has been placed on a real machine.
+    holding_node_id: Mutex<Option<&'static str>>,
 }
 
 impl MockBehavior {
@@ -176,6 +182,16 @@ impl MockBehavior {
             .runtime_info
             .lock()
             .expect("runtime_info mutex poisoned") = runtime_info;
+    }
+
+    /// Makes every backend built from here on answer `holding_node_id` with
+    /// `node_id`, the way `RemoteSandboxStub` does once placement has resolved
+    /// it. `None` restores the default — this process is the machine.
+    pub fn set_holding_node_id(&self, node_id: Option<&'static str>) {
+        *self
+            .holding_node_id
+            .lock()
+            .expect("holding_node_id mutex poisoned") = node_id;
     }
 
     fn runtime_info(&self) -> SandboxRuntimeInfo {
@@ -479,6 +495,14 @@ impl SandboxBackend for MockSandboxBackend {
 
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         self.behavior.runtime_info()
+    }
+
+    fn holding_node_id(&self) -> Option<&str> {
+        *self
+            .behavior
+            .holding_node_id
+            .lock()
+            .expect("holding_node_id mutex poisoned")
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {

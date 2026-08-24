@@ -359,7 +359,8 @@ pub trait PausedSandboxPublisher: Send + Sync {
     /// succeed, which no one can promise, but to try.
     fn wants_publishable_capture(&self) -> bool;
 
-    /// Records that the sandbox is live on this node again.
+    /// Records that the sandbox is live again, on the machine that actually
+    /// brought it up.
     ///
     /// `expires_at` is when the sandbox is due to end, and it travels with the
     /// write rather than waiting for the first lease renewal. Reclamation needs
@@ -368,11 +369,20 @@ pub trait PausedSandboxPublisher: Send + Sync {
     /// interval before its first renewal used to leave a row nothing could
     /// reclaim, claim or remove again. `None` means the sandbox was asked never
     /// to expire, which is a different fact and stays one.
+    ///
+    /// `holding_node_id` is the real machine, read from the backend that just
+    /// started it ([`SandboxBackend::holding_node_id`][crate::sandbox::SandboxBackend::holding_node_id]),
+    /// not this process's own identity. `None` covers every backend that runs
+    /// the VM in this same process, which is the correct, common case and the
+    /// one every implementation must fall back to its own identity for —
+    /// mirroring [`PausedSandboxPublisher::publish_paused`]'s identical
+    /// fallback for the paused half of this same question.
     async fn mark_running(
         &self,
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
+        holding_node_id: Option<String>,
     );
 
     /// Drops the cluster's record of the sandbox and the snapshot behind it.

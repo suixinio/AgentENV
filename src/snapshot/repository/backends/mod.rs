@@ -128,9 +128,18 @@ pub async fn build_snapshot_backend(
     // onto a store that does not hold everything would answer "absent" for
     // every snapshot the other one has, and absence is an instruction
     // downstream: callers delete artifacts and refuse resumes on it.
+    //
+    // 🔴 `targets`, because the comparison is allowed to repair before it
+    // refuses. What it replays is what the queue already owes the central
+    // catalog — including the history queued a few lines above — and that is
+    // the difference between an api replica whose `$AENV_HOME` is scratch
+    // starting and one that can never start again: it meets this comparison on
+    // every start, and the compensator that would close the difference is
+    // spawned below, on a start that never happens.
     let populations = admit_read_side(
         configured_read,
         &backlog,
+        &targets,
         &ObjectStoreCensus(object_store_catalog.as_ref()),
         central.as_ref(),
     )

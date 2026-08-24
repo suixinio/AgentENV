@@ -2102,11 +2102,23 @@ mod tests {
     async fn a_legal_postgres_read_still_has_to_get_past_the_mirror() {
         use crate::snapshot::repository::mirror::{
             admit_read_side, CatalogCensus, CatalogReadSide, MirrorBacklog, MirrorDirection,
+            MirrorTargets,
         };
         use crate::snapshot::repository::RepositoryResult;
         use crate::snapshot::SnapshotId;
 
         struct Census(Vec<SnapshotId>);
+
+        // Targets with no central half, so the replay the admission now runs
+        // before it refuses can land nothing. What this test is a seam for is
+        // the refusals, and a refusal proven against a target that could have
+        // repaired proves less than it looks.
+        fn no_repair_possible() -> MirrorTargets {
+            MirrorTargets::object_store(std::sync::Arc::new(
+                crate::snapshot::repository::mirror::test_doubles::ScriptedCatalog::default(),
+            )
+                as std::sync::Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>)
+        }
 
         #[async_trait::async_trait]
         impl CatalogCensus for Census {
@@ -2132,6 +2144,7 @@ mod tests {
         let error = admit_read_side(
             CatalogReadSide::Postgres,
             &backlog,
+            &no_repair_possible(),
             &Census(Vec::new()),
             &Census(Vec::new()),
         )
@@ -2156,6 +2169,7 @@ mod tests {
         let error = admit_read_side(
             CatalogReadSide::Postgres,
             &backlog,
+            &no_repair_possible(),
             &Census(held.clone()),
             &Census(Vec::new()),
         )
@@ -2169,6 +2183,7 @@ mod tests {
         admit_read_side(
             CatalogReadSide::Postgres,
             &backlog,
+            &no_repair_possible(),
             &Census(held.clone()),
             &Census(held),
         )

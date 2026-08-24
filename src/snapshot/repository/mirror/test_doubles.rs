@@ -22,6 +22,7 @@ use crate::snapshot::types::{
 use crate::types::SandboxResources;
 
 use super::central::CentralCatalogWrites;
+use super::population::CatalogCensus;
 
 /// One instant, shared by every fixture here.
 ///
@@ -574,6 +575,27 @@ impl ScriptedCentral {
             .find(|(scripted, _)| *scripted == call)
             .map(|(_, refusal)| refusal.clone());
         refusal.map(|refusal| Ok(CatalogWrite::Refused(refusal)))
+    }
+}
+
+/// 🔴 Live, over the rows this double actually holds — never a fixed list the
+/// test hands in.
+///
+/// The read-side admission replays what the mirror owes and then asks both
+/// stores again, and a census answering from a listing taken before that replay
+/// cannot tell a repair from a no-op: it would report the same difference
+/// either way, and a test built on it would pass over an admission that
+/// replayed nothing at all.
+#[async_trait]
+impl CatalogCensus for ScriptedCentral {
+    async fn every_snapshot_id(&self) -> RepositoryResult<Vec<SnapshotId>> {
+        Ok(self
+            .rows
+            .lock()
+            .expect("rows")
+            .values()
+            .map(|record| record.id.clone())
+            .collect())
     }
 }
 

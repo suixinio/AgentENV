@@ -360,6 +360,34 @@ spec:
         # there ever needs to survive a restart, that is a bug in the api half —
         # its durable state belongs in the shared store — and not a missing
         # volume.
+        #
+        # 🔴 One thing under here is not a cache, and a reader deciding what to
+        # put in this volume has to know which: `snapshot-catalog-mirror`, the
+        # double write's queue of owed catalog writes. Its own configuration
+        # calls it "node-local and durable" (`src/cfg.rs`), and on this half it
+        # is neither — every replica opens an empty one.
+        #
+        # What that costs at startup is handled in code and must stay handled:
+        # a mirror with no recorded read side reads `read = "postgres"` as the
+        # switch, so every replica runs the two-catalog population comparison
+        # on every start rather than once, and the comparison replays what the
+        # history backfill just queued before it refuses
+        # (`mirror/population.rs::admit_read_side`). Without that replay a
+        # difference of any size stops every *new* api Pod while the ones older
+        # than the difference keep serving — measured on the dev cluster at five
+        # snapshots — and it cannot clear itself, because the compensator that
+        # would close it is spawned after the refusal.
+        #
+        # 🔴 What it still costs, and what no code here fixes: a write this
+        # replica owes one of the two catalogs is queued in this directory, so a
+        # replica that dies holding one leaves a difference that no gauge counts.
+        # The next replica's comparison is what finds it. A difference where
+        # object storage is ahead is closed by the replay above; one where
+        # PostgreSQL is ahead is closed by nothing automatic and takes an
+        # operator. Giving this half a durable mirror is the fix for that, and
+        # it is a decision about the api half's persistence model — per-replica
+        # volume or none at all, never one shared between replicas — rather than
+        # a line to add here.
         - name: scratch
           emptyDir: {}
         # optional: an absent Secret, or a Secret without this key, mounts

@@ -1018,14 +1018,35 @@ impl MirrorBacklog {
         targets: &MirrorTargets,
     ) -> u64 {
         let direction = configured.debt_that_would_be_invisible();
-        // Only a switch. A restart on the side it was already reading is not
-        // something the guard refuses, so there is nothing here to unblock and
-        // no reason to make every start wait on a drain.
+        // Only a switch the guard itself refuses. A restart on the side it was
+        // already reading is not one, and neither is a store with no recorded
+        // side: [`Self::guard_read_side`] refuses on debt only when a *previous*
+        // side is on record, so there is nothing here to unblock and no reason
+        // to make every start wait on a drain.
+        //
+        // 🔴 That is not the same as "an unrecorded side needs no repair". A
+        // store with no recorded side still meets the population comparison,
+        // which does refuse it — and the repair that comparison needs is asked
+        // for where the refusal is, by [`Self::drain_debt_toward`], rather than
+        // paid for here by every start on a fresh store whether it helps or
+        // not.
         match self.recorded_read_side().await {
             Ok(Some(previous)) if previous != configured => {}
             _ => return self.lag_toward(direction),
         }
 
+        self.drain_debt_toward(direction, targets).await
+    }
+
+    /// Replays what `direction` is owed, once, within the start-up budget.
+    ///
+    /// Returns what is still owed afterwards. Like its caller it decides
+    /// nothing: whatever it could not settle is left for the check that asked.
+    pub(super) async fn drain_debt_toward(
+        &self,
+        direction: MirrorDirection,
+        targets: &MirrorTargets,
+    ) -> u64 {
         let owed = self.lag_toward(direction);
         if owed == 0 {
             return 0;

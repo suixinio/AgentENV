@@ -23,7 +23,7 @@ use std::net::Ipv4Addr;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
@@ -553,6 +553,7 @@ impl SandboxBackend for RemoteSandboxStub {
     async fn pause(
         &mut self,
         _artifact_root: Option<&std::path::Path>,
+        committer_waiting: bool,
     ) -> SandboxCaptureResult<PausedSandboxCapture> {
         // 🔴 The directory is not ours to choose. It has to be on the disk the
         // bytes are written to, which is the node's, and the node allocates it
@@ -570,17 +571,15 @@ impl SandboxBackend for RemoteSandboxStub {
             .pause(pb::SandboxPauseRequest {
                 sandbox_id: sandbox_id.to_string(),
                 execution_id: execution_id.to_string(),
-                // 🔴 `false`, and asked for honestly rather than as an
-                // aspiration. Nothing on this side consumes a staged row yet:
-                // the reply's `staged` field is not read here, and
-                // `PauseOutcome::publishable` — which is what the publisher
-                // above this backend commits — is a captured snapshot this half
-                // cannot produce. Asking a node to stage a capture whose row
-                // would then be dropped would burn durable storage on a
-                // snapshot nobody commits, and `Pause` refuses the flag for the
-                // matching reason: an absent `staged` must keep meaning "the
-                // backend had nothing to publish".
-                publish: false,
+                // 🔴 The caller's promise, forwarded rather than assumed. This
+                // is the one backend for which producing a publishable capture
+                // costs a durable write on another machine, and bytes staged
+                // for a publisher that is not going to commit are unreachable
+                // forever — no read path resolves an unannounced snapshot. So
+                // the question "will anybody commit this" is answered by the
+                // publisher above this backend, before the node is asked to
+                // spend. See `SandboxBackend::pause`.
+                publish: committer_waiting,
             })
             .await
             .map_err(wire::into_capture_error)?
@@ -600,6 +599,58 @@ impl SandboxBackend for RemoteSandboxStub {
             .map_err(SandboxCaptureError::terminal)?
             .unwrap_or(serde_json::Value::Null);
 
+        // 🔴 Decoded before `paused` is set, because a staged row this half
+        // cannot read is a failure of the pause's *publication*, not of the
+        // pause: the sandbox is down on the node either way and `stop` must
+        // still be suppressed. Hence the decode failures below are recoverable
+        // rather than terminal — they cost the cluster copy, never the sandbox.
+        if !response.staging_error.is_empty() {
+            // 🔴 A warning and not an error, matching what the node decided:
+            // the sandbox is paused on that machine and reopenable there, and
+            // what was lost is the copy that would have let it come back
+            // anywhere else. Failing here would hand the layer above a
+            // classification that is wrong in both directions — see
+            // `SandboxPauseResponse.staging_error`.
+            warn!(
+                %sandbox_id,
+                node_id,
+                error = %response.staging_error,
+                "a paused sandbox could not be staged for publication; it is resumable only on \
+                 the node that holds it"
+            );
+        }
+        let staged_value = response.staged.and_then(|staged| staged.value);
+        if !committer_waiting && staged_value.is_some() {
+            // 🔴 Said out loud rather than dropped quietly. Nothing asked this
+            // node to stage anything, so whatever it wrote is bytes with no row
+            // and no reader — the exact leak `publish` exists to prevent — and
+            // the only account of it anyone will ever get is this line.
+            warn!(
+                %sandbox_id,
+                node_id,
+                "node staged a snapshot for a pause that did not ask to publish; its bytes are \
+                 durable there and nothing will announce them"
+            );
+        }
+        let publishable = match staged_value.filter(|_| committer_waiting) {
+            Some(value) => {
+                let staged: crate::snapshot::repository::StagedSnapshot =
+                    wire::serialized(Some(&value), "staged snapshot")
+                        .map_err(SandboxCaptureError::recoverable)?
+                        .ok_or_else(|| {
+                            SandboxCaptureError::recoverable(anyhow!(
+                                "node {node_id} returned an empty staged snapshot for {sandbox_id}"
+                            ))
+                        })?;
+                Some(CapturedSandboxSnapshot::new(staged))
+            }
+            // 🔴 Not an error even when `publish` was asked for. The node
+            // answers with nothing when its pause found the sandbox already
+            // paused, and `Pause` has always documented an absent `staged` as
+            // "the backend had nothing publishable to offer".
+            None => None,
+        };
+
         // 🔴 Set before the value is handed back, because the very next thing
         // the caller does with this backend is `stop` it.
         self.paused = true;
@@ -616,14 +667,22 @@ impl SandboxBackend for RemoteSandboxStub {
                 execution_id,
                 state,
             )),
-            // 🔴 Always `None`, and it is not a gap. `publishable` exists so
-            // that a caller holding live capture artifacts can hand them to a
-            // repository before they are reclaimed. By the time this reply
-            // exists the node has already written the bytes and staged the row,
-            // and what the caller needs is the staged row — which travels in
-            // the reply rather than inside a handle that owns a directory on
-            // somebody else's disk.
-            publishable: None,
+            // 🔴 The staged row, wearing the capture's clothes. `publishable`
+            // exists so a caller holding live capture artifacts can hand them
+            // to a repository before they are reclaimed; by the time this reply
+            // exists the node has already written the bytes and there is
+            // nothing left to reclaim. What the publisher above needs is the
+            // row, and `SnapshotManager::stage_captured` recognises a capture
+            // that is already staged and commits it instead of staging it
+            // again — which it could not do anyway, having none of the files.
+            //
+            // 🔴 `None` when the node offered nothing, and that stays a
+            // meaningful answer rather than an error: a node whose pause was
+            // idempotent — the sandbox was already paused, or this call joined
+            // one in flight — has no capture, because the capture belongs to
+            // the pause that made it. Asking for `publish` and being given
+            // nothing is not the same as being refused.
+            publishable,
         })
     }
 

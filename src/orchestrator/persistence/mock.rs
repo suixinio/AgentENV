@@ -52,6 +52,7 @@ pub(crate) struct RecordingPersister {
     persisted: Arc<Mutex<Vec<SandboxMetadata>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
     artifact_root: Arc<Mutex<Option<PathBuf>>>,
+    allocated_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl RecordingPersister {
@@ -68,6 +69,21 @@ impl RecordingPersister {
     /// to say so and a test that wants the other half gets it without asking.
     pub(crate) fn holds_capture_at(&self, artifact_root: impl Into<PathBuf>) {
         *self.artifact_root.lock().unwrap() = Some(artifact_root.into());
+    }
+
+    /// Makes this persister hand a pause a directory to capture into.
+    ///
+    /// 🔴 A separate switch from [`Self::holds_capture_at`], and separate
+    /// because the two answer different questions at different times.
+    /// `allocate_artifact_root` decides, *before* the backend is asked to
+    /// pause, whether the capture lands somewhere that outlives the runtime —
+    /// which is what decides whether there is a publishable capture at all.
+    /// `paused_artifact_root` reports afterwards where a pause that already
+    /// happened put its bytes. A test that wants the second is not asking for
+    /// the first, and folding them together would give every existing caller of
+    /// `holds_capture_at` a publishable capture it never asked for.
+    pub(crate) fn allocates_artifact_root_at(&self, root: impl Into<PathBuf>) {
+        *self.allocated_root.lock().unwrap() = Some(root.into());
     }
 
     pub(crate) fn calls(&self) -> Vec<RecordingCall> {
@@ -130,7 +146,7 @@ impl SandboxPersister for RecordingPersister {
     ) -> PersistenceResult<Option<PathBuf>> {
         self.record(RecordingCall::AllocateArtifactRoot);
         self.maybe_fail(RecordingCall::AllocateArtifactRoot)?;
-        Ok(None)
+        Ok(self.allocated_root.lock().unwrap().clone())
     }
 
     async fn persist_paused(

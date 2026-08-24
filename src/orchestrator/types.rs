@@ -310,6 +310,42 @@ pub struct SnapshotCaptureResult {
     pub captured_snapshot: crate::sandbox::CapturedSandboxSnapshot,
 }
 
+/// Describes the snapshot a capture of `metadata`'s sandbox will become.
+///
+/// # 🔴 One place, because the fields are facts about a machine and there is
+/// only one machine that has them
+///
+/// Every field but two is copied straight off the sandbox's own record: the
+/// kernel and Firecracker it is running under, the images it resolved, the
+/// resources it was given. Three call sites need this value — the user-facing
+/// capture API, the pause publisher, and the node service serving a
+/// `Checkpoint` for a caller that has no sandbox of its own — and a second copy
+/// of the list is how one of them comes to be missing `custom_extension_params`
+/// on the day it is added, which nothing downstream would report as wrong.
+///
+/// 🔴 The id is minted here and is **not** a caller's to choose. Staging writes
+/// the bytes into the directory the id names, so the id belongs to whoever
+/// writes them.
+pub fn capture_publish_metadata(
+    metadata: &super::store::SandboxMetadata,
+    alias: Option<crate::snapshot::SnapshotAlias>,
+) -> crate::snapshot::SnapshotPublishMetadata {
+    crate::snapshot::SnapshotPublishMetadata {
+        id: crate::snapshot::SnapshotId::generate(),
+        alias,
+        source: crate::snapshot::SnapshotPublishSource::Sandbox {
+            source_sandbox_id: metadata.id.to_string(),
+        },
+        context: metadata.context.clone(),
+        startup: metadata.startup.clone(),
+        resources: metadata.resources,
+        runtime_versions: metadata.runtime_versions.clone(),
+        virtualization_mode: metadata.virtualization_mode,
+        image_configs: metadata.image_configs.clone(),
+        custom_extension_params: metadata.custom_extension_params.clone(),
+    }
+}
+
 /// What a completed pause leaves for the caller to act on.
 ///
 /// The sandbox is already paused, persisted and stopped by the time this is
@@ -321,4 +357,36 @@ pub struct SnapshotCaptureResult {
 pub struct PauseOutcome {
     pub metadata: super::store::SandboxMetadata,
     pub publishable: Option<crate::sandbox::CapturedSandboxSnapshot>,
+}
+
+impl PauseOutcome {
+    /// A pause with no capture to hand anyone.
+    ///
+    /// 🔴 Three different situations answer this way and none of them is a
+    /// failure: the sandbox was already paused, this call joined someone else's
+    /// pause, or the capture has already been given to a publisher in this
+    /// process. In all three the capture belongs to the pause that produced it
+    /// and is gone, which is what an absent `publishable` has always meant.
+    pub fn nothing_to_publish(metadata: super::store::SandboxMetadata) -> Self {
+        Self {
+            metadata,
+            publishable: None,
+        }
+    }
+}
+
+/// Who commits the capture a pause produces.
+///
+/// 🔴 Not a boolean, because the two arms differ in more than whether a value
+/// comes back: [`PausePublication::Here`] offers the capture to this process's
+/// own publisher and [`PausePublication::ByCaller`] does not offer it to
+/// anyone. A pause that did both would write two rows for one pause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PausePublication {
+    /// This process's paused-sandbox publisher, if it has one. The ordinary
+    /// pause, and the only one a machine-local role ever performs.
+    Here,
+    /// Whoever asked for the pause. Used when the deciding process is on the
+    /// other side of a wire and holds the cluster record this pause belongs to.
+    ByCaller,
 }

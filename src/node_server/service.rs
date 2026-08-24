@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::orchestrator::{
     ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
@@ -102,6 +102,86 @@ impl NodeSandboxService {
                 "sandbox {sandbox_id} is not on this node"
             ))),
         }
+    }
+
+    /// Writes one capture's bytes into the snapshot repository and encodes the
+    /// row the caller will announce.
+    ///
+    /// # 🔴 It returns a message, not a `Status`, because its two callers do
+    /// opposite things with the failure
+    ///
+    /// Staging runs *after* the operation that produced the capture has already
+    /// settled — a checkpoint has put the sandbox back to `Running`, a pause has
+    /// persisted it and stopped it — so nothing that fails here has touched the
+    /// runtime. But the two callers are not in the same position afterwards.
+    ///
+    /// A checkpoint's whole product is the staged row: with nothing to return
+    /// it fails the call, non-terminally, and the sandbox goes on running. A
+    /// pause has already produced the thing the user asked for, and failing the
+    /// call would hand the caller a classification that is false either way —
+    /// "recoverable" tells it to put back a sandbox this node has stopped, and
+    /// "terminal" tells it to destroy a pause that worked. So the pause
+    /// succeeds and reports the loss in `staging_error`.
+    ///
+    /// Returning the message leaves that choice with the caller instead of
+    /// making it here twice.
+    ///
+    /// 🔴 The publish metadata is built from *this node's* record and not from
+    /// anything on the wire. Every field of it but the alias is a fact about
+    /// this machine — the kernel it booted, the Firecracker it ran, the images
+    /// it resolved — and this node's record is the one that saw the capture
+    /// happen. The alias is the single field staging never reads, so it stays
+    /// the committer's to apply.
+    async fn stage_for_caller(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        metadata: &SandboxMetadata,
+        captured: crate::sandbox::CapturedSandboxSnapshot,
+    ) -> Result<pb::StagedSnapshot, String> {
+        let staged = self
+            .snapshots
+            .stage_captured(
+                crate::orchestrator::capture_publish_metadata(metadata, None),
+                captured,
+                // 🔴 The incarnation this call was fenced on, so the row records
+                // which run of the sandbox it is a snapshot of. Fencing already
+                // refused a caller naming a superseded run; this is what a later
+                // reader consults once the caller is long gone.
+                Some(execution_id),
+            )
+            .await
+            .map_err(|err| format!("stage sandbox {sandbox_id}'s capture: {err}"))?
+            // 🔴 Drops the local half here, which releases the capture's
+            // temporary directory. Nothing below reads a file: the local half's
+            // one consumer is the P2P advertisement, and that belongs to the
+            // process that commits, which is not this one.
+            .into_staged();
+
+        // 🔴 The bytes are staged by now and this reply was the only thing that
+        // would have told anyone about them. Reported like any other staging
+        // failure: what is lost is the snapshot, never the sandbox.
+        let value = crate::proto::node::encode_value(&staged).map_err(|err| {
+            format!(
+                "encode the staged snapshot for sandbox {sandbox_id}: {err} (its bytes are staged \
+                 on this node and nothing will announce them)"
+            )
+        })?;
+
+        // 🔴 An `info!` and not a `debug!`, and it names the id. These bytes
+        // are durable from this instant and nothing on this node will ever
+        // mention them again: a caller that dies before committing leaves them
+        // with no row, and no read path resolves an unannounced snapshot, so
+        // nothing finds them. This line is the only record that they exist, and
+        // an operator reconciling `snapshots/` against the catalog has nothing
+        // else to reconcile it *from*.
+        info!(
+            %sandbox_id,
+            snapshot_id = %staged.commit.id,
+            "staged a snapshot for its caller to announce"
+        );
+
+        Ok(pb::StagedSnapshot { value: Some(value) })
     }
 
     /// The live facts for everything this node is running, or `None` when the
@@ -202,22 +282,34 @@ fn untouched(status: Status) -> Status {
 /// answers that claim the sandbox survived are the ones this node can prove:
 /// the orchestrator's own capture classification, and the errors raised before
 /// the backend was ever asked to pause.
-fn pause_failure_status(sandbox_id: SandboxId, err: &OrchestratorError) -> Status {
+fn capture_op_failure_status(
+    sandbox_id: SandboxId,
+    operation: SandboxOperation,
+    err: &OrchestratorError,
+) -> Status {
     let status = orchestrator_status(err);
     let terminal = match err {
         // The backend answered, and its answer already says which of the two
         // this is — the orchestrator acted on the same flag when it decided
         // whether to put the sandbox back or tear it down.
         //
+        // 🔴 The operation is matched, not ignored. A sandbox can only be
+        // inside one lifecycle operation at a time, so a `SandboxOperationFailed`
+        // naming a *different* one than the call being served is not this
+        // call's capture answering: it is some other failure arriving through
+        // the same shape, and reading its classification would be reading a
+        // verdict about a runtime this call never touched. That falls through
+        // to the fail-closed default below.
+        //
         // 🔴 `unwrap_or(true)` and not `false`: a source that is not a capture
         // error is a failure this node cannot account for, and the fail-closed
         // reading of "I do not know what happened to the runtime" is that it
         // did not survive.
         OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::Pause,
+            operation: failed,
             source,
             ..
-        } => source
+        } if *failed == operation => source
             .downcast_ref::<SandboxCaptureError>()
             .map(SandboxCaptureError::is_terminal)
             .unwrap_or(true),
@@ -233,7 +325,7 @@ fn pause_failure_status(sandbox_id: SandboxId, err: &OrchestratorError) -> Statu
         | OrchestratorError::VirtualizationModeMismatch { .. } => false,
         // 🔴 Allocating the artifact directory happens before the backend is
         // asked for anything, and its failure puts the sandbox straight back to
-        // running.
+        // running. A capture never reaches the persister at all.
         OrchestratorError::SandboxPersistenceFailed(_) => false,
         // 🔴 Including `SandboxNotFound`, which on this path means the pause
         // found no sandbox to pause and removed the record — so the caller's
@@ -413,18 +505,32 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
     /// request that never reached the backend — must say so explicitly, or a
     /// caller doing exactly what it was told to do will delete a running
     /// sandbox because its pause arrived at an awkward moment. See
-    /// [`pause_failure_status`].
+    /// [`capture_op_failure_status`].
     ///
-    /// # 🔴 `publish` is refused rather than answered with nothing
+    /// # 🔴 What `publish` changes, and what it does not
     ///
-    /// Staging a publishable capture on the node is not wired up: the seam
-    /// exists (`SnapshotManager::stage_captured` / `commit_staged`) and the
-    /// orchestrator does not hand the publishable capture back out of
-    /// `pause_sandbox`, so there is nothing here to stage. Answering
-    /// `staged: None` would be indistinguishable from a backend that had no
-    /// publishable capture to offer — which is exactly how a sandbox comes to
-    /// be paused with nothing to rebuild it from anywhere, silently. A caller
-    /// that needs the published arm is told it cannot have it.
+    /// Without it the pause is this node's business: the bytes stay here, the
+    /// caller gets a path and a handle, and the sandbox is reopenable on this
+    /// machine and nowhere else. With it the capture is *also* staged into the
+    /// snapshot repository and the row comes back for the caller to commit, so
+    /// the sandbox survives losing this machine.
+    ///
+    /// It does not change the pause. Staging happens after the sandbox is
+    /// paused, persisted and stopped, and a staging that fails leaves all three
+    /// of those standing — so the reply says so and the sandbox stays paused
+    /// here rather than being torn down for a failure that never touched it.
+    ///
+    /// 🔴 An absent `staged` in a reply that was *asked* to publish is not a
+    /// silent gap and never becomes one: the pause path only reaches this call
+    /// without a capture when the pause did not happen on this call — the
+    /// sandbox was already paused, or this call joined one in flight — and in
+    /// both the capture belongs to the pause that produced it and is gone. Any
+    /// other reason fails the call.
+    ///
+    /// 🔴 This node's own publisher is not consulted on this arm. On `--role
+    /// node` it is `DisabledPausedSandboxRegistry` and would drop the capture;
+    /// on any role it would be a second process writing a row for a pause the
+    /// caller already owns.
     async fn pause(
         &self,
         request: Request<pb::SandboxPauseRequest>,
@@ -436,27 +542,67 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         // would have a malformed request tear down the sandbox it named.
         let sandbox_id = convert::sandbox_id(&request.sandbox_id).map_err(untouched)?;
         let execution_id = convert::execution_id(&request.execution_id).map_err(untouched)?;
-        if request.publish {
-            // 🔴 Before the fence and before the pause. A refusal that arrived
-            // after the VM was stopped would have destroyed the thing the
-            // caller was refused.
-            return Err(crate::proto::node::capture_failure_status(
-                tonic::Code::Unimplemented,
-                "publishing a pause is not served yet: staging a captured snapshot on the node is \
-                 not wired up, and answering with no staged row would be indistinguishable from a \
-                 backend that had nothing publishable to offer",
-                false,
-                "the node did not touch the sandbox",
-            ));
-        }
         self.fenced(sandbox_id, execution_id)
             .await
             .map_err(untouched)?;
 
-        let metadata = Arc::clone(&self.orchestration)
-            .pause_sandbox(sandbox_id)
-            .await
-            .map_err(|err| pause_failure_status(sandbox_id, &err))?;
+        // 🔴 Two entry points and not one with a flag, because they differ in
+        // who the capture is offered to and not merely in what comes back.
+        // The unpublished arm is left byte-for-byte the call it has always
+        // been: `pause_sandbox`, which offers the capture to this process's own
+        // publisher exactly as a machine-local role does.
+        let (metadata, staged, staging_error) = if request.publish {
+            let outcome = Arc::clone(&self.orchestration)
+                .pause_sandbox_for_publication(sandbox_id)
+                .await
+                .map_err(|err| {
+                    capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err)
+                })?;
+            let (staged, staging_error) = match outcome.publishable {
+                // 🔴 A staging that fails does not fail the pause, and this is
+                // the only place on this service where a failure is reported
+                // inside a success. The sandbox is paused, persisted and
+                // stopped by now; the two answers a failed pause can carry are
+                // "put it back to running" and "tear it down", and both are
+                // lies about a sandbox that is sitting here paused and
+                // perfectly reopenable. What is lost is the cluster's copy, so
+                // that is what the reply says was lost. See
+                // `SandboxPauseResponse.staging_error`.
+                Some(publishable) => match self
+                    .stage_for_caller(sandbox_id, execution_id, &outcome.metadata, publishable)
+                    .await
+                {
+                    Ok(staged) => (Some(staged), String::new()),
+                    Err(err) => {
+                        warn!(
+                            %sandbox_id,
+                            error = %err,
+                            "paused a sandbox and could not stage its capture; it is resumable on \
+                             this node only"
+                        );
+                        (None, err)
+                    }
+                },
+                // The pause was idempotent: nothing happened on this call, so
+                // there is no capture of it. See the note on the flag above.
+                None => {
+                    debug!(
+                        %sandbox_id,
+                        "pause produced no publishable capture; the sandbox was already paused here"
+                    );
+                    (None, String::new())
+                }
+            };
+            (outcome.metadata, staged, staging_error)
+        } else {
+            let metadata = Arc::clone(&self.orchestration)
+                .pause_sandbox(sandbox_id)
+                .await
+                .map_err(|err| {
+                    capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err)
+                })?;
+            (metadata, None, String::new())
+        };
 
         // 🔴 The handle the pause produced, from the record the pause wrote. A
         // reply without it is not a pause with nothing to say: it is a stopped
@@ -508,7 +654,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .orchestration
             .paused_artifact_root(&sandbox_id)
             .await
-            .map_err(|err| pause_failure_status(sandbox_id, &err))?;
+            .map_err(|err| capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err))?;
         if artifact_root.is_none() {
             // Not a failure: a node whose persister allocates nothing captured
             // into temporaries it manages itself, and there is no directory to
@@ -527,26 +673,91 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                     .unwrap_or_default(),
                 state: Some(state),
             }),
-            // 🔴 Always absent, and only reachable because `publish` was not
-            // asked for: the arm that would fill this is refused above.
-            staged: None,
+            // 🔴 Absent unless `publish` was asked for, and then absent for
+            // exactly two reasons — the idempotent pause above, and a staging
+            // that failed. `staging_error` is what tells them apart.
+            staged,
+            staging_error,
         }))
     }
 
+    /// Captures a snapshot of a running sandbox and writes its bytes, leaving
+    /// the row for the caller to announce.
+    ///
+    /// # 🔴 Why the reply is a staged row and not a capture
+    ///
+    /// A `CapturedSandboxSnapshot` owns a temporary directory on this machine
+    /// and cannot cross a process boundary, so what crosses is what is left
+    /// once the bytes are durable: a [`StagedSnapshot`], which is a pure value
+    /// carrying everything the catalog row needs and nothing that points at
+    /// this disk. The caller commits it. Until it does, no reader anywhere can
+    /// resolve this snapshot.
+    ///
+    /// # 🔴 Why this node picks the snapshot id, and the caller picks the name
+    ///
+    /// Staging writes the bytes into the directory the id names. The id is
+    /// therefore a decision only the machine writing them can take — it is the
+    /// one that finds out whether the write worked. Everything else on the row
+    /// except the alias is a fact about *this* machine (its kernel, its
+    /// Firecracker, the images it resolved) and is read off this node's own
+    /// record of the sandbox, which is the record that saw the capture happen.
+    /// The alias is the single field staging never looks at, so it stays the
+    /// caller's, applied when the row is committed.
+    ///
+    /// # 🔴 What is left behind when the caller never commits
+    ///
+    /// Staged bytes. They are durable, they are reachable by id, and no row
+    /// points at them — the same residue a `publish` whose commit failed leaves
+    /// behind, and this build reclaims neither. The window is one round trip
+    /// wide and each loss costs one capture's worth of storage. Nothing else
+    /// breaks: an unannounced snapshot is invisible to every read path, so it
+    /// cannot be resolved, launched, or mistaken for a snapshot that works.
     async fn checkpoint(
         &self,
-        _request: Request<pb::SandboxCheckpointRequest>,
+        request: Request<pb::SandboxCheckpointRequest>,
     ) -> Result<Response<pb::SandboxCheckpointResponse>, Status> {
-        // The same missing piece as `pause`, minus the artifact root: a
-        // checkpoint's whole product is the staged snapshot, and staging on the
-        // node is not wired up.
-        Err(crate::proto::node::capture_failure_status(
-            tonic::Code::Unimplemented,
-            "checkpoint is not served yet: staging a captured snapshot on the node is not wired \
-             up, and there is nothing else this call could return",
-            false,
-            "the node did not touch the sandbox",
-        ))
+        let request = request.into_inner();
+        // 🔴 Classified, for the reason spelled out on `pause`: the caller
+        // reads an unclassified capture failure as terminal, so a malformed
+        // request that never reached the runtime must say it never reached it.
+        let sandbox_id = convert::sandbox_id(&request.sandbox_id).map_err(untouched)?;
+        let execution_id = convert::execution_id(&request.execution_id).map_err(untouched)?;
+        self.fenced(sandbox_id, execution_id)
+            .await
+            .map_err(untouched)?;
+
+        let capture = Arc::clone(&self.orchestration)
+            .capture_snapshot(sandbox_id)
+            .await
+            .map_err(|err| {
+                capture_op_failure_status(sandbox_id, SandboxOperation::Snapshot, &err)
+            })?;
+
+        // 🔴 Non-terminal, and `capture_snapshot` is what makes that true rather
+        // than optimism: it has already put the sandbox back to `Running` by
+        // the time it hands over a capture. A terminal answer here would have
+        // the caller tear down a sandbox that is running and serving requests
+        // because a disk filled up.
+        let staged = self
+            .stage_for_caller(
+                sandbox_id,
+                execution_id,
+                &capture.metadata,
+                capture.captured_snapshot,
+            )
+            .await
+            .map_err(|err| {
+                crate::proto::node::capture_failure_status(
+                    tonic::Code::Internal,
+                    err,
+                    false,
+                    "the sandbox is still running on this node",
+                )
+            })?;
+
+        Ok(Response::new(pb::SandboxCheckpointResponse {
+            staged: Some(staged),
+        }))
     }
 
     /// Reopens the capture this node is holding.

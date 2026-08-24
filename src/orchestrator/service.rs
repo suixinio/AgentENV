@@ -35,8 +35,8 @@ use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
-    SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
+    PausePublication, SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -1640,9 +1640,45 @@ where
     /// sandbox (`Pausing` state), this call waits for it to complete and then
     /// returns the outcome rather than duplicating the work.
     pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
+        self.pause_sandbox_with(sandbox_id, PausePublication::Here)
+            .await
+            .map(|outcome| outcome.metadata)
+    }
+
+    /// [`Self::pause_sandbox`], handing the capture back instead of publishing
+    /// it here.
+    ///
+    /// # 🔴 Its one caller has no sandbox of its own and no publisher either
+    ///
+    /// The node service serves a `Pause` for a process that decided the pause,
+    /// holds the cluster's record of the sandbox, and will commit the row. This
+    /// machine's own publisher is not that process — on `--role node` it is
+    /// `DisabledPausedSandboxRegistry`, which records nothing — so letting the
+    /// ordinary path run would offer the capture to a publisher that drops it,
+    /// and the caller would be told the pause produced nothing publishable.
+    ///
+    /// 🔴 [`PauseOutcome::publishable`] is `None` here whenever the pause did
+    /// not *happen* on this call: a sandbox already paused, or a concurrent
+    /// pause this one joined. That is not this path failing to produce a
+    /// capture. The capture belongs to the pause that made it and is long gone,
+    /// and `None` says exactly that to a caller that reads it as "nothing to
+    /// publish" — which is the reading the wire has always documented.
+    pub async fn pause_sandbox_for_publication(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<PauseOutcome> {
+        self.pause_sandbox_with(sandbox_id, PausePublication::ByCaller)
+            .await
+    }
+
+    async fn pause_sandbox_with(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        publication: PausePublication,
+    ) -> Result<PauseOutcome> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("pause", sandbox_id, async move {
-            this.pause_sandbox_inner(sandbox_id).await
+            this.pause_sandbox_inner(sandbox_id, publication).await
         })
         .await
     }
@@ -1655,7 +1691,8 @@ where
     async fn pause_sandbox_inner(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
-    ) -> Result<SandboxMetadata> {
+        publication: PausePublication,
+    ) -> Result<PauseOutcome> {
         info!("pausing sandbox");
         match self
             .store
@@ -1667,12 +1704,15 @@ where
                 return match actual_state {
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
-                    SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
+                    SandboxState::Pausing => self
+                        .join_concurrent_pause(sandbox_id)
+                        .await
+                        .map(PauseOutcome::nothing_to_publish),
                     // Already paused: idempotent success. The capture belongs to
                     // the pause that produced it and is long gone, so there is
                     // nothing left to publish here.
                     SandboxState::Paused => match self.store.get(&sandbox_id).await? {
-                        Some(metadata) => Ok(metadata),
+                        Some(metadata) => Ok(PauseOutcome::nothing_to_publish(metadata)),
                         None => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
                     },
                     SandboxState::Killing => {
@@ -1795,9 +1835,25 @@ where
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
+        //
+        // 🔴 Whether anyone is waiting to commit a publishable capture is asked
+        // *now*, before the backend is told to make one. A backend that has to
+        // write durable bytes to produce one — which is every backend driving a
+        // sandbox on another machine — would otherwise write them for a
+        // publisher that is about to drop the capture, and unannounced bytes
+        // are unreachable by every read path there is. See
+        // [`PausedSandboxPublisher::wants_publishable_capture`].
+        let committer_waiting = match publication {
+            PausePublication::ByCaller => true,
+            PausePublication::Here => self
+                .paused_publisher()
+                .is_some_and(|publisher| publisher.wants_publishable_capture()),
+        };
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
-            sandbox.pause(artifact_root.as_deref()).await
+            sandbox
+                .pause(artifact_root.as_deref(), committer_waiting)
+                .await
         };
 
         // If pausing failed, attempt to put the sandbox back and return an error.
@@ -1934,16 +1990,28 @@ where
         // The sandbox is already paused and locally resumable, so this runs
         // after the point of no return on purpose: it can only add cross-node
         // recovery, never take the pause away.
-        self.publish_paused_sandbox(
-            sandbox_id,
-            PauseOutcome {
-                metadata: paused_metadata.clone(),
-                publishable,
-            },
-        )
-        .await;
+        let outcome = PauseOutcome {
+            metadata: paused_metadata,
+            publishable,
+        };
 
-        Ok(paused_metadata)
+        match publication {
+            PausePublication::Here => {
+                let metadata = outcome.metadata.clone();
+                self.publish_paused_sandbox(sandbox_id, outcome).await;
+                // 🔴 Emptied on the way out rather than left populated. This arm
+                // has already handed the capture to the publisher; a caller
+                // finding one here would be looking at a capture that has been
+                // consumed, and the only thing it could do with it is publish it
+                // a second time.
+                Ok(PauseOutcome::nothing_to_publish(metadata))
+            }
+            // 🔴 No publisher call at all, not even a best-effort one. The
+            // caller is the process that will commit, and this machine offering
+            // the same capture to its own publisher as well is how one pause
+            // comes to write two rows.
+            PausePublication::ByCaller => Ok(outcome),
+        }
     }
 
     /// Where this resume gets the runtime state it has to reopen.
@@ -2718,9 +2786,10 @@ where
                 // Publishing happens inside the pause, so an expired sandbox is
                 // just as recoverable from another node as an explicitly paused
                 // one — which matters more here, not less: nobody is watching.
-                SandboxTimeoutAction::Pause => {
-                    self.pause_sandbox_inner(metadata.id).await.map(|_| ())
-                }
+                SandboxTimeoutAction::Pause => self
+                    .pause_sandbox_inner(metadata.id, PausePublication::Here)
+                    .await
+                    .map(|_| ()),
                 SandboxTimeoutAction::Delete => {
                     self.delete_sandbox_inner(metadata.id, ClusterDisposition::Forget)
                         .await
@@ -3431,7 +3500,10 @@ where
                         unreachable!("paused sandboxes should have been filtered out")
                     }
                     SandboxState::Running => {
-                        if let Err(err) = self.pause_sandbox_inner(sandbox_id).await {
+                        if let Err(err) = self
+                            .pause_sandbox_inner(sandbox_id, PausePublication::Here)
+                            .await
+                        {
                             last_failures.push(format!("{sandbox_id}: {err}"));
                         }
                     }

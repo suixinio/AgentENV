@@ -18,9 +18,7 @@ use crate::orchestrator::{
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
-};
+use crate::snapshot::{CommandContext, SnapshotAlias};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
@@ -1371,21 +1369,13 @@ impl Sandboxes<()> for ApiImpl {
         let published = match timer
             .time(
                 "publish",
+                // 🔴 The id inside this value is a proposal, not a decision.
+                // When the sandbox runs on another node the capture arrives
+                // already staged — under the id *that* node wrote the bytes
+                // into — and only the alias here survives. Which is why the
+                // response below is built from `published`, never from this.
                 self.snapshot_manager.publish_captured(
-                    SnapshotPublishMetadata {
-                        id: SnapshotId::generate(),
-                        alias: alias.clone(),
-                        source: SnapshotPublishSource::Sandbox {
-                            source_sandbox_id: capture.metadata.id.to_string(),
-                        },
-                        context: capture.metadata.context.clone(),
-                        startup: capture.metadata.startup.clone(),
-                        resources: capture.metadata.resources,
-                        runtime_versions: capture.metadata.runtime_versions.clone(),
-                        virtualization_mode: capture.metadata.virtualization_mode,
-                        image_configs: capture.metadata.image_configs.clone(),
-                        custom_extension_params: capture.metadata.custom_extension_params.clone(),
-                    },
+                    crate::orchestrator::capture_publish_metadata(&capture.metadata, alias.clone()),
                     capture.captured_snapshot,
                 ),
             )

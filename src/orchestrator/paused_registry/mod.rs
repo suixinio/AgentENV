@@ -339,6 +339,26 @@ pub trait PausedSandboxPublisher: Send + Sync {
     /// can change between the pause and the comparison.
     async fn publish_paused(&self, outcome: PauseOutcome) -> Option<String>;
 
+    /// Whether a publishable capture offered to [`Self::publish_paused`] would
+    /// actually be committed.
+    ///
+    /// # 🔴 A promise, asked before the pause, because one backend has to spend
+    /// to answer it
+    ///
+    /// A pause on this machine produces its publishable capture by borrowing
+    /// artifacts the persister has already written — it costs nothing, and a
+    /// backend that produces one regardless is not wasting anything. A pause on
+    /// *another* machine produces one by writing a whole snapshot into durable
+    /// storage. Those bytes become unreachable the moment nobody commits a row
+    /// naming them: no read path resolves an unannounced snapshot, so nothing
+    /// finds them again, and this build has no sweep that would.
+    ///
+    /// So the question has to be asked before the capture is made rather than
+    /// after it is offered, and this is where it is asked. A publisher that
+    /// answers `true` is undertaking to reach `publish_captured` — not to
+    /// succeed, which no one can promise, but to try.
+    fn wants_publishable_capture(&self) -> bool;
+
     /// Records that the sandbox is live on this node again.
     ///
     /// `expires_at` is when the sandbox is due to end, and it travels with the

@@ -587,6 +587,7 @@ async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {
             ),
         }),
         staged: None,
+        staging_error: String::new(),
     }));
 
     let factory = RemoteSandboxBackendFactory::new(node.placement());
@@ -598,7 +599,7 @@ async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {
         };
     backend.start().await.expect("start");
 
-    let capture = backend.pause(None).await.expect("pause");
+    let capture = backend.pause(None, false).await.expect("pause");
     // 🔴 Always absent, and not because the node had nothing: by the time this
     // reply exists the bytes are already durable there, so what a caller needs
     // is the staged row and not a handle owning a directory on another disk.
@@ -639,6 +640,7 @@ async fn a_pause_with_nothing_to_reopen_is_terminal() {
     *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
         paused_state: None,
         staged: None,
+        staging_error: String::new(),
     }));
 
     let factory = RemoteSandboxBackendFactory::new(node.placement());
@@ -650,7 +652,7 @@ async fn a_pause_with_nothing_to_reopen_is_terminal() {
         };
     backend.start().await.expect("start");
 
-    let err = match backend.pause(None).await {
+    let err = match backend.pause(None, false).await {
         Err(err) => err,
         Ok(_) => panic!("a pause with no state to reopen must not look like a success"),
     };
@@ -713,18 +715,9 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
         .is_terminal());
 }
 
-/// A checkpoint comes back as the staged snapshot itself, ready to commit.
-#[tokio::test]
-async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
-    let (script, node) = scripted_node().await;
-    let execution_id = ExecutionId::new();
-    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
-        sandbox_id: launch_config().sandbox_id.to_string(),
-        execution_id: execution_id.to_string(),
-        ..Default::default()
-    }));
-
-    let staged = StagedSnapshot {
+/// A row a node might hand back, staged on the node under test.
+fn staged_snapshot(execution_id: ExecutionId) -> StagedSnapshot {
+    StagedSnapshot {
         commit: SnapshotCommit {
             id: SnapshotId::generate(),
             alias: None,
@@ -736,7 +729,21 @@ async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
         staged_at_unix_ms: 1_700_000_000_000,
         origin_node_id: "node-under-test".to_string(),
         execution_id: Some(execution_id),
-    };
+    }
+}
+
+/// A checkpoint comes back as the staged snapshot itself, ready to commit.
+#[tokio::test]
+async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let staged = staged_snapshot(execution_id);
     *script.checkpoint.lock().expect("lock") = Some(Ok(pb::SandboxCheckpointResponse {
         staged: Some(pb::StagedSnapshot {
             value: Some(wire::serialize(&staged, "staged snapshot").expect("encode")),
@@ -1662,6 +1669,7 @@ async fn paused_stub(
             state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
         }),
         staged: None,
+        staging_error: String::new(),
     }));
     let factory = RemoteSandboxBackendFactory::new(node.placement());
     let mut backend = factory
@@ -1689,7 +1697,7 @@ async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
     let (script, node) = scripted_node().await;
 
     let (mut paused, _) = paused_stub(&script, &node).await;
-    paused.pause(None).await.expect("pause");
+    paused.pause(None, false).await.expect("pause");
     paused.stop().await.expect("stop");
     assert!(
         script.seen_delete.lock().expect("lock").is_empty(),
@@ -1706,68 +1714,108 @@ async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
     assert_eq!(deletes[0].execution_id, execution_id.to_string());
 }
 
-/// The pause this half sends does not ask for the arm the node refuses.
+/// The pause this half sends asks for exactly what its caller promised to
+/// commit, and brings the row back only when it did.
 ///
-/// 🔴 Two assertions, and the second is what makes the first mean something. A
-/// `publish` flag is one bit and nothing in this project's mutation testing
-/// covers a `.proto` field, so "the request said false" on its own is a fact
-/// about a constant. Sending the same pause to the *real* node service — which
-/// refuses `publish: true` before it touches the sandbox — is what turns the
-/// bit into behaviour.
+/// 🔴 Both values of the flag, in one test, because a `publish` flag is one bit
+/// and nothing in this project's mutation testing covers a `.proto` field.
+/// "The request said false" on its own is a fact about a constant; the pair —
+/// the flag on the wire tracking the argument, and the row coming back only on
+/// the arm that asked for it — is a fact about behaviour.
+///
+/// 🔴 The staged row on the `true` arm is what stops this passing on a build
+/// that sets the flag and drops the reply. That drop is not a cosmetic
+/// failure: the node has written a whole snapshot into durable storage by the
+/// time it answers, and a caller that discards the row leaves those bytes with
+/// nothing to announce them and no way to find them again.
 #[tokio::test]
-async fn a_pause_sent_from_here_asks_for_nothing_the_node_refuses() {
+async fn a_pause_asks_for_a_row_only_when_its_caller_will_commit_one() {
     let (script, node) = scripted_node().await;
-    let (mut backend, _) = paused_stub(&script, &node).await;
-    backend.pause(None).await.expect("pause");
 
+    let staged = staged_snapshot(ExecutionId::new());
+    // 🔴 After `paused_stub`, which writes its own pause script on the way to
+    // starting the sandbox. Setting it first would be overwritten and this test
+    // would assert against a reply with no row in it.
+    let (mut backend, _) = paused_stub(&script, &node).await;
+    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
+        paused_state: Some(pb::PausedState {
+            artifact_root: "/var/lib/agentenv/paused/one".to_string(),
+            state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
+        }),
+        staged: Some(pb::StagedSnapshot {
+            value: Some(wire::serialize(&staged, "staged snapshot").expect("encode")),
+        }),
+        staging_error: String::new(),
+    }));
+    let capture = backend
+        .pause(None, true)
+        .await
+        .expect("a pause whose caller will commit");
     let sent = script.seen_pause.lock().expect("lock").clone();
     assert_eq!(sent.len(), 1, "the pause did not reach the node");
+    assert!(
+        sent[0].publish,
+        "a caller that promised to commit asked the node for nothing"
+    );
+    let decoded: crate::snapshot::repository::StagedSnapshot = capture
+        .publishable
+        .expect("a pause that asked to publish came back with nothing to publish")
+        .downcast()
+        .expect("the capture carries a staged snapshot and not something else");
+    assert_eq!(decoded.id(), staged.id());
+    assert_eq!(decoded.origin_node_id, "node-under-test");
+
+    // The other arm: nobody is going to commit, so nothing is asked for — and
+    // the node's row, if it sent one anyway, is not adopted.
+    let (script, node) = scripted_node().await;
+    let (mut backend, _) = paused_stub(&script, &node).await;
+    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
+        paused_state: Some(pb::PausedState {
+            artifact_root: "/var/lib/agentenv/paused/two".to_string(),
+            state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
+        }),
+        staged: Some(pb::StagedSnapshot {
+            value: Some(wire::serialize(&staged, "staged snapshot").expect("encode")),
+        }),
+        staging_error: String::new(),
+    }));
+    let capture = backend
+        .pause(None, false)
+        .await
+        .expect("a pause whose caller will not commit");
+    let sent = script.seen_pause.lock().expect("lock").clone();
     assert!(
         !sent[0].publish,
         "this half asked a node to stage a row it does not commit"
     );
+    assert!(
+        capture.publishable.is_none(),
+        "a row nobody asked for was adopted anyway"
+    );
+}
 
-    // The other half: the real service answers the request this half sends,
-    // and refuses the one it does not.
+/// The whole published pause, across both halves: this half asks, the real node
+/// service stages, and the row that comes back is the one the node wrote.
+///
+/// 🔴 The scripted test above proves the stub reads a reply. This one proves
+/// there is a reply to read: it drives the request through the real service,
+/// whose refusal of this exact flag is what the split shipped with.
+#[tokio::test]
+async fn a_published_pause_crosses_both_halves() {
     let real = real_node().await;
     let orchestration = real.orchestration.as_ref().expect("a real node").clone();
     let factory = RemoteSandboxBackendFactory::new(real.placement());
     let execution_id = ExecutionId::new();
     let config = launch_config();
-    let sandbox_id = config.sandbox_id;
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
         .expect("build a stub");
     backend.start().await.expect("start on the node");
 
-    let mut client =
-        crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient::connect(
-            real.endpoint.endpoint.clone(),
-        )
+    let capture = backend
+        .pause(None, true)
         .await
-        .expect("connect");
-    let refused = client
-        .pause(pb::SandboxPauseRequest {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: execution_id.to_string(),
-            publish: true,
-        })
-        .await
-        .expect_err("publishing a pause is not served");
-    assert_eq!(refused.code(), tonic::Code::Unimplemented, "{refused}");
-    assert!(
-        !orchestration
-            .list_live_sandboxes()
-            .await
-            .expect("list")
-            .is_empty(),
-        "a refused pause stopped the sandbox anyway"
-    );
-
-    backend
-        .pause(None)
-        .await
-        .expect("the pause this half sends");
+        .expect("the published pause this half sends");
     assert!(
         orchestration
             .list_live_sandboxes()
@@ -1775,6 +1823,17 @@ async fn a_pause_sent_from_here_asks_for_nothing_the_node_refuses() {
             .expect("list")
             .is_empty(),
         "the pause this half sends did not pause anything"
+    );
+
+    // 🔴 `real_node` gives the service a snapshot manager that refuses to
+    // stage, which is the honest default for a harness that writes no bytes. So
+    // the assertion this arm can make is the one that matters for the split:
+    // the flag is no longer refused at the door, and the sandbox was paused
+    // either way. Whether a row comes back when staging works is
+    // `a_published_pause_stages_the_bytes_here_and_leaves_the_row_to_the_caller`.
+    assert!(
+        capture.publishable.is_none(),
+        "a node whose repository refuses to stage handed back a row anyway"
     );
 }
 
@@ -1806,7 +1865,7 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
         .expect("build a stub");
     backend.start().await.expect("start on the node");
 
-    let capture = backend.pause(None).await.expect("pause on the node");
+    let capture = backend.pause(None, false).await.expect("pause on the node");
     // 🔴 The stop the orchestrator sends after every successful pause. It is
     // here rather than left out because leaving it out is what made this round
     // trip look like it worked.

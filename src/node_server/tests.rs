@@ -1049,24 +1049,15 @@ async fn a_forked_child_with_no_marker_is_not_reported() {
 /// something plausible would be exactly the "shipped early, wired later" shape
 /// that has already cost this project three defects.
 ///
-/// 🔴 `pause` is deliberately absent from this list now, and its presence in
-/// the one below — where the sandbox has to survive the refusal — is what keeps
-/// the two apart: a `pause` that answered `Unimplemented` again would fail
-/// `a_pause_leaves_the_capture_where_the_node_put_it`, and a `checkpoint` that
-/// started answering would fail this one.
+/// 🔴 `pause` and `checkpoint` are both deliberately absent from this list now.
+/// Each is served, and each is pinned by a test that would fail if it went back
+/// to refusing — `a_pause_leaves_the_capture_where_the_node_put_it` and
+/// `a_checkpoint_answers_with_a_row_nobody_has_announced` — so a method
+/// reappearing here would break those rather than this.
 #[tokio::test]
 async fn the_unserved_calls_say_so_rather_than_answering() {
     let (orchestration, service) = service().await;
     let sandbox = start(&orchestration, Some(b"owned")).await;
-
-    let err = service
-        .checkpoint(Request::new(pb::SandboxCheckpointRequest {
-            sandbox_id: sandbox.id.to_string(),
-            execution_id: sandbox.execution_id.to_string(),
-        }))
-        .await
-        .expect_err("checkpoint is not served");
-    assert_eq!(err.code(), Code::Unimplemented);
 
     let err = service
         .update_params(Request::new(pb::SandboxParamsRequest {
@@ -1839,6 +1830,71 @@ async fn service_with_persister() -> (
     (orchestration, service, persister)
 }
 
+/// A node service that can really stage a capture.
+///
+/// 🔴 Three things have to be true at once for staging to happen at all, and
+/// each of them is off in the default harness: the persister has to hand the
+/// pause a directory that outlives the runtime (otherwise there is no
+/// publishable capture), the backend's capture has to be something a repository
+/// recognises (otherwise staging refuses it), and the repository has to accept
+/// writes (the default one refuses, so a test that reaches it fails loudly).
+/// Turning all three on here rather than in each test keeps "this test staged
+/// nothing" from ever being an accident of the harness.
+struct StagingHarness {
+    orchestration: Arc<dyn SandboxOrchestration>,
+    service: NodeSandboxService,
+    repository: Arc<crate::snapshot::mock::RecordingSnapshotRepository>,
+    behavior: Arc<MockBehavior>,
+    /// Held: the artifact root lives as long as this does.
+    _artifacts: tempfile::TempDir,
+}
+
+async fn staging_service() -> StagingHarness {
+    crate::logging::init_for_tests();
+    let artifacts = tempfile::tempdir().expect("tempdir");
+    let persister = RecordingPersister::default();
+    persister.allocates_artifact_root_at(artifacts.path().join("capture"));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.make_captures_stageable();
+    let orchestrator = Orchestrator::new(
+        ServerRole::All,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        persister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let (manager, repository) = crate::snapshot::mock::recording_snapshot_manager();
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(manager),
+        NODE.to_string(),
+    );
+    StagingHarness {
+        orchestration,
+        service,
+        repository,
+        behavior,
+        _artifacts: artifacts,
+    }
+}
+
+/// The staged row a reply carries, decoded.
+fn decode_staged(
+    staged: Option<pb::StagedSnapshot>,
+) -> crate::snapshot::repository::StagedSnapshot {
+    let value = staged
+        .expect("the reply carried no staged snapshot")
+        .value
+        .expect("the staged snapshot carried no value");
+    assert_eq!(
+        value.schema_version, 1,
+        "a staged row went out stamped with a schema this build does not write"
+    );
+    serde_json::from_slice(&value.json).expect("the staged row should decode")
+}
+
 fn pause_request(sandbox: &SandboxMetadata, publish: bool) -> pb::SandboxPauseRequest {
     pb::SandboxPauseRequest {
         sandbox_id: sandbox.id.to_string(),
@@ -1957,46 +2013,340 @@ async fn a_pause_whose_record_could_not_be_read_is_not_a_pause_without_a_directo
     assert_eq!(reply.artifact_root, "/var/lib/agentenv/paused/abc/7");
 }
 
-/// Asking for a pause to be published is refused, and refused before the
-/// sandbox is touched.
+/// A pause asked to publish stages the capture here and hands the row back
+/// unannounced.
 ///
-/// 🔴 Two assertions and both are load-bearing. The refusal itself keeps
-/// `staged: None` meaning "the backend had nothing publishable" rather than
-/// "this build cannot stage" — collapsing those is how a sandbox comes to be
-/// paused with nothing to rebuild it from anywhere, silently. And the sandbox
-/// still running afterwards is what makes it a refusal rather than a pause that
-/// threw its own result away.
+/// 🔴 `publish` is the only difference between the two halves of this test, and
+/// each half is the other's control. Without the `publish: false` half, "a row
+/// came back" is satisfied by a node that stages every pause — which is exactly
+/// the leak the flag exists to prevent, since nothing commits a row nobody
+/// asked for. Without the `publish: true` half, "nothing was staged" is
+/// satisfied by a node that stages nothing ever.
+///
+/// 🔴 The empty `committed()` is paired with a non-empty `staged()` in the same
+/// round. On its own it would pass on a build that had stopped doing anything
+/// at all; next to a staging that did happen it says the one thing it is here
+/// to say — the bytes are durable and the row is still the caller's to
+/// announce.
 #[tokio::test]
-async fn asking_for_a_published_pause_is_refused_before_the_sandbox_is_touched() {
-    let (orchestration, service) = service().await;
-    let sandbox = start(&orchestration, Some(b"owned")).await;
+async fn a_published_pause_stages_the_bytes_here_and_leaves_the_row_to_the_caller() {
+    let harness = staging_service().await;
+    let published = start(&harness.orchestration, Some(b"owned")).await;
+    let unpublished = start(&harness.orchestration, Some(b"owned")).await;
 
-    let err = service
+    let reply = harness
+        .service
+        .pause(Request::new(pause_request(&published, true)))
+        .await
+        .expect("a published pause")
+        .into_inner();
+
+    let staged = decode_staged(reply.staged);
+    assert_eq!(
+        harness.repository.staged(),
+        vec![staged.commit.id.clone()],
+        "the bytes went somewhere other than the id the row names"
+    );
+    assert!(
+        harness.repository.committed().is_empty(),
+        "the node announced the row itself; it is the caller's to commit"
+    );
+    // 🔴 The repository's own identity and not the service's `node_id`. Both
+    // resolve to `NodeIdentity::from_config` on a real node, so they agree
+    // there; here they deliberately do not, which is what makes this assertion
+    // about the value `stage` actually wrote rather than about a string this
+    // test handed the service two lines earlier.
+    assert_eq!(
+        staged.origin_node_id,
+        crate::identity::local_node_id(),
+        "the row must name the machine holding the bytes"
+    );
+    assert_ne!(
+        staged.origin_node_id, "",
+        "a row that names no machine cannot be resumed anywhere"
+    );
+    assert_eq!(
+        staged.execution_id,
+        Some(published.execution_id),
+        "the row must name the run it is a snapshot of"
+    );
+    assert!(
+        matches!(
+            &staged.commit.source,
+            crate::snapshot::SnapshotPublishSource::Sandbox { source_sandbox_id }
+                if source_sandbox_id == &published.id.to_string()
+        ),
+        "the row must name the sandbox it came from, and names {:?}",
+        staged.commit.source
+    );
+    assert!(
+        staged.commit.alias.is_none(),
+        "staging is never told a name; binding one is the committer's business"
+    );
+    // 🔴 The reply is still a pause: the paused state has to be there too, or a
+    // published pause is a sandbox the caller cannot reopen anywhere.
+    assert!(reply.paused_state.is_some());
+
+    // The control face: the same call with the flag off.
+    let reply = harness
+        .service
+        .pause(Request::new(pause_request(&unpublished, false)))
+        .await
+        .expect("an unpublished pause")
+        .into_inner();
+    assert!(
+        reply.staged.is_none(),
+        "a pause that did not ask to publish came back with a row"
+    );
+    assert!(reply.paused_state.is_some());
+    assert_eq!(
+        harness.repository.staged().len(),
+        1,
+        "a pause that did not ask to publish staged bytes anyway"
+    );
+
+    assert!(
+        listed(&harness.service).await.is_empty(),
+        "a sandbox that was paused is still running"
+    );
+}
+
+/// A pause of a sandbox that is already paused answers with no row rather than
+/// failing.
+///
+/// 🔴 The first pause in the same round is what makes the absent row mean "this
+/// call produced no capture" rather than "this node never produces one". The
+/// distinction is the whole reason an absent `staged` is allowed to be an
+/// answer: collapsing it into a refusal would fail every retried pause, and
+/// collapsing the other way would hide a node that had silently stopped
+/// staging.
+#[tokio::test]
+async fn a_pause_that_had_already_happened_answers_with_no_row() {
+    let harness = staging_service().await;
+    let sandbox = start(&harness.orchestration, Some(b"owned")).await;
+
+    let first = harness
+        .service
         .pause(Request::new(pause_request(&sandbox, true)))
         .await
-        .expect_err("publishing a pause is not served");
-    assert_eq!(err.code(), Code::Unimplemented, "{err}");
+        .expect("the pause that does the work")
+        .into_inner();
+    assert!(
+        first.staged.is_some(),
+        "the pause that actually paused produced no row"
+    );
+
+    let again = harness
+        .service
+        .pause(Request::new(pause_request(&sandbox, true)))
+        .await
+        .expect("a repeated pause is idempotent, not an error")
+        .into_inner();
+    assert!(
+        again.staged.is_none(),
+        "a pause that did nothing produced a second row for one capture"
+    );
+    assert_eq!(
+        harness.repository.staged().len(),
+        1,
+        "one capture was staged twice"
+    );
+    assert!(again.paused_state.is_some());
+}
+
+/// A pause whose staging failed still pauses, and says what was lost.
+///
+/// 🔴 This is the one place on this service where a failure is reported inside
+/// a success, and the test exists because the alternative is not a worse error
+/// message — it is a wrong one. A failed `Pause` carries a classification with
+/// two possible readings and both are false here: *recoverable* has the caller
+/// put back a sandbox this node has stopped, and *terminal* has it destroy a
+/// pause that worked.
+///
+/// 🔴 Three faces in one round, because `staging_error` exists to tell them
+/// apart and any two of them alone would let it be a constant: staging worked
+/// (a row, no error), staging broke (no row, an error), and the pause was
+/// idempotent (no row, no error).
+#[tokio::test]
+async fn a_pause_whose_staging_failed_still_pauses_and_says_what_was_lost() {
+    let harness = staging_service().await;
+    let works = start(&harness.orchestration, Some(b"owned")).await;
+    let breaks = start(&harness.orchestration, Some(b"owned")).await;
+
+    let ok = harness
+        .service
+        .pause(Request::new(pause_request(&works, true)))
+        .await
+        .expect("a published pause")
+        .into_inner();
+    assert!(ok.staged.is_some());
+    assert_eq!(
+        ok.staging_error, "",
+        "a staging that worked reported an error"
+    );
+
+    harness.repository.fail_staging();
+    let broken = harness
+        .service
+        .pause(Request::new(pause_request(&breaks, true)))
+        .await
+        .expect("a staging failure must not fail the pause")
+        .into_inner();
+    assert!(
+        broken.staged.is_none(),
+        "a staging that failed produced a row anyway"
+    );
+    assert!(
+        broken.staging_error.contains("no room on the device"),
+        "the reply did not say what failed: {:?}",
+        broken.staging_error
+    );
+    // 🔴 The pause itself stands: the state to reopen it is there, and the
+    // sandbox is off the listing. Without these two the assertions above are
+    // satisfied by a call that refused everything.
+    assert!(
+        broken.paused_state.is_some(),
+        "a pause that could not be staged came back with no way to reopen it"
+    );
+    assert!(
+        listed(&harness.service).await.is_empty(),
+        "a pause whose staging failed left the sandbox running"
+    );
+
+    // The third face: a pause with nothing to stage says nothing failed.
+    let again = harness
+        .service
+        .pause(Request::new(pause_request(&breaks, true)))
+        .await
+        .expect("a repeated pause")
+        .into_inner();
+    assert!(again.staged.is_none());
+    assert_eq!(
+        again.staging_error, "",
+        "a pause that had nothing to stage reported a staging failure"
+    );
+}
+
+/// A checkpoint answers with a row nobody has announced, and leaves the sandbox
+/// running.
+///
+/// 🔴 The sandbox still being listed afterwards is not incidental: a checkpoint
+/// that stopped the VM would satisfy every other assertion here, and the whole
+/// point of the call is that it does not.
+#[tokio::test]
+async fn a_checkpoint_answers_with_a_row_nobody_has_announced() {
+    let harness = staging_service().await;
+    let sandbox = start(&harness.orchestration, Some(b"owned")).await;
+
+    let reply = harness
+        .service
+        .checkpoint(Request::new(pb::SandboxCheckpointRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: sandbox.execution_id.to_string(),
+        }))
+        .await
+        .expect("a checkpoint")
+        .into_inner();
+
+    let staged = decode_staged(reply.staged);
+    assert_eq!(
+        harness.repository.staged(),
+        vec![staged.commit.id.clone()],
+        "the bytes went somewhere other than the id the row names"
+    );
+    assert!(
+        harness.repository.committed().is_empty(),
+        "the node announced the row itself; it is the caller's to commit"
+    );
+    assert_eq!(staged.origin_node_id, crate::identity::local_node_id());
+    assert_ne!(staged.origin_node_id, "");
+    assert_eq!(staged.execution_id, Some(sandbox.execution_id));
+    assert!(
+        matches!(
+            &staged.commit.source,
+            crate::snapshot::SnapshotPublishSource::Sandbox { source_sandbox_id }
+                if source_sandbox_id == &sandbox.id.to_string()
+        ),
+        "the row must name the sandbox it came from, and names {:?}",
+        staged.commit.source
+    );
+
+    assert_eq!(
+        listed(&harness.service).await.len(),
+        1,
+        "a checkpoint stopped the sandbox it was supposed to leave running"
+    );
+
+    // A second checkpoint of the same sandbox is a second snapshot, under a
+    // second id — the control that stops the assertion above passing on a node
+    // that answers with one cached row forever.
+    let again = harness
+        .service
+        .checkpoint(Request::new(pb::SandboxCheckpointRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: sandbox.execution_id.to_string(),
+        }))
+        .await
+        .expect("a second checkpoint")
+        .into_inner();
+    let again = decode_staged(again.staged);
+    assert_ne!(again.commit.id, staged.commit.id);
+    assert_eq!(harness.repository.staged().len(), 2);
+}
+
+/// A checkpoint whose staging fails says the sandbox survived; one whose
+/// capture failed terminally says it did not.
+///
+/// 🔴 The two arms are in one test because the classification is a single bit
+/// and "always false" passes any test that only ever asks for one of them. The
+/// caller tears sandboxes down on the strength of this bit: read as terminal, a
+/// full disk deletes a sandbox that is running and serving requests; read as
+/// recoverable, a runtime that was mutated past safe resume is left marked
+/// running.
+#[tokio::test]
+async fn a_checkpoint_says_whether_the_sandbox_survived_its_failure() {
+    let harness = staging_service().await;
+    let sandbox = start(&harness.orchestration, Some(b"owned")).await;
+
+    harness.repository.fail_staging();
+    let err = harness
+        .service
+        .checkpoint(Request::new(pb::SandboxCheckpointRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: sandbox.execution_id.to_string(),
+        }))
+        .await
+        .expect_err("staging was made to fail");
     assert_eq!(
         classification(&err),
         Some(false),
-        "a refusal that touched nothing was not classified as such: {err}"
+        "a staging failure that never touched the runtime was called terminal: {err}"
     );
     assert_eq!(
-        listed(&service).await.len(),
+        listed(&harness.service).await.len(),
         1,
-        "a refused pause stopped the sandbox anyway"
+        "the sandbox the failure did not touch is gone"
     );
 
-    // 🔴 The control face: the same call, one flag different, and this one
-    // actually pauses. Without it the assertion above is satisfied by a `pause`
-    // that refuses everything.
-    service
-        .pause(Request::new(pause_request(&sandbox, false)))
+    // The other arm: a capture that mutated the runtime past safe resume.
+    harness.behavior.push_action(
+        crate::sandbox::mock::MockOperation::Snapshot,
+        crate::sandbox::mock::MockAction::FailTerminal {
+            message: "the VM was left paused".to_string(),
+        },
+    );
+    let err = harness
+        .service
+        .checkpoint(Request::new(pb::SandboxCheckpointRequest {
+            sandbox_id: sandbox.id.to_string(),
+            execution_id: sandbox.execution_id.to_string(),
+        }))
         .await
-        .expect("a pause that asks for nothing this build cannot do");
-    assert!(
-        listed(&service).await.is_empty(),
-        "the sandbox that was paused is still running"
+        .expect_err("the capture was made to fail terminally");
+    assert_eq!(
+        classification(&err),
+        Some(true),
+        "a capture that mutated the runtime was called recoverable: {err}"
     );
 }
 

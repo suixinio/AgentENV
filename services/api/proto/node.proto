@@ -396,6 +396,26 @@ message SandboxPauseResponse {
   // Present only when `publish` was asked for and the backend could offer a
   // publishable capture.
   StagedSnapshot staged = 2;
+  // Why `staged` is absent, when `publish` was asked for and the staging was
+  // attempted and failed. Empty otherwise.
+  //
+  // 🔴 A field rather than a failed call, and this is the one place on this
+  // service where a failure is reported inside a success. By the time staging
+  // runs the sandbox is already paused, persisted and stopped, and the
+  // classification the caller reads off a failed pause has only two answers:
+  // *recoverable*, which it acts on by putting the sandbox back to running, and
+  // *terminal*, which it acts on by tearing it down. Neither is true here. A
+  // recoverable answer would leave the caller believing a sandbox is running
+  // that this node has stopped; a terminal one would destroy a pause that
+  // worked. So the pause succeeds, and what failed is named.
+  //
+  // 🔴 It is also what keeps an absent `staged` unambiguous. Without it, a
+  // caller that asked to publish and got nothing could not tell a pause that
+  // had nothing to stage — an idempotent re-pause, whose capture belongs to the
+  // pause that made it — from a staging that broke. The first is normal and the
+  // second means this sandbox now exists on one machine's disk and nowhere
+  // else.
+  string staging_error = 3;
 }
 
 message SandboxCheckpointRequest {

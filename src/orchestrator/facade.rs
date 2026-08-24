@@ -58,8 +58,8 @@ use super::store::{MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata
 #[cfg(test)]
 use super::types::SandboxState;
 use super::types::{
-    CreateSandboxRequest, ForkChildren, LiveSandbox, SandboxLifecycleEvent, SandboxRosterEntry,
-    SnapshotCaptureResult,
+    CreateSandboxRequest, ForkChildren, LiveSandbox, PauseOutcome, SandboxLifecycleEvent,
+    SandboxRosterEntry, SnapshotCaptureResult,
 };
 use super::{Result, SandboxForkOutcome};
 
@@ -190,6 +190,9 @@ orchestration_surface! {
         /// Pauses one sandbox, publishing it to the cluster if publishing is
         /// wired up.
         fn pause_sandbox(sandbox_id: SandboxId) -> Result<SandboxMetadata>;
+        /// Pauses one sandbox and hands the capture back for the caller to
+        /// publish, instead of offering it to this process's own publisher.
+        fn pause_sandbox_for_publication(sandbox_id: SandboxId) -> Result<PauseOutcome>;
         /// Brings a paused sandbox back, under a fresh execution.
         fn resume_sandbox(
             sandbox_id: SandboxId,

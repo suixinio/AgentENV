@@ -261,9 +261,26 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// For simplicity, [`SandboxCaptureError::Recoverable`] must guarantee the sandbox
     /// has already been restored to a running state before the error is returned.
+    ///
+    /// # 🔴 `committer_waiting` binds only the backends that have to spend to
+    /// answer it
+    ///
+    /// It says whether the caller will commit a
+    /// [`PausedSandboxCapture::publishable`] if one is offered. An
+    /// implementation that produces one by *writing durable bytes* must not
+    /// write them when this is `false`: nothing announces bytes nobody
+    /// commits, no read path resolves an unannounced snapshot, and so nothing
+    /// ever finds them again.
+    ///
+    /// An implementation whose publishable capture is a borrow of artifacts
+    /// something else already wrote spends nothing to offer one and may offer
+    /// it either way. Suppressing it there would not save storage; it would
+    /// only change *which* "not recorded" reason the caller reports, turning
+    /// "nobody was going to commit this" into "there was nothing to commit".
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,
+        committer_waiting: bool,
     ) -> SandboxCaptureResult<PausedSandboxCapture>;
 
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.

@@ -89,6 +89,23 @@ pub struct MockBehavior {
     /// produces: the source is up and routable, and a child comes back from
     /// wherever it started without the address the proxy route needs.
     fork_children_without_address: AtomicBool,
+    /// What the last `pause` was told about whether anyone would commit a
+    /// publishable capture.
+    ///
+    /// 🔴 Recorded rather than acted on. This backend produces the same capture
+    /// either way — like the Firecracker one it borrows artifacts somebody else
+    /// wrote — so nothing about its behaviour would reveal a caller that passed
+    /// the wrong value, and the value is what decides whether a *remote* pause
+    /// spends a durable write.
+    pause_committer_waiting: Mutex<Option<bool>>,
+    /// Whether captures come back as something a snapshot repository can stage.
+    ///
+    /// 🔴 Off by default, and the default is the interesting half. A capture
+    /// this repository cannot recognise is what a backend that has no publish
+    /// support produces, and the tests that assert an upload was *not*
+    /// attempted rely on that being the shape a plain mock hands back. Turning
+    /// it on is how a test says "and this one really could have been staged".
+    captures_are_stageable: AtomicBool,
 }
 
 impl MockBehavior {
@@ -99,6 +116,31 @@ impl MockBehavior {
     pub fn push_action(&self, operation: MockOperation, action: MockAction) {
         let mut actions = self.actions.lock().expect("mock behavior mutex poisoned");
         actions.entry(operation).or_default().push_back(action);
+    }
+
+    /// Makes every capture from here on something a repository can stage.
+    pub fn make_captures_stageable(&self) {
+        self.captures_are_stageable.store(true, Ordering::SeqCst);
+    }
+
+    fn capture(&self) -> CapturedSandboxSnapshot {
+        if self.captures_are_stageable.load(Ordering::SeqCst) {
+            CapturedSandboxSnapshot::new(
+                crate::sandbox::FirecrackerCapturedSnapshot::in_caller_owned_dir(
+                    crate::sandbox::FirecrackerSnapshotManifest::for_test(32768, &[]),
+                ),
+            )
+        } else {
+            CapturedSandboxSnapshot::new(MockCapturedSnapshot)
+        }
+    }
+
+    /// What the last `pause` was told, or `None` if none has run.
+    pub fn pause_committer_waiting(&self) -> Option<bool> {
+        *self
+            .pause_committer_waiting
+            .lock()
+            .expect("pause_committer_waiting mutex poisoned")
     }
 
     pub fn set_on_operation(&self, operation: MockOperation, hook: Arc<dyn Fn() + Send + Sync>) {
@@ -338,7 +380,13 @@ impl SandboxBackend for MockSandboxBackend {
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,
+        committer_waiting: bool,
     ) -> SandboxCaptureResult<PausedSandboxCapture> {
+        *self
+            .behavior
+            .pause_committer_waiting
+            .lock()
+            .expect("pause_committer_waiting mutex poisoned") = Some(committer_waiting);
         let pause_result = self
             .behavior
             .apply_capture_result(MockOperation::Pause)
@@ -358,7 +406,7 @@ impl SandboxBackend for MockSandboxBackend {
         // can also be published, a pause into managed temporaries cannot.
         Ok(PausedSandboxCapture {
             state: Arc::new(MockSnapshot),
-            publishable: artifact_root.map(|_| CapturedSandboxSnapshot::new(MockCapturedSnapshot)),
+            publishable: artifact_root.map(|_| self.behavior.capture()),
         })
     }
 
@@ -370,7 +418,7 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
-        Ok(CapturedSandboxSnapshot::new(MockCapturedSnapshot))
+        Ok(self.behavior.capture())
     }
 
     async fn fork(

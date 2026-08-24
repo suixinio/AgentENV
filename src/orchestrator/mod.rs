@@ -41,9 +41,9 @@ pub use store::{
     DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
 };
 pub use types::{
-    CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
-    SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
+    capture_publish_metadata, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
+    PauseOutcome, PausePublication, SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

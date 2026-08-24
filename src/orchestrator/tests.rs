@@ -6060,13 +6060,16 @@ fn disabled_registry_is_not_cluster_backed() {
 
 /// Records what the orchestrator asks of the cluster, so tests can assert that
 /// a pause reached it without standing up a registry.
-#[derive(Default)]
 struct RecordingPublisher {
     published: StdMutex<Vec<(SandboxId, ExecutionId)>>,
     /// Both halves of the write, because "which sandbox" and "which run of it"
     /// are separate facts and only the second one can be got wrong.
     marked_running: StdMutex<Vec<(SandboxId, ExecutionId)>>,
     forgotten: StdMutex<Vec<SandboxId>>,
+    /// What this publisher answers when asked whether it would commit a
+    /// publishable capture. Defaults to yes, matching every cluster-backed
+    /// registry.
+    wants_captures: StdMutex<bool>,
 }
 
 impl RecordingPublisher {
@@ -6099,6 +6102,21 @@ impl RecordingPublisher {
     fn forgotten(&self) -> Vec<SandboxId> {
         self.forgotten.lock().unwrap().clone()
     }
+
+    fn commits_nothing(&self) {
+        *self.wants_captures.lock().unwrap() = false;
+    }
+}
+
+impl Default for RecordingPublisher {
+    fn default() -> Self {
+        Self {
+            published: StdMutex::default(),
+            marked_running: StdMutex::default(),
+            forgotten: StdMutex::default(),
+            wants_captures: StdMutex::new(true),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -6110,6 +6128,10 @@ impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
             .push((outcome.metadata.id, outcome.metadata.execution_id));
 
         Some("test-node".to_string())
+    }
+
+    fn wants_publishable_capture(&self) -> bool {
+        *self.wants_captures.lock().unwrap()
     }
 
     async fn mark_running(
@@ -6138,6 +6160,53 @@ async fn orchestrator_with_recording_publisher() -> (Arc<TestOrchestrator>, Arc<
     );
 
     (orchestrator, publisher)
+}
+
+/// A pause tells the backend whether anyone is going to commit what it stages,
+/// and the answer is the publisher's rather than a constant.
+///
+/// 🔴 Both answers in one round, against the same orchestrator and the same
+/// backend. The flag is what stops a node writing a whole snapshot into durable
+/// storage for a publisher that is about to drop it — bytes no read path can
+/// resolve and no sweep in this build collects — and a test that only ever saw
+/// one answer would pass on an implementation that hard-codes either.
+///
+/// 🔴 It is asserted at the *backend*, not at the publisher. The decision has
+/// to arrive where the spending happens; a value computed correctly and then
+/// not passed down is precisely the failure that leaves no trace anywhere else.
+#[tokio::test]
+async fn a_pause_tells_the_backend_whether_anyone_will_commit_its_capture() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let publisher = Arc::new(RecordingPublisher::default());
+    orchestrator.set_paused_publisher(
+        Arc::clone(&publisher) as Arc<dyn crate::orchestrator::PausedSandboxPublisher>
+    );
+
+    let willing = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(willing.id).await?;
+    assert_eq!(
+        behavior.pause_committer_waiting(),
+        Some(true),
+        "a publisher that commits was reported to the backend as one that does not"
+    );
+
+    publisher.commits_nothing();
+    let unwilling = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(unwilling.id).await?;
+    assert_eq!(
+        behavior.pause_committer_waiting(),
+        Some(false),
+        "a publisher that commits nothing was reported to the backend as one that does"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]

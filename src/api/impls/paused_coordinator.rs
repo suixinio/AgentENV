@@ -23,9 +23,7 @@ use crate::orchestrator::{
     MarkRunningOutcome, PauseOutcome, PausedRegistryState, PausedSandboxEntry,
     PausedSandboxPublisher, PausedSandboxRegistry, SandboxMetadata,
 };
-use crate::snapshot::{
-    SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
-};
+use crate::snapshot::{SnapshotId, SnapshotManager, SnapshotPublishMetadata};
 use crate::types::{ExecutionId, SandboxId};
 
 /// Which sandboxes running on this node the registry has confirmed this node as
@@ -823,6 +821,15 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
         self.publish(outcome).await.registered_as()
     }
 
+    /// 🔴 The same predicate [`PausedSandboxCoordinator::publish`] gates the
+    /// upload on, read one step earlier. Asking it here and asking it there
+    /// have to give the same answer, or a pause spends a durable write on a
+    /// capture the very next check throws away — which is the whole reason the
+    /// question is asked twice rather than the answer being carried.
+    fn wants_publishable_capture(&self) -> bool {
+        self.registry.is_cluster_backed()
+    }
+
     async fn mark_running(
         &self,
         sandbox_id: SandboxId,
@@ -889,23 +896,14 @@ fn orphan_verdict(registry_readable: bool, referenced: bool) -> OrphanVerdict {
 }
 
 /// Describes the snapshot a pause publishes.
+///
+/// 🔴 Unnamed, always. This snapshot is an implementation detail of pause, not
+/// something a user asked to be able to launch by name — and the alias is the
+/// one field of the publish metadata that a *remote* staging adopts from this
+/// half rather than deciding for itself, so passing one here would bind a name
+/// to a pause's private snapshot on a cluster as readily as on this node.
 fn publish_metadata(metadata: &SandboxMetadata) -> SnapshotPublishMetadata {
-    SnapshotPublishMetadata {
-        id: SnapshotId::generate(),
-        // Unnamed on purpose: this snapshot is an implementation detail of
-        // pause, not something a user asked to be able to launch by name.
-        alias: None,
-        source: SnapshotPublishSource::Sandbox {
-            source_sandbox_id: metadata.id.to_string(),
-        },
-        context: metadata.context.clone(),
-        startup: metadata.startup.clone(),
-        resources: metadata.resources,
-        runtime_versions: metadata.runtime_versions.clone(),
-        virtualization_mode: metadata.virtualization_mode,
-        image_configs: metadata.image_configs.clone(),
-        custom_extension_params: metadata.custom_extension_params.clone(),
-    }
+    crate::orchestrator::capture_publish_metadata(metadata, None)
 }
 
 #[cfg(test)]

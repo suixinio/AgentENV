@@ -173,6 +173,40 @@ var (
 		},
 	)
 
+	// schedulerRegistryHeartbeatLeaseRenewalEnabled is the resident answer to
+	// "is the heartbeat-driven lease renewal switched on", the same shape as
+	// registryWriteFencingEnabled in registry_service.go: a gauge rather than a
+	// log line, because the question is asked months later, about a process
+	// nobody has the start-up logs of any more.
+	schedulerRegistryHeartbeatLeaseRenewalEnabled = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_lease_renewal_enabled",
+			Help: "1 when scheduler.registry.heartbeat_lease_renewal is on and this process has a write surface to act through, 0 otherwise. Off by default.",
+		},
+	)
+	// schedulerRegistryParkedLeaseRenewalCandidates is published every round
+	// regardless of the switch above, so an operator can see how many rows this
+	// would act on before ever turning it on, and the series does not vanish
+	// the moment somebody turns it back off.
+	schedulerRegistryParkedLeaseRenewalCandidates = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_lease_renewal_candidates",
+			Help: "publishing/local_only rows this round found a fresh, first-party roster for: the row's own holder heartbeated recently and still lists the sandbox. Published whether or not the renewal switch is on.",
+		},
+	)
+	schedulerRegistryHeartbeatLeaseRenewed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_lease_renewed_total",
+			Help: "Rows the heartbeat-driven lease renewal actually extended lease_expires_at on.",
+		},
+	)
+	schedulerRegistryHeartbeatLeaseRenewalFailures = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_lease_renewal_failures_total",
+			Help: "Heartbeat-driven lease renewal attempts that failed to write.",
+		},
+	)
+
 	// The routing half's identity axis. Every series below has a closed label
 	// set, the same rule the lookup results follow.
 
@@ -492,6 +526,37 @@ func SetRegistryEnabled(enabled bool) {
 		value = 1
 	}
 	schedulerRegistryEnabled.Set(value)
+}
+
+// SetHeartbeatLeaseRenewalEnabled publishes whether the heartbeat-driven
+// lease renewal is switched on. Called once at start-up, on every path —
+// including query-only replicas and a write surface that never got built —
+// which report 0 as a fact rather than leaving the gauge at its Prometheus
+// default. Mirrors SetRegistryWriteFencingEnabled in registry_service.go.
+func SetHeartbeatLeaseRenewalEnabled(enabled bool) {
+	value := 0.0
+	if enabled {
+		value = 1
+	}
+	schedulerRegistryHeartbeatLeaseRenewalEnabled.Set(value)
+}
+
+// recordRegistryParkedLeaseRenewalCandidates publishes this round's candidate
+// count, whether or not the renewal switch is on — see the gauge's own doc.
+func recordRegistryParkedLeaseRenewalCandidates(n int) {
+	schedulerRegistryParkedLeaseRenewalCandidates.Set(float64(n))
+}
+
+// recordRegistryHeartbeatLeaseRenewed counts rows a heartbeat-driven renewal
+// round actually extended.
+func recordRegistryHeartbeatLeaseRenewed(n uint64) {
+	schedulerRegistryHeartbeatLeaseRenewed.Add(float64(n))
+}
+
+// recordRegistryHeartbeatLeaseRenewalFailure counts a round whose write
+// failed outright — the candidates were found but the store call errored.
+func recordRegistryHeartbeatLeaseRenewalFailure() {
+	schedulerRegistryHeartbeatLeaseRenewalFailures.Inc()
 }
 
 // warnRefusedBinding says so when a write was turned away.

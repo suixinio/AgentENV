@@ -348,6 +348,113 @@ func TestReconcileSeparatesStrandedParkedRowsFromClaimableOnes(t *testing.T) {
 	}
 }
 
+// hasParkedLeaseRenewal reports whether the candidate list names exactly this
+// (sandbox, node) pair, so a test does not have to depend on the slice's
+// iteration order.
+func hasParkedLeaseRenewal(candidates []pausedregistry.ParkedLeaseHolder, sandboxID, nodeID string) bool {
+	for _, c := range candidates {
+		if c.SandboxID == sandboxID && c.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// TestReconcileParkedLeaseRenewalCandidatesNeedTheHoldersOwnFreshRoster pins
+// the whole eligibility rule computeRegistryReconcile derives — see
+// registryReconcileResult.parkedLeaseRenewals — with one round carrying a
+// positive case for every way to be excluded, so each exclusion has to
+// actually be checked rather than merely coinciding with an empty round.
+func TestReconcileParkedLeaseRenewalCandidatesNeedTheHoldersOwnFreshRoster(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		// Eligible: publishing, snapshot published, holder's roster fresh and
+		// lists it.
+		{SandboxID: "s1", State: pausedregistry.StatePublishing, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Eligible: same, local_only.
+		{SandboxID: "s2", State: pausedregistry.StateLocalOnly, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: node-a's roster is fresh but does not list s3 — the node
+		// itself is not vouching for this row.
+		{SandboxID: "s3", State: pausedregistry.StatePublishing, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: node-b's roster does list s4, but it is stale — a silent
+		// node's last report is not evidence of anything current.
+		{SandboxID: "s4", State: pausedregistry.StatePublishing, OriginNodeID: "node-b", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: stranded (no snapshot) — nobody can claim it, so there is
+		// nothing a renewal protects.
+		{SandboxID: "s5", State: pausedregistry.StatePublishing, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: running — this mechanism is scoped to the two parked
+		// states, even though node-a's roster is fresh and lists it too.
+		{SandboxID: "s6", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: paused — nobody holds it, so it never reaches the branch
+		// that builds a candidate at all.
+		{SandboxID: "s7", State: pausedregistry.StatePaused, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+	}
+	// node-a: fresh, and vouches for everything except s3.
+	f.roster("node-a", 0, "s1", "s2", "s5", "s6", "s7")
+	// node-b: vouches for s4, but its last report is well past reportTTL.
+	f.roster("node-b", 5*time.Minute, "s4")
+
+	result := f.run(testReportTTL)
+
+	if got := len(result.parkedLeaseRenewals); got != 2 {
+		t.Fatalf("expected exactly 2 renewal candidates, got %d: %+v", got, result.parkedLeaseRenewals)
+	}
+	if !hasParkedLeaseRenewal(result.parkedLeaseRenewals, "s1", "node-a") {
+		t.Fatalf("expected s1 to be a candidate: %+v", result.parkedLeaseRenewals)
+	}
+	if !hasParkedLeaseRenewal(result.parkedLeaseRenewals, "s2", "node-a") {
+		t.Fatalf("expected s2 to be a candidate: %+v", result.parkedLeaseRenewals)
+	}
+	for _, excluded := range []string{"s3", "s4", "s5", "s6", "s7"} {
+		for _, c := range result.parkedLeaseRenewals {
+			if c.SandboxID == excluded {
+				t.Fatalf("%s must not be a renewal candidate: %+v", excluded, result.parkedLeaseRenewals)
+			}
+		}
+	}
+}
+
+// TestReconcileParkedLeaseRenewalUsesTheRowsRawHolderNotTheResolvedOne is the
+// correctness detail the write path depends on: RenewParkedLeases' statement
+// matches a row's origin_node_id column literally, and that column can still
+// hold a node's previous identity mid-upgrade even though every roster below
+// is keyed by the current one. Sending the resolved identity here would build
+// a candidate that can never match the row it was derived from.
+func TestReconcileParkedLeaseRenewalUsesTheRowsRawHolderNotTheResolvedOne(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		{SandboxID: "s1", State: pausedregistry.StatePublishing, OriginNodeID: "pod-old", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+	}
+	// The roster is reported under the canonical identity, and freshness has
+	// to be judged against that — resolveNodeID is what bridges the two.
+	f.roster("node-a", 0, "s1")
+	f.resolveNodeID = func(id string) string {
+		if id == "pod-old" {
+			return "node-a"
+		}
+		return id
+	}
+
+	result := f.run(testReportTTL)
+
+	if got := len(result.parkedLeaseRenewals); got != 1 {
+		t.Fatalf("expected exactly 1 renewal candidate, got %d: %+v", got, result.parkedLeaseRenewals)
+	}
+	if result.parkedLeaseRenewals[0].NodeID != "pod-old" {
+		t.Fatalf("expected the raw, unresolved holder %q, got %q", "pod-old", result.parkedLeaseRenewals[0].NodeID)
+	}
+	// Control: without the resolver, the row's own identity already equals
+	// the roster's, and the same candidate must still be produced — proving
+	// the assertion above is about which identity is *sent*, not an artefact
+	// of the resolver being absent.
+	f.resolveNodeID = nil
+	f.sandboxes[0].OriginNodeID = "node-a"
+	identity := f.run(testReportTTL)
+	if got := len(identity.parkedLeaseRenewals); got != 1 || identity.parkedLeaseRenewals[0].NodeID != "node-a" {
+		t.Fatalf("expected the identity-resolver control to also produce one candidate under node-a, got %+v", identity.parkedLeaseRenewals)
+	}
+}
+
 func TestReconcileCountsInvalidRows(t *testing.T) {
 	f := newReconcileFixture()
 	f.sandboxes = []pausedregistry.Sandbox{

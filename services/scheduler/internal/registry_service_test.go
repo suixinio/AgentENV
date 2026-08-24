@@ -56,10 +56,11 @@ type fakeStore struct {
 
 	leaseTTL time.Duration
 
-	calls    []string
-	lastHeld []pausedregistry.HeldSandbox
-	lastGen  int64
-	lastMeta json.RawMessage
+	calls             []string
+	lastHeld          []pausedregistry.HeldSandbox
+	lastParkedHolders []pausedregistry.ParkedLeaseHolder
+	lastGen           int64
+	lastMeta          json.RawMessage
 	// lastExecution is what the handler passed down as the incarnation, so a
 	// test can assert the value reached the store rather than only that the
 	// call was accepted.
@@ -139,6 +140,17 @@ func (f *fakeStore) ReleaseClaim(_ context.Context, _, _ string, gen int64) (boo
 func (f *fakeStore) RenewLease(_ context.Context, _, _ string, held []pausedregistry.HeldSandbox) (uint64, error) {
 	f.record("RenewLease")
 	f.lastHeld = held
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.renewed, nil
+}
+
+func (f *fakeStore) RenewParkedLeases(_ context.Context, _ string, holders []pausedregistry.ParkedLeaseHolder) (uint64, error) {
+	f.record("RenewParkedLeases")
+	f.mu.Lock()
+	f.lastParkedHolders = holders
+	f.mu.Unlock()
 	if f.err != nil {
 		return 0, f.err
 	}

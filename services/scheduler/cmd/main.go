@@ -62,6 +62,11 @@ func main() {
 	registryWriter, registryGrace, closeRegistryWriter := createRegistryStore(logger, cfg, *queryOnly)
 	defer closeRegistryWriter()
 
+	// Reflects the configured *and* effective truth, not just the setting: a
+	// cluster with the switch on but no write surface (no DSN, write disabled,
+	// or a query-only replica) reads 0 here, the same as if it were off.
+	scheduler.SetHeartbeatLeaseRenewalEnabled(registryWriter != nil && cfg.Scheduler.Registry.HeartbeatLeaseRenewal)
+
 	// nil until the write surface is switched on; /healthz reports "off" then.
 	var registryPhase func() (string, time.Duration, time.Duration)
 
@@ -112,6 +117,15 @@ func main() {
 		}
 		if cfg.Scheduler.Routing.BindingSweep {
 			serviceOpts = append(serviceOpts, scheduler.WithBindingSweep(cfg.Scheduler.BindingSweepSilence))
+		}
+		if registryWriter != nil {
+			// registryWriter is a concrete *pausedregistry.PostgresStore here,
+			// guarded non-nil before it is handed to the option as an
+			// interface — checking after wrapping is the classic nil-interface
+			// trap this guard exists to avoid.
+			serviceOpts = append(serviceOpts, scheduler.WithHeartbeatLeaseRenewal(
+				registryWriter, registryGrace, cfg.Scheduler.Registry.HeartbeatLeaseRenewal,
+			))
 		}
 		announceBindingSweep(logger, cfg)
 		svc := scheduler.NewService(

@@ -69,6 +69,20 @@ type Service struct {
 	bindingSweep bool
 	// bindingSweepSilence is how long a node may say nothing first.
 	bindingSweepSilence time.Duration
+	// registryWriter is the narrow write surface the heartbeat-driven lease
+	// renewal uses, nil unless WithHeartbeatLeaseRenewal wired one in. Every
+	// other reconciliation path — including this one when the switch below is
+	// off — never touches it.
+	registryWriter pausedregistry.ParkedLeaseRenewer
+	// registryGrace gates registryWriter through the write surface's own
+	// restart grace window. See renewParkedLeasesFromHeartbeats.
+	registryGrace registryGraceGate
+	// heartbeatLeaseRenewal is the switch itself.
+	//
+	// 🔴 Off by default, unlike registry write_fencing: this is a new write
+	// path added to a table two deployments already share, not a rollback for
+	// one that shipped on. See WithHeartbeatLeaseRenewal.
+	heartbeatLeaseRenewal bool
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -183,6 +197,47 @@ func WithPausedRegistry(reader pausedregistry.Reader, reportTTL time.Duration, l
 		if leaseWarnWindow > 0 {
 			s.registryLeaseWarnWindow = leaseWarnWindow
 		}
+	}
+}
+
+// WithHeartbeatLeaseRenewal turns on the scheduler-driven renewal of
+// publishing/local_only leases: each reconcile round, a row whose holder's
+// own fresh heartbeat roster still lists the sandbox has lease_expires_at
+// pushed out directly by this process.
+//
+// 🔴 Why this exists at all. The api half's own renewal call
+// (renew_paused_leases, `src/api/impls/paused_recovery.rs`) renews under its
+// own process identity, which for those two states is no longer the row's
+// holder now that origin_node_id names the machine that actually holds the
+// bytes rather than the api replica that wrote the row — see the commit that
+// changed that. This round already has both facts this needs — the registry
+// row and a fresh roster naming the same sandbox — so acting on them here is
+// authority actually held by the party asserting it: the node's own
+// heartbeat, which it cannot forge, rather than a caller renewing on a row it
+// does not hold. See computeRegistryReconcile's parkedLeaseRenewals for the
+// exact eligibility rule.
+//
+// 🔴 Off by default, unlike scheduler.registry.write_fencing. That switch
+// defaults on because it is the rollback for a predicate that already shipped
+// serving every deployment; this one is a new write path added to a table
+// both the EKS and the pve-sg trees still share, and turning it on for either
+// without the other agreeing is exactly the zero-behaviour-change guarantee
+// this switch exists to preserve until both sides are ready.
+//
+// writer nil disables the option outright, mirroring WithPausedRegistry —
+// there is nothing to gate if there is nothing to write through. grace is
+// accepted separately, and may be nil: registryGraceGate's one implementation
+// today, *pausedregistry.Grace, tolerates a nil receiver by treating it as
+// always serving, and any other implementation is asked to keep that
+// property (see registryGraceGate's own doc).
+func WithHeartbeatLeaseRenewal(writer pausedregistry.ParkedLeaseRenewer, grace registryGraceGate, enabled bool) ServiceOption {
+	return func(s *Service) {
+		if writer == nil {
+			return
+		}
+		s.registryWriter = writer
+		s.registryGrace = grace
+		s.heartbeatLeaseRenewal = enabled
 	}
 }
 

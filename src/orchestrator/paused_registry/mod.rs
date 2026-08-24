@@ -410,7 +410,22 @@ pub trait PausedSandboxPublisher: Send + Sync {
     );
 
     /// Drops the cluster's record of the sandbox and the snapshot behind it.
-    async fn forget(&self, sandbox_id: SandboxId);
+    ///
+    /// `holding_node_id` is the real machine this delete just stopped the
+    /// sandbox on, read from the backend the same way
+    /// [`Self::mark_running`]'s `holding_node_id` is — see that parameter's
+    /// doc. `None` covers every backend that runs the VM in this same
+    /// process, which is the correct, common case and the one every
+    /// implementation must fall back to its own identity for, mirroring
+    /// `mark_running`'s identical fallback for the mirror-image question (a
+    /// sandbox this process is bringing up, rather than tearing down).
+    ///
+    /// Without this, an implementation deciding whether the row still
+    /// describes a sandbox live elsewhere has nothing but its own process
+    /// identity to compare the row's real machine against — which is never
+    /// equal to it on a half that never holds a sandbox itself, and made
+    /// every such delete refuse to clear the row it had just made accurate.
+    async fn forget(&self, sandbox_id: SandboxId, holding_node_id: Option<String>);
 }
 
 /// Says what a granted claim cost, once, wherever the claim came from.

@@ -732,7 +732,13 @@ impl ApiImpl {
     /// sandbox this node does not hold, which exists in the cluster purely as a
     /// published snapshot.
     pub(super) async fn forget_paused_sandbox(&self, sandbox_id: SandboxId) {
-        self.paused.forget_sandbox(sandbox_id).await;
+        // No handle: this call stopped nothing, so it has no real machine to
+        // report. `forget_sandbox`'s fallback (this process's own identity)
+        // is the correct answer here, not a stopgap — a `Running` row this
+        // path finds was never touched by this delete, and must be left
+        // alone exactly as if a real holder had been read and found to
+        // differ.
+        self.paused.forget_sandbox(sandbox_id, None).await;
     }
 
     /// Brings this node's copies of sandboxes back in line with the cluster.

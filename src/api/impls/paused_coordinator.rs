@@ -782,7 +782,12 @@ impl PausedSandboxCoordinator {
     /// Only correct once the sandbox itself is gone: the snapshot is what makes
     /// the sandbox recoverable, so removing it while the sandbox still exists
     /// somewhere would quietly strip its last durable copy.
-    pub async fn forget_sandbox(&self, sandbox_id: SandboxId) {
+    ///
+    /// `holding_node_id` is the real machine this delete just stopped the
+    /// sandbox on — see [`PausedSandboxPublisher::forget`]'s doc for where it
+    /// comes from and why `self.node_id` (this process's own identity, the
+    /// claimant) is never a substitute for it here.
+    pub async fn forget_sandbox(&self, sandbox_id: SandboxId, holding_node_id: Option<String>) {
         self.running_registrations.forget(&sandbox_id);
 
         let entry = match self.registry.get(&sandbox_id).await {
@@ -796,7 +801,16 @@ impl PausedSandboxCoordinator {
             }
         };
 
-        if let Some(holder) = live_elsewhere(&entry, &self.node_id) {
+        // The real machine this delete just stopped the sandbox on, falling
+        // back to this process's own identity exactly the way
+        // `mark_sandbox_running` does for the mirror-image question — correct
+        // on every role that runs the VM in this same process, and the only
+        // answer a caller with no better one can give.
+        let holder_node_id = holding_node_id
+            .as_deref()
+            .unwrap_or(self.node_id.as_str());
+
+        if let Some(holder) = live_elsewhere(&entry, &self.node_id, holder_node_id) {
             // Deleting the local copy of a sandbox that is live on another node
             // says nothing about that node's copy — it keeps running. Clearing
             // the row here would only strip it of the snapshot it can be
@@ -930,8 +944,8 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
             .await;
     }
 
-    async fn forget(&self, sandbox_id: SandboxId) {
-        self.forget_sandbox(sandbox_id).await;
+    async fn forget(&self, sandbox_id: SandboxId, holding_node_id: Option<String>) {
+        self.forget_sandbox(sandbox_id, holding_node_id).await;
     }
 }
 
@@ -941,15 +955,43 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
 /// clear from any node: the delete then completes on whichever node holds the
 /// artifacts, when it next reconciles. A sandbox that is *live* elsewhere is
 /// not, because nothing this node does will stop it.
-fn live_elsewhere(entry: &PausedSandboxEntry, node_id: &str) -> Option<String> {
+///
+/// # 🔴 Two identities in, deliberately never the same argument
+///
+/// Mirrors the claimant/holder split [`PausedSandboxCoordinator::mark_sandbox_running`]
+/// documents for the opposite question. `claimant_node_id` is always
+/// `self.node_id` — this process's own identity — and is what a `Resuming`
+/// row's `claimed_by_node_id` is compared against, because that field is
+/// itself always a claimant (the identity a resume claimed under, written by
+/// `mark_running`'s CAS guard — see that method's doc). `holder_node_id` is
+/// the real machine, and is what a `Running` row's `origin_node_id` is
+/// compared against, because `origin_node_id` has been a real machine, never
+/// a claimant, since 259d0de split `mark_running`'s write in two.
+///
+/// Before that split — and still, on a role that runs its own sandboxes —
+/// `self.node_id` was itself a real machine, so passing it for both
+/// arguments reproduces the old behavior exactly. On the api half, it is a
+/// Pod identity that no `origin_node_id` will ever equal, and comparing a
+/// `Running` row against it made this function report every such row as live
+/// elsewhere forever — the delete kept succeeding, but the row and the
+/// snapshot behind it were never cleared. `forget_sandbox` computes
+/// `holder_node_id` with the same fallback `mark_sandbox_running` uses for
+/// the mirror-image write, so a role with nothing better to report still
+/// gets its own identity, and a role that knows the real machine — because
+/// the backend it just stopped told it — gets that instead.
+fn live_elsewhere(
+    entry: &PausedSandboxEntry,
+    claimant_node_id: &str,
+    holder_node_id: &str,
+) -> Option<String> {
     match entry.state {
-        PausedRegistryState::Running if entry.origin_node_id != node_id => {
+        PausedRegistryState::Running if entry.origin_node_id != holder_node_id => {
             Some(entry.origin_node_id.clone())
         }
         PausedRegistryState::Resuming => entry
             .claimed_by_node_id
             .as_ref()
-            .filter(|claimer| *claimer != node_id)
+            .filter(|claimer| *claimer != claimant_node_id)
             .cloned(),
         _ => None,
     }
@@ -1141,24 +1183,35 @@ mod tests {
     /// Deleting a stale local copy must not take the live sandbox's snapshot
     /// with it. The delete does not reach the node actually running it, so
     /// clearing the row would leave that node's sandbox unrecoverable.
+    ///
+    /// The claimant argument is deliberately not `"node-a"` here: a `Running`
+    /// row is decided on the holder alone, and giving the claimant a value
+    /// that would also make the naive (pre-split) comparison pass — while the
+    /// holder is the one that actually differs from the row — is what proves
+    /// this branch is reading `holder_node_id`, not `claimant_node_id`.
     #[test]
     fn a_sandbox_running_on_another_node_is_not_forgotten() {
         assert_eq!(
             live_elsewhere(
                 &entry(PausedRegistryState::Running, "node-b", None),
-                "node-a"
+                "node-b",
+                "node-a",
             ),
             Some("node-b".to_string())
         );
     }
 
-    /// Same for a resume in flight somewhere else.
+    /// Same for a resume in flight somewhere else. Mirrors the test above:
+    /// the holder argument is deliberately the value that would make a
+    /// `Running`-style comparison pass, to prove the `Resuming` branch reads
+    /// `claimant_node_id` and never falls back to `holder_node_id`.
     #[test]
     fn a_sandbox_claimed_by_another_node_is_not_forgotten() {
         assert_eq!(
             live_elsewhere(
                 &entry(PausedRegistryState::Resuming, "node-a", Some("node-b")),
-                "node-a"
+                "node-a",
+                "node-b",
             ),
             Some("node-b".to_string())
         );
@@ -1169,7 +1222,8 @@ mod tests {
     fn our_own_sandbox_is_forgotten() {
         assert!(live_elsewhere(
             &entry(PausedRegistryState::Running, "node-a", None),
-            "node-a"
+            "node-a",
+            "node-a",
         )
         .is_none());
     }
@@ -1185,10 +1239,76 @@ mod tests {
             PausedRegistryState::LocalOnly,
         ] {
             assert!(
-                live_elsewhere(&entry(state, "node-b", None), "node-a").is_none(),
+                live_elsewhere(&entry(state, "node-b", None), "node-a", "node-a").is_none(),
                 "{state:?} should be clearable from another node"
             );
         }
+    }
+
+    /// 🔴 The exact split-topology bug found on the dev cluster after 259d0de
+    /// split `mark_running`'s write: `origin_node_id` has been a real machine
+    /// ever since, but this comparison was still made against the *claimant*
+    /// — `self.node_id`, which on the api half is the api Pod's own identity
+    /// and never equals a real node's name. Every delete of a resumed
+    /// sandbox therefore found its `Running` row "live elsewhere" forever:
+    /// the delete itself kept succeeding, but the registry row and the
+    /// snapshot behind it leaked on every single one. The holder argument —
+    /// the real machine this delete's own handle just reported stopping —
+    /// is what has to be compared, not the claimant.
+    #[test]
+    fn a_sandbox_this_delete_just_stopped_is_forgotten_even_though_the_claimant_is_never_a_real_node(
+    ) {
+        assert!(
+            live_elsewhere(
+                &entry(PausedRegistryState::Running, "aenv-master-01", None),
+                // The api replica's own pod identity: structurally never
+                // equal to any real node's name.
+                "aenv-api-6c9f8d59b4-x7z2q",
+                // What this delete's handle reported holding it on.
+                "aenv-master-01",
+            )
+            .is_none(),
+            "the row names the machine this delete just stopped it on; it must be forgotten"
+        );
+    }
+
+    /// 🔴 The end-to-end version of the two tests above: proves the row is
+    /// actually gone from the registry after a real `forget_sandbox` call,
+    /// not merely that the pure `live_elsewhere` decision returned `None`.
+    ///
+    /// This is the shape of assertion the dev-cluster leak needed and did not
+    /// have: a test that only checked `delete_sandbox`'s `Ok(())` return
+    /// would have passed throughout the whole incident, because the delete
+    /// itself never failed — only the registry row and the snapshot behind
+    /// it were silently left behind on every single one.
+    #[tokio::test]
+    async fn forget_sandbox_clears_the_row_the_real_holder_just_stopped_it_on() {
+        let sandbox_id = SandboxId::new();
+        let mut seeded_row = entry(PausedRegistryState::Running, "real-node-1", None);
+        seeded_row.sandbox_id = sandbox_id;
+        // Keeps this test to the registry row alone; snapshot deletion has
+        // its own coverage above.
+        seeded_row.snapshot_id = None;
+        let registry = Arc::new(RecordingRegistry {
+            rows: Mutex::new(HashMap::from([(sandbox_id, seeded_row)])),
+            ..RecordingRegistry::default()
+        });
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        // THIS_REPLICA ("api-replica-1") is the coordinator's own claimant
+        // identity, and structurally never equals a real node's name — the
+        // exact split-topology shape that leaked every row on the dev
+        // cluster. `holding_node_id` is what a real delete threads through
+        // from the handle it just stopped, naming the same machine the row
+        // already does.
+        coordinator
+            .forget_sandbox(sandbox_id, Some("real-node-1".to_string()))
+            .await;
+
+        assert!(
+            registry.row(&sandbox_id).is_none(),
+            "the registry row must actually be gone, not just have `forget_sandbox` return"
+        );
     }
 
     /// 🔴 The re-read is the whole safety property, and it is invisible from

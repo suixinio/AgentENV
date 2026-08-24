@@ -6168,7 +6168,12 @@ struct RecordingPublisher {
     /// "which machine reported it live" — the third being the one
     /// `resume_sandbox_inner` has to read off the backend rather than assume.
     marked_running: StdMutex<Vec<(SandboxId, ExecutionId, Option<String>)>>,
-    forgotten: StdMutex<Vec<SandboxId>>,
+    /// Both facts of the write: "which sandbox", and "which machine this
+    /// delete's own handle reported holding it" — the second being what
+    /// `delete_sandbox_inner` has to read off the handle before it is
+    /// stopped, mirroring `marked_running`'s third field for the
+    /// mirror-image question.
+    forgotten: StdMutex<Vec<(SandboxId, Option<String>)>>,
     /// What this publisher answers when asked whether it would commit a
     /// publishable capture. Defaults to yes, matching every cluster-backed
     /// registry.
@@ -6203,6 +6208,15 @@ impl RecordingPublisher {
     }
 
     fn forgotten(&self) -> Vec<SandboxId> {
+        self.forgotten
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sandbox_id, ..)| *sandbox_id)
+            .collect()
+    }
+
+    fn forgotten_with_holder(&self) -> Vec<(SandboxId, Option<String>)> {
         self.forgotten.lock().unwrap().clone()
     }
 
@@ -6250,8 +6264,11 @@ impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
             .push((sandbox_id, execution_id, holding_node_id));
     }
 
-    async fn forget(&self, sandbox_id: SandboxId) {
-        self.forgotten.lock().unwrap().push(sandbox_id);
+    async fn forget(&self, sandbox_id: SandboxId, holding_node_id: Option<String>) {
+        self.forgotten
+            .lock()
+            .unwrap()
+            .push((sandbox_id, holding_node_id));
     }
 }
 
@@ -6827,6 +6844,55 @@ async fn a_resume_on_a_named_machine_reports_that_machine_not_this_process() -> 
     );
 
     orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+/// The mirror-image of the test above, for the opposite direction: `forget`
+/// has to be told the real machine `delete_sandbox_inner`'s own handle just
+/// stopped, not left to assume this process is the answer.
+///
+/// 🔴 What this pins: `delete_sandbox_inner` reading `holding_node_id` off
+/// the handle it is about to stop, before that handle is moved into the stop
+/// call, and passing it through to `PausedSandboxPublisher::forget`. This is
+/// the exact dev-cluster regression: on the api half `self.node_id` is the
+/// api Pod's own identity, and comparing a `Running` registry row's real
+/// machine against it (`live_elsewhere` in `paused_coordinator.rs`) was
+/// always false, so every delete of a resumed sandbox leaked its cluster row
+/// and snapshot — silently, because the delete itself still reported
+/// success. Revert the read this test pins and every delete forgets nothing
+/// but the api Pod's own identity, which no row will ever have named.
+#[tokio::test]
+async fn a_delete_on_a_named_machine_reports_that_machine_not_this_process() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let publisher = Arc::new(RecordingPublisher::default());
+    orchestrator.set_paused_publisher(
+        Arc::clone(&publisher) as Arc<dyn crate::orchestrator::PausedSandboxPublisher>
+    );
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    // Every backend this factory builds — including the one this sandbox is
+    // already running on — now answers as though it were placed on
+    // `node-203`, the way `RemoteSandboxStub` does once a resume has landed
+    // somewhere. Set after creation, on purpose: it proves the delete path
+    // reads this dynamically off the live handle rather than off a value
+    // captured once at creation.
+    behavior.set_holding_node_id(Some("node-203"));
+
+    orchestrator.delete_sandbox(created.id).await?;
+
+    assert_eq!(
+        publisher.forgotten_with_holder(),
+        vec![(created.id, Some("node-203".to_string()))],
+        "the report must name the machine the handle said it was stopping, not this process"
+    );
+
     Ok(())
 }
 

@@ -1414,6 +1414,22 @@ where
             },
         };
 
+        // Read before `handle` is moved into the stop below: the real machine
+        // this delete is about to stop the sandbox on, when this process did
+        // not run it itself. `forget` needs this to tell a sandbox this
+        // operation just stopped from one the registry names as running
+        // somewhere this operation never touched — see
+        // `PausedSandboxPublisher::forget`'s doc, and `mark_sandbox_running`'s
+        // identical read for the mirror-image case (bringing a sandbox up,
+        // not tearing it down).
+        let holding_node_id_for_forget = match handle.as_ref() {
+            Some(handle) => {
+                let sandbox = handle.lock().await;
+                sandbox.holding_node_id().map(str::to_string)
+            }
+            None => None,
+        };
+
         // If a runtime could be reached, attempt to stop it.
         if let Some(handle) = handle {
             let stop_result = {
@@ -1463,7 +1479,9 @@ where
         // cleans up as thoroughly as a requested one.
         if disposition == ClusterDisposition::Forget {
             if let Some(publisher) = self.paused_publisher() {
-                publisher.forget(sandbox_id).await;
+                publisher
+                    .forget(sandbox_id, holding_node_id_for_forget)
+                    .await;
             }
         }
         info!("sandbox deleted");

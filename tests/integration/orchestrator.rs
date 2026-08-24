@@ -6,6 +6,7 @@ use agentenv::orchestrator::{
     InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxLaunchSource,
     SandboxState, SandboxTimeoutAction,
 };
+use agentenv::role::ServerRole;
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotSource,
@@ -72,7 +73,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let factory = FirecrackerSandboxFactory::new();
         let paused_store = root.path().join("paused-sandboxes");
         let persister = host_file_persister(paused_store.clone());
-        let orchestrator = Orchestrator::new(store, factory, persister).await?;
+        let orchestrator = Orchestrator::new(ServerRole::All, store, factory, persister).await?;
         let case_id = Uuid::now_v7().to_string();
 
         let request = CreateSandboxRequest {
@@ -165,6 +166,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         drop(orchestrator);
 
         let restarted = Orchestrator::new(
+            ServerRole::All,
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             host_file_persister(paused_store),

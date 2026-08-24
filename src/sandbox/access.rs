@@ -6,10 +6,11 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
 use rand::{rngs::SysRng, TryRng};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
+use crate::role::ServerRole;
 use crate::types::SandboxId;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -18,6 +19,32 @@ const MANAGED_SEED_RELATIVE_PATH: &str = "secrets/sandbox-access-token-hash-seed
 const MANAGED_SEED_BYTES: usize = 32;
 const SEED_HEX_LEN: usize = MANAGED_SEED_BYTES * 2;
 const MANAGED_SEED_FILE_MAX_LEN: usize = SEED_HEX_LEN + 1;
+
+/// The name of the environment variable an operator sets, quoted in the refusal
+/// so the message can be acted on without opening the configuration reference.
+const SEED_ENV_VAR: &str = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED";
+
+/// How many leading bytes of `SHA-256(seed)` stand in for the seed in
+/// [`SEED_FINGERPRINT_METRIC`].
+///
+/// 🔴 A prefix of a hash, never the seed. What the label has to support is one
+/// question — "do these two processes hold the same seed?" — and eight bytes
+/// answer it. It is not a secret in the sense the seed is, but it is also not
+/// nothing: a seed guessable from a short list stays guessable through its
+/// hash, so this is a comparison aid and not a reason to relax how the seed
+/// itself is handled.
+const SEED_FINGERPRINT_BYTES: usize = 8;
+
+/// The gauge that makes "every replica holds the same seed" answerable from a
+/// scrape.
+///
+/// 🔴 Always `1`, and the value is not the point: the *label* is. A missing
+/// seed is caught at startup by [`ServerRole::needs_a_configured_access_token_seed`],
+/// but two replicas each configured with a different non-empty seed pass every
+/// check there is and still hand users tokens the other one rejects. Comparing
+/// this label across replicas is the only place that divergence is visible
+/// (`_sd-impl-phase3-role.md` §9.3 item 4).
+const SEED_FINGERPRINT_METRIC: &str = "agentenv_access_token_seed_fingerprint";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct EnvdAccessToken(String);
@@ -47,20 +74,56 @@ impl SandboxAccessTokenGenerator {
         })
     }
 
+    /// Resolves the seed this process signs envd access tokens with, and
+    /// publishes its fingerprint.
+    ///
+    /// The fingerprint is published for *every* role, including `all`. That is
+    /// deliberate and it is what makes the gauge worth having before the split
+    /// ships: on today's fleet, where every machine runs `--role all`, scraping
+    /// it from two nodes answers "do these two agree?" — which is the same
+    /// question two `api` replicas will need answered, asked a release early.
     pub(crate) fn load_or_create(
         config: &AppConfig,
+        role: ServerRole,
+        managed_seed_must_exist: bool,
+    ) -> Result<Self> {
+        let generator = Self::resolve(config, role, managed_seed_must_exist)?;
+        generator.publish_seed_fingerprint(role);
+        Ok(generator)
+    }
+
+    fn resolve(
+        config: &AppConfig,
+        role: ServerRole,
         managed_seed_must_exist: bool,
     ) -> Result<Self> {
         if let Some(seed) = config.sandbox.access_token_hash_seed.as_deref() {
             return Self::new(seed);
         }
 
+        // 🔴 Before the managed file is even looked for. Falling back to a
+        // node-local seed is the failure, not a step on the way to it: the
+        // process would come up, serve requests, and mint tokens no sibling
+        // replica can verify.
+        if role.needs_a_configured_access_token_seed() {
+            bail!(
+                "--role {role} has no envd access-token seed configured. Set {SEED_ENV_VAR} (or \
+                 [sandbox].access_token_hash_seed) to the same value on every {role} replica, and \
+                 do not let this process generate one: envd access tokens are \
+                 HMAC(seed, sandbox_id), so a seed invented here would make this replica hand out \
+                 tokens its siblings reject and reject the ones they handed out — silently, on \
+                 whichever request the load balancer sent where. In Kubernetes the value is the \
+                 `sandbox-access-token-hash-seed` key of the `agentenv-runtime-secrets` Secret, \
+                 which deploy/k8s/base/agentenv-api-deployment.yaml already reads with \
+                 `optional: false`; create the Secret before rolling out the Deployment.",
+                role = role.as_str()
+            );
+        }
+
         let managed_seed_path = config.home_path.join(MANAGED_SEED_RELATIVE_PATH);
         let seed = resolve_seed(&managed_seed_path, managed_seed_must_exist)?;
 
-        if config.sandbox.access_token_hash_seed.is_none()
-            && config.cluster.scheduler_endpoint.is_some()
-        {
+        if config.cluster.scheduler_endpoint.is_some() {
             warn!(
                 path = %managed_seed_path.display(),
                 "using a node-local managed envd access-token seed; configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node before enabling cross-node sandbox recovery"
@@ -68,6 +131,28 @@ impl SandboxAccessTokenGenerator {
         }
 
         Self::new(&seed)
+    }
+
+    /// The first [`SEED_FINGERPRINT_BYTES`] bytes of `SHA-256(seed)`, in
+    /// lowercase hex.
+    ///
+    /// Two processes holding the same seed produce the same string; two holding
+    /// different seeds do not. That is the whole contract.
+    pub(crate) fn seed_fingerprint(&self) -> String {
+        let digest = Sha256::digest(&self.seed);
+        hex::encode(&digest[..SEED_FINGERPRINT_BYTES])
+    }
+
+    fn publish_seed_fingerprint(&self, role: ServerRole) {
+        let fingerprint = self.seed_fingerprint();
+        // The seed itself never reaches either sink; the fingerprint is what
+        // both carry.
+        info!(
+            role = role.as_str(),
+            fingerprint = %fingerprint,
+            "resolved the envd access-token seed"
+        );
+        metrics::gauge!(SEED_FINGERPRINT_METRIC, "fingerprint" => fingerprint).set(1.0);
     }
 
     pub fn generate(&self, subject: SandboxId) -> EnvdAccessToken {
@@ -452,23 +537,211 @@ mod tests {
         assert!(!format!("{token:?}").contains(token.expose()));
     }
 
+    /// A config whose only variable is the seed, so the tests below differ from
+    /// each other by exactly one thing.
+    fn config_with_seed(home: &Path, seed: Option<&str>) -> AppConfig {
+        AppConfig {
+            home_path: home.to_owned(),
+            sandbox: crate::cfg::SandboxConfig {
+                access_token_hash_seed: seed.map(str::to_owned),
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn explicit_seed_takes_precedence_without_creating_managed_state() -> Result<()> {
         let temp = TempDir::new()?;
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
-        let config = AppConfig {
-            home_path: temp.path().to_owned(),
-            sandbox: crate::cfg::SandboxConfig {
-                access_token_hash_seed: Some("configured-seed".to_owned()),
-            },
-            ..Default::default()
-        };
+        let config = config_with_seed(temp.path(), Some("configured-seed"));
 
-        let generator = SandboxAccessTokenGenerator::load_or_create(&config, false)?;
+        let generator =
+            SandboxAccessTokenGenerator::load_or_create(&config, ServerRole::All, false)?;
 
         assert_eq!(generator.seed, "configured-seed".as_bytes());
         assert!(!managed_path.exists());
         Ok(())
+    }
+
+    /// 🔴 The refusal and the thing it refuses, one config apart.
+    ///
+    /// Asserting only that `--role api` fails would pass on a `load_or_create`
+    /// that had simply stopped working; asserting only that `--role node`
+    /// succeeds would pass on the code as it was before this gate existed. The
+    /// evidence is that the same directory, the same absent seed and the same
+    /// call give opposite answers for two roles — and that the api arm leaves
+    /// no managed file behind, which is what says it refused *instead of*
+    /// falling back rather than after having done so.
+    ///
+    /// 🔴 This seam is the only place the refusal can be covered, and the
+    /// reason is worth knowing before somebody goes looking for the same test
+    /// one layer up: `ConfigManager::set_global` injects
+    /// `TEST_ACCESS_TOKEN_HASH_SEED` into every `#[cfg(test)]` build
+    /// (`src/cfg.rs`), so an `Orchestrator::new(ServerRole::Api, ..)` in any
+    /// unit test always finds a configured seed and always succeeds. A test
+    /// there would look like it covered this and would not.
+    #[test]
+    fn the_api_half_refuses_to_invent_a_seed_and_the_other_two_still_may() -> Result<()> {
+        for role in [ServerRole::Node, ServerRole::All] {
+            let temp = TempDir::new()?;
+            let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+            let config = config_with_seed(temp.path(), None);
+
+            let generator = SandboxAccessTokenGenerator::load_or_create(&config, role, false)
+                .unwrap_or_else(|error| {
+                    panic!("--role {} should still generate: {error:#}", role.as_str())
+                });
+
+            assert_eq!(generator.seed.len(), SEED_HEX_LEN);
+            assert!(
+                managed_path.exists(),
+                "--role {} did not write the managed seed it generated",
+                role.as_str()
+            );
+        }
+
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+        let config = config_with_seed(temp.path(), None);
+
+        let error = SandboxAccessTokenGenerator::load_or_create(&config, ServerRole::Api, false)
+            .expect_err("--role api must not invent a seed its siblings cannot derive");
+
+        let message = format!("{error:#}");
+        // Actionable, in the words an operator would go looking for.
+        assert!(message.contains(SEED_ENV_VAR), "{message}");
+        assert!(
+            message.contains("same value on every api replica"),
+            "{message}"
+        );
+        assert!(message.contains("agentenv-runtime-secrets"), "{message}");
+        // Refused before the fallback, not after it.
+        assert!(
+            !managed_path.exists(),
+            "--role api generated a seed on its way to refusing"
+        );
+        Ok(())
+    }
+
+    /// What satisfies the refusal, and what does not. A seed that is only
+    /// whitespace is the shape a Secret key present-but-empty takes, and it has
+    /// to be as loud as a missing one rather than quietly becoming a valid
+    /// zero-length key.
+    #[test]
+    fn a_configured_seed_is_what_the_api_half_wants_and_a_blank_one_is_not() -> Result<()> {
+        let temp = TempDir::new()?;
+
+        let configured = config_with_seed(temp.path(), Some("cluster-wide-seed"));
+        let generator =
+            SandboxAccessTokenGenerator::load_or_create(&configured, ServerRole::Api, false)?;
+        assert_eq!(generator.seed, "cluster-wide-seed".as_bytes());
+
+        let blank = config_with_seed(temp.path(), Some("   "));
+        let error = SandboxAccessTokenGenerator::load_or_create(&blank, ServerRole::Api, false)
+            .expect_err("a whitespace-only seed is not a seed");
+        assert!(
+            format!("{error:#}").contains("must be non-empty"),
+            "{error:#}"
+        );
+
+        assert!(!temp.path().join(MANAGED_SEED_RELATIVE_PATH).exists());
+        Ok(())
+    }
+
+    /// 🔴 The half of the fingerprint that gives it any value: two different
+    /// seeds must produce two different labels. "The same seed hashes to the
+    /// same thing" is also true of a function that returns a constant, and a
+    /// constant is exactly the failure mode this metric exists to rule out —
+    /// two replicas reporting equal fingerprints while holding different seeds.
+    #[test]
+    fn the_fingerprint_tells_two_seeds_apart_and_agrees_with_itself() -> Result<()> {
+        let alpha = SandboxAccessTokenGenerator::new("seed-alpha")?;
+        let alpha_again = SandboxAccessTokenGenerator::new("seed-alpha")?;
+        let beta = SandboxAccessTokenGenerator::new("seed-beta")?;
+
+        assert_eq!(alpha.seed_fingerprint(), alpha_again.seed_fingerprint());
+        assert_ne!(
+            alpha.seed_fingerprint(),
+            beta.seed_fingerprint(),
+            "a fingerprint two different seeds share cannot answer whether two replicas agree"
+        );
+
+        // Pinned to the digest rather than to itself: a fingerprint that is
+        // *some* stable function of the seed still fails the cluster if the two
+        // replicas run builds that compute it differently.
+        assert_eq!(alpha.seed_fingerprint(), "ba316cd7abc9b7dc");
+        assert_eq!(beta.seed_fingerprint(), "d9c30acfd5686611");
+        assert_eq!(alpha.seed_fingerprint().len(), SEED_FINGERPRINT_BYTES * 2);
+
+        // And it is a hash, not the seed wearing a hat.
+        assert!(!alpha.seed_fingerprint().contains("seed-alpha"));
+        assert!(alpha
+            .seed_fingerprint()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        Ok(())
+    }
+
+    /// The gauge, read the way a scrape reads it.
+    ///
+    /// 🔴 Three loads in one test, and the third is the control: without a run
+    /// that publishes a *different* label, "the label matched" is satisfied by
+    /// a recorder that only ever saw one value. What is asserted is the shape
+    /// the §12 P4 probe compares across replicas — same seed, same label;
+    /// different seed, different label — plus the fact that neither label is
+    /// the seed.
+    #[test]
+    fn the_seed_fingerprint_is_published_where_two_replicas_can_be_compared() -> Result<()> {
+        let temp = TempDir::new()?;
+
+        let first = published_fingerprints(&config_with_seed(temp.path(), Some("replica-seed")))?;
+        let second = published_fingerprints(&config_with_seed(temp.path(), Some("replica-seed")))?;
+        let divergent = published_fingerprints(&config_with_seed(temp.path(), Some("other-seed")))?;
+
+        assert_eq!(
+            first,
+            vec![SandboxAccessTokenGenerator::new("replica-seed")?.seed_fingerprint()],
+            "exactly one fingerprint should be published, and it should be this seed's"
+        );
+        assert_eq!(first, second, "two replicas holding one seed must agree");
+        assert_ne!(
+            first, divergent,
+            "a third replica with its own seed must be distinguishable, or the gauge is a constant"
+        );
+        assert!(!first[0].contains("replica-seed"));
+        Ok(())
+    }
+
+    /// Every `fingerprint` label `load_or_create` published, at value 1.
+    fn published_fingerprints(config: &AppConfig) -> Result<Vec<String>> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let loaded = SandboxAccessTokenGenerator::load_or_create(config, ServerRole::Api, false);
+        drop(guard);
+        loaded?;
+
+        Ok(snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _unit, _description, value)| {
+                composite.key().name() == SEED_FINGERPRINT_METRIC
+                    && matches!(value, DebugValue::Gauge(reading) if reading.into_inner() == 1.0)
+            })
+            .map(|(composite, _unit, _description, _value)| {
+                composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "fingerprint")
+                    .map_or_else(
+                        || "<no fingerprint label>".to_owned(),
+                        |label| label.value().to_owned(),
+                    )
+            })
+            .collect())
     }
 
     #[test]

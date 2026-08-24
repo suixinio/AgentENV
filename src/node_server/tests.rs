@@ -17,6 +17,7 @@ use crate::orchestrator::{
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
+use crate::role::ServerRole;
 use crate::sandbox::mock::MockBackendFactory;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::snapshot::{mock::mock_snapshot_manager, RunnableSnapshot};
@@ -29,6 +30,7 @@ const NODE: &str = "node-under-test";
 async fn service() -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -291,6 +293,7 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
 
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         HalfAnswering(InMemoryMetadataStore::new()),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -452,6 +455,7 @@ async fn the_listing_reports_the_incarnation_the_handle_is_running() {
     crate::logging::init_for_tests();
     let drifted = Arc::new(std::sync::Mutex::new(Vec::new()));
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         InMemoryMetadataStore::new(),
         Drifting {
             inner: MockBackendFactory::new(),
@@ -502,6 +506,7 @@ async fn a_sandbox_whose_handle_is_busy_is_still_reported() {
     crate::logging::init_for_tests();
     let behavior = Arc::new(MockBehavior::new());
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         DisabledSandboxPersister,

@@ -93,6 +93,7 @@ fn wiring_at(
 
 async fn build_api(resume_wiring: ResumeWiring) -> Arc<ApiImpl> {
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,

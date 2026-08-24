@@ -2008,6 +2008,7 @@ mod tests {
     async fn build_api_with(domains: Vec<String>, role: ServerRole) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().unwrap();
         let orchestrator = Orchestrator::new(
+            ServerRole::All,
             crate::orchestrator::InMemoryMetadataStore::new(),
             crate::sandbox::FirecrackerSandboxFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),

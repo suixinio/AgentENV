@@ -1303,6 +1303,7 @@ mod tests {
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator, PausedSandboxRegistry,
     };
+    use crate::role::ServerRole;
     use crate::sandbox::FirecrackerSandboxFactory;
     use crate::snapshot::mock::mock_snapshot_manager;
     use crate::snapshot::SnapshotId;
@@ -1330,6 +1331,7 @@ mod tests {
         registry: Arc<dyn PausedSandboxRegistry>,
     ) -> Arc<ApiImpl> {
         let orchestrator = Orchestrator::new(
+            ServerRole::All,
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.to_path_buf()),
@@ -2124,6 +2126,7 @@ mod cross_node_resume_scope_tests {
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
+    use crate::role::ServerRole;
     use crate::sandbox::FirecrackerSandboxFactory;
     use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit, StartedBuild};
     use crate::snapshot::repository::{
@@ -2254,6 +2257,7 @@ mod cross_node_resume_scope_tests {
         });
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
+            ServerRole::All,
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),

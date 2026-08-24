@@ -147,6 +147,35 @@ impl ServerRole {
         matches!(self, Self::Node)
     }
 
+    /// Whether this role has to be *handed* its envd access-token seed rather
+    /// than being allowed to invent a node-local one.
+    ///
+    /// envd access tokens are `HMAC(seed, sandbox_id)`, so the seed is not a
+    /// private detail of the process that holds it: it is the only thing that
+    /// makes two processes agree on what a sandbox's token is.
+    ///
+    /// 🔴 `api` only, and it is about replication rather than about being the
+    /// deciding half. An `api` Deployment runs more than one replica, and every
+    /// one of them mints tokens (`create`, `fork`), re-derives them (`resume`)
+    /// and hands them back (`GET /sandboxes/{id}`). Two replicas with two
+    /// invented seeds do not disagree loudly — the user is handed a token by
+    /// whichever replica the load balancer picked, and it stops working the
+    /// moment another one answers, with no error, no log and no metric
+    /// (`_sd-impl-phase3-role.md` §9.2). Refusing to start is the only form of
+    /// that fault anybody sees.
+    ///
+    /// `node` and `all` answer `false`, and that is today's behaviour verbatim:
+    /// a single machine that generates its own seed and keeps it under
+    /// `$AENV_HOME/secrets/` works, and a developer running `--role all` should
+    /// not need a secret to boot. Cross-*node* agreement still matters for
+    /// cross-node recovery, but that is a warning's job, not a refusal's — the
+    /// deployment that needs it is not the deployment that is broken without
+    /// it. What tells the two apart on a live cluster is the fingerprint gauge,
+    /// not this gate; see [`crate::sandbox::SandboxAccessTokenGenerator`].
+    pub fn needs_a_configured_access_token_seed(self) -> bool {
+        matches!(self, Self::Api)
+    }
+
     /// Whether this role sends heartbeats to the scheduler.
     ///
     /// A heartbeat reports a *machine* — its CPU, its memory, the sandboxes on
@@ -311,6 +340,26 @@ mod tests {
         // looked like it had landed.
         assert!(!node.serves_wake_decisions());
         assert!(node.reclaims_host_leftovers_at_startup());
+    }
+
+    /// 🔴 Both faces in one test, because either one alone is satisfied by a
+    /// constant: "api needs a seed" passes on a predicate that is always true,
+    /// and "node does not" passes on one that is always false. What the gate
+    /// has to say is that the two differ.
+    #[test]
+    fn only_the_replicated_half_must_be_handed_its_access_token_seed() {
+        assert!(
+            ServerRole::Api.needs_a_configured_access_token_seed(),
+            "an api replica that invents a seed mints tokens its siblings cannot derive"
+        );
+        assert!(
+            !ServerRole::Node.needs_a_configured_access_token_seed(),
+            "a node's managed seed is node-local state and has always been allowed to be"
+        );
+        assert!(
+            !ServerRole::All.needs_a_configured_access_token_seed(),
+            "the rollback target boots on a developer's machine with no secret at all"
+        );
     }
 
     #[test]

@@ -1167,6 +1167,7 @@ mod template_read_scope_tests {
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
     };
+    use crate::role::ServerRole;
     use crate::sandbox::FirecrackerSandboxFactory;
     use crate::snapshot::repository::interfaces::{
         SnapshotCatalog, SnapshotCommit, SnapshotListPage, StartedBuild,
@@ -1325,6 +1326,7 @@ mod template_read_scope_tests {
 
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
+            ServerRole::All,
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),

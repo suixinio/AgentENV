@@ -21,6 +21,7 @@ use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
     NodeSandboxService, NodeSandboxServiceServer,
 };
+use crate::role::ServerRole;
 use crate::sandbox::mock::MockBackendFactory;
 use crate::sandbox::{SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig};
 use crate::snapshot::mock::MockSnapshotArtifactStore;
@@ -107,6 +108,7 @@ where
 async fn real_node() -> RunningNode {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -978,6 +980,7 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
 async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
+        ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,

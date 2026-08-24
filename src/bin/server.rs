@@ -381,7 +381,7 @@ async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Res
     // few seconds of 404s indistinguishable from a cold cache. Pinned by
     // `the_roster_is_complete_the_moment_new_returns` in
     // `src/orchestrator/tests.rs`.
-    let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
+    let orchestrator = Orchestrator::with_file_backed_store_and_factory(role, factory).await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -747,7 +747,14 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // sandboxes this replica believes it can resume. The durable record of a
     // paused sandbox is the cluster store's row and the registry's, not a file
     // here.
+    //
+    // 🔴 And the role is what makes the envd access-token seed mandatory. Two
+    // replicas that each invented one would hand users tokens the other cannot
+    // verify, and nothing about that is visible until a user's token stops
+    // working (`_sd-impl-phase3-role.md` §9.2). Refused here, at construction,
+    // before the listener opens.
     let orchestrator = Orchestrator::new(
+        role,
         store,
         RemoteSandboxBackendFactory::new(placement),
         DisabledSandboxPersister,

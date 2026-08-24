@@ -14,6 +14,7 @@ use crate::cfg::ConfigManager;
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
+use crate::role::ServerRole;
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
     FreshSandboxBuildSpec, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
@@ -142,8 +143,14 @@ enum ClusterDisposition {
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
+    /// A throwaway orchestrator for tests and examples.
+    ///
+    /// Fixed at [`ServerRole::All`] rather than taking a role, because that is
+    /// what it is for: the single-process shape, with no configured envd
+    /// access-token seed required of whoever calls it.
     pub async fn with_in_memory_store() -> Arc<Self> {
         Self::new(
+            ServerRole::All,
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             DisabledSandboxPersister,
@@ -157,14 +164,17 @@ impl<F> Orchestrator<InMemoryMetadataStore, F>
 where
     F: SandboxBackendFactory,
 {
-    pub async fn with_file_backed_store_and_factory(factory: F) -> Result<Arc<Self>> {
+    pub async fn with_file_backed_store_and_factory(
+        role: ServerRole,
+        factory: F,
+    ) -> Result<Arc<Self>> {
         let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
         let persister = FileBackedSandboxPersister::new(
             config.orchestrator.persisted_sandbox_store_path.clone(),
             config.virtualization_mode,
         );
-        Self::new(store, factory, persister).await
+        Self::new(role, store, factory, persister).await
     }
 }
 
@@ -174,12 +184,19 @@ where
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
-    pub async fn new(store: S, factory: F, persister: P) -> Result<Arc<Self>> {
+    /// Builds the orchestrator this process will run.
+    ///
+    /// `role` is carried no further than construction: the only thing it
+    /// decides is whether this process may invent its own envd access-token
+    /// seed when none is configured. A replicated half may not — see
+    /// [`ServerRole::needs_a_configured_access_token_seed`].
+    pub async fn new(role: ServerRole, store: S, factory: F, persister: P) -> Result<Arc<Self>> {
         let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner(store, factory, persister, image_refs).await
+        Self::new_inner(role, store, factory, persister, image_refs).await
     }
 
     async fn new_inner(
+        role: ServerRole,
         store: S,
         factory: F,
         persister: P,
@@ -196,7 +213,7 @@ where
         let persisted = persister.load_all(&factory).await?;
         let managed_seed_must_exist = persisted.iter().any(|metadata| metadata.secure);
         let access_tokens = tokio::task::spawn_blocking(move || {
-            SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
+            SandboxAccessTokenGenerator::load_or_create(app_config, role, managed_seed_must_exist)
         })
         .await
         .context("join envd access-token seed loader")??;

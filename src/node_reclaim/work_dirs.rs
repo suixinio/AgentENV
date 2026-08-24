@@ -691,7 +691,7 @@ mod tests {
         helper
             .join()
             .expect("the helper thread did not panic")
-            .expect("the helper thread");
+            .expect("the helper thread reached the directory in time");
 
         assert!(!ordinary.exists());
         assert!(!vanishing.exists());
@@ -726,7 +726,7 @@ mod tests {
         helper
             .join()
             .expect("the helper thread did not panic")
-            .expect("the helper thread");
+            .expect("the helper thread reached the directory in time");
 
         assert!(!ordinary.exists());
         assert!(changed.exists(), "what replaced it is still there");

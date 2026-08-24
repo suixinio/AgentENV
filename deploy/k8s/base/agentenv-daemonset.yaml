@@ -61,6 +61,39 @@ spec:
                   name: paused-registry-config
                   key: AENV_PAUSED_REGISTRY_BACKEND
                   optional: true
+            # 阶段 2c: which catalog this node writes, and which one it reads.
+            # See the note on snapshot-catalog-config in kustomization.yaml for
+            # the values and why they are not `off`.
+            #
+            # 🔴 Both halves of the cluster read the same two keys from the same
+            # ConfigMap, and a test in `services/shared/config` fails if they
+            # stop doing so. The node and the api Deployment answering
+            # snapshot lookups out of two different catalogs is the split this
+            # is here to prevent, and neither process can detect it: a read of
+            # the catalog that lacks a row does not fail, it answers "no such
+            # snapshot", and callers delete artifacts and refuse resumes on
+            # absence.
+            #
+            # 🔴 These were `kubectl set env` on the live DaemonSet before they
+            # were here, so the drift ran in the quiet direction: an `apply -k`
+            # dropped them, this node fell back to object_store/object_store
+            # (src/cfg.rs), and the scheduler went on treating PostgreSQL as
+            # authoritative. Optional on both, because the pair falls back
+            # together — and because losing only the write key produces the one
+            # combination `AppConfig::validate_snapshot_catalog` refuses at
+            # startup rather than a quieter wrong answer.
+            - name: AENV_SNAPSHOT_CATALOG_WRITE
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-catalog-config
+                  key: AENV_SNAPSHOT_CATALOG_WRITE
+                  optional: true
+            - name: AENV_SNAPSHOT_CATALOG_READ
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-catalog-config
+                  key: AENV_SNAPSHOT_CATALOG_READ
+                  optional: true
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
             - name: API_ADDR

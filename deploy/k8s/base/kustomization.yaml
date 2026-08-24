@@ -178,6 +178,58 @@ configMapGenerator:
   - name: node-service-config
     literals:
       - AENV_NODE_SERVICE_ENABLED=false
+  # 阶段 2c's two knobs: which catalog the node writes, and which one it reads.
+  #
+  # 🔴 These values are the cluster's *current, verified* state, not an off
+  # position waiting to be flipped. Both halves have been running
+  # `both`/`postgres` since 2c was accepted; they simply were not in this
+  # repository, having been set with `kubectl set env` on the live objects. That
+  # made every `apply -k` a silent rollback: the literal env disappears, the
+  # process falls back to `[snapshot.catalog]`'s `object_store`/`object_store`
+  # (src/cfg.rs), and the cluster ends up reading two different catalogs — the
+  # AgentENV halves from object storage, the scheduler from PostgreSQL — with
+  # nothing failing anywhere. Reads of a store that has the rows and reads of a
+  # store that does not both answer; one of them answers "no such snapshot", and
+  # callers delete artifacts and refuse resumes on absence.
+  #
+  # So writing `off` here would not be the cautious choice, it would *be* the
+  # bug: the first apply after it would perform exactly the regression this
+  # ConfigMap exists to stop.
+  #
+  # 🔴 Environment, not `config/agentenv.toml`, for the reason
+  # AENV_PAUSED_REGISTRY_BACKEND is: `deploy/k8s/run.sh` overwrites that file
+  # from config/default.toml on every apply (run.sh:30), so a cluster that said
+  # this in the ConfigMap would lose it on the next one. `src/cfg.rs` carries the
+  # same note on the two `env =` attributes.
+  #
+  # 🔴 They are two keys and they roll separately — adding the second copy and
+  # starting to trust it are different decisions with different ways back — and
+  # only some pairs are legal. `AppConfig::validate_snapshot_catalog` refuses
+  # write=object_store with read=postgres (reading a table nothing writes) at
+  # startup rather than correcting it. That refusal is also what makes the
+  # `optional: true` on both references safe: lose this whole ConfigMap and both
+  # keys fall back together to object_store/object_store, which is legal and
+  # merely old; lose only WRITE and the pair is illegal and the Pod says so.
+  # There is no way to lose one of these quietly in the dangerous direction.
+  #
+  # Rolling back is `read`, then `write`, in that order, and never the reverse:
+  # object storage stays a complete copy for as long as `write` says `both`.
+  #
+  # 🔴 One-time cost on the cluster that is already running these out of band:
+  # the next `apply -k` there does not merge, it is **rejected**. The live
+  # objects carry these as `value:` literals that no `last-applied-configuration`
+  # mentions, so the three-way merge keeps the literal and adds the reference,
+  # and an env var holding both `value` and `valueFrom` fails API validation.
+  # That is the loud direction and it costs nothing to be in, but it does not
+  # clear itself. Clear it with one in-place patch per workload, replacing each
+  # literal entry with the reference below, and then apply — do **not** reach for
+  # `kubectl set env …-` to delete the literals first, because that rolls both
+  # halves onto the object_store defaults for the length of the roll, which is
+  # the outage this ConfigMap exists to prevent.
+  - name: snapshot-catalog-config
+    literals:
+      - AENV_SNAPSHOT_CATALOG_WRITE=both
+      - AENV_SNAPSHOT_CATALOG_READ=postgres
 
 images:
   - name: agentenv-gateway

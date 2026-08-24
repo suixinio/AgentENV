@@ -148,6 +148,36 @@ spec:
             # paused registry would arbitrate a registry only it can see.
             - name: AENV_PAUSED_REGISTRY_BACKEND
               value: "central"
+            # 阶段 2c, the same two keys and the same ConfigMap the DaemonSet
+            # reads. See the note on snapshot-catalog-config in
+            # kustomization.yaml.
+            #
+            # 🔴 A configMapKeyRef here rather than the literals this half uses
+            # for AENV_ORCHESTRATOR_STORE_BACKEND and
+            # AENV_PAUSED_REGISTRY_BACKEND above, and the difference is real:
+            # those two are settings where the api half's correct value differs
+            # from the node's, so writing them out here says so. This pair is
+            # the opposite — the two halves must hold the *same* value, and the
+            # moment they can be edited apart somebody will edit one. The whole
+            # cluster answers snapshot lookups from one catalog or it has a
+            # split nothing reports.
+            #
+            # These were added to the live Deployment with `kubectl set env` when
+            # 3a went out, which is why they are being written down now: until
+            # they were in this file, the api half's copy of 2c's end state
+            # survived exactly until the next `apply -k`.
+            - name: AENV_SNAPSHOT_CATALOG_WRITE
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-catalog-config
+                  key: AENV_SNAPSHOT_CATALOG_WRITE
+                  optional: true
+            - name: AENV_SNAPSHOT_CATALOG_READ
+              valueFrom:
+                configMapKeyRef:
+                  name: snapshot-catalog-config
+                  key: AENV_SNAPSHOT_CATALOG_READ
+                  optional: true
             - name: API_ADDR
               value: "0.0.0.0:8000"
             # The data plane's wake-up surface (ResumeSandbox), which the

@@ -965,16 +965,17 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         // its answer, so what happens here is assignment. Running the hook
         // again would be a second chance for the extension to change its mind
         // about a value the caller has already recorded.
-        let _params: Option<CustomExtensionParams> = convert::serialized(
+        let params: Option<CustomExtensionParams> = convert::serialized(
             request.custom_extension_params.as_ref(),
             "custom_extension_params",
         )?;
 
-        Err(Status::unimplemented(
-            "update_params is not served yet: the orchestrator's only entry point runs the \
-             custom extension hook itself, and this call carries a value the hook has already \
-             approved",
-        ))
+        Arc::clone(&self.orchestration)
+            .replace_sandbox_custom_extension_params(sandbox_id, params)
+            .await
+            .map_err(|err| orchestrator_status(&err))?;
+
+        Ok(Response::new(pb::SandboxParamsResponse {}))
     }
 
     /// What this node is running under one sandbox id.

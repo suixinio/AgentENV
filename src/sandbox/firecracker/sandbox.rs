@@ -486,8 +486,12 @@ impl SandboxBackend for FirecrackerSandbox {
         }
     }
 
-    fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
+    async fn update_custom_extension_params(
+        &mut self,
+        params: Option<CustomExtensionParams>,
+    ) -> Result<()> {
         self.current_custom_extension_params = params;
+        Ok(())
     }
 }
 

@@ -1642,6 +1642,108 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
     Ok(())
 }
 
+/// `replace_sandbox_custom_extension_params` is the node-reachable half of
+/// `patch_sandbox_custom_extension_params` — the assign-then-persist tail
+/// with no hook involved. This exercises it directly, the way
+/// `sandbox_network_policy_is_applied_and_persisted` exercises its sibling:
+/// what the mock backend actually holds afterward — not merely that the call
+/// returned `Ok` — is checked, alongside the metadata store's row.
+#[tokio::test]
+async fn sandbox_custom_extension_params_are_applied_and_persisted() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    assert_eq!(created.custom_extension_params, None);
+    assert_eq!(behavior.last_custom_extension_params(), None);
+
+    let mut params = serde_json::Map::new();
+    params.insert("mode".to_string(), json!("fast"));
+    orchestrator
+        .replace_sandbox_custom_extension_params(created.id, Some(params.clone()))
+        .await?;
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(Some(params.clone())),
+        "the runtime must hold exactly the value that was applied"
+    );
+
+    let updated = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox metadata should exist");
+    assert_eq!(updated.custom_extension_params, Some(params));
+
+    Ok(())
+}
+
+/// A backend failure during the assignment must not reach the metadata
+/// store: the caller gets an error and `GET` must keep reporting the value
+/// the runtime actually holds, not the one the failed call carried. This is
+/// the exact property the `Unimplemented`-forever node handler broke — the
+/// store updated regardless of whether the runtime ever received the value.
+#[tokio::test]
+async fn a_failed_custom_extension_params_assignment_leaves_the_store_untouched() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    let mut first = serde_json::Map::new();
+    first.insert("mode".to_string(), json!("fast"));
+    orchestrator
+        .replace_sandbox_custom_extension_params(created.id, Some(first.clone()))
+        .await?;
+
+    behavior.push_action(
+        MockOperation::UpdateCustomExtensionParams,
+        MockAction::Fail {
+            message: "extension runtime unreachable".to_string(),
+        },
+    );
+    let mut second = serde_json::Map::new();
+    second.insert("mode".to_string(), json!("slow"));
+    let err = orchestrator
+        .replace_sandbox_custom_extension_params(created.id, Some(second.clone()))
+        .await
+        .expect_err("the injected backend failure must surface");
+    assert!(
+        matches!(
+            err,
+            OrchestratorError::SandboxOperationFailed {
+                operation: SandboxOperation::PatchCustomExtensionParams,
+                ..
+            }
+        ),
+        "unexpected error variant: {err:?}"
+    );
+
+    assert_eq!(
+        behavior.last_custom_extension_params(),
+        Some(Some(first.clone())),
+        "the runtime must not adopt a value it never accepted"
+    );
+    let after = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox metadata should exist");
+    assert_eq!(
+        after.custom_extension_params,
+        Some(first),
+        "the metadata store must not adopt a value the runtime never received"
+    );
+
+    Ok(())
+}
+
 async fn wait_for_state(
     orchestrator: &Arc<TestOrchestrator>,
     sandbox_id: &SandboxId,

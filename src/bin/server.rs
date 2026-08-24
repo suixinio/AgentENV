@@ -592,8 +592,17 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     }
     // `ApiImpl` needs a coordinator either way; this one is wired to a registry
     // that answers nothing and records nothing, so every cluster-facing call
-    // through it is a no-op. Publishing the *bytes* of a pause still happens —
-    // that is the node's job — and only the cluster bookkeeping is dropped.
+    // through it is a no-op.
+    //
+    // 🔴 Including the publish. This comment used to say that publishing the
+    // *bytes* of a pause still happened here — that it was the node's job and
+    // only the bookkeeping was dropped — and that is exactly what leaked: the
+    // capture went to the shared repository on every pause, and with no row to
+    // name it, no resume could find it and no delete could collect it. The
+    // coordinator now asks whether anything could reference an upload before
+    // making one (`PausedSandboxCoordinator::publish`); a pause here stays
+    // durable through the node-local persister, which is what the resume on
+    // this half reads anyway.
     let paused_wiring = PausedSandboxWiring::new(
         Arc::new(DisabledPausedSandboxRegistry),
         Arc::clone(&core.snapshot_manager),

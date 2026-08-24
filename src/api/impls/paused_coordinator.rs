@@ -205,6 +205,20 @@ enum Unrecorded {
     /// therefore trade an empty registry for a resume path that refuses every
     /// paused sandbox it just recorded. See the report on this batch.
     HeldByAnotherMachine(String),
+    /// There is no cluster registry, so there is nothing a published snapshot
+    /// could be referenced by — and nothing was published.
+    ///
+    /// 🔴 The `--role node` case, and `--role all` with
+    /// `paused_registry.backend = "local"`. Both wire in
+    /// [`DisabledPausedSandboxRegistry`](crate::orchestrator::DisabledPausedSandboxRegistry),
+    /// whose `begin_pause` and `complete_pause` are no-ops — but the
+    /// `publish_captured` between them was not, and uploaded the whole capture
+    /// to the shared repository on every pause. Nothing could ever reach it:
+    /// `claim_for_resume` answers `NotFound`, so no resume resolves it, and
+    /// `forget_sandbox` reads `get` -> `None` and returns before the delete, so
+    /// deleting the sandbox never collected it either. One orphaned snapshot
+    /// per pause, growing for as long as the node ran.
+    NoClusterRegistry,
     /// The registry could not be reached. The sandbox is paused either way; what
     /// was lost is the cluster's knowledge of it.
     Unreachable,
@@ -217,6 +231,7 @@ impl Unrecorded {
         match self {
             Self::NoDurableCapture => "no_durable_capture",
             Self::HeldByAnotherMachine(_) => "held_by_another_machine",
+            Self::NoClusterRegistry => "no_cluster_registry",
             Self::Unreachable => "unreachable",
         }
     }
@@ -381,6 +396,30 @@ impl PausedSandboxCoordinator {
             }
         };
 
+        // 🔴 Before the upload, not after it, and this is the only line that
+        // stops it. Everything below against a registry that tracks nothing is
+        // a no-op — `begin_pause` returns generation 0, `complete_pause`
+        // returns `Ok(())` — except the call in the middle, which is not:
+        // `publish_captured` writes the whole capture into the shared
+        // repository and commits a catalog row for it. Nothing ever reaches
+        // that row. `claim_for_resume` answers `NotFound`, so no resume
+        // resolves it; `forget_sandbox` reads `get` -> `None` and returns
+        // before the delete, so deleting the sandbox never collects it. One
+        // orphaned snapshot per pause, for as long as the process runs.
+        //
+        // 🔴 Skipping it takes nothing away from this pause. The origin node
+        // reopens a paused sandbox from its own persisted record
+        // (`Orchestrator::paused_state_for_resume` asks the store for the
+        // handle, never the repository), and the one path that does read a
+        // published pause snapshot — `resume_from_registry` — starts from a
+        // claim only a cluster-backed registry can grant. The capture dropped
+        // here owns no directory either: a pause's publishable capture is
+        // `FirecrackerCapturedSnapshot::in_caller_owned_dir`, whose artifacts
+        // belong to the persister and outlive it.
+        if !self.registry.is_cluster_backed() {
+            return self.unrecorded(sandbox_id, Unrecorded::NoClusterRegistry);
+        }
+
         let entry = PausedSandboxEntry {
             sandbox_id,
             // Filled in by the registry from its own configured cluster.
@@ -489,7 +528,7 @@ impl PausedSandboxCoordinator {
     /// 🔴 Every branch that leaves no row comes through here, so none of them
     /// can go back to being an unremarked `return`. The levels differ because
     /// the reasons do: an unreachable registry is a failure to chase, while the
-    /// other two are the topology behaving as designed and would be noise as
+    /// rest are the topology behaving as designed and would be noise as
     /// warnings on every pause.
     fn unrecorded(&self, sandbox_id: SandboxId, reason: Unrecorded) -> ClusterRecord {
         metrics::counter!(
@@ -509,6 +548,13 @@ impl PausedSandboxCoordinator {
                 "paused sandbox is parked on another machine and has no cluster record: this half \
                  cannot write a row naming a node it is not, so the sandbox is resumable only \
                  through that machine"
+            ),
+            Unrecorded::NoClusterRegistry => info!(
+                %sandbox_id,
+                "no cluster registry is configured, so this pause published no snapshot: the \
+                 sandbox is resumable from this node's own persisted record and nowhere else. \
+                 Publishing one would have uploaded a capture nothing can reference and nothing \
+                 deletes"
             ),
             Unrecorded::NoDurableCapture => debug!(
                 %sandbox_id,
@@ -870,6 +916,16 @@ mod tests {
         BeganPause, HeldSandbox, PausedRegistryError, ReclaimedHoldings, RegistryResult,
         ReleasedHoldings, ResumeClaim,
     };
+    use crate::sandbox::{
+        CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
+    };
+    use crate::snapshot::repository::{
+        ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
+        SnapshotListFilter, SnapshotRepository, StartedBuild,
+    };
+    use crate::snapshot::{
+        PersistedDiskImagePublication, RepositoryResult, SnapshotRecord, TemplateBuildErrorReason,
+    };
 
     /// T-A1-9. 🔴 A committed snapshot must not carry the incarnation that
     /// produced it.
@@ -1228,10 +1284,25 @@ mod tests {
     /// `CountingRegistry` counts calls, and a call count cannot tell a pause
     /// that left the cluster knowing about a sandbox from one that merely tried
     /// — which is the entire question on this path.
-    #[derive(Default)]
     struct RecordingRegistry {
         rows: Mutex<HashMap<SandboxId, PausedSandboxEntry>>,
         begin_pause_fails: bool,
+        /// 🔴 The one value the publish decision turns on, and therefore the
+        /// only value the paired tests below are allowed to differ in. Every
+        /// other answer this fake gives is identical either way, so a
+        /// difference in what the coordinator did cannot come from anywhere
+        /// else.
+        cluster_backed: bool,
+    }
+
+    impl Default for RecordingRegistry {
+        fn default() -> Self {
+            Self {
+                rows: Mutex::default(),
+                begin_pause_fails: false,
+                cluster_backed: true,
+            }
+        }
     }
 
     impl RecordingRegistry {
@@ -1239,6 +1310,16 @@ mod tests {
         fn unreachable() -> Self {
             Self {
                 begin_pause_fails: true,
+                ..Self::default()
+            }
+        }
+
+        /// The registry a node-local deployment gets: it answers every call
+        /// exactly as the cluster-backed one does, and tracks nothing
+        /// cluster-wide.
+        fn node_local() -> Self {
+            Self {
+                cluster_backed: false,
                 ..Self::default()
             }
         }
@@ -1370,7 +1451,7 @@ mod tests {
         }
 
         fn is_cluster_backed(&self) -> bool {
-            true
+            self.cluster_backed
         }
     }
 
@@ -1423,6 +1504,333 @@ mod tests {
             // row where these tests can see it.
             publishable: committable.then(|| crate::sandbox::CapturedSandboxSnapshot::new(())),
         }
+    }
+
+    /// Every call the snapshot repository received, in order.
+    ///
+    /// 🔴 The only fake in this module that can answer "were the bytes
+    /// uploaded". `mock_snapshot_manager` refuses to stage anything, so every
+    /// test written over it lands on the failure arm — which is exactly why the
+    /// leak survived: over that fixture a pause that uploads and a pause that
+    /// does not are the same green test.
+    #[derive(Debug, Default)]
+    struct RepositoryJournal(Mutex<Vec<String>>);
+
+    impl RepositoryJournal {
+        fn record(&self, entry: &str) {
+            self.0.lock().expect("journal").push(entry.to_string());
+        }
+
+        fn entries(&self) -> Vec<String> {
+            self.0.lock().expect("journal").clone()
+        }
+    }
+
+    /// The byte half: the call that puts a capture into shared storage.
+    struct JournallingArtifacts(Arc<RepositoryJournal>);
+
+    #[async_trait]
+    impl SnapshotArtifactStore for JournallingArtifacts {
+        async fn import_built_artifacts(
+            &self,
+            _metadata: &SnapshotPublishMetadata,
+            _manifest: &FirecrackerSnapshotManifest,
+            _publications: &mut Vec<PersistedDiskImagePublication>,
+        ) -> RepositoryResult<ImportedSnapshotArtifacts> {
+            self.0.record("artifacts.upload");
+
+            Ok(ImportedSnapshotArtifacts::default())
+        }
+
+        async fn delete_artifacts(
+            &self,
+            _id: &SnapshotId,
+            _publications: &[PersistedDiskImagePublication],
+        ) {
+            self.0.record("artifacts.delete");
+        }
+    }
+
+    /// The row half: the call that makes an uploaded capture findable.
+    struct JournallingCatalog(Arc<RepositoryJournal>);
+
+    #[async_trait]
+    impl SnapshotCatalog for JournallingCatalog {
+        async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+            self.0.record("catalog.create");
+
+            Ok(record)
+        }
+
+        async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+            self.0.record("catalog.commit");
+            let mut record =
+                SnapshotRecord::template_waiting(commit.id, commit.alias.clone(), commit.resources);
+            record.mark_committed(
+                commit.alias,
+                commit.resources,
+                commit.committed,
+                commit.source,
+                0,
+            );
+
+            Ok(record)
+        }
+
+        async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+            self.0.record("catalog.get");
+
+            Ok(None)
+        }
+
+        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
+            self.0.record("catalog.delete_record");
+
+            Ok(())
+        }
+
+        async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+            Ok(None)
+        }
+
+        async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+            unreachable!("a pause never starts a template build")
+        }
+
+        async fn mark_build_error(
+            &self,
+            _id: &SnapshotId,
+            _reason: TemplateBuildErrorReason,
+        ) -> RepositoryResult<()> {
+            unreachable!("a pause never fails a template build")
+        }
+    }
+
+    /// A snapshot manager whose repository takes what it is given and says so.
+    fn journalling_snapshot_manager(journal: Arc<RepositoryJournal>) -> Arc<SnapshotManager> {
+        Arc::new(SnapshotManager::from_parts(
+            Arc::new(SnapshotRepository::on_node(
+                Arc::new(JournallingCatalog(Arc::clone(&journal))),
+                Arc::new(JournallingArtifacts(journal)),
+                THIS_REPLICA.to_string(),
+            )),
+            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            None,
+        ))
+    }
+
+    fn coordinator_over(
+        registry: Arc<dyn PausedSandboxRegistry>,
+        snapshot_manager: Arc<SnapshotManager>,
+    ) -> PausedSandboxCoordinator {
+        PausedSandboxCoordinator::new(registry, snapshot_manager, THIS_REPLICA.to_string())
+    }
+
+    /// A pause carrying a capture the repository can really commit.
+    ///
+    /// 🔴 Not [`pause_outcome`]'s placeholder. `stage_captured` downcasts to
+    /// `FirecrackerCapturedSnapshot` and refuses anything else, so a
+    /// placeholder capture can only ever prove that the upload failed — never
+    /// that it was not attempted.
+    fn publishable_pause_outcome(sandbox_id: SandboxId) -> PauseOutcome {
+        let mut metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..SandboxMetadata::default()
+        };
+        metadata.paused_state = Some(Arc::new(CapturedOn(None)));
+
+        PauseOutcome {
+            metadata,
+            publishable: Some(CapturedSandboxSnapshot::new(
+                FirecrackerCapturedSnapshot::in_caller_owned_dir(
+                    FirecrackerSnapshotManifest::for_test(32768, &[]),
+                ),
+            )),
+        }
+    }
+
+    /// 🔴 The leak `--role node` ran into, stated as the one question that
+    /// separates the two halves: is there anything that could reference what
+    /// this pause is about to upload?
+    ///
+    /// Both halves run in the same test, against the same repository, and
+    /// differ in exactly one value — `is_cluster_backed`. That matters twice
+    /// over. It is what makes "the disabled half uploaded nothing" evidence at
+    /// all: the journal below is not empty, it holds the cluster-backed half's
+    /// upload and commit, so a fake that was never wired up would fail the
+    /// assertion before it could pass the negative one. And it is what pins the
+    /// rollback target: the cluster-backed half here *is* `--role all` with the
+    /// central registry, and it uploads, commits, and leaves a row pointing at
+    /// what it committed, exactly as before.
+    #[tokio::test]
+    async fn a_pause_uploads_only_when_something_can_reference_what_it_uploads() {
+        let journal = Arc::new(RepositoryJournal::default());
+        let snapshots = journalling_snapshot_manager(Arc::clone(&journal));
+
+        let cluster_registry = Arc::new(RecordingRegistry::default());
+        let local_registry = Arc::new(RecordingRegistry::node_local());
+        let cluster = coordinator_over(Arc::clone(&cluster_registry) as _, Arc::clone(&snapshots));
+        let local = coordinator_over(Arc::clone(&local_registry) as _, Arc::clone(&snapshots));
+
+        let referenced = SandboxId::new();
+        let unreferenced = SandboxId::new();
+
+        let with_cluster = cluster.publish(publishable_pause_outcome(referenced)).await;
+        let without_cluster = local.publish(publishable_pause_outcome(unreferenced)).await;
+
+        // The half that has somewhere to point: bytes, row, and a registry
+        // entry naming the snapshot those bytes became.
+        assert_eq!(
+            with_cluster,
+            ClusterRecord::Registered(THIS_REPLICA.to_string()),
+            "a pause a cluster registry can reference must still be registered"
+        );
+        let row = cluster_registry
+            .row(&referenced)
+            .expect("a cluster-backed pause leaves a row");
+        assert_eq!(row.state, PausedRegistryState::Paused);
+        assert!(
+            row.snapshot_id.is_some(),
+            "the row must name the snapshot the upload produced, or the upload is orphaned \
+             on this path too"
+        );
+
+        // The half that has nowhere to point: no bytes, no row, and a reason
+        // that says which of the ways to leave no row this was.
+        assert_eq!(
+            without_cluster,
+            ClusterRecord::Unrecorded(Unrecorded::NoClusterRegistry),
+            "a pause with no cluster registry must say so, not report a row it never wrote"
+        );
+        assert!(
+            local_registry.row(&unreferenced).is_none(),
+            "a registry that tracks nothing cluster-wide holds no row"
+        );
+
+        // 🔴 The whole point, and it is only readable because the same journal
+        // has the other half's upload in it: exactly one of the two pauses put
+        // anything into the repository.
+        assert_eq!(
+            journal.entries(),
+            vec!["artifacts.upload".to_string(), "catalog.commit".to_string()],
+            "exactly one of the two pauses may reach the repository, and it is the one \
+             whose upload something references"
+        );
+    }
+
+    /// The fake's flag is only worth anything if the backend it stands in for
+    /// answers the same way. `DisabledPausedSandboxRegistry` is what both
+    /// `--role node` and `--role all` with `paused_registry.backend = "local"`
+    /// actually wire in, so it is asked here directly, against the same
+    /// repository that has just been shown to accept an upload.
+    #[tokio::test]
+    async fn the_registry_a_node_actually_wires_in_publishes_nothing_either() {
+        let journal = Arc::new(RepositoryJournal::default());
+        let snapshots = journalling_snapshot_manager(Arc::clone(&journal));
+
+        let accepted = coordinator_over(
+            Arc::new(RecordingRegistry::default()) as _,
+            Arc::clone(&snapshots),
+        )
+        .publish(publishable_pause_outcome(SandboxId::new()))
+        .await;
+        let disabled = coordinator_over(
+            Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry) as _,
+            Arc::clone(&snapshots),
+        )
+        .publish(publishable_pause_outcome(SandboxId::new()))
+        .await;
+
+        assert_eq!(
+            accepted,
+            ClusterRecord::Registered(THIS_REPLICA.to_string()),
+            "the pause that proves the repository is wired up must still be registered"
+        );
+        assert_eq!(
+            disabled,
+            ClusterRecord::Unrecorded(Unrecorded::NoClusterRegistry),
+            "the real disabled backend must reach the same answer the flagged fake does"
+        );
+        assert_eq!(
+            journal.entries(),
+            vec!["artifacts.upload".to_string(), "catalog.commit".to_string()],
+            "the disabled backend must add nothing to what the accepted pause uploaded"
+        );
+    }
+
+    /// 🔴 What an operator can see afterwards, which is the half a silent skip
+    /// would lose. Each reason is counted under its own label, and the labels
+    /// have to differ: "there is no registry here" is the topology, while "the
+    /// registry did not answer" is an outage, and a single `pause_unrecorded`
+    /// count would put a rollout and a broken scheduler in the same series.
+    #[tokio::test]
+    async fn each_way_of_leaving_no_row_is_counted_under_its_own_reason() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Held across the awaits, which works only because `#[tokio::test]`
+        // runs a current-thread runtime.
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let journal = Arc::new(RepositoryJournal::default());
+        let snapshots = journalling_snapshot_manager(Arc::clone(&journal));
+
+        coordinator_over(
+            Arc::new(RecordingRegistry::default()) as _,
+            Arc::clone(&snapshots),
+        )
+        .publish(publishable_pause_outcome(SandboxId::new()))
+        .await;
+        coordinator_over(
+            Arc::new(RecordingRegistry::node_local()) as _,
+            Arc::clone(&snapshots),
+        )
+        .publish(publishable_pause_outcome(SandboxId::new()))
+        .await;
+        coordinator_over(
+            Arc::new(RecordingRegistry::unreachable()) as _,
+            Arc::clone(&snapshots),
+        )
+        .publish(publishable_pause_outcome(SandboxId::new()))
+        .await;
+        drop(guard);
+
+        let mut counted: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                let key = composite.key();
+                if key.name() != "agentenv_paused_registry_pause_unrecorded_total" {
+                    return None;
+                }
+                let reason = key
+                    .labels()
+                    .find(|label| label.key() == "reason")?
+                    .value()
+                    .to_string();
+                match value {
+                    DebugValue::Counter(count) => Some((reason, count)),
+                    other => panic!("the unrecorded reason must be a counter, not {other:?}"),
+                }
+            })
+            .collect();
+        counted.sort();
+
+        assert_eq!(
+            counted,
+            vec![
+                ("no_cluster_registry".to_string(), 1),
+                ("unreachable".to_string(), 1),
+            ],
+            "a pause that was registered must count nothing, and the two that were not must \
+             be told apart by their label"
+        );
     }
 
     /// 🔴 Both halves are one test, and deliberately. "The registry has a row"
@@ -1571,6 +1979,24 @@ mod tests {
                 .await,
             None,
             "a registry that could not be reached must not stamp the local record either"
+        );
+
+        // 🔴 The stamp this path used to hand back regardless. `publish`
+        // returned `Registered` at the end of its happy path, and the disabled
+        // registry made every call on the way there succeed — so a node with no
+        // cluster registry marked each of its paused records as announced to
+        // one. Inert while the registry stays disabled, and not inert at all
+        // afterwards: the stamp is reconciliation's licence to discard a local
+        // record the registry has no row for, and it would have had a row for
+        // none of them.
+        let local_registry = Arc::new(RecordingRegistry::node_local());
+        let node_local = recording_coordinator(Arc::clone(&local_registry));
+        assert_eq!(
+            node_local
+                .publish_paused(pause_outcome(SandboxId::new(), true, None))
+                .await,
+            None,
+            "a pause with no cluster registry must not stamp the local record as announced"
         );
     }
 }

@@ -12,6 +12,7 @@ pub use image::{
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::virtualization::VirtualizationMode;
 
@@ -1403,6 +1404,32 @@ impl AppConfig {
                 .get_or_insert_with(PosixFsBackendConfig::default);
             posix_fs.snapshot_store =
                 resolve_path(&self.home_path, config_dir, &posix_fs.snapshot_store);
+            // 🔴 `posix_fs` is also `repository_backend`'s own `#[config(default
+            // = "posix_fs", ...)]`, so this branch cannot tell "posix_fs was
+            // chosen" from "nothing chose anything" — confique has already
+            // collapsed that distinction by the time `normalize` runs, and
+            // recovering it would mean this field stops being a plain enum with
+            // a default. What is still true either way, and worth saying either
+            // way, is *where this process is about to look for snapshots*: on a
+            // machine where `$AENV_HOME` is a real, persistent directory this is
+            // a normal, working default; in a container where it is an emptyDir
+            // — every Kubernetes Pod this binary runs in — it is silently a
+            // brand-new, empty store on every restart, and the only visible
+            // effect is downstream reads answering "0 rows" or "no such
+            // snapshot" in a way that reads exactly like a genuine catalog
+            // inconsistency rather than like a missing `oss` config. That
+            // confusion has already cost real debugging time on a real cluster
+            // once. Logged here, once, at the one place both paths (default and
+            // explicit) are guaranteed to pass through.
+            warn!(
+                path = %posix_fs.snapshot_store.display(),
+                "snapshot repository backend resolved to posix_fs (this is also the default when \
+                 nothing sets AENV_SNAPSHOT_REPOSITORY_BACKEND, so this line does not mean the \
+                 choice was explicit); if the intent was `oss`, check \
+                 AENV_SNAPSHOT_REPOSITORY_BACKEND and AENV_CONFIG_OVERLAY_PATH — an empty or \
+                 unexpectedly small snapshot store at this path is that fallback, not a catalog \
+                 inconsistency"
+            );
         }
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);

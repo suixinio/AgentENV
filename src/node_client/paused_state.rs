@@ -104,11 +104,66 @@ impl PausedSandboxState for RemotePausedState {
     fn runtime_artifacts(&self) -> RuntimeArtifactSet {
         RuntimeArtifactSet::empty()
     }
+
+    /// The origin node, which is the whole reason this type exists.
+    ///
+    /// 🔴 The one implementation that answers this at all. Everything else
+    /// captures on the machine it runs on and says `None`; this state is the
+    /// one that was produced somewhere else, and a caller deciding what a pause
+    /// left behind has to be able to tell those apart without knowing which
+    /// backend produced the value.
+    fn holding_node_id(&self) -> Option<&str> {
+        Some(&self.origin_node_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture taken on the machine holding it: what every backend but this
+    /// one produces, standing in for them so both answers come from the same
+    /// trait in the same run.
+    #[derive(Debug)]
+    struct CapturedHere;
+
+    impl PausedSandboxState for CapturedHere {
+        fn encode(&self) -> Result<Value> {
+            Ok(Value::Null)
+        }
+
+        fn runtime_artifacts(&self) -> RuntimeArtifactSet {
+            RuntimeArtifactSet::empty()
+        }
+    }
+
+    /// 🔴 Both halves in one run, through one trait. The caller deciding what a
+    /// pause left behind reads this through `dyn PausedSandboxState` and cannot
+    /// see which backend answered, so "names a machine" is only a fact if
+    /// something in the same run answers `None` — otherwise a default that
+    /// started returning some node would pass unnoticed and every local pause
+    /// would be reported as parked on another machine.
+    #[test]
+    fn only_a_capture_taken_elsewhere_names_a_machine() {
+        let elsewhere: &dyn PausedSandboxState = &RemotePausedState::new(
+            "node-a".to_string(),
+            "/var/lib/agentenv/paused/abc".to_string(),
+            ExecutionId::new(),
+            json!({}),
+        );
+        let here: &dyn PausedSandboxState = &CapturedHere;
+
+        assert_eq!(
+            elsewhere.holding_node_id(),
+            Some("node-a"),
+            "a capture taken on another machine has to say which"
+        );
+        assert_eq!(
+            here.holding_node_id(),
+            None,
+            "a capture taken here names no other machine"
+        );
+    }
 
     #[test]
     fn the_encoding_carries_the_machine_the_bytes_are_on() {

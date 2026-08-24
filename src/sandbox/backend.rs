@@ -35,6 +35,22 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     /// The orchestrator only carries this value to the image-liveness layer; it
     /// does not interpret the backend-specific artifact identities inside it.
     fn runtime_artifacts(&self) -> RuntimeArtifactSet;
+
+    /// The machine whose disk holds this capture, when that is not the machine
+    /// this process runs on.
+    ///
+    /// 🔴 `None` — the default, and the answer for every backend that captures
+    /// locally — means *this machine*, never *nowhere*. Whether a local capture
+    /// went anywhere that outlives the runtime is
+    /// [`PausedSandboxCapture::publishable`]'s question, and the two are not
+    /// interchangeable: a pause driven from the deciding half offers nothing
+    /// publishable *here* and is still parked, durably, on the node that wrote
+    /// the bytes. Reading the second question's answer as the first's is how a
+    /// pause that is perfectly recoverable comes to be treated as one that left
+    /// nothing behind.
+    fn holding_node_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl dyn PausedSandboxState {

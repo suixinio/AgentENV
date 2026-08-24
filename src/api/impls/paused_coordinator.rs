@@ -17,7 +17,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::orchestrator::{
     MarkRunningOutcome, PauseOutcome, PausedRegistryState, PausedSandboxEntry,
@@ -157,6 +157,89 @@ pub enum StaleReleaseOutcome {
     Failed,
 }
 
+/// What a pause left behind in the cluster registry.
+///
+/// # 🔴 Three answers, and the two that leave no row are not the same answer
+///
+/// A pause that could not reach the registry and a pause that had nothing to
+/// register both end with no row, and for months they also ended with the same
+/// silent `None` out of the same `?`. That is how `--role api` came to record
+/// nothing at all without anybody noticing: every pause it performs takes the
+/// second branch, which said nothing, and the empty table was indistinguishable
+/// from a cluster where nobody had paused anything.
+///
+/// "Could not be reached" and "does not exist" have to be different answers
+/// here, because they call for opposite responses from whoever is looking: the
+/// first is an outage to chase, the second is the topology working as designed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClusterRecord {
+    /// A row now describes this sandbox, under the node identity carried here.
+    /// That identity is what the orchestrator stamps on the local record, and
+    /// what reconciliation later compares the row against.
+    Registered(String),
+    /// No row, and why not.
+    Unrecorded(Unrecorded),
+}
+
+/// Why a pause left the cluster registry untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unrecorded {
+    /// The capture went into this process's own temporary artifacts, which are
+    /// reclaimed with the paused state. There is no machine a row could point
+    /// at, and there never will be: this is the sandbox that really is
+    /// recoverable nowhere but inside this process.
+    NoDurableCapture,
+    /// The capture is durable, on the machine named here, and this half still
+    /// cannot record it.
+    ///
+    /// 🔴 The `--role api` case, and the reason `paused_sandboxes` is empty on
+    /// a split cluster. The bytes are on the node that ran the sandbox, which
+    /// keeps its own record of them, so a row saying "parked on that node" is
+    /// exactly what the registry is for — but it cannot be written under the
+    /// identity this half would have to write it under. `begin_pause` names the
+    /// machine whose disk holds the artifacts
+    /// (`CentralPausedSandboxRegistry::begin_pause`), while the resume
+    /// arbitration on this half reads a row naming any node but its own as a
+    /// refusal (`arbitration` in `super::paused_recovery`, which answers
+    /// `NotReady`/`Blocked` and becomes a 409). Writing the row today would
+    /// therefore trade an empty registry for a resume path that refuses every
+    /// paused sandbox it just recorded. See the report on this batch.
+    HeldByAnotherMachine(String),
+    /// The registry could not be reached. The sandbox is paused either way; what
+    /// was lost is the cluster's knowledge of it.
+    Unreachable,
+}
+
+impl Unrecorded {
+    /// The label this reason is counted under, so an operator can tell an
+    /// outage from the topology from a scrape rather than from a log line.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::NoDurableCapture => "no_durable_capture",
+            Self::HeldByAnotherMachine(_) => "held_by_another_machine",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+impl ClusterRecord {
+    /// The identity the row was written under, or `None` when there is no row.
+    ///
+    /// 🔴 Both `Unrecorded` reasons collapse here, and only here. The
+    /// orchestrator stamps the local record with this so reconciliation may
+    /// later act on the registry's answers about it, and a stamp on a record
+    /// the registry has never heard of is what makes reconciliation discard
+    /// sandboxes it should not touch — so every reason that leaves no row has to
+    /// leave no stamp either. The distinction between them is kept where it is
+    /// useful, which is the log and the counter, not this return value.
+    fn registered_as(self) -> Option<String> {
+        match self {
+            Self::Registered(node_id) => Some(node_id),
+            Self::Unrecorded(_) => None,
+        }
+    }
+}
+
 /// Owns the cluster's view of this node's paused sandboxes.
 pub struct PausedSandboxCoordinator {
     registry: Arc<dyn PausedSandboxRegistry>,
@@ -259,13 +342,44 @@ impl PausedSandboxCoordinator {
     /// paused, persisted and locally resumable, so every failure below costs
     /// cross-node recovery and nothing else. Turning a published-snapshot
     /// failure into a pause failure would trade a working pause for a broken
-    /// one.
-    async fn publish(&self, outcome: PauseOutcome) -> Option<String> {
+    /// one. That is also the answer to "what if the row cannot be written": the
+    /// pause stands, the loss is named, and nothing is retried inside the call —
+    /// a pause that hangs waiting for a registry is a worse pause than one whose
+    /// cluster record is missing and says so.
+    ///
+    /// Returns [`ClusterRecord`], not a bare `Option`, so that "no row" always
+    /// arrives with the reason attached.
+    async fn publish(&self, outcome: PauseOutcome) -> ClusterRecord {
         let sandbox_id = outcome.metadata.id;
 
-        // No publishable capture means the pause wrote into backend-managed
-        // temporaries that no other node could ever read.
-        let publishable = outcome.publishable?;
+        // 🔴 Asked before `publishable`, because it is the question that
+        // separates the two ways a pause can offer nothing to commit here. The
+        // capture may be sitting, durable, on the machine that took it.
+        let holding_node = outcome
+            .metadata
+            .paused_state
+            .as_ref()
+            .and_then(|state| state.holding_node_id())
+            .map(str::to_string);
+
+        let publishable = match outcome.publishable {
+            Some(publishable) => publishable,
+            // The capture is on another machine, which keeps its own durable
+            // record of it. Nothing to commit from here, and — for now — no row
+            // either; `Unrecorded::HeldByAnotherMachine` carries why.
+            None => {
+                if let Some(holding_node) = holding_node {
+                    return self
+                        .unrecorded(sandbox_id, Unrecorded::HeldByAnotherMachine(holding_node));
+                }
+
+                // And the case the early return here was originally written
+                // for, which is still a case: the pause wrote into
+                // backend-managed temporaries that no other node could ever
+                // read, and that are reclaimed with the paused state.
+                return self.unrecorded(sandbox_id, Unrecorded::NoDurableCapture);
+            }
+        };
 
         let entry = PausedSandboxEntry {
             sandbox_id,
@@ -294,7 +408,7 @@ impl PausedSandboxCoordinator {
                     "failed to register paused sandbox; it stays resumable on this node only"
                 );
 
-                return None;
+                return self.unrecorded(sandbox_id, Unrecorded::Unreachable);
             }
         };
 
@@ -366,7 +480,43 @@ impl PausedSandboxCoordinator {
             }
         }
 
-        Some(self.node_id.clone())
+        ClusterRecord::Registered(self.node_id.clone())
+    }
+
+    /// Says, once and at the right volume, that a pause left the cluster
+    /// registry untouched — and which of the reasons it was.
+    ///
+    /// 🔴 Every branch that leaves no row comes through here, so none of them
+    /// can go back to being an unremarked `return`. The levels differ because
+    /// the reasons do: an unreachable registry is a failure to chase, while the
+    /// other two are the topology behaving as designed and would be noise as
+    /// warnings on every pause.
+    fn unrecorded(&self, sandbox_id: SandboxId, reason: Unrecorded) -> ClusterRecord {
+        metrics::counter!(
+            "agentenv_paused_registry_pause_unrecorded_total",
+            "reason" => reason.reason()
+        )
+        .increment(1);
+
+        match &reason {
+            Unrecorded::Unreachable => {
+                // Already warned at the call site with the error in hand; this
+                // only counts it.
+            }
+            Unrecorded::HeldByAnotherMachine(holding_node) => info!(
+                %sandbox_id,
+                holding_node = %holding_node,
+                "paused sandbox is parked on another machine and has no cluster record: this half \
+                 cannot write a row naming a node it is not, so the sandbox is resumable only \
+                 through that machine"
+            ),
+            Unrecorded::NoDurableCapture => debug!(
+                %sandbox_id,
+                "pause produced no capture that outlives this process; nothing to record cluster-wide"
+            ),
+        }
+
+        ClusterRecord::Unrecorded(reason)
     }
 
     /// Hands back the rows a previous process on this machine died holding.
@@ -624,7 +774,7 @@ impl PausedSandboxCoordinator {
 #[async_trait]
 impl PausedSandboxPublisher for PausedSandboxCoordinator {
     async fn publish_paused(&self, outcome: PauseOutcome) -> Option<String> {
-        self.publish(outcome).await
+        self.publish(outcome).await.registered_as()
     }
 
     async fn mark_running(
@@ -716,6 +866,10 @@ fn publish_metadata(metadata: &SandboxMetadata) -> SnapshotPublishMetadata {
 mod tests {
     use super::test_support::{CountingRegistry, GetAnswer};
     use super::*;
+    use crate::orchestrator::{
+        BeganPause, HeldSandbox, PausedRegistryError, ReclaimedHoldings, RegistryResult,
+        ReleasedHoldings, ResumeClaim,
+    };
 
     /// T-A1-9. 🔴 A committed snapshot must not carry the incarnation that
     /// produced it.
@@ -1066,6 +1220,358 @@ mod tests {
             StaleReleaseOutcome::Fenced
         );
         assert_eq!(registry.release_calls(), 0);
+    }
+
+    /// A registry that keeps the rows it is told to write.
+    ///
+    /// 🔴 The only fake in this module that can answer "is there a row".
+    /// `CountingRegistry` counts calls, and a call count cannot tell a pause
+    /// that left the cluster knowing about a sandbox from one that merely tried
+    /// — which is the entire question on this path.
+    #[derive(Default)]
+    struct RecordingRegistry {
+        rows: Mutex<HashMap<SandboxId, PausedSandboxEntry>>,
+        begin_pause_fails: bool,
+    }
+
+    impl RecordingRegistry {
+        /// A registry nobody can reach on the one call that creates a row.
+        fn unreachable() -> Self {
+            Self {
+                begin_pause_fails: true,
+                ..Self::default()
+            }
+        }
+
+        fn row(&self, sandbox_id: &SandboxId) -> Option<PausedSandboxEntry> {
+            self.rows.lock().unwrap().get(sandbox_id).cloned()
+        }
+
+        fn row_count(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl PausedSandboxRegistry for RecordingRegistry {
+        async fn begin_pause(&self, entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
+            if self.begin_pause_fails {
+                return Err(PausedRegistryError::Backend {
+                    operation: "begin_pause",
+                    source: anyhow::anyhow!("registry is unreachable"),
+                });
+            }
+
+            let mut row = entry.clone();
+            row.generation = 1;
+            row.state = PausedRegistryState::Publishing;
+            self.rows.lock().unwrap().insert(entry.sandbox_id, row);
+
+            Ok(BeganPause {
+                generation: 1,
+                previous_snapshot_id: None,
+            })
+        }
+
+        async fn complete_pause(
+            &self,
+            sandbox_id: &SandboxId,
+            generation: i64,
+            snapshot_id: &SnapshotId,
+        ) -> RegistryResult<()> {
+            if let Some(row) = self.rows.lock().unwrap().get_mut(sandbox_id) {
+                if row.generation == generation {
+                    row.state = PausedRegistryState::Paused;
+                    row.snapshot_id = Some(snapshot_id.clone());
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn mark_local_only(
+            &self,
+            sandbox_id: &SandboxId,
+            generation: i64,
+        ) -> RegistryResult<()> {
+            if let Some(row) = self.rows.lock().unwrap().get_mut(sandbox_id) {
+                if row.generation == generation {
+                    row.state = PausedRegistryState::LocalOnly;
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
+            Ok(self.row(sandbox_id))
+        }
+
+        async fn get_many(
+            &self,
+            sandbox_ids: &[SandboxId],
+        ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+            let rows = self.rows.lock().unwrap();
+
+            Ok(sandbox_ids
+                .iter()
+                .filter_map(|id| rows.get(id).map(|row| (*id, row.clone())))
+                .collect())
+        }
+
+        async fn claim_for_resume(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _execution_id: ExecutionId,
+        ) -> RegistryResult<ResumeClaim> {
+            Ok(ResumeClaim::NotFound)
+        }
+
+        async fn release_claim(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> RegistryResult<bool> {
+            Ok(false)
+        }
+
+        async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
+            Ok(0)
+        }
+
+        async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
+            Ok(ReclaimedHoldings::default())
+        }
+
+        async fn mark_running(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _execution_id: ExecutionId,
+            _expires_at: Option<SystemTime>,
+        ) -> RegistryResult<MarkRunningOutcome> {
+            Ok(MarkRunningOutcome::Untracked)
+        }
+
+        async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
+            Ok(ReleasedHoldings::default())
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.get(sandbox_id) {
+                Some(row) if row.generation == generation => {
+                    rows.remove(sandbox_id);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+
+        fn is_cluster_backed(&self) -> bool {
+            true
+        }
+    }
+
+    /// A paused state that says where its bytes are, and nothing else.
+    #[derive(Debug)]
+    struct CapturedOn(Option<String>);
+
+    impl crate::sandbox::PausedSandboxState for CapturedOn {
+        fn encode(&self) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        fn runtime_artifacts(&self) -> crate::sandbox::RuntimeArtifactSet {
+            crate::sandbox::RuntimeArtifactSet::empty()
+        }
+
+        fn holding_node_id(&self) -> Option<&str> {
+            self.0.as_deref()
+        }
+    }
+
+    const THIS_REPLICA: &str = "api-replica-1";
+
+    fn recording_coordinator(registry: Arc<RecordingRegistry>) -> PausedSandboxCoordinator {
+        PausedSandboxCoordinator::new(
+            registry,
+            Arc::new(crate::snapshot::mock::mock_snapshot_manager()),
+            THIS_REPLICA.to_string(),
+        )
+    }
+
+    /// One pause, described by the only two things this decision reads: whether
+    /// a capture can be committed from here, and which machine the bytes are on.
+    fn pause_outcome(
+        sandbox_id: SandboxId,
+        committable: bool,
+        holding_node: Option<&str>,
+    ) -> PauseOutcome {
+        let mut metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..SandboxMetadata::default()
+        };
+        metadata.paused_state = Some(Arc::new(CapturedOn(holding_node.map(str::to_string))));
+
+        PauseOutcome {
+            metadata,
+            // The concrete capture is never read on the paths under test: the
+            // mock snapshot manager refuses to stage anything it did not
+            // produce, which lands on the `mark_local_only` arm and leaves the
+            // row where these tests can see it.
+            publishable: committable.then(|| crate::sandbox::CapturedSandboxSnapshot::new(())),
+        }
+    }
+
+    /// 🔴 Both halves are one test, and deliberately. "The registry has a row"
+    /// is only evidence if something in the same run, through the same fake,
+    /// leaves it without one — otherwise a green assertion proves the fixture
+    /// wrote a row, not that the code under test did. The two pauses differ in
+    /// exactly one value: whether the capture can be committed from here.
+    #[tokio::test]
+    async fn only_the_pause_this_half_can_commit_leaves_a_row() {
+        let registry = Arc::new(RecordingRegistry::default());
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        let committable = SandboxId::new();
+        let elsewhere = SandboxId::new();
+
+        let committed = coordinator
+            .publish(pause_outcome(committable, true, None))
+            .await;
+        let parked = coordinator
+            .publish(pause_outcome(elsewhere, false, Some("node-7")))
+            .await;
+
+        assert_eq!(
+            committed,
+            ClusterRecord::Registered(THIS_REPLICA.to_string()),
+            "a capture this half can commit must be registered under this identity"
+        );
+        assert!(
+            registry.row(&committable).is_some(),
+            "a capture this half can commit must leave the cluster a row"
+        );
+
+        assert_eq!(
+            parked,
+            ClusterRecord::Unrecorded(Unrecorded::HeldByAnotherMachine("node-7".to_string())),
+            "a capture on another machine must say so rather than report nothing"
+        );
+        assert!(
+            registry.row(&elsewhere).is_none(),
+            "a capture on another machine leaves no row on this half yet"
+        );
+        assert_eq!(
+            registry.row_count(),
+            1,
+            "exactly one of the two pauses reached the registry"
+        );
+    }
+
+    /// 🔴 The distinction the empty table on 203/204 turned on. A pause that
+    /// could not reach the registry and a pause that had nothing to put in it
+    /// both end with no row; answering both with the same silent nothing is
+    /// what made "the api half records nothing" look like "nobody has paused
+    /// anything".
+    #[tokio::test]
+    async fn out_of_reach_and_nothing_to_record_are_different_answers() {
+        let unreachable_registry = Arc::new(RecordingRegistry::unreachable());
+        let unreachable = recording_coordinator(Arc::clone(&unreachable_registry));
+        let reachable_registry = Arc::new(RecordingRegistry::default());
+        let reachable = recording_coordinator(Arc::clone(&reachable_registry));
+
+        let out_of_reach = unreachable
+            .publish(pause_outcome(SandboxId::new(), true, None))
+            .await;
+        let nothing_to_record = reachable
+            .publish(pause_outcome(SandboxId::new(), false, None))
+            .await;
+
+        assert_eq!(
+            out_of_reach,
+            ClusterRecord::Unrecorded(Unrecorded::Unreachable)
+        );
+        assert_eq!(
+            nothing_to_record,
+            ClusterRecord::Unrecorded(Unrecorded::NoDurableCapture)
+        );
+        assert_ne!(
+            out_of_reach, nothing_to_record,
+            "a registry that could not be reached must not read as a pause with nothing to record"
+        );
+        assert_eq!(
+            unreachable_registry.row_count(),
+            0,
+            "a registry that refused the write holds no row"
+        );
+        assert_eq!(
+            reachable_registry.row_count(),
+            0,
+            "a pause with nothing durable behind it writes no row to a registry that would take one"
+        );
+    }
+
+    /// The machine comes off the paused state, not off the process reporting
+    /// it. The two differ on the api half — that is the whole point of the
+    /// split — and a reason naming this replica would send whoever reads it
+    /// looking for the bytes on a Pod that has never held any.
+    #[tokio::test]
+    async fn a_parked_pause_names_the_machine_the_bytes_are_on() {
+        let registry = Arc::new(RecordingRegistry::default());
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        let record = coordinator
+            .publish(pause_outcome(SandboxId::new(), false, Some("node-203")))
+            .await;
+
+        assert_eq!(
+            record,
+            ClusterRecord::Unrecorded(Unrecorded::HeldByAnotherMachine("node-203".to_string()))
+        );
+        assert_ne!(
+            record,
+            ClusterRecord::Unrecorded(Unrecorded::HeldByAnotherMachine(THIS_REPLICA.to_string())),
+            "the machine holding the bytes is not the replica that drove the pause"
+        );
+    }
+
+    /// 🔴 What the orchestrator does with each answer, which is the one place
+    /// the three collapse back into two. Only a row may be stamped onto the
+    /// local record: that stamp is reconciliation's licence to act on what the
+    /// registry says about the sandbox, and a stamp for a sandbox the registry
+    /// has never heard of is how reconciliation comes to discard records it
+    /// must not touch.
+    #[tokio::test]
+    async fn only_a_written_row_is_handed_back_for_the_local_record() {
+        let registry = Arc::new(RecordingRegistry::default());
+        let coordinator = recording_coordinator(Arc::clone(&registry));
+
+        let registered = coordinator
+            .publish_paused(pause_outcome(SandboxId::new(), true, None))
+            .await;
+        let parked = coordinator
+            .publish_paused(pause_outcome(SandboxId::new(), false, Some("node-7")))
+            .await;
+        let nothing = coordinator
+            .publish_paused(pause_outcome(SandboxId::new(), false, None))
+            .await;
+
+        assert_eq!(registered, Some(THIS_REPLICA.to_string()));
+        assert_eq!(parked, None);
+        assert_eq!(nothing, None);
+
+        let unreachable_registry = Arc::new(RecordingRegistry::unreachable());
+        let unreachable = recording_coordinator(Arc::clone(&unreachable_registry));
+        assert_eq!(
+            unreachable
+                .publish_paused(pause_outcome(SandboxId::new(), true, None))
+                .await,
+            None,
+            "a registry that could not be reached must not stamp the local record either"
+        );
     }
 }
 

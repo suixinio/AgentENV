@@ -198,6 +198,12 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use std::path::Path;
+
+    use tracing::Level;
+
+    use crate::logging::capture::Recorder;
+
     struct Fixture {
         work: TempDir,
         persisted: TempDir,
@@ -258,6 +264,101 @@ mod tests {
             std::fs::create_dir_all(&path).unwrap();
             path
         }
+
+        /// A leftover that is taken away *between* the decision and the delete,
+        /// which is the only way to reach the delete's own error handling.
+        ///
+        /// 🔴 There is no sleep and no polling in this, and it is not a race
+        /// that usually wins. The directory's owner stamp is a FIFO, so `plan`
+        /// blocks inside `owner_of` until somebody writes it; opening a FIFO
+        /// for writing succeeds *exactly* when a reader is already waiting on
+        /// it, and fails with `ENXIO` until then. So the helper thread's open
+        /// is the synchronisation: when it returns, `plan` is provably inside
+        /// the read. The helper then writes the stamp bytes, changes the
+        /// directory, and only then closes its end — and the read cannot finish
+        /// until it does, so `plan` cannot reach `remove_dir_all` before the
+        /// change has happened.
+        ///
+        /// Returns the path and the helper's handle; join it so a helper that
+        /// gave up is a failure rather than a silently weakened test.
+        fn dir_that_changes_while_it_is_being_decided(
+            &self,
+            name: &str,
+            change: WhileTheSweepIsDeciding,
+        ) -> (PathBuf, std::thread::JoinHandle<Result<(), String>>) {
+            let path = self.dir_without_a_stamp(name);
+            let stamp = super::owner::stamp_path_of(&path);
+            nix::unistd::mkfifo(
+                &stamp,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+
+            let directory = path.clone();
+            let helper = std::thread::spawn(move || {
+                answer_the_stamp_then_change(&stamp, &directory, change)
+            });
+            (path, helper)
+        }
+    }
+
+    /// What happens to a work directory while `plan` is deciding about it.
+    #[derive(Clone, Copy)]
+    enum WhileTheSweepIsDeciding {
+        /// It is removed: a concurrent operator, or the `TempDir` of a process
+        /// that had not quite finished exiting. The delete then answers
+        /// `NotFound`.
+        ItDisappears,
+        /// It is gone and something that is not a directory stands in its
+        /// place, so the delete fails for a reason that is not absence.
+        ItBecomesAFile,
+    }
+
+    /// The helper half of [`Fixture::dir_that_changes_while_it_is_being_decided`].
+    fn answer_the_stamp_then_change(
+        stamp: &Path,
+        directory: &Path,
+        change: WhileTheSweepIsDeciding,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut writer = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(stamp)
+            {
+                Ok(file) => break file,
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    // Nothing ever read it. Open both ends so that a reader
+                    // arriving late is released rather than left hanging, and
+                    // report it: a test that quietly stopped exercising this is
+                    // worse than one that fails.
+                    let _ = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(stamp);
+                    return Err(format!("nothing read the owner stamp within 30s: {error}"));
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        };
+
+        writer
+            .write_all(&super::owner::leftover_stamp_bytes())
+            .map_err(|error| format!("cannot write the owner stamp: {error}"))?;
+
+        // 🔴 Before the write end closes, and therefore before the read that is
+        // holding `plan` open can return.
+        std::fs::remove_dir_all(directory)
+            .map_err(|error| format!("cannot take the directory away: {error}"))?;
+        if matches!(change, WhileTheSweepIsDeciding::ItBecomesAFile) {
+            std::fs::write(directory, "not a directory any more")
+                .map_err(|error| format!("cannot put a file in its place: {error}"))?;
+        }
+        Ok(())
     }
 
     /// 🔴 T-NR-48. A directory whose server process is still running is kept,
@@ -475,16 +576,168 @@ mod tests {
         assert_eq!(reclaim(&fixture.paths(), true).reclaimed, 1);
     }
 
-    /// T-NR-25. A file (not a directory) carrying the prefix is removed too —
-    /// leftovers are not all directories, and `remove_dir_all` on a file is an
-    /// error rather than a silent skip, so it is counted.
+    /// T-NR-25. A file (not a directory) carrying the prefix is reported rather
+    /// than ignored.
+    ///
+    /// 🔴 It never reaches the delete: a file has no owner stamp inside it, and
+    /// `stamp/owner` under a file answers `NotADirectory` rather than
+    /// `NotFound`, so it is [`Verdict::Undetermined`] — "I could not tell whose
+    /// this is", which is what it is. The delete's own error handling is a
+    /// different question and is asked below, where a directory is made to fail
+    /// the delete itself.
     #[test]
     fn a_leftover_that_is_not_a_directory_is_reported_rather_than_ignored() {
         let fixture = Fixture::new();
-        std::fs::write(fixture.work.path().join("agentenv-fc-stray"), "x").unwrap();
+        let stray = fixture.work.path().join("agentenv-fc-stray");
+        std::fs::write(&stray, "x").unwrap();
+        // The non-empty half: an ordinary leftover beside it, so the numbers
+        // below are a reading of the stray file and not of an inert sweep.
+        let leftover = fixture.dir("agentenv-fc-dead");
 
         let counts = reclaim(&fixture.paths(), true);
-        assert_eq!(counts.reclaimed + counts.failed, 1);
-        assert_eq!(counts.left_alone, 0);
+        assert_eq!(
+            counts,
+            ReclaimCounts {
+                reclaimed: 1,
+                left_alone: 0,
+                failed: 1,
+            },
+            "something that cannot be classified is a failure, never a decision"
+        );
+        assert!(stray.exists(), "and it is left where it is");
+        assert!(!leftover.exists());
+    }
+
+    /// 🔴 T-NR-50. The veto is announced when it is actually holding something
+    /// back, and not otherwise.
+    ///
+    /// The line is the only place the two operands of that predicate are told
+    /// apart. "Nothing was deleted" is true of a vetoed sweep and of a sweep
+    /// with nothing to do, and an operator reading a node that quietly stopped
+    /// reclaiming anything has this line or has nothing.
+    #[test]
+    fn the_veto_is_announced_only_when_it_holds_something_back() {
+        const ANNOUNCEMENT: &str = "leaving every sandbox work directory in place";
+
+        // Candidates, and no premise: the veto bites, and says so.
+        let held_back = Fixture::new();
+        held_back.dir("agentenv-fc-A1");
+        let announced = Recorder::default();
+        let guard = announced.install();
+        let counts = reclaim(&held_back.paths(), false);
+        drop(guard);
+        assert_eq!(counts.left_alone, 1, "there was something to hold back");
+        assert!(
+            announced.saw(Level::WARN, ANNOUNCEMENT),
+            "the veto went unannounced: {:?}",
+            announced.events()
+        );
+
+        // 🔴 The same candidates with the premise established. Only the second
+        // operand moved, which is the case a predicate reading `||` where it
+        // says `&&` gets wrong.
+        let swept = Fixture::new();
+        swept.dir("agentenv-fc-A1");
+        let unvetoed = Recorder::default();
+        let guard = unvetoed.install();
+        let counts = reclaim(&swept.paths(), true);
+        drop(guard);
+        assert_eq!(counts.reclaimed, 1, "and this one did sweep");
+        assert!(
+            !unvetoed.saw(Level::WARN, ANNOUNCEMENT),
+            "a sweep that reclaimed everything announced a veto: {:?}",
+            unvetoed.events()
+        );
+
+        // ...and the first operand on its own: no premise, but nothing under
+        // the work base either, so there is nothing to hold back and nothing
+        // to say.
+        let empty = Fixture::new();
+        let nothing_held = Recorder::default();
+        let guard = nothing_held.install();
+        let counts = reclaim(&empty.paths(), false);
+        drop(guard);
+        assert_eq!(counts, ReclaimCounts::default());
+        assert!(
+            !nothing_held.saw(Level::WARN, ANNOUNCEMENT),
+            "a veto over nothing was announced as if it held something: {:?}",
+            nothing_held.events()
+        );
+    }
+
+    /// 🔴 T-NR-51. A work directory that is already gone when the delete runs
+    /// is not a failure; one that is there and will not go is.
+    ///
+    /// The two arrive at the same line as two `io::Error`s and are separated
+    /// only by their `kind`. Collapsed either way this is a real fault: read as
+    /// "all errors are absence", a node that cannot delete anything reports the
+    /// same clean zeroes as a node with nothing to delete; read as "absence is
+    /// an error", every ordinary race turns into a `failed` count, and `failed`
+    /// is what vetoes the *next* sweep's deletions.
+    ///
+    /// Both are driven by taking the directory away while `plan` is inside
+    /// `owner_of` reading its stamp — see [`Fixture::dir_that_changes_while_it_is_being_decided`].
+    #[test]
+    fn a_directory_that_vanished_before_the_delete_is_not_a_failure() {
+        let fixture = Fixture::new();
+        // The non-empty half: an ordinary leftover that goes through normally.
+        let ordinary = fixture.dir("agentenv-fc-Ordinary");
+        let (vanishing, helper) = fixture.dir_that_changes_while_it_is_being_decided(
+            "agentenv-fc-Vanishing",
+            WhileTheSweepIsDeciding::ItDisappears,
+        );
+
+        let counts = reclaim(&fixture.paths(), true);
+        helper
+            .join()
+            .expect("the helper thread did not panic")
+            .expect("the helper thread");
+
+        assert!(!ordinary.exists());
+        assert!(!vanishing.exists());
+        assert_eq!(
+            counts,
+            ReclaimCounts {
+                reclaimed: 1,
+                left_alone: 0,
+                failed: 0,
+            },
+            "a directory that was already gone is not one that could not be removed"
+        );
+    }
+
+    /// 🔴 T-NR-52. The other half of T-NR-51: a delete that fails for a reason
+    /// that is *not* absence is counted.
+    ///
+    /// Same mechanism, and the directory is replaced by a plain file rather
+    /// than removed, so `remove_dir_all` answers `NotADirectory`. This is the
+    /// half that keeps a node which has lost the ability to delete anything
+    /// from reporting a clean sweep.
+    #[test]
+    fn a_delete_that_fails_for_any_other_reason_is_counted() {
+        let fixture = Fixture::new();
+        let ordinary = fixture.dir("agentenv-fc-Ordinary");
+        let (changed, helper) = fixture.dir_that_changes_while_it_is_being_decided(
+            "agentenv-fc-Changed",
+            WhileTheSweepIsDeciding::ItBecomesAFile,
+        );
+
+        let counts = reclaim(&fixture.paths(), true);
+        helper
+            .join()
+            .expect("the helper thread did not panic")
+            .expect("the helper thread");
+
+        assert!(!ordinary.exists());
+        assert!(changed.exists(), "what replaced it is still there");
+        assert_eq!(
+            counts,
+            ReclaimCounts {
+                reclaimed: 1,
+                left_alone: 0,
+                failed: 1,
+            },
+            "a delete that did not work must not read as one that had nothing to do"
+        );
     }
 }

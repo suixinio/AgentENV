@@ -270,7 +270,32 @@ pub(super) const DEAD_OWNER_PID: i32 = 999_001;
 /// leftover in these suites is.
 #[cfg(test)]
 pub(super) fn stamp_as_leftover(work_dir: &Path) {
-    stamp_for_test(work_dir, DEAD_OWNER_PID, 1, None);
+    std::fs::write(stamp_path(work_dir), leftover_stamp_bytes()).unwrap();
+}
+
+/// The bytes [`stamp_as_leftover`] writes.
+///
+/// 🔴 Handed out rather than reproduced by hand, for the reason
+/// [`stamp_for_test`] gives: a test that has to deliver a stamp through
+/// something other than a file — see `work_dirs`' vanishing-directory suite,
+/// which delivers one down a FIFO — still has to deliver the format this
+/// module reads, or it is testing its own copy of it.
+#[cfg(test)]
+pub(super) fn leftover_stamp_bytes() -> Vec<u8> {
+    serde_json::to_vec(&OwnerStamp {
+        version: STAMP_VERSION,
+        boot_id: None,
+        pid: DEAD_OWNER_PID,
+        starttime: 1,
+    })
+    .unwrap()
+}
+
+/// Where [`owner_of`] looks for the stamp, for tests that have to put
+/// something other than an ordinary file there.
+#[cfg(test)]
+pub(super) fn stamp_path_of(work_dir: &Path) -> PathBuf {
+    stamp_path(work_dir)
 }
 
 #[cfg(test)]

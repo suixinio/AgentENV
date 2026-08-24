@@ -159,6 +159,56 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
         )))
     }
 
+    /// 🔴 Yes: the VMs are on other machines, and those machines are not going
+    /// anywhere when this process does.
+    ///
+    /// What this buys is that a rolled api replica does not pause the cluster.
+    /// The shutdown path preserves everything in the record store by pausing
+    /// it, which is right for a machine that is about to stop running VMs and
+    /// catastrophic for a replica whose store is the whole cluster's ledger.
+    fn sandboxes_outlive_this_process(&self) -> bool {
+        true
+    }
+
+    /// Yes: a sandbox this factory built goes on running whether or not this
+    /// process happens to be holding a handle for it.
+    ///
+    /// # 🔴 The assumption this exists to retire
+    ///
+    /// `Orchestrator` keeps live backends in a process-local map and, for a
+    /// single process, "not in the map" and "not running" are the same fact.
+    /// `--role api` is deployed as replicas behind a Service with no session
+    /// affinity, so the two come apart on the first request: the replica a
+    /// pause lands on is not usually the replica that created the sandbox, and
+    /// the one that did not create it has an empty map and the cluster's own
+    /// record in front of it.
+    ///
+    /// What that cost in production is worth writing down, because it is what
+    /// makes this method's existence non-negotiable: the pause path read the
+    /// missing handle as a sandbox that had gone and **deleted the shared
+    /// record**, leaving the VM running on its node with nothing left that
+    /// could name it. Two of those filled half a machine and could not be
+    /// deleted through the API at all.
+    ///
+    /// 🔴 The stub is deliberately built with no node in it. Which machine a
+    /// sandbox is on is a question for the scheduler
+    /// ([`NodePlacement::place_existing`][super::NodePlacement::place_existing]),
+    /// this method is synchronous, and a factory that took a network round trip
+    /// would break the seam described at the top of this type.
+    fn adopt_running(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        resources: SandboxResources,
+    ) -> Result<Option<Box<dyn SandboxBackend>>> {
+        Ok(Some(Box::new(RemoteSandboxStub::attaching(
+            sandbox_id,
+            execution_id,
+            resources,
+            Arc::clone(&self.placement),
+        ))))
+    }
+
     /// Reads back what [`RemotePausedState::encode`] wrote.
     ///
     /// 🔴 `artifact_root` is ignored, and the one inside the encoding is used

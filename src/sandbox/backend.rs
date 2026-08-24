@@ -357,6 +357,52 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>>;
 
+    /// Whether the sandboxes this factory builds keep running after this
+    /// process exits.
+    ///
+    /// 🔴 `false` — the default — is what makes a shutdown pause every sandbox
+    /// in the record store before the process goes away: the VMs are this
+    /// process's, so nobody else will preserve them.
+    ///
+    /// A factory that answers `true` runs its sandboxes on other machines, and
+    /// a caller that preserved them on the way out would be pausing the whole
+    /// cluster's running sandboxes every time one replica of a replicated half
+    /// was rolled. Two answers rather than a role check because the fact
+    /// belongs to the factory: it is the thing that knows where its sandboxes
+    /// are.
+    fn sandboxes_outlive_this_process(&self) -> bool {
+        false
+    }
+
+    /// A backend for a sandbox that is **already running**, rebuilt from what
+    /// the record says about it.
+    ///
+    /// # 🔴 `Ok(None)` is a fact about this factory, not about the sandbox
+    ///
+    /// It means *the sandboxes this factory builds live in the process that
+    /// started them*, so a caller holding no handle for one is holding no
+    /// handle for a runtime that is gone. It does **not** mean the sandbox does
+    /// not exist — the caller has a record in front of it saying otherwise —
+    /// and the difference is the whole reason this returns an `Option` instead
+    /// of an error.
+    ///
+    /// A factory whose sandboxes run on other machines answers `Some`. Nothing
+    /// about the machine is needed here: the identity, the incarnation and the
+    /// record are enough to address a sandbox that is already up, and finding
+    /// which machine it is on is the backend's own asynchronous work.
+    ///
+    /// 🔴 An `Err` is "I could not tell", and a caller may not read it as
+    /// either of the two answers above. The default is `Ok(None)` because a
+    /// machine-local factory can answer that without asking anyone.
+    fn adopt_running(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+        _resources: crate::types::SandboxResources,
+    ) -> Result<Option<Box<dyn SandboxBackend>>> {
+        Ok(None)
+    }
+
     /// Build a sandbox backend from backend-specific paused state captured by `pause`.
     ///
     /// 🔴 `decode_paused_state` above deliberately takes no incarnation: it

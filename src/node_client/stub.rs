@@ -63,6 +63,15 @@ pub(super) enum PendingLaunch {
     /// A child of a fork that has already happened: the node started it, so
     /// there is nothing left to launch.
     AlreadyStarted,
+    /// A sandbox that is already running on some machine, reached by a process
+    /// that never started it and so was never handed a reply naming one.
+    ///
+    /// 🔴 Distinct from [`AlreadyStarted`](Self::AlreadyStarted), which carries
+    /// the reply: that variant knows the machine, the address and the size,
+    /// because the call that produced it said so. This one knows only the
+    /// sandbox, and has to go and ask. Collapsing the two would mean a stub
+    /// that quietly reports "not placed anywhere" for a sandbox that is up.
+    Attach,
 }
 
 /// One sandbox on another node.
@@ -147,6 +156,78 @@ impl RemoteSandboxStub {
                     .then_some(ack.rootfs_virtual_size),
             }),
         }
+    }
+
+    /// A stub for a sandbox that is already running somewhere, built by a
+    /// process that did not start it.
+    ///
+    /// # 🔴 This is what a replicated deciding half has instead of a handle
+    ///
+    /// `Orchestrator` keeps its backends in a process-local map, which is the
+    /// whole truth when there is one process. `--role api` runs several behind
+    /// a load balancer with no session affinity, so the replica a call lands on
+    /// is *not* the replica that started the sandbox — and the one that did not
+    /// start it has an empty map and a perfectly good record. Without this it
+    /// reads that pair as "the sandbox is gone".
+    ///
+    /// 🔴 It is placed nowhere until [`start`](SandboxBackend::start) is
+    /// called, exactly like every other stub in this file, and for the same
+    /// reason: the factory method that produces it is synchronous and may not
+    /// touch a network. `start` on this variant starts nothing — it finds the
+    /// machine the sandbox is already on and opens a channel to it.
+    pub(super) fn attaching(
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        resources: SandboxResources,
+        placement: Arc<dyn NodePlacement>,
+    ) -> Self {
+        Self::pending(
+            sandbox_id,
+            execution_id,
+            resources,
+            placement,
+            PendingLaunch::Attach,
+        )
+    }
+
+    /// Finds the machine a sandbox that is already running is on, and connects.
+    ///
+    /// 🔴 `place_existing`, for the reason written on [`reopen`](Self::reopen):
+    /// this asks *where this sandbox is*, and `place_new` answers *which
+    /// machine has room*. A teardown sent on the second answer would be sent to
+    /// a machine that has never seen the sandbox, which comes back `NotFound` —
+    /// and a caller that read that as "already gone" would leave a VM running
+    /// with nothing accounting for it.
+    ///
+    /// 🔴 Nothing here checks an incarnation, and nothing needs to: every call
+    /// this stub goes on to make carries `execution_id` as its fence, and the
+    /// node refuses a call that names a run it is not running. Checking here as
+    /// well would be a second answer to the same question, taken a round trip
+    /// earlier.
+    async fn attach(&mut self) -> Result<()> {
+        let sandbox_id = self.sandbox_id;
+        let node = self
+            .placement
+            .place_existing(sandbox_id)
+            .await
+            .with_context(|| format!("locate the machine running sandbox {sandbox_id}"))?;
+        let client = Self::connect(&node.endpoint)
+            .await
+            .with_context(|| format!("reach node {} for sandbox {sandbox_id}", node.node_id))?;
+
+        self.placed = Some(Placed {
+            node,
+            client,
+            // 🔴 Both unknown, and left unknown rather than guessed. They are
+            // learned from the reply to the call that started the sandbox, and
+            // this process did not make that call. A caller that needs the
+            // address — publishing a proxy route, say — must read it from
+            // somewhere that has it; inventing one here would route a user's
+            // traffic at an address nothing is listening on.
+            host_interaction_ip: None,
+            rootfs_virtual_size: None,
+        });
+        Ok(())
     }
 
     /// Asks the machine holding this sandbox's capture to reopen it.
@@ -295,6 +376,9 @@ impl SandboxBackend for RemoteSandboxStub {
         }
         let request = match &self.pending {
             PendingLaunch::AlreadyStarted => return Ok(()),
+            // 🔴 Nothing is started here. The sandbox is up; what this call
+            // does is find out where.
+            PendingLaunch::Attach => return self.attach().await,
             PendingLaunch::FromSnapshot { request } => (**request).clone(),
             PendingLaunch::Resume {
                 request,

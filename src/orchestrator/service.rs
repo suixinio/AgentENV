@@ -131,6 +131,41 @@ pub struct Orchestrator<
     paused_publisher: OnceCell<Arc<dyn PausedSandboxPublisher>>,
 }
 
+/// What can be driven for a sandbox this process is holding no handle for.
+///
+/// # 🔴 Three answers, because two of them used to be told apart by nothing
+///
+/// [`Orchestrator::sandboxes`] is a *process-local* map of live backends. For a
+/// single process, an id missing from it means the sandbox's runtime is gone,
+/// and the pause and snapshot paths acted on exactly that reading: they deleted
+/// the record. `--role api` is deployed as several replicas behind a Service
+/// with no session affinity, and there the same absence usually means something
+/// else entirely — *another replica started it* — because a sandbox's record is
+/// shared and its handle is not.
+///
+/// Read as the first, the second destroys the sandbox: the record goes, the VM
+/// stays up on its node, and nothing left in the cluster can name it. So the
+/// two are separate values here, and the caller has to say which one it is
+/// acting on.
+///
+/// 🔴 And a fourth answer that is not a variant: `Err`. "I could not reach the
+/// store" and "I could not reach the machine" are neither of the three, and a
+/// caller that folded either into [`RuntimeGone`](Self::RuntimeGone) would be
+/// deleting records because a network was slow.
+enum AbsentHandle {
+    /// The sandbox runs on a machine this half can address, and the backend to
+    /// drive it with has been rebuilt from the record. Usable exactly like the
+    /// handle that was not here.
+    Adopted(SandboxHandle),
+    /// There is a record, and this factory's sandboxes live in the process that
+    /// started them — so the runtime the record describes is gone. This is the
+    /// only answer that entitles a caller to clean the record up.
+    RuntimeGone,
+    /// The store has no record under this id: the sandbox does not exist. There
+    /// is nothing to drive and nothing to clean up.
+    NoRecord,
+}
+
 /// What a teardown should do with the sandbox's cluster-wide record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClusterDisposition {
@@ -325,6 +360,47 @@ where
 
     async fn release_image_refs(&self, owner: RuntimeImageOwner) {
         self.image_refs.unpin_best_effort(owner).await;
+    }
+
+    /// Works out what can be driven for a sandbox whose handle is not here.
+    ///
+    /// Called only after the process-local map has come up empty; the three
+    /// answers and the error are described on [`AbsentHandle`].
+    ///
+    /// 🔴 The adopted backend is started before it is handed back, and `start`
+    /// on it starts nothing: it is where a stub for an already-running sandbox
+    /// finds the machine it is on and opens a channel to it. Handing back an
+    /// unattached backend would move that round trip inside the caller's
+    /// rollback-shaped code, where its failure is much easier to mistake for
+    /// the operation's own.
+    async fn absent_handle(&self, sandbox_id: SandboxId) -> Result<AbsentHandle> {
+        // 🔴 The store first, and its error propagates. A caller that could not
+        // read the record has learned nothing about the sandbox, and every
+        // answer below is a claim about a record that was read.
+        let Some(metadata) = self.store.get(&sandbox_id).await? else {
+            return Ok(AbsentHandle::NoRecord);
+        };
+
+        let adopted = self
+            .factory
+            .adopt_running(sandbox_id, metadata.execution_id, metadata.resources)
+            .map_err(|error| {
+                OrchestratorError::InternalError(format!(
+                    "could not tell where sandbox {sandbox_id} is running: {error:#}"
+                ))
+            })?;
+        let Some(mut backend) = adopted else {
+            return Ok(AbsentHandle::RuntimeGone);
+        };
+
+        backend.start().await.map_err(|error| {
+            OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} is not running in this process and the machine running it \
+                 could not be reached: {error:#}"
+            ))
+        })?;
+        debug!(%sandbox_id, "adopted a sandbox this process did not start");
+        Ok(AbsentHandle::Adopted(Arc::new(Mutex::new(backend))))
     }
 
     /// Snapshot the running set's local runtime artifacts for maintenance.
@@ -657,8 +733,20 @@ where
         let source_handle = {
             let sandboxes = self.sandboxes.read().await;
             sandboxes.get(&source_sandbox_id).cloned()
-        }
-        .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
+        };
+        // 🔴 A replica that did not start the source sandbox is not a replica
+        // the source sandbox is missing from. Answering `SandboxNotFound` here
+        // made a fork fail on whichever of the api replicas the request
+        // happened to reach.
+        let source_handle = match source_handle {
+            Some(handle) => handle,
+            None => match self.absent_handle(source_sandbox_id).await? {
+                AbsentHandle::Adopted(handle) => handle,
+                AbsentHandle::RuntimeGone | AbsentHandle::NoRecord => {
+                    return Err(OrchestratorError::SandboxNotFound(source_sandbox_id))
+                }
+            },
+        };
 
         let source_metadata = self
             .store
@@ -1291,8 +1379,42 @@ where
         };
 
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        // See the matching note in `pause_sandbox_inner`: an adopted backend is
+        // never filed in the running set.
+        let handle_was_held_here = handle.is_some();
 
-        // If the sandbox is still in memory, attempt to stop it.
+        // 🔴 A delete that finds no handle used to drop straight through to
+        // "remove the record", answer 204, and never tell anybody's machine.
+        // On a replicated deciding half that is how a sandbox becomes an orphan
+        // VM: the user is told it is gone, the node goes on running it, and the
+        // only thing that named it has just been erased.
+        let handle = match handle {
+            Some(handle) => Some(handle),
+            None => match self.absent_handle(sandbox_id).await {
+                Ok(AbsentHandle::Adopted(handle)) => Some(handle),
+                // Nothing is running that this half can reach, so there is
+                // nothing to stop — and the record below is the last of it.
+                Ok(AbsentHandle::RuntimeGone) | Ok(AbsentHandle::NoRecord) => None,
+                // 🔴 Refused rather than completed. The record is the only
+                // remaining handle on a VM that may well still be up, and a
+                // delete that forgot it because a lookup timed out would be the
+                // orphan this branch exists to prevent.
+                Err(error) => {
+                    warn!(error = %error, "could not reach the sandbox while deleting; leaving its record alone");
+                    self.restore_proxy_route(sandbox_id, removed_route).await;
+                    self.store
+                        .update_state_if_state(
+                            &sandbox_id,
+                            previous_state,
+                            &[SandboxState::Killing],
+                        )
+                        .await?;
+                    return Err(error);
+                }
+            },
+        };
+
+        // If a runtime could be reached, attempt to stop it.
         if let Some(handle) = handle {
             let stop_result = {
                 let mut sandbox = handle.lock().await;
@@ -1301,7 +1423,9 @@ where
 
             if let Err(err) = stop_result {
                 warn!(error = ?err, "failed to stop sandbox during delete");
-                self.sandboxes.write().await.insert(sandbox_id, handle);
+                if handle_was_held_here {
+                    self.sandboxes.write().await.insert(sandbox_id, handle);
+                }
                 self.restore_proxy_route(sandbox_id, removed_route).await;
                 self.store
                     .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
@@ -1617,12 +1741,57 @@ where
 
         let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
-        let Some(handle) = handle else {
-            warn!("sandbox handle not found while pausing, removing from store");
-            self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-                .await;
-            self.store.remove(&sandbox_id).await?;
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        // 🔴 Whether the backend below is this process's own. A handle rebuilt
+        // from the record is built for one operation and is never put into the
+        // running set: that map is what this process is *running*, and a
+        // replica that filed a stub for somebody else's sandbox in it would go
+        // on reporting a sandbox it does not hold, with a backend that goes
+        // stale the moment the sandbox is resumed on another machine.
+        let handle_was_held_here = handle.is_some();
+        let handle = match handle {
+            Some(handle) => handle,
+            None => match self.absent_handle(sandbox_id).await {
+                // The sandbox is running on a machine this half addresses, and
+                // this replica simply is not the one that started it.
+                Ok(AbsentHandle::Adopted(handle)) => handle,
+                // 🔴 The only branch that may still remove the record: this
+                // factory's sandboxes live in this process, so a record with no
+                // handle here describes a runtime that is gone.
+                Ok(AbsentHandle::RuntimeGone) => {
+                    warn!("sandbox handle not found while pausing, removing from store");
+                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                        .await;
+                    self.store.remove(&sandbox_id).await?;
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                }
+                // Nothing to remove: something else already took the record.
+                Ok(AbsentHandle::NoRecord) => {
+                    warn!("sandbox record disappeared while pausing");
+                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                        .await;
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                }
+                // 🔴 Not knowing is not a licence to delete. The record stays
+                // exactly as it was and the sandbox goes back to `Running`, so
+                // a retry — on this replica or another — finds the same
+                // sandbox it would have found had this call never happened.
+                Err(error) => {
+                    warn!(error = %error, "could not reach the sandbox while pausing; leaving its record alone");
+                    self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                        .await;
+                    let _ = self
+                        .store
+                        .update_state_if_state(
+                            &sandbox_id,
+                            SandboxState::Running,
+                            &[SandboxState::Pausing],
+                        )
+                        .await;
+                    self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                        .await;
+                    return Err(error);
+                }
+            },
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
@@ -1650,7 +1819,9 @@ where
                     }
                     self.store.remove(&sandbox_id).await?;
                 } else {
-                    self.sandboxes.write().await.insert(sandbox_id, handle);
+                    if handle_was_held_here {
+                        self.sandboxes.write().await.insert(sandbox_id, handle);
+                    }
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
                         .await;
                     let _ = self
@@ -1719,7 +1890,9 @@ where
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
             } else {
-                self.sandboxes.write().await.insert(sandbox_id, handle);
+                if handle_was_held_here {
+                    self.sandboxes.write().await.insert(sandbox_id, handle);
+                }
                 self.restore_proxy_route(sandbox_id, removed_proxy_route)
                     .await;
                 let _ = self
@@ -2074,11 +2247,36 @@ where
             let sandboxes = self.sandboxes.read().await;
             sandboxes.get(&sandbox_id).cloned()
         };
-        let Some(handle) = handle else {
-            warn!("sandbox handle not found while snapshotting, removing from store");
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            self.store.remove(&sandbox_id).await?;
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        let handle = match handle {
+            Some(handle) => handle,
+            None => match self.absent_handle(sandbox_id).await {
+                Ok(AbsentHandle::Adopted(handle)) => handle,
+                // 🔴 See the matching branch in `pause_sandbox_inner`: this is
+                // the only reading of a missing handle that means the sandbox
+                // is gone, and so the only one that may take the record.
+                Ok(AbsentHandle::RuntimeGone) => {
+                    warn!("sandbox handle not found while snapshotting, removing from store");
+                    self.detach_sandbox_handle_and_route(&sandbox_id).await;
+                    self.store.remove(&sandbox_id).await?;
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                }
+                Ok(AbsentHandle::NoRecord) => {
+                    warn!("sandbox record disappeared while snapshotting");
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                }
+                Err(error) => {
+                    warn!(error = %error, "could not reach the sandbox while snapshotting; leaving its record alone");
+                    let _ = self
+                        .store
+                        .update_state_if_state(
+                            &sandbox_id,
+                            SandboxState::Running,
+                            &[SandboxState::Snapshotting],
+                        )
+                        .await;
+                    return Err(error);
+                }
+            },
         };
 
         // Call sandbox backend to capture the snapshot.
@@ -2181,11 +2379,24 @@ where
         let sandbox = {
             let sandboxes = self.sandboxes.read().await;
             sandboxes.get(&sandbox_id).cloned()
-        }
-        .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
-            sandbox_id,
-            operation: SandboxOperation::UpdateNetwork,
-        })?;
+        };
+        // As in `fork_sandbox_inner`: on a replicated deciding half the handle
+        // usually lives on another replica, and that is not a conflict.
+        let sandbox = match sandbox {
+            Some(handle) => handle,
+            None => match self.absent_handle(sandbox_id).await? {
+                AbsentHandle::Adopted(handle) => handle,
+                AbsentHandle::RuntimeGone => {
+                    return Err(OrchestratorError::SandboxOperationConflict {
+                        sandbox_id,
+                        operation: SandboxOperation::UpdateNetwork,
+                    })
+                }
+                AbsentHandle::NoRecord => {
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id))
+                }
+            },
+        };
 
         let runtime_policy = network_policy.runtime_policy();
 
@@ -2253,11 +2464,22 @@ where
         let sandbox = {
             let sandboxes = self.sandboxes.read().await;
             sandboxes.get(&sandbox_id).cloned()
-        }
-        .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
-            sandbox_id,
-            operation: SandboxOperation::PatchCustomExtensionParams,
-        })?;
+        };
+        let sandbox = match sandbox {
+            Some(handle) => handle,
+            None => match self.absent_handle(sandbox_id).await? {
+                AbsentHandle::Adopted(handle) => handle,
+                AbsentHandle::RuntimeGone => {
+                    return Err(OrchestratorError::SandboxOperationConflict {
+                        sandbox_id,
+                        operation: SandboxOperation::PatchCustomExtensionParams,
+                    })
+                }
+                AbsentHandle::NoRecord => {
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id))
+                }
+            },
+        };
 
         // Invoke the extension's patch-params hook here (the backend only
         // stores the approved value). The sandbox lock is not held during
@@ -3165,6 +3387,22 @@ where
         const MAX_SHUTDOWN_PASSES: usize = 3;
         let mut last_failures = Vec::new();
 
+        // 🔴 Nothing to preserve when the VMs are not this process's.
+        //
+        // The loop below reads every non-paused record in the store and pauses
+        // it, which is what a machine about to stop running VMs owes the
+        // sandboxes on it. A replicated deciding half's store is the *cluster's*
+        // ledger, so the same loop there pauses — or, before the handle-absence
+        // reading was fixed, deleted the records of — every running sandbox in
+        // the cluster, once per replica rolled.
+        if self.factory.sandboxes_outlive_this_process() {
+            info!(
+                "this process runs no sandboxes of its own; leaving the recorded sandboxes to \
+                 the machines running them"
+            );
+            return Ok(());
+        }
+
         // Preserve recoverable sandboxes by pausing running VMs before process exit.
         for pass in 1..=MAX_SHUTDOWN_PASSES {
             let sandboxes = self
@@ -3402,6 +3640,15 @@ where
         metadata.secure = secure;
         self.store.update(metadata).await?;
         Ok(())
+    }
+
+    /// Drops this process's handle for a sandbox, leaving its record alone.
+    ///
+    /// What a replica that never started the sandbox looks like from the
+    /// inside, and the only way to produce that shape without standing up a
+    /// second replica.
+    pub(crate) async fn forget_sandbox_handle_for_test(&self, sandbox_id: &SandboxId) -> bool {
+        self.sandboxes.write().await.remove(sandbox_id).is_some()
     }
 
     pub(crate) async fn remove_proxy_route_for_test(&self, sandbox_id: &SandboxId) {

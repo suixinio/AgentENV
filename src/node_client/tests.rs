@@ -15,7 +15,8 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 use crate::orchestrator::{
-    DisabledSandboxPersister, InMemoryMetadataStore, Orchestrator, SandboxOrchestration,
+    DisabledSandboxPersister, InMemoryMetadataStore, MetadataStore, Orchestrator,
+    SandboxOrchestration,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
@@ -1844,5 +1845,671 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
         live[0].execution_id,
         Some(paused_execution_id),
         "the sandbox came back as the run it was paused under"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two replicas over one ledger
+// ---------------------------------------------------------------------------
+//
+// 🔴 What this section is for, stated once.
+//
+// `Orchestrator` keeps its live backends in a process-local map. That map is
+// the whole truth when there is one process, and `--role api` is deployed as
+// two replicas behind a Service with **no session affinity** — so the replica a
+// request lands on is not usually the replica that started the sandbox.
+//
+// The pause path read "no handle here" as "the sandbox is gone" and deleted the
+// shared record. On a cluster that meant: the user's pause answered 404, the VM
+// went on running on its node, and the only thing that could still name it had
+// just been erased. Two of those filled half a machine, and no API call could
+// reach either.
+//
+// Everything below is written as two faces that differ in exactly one value —
+// which replica the call lands on, whether the machine can be reached, whether
+// the factory's sandboxes are on other machines — because the failure is a
+// *silence* and an assertion with one face passes on a build that does nothing
+// at all.
+
+/// One `InMemoryMetadataStore` behind more than one orchestrator.
+///
+/// 🔴 Every method forwards, including the ones with defaults. A newtype that
+/// let a default stand would be a second store implementation wearing the first
+/// one's name, and the whole point here is that two replicas read and write the
+/// *same* records.
+#[derive(Clone)]
+struct SharedLedger(Arc<InMemoryMetadataStore>);
+
+type StoreResult<T> = std::result::Result<T, crate::orchestrator::StoreError>;
+
+#[async_trait]
+impl crate::orchestrator::MetadataStore for SharedLedger {
+    async fn add(&self, metadata: crate::orchestrator::SandboxMetadata) -> StoreResult<()> {
+        self.0.add(metadata).await
+    }
+    async fn update(&self, metadata: crate::orchestrator::SandboxMetadata) -> StoreResult<()> {
+        self.0.update(metadata).await
+    }
+    async fn update_state_if_state(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+        new_state: crate::orchestrator::SandboxState,
+        expected_states: &[crate::orchestrator::SandboxState],
+    ) -> StoreResult<crate::orchestrator::SandboxState> {
+        self.0
+            .update_state_if_state(sandbox_id, new_state, expected_states)
+            .await
+    }
+    async fn update_if_state<F>(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+        expected_states: &[crate::orchestrator::SandboxState],
+        update: F,
+    ) -> StoreResult<crate::orchestrator::MetadataUpdateResult>
+    where
+        F: FnOnce(&mut crate::orchestrator::SandboxMetadata) + Send,
+    {
+        self.0
+            .update_if_state(sandbox_id, expected_states, update)
+            .await
+    }
+    async fn get(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+    ) -> StoreResult<Option<crate::orchestrator::SandboxMetadata>> {
+        self.0.get(sandbox_id).await
+    }
+    async fn remove(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+    ) -> StoreResult<Option<crate::orchestrator::SandboxMetadata>> {
+        self.0.remove(sandbox_id).await
+    }
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+        expected_execution_id: ExecutionId,
+        expected_states: &[crate::orchestrator::SandboxState],
+    ) -> StoreResult<crate::orchestrator::FencedRemoval> {
+        self.0
+            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+            .await
+    }
+    async fn list(&self) -> StoreResult<Vec<crate::orchestrator::SandboxMetadata>> {
+        self.0.list().await
+    }
+    async fn list_with_callback<F>(&self, callback: F) -> StoreResult<()>
+    where
+        F: FnMut(&crate::orchestrator::SandboxMetadata) + Send,
+    {
+        self.0.list_with_callback(callback).await
+    }
+    async fn list_filtered(
+        &self,
+        filter: crate::orchestrator::SandboxListFilter,
+    ) -> StoreResult<Vec<crate::orchestrator::SandboxMetadata>> {
+        self.0.list_filtered(filter).await
+    }
+    async fn list_expired(
+        &self,
+        now: std::time::SystemTime,
+    ) -> StoreResult<Vec<crate::orchestrator::SandboxMetadata>> {
+        self.0.list_expired(now).await
+    }
+    async fn list_ids(&self) -> StoreResult<Vec<crate::types::SandboxId>> {
+        self.0.list_ids().await
+    }
+    async fn wait_while_in_states(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+        transitional_states: &[crate::orchestrator::SandboxState],
+    ) -> StoreResult<Option<crate::orchestrator::SandboxMetadata>> {
+        self.0
+            .wait_while_in_states(sandbox_id, transitional_states)
+            .await
+    }
+    async fn expired_batch(
+        &self,
+        now: std::time::SystemTime,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::orchestrator::SandboxMetadata>> {
+        self.0.expired_batch(now, limit).await
+    }
+    async fn get_many(
+        &self,
+        ids: &[crate::types::SandboxId],
+    ) -> StoreResult<crate::orchestrator::MetadataRows> {
+        self.0.get_many(ids).await
+    }
+    async fn start_transition(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+        request: crate::orchestrator::TransitionRequest,
+    ) -> StoreResult<crate::orchestrator::TransitionOutcome> {
+        self.0.start_transition(sandbox_id, request).await
+    }
+    async fn paused_handle(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+    ) -> StoreResult<crate::orchestrator::PausedHandle> {
+        self.0.paused_handle(sandbox_id).await
+    }
+    async fn transition_settlement(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+        transition_id: &str,
+    ) -> StoreResult<crate::orchestrator::TransitionSettlement> {
+        self.0
+            .transition_settlement(sandbox_id, transition_id)
+            .await
+    }
+    async fn reserve(
+        &self,
+        sandbox_id: &crate::types::SandboxId,
+    ) -> StoreResult<crate::orchestrator::Reservation> {
+        self.0.reserve(sandbox_id).await
+    }
+    async fn heal_expiry_index(&self) -> StoreResult<usize> {
+        self.0.heal_expiry_index().await
+    }
+    async fn reap_stuck_transitions(
+        &self,
+        now: std::time::SystemTime,
+    ) -> StoreResult<Vec<crate::types::SandboxId>> {
+        self.0.reap_stuck_transitions(now).await
+    }
+}
+
+type ApiReplica =
+    Arc<Orchestrator<SharedLedger, RemoteSandboxBackendFactory, DisabledSandboxPersister>>;
+
+/// One replica of the deciding half: the cluster ledger, and a factory whose
+/// sandboxes are on `node`.
+async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
+    Orchestrator::new(
+        // 🔴 `All` rather than `Api`, and it changes nothing this file is
+        // about: the role is read once, to decide whether the process may
+        // invent its own envd access-token seed, and a test config has none to
+        // find. Everything that makes this a replica of the deciding half is
+        // the store and the factory below.
+        ServerRole::All,
+        ledger.clone(),
+        RemoteSandboxBackendFactory::new(node.placement()),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("a replica of the deciding half")
+}
+
+/// A machine-local half: its sandboxes are in its own process.
+async fn local_half(
+) -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory, DisabledSandboxPersister>> {
+    Orchestrator::new(
+        ServerRole::All,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("a machine-local orchestrator")
+}
+
+fn cluster_create_request() -> crate::orchestrator::CreateSandboxRequest {
+    crate::orchestrator::CreateSandboxRequest {
+        source: crate::orchestrator::SandboxLaunchSource::Snapshot(Box::new(
+            RunnableSnapshot::mock(),
+        )),
+        // Long enough that neither replica's eviction loop can be what moved a
+        // sandbox out from under an assertion.
+        expiry: crate::orchestrator::SandboxExpiry::After(std::time::Duration::from_secs(600)),
+        timeout_action: crate::orchestrator::SandboxTimeoutAction::Pause,
+        user_metadata: None,
+        env_vars: None,
+        network_policy: Default::default(),
+        custom_extension_params: None,
+        control_plane_config: None,
+        execution_id: None,
+        auto_resume: false,
+        secure: false,
+    }
+}
+
+/// The ids the node is running right now.
+async fn running_on(node: &RunningNode) -> Vec<crate::types::SandboxId> {
+    let mut ids: Vec<_> = node
+        .orchestration
+        .as_ref()
+        .expect("a real node")
+        .list_live_sandboxes()
+        .await
+        .expect("the node can list what it is running")
+        .into_iter()
+        .map(|sandbox| sandbox.sandbox_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Waits until nothing is listening on the node's address any more.
+async fn wait_until_unreachable(endpoint: &str) {
+    let addr = endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    for _ in 0..500 {
+        if tokio::net::TcpStream::connect(&addr).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the node kept answering after it was told to stop");
+}
+
+/// A pause pauses the same VM whichever replica it lands on.
+///
+/// 🔴 Two faces differing in exactly one value: which of two replicas of one
+/// deciding half the call was made on. Both must succeed **and** both VMs must
+/// actually stop on the node — a build where the second face merely returned a
+/// different error, or returned `Ok` without asking anyone, passes neither
+/// half of that.
+#[tokio::test]
+async fn a_pause_pauses_the_same_vm_whichever_replica_it_lands_on() {
+    let node = real_node().await;
+    let on_the_node = node.orchestration.as_ref().expect("a real node").clone();
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let started_here = api_replica(&node, &ledger).await;
+    let landed_elsewhere = api_replica(&node, &ledger).await;
+
+    let owned = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("a replica creates a sandbox on the node");
+    let stray = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("a replica creates a second sandbox on the node");
+
+    let mut both = vec![owned.id, stray.id];
+    both.sort();
+    assert_eq!(
+        running_on(&node).await,
+        both,
+        "the node is not running both"
+    );
+
+    // Face 1: the replica that started it. This is the request that always
+    // worked, and it is here so that face 2 means something.
+    Arc::clone(&started_here)
+        .pause_sandbox(owned.id)
+        .await
+        .expect("the replica that started the sandbox pauses it");
+
+    // Face 2: the same call, on the replica that did not. The one value that
+    // differs between the two.
+    Arc::clone(&landed_elsewhere)
+        .pause_sandbox(stray.id)
+        .await
+        .expect("a replica that did not start the sandbox pauses it");
+
+    // 🔴 Both VMs are actually down on the machine that was running them.
+    // Without this the test passes on a pause that answered `Ok` and told
+    // nobody, which is the other half of the same bug.
+    assert_eq!(
+        running_on(&node).await,
+        Vec::<crate::types::SandboxId>::new(),
+        "a pause reported success and left the VM running"
+    );
+
+    for sandbox_id in [owned.id, stray.id] {
+        assert_eq!(
+            on_the_node
+                .get_sandbox(&sandbox_id)
+                .await
+                .expect("the node's own record")
+                .expect("the node kept a record")
+                .state,
+            crate::orchestrator::SandboxState::Paused,
+        );
+        assert_eq!(
+            ledger
+                .0
+                .get(&sandbox_id)
+                .await
+                .expect("read the ledger")
+                .expect("the shared record survived the pause")
+                .state,
+            crate::orchestrator::SandboxState::Paused,
+        );
+    }
+}
+
+/// A missing handle takes the shared record with it **only** when there is
+/// nothing anywhere to address.
+///
+/// 🔴 The second face is the one that gives the first its resolution. "The
+/// record is still there" is satisfied by a build whose clean-up code never
+/// runs at all, so the same test drives a case where a record genuinely *is*
+/// removed. The single value that differs is whether the factory's sandboxes
+/// live on other machines.
+#[tokio::test]
+async fn a_missing_handle_removes_the_record_only_when_nothing_can_be_addressed() {
+    let node = real_node().await;
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let started_here = api_replica(&node, &ledger).await;
+    let landed_elsewhere = api_replica(&node, &ledger).await;
+
+    // Face 1: sandboxes on other machines. The replica taking the call holds no
+    // handle, and the record must survive.
+    let remote = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    Arc::clone(&landed_elsewhere)
+        .pause_sandbox(remote.id)
+        .await
+        .expect("a replica holding no handle pauses the sandbox");
+    let record = ledger
+        .0
+        .get(&remote.id)
+        .await
+        .expect("read the ledger")
+        .expect("🔴 the shared record was deleted by a pause on a replica that held no handle");
+    assert_eq!(record.state, crate::orchestrator::SandboxState::Paused);
+
+    // Face 2: sandboxes in this process. The same missing handle, and here it
+    // really does mean the runtime is gone — so the record goes.
+    let local = local_half().await;
+    let mine = Arc::clone(&local)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create in this process");
+    assert!(
+        local.forget_sandbox_handle_for_test(&mine.id).await,
+        "the sandbox this process started had no handle to forget"
+    );
+    let err = Arc::clone(&local)
+        .pause_sandbox(mine.id)
+        .await
+        .expect_err("a runtime that is gone cannot be paused");
+    assert!(
+        matches!(err, crate::orchestrator::OrchestratorError::SandboxNotFound(id) if id == mine.id),
+        "{err:?}"
+    );
+    assert!(
+        local
+            .get_sandbox(&mine.id)
+            .await
+            .expect("read the record")
+            .is_none(),
+        "the record of a runtime that is gone was kept"
+    );
+}
+
+/// A pause that cannot reach the machine leaves the sandbox exactly as it was.
+///
+/// 🔴 "I could not find out" is neither of the other two answers, and folding
+/// it into "the sandbox is gone" is what turned a network hiccup into a deleted
+/// record. The control face is the same call, on the same replica, against the
+/// same sandbox — with the machine up.
+#[tokio::test]
+async fn a_pause_that_cannot_reach_the_machine_leaves_the_record_alone() {
+    let node = real_node().await;
+    let endpoint = node.endpoint.endpoint.clone();
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let started_here = api_replica(&node, &ledger).await;
+    let landed_elsewhere = api_replica(&node, &ledger).await;
+
+    let reachable = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    let unreachable = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+
+    // Control face: the machine is up, so the pause goes through.
+    Arc::clone(&landed_elsewhere)
+        .pause_sandbox(reachable.id)
+        .await
+        .expect("the machine is up");
+
+    // And now it is not.
+    drop(node);
+    wait_until_unreachable(&endpoint).await;
+
+    let err = Arc::clone(&landed_elsewhere)
+        .pause_sandbox(unreachable.id)
+        .await
+        .expect_err("a pause cannot succeed against a machine that is not answering");
+    assert!(
+        format!("{err}").contains("could not be reached"),
+        "the failure did not say the machine was unreachable: {err}"
+    );
+
+    // 🔴 The record is untouched, and it is back in the state it started in —
+    // not left parked in `Pausing`, which is a sandbox no later call can act
+    // on.
+    let record = ledger
+        .0
+        .get(&unreachable.id)
+        .await
+        .expect("read the ledger")
+        .expect("🔴 an unreachable machine caused the shared record to be deleted");
+    assert_eq!(record.state, crate::orchestrator::SandboxState::Running);
+
+    // The control's record, for contrast, moved.
+    assert_eq!(
+        ledger
+            .0
+            .get(&reachable.id)
+            .await
+            .expect("read the ledger")
+            .expect("the paused sandbox kept its record")
+            .state,
+        crate::orchestrator::SandboxState::Paused,
+    );
+}
+
+/// A delete on a replica that did not start the sandbox reaches the machine.
+///
+/// 🔴 This is the other half of the same fault, and it failed the opposite way
+/// round: the delete found no handle, skipped the teardown entirely, removed
+/// the record and answered 204. The VM stayed up with nothing left to name it.
+///
+/// The second face is a delete that could not reach the machine, which must
+/// keep the record — and which is what stops the first face from passing on a
+/// build that deletes records unconditionally.
+#[tokio::test]
+async fn a_delete_on_a_replica_that_did_not_start_the_sandbox_reaches_the_machine() {
+    let node = real_node().await;
+    let endpoint = node.endpoint.endpoint.clone();
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let started_here = api_replica(&node, &ledger).await;
+    let landed_elsewhere = api_replica(&node, &ledger).await;
+
+    let torn_down = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    let kept = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+
+    Arc::clone(&landed_elsewhere)
+        .delete_sandbox(torn_down.id)
+        .await
+        .expect("a replica that did not start the sandbox deletes it");
+    assert_eq!(
+        running_on(&node).await,
+        vec![kept.id],
+        "the delete answered success without telling the machine"
+    );
+    assert!(
+        ledger
+            .0
+            .get(&torn_down.id)
+            .await
+            .expect("read the ledger")
+            .is_none(),
+        "a completed delete left the record behind"
+    );
+
+    // Second face: the machine stops answering, so the delete must fail with
+    // the record intact rather than forget a VM that may still be up.
+    drop(node);
+    wait_until_unreachable(&endpoint).await;
+
+    let err = Arc::clone(&landed_elsewhere)
+        .delete_sandbox(kept.id)
+        .await
+        .expect_err("a delete cannot complete against a machine that is not answering");
+    assert!(
+        format!("{err}").contains("could not be reached"),
+        "the failure did not say the machine was unreachable: {err}"
+    );
+    let record = ledger
+        .0
+        .get(&kept.id)
+        .await
+        .expect("read the ledger")
+        .expect("🔴 a delete that never reached the machine forgot the sandbox anyway");
+    assert_eq!(record.state, crate::orchestrator::SandboxState::Running);
+}
+
+/// A replica going away does not pause the cluster's sandboxes.
+///
+/// 🔴 The shutdown path preserves everything in the record store by pausing it,
+/// which is what a machine that is about to stop running VMs owes them. A
+/// deciding half's record store is the *cluster's* ledger and it runs no VMs at
+/// all, so the same loop there pauses every running sandbox in the cluster once
+/// per replica rolled.
+///
+/// The control face is a half whose sandboxes really are its own: its shutdown
+/// must still pause them, or this test passes on a build that has simply
+/// stopped preserving anything.
+#[tokio::test]
+async fn a_replica_going_away_leaves_the_clusters_sandboxes_running() {
+    let node = real_node().await;
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let replica = api_replica(&node, &ledger).await;
+
+    let elsewhere = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    Arc::clone(&replica)
+        .shutdown()
+        .await
+        .expect("the replica shuts down");
+
+    assert_eq!(
+        running_on(&node).await,
+        vec![elsewhere.id],
+        "🔴 a replica shutting down paused a sandbox on a machine that is still up"
+    );
+    assert_eq!(
+        ledger
+            .0
+            .get(&elsewhere.id)
+            .await
+            .expect("read the ledger")
+            .expect("the shared record survived a replica restart")
+            .state,
+        crate::orchestrator::SandboxState::Running,
+    );
+
+    // Control face: a half whose VMs are in its own process still preserves
+    // them on the way out.
+    let local = local_half().await;
+    let mine = Arc::clone(&local)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create in this process");
+    Arc::clone(&local)
+        .shutdown()
+        .await
+        .expect("the local half shuts down");
+    assert_eq!(
+        local
+            .get_sandbox(&mine.id)
+            .await
+            .expect("read the record")
+            .expect("a preserved sandbox keeps its record")
+            .state,
+        crate::orchestrator::SandboxState::Paused,
+        "a half that runs its own VMs stopped preserving them"
+    );
+}
+
+/// An egress policy set on a replica that did not start the sandbox reaches the
+/// machine.
+///
+/// 🔴 This path failed less loudly than pause and delete — it answered
+/// `SandboxOperationConflict`, a 409 telling the user something else was busy
+/// with their sandbox when nothing was — but it failed for exactly the same
+/// reason, on whichever replica the request happened to land.
+///
+/// The control face is a half whose sandboxes really are in its own process:
+/// there a missing handle *is* a conflict, and it must still be reported as
+/// one.
+#[tokio::test]
+async fn an_egress_policy_set_on_a_replica_that_did_not_start_the_sandbox_reaches_the_machine() {
+    let node = real_node().await;
+    let on_the_node = node.orchestration.as_ref().expect("a real node").clone();
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let started_here = api_replica(&node, &ledger).await;
+    let landed_elsewhere = api_replica(&node, &ledger).await;
+
+    let sandbox = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+
+    let policy = crate::sandbox::SandboxNetworkPolicy::new(
+        crate::sandbox::BaseSandboxNetworkPolicy::Deny,
+        Default::default(),
+    );
+    Arc::clone(&landed_elsewhere)
+        .replace_sandbox_network_policy(sandbox.id, policy.clone())
+        .await
+        .expect("a replica that did not start the sandbox sets its egress policy");
+
+    // 🔴 On the machine, not merely in the ledger. A build that recorded the
+    // policy and told nobody satisfies every assertion that stops at the store.
+    assert_eq!(
+        on_the_node
+            .get_sandbox(&sandbox.id)
+            .await
+            .expect("the node's own record")
+            .expect("the node kept a record")
+            .network_policy,
+        policy,
+        "the policy never reached the machine running the sandbox"
+    );
+
+    // Control face: in a half that runs its own VMs, a handle that is not there
+    // is a sandbox that is not there to reconfigure.
+    let local = local_half().await;
+    let mine = Arc::clone(&local)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create in this process");
+    assert!(
+        local.forget_sandbox_handle_for_test(&mine.id).await,
+        "the sandbox this process started had no handle to forget"
+    );
+    let err = Arc::clone(&local)
+        .replace_sandbox_network_policy(mine.id, policy)
+        .await
+        .expect_err("a runtime that is gone cannot be reconfigured");
+    assert!(
+        matches!(
+            err,
+            crate::orchestrator::OrchestratorError::SandboxOperationConflict { sandbox_id, .. }
+                if sandbox_id == mine.id
+        ),
+        "{err:?}"
     );
 }

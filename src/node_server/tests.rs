@@ -160,6 +160,16 @@ impl crate::orchestrator::MetadataStore for FlakyRecords {
     ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
         self.inner.remove(sandbox_id).await
     }
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: crate::types::ExecutionId,
+        expected_states: &[crate::orchestrator::SandboxState],
+    ) -> Result<crate::orchestrator::FencedRemoval, crate::orchestrator::StoreError> {
+        self.inner
+            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+            .await
+    }
     async fn list(&self) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
         self.inner.list().await
     }
@@ -364,6 +374,16 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
             sandbox_id: &crate::types::SandboxId,
         ) -> Result<Option<SandboxMetadata>, StoreError> {
             self.0.remove(sandbox_id).await
+        }
+        async fn remove_if_execution(
+            &self,
+            sandbox_id: &crate::types::SandboxId,
+            expected_execution_id: crate::types::ExecutionId,
+            expected_states: &[crate::orchestrator::SandboxState],
+        ) -> Result<crate::orchestrator::FencedRemoval, StoreError> {
+            self.0
+                .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+                .await
         }
         async fn list(&self) -> Result<Vec<SandboxMetadata>, StoreError> {
             self.0.list().await

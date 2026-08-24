@@ -7,8 +7,8 @@ use tokio::sync::{watch, RwLock};
 use crate::orchestrator::SandboxState;
 
 use super::{
-    MetadataStore, MetadataUpdateResult, Result, SandboxId, SandboxListFilter, SandboxMetadata,
-    StoreError,
+    ExecutionId, FencedRemoval, MetadataStore, MetadataUpdateResult, Result, SandboxId,
+    SandboxListFilter, SandboxMetadata, StoreError,
 };
 
 /// In-memory metadata store backed by a `RwLock<HashMap>`.
@@ -273,6 +273,42 @@ impl MetadataStore for InMemoryMetadataStore {
         }
 
         Ok(removed.map(|record| record.metadata))
+    }
+
+    /// One write lock covers the predicate and the removal, so nothing can
+    /// change owner in between — which is the guarantee the Redis backend needs
+    /// a script for.
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> Result<FencedRemoval> {
+        let (outcome, removed) = {
+            let mut inner = self.inner.write().await;
+            let Some(record) = inner.records.get(sandbox_id) else {
+                return Ok(FencedRemoval::Absent);
+            };
+            let state = record.metadata.state;
+            let execution_id = record.metadata.execution_id;
+            if execution_id != expected_execution_id || !expected_states.contains(&state) {
+                return Ok(FencedRemoval::Superseded {
+                    state,
+                    execution_id,
+                });
+            }
+            let removed = inner.records.remove(sandbox_id);
+            if let Some(record) = &removed {
+                inner.deindex_expiry(&record.metadata.id, record.metadata.expires_at);
+            }
+            (FencedRemoval::Removed, removed)
+        };
+
+        if let Some(record) = &removed {
+            Self::notify_state(&record.state_tx, None);
+        }
+
+        Ok(outcome)
     }
 
     async fn list_ids(&self) -> Result<Vec<SandboxId>> {

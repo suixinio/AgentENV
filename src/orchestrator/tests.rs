@@ -291,6 +291,17 @@ impl MetadataStore for ScriptedStore {
         self.inner.remove(sandbox_id).await
     }
 
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: crate::types::ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> StdResult<FencedRemoval, StoreError> {
+        self.inner
+            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+            .await
+    }
+
     async fn list(&self) -> StdResult<Vec<SandboxMetadata>, StoreError> {
         self.inner.list().await
     }
@@ -440,6 +451,17 @@ impl MetadataStore for RaceBeforeUpdateStore {
         self.inner.remove(sandbox_id).await
     }
 
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: crate::types::ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> StdResult<FencedRemoval, StoreError> {
+        self.inner
+            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+            .await
+    }
+
     async fn list_ids(&self) -> StdResult<Vec<SandboxId>, StoreError> {
         self.inner.list_ids().await
     }
@@ -547,6 +569,28 @@ impl MetadataStore for ConflictOnUpdateStore {
         Ok(self.metadata.lock().await.take())
     }
 
+    async fn remove_if_execution(
+        &self,
+        _sandbox_id: &SandboxId,
+        expected_execution_id: crate::types::ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> StdResult<FencedRemoval, StoreError> {
+        let mut slot = self.metadata.lock().await;
+        let Some(metadata) = slot.as_ref() else {
+            return Ok(FencedRemoval::Absent);
+        };
+        if metadata.execution_id != expected_execution_id
+            || !expected_states.contains(&metadata.state)
+        {
+            return Ok(FencedRemoval::Superseded {
+                state: metadata.state,
+                execution_id: metadata.execution_id,
+            });
+        }
+        slot.take();
+        Ok(FencedRemoval::Removed)
+    }
+
     async fn list_ids(&self) -> StdResult<Vec<SandboxId>, StoreError> {
         Ok(self
             .metadata
@@ -639,6 +683,15 @@ impl MetadataStore for ScriptedWaitStore {
         _sandbox_id: &SandboxId,
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
         Ok(None)
+    }
+
+    async fn remove_if_execution(
+        &self,
+        _sandbox_id: &SandboxId,
+        _expected_execution_id: crate::types::ExecutionId,
+        _expected_states: &[SandboxState],
+    ) -> StdResult<FencedRemoval, StoreError> {
+        Ok(FencedRemoval::Absent)
     }
 
     async fn list_ids(&self) -> StdResult<Vec<SandboxId>, StoreError> {
@@ -816,6 +869,14 @@ fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
         NewTimeout::Set(Duration::from_secs(15)),
         None,
     )
+}
+
+/// A registered sandbox handle with no behaviour of its own.
+fn mock_sandbox_handle() -> SandboxHandle {
+    Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
+        Arc::new(MockBehavior::new()),
+        ExecutionId::new(),
+    ))))
 }
 
 /// A claim token for tests that drive the orchestrator directly.
@@ -1114,10 +1175,16 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
     )));
     let replacement_target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
 
+    // 🔴 Named rather than left to `Default`: what keeps this record is that it
+    // names a launch other than the one cleaning up, and a premise that only
+    // holds because a fixture happens to mint a fresh id is not a premise.
+    let replacement_execution_id = ExecutionId::new();
+    assert_ne!(replacement_execution_id, plan.execution_id());
     orchestrator
         .store
         .add(SandboxMetadata {
             id: sandbox_id,
+            execution_id: replacement_execution_id,
             state: SandboxState::Running,
             ..Default::default()
         })
@@ -1148,15 +1215,205 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
         Some(replacement_target)
     );
+    let untouched = orchestrator
+        .store
+        .get(&sandbox_id)
+        .await
+        .unwrap()
+        .expect("running metadata should remain untouched");
+    assert_eq!(untouched.state, SandboxState::Running);
+    assert_eq!(untouched.execution_id, replacement_execution_id);
+}
+
+/// A create that fails after its record was written clears that record whether
+/// or not something else has taken over its id — and clears only its own.
+///
+/// # 🔴 What the third sandbox is for
+///
+/// Two of these three ids end with no record, so on their own they cannot tell
+/// a working predicate from a cleanup that deletes whatever it is pointed at.
+/// The third differs in exactly one value — whose incarnation the record under
+/// the id names — and it has to still be there when the run ends.
+///
+/// # 🔴 Why "no record" is the right answer for the middle one
+///
+/// A create's record is written in `Creating`, and the state machine has no
+/// edge from `Creating` to `Killing`, so a delete waits for a transition that
+/// already ended and then answers `invalid state Creating` — forever. Leaving
+/// that record behind is not a smaller failure than deleting the wrong one; it
+/// is a row only a hand-written Redis command can remove.
+#[tokio::test]
+async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was_replaced() {
+    let orchestrator = make_orchestrator().await;
+
+    // Same failure, same stage, same run. One value differs per sandbox.
+    let handle_kept = SandboxId::new();
+    let handle_replaced = SandboxId::new();
+    let record_is_another_launchs = SandboxId::new();
+
+    let plan_kept = create_launch_plan_with_resources(handle_kept);
+    let plan_replaced = create_launch_plan_with_resources(handle_replaced);
+    let plan_other = create_launch_plan_with_resources(record_is_another_launchs);
+
+    // The first two ids hold the record their own launch wrote ...
+    for plan in [&plan_kept, &plan_replaced] {
+        orchestrator
+            .store
+            .add(
+                plan.transitional_metadata()
+                    .expect("a create plan carries its record")
+                    .clone(),
+            )
+            .await
+            .unwrap();
+    }
+    // ... and the third holds one written by a launch that is not this one.
+    let other_launch = SandboxMetadata {
+        id: record_is_another_launchs,
+        execution_id: ExecutionId::new(),
+        state: SandboxState::Creating,
+        ..Default::default()
+    };
+    assert_ne!(other_launch.execution_id, plan_other.execution_id());
+    orchestrator.store.add(other_launch.clone()).await.unwrap();
+
+    let own_handle = mock_sandbox_handle();
+    let replacement_for_mine = mock_sandbox_handle();
+    let replacement_for_other = mock_sandbox_handle();
+    {
+        let mut sandboxes = orchestrator.sandboxes.write().await;
+        sandboxes.insert(handle_kept, Arc::clone(&own_handle));
+        sandboxes.insert(handle_replaced, Arc::clone(&replacement_for_mine));
+        sandboxes.insert(
+            record_is_another_launchs,
+            Arc::clone(&replacement_for_other),
+        );
+    }
+
+    orchestrator
+        .cleanup_failed_launch(
+            &plan_kept,
+            own_handle,
+            FailedLaunchStage::TransitionalPersisted,
+        )
+        .await;
+    orchestrator
+        .cleanup_failed_launch(
+            &plan_replaced,
+            mock_sandbox_handle(),
+            FailedLaunchStage::TransitionalPersisted,
+        )
+        .await;
+    orchestrator
+        .cleanup_failed_launch(
+            &plan_other,
+            mock_sandbox_handle(),
+            FailedLaunchStage::TransitionalPersisted,
+        )
+        .await;
+
+    // Still holding its own handle: the ordinary rollback, and both go.
+    assert!(
+        orchestrator
+            .store
+            .get(&handle_kept)
+            .await
+            .unwrap()
+            .is_none(),
+        "a create that kept its handle must not leave a Creating record"
+    );
+    assert!(!orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&handle_kept));
+
+    // Handle taken over: the replacement keeps everything keyed by the id, and
+    // the record this launch wrote is still cleared.
+    assert!(
+        orchestrator
+            .store
+            .get(&handle_replaced)
+            .await
+            .unwrap()
+            .is_none(),
+        "a create whose handle was replaced must still take back its own record"
+    );
+    let still_registered = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&handle_replaced)
+        .cloned()
+        .expect("the replacement handle must stay registered");
+    assert!(Arc::ptr_eq(&still_registered, &replacement_for_mine));
+
+    // 🔴 The non-empty half: a record that must survive the same cleanup.
+    let survivor = orchestrator
+        .store
+        .get(&record_is_another_launchs)
+        .await
+        .unwrap()
+        .expect("a record written by another launch must survive this cleanup");
+    assert_eq!(survivor.state, SandboxState::Creating);
+    assert_eq!(survivor.execution_id, other_launch.execution_id);
+    let other_registered = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&record_is_another_launchs)
+        .cloned()
+        .expect("the replacement handle must stay registered");
+    assert!(Arc::ptr_eq(&other_registered, &replacement_for_other));
+}
+
+/// A resume that loses its id is deliberately left alone, and this pins that.
+///
+/// 🔴 Not an oversight and not a smaller version of the create case. A resume's
+/// record predates the launch and belongs to the sandbox, its rollback is a
+/// state change back to `Paused` rather than a removal, and the rest of that
+/// rollback — the persister's resume record, the image pin — is keyed by
+/// sandbox id, which is exactly what the refusal is protecting. If that is ever
+/// answered too, it needs a fenced *state write*, and this test is what will
+/// say so.
+#[tokio::test]
+async fn a_failed_resume_whose_handle_was_replaced_still_leaves_its_record_alone() {
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    let plan = resume_launch_plan(sandbox_id);
+    let mut resuming = paused_resume_metadata(sandbox_id);
+    resuming.state = SandboxState::Resuming;
+    // 🔴 The record names *this* launch's incarnation, so the only thing that
+    // can keep it is the plan-variant check. A fixture whose incarnation
+    // differed would be kept by the fence instead, and this test would pass
+    // with the check deleted.
+    resuming.execution_id = plan.execution_id();
+    orchestrator.store.add(resuming).await.unwrap();
+
+    let replacement = mock_sandbox_handle();
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, Arc::clone(&replacement));
+
+    orchestrator
+        .cleanup_failed_launch(
+            &plan,
+            mock_sandbox_handle(),
+            FailedLaunchStage::TransitionalPersisted,
+        )
+        .await;
+
     assert_eq!(
         orchestrator
             .store
             .get(&sandbox_id)
             .await
             .unwrap()
-            .expect("running metadata should remain untouched")
+            .expect("a resume must never remove the sandbox's own record")
             .state,
-        SandboxState::Running
+        SandboxState::Resuming
     );
 }
 
@@ -6656,6 +6913,22 @@ impl MetadataStore for SerialisingStore {
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
         self.references.lock().unwrap().remove(sandbox_id);
         self.inner.remove(sandbox_id).await
+    }
+
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: crate::types::ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> StdResult<FencedRemoval, StoreError> {
+        let outcome = self
+            .inner
+            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+            .await?;
+        if outcome == FencedRemoval::Removed {
+            self.references.lock().unwrap().remove(sandbox_id);
+        }
+        Ok(outcome)
     }
 
     async fn list(&self) -> StdResult<Vec<SandboxMetadata>, StoreError> {

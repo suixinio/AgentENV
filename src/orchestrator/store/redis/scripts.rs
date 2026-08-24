@@ -174,6 +174,51 @@ return false
 
 lazy_script!(remove, REMOVE);
 
+pub const FENCED_REMOVE_ABSENT: i64 = 0;
+pub const FENCED_REMOVE_REMOVED: i64 = 1;
+pub const FENCED_REMOVE_SUPERSEDED: i64 = 2;
+pub const FENCED_REMOVE_UNDECODABLE: i64 = 3;
+
+/// `KEYS = [record, index, expiry, pending]`
+///
+/// `ARGV = [sandbox_id, expected_execution, expected_state...]`
+///
+/// Returns `{code, state, execution_id}`, where `code` is one of the
+/// `FENCED_REMOVE_*` constants above and the two detail fields are filled in
+/// only for `FENCED_REMOVE_SUPERSEDED`.
+///
+/// 🔴 The predicate and the `DEL` are one script for the same reason
+/// `SWEEP_INDEX_MEMBER` is: `add` is lockless and `restore_sandbox` supplies
+/// its own id, so the record under an id can change owner between a `GET` in
+/// Rust and the `DEL` that follows it — and this script's whole job is to
+/// refuse to delete a record somebody else owns.
+///
+/// 🔴 An undecodable record is refused rather than deleted, which is the one
+/// place this deliberately differs from [`REMOVE`]. `REMOVE` is an
+/// unconditional instruction and may sweep bytes it cannot read; this one is a
+/// claim of ownership, and bytes nobody can read prove no ownership.
+const REMOVE_IF_EXECUTION: &str = r#"
+local raw = redis.call('GET', KEYS[1])
+if not raw then return {0, '', ''} end
+local ok, cur = pcall(cjson.decode, raw)
+if not ok then return {3, '', ''} end
+local state = tostring(cur['state'])
+local execution = tostring(cur['execution_id'])
+if execution ~= ARGV[2] then return {2, state, execution} end
+local matched = false
+for i = 3, #ARGV do
+  if ARGV[i] == cur['state'] then matched = true break end
+end
+if not matched then return {2, state, execution} end
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[4], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1] .. ':' .. execution)
+return {1, '', ''}
+"#;
+
+lazy_script!(remove_if_execution, REMOVE_IF_EXECUTION);
+
 /// `KEYS = [index, record]`, `ARGV = [sandbox_id]`
 ///
 /// Drops an index member whose record is gone, and returns how many it dropped.
@@ -361,6 +406,7 @@ mod tests {
             add(),
             update(),
             remove(),
+            remove_if_execution(),
             sweep_index_member(),
             start_transition(),
             complete_transition(),
@@ -374,6 +420,19 @@ mod tests {
             assert_eq!(script.get_hash().len(), 40);
             assert!(hashes.insert(script.get_hash().to_string()));
         }
+    }
+
+    /// 🔴 Named here and not only in the Lua, because dropping either
+    /// predicate turns a fenced take-back into the unconditional [`REMOVE`] it
+    /// must never become — and both scripts would still be valid Lua.
+    #[test]
+    fn the_fenced_remove_really_checks_both_predicates() {
+        assert!(REMOVE_IF_EXECUTION.contains("cur['execution_id']"));
+        assert!(REMOVE_IF_EXECUTION.contains("cur['state']"));
+        // The control: the unconditional one checks neither, which is what
+        // makes it the wrong script for a rollback to reach for.
+        assert!(!REMOVE.contains("cur['state']"));
+        assert_ne!(remove().get_hash(), remove_if_execution().get_hash());
     }
 
     /// 🔴 The negative control has to differ from the real script, or the

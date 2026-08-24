@@ -33,11 +33,11 @@ pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{
     configured_max_sandbox_lifetime, is_allowed_transition, ActiveStateRecord, ControlPlaneConfig,
-    InMemoryMetadataStore, MetadataRows, MetadataStore, MetadataUpdateResult, NewTimeout,
-    PausedHandle, PausedStateRef, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,
-    Reservation, ReservationGuard, SandboxListFilter, SandboxMetadata, SandboxTimeoutAction,
-    StartWaiter, StoreError, StoredSandboxRecord, TransitionEffect, TransitionGuard,
-    TransitionOutcome, TransitionRequest, TransitionSettlement, WaitForStart,
+    FencedRemoval, InMemoryMetadataStore, MetadataRows, MetadataStore, MetadataUpdateResult,
+    NewTimeout, PausedHandle, PausedStateRef, RedisMetadataStore, RedisStoreConfig,
+    RedisStoreConfigError, Reservation, ReservationGuard, SandboxListFilter, SandboxMetadata,
+    SandboxTimeoutAction, StartWaiter, StoreError, StoredSandboxRecord, TransitionEffect,
+    TransitionGuard, TransitionOutcome, TransitionRequest, TransitionSettlement, WaitForStart,
     DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
 };
 pub use types::{

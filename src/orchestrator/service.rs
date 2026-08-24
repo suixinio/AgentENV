@@ -2887,13 +2887,106 @@ where
             warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while rolling back launch");
         }
 
-        if !should_rollback_shared_state {
+        let Some(expected_state) = stage.rollback_expected_state(plan) else {
+            return;
+        };
+
+        if should_rollback_shared_state {
+            self.rollback_failed_launch_metadata(plan, expected_state)
+                .await;
             return;
         }
 
-        if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.rollback_failed_launch_metadata(plan, expected_state)
-                .await;
+        self.reclaim_superseded_launch_record(plan, expected_state)
+            .await;
+    }
+
+    /// The half of a launch rollback that survives losing the id.
+    ///
+    /// # 🔴 Why this is not simply the rollback above
+    ///
+    /// When [`detach_launch_runtime_if_current`](Self::detach_launch_runtime_if_current)
+    /// refuses, everything this node keys by sandbox id — the handle, the proxy
+    /// route, the `StartingSandbox` image pin — describes the *replacement*
+    /// launch, and touching any of it would tear down a sandbox somebody else
+    /// is still building. That refusal is correct and stays.
+    ///
+    /// The record is the one thing that is not merely keyed by the id: it is
+    /// stamped with the incarnation that wrote it. So this launch can ask for
+    /// its own record back without being able to touch a replacement's, and
+    /// [`MetadataStore::remove_if_execution`] is where that question is decided
+    /// atomically.
+    ///
+    /// # 🔴 Why it may not be skipped
+    ///
+    /// A create's record is written in `Creating`, and the state machine has no
+    /// edge from `Creating` to `Killing` (`creating_has_no_direct_edge_to_killing`).
+    /// A delete therefore waits for `Creating` to end and gives up with
+    /// `invalid state Creating` — so a create that stops the VM and leaves its
+    /// own record behind leaves one no API call can ever remove. That is the
+    /// record an operator had to delete out of Redis by hand.
+    ///
+    /// A resume is deliberately *not* rescued here. Its record predates the
+    /// launch and belongs to the sandbox rather than to this attempt, its
+    /// rollback is a state change back to `Paused` rather than a removal, and
+    /// the rest of that rollback (the persister's `rollback_resuming`, the
+    /// image pin) is keyed by sandbox id and so is exactly what the refusal
+    /// above is protecting. Answering that needs a fenced state write, not a
+    /// fenced removal.
+    async fn reclaim_superseded_launch_record(
+        &self,
+        plan: &LaunchPlan,
+        expected_state: SandboxState,
+    ) {
+        let LaunchPlan::Create(_) = plan else {
+            return;
+        };
+        let sandbox_id = plan.sandbox_id();
+        let execution_id = plan.execution_id();
+        match self
+            .store
+            .remove_if_execution(
+                &sandbox_id,
+                execution_id,
+                std::slice::from_ref(&expected_state),
+            )
+            .await
+        {
+            Ok(FencedRemoval::Removed) => {
+                info!(
+                    %sandbox_id,
+                    %execution_id,
+                    state = ?expected_state,
+                    "skipped shared state rollback but took this launch's own record back"
+                );
+            }
+            Ok(FencedRemoval::Absent) => {
+                debug!(
+                    %sandbox_id,
+                    %execution_id,
+                    "skipped shared state rollback; this launch's record was already gone"
+                );
+            }
+            Ok(FencedRemoval::Superseded {
+                state,
+                execution_id: actual,
+            }) => {
+                info!(
+                    %sandbox_id,
+                    %execution_id,
+                    actual_execution_id = %actual,
+                    actual_state = ?state,
+                    "skipped shared state rollback; the record under this id is another launch's"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    %sandbox_id,
+                    %execution_id,
+                    error = %format_args!("{err:#}"),
+                    "skipped shared state rollback and could not take this launch's own record back"
+                );
+            }
         }
     }
 
@@ -2942,9 +3035,16 @@ where
         };
 
         if !Arc::ptr_eq(current_handle, handle) {
+            // 🔴 Names what is being given up, not only that something was.
+            // Everything below is keyed by sandbox id and now describes the
+            // replacement, so none of it may be undone from here; the record
+            // is handled separately, by
+            // [`reclaim_superseded_launch_record`](Self::reclaim_superseded_launch_record),
+            // because it names the incarnation that wrote it.
             warn!(
                 stage = ?stage,
-                "sandbox handle was replaced during failed launch cleanup; skipping shared state rollback"
+                "sandbox handle was replaced during failed launch cleanup; \
+                 leaving the handle, the proxy route and the starting image pin to the replacement"
             );
             return false;
         }

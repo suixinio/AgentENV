@@ -8,9 +8,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use super::super::{
-    MetadataRows, MetadataStore, MetadataUpdateResult, PausedHandle, Reservation, Result,
-    SandboxListFilter, SandboxMetadata, StoreError, TransitionOutcome, TransitionRequest,
-    TransitionSettlement,
+    state_from_token, state_token, FencedRemoval, MetadataRows, MetadataStore,
+    MetadataUpdateResult, PausedHandle, Reservation, Result, SandboxListFilter, SandboxMetadata,
+    StoreError, TransitionOutcome, TransitionRequest, TransitionSettlement,
 };
 use super::keys::{routing, ExpiryMember};
 use super::record::{to_unix_millis, StoredSandboxRecord};
@@ -543,6 +543,67 @@ impl MetadataStore for RedisMetadataStore {
 
     async fn remove(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>> {
         self.inner().remove_record(sandbox_id).await
+    }
+
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> Result<FencedRemoval> {
+        let inner = self.inner();
+        let mut connection = inner.connection();
+        let mut invocation = scripts::remove_if_execution().prepare_invoke();
+        invocation
+            .key(inner.keys().record(sandbox_id))
+            .key(inner.keys().index())
+            .key(inner.keys().expiry())
+            .key(inner.keys().pending())
+            .arg(sandbox_id.to_string())
+            .arg(expected_execution_id.to_string());
+        // Variadic, and the script scans from the fixed argument count onwards.
+        // Keep the two in step.
+        for state in expected_states {
+            invocation.arg(state_token(*state));
+        }
+
+        let (code, state, execution): (i64, String, String) = invocation
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+
+        match code {
+            scripts::FENCED_REMOVE_REMOVED => {
+                inner.invalidate_listing_memo().await;
+                inner.notify(&routing::record(sandbox_id)).await;
+                Ok(FencedRemoval::Removed)
+            }
+            scripts::FENCED_REMOVE_ABSENT => Ok(FencedRemoval::Absent),
+            scripts::FENCED_REMOVE_SUPERSEDED => {
+                // 🔴 Both details have to parse. A record whose state or
+                // incarnation this build cannot read is one this caller cannot
+                // prove is not its own, and reporting it as somebody else's
+                // would be a guess dressed as a refusal.
+                let (Some(state), Ok(execution_id)) =
+                    (state_from_token(&state), ExecutionId::parse_str(&execution))
+                else {
+                    return Err(backend_msg(format!(
+                        "sandbox {sandbox_id} record refused a fenced removal with an \
+                         unreadable state {state:?} or incarnation {execution:?}"
+                    )));
+                };
+                Ok(FencedRemoval::Superseded {
+                    state,
+                    execution_id,
+                })
+            }
+            scripts::FENCED_REMOVE_UNDECODABLE => Err(backend_msg(format!(
+                "sandbox {sandbox_id} record could not be decoded by the fenced removal script"
+            ))),
+            other => Err(backend_msg(format!(
+                "fenced removal script returned an unknown code {other} for sandbox {sandbox_id}"
+            ))),
+        }
     }
 
     async fn list(&self) -> Result<Vec<SandboxMetadata>> {

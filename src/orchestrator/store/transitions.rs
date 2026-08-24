@@ -88,6 +88,27 @@ pub fn state_token(state: SandboxState) -> &'static str {
     }
 }
 
+/// The state a stored token names, or `None` when it names nothing.
+///
+/// 🔴 The inverse of [`state_token`], and it exists because a Lua predicate
+/// that *refuses* has to be able to say what it found. A script that returns
+/// only "no" leaves the caller reporting a refusal it cannot describe, which is
+/// exactly the log line this repository keeps having to guess from.
+/// `every_state_survives_its_token` keeps the pair total.
+pub fn state_from_token(token: &str) -> Option<SandboxState> {
+    Some(match token {
+        "Creating" => SandboxState::Creating,
+        "Resuming" => SandboxState::Resuming,
+        "Running" => SandboxState::Running,
+        "Snapshotting" => SandboxState::Snapshotting,
+        "Forking" => SandboxState::Forking,
+        "Pausing" => SandboxState::Pausing,
+        "Paused" => SandboxState::Paused,
+        "Killing" => SandboxState::Killing,
+        _ => return None,
+    })
+}
+
 /// Whether the state machine has an edge from `from` to `to`.
 pub fn is_allowed_transition(from: SandboxState, to: SandboxState) -> bool {
     ALLOWED[index(from)][index(to)]
@@ -181,6 +202,18 @@ mod tests {
                 "the stored form of {state} is not what the scripts compare against"
             );
         }
+    }
+
+    /// 🔴 Both directions, in one test. A `state_token` arm added without its
+    /// `state_from_token` twin turns every refusal that names that state into
+    /// an undescribable one, and nothing else in the tree would notice.
+    #[test]
+    fn every_state_survives_its_token() {
+        for state in STATES {
+            assert_eq!(state_from_token(state_token(state)), Some(state));
+        }
+        assert_eq!(state_from_token("running"), None);
+        assert_eq!(state_from_token(""), None);
     }
 
     #[test]

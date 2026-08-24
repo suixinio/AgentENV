@@ -25,7 +25,7 @@ pub use redis::{
     StoredSandboxRecord, DEFAULT_KEY_PREFIX as DEFAULT_STORE_KEY_PREFIX,
     RECORD_VERSION as STORE_RECORD_VERSION,
 };
-pub use transitions::{is_allowed_transition, state_token, TransitionEffect};
+pub use transitions::{is_allowed_transition, state_from_token, state_token, TransitionEffect};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -33,6 +33,33 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct MetadataUpdateResult {
     pub previous: SandboxMetadata,
     pub current: SandboxMetadata,
+}
+
+/// What a removal fenced on an incarnation found under the id.
+///
+/// # 🔴 Three answers, because the middle one is the whole point
+///
+/// A plain `remove` answers "was anything there". The caller this exists for —
+/// a launch rolling its own record back after somebody else has taken over the
+/// id — needs to tell "I took my record back" from "the record under this id is
+/// not mine", and *silence* is what made a stuck record unattributable in
+/// production: the sandbox was left in `Creating`, no delete could take it out
+/// of `Creating` (`creating_has_no_direct_edge_to_killing`), and the only log
+/// line was a warning that a rollback had been skipped without saying what it
+/// had skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FencedRemoval {
+    /// The record was still the one this incarnation wrote, and is gone.
+    Removed,
+    /// There was no record under this id.
+    Absent,
+    /// A record is there and it is not the one the caller wrote — a different
+    /// incarnation, or the same one that has since moved on. Whoever wrote it
+    /// owns it, and the caller must leave it alone.
+    Superseded {
+        state: SandboxState,
+        execution_id: ExecutionId,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -540,6 +567,27 @@ pub trait MetadataStore: Send + Sync {
         F: FnOnce(&mut SandboxMetadata) + Send;
     async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
     async fn remove(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
+    /// Removes the record only while it is still the one `expected_execution_id`
+    /// wrote, and only from one of `expected_states`.
+    ///
+    /// # 🔴 Required, and not one of the cluster primitives below
+    ///
+    /// Those have defaults because they mean nothing on a node's private
+    /// ledger. This one is on the rollback path of every failed launch on every
+    /// backend, so a default would have to answer for real — and the only
+    /// default available is a read followed by a removal, which is exactly the
+    /// check-then-write this store spent a file of Lua avoiding.
+    /// `restore_sandbox` takes a caller-supplied id and `add` is lockless, so
+    /// the record under an id genuinely can change owner in that gap.
+    ///
+    /// Idempotent: removing something that is not there is [`FencedRemoval::Absent`],
+    /// not an error, exactly as `remove` returning `None` is not an error.
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> Result<FencedRemoval>;
     async fn list(&self) -> Result<Vec<SandboxMetadata>>;
     async fn list_with_callback<F>(&self, callback: F) -> Result<()>
     where

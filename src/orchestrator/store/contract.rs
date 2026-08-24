@@ -22,9 +22,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use super::{MetadataStore, PausedHandle, SandboxListFilter, SandboxMetadata, StoreError};
+use super::{
+    FencedRemoval, MetadataStore, PausedHandle, SandboxListFilter, SandboxMetadata, StoreError,
+};
 use crate::orchestrator::SandboxState;
-use crate::types::SandboxId;
+use crate::types::{ExecutionId, SandboxId};
 
 fn running(id: SandboxId) -> SandboxMetadata {
     SandboxMetadata {
@@ -60,6 +62,106 @@ pub(crate) async fn add_get_remove_round_trip<S: MetadataStore>(store: &S) {
     // an answer, and callers rely on it being idempotent.
     assert!(store.remove(&id).await.unwrap().is_none());
     assert!(store.list_ids().await.unwrap().is_empty());
+}
+
+/// A fenced removal takes back the record its own incarnation wrote and
+/// refuses every other one.
+///
+/// 🔴 Four records, one run, differing in one value each, because the assertion
+/// that matters is "this one went and that one stayed". A suite in which
+/// everything is expected to vanish cannot tell a working predicate from a
+/// backend that simply deletes whatever it is handed.
+pub(crate) async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(store: &S) {
+    let mine = ExecutionId::new();
+    let theirs = ExecutionId::new();
+
+    let creating = |id, execution_id| SandboxMetadata {
+        id,
+        execution_id,
+        state: SandboxState::Creating,
+        ..Default::default()
+    };
+
+    // The record this incarnation wrote.
+    let own = SandboxId::new();
+    // Same state, another incarnation: the id was taken over.
+    let other_incarnation = SandboxId::new();
+    // Same incarnation, a state it has already left.
+    let other_state = SandboxId::new();
+    // Nothing at all.
+    let absent = SandboxId::new();
+
+    store.add(creating(own, mine)).await.unwrap();
+    store
+        .add(creating(other_incarnation, theirs))
+        .await
+        .unwrap();
+    let mut moved_on = creating(other_state, mine);
+    moved_on.state = SandboxState::Running;
+    store.add(moved_on).await.unwrap();
+
+    assert_eq!(
+        store
+            .remove_if_execution(&own, mine, &[SandboxState::Creating])
+            .await
+            .unwrap(),
+        FencedRemoval::Removed
+    );
+    assert_eq!(
+        store
+            .remove_if_execution(&other_incarnation, mine, &[SandboxState::Creating])
+            .await
+            .unwrap(),
+        FencedRemoval::Superseded {
+            state: SandboxState::Creating,
+            execution_id: theirs,
+        }
+    );
+    assert_eq!(
+        store
+            .remove_if_execution(&other_state, mine, &[SandboxState::Creating])
+            .await
+            .unwrap(),
+        FencedRemoval::Superseded {
+            state: SandboxState::Running,
+            execution_id: mine,
+        }
+    );
+    assert_eq!(
+        store
+            .remove_if_execution(&absent, mine, &[SandboxState::Creating])
+            .await
+            .unwrap(),
+        FencedRemoval::Absent
+    );
+
+    // 🔴 The non-empty half. One record went; the other two are still readable
+    // and still in the membership index, which is what says the predicate did
+    // the work rather than the removal being a no-op that happened to look
+    // right.
+    assert!(store.get(&own).await.unwrap().is_none());
+    assert_eq!(
+        store.get(&other_incarnation).await.unwrap().unwrap().state,
+        SandboxState::Creating
+    );
+    assert_eq!(
+        store.get(&other_state).await.unwrap().unwrap().state,
+        SandboxState::Running
+    );
+    let ids = store.list_ids().await.unwrap();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.contains(&other_incarnation), "{ids:?}");
+    assert!(ids.contains(&other_state), "{ids:?}");
+    assert!(!ids.contains(&own), "{ids:?}");
+
+    // Removing what is already gone is an answer, not an error.
+    assert_eq!(
+        store
+            .remove_if_execution(&own, mine, &[SandboxState::Creating])
+            .await
+            .unwrap(),
+        FencedRemoval::Absent
+    );
 }
 
 pub(crate) async fn add_refuses_a_duplicate<S: MetadataStore>(store: &S) {
@@ -523,6 +625,7 @@ macro_rules! metadata_store_contract {
     () => {
         crate::orchestrator::store::contract::metadata_store_contract_suite!(
             add_get_remove_round_trip,
+            a_fenced_removal_takes_back_only_its_own_record,
             add_refuses_a_duplicate,
             missing_records_are_reported_as_missing,
             state_cas_moves_only_from_an_expected_state,

@@ -610,6 +610,45 @@ impl Templates<()> for ApiImpl {
         path_params: &models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams,
         body: &models::TemplateBuildStartV2,
     ) -> Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, ()> {
+        // 🔴 First, before the request is read at all, because the answer does
+        // not depend on the request: a build drives a real Firecracker VM from
+        // `TemplateBuildRunner`, outside the orchestrator and therefore outside
+        // everything the split made remote. On `--role api` there is no
+        // `/dev/kvm`, no ublk and no Firecracker binary, so the build the 202
+        // promised dies in a background task minutes later and the only account
+        // of why is a `warn!` line on a Pod nobody is tailing — the status
+        // endpoint reports the generic `template build failed while running the
+        // build sandbox` (`TemplateBuilder::build_failure_reason`), which reads
+        // the same as a user's `RUN` step failing.
+        //
+        // Refusing here is not a smaller version of running it elsewhere. It is
+        // the whole difference between an answer the caller gets and an answer
+        // only a log has. Nothing has been mutated at this point, so the
+        // template row is left exactly as it was found, in `waiting`.
+        if !self.role().runs_sandbox_runtime() {
+            warn!(
+                template_id = %path_params.template_id,
+                role = self.role().as_str(),
+                "refused a template build: this role runs no sandbox runtime"
+            );
+            return Ok(v2_start_build_error(Self::error(
+                // 🔴 500 because it is the only code this operation declares
+                // that means "this server, not your request"
+                // (`src/api/openapi.yml`: 202/400/401/404/500). 501 and 503 say
+                // it better and neither is in the schema, and inventing one
+                // here would mean a body whose `code` and whose HTTP status
+                // disagree — `v2_start_build_error` maps anything unrecognised
+                // to 500 regardless.
+                500,
+                "template builds are not available on --role api: building a template runs a \
+                 Firecracker VM on the machine that serves this call, and this process has no \
+                 /dev/kvm, no ublk and no Firecracker binary. Run the build against a server \
+                 started with --role all; a --role node server does not answer this route \
+                 either, so there is no node for this one to forward it to. The template was \
+                 left untouched and is still waiting to be built.",
+            )));
+        }
+
         if path_params.template_id != path_params.build_id {
             return Ok(v2_start_build_error(Self::error(
                 400,
@@ -1298,7 +1337,20 @@ mod template_read_scope_tests {
         build_starts: Arc<AtomicUsize>,
     }
 
+    /// The surface as the role every fixture here predates the split with.
     async fn surface() -> Surface {
+        surface_as(ServerRole::All).await
+    }
+
+    /// The same surface, differing in exactly one value: which half of the
+    /// split the process serving it runs as.
+    ///
+    /// 🔴 The orchestrator stays `All` in every case. It is not what the build
+    /// route reads — the handler asks `ApiImpl::role()` — and an `Orchestrator`
+    /// built as `Api` refuses to construct without a configured envd access
+    /// -token seed, which would make the refusing half of these tests fail on
+    /// the fixture rather than on the thing under test.
+    async fn surface_as(role: ServerRole) -> Surface {
         let id = SnapshotId::generate();
         let alias = SnapshotAlias::parse("pending-template").expect("alias parses");
         let now = 1_700_000_000_000;
@@ -1357,9 +1409,10 @@ mod template_read_scope_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `All` and not a default: these fixtures predate the split and
-            // assert today's behaviour, which is what `all` is defined as.
-            crate::role::ServerRole::All,
+            // 🔴 The one value these fixtures vary. `surface()` passes `All`,
+            // because they predate the split and assert today's behaviour,
+            // which is what `all` is defined as.
+            role,
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
 
@@ -1378,6 +1431,44 @@ mod template_read_scope_tests {
 
     fn host() -> Host {
         Host::from(http::uri::Authority::from_static("localhost"))
+    }
+
+    /// `POST /v2/templates/{id}/builds/{id}` against a surface, with the one
+    /// body every one of these fixtures sends.
+    async fn start_a_build(s: &Surface) -> V2TemplatesTemplateIdBuildsBuildIdPostResponse {
+        s.api
+            .v2_templates_template_id_builds_build_id_post(
+                &Method::POST,
+                &host(),
+                &CookieJar::new(),
+                &claims(),
+                &models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams {
+                    template_id: s.id.to_string(),
+                    build_id: s.id.to_string(),
+                },
+                &models::TemplateBuildStartV2::new(),
+            )
+            .await
+            .expect("the handler answers")
+    }
+
+    /// The message a role refusal carries, or `None` when the handler did not
+    /// refuse on the role.
+    ///
+    /// 🔴 The status code alone cannot tell the two apart, and that is a fact
+    /// about the API rather than about this helper: `/v2/templates/{id}/builds/
+    /// {id}` declares 202/400/401/404/500 and nothing else, so the refusal has
+    /// to reuse 500 — which is also what a failed build admission answers. What
+    /// separates them is the text, so the text is what this reads.
+    fn role_refusal(response: &V2TemplatesTemplateIdBuildsBuildIdPostResponse) -> Option<&str> {
+        match response {
+            V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status500_ServerError(error)
+                if error.message.contains("--role api") =>
+            {
+                Some(error.message.as_str())
+            }
+            _ => None,
+        }
     }
 
     /// `GET /templates/{id}`.
@@ -1561,6 +1652,63 @@ mod template_read_scope_tests {
             1,
             "and the read must have got far enough to ask for the admission"
         );
+    }
+
+    /// 🔴 The same call on each half of the split, and the point is that the
+    /// three do not answer alike.
+    ///
+    /// A build drives a Firecracker VM directly, outside the orchestrator, so
+    /// on `--role api` it cannot work — and until this refusal existed it did
+    /// not *fail* either: the 202 went out, the build died in a background task
+    /// and the status endpoint reported the same generic reason a user's broken
+    /// `RUN` step reports. What is asserted below is that the caller is told,
+    /// and told before anything is started.
+    ///
+    /// Both faces in one test, because either alone is satisfied by a constant:
+    /// "api is refused" passes on a gate that is always true, "all is admitted"
+    /// passes on one that is always false. And the discriminator is the
+    /// admission counter rather than the status code, because a refusal and a
+    /// failed admission are both 500 — only one of them got as far as asking
+    /// the catalog to start a build.
+    #[tokio::test]
+    async fn a_build_is_refused_by_the_half_that_runs_no_sandboxes_and_admitted_by_the_halves_that_do(
+    ) {
+        let s = surface_as(ServerRole::Api).await;
+        let response = start_a_build(&s).await;
+        let refusal = role_refusal(&response).unwrap_or_else(|| {
+            panic!(
+                "--role api has no /dev/kvm to run the build on, and answering anything but a \
+                 refusal here is what made the failure arrive minutes later as a log line, got \
+                 {response:?}"
+            )
+        });
+        assert!(
+            refusal.contains("--role all"),
+            "a refusal that does not say where the build can be run is a dead end, got {refusal:?}"
+        );
+        assert_eq!(
+            s.build_starts.load(Ordering::SeqCst),
+            0,
+            "🔴 and it must refuse before the admission: a build the catalog has admitted is a \
+             template moved out of `waiting` into a `building` state nothing will ever finish"
+        );
+
+        for role in [ServerRole::All, ServerRole::Node] {
+            let s = surface_as(role).await;
+            let response = start_a_build(&s).await;
+            assert!(
+                role_refusal(&response).is_none(),
+                "--role {} runs sandboxes, so this build takes the road it always took, got \
+                 {response:?}",
+                role.as_str()
+            );
+            assert_eq!(
+                s.build_starts.load(Ordering::SeqCst),
+                1,
+                "and it reached the admission, which is the road being taken rather than merely \
+                 a status code that is not the refusal's"
+            );
+        }
     }
 
     /// `DELETE /templates/{id}` — the failure that reports success.

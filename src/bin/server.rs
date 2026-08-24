@@ -713,8 +713,12 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   blocked at the pause rather than at the wake-up.
 /// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
 ///   directly, outside the orchestrator entirely, so a build here would reach
-///   for `/dev/kvm` in a Pod that has none. It fails, which is the safe
-///   direction, but it fails late.
+///   for `/dev/kvm` in a Pod that has none. It is now refused at the door
+///   instead: `POST /v2/templates/{id}/builds/{id}` answers the caller rather
+///   than accepting the build and losing it in a background task
+///   (`crate::api::impls` — the refusal reads `ServerRole::runs_sandbox_runtime`
+///   and names where the build can be run). The capability is still missing;
+///   what changed is that its absence is now something the caller is told.
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::Api;
     // The four this role answers `false` to, stated where somebody adding a

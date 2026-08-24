@@ -806,9 +806,7 @@ impl PausedSandboxCoordinator {
         // `mark_sandbox_running` does for the mirror-image question — correct
         // on every role that runs the VM in this same process, and the only
         // answer a caller with no better one can give.
-        let holder_node_id = holding_node_id
-            .as_deref()
-            .unwrap_or(self.node_id.as_str());
+        let holder_node_id = holding_node_id.as_deref().unwrap_or(self.node_id.as_str());
 
         if let Some(holder) = live_elsewhere(&entry, &self.node_id, holder_node_id) {
             // Deleting the local copy of a sandbox that is live on another node

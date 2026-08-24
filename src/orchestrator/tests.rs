@@ -5638,6 +5638,98 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     Ok(())
 }
 
+/// A fork child that came back with no address is refused, not registered.
+///
+/// # 🔴 One value apart, and they must not both be a success
+///
+/// A route is where the proxy sends every request for a sandbox. A child
+/// registered without one is a running VM that every request to it misses, with
+/// nothing saying so; refusing it turns that into an answer the caller can act
+/// on. This is also the reason a node's fork answer has to carry each child's
+/// real address: when it did not, this refusal fired on every child of every
+/// fork the API half drove.
+///
+/// The non-empty half is the first fork, on the same source, in the same test —
+/// so this is not a fork that refuses everything. It also pins that the two
+/// children are routed to *different* addresses, which is what separates a
+/// child's own address reaching the route table from the source's being reused.
+#[tokio::test]
+async fn a_fork_child_with_no_address_is_refused_rather_than_registered() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "fork-addressing")]))
+        .await?;
+
+    // Face one: the fork's children come back with addresses.
+    let routable = orchestrator
+        .fork_sandbox(source.id, ForkChildren::Fresh(2), NewTimeout::UseExisting)
+        .await?
+        .into_iter()
+        .collect::<StdResult<Vec<_>, _>>()?;
+    assert_eq!(routable.len(), 2);
+    let mut routes = Vec::with_capacity(routable.len());
+    for child in &routable {
+        match orchestrator.proxy_lookup_for(&child.id).await? {
+            ProxyLookupResult::Ready(target) => routes.push(target.ip),
+            other => panic!("a started fork child is not routable: {other:?}"),
+        }
+    }
+    assert_ne!(
+        routes[0], routes[1],
+        "two fork children were routed to one address"
+    );
+    for route in &routes {
+        assert_ne!(
+            Some(*route),
+            orchestrator
+                .proxy_lookup_for(&source.id)
+                .await
+                .ok()
+                .and_then(|lookup| match lookup {
+                    ProxyLookupResult::Ready(target) => Some(target.ip),
+                    _ => None,
+                }),
+            "a fork child was routed to the sandbox it was forked from"
+        );
+    }
+
+    // Face two: the same fork, on the same source, with the one value moved.
+    behavior.set_fork_children_without_address(true);
+    let refused = orchestrator
+        .fork_sandbox(source.id, ForkChildren::Fresh(2), NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(refused.len(), 2);
+    for outcome in refused {
+        let err = outcome.expect_err("a child with no address must not be registered");
+        assert!(
+            err.to_string().contains("missing host interaction IP"),
+            "a child with no address was refused for some other reason: {err:?}"
+        );
+    }
+
+    // 🔴 And the refusal left nothing behind. The store holds the source and
+    // the two children that were routable, and nothing else — a child that
+    // could not be routed must not survive as a record either.
+    let mut recorded = orchestrator
+        .list_sandboxes()
+        .await?
+        .into_iter()
+        .map(|metadata| metadata.id)
+        .collect::<Vec<_>>();
+    recorded.sort();
+    let mut expected = vec![source.id, routable[0].id, routable[1].id];
+    expected.sort();
+    assert_eq!(
+        recorded, expected,
+        "a fork child that could not be routed was registered anyway"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn fork_sandbox_keeps_successful_siblings_when_one_start_fails() -> Result<()> {
     setup();

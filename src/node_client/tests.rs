@@ -2513,3 +2513,196 @@ async fn an_egress_policy_set_on_a_replica_that_did_not_start_the_sandbox_reache
         "{err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fork, driven by the deciding half
+// ---------------------------------------------------------------------------
+
+/// Where this replica would send traffic for a sandbox.
+async fn routed_to(
+    replica: &ApiReplica,
+    sandbox_id: crate::types::SandboxId,
+) -> std::net::Ipv4Addr {
+    match replica
+        .proxy_lookup_for(&sandbox_id)
+        .await
+        .expect("the replica can look a route up")
+    {
+        crate::orchestrator::ProxyLookupResult::Ready(target) => target.ip,
+        other => panic!("sandbox {sandbox_id} is not routable: {other:?}"),
+    }
+}
+
+/// A fork driven by the API half makes every child routable, at the address the
+/// child's own VM answers on.
+///
+/// # 🔴 This is the shape the bug had in production
+///
+/// `--role api` forks by asking a node, and the node's answer is the only thing
+/// this half ever learns about where a child is. The node used to answer with
+/// an empty address, so `proxy_target_from_sandbox` refused every child with
+/// *missing host interaction IP after start* — deterministically, on children
+/// whose VMs were up and healthy on the node, which were then torn down again.
+///
+/// The faces, against one node in one round:
+///
+/// * Every child both **starts** and is **routable**. A build that starts the
+///   children and cannot route them fails the second half, which is exactly
+///   what the bug did.
+/// * The three addresses — two children and their source — are all different.
+///   That is what says each was read from that child's own handle on the node,
+///   rather than being a constant or a copy of the source's.
+/// * The node itself agrees all three are running, so nothing here is satisfied
+///   by a route to a VM that is not there.
+#[tokio::test]
+async fn a_fork_driven_by_the_deciding_half_routes_each_child_to_its_own_vm() {
+    let node = real_node().await;
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let replica = api_replica(&node, &ledger).await;
+
+    let source = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("a replica creates the sandbox it will fork");
+
+    let outcomes = Arc::clone(&replica)
+        .fork_sandbox(
+            source.id,
+            crate::orchestrator::ForkChildren::Fresh(2),
+            crate::orchestrator::NewTimeout::UseExisting,
+        )
+        .await
+        .expect("the fork ran");
+    assert_eq!(outcomes.len(), 2);
+    let children = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("a fork child whose VM started on the node"))
+        .collect::<Vec<_>>();
+
+    let source_address = routed_to(&replica, source.id).await;
+    let first = routed_to(&replica, children[0].id).await;
+    let second = routed_to(&replica, children[1].id).await;
+
+    assert_ne!(
+        first, second,
+        "two fork children were routed to one address"
+    );
+    assert_ne!(
+        first, source_address,
+        "a fork child was routed to the sandbox it was forked from"
+    );
+    assert_ne!(
+        second, source_address,
+        "a fork child was routed to the sandbox it was forked from"
+    );
+
+    let mut running = vec![source.id, children[0].id, children[1].id];
+    running.sort();
+    assert_eq!(
+        running_on(&node).await,
+        running,
+        "the machine is not running what this half just routed traffic to"
+    );
+}
+
+/// A child the node reported no address for arrives here with none.
+///
+/// 🔴 Two halves one wire value apart, in one answer to one fork: the first
+/// child comes back with an address and a rootfs size, the second with the
+/// blanks proto3 cannot tell from "unset". The first has to arrive as facts.
+/// The second has to arrive as *nothing at all* — never as a default, never as
+/// its sibling's — because that `None` is what makes the orchestrator above
+/// refuse the child loudly instead of publishing a route to an address nothing
+/// is listening on.
+#[tokio::test]
+async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        host_interaction_ip: "10.9.9.9".to_string(),
+        rootfs_virtual_size: 1024,
+        ..Default::default()
+    }));
+
+    let specs = (0..2)
+        .map(|_| SandboxForkSpec {
+            sandbox_id: crate::types::SandboxId::new(),
+            execution_id: ExecutionId::new(),
+            envd_access_token: None,
+        })
+        .collect::<Vec<_>>();
+    *script.fork.lock().expect("lock") = Some(Ok(pb::SandboxForkResponse {
+        children: vec![
+            pb::ForkChildResult {
+                sandbox_id: specs[0].sandbox_id.to_string(),
+                execution_id: specs[0].execution_id.to_string(),
+                outcome: Some(pb::fork_child_result::Outcome::Started(
+                    pb::SandboxCreateResponse {
+                        sandbox_id: specs[0].sandbox_id.to_string(),
+                        execution_id: specs[0].execution_id.to_string(),
+                        host_interaction_ip: "10.4.5.6".to_string(),
+                        rootfs_virtual_size: 8192,
+                        ..Default::default()
+                    },
+                )),
+            },
+            // The same child, one value each way: no address, no size.
+            pb::ForkChildResult {
+                sandbox_id: specs[1].sandbox_id.to_string(),
+                execution_id: specs[1].execution_id.to_string(),
+                outcome: Some(pb::fork_child_result::Outcome::Started(
+                    pb::SandboxCreateResponse {
+                        sandbox_id: specs[1].sandbox_id.to_string(),
+                        execution_id: specs[1].execution_id.to_string(),
+                        host_interaction_ip: String::new(),
+                        rootfs_virtual_size: 0,
+                        ..Default::default()
+                    },
+                )),
+            },
+        ],
+    }));
+
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let mut backend =
+        match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        {
+            Ok(backend) => backend,
+            Err(err) => panic!("building a stub should not fail: {err:#}"),
+        };
+    backend.start().await.expect("start");
+
+    let mut children = backend.fork(&specs).await.expect("fork").into_iter();
+    let reported: Box<dyn SandboxBackend> = children
+        .next()
+        .expect("the first child")
+        .expect("which started");
+    let blank: Box<dyn SandboxBackend> = children
+        .next()
+        .expect("the second child")
+        .expect("which started");
+
+    assert_eq!(
+        reported.host_interaction_ip(),
+        Some(std::net::Ipv4Addr::new(10, 4, 5, 6)),
+        "the address the node reported for a fork child did not reach this half"
+    );
+    assert_eq!(
+        reported.runtime_info().rootfs_virtual_size,
+        Some(8192),
+        "the rootfs size the node reported for a fork child did not reach this half"
+    );
+
+    assert_eq!(
+        blank.host_interaction_ip(),
+        None,
+        "a fork child the node gave no address for was made to look routable"
+    );
+    assert_eq!(
+        blank.runtime_info().rootfs_virtual_size,
+        None,
+        "a fork child the node gave no rootfs size for was given one anyway"
+    );
+}

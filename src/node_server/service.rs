@@ -24,8 +24,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
 use crate::orchestrator::{
-    ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, NewTimeout,
-    OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
+    ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
+    NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
     SandboxOrchestration,
 };
 use crate::proto::node as pb;
@@ -104,11 +104,8 @@ impl NodeSandboxService {
         }
     }
 
-    /// What a caller learns about a sandbox this node has just brought up.
-    ///
-    /// Shared by `create` and `resume` because the two answer the same
-    /// question — *what is running now, and under which run* — and a second
-    /// copy of it is a second place for a field to be forgotten.
+    /// The live facts for everything this node is running, or `None` when the
+    /// read did not work.
     ///
     /// The two facts a record cannot supply — the address the sandbox reaches
     /// the host on, and the size the rootfs turned out to be — are only
@@ -116,24 +113,43 @@ impl NodeSandboxService {
     /// one.
     ///
     /// It costs a scan of everything running on this node. That is a real cost
-    /// and it is the right trade here: the call it is inside has just booted a
-    /// virtual machine, and the alternative is a second accessor on the
-    /// orchestration surface that exists to serve one field.
+    /// and it is the right trade here: the calls it is inside have just booted
+    /// virtual machines, and the alternative is a second accessor on the
+    /// orchestration surface that exists to serve two fields.
     ///
     /// 🔴 `.ok()` and not `?`: an operation that *succeeded* must not be
     /// reported as a failure because the follow-up read did not work. The
     /// sandbox is running either way, and a caller told it failed would leak
     /// it.
-    async fn running_sandbox(&self, metadata: &SandboxMetadata) -> pb::SandboxCreateResponse {
-        let sandbox_id = metadata.id;
-        let live = self.orchestration.list_live_sandboxes().await.ok();
-        let facts = live.as_ref().and_then(|live| {
-            live.iter()
-                .find(|candidate| candidate.sandbox_id == sandbox_id)
-        });
+    async fn live_facts(&self) -> Option<Vec<LiveSandbox>> {
+        self.orchestration.list_live_sandboxes().await.ok()
+    }
 
+    /// One sandbox's live facts out of a scan.
+    fn facts_for(live: Option<&Vec<LiveSandbox>>, sandbox_id: SandboxId) -> Option<&LiveSandbox> {
+        live?
+            .iter()
+            .find(|candidate| candidate.sandbox_id == sandbox_id)
+    }
+
+    /// What a caller learns about a sandbox this node has just brought up.
+    ///
+    /// 🔴 One renderer for `create`, `resume` **and** each of `fork`'s
+    /// children, because the three answer the same question — *what is running
+    /// now, and under which run* — and a second copy of it is a second place
+    /// for a field to be forgotten. `fork` had that second copy, and it had
+    /// forgotten both of the fields only the live handle can supply: it sent
+    /// an empty address and a zero rootfs size for children whose VMs were up
+    /// and addressable. The API half reads the address to publish the child's
+    /// proxy route, so every fork it drove failed with *missing host
+    /// interaction IP after start* — deterministically, on a child that was
+    /// running fine.
+    fn started_sandbox(
+        metadata: &SandboxMetadata,
+        facts: Option<&LiveSandbox>,
+    ) -> pb::SandboxCreateResponse {
         pb::SandboxCreateResponse {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_id: metadata.id.to_string(),
             execution_id: metadata.execution_id.to_string(),
             host_interaction_ip: facts
                 .and_then(|facts| facts.host_interaction_ip)
@@ -150,6 +166,13 @@ impl NodeSandboxService {
             started_at_ms: convert::unix_millis(Some(metadata.created_at)),
             expires_at_ms: convert::unix_millis(metadata.expires_at),
         }
+    }
+
+    /// [`started_sandbox`](Self::started_sandbox) for a single sandbox, with
+    /// the scan it needs.
+    async fn running_sandbox(&self, metadata: &SandboxMetadata) -> pb::SandboxCreateResponse {
+        let live = self.live_facts().await;
+        Self::started_sandbox(metadata, Self::facts_for(live.as_ref(), metadata.id))
     }
 }
 
@@ -654,6 +677,12 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
+        // 🔴 One scan for the whole fork, not one per child. Every child that
+        // started is already registered and unlocked by the time `fork_sandbox`
+        // returns, so a single pass sees all of them — and asking once per
+        // child would re-read every sandbox on this node once per child.
+        let live = self.live_facts().await;
+
         // 🔴 One result per requested child, in request order, paired by
         // position. That is the contract the orchestrator's fork states and the
         // one the caller's markers were assigned under; zipping is what keeps
@@ -665,20 +694,16 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 Ok(metadata) => pb::ForkChildResult {
                     sandbox_id: metadata.id.to_string(),
                     execution_id: metadata.execution_id.to_string(),
+                    // 🔴 The same renderer `create` and `resume` answer with.
+                    // A child's address and rootfs size are *its own* — it was
+                    // given its own network slot — so they are read from that
+                    // child's live handle rather than blanked or copied from
+                    // the source.
                     outcome: Some(pb::fork_child_result::Outcome::Started(
-                        pb::SandboxCreateResponse {
-                            sandbox_id: metadata.id.to_string(),
-                            execution_id: metadata.execution_id.to_string(),
-                            host_interaction_ip: String::new(),
-                            rootfs_virtual_size: 0,
-                            resources: Some(pb::SandboxResources {
-                                cpu_count: metadata.resources.cpu_count,
-                                memory_mib: metadata.resources.memory_mib,
-                                disk_size_mib: metadata.resources.disk_size_mib,
-                            }),
-                            started_at_ms: convert::unix_millis(Some(metadata.created_at)),
-                            expires_at_ms: convert::unix_millis(metadata.expires_at),
-                        },
+                        Self::started_sandbox(
+                            &metadata,
+                            Self::facts_for(live.as_ref(), metadata.id),
+                        ),
                     )),
                 },
                 Err(err) => pb::ForkChildResult {

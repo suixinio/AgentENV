@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{sync::Mutex, thread};
@@ -75,6 +75,20 @@ pub struct MockBehavior {
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
+    /// How many fork children this behaviour has handed out an address to.
+    ///
+    /// 🔴 What makes each child's address *its own*. A real backend gives every
+    /// fork child its own network slot, so no two of them — and not the source
+    /// either — answer on the same address. A mock that handed every child the
+    /// parent's would let "the field is filled in" pass on a build that filled
+    /// it in from the wrong sandbox.
+    forked_children: AtomicUsize,
+    /// Whether fork children come back with no address at all.
+    ///
+    /// The failing half of the same question, and the one a real deployment
+    /// produces: the source is up and routable, and a child comes back from
+    /// wherever it started without the address the proxy route needs.
+    fork_children_without_address: AtomicBool,
 }
 
 impl MockBehavior {
@@ -106,6 +120,31 @@ impl MockBehavior {
             .lock()
             .expect("runtime_info mutex poisoned")
             .clone()
+    }
+
+    /// Makes every fork child from here on come back without an address.
+    pub fn set_fork_children_without_address(&self, without: bool) {
+        self.fork_children_without_address
+            .store(without, Ordering::SeqCst);
+    }
+
+    /// The address the next fork child answers on, given its parent's.
+    ///
+    /// 🔴 Derived from the parent's rather than invented, so a parent that has
+    /// no address forks into children that have none either — a network slot
+    /// nobody could allocate does not become one when a sandbox is forked.
+    fn next_fork_child_host_ip(
+        &self,
+        parent: Option<std::net::Ipv4Addr>,
+    ) -> Option<std::net::Ipv4Addr> {
+        if self.fork_children_without_address.load(Ordering::SeqCst) {
+            return None;
+        }
+        let offset = self.forked_children.fetch_add(1, Ordering::SeqCst);
+        let offset = u32::try_from(offset).unwrap_or(u32::MAX);
+        parent.map(|parent| {
+            std::net::Ipv4Addr::from(u32::from(parent).wrapping_add(offset).wrapping_add(1))
+        })
     }
 
     pub fn set_source_config_paths(&self, paths: Vec<std::path::PathBuf>) {
@@ -348,10 +387,12 @@ impl SandboxBackend for MockSandboxBackend {
                     .apply_sync(MockOperation::ForkChild)
                     .map(|()| {
                         // Each child runs under the incarnation its spec named,
-                        // never the parent's.
+                        // never the parent's — and answers on its own address,
+                        // never the parent's, because a real backend hands each
+                        // child its own network slot.
                         Box::new(Self::new_with_host_ip(
                             Arc::clone(&self.behavior),
-                            self.host_ip,
+                            self.behavior.next_fork_child_host_ip(self.host_ip),
                             child.execution_id,
                         )) as Box<dyn SandboxBackend>
                     })

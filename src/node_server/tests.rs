@@ -19,8 +19,10 @@ use crate::orchestrator::{
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
 use crate::role::ServerRole;
-use crate::sandbox::mock::MockBackendFactory;
-use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
+use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
+use crate::sandbox::{
+    PausedSandboxState, RuntimeArtifactSet, SandboxNetworkPolicy, SandboxRuntimeInfo,
+};
 use crate::snapshot::{mock::mock_snapshot_manager, RunnableSnapshot};
 use crate::types::{ExecutionId, SandboxId};
 
@@ -29,11 +31,17 @@ use super::service::NodeSandboxService;
 const NODE: &str = "node-under-test";
 
 async fn service() -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
+    service_with(MockBackendFactory::new()).await
+}
+
+async fn service_with(
+    factory: MockBackendFactory,
+) -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
+        factory,
         DisabledSandboxPersister,
     )
     .await
@@ -1138,6 +1146,123 @@ async fn a_fork_with_no_children_is_refused() {
         .await
         .expect_err("a fork with nothing to fork into");
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+/// The size the backend reports for a rootfs before the source was created.
+const ROOTFS_WHEN_THE_SOURCE_STARTED: u64 = 4 * 1024 * 1024;
+/// And a different one by the time the fork runs.
+const ROOTFS_BY_THE_TIME_IT_FORKED: u64 = 9 * 1024 * 1024;
+
+/// A fork answers each child with the facts of the VM that child got — the way
+/// a create does, and not with a blank.
+///
+/// # 🔴 Why both fields are pinned here by name
+///
+/// `ForkChildResult::Started` carries a `SandboxCreateResponse`, and two of its
+/// fields are knowable only from the live handle: the address the sandbox
+/// reaches the host on, and the size its rootfs turned out to be. This RPC used
+/// to fill both with the wire's zero value while the children's VMs were up and
+/// addressable. Nothing in this project's mutation testing covers a `.proto`,
+/// and an empty address and a zero size are both *legal* values on those
+/// fields, so the only thing that can say the fork read them is a test that
+/// says so.
+///
+/// The control faces, all in one round and each differing in exactly one value:
+///
+/// * **create against fork.** The source is a sandbox this node created, and
+///   the node already answers for it with an address and a size. The children
+///   have to answer the same way. A build that fills one field and blanks the
+///   other fails here.
+/// * **child against child, and child against source.** The two children answer
+///   with addresses that differ from each other *and* from the source's. That
+///   is what separates "read from each child's own handle" from "filled in with
+///   something": a build that copied the source's address, or handed every
+///   child one constant, passes "non-empty" and fails this.
+/// * **the size moves.** The backend reports a different rootfs size by the
+///   time the fork runs than it did when the source started, and the children
+///   answer with the new one. A build that carried the source's size across, or
+///   left the field at zero, fails on that value.
+#[tokio::test]
+async fn a_fork_answers_each_child_with_the_facts_of_its_own_vm() {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_runtime_info(SandboxRuntimeInfo {
+        rootfs_virtual_size: Some(ROOTFS_WHEN_THE_SOURCE_STARTED),
+        runtime_artifacts: RuntimeArtifactSet::empty(),
+    });
+    let (orchestration, service) =
+        service_with(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
+    let source = start(&orchestration, Some(b"owned")).await;
+
+    // What this node answers about a sandbox it *created*: the face the fork
+    // has to match.
+    let created = listed(&service).await;
+    assert_eq!(created.len(), 1);
+    let source_address = created[0].host_interaction_ip.clone();
+    assert!(
+        !source_address.is_empty(),
+        "a sandbox this node created was reported with no address, so this test \
+         is not comparing against anything"
+    );
+    assert_eq!(
+        created[0].rootfs_virtual_size,
+        ROOTFS_WHEN_THE_SOURCE_STARTED
+    );
+
+    // 🔴 One value moved before the fork. It is what tells a size read from the
+    // child's own handle from one carried over out of the source's record.
+    behavior.set_runtime_info(SandboxRuntimeInfo {
+        rootfs_virtual_size: Some(ROOTFS_BY_THE_TIME_IT_FORKED),
+        runtime_artifacts: RuntimeArtifactSet::empty(),
+    });
+
+    let answered = service
+        .fork(Request::new(pb::SandboxForkRequest {
+            source_sandbox_id: source.id.to_string(),
+            source_execution_id: source.execution_id.to_string(),
+            children: (0..2)
+                .map(|_| pb::ForkChildSpec {
+                    sandbox_id: SandboxId::new().to_string(),
+                    execution_id: ExecutionId::new().to_string(),
+                    control_plane_config: b"child".to_vec(),
+                })
+                .collect(),
+            timeout_ms: 0,
+        }))
+        .await
+        .expect("the fork ran")
+        .into_inner()
+        .children;
+
+    let started = answered
+        .iter()
+        .map(|child| match &child.outcome {
+            Some(pb::fork_child_result::Outcome::Started(ack)) => ack,
+            other => panic!("a child whose VM is running was answered with {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 2);
+
+    for ack in &started {
+        assert!(
+            !ack.host_interaction_ip.is_empty(),
+            "a running fork child was answered with no address, which is what the \
+             API half reads to publish its proxy route"
+        );
+        assert_eq!(
+            ack.rootfs_virtual_size, ROOTFS_BY_THE_TIME_IT_FORKED,
+            "a fork child's rootfs size was not read from its own handle"
+        );
+    }
+    assert_ne!(
+        started[0].host_interaction_ip, started[1].host_interaction_ip,
+        "two fork children were answered with one address"
+    );
+    for ack in &started {
+        assert_ne!(
+            ack.host_interaction_ip, source_address,
+            "a fork child was answered with the address of the sandbox it was forked from"
+        );
+    }
 }
 
 /// The orchestrator's own fork still works through the facade with assigned

@@ -211,6 +211,14 @@ struct CommitArgs<'a> {
     committed_payload: Vec<u8>,
     alias: Option<&'a SnapshotAlias>,
     resources: SandboxResources,
+    /// The commit's own source axis (template vs sandbox) — this statement
+    /// never changes `source_kind` in the database (the axis is fixed at
+    /// `begin_snapshot`), but the in-memory record this call hands back must
+    /// still report it correctly rather than assuming every commit is a
+    /// template. A sandbox commit whose returned record silently claimed to
+    /// be a template would lose `source_sandbox_id` from every caller that
+    /// trusts this return value instead of re-reading the row.
+    source: SnapshotSource,
 }
 
 async fn commit_snapshot(
@@ -302,16 +310,12 @@ async fn commit_snapshot(
             RepositoryError::backend("re-decode the payload this call just wrote", error)
         })?;
 
-    Ok(CatalogWrite::Applied(SnapshotRecord {
-        id: args.id.clone(),
-        alias: args.alias.cloned(),
-        // 🔴 Rebuilt as a template row: the caller (`publish_commit`) opened
-        // this row as `SnapshotSource::Template` (see `commit_opening_record`)
-        // and this statement never changes `source_kind`, so a caller for a
-        // sandbox commit must have opened it that way already. Reconstructed
-        // from `committed`'s own fields where those disagree is out of scope
-        // for this call: the source axis is fixed at `begin_snapshot`.
-        source: SnapshotSource::Template {
+    // 🔴 A `Ready` template carries its build's own finish time; a sandbox
+    // snapshot has no build state at all (`SnapshotSource::Sandbox` carries
+    // only the id it was captured from) -- see `decode_row`'s identical
+    // branch for the read path this must agree with.
+    let source = match args.source {
+        SnapshotSource::Template { .. } => SnapshotSource::Template {
             build: crate::snapshot::types::TemplateBuildInfo {
                 status: crate::snapshot::types::TemplateBuildStatus::Ready,
                 started_at_unix_ms: None,
@@ -319,6 +323,13 @@ async fn commit_snapshot(
                 error_reason: None,
             },
         },
+        sandbox @ SnapshotSource::Sandbox { .. } => sandbox,
+    };
+
+    Ok(CatalogWrite::Applied(SnapshotRecord {
+        id: args.id.clone(),
+        alias: args.alias.cloned(),
+        source,
         resources: args.resources,
         created_at_unix_ms: created_at_ms,
         updated_at_unix_ms: updated_at_ms,
@@ -656,6 +667,9 @@ pub(crate) async fn publish_commit(
             committed_payload,
             alias: commit.alias.as_ref(),
             resources: commit.resources,
+            // `opening.source` was derived from `commit.source` by
+            // `commit_opening_record` above and carries the same axis.
+            source: opening.source,
         },
         true,
         node_id,

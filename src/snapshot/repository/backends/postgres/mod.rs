@@ -329,6 +329,43 @@ mod pg {
         );
     }
 
+    /// Regression: `commit_snapshot`'s in-memory return value used to
+    /// hardcode `SnapshotSource::Template` regardless of what was actually
+    /// committed, so a sandbox (pause) commit's immediate return value would
+    /// silently claim to be a template and lose `source_sandbox_id` — even
+    /// though the row written to the database was always correct (`reads.rs`
+    /// decodes it right back). Any caller trusting `publish_commit`'s return
+    /// value directly, rather than re-reading the row, would have seen the
+    /// wrong thing.
+    #[tokio::test]
+    async fn publish_commit_of_a_sandbox_snapshot_reports_its_source_correctly() {
+        let catalog = catalog!("publish_commit_of_a_sandbox_snapshot_reports_its_source_correctly");
+        let commit = SnapshotCommit {
+            id: SnapshotId::generate(),
+            alias: None,
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "sbx-42".to_string(),
+            },
+            resources: resources(),
+            created_at_unix_ms: None,
+            committed: CommittedSnapshot::mock(),
+        };
+
+        let published = catalog
+            .publish_commit(commit)
+            .await
+            .expect("publish_commit should succeed");
+        match published.source {
+            crate::snapshot::types::SnapshotSource::Sandbox { source_sandbox_id } => {
+                assert_eq!(source_sandbox_id, "sbx-42");
+            }
+            other => panic!(
+                "publish_commit's own return value must report the sandbox source, not \
+                 fabricate a template: {other:?}"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn publish_commit_over_an_existing_template_row_reuses_it() {
         let catalog = catalog!("publish_commit_over_an_existing_template_row_reuses_it");

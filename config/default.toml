@@ -178,6 +178,30 @@ api_grpc_addr = "0.0.0.0:8002"
 # given a second endpoint list to keep in step with the first.
 node_service_port = 8001
 
+[pg]
+# Shared PostgreSQL connection settings for the control plane (--role api /
+# --role all), consumed by src/pg/mod.rs. Empty on purpose: `dsn` is a
+# credential and this file is copied verbatim over the cluster ConfigMap on
+# every `make k8s-apply` (deploy/k8s/run.sh), so it can never carry one.
+# `the_bundled_default_config_never_carries_a_pg_dsn` fails the build if it
+# ever does.
+#
+# Supply the DSN the same way [backend.oss]'s credentials are supplied: a
+# second file named by AENV_CONFIG_OVERLAY_PATH, projected from a mounted
+# Secret, listed after any credential-free overlay. Absent `dsn` means
+# PostgreSQL is not configured for this process.
+#
+# dsn = "postgres://user:password@host:5432/dbname"
+#
+# Per-replica pool cap. `--role api` runs more than one replica, so the
+# cluster-wide connection count is `replica_count * max_connections`, not
+# this number alone. Defaults to 8 when unset.
+# max_connections = 8
+#
+# Bounds the pool's initial connection attempt and every later acquire.
+# Defaults to 5 seconds when unset.
+# connect_timeout_secs = 5
+
 [api]
 # Credentials that prove a control-plane call arrived through the gateway.
 # Empty (together with control_plane_token_file) leaves the node's user-facing

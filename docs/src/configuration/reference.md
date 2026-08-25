@@ -61,10 +61,10 @@ own directory. Prefer absolute paths or the `$AENV_HOME` placeholder.
 Most settings can be overridden with an `AENV_*` variable and do not need a
 file. Two kinds cannot:
 
-- `[backend.oss]` and `[backend.posix_fs]`. They are reached as
+- `[backend.oss]`, `[backend.posix_fs]` and `[pg]`. They are reached as
   `Option<...>`, confique descends into a struct only through
   `#[config(nested)]`, and `nested` may not be `Option<_>` — so no environment
-  variable can reach a field inside either section. An overlay file is the only
+  variable can reach a field inside any of them. An overlay file is the only
   way to set them from outside `AENV_CONFIG_PATH`.
 - Anything a deployment overwrites. `deploy/k8s/run.sh` regenerates the cluster
   ConfigMap from `config/default.toml` on every apply, so a value that exists
@@ -505,6 +505,36 @@ Notes:
 - `credential_process` and static access key settings are mutually exclusive in practice; when `credential_process` is set, the backend ignores static credential fields.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
+
+## `[pg]`
+
+Shared PostgreSQL connection settings for the control plane (`--role api` /
+`--role all`), consumed by `src/pg/mod.rs`: a per-replica connection pool and
+a cluster-leadership primitive built on session-scoped advisory locks. Empty
+by default — nothing in this crate depends on PostgreSQL yet.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `dsn` | string | unset | A libpq-style connection URL (`postgres://user:password@host:port/dbname`). Absent or blank means PostgreSQL is not configured for this process. |
+| `max_connections` | integer | `8` | Per-replica pool cap. `--role api` runs more than one replica and each builds its own pool independently, so the cluster-wide connection count this deployment produces is `replica_count * max_connections`, not this number alone — keep it comfortably under PostgreSQL's own `max_connections`. |
+| `connect_timeout_secs` | integer | `5` | Bounds the pool's initial connection attempt and every later acquire. |
+
+No environment variable reaches this section, for the same reason as
+`[backend.posix_fs]`/`[backend.oss]` above: `[pg]` is `Option<PgConfig>`, and
+confique never reads a non-`nested` `Option` from the environment. Supply the
+section through [an overlay file](#layered-configuration-files) — `dsn` is a
+credential and must never be written into a tracked file such as
+`config/default.toml`, the same rule `[backend.oss]`'s `access_key_id` and
+`access_key_secret` follow.
+
+### 🔴 `dsn` must never reach `--role node`
+
+`--role node` runs user-submitted code; database credentials, the connection
+budget and the schema belong to the deciding half only. A `--role node`
+process refuses to start if `[pg].dsn` resolves to a non-blank value —
+`ServerRole::check_pg_dsn`, checked in `src/bin/server.rs` before any
+role-specific assembly runs. `--role api` and `--role all` may configure
+`[pg]` freely.
 
 Other path override:
 

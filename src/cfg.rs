@@ -105,6 +105,31 @@ pub(crate) fn regctl_path(deps_path: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, Config)]
 pub struct AppConfig {
+    /// Shared PostgreSQL connection settings for the control plane
+    /// (`--role api` / `--role all`). See `src/pg/mod.rs`.
+    ///
+    /// `Option<PgConfig>`, not `#[config(nested)]`, on purpose and for the
+    /// same reason as `[backend.oss]`: confique only descends into a struct
+    /// through `#[config(nested)]`, which may not be `Option<_>`, so this is
+    /// deserialized from a file and from nothing else — no `env =` binding on
+    /// it or anything inside it can ever be read. The DSN belongs in a file
+    /// named by `AENV_CONFIG_OVERLAY_PATH`, mounted from a Secret, never in
+    /// `config/default.toml`.
+    ///
+    /// 🔴 Kept first in this struct, deliberately: the source scan behind
+    /// `no_new_env_binding_is_declared_where_confique_cannot_read_it` walks
+    /// backward from an `Option<_>` field over any preceding sibling field
+    /// that ends in a comma, including ones with unrelated `#[config(nested)]`
+    /// attributes, and only stops at whatever comes before the field it is
+    /// checking — so a bare `Option<_>` field placed *after* one of this
+    /// struct's many `#[config(nested)]` fields would read as falsely
+    /// reachable and the scan would stop watching it for a dead `env =`
+    /// binding. `[backend.oss]`/`[backend.posix_fs]` avoid the same trap by
+    /// living inside `BackendConfig`, a struct with no `nested` fields in it
+    /// at all; `[pg]` has no natural wrapper of its own to borrow that from,
+    /// so first-with-nothing-before-it is what keeps the scan honest here
+    /// instead.
+    pub pg: Option<PgConfig>,
     #[config(
         env = "AENV_HOME_PATH",
         parse_env = parse_required_path,
@@ -561,6 +586,54 @@ pub enum SnapshotCatalogRead {
 pub struct SnapshotImagePublishConfig {
     #[config(default = false)]
     pub enabled: bool,
+}
+
+/// `[pg]`: shared PostgreSQL connection settings, consumed by
+/// `src/pg::PgPoolSettings::from_config`.
+///
+/// Reached only as `Option<PgConfig>` (see the field doc on
+/// [`AppConfig::pg`]), so — like [`OssBackendConfig`] — every field here is
+/// deserialized by serde from a file and none may ever carry an `env =`
+/// attribute; `no_new_env_binding_is_declared_where_confique_cannot_read_it`
+/// enforces that by scanning this file's source text.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PgConfig {
+    /// A libpq-style connection URL
+    /// (`postgres://user:password@host:port/dbname`). Absent or blank means
+    /// PostgreSQL is not configured for this process.
+    ///
+    /// 🔴 Never a real value in `config/default.toml` or any other tracked
+    /// file — `the_bundled_default_config_never_carries_a_pg_dsn` fails the
+    /// build if it ever is. `deploy/k8s` must supply it the same way it
+    /// supplies `[backend.oss]`'s credentials: a tracked, credential-free
+    /// overlay file for everything else in this struct, and a second overlay
+    /// projected from a mounted Secret, listed after it in
+    /// `AENV_CONFIG_OVERLAY_PATH`, carrying this field alone.
+    pub dsn: Option<String>,
+    /// Per-replica pool cap. Defaults to 8 when unset — see
+    /// `src/pg::pool::DEFAULT_MAX_CONNECTIONS` for why that number, and for
+    /// the reminder that `--role api` runs more than one replica: the
+    /// cluster-wide connection count this deployment produces is
+    /// `replica_count * max_connections`, not this number alone, and has to
+    /// stay under PostgreSQL's own `max_connections`.
+    pub max_connections: Option<u32>,
+    /// Bounds the pool's initial connection attempt and every later acquire.
+    /// Defaults to 5 seconds when unset.
+    pub connect_timeout_secs: Option<u64>,
+}
+
+impl PgConfig {
+    /// [`Self::dsn`] with surrounding whitespace trimmed and blank treated as
+    /// absent — the same "blank is the same as absent" rule
+    /// `PausedRegistryConfig`'s `scheduler_endpoint` uses, for the same
+    /// reason: a ConfigMap that carries the key with an empty value is not
+    /// naming a database.
+    pub fn dsn(&self) -> Option<&str> {
+        self.dsn
+            .as_deref()
+            .map(str::trim)
+            .filter(|dsn| !dsn.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2203,6 +2276,39 @@ mod tests {
         }
     }
 
+    /// `[pg].dsn` is a credential and `config/default.toml` is copied
+    /// verbatim over the cluster ConfigMap on every apply
+    /// (`deploy/k8s/run.sh`), so a real DSN committed here would ship a
+    /// database password into a checkout and into every apply of it.
+    ///
+    /// An absent `[pg]` table is fine (`dsn` reads back as `None` either
+    /// way); what this refuses is a `dsn` key with a non-blank value.
+    #[test]
+    fn the_bundled_default_config_never_carries_a_pg_dsn() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml"),
+        )
+        .expect("read the bundled config");
+        let parsed: toml::Value = toml::from_str(&text)
+            .map_err(|err| err.message().to_string())
+            .expect("parse the bundled config");
+
+        let Some(section) = parsed.get("pg").and_then(toml::Value::as_table) else {
+            return;
+        };
+        let blank = section
+            .get("dsn")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        assert!(
+            blank.is_empty(),
+            "config/default.toml commits a non-blank [pg].dsn -- a database credential must \
+             come from a file named by AENV_CONFIG_OVERLAY_PATH, projected from a mounted \
+             Secret, never from a tracked file"
+        );
+    }
+
     /// The backend a deployment actually runs has to be settable from outside
     /// the file, for the same reason: the file is overwritten on every apply.
     /// And what is settable has to be exactly what is accepted — a value that
@@ -3305,9 +3411,10 @@ endpoint = "http://second:9000"
 
         assert!(
             unreachable.contains(&"OssBackendConfig".to_string())
-                && unreachable.contains(&"PosixFsBackendConfig".to_string()),
-            "the scan lost sight of the two [backend] structs it exists to guard; found \
-             {unreachable:?}"
+                && unreachable.contains(&"PosixFsBackendConfig".to_string())
+                && unreachable.contains(&"PgConfig".to_string()),
+            "the scan lost sight of the [backend] structs and PgConfig it exists to guard; \
+             found {unreachable:?}"
         );
 
         assert_eq!(

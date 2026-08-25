@@ -126,6 +126,20 @@ redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-man
 # this does not add a second TLS stack next to the one `reqwest` already
 # pulls in. See `src/pg/mod.rs`.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres"] }
+# Stage A of the scheduler fold (docs/proposals/_sd-phase4-stageA-node-inventory.md):
+# `src/node_registry/kubernetes_discovery.rs` ports
+# `services/scheduler/internal/kubernetes_discovery.go`'s EndpointSlice/Pod
+# informers. `kube`'s default TLS backend is rustls; `openssl-tls` (backed by
+# `hyper-openssl`) is selected explicitly instead, for the same reason the
+# `sqlx` entry above picks `tls-native-tls`: `reqwest` already resolves to
+# native-tls/openssl by default, and a second TLS stack in the same binary is
+# exactly what that entry's comment argues against. `crates/aenv` is the
+# documented exception that uses rustls on purpose; this is not it. `v1_34`
+# pins a specific Kubernetes API generation rather than tracking `k8s-openapi`'s
+# `latest` feature, matching how Firecracker/kernel versions are pinned in
+# `config/deps_manifest.toml` rather than floated.
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "openssl-tls"] }
+k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

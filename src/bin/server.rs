@@ -1558,4 +1558,46 @@ mod tests {
              un-bounded fallback here reintroduces the node-never-exits hang"
         );
     }
+
+    /// `ServerRole::check_pg_dsn`'s own tests (`src/role.rs`) only exercise
+    /// the pure function directly — none of them can notice if the one call
+    /// site that actually wires it into the running process disappears. That
+    /// call site is the entire enforcement of "a `[pg].dsn` must never reach
+    /// `--role node`": delete it and every test in `src/role.rs` stays green
+    /// while the invariant it guards is gone. Scans this file's own source
+    /// text for the call, the same way
+    /// `only_the_split_roles_bind_a_second_listener` does for
+    /// `spawn_grpc_surface`, so deleting the call site fails a test instead
+    /// of only a future security review.
+    #[test]
+    fn async_main_actually_calls_check_pg_dsn() {
+        let source = include_str!("server.rs");
+        let body = |name: &str| {
+            let start = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+            let open = source[start..].find('{').expect("a body") + start;
+            let mut depth = 0usize;
+            for (offset, byte) in source[open..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return source[open..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{name} has no closing brace");
+        };
+
+        assert!(
+            body("async fn async_main() -> anyhow::Result<()>").contains("check_pg_dsn"),
+            "async_main no longer calls ServerRole::check_pg_dsn — a [pg].dsn could reach \
+             --role node with nothing left to refuse it, even though src/role.rs's own tests \
+             of the pure function would still report green"
+        );
+    }
 }

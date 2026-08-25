@@ -765,6 +765,406 @@ async fn an_unreachable_node_does_not_mean_the_sandbox_stopped() {
         .expect("a node that says the sandbox is not there has answered");
 }
 
+// ---------------------------------------------------------------------------
+// A stale node address: retried once against a freshly resolved one, and
+// never against an answer the node actually sent
+// ---------------------------------------------------------------------------
+
+/// A placement source that hands out one address for the *initial* placement
+/// and a different one — for the same node id — once asked to re-resolve.
+///
+/// Models the split the stale-node-address retry depends on: a scheduler's
+/// per-sandbox binding cache (`place_existing`) can go on naming a node's old
+/// address long after `resolve_node` — backed by node discovery rather than
+/// that cache — already knows the new one.
+struct ReplacementNodePlacement {
+    node_id: String,
+    initial: NodeEndpoint,
+    resolved: NodeEndpoint,
+    resolve_calls: std::sync::atomic::AtomicUsize,
+    /// How many calls to `resolve_node` answer with `resolved` before every
+    /// call after that refuses instead.
+    ///
+    /// 🔴 Load-bearing for
+    /// `a_forks_children_carry_the_connection_the_retry_actually_used`, and
+    /// only for that test: every remote call retries once on its own, so a
+    /// fork child built from a stale, pre-retry connection would silently
+    /// self-heal on its *own* first call — the very next `resolve_node` —
+    /// and the bug that test exists to catch would go unnoticed. Setting
+    /// this to `1` removes that safety net: a second re-resolve, which only
+    /// happens if the child was handed the connection the retry had already
+    /// abandoned, fails instead of quietly succeeding. Every other test
+    /// leaves this at `usize::MAX`, where the cap never bites.
+    resolve_budget: usize,
+}
+
+#[async_trait]
+impl NodePlacement for ReplacementNodePlacement {
+    async fn place_new(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _resources: crate::types::SandboxResources,
+    ) -> anyhow::Result<NodeEndpoint> {
+        Ok(self.initial.clone())
+    }
+
+    async fn place_existing(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+    ) -> anyhow::Result<Option<NodeEndpoint>> {
+        Ok(Some(self.initial.clone()))
+    }
+
+    async fn resolve_node(&self, node_id: &str) -> anyhow::Result<NodeEndpoint> {
+        assert_eq!(
+            node_id, self.node_id,
+            "asked to resolve a node this test never placed a sandbox on"
+        );
+        let call_number = self
+            .resolve_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if call_number > self.resolve_budget {
+            anyhow::bail!(
+                "this test's re-resolve budget ({}) is exhausted; a build that hands a fork \
+                 child the pre-retry connection needs a second re-resolve to self-heal, and \
+                 this refusal is what stops that from happening invisibly",
+                self.resolve_budget
+            );
+        }
+        Ok(self.resolved.clone())
+    }
+
+    async fn record_placement(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+        _node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A stale node address — a connection that once worked and now cannot be
+/// reached at all — is retried exactly once against a freshly resolved
+/// address, and the retry reaches the node the fresh address actually names.
+///
+/// 🔴 Deleting the retry turns this red outright. Wiring the re-resolve to
+/// `place_existing` instead of `resolve_node` — exactly the stale binding
+/// cache this exists to route around — also turns it red: `place_existing`
+/// here answers with `initial` again, the same dead address, so the retried
+/// call would fail exactly like the first one instead of reaching
+/// `script_b`.
+#[tokio::test]
+async fn a_stale_node_address_is_retried_once_against_a_freshly_resolved_one() {
+    let (script_a, node_a) = scripted_node().await;
+    let (script_b, node_b) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script_a.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let placement = Arc::new(ReplacementNodePlacement {
+        node_id: "the-rolling-node".to_string(),
+        initial: NodeEndpoint::same_address("the-rolling-node", node_a.endpoint.endpoint.clone()),
+        resolved: NodeEndpoint::same_address("the-rolling-node", node_b.endpoint.endpoint.clone()),
+        resolve_calls: std::sync::atomic::AtomicUsize::new(0),
+        resolve_budget: usize::MAX,
+    });
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
+    backend
+        .start()
+        .await
+        .expect("start against the initial node");
+
+    // Kill the node this stub is currently placed on, and wait for the OS to
+    // agree it is gone — the same failure a rolling restart produces once the
+    // old pod's socket is actually closed, rather than a status either half
+    // of this process ever manufactured by hand.
+    let dead_addr = node_a.endpoint.endpoint.clone();
+    drop(node_a);
+    wait_until_unreachable(&dead_addr).await;
+
+    backend
+        .stop()
+        .await
+        .expect("a stale address is retried against the freshly resolved one");
+
+    assert_eq!(
+        placement
+            .resolve_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the retry must re-resolve exactly once"
+    );
+    let deletes = script_b.seen_delete.lock().expect("lock").clone();
+    assert_eq!(
+        deletes.len(),
+        1,
+        "the retried delete never reached the re-resolved node"
+    );
+    assert_eq!(deletes[0].execution_id, execution_id.to_string());
+    // And the node the retry gave up on was never asked twice — there was no
+    // connection left to ask it on.
+    assert!(script_a.seen_delete.lock().expect("lock").is_empty());
+}
+
+/// A fork's child stubs carry the connection the retry actually used, not the
+/// one it had already abandoned by the time the fork succeeded.
+///
+/// 🔴 Reading `node`/`client` from a value captured *before* the retried
+/// `fork` call — instead of from `self.placed` afterward — turns this red:
+/// every child would be built from the dead node's connection, and operating
+/// on one would fail exactly like the parent's first attempt did, rather than
+/// reaching the node the fork was actually run on.
+#[tokio::test]
+async fn a_forks_children_carry_the_connection_the_retry_actually_used() {
+    let (script_a, node_a) = scripted_node().await;
+    let (script_b, node_b) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script_a.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let child_spec = SandboxForkSpec {
+        sandbox_id: crate::types::SandboxId::new(),
+        execution_id: ExecutionId::new(),
+        envd_access_token: None,
+    };
+    *script_b.fork.lock().expect("lock") = Some(Ok(pb::SandboxForkResponse {
+        children: vec![pb::ForkChildResult {
+            sandbox_id: child_spec.sandbox_id.to_string(),
+            execution_id: child_spec.execution_id.to_string(),
+            outcome: Some(pb::fork_child_result::Outcome::Started(
+                pb::SandboxCreateResponse {
+                    sandbox_id: child_spec.sandbox_id.to_string(),
+                    execution_id: child_spec.execution_id.to_string(),
+                    ..Default::default()
+                },
+            )),
+        }],
+    }));
+
+    let placement = Arc::new(ReplacementNodePlacement {
+        node_id: "the-forking-node".to_string(),
+        initial: NodeEndpoint::same_address("the-forking-node", node_a.endpoint.endpoint.clone()),
+        resolved: NodeEndpoint::same_address("the-forking-node", node_b.endpoint.endpoint.clone()),
+        resolve_calls: std::sync::atomic::AtomicUsize::new(0),
+        // See the field doc: this is the test that needs the cap to bite.
+        resolve_budget: 1,
+    });
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
+    backend
+        .start()
+        .await
+        .expect("start against the initial node");
+
+    let dead_addr = node_a.endpoint.endpoint.clone();
+    drop(node_a);
+    wait_until_unreachable(&dead_addr).await;
+
+    let results = backend
+        .fork(&[child_spec])
+        .await
+        .expect("the fork retries against the re-resolved node");
+    let mut child = results
+        .into_iter()
+        .next()
+        .expect("one child")
+        .expect("the child started");
+
+    // The proof: operating on the child must reach node_b, the node the
+    // retry actually used — not fail against the dead node_a, which is what
+    // it would do if the child had been built from the pre-retry client.
+    child
+        .stop()
+        .await
+        .expect("the child's connection must be the one the retry used, not the abandoned one");
+    assert_eq!(script_b.seen_delete.lock().expect("lock").len(), 1);
+    assert!(script_a.seen_delete.lock().expect("lock").is_empty());
+}
+
+/// The control face: a status the node *sent* — even the identically-coded
+/// `Unavailable` a transport failure also produces — is never retried against
+/// a different address. Only a connection that never reached the node at all
+/// is.
+///
+/// 🔴 This is the half `an_unreachable_node_does_not_mean_the_sandbox_stopped`
+/// cannot cover on its own: that test's node answers the same canned status on
+/// every call, so a build that wrongly retried an application-level
+/// `Unavailable` would still surface the same message text and pass it.
+/// Pointing the re-resolve target at a second node that would visibly answer
+/// instead — and asserting it is never touched — is what catches that
+/// mutation.
+#[tokio::test]
+async fn a_status_the_node_sent_is_not_retried_against_a_different_address() {
+    let (script, node) = scripted_node().await;
+    let (script_elsewhere, node_elsewhere) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let placement = Arc::new(ReplacementNodePlacement {
+        node_id: "the-node".to_string(),
+        initial: NodeEndpoint::same_address("the-node", node.endpoint.endpoint.clone()),
+        resolved: NodeEndpoint::same_address("the-node", node_elsewhere.endpoint.endpoint.clone()),
+        resolve_calls: std::sync::atomic::AtomicUsize::new(0),
+        resolve_budget: usize::MAX,
+    });
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start");
+
+    *script.delete.lock().expect("lock") = Some(Err(Status::unavailable("the node is restarting")));
+    let err = backend
+        .stop()
+        .await
+        .expect_err("the node's own answer must not be swallowed");
+    assert!(
+        format!("{err:#}").contains("the node is restarting"),
+        "the failure lost what the node said: {err:#}"
+    );
+    assert_eq!(
+        placement
+            .resolve_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an application-level Unavailable must never trigger a re-resolve"
+    );
+    assert!(
+        script_elsewhere
+            .seen_delete
+            .lock()
+            .expect("lock")
+            .is_empty(),
+        "a status the node sent must never be replayed against another address"
+    );
+}
+
+/// The re-resolve-and-retry path is bounded: a re-resolve that would take
+/// longer than `STALE_PLACEMENT_RETRY_BUDGET` does not turn a fast failure
+/// into a slow one. The original transport failure is surfaced once the
+/// budget elapses, not once the slow re-resolve eventually finishes.
+///
+/// 🔴 Deleting the `tokio::time::timeout` wrapper around the retry — while
+/// leaving everything else intact — turns this red: without it, this test
+/// hangs for the placement's full multi-second `resolve_node` delay instead
+/// of returning within the budget, and the elapsed-time assertion below
+/// catches that directly rather than via a flaky sleep-and-hope race.
+#[tokio::test]
+async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
+    struct SlowReresolve {
+        node_id: String,
+        initial: NodeEndpoint,
+        resolve_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NodePlacement for SlowReresolve {
+        async fn place_new(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _resources: crate::types::SandboxResources,
+        ) -> anyhow::Result<NodeEndpoint> {
+            Ok(self.initial.clone())
+        }
+        async fn place_existing(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+        ) -> anyhow::Result<Option<NodeEndpoint>> {
+            Ok(Some(self.initial.clone()))
+        }
+        async fn resolve_node(&self, node_id: &str) -> anyhow::Result<NodeEndpoint> {
+            assert_eq!(node_id, self.node_id);
+            self.resolve_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Comfortably past the retry budget, so a build that dropped the
+            // timeout would make this test hang here instead of failing fast.
+            tokio::time::sleep(
+                super::stub::STALE_PLACEMENT_RETRY_BUDGET + std::time::Duration::from_secs(5),
+            )
+            .await;
+            Ok(self.initial.clone())
+        }
+        async fn record_placement(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _execution_id: ExecutionId,
+            _node: &NodeEndpoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (script_a, node_a) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    *script_a.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let placement = Arc::new(SlowReresolve {
+        node_id: "the-slow-node".to_string(),
+        initial: NodeEndpoint::same_address("the-slow-node", node_a.endpoint.endpoint.clone()),
+        resolve_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start");
+
+    let dead_addr = node_a.endpoint.endpoint.clone();
+    drop(node_a);
+    wait_until_unreachable(&dead_addr).await;
+
+    let started = std::time::Instant::now();
+    let err = backend
+        .stop()
+        .await
+        .expect_err("the node is genuinely gone; a slow re-resolve cannot save this call");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed
+            < super::stub::STALE_PLACEMENT_RETRY_BUDGET + std::time::Duration::from_millis(1500),
+        "the retry budget did not bound the call: it took {elapsed:?}, and the re-resolve alone \
+         sleeps for {:?}",
+        super::stub::STALE_PLACEMENT_RETRY_BUDGET + std::time::Duration::from_secs(5)
+    );
+    assert!(
+        format!("{err:#}").contains("tcp connect error"),
+        "the original transport failure must be surfaced when the retry times out, got: {err:#}"
+    );
+    assert_eq!(
+        placement
+            .resolve_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the re-resolve was attempted exactly once"
+    );
+}
+
 /// A pause comes back as a reference to bytes on the node, not as a handle.
 #[tokio::test]
 async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {

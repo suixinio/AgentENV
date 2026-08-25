@@ -1,5 +1,6 @@
 //! Reading what a node said, and refusing what it did not.
 
+use std::error::Error as _;
 use std::net::Ipv4Addr;
 
 use anyhow::{anyhow, Context, Result};
@@ -19,6 +20,39 @@ use crate::types::SandboxId;
 /// it asked — see `RemoteSandboxStub::stop`.
 pub(super) fn into_error(status: Status) -> anyhow::Error {
     anyhow!("{}: {}", status.code(), status.message())
+}
+
+/// Whether a status means the call never reached the node at all — the
+/// connection could not be established or broke before an answer came back —
+/// as opposed to a status the node actually sent.
+///
+/// # 🔴 Why `source().is_some()` is load-bearing and not `code()` alone
+///
+/// `Code::Unavailable` is not unambiguous by itself: it is exactly the code a
+/// node could deliberately send back (there is no such reply in this service
+/// today, but nothing about the protocol rules one out — see
+/// [`RemoteResumeFailure::from_status`], which already treats a *sent*
+/// `Unavailable` as an answer rather than a transport failure). What tells the
+/// two apart is how the client-side `Status` was built:
+///
+/// * a status the node actually sent is decoded off the wire by
+///   `Status::from_header_map`, which always sets `source: None` — there is no
+///   underlying Rust error, only bytes that were parsed;
+/// * a status this process manufactured because the call itself failed —
+///   connection refused, DNS failure, a connection that died mid-flight, the
+///   node never having been dialed at all — goes through tonic's
+///   `Status::from_error`, which always attaches the original transport error
+///   as the source.
+///
+/// So a status with no source is, whatever its code, something the node said.
+/// Treating it as unreachable and retrying would replay a request the node
+/// already refused for a reason of its own.
+///
+/// A caller that finds this true has learned nothing about the node's
+/// opinion of the request — only that the request never reached it — and may
+/// safely retry the same request once a fresh address has been resolved.
+pub(super) fn is_unreachable(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable && status.source().is_some()
 }
 
 /// Turns a gRPC failure on a capture into the classification the caller acts
@@ -202,6 +236,45 @@ pub(super) fn host_ip(raw: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection failure that never reached the node is retried; a status
+    /// the node actually sent — even the identically-coded `Unavailable` —
+    /// is not.
+    ///
+    /// 🔴 This is the distinction the stale-node-address retry in
+    /// `RemoteSandboxStub` depends on entirely: mutating the implementation so
+    /// it retried on `code() == Unavailable` alone (dropping the `source()`
+    /// check) would make this test pass exactly as before for the transport
+    /// case and start replaying every deliberate `Unavailable` answer too —
+    /// which is why the second assertion here matters as much as the first.
+    #[test]
+    fn only_a_status_with_no_answer_behind_it_counts_as_unreachable() {
+        // A transport failure: the call never produced an HTTP response, so
+        // tonic built this status from the connect error itself, and
+        // `Status::from_error` always attaches that error as the source.
+        let transport_failure = Status::from_error(Box::new(tonic::ConnectError(Box::new(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "tcp connect error"),
+        ))));
+        assert_eq!(transport_failure.code(), tonic::Code::Unavailable);
+        assert!(
+            is_unreachable(&transport_failure),
+            "a connect failure must be retried"
+        );
+
+        // The node answering with the very same code is not a transport
+        // failure: nothing this process manufactured, no source attached.
+        let sent_by_the_node = Status::unavailable("draining, try another node");
+        assert_eq!(sent_by_the_node.code(), tonic::Code::Unavailable);
+        assert!(
+            !is_unreachable(&sent_by_the_node),
+            "a status the node actually sent must not be retried, even at the same code"
+        );
+
+        // And an ordinary application-level refusal is naturally excluded by
+        // the code check alone.
+        let refused = Status::not_found("no such sandbox here");
+        assert!(!is_unreachable(&refused));
+    }
 
     /// 🔴 The three answers a resume can come back with stay three.
     ///

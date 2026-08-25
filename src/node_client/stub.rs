@@ -18,12 +18,15 @@
 //! sandbox is gone" both end with nothing to do — and taking the first for the
 //! second is how a cluster stops accounting for a VM that is still running.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
@@ -559,13 +562,6 @@ impl RemoteSandboxStub {
         })
     }
 
-    fn placed_mut(&mut self) -> Result<&mut Placed> {
-        let sandbox_id = self.sandbox_id;
-        self.placed
-            .as_mut()
-            .ok_or_else(|| anyhow!("sandbox {sandbox_id} has not been started on any node yet"))
-    }
-
     /// Tells the placement source which machine this sandbox ended up on.
     ///
     /// # 🔴 Logged and swallowed, and that is the whole contract
@@ -620,7 +616,242 @@ impl RemoteSandboxStub {
             .with_context(|| format!("connect to node service at {endpoint}"))?;
         Ok(NodeSandboxServiceClient::new(channel))
     }
+
+    /// Drops a `Placed` that a call just found completely unreachable, and
+    /// rebuilds one against a freshly resolved address for the *same* node.
+    ///
+    /// # 🔴 `resolve_node`, never `place_existing`
+    ///
+    /// The stale address a call just failed against came from whichever
+    /// lookup produced this stub's current `Placed` — for the case this
+    /// exists to fix, that is the scheduler's per-sandbox binding cache,
+    /// answered by `LookupNode`/`place_existing`. That cache is refreshed
+    /// only by `ReconcileNode`, which a node's own heartbeat can be skipped
+    /// past for the exact window a rolling restart opens (see the module-level
+    /// incident this fixes). Asking `place_existing` again would consult the
+    /// same stale cache and could easily get the same stale answer back.
+    ///
+    /// `resolve_node` asks a different question — *where is the node whose
+    /// identity I already hold* — and on the cluster placement source that
+    /// question goes to `GetNode`, which reads node discovery directly rather
+    /// than the binding cache. This stub already knows which node it is
+    /// entitled to talk to (it got there via a `Placed` built from an earlier,
+    /// trusted placement decision); what is stale is only the address, and
+    /// `resolve_node` is the call built for exactly that gap — see its doc on
+    /// [`NodePlacement::resolve_node`].
+    ///
+    /// # 🔴 The old facts survive
+    ///
+    /// `host_interaction_ip` and `rootfs_virtual_size` are properties of the
+    /// sandbox as the node last reported them, not of the TCP connection that
+    /// happened to be open when it did. Losing them here would turn a
+    /// reconnect into a regression for any caller that reads them later.
+    async fn reresolve_placement(&mut self) -> Result<()> {
+        let sandbox_id = self.sandbox_id;
+        let stale = self
+            .placed
+            .take()
+            .ok_or_else(|| anyhow!("sandbox {sandbox_id} has not been started on any node yet"))?;
+        let node_id = stale.node.node_id.clone();
+        let node = self
+            .placement
+            .resolve_node(&node_id)
+            .await
+            .with_context(|| format!("re-resolve node {node_id} for sandbox {sandbox_id}"))?;
+        let client = Self::connect(&node.endpoint)
+            .await
+            .with_context(|| format!("reconnect to node {node_id} for sandbox {sandbox_id}"))?;
+        self.placed = Some(Placed {
+            node,
+            client,
+            host_interaction_ip: stale.host_interaction_ip,
+            rootfs_virtual_size: stale.rootfs_virtual_size,
+        });
+        Ok(())
+    }
+
+    /// Runs one RPC against this stub's current placement, and if it never
+    /// reached the node at all, re-resolves the node's address once and tries
+    /// exactly once more.
+    ///
+    /// # 🔴 Never on an answer, only on silence
+    ///
+    /// `attempt` is retried only when its failure satisfies
+    /// [`wire::is_unreachable`] — a status this process manufactured because
+    /// the call never produced a response, never a status the node sent. A
+    /// node that answered `NotFound`, `FailedPrecondition`, or anything else
+    /// of its own has been asked exactly once by the time this returns, the
+    /// same as before this retry existed. Replaying such an answer against a
+    /// freshly resolved address would not be a retry of a failed connection;
+    /// it would be a second, uninvited delivery of a request the node has
+    /// already ruled on.
+    ///
+    /// # 🔴 One retry, and it is bounded
+    ///
+    /// At most one re-resolve-and-reconnect happens (`retried` below never
+    /// lets a second one start). The re-resolve, the reconnect and the retried
+    /// call together are bounded by [`STALE_PLACEMENT_RETRY_BUDGET`], so a
+    /// node that is genuinely gone costs this call one extra, short round trip
+    /// rather than turning a fast failure into a slow one. The *first*
+    /// attempt is not part of that budget — it is the caller's ordinary RPC,
+    /// unretried, exactly as it behaved before this existed.
+    ///
+    /// `attempt` is handed a fresh `&mut NodeSandboxServiceClient<Channel>`
+    /// each time it runs — never the same client object it saw before a
+    /// retry — because a retry that kept the old client would still be
+    /// dialling the connection this whole method exists to stop using.
+    async fn call_with_stale_placement_retry<T, F>(
+        &mut self,
+        operation: &'static str,
+        mut attempt: F,
+    ) -> Result<tonic::Response<T>, tonic::Status>
+    where
+        F: for<'a> FnMut(
+            &'a mut NodeSandboxServiceClient<Channel>,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<tonic::Response<T>, tonic::Status>> + Send + 'a>,
+        >,
+    {
+        let sandbox_id = self.sandbox_id;
+        let stale_node_id = match self.placed.as_ref() {
+            Some(placed) => placed.node.node_id.clone(),
+            None => {
+                return Err(tonic::Status::internal(format!(
+                    "sandbox {sandbox_id} has not been started on any node yet"
+                )))
+            }
+        };
+
+        let first = {
+            let client = &mut self.placed.as_mut().expect("checked above").client;
+            attempt(client).await
+        };
+        let status = match first {
+            Ok(response) => return Ok(response),
+            Err(status) => status,
+        };
+        if !wire::is_unreachable(&status) {
+            return Err(status);
+        }
+
+        // Bounded so that a node which is genuinely gone costs this call one
+        // extra, short round trip rather than turning a fast failure into a
+        // slow one. `retry_after_reresolve` is an ordinary method call — its
+        // future naturally reborrows `self` for its own duration and releases
+        // it as soon as this `.await` resolves, whether by success, an
+        // answer, or the timeout below, so `self` is free to use again in
+        // every arm.
+        match tokio::time::timeout(
+            STALE_PLACEMENT_RETRY_BUDGET,
+            self.retry_after_reresolve(&mut attempt),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let new_endpoint = self
+                    .placed
+                    .as_ref()
+                    .map(|placed| placed.node.endpoint.clone())
+                    .unwrap_or_default();
+                info!(
+                    %sandbox_id,
+                    node_id = %stale_node_id,
+                    new_endpoint = %new_endpoint,
+                    operation,
+                    "a stale node address failed to connect; re-resolved the node's address \
+                     and retried, and the retry succeeded"
+                );
+                Ok(response)
+            }
+            // The retried attempt itself ran and the node answered — even an
+            // answer that is itself an error is not this method's to retry
+            // again; see the doc above.
+            Ok(Err(retry_error)) => {
+                if let Some(retried_status) = retry_error.downcast_ref::<tonic::Status>() {
+                    if wire::is_unreachable(retried_status) {
+                        // The freshly resolved address could not be reached
+                        // either. This is still exactly one retry — the
+                        // *node* has not answered at all, on either address —
+                        // and it is surfaced rather than tried a third time.
+                        info!(
+                            %sandbox_id,
+                            node_id = %stale_node_id,
+                            operation,
+                            error = %retried_status,
+                            "a stale node address failed to connect; re-resolved the node's \
+                             address and retried, and the re-resolved address could not be \
+                             reached either"
+                        );
+                    } else {
+                        info!(
+                            %sandbox_id,
+                            node_id = %stale_node_id,
+                            operation,
+                            error = %retried_status,
+                            "a stale node address failed to connect; re-resolved the node's \
+                             address and retried, and the node answered"
+                        );
+                    }
+                    Err(retried_status.clone())
+                } else {
+                    warn!(
+                        %sandbox_id,
+                        node_id = %stale_node_id,
+                        operation,
+                        error = %retry_error,
+                        "a stale node address failed to connect, and re-resolving it failed too"
+                    );
+                    Err(status)
+                }
+            }
+            Err(_elapsed) => {
+                warn!(
+                    %sandbox_id,
+                    node_id = %stale_node_id,
+                    operation,
+                    budget_secs = STALE_PLACEMENT_RETRY_BUDGET.as_secs(),
+                    "a stale node address failed to connect, and re-resolving it did not \
+                     finish within budget"
+                );
+                Err(status)
+            }
+        }
+    }
+
+    /// The re-resolve-and-retry half of
+    /// [`call_with_stale_placement_retry`](Self::call_with_stale_placement_retry),
+    /// split out so that half can be wrapped in a timeout without fighting the
+    /// borrow checker over holding `self` across a manually written `async`
+    /// block: an ordinary method call's future reborrows `self` for exactly
+    /// its own duration, which is what lets the caller use `self` again in
+    /// every arm of the `match` on this method's result.
+    async fn retry_after_reresolve<T, F>(&mut self, attempt: &mut F) -> Result<tonic::Response<T>>
+    where
+        F: for<'a> FnMut(
+            &'a mut NodeSandboxServiceClient<Channel>,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<tonic::Response<T>, tonic::Status>> + Send + 'a>,
+        >,
+    {
+        self.reresolve_placement().await?;
+        let client = &mut self
+            .placed
+            .as_mut()
+            .expect("reresolve_placement just set this")
+            .client;
+        attempt(client).await.map_err(anyhow::Error::new)
+    }
 }
+
+/// How long a re-resolve-and-reconnect retry after a stale node address may
+/// take before the original failure is surfaced instead.
+///
+/// 🔴 Deliberately short: this budget exists so that a node which is
+/// genuinely gone costs one bounded extra round trip rather than turning a
+/// fast failure into a slow one. It covers the re-resolve RPC, the reconnect,
+/// and the retried call together — not the first attempt, which is the
+/// caller's ordinary, unretried RPC.
+pub(super) const STALE_PLACEMENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
 #[async_trait]
 impl SandboxBackend for RemoteSandboxStub {
@@ -730,25 +961,32 @@ impl SandboxBackend for RemoteSandboxStub {
         // machine that is not doing the writing.
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
-        let placed = self
-            .placed_mut()
-            .map_err(SandboxCaptureError::recoverable)?;
-        let node_id = placed.node.node_id.clone();
+        let node_id = self
+            .placed()
+            .map_err(SandboxCaptureError::recoverable)?
+            .node
+            .node_id
+            .clone();
 
-        let response = placed
-            .client
-            .pause(pb::SandboxPauseRequest {
-                sandbox_id: sandbox_id.to_string(),
-                execution_id: execution_id.to_string(),
-                // 🔴 The caller's promise, forwarded rather than assumed. This
-                // is the one backend for which producing a publishable capture
-                // costs a durable write on another machine, and bytes staged
-                // for a publisher that is not going to commit are unreachable
-                // forever — no read path resolves an unannounced snapshot. So
-                // the question "will anybody commit this" is answered by the
-                // publisher above this backend, before the node is asked to
-                // spend. See `SandboxBackend::pause`.
-                publish: committer_waiting,
+        // 🔴 Retried once on a connection that never reached `node_id` at
+        // all — see `call_with_stale_placement_retry`'s doc. A pause that the
+        // node actually answered, even with an error, is never replayed here.
+        let response = self
+            .call_with_stale_placement_retry("pause", |client| {
+                Box::pin(client.pause(pb::SandboxPauseRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                    // 🔴 The caller's promise, forwarded rather than assumed.
+                    // This is the one backend for which producing a
+                    // publishable capture costs a durable write on another
+                    // machine, and bytes staged for a publisher that is not
+                    // going to commit are unreachable forever — no read path
+                    // resolves an unannounced snapshot. So the question "will
+                    // anybody commit this" is answered by the publisher above
+                    // this backend, before the node is asked to spend. See
+                    // `SandboxBackend::pause`.
+                    publish: committer_waiting,
+                }))
             })
             .await
             .map_err(wire::into_capture_error)?
@@ -875,16 +1113,21 @@ impl SandboxBackend for RemoteSandboxStub {
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
-        let placed = self
-            .placed_mut()
-            .map_err(SandboxCaptureError::recoverable)?;
-        let node_id = placed.node.node_id.clone();
+        let node_id = self
+            .placed()
+            .map_err(SandboxCaptureError::recoverable)?
+            .node
+            .node_id
+            .clone();
 
-        let response = placed
-            .client
-            .checkpoint(pb::SandboxCheckpointRequest {
-                sandbox_id: sandbox_id.to_string(),
-                execution_id: execution_id.to_string(),
+        // 🔴 Retried once on a connection that never reached `node_id` at
+        // all — see `call_with_stale_placement_retry`'s doc.
+        let response = self
+            .call_with_stale_placement_retry("snapshot", |client| {
+                Box::pin(client.checkpoint(pb::SandboxCheckpointRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                }))
             })
             .await
             .map_err(wire::into_capture_error)?
@@ -919,54 +1162,66 @@ impl SandboxBackend for RemoteSandboxStub {
         let execution_id = self.execution_id;
         let resources = self.resources;
         let placement = Arc::clone(&self.placement);
-        let placed = self
-            .placed_mut()
-            .map_err(SandboxCaptureError::recoverable)?;
-        let node = placed.node.clone();
+        self.placed().map_err(SandboxCaptureError::recoverable)?;
 
-        let response = placed
-            .client
-            .fork(pb::SandboxForkRequest {
-                source_sandbox_id: sandbox_id.to_string(),
-                source_execution_id: execution_id.to_string(),
-                children: spec
-                    .iter()
-                    .map(|child| pb::ForkChildSpec {
-                        sandbox_id: child.sandbox_id.to_string(),
-                        // 🔴 The orchestrator above this backend has already
-                        // minted the child's incarnation and is about to write
-                        // it into the child's record, so the node has to run
-                        // under it rather than choose its own.
-                        execution_id: child.execution_id.to_string(),
-                        // 🔴 A fork child reaches the node unmarked, and that
-                        // is a known gap rather than a decision.
-                        //
-                        // A create is stamped by
-                        // `Orchestrator::stamp_control_plane_ownership`,
-                        // which works because the sandbox's record exists —
-                        // as a launch plan — before the backend is built. A
-                        // fork child's record does not: it is a clone of the
-                        // parent's, taken *after* the node has answered, so
-                        // there is nothing to encode at this point.
-                        // `ForkChildAssignment` already has the field for it,
-                        // and filling it belongs to the surface that decides
-                        // what a child's record is.
-                        //
-                        // The direction this fails in is the safe one: an
-                        // unmarked child is a sandbox no control plane claims,
-                        // so reconciliation leaves it alone rather than tearing
-                        // it down. What it costs is that a fork child started
-                        // by the API half is absent from `ListSandboxes`, and
-                        // would be leaked rather than reclaimed if the control
-                        // plane's record of it were lost.
-                        control_plane_config: Vec::new(),
-                    })
-                    .collect(),
-                timeout_ms: 0,
+        // 🔴 Retried once on a connection that never reached the node at
+        // all — see `call_with_stale_placement_retry`'s doc.
+        let response = self
+            .call_with_stale_placement_retry("fork", |client| {
+                Box::pin(
+                    client.fork(pb::SandboxForkRequest {
+                        source_sandbox_id: sandbox_id.to_string(),
+                        source_execution_id: execution_id.to_string(),
+                        children: spec
+                            .iter()
+                            .map(|child| pb::ForkChildSpec {
+                                sandbox_id: child.sandbox_id.to_string(),
+                                // 🔴 The orchestrator above this backend has already
+                                // minted the child's incarnation and is about to write
+                                // it into the child's record, so the node has to run
+                                // under it rather than choose its own.
+                                execution_id: child.execution_id.to_string(),
+                                // 🔴 A fork child reaches the node unmarked, and that
+                                // is a known gap rather than a decision.
+                                //
+                                // A create is stamped by
+                                // `Orchestrator::stamp_control_plane_ownership`,
+                                // which works because the sandbox's record exists —
+                                // as a launch plan — before the backend is built. A
+                                // fork child's record does not: it is a clone of the
+                                // parent's, taken *after* the node has answered, so
+                                // there is nothing to encode at this point.
+                                // `ForkChildAssignment` already has the field for it,
+                                // and filling it belongs to the surface that decides
+                                // what a child's record is.
+                                //
+                                // The direction this fails in is the safe one: an
+                                // unmarked child is a sandbox no control plane claims,
+                                // so reconciliation leaves it alone rather than tearing
+                                // it down. What it costs is that a fork child started
+                                // by the API half is absent from `ListSandboxes`, and
+                                // would be leaked rather than reclaimed if the control
+                                // plane's record of it were lost.
+                                control_plane_config: Vec::new(),
+                            })
+                            .collect(),
+                        timeout_ms: 0,
+                    }),
+                )
             })
             .await
             .map_err(wire::into_capture_error)?
             .into_inner();
+
+        // 🔴 Read *after* the call, not before it and not from a value
+        // captured earlier: a retry inside the call above may have rebuilt
+        // `self.placed` against a freshly resolved address, and every child
+        // stub this returns must be handed that live connection — the one the
+        // retry, if any, actually used — rather than the one it has already
+        // abandoned.
+        let placed = self.placed().map_err(SandboxCaptureError::recoverable)?;
+        let node = placed.node.clone();
+        let client = placed.client.clone();
 
         // 🔴 One result per spec, in order, or the whole fork is a failure.
         // The caller pairs these positionally with the children it asked for
@@ -981,7 +1236,6 @@ impl SandboxBackend for RemoteSandboxStub {
             )));
         }
 
-        let client = placed.client.clone();
         Ok(response
             .children
             .into_iter()
@@ -1044,19 +1298,29 @@ impl SandboxBackend for RemoteSandboxStub {
         if self.paused {
             return Ok(());
         }
-        let Some(placed) = self.placed.as_mut() else {
+        let Some(placed) = self.placed.as_ref() else {
             // Never started anywhere, so there is nothing to tear down. This is
             // the *only* branch that treats "no sandbox" as success, and it is
             // safe because it is decided from this process's own state rather
             // than from a node's answer.
             return Ok(());
         };
+        let node_id = placed.node.node_id.clone();
 
-        match placed
-            .client
-            .delete(pb::SandboxDeleteRequest {
-                sandbox_id: sandbox_id.to_string(),
-                execution_id: execution_id.to_string(),
+        // 🔴 Retried once, and only when the failure means the call never
+        // reached `node_id` at all — never when it means the node answered.
+        // See `call_with_stale_placement_retry`'s doc, and the module-level
+        // incident this exists to fix: a delete for a sandbox paused before a
+        // rolling node restart can find `self.placed` freshly rebuilt (see
+        // `absent_handle`/`attach`) from a cluster binding cache that has not
+        // yet been reconciled to the restarted node's new address, and every
+        // such delete failed with exactly the transport error this retries.
+        match self
+            .call_with_stale_placement_retry("stop", |client| {
+                Box::pin(client.delete(pb::SandboxDeleteRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                }))
             })
             .await
         {
@@ -1068,9 +1332,8 @@ impl SandboxBackend for RemoteSandboxStub {
             // 🔴 Everything else, including a node that did not answer at all.
             // A stop that reported success because the node was unreachable
             // would take the cluster's last record of a running VM with it.
-            Err(status) => Err(wire::into_error(status)).with_context(|| {
-                format!("stop sandbox {sandbox_id} on node {}", placed.node.node_id)
-            }),
+            Err(status) => Err(wire::into_error(status))
+                .with_context(|| format!("stop sandbox {sandbox_id} on node {node_id}")),
         }
     }
 
@@ -1116,17 +1379,19 @@ impl SandboxBackend for RemoteSandboxStub {
         let encoded = policy
             .map(|policy| wire::serialize(&policy, "network policy"))
             .transpose()?;
-        let placed = self.placed_mut()?;
+        self.placed()?;
 
-        placed
-            .client
-            .update_network(pb::SandboxNetworkRequest {
+        // 🔴 Retried once on a connection that never reached the node at
+        // all — see `call_with_stale_placement_retry`'s doc.
+        self.call_with_stale_placement_retry("update_network_policy", |client| {
+            Box::pin(client.update_network(pb::SandboxNetworkRequest {
                 sandbox_id: sandbox_id.to_string(),
                 execution_id: execution_id.to_string(),
-                network_policy: encoded,
-            })
-            .await
-            .map_err(wire::into_error)?;
+                network_policy: encoded.clone(),
+            }))
+        })
+        .await
+        .map_err(wire::into_error)?;
         Ok(())
     }
 
@@ -1148,17 +1413,19 @@ impl SandboxBackend for RemoteSandboxStub {
         let encoded = params
             .map(|params| wire::serialize(&params, "custom extension params"))
             .transpose()?;
-        let placed = self.placed_mut()?;
+        self.placed()?;
 
-        placed
-            .client
-            .update_params(pb::SandboxParamsRequest {
+        // 🔴 Retried once on a connection that never reached the node at
+        // all — see `call_with_stale_placement_retry`'s doc.
+        self.call_with_stale_placement_retry("update_custom_extension_params", |client| {
+            Box::pin(client.update_params(pb::SandboxParamsRequest {
                 sandbox_id: sandbox_id.to_string(),
                 execution_id: execution_id.to_string(),
-                custom_extension_params: encoded,
-            })
-            .await
-            .map_err(wire::into_error)?;
+                custom_extension_params: encoded.clone(),
+            }))
+        })
+        .await
+        .map_err(wire::into_error)?;
         Ok(())
     }
 }

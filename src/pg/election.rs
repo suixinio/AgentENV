@@ -466,4 +466,109 @@ mod tests {
 
         handle_b.shutdown().await;
     }
+
+    /// The other half of the design's advantage over a Redis-style TTL lock:
+    /// the lock is tied to the leader's actual PostgreSQL session, so killing
+    /// that session out from under it — not asking it to shut down — must
+    /// still free the lock for another competitor, with no lease to wait out.
+    #[tokio::test]
+    async fn killing_the_leaders_backend_lets_another_competitor_take_over() {
+        let pool_a = pool_or_skip!("killing_the_leaders_backend_lets_another_competitor_take_over");
+        let pool_b = pool_or_skip!("killing_the_leaders_backend_lets_another_competitor_take_over");
+        // A third, throwaway pool used only to issue `pg_terminate_backend`
+        // and then probe the lock directly, from a session that isn't the
+        // one being killed.
+        let pool_probe =
+            pool_or_skip!("killing_the_leaders_backend_lets_another_competitor_take_over");
+        let key = next_test_lock_key();
+
+        let leader_pid = Arc::new(tokio::sync::Mutex::new(None::<i32>));
+        let pid_slot = Arc::clone(&leader_pid);
+        let handle_a = spawn_singleton_task_raw(pool_a, key, TICK, move |ctx| {
+            let pid_slot = Arc::clone(&pid_slot);
+            Box::pin(async move {
+                let mut slot = pid_slot.lock().await;
+                if slot.is_none() {
+                    if let Ok(pid) = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *ctx.conn)
+                        .await
+                    {
+                        *slot = Some(pid);
+                    }
+                }
+            })
+        });
+
+        let pid = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = *leader_pid.lock().await {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a should acquire leadership and report its backend pid");
+
+        let mut probe = pool_probe
+            .acquire()
+            .await
+            .expect("acquiring a probe connection should succeed");
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .execute(&mut *probe)
+            .await
+            .expect("terminating the leader's backend should succeed");
+
+        // The core claim under test: PostgreSQL released the session-scoped
+        // advisory lock the instant the leader's backend died — no lease, no
+        // TTL, nothing for anyone to wait out. Proved directly here, on a
+        // probe session distinct from both a and b, and independent of
+        // either of their own polling loops' timing — `pg_terminate_backend`
+        // returning does not guarantee the backend has fully exited yet, so
+        // this polls briefly rather than asserting on the very first try.
+        let lock_and_unlock = timeout(Duration::from_secs(5), async {
+            loop {
+                let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                    .bind(key)
+                    .fetch_one(&mut *probe)
+                    .await
+                    .expect("pg_try_advisory_lock should succeed");
+                if acquired {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        lock_and_unlock
+            .expect("the lock should become acquirable promptly once the leader's backend is dead");
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *probe)
+            .await
+            .expect("releasing the probe's advisory lock should succeed");
+        drop(probe);
+
+        // Stop a's own loop so it cannot race b for re-acquisition below —
+        // the mechanism under test was already proved directly above; this
+        // just isolates b's takeover from a fresh, unrelated race between a
+        // and b's independent polling intervals.
+        handle_a.shutdown().await;
+
+        let became_leader_b = Arc::new(Notify::new());
+        let notify_b = Arc::clone(&became_leader_b);
+        let handle_b = spawn_singleton_task_raw(pool_b, key, TICK, move |_ctx| {
+            let notify_b = Arc::clone(&notify_b);
+            Box::pin(async move {
+                notify_b.notify_one();
+            })
+        });
+
+        timeout(Duration::from_secs(5), became_leader_b.notified())
+            .await
+            .expect("b should take over the lock once a is no longer contesting for it");
+
+        handle_b.shutdown().await;
+    }
 }

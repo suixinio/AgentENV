@@ -71,6 +71,25 @@ impl NodeEndpoint {
     }
 }
 
+/// Whether a node the caller already has an id for is still part of the
+/// cluster, as the placement source's own node registry currently has it.
+///
+/// This is a different question from [`NodePlacement::place_existing`]'s, and
+/// deliberately answered from a different table — see
+/// [`NodePlacement::node_membership`]'s doc for why the two cannot be folded
+/// together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeMembership {
+    /// The registry still lists this node — a fresh heartbeat, or a stale one
+    /// that has not (yet) aged all the way out. The node may yet report back
+    /// on its own.
+    Present,
+    /// The registry holds nothing under this id: explicitly unregistered
+    /// (`UnregisterNode`), or dropped once discovery stopped listing it at
+    /// all. Nothing on this node is coming back to report anything.
+    Gone,
+}
+
 #[async_trait]
 pub trait NodePlacement: Send + Sync + 'static {
     /// A node with room for a new sandbox.
@@ -110,6 +129,35 @@ pub trait NodePlacement: Send + Sync + 'static {
     /// A caller that has not already established which machine it is entitled
     /// to talk to has no business here.
     async fn resolve_node(&self, node_id: &str) -> anyhow::Result<NodeEndpoint>;
+
+    /// Whether a node this caller already has an id for is still part of the
+    /// cluster.
+    ///
+    /// # 🔴 A different question from `place_existing`, and answered from a
+    /// different table
+    ///
+    /// `place_existing` answers from the sandbox-to-node binding — plus its
+    /// heartbeat-roster and paused-registry fallbacks — and its `Ok(None)` is
+    /// reached the moment nothing currently fresh names a holder. A sandbox
+    /// paused or deleted seconds after its own create can trigger that
+    /// entirely legitimately, before the very first heartbeat has had a
+    /// chance to seed the binding; see `NodePlacement::place_existing`'s own
+    /// note on the same shape of answer, and the delete-before-first-heartbeat
+    /// reproduction it exists to keep working. Reading that `Ok(None)` as "the
+    /// node is gone" would forget a sandbox that is very much alive.
+    ///
+    /// This method answers from node discovery instead: whether the node
+    /// itself is still known there, by a heartbeat fresh or merely stale, and
+    /// [`NodeMembership::Gone`] only once discovery has actually stopped
+    /// listing it — explicitly unregistered, or dropped once its heartbeat
+    /// aged out. That is a much stronger claim, and it is the one a caller
+    /// may safely use to conclude a runtime is never coming back on its own.
+    ///
+    /// `Err` means the source could not be asked at all, and every caller
+    /// must treat it exactly like [`NodeMembership::Present`] — not knowing
+    /// is not licence to conclude "gone", the same reasoning
+    /// `place_existing`'s doc gives for keeping `Ok(None)` and `Err` apart.
+    async fn node_membership(&self, node_id: &str) -> anyhow::Result<NodeMembership>;
 
     /// Tells the placement source that a sandbox is now on this node.
     ///
@@ -182,6 +230,14 @@ impl NodePlacement for FixedNodePlacement {
     /// placement source's answer unchecked.
     async fn resolve_node(&self, _node_id: &str) -> anyhow::Result<NodeEndpoint> {
         Ok(self.node.clone())
+    }
+
+    /// Always present. A fixed placement stands in for a cluster with exactly
+    /// one machine, and there is no registry for that one machine to have
+    /// fallen out of — the id is not even checked, for the same reason
+    /// `resolve_node` above does not check it.
+    async fn node_membership(&self, _node_id: &str) -> anyhow::Result<NodeMembership> {
+        Ok(NodeMembership::Present)
     }
 
     /// Nothing to tell: this placement is a constant, and a constant learns

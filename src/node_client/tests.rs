@@ -40,7 +40,7 @@ use crate::types::ExecutionId;
 
 use super::factory::RemoteSandboxBackendFactory;
 use super::paused_state::RemotePausedState;
-use super::placement::{FixedNodePlacement, NodeEndpoint, NodePlacement};
+use super::placement::{FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement};
 use super::wire;
 
 // ---------------------------------------------------------------------------
@@ -920,6 +920,13 @@ impl NodePlacement for ReplacementNodePlacement {
         Ok(self.resolved.clone())
     }
 
+    /// Unused by every test this double serves: they all exercise the stale
+    /// *connection* retry, never a dial that fails outright, so `attach`'s
+    /// membership check is never reached.
+    async fn node_membership(&self, _node_id: &str) -> anyhow::Result<NodeMembership> {
+        Ok(NodeMembership::Present)
+    }
+
     async fn record_placement(
         &self,
         _sandbox_id: crate::types::SandboxId,
@@ -1188,6 +1195,11 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             )
             .await;
             Ok(self.initial.clone())
+        }
+        /// Unused: this test is about the reconnect retry budget, never
+        /// reached from `attach`'s dial-failure path.
+        async fn node_membership(&self, _node_id: &str) -> anyhow::Result<NodeMembership> {
+            Ok(NodeMembership::Present)
         }
         async fn record_placement(
             &self,
@@ -3959,6 +3971,24 @@ struct ClusterPlacement {
     resolves: Option<NodeEndpoint>,
     recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)>>,
     resolve_calls: Mutex<usize>,
+    /// What `node_membership` answers, whatever node it is asked about.
+    /// `Present` by default: a node this test never told to leave the cluster
+    /// has not left it.
+    membership: Mutex<MembershipAnswer>,
+}
+
+/// What `ClusterPlacement::node_membership` answers.
+///
+/// 🔴 A separate type from `NodeMembership` rather than a reuse of it: this
+/// one needs a third face — the placement source could not be asked at all —
+/// that the production type deliberately has no variant for (it lives in
+/// `Err` there instead, the same way `LookupAnswer::Unavailable` stands in for
+/// `place_existing`'s `Err`).
+#[derive(Clone, Copy)]
+enum MembershipAnswer {
+    Present,
+    Gone,
+    Unavailable,
 }
 
 impl ClusterPlacement {
@@ -3972,6 +4002,7 @@ impl ClusterPlacement {
             resolves: Some(node.clone()),
             recorded: Mutex::new(Vec::new()),
             resolve_calls: Mutex::new(0),
+            membership: Mutex::new(MembershipAnswer::Present),
             node,
         })
     }
@@ -4031,6 +4062,12 @@ impl ClusterPlacement {
     fn resolve_calls(&self) -> usize {
         *self.resolve_calls.lock().expect("lock")
     }
+
+    /// Tells this placement what to answer the next time it is asked whether
+    /// its one node is still part of the cluster.
+    fn set_membership(&self, answer: MembershipAnswer) {
+        *self.membership.lock().expect("lock") = answer;
+    }
 }
 
 #[async_trait]
@@ -4061,6 +4098,21 @@ impl NodePlacement for ClusterPlacement {
         self.resolves
             .clone()
             .ok_or_else(|| anyhow::anyhow!("the scheduler could not say where node {node_id} is"))
+    }
+
+    async fn node_membership(&self, node_id: &str) -> anyhow::Result<NodeMembership> {
+        assert_eq!(
+            node_id, self.node.node_id,
+            "asked about the membership of a node this test never placed a sandbox on"
+        );
+        match *self.membership.lock().expect("lock") {
+            MembershipAnswer::Present => Ok(NodeMembership::Present),
+            MembershipAnswer::Gone => Ok(NodeMembership::Gone),
+            MembershipAnswer::Unavailable => anyhow::bail!(
+                "the scheduler could not say whether node {node_id} is still in the cluster: \
+                 unavailable"
+            ),
+        }
     }
 
     async fn record_placement(
@@ -4391,6 +4443,123 @@ async fn a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it() {
             .expect("the node's own record")
             .is_none(),
         "the delete answered success without telling the machine"
+    );
+}
+
+/// A delete forgets a running sandbox's record once the node holding it has
+/// left the cluster — and refuses, exactly as before this change, for as long
+/// as the cluster still lists it.
+///
+/// # 🔴 Three faces over one value: what the placement source says about the
+/// node's own membership once a delete's dial to it fails
+///
+/// * **Face 1 — still listed.** A node whose registry entry is merely stale
+///   is not a node that is gone: it may yet report back on its own, and a
+///   single failed dial is not proof otherwise. This is today's behaviour —
+///   the world before this test's fix — and it is the regression guard: a
+///   build that started forgetting on *any* dial failure, not only a
+///   confirmed-gone one, passes every other face here and fails this one.
+/// * **Face 2 — evicted.** The node's own record is gone from the registry:
+///   explicitly unregistered, or dropped once discovery stopped listing it.
+///   Nothing on it is coming back to report anything, so the sandbox's record
+///   may be forgotten even though the machine itself was never reached again.
+/// * **Face 3 — unanswerable.** The membership question itself could not be
+///   asked. This must land exactly on face 1's answer: not knowing whether a
+///   node is gone is never licence to conclude that it is.
+///
+/// The node is shut down once, before any of the three deletes: every face is
+/// about what the *placement source* says, not about a dial that might
+/// happen to succeed.
+#[tokio::test]
+async fn a_delete_forgets_a_sandbox_only_once_its_node_has_left_the_cluster() {
+    let node = real_node().await;
+    let endpoint = node.endpoint.endpoint.clone();
+    let placement = ClusterPlacement::recording(node.endpoint.clone());
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let started_here = api_replica_on(Arc::clone(&placement), &ledger).await;
+    let landed_elsewhere = api_replica_on(Arc::clone(&placement), &ledger).await;
+
+    let still_listed = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    let evicted = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    let unanswerable = Arc::clone(&started_here)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+
+    // The node is gone for the rest of this test. Every dial from here on
+    // fails identically; what differs across the three faces is only what the
+    // placement source says about the node's own membership.
+    drop(node);
+    wait_until_unreachable(&endpoint).await;
+
+    // Face 1: still listed. Refuse, and keep the record.
+    placement.set_membership(MembershipAnswer::Present);
+    let err = Arc::clone(&landed_elsewhere)
+        .delete_sandbox(still_listed.id)
+        .await
+        .expect_err(
+            "🔴 a node the registry still lists must not be forgotten over one failed dial",
+        );
+    assert!(
+        format!("{err}").contains("could not be reached"),
+        "the refusal did not say why: {err}"
+    );
+    assert_eq!(
+        ledger
+            .0
+            .get(&still_listed.id)
+            .await
+            .expect("read the ledger")
+            .expect("🔴 a still-listed node's sandbox was forgotten anyway")
+            .state,
+        crate::orchestrator::SandboxState::Running,
+        "a refused delete left the record somewhere other than where it found it"
+    );
+
+    // Face 2: evicted from the registry entirely. Forget it.
+    placement.set_membership(MembershipAnswer::Gone);
+    Arc::clone(&landed_elsewhere)
+        .delete_sandbox(evicted.id)
+        .await
+        .expect("🔴 a sandbox on a node confirmed gone from the cluster could not be forgotten");
+    assert!(
+        ledger
+            .0
+            .get(&evicted.id)
+            .await
+            .expect("read the ledger")
+            .is_none(),
+        "a node confirmed gone from the cluster left its sandbox's record behind"
+    );
+
+    // Face 3: the membership question itself could not be answered. Land
+    // exactly on face 1 — refuse, and keep the record.
+    placement.set_membership(MembershipAnswer::Unavailable);
+    let err = Arc::clone(&landed_elsewhere)
+        .delete_sandbox(unanswerable.id)
+        .await
+        .expect_err(
+            "🔴 a delete must not forget a sandbox it could not confirm was gone from the cluster",
+        );
+    assert!(
+        format!("{err}").contains("could not be reached"),
+        "the refusal did not say why: {err}"
+    );
+    assert_eq!(
+        ledger
+            .0
+            .get(&unanswerable.id)
+            .await
+            .expect("read the ledger")
+            .expect("🔴 an unanswerable membership check forgot the sandbox anyway")
+            .state,
+        crate::orchestrator::SandboxState::Running,
     );
 }
 

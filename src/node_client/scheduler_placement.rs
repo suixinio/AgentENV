@@ -27,7 +27,7 @@ use tonic::transport::{Channel, Endpoint};
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::placement::{NodeEndpoint, NodePlacement};
+use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
 
 /// Placement backed by the cluster scheduler.
 pub struct SchedulerNodePlacement {
@@ -196,6 +196,41 @@ impl NodePlacement for SchedulerNodePlacement {
             );
         }
         Ok(resolved)
+    }
+
+    /// Also `GetNode`, and for the same reason `resolve_node` above uses it
+    /// rather than `LookupNode`: this asks about the node's own identity, not
+    /// about which node holds a sandbox.
+    ///
+    /// 🔴 `NotFound` is kept apart from every other failure, the same shape as
+    /// `place_existing`'s `NOT_FOUND` handling above. The scheduler's
+    /// `AtomicNodeRegistry.GetObserved` produces it in exactly one place: the
+    /// node's own record has been dropped from the registry entirely — an
+    /// explicit `UnregisterNode`, or the registry's own discovery no longer
+    /// listing the node at all. A node it merely rates unhealthy — a stale
+    /// heartbeat that has not (yet) aged out of discovery — still answers
+    /// `Ok`, carrying that status in the snapshot this method does not even
+    /// read. Folding every other failure into the same answer `NotFound` gets
+    /// here is what would let a scheduler hiccup be read as a node leaving the
+    /// cluster.
+    async fn node_membership(&self, node_id: &str) -> Result<NodeMembership> {
+        match self
+            .client()
+            .get_node(scheduler::GetNodeRequest {
+                node_id: node_id.to_string(),
+                // See `resolve_node`'s note on the same field, verbatim: blank
+                // means "do not filter by cluster".
+                cluster_id: String::new(),
+            })
+            .await
+        {
+            Ok(_) => Ok(NodeMembership::Present),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(NodeMembership::Gone),
+            Err(status) => bail!(
+                "the scheduler could not say whether node {node_id} is still in the cluster: \
+                 {status}"
+            ),
+        }
     }
 
     async fn record_placement(
@@ -745,5 +780,52 @@ mod against_a_scheduler {
             .await
             .expect_err("a node the scheduler cannot place was resolved anyway");
         assert!(format!("{err}").contains("could not say where"), "{err}");
+    }
+
+    /// A node's cluster membership is a different answer from "is it healthy
+    /// right now" — `NotFound` alone means gone, not merely unhealthy.
+    ///
+    /// 🔴 Three faces over what `GetNode` answers, mirroring the shape
+    /// `place_existing`'s own `NOT_FOUND` handling gets: an ordinary answer, an
+    /// authoritative absence (`NotFound`, produced only once the registry has
+    /// actually dropped the node), and everything else, which must never be
+    /// read as the second. Folding the third into the second is exactly the
+    /// mistake that would let a scheduler hiccup evict a node that never left.
+    #[tokio::test]
+    async fn node_membership_tells_gone_from_merely_unreachable() {
+        let (scripted, placement, _stop) = scheduler_on_a_socket().await;
+
+        scripted.answers_get_node(Ok(scheduler::GetNodeResponse {
+            node: Some(scheduler::ObservedNode {
+                node_id: "node-a".to_string(),
+                endpoint: "http://10.0.0.7:8000".to_string(),
+                ..Default::default()
+            }),
+        }));
+        assert_eq!(
+            placement
+                .node_membership("node-a")
+                .await
+                .expect("the registry answered"),
+            NodeMembership::Present,
+            "a node the registry still lists was read as gone"
+        );
+
+        scripted.answers_get_node(Err(Status::not_found("observed node not found")));
+        assert_eq!(
+            placement
+                .node_membership("node-a")
+                .await
+                .expect("an absent node is an answer, not a failure"),
+            NodeMembership::Gone,
+            "a node the registry has stopped listing was read as still present"
+        );
+
+        scripted.answers_get_node(Err(Status::unavailable("scheduler store unavailable")));
+        let err = placement
+            .node_membership("node-a")
+            .await
+            .expect_err("a scheduler that could not answer was read as a verdict");
+        assert!(format!("{err}").contains("could not say"), "{err}");
     }
 }

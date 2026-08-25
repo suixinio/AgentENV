@@ -218,11 +218,19 @@ spec:
                   name: snapshot-storage-config
                   key: AENV_SNAPSHOT_REPOSITORY_BACKEND
                   optional: true
+            # 🔴 `AENV_API_CONFIG_OVERLAY_PATH`, not the plain
+            # `AENV_CONFIG_OVERLAY_PATH` key the DaemonSet reads — this is the
+            # one place this half's overlay chain diverges from the
+            # DaemonSet's, because it is the only workload that may ever carry
+            # `[pg]`. See the note on AENV_API_CONFIG_OVERLAY_PATH under
+            # snapshot-storage-config in kustomization.yaml for the full
+            # four-file chain and why it could not simply extend the shared
+            # key instead.
             - name: AENV_CONFIG_OVERLAY_PATH
               valueFrom:
                 configMapKeyRef:
                   name: snapshot-storage-config
-                  key: AENV_CONFIG_OVERLAY_PATH
+                  key: AENV_API_CONFIG_OVERLAY_PATH
                   optional: true
             # The two node-local disk budgets, in GiB, read from a ConfigMap
             # because `config/agentenv.toml` does not survive an apply and
@@ -486,13 +494,24 @@ spec:
             - name: backend-credentials
               mountPath: /etc/agentenv/backend
               readOnly: true
+            # The tracked, credential-free half of `[pg]` — same ConfigMap,
+            # same `subPath` caveat as oss-overlay.toml just above.
+            - name: agentenv-config
+              mountPath: /workspace/config/pg-overlay.toml
+              subPath: pg-overlay.toml
+              readOnly: true
+            # The PostgreSQL DSN, and the only place in this tree it comes
+            # from — see pg-credentials below.
+            - name: pg-credentials
+              mountPath: /etc/agentenv/pg
+              readOnly: true
             - name: scratch
               mountPath: /workspace/env
             - name: control-plane-token
               mountPath: /etc/agentenv/control-plane
               readOnly: true
       volumes:
-        # 🔴 The config ConfigMap, an emptyDir and one projected Secret key —
+        # 🔴 The config ConfigMap, an emptyDir and two projected Secret keys —
         # and nothing else. In particular **no `hostPath: /var/lib/aenv` and no
         # `hostPath: /dev`**, both of which the DaemonSet has and both of which
         # would hand this half write access to a machine's local sandbox state
@@ -539,6 +558,29 @@ spec:
             items:
               - key: backend-oss-credentials.toml
                 path: backend-oss.toml
+        # `[pg].dsn` — same reasoning as backend-credentials just above,
+        # `PgConfig` is also read from a file and from nothing else (`[pg]` is
+        # not `#[config(nested)]` and confique gives no `env =` attribute any
+        # power over a struct it does not descend into non-nested), and the
+        # same `optional: true` / missing-file-fails-loudly contract applies.
+        #
+        # A *different* Secret from backend-credentials — `agentenv-postgres`,
+        # not `rustfs-credentials` — because it already exists for
+        # `services/scheduler`'s own `SCHEDULER_REGISTRY_DSN`
+        # (`scheduler-deployment.yaml`) and carries the same database's
+        # credentials; reusing it rather than minting a second Secret for the
+        # same DSN is the point. See the note on AENV_API_CONFIG_OVERLAY_PATH
+        # under snapshot-storage-config in kustomization.yaml for the `kubectl
+        # patch` that adds the `pg-dsn.toml` key this references — it is not
+        # created by anything in this repository, the same gap
+        # backend-oss-credentials.toml has on a fresh cluster.
+        - name: pg-credentials
+          secret:
+            secretName: agentenv-postgres
+            optional: true
+            items:
+              - key: pg-dsn.toml
+                path: pg-dsn.toml
         # The image sets AENV_HOME_PATH=/workspace/env, and the process creates
         # caches under it. On the node that path is the machine's hostPath; here
         # it is scratch with the Pod's own lifetime. If anything this half writes

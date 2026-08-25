@@ -69,6 +69,17 @@ configMapGenerator:
       # on top by AENV_CONFIG_OVERLAY_PATH below. It carries the endpoint, the
       # bucket, the region and the cache budget — never a credential.
       - config/oss-overlay.toml
+      # 🔴 Same reasoning as config/oss-overlay.toml just above, for `[pg]`
+      # instead of `[backend.oss]`: config/default.toml ships an empty `[pg]`
+      # (dsn can never be a real value there — see its own comment), and this
+      # tracked file is the credential-free half. See the note on
+      # AENV_API_CONFIG_OVERLAY_PATH under snapshot-storage-config below for
+      # the second, Secret-projected half and why this one key cannot simply
+      # be appended to AENV_CONFIG_OVERLAY_PATH itself. Read only by
+      # agentenv-api-deployment.yaml — never mounted onto the DaemonSet,
+      # which must never hold `[pg].dsn` at all (`ServerRole::check_pg_dsn`
+      # refuses `--role node` startup outright if it is configured).
+      - config/pg-overlay.toml
   - name: scheduler-k8s-config
     files:
       - config/scheduler.json
@@ -419,6 +430,61 @@ configMapGenerator:
     literals:
       - AENV_SNAPSHOT_REPOSITORY_BACKEND=oss
       - AENV_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml
+      # 🔴 Not AENV_CONFIG_OVERLAY_PATH itself, deliberately, even though it is
+      # read into that exact environment variable by
+      # agentenv-api-deployment.yaml alone. `--role api`/`--role all` is the
+      # only role that may ever hold `[pg]` — `--role node`
+      # (agentenv-daemonset.yaml) reads AENV_CONFIG_OVERLAY_PATH from the key
+      # right above this one, unchanged, and must keep reading exactly that
+      # two-file list forever: `ServerRole::check_pg_dsn` refuses `--role
+      # node` startup outright if `[pg].dsn` is configured at all, and a node
+      # Pod named a pg overlay file it never has mounted would simply fail to
+      # start on a missing file. A plain ConfigMap value cannot be
+      # concatenated declaratively, so api gets its own key with the full
+      # four-file list — including the two the DaemonSet also uses, repeated
+      # here rather than composed, so nothing has to reach across two
+      # ConfigMap keys to know api's actual overlay chain.
+      #
+      # The two new segments, in the same tracked-file-then-Secret order
+      # config/oss-overlay.toml's own comment explains:
+      #   · config/pg-overlay.toml — tracked, no credentials (see its own
+      #     comment in the generator above);
+      #   · pg-dsn.toml — projected from the `agentenv-postgres` Secret,
+      #     the credential alone, listed last so it wins where they overlap.
+      #
+      # 🔴 The Secret needs one key that is not there on a fresh cluster
+      # (same shape of gap as `rustfs-credentials`'s `backend-oss-credentials.toml`
+      # documented above): `agentenv-postgres` already carries the DSN as a
+      # plain string, under `dsn` — `SCHEDULER_REGISTRY_DSN` reads it that
+      # way. `[pg].dsn` needs the *same* value wrapped in TOML, because
+      # AENV_CONFIG_OVERLAY_PATH's files are parsed as config, not read as raw
+      # strings. Add it once, before rolling agentenv-api:
+      #
+      #   NS=agentenv-system
+      #   DSN=$(kubectl -n $NS get secret agentenv-postgres \
+      #        -o jsonpath='{.data.dsn}' | base64 -d)
+      #   T=$(mktemp) && printf '[pg]\ndsn = "%s"\n' "$DSN" > "$T"
+      #   kubectl -n $NS patch secret agentenv-postgres --type merge \
+      #     -p "{\"data\":{\"pg-dsn.toml\":\"$(base64 -w0 "$T")\"}}"
+      #   shred -u "$T"
+      #
+      # Same rollout rule as backend-oss.toml: both new mounts are `subPath`,
+      # so add the Secret key first, then apply, then roll agentenv-api.
+      # Rolling before the key exists fails the Pod at startup (`[pg]` maps
+      # onto a file this manifest names but the Secret does not yet hold —
+      # `optional: true` on the volume means an *absent Secret* mounts an
+      # empty directory and the named file is then missing; the process
+      # refuses to start naming it, which is the loud failure this needs).
+      #
+      # Turning it off is one command and does not touch a manifest:
+      #   kubectl -n agentenv-system set env deploy/agentenv-api \
+      #     AENV_CONFIG_OVERLAY_PATH=
+      # which lands `--role api` back on `config/agentenv.toml` alone —
+      # `[pg]` absent, `[backend.oss]` absent too (the same rollback the
+      # unmodified key above documents), so pair this with re-adding
+      # AENV_SNAPSHOT_REPOSITORY_BACKEND/AENV_CONFIG_OVERLAY_PATH by hand if
+      # only the pg half should go.
+      - AENV_API_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml:/workspace/config/pg-overlay.toml:/etc/agentenv/pg/pg-dsn.toml
   # The two node-local image-cache budgets, in GiB, sized for the *smaller*
   # machine in the fleet.
   #

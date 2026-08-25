@@ -174,6 +174,76 @@ func TestNoObjectStorageCredentialIsCommittedToTheRepository(t *testing.T) {
 	}
 }
 
+// 🔴 `[pg].dsn` is the same shape of hazard as `[backend.oss]`'s credentials,
+// and it needs its own scan: the walk above only looks at sections prefixed
+// `backend.`, so a `dsn` committed under `[pg]` would sail straight past it.
+//
+// Same design as `[backend.oss]`: `config/default.toml` documents `dsn` as a
+// commented-out example (`# dsn = "postgres://user:password@host:5432/dbname"`)
+// and that line is this test's negative control, the same way
+// `# access_key_id` is the object-storage scan's.
+func TestNoPgDsnIsCommittedToTheRepository(t *testing.T) {
+	// 🔴 The non-empty half, ahead of the scan — see the identical note on
+	// TestNoObjectStorageCredentialIsCommittedToTheRepository for why this
+	// control has to come first.
+	planted := tomlAssignments(t, strings.Join([]string{
+		"[pg]",
+		`dsn = "postgres://aenv:SOMETHINGSOMETHING@host:5432/aenv"`,
+	}, "\n"))
+	if got := planted["pg"]["dsn"]; got != "postgres://aenv:SOMETHINGSOMETHING@host:5432/aenv" {
+		t.Fatalf("the scanner cannot see a dsn assignment it is meant to catch: got %q", got)
+	}
+
+	runtimeRaw, err := os.ReadFile(runtimeConfigPath)
+	if err != nil {
+		t.Fatalf("reading the runtime config failed: %v", err)
+	}
+	if !strings.Contains(string(runtimeRaw), "# dsn = ") {
+		t.Fatal("config/default.toml no longer documents [pg] with a commented-out dsn example. " +
+			"That example is this test's negative control: without it, nothing proves the scan " +
+			"below distinguishes documentation from a setting.")
+	}
+
+	repoRoot := filepath.Join(manifestDir, "..", "..", "..")
+	roots := []string{
+		filepath.Join(repoRoot, "config"),
+		filepath.Join(repoRoot, "deploy"),
+	}
+	scanned := 0
+	walk := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() || info.Size() > 512*1024 {
+			return nil
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		scanned++
+		if dsn, found := tomlAssignments(t, string(raw))["pg"]["dsn"]; found && dsn != "" {
+			t.Errorf("%s carries a committed credential: [pg].dsn. Credentials belong in the "+
+				"`agentenv-postgres` Secret, reaching the process as the overlay file "+
+				"AENV_CONFIG_OVERLAY_PATH names — never in a file this repository tracks, and "+
+				"never in the ConfigMap run.sh generates from one.", path)
+		}
+		return nil
+	}
+	for _, root := range roots {
+		if err := filepath.Walk(root, walk); err != nil {
+			t.Fatalf("walking %s failed: %v", root, err)
+		}
+	}
+	if scanned < 20 {
+		t.Fatalf("the credential scan read only %d files; it is not looking at config/ and "+
+			"deploy/ and its clean result means nothing", scanned)
+	}
+}
+
 // 🔴 The repository ships the backend that is safe to fall back to, and says so
 // where the fallback is decided.
 //
@@ -200,12 +270,31 @@ func TestTheRuntimeConfigShipsThePosixFallback(t *testing.T) {
 	}
 }
 
-// The paths listed in the manifests' AENV_CONFIG_OVERLAY_PATH, in the order
-// they are applied.
+// The env var every AENV_CONFIG_OVERLAY_PATH-reading workload except
+// agentenv-api-deployment.yaml is set from.
+//
+// 🔴 Not the literal string `agentenv-api-deployment.yaml` itself reads,
+// because that one is the one place the overlay chain diverges: `--role
+// api`/`--role all` is the only role that may ever hold `[pg]`, so it needs
+// two extra segments (`pg-overlay.toml`, `pg-dsn.toml`) that
+// agentenv-daemonset.yaml must never mount — see the note on
+// AENV_API_CONFIG_OVERLAY_PATH under snapshot-storage-config in
+// kustomization.yaml. [`apiConfigOverlayLiteral`] is its own key for that
+// reason: two ConfigMap literals, resolved separately below, rather than one
+// list every reader is assumed to share.
+const sharedConfigOverlayLiteral = "AENV_CONFIG_OVERLAY_PATH="
+
+// The env var agentenv-api-deployment.yaml alone is set from — see
+// [`sharedConfigOverlayLiteral`]'s own doc.
+const apiConfigOverlayLiteral = "AENV_API_CONFIG_OVERLAY_PATH="
+
+// The paths listed in the manifests against `literal` (one of
+// [`sharedConfigOverlayLiteral`] or [`apiConfigOverlayLiteral`]), in the
+// order they are applied.
 //
 // Empty segments are dropped, the way the loader drops them: a manifest is
 // allowed to write "$(A):$(B)" and clear one half.
-func overlayPathsFromManifests(t *testing.T) []string {
+func overlayPathsFromManifestsFor(t *testing.T, literal string) []string {
 	t.Helper()
 
 	var out []string
@@ -222,7 +311,7 @@ func overlayPathsFromManifests(t *testing.T) []string {
 			if strings.HasPrefix(trimmed, "#") {
 				continue
 			}
-			_, value, found := strings.Cut(trimmed, "AENV_CONFIG_OVERLAY_PATH=")
+			_, value, found := strings.Cut(trimmed, literal)
 			if !found {
 				continue
 			}
@@ -239,6 +328,17 @@ func overlayPathsFromManifests(t *testing.T) []string {
 		t.Fatalf("walking %s failed: %v", manifestDir, err)
 	}
 	return out
+}
+
+// The shared overlay chain — [`sharedConfigOverlayLiteral`] — which is what
+// every caller before AENV_API_CONFIG_OVERLAY_PATH existed meant by "the"
+// overlay path. Kept as the default for callers that are about
+// [backend.oss] specifically: both workloads still read that section from
+// this exact chain, api's included, since AENV_API_CONFIG_OVERLAY_PATH's
+// value starts with the same two segments.
+func overlayPathsFromManifests(t *testing.T) []string {
+	t.Helper()
+	return overlayPathsFromManifestsFor(t, sharedConfigOverlayLiteral)
 }
 
 // True when any manifest sets AENV_SNAPSHOT_REPOSITORY_BACKEND to oss.
@@ -406,11 +506,6 @@ func TestTheOssBackendSwitchIsNeverSetWithoutTheSectionItNeeds(t *testing.T) {
 // is a workload that will not start, and nothing but this notices before the
 // apply.
 func TestEveryWorkloadReadingTheBackendMountsTheOverlaysItNames(t *testing.T) {
-	overlays := overlayPathsFromManifests(t)
-	if len(overlays) == 0 {
-		t.Skip("no manifest sets AENV_CONFIG_OVERLAY_PATH")
-	}
-
 	// A container path counts as mounted when the workload either mounts that
 	// exact file or mounts the directory holding it and projects that name into
 	// it — which is how a Secret key with a different name arrives.
@@ -442,11 +537,29 @@ func TestEveryWorkloadReadingTheBackendMountsTheOverlaysItNames(t *testing.T) {
 		}
 	}
 
-	workloads := []string{"agentenv-api-deployment.yaml", "agentenv-daemonset.yaml"}
-	for _, workload := range workloads {
-		raw, err := os.ReadFile(filepath.Join(manifestDir, workload))
+	// 🔴 Each workload against its *own* overlay chain, not one shared list —
+	// see the note on apiConfigOverlayLiteral for why agentenv-api-deployment.yaml
+	// reads a different ConfigMap key than agentenv-daemonset.yaml does: it is
+	// the only workload that may ever hold `[pg]`, and its chain carries two
+	// segments (pg-overlay.toml, pg-dsn.toml) the DaemonSet must never mount.
+	workloads := []struct {
+		manifest string
+		literal  string
+	}{
+		{"agentenv-daemonset.yaml", sharedConfigOverlayLiteral},
+		{"agentenv-api-deployment.yaml", apiConfigOverlayLiteral},
+	}
+	for _, w := range workloads {
+		overlays := overlayPathsFromManifestsFor(t, w.literal)
+		if len(overlays) == 0 {
+			t.Errorf("no manifest sets %s, so %s's own overlay chain cannot be checked",
+				w.literal, w.manifest)
+			continue
+		}
+
+		raw, err := os.ReadFile(filepath.Join(manifestDir, w.manifest))
 		if err != nil {
-			t.Fatalf("reading %s failed: %v", workload, err)
+			t.Fatalf("reading %s failed: %v", w.manifest, err)
 		}
 		manifest := string(raw)
 
@@ -454,19 +567,40 @@ func TestEveryWorkloadReadingTheBackendMountsTheOverlaysItNames(t *testing.T) {
 			t.Errorf("%s does not read %s. Both halves must resolve snapshots out of the same "+
 				"repository; one on posix_fs while the other is on oss answers \"no such "+
 				"snapshot\" for artifacts that are sitting in the bucket, and reports nothing.",
-				workload, ossBackendEnv)
+				w.manifest, ossBackendEnv)
 		}
-		if !strings.Contains(manifest, "key: AENV_CONFIG_OVERLAY_PATH\n") {
-			t.Errorf("%s does not read AENV_CONFIG_OVERLAY_PATH, so it never sees [backend.oss]",
-				workload)
+		literalKey := strings.TrimSuffix(w.literal, "=")
+		if !strings.Contains(manifest, "key: "+literalKey+"\n") {
+			t.Errorf("%s does not read %s, so it never sees the overlay chain that name promises",
+				w.manifest, literalKey)
 		}
 		for _, overlay := range overlays {
 			if !mounts(manifest, overlay) {
 				t.Errorf("%s is told to read %s and does not mount it. A named overlay that is "+
 					"not on disk stops the process — deliberately, because the alternative is a "+
 					"node that starts on posix_fs with an empty snapshot store.",
-					workload, overlay)
+					w.manifest, overlay)
 			}
+		}
+	}
+
+	// 🔴 And the divergence itself must stay additive. api's chain has to be a
+	// strict superset of the shared one — the two segments both workloads need
+	// for [backend.oss] — never a replacement for it: losing that would mean
+	// api quietly stopped resolving snapshots from the same repository the
+	// DaemonSet does, the moment somebody edited AENV_API_CONFIG_OVERLAY_PATH
+	// and dropped a segment instead of adding to it.
+	shared := overlayPathsFromManifestsFor(t, sharedConfigOverlayLiteral)
+	apiChain := overlayPathsFromManifestsFor(t, apiConfigOverlayLiteral)
+	apiSet := map[string]bool{}
+	for _, seg := range apiChain {
+		apiSet[seg] = true
+	}
+	for _, seg := range shared {
+		if !apiSet[seg] {
+			t.Errorf("agentenv-api-deployment.yaml's own overlay chain (%v) is missing %q, which "+
+				"the shared AENV_CONFIG_OVERLAY_PATH chain (%v) carries — api would stop seeing "+
+				"[backend.oss] the way the DaemonSet does", apiChain, seg, shared)
 		}
 	}
 }

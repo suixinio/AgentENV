@@ -1,0 +1,23 @@
+# The credential-free half of `[pg]`, layered over `config/agentenv.toml` by
+# AENV_CONFIG_OVERLAY_PATH — same split as `oss-overlay.toml`'s, for the same
+# reason: `config/default.toml` ships an empty `[pg]` (see its own comment on
+# why `dsn` can never be a real value there), and this file is where anything
+# in `PgConfig` other than `dsn` gets a tracked, reviewable home instead of
+# living only in a live ConfigMap one `make k8s-apply` away from reverting.
+#
+# 🔴 No credential is in this file, and none may ever be added — `dsn` is the
+# only field `PgConfig` has that is one, and it comes from the second overlay:
+# the `agentenv-postgres` Secret's `pg-dsn.toml` key, projected as a file and
+# listed *after* this one in AENV_CONFIG_OVERLAY_PATH — see the note on
+# snapshot-storage-config in `deploy/k8s/base/kustomization.yaml` for how it
+# gets there. `TestNoPgDsnIsCommittedToTheRepository`
+# (`services/shared/config`) fails if `dsn` ever appears in a tracked file.
+#
+# Empty today: `max_connections` (default 8 per replica) and
+# `connect_timeout_secs` (default 5) have not needed a cluster-specific value
+# yet. Uncomment and set them here, not in the Secret, the day one does — see
+# `config/default.toml`'s own `[pg]` section for what each one means.
+#
+# [pg]
+# max_connections = 8
+# connect_timeout_secs = 5

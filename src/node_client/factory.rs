@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::proto::node as pb;
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend,
-    SandboxBackendFactory, SandboxLaunchConfig,
+    SandboxBackendFactory, SandboxLaunchConfig, UnresolvedImageBuildSpec,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
@@ -153,7 +153,94 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             execution_id,
             resources,
             Arc::clone(&self.placement),
-            PendingLaunch::FromSnapshot {
+            PendingLaunch::Launch {
+                request: Box::new(request),
+            },
+        )))
+    }
+
+    /// The cold-create counterpart of [`build_from_snapshot`](Self::build_from_snapshot)
+    /// above: builds the same kind of pending `Create` request, from a
+    /// `Source::Image` instead of a `Source::Snapshot`.
+    ///
+    /// # 🔴 Why this one does not refuse
+    ///
+    /// [`build`](Self::build) above refuses because the [`FreshSandboxBuildSpec`]
+    /// it is handed has already lost the user's image reference to local
+    /// resolution. [`UnresolvedImageBuildSpec`] is the type that exists so
+    /// that does not happen here: `--role api`'s `sandboxes_cold_post`
+    /// constructs one instead of resolving anything, and everything in it —
+    /// the reference, the attached drives' references, the already-computed
+    /// resources — travels to the node as-is. The node resolves it, the same
+    /// way a local cold create resolves it before ever reaching a factory.
+    fn build_from_image_ref(
+        &self,
+        spec: UnresolvedImageBuildSpec,
+        launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        let resources = spec.resources;
+        let attached_drives = spec
+            .attached_drives
+            .iter()
+            .map(|drive| pb::AttachedDrive {
+                image_ref: drive.image_ref.clone(),
+                mount_path: drive.mount_path.display().to_string(),
+                drive_id: drive.drive_id.clone(),
+                read_only: drive.read_only,
+                sub_path: drive
+                    .sub_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                virtual_size_bytes: drive.virtual_size.unwrap_or_default(),
+            })
+            .collect();
+
+        let request = pb::SandboxCreateRequest {
+            sandbox_id: launch_config.sandbox_id.to_string(),
+            execution_id: execution_id.to_string(),
+            source: Some(pb::sandbox_create_request::Source::Image(pb::ImageSource {
+                image_ref: spec.image_ref,
+                resources: Some(pb::SandboxResources {
+                    cpu_count: resources.cpu_count,
+                    memory_mib: resources.memory_mib,
+                    disk_size_mib: resources.disk_size_mib,
+                }),
+                attached_drives,
+                extra_boot_args: spec.extra_boot_args.unwrap_or_default(),
+            })),
+            // 🔴 Same reasoning as `build_from_snapshot`'s `expiry`, verbatim:
+            // this orchestrator keeps the deadline, so the node keeps none.
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
+            timeout_action: pb::TimeoutAction::Pause as i32,
+            auto_resume: false,
+            secure: launch_config.envd_access_token.is_some(),
+            user_metadata: Default::default(),
+            env_vars: launch_config.env_vars.clone().unwrap_or_default(),
+            network_policy: launch_config
+                .network
+                .as_ref()
+                .map(|policy| wire::serialize(policy, "network policy"))
+                .transpose()?,
+            custom_extension_params: launch_config
+                .custom_extension_params
+                .as_ref()
+                .map(|params| wire::serialize(params, "custom extension params"))
+                .transpose()?,
+            // See `build_from_snapshot`'s note on the same field: written by
+            // `Orchestrator::stamp_control_plane_ownership`, not here.
+            control_plane_config: launch_config.control_plane_config.unwrap_or_default(),
+        };
+
+        Ok(Box::new(RemoteSandboxStub::pending(
+            launch_config.sandbox_id,
+            execution_id,
+            resources,
+            Arc::clone(&self.placement),
+            PendingLaunch::Launch {
                 request: Box::new(request),
             },
         )))

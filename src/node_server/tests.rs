@@ -1291,6 +1291,7 @@ async fn a_fork_answers_each_child_with_the_facts_of_its_own_vm() {
     behavior.set_runtime_info(SandboxRuntimeInfo {
         rootfs_virtual_size: Some(ROOTFS_WHEN_THE_SOURCE_STARTED),
         runtime_artifacts: RuntimeArtifactSet::empty(),
+        ..Default::default()
     });
     let (orchestration, service) =
         service_with(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
@@ -1316,6 +1317,7 @@ async fn a_fork_answers_each_child_with_the_facts_of_its_own_vm() {
     behavior.set_runtime_info(SandboxRuntimeInfo {
         rootfs_virtual_size: Some(ROOTFS_BY_THE_TIME_IT_FORKED),
         runtime_artifacts: RuntimeArtifactSet::empty(),
+        ..Default::default()
     });
 
     let answered = service
@@ -1440,6 +1442,7 @@ async fn describe_answers_for_a_sandbox_the_listing_leaves_out() {
     behavior.set_runtime_info(SandboxRuntimeInfo {
         rootfs_virtual_size: Some(ROOTFS_WHEN_IT_STARTED),
         runtime_artifacts: RuntimeArtifactSet::empty(),
+        ..Default::default()
     });
     let (orchestration, service) =
         service_with(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
@@ -1477,6 +1480,7 @@ async fn describe_answers_for_a_sandbox_the_listing_leaves_out() {
     behavior.set_runtime_info(SandboxRuntimeInfo {
         rootfs_virtual_size: Some(ROOTFS_BY_THE_TIME_IT_WAS_ASKED),
         runtime_artifacts: RuntimeArtifactSet::empty(),
+        ..Default::default()
     });
 
     let described_marked = describe(&service, marked.id)

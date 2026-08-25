@@ -31,9 +31,9 @@ use tracing::{debug, info, warn};
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
 use crate::sandbox::{
-    CapturedSandboxSnapshot, CustomExtensionParams, PausedSandboxCapture, RuntimeArtifactSet,
-    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxNetworkPolicy, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, CustomExtensionParams, PausedSandboxCapture, ResolvedImageFacts,
+    RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
+    SandboxForkResult, SandboxForkSpec, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
@@ -50,7 +50,12 @@ use std::sync::Arc;
 /// it to create the sandbox both happen in `start`, and that is the property
 /// that lets a remote factory satisfy a trait written for a local one.
 pub(super) enum PendingLaunch {
-    FromSnapshot {
+    /// A `Create` request built and ready to send — from a `Source::Snapshot`
+    /// or a `Source::Image`, whichever `SandboxBackendFactory::build_from_snapshot`
+    /// or `build_from_image_ref` built it as. `start` treats the two exactly
+    /// alike: neither carries anything this process needs to interpret before
+    /// sending it.
+    Launch {
         request: Box<pb::SandboxCreateRequest>,
     },
     /// A paused sandbox to be reopened on the machine that holds its capture.
@@ -113,6 +118,16 @@ struct Placed {
     client: NodeSandboxServiceClient<Channel>,
     host_interaction_ip: Option<Ipv4Addr>,
     rootfs_virtual_size: Option<u64>,
+    /// Set only by [`start`](RemoteSandboxStub::start)'s image-source arm,
+    /// decoded from the node's `Create` reply: this process built the request
+    /// from an [`UnresolvedImageBuildSpec`][crate::sandbox::UnresolvedImageBuildSpec]
+    /// and so had no context or image configs of its own to put in the
+    /// orchestrator's transitional record. `None` everywhere else — a
+    /// snapshot-source create, an attach, and a resume all start from a
+    /// record that already carries the right values, and re-deriving them
+    /// here would be a second copy to keep in step. See
+    /// [`SandboxRuntimeInfo::resolved_image_facts`].
+    resolved_image_facts: Option<ResolvedImageFacts>,
 }
 
 /// What a machine reports about a sandbox it is running.
@@ -168,6 +183,10 @@ impl RemoteSandboxStub {
                 host_interaction_ip: wire::host_ip(&ack.host_interaction_ip),
                 rootfs_virtual_size: (ack.rootfs_virtual_size > 0)
                     .then_some(ack.rootfs_virtual_size),
+                // This constructor is for a fork child: the caller already
+                // has the parent's context and image configs locally, so
+                // there is nothing here for the orchestrator to patch.
+                resolved_image_facts: None,
             }),
         }
     }
@@ -264,6 +283,10 @@ impl RemoteSandboxStub {
             client,
             host_interaction_ip: facts.host_interaction_ip,
             rootfs_virtual_size: facts.rootfs_virtual_size,
+            // Attaching to a sandbox this process never started: whatever
+            // record it has is the one the orchestrator already trusts, and
+            // this call learns nothing new about it.
+            resolved_image_facts: None,
         });
         Ok(())
     }
@@ -549,6 +572,9 @@ impl RemoteSandboxStub {
             host_interaction_ip: wire::host_ip(&started.host_interaction_ip),
             rootfs_virtual_size: (started.rootfs_virtual_size > 0)
                 .then_some(started.rootfs_virtual_size),
+            // A resume reopens the record the pause left behind, which
+            // already carries the sandbox's context and image configs.
+            resolved_image_facts: None,
         });
         Ok(())
     }
@@ -666,6 +692,10 @@ impl RemoteSandboxStub {
             client,
             host_interaction_ip: stale.host_interaction_ip,
             rootfs_virtual_size: stale.rootfs_virtual_size,
+            // Carried over rather than dropped: a re-resolve is a reconnect,
+            // not a new placement, and whatever this stub had already learned
+            // stays true of the same sandbox.
+            resolved_image_facts: stale.resolved_image_facts,
         });
         Ok(())
     }
@@ -853,6 +883,29 @@ impl RemoteSandboxStub {
 /// caller's ordinary, unretried RPC.
 pub(super) const STALE_PLACEMENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
+/// Decodes a `Create` reply's resolved context and image configs, when the
+/// node sent both.
+///
+/// 🔴 `Ok(None)` covers an older node that predates these fields as well as
+/// one that, for whatever reason, sent only one of the two — both are read
+/// the same way a missing field is read everywhere else on this service: as
+/// "nothing to patch", not as a partial answer to trust half of.
+fn decode_resolved_image_facts(
+    ack: &pb::SandboxCreateResponse,
+) -> Result<Option<ResolvedImageFacts>> {
+    let context: Option<crate::snapshot::CommandContext> =
+        wire::serialized(ack.context.as_ref(), "resolved context")?;
+    let image_configs: Option<crate::types::ImageConfigs> =
+        wire::serialized(ack.image_configs.as_ref(), "resolved image configs")?;
+    Ok(match (context, image_configs) {
+        (Some(context), Some(image_configs)) => Some(ResolvedImageFacts {
+            context,
+            image_configs,
+        }),
+        _ => None,
+    })
+}
+
 #[async_trait]
 impl SandboxBackend for RemoteSandboxStub {
     fn execution_id(&self) -> ExecutionId {
@@ -868,7 +921,7 @@ impl SandboxBackend for RemoteSandboxStub {
             // 🔴 Nothing is started here. The sandbox is up; what this call
             // does is find out where.
             PendingLaunch::Attach => return self.attach().await,
-            PendingLaunch::FromSnapshot { request } => (**request).clone(),
+            PendingLaunch::Launch { request } => (**request).clone(),
             PendingLaunch::Resume {
                 request,
                 origin_node_id,
@@ -925,11 +978,31 @@ impl SandboxBackend for RemoteSandboxStub {
         // going away.
         self.announce_placement(&node).await;
 
+        // 🔴 Best-effort, like `host_ip` just above: the sandbox is already up
+        // on the node by this point, and failing the whole create over a
+        // decode problem in this one reply field would trade a working
+        // sandbox for none. See `resolved_image_facts` on `Placed`.
+        let resolved_image_facts = match decode_resolved_image_facts(&ack) {
+            Ok(facts) => facts,
+            Err(err) => {
+                warn!(
+                    sandbox_id = %self.sandbox_id,
+                    node = %node.node_id,
+                    error = %format_args!("{err:#}"),
+                    "could not decode the node's resolved context/image configs; the sandbox is \
+                     up, but the orchestrator's own record of it may show stale context until \
+                     this sandbox is next paused and republished"
+                );
+                None
+            }
+        };
+
         self.placed = Some(Placed {
             node,
             client,
             host_interaction_ip: wire::host_ip(&ack.host_interaction_ip),
             rootfs_virtual_size: (ack.rootfs_virtual_size > 0).then_some(ack.rootfs_virtual_size),
+            resolved_image_facts,
         });
         Ok(())
     }
@@ -1351,6 +1424,10 @@ impl SandboxBackend for RemoteSandboxStub {
                 .and_then(|placed| placed.rootfs_virtual_size),
             // See the table at the top of this file.
             runtime_artifacts: RuntimeArtifactSet::empty(),
+            resolved_image_facts: self
+                .placed
+                .as_ref()
+                .and_then(|placed| placed.resolved_image_facts.clone()),
         }
     }
 

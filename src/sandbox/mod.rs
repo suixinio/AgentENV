@@ -21,9 +21,9 @@ use crate::types::{ImageConfigs, SandboxId};
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
-    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult,
-    SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, ResolvedImageFacts,
+    RuntimeArtifactSet, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use extra_drive::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
@@ -45,6 +45,52 @@ pub struct FreshSandboxBuildSpec {
     pub context: crate::snapshot::CommandContext,
     pub resources: crate::types::SandboxResources,
     pub extra_drives: Vec<ExtraDrive>,
+    pub extra_boot_args: Option<String>,
+}
+
+/// One attached drive named by an OCI image reference nobody has resolved
+/// yet.
+///
+/// # 🔴 The unresolved counterpart to [`ExtraDrive::Overlaybd`]
+///
+/// `ExtraDrive` carries an `image_config_path` — a path on the local disk an
+/// `ImageResolver` already wrote. This carries the reference that path would
+/// have come from, because the machine building the request
+/// (`--role api`, which has no `regctl`) is not the machine that gets to
+/// resolve it. See [`UnresolvedImageBuildSpec`] and
+/// `SandboxLaunchSource::UnresolvedImage`.
+#[derive(Clone, Debug)]
+pub struct UnresolvedAttachedDrive {
+    pub image_ref: String,
+    pub drive_id: String,
+    pub mount_path: PathBuf,
+    pub sub_path: Option<PathBuf>,
+    pub read_only: bool,
+    /// Already converted to bytes from the REST API's `diskSizeMB`, exactly
+    /// as [`ExtraDrive::Overlaybd::virtual_size`] carries it. `None` when the
+    /// caller named no size, in which case the node that resolves this drive
+    /// falls back to the source image's own size, same as a local cold create
+    /// does today.
+    pub virtual_size: Option<u64>,
+}
+
+/// A sandbox to build from an OCI image reference nobody has resolved yet.
+///
+/// # 🔴 The unresolved counterpart to [`FreshSandboxBuildSpec`]
+///
+/// `FreshSandboxBuildSpec` is handed to a factory that resolves images
+/// locally and can turn a reference into a local overlaybd path itself. A
+/// factory whose sandboxes run on another machine (`RemoteSandboxBackendFactory`)
+/// cannot do that — resolving an image needs `regctl`, and `--role api` has
+/// none — so it needs the reference, not a path, to hand to the machine that
+/// will. `resources` is unaffected: computing the sandbox's CPU/memory/disk
+/// request needs no image, so it is resolved locally either way and travels
+/// here already concrete, exactly like `FreshSandboxBuildSpec::resources`.
+#[derive(Clone, Debug)]
+pub struct UnresolvedImageBuildSpec {
+    pub image_ref: String,
+    pub resources: crate::types::SandboxResources,
+    pub attached_drives: Vec<UnresolvedAttachedDrive>,
     pub extra_boot_args: Option<String>,
 }
 

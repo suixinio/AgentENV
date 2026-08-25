@@ -459,6 +459,10 @@ impl SandboxBackend for FirecrackerSandbox {
             runtime_artifacts: RuntimeArtifactSet::from_overlaybd_image_configs(
                 self.runtime_image_config_paths(),
             ),
+            // This backend resolves its image before it is ever built (see
+            // `FreshSandboxBuildSpec`), so the orchestrator's transitional
+            // record already carries the right context and image configs.
+            resolved_image_facts: None,
         }
     }
 

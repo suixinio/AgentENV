@@ -24,11 +24,22 @@ struct PendingAttachedDrive {
     image: String,
 }
 
-/// Resolves attached drive declarations into `ResolvedAttachedDrive` values ready for sandbox launch.
-pub(super) async fn resolve_attached_drives(
+/// Validates and deduplicates attached drive declarations, without resolving
+/// any of their source images.
+///
+/// # 🔴 Deliberately split out of [`resolve_attached_drives`]
+///
+/// Everything here is pure input validation — drive id shape, mount path
+/// shape, sub-path shape, uniqueness, `diskSizeMB`'s bounds — and needs no
+/// registry access. `sandboxes_cold_post` on `--role api` cannot resolve an
+/// image (no `regctl`), but it can and must still run these same checks
+/// before it ever asks a node to: a caller sending a malformed drive should
+/// get a 400 from the machine it talked to, not a registry round trip on
+/// another machine followed by a refusal that says nothing about the request.
+/// See [`unresolved_attached_drives`], this function's other caller.
+fn validate_attached_drives(
     drives: &[models::AttachedDrive],
-    image_resolver: &ImageResolver,
-) -> Result<Vec<ResolvedAttachedDrive>, models::Error> {
+) -> Result<Vec<PendingAttachedDrive>, models::Error> {
     let mut pending = Vec::with_capacity(drives.len());
     let mut drive_ids = HashSet::new();
     let mut mount_paths = HashSet::new();
@@ -92,6 +103,16 @@ pub(super) async fn resolve_attached_drives(
         });
     }
 
+    Ok(pending)
+}
+
+/// Resolves attached drive declarations into `ResolvedAttachedDrive` values ready for sandbox launch.
+pub(super) async fn resolve_attached_drives(
+    drives: &[models::AttachedDrive],
+    image_resolver: &ImageResolver,
+) -> Result<Vec<ResolvedAttachedDrive>, models::Error> {
+    let pending = validate_attached_drives(drives)?;
+
     let resolved_images = futures::future::try_join_all(pending.iter().map(|drive| async move {
         image_resolver
             .resolve(&drive.image)
@@ -131,6 +152,30 @@ pub(super) async fn resolve_attached_drives(
     }
 
     Ok(resolved)
+}
+
+/// The `--role api` counterpart of [`resolve_attached_drives`]: validates the
+/// same way, but leaves every drive's image reference unresolved for the node
+/// that will build the sandbox to resolve instead.
+///
+/// 🔴 Used only when `!role.runs_sandbox_runtime()` — see
+/// `sandboxes_cold_post`'s role branch. A role that can resolve images itself
+/// always takes `resolve_attached_drives`, unchanged.
+pub(super) fn unresolved_attached_drives(
+    drives: &[models::AttachedDrive],
+) -> Result<Vec<crate::sandbox::UnresolvedAttachedDrive>, models::Error> {
+    let pending = validate_attached_drives(drives)?;
+    Ok(pending
+        .into_iter()
+        .map(|drive| crate::sandbox::UnresolvedAttachedDrive {
+            image_ref: drive.image,
+            drive_id: drive.drive_id,
+            mount_path: drive.mount_path,
+            sub_path: drive.sub_path,
+            read_only: drive.read_only,
+            virtual_size: drive.virtual_size,
+        })
+        .collect())
 }
 
 fn bad_request(err: anyhow::Error) -> models::Error {

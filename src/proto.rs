@@ -177,6 +177,76 @@ mod node_wire_tests {
             .is_empty());
     }
 
+    /// The fields added for an unresolved-image `Create` — `AttachedDrive`'s
+    /// `sub_path`/`virtual_size_bytes` and `SandboxCreateResponse`'s
+    /// `context`/`image_configs` — keep the numbers they were assigned.
+    ///
+    /// 🔴 Same rationale as `the_staging_fields_keep_their_wire_numbers`
+    /// above: nothing that touches the Rust tree alone can catch a
+    /// renumbering here, both ends of this service are built from the same
+    /// file, and a renumbering only misbehaves against a peer built before
+    /// it — a rolling upgrade, which is how this control plane deploys.
+    #[test]
+    fn the_unresolved_image_create_fields_keep_their_wire_numbers() {
+        // Tag 5, wire type 2 (length-delimited string): 5 << 3 | 2 == 0x2a.
+        let sub_path = pb::AttachedDrive {
+            image_ref: String::new(),
+            mount_path: String::new(),
+            drive_id: String::new(),
+            read_only: false,
+            sub_path: "workspace/data".to_string(),
+            virtual_size_bytes: 0,
+        };
+        assert_eq!(
+            sub_path.encode_to_vec().first().copied(),
+            Some(0x2a),
+            "AttachedDrive.sub_path moved off field 5"
+        );
+
+        // Tag 6, wire type 0 (varint): 6 << 3 | 0 == 0x30.
+        let virtual_size = pb::AttachedDrive {
+            image_ref: String::new(),
+            mount_path: String::new(),
+            drive_id: String::new(),
+            read_only: false,
+            sub_path: String::new(),
+            virtual_size_bytes: 2 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(
+            virtual_size.encode_to_vec().first().copied(),
+            Some(0x30),
+            "AttachedDrive.virtual_size_bytes moved off field 6"
+        );
+
+        assert!(pb::AttachedDrive::default().encode_to_vec().is_empty());
+
+        // Tag 8, wire type 2 (length-delimited message): 8 << 3 | 2 == 0x42.
+        let context = pb::SandboxCreateResponse {
+            context: Some(pb::SerializedValue::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            context.encode_to_vec().first().copied(),
+            Some(0x42),
+            "SandboxCreateResponse.context moved off field 8"
+        );
+
+        // Tag 9, wire type 2 (length-delimited message): 9 << 3 | 2 == 0x4a.
+        let image_configs = pb::SandboxCreateResponse {
+            image_configs: Some(pb::SerializedValue::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            image_configs.encode_to_vec().first().copied(),
+            Some(0x4a),
+            "SandboxCreateResponse.image_configs moved off field 9"
+        );
+
+        assert!(pb::SandboxCreateResponse::default()
+            .encode_to_vec()
+            .is_empty());
+    }
+
     /// A peer built before `staging_error` existed still parses a reply that
     /// carries one, and reads it as the pause it is.
     ///

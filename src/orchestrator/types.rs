@@ -22,6 +22,29 @@ pub enum SandboxLaunchSource {
         /// Raw source image config metadata for the sandbox's resolved images.
         image_configs: Box<ImageConfigs>,
     },
+    /// A cold create from an OCI image reference this orchestrator cannot
+    /// resolve itself.
+    ///
+    /// # 🔴 The unresolved counterpart to [`Self::Image`]
+    ///
+    /// `Image` above carries a `regctl`-resolved local path — what a
+    /// machine-local cold create (`--role all` / `--role node`) already has by
+    /// the time it builds a launch source. `--role api` has no `regctl`, so
+    /// `sandboxes_cold_post` cannot produce that variant at all when
+    /// `!role.runs_sandbox_runtime()`; this is what it builds instead. It
+    /// carries only what is known without an image resolver: the reference
+    /// itself, the already-computed resources (no image needed to size a
+    /// sandbox), and attached drives named by reference rather than by local
+    /// path. `create_sandbox_inner` routes it to
+    /// `SandboxBackendFactory::build_from_image_ref`, whose only real
+    /// implementation (`RemoteSandboxBackendFactory`) ships it to a node that
+    /// *can* resolve it.
+    UnresolvedImage {
+        image_ref: String,
+        resources: crate::types::SandboxResources,
+        attached_drives: Vec<crate::sandbox::UnresolvedAttachedDrive>,
+        extra_boot_args: Option<String>,
+    },
 }
 
 /// Who keeps a new sandbox's deadline, and — when it is this orchestrator —

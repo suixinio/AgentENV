@@ -248,6 +248,19 @@ message AttachedDrive {
   string mount_path = 2;
   string drive_id = 3;
   bool read_only = 4;
+  // Sub-path inside the drive root to bind-mount onto mount_path, exactly as
+  // `ExtraDrive::Overlaybd::sub_path` carries it once resolved. Empty means
+  // none — the REST API's own `subPath` is optional and an absent one means
+  // the same thing.
+  string sub_path = 5;
+  // The block device's requested virtual size in bytes, already converted
+  // from the REST API's `diskSizeMB` (see `ExtraDrive::Overlaybd::virtual_size`).
+  // Sent as bytes rather than megabytes so the node applies exactly the value
+  // the caller validated, instead of re-deriving it from a rounder unit. 0
+  // means unset: the node resolves the source image's own size while
+  // materializing the runtime device, the same fallback a local cold create
+  // already uses when the caller names no size.
+  uint64 virtual_size_bytes = 6;
 }
 
 // Marker: the node keeps the deadline and the caller named none, so the node's
@@ -388,6 +401,23 @@ message SandboxCreateResponse {
   int64 started_at_ms = 6;
   // 0 means the sandbox has no expiry.
   int64 expires_at_ms = 7;
+
+  // The sandbox's context and image configs, as this node's own record of the
+  // now-running sandbox has them — `SandboxMetadata::context` /
+  // `::image_configs`, as `CommandContext` / `ImageConfigs` serialise. Sent
+  // unconditionally, for every source, so one field is one answer rather than
+  // two depending on which oneof arm asked.
+  //
+  // 🔴 Read only by a `Source::Image` caller in practice. A `Source::Snapshot`
+  // caller already resolved the committed snapshot itself before sending this
+  // request, so its own transitional record already carries the same values
+  // and applying these again is a no-op. `Source::Image` is the caller that
+  // needs them: resolving an unresolved reference is what *this call* just
+  // did, on a different machine than the caller, so the caller had nothing of
+  // its own to put in its transitional record until this reply arrived. See
+  // `SandboxRuntimeInfo::resolved_image_facts`.
+  SerializedValue context = 8;
+  SerializedValue image_configs = 9;
 }
 
 // ---------------------------------------------------------------------------

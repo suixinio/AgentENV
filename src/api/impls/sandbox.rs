@@ -7,7 +7,7 @@ use axum_extra::extract::CookieJar;
 use headers::Host;
 use http::Method;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
@@ -24,7 +24,7 @@ use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
-use super::attached_drives::resolve_attached_drives;
+use super::attached_drives::{resolve_attached_drives, unresolved_attached_drives};
 use super::pagination::PaginationCursor;
 use super::paused_recovery::{CrossNodeResume, MissingLocalResume, ResumeArbitration};
 use super::ApiImpl;
@@ -454,106 +454,11 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
-        // 🔴 First, ahead of the image resolver, because the resolver is what
-        // was answering instead. A cold start's first act is to resolve
-        // `body.image` on the machine serving this call: `regctl` fetches the
-        // manifest, pulls the blobs and converts them into a local overlaybd
-        // image, which is then handed to a local Firecracker VM. The `api` Pod
-        // installs no `regctl` — by design, that is a node's tooling — so the
-        // very first step failed with `regctl is required for OCI registry
-        // access: {deps}/regctl/.../regctl` and returned, and the caller was
-        // told a registry tool was missing rather than that this half cannot
-        // cold-start at all.
-        //
-        // Worse, the refusal that *does* say it — the one in
-        // `RemoteSandboxBackendFactory::build`, which is where a cold create
-        // runs out of road because the build spec it is handed no longer
-        // carries the user's image reference — sits behind that resolve and so
-        // was structurally unreachable on `--role api`. This gate is what makes
-        // the answer the role's rather than the toolchain's; that `bail!` stays
-        // as the backstop for any caller that gets there another way.
-        //
-        // Nothing has been resolved, allocated or created at this point, so
-        // there is nothing to roll back.
-        if !self.role().runs_sandbox_runtime() {
-            warn!(
-                image = %body.image,
-                role = self.role().as_str(),
-                "refused a cold sandbox create: this role runs no sandbox runtime"
-            );
-            return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                Self::error(
-                    // 🔴 500 because it is the only code this operation
-                    // declares that means "this server, not your request"
-                    // (`src/api/openapi.yml`: 201/400/401/500). The request is
-                    // well-formed and would work verbatim against the other
-                    // half, so 400 would blame the caller for the deployment's
-                    // shape; 501 and 503 say it better and neither is in the
-                    // schema. The cost is that this refusal and a genuine
-                    // resolve failure share a status code — which is why the
-                    // test below discriminates on whether the image resolver
-                    // ran, not on the code.
-                    500,
-                    "cold sandbox creation is not available on --role api: a cold start resolves \
-                     the OCI image on the machine that serves this call — regctl pulls and \
-                     converts the layers into a local overlaybd image, which is then handed to a \
-                     local Firecracker VM — and this process has no regctl, no /dev/kvm and no \
-                     ublk. Create the sandbox from a template or snapshot with POST /sandboxes, \
-                     which this half does place on a node; for a cold start, run this call \
-                     against a server started with --role all. A --role node server answers this \
-                     route with 404, so there is no node for this one to forward it to. Nothing \
-                     was created.",
-                ),
-            ));
-        }
-
-        let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
-        // TODO: Move cold-start image resolution into an async create operation
-        // once the API supports 202 Accepted + status polling.
-        let resolved_rootfs = match timer
-            .time("resolve_rootfs", image_resolver.resolve(&body.image))
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) if err.is_user_error() => {
-                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                    Self::error(400, err.to_string()),
-                ));
-            }
-            Err(err) => {
-                warn!(error = %format_args!("{err:#}"), image = %body.image, "failed to resolve sandbox rootfs image");
-                return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                    Self::error(
-                        500,
-                        format!("resolve sandbox rootfs image '{}': {err:#}", body.image),
-                    ),
-                ));
-            }
-        };
+
         let resources = match cold_start_resources(body) {
             Ok(resources) => resources,
             Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
-        };
-        let resolved_attached = match timer
-            .time(
-                "resolve_attached_drives",
-                resolve_attached_drives(
-                    body.attached_drives.as_deref().unwrap_or_default(),
-                    image_resolver.as_ref(),
-                ),
-            )
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                warn!(error = %err.message, "failed to resolve attached drives");
-                return Ok(Self::client_or_server_response(
-                    err,
-                    SandboxesColdPostResponse::Status400_BadRequest,
-                    SandboxesColdPostResponse::Status500_ServerError,
-                ));
-            }
         };
 
         let network_policy =
@@ -576,12 +481,73 @@ impl Sandboxes<()> for ApiImpl {
             ));
         }
 
-        let image_configs = build_image_configs(&resolved_rootfs, &resolved_attached);
-        let extra_drives = resolved_attached.into_iter().map(|r| r.drive).collect();
+        // 🔴 The only place this route forks on role, and the fix for a real
+        // capability gap rather than a stylistic choice: a cold start's first
+        // act used to be resolving `body.image` unconditionally on the
+        // machine serving this call — `regctl` fetches the manifest, pulls
+        // the blobs and converts them into a local overlaybd image, which is
+        // then handed to a local Firecracker VM. `--role api` has no
+        // `regctl`, no `/dev/kvm` and no `ublk`, so that used to fail this
+        // route outright (formerly refused at the door here with a 500
+        // naming `--role api`; see `SandboxLaunchSource::UnresolvedImage`'s
+        // doc for the shape of that gap). What changed: this half now
+        // validates the request exactly as strictly as the half that
+        // resolves does (`unresolved_attached_drives` runs the same checks
+        // as `resolve_attached_drives`, minus the registry calls) and ships
+        // the raw reference to a node — the same node-dispatch a
+        // snapshot-source create already uses — which resolves it as part of
+        // the same `Create` call (`NodeSandboxService::create`'s
+        // `Source::Image` arm).
+        let source = if self.role().runs_sandbox_runtime() {
+            let image_resolver = self.image_resolver();
+            // TODO: Move cold-start image resolution into an async create
+            // operation once the API supports 202 Accepted + status polling.
+            let resolved_rootfs = match timer
+                .time("resolve_rootfs", image_resolver.resolve(&body.image))
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) if err.is_user_error() => {
+                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                        Self::error(400, err.to_string()),
+                    ));
+                }
+                Err(err) => {
+                    warn!(error = %format_args!("{err:#}"), image = %body.image, "failed to resolve sandbox rootfs image");
+                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
+                        Self::error(
+                            500,
+                            format!("resolve sandbox rootfs image '{}': {err:#}", body.image),
+                        ),
+                    ));
+                }
+            };
+            let resolved_attached = match timer
+                .time(
+                    "resolve_attached_drives",
+                    resolve_attached_drives(
+                        body.attached_drives.as_deref().unwrap_or_default(),
+                        image_resolver.as_ref(),
+                    ),
+                )
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    warn!(error = %err.message, "failed to resolve attached drives");
+                    return Ok(Self::client_or_server_response(
+                        err,
+                        SandboxesColdPostResponse::Status400_BadRequest,
+                        SandboxesColdPostResponse::Status500_ServerError,
+                    ));
+                }
+            };
 
-        let base = resolved_rootfs.base_context;
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Image {
+            let image_configs = build_image_configs(&resolved_rootfs, &resolved_attached);
+            let extra_drives = resolved_attached.into_iter().map(|r| r.drive).collect();
+
+            let base = resolved_rootfs.base_context;
+            SandboxLaunchSource::Image {
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
                 context: Box::new(
@@ -597,7 +563,36 @@ impl Sandboxes<()> for ApiImpl {
                 extra_drives,
                 extra_boot_args: body.extra_boot_args.clone(),
                 image_configs: Box::new(image_configs),
-            },
+            }
+        } else {
+            let attached_drives = match unresolved_attached_drives(
+                body.attached_drives.as_deref().unwrap_or_default(),
+            ) {
+                Ok(drives) => drives,
+                Err(err) => {
+                    warn!(error = %err.message, "failed to validate attached drives");
+                    return Ok(Self::client_or_server_response(
+                        err,
+                        SandboxesColdPostResponse::Status400_BadRequest,
+                        SandboxesColdPostResponse::Status500_ServerError,
+                    ));
+                }
+            };
+            info!(
+                image = %body.image,
+                "cold sandbox create: this role has no regctl of its own, dispatching the \
+                 unresolved image reference to a node to resolve"
+            );
+            SandboxLaunchSource::UnresolvedImage {
+                image_ref: body.image.clone(),
+                resources,
+                attached_drives,
+                extra_boot_args: body.extra_boot_args.clone(),
+            }
+        };
+
+        let request = CreateSandboxRequest {
+            source,
             expiry: requested_expiry(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -2386,95 +2381,86 @@ mod cold_start_role_tests {
             .expect("the handler answers")
     }
 
-    /// The message a role refusal carries, or `None` when the handler did not
-    /// refuse on the role.
-    ///
-    /// 🔴 The status code cannot tell the two apart, and that is a fact about
-    /// the API rather than about this helper: `/sandboxes-cold` declares
-    /// 201/400/401/500 and nothing else, so the refusal reuses 500 — which is
-    /// also what an unresolvable image or a failed create answers.
-    fn role_refusal(response: &SandboxesColdPostResponse) -> Option<&str> {
-        match response {
-            SandboxesColdPostResponse::Status500_ServerError(error)
-                if error.message.contains("--role api") =>
-            {
-                Some(error.message.as_str())
-            }
-            _ => None,
-        }
-    }
-
     /// The argv of the fake `regctl`'s last run, or `None` if it never ran.
     ///
     /// 🔴 This is the discriminator. "Did this call reach the image resolver"
-    /// is the question the defect is about, and it is answerable only as a
-    /// side effect: the resolver's first act is to shell out to `regctl`, and
-    /// the fake records what it was asked for. A status code cannot answer it.
+    /// is the question at stake here, and it is answerable only as a side
+    /// effect: the resolver's first act is to shell out to `regctl`, and the
+    /// fake records what it was asked for. A status code cannot answer it.
     fn regctl_argv(s: &Surface) -> Option<Vec<String>> {
         std::fs::read_to_string(s.regctl_dir.join("argv"))
             .ok()
             .map(|raw| raw.lines().map(ToString::to_string).collect())
     }
 
-    /// 🔴 The same call on each half of the split, and the point is that the
-    /// three do not answer alike.
+    /// `--role api` used to refuse a cold start outright — see the retired
+    /// history on `SandboxLaunchSource::UnresolvedImage`. This pins the
+    /// replacement: `--role api` no longer touches `regctl` (it cannot — no
+    /// `/dev/kvm`, no `ublk` either) but *does* now build a launch source and
+    /// hand it to the orchestrator, same as `--role all`/`--role node` always
+    /// have — just carrying a reference instead of an already-resolved path.
     ///
-    /// Both faces in one test, because either alone is satisfied by a constant:
-    /// "api is refused" passes on a gate that is always true, "all and node are
-    /// not" passes on one that is always false. And the discriminator is
-    /// whether `regctl` ran rather than the status code, because the refusal
-    /// and an unresolvable image are both answered by this route — only one of
-    /// them got as far as asking a registry anything.
+    /// # 🔴 Why the api-role assertion is a refusal from `build_from_image_ref`
     ///
-    /// `Node` is asserted alongside `All` even though a node never reaches this
-    /// handler in production — `RoleGate` answers `POST /sandboxes-cold` with
-    /// 404 there (`crate::api::role_gate`) — because the gate under test is
-    /// `runs_sandbox_runtime`, and a node runs one. That 404 is also why the
-    /// refusal tells the caller there is no node to forward to.
+    /// `surface_as`'s fixture orchestrator is deliberately the same
+    /// `FirecrackerSandboxFactory` `All`/`Node` use (see its own note) rather
+    /// than a `RemoteSandboxBackendFactory` dialling a real node, so an
+    /// unresolved-image create on this fixture runs out of road at
+    /// `SandboxBackendFactory::build_from_image_ref`'s *default* refusal.
+    /// That refusal is exactly what proves the request got there at all —
+    /// reaching it means `sandboxes_cold_post` built
+    /// `SandboxLaunchSource::UnresolvedImage` from `body.image` verbatim and
+    /// handed it to the orchestrator without ever calling `regctl`, which is
+    /// the whole of what this route owes `--role api` now. A real remote
+    /// dispatch — the node actually resolving the reference itself — is
+    /// exercised end-to-end in `node_client::tests` and `node_server::tests`,
+    /// which run a real node service over a real socket; this test's job is
+    /// only the fork inside this one function.
+    ///
+    /// `Node` is asserted alongside `All` even though a node never reaches
+    /// this handler in production — `RoleGate` answers `POST /sandboxes-cold`
+    /// with 404 there (`crate::api::role_gate`) — because the branch under
+    /// test is `runs_sandbox_runtime`, and a node answers `true` to it.
     #[tokio::test]
-    async fn a_cold_start_is_refused_by_the_half_that_runs_no_sandbox_runtime_and_attempted_by_the_halves_that_do(
-    ) {
+    async fn a_cold_start_resolves_locally_or_ships_the_reference_unresolved_depending_on_role() {
         let s = surface_as(ServerRole::Api).await;
         let response = cold_start(&s).await;
-        let refusal = role_refusal(&response).unwrap_or_else(|| {
-            panic!(
-                "--role api has no regctl and no /dev/kvm to cold-start on, and answering \
-                 anything but a refusal here is what made the operator read a missing-tool error \
-                 instead of a wrong-half one, got {response:?}"
-            )
-        });
-        assert!(
-            refusal.contains("--role all"),
-            "a refusal that does not say where a cold start can be run is a dead end, got \
-             {refusal:?}"
-        );
-        assert!(
-            refusal.contains("POST /sandboxes"),
-            "the create path this half *does* serve is the actionable half of the answer, got \
-             {refusal:?}"
-        );
-        assert!(
-            refusal.contains("404"),
-            "a caller told only 'not here' will ask which node to send it to; a --role node \
-             server answers this route with 404, so the answer is 'none', got {refusal:?}"
-        );
         assert_eq!(
             regctl_argv(&s),
             None,
-            "🔴 and it must refuse before the image resolver: resolution is the first thing this \
-             route does, so a refusal placed after it is a refusal no --role api caller can ever \
-             reach"
+            "🔴 --role api must never resolve the image itself — that capability gap is what \
+             this route now closes by dispatching instead of resolving — so regctl must not \
+             have run, got {response:?}"
         );
+        match &response {
+            SandboxesColdPostResponse::Status500_ServerError(error) => {
+                assert!(
+                    !error.message.contains("--role api"),
+                    "this must not be the old door refusal — the whole point of the fix is that \
+                     --role api no longer refuses this route outright — got {:?}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("resolves OCI images itself"),
+                    "the fixture's orchestrator has no RemoteSandboxBackendFactory to dial a \
+                     node with, so the request should run out of road at \
+                     SandboxBackendFactory::build_from_image_ref's default refusal — reaching \
+                     that refusal (rather than the door refusal, and rather than a panic) is the \
+                     evidence that sandboxes_cold_post built an unresolved-image launch source \
+                     and handed it to the orchestrator, got {:?}",
+                    error.message
+                );
+            }
+            other => panic!(
+                "expected the fixture's local factory to refuse an unresolved-image build (it \
+                 inherits SandboxBackendFactory::build_from_image_ref's default rather than \
+                 overriding it, unlike RemoteSandboxBackendFactory), got {other:?}"
+            ),
+        }
 
         for role in [ServerRole::All, ServerRole::Node] {
             let s = surface_as(role).await;
             let response = cold_start(&s).await;
-            assert!(
-                role_refusal(&response).is_none(),
-                "--role {} runs a sandbox runtime, so this create takes the road it always took, \
-                 got {response:?}",
-                role.as_str()
-            );
             let argv = regctl_argv(&s).unwrap_or_else(|| {
                 panic!(
                     "--role {} must still resolve the image itself, and the resolver's first act \
@@ -2485,8 +2471,7 @@ mod cold_start_role_tests {
             });
             assert!(
                 argv.iter().any(|arg| arg == IMAGE),
-                "the road being taken is the image resolver's, which is more than a status code \
-                 that merely is not the refusal's, got argv {argv:?}"
+                "the road being taken is the image resolver's, got argv {argv:?}"
             );
             assert!(
                 matches!(response, SandboxesColdPostResponse::Status400_BadRequest(_)),

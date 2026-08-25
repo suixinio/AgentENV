@@ -4,6 +4,7 @@ use super::store::{NewTimeout, SandboxMetadata};
 use super::types::SandboxState;
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
+    UnresolvedImageBuildSpec,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
@@ -104,6 +105,14 @@ pub(super) enum CreateLaunchSource {
     Fresh {
         build_spec: Box<FreshSandboxBuildSpec>,
     },
+    /// See `SandboxLaunchSource::UnresolvedImage` for why this is not folded
+    /// into `Fresh`: `build_sandbox` routes it to
+    /// `SandboxBackendFactory::build_from_image_ref` rather than `build`,
+    /// because the two carry different information (a reference versus an
+    /// already-resolved local path) for two different kinds of factory.
+    UnresolvedImage {
+        build_spec: Box<UnresolvedImageBuildSpec>,
+    },
 }
 
 pub(super) struct ResumeLaunchPlan {
@@ -179,6 +188,30 @@ impl LaunchPlan {
             sandbox_id,
             execution_id,
             source: CreateLaunchSource::Fresh {
+                build_spec: Box::new(build_spec),
+            },
+            launch_config,
+            metadata,
+            timeout,
+        }))
+    }
+
+    /// The unresolved-image counterpart of [`Self::for_create_fresh`]; see
+    /// [`CreateLaunchSource::UnresolvedImage`].
+    pub(super) fn for_create_unresolved_image(
+        sandbox_id: SandboxId,
+        build_spec: UnresolvedImageBuildSpec,
+        launch_config: SandboxLaunchConfig,
+        mut metadata: SandboxMetadata,
+        timeout: NewTimeout,
+        run_as: Option<ExecutionId>,
+    ) -> Self {
+        let execution_id = run_as.unwrap_or_else(ExecutionId::new);
+        metadata.execution_id = execution_id;
+        Self::Create(Box::new(CreateLaunchPlan {
+            sandbox_id,
+            execution_id,
+            source: CreateLaunchSource::UnresolvedImage {
                 build_spec: Box::new(build_spec),
             },
             launch_config,

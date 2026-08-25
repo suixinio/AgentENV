@@ -850,18 +850,26 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///
 /// # 🔴 What is here and does not work yet
 ///
-/// - **A cold create.** `RemoteSandboxBackendFactory::build` refuses: the build
-///   spec it is handed has already been resolved into paths on a local disk and
-///   the user's image reference is gone by then. Creating from a snapshot or a
-///   template works; `POST /sandboxes-cold` does not. It is now refused at the
-///   door instead of failing on the way there: the route reads
-///   `ServerRole::runs_sandbox_runtime` before it resolves anything
-///   (`crate::api::impls`), because resolution comes first on that path and
-///   this Pod has no `regctl` — so what a caller used to be told was that a
-///   registry tool was missing, and the factory's refusal, which is the one
-///   that says *this half cannot cold-start*, was never reached. The
-///   capability is still missing; what changed is that its absence is now
-///   something the caller is told.
+/// - **A cold create — retired.** This bullet used to say
+///   `RemoteSandboxBackendFactory::build` refuses outright — the build spec it
+///   is handed has already been resolved into paths on a local disk and the
+///   user's image reference is gone by then — so `POST /sandboxes-cold` was
+///   refused at the door (`ServerRole::runs_sandbox_runtime`, read before
+///   anything is resolved, in `crate::api::impls`) rather than failing on the
+///   way there with a missing-`regctl` error. Kept here rather than deleted so
+///   it is not re-derived from the same reasoning. It no longer holds:
+///   `sandboxes_cold_post` now builds `SandboxLaunchSource::UnresolvedImage`
+///   instead of resolving anything when `!role.runs_sandbox_runtime()`, and
+///   `SandboxBackendFactory::build_from_image_ref`
+///   (`RemoteSandboxBackendFactory`'s implementation, the method `build`
+///   still refuses for) ships the reference — and each attached drive's own
+///   reference — to a node exactly as unresolved as a snapshot id already
+///   was. `NodeSandboxService::create`'s `Source::Image` arm resolves it
+///   there, node-side, into the same `SandboxLaunchSource::Image` a local
+///   cold create already builds, and the node's `Create` reply also carries
+///   the resolved context and image configs back
+///   (`SandboxRuntimeInfo::resolved_image_facts`) so this half's own record of
+///   the sandbox is not left with placeholders it invented.
 /// - **Publishing a pause.** Pausing and resuming a sandbox on another machine
 ///   both work — `Pause` leaves the capture on the node and a reference in the
 ///   cluster store, `Orchestrator::resume_sandbox` reads that reference back

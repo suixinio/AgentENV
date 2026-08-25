@@ -18,6 +18,7 @@
 //! sandboxes down on the strength of them, and "I could not look" and "there is
 //! nothing there" have to stay two different answers all the way up.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -30,12 +31,14 @@ use crate::orchestrator::{
     SandboxOrchestration,
 };
 use crate::proto::node as pb;
-use crate::sandbox::{CustomExtensionParams, SandboxCaptureError, SandboxNetworkPolicy};
+use crate::sandbox::{
+    CustomExtensionParams, ExtraDrive, SandboxCaptureError, SandboxNetworkPolicy,
+};
 use crate::snapshot::{
     CommandContext, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
 };
 use crate::template::{TemplateBuildRunner, TemplateBuildSpec, TemplateBuildStep, TemplateBuilder};
-use crate::types::{ExecutionId, ImageConfigs, SandboxId};
+use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 
 use super::convert;
 use super::ownership::owned_by_control_plane;
@@ -53,24 +56,34 @@ pub struct NodeSandboxService {
     /// the node decides what that means on its disk.
     snapshots: Arc<SnapshotManager>,
     node_id: String,
-    /// What `build_template` needs beyond the above, or `None` on a service
-    /// nobody wired to build templates.
+    /// What `build_template` needs beyond the above, plus the `ImageResolver`
+    /// `create` reads for a `Source::Image` request — or `None` on a service
+    /// nobody wired for either.
     ///
     /// 🔴 A builder step (`with_template_build`) rather than two more
     /// constructor parameters, and deliberately so: every test in this module
-    /// but the ones that specifically exercise a build constructs a service
-    /// through `new(...)` alone, and a required fourth and fifth argument
-    /// would be pure churn for all of them. Production always calls
-    /// `with_template_build` — see `node_server::server`.
+    /// but the ones that specifically exercise a build or an image-source
+    /// create constructs a service through `new(...)` alone, and required
+    /// extra arguments would be pure churn for all of them. Production always
+    /// calls `with_template_build` — see `node_server::server`.
+    ///
+    /// 🔴 `create`'s `Source::Image` arm reuses `image_resolver` rather than
+    /// getting its own copy. Resolving an OCI image reference into local
+    /// overlaybd is one capability regardless of which RPC needed it, and a
+    /// node wired for one has always been wired for the other —
+    /// `assemble_node_core` builds this `ImageResolver` unconditionally, the
+    /// same as `template_builder`.
     template_build: Option<TemplateBuildWiring>,
 }
 
 /// What [`NodeSandboxService::build_template`] needs beyond the orchestrator
-/// and the snapshot manager every other call already has.
+/// and the snapshot manager every other call already has — also read by
+/// `create`'s `Source::Image` arm for `image_resolver` alone. See the note on
+/// `template_build`.
 struct TemplateBuildWiring {
     /// Resolves an image reference into local overlaybd, node-side — the
     /// piece `--role api` cannot do for itself: see the note on
-    /// `TemplateBuildImageBase` in `node.proto`.
+    /// `TemplateBuildImageBase` and `ImageSource` in `node.proto`.
     image_resolver: Arc<ImageResolver>,
     /// Drives `TemplateBuildRunner` and validates the build's `TemplateBuildContext`.
     template_builder: Arc<TemplateBuilder>,
@@ -423,6 +436,14 @@ impl NodeSandboxService {
             }),
             started_at_ms: convert::unix_millis(Some(metadata.created_at)),
             expires_at_ms: convert::unix_millis(metadata.expires_at),
+            // 🔴 Left unset here rather than encoded: `started_sandbox` is
+            // also `fork`'s renderer, and a fork child's context and image
+            // configs are already known to the caller from the parent it
+            // forked — nothing here needs patching. `create` is the one
+            // caller that sets these two fields itself, after this call
+            // returns; see there.
+            context: None,
+            image_configs: None,
         }
     }
 
@@ -431,6 +452,105 @@ impl NodeSandboxService {
     async fn running_sandbox(&self, metadata: &SandboxMetadata) -> pb::SandboxCreateResponse {
         let live = self.live_facts().await;
         Self::started_sandbox(metadata, Self::facts_for(live.as_ref(), metadata.id))
+    }
+
+    /// `create`'s `Source::Image` arm: resolves the reference and its
+    /// attached drives node-side, into the same `SandboxLaunchSource::Image`
+    /// a local cold create already builds from a `regctl`-resolved path. See
+    /// the note on `ImageSource` in `node.proto` for why the reference
+    /// crosses this call unresolved rather than already turned into one.
+    async fn resolve_image_source(
+        &self,
+        image: pb::ImageSource,
+    ) -> Result<SandboxLaunchSource, Status> {
+        let Some(wiring) = self.template_build.as_ref() else {
+            // 🔴 Mirrors `build_template`'s own refusal when nobody called
+            // `with_template_build`: production always does (see
+            // `node_server::server`), so this is a test-fixture-only path in
+            // practice, not a production one.
+            return Err(Status::unimplemented(
+                "this node was not wired to resolve images \
+                 (NodeSandboxService::with_template_build was not called), so a cold create from \
+                 an image reference cannot be served here",
+            ));
+        };
+        if image.image_ref.is_empty() {
+            return Err(Status::invalid_argument("image.image_ref is required"));
+        }
+        let requested = image
+            .resources
+            .ok_or_else(|| Status::invalid_argument("image.resources is required"))?;
+        if requested.cpu_count == 0 || requested.memory_mib == 0 {
+            return Err(Status::invalid_argument(
+                "image.resources.cpu_count and image.resources.memory_mib must be greater than 0",
+            ));
+        }
+        let resources = SandboxResources {
+            cpu_count: requested.cpu_count,
+            memory_mib: requested.memory_mib,
+            disk_size_mib: requested.disk_size_mib,
+        };
+
+        let resolved_rootfs =
+            resolve_build_image(&wiring.image_resolver, Some(image.image_ref.as_str())).await?;
+
+        let mut image_configs = ImageConfigs::new();
+        if let Some(config) = &resolved_rootfs.raw_config {
+            image_configs.add(None::<String>, "/", config.clone());
+        }
+
+        let mut extra_drives = Vec::with_capacity(image.attached_drives.len());
+        for drive in &image.attached_drives {
+            if drive.image_ref.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "attached drive '{}' has no image_ref",
+                    drive.drive_id
+                )));
+            }
+            let resolved_drive =
+                resolve_build_image(&wiring.image_resolver, Some(drive.image_ref.as_str())).await?;
+            let sub_path = (!drive.sub_path.is_empty()).then(|| PathBuf::from(&drive.sub_path));
+            let mut extra_drive = ExtraDrive::try_new_overlaybd_with_mount_path(
+                drive.drive_id.clone(),
+                resolved_drive.overlaybd_config_path,
+                drive.read_only,
+                PathBuf::from(&drive.mount_path),
+                sub_path,
+            )
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            if drive.virtual_size_bytes > 0 {
+                extra_drive = extra_drive
+                    .try_with_virtual_size(drive.virtual_size_bytes)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            }
+            if let Some(config) = &resolved_drive.raw_config {
+                image_configs.add(
+                    Some(extra_drive.drive_id().to_string()),
+                    extra_drive.mount_path().display().to_string(),
+                    config.clone(),
+                );
+            }
+            extra_drives.push(extra_drive);
+        }
+
+        let base = resolved_rootfs.base_context;
+        let context = CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
+            .with_user(base.user)
+            .with_exposed_ports(base.exposed_ports)
+            .with_entrypoint(base.entrypoint)
+            .with_cmd(base.cmd)
+            .with_volumes(base.volumes)
+            .with_labels(base.labels);
+
+        Ok(SandboxLaunchSource::Image {
+            image_ref: resolved_rootfs.image_ref,
+            overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
+            context: Box::new(context),
+            resources: Some(resources),
+            extra_drives,
+            extra_boot_args: (!image.extra_boot_args.is_empty()).then_some(image.extra_boot_args),
+            image_configs: Box::new(image_configs),
+        })
     }
 }
 
@@ -733,20 +853,8 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                     })?;
                 SandboxLaunchSource::Snapshot(Box::new(runnable))
             }
-            Some(pb::sandbox_create_request::Source::Image(_)) => {
-                // 🔴 Declared in the proto and refused here, rather than
-                // half-implemented. A cold create needs the node to resolve an
-                // image reference and its attached drives into local overlaybd,
-                // and the piece that is genuinely missing is on the *calling*
-                // side: `SandboxBackendFactory::build` hands a factory a
-                // `FreshSandboxBuildSpec` whose paths are already resolved and
-                // local, so a remote factory has no reference left to send. See
-                // the note on `RemoteSandboxBackendFactory::build`.
-                return Err(Status::unimplemented(
-                    "creating a sandbox from an image reference is not served yet: the remote \
-                     factory is handed an already-resolved local build spec and has no reference \
-                     left to send. Use a snapshot source.",
-                ));
+            Some(pb::sandbox_create_request::Source::Image(image)) => {
+                self.resolve_image_source(image).await?
             }
             None => return Err(Status::invalid_argument("source is required")),
         };
@@ -778,7 +886,21 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
-        Ok(Response::new(self.running_sandbox(&metadata).await))
+        let mut response = self.running_sandbox(&metadata).await;
+        // 🔴 Sent unconditionally rather than only for a `Source::Image`
+        // create: this process's own record of the sandbox is the same
+        // `metadata` either way, and a `Source::Snapshot` caller that already
+        // knew both values reads back exactly what it sent. See the note on
+        // these two fields in `node.proto`.
+        response.context = Some(
+            crate::proto::node::encode_value(&metadata.context)
+                .map_err(|err| Status::internal(format!("encode resolved context: {err}")))?,
+        );
+        response.image_configs = Some(
+            crate::proto::node::encode_value(&metadata.image_configs)
+                .map_err(|err| Status::internal(format!("encode resolved image configs: {err}")))?,
+        );
+        Ok(Response::new(response))
     }
 
     async fn delete(

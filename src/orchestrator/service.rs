@@ -19,7 +19,7 @@ use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
     FreshSandboxBuildSpec, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
     SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo, UnresolvedImageBuildSpec,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
@@ -669,6 +669,73 @@ where
                 };
 
                 self.launch_sandbox(LaunchPlan::for_create_fresh(
+                    sandbox_id,
+                    build_spec,
+                    launch_config,
+                    transitional_metadata,
+                    new_timeout,
+                    execution_id,
+                ))
+                .await
+            }
+            SandboxLaunchSource::UnresolvedImage {
+                image_ref,
+                resources,
+                attached_drives,
+                extra_boot_args,
+            } => {
+                let launch_config = SandboxLaunchConfig {
+                    sandbox_id,
+                    snapshot_id: image_ref.clone(),
+                    env_vars,
+                    network: network_policy.runtime_policy(),
+                    // 🔴 Empty, and not a placeholder to fill in: this field is
+                    // read only by a factory that boots a local Firecracker VM
+                    // directly from it, and the only factory that ever builds
+                    // from this launch source (`RemoteSandboxBackendFactory`)
+                    // does not — it ships sandbox_id/policy/etc. over the wire
+                    // and the node builds its own launch config from what it
+                    // resolves. See `SandboxBackendFactory::build_from_image_ref`.
+                    extra_mmds: serde_json::Map::new(),
+                    custom_extension_params: custom_extension_params.clone(),
+                    envd_access_token,
+                    control_plane_config: None,
+                };
+                let build_spec = UnresolvedImageBuildSpec {
+                    image_ref: image_ref.clone(),
+                    resources,
+                    attached_drives,
+                    extra_boot_args,
+                };
+
+                let transitional_metadata = SandboxMetadata {
+                    id: sandbox_id,
+                    snapshot_id: image_ref,
+                    snapshot_alias: None,
+                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                    runtime_versions: configured_runtime_versions(),
+                    resources,
+                    // 🔴 `context` and `image_configs` are left at their
+                    // `Default` (empty) here rather than guessed at: this
+                    // process cannot resolve the image and so does not know
+                    // them yet. `launch_sandbox` overwrites both with the
+                    // node's answer once `start_nowait` returns
+                    // (`SandboxRuntimeInfo::resolved_image_facts`); if that
+                    // never arrives — an older node, or a launch that fails
+                    // first — the record keeps these placeholders rather than
+                    // anything invented.
+                    timeout_action,
+                    auto_resume,
+                    user_metadata,
+                    network_policy,
+                    custom_extension_params,
+                    secure,
+                    control_plane_config,
+                    max_lifetime: configured_max_sandbox_lifetime(),
+                    ..Default::default()
+                };
+
+                self.launch_sandbox(LaunchPlan::for_create_unresolved_image(
                     sandbox_id,
                     build_spec,
                     launch_config,
@@ -3203,11 +3270,20 @@ where
             return Err(OrchestratorError::ShuttingDown);
         }
 
-        let runtime_resources =
-            resources_with_runtime_info(plan.resources(), sandbox.runtime_info());
+        let runtime_info = sandbox.runtime_info();
+        let runtime_resources = resources_with_runtime_info(plan.resources(), runtime_info.clone());
         let transitional_metadata = plan.transitional_metadata().map(|metadata| {
             let mut metadata = metadata.clone();
             metadata.resources = runtime_resources;
+            // 🔴 Only ever `Some` for a backend that did not know its own
+            // sandbox's context and image configs until it started — see
+            // `SandboxRuntimeInfo::resolved_image_facts`. Every other backend
+            // already wrote the right values into `transitional_metadata`
+            // before this point, and leaves this `None`.
+            if let Some(facts) = runtime_info.resolved_image_facts.clone() {
+                metadata.context = facts.context;
+                metadata.image_configs = facts.image_configs;
+            }
             metadata
         });
 
@@ -3340,6 +3416,13 @@ where
                     plan.launch_config.clone(),
                     execution_id,
                 ),
+                CreateLaunchSource::UnresolvedImage { build_spec } => {
+                    self.factory.build_from_image_ref(
+                        (**build_spec).clone(),
+                        plan.launch_config.clone(),
+                        execution_id,
+                    )
+                }
             },
             LaunchPlan::Resume(plan) => self.factory.build_from_paused_state(
                 plan.sandbox_id,

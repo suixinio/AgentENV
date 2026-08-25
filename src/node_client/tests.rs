@@ -133,6 +133,76 @@ async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     serve(service, Some(orchestration)).await
 }
 
+/// A node wired to resolve OCI images itself, via a fake `regctl` that
+/// records every reference it is asked to resolve into `{regctl_dir}/argv`
+/// and answers with a registry 404 — a *user* error, so `ImageResolver`
+/// refuses in one round trip rather than retrying (see
+/// `tests/fixtures/regctl-recorder.sh`).
+///
+/// # 🔴 This is the only fixture in this file that exercises
+/// `NodeSandboxService::with_template_build`
+///
+/// Every other real-node fixture here builds the service through `new`
+/// alone, deliberately — see the note on `NodeSandboxService::template_build`
+/// — because the RPCs those fixtures exercise never touch image resolution.
+/// This one does: it is the fixture for `create`'s `Source::Image` arm and
+/// `RemoteSandboxBackendFactory::build_from_image_ref`, and neither reaches
+/// any further than `Unimplemented` without a wired `ImageResolver`.
+async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) {
+    crate::logging::init_for_tests();
+
+    let root = tempfile::tempdir().expect("a temp dir");
+    let deps_path = root.path().join("deps");
+    let regctl = crate::cfg::regctl_path(&deps_path);
+    let regctl_dir = regctl
+        .parent()
+        .expect("the regctl path has a parent")
+        .to_path_buf();
+    std::fs::create_dir_all(&regctl_dir).expect("create the fake regctl's directory");
+    std::fs::write(regctl_dir.join("stdout"), "").expect("write the stdout fixture");
+    std::fs::write(
+        regctl_dir.join("stderr"),
+        "request failed: not found [http 404]: {}\n",
+    )
+    .expect("write the stderr fixture");
+    std::fs::write(regctl_dir.join("exit_code"), "1\n").expect("write the exit code fixture");
+    std::os::unix::fs::symlink(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/regctl-recorder.sh"),
+        &regctl,
+    )
+    .expect("link the fake regctl");
+
+    let config = crate::cfg::AppConfig {
+        deps_path,
+        ..Default::default()
+    };
+    let image_resolver = Arc::new(crate::image::ImageResolver::new(&config));
+    let template_builder = Arc::new(crate::template::TemplateBuilder::new());
+
+    let orchestrator = Orchestrator::new(
+        ServerRole::All,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = crate::node_server::NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(resolvable_snapshot_manager()),
+        "node-under-test".to_string(),
+    )
+    .with_template_build(image_resolver, template_builder);
+
+    let node = serve(service, Some(orchestration)).await;
+    // Held for the fixture's lifetime, matching `sandbox.rs`'s own
+    // `surface_as`: the fake `regctl` symlink and the argv it writes both
+    // live under it.
+    std::mem::forget(root);
+    (node, regctl_dir)
+}
+
 /// A catalog and resolver that answer with one mock snapshot, so a create can
 /// get as far as starting a sandbox.
 fn resolvable_snapshot_manager() -> SnapshotManager {
@@ -1505,6 +1575,82 @@ async fn a_cold_create_is_refused_with_the_reason() {
         Ok(_) => panic!("a cold create was accepted, and there is nothing to send"),
     };
     assert!(err.to_string().contains("image reference"), "{err:#}");
+}
+
+/// The counterpart of the refusal just above, for the method that exists
+/// precisely because that one refuses: `build_from_image_ref` is handed a
+/// reference — not a path — and this pins that the reference *is* what
+/// crosses the wire, and that the node resolves it with its own
+/// `ImageResolver` rather than trusting a value this process never had.
+///
+/// # 🔴 Why the fake `regctl`'s argv is the only evidence that matters
+///
+/// This process never calls `regctl` at all — `real_node_with_image_resolution`
+/// wires the fake into the *node's* `deps_path`, not this process's. So the
+/// fake recording exactly the reference this test sent is proof of two
+/// things at once: that `RemoteSandboxBackendFactory::build_from_image_ref`
+/// shipped `spec.image_ref` unresolved (a resolved reference would have shown
+/// up as a local overlaybd config path, and there would have been no regctl
+/// call here to record at all), and that `NodeSandboxService::create`'s
+/// `Source::Image` arm is the one that called it, on the node.
+///
+/// A real image resolve is out of scope here — it needs a real manifest, real
+/// blobs and real overlaybd conversion — so the fake answers every lookup
+/// with a registry 404 and the create fails there. That failure is itself
+/// checked: `start` must fail with the *node's* resolve error, not with
+/// `Unimplemented` — the answer this call used to give unconditionally, and
+/// would still give if `create`'s `Source::Image` arm regressed to refusing.
+#[tokio::test]
+async fn an_unresolved_image_reference_ships_to_the_node_which_resolves_it_itself() {
+    const IMAGE: &str = "registry.invalid/agentenv/cold-start:pinned";
+
+    let (node, regctl_dir) = real_node_with_image_resolution().await;
+    let factory = RemoteSandboxBackendFactory::new(node.placement());
+
+    let mut backend = factory
+        .build_from_image_ref(
+            crate::sandbox::UnresolvedImageBuildSpec {
+                image_ref: IMAGE.to_string(),
+                resources: crate::types::SandboxResources {
+                    cpu_count: 1,
+                    memory_mib: 256,
+                    disk_size_mib: 0,
+                },
+                attached_drives: Vec::new(),
+                extra_boot_args: None,
+            },
+            launch_config(),
+            ExecutionId::new(),
+        )
+        .expect("building from an unresolved image reference is accepted, unlike `build`");
+
+    let err = backend
+        .start()
+        .await
+        .expect_err("the fake registry answers every lookup with a 404");
+    let message = format!("{err:#}");
+    assert!(
+        !message.to_lowercase().contains("unimplemented"),
+        "this must be the node's own resolve failure, not the old blanket refusal — reaching \
+         Unimplemented here would mean create's Source::Image arm regressed to refusing again, \
+         got {message:?}"
+    );
+    assert!(
+        message.contains(IMAGE),
+        "the node's own resolve failure should name the exact reference this test sent — proof \
+         that the reference, not a path this process invented, is what crossed the wire, got \
+         {message:?}"
+    );
+
+    let argv = std::fs::read_to_string(regctl_dir.join("argv"))
+        .expect("the fake regctl on the node's own deps_path recorded a run");
+    assert!(
+        argv.contains(IMAGE),
+        "the node must have asked its own regctl to resolve exactly the reference this process \
+         sent, unresolved — this is the proof that `create`'s Source::Image arm calls its own \
+         ImageResolver, on the node, rather than trusting a value this process never had, got \
+         argv {argv:?}"
+    );
 }
 
 /// A paused state with no machine attached to it is refused.

@@ -9,13 +9,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
     EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
-    SandboxLaunchConfig, SandboxNetworkPolicy,
+    SandboxLaunchConfig, SandboxNetworkPolicy, UnresolvedImageBuildSpec,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
@@ -149,6 +149,30 @@ impl RuntimeArtifactSet {
 pub struct SandboxRuntimeInfo {
     pub rootfs_virtual_size: Option<u64>,
     pub runtime_artifacts: RuntimeArtifactSet,
+    /// The sandbox's context and image configs, when this backend only
+    /// learned them once it had started.
+    ///
+    /// # 🔴 `None` for every backend that already knew before it was built
+    ///
+    /// A local factory resolves an image before it ever builds a backend, so
+    /// the orchestrator's transitional record is already right and this stays
+    /// `None`. `RemoteSandboxStub` is the one exception: built from
+    /// [`UnresolvedImageBuildSpec`], it does not learn the resolved context
+    /// and image configs until the node's `Create` reply comes back inside
+    /// `start()` — the node resolved the reference, this process never did.
+    /// The orchestrator reads this after `start_nowait` succeeds and, when it
+    /// is `Some`, overwrites the placeholder it wrote into the transitional
+    /// record before the backend existed. See
+    /// `Orchestrator::launch_sandbox`.
+    pub resolved_image_facts: Option<ResolvedImageFacts>,
+}
+
+/// A sandbox's context and image configs, learned by a backend that did not
+/// know them until it started. See [`SandboxRuntimeInfo::resolved_image_facts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedImageFacts {
+    pub context: crate::snapshot::CommandContext,
+    pub image_configs: crate::types::ImageConfigs,
 }
 
 /// Opaque captured snapshot artifacts produced from a running sandbox.
@@ -385,6 +409,34 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         launch_config: SandboxLaunchConfig,
         execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>>;
+
+    /// Build a brand-new sandbox backend from an OCI image reference this
+    /// factory has not resolved.
+    ///
+    /// # 🔴 Default refuses, and that is the answer for every factory that
+    /// resolves images itself
+    ///
+    /// [`build`](Self::build) already covers "build fresh, from an image": a
+    /// factory that runs sandboxes locally resolves the reference into a
+    /// [`FreshSandboxBuildSpec`] before it ever reaches a factory, because
+    /// resolving needs `regctl` and the factory has it. This method exists
+    /// for the one factory that does not — `RemoteSandboxBackendFactory`,
+    /// whose sandboxes run on a machine that has `regctl` and this process
+    /// does not — and it is the only implementation that should ever override
+    /// the refusal below. Every local factory, and every test mock that
+    /// builds locally, is correct to inherit it unchanged.
+    fn build_from_image_ref(
+        &self,
+        _spec: UnresolvedImageBuildSpec,
+        _launch_config: SandboxLaunchConfig,
+        _execution_id: ExecutionId,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        bail!(
+            "this factory builds sandboxes on this machine and resolves OCI images itself, so \
+             an already-unresolved image reference should never have reached it: see \
+             SandboxBackendFactory::build for the path a local cold create actually takes"
+        )
+    }
 
     /// Build a sandbox backend from a runnable committed snapshot plus launch request.
     fn build_from_snapshot(

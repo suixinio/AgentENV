@@ -72,6 +72,10 @@ type fakeStore struct {
 	lastNodeID       string
 	lastHolderNodeID string
 	reclaims         int
+	// deadlineRenewal is what RenewSandboxDeadline answers. The zero value is
+	// not_tracked, matching MarkRunning's zero value being the same kind of
+	// "no row" answer.
+	deadlineRenewal pausedregistry.DeadlineRenewalOutcome
 }
 
 func (f *fakeStore) record(name string) {
@@ -184,6 +188,16 @@ func (f *fakeStore) MarkRunning(_ context.Context, _, _, nodeID, holderNodeID, e
 		return pausedregistry.MarkRunningUntracked, f.err
 	}
 	return f.markRunning, nil
+}
+
+func (f *fakeStore) RenewSandboxDeadline(_ context.Context, _, _, executionID string, expiresAt *time.Time) (pausedregistry.DeadlineRenewalOutcome, error) {
+	f.record("RenewSandboxDeadline")
+	f.lastExecution = executionID
+	f.lastExpiresAt = expiresAt
+	if f.err != nil {
+		return pausedregistry.DeadlineRenewalNotTracked, f.err
+	}
+	return f.deadlineRenewal, nil
 }
 
 func (f *fakeStore) ReleaseNodeHoldings(_ context.Context, _, _ string) (pausedregistry.ReleasedHoldings, error) {
@@ -506,6 +520,14 @@ func TestATransitionRefusesFieldsItsKindNeverWrites(t *testing.T) {
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM, ExpectGeneration: &gen, SnapshotId: rsSnap}},
 		{"mark_local_only with metadata", &schedulerv1.TransitionSandboxRequest{
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY, ExpectGeneration: &gen, MetadataJson: metadata}},
+		{"renew_deadline with a generation", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution, ExpectGeneration: &gen}},
+		{"renew_deadline with metadata", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution, MetadataJson: metadata}},
+		{"renew_deadline with a snapshot", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution, SnapshotId: rsSnap}},
+		{"renew_deadline with a holder", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution, HolderNodeId: "aenv-master-01"}},
 		{"a kind this build does not serve", &schedulerv1.TransitionSandboxRequest{
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_UNSPECIFIED}},
 	}
@@ -693,6 +715,7 @@ func TestHolderNodeIDIsRefusedOnEveryOtherKind(t *testing.T) {
 		schedulerv1.TransitionKind_TRANSITION_KIND_MARK_LOCAL_ONLY,
 		schedulerv1.TransitionKind_TRANSITION_KIND_RELEASE_CLAIM,
 		schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE,
+		schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE,
 	}
 	for _, kind := range kinds {
 		_, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
@@ -702,6 +725,88 @@ func TestHolderNodeIDIsRefusedOnEveryOtherKind(t *testing.T) {
 		if codeOf(err) != codes.InvalidArgument {
 			t.Fatalf("%v: expected InvalidArgument for a holder_node_id it does not record, got %s (%v)", kind, codeOf(err), err)
 		}
+	}
+}
+
+// TestRenewDeadlineForwardsTheDeadlineItWasGiven is the wire-translation half
+// of deadline propagation: whatever the caller put on the request is what the
+// store is asked to write, not merely "something non-empty". A test that only
+// checked "the column is non-null" cannot tell a clamped, correct deadline
+// from the caller's raw, unclamped one — see keep_alive_for's own clamp — so
+// this pins the exact value, in both directions (a real deadline, and an
+// explicit absence of one).
+func TestRenewDeadlineForwardsTheDeadlineItWasGiven(t *testing.T) {
+	deadline := time.Unix(1_700_000_000, 654_000_000).UTC()
+	micros := deadline.UnixMicro()
+
+	t.Run("a deadline", func(t *testing.T) {
+		store := &fakeStore{deadlineRenewal: pausedregistry.DeadlineRenewalRenewed}
+		svc := newTestRegistryService(t, store)
+		if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution,
+			SandboxExpiresAtUnixMicros: &micros,
+		}); err != nil {
+			t.Fatalf("renew_deadline failed: %v", err)
+		}
+		if store.lastExpiresAt == nil || !store.lastExpiresAt.Equal(deadline) {
+			t.Fatalf("deadline: got %v, want %s", store.lastExpiresAt, deadline)
+		}
+	})
+
+	// Absent is not zero: absent means the sandbox was asked never to expire,
+	// and reclamation must leave it alone forever — zero is a deadline in
+	// 1970, which reclamation acts on immediately.
+	t.Run("no deadline", func(t *testing.T) {
+		store := &fakeStore{deadlineRenewal: pausedregistry.DeadlineRenewalRenewed}
+		svc := newTestRegistryService(t, store)
+		if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution,
+		}); err != nil {
+			t.Fatalf("renew_deadline failed: %v", err)
+		}
+		if store.lastExpiresAt != nil {
+			t.Fatalf("an absent deadline became %v; that sandbox is now reclaimable", store.lastExpiresAt)
+		}
+	})
+}
+
+// TestRenewDeadlineOutcomesReachTheWire is DeadlineRenewalOutcome's own
+// version of TestAllFourClaimOutcomesReachTheWire: none of the three answers
+// is an error, and a caller reading the wrong one off the wire would either
+// trust a deadline that was never written (superseded/not_tracked read as
+// renewed) or warn about a healthy, ordinary case (renewed or not_tracked
+// read as superseded).
+func TestRenewDeadlineOutcomesReachTheWire(t *testing.T) {
+	cases := []struct {
+		outcome pausedregistry.DeadlineRenewalOutcome
+		want    schedulerv1.DeadlineRenewalOutcome
+	}{
+		{pausedregistry.DeadlineRenewalRenewed, schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_RENEWED},
+		{pausedregistry.DeadlineRenewalNotTracked, schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_NOT_TRACKED},
+		{pausedregistry.DeadlineRenewalSuperseded, schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_SUPERSEDED},
+	}
+
+	for _, tc := range cases {
+		t.Run(string(tc.outcome), func(t *testing.T) {
+			store := &fakeStore{deadlineRenewal: tc.outcome}
+			svc := newTestRegistryService(t, store)
+
+			resp, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+				ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+				Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution,
+			})
+			// None of the three is an error: the api half's own record of the
+			// timeout extension already succeeded by the time this call is
+			// made, and this write is only a best-effort mirror.
+			if err != nil {
+				t.Fatalf("renew_deadline(%s) was reported as a failure: %v", tc.outcome, err)
+			}
+			if got := resp.GetDeadlineRenewalOutcome(); got != tc.want {
+				t.Fatalf("outcome: got %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1122,6 +1227,8 @@ func TestATransitionWithoutAnExecutionIsRefused(t *testing.T) {
 			MetadataJson: json.RawMessage(`{"id":"s"}`)}},
 		{"mark_running without an execution", &schedulerv1.TransitionSandboxRequest{
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING}},
+		{"renew_deadline without an execution", &schedulerv1.TransitionSandboxRequest{
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE}},
 		// The other four refuse the field outright: it means nothing for them,
 		// and a caller that sent it would believe a write was fenced that never
 		// was.
@@ -1182,6 +1289,20 @@ func TestTheFencedKindsPassTheExecutionDown(t *testing.T) {
 			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_MARK_RUNNING, ExecutionId: rsExecution,
 		}); err != nil {
 			t.Fatalf("mark_running failed: %v", err)
+		}
+		if store.lastExecution != rsExecution {
+			t.Fatalf("the store was given %q, want %q", store.lastExecution, rsExecution)
+		}
+	})
+
+	t.Run("renew_deadline", func(t *testing.T) {
+		store := &fakeStore{deadlineRenewal: pausedregistry.DeadlineRenewalRenewed}
+		svc := newTestRegistryService(t, store)
+		if _, err := svc.TransitionSandbox(context.Background(), &schedulerv1.TransitionSandboxRequest{
+			ClusterId: rsCluster, SandboxId: rsSandbox, NodeId: rsNode,
+			Kind: schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE, ExecutionId: rsExecution,
+		}); err != nil {
+			t.Fatalf("renew_deadline failed: %v", err)
 		}
 		if store.lastExecution != rsExecution {
 			t.Fatalf("the store was given %q, want %q", store.lastExecution, rsExecution)

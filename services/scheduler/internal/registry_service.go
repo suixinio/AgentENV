@@ -373,6 +373,37 @@ func (s *PausedRegistryService) TransitionSandbox(ctx context.Context, req *sche
 			MarkRunningOutcome: markRunningOutcomeToProto(outcome),
 		}, nil
 
+	case schedulerv1.TransitionKind_TRANSITION_KIND_RENEW_DEADLINE:
+		if err := rejectFields(req, fieldGeneration|fieldMetadata|fieldSnapshot|fieldHolder); err != nil {
+			return nil, s.fail("TransitionSandbox", err)
+		}
+		execution, err := requireExecution(req)
+		if err != nil {
+			return nil, s.fail("TransitionSandbox", err)
+		}
+		var expiresAt *time.Time
+		if req.SandboxExpiresAtUnixMicros != nil {
+			// Absent is not zero — see the identical note on mark_running's
+			// own read of this field.
+			deadline := time.UnixMicro(req.GetSandboxExpiresAtUnixMicros()).UTC()
+			expiresAt = &deadline
+		}
+		outcome, err := store.RenewSandboxDeadline(ctx, req.GetClusterId(), req.GetSandboxId(), execution, expiresAt)
+		if err != nil {
+			return nil, s.fail("TransitionSandbox", err)
+		}
+		// 🔴 Neither not-tracked nor superseded is a failure on the wire, the
+		// same way mark_running's own non-adopted answers are not: the api
+		// half's request to extend a sandbox's timeout already succeeded on
+		// its own authoritative record by the time this call is made (see
+		// keep_alive_for), and this write is only a best-effort mirror for
+		// ReclaimExpiredHoldings' backstop. See DeadlineRenewalOutcome's doc
+		// for why the two are told apart anyway.
+		registryWriteRPCs.WithLabelValues("TransitionSandbox", codes.OK.String()).Inc()
+		return &schedulerv1.TransitionSandboxResponse{
+			DeadlineRenewalOutcome: deadlineRenewalOutcomeToProto(outcome),
+		}, nil
+
 	case schedulerv1.TransitionKind_TRANSITION_KIND_REMOVE:
 		if err := rejectFields(req, fieldMetadata|fieldSnapshot|fieldExecution|fieldHolder); err != nil {
 			return nil, s.fail("TransitionSandbox", err)
@@ -422,6 +453,25 @@ func markRunningOutcomeToProto(outcome pausedregistry.MarkRunningOutcome) schedu
 		return schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_HELD_ELSEWHERE
 	default:
 		return schedulerv1.MarkRunningOutcome_MARK_RUNNING_OUTCOME_UNSPECIFIED
+	}
+}
+
+// deadlineRenewalOutcomeToProto maps the store's answer onto the wire enum.
+//
+// An outcome this build does not know maps to UNSPECIFIED rather than to a
+// plausible neighbour, the same reason markRunningOutcomeToProto does: a
+// caller that read RENEWED off an unrecognised value would trust a deadline
+// that was never written.
+func deadlineRenewalOutcomeToProto(outcome pausedregistry.DeadlineRenewalOutcome) schedulerv1.DeadlineRenewalOutcome {
+	switch outcome {
+	case pausedregistry.DeadlineRenewalRenewed:
+		return schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_RENEWED
+	case pausedregistry.DeadlineRenewalNotTracked:
+		return schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_NOT_TRACKED
+	case pausedregistry.DeadlineRenewalSuperseded:
+		return schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_SUPERSEDED
+	default:
+		return schedulerv1.DeadlineRenewalOutcome_DEADLINE_RENEWAL_OUTCOME_UNSPECIFIED
 	}
 }
 

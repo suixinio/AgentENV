@@ -191,6 +191,33 @@ type Store interface {
 	// is a0487f0's bug, the one this split exists to close.
 	MarkRunning(ctx context.Context, clusterID, sandboxID, nodeID, holderNodeID, executionID string, expiresAt *time.Time) (MarkRunningOutcome, error)
 
+	// RenewSandboxDeadline updates sandbox_expires_at alone on a `running`
+	// row — never lease_expires_at, origin_node_id, claimed_by_node_id or
+	// generation — so the api half's own POST /timeout can extend a deadline
+	// any number of times after the resume that last wrote this column via
+	// MarkRunning, instead of it being stuck at whatever MarkRunning wrote
+	// once at resume.
+	//
+	// 🔴 Fenced on executionID alone, never on a node identity. Every other
+	// conditional write on this interface guards against a *different actor*
+	// racing it — another node's claim, another node's incarnation — because
+	// each one writes an identity column (origin_node_id,
+	// claimed_by_node_id, execution_id) that a wrong actor could corrupt.
+	// This write touches none of those; the only thing that can go wrong is
+	// attaching a deadline the caller computed against a `running` sandbox
+	// under incarnation A to a row that has since become incarnation B (a
+	// fresh resume after a pause, or moved on entirely) — always the *same*
+	// row's own later history, never a rival node's write. executionID is
+	// what tells the two apart, exactly the way MarkRunning's branch ③ does
+	// for its own retry-vs-takeover question. No expect_generation: this
+	// write does not participate in the state machine's generation sequence
+	// at all — it neither reads nor changes what generation means.
+	//
+	// A caller that observes DeadlineRenewalSuperseded must not retry with
+	// the same deadline: the row it would be retrying against is not the
+	// sandbox that asked for the extension any more.
+	RenewSandboxDeadline(ctx context.Context, clusterID, sandboxID, executionID string, expiresAt *time.Time) (DeadlineRenewalOutcome, error)
+
 	// ReleaseNodeHoldings frees the rows a previous process on this same
 	// machine was holding when it died.
 	//
@@ -314,6 +341,29 @@ const (
 	// MarkRunningHeldElsewhere means a row exists and another node holds the
 	// claim on it: two nodes believe they are bringing the same sandbox up.
 	MarkRunningHeldElsewhere MarkRunningOutcome = "held_elsewhere"
+)
+
+// DeadlineRenewalOutcome is which of the three answers RenewSandboxDeadline
+// gave.
+//
+// A bare "matched" bool would run together the same two situations
+// MarkRunningOutcome exists to split: a sandbox this cluster never tracked —
+// the common, healthy case — and a row that exists but has moved on to a
+// different incarnation since the caller last observed it as `running`
+// locally. See RenewSandboxDeadline's own doc for why that second case must
+// not be retried as though it were the first.
+type DeadlineRenewalOutcome string
+
+const (
+	// DeadlineRenewalRenewed means the row now carries the new deadline.
+	DeadlineRenewalRenewed DeadlineRenewalOutcome = "renewed"
+	// DeadlineRenewalNotTracked means there is no row. What a sandbox this
+	// cluster does not track looks like.
+	DeadlineRenewalNotTracked DeadlineRenewalOutcome = "not_tracked"
+	// DeadlineRenewalSuperseded means a row exists but is not `running` under
+	// the incarnation the caller named — it moved on since. The deadline was
+	// not written.
+	DeadlineRenewalSuperseded DeadlineRenewalOutcome = "superseded"
 )
 
 // ConflictReason splits the two situations ClaimOutcomeConflict ran together.

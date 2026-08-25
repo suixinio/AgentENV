@@ -115,6 +115,10 @@ var (
 		Name: "agentenv_scheduler_registry_write_mark_running_refused_total",
 		Help: "mark_running calls refused because another node held the resume claim.",
 	})
+	registryRenewDeadlineSuperseded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agentenv_scheduler_registry_write_renew_deadline_superseded_total",
+		Help: "renew_deadline calls that found a row no longer running under the incarnation the caller named: the deadline was not written.",
+	})
 	registryReclaimReleased = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "agentenv_scheduler_registry_write_reclaim_released_total",
 		Help: "Rows reclamation handed back to the cluster as paused.",

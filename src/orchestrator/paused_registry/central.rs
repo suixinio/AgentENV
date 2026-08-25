@@ -31,9 +31,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    log_claim_outcome, BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome,
-    PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
-    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    log_claim_outcome, BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox,
+    MarkRunningOutcome, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
+    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::proto::scheduler as pb;
@@ -413,7 +413,11 @@ impl CentralPausedSandboxRegistry {
         // one would read as though this call renewed something. Zero is how the
         // wire says "not carried" for a plain integer field.
         let lease_ttl_millis = match kind {
-            pb::TransitionKind::Remove => 0,
+            // Neither stamps a lease: remove deletes the row outright, and
+            // renew_deadline touches sandbox_expires_at alone — see
+            // renewSandboxDeadlineSQL's own doc for why it carries no lease
+            // write at all.
+            pb::TransitionKind::Remove | pb::TransitionKind::RenewDeadline => 0,
             _ => self.lease_ttl_millis,
         };
 
@@ -822,6 +826,48 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
             pb::MarkRunningOutcome::HeldElsewhere => MarkRunningOutcome::HeldElsewhere,
             pb::MarkRunningOutcome::Unspecified if response.tracked => MarkRunningOutcome::Adopted,
             pb::MarkRunningOutcome::Unspecified => MarkRunningOutcome::Untracked,
+        })
+    }
+
+    async fn renew_sandbox_deadline(
+        &self,
+        sandbox_id: &SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
+    ) -> RegistryResult<DeadlineRenewalOutcome> {
+        // node_id carries no meaning for this kind — the controller's guard is
+        // execution_id alone, never a node identity — so this is simply
+        // `self.node_id` the way every call on this client's own behalf sends
+        // it, and the controller does not read it for this kind.
+        let response = self
+            .transition_with_deadline(
+                "renew_sandbox_deadline",
+                pb::TransitionKind::RenewDeadline,
+                sandbox_id,
+                &self.node_id,
+                None,
+                Vec::new(),
+                String::new(),
+                Some(execution_id),
+                expires_at.map(micros_since_epoch),
+                None,
+            )
+            .await?;
+
+        Ok(match response.deadline_renewal_outcome() {
+            pb::DeadlineRenewalOutcome::Renewed => DeadlineRenewalOutcome::Renewed,
+            pb::DeadlineRenewalOutcome::NotTracked => DeadlineRenewalOutcome::NotTracked,
+            pb::DeadlineRenewalOutcome::Superseded => DeadlineRenewalOutcome::Superseded,
+            // Unlike mark_running's Unspecified branch, this is not an older
+            // controller's compatibility path — this whole kind is new, and a
+            // controller that predates it refuses the request outright (its
+            // TransitionSandbox switch's own default arm), which arrives here
+            // as a transport failure, not a response with this field unset.
+            // Reaching this arm means a controller answered success without
+            // setting the one field this call cares about, and NotTracked is
+            // the reading that cannot be mistaken for a deadline that was
+            // actually written.
+            pb::DeadlineRenewalOutcome::Unspecified => DeadlineRenewalOutcome::NotTracked,
         })
     }
 
@@ -2151,6 +2197,110 @@ mod tests {
             .mark_running(&sandbox_id, NODE, NODE, ExecutionId::new(), None)
             .await
             .expect("mark running");
+        let seen = harness.fake.seen_transition.lock().unwrap().clone();
+        assert_eq!(
+            seen.last()
+                .expect("a transition was sent")
+                .sandbox_expires_at_unix_micros,
+            None
+        );
+    }
+
+    /// The three answers `renew_sandbox_deadline` gives, each read off a
+    /// distinct wire value — mirroring
+    /// `marking_a_sandbox_running_reports_whether_the_cluster_tracks_it` for
+    /// this call's own outcome enum.
+    #[tokio::test]
+    async fn renewing_a_sandbox_deadline_reports_which_of_the_three_answers() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+
+        for (outcome, expected) in [
+            (
+                pb::DeadlineRenewalOutcome::Renewed,
+                DeadlineRenewalOutcome::Renewed,
+            ),
+            (
+                pb::DeadlineRenewalOutcome::NotTracked,
+                DeadlineRenewalOutcome::NotTracked,
+            ),
+            // 🔴 The one a bare "did it write" could not carry: a row exists,
+            // but has moved on to a different incarnation since the caller
+            // last observed it running. Retrying this with the same deadline
+            // would be wrong, not merely redundant.
+            (
+                pb::DeadlineRenewalOutcome::Superseded,
+                DeadlineRenewalOutcome::Superseded,
+            ),
+        ] {
+            *harness.fake.transition.lock().unwrap() = Some(Ok(pb::TransitionSandboxResponse {
+                deadline_renewal_outcome: outcome as i32,
+                ..Default::default()
+            }));
+
+            assert_eq!(
+                harness
+                    .registry
+                    .renew_sandbox_deadline(&sandbox_id, ExecutionId::new(), None)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    /// The wire-translation half: `renew_sandbox_deadline` must carry the
+    /// exact incarnation and deadline it was given, name the right
+    /// `TransitionKind`, and leave every field that means nothing for this
+    /// kind untouched — a caller sending `RENEW_DEADLINE` with a stray
+    /// `expect_generation` or `holder_node_id` would have those refused by
+    /// the controller (see `TestATransitionRefusesFieldsItsKindNeverWrites`
+    /// on the Go side), so this client must never populate them.
+    #[tokio::test]
+    async fn renewing_a_sandbox_deadline_carries_the_incarnation_and_deadline_given() {
+        let harness = harness().await;
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+
+        harness
+            .registry
+            .renew_sandbox_deadline(&sandbox_id, execution_id, Some(deadline))
+            .await
+            .expect("renew_sandbox_deadline");
+
+        let seen = harness.fake.seen_transition.lock().unwrap().clone();
+        let request = seen.last().expect("a transition was sent");
+        assert_eq!(
+            request.kind,
+            pb::TransitionKind::RenewDeadline as i32,
+            "the wrong TransitionKind reaches a different statement entirely"
+        );
+        assert_eq!(request.execution_id, execution_id.to_string());
+        assert_eq!(
+            request.sandbox_expires_at_unix_micros,
+            Some(1_900_000_000_000_000)
+        );
+        assert_eq!(
+            request.expect_generation, None,
+            "this write is not part of the generation sequence"
+        );
+        assert_eq!(
+            request.holder_node_id, "",
+            "this write touches no identity column, so it names no holder"
+        );
+        assert!(request.metadata_json.is_empty());
+        assert_eq!(request.snapshot_id, "");
+
+        // Absent stays absent — the identical contract mark_running's own
+        // deadline field carries, and for the identical reason: a sandbox
+        // asked never to expire is a different fact from one whose deadline
+        // is unknown.
+        harness
+            .registry
+            .renew_sandbox_deadline(&sandbox_id, execution_id, None)
+            .await
+            .expect("renew_sandbox_deadline");
         let seen = harness.fake.seen_transition.lock().unwrap().clone();
         assert_eq!(
             seen.last()

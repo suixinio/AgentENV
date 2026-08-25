@@ -1293,6 +1293,94 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, clusterID, sandboxID, n
 	return MarkRunningHeldElsewhere, nil
 }
 
+// renewSandboxDeadlineSQL updates sandbox_expires_at alone on a `running`
+// row, fenced on execution_id.
+//
+// 🔴 No node identity anywhere in this statement — not in the SET list, not
+// in the WHERE clause. Every other conditional write on this file guards
+// against a *different actor* racing it (another node's claim, another
+// node's incarnation) because it writes a column that actor could corrupt:
+// origin_node_id, claimed_by_node_id, execution_id, generation. This one
+// writes none of those, so there is no rival actor to guard against — only
+// this same row's own later history, which is exactly what execution_id
+// alone tells apart. See Store.RenewSandboxDeadline's doc.
+//
+// updated_at is bumped, unlike RenewLiveLeases' own write to this row's
+// lease column: that write is heartbeat-sourced and proves nothing about
+// reachability on its own (see renewLiveLeaseSQL's own doc), but this one is
+// a real, positive write the api half made on a user's explicit request —
+// the same standing every other write on this file already has.
+const renewSandboxDeadlineSQL = `
+UPDATE paused_sandboxes
+   SET sandbox_expires_at = $3,
+       updated_at         = now()
+ WHERE sandbox_id = $1::uuid
+   AND cluster_id = $4::uuid
+   AND state = 'running'
+   AND execution_id = $2::uuid`
+
+// RenewSandboxDeadline implements Store.
+func (s *PostgresStore) RenewSandboxDeadline(ctx context.Context, clusterID, sandboxID, executionID string, expiresAt *time.Time) (DeadlineRenewalOutcome, error) {
+	cluster, err := requireUUID("cluster_id", clusterID)
+	if err != nil {
+		return DeadlineRenewalNotTracked, err
+	}
+	sandbox, err := requireUUID("sandbox_id", sandboxID)
+	if err != nil {
+		return DeadlineRenewalNotTracked, err
+	}
+	execution, err := requireExecutionUUID(executionID)
+	if err != nil {
+		return DeadlineRenewalNotTracked, err
+	}
+
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+
+	// One transaction around the write and the re-read that classifies it,
+	// for the same reason MarkRunning's does: a classification made against a
+	// version of the row this statement never saw could report
+	// DeadlineRenewalNotTracked about a row this same call just missed by a
+	// race, rather than the truth.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return DeadlineRenewalNotTracked, fmt.Errorf("registry renew_sandbox_deadline: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	tag, err := tx.Exec(ctx, renewSandboxDeadlineSQL, sandbox, execution, expiresAt, cluster)
+	if err != nil {
+		return DeadlineRenewalNotTracked, fmt.Errorf("registry renew_sandbox_deadline: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return DeadlineRenewalNotTracked, fmt.Errorf("registry renew_sandbox_deadline: %w", err)
+		}
+		return DeadlineRenewalRenewed, nil
+	}
+
+	// Nothing matched. Either there is no row at all — untracked, the common
+	// case, e.g. a disabled registry or a resume whose own mark_running has
+	// not landed yet — or there is one that has moved on since the caller
+	// last observed it as `running` under this incarnation.
+	entry, found, err := fetchWith(ctx, tx, cluster, sandbox)
+	if err != nil {
+		return DeadlineRenewalNotTracked, err
+	}
+	if !found {
+		return DeadlineRenewalNotTracked, nil
+	}
+
+	registryRenewDeadlineSuperseded.Inc()
+	s.log.Info("renew_sandbox_deadline matched no row: it has moved on since the caller last observed it running",
+		zap.String("sandbox_id", sandbox),
+		zap.String("state", string(entry.State)),
+		zap.String("expected_execution_id", execution),
+		zap.String("observed_execution_id", entry.ExecutionID),
+	)
+	return DeadlineRenewalSuperseded, nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Leases
 // ─────────────────────────────────────────────────────────────────────────────

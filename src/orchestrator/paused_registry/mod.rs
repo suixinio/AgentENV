@@ -38,8 +38,8 @@ use crate::types::{ExecutionId, SandboxId};
 pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use types::{
-    BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome, PausedRegistryState,
-    PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
+    BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
+    PausedRegistryState, PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
 };
 
 pub type RegistryResult<T> = std::result::Result<T, PausedRegistryError>;
@@ -281,6 +281,42 @@ pub trait PausedSandboxRegistry: Send + Sync {
         expires_at: Option<SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome>;
 
+    /// Updates `sandbox_expires_at` alone on a `Running` row — never the lease,
+    /// never any identity column, never `generation`.
+    ///
+    /// This is the write [`mark_running`](Self::mark_running) alone cannot be:
+    /// `mark_running` stamps a deadline once, at resume, and never again for
+    /// the rest of the sandbox's run — so a later `POST /timeout` extending
+    /// that deadline had nowhere on this interface to go. This is that
+    /// somewhere.
+    ///
+    /// # 🔴 One identity, and it answers a different question than
+    /// `mark_running`'s two
+    ///
+    /// `mark_running`'s `node_id`/`holder_node_id` split exists because that
+    /// write decides *who may run the sandbox* — a question with a wrong
+    /// answerer to guard against (another node's stale claim, another node's
+    /// incarnation). This write decides only *when a sandbox already agreed
+    /// to be running is due to end*, and touches no column a wrong answerer
+    /// could corrupt: not `origin_node_id`, not `claimed_by_node_id`, not
+    /// `execution_id` itself. There is no rival actor to fence against, only
+    /// this same row's own later history — a fresh resume, under a fresh
+    /// `execution_id`, since the caller last observed the sandbox `Running`
+    /// locally. `execution_id` alone is what tells that apart, the same way
+    /// `mark_running`'s own branch ③ does for its retry-vs-takeover question.
+    /// No `node_id`, no generation: this write does not participate in the
+    /// registry's ownership questions at all.
+    ///
+    /// A caller that gets back [`DeadlineRenewalOutcome::Superseded`] must not
+    /// retry with the same deadline — the row it would be retrying against is
+    /// not the sandbox that asked for the extension any more.
+    async fn renew_sandbox_deadline(
+        &self,
+        sandbox_id: &SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
+    ) -> RegistryResult<DeadlineRenewalOutcome>;
+
     /// Hands back every live sandbox this node was holding when its previous
     /// process died, and reports what was found.
     ///
@@ -407,6 +443,40 @@ pub trait PausedSandboxPublisher: Send + Sync {
         execution_id: ExecutionId,
         expires_at: Option<SystemTime>,
         holding_node_id: Option<String>,
+    );
+
+    /// Extends the deadline the cluster registry holds for an already-running
+    /// sandbox, without disturbing anything else about the row.
+    ///
+    /// `mark_running` above stamps a deadline once, at resume; every
+    /// `POST /timeout` after that has nowhere else on this trait to reach the
+    /// registry, and until this method existed such an extension never
+    /// travelled past the orchestrator's own metadata store — the cluster
+    /// kept enforcing whatever `mark_running` last wrote.
+    ///
+    /// `execution_id` must be the sandbox's *current* incarnation, exactly as
+    /// the orchestrator's own metadata names it at the moment `keep_alive_for`
+    /// observed the sandbox `Running` — see
+    /// [`PausedSandboxRegistry::renew_sandbox_deadline`] for what it fences.
+    /// `expires_at` must be the deadline *after* `keep_alive_for`'s own
+    /// lifetime-ceiling clamp, never the caller's raw request: this method has
+    /// no ceiling of its own to apply, and a caller that forwarded the raw
+    /// value would let a request that only *looked* like it asked for more
+    /// than the ceiling allows quietly outlive it in the registry, even though
+    /// the orchestrator's own record stayed clamped.
+    ///
+    /// Best-effort, like every other method on this trait: the local timeout
+    /// extension has already succeeded by the time this runs, and this write
+    /// is only a backstop mirror for [`ReclaimExpiredHoldings`
+    /// ](super::PausedSandboxRegistry::reclaim_expired_holdings)'s cluster-wide
+    /// reclaim — not the sandbox's own enforcement, which the orchestrator's
+    /// local record already carries. A transport failure here costs that
+    /// mirror staying stale until the sandbox's next resume, and nothing else.
+    async fn renew_deadline(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
     );
 
     /// Drops the cluster's record of the sandbox and the snapshot behind it.

@@ -259,3 +259,26 @@ impl MarkRunningOutcome {
         matches!(self, Self::Adopted)
     }
 }
+
+/// Which of the three answers [`renew_sandbox_deadline`] gave.
+///
+/// [`renew_sandbox_deadline`]: super::PausedSandboxRegistry::renew_sandbox_deadline
+///
+/// A bare "did it write" would run together the same two situations
+/// [`MarkRunningOutcome`] exists to split apart: a sandbox this cluster never
+/// tracked (the common, healthy case — a disabled registry, or a resume whose
+/// own `mark_running` has not landed yet) and a row that exists but has moved
+/// on to a different incarnation since the caller last observed it `Running`
+/// locally. The second case is the one a caller must never retry the same
+/// deadline against: the row it would be retrying is not the sandbox that
+/// asked for the extension any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineRenewalOutcome {
+    /// The row now carries the new deadline.
+    Renewed,
+    /// No row. What a sandbox this cluster does not track looks like.
+    NotTracked,
+    /// A row exists but is not `Running` under the incarnation this call
+    /// named — it moved on since. The deadline was not written.
+    Superseded,
+}

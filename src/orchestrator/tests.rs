@@ -3275,6 +3275,104 @@ async fn keep_alive_clamps_an_over_long_renewal_to_the_ceiling() -> Result<()> {
     Ok(())
 }
 
+/// The cluster-registry propagation half of the test above: the deadline the
+/// publisher is told about must be the *clamped* one, not the caller's raw
+/// 3600s request.
+///
+/// This is the fix for the bug `POST /timeout` never reached
+/// `paused_sandboxes.sandbox_expires_at` at all: before `keep_alive_for`
+/// called `renew_deadline`, nothing on this path ever reached the cluster
+/// registry a second time after the resume that first wrote it. A test that
+/// only checked "a call was made" could not tell that fix apart from one that
+/// forwarded `valid_timeout` (the caller's raw duration) or `new_expire_time`
+/// straight out of the closure — both unclamped — so this pins the exact
+/// value the same way `keep_alive_clamps_an_over_long_renewal_to_the_ceiling`
+/// pins it for the local record.
+#[tokio::test]
+async fn keep_alive_reports_the_clamped_deadline_to_the_cluster_registry() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let execution_id = ExecutionId::new();
+    let created_at = SystemTime::now() - Duration::from_secs(60);
+    let mut metadata = SandboxMetadata {
+        id: sandbox_id,
+        execution_id,
+        state: SandboxState::Running,
+        created_at,
+        max_lifetime: Some(Duration::from_secs(300)),
+        running_since: Some(created_at),
+        ..Default::default()
+    };
+    metadata.set_timeout(Some(Duration::from_secs(30)));
+
+    let store = InMemoryMetadataStore::new();
+    store.add(metadata).await?;
+    let orchestrator = make_orchestrator_without_background(store);
+    let publisher = Arc::new(RecordingPublisher::default());
+    orchestrator.set_paused_publisher(
+        Arc::clone(&publisher) as Arc<dyn crate::orchestrator::PausedSandboxPublisher>
+    );
+
+    orchestrator
+        .keep_alive_for(sandbox_id, Some(Duration::from_secs(3_600)), true)
+        .await?
+        .expect("keep_alive_for should return updated metadata");
+
+    let renewed = publisher.renewed_deadlines();
+    assert_eq!(
+        renewed.len(),
+        1,
+        "exactly one deadline renewal should have reached the registry: {renewed:?}"
+    );
+    let (renewed_id, renewed_execution, renewed_deadline) = renewed[0];
+    assert_eq!(renewed_id, sandbox_id);
+    assert_eq!(
+        renewed_execution, execution_id,
+        "the registry write must be fenced on the sandbox's own current incarnation"
+    );
+    assert_eq!(
+        renewed_deadline,
+        Some(created_at + Duration::from_secs(300)),
+        "the registry must see the clamped deadline (created_at + 300s ceiling), \
+         not the caller's raw 3600s request"
+    );
+    Ok(())
+}
+
+/// The skipped-write control for the test above: `allow_shorter=false`
+/// leaving the local record untouched must also leave the registry
+/// untouched. A publisher called anyway would mislead `ReclaimExpiredHoldings`
+/// into treating a no-op request as a genuine extension.
+#[tokio::test]
+async fn keep_alive_does_not_report_a_skipped_update_to_the_cluster_registry() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let publisher = Arc::new(RecordingPublisher::default());
+    orchestrator.set_paused_publisher(
+        Arc::clone(&publisher) as Arc<dyn crate::orchestrator::PausedSandboxPublisher>
+    );
+
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(90), &[("case_id", case_id.as_str())]))
+        .await?;
+    let sandbox_id = created.id;
+
+    orchestrator
+        .keep_alive_for(sandbox_id, Some(Duration::from_secs(10)), false)
+        .await?
+        .expect("a shorter timeout is skipped, not refused");
+
+    assert!(
+        publisher.renewed_deadlines().is_empty(),
+        "a skipped local update must not report a renewal to the registry: {:?}",
+        publisher.renewed_deadlines()
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
 /// The control face for the test above: the same call on a node with no
 /// ceiling. Without this, "clamped to 300" could just as well be "the ceiling
 /// was never consulted and 300 came from somewhere else".
@@ -6218,6 +6316,11 @@ struct RecordingPublisher {
     /// stopped, mirroring `marked_running`'s third field for the
     /// mirror-image question.
     forgotten: StdMutex<Vec<(SandboxId, Option<String>)>>,
+    /// Every `renew_deadline` call: which sandbox, which incarnation it named,
+    /// and the deadline it carried. The deadline is what a test asserts
+    /// against — it must be `keep_alive_for`'s clamped value, never the raw
+    /// duration a caller asked `POST /timeout` for.
+    renewed_deadlines: StdMutex<Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)>>,
     /// What this publisher answers when asked whether it would commit a
     /// publishable capture. Defaults to yes, matching every cluster-backed
     /// registry.
@@ -6264,6 +6367,10 @@ impl RecordingPublisher {
         self.forgotten.lock().unwrap().clone()
     }
 
+    fn renewed_deadlines(&self) -> Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)> {
+        self.renewed_deadlines.lock().unwrap().clone()
+    }
+
     fn commits_nothing(&self) {
         *self.wants_captures.lock().unwrap() = false;
     }
@@ -6275,6 +6382,7 @@ impl Default for RecordingPublisher {
             published: StdMutex::default(),
             marked_running: StdMutex::default(),
             forgotten: StdMutex::default(),
+            renewed_deadlines: StdMutex::default(),
             wants_captures: StdMutex::new(true),
         }
     }
@@ -6306,6 +6414,18 @@ impl crate::orchestrator::PausedSandboxPublisher for RecordingPublisher {
             .lock()
             .unwrap()
             .push((sandbox_id, execution_id, holding_node_id));
+    }
+
+    async fn renew_deadline(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<std::time::SystemTime>,
+    ) {
+        self.renewed_deadlines
+            .lock()
+            .unwrap()
+            .push((sandbox_id, execution_id, expires_at));
     }
 
     async fn forget(&self, sandbox_id: SandboxId, holding_node_id: Option<String>) {

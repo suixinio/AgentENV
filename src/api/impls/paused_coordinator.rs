@@ -20,8 +20,8 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, error, info, warn};
 
 use crate::orchestrator::{
-    MarkRunningOutcome, PauseOutcome, PausedRegistryState, PausedSandboxEntry,
-    PausedSandboxPublisher, PausedSandboxRegistry, SandboxMetadata,
+    DeadlineRenewalOutcome, MarkRunningOutcome, PauseOutcome, PausedRegistryState,
+    PausedSandboxEntry, PausedSandboxPublisher, PausedSandboxRegistry, SandboxMetadata,
 };
 use crate::snapshot::{SnapshotId, SnapshotManager, SnapshotPublishMetadata};
 use crate::types::{ExecutionId, SandboxId};
@@ -760,6 +760,55 @@ impl PausedSandboxCoordinator {
             .observe(sandbox_id, &holder, confirmed);
     }
 
+    /// Mirrors a `POST /timeout` extension into the cluster registry.
+    ///
+    /// Best-effort by the same contract every method on this trait carries:
+    /// `keep_alive_for` has already committed the new deadline to the
+    /// orchestrator's own metadata store by the time this runs, and that
+    /// record — not this one — is what the sandbox's own eviction and every
+    /// other read of "when is this due to end" honours. This write only keeps
+    /// `ReclaimExpiredHoldings`' cluster-wide backstop from judging the
+    /// sandbox against a deadline as stale as its last resume.
+    ///
+    /// `expires_at` must already be `keep_alive_for`'s clamped value, not the
+    /// caller's raw request — see [`PausedSandboxPublisher::renew_deadline`]'s
+    /// doc for why forwarding the unclamped one would let a request that only
+    /// *looked* like it exceeded the lifetime ceiling quietly outlive it here
+    /// while the orchestrator's own record stayed correctly clamped.
+    pub async fn renew_sandbox_deadline(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
+    ) {
+        match self
+            .registry
+            .renew_sandbox_deadline(&sandbox_id, execution_id, expires_at)
+            .await
+        {
+            Ok(DeadlineRenewalOutcome::Renewed) => {}
+            // Neither is a failure worth more than a debug line: not-tracked
+            // is the common, healthy case (a disabled registry, or a resume
+            // whose own mark_running has not landed on this replica's write
+            // yet); superseded means the row has moved on since this call's
+            // local view of it, and retrying with the same deadline would be
+            // wrong, not merely redundant — see renew_sandbox_deadline's own
+            // doc on the registry trait.
+            Ok(other) => {
+                debug!(%sandbox_id, outcome = ?other, "cluster registry deadline was not renewed");
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    %sandbox_id,
+                    "failed to mirror the extended timeout into the cluster registry; \
+                     ReclaimExpiredHoldings may still judge this sandbox against a stale deadline \
+                     if this node ever stops reporting"
+                );
+            }
+        }
+    }
+
     /// The identity this node was confirmed as the holder of `sandbox_id`
     /// under, if the registry ever confirmed it.
     ///
@@ -939,6 +988,16 @@ impl PausedSandboxPublisher for PausedSandboxCoordinator {
         holding_node_id: Option<String>,
     ) {
         self.mark_sandbox_running(sandbox_id, execution_id, expires_at, holding_node_id)
+            .await;
+    }
+
+    async fn renew_deadline(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        expires_at: Option<SystemTime>,
+    ) {
+        self.renew_sandbox_deadline(sandbox_id, execution_id, expires_at)
             .await;
     }
 
@@ -1375,6 +1434,51 @@ mod tests {
         )
     }
 
+    /// `renew_sandbox_deadline` forwards exactly the sandbox, incarnation and
+    /// deadline it was given — the coordinator must not substitute its own
+    /// identity or drop the deadline on the way to the registry.
+    #[tokio::test]
+    async fn renew_sandbox_deadline_forwards_what_it_was_given() {
+        let registry = Arc::new(CountingRegistry::new(0, false));
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        let deadline =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+
+        coordinator
+            .renew_sandbox_deadline(sandbox_id, execution_id, Some(deadline))
+            .await;
+
+        assert_eq!(
+            registry.renewed_deadlines(),
+            vec![(sandbox_id, execution_id, Some(deadline))]
+        );
+    }
+
+    /// The registry being unreachable for this write must not be visible to
+    /// the caller: `keep_alive_for`'s own local update already succeeded, and
+    /// this mirror is best-effort by contract — see
+    /// `PausedSandboxPublisher::renew_deadline`'s own doc.
+    #[tokio::test]
+    async fn renew_sandbox_deadline_does_not_propagate_a_registry_failure() {
+        let registry = Arc::new(CountingRegistry::failing_renew_deadline());
+        let coordinator = coordinator(Arc::clone(&registry));
+
+        // Must return `()` and must not panic, unwrap, or otherwise surface
+        // the backend error to a caller with no way to act on it.
+        coordinator
+            .renew_sandbox_deadline(SandboxId::new(), ExecutionId::new(), None)
+            .await;
+
+        assert_eq!(
+            registry.renewed_deadlines().len(),
+            1,
+            "the attempt must still have been made"
+        );
+    }
+
     /// The failure this whole retry exists for. Nothing else releases these
     /// rows and `claim_for_resume` refuses them outright, so a single failed
     /// attempt used to strand every sandbox the previous process was running
@@ -1681,6 +1785,33 @@ mod tests {
             row.generation += 1;
 
             Ok(MarkRunningOutcome::Adopted)
+        }
+
+        // Mirrors renewSandboxDeadlineSQL's own guard: `Running` and the same
+        // incarnation this call names, nothing else. A row this fake's own
+        // `mark_running` never stamped an incarnation onto (seeded directly by
+        // a test, or adopted through a path that predates the incarnation
+        // being tracked) is treated as matching whatever is asked, the same
+        // way a freshly-seeded row has no incarnation to disagree with —
+        // callers that care about the fencing itself seed `execution_id`
+        // explicitly.
+        async fn renew_sandbox_deadline(
+            &self,
+            sandbox_id: &SandboxId,
+            execution_id: ExecutionId,
+            _expires_at: Option<SystemTime>,
+        ) -> RegistryResult<DeadlineRenewalOutcome> {
+            let rows = self.rows.lock().unwrap();
+            let Some(row) = rows.get(sandbox_id) else {
+                return Ok(DeadlineRenewalOutcome::NotTracked);
+            };
+            let matches = row.state == PausedRegistryState::Running
+                && row.execution_id.is_none_or(|on_row| on_row == execution_id);
+            Ok(if matches {
+                DeadlineRenewalOutcome::Renewed
+            } else {
+                DeadlineRenewalOutcome::Superseded
+            })
         }
 
         async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
@@ -2500,9 +2631,9 @@ pub(super) mod test_support {
     use async_trait::async_trait;
 
     use crate::orchestrator::{
-        BeganPause, ConflictReason, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
-        PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult,
-        ReleasedHoldings, ResumeClaim,
+        BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
+        PausedRegistryError, PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings,
+        RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::snapshot::SnapshotId;
     use crate::types::{ExecutionId, SandboxId};
@@ -2532,6 +2663,12 @@ pub(super) mod test_support {
         /// instead of `NotFound` — so a test can drive `arbitration`'s
         /// self-comparison branch, which `NotFound` never reaches.
         conflict_origin: Option<String>,
+        renew_deadline_fails: bool,
+        /// Every `renew_sandbox_deadline` call this registry answered, so a
+        /// test can assert the coordinator forwarded the right incarnation
+        /// and deadline rather than only that it did not panic.
+        renewed_deadlines:
+            std::sync::Mutex<Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)>>,
     }
 
     /// What a programmed `get` should answer.
@@ -2558,6 +2695,8 @@ pub(super) mod test_support {
                 remove_calls: AtomicUsize::new(0),
                 claimed_as: std::sync::Mutex::new(Vec::new()),
                 conflict_origin: None,
+                renew_deadline_fails: false,
+                renewed_deadlines: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -2597,6 +2736,15 @@ pub(super) mod test_support {
             }
         }
 
+        /// Every `renew_sandbox_deadline` call fails with a backend error —
+        /// the shape of a controller mid-rollout for this one write.
+        pub(crate) fn failing_renew_deadline() -> Self {
+            Self {
+                renew_deadline_fails: true,
+                ..Self::new(0, false)
+            }
+        }
+
         pub(crate) fn release_calls(&self) -> usize {
             self.release_calls.load(Ordering::SeqCst)
         }
@@ -2617,6 +2765,12 @@ pub(super) mod test_support {
         /// Every `node_id` a `claim_for_resume` call was made under, in order.
         pub(crate) fn claimed_as(&self) -> Vec<String> {
             self.claimed_as.lock().unwrap().clone()
+        }
+
+        pub(crate) fn renewed_deadlines(
+            &self,
+        ) -> Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)> {
+            self.renewed_deadlines.lock().unwrap().clone()
         }
     }
 
@@ -2738,6 +2892,24 @@ pub(super) mod test_support {
             }
 
             Ok(MarkRunningOutcome::Adopted)
+        }
+
+        async fn renew_sandbox_deadline(
+            &self,
+            sandbox_id: &SandboxId,
+            execution_id: ExecutionId,
+            expires_at: Option<std::time::SystemTime>,
+        ) -> RegistryResult<DeadlineRenewalOutcome> {
+            self.renewed_deadlines
+                .lock()
+                .unwrap()
+                .push((*sandbox_id, execution_id, expires_at));
+
+            if self.renew_deadline_fails {
+                return Err(unreachable_backend("renew_sandbox_deadline"));
+            }
+
+            Ok(DeadlineRenewalOutcome::Renewed)
         }
 
         async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {

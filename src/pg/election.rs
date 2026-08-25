@@ -16,9 +16,11 @@
 //! call [`spawn_singleton_task`] from wherever `--role api` assembly already
 //! starts its other background loops.
 
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use futures::FutureExt as _;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnection, PgPool, Postgres};
 use sqlx::Connection as _;
@@ -191,11 +193,50 @@ where
             let Some(conn) = leader.as_mut() else {
                 continue;
             };
-            body(LeaderContext { conn }).await;
+            // 🔴 Caught, not left to unwind through this task. An unwind would
+            // drop `leader` on the way out, and `PoolConnection::drop` returns
+            // the connection to `pool` — silently, still holding the advisory
+            // lock, for some other borrower to inherit still locked. `release`
+            // below documents the same hazard for the ordinary unlock-failure
+            // path; a panic just reaches it a different way.
+            let outcome = AssertUnwindSafe(body(LeaderContext { conn }))
+                .catch_unwind()
+                .await;
+            if let Err(payload) = outcome {
+                warn!(
+                    key,
+                    panic = %panic_message(&payload),
+                    "pg singleton task body panicked; closing the leader connection instead of \
+                     returning it to the pool with the advisory lock still held"
+                );
+                // Close outright rather than routing through `release`'s
+                // ordinary `pg_advisory_unlock` attempt: a panic mid-`body`
+                // gives no guarantee the session (or this key's hold count,
+                // if `body` itself took other locks before panicking) is in a
+                // state where one unlock call is enough to fully release it.
+                // Closing the connection releases everything it held,
+                // unconditionally.
+                if let Some(conn) = leader.take() {
+                    let _ = conn.close().await;
+                }
+            }
         }
     });
 
     SingletonTaskHandle { shutdown_tx, join }
+}
+
+/// Best-effort text for a caught `body` panic payload, for the log line only
+/// — never propagated, since the payload itself is not `Send`-safe to hold
+/// past this point in every case `std::panic::catch_unwind` allows.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 async fn try_acquire(
@@ -373,6 +414,56 @@ mod tests {
         );
 
         handle_a.shutdown().await;
+        handle_b.shutdown().await;
+    }
+
+    /// `body` panicking must not leave the advisory lock stranded on a
+    /// connection that goes back to the pool still holding it — the T1-3
+    /// hazard: an uncaught unwind would drop `leader`, and
+    /// `PoolConnection::drop` returns the connection to the pool as-is,
+    /// lock and all, for the next borrower to inherit still locked.
+    ///
+    /// `a`'s body panics on its very first run; the test then shuts `a` down
+    /// (without waiting out any further ticks, so `a` gets no chance to
+    /// re-contest) and confirms `b` can still take over — proving the panic
+    /// path itself released the lock rather than shutdown's own release.
+    #[tokio::test]
+    async fn a_panicking_body_releases_the_lock_for_another_competitor() {
+        let pool_a = pool_or_skip!("a_panicking_body_releases_the_lock_for_another_competitor");
+        let pool_b = pool_or_skip!("a_panicking_body_releases_the_lock_for_another_competitor");
+        let key = next_test_lock_key();
+
+        let led_then_panicked = Arc::new(Notify::new());
+        let notify = Arc::clone(&led_then_panicked);
+        let handle_a = spawn_singleton_task_raw(pool_a, key, TICK, move |_ctx| {
+            let notify = Arc::clone(&notify);
+            Box::pin(async move {
+                notify.notify_one();
+                panic!("intentional panic exercising the singleton task's panic-recovery path");
+            })
+        });
+        timeout(Duration::from_secs(5), led_then_panicked.notified())
+            .await
+            .expect("a should acquire leadership and run body before panicking");
+
+        // Shut a down immediately so it cannot win a re-acquisition race
+        // against b before b even starts — isolating that the panic path
+        // itself, not shutdown's own release, freed the lock.
+        handle_a.shutdown().await;
+
+        let became_leader_b = Arc::new(Notify::new());
+        let notify_b = Arc::clone(&became_leader_b);
+        let handle_b = spawn_singleton_task_raw(pool_b, key, TICK, move |_ctx| {
+            let notify_b = Arc::clone(&notify_b);
+            Box::pin(async move {
+                notify_b.notify_one();
+            })
+        });
+
+        timeout(Duration::from_secs(5), became_leader_b.notified())
+            .await
+            .expect("a competitor should take over after the previous leader's body panicked");
+
         handle_b.shutdown().await;
     }
 }

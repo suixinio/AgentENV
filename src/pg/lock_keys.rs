@@ -78,6 +78,37 @@ impl AdvisoryLockKey {
     }
 }
 
+/// `schemaLockKey` in both `services/scheduler/internal/registry/migrate.go`
+/// and `services/scheduler/internal/catalog/migrate.go` — the same literal in
+/// both files, deliberately, per their own doc comments: two independent
+/// schema appliers running from one goroutine, one after the other, must not
+/// be given two lock keys a future caller could order the other way round.
+///
+/// Stage B's Rust migration runner (`crate::snapshot::repository::backends::
+/// postgres::migrate`) takes this same key, session-scoped
+/// (`pg_advisory_lock`/`pg_advisory_unlock`), for the same reason: a schema
+/// two Go processes and a fleet of `--role api` replicas might ever migrate
+/// concurrently must serialize against all of them through one number, not a
+/// second one that happens not to collide today.
+///
+/// Not an [`AdvisoryLockKey`] variant — see this module's own doc comment on
+/// why the Go constants stay outside that enum's namespace.
+pub const GO_SCHEMA_LOCK_KEY: i64 = 0x0A6E_7653_4348_4D41;
+
+/// `buildAdmissionKey` in `services/scheduler/internal/catalog/queries_admin.go`
+/// — `pg_advisory_xact_lock`, taken around every catalog build admission
+/// check (the cluster-wide build ceiling plus the per-template exclusion) and
+/// released automatically at transaction end. Stage B's
+/// `PostgresSnapshotCatalog::try_start_build` takes this same key for the
+/// same admission check, now running in-process instead of over gRPC.
+///
+/// Not an [`AdvisoryLockKey`] variant, for the same reason [`GO_SCHEMA_LOCK_KEY`]
+/// is not: it is transaction-scoped rather than session-scoped, but shares the
+/// same 64-bit keyspace regardless (see this module's doc comment), and it is
+/// a literal owned by the Go source it names, not a spot in the enumerated set
+/// this crate hands out itself.
+pub const GO_BUILD_ADMISSION_LOCK_KEY: i64 = 3_405_691_582;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,8 +147,13 @@ mod tests {
     /// re-checked against the new value — not silently reused.
     #[test]
     fn lock_keys_never_collide_with_the_go_advisory_locks() {
-        const GO_SCHEMA_LOCK_KEY: i64 = 0x0A6E_7653_4348_4D41;
-        const GO_BUILD_ADMISSION_KEY: i64 = 3_405_691_582;
+        // 🔴 Sanity check on the literals themselves, ahead of using them
+        // below: these must still read as the two Go constants' actual
+        // values, not silently drift into something this test would then
+        // validate against itself.
+        assert_eq!(GO_SCHEMA_LOCK_KEY, 0x0A6E_7653_4348_4D41);
+        assert_eq!(GO_BUILD_ADMISSION_LOCK_KEY, 3_405_691_582);
+
         for key in [
             AdvisoryLockKey::CatalogBuildReaper,
             AdvisoryLockKey::PausedRegistryReconcile,
@@ -131,9 +167,14 @@ mod tests {
             );
             assert_ne!(
                 key.as_i64(),
-                GO_BUILD_ADMISSION_KEY,
+                GO_BUILD_ADMISSION_LOCK_KEY,
                 "{key:?} collides with buildAdmissionKey"
             );
         }
+        // The two Go constants must not collide with each other either —
+        // both share this same 64-bit keyspace despite one being
+        // session-scoped and the other transaction-scoped (see this module's
+        // top doc comment).
+        assert_ne!(GO_SCHEMA_LOCK_KEY, GO_BUILD_ADMISSION_LOCK_KEY);
     }
 }

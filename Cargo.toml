@@ -125,7 +125,7 @@ redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-man
 # is never overridden to rustls the way `crates/aenv` deliberately is -- so
 # this does not add a second TLS stack next to the one `reqwest` already
 # pulls in. See `src/pg/mod.rs`.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "uuid", "json"] }
 # Stage A of the scheduler fold (docs/proposals/_sd-phase4-stageA-node-inventory.md):
 # `src/node_registry/kubernetes_discovery.rs` ports
 # `services/scheduler/internal/kubernetes_discovery.go`'s EndpointSlice/Pod

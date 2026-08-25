@@ -304,3 +304,84 @@ macro_rules! pool_or_skip {
 }
 
 pub(crate) use pool_or_skip;
+
+/// A pool scoped to a fresh, uniquely-named PostgreSQL schema on the shared
+/// ephemeral test server, or `None` under the same conditions as
+/// [`dsn_for`].
+///
+/// 🔴 Exists because [`pool_for`] is not enough for anything that runs real
+/// DDL. The ephemeral server is one Postgres instance shared by every test in
+/// this binary (see this module's own doc comment), all connecting to the
+/// same literal `postgres` database — [`pool_for`] gives election tests their
+/// own *pool*, but every pool still points at the same physical tables. Two
+/// `#[tokio::test]` functions run concurrently by default, and a migration
+/// test that creates `snapshots`/`aliases`/etc. races every other migration
+/// test doing the same in the same schema — including one that drops them
+/// (`the_documented_rollback_command_actually_rolls_back`), which is a
+/// `relation "..." does not exist` away from failing a sibling test that
+/// merely happened to run at the wrong moment. A private schema per test,
+/// selected via `search_path` on every connection the pool hands out, gives
+/// each test its own copy of every table name with no coordination between
+/// tests required.
+///
+/// Every connection this pool ever opens carries the schema via
+/// `after_connect`, not a per-transaction `SET LOCAL` — the schema has to
+/// survive for the whole test, across however many connections the pool
+/// borrows out over that time, not just one transaction.
+pub(crate) async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
+    let dsn = dsn_for(test)?;
+
+    static NEXT: AtomicI64 = AtomicI64::new(0);
+    let schema = format!(
+        "aenv_test_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+
+    // A throwaway single-connection pool just to create the schema — the
+    // real pool below assumes it already exists by the time its first
+    // `after_connect` hook runs.
+    let bootstrap = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&dsn)
+        .await
+        .unwrap_or_else(|error| panic!("failed to connect the bootstrap pool for {test}: {error}"));
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&bootstrap)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to create test schema {schema} for {test}: {error}")
+        });
+    bootstrap.close().await;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(move |conn, _meta| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO \"{schema}\""))
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&dsn)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to connect the schema-scoped pool for {test}: {error}")
+        });
+    Some(pool)
+}
+
+/// Binds a schema-scoped pool, or returns from the test having said so out
+/// loud. See [`isolated_schema_pool`].
+macro_rules! isolated_schema_pool_or_skip {
+    ($test:literal) => {
+        match crate::pg::harness::isolated_schema_pool($test).await {
+            Some(pool) => pool,
+            None => return,
+        }
+    };
+}
+
+pub(crate) use isolated_schema_pool_or_skip;

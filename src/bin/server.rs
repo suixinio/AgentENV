@@ -292,6 +292,11 @@ async fn async_main() -> anyhow::Result<()> {
     // host on the way to finding that out helps nobody.
     role.check_setup_flags(cli.setup_only, cli.setup_host)?;
 
+    // 🔴 Security invariant, checked before any role-specific assembly runs:
+    // a machine that runs user code must never hold database credentials.
+    // See `agentenv::pg` and `ServerRole::check_pg_dsn`.
+    role.check_pg_dsn(config.pg.as_ref().and_then(agentenv::cfg::PgConfig::dsn))?;
+
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
         info!(target: "agentenv", "dependency setup complete (setup-only mode)");

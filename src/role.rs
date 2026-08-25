@@ -220,6 +220,36 @@ impl ServerRole {
              --role node (or --role all)"
         )
     }
+
+    /// Refuses a `--role node` process that has been handed a PostgreSQL
+    /// DSN.
+    ///
+    /// `dsn` is [`crate::cfg::PgConfig::dsn`]'s output — already trimmed,
+    /// already `None` for blank — so this only ever sees a value here when
+    /// one is genuinely configured.
+    ///
+    /// A hard startup failure rather than a warning, for the same reason
+    /// `src/snapshot/repository/backends/central/mod.rs` gives for the
+    /// snapshot catalog and `PausedRegistryBackendKind::Postgres`
+    /// (`src/cfg.rs`) already enforces for the paused registry: database
+    /// credentials, the connection budget and the schema are the deciding
+    /// half's business, never the machines that run user code. `--role node`
+    /// runs user code; `--role api` and `--role all` decide, and both may
+    /// configure `[pg]` freely.
+    pub fn check_pg_dsn(self, dsn: Option<&str>) -> Result<()> {
+        if self != Self::Node {
+            return Ok(());
+        }
+        if dsn.is_none() {
+            return Ok(());
+        }
+        bail!(
+            "--role node must not be configured with [pg].dsn: database credentials, the \
+             connection budget and the schema belong to the deciding half (--role api / --role \
+             all), never to a machine that runs user code. Remove [pg] from this node's \
+             configuration, or from whatever file AENV_CONFIG_OVERLAY_PATH names for it"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -383,5 +413,28 @@ mod tests {
         // And the other two roles provision as they always did.
         assert!(ServerRole::Node.check_setup_flags(true, true).is_ok());
         assert!(ServerRole::All.check_setup_flags(true, true).is_ok());
+    }
+
+    /// 🔴 The security invariant this gate exists for: a `[pg].dsn` must
+    /// never reach `--role node`, which runs user code, but is exactly what
+    /// `--role api` and `--role all` are for.
+    #[test]
+    fn a_configured_pg_dsn_is_refused_for_node_and_only_for_node() {
+        let dsn = Some("postgres://user:pw@db.internal:5432/agentenv");
+
+        let err = ServerRole::Node.check_pg_dsn(dsn).unwrap_err().to_string();
+        assert!(err.contains("[pg].dsn"), "{err}");
+        assert!(err.contains("--role node"), "{err}");
+
+        // The other two roles decide; both may hold the DSN.
+        assert!(ServerRole::Api.check_pg_dsn(dsn).is_ok());
+        assert!(ServerRole::All.check_pg_dsn(dsn).is_ok());
+
+        // No DSN configured at all is fine for every role, node included —
+        // this gate is about a DSN reaching a node, not about node's role
+        // identity on its own.
+        assert!(ServerRole::Node.check_pg_dsn(None).is_ok());
+        assert!(ServerRole::Api.check_pg_dsn(None).is_ok());
+        assert!(ServerRole::All.check_pg_dsn(None).is_ok());
     }
 }

@@ -181,7 +181,7 @@ async fn serve_api(resume_wiring: ResumeWiring) -> RunningApi {
 
     let served = Arc::clone(&api);
     tokio::spawn(async move {
-        let _ = super::serve_on(listener, served, async {
+        let _ = super::serve_on(listener, served, None, async {
             let _ = rx.await;
         })
         .await;

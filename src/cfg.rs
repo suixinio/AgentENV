@@ -1000,22 +1000,61 @@ pub struct ObservabilitySchedulerReportConfig {
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint_file: String,
+    /// A second heartbeat target, dialled and sent to concurrently with
+    /// `[cluster].scheduler_endpoint` on every tick. Empty (the default)
+    /// disables it outright — no second connection is made, no second RPC is
+    /// sent, and the heartbeat loop is byte-for-byte what it was before this
+    /// field existed.
+    ///
+    /// 🔴 Stage A/D5 (`docs/proposals/_sd-phase4-stageA-node-inventory.md`
+    /// §5, "方案一"): api's own `src/node_registry` node registry only has
+    /// something to answer `resolve_node`/`node_membership`/the equivalence
+    /// dump endpoint with once heartbeats actually reach it — discovery
+    /// alone tells api *that* a node exists, not what it last reported.
+    /// Pointing this at `[cluster].api_grpc_addr` (or a Service in front of
+    /// several `--role api` replicas) lets a node report to both scheduler
+    /// (still authoritative — this is additive, not a replacement) and api's
+    /// registry, without a second copy of the reporter's retry/backoff/
+    /// hot-reload machinery: this target is dialled once, lazily, and is
+    /// **not** hot-reloadable the way `scheduler_endpoint_file`/
+    /// `[cluster].scheduler_endpoint_file` are — it is a Stage A/D5-only
+    /// bridge, not a permanent second heartbeat destination, so it does not
+    /// inherit that machinery's cost.
+    ///
+    /// 🔴 Best-effort and one-way: a failure here is logged and dropped,
+    /// never affects the primary send's success/failure, backoff, or the
+    /// `HeartbeatNodeNotConfigured` handling above — this heartbeat's
+    /// authoritative destination is still, and only, `scheduler_endpoint`.
+    /// The response (including any `cpu_config_json`) is read only far
+    /// enough to log a mismatch; it never overwrites what the primary
+    /// response already stored via `store_cluster_cpu_config`.
+    #[config(
+        default = "",
+        env = "AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT",
+        parse_env = parse_trimmed_string
+    )]
+    pub dual_report_api_endpoint: String,
 }
 
 /// Where `--role api` resolves a known node's current address for
-/// [`crate::node_client::placement::NodePlacement::resolve_node`] (and, once
-/// wired up, [`crate::node_client::placement::NodePlacement::node_membership`]).
+/// [`crate::node_client::placement::NodePlacement::resolve_node`] and
+/// [`crate::node_client::placement::NodePlacement::node_membership`].
 ///
 /// 🔴 Stage A of the scheduler fold
 /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): `Scheduler` (the
 /// default) asks `[cluster].scheduler_endpoint` over gRPC, byte-for-byte
-/// today's behavior. `Native` would answer from api's own
-/// `src/node_registry` node registry instead — no such consumer exists yet;
-/// `cluster_placement` in `src/bin/server.rs` does not read this field, so
-/// setting it to `Native` currently changes nothing. It is declared ahead of
-/// that wiring so the config surface, its env binding, and its default are
-/// settled and tested in isolation first, the same order every other
-/// `node_registry` piece landed in.
+/// today's behavior — `cluster_placement` in `src/bin/server.rs` builds no
+/// registry, no kube client, nothing. `Native` answers `resolve_node`/
+/// `node_membership` from api's own `src/node_registry` node registry
+/// instead (`crate::node_client::NativeNodePlacement`); the other three
+/// `NodePlacement` methods (`place_new`/`place_existing`/`record_placement`)
+/// still delegate to an inner `SchedulerNodePlacement` even under `Native` —
+/// those need the binding store, which is Stage D's, not Stage A's. `Native`
+/// also gates whether `assemble_api` starts Kubernetes discovery
+/// (`[cluster.kubernetes_discovery]`) and the heartbeat-receiving gRPC
+/// service at all: under `Scheduler`, nothing in this module runs, no kube
+/// client is built, and the process's dependency footprint is unchanged from
+/// before this switch existed.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodePlacementSource {
@@ -1103,6 +1142,63 @@ pub struct ClusterConfig {
     /// [`node_service_addr`]: ClusterConfig::node_service_addr
     #[config(default = 8001u16, env = "AENV_NODE_SERVICE_PORT")]
     pub node_service_port: u16,
+    /// Kubernetes EndpointSlice/Pod discovery for
+    /// [`NodePlacementSource::Native`]'s node registry. Read, and a kube
+    /// client built, only when `node_placement_source = "native"` — see
+    /// [`NodePlacementSource`]'s doc comment.
+    #[config(nested)]
+    pub kubernetes_discovery: ClusterKubernetesDiscoveryConfig,
+}
+
+/// Rust-side counterpart of Go's `SchedulerDiscoveryKubernetesConfig`
+/// (`services/shared/config/config.go`), consumed by
+/// [`crate::node_registry::kubernetes_discovery::KubernetesDiscovery`].
+///
+/// 🔴 Every field here is required in the sense that
+/// [`NodePlacementSource::Native`] refuses to start without `namespace` and
+/// `service_name` — mirroring Go's own `SchedulerDiscoveryConfig` validation
+/// (`scheduler.discovery.kubernetes.namespace is required`, `...service_name
+/// is required`) — but neither carries a default, unlike Go, because there is
+/// no single namespace/Service name every deployment of this process shares
+/// the way `agentenv-system`/`agentenv-nodes` happens to be what
+/// `deploy/k8s/base/config/scheduler.json` picks for the scheduler today.
+/// `Scheduler` mode (the default) never reads this struct at all, so an
+/// unconfigured cluster with the default placement source is unaffected by
+/// the missing defaults.
+#[derive(Debug, Config, Clone)]
+pub struct ClusterKubernetesDiscoveryConfig {
+    /// The namespace the watched `EndpointSlice`/`Pod` objects live in.
+    #[config(default = "", env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE")]
+    pub namespace: String,
+    /// The `Service` name whose `EndpointSlice`s are watched — matches
+    /// `kubernetes.io/service-name` on each slice.
+    #[config(default = "", env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME")]
+    pub service_name: String,
+    /// The node's user-facing HTTP port, as named on the watched
+    /// `EndpointSlice` — discovery's `Node.endpoint` is built from the
+    /// slice's address and this port, the same value
+    /// `deploy/k8s/base/config/scheduler.json`'s scheduler discovery config
+    /// carries as `port` (`8000` in that deployment).
+    #[config(default = 8000u16, env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_PORT")]
+    pub port: u16,
+    /// The scheme discovered node endpoints are built with (`"http"` or
+    /// `"https"`).
+    #[config(default = "http", env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_SCHEME")]
+    pub scheme: String,
+    /// A label selector for pods to exclude from discovery entirely. Empty
+    /// (the default) disables the filter.
+    #[config(
+        default = "",
+        env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_IGNORE_POD_SELECTOR"
+    )]
+    pub ignore_pod_selector: String,
+    /// A label selector for pods to keep discovered but mark unschedulable.
+    /// Empty (the default) disables the filter.
+    #[config(
+        default = "",
+        env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_NO_SCHEDULE_POD_SELECTOR"
+    )]
+    pub no_schedule_pod_selector: String,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1325,6 +1421,7 @@ impl_config_default!(
     ObservabilityConfig,
     ObservabilitySchedulerReportConfig,
     ClusterConfig,
+    ClusterKubernetesDiscoveryConfig,
     NodeIdentityConfig,
     OrchestratorConfig,
     P2pConfig,
@@ -4289,6 +4386,7 @@ endpoint = "http://second:9000"
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
+            kubernetes_discovery: Default::default(),
         };
         config.normalize();
         assert_eq!(config.scheduler_endpoint, None);
@@ -4300,6 +4398,7 @@ endpoint = "http://second:9000"
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
+            kubernetes_discovery: Default::default(),
         };
         config.normalize();
         assert_eq!(

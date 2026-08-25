@@ -1,8 +1,13 @@
 //! The gRPC surface the API half serves.
 //!
-//! One service, one method: the data plane's cold path. See
-//! [`resume`] for what it decides and `services/api/proto/apiproxy/apiproxy.proto`
-//! for the contract.
+//! Two services can share this one listener: the data plane's cold path
+//! (always — see [`resume`] and `services/api/proto/apiproxy/apiproxy.proto`
+//! for the contract) and, when `[cluster].node_placement_source = "native"`,
+//! api's Stage A node-registry heartbeat-receiving plane (task's own "D5" —
+//! see `crate::node_registry::grpc_service`). One TCP listener, one port to
+//! open in a deployment, two independent-audience gRPC services
+//! multiplexed by HTTP/2 path — the same way any two tonic services share a
+//! `Server::builder()`.
 //!
 //! # 🔴 Served by `--role api`, and by nothing else
 //!
@@ -22,7 +27,9 @@ use anyhow::Context;
 use tracing::info;
 
 use crate::api::ApiImpl;
+use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::proto::apiproxy::sandbox_resume_service_server::SandboxResumeServiceServer;
+use crate::proto::scheduler::scheduler_server::SchedulerServer;
 
 pub use resume::SandboxResumeService;
 
@@ -35,12 +42,14 @@ where
     SandboxResumeServiceServer::new(SandboxResumeService::new(api_impl))
 }
 
-/// Serves the wake-up surface on a listener somebody else bound, until
-/// `shutdown` resolves.
+/// Serves the wake-up surface — and, when `node_registry` is `Some`, the
+/// Stage A node-registry heartbeat plane alongside it — on a listener
+/// somebody else bound, until `shutdown` resolves.
 ///
 /// 🔴 A separate listener from the HTTP one, for the same reason the node
 /// service is: the two have different audiences. This one is spoken to only by
-/// the gateway's cold path, and a deployment has to be able to expose them
+/// the gateway's cold path (and, once `node_registry` is wired, by nodes'
+/// dual heartbeat), and a deployment has to be able to expose them
 /// differently — the HTTP port carries user traffic, this one carries a
 /// decision.
 ///
@@ -50,18 +59,31 @@ where
 /// cold path can wake a paused sandbox, and a replica that came up without it
 /// answers every wake-up with a connection refused that the gateway reads as a
 /// control plane that is merely slow.
+///
+/// 🔴 `node_registry` is `None` under `[cluster].node_placement_source =
+/// "scheduler"` (the default) — this surface then serves exactly what it
+/// served before that switch existed, byte-for-byte.
 pub async fn serve_on<I>(
     listener: tokio::net::TcpListener,
     api_impl: I,
+    node_registry: Option<NodeRegistryGrpcService>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()>
 where
     I: AsRef<ApiImpl> + Send + Sync + 'static,
 {
     let addr = listener.local_addr().ok();
-    info!(target: "agentenv", ?addr, "serving the sandbox resume service");
-    tonic::transport::Server::builder()
-        .add_service(server(api_impl))
+    let serves_node_registry = node_registry.is_some();
+    info!(
+        target: "agentenv", ?addr, serves_node_registry,
+        "serving the sandbox resume service"
+    );
+    let mut builder = tonic::transport::Server::builder().add_service(server(api_impl));
+    if let Some(node_registry) = node_registry {
+        NodeRegistryGrpcService::describe_metrics();
+        builder = builder.add_service(SchedulerServer::new(node_registry));
+    }
+    builder
         .serve_with_incoming_shutdown(
             tonic::transport::server::TcpIncoming::from(listener),
             shutdown,

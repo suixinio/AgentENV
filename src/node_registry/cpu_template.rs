@@ -562,4 +562,66 @@ mod tests {
         assert!(result.cpuid_modifiers.is_empty());
         assert!(result.msr_modifiers.is_empty());
     }
+
+    /// 🔴 D6 (task's own label): cross-language proof that this port and the
+    /// Go scheduler's `IntersectCpuConfigs` agree byte-for-byte, not merely
+    /// "logically" the way the fixtures above (built from Rust constructors
+    /// and compared against Rust-computed expectations) do. Every input/
+    /// output pair below was produced by *running the real Go function* —
+    /// `services/scheduler/internal/cpu_template.go`'s `IntersectCpuConfigs`
+    /// — against these exact JSON strings, from a temporary `_test.go` added
+    /// to `services/scheduler/internal` (same package, so it could see the
+    /// unexported function), `go test -run TestZZZGoldenDump -v`, output
+    /// captured, temporary file deleted (never committed — `git status
+    /// --porcelain services/` was empty afterward). If this Rust port and
+    /// the Go original ever disagree on any of these three inputs, a
+    /// heartbeat answered by one implementation and applied to a node that
+    /// trusts the other produces a different `PUT /cpu-config` body, which is
+    /// exactly the failure CLAUDE.md's "must keep working" chain is about.
+    #[test]
+    fn matches_the_real_go_implementation_byte_for_byte() {
+        // A single config: the intersection of one thing with itself is
+        // itself, byte-for-byte, field order included.
+        let single_full = r#"{"kvm_capabilities":["cap.a","cap.b"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000001111"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000011111111"}]}"#;
+        assert_eq!(
+            intersect_cpu_configs(&[single_full.to_string()]).expect("go golden: single_full"),
+            single_full,
+            "single-config intersection diverged from the real Go output"
+        );
+
+        // Two configs: a kvm_capabilities set intersection, a leaf present in
+        // only one config dropped, an msr present in only one config
+        // dropped, and a bitmap AND on the leaf/addr both configs share
+        // (0xFF & 0xAA = 0xAA on the msr; two independent register ANDs on
+        // the cpuid leaf).
+        let two_a = r#"{"kvm_capabilities":["cap.a","cap.b","cap.c"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000001111"},{"register":"ebx","bitmap":"0b00000000000000000000000011110000"}]},{"leaf":"0x7","subleaf":"0x0","flags":0,"modifiers":[{"register":"ecx","bitmap":"0b00000000000000000000000000000001"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000011111111"},{"addr":"0x20","bitmap":"0b0000000000000000000000000000000000000000000000000000000000001111"}]}"#;
+        let two_b = r#"{"kvm_capabilities":["cap.a","cap.c","cap.d"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000101"},{"register":"ebx","bitmap":"0b00000000000000000000000010100000"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000010101010"}]}"#;
+        let two_want = r#"{"kvm_capabilities":["cap.a","cap.c"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000101"},{"register":"ebx","bitmap":"0b00000000000000000000000010100000"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000010101010"}]}"#;
+        assert_eq!(
+            intersect_cpu_configs(&[two_a.to_string(), two_b.to_string()])
+                .expect("go golden: two_intersect_subset"),
+            two_want,
+            "two-config intersection diverged from the real Go output"
+        );
+
+        // Three configs, all reporting leaf 0xb (the read-only topology
+        // leaf): Go's output drops it entirely, even though every config
+        // reported it — this is the case a naive "AND the field that all
+        // three share" rewrite would get wrong.
+        let three_a = r#"{"kvm_capabilities":["cap.x"],"cpuid_modifiers":[{"leaf":"0xb","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000001111"}]},{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000011"}]}],"msr_modifiers":[]}"#;
+        let three_b = r#"{"kvm_capabilities":["cap.x"],"cpuid_modifiers":[{"leaf":"0xb","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000111"}]},{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000110"}]}],"msr_modifiers":[]}"#;
+        let three_c = r#"{"kvm_capabilities":["cap.x","cap.y"],"cpuid_modifiers":[{"leaf":"0xb","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000011"}]},{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000111"}]}],"msr_modifiers":[]}"#;
+        let three_want = r#"{"kvm_capabilities":["cap.x"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000010"}]}],"msr_modifiers":[]}"#;
+        assert_eq!(
+            intersect_cpu_configs(&[
+                three_a.to_string(),
+                three_b.to_string(),
+                three_c.to_string()
+            ])
+            .expect("go golden: three_way_leaf_0xb_readonly"),
+            three_want,
+            "three-config intersection (with the read-only leaf 0xb dropped) diverged from the \
+             real Go output"
+        );
+    }
 }

@@ -3,14 +3,18 @@
 //! inventory (`node_registry.go`, `kubernetes_discovery.go`, `filter.go`,
 //! `strategy.go`, `warmup.go`, `cpu_template.go`).
 //!
-//! Nothing in this module is wired into any runtime path yet — see each
-//! submodule's own doc comment for what Go file it ports and how far the port
-//! goes. `[cluster].node_placement_source` (once it exists) is what flips a
-//! consumer onto this module's answers instead of the scheduler's; until
-//! then this tree is inert, load-bearing only for its own tests.
+//! `[cluster].node_placement_source = "native"` is what flips `--role api`
+//! onto this module's answers instead of the scheduler's — see
+//! [`crate::node_client::NativeNodePlacement`] (the placement-side consumer)
+//! and [`grpc_service`] (the heartbeat-receiving plane that feeds it). Under
+//! the default `"scheduler"`, `assemble_api` builds none of this — no
+//! registry, no kube client, no gRPC service — so this tree stays exactly as
+//! inert as it was before the switch existed.
 
 pub mod cpu_template;
+pub mod dump;
 pub mod filter;
+pub mod grpc_service;
 pub mod kubernetes_discovery;
 pub mod registry;
 pub mod strategy;

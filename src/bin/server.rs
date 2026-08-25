@@ -2,10 +2,21 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
-use agentenv::cfg::{AppConfig, MetadataStoreBackendKind, PausedRegistryBackendKind};
+use agentenv::cfg::{
+    AppConfig, MetadataStoreBackendKind, NodePlacementSource, PausedRegistryBackendKind,
+};
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
-use agentenv::node_client::{RemoteSandboxBackendFactory, SchedulerNodePlacement};
+use agentenv::node_client::{
+    NativeNodePlacement, RemoteSandboxBackendFactory, SchedulerNodePlacement,
+};
+use agentenv::node_registry::dump::NodeRegistryDumpSource;
+use agentenv::node_registry::grpc_service::NodeRegistryGrpcService;
+use agentenv::node_registry::kubernetes_discovery::{
+    validate_optional_pod_selector, KubernetesDiscovery, KubernetesDiscoveryConfig,
+};
+use agentenv::node_registry::registry::AtomicNodeRegistry;
+use agentenv::node_registry::warmup::WarmupGate;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::{
     build_paused_registry, DisabledPausedSandboxRegistry, DisabledSandboxPersister,
@@ -966,7 +977,27 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // and an untested refusal branch is the shape this programme has already
     // paid for twice.
     let store_config = cluster_store_config(&config.orchestrator.store)?;
-    let placement = cluster_placement(&config.cluster, &config.observability.scheduler_report)?;
+    // 🔴 Stage A's placement switch (`[cluster].node_placement_source`, task's
+    // own "D7"): under `Native`, this builds api's own node registry — kube
+    // discovery, the heartbeat-receiving gRPC service, and the warm-up gate —
+    // *before* `cluster_placement` runs, so `cluster_placement` can hand a
+    // `NativeNodePlacement` a handle on it. Under `Scheduler` (the default),
+    // this constructs nothing: no registry, no kube client, no gRPC service —
+    // see `start_native_node_registry`'s own doc comment.
+    let native_node_registry = match config.cluster.node_placement_source {
+        NodePlacementSource::Native => Some(start_native_node_registry(&config.cluster).await?),
+        NodePlacementSource::Scheduler => None,
+    };
+    let (native_registry_handle, node_registry_grpc_service, mut node_registry_upkeep) =
+        match native_node_registry {
+            Some(bits) => (Some(bits.registry), Some(bits.grpc_service), bits.tasks),
+            None => (None, None, Vec::new()),
+        };
+    let placement = cluster_placement(
+        &config.cluster,
+        &config.observability.scheduler_report,
+        native_registry_handle.as_ref(),
+    )?;
     let store = RedisMetadataStore::connect(store_config)
         .await
         .context("connect the cluster metadata store")?;
@@ -1090,13 +1121,55 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             retrier.retry_stale_node_holdings_release().await;
         }));
     }
+    // The node registry's own background tasks (kube discovery, its metrics
+    // refresh loop) stop the same way and at the same point as the rest of
+    // this role's upkeep — see `spawn_paused_record_upkeep`'s callers for why
+    // that point is "before the shutdown pauses start" and not later.
+    paused_upkeep.append(&mut node_registry_upkeep);
+
+    // 🔴 Task 4's equivalence-dump debug endpoint: built and mounted
+    // regardless of `node_placement_source`, per the task's own instruction
+    // that the comparison hook has to work under the default (`Scheduler`)
+    // switch position too — see `node_registry::dump`'s own module doc for
+    // why the two modes converge on the same output shape. Native mode reads
+    // the registry `start_native_node_registry` already built above;
+    // scheduler mode reuses the same, already-validated
+    // `[cluster].scheduler_endpoint` `cluster_placement` required, over a
+    // second lazily connected channel (never the same `Channel` as
+    // `cluster_placement`'s own `SchedulerNodePlacement`, so a slow or wedged
+    // debug request can never contend with real placement traffic).
+    let node_registry_dump_source = match &native_registry_handle {
+        Some(registry) => NodeRegistryDumpSource::Native(Arc::clone(registry)),
+        None => {
+            let endpoint = config
+                .cluster
+                .scheduler_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .expect("cluster_placement already required a non-empty scheduler_endpoint");
+            let channel = tonic::transport::Endpoint::from_shared(
+                agentenv::scheduler_endpoint::qualified(endpoint),
+            )
+            .context("build the node-registry dump's scheduler-proxy channel")?
+            .connect_lazy();
+            NodeRegistryDumpSource::SchedulerProxy(channel)
+        }
+    };
 
     let grpc = {
         let served = Arc::clone(&api_impl);
         spawn_grpc_surface(
             &config.cluster.api_grpc_addr,
             "sandbox resume service",
-            move |listener, shutdown| agentenv::api::grpc::serve_on(listener, served, shutdown),
+            move |listener, shutdown| {
+                agentenv::api::grpc::serve_on(
+                    listener,
+                    served,
+                    node_registry_grpc_service,
+                    shutdown,
+                )
+            },
         )
         .await?
     };
@@ -1104,7 +1177,26 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     Ok(Assembly {
         // 🔴 No RoleGate: this half serves the whole user-facing surface. The
         // gate exists to stop a *node* answering it.
-        app: server::new(api_impl, role),
+        //
+        // 🔴 `/debug/node-registry` is mounted the same way `/metrics` is in
+        // `agentenv::api::server::new` — outside both the control-plane gate
+        // and the role gate, which are attached only to the *generated*
+        // router before this `.route` call ever runs. That is deliberate for
+        // `/metrics` (Prometheus scraping carries no credential) and adopted
+        // here for the same operational-tooling reason: this is a read-only
+        // cluster-verification aid for Stage A's placement switch, not a
+        // user-facing endpoint, and gating it behind the control-plane token
+        // would make the one tool built to check the switch's correctness
+        // unusable from outside the token-holding caller. Revisit this if
+        // node topology/address exposure through an unauthenticated endpoint
+        // is judged unacceptable for a given deployment.
+        app: server::new(api_impl, role).route(
+            "/debug/node-registry",
+            axum::routing::get(move || {
+                let source = node_registry_dump_source.clone();
+                async move { axum::Json(agentenv::node_registry::dump::dump(&source).await) }
+            }),
+        ),
         orchestration,
         upkeep: paused_upkeep,
         reporter: None,
@@ -1149,10 +1241,23 @@ fn cluster_store_config(
     })
 }
 
-/// The scheduler-backed placement this half asks where sandboxes go.
+/// The scheduler-backed placement this half asks where sandboxes go —
+/// wrapped in [`NativeNodePlacement`] under `Native` so `resolve_node`/
+/// `node_membership` answer from `node_registry` instead, while `place_new`/
+/// `place_existing`/`record_placement` keep going through this same
+/// `SchedulerNodePlacement` either way. See
+/// `docs/proposals/_sd-phase4-stageA-node-inventory.md` §5 and
+/// [`NodePlacementSource`]'s own doc comment for why the split is drawn
+/// there.
+///
+/// 🔴 `[cluster].scheduler_endpoint` is required regardless of
+/// `node_placement_source`: even under `Native`, three of five
+/// `NodePlacement` methods still need a working `SchedulerNodePlacement`, so
+/// `Native` is not a way to run `--role api` without a scheduler.
 fn cluster_placement(
     config: &agentenv::cfg::ClusterConfig,
     scheduler_report: &agentenv::cfg::ObservabilitySchedulerReportConfig,
+    native_registry: Option<&Arc<AtomicNodeRegistry>>,
 ) -> anyhow::Result<Arc<dyn agentenv::node_client::NodePlacement>> {
     let endpoint = config
         .scheduler_endpoint
@@ -1167,12 +1272,150 @@ fn cluster_placement(
                  fall back to"
             )
         })?;
-    Ok(Arc::new(SchedulerNodePlacement::connect_hot_reloadable(
+    let scheduler = SchedulerNodePlacement::connect_hot_reloadable(
         endpoint,
         config,
         scheduler_report,
         config.node_service_port,
-    )?))
+    )?;
+    match (config.node_placement_source, native_registry) {
+        (NodePlacementSource::Native, Some(registry)) => Ok(Arc::new(NativeNodePlacement::new(
+            Arc::clone(registry),
+            config.node_service_port,
+            scheduler,
+        ))),
+        _ => Ok(Arc::new(scheduler)),
+    }
+}
+
+/// Bundles what `[cluster].node_placement_source = "native"` needs running
+/// before `cluster_placement` can hand a [`NativeNodePlacement`] a registry
+/// to read: the registry itself, the heartbeat-receiving gRPC service that
+/// feeds it (task's own "D5"), and the background tasks that keep both
+/// current (kube discovery, the observed-nodes metrics gauge). Callers merge
+/// `tasks` into the role's own `upkeep` and pass `grpc_service` to
+/// `agentenv::api::grpc::serve_on`.
+///
+/// 🔴 Under `[cluster].node_placement_source = "scheduler"` (the default),
+/// nothing in `assemble_api` calls this at all — no registry, no kube
+/// client, no gRPC service, matching the task's own instruction that the
+/// default path's dependency footprint must be unchanged.
+struct NativeNodeRegistryBits {
+    registry: Arc<AtomicNodeRegistry>,
+    grpc_service: NodeRegistryGrpcService,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// How often the observed-nodes-by-status gauge refreshes, and the interval
+/// `runKubernetesDiscoveryWithRetry`'s Go counterpart's initial/maximum
+/// reconnect backoff bracket (`services/scheduler/cmd/main.go`'s
+/// `runKubernetesDiscoveryWithRetry`).
+const NODE_REGISTRY_METRICS_INTERVAL: Duration = Duration::from_secs(15);
+const KUBE_DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const KUBE_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+async fn start_native_node_registry(
+    config: &agentenv::cfg::ClusterConfig,
+) -> anyhow::Result<NativeNodeRegistryBits> {
+    let discovery = &config.kubernetes_discovery;
+    let namespace = discovery.namespace.trim();
+    let service_name = discovery.service_name.trim();
+    // 🔴 Refused here, before anything is connected — the same discipline
+    // `cluster_placement`'s own doc comment names: a misconfigured replica
+    // should be told about the setting it can see from its own config,
+    // rather than have a retry loop fail silently in the background forever
+    // for a reason a startup log line would have caught immediately.
+    if namespace.is_empty() || service_name.is_empty() {
+        anyhow::bail!(
+            "--role api needs [cluster.kubernetes_discovery].namespace and .service_name \
+             (AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE / \
+             AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when \
+             [cluster].node_placement_source = \"native\": Stage A's node registry has nothing \
+             to discover nodes from otherwise"
+        );
+    }
+    let kube_config = KubernetesDiscoveryConfig {
+        namespace: namespace.to_string(),
+        service_name: service_name.to_string(),
+        port: i32::from(discovery.port),
+        scheme: discovery.scheme.clone(),
+        ignore_pod_selector: discovery.ignore_pod_selector.clone(),
+        no_schedule_pod_selector: discovery.no_schedule_pod_selector.clone(),
+    };
+    // Same validation `KubernetesDiscovery::new` runs internally, run once
+    // here so a bad selector fails startup instead of failing the same way,
+    // silently, on every iteration of the retry loop below forever.
+    validate_optional_pod_selector(&kube_config.ignore_pod_selector, "ignore_pod_selector")?;
+    validate_optional_pod_selector(
+        &kube_config.no_schedule_pod_selector,
+        "no_schedule_pod_selector",
+    )?;
+
+    let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
+    let warmup = Arc::new(WarmupGate::new(
+        Arc::clone(&registry) as Arc<dyn agentenv::node_registry::registry::NodeRegistry>,
+        Duration::from_secs(15),
+        std::time::SystemTime::now(),
+    ));
+    let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));
+
+    let discovery_task = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(run_kubernetes_discovery_with_retry(kube_config, registry))
+    };
+    let metrics_task = {
+        let metrics_service = grpc_service.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(NODE_REGISTRY_METRICS_INTERVAL);
+            loop {
+                interval.tick().await;
+                metrics_service.refresh_observed_nodes_metric();
+            }
+        })
+    };
+
+    Ok(NativeNodeRegistryBits {
+        registry,
+        grpc_service,
+        tasks: vec![discovery_task, metrics_task],
+    })
+}
+
+/// Mirrors `services/scheduler/cmd/main.go`'s `runKubernetesDiscoveryWithRetry`:
+/// (re)connects and runs discovery, and on any failure — connecting or the
+/// watch loop itself ending — waits an exponentially growing backoff and
+/// tries again. Never returns under normal operation; callers drive it as a
+/// background task.
+///
+/// 🔴 Does not special-case an in-cluster-config failure the way Go's
+/// version does (`errors.Is(err, rest.ErrNotInCluster)` stops retrying
+/// outright there): `kube::Config::infer` does not expose an equivalently
+/// precise "this will never succeed" signal to distinguish from "the
+/// apiserver is transiently unreachable", so every failure here is treated
+/// as retryable. The cost is a Pod that will never have in-cluster
+/// credentials logging a warning every `KUBE_DISCOVERY_MAX_BACKOFF` forever
+/// instead of failing loudly once — a known, narrower gap than the retry
+/// loop's own reason for existing (a transiently unreachable apiserver at
+/// startup must not be fatal).
+async fn run_kubernetes_discovery_with_retry(
+    config: KubernetesDiscoveryConfig,
+    registry: Arc<AtomicNodeRegistry>,
+) {
+    let mut backoff = KUBE_DISCOVERY_INITIAL_BACKOFF;
+    loop {
+        match KubernetesDiscovery::connect(config.clone(), Arc::clone(&registry)).await {
+            Ok(discovery) => {
+                if let Err(err) = discovery.run().await {
+                    warn!(target: "agentenv", error = %err, "kubernetes node discovery ended; retrying");
+                }
+            }
+            Err(err) => {
+                warn!(target: "agentenv", error = %err, "kubernetes node discovery failed to start; retrying");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff.saturating_mul(2), KUBE_DISCOVERY_MAX_BACKOFF);
+    }
 }
 
 /// Binds a gRPC listener and spawns the server that answers on it.
@@ -1427,7 +1670,11 @@ mod tests {
             "the default is no endpoint, which is what makes this refusal necessary"
         );
 
-        let err = match cluster_placement(&config.cluster, &config.observability.scheduler_report) {
+        let err = match cluster_placement(
+            &config.cluster,
+            &config.observability.scheduler_report,
+            None,
+        ) {
             Ok(_) => panic!("there is no machine here to fall back to"),
             Err(err) => err.to_string(),
         };
@@ -1443,7 +1690,12 @@ mod tests {
         // that fails on every call instead of a process that refuses to start.
         config.cluster.scheduler_endpoint = Some("   ".to_string());
         assert!(
-            cluster_placement(&config.cluster, &config.observability.scheduler_report).is_err(),
+            cluster_placement(
+                &config.cluster,
+                &config.observability.scheduler_report,
+                None
+            )
+            .is_err(),
             "a blank endpoint is not an endpoint"
         );
 
@@ -1451,7 +1703,12 @@ mod tests {
         // above are about what was missing.
         config.cluster.scheduler_endpoint = Some("http://scheduler:9090".to_string());
         assert!(
-            cluster_placement(&config.cluster, &config.observability.scheduler_report).is_ok(),
+            cluster_placement(
+                &config.cluster,
+                &config.observability.scheduler_report,
+                None
+            )
+            .is_ok(),
             "a configured endpoint is what this role runs on"
         );
     }

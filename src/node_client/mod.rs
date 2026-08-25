@@ -34,6 +34,7 @@
 
 mod build;
 mod factory;
+mod native_placement;
 mod paused_state;
 mod placement;
 mod scheduler_placement;
@@ -45,7 +46,8 @@ mod tests;
 
 pub(crate) use build::build_template_on_a_node;
 pub use factory::RemoteSandboxBackendFactory;
+pub use native_placement::NativeNodePlacement;
 pub use paused_state::RemotePausedState;
-pub use placement::{FixedNodePlacement, NodeEndpoint, NodePlacement};
+pub use placement::{FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement};
 pub use scheduler_placement::SchedulerNodePlacement;
 pub use stub::RemoteSandboxStub;

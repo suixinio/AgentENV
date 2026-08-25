@@ -15,6 +15,7 @@ make test-unit                # unit tests only (library *and* bin targets)
 make test-agent-integration   # integration tests (tests/integration/*.rs)
 make bench                    # snapshot benchmarks
 make test-with-redis          # the orchestrator metadata store against a real redis-server
+make test-with-postgres       # the src/pg/ shared control-plane suite against a real postgres server
 make start-server             # build and run the API server (auto-provisions dependencies)
 ```
 
@@ -38,6 +39,19 @@ suite is part of `cargo test -p agentenv --lib`, so `make test-unit` runs it too
 changes `InMemoryMetadataStore` has to run it**: the two backends share one
 contract suite (`src/orchestrator/store/contract.rs`) and a change made to one
 and forgotten for the other is invisible anywhere else.
+
+`make test-with-postgres` runs `src/pg/`'s suite (per-process connection pool
+plus the `pg_try_advisory_lock`-based cluster-leadership election used by
+`--role api`/`--role all`) with `AENV_PG_TEST_REQUIRED=1`, which turns "no
+usable `initdb`/`postgres` on this machine" into a failure rather than a skip,
+and fails the target if any test printed a `SKIPPED[postgres]` line. It first
+checks for `initdb`/`postgres` itself — Debian/Ubuntu's `postgresql` package
+installs them under `/usr/lib/postgresql/<version>/bin/`, off `PATH` — using
+the same lookup order as `src/pg/harness.rs::find_bin`; set `INITDB_BIN`/
+`POSTGRES_BIN` to point at specific binaries. The suite is part of
+`cargo test -p agentenv --lib`, so `make test-unit` runs it too — but, exactly
+as with `test-with-redis`, only `test-with-postgres` makes a missing server an
+error instead of a silently-green skip.
 
 Dev/CI tooling via `cargo adev` (delegated from Makefile):
 ```bash

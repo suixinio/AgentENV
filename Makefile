@@ -54,7 +54,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-ublk install-ublk \
 	fmt clippy \
 	mutants coverage \
-	test test-unit test-integration test-with-redis test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
+	test test-unit test-integration test-with-redis test-with-postgres test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
@@ -169,6 +169,42 @@ test-with-redis:
 	    exit 1; \
 	  fi; \
 	  if [ $$status -eq 0 ]; then echo; echo "no store tests were skipped"; fi; \
+	  exit $$status
+
+# The `src/pg/` suite (per-process pool + advisory-lock election), against a
+# real postgres server. Mirrors test-with-redis above: `src/pg/harness.rs`
+# borrows the same skip/required convention deliberately, down to the
+# `SKIPPED[...]` marker, and without a make target enforcing it, a machine
+# without postgres installed silently downgrades every real-server test in
+# that suite to a skip and still reports ok — the exact failure mode this
+# repository has already been bitten by once, for Redis.
+#
+# Debian/Ubuntu's postgresql package puts `initdb`/`postgres` under
+# /usr/lib/postgresql/<version>/bin/, which is not on PATH; this probe uses
+# the same lookup order as `src/pg/harness.rs::find_bin` (INITDB_BIN/
+# POSTGRES_BIN override, then PATH, then that versioned layout) so the
+# preflight check and the suite itself never disagree about availability.
+PG_TEST_LOG ?= target/pg-store-tests.log
+
+test-with-postgres:
+	@initdb_bin="$${INITDB_BIN:-$$(command -v initdb 2>/dev/null || ls -1 /usr/lib/postgresql/*/bin/initdb 2>/dev/null | sort -V | tail -1)}"; \
+	postgres_bin="$${POSTGRES_BIN:-$$(command -v postgres 2>/dev/null || ls -1 /usr/lib/postgresql/*/bin/postgres 2>/dev/null | sort -V | tail -1)}"; \
+	if [ -z "$$initdb_bin" ] || [ ! -x "$$initdb_bin" ] || [ -z "$$postgres_bin" ] || [ ! -x "$$postgres_bin" ]; then \
+	  echo "initdb/postgres not found: the pg tests would skip instead of running."; \
+	  echo "Install postgresql (e.g. apt install postgresql), or point INITDB_BIN/POSTGRES_BIN at them."; \
+	  echo "Debian/Ubuntu puts them under /usr/lib/postgresql/<version>/bin/, off PATH."; \
+	  exit 1; \
+	fi
+	@mkdir -p $(dir $(PG_TEST_LOG))
+	@AENV_PG_TEST_REQUIRED=1 $(CARGO) test -p agentenv --lib pg:: -- --nocapture \
+	  > $(PG_TEST_LOG) 2>&1; status=$$?; \
+	  cat $(PG_TEST_LOG); \
+	  if grep -q 'SKIPPED\[postgres\]' $(PG_TEST_LOG); then \
+	    echo; echo "this run skipped pg tests:"; \
+	    grep 'SKIPPED\[postgres\]' $(PG_TEST_LOG); \
+	    exit 1; \
+	  fi; \
+	  if [ $$status -eq 0 ]; then echo; echo "no pg tests were skipped"; fi; \
 	  exit $$status
 
 test-integration: test-agent-integration test-envd test-ublk

@@ -1972,6 +1972,226 @@ func TestRenewParkedLeasesRefusesAMalformedSandboxID(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RenewLiveLeases
+//
+// RenewParkedLeases' own test suite above pins that a `running` row's lease is
+// never touched by that statement (TestRenewParkedLeasesTouchesOnlyPublishingAndLocalOnly).
+// The tests below are that statement's mirror image for RenewLiveLeases:
+// pinning that *only* `running` rows move, with the same shape of assertions
+// RenewParkedLeases' own suite uses — a measured lease movement, not merely a
+// nil error, since a zero-row UPDATE also returns nil.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// stPodClaimant and stMachineHolder are deliberately shaped like the two
+// different identity spaces the split-role deployment actually produces — a
+// Kubernetes Deployment pod name and a real machine's hostname — rather than
+// reusing stNodeA/stNodeB, which are both machine-shaped generic strings and
+// would let a broken origin_node_id comparison pass by coincidence (compare
+// two "node-a"-shaped values and a bug that accidentally matches on a
+// substring, a prefix, or drops the comparison to a truthiness check would
+// never show up). RenewLiveLeases exists specifically because a pod-shaped
+// caller identity can never equal a running row's machine-shaped
+// origin_node_id — see RenewLiveLeases' own doc — so its own tests should not
+// use fixture values where that structural mismatch is invisible.
+const (
+	stPodClaimant   = "agentenv-api-7f9c8d5b6-x2kpq"
+	stMachineHolder = "aenv-node-07.prod.internal"
+)
+
+// TestRenewLiveLeasesOnlyTheAssertedHolderMatches mirrors
+// TestRenewParkedLeasesOnlyTheAssertedHolderMatches, with shapes distinct
+// enough that a comparison silently reduced to "non-empty" or "same length"
+// could not pass this test by accident.
+func TestRenewLiveLeasesOnlyTheAssertedHolderMatches(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(71)
+
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+
+	// The control: asserting the api replica's own pod identity — exactly
+	// what the split-role api half's periodic renew_paused_leases call
+	// reports today — must renew nothing. This is the bug RenewLiveLeases
+	// exists to route around, pinned as a negative here so a regression that
+	// silently widens the predicate back to accepting any caller shows up as
+	// a test failure rather than as a reclaimed sandbox on a live node.
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stPodClaimant}}); err != nil || renewed != 0 {
+		t.Fatalf("asserting a pod-shaped non-holder identity must renew nothing: renewed=%d err=%v", renewed, err)
+	}
+	if row := f.raw(id); row.leaseExpires == nil || row.leaseExpires.After(f.dbNow()) {
+		t.Fatalf("the row must still read as lapsed after a mismatched assertion: %+v", row.leaseExpires)
+	}
+
+	// The row's own holder does renew it.
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 1 {
+		t.Fatalf("the row's own holder must renew it: renewed=%d err=%v", renewed, err)
+	}
+	if row := f.raw(id); row.leaseExpires == nil || !row.leaseExpires.After(f.dbNow()) {
+		t.Fatalf("the correct holder's renewal must land: %+v", row.leaseExpires)
+	}
+}
+
+// TestRenewLiveLeasesTouchesOnlyRunning is RenewLiveLeases' mirror of
+// TestRenewParkedLeasesTouchesOnlyPublishingAndLocalOnly: every other state,
+// including `resuming` — which RenewLease's own resuming branch already
+// renews correctly under the claimant identity, see paused_recovery.rs — must
+// come back untouched.
+func TestRenewLiveLeasesTouchesOnlyRunning(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+
+	paused := sandboxUUID(72)
+	running := sandboxUUID(73)
+	resuming := sandboxUUID(74)
+	publishing := sandboxUUID(75)
+	localOnly := sandboxUUID(76)
+
+	f.seed(seedRow{sandboxID: paused, state: "paused", originNode: stMachineHolder, snapshotID: snapshotUUID(72), leaseExpires: "now() - interval '1 hour'"})
+	f.seed(seedRow{sandboxID: running, state: "running", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+	// originNode (not claimedBy) is deliberately set to stMachineHolder here,
+	// matching every other row in this test: if the statement's state scope
+	// were ever accidentally widened to include `resuming`, origin_node_id
+	// would already match and this row would renew — the identity check must
+	// not be the thing masking a state-scope regression.
+	f.seed(seedRow{sandboxID: resuming, state: "resuming", originNode: stMachineHolder, claimedBy: stNodeB, snapshotID: snapshotUUID(74), leaseExpires: "now() - interval '1 hour'"})
+	f.seed(seedRow{sandboxID: publishing, state: "publishing", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+	f.seed(seedRow{sandboxID: localOnly, state: "local_only", originNode: stMachineHolder, snapshotID: snapshotUUID(76), leaseExpires: "now() - interval '1 hour'"})
+
+	renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{
+		{SandboxID: paused, NodeID: stMachineHolder},
+		{SandboxID: running, NodeID: stMachineHolder},
+		{SandboxID: resuming, NodeID: stMachineHolder},
+		{SandboxID: publishing, NodeID: stMachineHolder},
+		{SandboxID: localOnly, NodeID: stMachineHolder},
+	})
+	if err != nil {
+		t.Fatalf("renew_live_leases failed: %v", err)
+	}
+	if renewed != 1 {
+		t.Fatalf("expected only the running row to renew, got %d", renewed)
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   string
+		want bool // true: lease must have moved to the future
+	}{
+		{"paused", paused, false},
+		{"running", running, true},
+		{"resuming", resuming, false},
+		{"publishing", publishing, false},
+		{"local_only", localOnly, false},
+	} {
+		row := f.raw(tc.id)
+		moved := row.leaseExpires != nil && row.leaseExpires.After(f.dbNow())
+		if moved != tc.want {
+			t.Fatalf("%s: expected moved=%v, got leaseExpires=%v", tc.name, tc.want, row.leaseExpires)
+		}
+	}
+}
+
+// TestRenewLiveLeasesLeavesSandboxExpiresAtAlone mirrors
+// TestRenewParkedLeasesLeavesSandboxExpiresAtAlone: the api half's own
+// authority over the deadline is not something this heartbeat-driven write
+// may touch, even for the one state it does renew.
+func TestRenewLiveLeasesLeavesSandboxExpiresAtAlone(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(77)
+
+	f.seed(seedRow{
+		sandboxID: id, state: "running", originNode: stMachineHolder,
+		leaseExpires: "now() - interval '1 hour'", sandboxExpiry: "now() + interval '2 hours'",
+	})
+	before := f.raw(id)
+	if before.leaseExpires == nil || before.sandboxExpiry == nil {
+		t.Fatal("the seed must have written both clocks")
+	}
+
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 1 {
+		t.Fatalf("renew_live_leases failed: renewed=%d err=%v", renewed, err)
+	}
+
+	after := f.raw(id)
+	if after.sandboxExpiry == nil || !after.sandboxExpiry.Equal(*before.sandboxExpiry) {
+		t.Fatalf("sandbox_expires_at must be untouched: before=%v after=%v", before.sandboxExpiry, after.sandboxExpiry)
+	}
+	if gap := after.leaseExpires.Sub(*before.leaseExpires); gap < 55*time.Minute {
+		t.Fatalf("expected the lease to move forward by roughly an hour, moved by %s", gap)
+	}
+}
+
+// TestRenewLiveLeasesCannotReachAnotherClustersRows mirrors
+// TestRenewParkedLeasesCannotReachAnotherClustersRows.
+func TestRenewLiveLeasesCannotReachAnotherClustersRows(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(78)
+
+	f.seed(seedRow{sandboxID: id, cluster: f.other, state: "running", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 0 {
+		t.Fatalf("another cluster's row must not be renewable: renewed=%d err=%v", renewed, err)
+	}
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.other, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 1 {
+		t.Fatalf("the row's own cluster must be able to renew it: renewed=%d err=%v", renewed, err)
+	}
+}
+
+// TestRenewLiveLeasesOfNothingAsksNothing mirrors
+// TestRenewParkedLeasesOfNothingAsksNothing.
+func TestRenewLiveLeasesOfNothingAsksNothing(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(79)
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, nil); err != nil || renewed != 0 {
+		t.Fatalf("renew_live_leases of nothing failed: renewed=%d err=%v", renewed, err)
+	}
+	if row := f.raw(id); row.leaseExpires == nil || row.leaseExpires.After(f.dbNow()) {
+		t.Fatalf("an empty request must not have touched the row: %+v", row.leaseExpires)
+	}
+
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 1 {
+		t.Fatalf("the same row named explicitly must renew: renewed=%d err=%v", renewed, err)
+	}
+}
+
+// TestRenewLiveLeasesRefusesAnEmptyNodeID mirrors
+// TestRenewParkedLeasesRefusesAnEmptyNodeID.
+func TestRenewLiveLeasesRefusesAnEmptyNodeID(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(80)
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+
+	if _, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: ""}}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for an empty node id, got %v", err)
+	}
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 1 {
+		t.Fatalf("a real node id must succeed: renewed=%d err=%v", renewed, err)
+	}
+}
+
+// TestRenewLiveLeasesRefusesAMalformedSandboxID mirrors
+// TestRenewParkedLeasesRefusesAMalformedSandboxID.
+func TestRenewLiveLeasesRefusesAMalformedSandboxID(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+
+	if _, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: "not-a-uuid", NodeID: stMachineHolder}}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for a malformed sandbox id, got %v", err)
+	}
+
+	id := sandboxUUID(81)
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stMachineHolder, leaseExpires: "now() - interval '1 hour'"})
+	if renewed, err := f.store.RenewLiveLeases(ctx, f.cluster, []ParkedLeaseHolder{{SandboxID: id, NodeID: stMachineHolder}}); err != nil || renewed != 1 {
+		t.Fatalf("a well-formed id must succeed: renewed=%d err=%v", renewed, err)
+	}
+}
+
 // TestALeaseViewDoesNotOwnThePool: a view is what a per-request handler holds,
 // and closing it must not drain the pool underneath the store it came from.
 func TestALeaseViewDoesNotOwnThePool(t *testing.T) {

@@ -1438,6 +1438,75 @@ func (s *PostgresStore) RenewParkedLeases(ctx context.Context, clusterID string,
 	return uint64(tag.RowsAffected()), nil
 }
 
+// renewLiveLeaseSQL is renewParkedLeaseSQL's sibling for `running` rows.
+//
+// Same shape, same three load-bearing properties (see renewParkedLeaseSQL's
+// own comment): sandbox_expires_at stays untouched — that deadline is the API
+// half's to set, not a fact a heartbeat proves anything about — the
+// (sandbox, node) pairs are caller-asserted and re-checked against the row's
+// own origin_node_id rather than trusted, and `running` is the only state
+// this statement will touch.
+//
+// updated_at *is* written, deliberately unlike leaving it alone: this is the
+// one write on this row that only ever happens when the row's own holder has
+// a fresh heartbeat roster that still lists the sandbox (see
+// registryReconcileResult.liveLeaseRenewals), so bumping it here is a
+// confirmation earned the same way MarkRunning's own updated_at write is —
+// unlike a write sourced from the api half's cluster-wide metadata view,
+// which proves nothing about whether the node behind origin_node_id is still
+// reachable and must never be allowed to feed reconcile.go's ghost detection
+// a false "recently confirmed".
+const renewLiveLeaseSQL = `
+UPDATE paused_sandboxes AS p
+   SET lease_expires_at = now() + make_interval(secs => $1::double precision),
+       updated_at       = now()
+  FROM (SELECT unnest($3::uuid[]) AS sandbox_id,
+               unnest($4::text[]) AS node_id) AS v
+ WHERE p.sandbox_id = v.sandbox_id
+   AND p.cluster_id = $2::uuid
+   AND p.state = 'running'
+   AND p.origin_node_id = v.node_id`
+
+// RenewLiveLeases implements Store.
+//
+// The lease length is this store's own, the same reasoning as
+// RenewParkedLeases: the caller here is the scheduler's own reconciliation,
+// working from a roster that carries no lease length of its own.
+func (s *PostgresStore) RenewLiveLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error) {
+	cluster, err := requireUUID("cluster_id", clusterID)
+	if err != nil {
+		return 0, err
+	}
+	if len(holders) == 0 {
+		// Nothing asserted, so nothing is asked — matches RenewParkedLeases'
+		// own empty-input handling.
+		return 0, nil
+	}
+
+	ids := make([]string, 0, len(holders))
+	nodeIDs := make([]string, 0, len(holders))
+	for _, h := range holders {
+		id, err := requireUUID("sandbox_id", h.SandboxID)
+		if err != nil {
+			return 0, err
+		}
+		if strings.TrimSpace(h.NodeID) == "" {
+			return 0, fmt.Errorf("%w: node_id is required", ErrInvalidArgument)
+		}
+		ids = append(ids, id)
+		nodeIDs = append(nodeIDs, h.NodeID)
+	}
+
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx, renewLiveLeaseSQL, s.ttlSeconds(), cluster, ids, nodeIDs)
+	if err != nil {
+		return 0, fmt.Errorf("registry renew_live_leases: %w", err)
+	}
+	return uint64(tag.RowsAffected()), nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reclamation
 // ─────────────────────────────────────────────────────────────────────────────

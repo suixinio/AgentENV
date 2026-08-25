@@ -457,6 +457,87 @@ func TestReconcileParkedLeaseRenewalUsesTheRowsRawHolderNotTheResolvedOne(t *tes
 	}
 }
 
+// TestReconcileLiveLeaseRenewalCandidatesNeedTheHoldersOwnFreshRoster is
+// TestReconcileParkedLeaseRenewalCandidatesNeedTheHoldersOwnFreshRoster's
+// mirror for `running` rows: the same eligibility rule, scoped to the one
+// live state whose api-half renewal call can never reach it (see
+// RenewLiveLeases' own doc), with a positive case for every way to be
+// excluded.
+func TestReconcileLiveLeaseRenewalCandidatesNeedTheHoldersOwnFreshRoster(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		// Eligible: running, holder's roster fresh and lists it.
+		{SandboxID: "s1", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: node-a's roster is fresh but does not list s2 — the node
+		// itself is not vouching for this row.
+		{SandboxID: "s2", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: node-b's roster does list s3, but it is stale.
+		{SandboxID: "s3", State: pausedregistry.StateRunning, OriginNodeID: "node-b", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: resuming — a claim in flight is not in anybody's roster
+		// yet, and this mechanism is scoped to `running` regardless.
+		{SandboxID: "s4", State: pausedregistry.StateResuming, OriginNodeID: "node-a", ClaimedByNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: publishing — the parked mechanism's own candidate, not
+		// this one's, even though node-a's roster is fresh and lists it too.
+		{SandboxID: "s5", State: pausedregistry.StatePublishing, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+		// Excluded: paused — nobody holds it.
+		{SandboxID: "s6", State: pausedregistry.StatePaused, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour)},
+	}
+	// node-a: fresh, and vouches for everything except s2.
+	f.roster("node-a", 0, "s1", "s4", "s5", "s6")
+	// node-b: vouches for s3, but its last report is well past reportTTL.
+	f.roster("node-b", 5*time.Minute, "s3")
+
+	result := f.run(testReportTTL)
+
+	if got := len(result.liveLeaseRenewals); got != 1 {
+		t.Fatalf("expected exactly 1 renewal candidate, got %d: %+v", got, result.liveLeaseRenewals)
+	}
+	if !hasParkedLeaseRenewal(result.liveLeaseRenewals, "s1", "node-a") {
+		t.Fatalf("expected s1 to be a candidate: %+v", result.liveLeaseRenewals)
+	}
+	for _, excluded := range []string{"s2", "s3", "s4", "s5", "s6"} {
+		for _, c := range result.liveLeaseRenewals {
+			if c.SandboxID == excluded {
+				t.Fatalf("%s must not be a live-lease renewal candidate: %+v", excluded, result.liveLeaseRenewals)
+			}
+		}
+	}
+	// Every publishing/local_only candidate must stay parkedLeaseRenewals'
+	// alone, and vice versa: the two lists must never double-count a row.
+	if !hasParkedLeaseRenewal(result.parkedLeaseRenewals, "s5", "node-a") {
+		t.Fatalf("expected s5 to remain a parked-lease candidate: %+v", result.parkedLeaseRenewals)
+	}
+}
+
+// TestReconcileLiveDeadlinePassedCountsARunningRowOnlyWhileItsLeaseSurvives
+// pins liveDeadlinePassed's exact scope: a running row past its own deadline
+// counts here only until its lease also lapses, at which point it moves to
+// reclaimableNow instead — the two must be mutually exclusive, since a row
+// counted in both would double-alert on the same fact.
+func TestReconcileLiveDeadlinePassedCountsARunningRowOnlyWhileItsLeaseSurvives(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		// Lease alive, deadline passed: the frozen-clock risk signal.
+		{SandboxID: "frozen", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, time.Hour), SandboxExpiresAt: at(f.dbNow, -time.Minute)},
+		// Lease lapsed, deadline passed: already reclaimableNow, not this.
+		{SandboxID: "reclaimable", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, -time.Minute), SandboxExpiresAt: at(f.dbNow, -time.Minute)},
+		// Lease alive, deadline still ahead: neither.
+		{SandboxID: "healthy", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(f.dbNow, time.Hour), SandboxExpiresAt: at(f.dbNow, time.Hour)},
+		// resuming with the same shape as "frozen": must not be counted, this
+		// gauge is running-only (see its own doc for why).
+		{SandboxID: "resuming-frozen", State: pausedregistry.StateResuming, OriginNodeID: "node-a", ClaimedByNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(f.dbNow, time.Hour), SandboxExpiresAt: at(f.dbNow, -time.Minute)},
+	}
+
+	result := f.run(testReportTTL)
+
+	if result.liveDeadlinePassed != 1 {
+		t.Fatalf("expected exactly 1 row with a passed deadline and a live lease, got %d", result.liveDeadlinePassed)
+	}
+	if result.reclaimableNow != 1 {
+		t.Fatalf("expected exactly 1 reclaimable row, got %d", result.reclaimableNow)
+	}
+}
+
 func TestReconcileCountsInvalidRows(t *testing.T) {
 	f := newReconcileFixture()
 	f.sandboxes = []pausedregistry.Sandbox{

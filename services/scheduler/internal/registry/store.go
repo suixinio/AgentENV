@@ -118,6 +118,40 @@ type Store interface {
 	// column at all rather than by writing it correctly.
 	RenewParkedLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
 
+	// RenewLiveLeases extends lease_expires_at alone — never sandbox_expires_at
+	// — on `running` rows named in holders. RenewParkedLeases' sibling for the
+	// other state a caller with no standing identity can still vouch for.
+	//
+	// 🔴 Why this exists at all, separate from RenewParkedLeases. RenewLease's
+	// own `running` branch compares origin_node_id against the caller's
+	// identity, which is exactly right for a node renewing sandboxes it
+	// physically runs — and exactly never satisfiable by the api half's own
+	// periodic renewal call (`renew_paused_leases`,
+	// `src/api/impls/paused_recovery.rs`), whose identity is a Kubernetes Pod
+	// name, not the machine origin_node_id names since the identity axis split
+	// origin_node_id from the caller (see markRunningFencedSQL's holder/
+	// claimant note). A `running` row therefore loses lease renewal entirely
+	// under that split, the same gap RenewParkedLeases closed for
+	// publishing/local_only — and losing it here is worse: once the lease
+	// eventually lapses, ReclaimExpiredHoldings' running branch may act on it,
+	// tearing down a sandbox a perfectly healthy node is still serving.
+	//
+	// Deliberately not folded into RenewParkedLeases by widening its state
+	// list. Two statements, not one covering three states: see
+	// beginPauseFencedSQL/beginPauseUnfencedSQL's own note on why this
+	// codebase keeps such variants separate — each stays independently
+	// testable, and RenewParkedLeases' own tests keep pinning that it never
+	// touches `running` (TestRenewParkedLeasesTouchesOnlyPublishingAndLocalOnly)
+	// without this method's existence putting that pin at risk.
+	//
+	// holders must carry each row's raw origin_node_id, exactly as
+	// ParkedLeaseHolder.NodeID's own doc requires — the scheduler's
+	// heartbeat-driven reconciliation builds this the same way it builds
+	// RenewParkedLeases' candidates: from a node's own fresh heartbeat roster,
+	// the one channel a node cannot forge another node's identity onto. See
+	// registryReconcileResult.liveLeaseRenewals.
+	RenewLiveLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
+
 	// MarkRunning records that a sandbox is live, claimed under nodeID and
 	// physically running on holderNodeID.
 	//
@@ -231,6 +265,21 @@ type Store interface {
 // not a new implementation to maintain.
 type ParkedLeaseRenewer interface {
 	RenewParkedLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
+}
+
+// HeartbeatLeaseRenewer is the two writes the scheduler's heartbeat-driven
+// reconciliation needs: RenewParkedLeases for publishing/local_only rows and
+// RenewLiveLeases for `running` ones, and nothing else of Store.
+//
+// A separate, wider interface rather than adding RenewLiveLeases onto
+// ParkedLeaseRenewer itself: the two statements protect different states for
+// different reasons (see each method's own doc) and a caller that only ever
+// needed the parked half — none exists today, but the seam should not
+// silently start demanding more than it uses — would otherwise be forced to
+// implement a write it never calls. Any Store satisfies this automatically.
+type HeartbeatLeaseRenewer interface {
+	ParkedLeaseRenewer
+	RenewLiveLeases(ctx context.Context, clusterID string, holders []ParkedLeaseHolder) (uint64, error)
 }
 
 // Rows is a bulk read: the rows that exist, what was looked up, and when.

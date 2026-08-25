@@ -131,7 +131,21 @@ var (
 	schedulerRegistryReclaimableNow = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "agentenv_scheduler_registry_reclaimable_now",
-			Help: "Live rows whose lease has lapsed and whose sandbox has outlived its own deadline: the rows the node-side reclaim will act on next tick.",
+			Help: "Rows the node-side reclaim will act on next tick: a running row whose lease has lapsed and whose sandbox has outlived its own deadline, or a resuming row whose lease alone has lapsed.",
+		},
+	)
+	// schedulerRegistryLiveDeadlinePassed is the visible half of the gap
+	// RenewLiveLeases does not close: sandbox_expires_at is the api half's
+	// authority and its own renewal call cannot reach a `running` row any more
+	// than the lease could before this fix, so a keep-alive issued after a
+	// sandbox's last resume does not reach this column. A row counted here is
+	// not being reclaimed — its lease is still fresh — but the instant that
+	// stops being true, reclaim will compare against whatever stale deadline
+	// this column still carries.
+	schedulerRegistryLiveDeadlinePassed = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_registry_live_deadline_passed",
+			Help: "running rows whose sandbox_expires_at has already passed while lease_expires_at is still being renewed. Not in danger yet — the lease keeps reclaim from acting — but reclaim will use this stale deadline the moment the lease does lapse.",
 		},
 	)
 	schedulerRegistryRosterStale = promauto.NewGaugeVec(
@@ -204,6 +218,29 @@ var (
 		prometheus.CounterOpts{
 			Name: "agentenv_scheduler_registry_heartbeat_lease_renewal_failures_total",
 			Help: "Heartbeat-driven lease renewal attempts that failed to write.",
+		},
+	)
+
+	// schedulerRegistryLiveLeaseRenewalCandidates is
+	// schedulerRegistryParkedLeaseRenewalCandidates' sibling for `running`
+	// rows — see RenewLiveLeases' own doc for why this is a separate write
+	// from the parked one rather than a wider version of it.
+	schedulerRegistryLiveLeaseRenewalCandidates = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_live_lease_renewal_candidates",
+			Help: "running rows this round found a fresh, first-party roster for: the row's own holder heartbeated recently and still lists the sandbox. Published whether or not the renewal switch is on.",
+		},
+	)
+	schedulerRegistryLiveLeaseRenewed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_live_lease_renewed_total",
+			Help: "running rows the heartbeat-driven lease renewal actually extended lease_expires_at on.",
+		},
+	)
+	schedulerRegistryLiveLeaseRenewalFailures = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_registry_heartbeat_live_lease_renewal_failures_total",
+			Help: "Heartbeat-driven live (running) lease renewal attempts that failed to write.",
 		},
 	)
 
@@ -559,6 +596,24 @@ func recordRegistryHeartbeatLeaseRenewalFailure() {
 	schedulerRegistryHeartbeatLeaseRenewalFailures.Inc()
 }
 
+// recordRegistryLiveLeaseRenewalCandidates is
+// recordRegistryParkedLeaseRenewalCandidates' sibling for `running` rows.
+func recordRegistryLiveLeaseRenewalCandidates(n int) {
+	schedulerRegistryLiveLeaseRenewalCandidates.Set(float64(n))
+}
+
+// recordRegistryLiveLeaseRenewed counts `running` rows a heartbeat-driven
+// renewal round actually extended.
+func recordRegistryLiveLeaseRenewed(n uint64) {
+	schedulerRegistryLiveLeaseRenewed.Add(float64(n))
+}
+
+// recordRegistryLiveLeaseRenewalFailure counts a round whose `running` write
+// failed outright.
+func recordRegistryLiveLeaseRenewalFailure() {
+	schedulerRegistryLiveLeaseRenewalFailures.Inc()
+}
+
 // warnRefusedBinding says so when a write was turned away.
 //
 // 🔴 Both refusals are worth a line. rejected_older means an older incarnation
@@ -681,6 +736,7 @@ func recordRegistryReconcile(result registryReconcileResult, now time.Time) {
 	schedulerRegistryParkedLeaseExpiring.Set(float64(result.parkedLeaseExpiring))
 	schedulerRegistryLiveLeaseLapsed.Set(float64(result.liveLeaseLapsed))
 	schedulerRegistryReclaimableNow.Set(float64(result.reclaimableNow))
+	schedulerRegistryLiveDeadlinePassed.Set(float64(result.liveDeadlinePassed))
 	schedulerRegistryStrandedRows.Set(float64(result.strandedRows))
 	schedulerRegistryInvalidRows.Set(float64(result.invalidRows))
 	schedulerRegistryLastSuccess.Set(float64(now.Unix()))

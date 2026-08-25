@@ -162,6 +162,37 @@ type registryReconcileResult struct {
 	// tick — a live row whose lease has lapsed and whose sandbox has outlived
 	// its own deadline.
 	reclaimableNow int
+	// liveLeaseRenewals lists the claimable `running` rows this round found a
+	// fresh, first-party reason to keep alive: the row's own holder has a
+	// current heartbeat roster, and that roster still lists the sandbox. The
+	// candidate set for RenewLiveLeases — see renewLiveLeasesFromHeartbeats.
+	//
+	// parkedLeaseRenewals' sibling for the other state the api half's own
+	// renewal call (renew_paused_leases) cannot reach after the identity axis
+	// split: `running` rows are held by the real machine named in
+	// origin_node_id, never by the api replica renewing them, so RenewLease's
+	// `running` branch never matches there and this round-trip through the
+	// node's own heartbeat is what keeps the lease from lapsing on an
+	// otherwise perfectly healthy sandbox.
+	//
+	// 🔴 Populated every round regardless of whether the write path is
+	// switched on, mirroring parkedLeaseRenewals' own note.
+	liveLeaseRenewals []pausedregistry.ParkedLeaseHolder
+	// liveDeadlinePassed counts `running` rows whose sandbox_expires_at has
+	// already passed while the lease is still being renewed.
+	//
+	// This is the visible half of a gap RenewLiveLeases does not close:
+	// lease_expires_at can be kept fresh forever by a healthy node's
+	// heartbeat, but sandbox_expires_at is the api half's authority and the
+	// api half's own renewal call cannot write it here either, for the same
+	// identity-axis reason RenewLiveLeases exists at all — so a keep-alive
+	// issued after a sandbox last resumed does not reach this column. A row
+	// counted here is not in danger *yet*: leaseExpired still gates
+	// reclaimableNow, so nothing acts on it while the node stays reachable.
+	// It becomes reclaimableNow the instant the lease does lapse, at which
+	// point reclaim compares against whatever stale deadline this column
+	// still carries rather than the sandbox's true, possibly-extended one.
+	liveDeadlinePassed int
 	// invalidRows counts paused rows with no snapshot reference. The node-side
 	// decoder fails the whole get_many batch on one of these, so a single bad
 	// row silently freezes one machine's reconciliation. It should be zero.
@@ -306,10 +337,34 @@ func computeRegistryReconcile(in registryReconcileInput) registryReconcileResult
 				}
 			}
 		case pausedregistry.StateRunning, pausedregistry.StateResuming:
-			if sandbox.LeaseExpired(dbNow) {
+			leaseExpired := sandbox.LeaseExpired(dbNow)
+			deadlinePassed := sandbox.SandboxExpiresAt != nil && sandbox.SandboxExpiresAt.Before(dbNow)
+			if leaseExpired {
 				result.liveLeaseLapsed++
-				if sandbox.SandboxExpiresAt != nil && sandbox.SandboxExpiresAt.Before(dbNow) {
+				if deadlinePassed {
 					result.reclaimableNow++
+				}
+			} else if sandbox.State == pausedregistry.StateRunning && deadlinePassed {
+				// The lease is still being renewed — by a healthy node's own
+				// heartbeat, once RenewLiveLeases is wired in below — so
+				// nothing acts on this row yet. See liveDeadlinePassed's own
+				// doc for what it becomes once the lease does lapse.
+				result.liveDeadlinePassed++
+			}
+			// The heartbeat-driven renewal candidate for `running` rows:
+			// RenewParkedLeases' own eligibility rule (see the publishing/
+			// local_only branch above), scoped to the one live state whose
+			// holder is never the api replica renewing it. `resuming` is
+			// deliberately excluded — a claim in flight is not in anybody's
+			// roster yet (see the ghost-detection note below on why absence
+			// from a roster proves nothing for `resuming`), so it would never
+			// find a candidate here regardless.
+			if sandbox.State == pausedregistry.StateRunning && rawHolder != "" && holderFresh {
+				if _, listed := rosterSets[holder][sandbox.SandboxID]; listed {
+					result.liveLeaseRenewals = append(result.liveLeaseRenewals, pausedregistry.ParkedLeaseHolder{
+						SandboxID: sandbox.SandboxID,
+						NodeID:    rawHolder,
+					})
 				}
 			}
 		}
@@ -471,9 +526,11 @@ func (s *Service) reconcileRegistryOnce(ctx context.Context) bool {
 		zap.Int("parked_lease_expiring", result.parkedLeaseExpiring),
 		zap.Int("live_lease_lapsed", result.liveLeaseLapsed),
 		zap.Int("reclaimable_now", result.reclaimableNow),
+		zap.Int("live_deadline_passed", result.liveDeadlinePassed),
 	)
 
 	s.renewParkedLeasesFromHeartbeats(ctx, result)
+	s.renewLiveLeasesFromHeartbeats(ctx, result)
 
 	return false
 }
@@ -518,6 +575,39 @@ func (s *Service) renewParkedLeasesFromHeartbeats(ctx context.Context, result re
 		return
 	}
 	recordRegistryHeartbeatLeaseRenewed(renewed)
+}
+
+// renewLiveLeasesFromHeartbeats is renewParkedLeasesFromHeartbeats' sibling
+// for `running` rows — see registryReconcileResult.liveLeaseRenewals for the
+// eligibility rule and RenewLiveLeases for why this write exists at all.
+//
+// Gated behind the same switch and the same restart-grace window as the
+// parked half, and deliberately so: this is the other state
+// scheduler.registry.heartbeat_lease_renewal was always describing —
+// "keep alive whatever this node's own heartbeat vouches for" — not a
+// narrower feature that happened to ship first. Splitting the switch would
+// let an operator turn on lease renewal for parked rows while leaving
+// `running` rows exposed to the exact identity-axis gap this method closes,
+// with no reason to ever want that combination.
+func (s *Service) renewLiveLeasesFromHeartbeats(ctx context.Context, result registryReconcileResult) {
+	recordRegistryLiveLeaseRenewalCandidates(len(result.liveLeaseRenewals))
+
+	if !s.heartbeatLeaseRenewal || s.registryWriter == nil || len(result.liveLeaseRenewals) == 0 {
+		return
+	}
+
+	if err := s.registryGrace.RequireServing(); err != nil {
+		s.logger.Debug("skipping heartbeat-driven live lease renewal", zap.Error(err))
+		return
+	}
+
+	renewed, err := s.registryWriter.RenewLiveLeases(ctx, s.registry.ClusterID(), result.liveLeaseRenewals)
+	if err != nil {
+		recordRegistryLiveLeaseRenewalFailure()
+		s.logger.Warn("heartbeat-driven live lease renewal failed", zap.Error(err))
+		return
+	}
+	recordRegistryLiveLeaseRenewed(renewed)
 }
 
 // registryReconcileInput gathers everything one round compares, scoped to the

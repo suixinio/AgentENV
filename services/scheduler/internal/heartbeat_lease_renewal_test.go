@@ -23,6 +23,13 @@ import (
 // the test told it to, the same discipline registry_service_test.go's
 // fakeStore follows: the point of these tests is the wiring, and the wiring's
 // failure mode is a write that silently never happens.
+//
+// Despite the name it satisfies the whole of pausedregistry.HeartbeatLeaseRenewer,
+// not just the parked half: RenewParkedLeases and RenewLiveLeases are tracked
+// through entirely separate fields (lastHolders/renewed/err vs.
+// lastLiveHolders/liveRenewed/liveErr) so a test can drive one write's outcome
+// without the other silently taking the same value — the exact shape a
+// forked-then-diverged pair of statements needs from its test double.
 type fakeParkedLeaseRenewer struct {
 	mu          sync.Mutex
 	calls       int
@@ -30,6 +37,12 @@ type fakeParkedLeaseRenewer struct {
 	lastHolders []pausedregistry.ParkedLeaseHolder
 	renewed     uint64
 	err         error
+
+	liveCalls       int
+	lastLiveCluster string
+	lastLiveHolders []pausedregistry.ParkedLeaseHolder
+	liveRenewed     uint64
+	liveErr         error
 }
 
 func (f *fakeParkedLeaseRenewer) RenewParkedLeases(_ context.Context, clusterID string, holders []pausedregistry.ParkedLeaseHolder) (uint64, error) {
@@ -48,6 +61,24 @@ func (f *fakeParkedLeaseRenewer) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+func (f *fakeParkedLeaseRenewer) RenewLiveLeases(_ context.Context, clusterID string, holders []pausedregistry.ParkedLeaseHolder) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.liveCalls++
+	f.lastLiveCluster = clusterID
+	f.lastLiveHolders = holders
+	if f.liveErr != nil {
+		return 0, f.liveErr
+	}
+	return f.liveRenewed, nil
+}
+
+func (f *fakeParkedLeaseRenewer) liveCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.liveCalls
 }
 
 // fakeGraceGate stands in for the write surface's restart-grace window,
@@ -74,7 +105,7 @@ func oneEligibleRowReader(now time.Time) *stubRegistryReader {
 	}
 }
 
-func serviceWithHeartbeatRenewal(reader *stubRegistryReader, nodes NodeRegistry, writer pausedregistry.ParkedLeaseRenewer, grace registryGraceGate, enabled bool) *Service {
+func serviceWithHeartbeatRenewal(reader *stubRegistryReader, nodes NodeRegistry, writer pausedregistry.HeartbeatLeaseRenewer, grace registryGraceGate, enabled bool) *Service {
 	return NewService(
 		zap.NewNop(),
 		nodes,
@@ -269,5 +300,182 @@ func TestHeartbeatLeaseRenewalCandidatesGaugeTracksTheRoundNotTheSwitch(t *testi
 	svc2.reconcileRegistryOnce(context.Background())
 	if got := testutil.ToFloat64(schedulerRegistryParkedLeaseRenewalCandidates); got != 0 {
 		t.Fatalf("expected 0 candidates with no rows at all, got %v", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// renewLiveLeasesFromHeartbeats: renewParkedLeasesFromHeartbeats' mirror for
+// `running` rows. Same wiring, same switch, same restart-grace gate — see
+// RenewLiveLeases' own doc for why this is a second write rather than a wider
+// version of the parked one, and WithHeartbeatLeaseRenewal's doc for why the
+// two share one switch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// oneEligibleRunningRowReader is oneEligibleRowReader's mirror for the live
+// path: a single `running` row that node-a's fresh roster vouches for.
+func oneEligibleRunningRowReader(now time.Time) *stubRegistryReader {
+	return &stubRegistryReader{
+		clusterID: "cluster-a",
+		listing: pausedregistry.Listing{
+			Now: now,
+			Sandboxes: []pausedregistry.Sandbox{
+				{SandboxID: "s1", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(now, time.Hour)},
+			},
+		},
+	}
+}
+
+// TestLiveLeaseRenewalWritesWhenEnabledAndServing is
+// TestHeartbeatLeaseRenewalWritesWhenEnabledAndServing's mirror for the live
+// path.
+func TestLiveLeaseRenewalWritesWhenEnabledAndServing(t *testing.T) {
+	now := time.Now()
+	reader := oneEligibleRunningRowReader(now)
+	writer := &fakeParkedLeaseRenewer{liveRenewed: 1}
+	svc := serviceWithHeartbeatRenewal(reader, nodeARoster(t, now), writer, fakeGraceGate{}, true)
+
+	renewedBefore := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewed)
+
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the loop to keep running")
+	}
+
+	// The parked write must not have fired for a running-only round, and vice
+	// versa is covered by the parked suite's own equivalent assertions —
+	// together they pin that the two writes are genuinely independent calls,
+	// not one call whose candidate list happens to be a union.
+	if got := writer.callCount(); got != 0 {
+		t.Fatalf("expected the parked writer never to be called for a running-only round, got %d", got)
+	}
+	if got := writer.liveCallCount(); got != 1 {
+		t.Fatalf("expected the live writer to be called once, got %d", got)
+	}
+	if writer.lastLiveCluster != "cluster-a" {
+		t.Fatalf("expected the reader's own cluster scope, got %q", writer.lastLiveCluster)
+	}
+	if !hasParkedLeaseRenewal(writer.lastLiveHolders, "s1", "node-a") {
+		t.Fatalf("expected s1/node-a to have been asked for, got %+v", writer.lastLiveHolders)
+	}
+	if got := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewed); got != renewedBefore+1 {
+		t.Fatalf("expected the renewed counter to advance by 1, went from %v to %v", renewedBefore, got)
+	}
+}
+
+// TestLiveLeaseRenewalSkippedWhenSwitchOff mirrors
+// TestHeartbeatLeaseRenewalSkippedWhenSwitchOff.
+func TestLiveLeaseRenewalSkippedWhenSwitchOff(t *testing.T) {
+	now := time.Now()
+	reader := oneEligibleRunningRowReader(now)
+	writer := &fakeParkedLeaseRenewer{liveRenewed: 1}
+	svc := serviceWithHeartbeatRenewal(reader, nodeARoster(t, now), writer, fakeGraceGate{}, false)
+
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the loop to keep running")
+	}
+	if got := writer.liveCallCount(); got != 0 {
+		t.Fatalf("expected the live writer never to be called with the switch off, got %d calls", got)
+	}
+}
+
+// TestLiveLeaseRenewalNeverWiredIsANoOp mirrors
+// TestHeartbeatLeaseRenewalNeverWiredIsANoOp.
+func TestLiveLeaseRenewalNeverWiredIsANoOp(t *testing.T) {
+	now := time.Now()
+	reader := oneEligibleRunningRowReader(now)
+	svc := NewService(
+		zap.NewNop(),
+		nodeARoster(t, now),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(time.Minute),
+		WithPausedRegistry(reader, testReportTTL, testReportTTL),
+	)
+
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the loop to keep running")
+	}
+	if got := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewalCandidates); got != 1 {
+		t.Fatalf("expected the candidate gauge to still report 1, got %v", got)
+	}
+}
+
+// TestLiveLeaseRenewalSkipsDuringTheGraceWindow mirrors
+// TestHeartbeatLeaseRenewalSkipsDuringTheGraceWindow.
+func TestLiveLeaseRenewalSkipsDuringTheGraceWindow(t *testing.T) {
+	now := time.Now()
+	reader := oneEligibleRunningRowReader(now)
+	writer := &fakeParkedLeaseRenewer{liveRenewed: 1}
+	svc := serviceWithHeartbeatRenewal(reader, nodeARoster(t, now), writer, fakeGraceGate{err: pausedregistry.ErrGracePeriod}, true)
+
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the loop to keep running")
+	}
+	if got := writer.liveCallCount(); got != 0 {
+		t.Fatalf("expected the live writer never to be called during the grace window, got %d calls", got)
+	}
+}
+
+// TestLiveLeaseRenewalFailureIsCountedAndLoopContinues mirrors
+// TestHeartbeatLeaseRenewalFailureIsCountedAndLoopContinues.
+func TestLiveLeaseRenewalFailureIsCountedAndLoopContinues(t *testing.T) {
+	now := time.Now()
+	reader := oneEligibleRunningRowReader(now)
+	writer := &fakeParkedLeaseRenewer{liveErr: errors.New("connection refused")}
+	svc := serviceWithHeartbeatRenewal(reader, nodeARoster(t, now), writer, fakeGraceGate{}, true)
+
+	renewedBefore := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewed)
+	failuresBefore := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewalFailures)
+
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("a failed renewal must not stop the reconcile loop")
+	}
+
+	if got := writer.liveCallCount(); got != 1 {
+		t.Fatalf("expected the write to have been attempted, got %d calls", got)
+	}
+	if got := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewalFailures); got != failuresBefore+1 {
+		t.Fatalf("expected the failure counter to advance by 1, went from %v to %v", failuresBefore, got)
+	}
+	if got := testutil.ToFloat64(schedulerRegistryLiveLeaseRenewed); got != renewedBefore {
+		t.Fatalf("expected the renewed counter to stay put on a failed write, went from %v to %v", renewedBefore, got)
+	}
+}
+
+// TestBothHeartbeatLeaseRenewalsFireInTheSameRound proves the two writes are
+// not mutually exclusive: a round carrying both a publishing candidate and a
+// running candidate must drive both stores, not whichever one the wiring
+// happens to check first.
+func TestBothHeartbeatLeaseRenewalsFireInTheSameRound(t *testing.T) {
+	now := time.Now()
+	reader := &stubRegistryReader{
+		clusterID: "cluster-a",
+		listing: pausedregistry.Listing{
+			Now: now,
+			Sandboxes: []pausedregistry.Sandbox{
+				{SandboxID: "s1", State: pausedregistry.StatePublishing, OriginNodeID: "node-a", SnapshotID: "snap", LeaseExpiresAt: at(now, time.Hour)},
+				{SandboxID: "s2", State: pausedregistry.StateRunning, OriginNodeID: "node-a", LeaseExpiresAt: at(now, time.Hour)},
+			},
+		},
+	}
+	nodes := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	heartbeatWithClusterRoster(t, nodes, "node-a", "cluster-a", now, "s1", "s2")
+
+	writer := &fakeParkedLeaseRenewer{renewed: 1, liveRenewed: 1}
+	svc := serviceWithHeartbeatRenewal(reader, nodes, writer, fakeGraceGate{}, true)
+
+	if stop := svc.reconcileRegistryOnce(context.Background()); stop {
+		t.Fatal("expected the loop to keep running")
+	}
+
+	if got := writer.callCount(); got != 1 {
+		t.Fatalf("expected the parked writer to be called once, got %d", got)
+	}
+	if got := writer.liveCallCount(); got != 1 {
+		t.Fatalf("expected the live writer to be called once, got %d", got)
+	}
+	if !hasParkedLeaseRenewal(writer.lastHolders, "s1", "node-a") {
+		t.Fatalf("expected s1/node-a on the parked call, got %+v", writer.lastHolders)
+	}
+	if !hasParkedLeaseRenewal(writer.lastLiveHolders, "s2", "node-a") {
+		t.Fatalf("expected s2/node-a on the live call, got %+v", writer.lastLiveHolders)
 	}
 }

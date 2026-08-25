@@ -59,6 +59,7 @@ type fakeStore struct {
 	calls             []string
 	lastHeld          []pausedregistry.HeldSandbox
 	lastParkedHolders []pausedregistry.ParkedLeaseHolder
+	lastLiveHolders   []pausedregistry.ParkedLeaseHolder
 	lastGen           int64
 	lastMeta          json.RawMessage
 	// lastExecution is what the handler passed down as the incarnation, so a
@@ -155,6 +156,17 @@ func (f *fakeStore) RenewParkedLeases(_ context.Context, _ string, holders []pau
 	f.record("RenewParkedLeases")
 	f.mu.Lock()
 	f.lastParkedHolders = holders
+	f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.renewed, nil
+}
+
+func (f *fakeStore) RenewLiveLeases(_ context.Context, _ string, holders []pausedregistry.ParkedLeaseHolder) (uint64, error) {
+	f.record("RenewLiveLeases")
+	f.mu.Lock()
+	f.lastLiveHolders = holders
 	f.mu.Unlock()
 	if f.err != nil {
 		return 0, f.err

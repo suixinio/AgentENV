@@ -1193,29 +1193,31 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .await?
     };
 
+    // 🔴 P5: built as its own `Router` and merged into the *generated*
+    // control-plane router by `server::new_with_control_plane_routes`,
+    // rather than `.route(..)`-ed onto the fully assembled `Router` `server::new`
+    // hands back. axum's `Router::layer` only covers routes registered
+    // before it runs, so a route added after `server::new` returns — after
+    // every layer, including `require_control_plane` and the role gate —
+    // was never behind either. This endpoint answers every node's internal
+    // address, its resource allocation and the cluster's CPU-config
+    // intersection, and is reachable through the gateway's REST fan-out the
+    // same as any other unrecognized path (`services/gateway/internal/server.go`).
+    // See `agentenv::api::server::new_with_control_plane_routes`'s own doc
+    // comment for the full argument, including why "zero impact by default"
+    // is not an accurate description of adding this endpoint at all.
+    let node_registry_debug_routes = axum::Router::new().route(
+        "/debug/node-registry",
+        axum::routing::get(move || {
+            let source = node_registry_dump_source.clone();
+            async move { axum::Json(agentenv::node_registry::dump::dump(&source).await) }
+        }),
+    );
+
     Ok(Assembly {
         // 🔴 No RoleGate: this half serves the whole user-facing surface. The
         // gate exists to stop a *node* answering it.
-        //
-        // 🔴 `/debug/node-registry` is mounted the same way `/metrics` is in
-        // `agentenv::api::server::new` — outside both the control-plane gate
-        // and the role gate, which are attached only to the *generated*
-        // router before this `.route` call ever runs. That is deliberate for
-        // `/metrics` (Prometheus scraping carries no credential) and adopted
-        // here for the same operational-tooling reason: this is a read-only
-        // cluster-verification aid for Stage A's placement switch, not a
-        // user-facing endpoint, and gating it behind the control-plane token
-        // would make the one tool built to check the switch's correctness
-        // unusable from outside the token-holding caller. Revisit this if
-        // node topology/address exposure through an unauthenticated endpoint
-        // is judged unacceptable for a given deployment.
-        app: server::new(api_impl, role).route(
-            "/debug/node-registry",
-            axum::routing::get(move || {
-                let source = node_registry_dump_source.clone();
-                async move { axum::Json(agentenv::node_registry::dump::dump(&source).await) }
-            }),
-        ),
+        app: server::new_with_control_plane_routes(api_impl, role, node_registry_debug_routes),
         orchestration,
         upkeep: paused_upkeep,
         reporter: None,

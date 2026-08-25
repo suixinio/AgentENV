@@ -33,6 +33,61 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
+    new_with_control_plane_routes::<I, A, E, C>(api_impl, role, Router::new())
+}
+
+/// Same as [`new`], plus `extra_control_plane_routes` merged into the
+/// *generated* control-plane router before the control-plane gate and role
+/// gate are attached — so anything registered on it is covered by both, the
+/// same as every generated route.
+///
+/// 🔴 P5: `src/bin/server.rs`'s `assemble_api` is the one caller that needs
+/// this — `/debug/node-registry`, Stage A's equivalence-dump debug endpoint
+/// (`node_registry::dump`'s own module doc), used to be `.route(...)`-ed onto
+/// the `Router` *this function itself returns*, i.e. after every layer
+/// `new`'s body below applies. axum's `Router::layer` — and, transitively,
+/// `require_control_plane`/the role gate wired through `assemble` — only
+/// ever covers routes registered before the `.layer` call that attaches it;
+/// a `.route` added to the router `new` hands back is a route the control
+/// -plane gate has never seen. `GET /sandboxes` needs a credential;
+/// `/debug/node-registry` — which answers every node's internal address, its
+/// resource allocation and the cluster's CPU-config intersection — did not.
+/// It is also reachable through the gateway: `hasSandbox=false` there routes
+/// unrecognized paths to the api half's REST surface exactly like a genuine
+/// user-facing route (`services/gateway/internal/server.go`), unlike
+/// `/metrics`, which the gateway 404s on its public listener explicitly.
+///
+/// 🔴 Describing this as zero-impact "by default" is not accurate and should
+/// not be repeated: `/debug/node-registry` did not exist before Stage A
+/// added it, so shipping it is one more reachable endpoint on this process's
+/// default HTTP surface regardless of gating, full stop. What moving it here
+/// changes is that a deployment that *has* configured a control-plane token
+/// (`ControlPlaneGate::from_global_config`) now actually needs it for this
+/// route too, matching every other control-plane route — a deployment
+/// running with the gate off (`an_empty_configured_token_lets_everything_through`'s
+/// own rollback state) answers it exactly as unauthenticated as it did
+/// before this change, because an off gate opens everything on this router,
+/// not merely this one route.
+pub fn new_with_control_plane_routes<I, A, E, C>(
+    api_impl: I,
+    role: ServerRole,
+    extra_control_plane_routes: Router,
+) -> Router
+where
+    I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+    A: apis::admin::Admin<E, Claims = C>
+        + apis::default::Default<E>
+        + apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::snapshots::Snapshots<E, Claims = C>
+        + apis::templates::Templates<E, Claims = C>
+        + apis::ApiKeyAuthHeader<Claims = C>
+        + apis::ApiAuthBasic<Claims = C>
+        + Send
+        + Sync
+        + 'static,
+    E: std::fmt::Debug + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+{
     // 🔴 The role now has two carriers: this parameter, which the role gate
     // reads, and the `ApiImpl`, which the data plane's auto-resume arm reads
     // (`crate::api::proxy::resolve_proxy_request`). Every assembly in
@@ -47,11 +102,14 @@ where
         "the role this router is gated on and the role its ApiImpl holds must agree"
     );
 
-    // Keep the generated control-plane API as the primary router, then merge in
-    // the hand-written `/proxy/*` entrypoints needed for the temporary reverse
-    // proxy contract.
+    // Keep the generated control-plane API as the primary router, merge the
+    // caller's extra gated routes into it *before* `assemble` attaches the
+    // control-plane gate and the role gate — so both cover them — then merge
+    // in the hand-written `/proxy/*` entrypoints needed for the temporary
+    // reverse proxy contract.
     assemble(
-        agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone()),
+        agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
+            .merge(extra_control_plane_routes),
         proxy::router(api_impl.clone()),
         Arc::new(ControlPlaneGate::from_global_config()),
         role,
@@ -221,6 +279,139 @@ mod tests {
             .await,
             StatusCode::FORBIDDEN,
             "the fallback carries host-routed sandbox traffic and must not be gated"
+        );
+    }
+
+    /// 🔴 P5. The mechanism [`new_with_control_plane_routes`] relies on to
+    /// fix `/debug/node-registry`'s original exposure: a route merged into
+    /// the *generated* router before `assemble` runs is covered by the
+    /// control-plane gate; the identical route `.route()`-ed onto
+    /// `assemble`'s own return value is not, because `Router::layer` only
+    /// ever covers routes registered before it runs. That asymmetry — not
+    /// any check this endpoint failed — is why `/debug/node-registry`
+    /// answered unauthenticated regardless of a configured control-plane
+    /// token before this fix. Proven here on a stand-in so a future
+    /// regression in the ordering shows up as a failing unit test rather
+    /// than only in a manual check of the real endpoint.
+    #[tokio::test]
+    async fn a_route_merged_before_assemble_is_gated_and_the_same_route_added_after_is_not() {
+        let debug_route = || Router::new().route("/debug/example", get(|| async { "debug" }));
+
+        let merged_before_assemble = assemble(
+            stand_in_control_plane().merge(debug_route()),
+            stand_in_data_plane(),
+            Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], "")),
+            ServerRole::All,
+        );
+        assert_eq!(
+            status(merged_before_assemble, Method::GET, "/debug/example", None).await,
+            StatusCode::FORBIDDEN,
+            "merged into the generated router before assemble runs, this route must be gated \
+             exactly like every other control-plane route"
+        );
+
+        // The control: the same route, added the way the original bug added
+        // it — after assemble's own return value — is not gated. If this
+        // assertion ever starts failing, axum's layering semantics changed
+        // underneath this file and the argument above no longer holds.
+        let added_after_assemble = assemble(
+            stand_in_control_plane(),
+            stand_in_data_plane(),
+            Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], "")),
+            ServerRole::All,
+        )
+        .route("/debug/example", get(|| async { "debug" }));
+        assert_ne!(
+            status(added_after_assemble, Method::GET, "/debug/example", None).await,
+            StatusCode::FORBIDDEN,
+            "the control: a route added after assemble's own return must not be covered by its \
+             layer — this is the bug the assertion above is the fix for"
+        );
+    }
+
+    /// 🔴 P5, the other half of the guard: the test above proves the
+    /// *mechanism* (`assemble` gates whatever `generated` already contains);
+    /// this proves `new_with_control_plane_routes` still actually hands
+    /// `assemble` the merged router rather than merging
+    /// `extra_control_plane_routes` onto `assemble`'s return value — which
+    /// would compile, pass every other test in this file (none of them
+    /// exercise `new_with_control_plane_routes` with a non-empty extra
+    /// router; `new` always passes `Router::new()`), and silently
+    /// reintroduce the exact bug `/debug/node-registry` originally had.
+    ///
+    /// A real end-to-end HTTP check would need a real `ApiImpl` behind a
+    /// mutated global control-plane token — disproportionate for a defect
+    /// that is one line of composition — so this reads this file's own
+    /// source instead, the same technique
+    /// `only_the_split_roles_bind_a_second_listener`
+    /// (`src/bin/server.rs`) uses for the same reason.
+    #[test]
+    fn extra_control_plane_routes_are_merged_before_assemble_is_called() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("pub fn new_with_control_plane_routes")
+            .expect("new_with_control_plane_routes is no longer in this file");
+        let open = source[start..].find('{').expect("a body") + start;
+        let mut depth = 0usize;
+        let mut body = "";
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body = &source[open..open + offset];
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !body.is_empty(),
+            "new_with_control_plane_routes has no closing brace"
+        );
+
+        let assemble_call = body
+            .find("assemble(")
+            .expect("assemble is called in this function");
+        let merge_call = body
+            .find(".merge(extra_control_plane_routes)")
+            .expect("extra_control_plane_routes must be merged somewhere in this function");
+        assert!(
+            merge_call > assemble_call,
+            "the merge must appear at or after `assemble(` starts — it belongs among assemble's \
+             own arguments"
+        );
+
+        // `assemble(...)`'s own matching close paren, scanned from `assemble(`'s
+        // own opening paren rather than the whole body — a naive search for
+        // the first `)` would stop inside an earlier argument's own parens.
+        let paren_open = assemble_call + "assemble(".len() - 1;
+        let mut paren_depth = 0i32;
+        let mut assemble_close = None;
+        for (offset, byte) in body[paren_open..].bytes().enumerate() {
+            match byte {
+                b'(' => paren_depth += 1,
+                b')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        assemble_close = Some(paren_open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let assemble_close = assemble_close.expect("assemble(...) has a matching close paren");
+
+        assert!(
+            merge_call < assemble_close,
+            "extra_control_plane_routes must be merged *inside* the call to assemble — into the \
+             `generated` router argument, before the control-plane gate and role gate are \
+             attached — not chained onto assemble's return value. Chaining it after is exactly \
+             the bug /debug/node-registry originally had: a route added after every layer runs \
+             is a route no layer ever covers."
         );
     }
 

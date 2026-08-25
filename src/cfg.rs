@@ -2695,12 +2695,17 @@ mod tests {
     }
 
     /// Stage A of the scheduler fold
-    /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): the switch that
-    /// will move `resolve_node` off the scheduler once a native backend
-    /// exists. Nothing reads this field's `Native` value yet — see
-    /// [`NodePlacementSource`]'s doc comment — but the config surface itself
-    /// (default, env override, and rejection of an unrecognized value) has to
-    /// hold up on its own before anything is wired to depend on it.
+    /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): the switch
+    /// that moves `resolve_node`/`node_membership` off the scheduler onto
+    /// api's own node registry (`NativeNodePlacement`, `src/bin/server.rs`'s
+    /// `cluster_placement`) once set to `Native`. 🔴 P6-d correction: this
+    /// used to say "nothing reads this field's `Native` value yet" — that
+    /// stopped being true once `cluster_placement` and
+    /// `start_native_node_registry` started branching on it. What is still
+    /// true, and the reason this test exists on its own regardless of that
+    /// wiring: the config surface (default, env override, and rejection of
+    /// an unrecognized value) has to hold up by itself, independent of
+    /// whatever reads it.
     #[test]
     fn node_placement_source_defaults_to_scheduler_and_is_settable_from_the_environment() {
         let _env = env_guard();

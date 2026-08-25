@@ -29,9 +29,40 @@
 //!   them), label-selector syntax the API server actually enforces, and the
 //!   `Serving`/`Terminating` condition semantics on a real EndpointSlice
 //!   controller's output.
-//! - Nothing in this file is wired into any assembly path (`--role api`
-//!   never constructs a [`KubernetesDiscovery`] yet) — see
-//!   `src/node_registry/mod.rs`.
+//! - 🔴 P6-d correction: the line that used to stand here — "nothing in
+//!   this file is wired into any assembly path" — stopped being true the
+//!   moment `src/bin/server.rs`'s `start_native_node_registry` started
+//!   calling [`KubernetesDiscovery::connect`] under
+//!   `[cluster].node_placement_source = "native"`. It is wired in now; what
+//!   is still true from the paragraph above is that none of that wiring has
+//!   been exercised against a real apiserver.
+//!
+//! # 🔴 P6-a: no cache-sync gate across the three watchers (tracked, not fixed)
+//!
+//! Go's `Run` (`kubernetes_discovery.go`) calls `WaitForCacheSync` on all
+//! three informers before `syncFromStore` ever runs, and `syncFromStore`'s
+//! own first line is `if !d.cacheSynced() { return }` — so a discovery pass
+//! never publishes a registry state built from only *some* of the three
+//! watchers having reached their initial list. [`sync_from_state`] here has
+//! no equivalent gate: [`watch_endpoint_slices`] calls
+//! [`super::registry::AtomicNodeRegistry::set`] the moment its own
+//! `Event::InitDone` arrives, regardless of whether either pod-selector
+//! watch has reached its own `InitDone` yet. With a selector configured,
+//! this is a real window — the filter set the not-yet-synced watch would
+//! have contributed is empty until its `InitDone`, which
+//! [`filter_nodes_by_pod_labels`] reads as "no filter" rather than "filter
+//! not ready yet", so a node that should be excluded can be published as
+//! active for the span of that window.
+//!
+//! Left unfixed here per the task's own D2 discipline (port faithfully in
+//! this change; known gaps are tracked, not silently patched alongside
+//! unrelated work) — and currently latent regardless: neither
+//! `deploy/k8s/base/agentenv-api-deployment.yaml` nor
+//! `deploy/k8s/base/config/scheduler.json` configures
+//! `ignore_pod_selector`/`no_schedule_pod_selector` today, so every sync in
+//! this deployment already has all the pod-selector data there is (none) by
+//! construction. Whoever configures a selector for the first time should
+//! close this gap before relying on it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;

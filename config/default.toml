@@ -154,6 +154,13 @@ peer_discovery_refresh_interval_secs = 5
 [cluster]
 # Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
+# A file holding a replacement for scheduler_endpoint above, re-read on the
+# heartbeat interval while the process runs — every scheduler-dialling
+# consumer in this process (P2P discovery, paused registry, snapshot catalog,
+# node/resume placement, heartbeat reporting) picks up an edit with no
+# restart. Mount it from a ConfigMap without subPath. Falls back to the
+# deprecated [observability.scheduler_report].scheduler_endpoint_file if unset.
+# scheduler_endpoint_file = "/etc/agentenv/heartbeat/scheduler-endpoint"
 
 # Where `--role node` serves the node sandbox service: the gRPC surface the API
 # half drives a machine through. A second listener rather than a route on the

@@ -972,11 +972,18 @@ pub struct ObservabilitySchedulerReportConfig {
     /// never update — and the reporter notices an edit within one heartbeat
     /// interval, with no pod restart.
     ///
-    /// Only this field's own consumer, [`crate::observability::reporter`],
-    /// reads it. It is not a second way to reach the scheduler for
-    /// `[cluster].scheduler_endpoint`'s other consumers (P2P, the paused
-    /// sandbox registry's `central` backend, resume placement) — those still
-    /// read the static value and still require a restart to change.
+    /// 🔴 **Deprecated** in favour of [`ClusterConfig::scheduler_endpoint_file`].
+    /// That field is the primary location now — Step 0.5 of the phase-4 fold
+    /// gave every `[cluster].scheduler_endpoint` consumer (P2P discovery, the
+    /// paused registry's `central` backend, the snapshot catalog client,
+    /// scheduler-backed node placement, resume placement) the same hot-reload
+    /// capability this field originally gave only
+    /// [`crate::observability::reporter`], which made "only the heartbeat can
+    /// hot-reload" no longer true. This field still works — existing
+    /// deployments that set only this one keep working unchanged — but is
+    /// read as a fallback: [`ClusterConfig::scheduler_endpoint_file`] wins
+    /// when both are set, logging a `warn!`. New deployments should set the
+    /// `[cluster]` field instead.
     ///
     /// 🔴 Not a union with the static value, unlike
     /// `ApiConfig::control_plane_token_file`'s relationship to
@@ -1003,6 +1010,43 @@ pub struct ClusterConfig {
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint: Option<String>,
+    /// A file holding a replacement for [`scheduler_endpoint`], re-read on a
+    /// fixed interval (reusing
+    /// [`ObservabilitySchedulerReportConfig::interval_secs`], the heartbeat
+    /// cadence, so this does not need a second timing knob) while the
+    /// process runs — no restart required to move traffic.
+    ///
+    /// This is the Step 0.5 generalization of what
+    /// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`]
+    /// originally gave only the heartbeat reporter: every consumer that dials
+    /// the scheduler — P2P peer discovery, the paused registry's `central`
+    /// backend, the snapshot catalog client, scheduler-backed node placement,
+    /// resume placement, and the heartbeat reporter itself — now watches this
+    /// file through the same [`crate::scheduler_endpoint::SchedulerEndpointSource`]
+    /// and picks up an edit within one interval, with no pod restart. Point
+    /// it at a file mounted from a ConfigMap **without** `subPath` — kubelet
+    /// only refreshes non-`subPath` volumes, so a `subPath` mount would
+    /// silently never update.
+    ///
+    /// 🔴 Not a union with the static value: once this has been read
+    /// successfully at least once, it *overrides* `scheduler_endpoint`
+    /// outright rather than adding to it. Unset — or set but never yet read
+    /// successfully (not mounted yet, briefly unreadable) — falls back to
+    /// the static value, which is today's behavior, byte-for-byte, for every
+    /// deployment that has not opted into this.
+    ///
+    /// When both this field and the deprecated
+    /// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`] are
+    /// set, this one wins and a `warn!` is logged once per resolution — see
+    /// [`crate::scheduler_endpoint::resolve_endpoint_file`].
+    ///
+    /// [`scheduler_endpoint`]: ClusterConfig::scheduler_endpoint
+    #[config(
+        default = "",
+        env = "AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE",
+        parse_env = parse_trimmed_string
+    )]
+    pub scheduler_endpoint_file: String,
     /// Where `--role node` serves the node sandbox service — the gRPC surface
     /// the API half drives a machine through (`crate::node_server`).
     ///
@@ -4161,6 +4205,7 @@ endpoint = "http://second:9000"
     fn cluster_normalize_trims_and_drops_blank_scheduler_endpoint() {
         let mut config = ClusterConfig {
             scheduler_endpoint: Some("  ".to_string()),
+            scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
@@ -4170,6 +4215,7 @@ endpoint = "http://second:9000"
 
         let mut config = ClusterConfig {
             scheduler_endpoint: Some("  http://scheduler:9090  ".to_string()),
+            scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,

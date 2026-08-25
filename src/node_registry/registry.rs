@@ -1683,4 +1683,71 @@ mod tests {
             "the intersection must stay withheld until node-c also reports a config"
         );
     }
+    // ---- kubernetes_discovery_test.go's registry-focused cases ----
+    //
+    // These five lived in kubernetes_discovery_test.go on the Go side
+    // (colocated with the discovery tests even though they exercise
+    // AtomicNodeRegistry alone), not node_registry_test.go /
+    // node_registry_roster_test.go. node_registry_reflects_endpoint_removal_across_syncs
+    // is ported in src/node_registry/kubernetes_discovery.rs, next to
+    // nodes_from_endpoint_slices, since it is the one that actually combines
+    // discovery output with registry state. lingering_node_gets_no_schedule_status_in_observed_view
+    // is Go's TestLingeringNodeGetsNoScheduleStatusInObservedView, whose
+    // assertion is already the first half of
+    // lingering_node_becomes_unhealthy_after_ttl above -- not duplicated
+    // again here. The remaining three below (snapshot filtering, the
+    // active/READY case, and discovery eviction clearing GetObserved/
+    // ListObserved) were not covered by any existing test until now.
+
+    #[test]
+    fn snapshot_filters_lingering_nodes() {
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-b", "http://node-b"),
+            ],
+            vec![node("node-c", "http://node-c")],
+        );
+
+        let no_lingering = registry.snapshot(false);
+        assert_eq!(no_lingering.len(), 2);
+
+        let with_lingering = registry.snapshot(true);
+        assert_eq!(with_lingering.len(), 3);
+    }
+
+    #[test]
+    fn active_node_gets_ready_status_in_observed_view() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+        );
+        let now = unix(100);
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), now)
+            .unwrap();
+
+        let observed = registry
+            .get_observed("node-a", "", now)
+            .expect("observed node");
+        assert_eq!(observed.snapshot.unwrap().status(), NodeStatus::Ready);
+    }
+
+    #[test]
+    fn set_removes_observed_nodes_missing_from_discovery() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+        );
+        let now = unix(100);
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), now)
+            .unwrap();
+
+        registry.set(Vec::new(), Vec::new()); // removed from discovery
+
+        assert!(registry.get_observed("node-a", "", now).is_none());
+        assert!(registry.list_observed("", now).is_empty());
+    }
 }

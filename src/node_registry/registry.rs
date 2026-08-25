@@ -121,6 +121,19 @@ pub trait NodeRegistry: Send + Sync {
         node_id: &str,
         service_instance_id: &str,
     ) -> Result<(), ServiceInstanceMismatch>;
+    /// 🔴 P4 (`node_registry::dump`'s D6 recompute): the CPU-config
+    /// intersection actually cached and handed to a node over `Heartbeat`
+    /// for `cluster_id` — the *gated* value `all_configs_ready` unlocks, not
+    /// a fresh recompute. `None` both before any node in the cluster has
+    /// reported a `cpu_config_json` and, crucially, while the cluster is
+    /// only *partially* reported: unlike [`dump`](super::dump)'s own
+    /// recompute (which runs the algorithm over whichever configs happen to
+    /// be present right now, gate or no gate), this is `None` for exactly as
+    /// long as production is honestly withholding an answer. The two can
+    /// disagree — recompute non-empty, applied still `None` — whenever a
+    /// node discovery already knows about has not yet sent its first
+    /// `cpu_config_json`.
+    fn applied_cpu_intersection(&self, cluster_id: &str) -> Option<String>;
 }
 
 #[derive(Debug, Clone)]
@@ -654,6 +667,11 @@ impl NodeRegistry for AtomicNodeRegistry {
         inner.invalidate_intersection(&cluster_id);
         Ok(())
     }
+
+    fn applied_cpu_intersection(&self, cluster_id: &str) -> Option<String> {
+        let inner = self.inner.read().expect("node registry lock poisoned");
+        inner.cpu_intersection.get(cluster_id).cloned()
+    }
 }
 
 fn filter_p2p_peers_locked(
@@ -898,14 +916,6 @@ mod tests {
         format!(
             r#"{{"kvm_capabilities":[],"cpuid_modifiers":[{{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{{"register":"eax","bitmap":"0b{eax:032b}"}}]}}],"msr_modifiers":[]}}"#
         )
-    }
-
-    fn extract_eax(json: &str) -> u32 {
-        let v: serde_json::Value = serde_json::from_str(json).expect("valid json");
-        let bitmap = v["cpuid_modifiers"][0]["modifiers"][0]["bitmap"]
-            .as_str()
-            .expect("bitmap string");
-        u32::from_str_radix(bitmap.trim_start_matches("0b"), 2).expect("valid bitmap")
     }
 
     fn heartbeat_with_config(
@@ -1248,7 +1258,15 @@ mod tests {
         let cfg = cpu_config_json(0xFF);
         let result = heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg);
         assert!(!result.is_empty());
-        assert_eq!(extract_eax(&result), 0xFF);
+        // 🔴 P6-f: exact string comparison, not `extract_eax`'s
+        // parse-into-`u32`. The self-intersection of one config is defined
+        // to be that config byte-for-byte (`cpu_template.rs`'s own golden
+        // test), and a `u32` round-trip cannot tell `"0b1111"` apart from
+        // `"0b00000000000000000000000000001111"` — both parse to 15 — so a
+        // regression that dropped zero-padding from the real formatter
+        // would pass this assertion silently while failing Go's own
+        // byte-for-byte test.
+        assert_eq!(result, cfg);
     }
 
     #[test]
@@ -1266,6 +1284,44 @@ mod tests {
 
         let result = heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg);
         assert!(result.is_empty());
+    }
+
+    /// 🔴 P4: `applied_cpu_intersection` is the gated value production
+    /// actually cached and would hand a node on its next heartbeat — not a
+    /// fresh recompute over whoever happens to have reported a non-empty
+    /// config right now. While node-b has heartbeated but not yet with a
+    /// `cpu_config_json` (the same "cluster size established, one member
+    /// still pending" state `heartbeat_withholds_cpu_intersection_until_all_nodes_ready`
+    /// above proves withholds the *heartbeat reply*), this must also stay
+    /// `None` — this is the accessor `node_registry::dump`'s D6 recompute
+    /// is checked against.
+    #[test]
+    fn applied_cpu_intersection_stays_none_while_the_cluster_is_only_partially_reported() {
+        let registry = AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-b", "http://node-b"),
+            ],
+            Duration::from_secs(30),
+        );
+        let cfg_a = cpu_config_json(0xFF);
+        heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg_a);
+        heartbeat_with_config(&registry, "node-b", "cluster-1", "");
+
+        assert_eq!(
+            registry.applied_cpu_intersection("cluster-1"),
+            None,
+            "node-b has reported but not yet with a cpu_config_json; the gate must stay shut"
+        );
+
+        let cfg_b = cpu_config_json(0x0F);
+        heartbeat_with_config(&registry, "node-b", "cluster-1", &cfg_b);
+        assert_eq!(
+            registry.applied_cpu_intersection("cluster-1"),
+            Some(cpu_config_json(0xFF & 0x0F)),
+            "every known reporter now has a config; the gate opens and the applied value \
+             catches up"
+        );
     }
 
     #[test]
@@ -1294,7 +1350,7 @@ mod tests {
         assert!(heartbeat_with_config(&registry, "node-a", "cluster-1", "").is_empty());
         assert!(heartbeat_with_config(&registry, "node-b", "cluster-1", "").is_empty());
 
-        assert_eq!(extract_eax(&result_a2), 0xFF & 0x0F);
+        assert_eq!(result_a2, cpu_config_json(0xFF & 0x0F));
     }
 
     #[test]
@@ -1323,8 +1379,8 @@ mod tests {
 
         let result_x = heartbeat_with_config(&registry, "x1", "cluster-x", "");
         assert!(!result_x.is_empty());
-        assert_eq!(extract_eax(&result_x), 0xFF & 0x0F);
-        assert_eq!(extract_eax(&result_y), 0xF0);
+        assert_eq!(result_x, cpu_config_json(0xFF & 0x0F));
+        assert_eq!(result_y, cpu_config_json(0xF0));
 
         assert!(heartbeat_with_config(&registry, "x2", "cluster-x", "").is_empty());
         assert!(heartbeat_with_config(&registry, "y1", "cluster-y", "").is_empty());

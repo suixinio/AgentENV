@@ -12,6 +12,20 @@ pub use metadata::ImageBaseContext;
 pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
 pub use resolver::{ImageResolver, ResolvedBlockImage};
 
+/// Boundedly closes every local image-cache RocksDB metadata store this
+/// process opened, so the shutdown path can wait on it with a bound instead of
+/// trusting an implicit `Drop` deep inside the tokio runtime's blocking pool.
+///
+/// 🔴 Not a method on [`ImageResolver`]: the store this closes is shared
+/// process-wide (`ImageCacheService`'s own instance registry deduplicates by
+/// cache root directory and never forgets an entry), so an individual
+/// resolver's handle is not this store's owner in any sense that would make
+/// "close the resolver" the right shape. See
+/// `crate::local_store::LocalKvStore::close` for the mechanism.
+pub async fn close_image_cache_stores(timeout: std::time::Duration) {
+    cache::close_shared_metadata_stores(timeout).await;
+}
+
 /// The image module's single error type.
 ///
 /// Variants exist only for the distinctions a caller actually branches on (the

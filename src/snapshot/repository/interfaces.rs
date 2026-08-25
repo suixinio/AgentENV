@@ -727,6 +727,17 @@ pub trait SnapshotCatalog: Send + Sync {
             },
         )
     }
+
+    /// Boundedly closes any durable local store this catalog owns, ahead of
+    /// process shutdown.
+    ///
+    /// The default no-op is correct for every backend that owns no local
+    /// store of its own — an object-store or central-catalog backend reaches
+    /// its state over the network, not through a node-local RocksDB handle.
+    /// The one override is the dual-write catalog's durable mirror backlog,
+    /// which is exactly the kind of store this exists for: see
+    /// `crate::local_store::LocalKvStore::close`.
+    async fn close(&self, _timeout: std::time::Duration) {}
 }
 
 #[async_trait]

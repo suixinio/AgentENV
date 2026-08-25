@@ -12,6 +12,7 @@ pub mod observability;
 pub mod orchestrator;
 pub mod overlaybd;
 pub mod p2p;
+pub mod pg;
 pub mod privileges;
 mod proto;
 pub mod role;

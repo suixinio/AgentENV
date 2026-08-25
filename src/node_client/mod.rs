@@ -32,6 +32,7 @@
 //! statement of what this build does rather than a silent absence. See
 //! `RemoteSandboxStub::pause`.
 
+mod build;
 mod factory;
 mod paused_state;
 mod placement;
@@ -42,6 +43,7 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use build::build_template_on_a_node;
 pub use factory::RemoteSandboxBackendFactory;
 pub use paused_state::RemotePausedState;
 pub use placement::{FixedNodePlacement, NodeEndpoint, NodePlacement};

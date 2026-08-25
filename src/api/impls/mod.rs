@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use super::proxy::{build_proxy_client, ProxyClient};
 use crate::identity::NodeIdentity;
 use crate::image::ImageResolver;
+use crate::node_client::NodePlacement;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
 use crate::role::ServerRole;
@@ -104,6 +105,14 @@ pub struct ApiImpl {
     /// cluster says a sandbox may be woken, and whether this process wakes them
     /// itself.
     resume_wiring: ResumeWiring,
+    /// Where a template build this process cannot run itself should be sent.
+    ///
+    /// 🔴 `Some` only for `--role api`: `runs_sandbox_runtime()` is true for
+    /// every other role, and a process that can build a template locally has
+    /// no business picking a node to send one to instead. `None` there is not
+    /// "not configured yet" — it is the role showing through, matching the
+    /// `resume_wiring` field's own `WakeSite::Local`/`Remote` split just above.
+    node_placement: Option<Arc<dyn NodePlacement>>,
 }
 
 impl ApiImpl {
@@ -111,6 +120,9 @@ impl ApiImpl {
     // a parameter that could be folded into another. The two newest — the role
     // and the wake-up wiring — are deliberately separate: the role is read on
     // the data plane's proxy path, the wiring only on the cold path.
+    //
+    // 🔴 Not ten: `node_placement` is deliberately not a constructor parameter
+    // — see `with_node_placement` below for why.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<dyn SandboxOrchestration>,
@@ -134,12 +146,37 @@ impl ApiImpl {
             sandbox_proxy_domains,
             role,
             resume_wiring,
+            node_placement: None,
         }
+    }
+
+    /// Wires this process to send a template build somewhere else when it
+    /// cannot run one itself.
+    ///
+    /// 🔴 A builder step and not an eleventh constructor argument, on
+    /// purpose: every call site of `new` but `assemble_api`'s predates this
+    /// field and has no placement to give it, `--role all`'s among them —
+    /// and that one is the rollback target, whose assembly function is
+    /// asserted byte-for-byte unchanged in behavior by
+    /// `only_the_split_roles_bind_a_second_listener`. A required tenth
+    /// argument would have meant editing it (and seven other call sites that
+    /// have nothing to do with this feature) to pass `None`, for a value
+    /// that only ever varies for one of them.
+    pub fn with_node_placement(mut self, node_placement: Arc<dyn NodePlacement>) -> Self {
+        self.node_placement = Some(node_placement);
+        self
     }
 
     /// Which half of the split this process runs.
     pub(crate) fn role(&self) -> ServerRole {
         self.role
+    }
+
+    /// Where to send a template build this process cannot run itself, or
+    /// `None` when it can (or, on a misconfigured `--role api`, when nobody
+    /// gave it one — see the field's own doc).
+    pub(crate) fn node_placement(&self) -> Option<Arc<dyn NodePlacement>> {
+        self.node_placement.as_ref().map(Arc::clone)
     }
 
     pub(crate) fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {

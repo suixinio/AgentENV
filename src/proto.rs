@@ -62,6 +62,27 @@ pub(crate) mod node {
         };
         tonic::Status::with_details(code, message, failure.encode_to_vec().into())
     }
+
+    /// Builds the status a node returns for a failed `BuildTemplate` call.
+    ///
+    /// 🔴 The step travels in the details and never folded into `message`:
+    /// `TemplateBuildErrorReason.step` (`src/snapshot/types/snapshot.rs`) is
+    /// read back structurally by a template's build-status API
+    /// (`models::BuildStatusReason.step`), and a caller that had to re-parse
+    /// `message` to recover it would be one string-format change away from
+    /// losing it silently.
+    pub(crate) fn build_failure_status(
+        code: tonic::Code,
+        message: impl Into<String>,
+        step: Option<&str>,
+    ) -> tonic::Status {
+        use prost::Message as _;
+
+        let detail = TemplateBuildFailureDetail {
+            step: step.unwrap_or_default().to_string(),
+        };
+        tonic::Status::with_details(code, message, detail.encode_to_vec().into())
+    }
 }
 
 #[cfg(test)]

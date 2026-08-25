@@ -149,10 +149,36 @@ impl TemplateBuilder {
         info!("template snapshot published");
         Ok(record)
     }
+
+    /// Builds the `TemplateBuildContext` a caller will drive and stage
+    /// itself, without executing or publishing it.
+    ///
+    /// 🔴 For `NodeSandboxService::build_template`: `execute_and_publish`
+    /// above also commits and advertises the built snapshot, and on the
+    /// api/node split those two steps run in different processes — the node
+    /// stages, the API half commits (`SnapshotManager::stage` +
+    /// `adopt_staged`, not `publish`). This method stops exactly where the
+    /// two diverge, and reuses `prepare_fresh_context` /
+    /// `prepare_snapshot_base_context` unchanged rather than restating the
+    /// validation they perform (the build id must differ from its base, a
+    /// snapshot base's virtualization mode must match this node's, resources
+    /// may not change under a snapshot base) a second time for the remote
+    /// caller.
+    pub(crate) fn prepare_remote_context(
+        &self,
+        spec: &TemplateBuildSpec,
+        snapshot_id: SnapshotId,
+        base_snapshot: Option<&RunnableSnapshot>,
+    ) -> TemplateBuildResult<TemplateBuildContext> {
+        match base_snapshot {
+            Some(base) => self.prepare_snapshot_base_context(spec, snapshot_id, base),
+            None => self.prepare_fresh_context(spec, snapshot_id),
+        }
+    }
 }
 
 impl TemplateBuilder {
-    fn build_failure_reason(error: &AnyhowError) -> TemplateBuildErrorReason {
+    pub(crate) fn build_failure_reason(error: &AnyhowError) -> TemplateBuildErrorReason {
         error
             .chain()
             .find_map(|cause| {

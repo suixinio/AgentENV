@@ -635,6 +635,8 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         let orchestration = Arc::clone(&orchestration);
         let snapshots = Arc::clone(&core.snapshot_manager);
         let node_id = core.identity.id.clone();
+        let image_resolver = Arc::clone(&core.image_resolver);
+        let template_builder = Arc::clone(&core.template_builder);
         spawn_grpc_surface(
             &config.cluster.node_service_addr,
             "node sandbox service",
@@ -644,6 +646,8 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
                     orchestration,
                     snapshots,
                     node_id,
+                    image_resolver,
+                    template_builder,
                     shutdown,
                 )
             },
@@ -834,7 +838,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let orchestrator = Orchestrator::new(
         role,
         store,
-        RemoteSandboxBackendFactory::new(placement),
+        // 🔴 A clone, not the original: `ApiImpl` needs its own handle on the
+        // same placement source to pick a node for a template build it
+        // cannot run itself (`POST /v2/templates/{id}/builds/{id}`,
+        // `run_the_build_on_a_node` in `src/api/impls/template.rs`) — the same
+        // question `place_new` already answers for a fresh sandbox create,
+        // asked here for a build sandbox instead of a user one.
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement)),
         DisabledSandboxPersister,
     )
     .await?;
@@ -888,21 +898,29 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     );
     orchestrator.set_paused_publisher(paused_wiring.publisher());
 
-    let api_impl = Arc::new(ApiImpl::new(
-        Arc::clone(&orchestration),
-        snapshot_manager,
-        template_builder,
-        image_resolver,
-        observability,
-        paused_wiring,
-        config.sandbox_proxy.domains.clone(),
-        role,
-        // 🔴 `WakeSite::Remote`: the pin is honoured by the orchestration
-        // surface below, which places the wake-up on the machine the paused
-        // state names, rather than by a same-machine check this process cannot
-        // make. Requires a scheduler endpoint and says so if it has none.
-        ResumeWiring::cluster_from_config()?,
-    ));
+    let api_impl = Arc::new(
+        ApiImpl::new(
+            Arc::clone(&orchestration),
+            snapshot_manager,
+            template_builder,
+            image_resolver,
+            observability,
+            paused_wiring,
+            config.sandbox_proxy.domains.clone(),
+            role,
+            // 🔴 `WakeSite::Remote`: the pin is honoured by the orchestration
+            // surface below, which places the wake-up on the machine the paused
+            // state names, rather than by a same-machine check this process cannot
+            // make. Requires a scheduler endpoint and says so if it has none.
+            ResumeWiring::cluster_from_config()?,
+        )
+        // 🔴 The role `!runs_sandbox_runtime()` names, and the one
+        // `v2_templates_...`'s remote branch exists for: a template build has
+        // to go somewhere, and the earlier clone into the factory is what
+        // makes handing this process the same placement source free. See
+        // `ApiImpl::with_node_placement`.
+        .with_node_placement(placement),
+    );
 
     // The same three passes, in the same order, and for the same reasons as
     // `assemble_all` — with one difference worth naming. There, "this process

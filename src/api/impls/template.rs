@@ -1063,13 +1063,14 @@ async fn run_the_build_on_a_node(
         }
     };
 
-    let request = match build_template_wire_request(&build_id, &base_source, &spec, resources) {
-        Ok(request) => request,
-        Err(reason) => {
-            mark_v2_build_error(&api, &build_id, reason).await;
-            return;
-        }
-    };
+    let request =
+        match build_template_wire_request(&api, &build_id, &base_source, &spec, resources).await {
+            Ok(request) => request,
+            Err(reason) => {
+                mark_v2_build_error(&api, &build_id, reason).await;
+                return;
+            }
+        };
 
     let staged =
         match crate::node_client::build_template_on_a_node(placement.as_ref(), resources, request)
@@ -1124,7 +1125,17 @@ async fn run_the_build_on_a_node(
 
 /// Turns a `TemplateBuildSpec` and its base source into the wire request
 /// `NodeSandboxService::build_template` accepts.
-fn build_template_wire_request(
+///
+/// 🔴 `Template(alias)` resolves the base's catalog row here, before
+/// dispatch — the read Q3 moved off the node (see
+/// `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3 and
+/// `TemplateBuildRequest.base_snapshot_resolved`'s own doc in node.proto).
+/// Only the row: `api.snapshot_manager.get`, never `load_runnable` — local
+/// artifact resolution belongs to whichever machine boots the build sandbox,
+/// and that machine is the node this request is about to be sent to, not
+/// this replica.
+async fn build_template_wire_request(
+    api: &ApiImpl,
     build_id: &SnapshotId,
     base_source: &TemplateBuildStartBaseSource,
     spec: &crate::template::TemplateBuildSpec,
@@ -1133,6 +1144,7 @@ fn build_template_wire_request(
     let steps = pb::encode_value(&spec.steps().to_vec()).map_err(|err| {
         TemplateBuildErrorReason::new(format!("encode template build steps: {err}"))
     })?;
+    let mut base_snapshot_resolved = None;
     let base = match base_source {
         TemplateBuildStartBaseSource::DefaultImage => {
             pb::template_build_request::Base::Image(pb::TemplateBuildImageBase {
@@ -1145,12 +1157,29 @@ fn build_template_wire_request(
             })
         }
         TemplateBuildStartBaseSource::Template(alias) => {
+            let record = match api.snapshot_manager.get(alias.as_ref()).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    return Err(TemplateBuildErrorReason::new(format!(
+                        "template alias not found: {alias}"
+                    )));
+                }
+                Err(err) => {
+                    return Err(TemplateBuildErrorReason::new(
+                        ApiImpl::snapshot_manager_error(&err).message,
+                    ));
+                }
+            };
+            base_snapshot_resolved = Some(pb::encode_value(&record).map_err(|err| {
+                TemplateBuildErrorReason::new(format!("encode base template record: {err}"))
+            })?);
             pb::template_build_request::Base::BaseSnapshotRef(alias.to_string())
         }
     };
     Ok(pb::TemplateBuildRequest {
         build_snapshot_id: build_id.to_string(),
         base: Some(base),
+        base_snapshot_resolved,
         steps: Some(steps),
         resources: Some(pb::SandboxResources {
             cpu_count: resources.cpu_count,

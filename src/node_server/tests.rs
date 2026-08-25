@@ -735,6 +735,7 @@ async fn a_create_carrying_an_empty_marker_produces_an_unowned_sandbox() {
             source: Some(pb::sandbox_create_request::Source::Snapshot(
                 pb::SnapshotSource {
                     snapshot_id: "mock".to_string(),
+                    resolved_record: None,
                 },
             )),
             expiry: Some(pb::sandbox_create_request::Expiry::NodeKeptTimeoutMs(
@@ -794,6 +795,7 @@ async fn a_create_that_does_not_say_who_keeps_the_deadline_is_refused_before_the
         source: Some(pb::sandbox_create_request::Source::Snapshot(
             pb::SnapshotSource {
                 snapshot_id: "no-such-snapshot".to_string(),
+                resolved_record: None,
             },
         )),
         expiry,
@@ -847,6 +849,7 @@ async fn a_create_uses_the_id_the_caller_chose() {
             source: Some(pb::sandbox_create_request::Source::Snapshot(
                 pb::SnapshotSource {
                     snapshot_id: "no-such-snapshot".to_string(),
+                    resolved_record: None,
                 },
             )),
             expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
@@ -869,6 +872,213 @@ async fn a_create_uses_the_id_the_caller_chose() {
             .expect("read")
             .is_none(),
         "a refused create left a record behind"
+    );
+}
+
+/// Q3's whole point, proven rather than asserted in prose: a `SnapshotSource`
+/// carrying `resolved_record` never reaches this node's own catalog.
+///
+/// `mock_snapshot_manager()`'s catalog (`MockSnapshotCatalog`) and runtime
+/// resolver (`MockSnapshotRuntimeResolver`) both fail every call, each with
+/// its own distinct message — "should not be called in this test" naming
+/// which one. That difference is the whole test: `load_runnable` (the
+/// pre-Stage-B path) would fail at the *catalog* step, before ever reaching
+/// the resolver; `resolve_runnable` (the path this test exercises) skips the
+/// catalog and fails at the *resolver* step instead. A create with
+/// `resolved_record` set failing with the resolver's message rather than the
+/// catalog's is the node never having asked its catalog anything.
+#[tokio::test]
+async fn a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup() {
+    let (_orchestration, service) = service().await;
+    let record =
+        crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+    let resolved_record = pb::encode_value(&record).expect("encode should succeed");
+
+    let err = service
+        .create(Request::new(pb::SandboxCreateRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            source: Some(pb::sandbox_create_request::Source::Snapshot(
+                pb::SnapshotSource {
+                    snapshot_id: record.id.to_string(),
+                    resolved_record: Some(resolved_record),
+                },
+            )),
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
+            timeout_action: pb::TimeoutAction::Pause as i32,
+            control_plane_config: b"owned".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("the mock runtime resolver fails every call");
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message().contains("runtime resolver"),
+        "a resolved_record must reach resolve_runnable directly, never the catalog: {err}"
+    );
+    assert!(
+        !err.message().contains("catalog"),
+        "a resolved_record must never touch the node's own catalog: {err}"
+    );
+}
+
+/// The rolling-upgrade fallback `SnapshotSource.resolved_record`'s doc
+/// promises: absent, the node resolves `snapshot_id` itself, exactly the
+/// pre-Stage-B path — same shape of proof as the test above, mirrored. This
+/// is `a_create_uses_the_id_the_caller_chose` in miniature, named for what it
+/// specifically guards: an API replica built before this field existed (or a
+/// caller that simply has nothing resolved yet) must not be refused for
+/// omitting it.
+#[tokio::test]
+async fn a_snapshot_source_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
+    let (_orchestration, service) = service().await;
+
+    let err = service
+        .create(Request::new(pb::SandboxCreateRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            source: Some(pb::sandbox_create_request::Source::Snapshot(
+                pb::SnapshotSource {
+                    snapshot_id: "no-such-snapshot".to_string(),
+                    resolved_record: None,
+                },
+            )),
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
+            timeout_action: pb::TimeoutAction::Pause as i32,
+            control_plane_config: b"owned".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("the mock catalog fails every call");
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message().contains("catalog"),
+        "an absent resolved_record must fall back to this node's own catalog lookup: {err}"
+    );
+}
+
+/// A `resolved_record` naming a different snapshot than `snapshot_id` is a
+/// malformed request, refused loudly rather than silently launching whichever
+/// one the record actually names.
+#[tokio::test]
+async fn a_resolved_record_naming_a_different_snapshot_is_refused() {
+    let (_orchestration, service) = service().await;
+    let record =
+        crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+    let resolved_record = pb::encode_value(&record).expect("encode should succeed");
+
+    let err = service
+        .create(Request::new(pb::SandboxCreateRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            source: Some(pb::sandbox_create_request::Source::Snapshot(
+                pb::SnapshotSource {
+                    snapshot_id: "a-different-snapshot-id".to_string(),
+                    resolved_record: Some(resolved_record),
+                },
+            )),
+            expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
+                pb::CallerKeptExpiry {},
+            )),
+            timeout_action: pb::TimeoutAction::Pause as i32,
+            control_plane_config: b"owned".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a resolved_record naming a different snapshot must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+/// [`a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup`]'s pair,
+/// for `BuildTemplate`'s `base_snapshot_resolved` instead of `Create`'s
+/// `resolved_record`. Same proof, same mock manager, same two distinct
+/// failure messages telling the catalog and the runtime resolver apart — see
+/// that test's own doc for why the message is the whole test.
+///
+/// The request never reaches `TemplateBuildRunner::execute` (which would
+/// need a real Firecracker VM): resolving the base fails first, inside
+/// `build_template_impl`'s `Base::BaseSnapshotRef` arm, before the build ever
+/// starts.
+#[tokio::test]
+async fn a_resolved_base_snapshot_skips_the_nodes_own_catalog_lookup() {
+    let (orchestration, mut service) = service().await;
+    service = service.with_template_build(
+        Arc::new(crate::image::ImageResolver::new(
+            &crate::cfg::AppConfig::default(),
+        )),
+        Arc::new(crate::template::TemplateBuilder::new()),
+    );
+    let _ = &orchestration;
+
+    let record =
+        crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+    let base_snapshot_resolved = pb::encode_value(&record).expect("encode should succeed");
+
+    let err = service
+        .build_template(Request::new(pb::TemplateBuildRequest {
+            build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
+            base: Some(pb::template_build_request::Base::BaseSnapshotRef(
+                "irrelevant-alias".to_string(),
+            )),
+            base_snapshot_resolved: Some(base_snapshot_resolved),
+            steps: None,
+            resources: Some(pb::SandboxResources {
+                cpu_count: 1,
+                memory_mib: 512,
+                disk_size_mib: 1024,
+            }),
+            start_cmd: String::new(),
+            ready_cmd: String::new(),
+        }))
+        .await
+        .expect_err("the mock runtime resolver fails every call");
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message().contains("runtime resolver"),
+        "base_snapshot_resolved must reach resolve_runnable directly, never the catalog: {err}"
+    );
+    assert!(
+        !err.message().contains("catalog"),
+        "base_snapshot_resolved must never touch the node's own catalog: {err}"
+    );
+}
+
+/// The fallback half of the pair above: no `base_snapshot_resolved`, so the
+/// node resolves `base_snapshot_ref` itself, exactly the pre-Stage-B path.
+#[tokio::test]
+async fn a_base_snapshot_ref_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
+    let (orchestration, mut service) = service().await;
+    service = service.with_template_build(
+        Arc::new(crate::image::ImageResolver::new(
+            &crate::cfg::AppConfig::default(),
+        )),
+        Arc::new(crate::template::TemplateBuilder::new()),
+    );
+    let _ = &orchestration;
+
+    let err = service
+        .build_template(Request::new(pb::TemplateBuildRequest {
+            build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
+            base: Some(pb::template_build_request::Base::BaseSnapshotRef(
+                "no-such-alias".to_string(),
+            )),
+            base_snapshot_resolved: None,
+            steps: None,
+            resources: Some(pb::SandboxResources {
+                cpu_count: 1,
+                memory_mib: 512,
+                disk_size_mib: 1024,
+            }),
+            start_cmd: String::new(),
+            ready_cmd: String::new(),
+        }))
+        .await
+        .expect_err("the mock catalog fails every call");
+    assert_eq!(err.code(), Code::Internal);
+    assert!(
+        err.message().contains("catalog"),
+        "an absent base_snapshot_resolved must fall back to this node's own catalog lookup: {err}"
     );
 }
 
@@ -899,6 +1109,7 @@ async fn a_create_missing_what_it_needs_is_refused() {
             source: Some(pb::sandbox_create_request::Source::Snapshot(
                 pb::SnapshotSource {
                     snapshot_id: "mock".to_string(),
+                    resolved_record: None,
                 },
             )),
             timeout_action: pb::TimeoutAction::Unspecified as i32,

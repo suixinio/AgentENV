@@ -95,6 +95,13 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             source: Some(pb::sandbox_create_request::Source::Snapshot(
                 pb::SnapshotSource {
                     snapshot_id: record.id.to_string(),
+                    // 🔴 The catalog row this half already holds, so the node
+                    // does not have to ask its own catalog for it — see
+                    // `SnapshotSource.resolved_record`'s own doc in
+                    // node.proto. `record` is the exact row this
+                    // `RunnableSnapshot` was resolved from; forwarding it is
+                    // free, `snapshot` already paid for the lookup.
+                    resolved_record: Some(wire::serialize(record, "resolved snapshot record")?),
                 },
             )),
             // 🔴 **Said out loud, because it used to be said by omission.**

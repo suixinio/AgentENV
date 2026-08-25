@@ -223,12 +223,36 @@ message PausedState {
 
 // A sandbox to start from a committed snapshot.
 //
-// 🔴 The id, and not a resolved snapshot. Resolving a snapshot yields local
-// artifact paths and an open image, and both belong to the machine that will
-// run the VM. The API half decides *which* snapshot; the node decides what
-// that means on its disk.
+// 🔴 The id, and not a *resolved runtime*. Resolving a snapshot into runnable
+// state yields local artifact paths and an open image, and both belong to the
+// machine that will run the VM — the node still does that part, from
+// `resolved_record` when it is set or from `snapshot_id` through its own
+// catalog access when it is not. The API half decides *which* snapshot; the
+// node decides what running it means on its disk.
 message SnapshotSource {
   string snapshot_id = 1;
+  // The catalog row for `snapshot_id`, resolved by the API half at dispatch
+  // time and carried as `SerializedValue` (`crate::snapshot::SnapshotRecord`,
+  // JSON) rather than mirrored as proto fields — same reasoning as
+  // `TemplateBuildRequest.steps` below: both ends of this call are Rust,
+  // deployed from one image.
+  //
+  // 🔴 Why this exists at all: `--role node` has no catalog access of its own
+  // once the central catalog moves behind `[pg]` (see
+  // `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3) — every write
+  // it could make already goes through bytes-only paths, and node must never
+  // hold `[pg].dsn`. Rather than stand up a new node<->api RPC face for two
+  // read-only lookups, the API half — which already resolves this snapshot
+  // for its own purposes before dispatch — forwards the row it already has.
+  //
+  // 🔴 Absent is not an error. A node built before this field existed ignores
+  // it (proto3 forward compatibility); a node built after it exists, talking
+  // to an API replica built before this field existed, sees it unset and
+  // falls back to resolving `snapshot_id` itself through its own
+  // `SnapshotManager` — the pre-existing path, kept for exactly this rolling
+  // upgrade window. See `NodeSandboxService::create`'s own fallback for the
+  // other half of that contract.
+  SerializedValue resolved_record = 2;
 }
 
 // A sandbox to start from an OCI image, cold.
@@ -738,7 +762,9 @@ message TemplateBuildRequest {
     TemplateBuildImageBase image = 2;
     // A committed snapshot to build on top of, by id or alias. Resolved
     // node-side through the same `SnapshotManager::load_runnable` a `Create`
-    // with a `SnapshotSource` resolves its base through.
+    // with a `SnapshotSource` resolves its base through — unless
+    // `base_snapshot_resolved` below is set, in which case the node resolves
+    // the *row* it already has instead of asking its own catalog for it.
     string base_snapshot_ref = 3;
   }
 
@@ -773,6 +799,15 @@ message TemplateBuildRequest {
   // rather than a new one: the caller's `adopt_staged` overwrites
   // `staged.commit.alias` unconditionally at commit time regardless of what
   // this node wrote, so sending one here would be a value nobody reads.
+
+  // The catalog row for `base_snapshot_ref`, resolved by the API half at
+  // dispatch time — meaningful only when `base` is `base_snapshot_ref`,
+  // ignored otherwise. Same shape, same reasoning and the same rolling-
+  // upgrade fallback contract as `SnapshotSource.resolved_record` above: see
+  // that field's doc. A field number of its own (not folded into the `base`
+  // oneof) because a oneof variant's shape cannot grow a second value without
+  // breaking every existing reader of `base_snapshot_ref` as a bare string.
+  SerializedValue base_snapshot_resolved = 8;
 }
 
 message TemplateBuildResponse {

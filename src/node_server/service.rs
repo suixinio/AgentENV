@@ -36,6 +36,7 @@ use crate::sandbox::{
 };
 use crate::snapshot::{
     CommandContext, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotRecord,
 };
 use crate::template::{TemplateBuildRunner, TemplateBuildSpec, TemplateBuildStep, TemplateBuilder};
 use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
@@ -301,16 +302,36 @@ impl NodeSandboxService {
                 if base_ref.is_empty() {
                     return Err(Status::invalid_argument("base_snapshot_ref is required"));
                 }
-                let runnable = self
-                    .snapshots
-                    .load_runnable(&base_ref)
-                    .await
-                    .map_err(|err| {
-                        Status::internal(format!("resolve base template {base_ref}: {err:#}"))
-                    })?
-                    .ok_or_else(|| {
-                        Status::not_found(format!("base template {base_ref} not found"))
-                    })?;
+                // 🔴 `base_snapshot_resolved`, when the API half sent one, in
+                // place of this node's own catalog lookup — same contract as
+                // `SnapshotSource.resolved_record` in `create` above; see
+                // that field's doc in node.proto.
+                let resolved: Option<SnapshotRecord> = convert::serialized(
+                    request.base_snapshot_resolved.as_ref(),
+                    "base_snapshot_resolved",
+                )?;
+                let runnable = match resolved {
+                    Some(record) => {
+                        self.snapshots
+                            .resolve_runnable(record)
+                            .await
+                            .map_err(|err| {
+                                Status::internal(format!(
+                                    "resolve base template {base_ref}: {err:#}"
+                                ))
+                            })?
+                    }
+                    None => self
+                        .snapshots
+                        .load_runnable(&base_ref)
+                        .await
+                        .map_err(|err| {
+                            Status::internal(format!("resolve base template {base_ref}: {err:#}"))
+                        })?
+                        .ok_or_else(|| {
+                            Status::not_found(format!("base template {base_ref} not found"))
+                        })?,
+                };
                 Some(runnable)
             }
             None => return Err(Status::invalid_argument("base is required")),
@@ -835,22 +856,52 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 if snapshot.snapshot_id.is_empty() {
                     return Err(Status::invalid_argument("snapshot.snapshot_id is required"));
                 }
-                let runnable = self
-                    .snapshots
-                    .load_runnable(&snapshot.snapshot_id)
-                    .await
-                    // 🔴 A resolver that could not answer is an error. Reading
-                    // it as "no such snapshot" would turn a registry outage
-                    // into a permanent-looking refusal.
-                    .map_err(|err| {
-                        Status::internal(format!(
-                            "resolve snapshot {}: {err:#}",
-                            snapshot.snapshot_id
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        Status::not_found(format!("snapshot {} not found", snapshot.snapshot_id))
-                    })?;
+                // 🔴 `resolved_record`, when the API half sent one, in place
+                // of this node's own catalog lookup — see
+                // `SnapshotSource.resolved_record`'s own doc in node.proto
+                // and Q3 in `_sd-phase4-open-questions-resolved.md`. Absent
+                // (an API replica built before this field existed) falls
+                // back to `load_runnable`, the pre-existing path, unchanged.
+                let resolved: Option<SnapshotRecord> =
+                    convert::serialized(snapshot.resolved_record.as_ref(), "resolved_record")?;
+                let runnable = match resolved {
+                    Some(record) => {
+                        if record.id.to_string() != snapshot.snapshot_id {
+                            return Err(Status::invalid_argument(format!(
+                                "resolved_record names snapshot {}, not snapshot_id {}",
+                                record.id, snapshot.snapshot_id
+                            )));
+                        }
+                        self.snapshots
+                            .resolve_runnable(record)
+                            .await
+                            .map_err(|err| {
+                                Status::internal(format!(
+                                    "resolve snapshot {}: {err:#}",
+                                    snapshot.snapshot_id
+                                ))
+                            })?
+                    }
+                    None => self
+                        .snapshots
+                        .load_runnable(&snapshot.snapshot_id)
+                        .await
+                        // 🔴 A resolver that could not answer is an error. Reading
+                        // it as "no such snapshot" would turn a registry outage
+                        // into a permanent-looking refusal.
+                        .map_err(|err| {
+                            Status::internal(format!(
+                                "resolve snapshot {}: {err:#}",
+                                snapshot.snapshot_id
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            Status::not_found(format!(
+                                "snapshot {} not found",
+                                snapshot.snapshot_id
+                            ))
+                        })?,
+                };
                 SandboxLaunchSource::Snapshot(Box::new(runnable))
             }
             Some(pb::sandbox_create_request::Source::Image(image)) => {

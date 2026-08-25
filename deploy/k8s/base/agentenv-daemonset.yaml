@@ -362,17 +362,39 @@ spec:
                     # the full 3600s grace.
                     #
                     # 🔴 /nodes and not /nodes/{id}, which is what one would
-                    # reach for first. Three disjoint counters have to be summed
-                    # to answer "is anything still here" — sandboxCount covers
-                    # only the states where the VM is up (Running, Pausing,
-                    # Snapshotting, Forking, Killing), sandboxStartingCount
-                    # covers Creating and Resuming, sandboxPausedCount covers
-                    # Paused — and the NodeDetail schema that /nodes/{id}
-                    # returns **has no sandboxStartingCount field at all**. A
-                    # node polled through /nodes/{id} therefore cannot see a
-                    # sandbox that is being created on it, and would call itself
-                    # drained while one was starting. /nodes returns this node
-                    # as a one-element array of Node, which carries all three.
+                    # reach for first. Two disjoint counters have to be summed
+                    # to answer "is anything still transitioning here" —
+                    # sandboxCount covers the states where the VM is up
+                    # (Running, Pausing, Snapshotting, Forking, Killing) and
+                    # sandboxStartingCount covers Creating and Resuming — and
+                    # the NodeDetail schema that /nodes/{id} returns **has no
+                    # sandboxStartingCount field at all**. A node polled
+                    # through /nodes/{id} therefore cannot see a sandbox that
+                    # is being created on it, and would call itself drained
+                    # while one was starting. /nodes returns this node as a
+                    # one-element array of Node, which carries both.
+                    #
+                    # 🔴 sandboxPausedCount is deliberately left out of the sum.
+                    # A Paused sandbox has no running VM and nothing in flight —
+                    # it is a metadata row plus an artifact directory under
+                    # orchestrator.persisted_sandbox_store_path, already
+                    # fsync'd to this Pod's `workspace` hostPath mount
+                    # (src/orchestrator/persistence/file_backed.rs, opened with
+                    # LocalStoreDurability::Sync) — and Orchestrator::new
+                    # restores every persisted Paused sandbox the moment the
+                    # next process starts on this same node
+                    # (src/orchestrator/service.rs). The shutdown this hook is
+                    # waiting to unblock does not touch Paused sandboxes either
+                    # (run_shutdown_cleanup filters them out with
+                    # `excluded_states: Some(vec![SandboxState::Paused])`)
+                    # because there is nothing left for it to preserve. Paused
+                    # sandboxes exist to sit there until a later resume, so
+                    # sandboxPausedCount does not go to zero on its own; summing
+                    # it in made every rolling update of this DaemonSet wait out
+                    # the full drain timeout, on every node, serially, for as
+                    # long as the cluster held any paused sandbox at all — which
+                    # is the normal, intended state of a cluster that uses pause
+                    # for anything.
                     #
                     # 🔴 X-Admin-Token, not X-API-Key: both node endpoints are
                     # declared with AdminApiKeyAuth and the wrong header is a
@@ -391,7 +413,7 @@ spec:
                       count=$(curl -sf -H 'X-Admin-Token: preStop' \
                         -H "x-agentenv-control-plane: ${CONTROL_PLANE_TOKEN}" \
                         "http://localhost:8000/nodes" \
-                        | jq -e 'if length == 1 then .[0] else null end | if . != null and (.sandboxCount|type)=="number" and (.sandboxStartingCount|type)=="number" and (.sandboxPausedCount|type)=="number" then .sandboxCount + .sandboxStartingCount + .sandboxPausedCount else null end') || count=""
+                        | jq -e 'if length == 1 then .[0] else null end | if . != null and (.sandboxCount|type)=="number" and (.sandboxStartingCount|type)=="number" then .sandboxCount + .sandboxStartingCount else null end') || count=""
                       case "$count" in ''|*[!0-9]*) count="" ;; esac
                       if [ -z "$count" ]; then
                         DRAIN_READ_FAILURES=$(( DRAIN_READ_FAILURES + 1 ))
@@ -404,7 +426,7 @@ spec:
                         continue
                       fi
                       DRAIN_READ_FAILURES=0
-                      echo "preStop: $count sandbox(es) remaining (running + starting + paused)"
+                      echo "preStop: $count sandbox(es) remaining (running + starting; paused sandboxes are excluded and stay put)"
                       if [ "$count" = "0" ]; then
                         echo "preStop: all sandboxes drained, exiting"
                         break

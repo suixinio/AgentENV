@@ -663,21 +663,50 @@ mod tests {
         );
     }
 
-    /// 🔴 T-RG-12. The drain waits on every sandbox, not on the running ones.
+    /// 🔴 T-RG-12. The drain waits on the sandboxes that are still
+    /// transitioning, not on the ones already at rest.
     ///
-    /// Three disjoint counters answer "is anything still here", and the two
-    /// obvious readings of this endpoint are both wrong: `sandboxCount` alone
-    /// misses paused sandboxes, and `sandboxCount + sandboxPausedCount` — the
-    /// fix the specification proposed — still misses `Creating` and `Resuming`.
+    /// Two disjoint counters answer "is anything still transitioning here":
+    /// `sandboxCount` alone misses `Creating`/`Resuming`, which is why
+    /// `sandboxStartingCount` has to be added too. `sandboxPausedCount` must
+    /// stay out of the sum: a Paused sandbox has no running VM, is already
+    /// durably persisted to this node's local disk
+    /// (`src/orchestrator/persistence/file_backed.rs`, restored by
+    /// `Orchestrator::new` on the next process's startup), and is explicitly
+    /// excluded from the set of sandboxes shutdown itself acts on
+    /// (`run_shutdown_cleanup`'s `excluded_states: [SandboxState::Paused]`).
+    /// It also never reaches zero on its own — pausing exists so a sandbox
+    /// stays there until a later resume — so summing it in stalls every
+    /// rolling update for the full drain timeout on any cluster that has a
+    /// paused sandbox anywhere, which is the ordinary state of a cluster that
+    /// uses pause at all.
     #[test]
-    fn the_drain_counts_running_starting_and_paused_sandboxes() {
+    fn the_drain_counts_running_and_starting_sandboxes_but_not_paused() {
         let script = prestop_script();
-        for field in ["sandboxCount", "sandboxStartingCount", "sandboxPausedCount"] {
+        for field in ["sandboxCount", "sandboxStartingCount"] {
             assert!(
                 script.contains(field),
                 "the drain condition must include {field}"
             );
         }
+        // The check is against the `jq` query line itself, not the whole
+        // script: the surrounding comments name `sandboxPausedCount` on
+        // purpose, to explain why it is excluded, and a substring check over
+        // the full script would fail on that prose rather than on the query.
+        let jq_line = script
+            .lines()
+            .find(|line| line.contains("sandboxCount|type"))
+            .expect("the drain loop reads the count through a jq filter over sandboxCount");
+        assert!(
+            jq_line.contains(".sandboxCount + .sandboxStartingCount"),
+            "the drain condition must sum exactly running + starting: {jq_line}"
+        );
+        assert!(
+            !jq_line.contains("sandboxPausedCount"),
+            "a paused sandbox is already durably persisted and outlives this process on \
+             purpose; summing it into the drain query stalls every rollout for as long as the \
+             cluster holds any paused sandbox at all: {jq_line}"
+        );
         // 🔴 And a field that is not a number is not a zero. Without this, an
         // endpoint that answered `[]` — which it does when observability is
         // switched off — would read as "nothing left here".

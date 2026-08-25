@@ -1324,6 +1324,29 @@ where
             })?;
         if timeout_updated {
             info!(?valid_timeout, "sandbox keep-alive timeout updated");
+
+            // Mirror the new deadline into the cluster registry. Best-effort,
+            // like every other write on `PausedSandboxPublisher`: the local
+            // record above is already the authoritative one, and this only
+            // keeps `ReclaimExpiredHoldings`' cluster-wide backstop from
+            // judging the sandbox against a deadline as stale as its last
+            // resume — see `renew_deadline`'s own doc.
+            //
+            // 🔴 `update_result.current.expires_at`, not `valid_timeout` and
+            // not `new_expire_time` from the closure above: `set_timeout`
+            // clamps to the sandbox's lifetime ceiling before it lands on the
+            // record, and this has to carry the same, already-clamped value
+            // out — never the caller's raw request, which the ceiling was
+            // never applied to at all.
+            if let Some(publisher) = self.paused_publisher() {
+                publisher
+                    .renew_deadline(
+                        sandbox_id,
+                        update_result.current.execution_id,
+                        update_result.current.expires_at,
+                    )
+                    .await;
+            }
         }
 
         Ok(Some(update_result.current))

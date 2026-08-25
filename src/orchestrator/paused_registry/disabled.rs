@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use super::{
-    BeganPause, HeldSandbox, MarkRunningOutcome, PausedSandboxEntry, PausedSandboxRegistry,
-    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedSandboxEntry,
+    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
@@ -94,6 +94,17 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         // Untracked, not held-elsewhere: this backend has no cluster to hold a
         // sandbox anywhere else.
         Ok(MarkRunningOutcome::Untracked)
+    }
+
+    async fn renew_sandbox_deadline(
+        &self,
+        _sandbox_id: &SandboxId,
+        _execution_id: ExecutionId,
+        _expires_at: Option<std::time::SystemTime>,
+    ) -> RegistryResult<DeadlineRenewalOutcome> {
+        // Not tracked, the same answer mark_running gives: this backend has no
+        // cluster row to write a deadline onto.
+        Ok(DeadlineRenewalOutcome::NotTracked)
     }
 
     async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {

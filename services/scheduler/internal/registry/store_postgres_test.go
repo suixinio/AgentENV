@@ -1583,6 +1583,209 @@ func TestMarkRunningPropagatesARowItCannotDecode(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RenewSandboxDeadline
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestRenewSandboxDeadlineWritesTheExactValue is the propagation test itself:
+// this is what closes the gap where POST /timeout's new deadline never
+// reached paused_sandboxes.sandbox_expires_at. It has to pin the exact value
+// carried in, not merely that the column stopped being NULL — a test that
+// only checked non-null would pass even if the wrong deadline (say, the
+// user's raw unclamped request instead of keep_alive_for's clamped one)
+// reached the row.
+func TestRenewSandboxDeadlineWritesTheExactValue(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(5001)
+
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stNodeA})
+	if before := f.raw(id); before.sandboxExpiry != nil {
+		t.Fatalf("the fixture already carries a deadline, so this proves nothing: %+v", before)
+	}
+
+	deadline := f.dbNow().Add(90 * time.Minute)
+	outcome, err := f.store.RenewSandboxDeadline(ctx, f.cluster, id, f.executionFor(id), &deadline)
+	if err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+	if outcome != DeadlineRenewalRenewed {
+		t.Fatalf("outcome: got %q, want %q", outcome, DeadlineRenewalRenewed)
+	}
+
+	row := f.raw(id)
+	if row.sandboxExpiry == nil {
+		t.Fatal("the deadline was not written")
+	}
+	if got := row.sandboxExpiry.Sub(deadline).Abs(); got > time.Second {
+		t.Fatalf("the deadline drifted by %s: got %s, want %s", got, row.sandboxExpiry, deadline)
+	}
+}
+
+// TestRenewSandboxDeadlineCanClearToNeverExpire proves nil is carried through
+// as a real value and not read as "leave it alone" — a sandbox whose owner
+// asked for no timeout at all must be able to clear a deadline an earlier
+// renewal wrote.
+func TestRenewSandboxDeadlineCanClearToNeverExpire(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(5002)
+
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stNodeA, sandboxExpiry: "now() + interval '1 hour'"})
+	if before := f.raw(id); before.sandboxExpiry == nil {
+		t.Fatal("the fixture does not carry a deadline, so clearing it proves nothing")
+	}
+
+	outcome, err := f.store.RenewSandboxDeadline(ctx, f.cluster, id, f.executionFor(id), nil)
+	if err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+	if outcome != DeadlineRenewalRenewed {
+		t.Fatalf("outcome: got %q, want %q", outcome, DeadlineRenewalRenewed)
+	}
+	if row := f.raw(id); row.sandboxExpiry != nil {
+		t.Fatalf("a sandbox asked never to expire still carries a deadline: %v", row.sandboxExpiry)
+	}
+}
+
+// TestRenewSandboxDeadlineTouchesOnlyItsOwnColumn is the isolation half: this
+// write must not become a second, uncoordinated way to renew the liveness
+// lease or move any identity column. Those are RenewLiveLeases' and
+// MarkRunning's jobs respectively, each with its own guard.
+func TestRenewSandboxDeadlineTouchesOnlyItsOwnColumn(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(5003)
+
+	f.seed(seedRow{
+		sandboxID: id, state: "running", originNode: stNodeA, generation: 7,
+		leaseExpires: "now() + interval '30 seconds'",
+	})
+	before := f.raw(id)
+
+	deadline := f.dbNow().Add(time.Hour)
+	if _, err := f.store.RenewSandboxDeadline(ctx, f.cluster, id, f.executionFor(id), &deadline); err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+
+	after := f.raw(id)
+	if after.leaseExpires == nil || !after.leaseExpires.Equal(*before.leaseExpires) {
+		t.Fatalf("lease_expires_at moved: got %v, want %v", after.leaseExpires, before.leaseExpires)
+	}
+	if after.generation != before.generation {
+		t.Fatalf("generation moved: got %d, want %d", after.generation, before.generation)
+	}
+	if after.originNode != before.originNode {
+		t.Fatalf("origin_node_id moved: got %q, want %q", after.originNode, before.originNode)
+	}
+	if after.state != before.state {
+		t.Fatalf("state moved: got %q, want %q", after.state, before.state)
+	}
+}
+
+// TestRenewSandboxDeadlineRefusesARowThatIsNotRunning covers a claimed
+// (`resuming`) row: the incarnation on it is the one the claim allocated, but
+// the row is not `running` yet, and this write only ever touches `running`
+// rows. Reporting Superseded here, and leaving the row untouched, is what
+// keeps a stale deadline observed against a since-superseded local view from
+// ever reaching a row this call did not mean to act on.
+func TestRenewSandboxDeadlineRefusesARowThatIsNotRunning(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(5004)
+
+	f.seed(seedRow{
+		sandboxID: id, state: "resuming", generation: 3, originNode: stNodeA,
+		claimedBy: stNodeB, snapshotID: snapshotUUID(5004),
+	})
+	before := f.raw(id)
+
+	deadline := f.dbNow().Add(time.Hour)
+	outcome, err := f.store.RenewSandboxDeadline(ctx, f.cluster, id, f.executionFor(id), &deadline)
+	if err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+	if outcome != DeadlineRenewalSuperseded {
+		t.Fatalf("outcome: got %q, want %q", outcome, DeadlineRenewalSuperseded)
+	}
+	if after := f.raw(id); after.sandboxExpiry != nil {
+		t.Fatalf("a superseded write must not touch the row: %+v (was %+v)", after, before)
+	}
+}
+
+// TestRenewSandboxDeadlineRefusesADifferentIncarnation is the guard's whole
+// point: a deadline computed against a `running` sandbox under incarnation A
+// must never attach to the row once it has moved on to incarnation B — a
+// fresh resume after a pause, running under a fresh execution_id. Superseded,
+// not an error, and not written.
+func TestRenewSandboxDeadlineRefusesADifferentIncarnation(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(5005)
+
+	f.seed(seedRow{sandboxID: id, state: "running", originNode: stNodeA})
+	// The row's own incarnation, seeded by f.seed via f.executionFor. A
+	// caller quoting anything else is quoting a stale, since-replaced one.
+	staleExecution := f.nextExecutionFor(id)
+
+	deadline := f.dbNow().Add(time.Hour)
+	outcome, err := f.store.RenewSandboxDeadline(ctx, f.cluster, id, staleExecution, &deadline)
+	if err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+	if outcome != DeadlineRenewalSuperseded {
+		t.Fatalf("outcome: got %q, want %q", outcome, DeadlineRenewalSuperseded)
+	}
+	if after := f.raw(id); after.sandboxExpiry != nil {
+		t.Fatalf("a fenced write must not touch the row: %+v", after)
+	}
+}
+
+// TestRenewSandboxDeadlineOnAnUntrackedSandboxReportsNotTracked is the common,
+// healthy case: a sandbox this cluster has no row for at all — a disabled
+// registry, or a resume whose own mark_running has not landed yet.
+func TestRenewSandboxDeadlineOnAnUntrackedSandboxReportsNotTracked(t *testing.T) {
+	f := newStoreFixture(t)
+	id := sandboxUUID(5006)
+
+	deadline := f.dbNow().Add(time.Hour)
+	outcome, err := f.store.RenewSandboxDeadline(context.Background(), f.cluster, id, f.executionFor(id), &deadline)
+	if err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+	if outcome != DeadlineRenewalNotTracked {
+		t.Fatalf("outcome: got %q, want %q", outcome, DeadlineRenewalNotTracked)
+	}
+	if row := f.raw(id); row.found {
+		t.Fatalf("renew_sandbox_deadline created a row: %+v", row)
+	}
+}
+
+// TestRenewSandboxDeadlineCannotReachAnotherClustersRow is the multi-tenancy
+// guard every write on this interface carries.
+func TestRenewSandboxDeadlineCannotReachAnotherClustersRow(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	id := sandboxUUID(5007)
+
+	f.seed(seedRow{sandboxID: id, cluster: f.other, state: "running", originNode: "node-z"})
+	if before := f.raw(id); before.sandboxExpiry != nil {
+		t.Fatalf("the fixture already carries a deadline, so this proves nothing: %+v", before)
+	}
+
+	deadline := f.dbNow().Add(time.Hour)
+	outcome, err := f.store.RenewSandboxDeadline(ctx, f.cluster, id, f.executionFor(id), &deadline)
+	if err != nil {
+		t.Fatalf("renew_sandbox_deadline failed: %v", err)
+	}
+	if outcome != DeadlineRenewalNotTracked {
+		t.Fatalf("one cluster reached another's row: outcome %q", outcome)
+	}
+	if after := f.raw(id); after.sandboxExpiry != nil {
+		t.Fatalf("another cluster's row was touched: %+v", after)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RenewLease
 // ─────────────────────────────────────────────────────────────────────────────
 

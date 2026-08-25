@@ -639,6 +639,17 @@ enum TransitionKind {
   TRANSITION_KIND_RELEASE_CLAIM = 5;
   // Deletes the row. Requires expect_generation.
   TRANSITION_KIND_REMOVE = 7;
+  // Updates sandbox_expires_at alone on a `running` row, fenced on
+  // execution_id — never on lease_expires_at, origin_node_id,
+  // claimed_by_node_id or generation, and never on a row that is not
+  // `running`. This is the api half's own deadline (POST /timeout), not a
+  // node's liveness lease, so it carries no node_id-keyed guard the way
+  // mark_running's holder write does: nothing about *who* runs the sandbox
+  // is read or written here, only *when* it is due to end. Requires
+  // execution_id; refuses expect_generation, metadata_json, snapshot_id and
+  // holder_node_id, exactly like mark_running refuses the fields it has no
+  // use for.
+  TRANSITION_KIND_RENEW_DEADLINE = 8;
 
   // 🔴 6 was TRANSITION_KIND_REMOVE_UNCONDITIONAL, the unconditional delete,
   // and this interface's one unguarded destructive write: the caller read the
@@ -670,6 +681,10 @@ message TransitionSandboxRequest {
   //
   // remove joined this list in D11. See the `reserved 6` note on
   // TransitionKind for what it used to be guarded against.
+  //
+  // 🔴 renew_deadline joins mark_running as a kind that never quotes one:
+  // its guard is execution_id, the same reason mark_running names for
+  // itself.
   optional int64 expect_generation = 5;
   // 🔴 Raw JSON bytes, passed through untouched. Not google.protobuf.Struct:
   // that reorders keys, collapses integers into doubles, and normalises what it
@@ -685,8 +700,7 @@ message TransitionSandboxRequest {
   int64 lease_ttl_millis = 7;
   // complete_pause only.
   string snapshot_id = 8;
-  // mark_running only: when the sandbox this node just brought up is due to
-  // end.
+  // mark_running and renew_deadline only: when the sandbox is due to end.
   //
   // 🔴 The column it writes is half of what reclamation requires, and until now
   // only renew_lease ever wrote it. A row therefore carried no deadline between
@@ -695,15 +709,24 @@ message TransitionSandboxRequest {
   // which NULL never satisfies. A node lost inside that window left a row
   // nothing would ever reclaim: not claimable, not removable, forever.
   //
+  // renew_deadline closes the other gap in the same column: the api half's
+  // own POST /timeout can extend this any number of times after the resume
+  // that last wrote it, and until renew_deadline existed nothing carried
+  // that extension here — mark_running fires once, at resume, and never
+  // again for the rest of the sandbox's run.
+  //
   // Absent means the sandbox was asked never to expire, which is a different
   // fact from unknown and is why this is optional rather than a zero.
   optional int64 sandbox_expires_at_unix_micros = 9;
   // Which incarnation of the sandbox is making this write. A UUIDv7 in the
   // same string shape as sandbox_id and cluster_id, lowercase canonical.
   //
-  // 🔴 Required on begin_pause and mark_running, refused on the other four —
-  // per-kind and explicit, the same way expect_generation is, so that "this
-  // field is required" never has a middle state of "validated when present".
+  // 🔴 Required on begin_pause, mark_running and renew_deadline, refused on
+  // the other five — per-kind and explicit, the same way expect_generation
+  // is, so that "this field is required" never has a middle state of
+  // "validated when present". renew_deadline's own guard is this field
+  // alone (see TransitionKind's doc): unlike begin_pause and mark_running it
+  // reads no node_id-keyed identity at all.
   //
   // Deliberately not an opt-in fencing token. e2b's ExpectExecutionID is
   // optional because a caller that has just read the row, or a human giving a
@@ -764,6 +787,32 @@ message TransitionSandboxResponse {
   // itself. Not an error: the claim this caller meant to release is no longer
   // this caller's.
   bool matched = 6;
+  // renew_deadline only. See DeadlineRenewalOutcome.
+  DeadlineRenewalOutcome deadline_renewal_outcome = 7;
+}
+
+// DeadlineRenewalOutcome is which of the three answers renew_deadline gave.
+//
+// A bare "did it match" would run the same two situations together that
+// MarkRunningOutcome exists to split apart: a sandbox this cluster never
+// tracked (the common, healthy case — a disabled registry, or a resume whose
+// own mark_running has not landed yet) looks identical, as a plain
+// zero-rows-affected, to a row that exists but has moved on to a different
+// incarnation since the caller last observed it as `running` locally. The
+// second case is worth its own name because it is the one a future caller
+// might be tempted to retry, and retrying it would attach a stale deadline
+// to a sandbox that is not the one that asked for it.
+enum DeadlineRenewalOutcome {
+  DEADLINE_RENEWAL_OUTCOME_UNSPECIFIED = 0;
+  // The row now carries the new deadline.
+  DEADLINE_RENEWAL_OUTCOME_RENEWED = 1;
+  // No row. What a sandbox this cluster does not track looks like.
+  DEADLINE_RENEWAL_OUTCOME_NOT_TRACKED = 2;
+  // A row exists, but is not `running` under the incarnation this call
+  // named — it has moved on (paused, deleted, or resumed again under a
+  // fresh incarnation) since the caller last observed it. The deadline was
+  // not written.
+  DEADLINE_RENEWAL_OUTCOME_SUPERSEDED = 3;
 }
 
 // MarkRunningOutcome splits the two facts the `tracked` bool ran together.

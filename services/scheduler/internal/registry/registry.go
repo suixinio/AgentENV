@@ -83,8 +83,13 @@ type Sandbox struct {
 	// LeaseExpiresAt is nil when the column is NULL, which the node treats as
 	// already expired — see LeaseExpired.
 	LeaseExpiresAt *time.Time
-	// SandboxExpiresAt is the deadline the sandbox's own owner set. Only
-	// renew_lease writes it, and a NULL never matches a reclaim condition.
+	// SandboxExpiresAt is the deadline the sandbox's own owner set. Written by
+	// RenewLease (every renewal, from the node's own local view), MarkRunning
+	// (once, at resume) and RenewSandboxDeadline (the api half's POST
+	// /timeout, any number of times after that) — never by
+	// RenewParkedLeases or RenewLiveLeases, which are heartbeat-driven and
+	// prove nothing about a user-requested deadline. A NULL never matches a
+	// reclaim condition.
 	SandboxExpiresAt *time.Time
 	// ExecutionID names the incarnation living on this row: one VM instance's
 	// whole life, from the resume that allocated it to the pause that parks it.

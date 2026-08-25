@@ -71,6 +71,67 @@ impl HoldNamespace {
     }
 }
 
+/// The process-wide registry `shared_from_resolved_config` deduplicates
+/// `ImageCacheService` instances into, keyed by cache root directory.
+///
+/// 🔴 Nothing ever removes an entry from this map. That is deliberate for its
+/// original purpose — the whole point is that every caller asking for the same
+/// root directory gets the same instance for the life of the process — but it
+/// also means the RocksDB metadata store an `ImageCacheService` opens is
+/// reachable, and closable, only through this map: an individual
+/// `ImageResolver`'s `Arc<dyn SourceImageStore>` is not the store's owner in
+/// any sense that would let shutdown reach it by holding a handle. See
+/// [`close_shared_metadata_stores`].
+fn shared_registry() -> &'static StdMutex<BTreeMap<PathBuf, Arc<ImageCacheService>>> {
+    static SHARED: OnceLock<StdMutex<BTreeMap<PathBuf, Arc<ImageCacheService>>>> = OnceLock::new();
+    SHARED.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+/// Boundedly stops background RocksDB compaction/flush for every image-cache
+/// metadata store this process has opened, across every distinct cache root
+/// directory it has ever seen (in practice there is one).
+///
+/// 🔴 Best-effort and logged per store rather than returning a result: this is
+/// a shutdown-path call, and a slow store closing is a fact to log and move
+/// past, not a reason to fail the rest of shutdown. See
+/// `LocalKvStore::close` for why this needs to be explicit and bounded at all.
+pub(crate) async fn close_shared_metadata_stores(timeout: Duration) {
+    // Collect the snapshot under the (synchronous, non-async-aware) registry
+    // lock, then drop it before awaiting each close — holding a
+    // `std::sync::MutexGuard` across an `.await` does not compile, and would
+    // be the wrong shape anyway: nothing here needs the registry locked while
+    // an individual store closes.
+    let snapshot: Vec<Arc<ImageCacheService>> = {
+        let services = shared_registry()
+            .lock()
+            .expect("image cache service registry lock poisoned");
+        services.values().cloned().collect()
+    };
+
+    for service in snapshot {
+        let Some(store) = service.metadata_store.get() else {
+            // Never opened for this cache root — nothing to close.
+            continue;
+        };
+        match store.close(timeout).await {
+            crate::local_store::LocalKvCloseOutcome::Closed => {
+                info!(
+                    store = %service.metadata_store_path.display(),
+                    "closed image cache metadata store"
+                );
+            }
+            crate::local_store::LocalKvCloseOutcome::TimedOut => {
+                warn!(
+                    store = %service.metadata_store_path.display(),
+                    timeout_secs = timeout.as_secs(),
+                    "image cache metadata store did not finish closing within timeout; \
+                     background RocksDB compaction/flush may still be running"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) struct ImageCacheService {
     commit_store: PathBuf,
     index_dir: PathBuf,
@@ -97,11 +158,8 @@ impl ImageCacheService {
     }
 
     fn shared_from_resolved_config(config: ResolvedImageCacheConfig) -> Arc<Self> {
-        static SHARED: OnceLock<StdMutex<BTreeMap<PathBuf, Arc<ImageCacheService>>>> =
-            OnceLock::new();
         let key = stable_path_identity(&config.root_dir);
-        let services = SHARED.get_or_init(|| StdMutex::new(BTreeMap::new()));
-        let mut services = services
+        let mut services = shared_registry()
             .lock()
             .expect("image cache service registry lock poisoned");
         if let Some(service) = services.get(&key) {

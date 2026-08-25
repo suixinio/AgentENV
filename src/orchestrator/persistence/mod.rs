@@ -155,6 +155,16 @@ pub trait SandboxPersister: Send + Sync {
 
     /// Delete the persistence record and all associated artifacts.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+
+    /// Boundedly close any durable local store this persister owns, ahead of
+    /// process shutdown.
+    ///
+    /// The default no-op is correct for persisters — [`DisabledSandboxPersister`]
+    /// included — that hold nothing durable to close. `FileBackedSandboxPersister`
+    /// is the one implementation that overrides this: see its `close` for why
+    /// a RocksDB-backed persister cannot rely on its own `Drop` to do this in
+    /// bounded time.
+    async fn close(&self, _timeout: std::time::Duration) {}
 }
 
 #[derive(Default)]

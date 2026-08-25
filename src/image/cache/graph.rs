@@ -204,6 +204,16 @@ impl ImageCacheMetadataStore {
         Ok(metadata)
     }
 
+    /// Boundedly stops background compaction/flush on this store, ahead of
+    /// process shutdown. See [`LocalKvStore::close`] for the mechanism and why
+    /// it needs to be explicit at all.
+    pub(crate) async fn close(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::local_store::LocalKvCloseOutcome {
+        self.store.close(timeout).await
+    }
+
     pub(crate) async fn record_hard_commit_object(
         &self,
         digest: HardCommitId,

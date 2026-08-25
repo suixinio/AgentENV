@@ -515,6 +515,39 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
         Ok(())
     }
+
+    /// Boundedly stops background compaction/flush on the paused-sandbox
+    /// RocksDB store, ahead of process shutdown.
+    ///
+    /// 🔴 Nothing here calls `Drop` on the store, and nothing needs to: this
+    /// only front-loads the wait `LocalKvStore::close` documents — see it for
+    /// why an unbounded version of that wait is what leaves `server --role
+    /// node` running past `terminationGracePeriodSeconds` after every log line
+    /// the graceful shutdown was ever going to print has already printed. A
+    /// node that never paused anything this run has an uninitialized `db`
+    /// cell and nothing to close, which is also why such nodes were always
+    /// observed to exit immediately.
+    async fn close(&self, timeout: std::time::Duration) {
+        let Some(db) = self.db.get() else {
+            return;
+        };
+        match db.close(timeout).await {
+            crate::local_store::LocalKvCloseOutcome::Closed => {
+                info!(
+                    store = %self.records_db_path().display(),
+                    "closed persisted-sandboxes store"
+                );
+            }
+            crate::local_store::LocalKvCloseOutcome::TimedOut => {
+                warn!(
+                    store = %self.records_db_path().display(),
+                    timeout_secs = timeout.as_secs(),
+                    "persisted-sandboxes store did not finish closing within timeout; \
+                     background RocksDB compaction/flush may still be running"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1113,6 +1146,43 @@ mod tests {
         assert!(loaded.is_empty());
         assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        Ok(())
+    }
+
+    /// A persister that never opened its RocksDB store this run — a node that
+    /// paused nothing — has nothing to close and must not open one just to
+    /// close it.
+    #[tokio::test]
+    async fn close_without_ever_opening_the_store_is_a_no_op() {
+        let temp = TempDir::new().expect("tempdir");
+        let persister = test_persister(temp.path());
+
+        persister.close(Duration::from_secs(1)).await;
+
+        assert!(
+            persister.db.get().is_none(),
+            "close must not open the store on a persister that never used it"
+        );
+    }
+
+    /// The store this persister actually wrote through closes within the
+    /// timeout, exercising the same `SandboxPersister::close` path
+    /// `Orchestrator::shutdown` calls on every real shutdown.
+    #[tokio::test]
+    async fn close_after_use_reports_closed() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("snapshot");
+        persist_test_record(&persister, &snapshot_root).await?;
+
+        let db = persister.db().await?;
+        assert_eq!(
+            db.close(Duration::from_secs(5)).await,
+            crate::local_store::LocalKvCloseOutcome::Closed
+        );
+
+        // `close` on the persister itself must reach the same store and agree.
+        persister.close(Duration::from_secs(5)).await;
         Ok(())
     }
 }

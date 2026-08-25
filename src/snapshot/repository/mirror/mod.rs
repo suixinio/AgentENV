@@ -518,6 +518,25 @@ impl DualWriteCatalog {
 
 #[async_trait]
 impl SnapshotCatalog for DualWriteCatalog {
+    /// Boundedly closes the durable mirror backlog's RocksDB store. Neither
+    /// catalog this wraps (`central`, over gRPC/SQL; `object_store`, through
+    /// its own backend) owns a node-local RocksDB store of its own today, so
+    /// the backlog is the only thing here that needs this.
+    async fn close(&self, timeout: std::time::Duration) {
+        match self.backlog.close(timeout).await {
+            crate::local_store::LocalKvCloseOutcome::Closed => {
+                info!("closed snapshot catalog mirror backlog store");
+            }
+            crate::local_store::LocalKvCloseOutcome::TimedOut => {
+                warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "snapshot catalog mirror backlog store did not finish closing within \
+                     timeout; background RocksDB compaction/flush may still be running"
+                );
+            }
+        }
+    }
+
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         let central = self
             .central

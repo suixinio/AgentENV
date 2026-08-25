@@ -918,6 +918,16 @@ impl MirrorBacklog {
         Ok(backlog)
     }
 
+    /// Boundedly stops background compaction/flush on the backlog's RocksDB
+    /// store, ahead of process shutdown. See `LocalKvStore::close` for the
+    /// mechanism and why it needs to be explicit and bounded at all.
+    pub(crate) async fn close(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::local_store::LocalKvCloseOutcome {
+        self.store.close(timeout).await
+    }
+
     #[cfg(test)]
     fn local_writes_refused(&self) -> bool {
         self.refuse_local_writes.load(Ordering::SeqCst)

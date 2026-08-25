@@ -1708,7 +1708,20 @@ where
         let outcome = self
             .shutdown_outcome
             .get_or_init(|| async move {
-                ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
+                let result = this.run_shutdown_cleanup().await;
+                // 🔴 Best-effort and unconditional, even when the cleanup pass
+                // above failed: the persister's RocksDB store (persisted
+                // sandboxes; see `FileBackedSandboxPersister::close`) is not
+                // holding anything that pause failures above would make unsafe
+                // to close, and skipping this on failure would leave exactly
+                // the nodes whose shutdown already went wrong also the ones
+                // whose store teardown stays unbounded. Runs once, inside the
+                // single-flight `get_or_init`, alongside the cleanup pass
+                // itself.
+                this.persister
+                    .close(crate::local_store::DEFAULT_CLOSE_TIMEOUT)
+                    .await;
+                ShutdownOutcome::from_result(result)
             })
             .await;
 

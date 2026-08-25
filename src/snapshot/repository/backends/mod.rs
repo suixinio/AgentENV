@@ -45,6 +45,13 @@ pub struct AssembledSnapshotBackend {
 /// is what the trait split bought.
 pub async fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
+    // 🔴 Unused for now — plumbing only (Stage B step 2,
+    // `docs/proposals/_sd-phase4-stageB-catalog.md` §7). Consumed starting
+    // with the read-side admission move to PostgreSQL (step 4) and the
+    // `PostgresSnapshotCatalog` construction that replaces
+    // `build_central_catalog`'s gRPC hop (steps 8-9). `None` for `--role
+    // node` always — see `src/bin/server.rs::build_pg_pool`.
+    _pg_pool: Option<sqlx::PgPool>,
 ) -> Result<AssembledSnapshotBackend> {
     let config = ConfigManager::global_config();
     let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;

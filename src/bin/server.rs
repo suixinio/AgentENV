@@ -25,6 +25,7 @@ use agentenv::orchestrator::{
 };
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::p2p::P2pTransport;
+use agentenv::pg::{self, PgPoolSettings};
 use agentenv::role::ServerRole;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
@@ -430,8 +431,29 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// This replica's `[pg]` connection pool, or `None` when PostgreSQL is not
+/// configured for this process.
+///
+/// 🔴 Never call this from `assemble_node`. `--role node` is refused at
+/// startup if `[pg].dsn` is configured at all (`ServerRole::check_pg_dsn`,
+/// enforced in `async_main` before any role-specific assembly runs), but that
+/// guard is defense against a *configured* DSN reaching a node — it does not
+/// stop this function itself from being called there. The two callers that
+/// may hold PostgreSQL credentials, the connection budget and the schema are
+/// `assemble_api` and `assemble_all`; see `src/pg/mod.rs`'s own module doc.
+async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool>> {
+    let Some(settings) = PgPoolSettings::from_config(config.pg.as_ref())? else {
+        return Ok(None);
+    };
+    Ok(Some(pg::connect(&settings).await?))
+}
+
 /// Brings up everything a role that runs sandboxes on this machine needs.
-async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Result<NodeCore> {
+async fn assemble_node_core(
+    config: &AppConfig,
+    role: ServerRole,
+    pg_pool: Option<sqlx::PgPool>,
+) -> anyhow::Result<NodeCore> {
     // Both roles that reach here run the machine and report it as one; the API
     // half never does, and never calls this.
     debug_assert!(role.runs_sandbox_runtime());
@@ -474,7 +496,7 @@ async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Res
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport).await?);
+    let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport, pg_pool).await?);
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     // The handle the cold-boot paths read the CPUID intersection from.
     //
@@ -575,7 +597,8 @@ async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Res
 /// here before the split.
 async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::All;
-    let core = assemble_node_core(config, role).await?;
+    let pg_pool = build_pg_pool(config).await?;
+    let core = assemble_node_core(config, role, pg_pool).await?;
 
     debug_assert!(role.arbitrates_paused_sandbox_ownership());
     // The rollback target serves everything it ever served: no RoleGate is
@@ -693,7 +716,11 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
 /// half rather than of this one — see the list on [`assemble_api`].
 async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::Node;
-    let core = assemble_node_core(config, role).await?;
+    // 🔴 Always `None`, never `build_pg_pool(config)`. `--role node` must
+    // never hold PostgreSQL credentials — see `build_pg_pool`'s own doc
+    // comment — and this is that invariant enforced by construction here,
+    // not only by `ServerRole::check_pg_dsn` at startup.
+    let core = assemble_node_core(config, role, None).await?;
 
     debug_assert!(!role.arbitrates_paused_sandbox_ownership());
     // Both are `role`'s to decide and both are read from it below rather than
@@ -1055,7 +1082,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // 🔴 No P2P transport is passed, and `[snapshot].p2p_enabled` is not
     // consulted: P2P moves bytes between machines that hold them, and this
     // process holds none.
-    let snapshot_manager = Arc::new(SnapshotManager::new(None).await?);
+    let pg_pool = build_pg_pool(config).await?;
+    let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool).await?);
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));
 

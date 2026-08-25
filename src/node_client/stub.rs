@@ -634,9 +634,51 @@ impl RemoteSandboxStub {
         }
     }
 
+    /// # 🔴 Why this dial carries an explicit `connect_timeout`
+    ///
+    /// `tonic::transport::Endpoint::connect_timeout` defaults to `None`
+    /// (`tonic::transport::channel::Endpoint::new`), and with no timeout set
+    /// `Endpoint::http_connector` passes `None` straight into
+    /// `hyper_util::client::legacy::connect::HttpConnector::set_connect_timeout`.
+    /// With that unset, `hyper-util`'s connect future is the bare
+    /// `TcpSocket::connect(addr).await` — no `tokio::time::timeout` wrapper of
+    /// any kind (`hyper-util`'s `connect()` free function: `Some(dur) =>
+    /// timeout(dur, connect).await`, `None => connect.await`). So an
+    /// unbounded dial is not idle — it is a real `connect(2)` syscall left to
+    /// the kernel, and its ceiling is `net.ipv4.tcp_syn_retries` (Linux
+    /// default 6, an exponential-backoff SYN retransmit schedule capped
+    /// around two minutes). A node whose pod has been deleted — gone from the
+    /// cluster's routing entirely rather than merely refusing the
+    /// connection — leaves every SYN unanswered, and this is what a cluster
+    /// incident measured at ~71 seconds before this fix: not a queue, not a
+    /// gRPC-level setting, the kernel's own SYN retry clock. `Endpoint`'s
+    /// `get_connect_timeout` and the error text this failure carries
+    /// (`"tcp connect error"`, from `ConnectError::m` in `hyper-util`'s
+    /// `connect()`) both match the production log line this fixes.
+    ///
+    /// `node_client::build::build_template_on_a_node` already carries this
+    /// exact lesson as `CONNECT_TIMEOUT` (`src/node_client/build.rs`) for the
+    /// one call in this crate that dials with its own fresh `Endpoint`
+    /// outside this function. This is the shared dial every other remote
+    /// call in this module goes through — `start`, `attach`, `reopen`, and
+    /// `reresolve_placement` (used by [`call_with_stale_placement_retry`]'s
+    /// post-re-resolve reconnect) — and, less obviously, also what a
+    /// `Channel` built here goes back through on its own: tonic's
+    /// `Reconnect` middleware
+    /// (`tonic::transport::channel::service::reconnect::Reconnect`) redials
+    /// with the very same connector — timeout and all — whenever a call
+    /// finds the connection this channel had open is gone. That is exactly
+    /// [`call_with_stale_placement_retry`]'s *first*, unretried `attempt`:
+    /// the node died out from under an already-`Placed` stub's open
+    /// connection, and the reconnect that call silently triggers was, until
+    /// this fix, the unbounded dial above — paid in full before the bounded
+    /// re-resolve-and-retry path this function's caller wraps in
+    /// [`STALE_PLACEMENT_RETRY_BUDGET`] ever got a turn. See that constant's
+    /// doc for how the two are sized together.
     pub(super) async fn connect(endpoint: &str) -> Result<NodeSandboxServiceClient<Channel>> {
         let channel = Endpoint::from_shared(endpoint.to_string())
             .with_context(|| format!("node endpoint {endpoint:?} is not a URI"))?
+            .connect_timeout(STUB_CONNECT_TIMEOUT)
             .connect()
             .await
             .with_context(|| format!("connect to node service at {endpoint}"))?;
@@ -873,6 +915,51 @@ impl RemoteSandboxStub {
     }
 }
 
+/// How long [`RemoteSandboxStub::connect`] may spend dialing before it gives
+/// up on that address.
+///
+/// # 🔴 Sized for an interactive call, not a build
+///
+/// This governs every ordinary remote call this module makes — `create`,
+/// `pause`, `snapshot`, `fork`, `stop`, the network/params updates — and,
+/// through tonic's `Reconnect` middleware, every silent redial an
+/// already-open `Channel` performs when the connection under it has died.
+/// The one longer-lived call in this crate,
+/// `node_client::build::build_template_on_a_node`, dials with its own
+/// `Endpoint` and its own ten-*minute* `CONNECT_TIMEOUT` for a reason that
+/// does not apply here — see that constant's doc — so it is deliberately
+/// not reused.
+///
+/// A TCP handshake to a node that is actually up completes in single-digit
+/// milliseconds on a cluster network: the kernel answers a SYN before the
+/// answer ever reaches the node's own workload, so this value being short
+/// does not risk mistaking a busy node for a dead one. What it is short
+/// *against* is [`Endpoint::connect_timeout`]'s default of `None` — an
+/// unbounded dial, gated only by the kernel's own SYN-retry ceiling
+/// (`net.ipv4.tcp_syn_retries`, roughly two minutes at Linux's default of 6)
+/// — which is what turned a node whose pod had already been deleted into a
+/// ~71-second wait before this fix. See [`RemoteSandboxStub::connect`]'s doc
+/// for the mechanism this closes.
+///
+/// # 🔴 Paired with [`STALE_PLACEMENT_RETRY_BUDGET`], not chosen alone
+///
+/// [`call_with_stale_placement_retry`](RemoteSandboxStub::call_with_stale_placement_retry)'s
+/// *first* attempt — the caller's ordinary RPC against a stub's existing
+/// `Placed` connection — is not wrapped in `STALE_PLACEMENT_RETRY_BUDGET` at
+/// all; this constant is the only bound on it, by way of the `Channel`'s own
+/// reconnect. So the worst-case wall time a caller can see from a genuinely
+/// unreachable node is approximately
+/// `STUB_CONNECT_TIMEOUT + STALE_PLACEMENT_RETRY_BUDGET` — currently
+/// `3s + 5s = 8s` — and every increase to either constant widens that sum
+/// directly. `STUB_CONNECT_TIMEOUT` is kept smaller than
+/// `STALE_PLACEMENT_RETRY_BUDGET`, and by more than a rounding margin: the
+/// budget's own reconnect (inside `reresolve_placement`) dials through this
+/// same timeout too, and it still has to leave room, inside that one budget,
+/// for the `resolve_node` RPC and the retried call that follow the reconnect
+/// in the same window. A `STUB_CONNECT_TIMEOUT` at or above the budget would
+/// leave that reconnect free to consume the entire budget by itself.
+pub(super) const STUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long a re-resolve-and-reconnect retry after a stale node address may
 /// take before the original failure is surfaced instead.
 ///
@@ -881,6 +968,19 @@ impl RemoteSandboxStub {
 /// fast failure into a slow one. It covers the re-resolve RPC, the reconnect,
 /// and the retried call together — not the first attempt, which is the
 /// caller's ordinary, unretried RPC.
+///
+/// # 🔴 Kept greater than [`STUB_CONNECT_TIMEOUT`], with headroom
+///
+/// The reconnect inside this budget dials through
+/// [`RemoteSandboxStub::connect`], which is itself bounded by
+/// `STUB_CONNECT_TIMEOUT`. This budget has to stay comfortably larger than
+/// that: a worst-case reconnect can burn the full `STUB_CONNECT_TIMEOUT`
+/// before the `resolve_node` RPC and the retried call even start, and both
+/// still have to finish inside what is left of this budget. Sized equal to
+/// or smaller than `STUB_CONNECT_TIMEOUT`, this budget would degenerate into
+/// "however long the reconnect alone takes," with nothing left over for
+/// either of those. See `STUB_CONNECT_TIMEOUT`'s doc for the sum the two
+/// constants together bound.
 pub(super) const STALE_PLACEMENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Decodes a `Create` reply's resolved context and image configs, when the

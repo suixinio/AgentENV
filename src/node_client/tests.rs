@@ -1250,6 +1250,98 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// A black-holed address: bounded by `STUB_CONNECT_TIMEOUT`, not by the
+// kernel's own SYN-retry ceiling
+// ---------------------------------------------------------------------------
+
+/// A private, non-routable address whose SYN is never answered — chosen
+/// empirically for this suite rather than assumed.
+///
+/// 🔴 Not `127.0.0.1:1` (or any other closed local port): that fails with an
+/// instant RST regardless of any `connect_timeout`, which is exactly why it
+/// tests nothing about this fix — see
+/// `a_node_nobody_answers_does_not_hang_the_remote_build` in
+/// `src/api/impls/template.rs`, which uses exactly that address to test a
+/// *different* thing (a refused connection must not hang a build lease),
+/// and its own doc comment says so.
+///
+/// 🔴 Also not an RFC 5737 documentation address (`192.0.2.0/24` and
+/// friends), despite those being the standard textbook choice for "an
+/// address nothing will ever answer": verified directly against this
+/// repository's own dev sandbox before writing this test, a raw
+/// `TcpStream::connect` to `192.0.2.1` returns *successfully* in well under
+/// a millisecond — some outbound network layer between this container and
+/// the internet answers on behalf of the whole public documentation range,
+/// which would make a test built on it pass by accident regardless of
+/// whether `STUB_CONNECT_TIMEOUT` does anything at all. A private,
+/// unassigned address such as this one is not proxied the same way: a raw
+/// socket connect to it was confirmed to block with no answer at all (not
+/// even an ICMP unreachable) for as long as it was given, which is the
+/// actual shape of failure a deleted Kubernetes pod's address produces on a
+/// real cluster.
+const BLACK_HOLE_ENDPOINT: &str = "http://10.255.255.1:1";
+
+/// The bug this whole change fixes, isolated to the one function it lives
+/// in: dialing an address whose SYN is never answered used to be gated only
+/// by the kernel's own SYN-retry ceiling (`net.ipv4.tcp_syn_retries`,
+/// exponential backoff capped around two minutes at Linux's default) — which
+/// is what a real cluster incident measured at ~71 seconds before this fix.
+/// `RemoteSandboxStub::connect` now carries `STUB_CONNECT_TIMEOUT`; this
+/// asserts the dial gives up at that bound instead.
+///
+/// 🔴 Deleting `.connect_timeout(STUB_CONNECT_TIMEOUT)` from
+/// `RemoteSandboxStub::connect` turns this red: without it, the dial this
+/// test makes does not return within the outer `tokio::time::timeout`
+/// below, and the test fails on that outer bound rather than on the
+/// elapsed-time assertion — deliberately, so a regression here fails this
+/// suite in 20 seconds instead of hanging it for the kernel's own ceiling.
+/// Confirmed by temporarily reverting that one line and re-running this test
+/// alone: the outer 20s timeout fired every time.
+#[tokio::test]
+async fn a_black_holed_dial_gives_up_at_the_connect_timeout_not_the_kernels_syn_ceiling() {
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        super::stub::RemoteSandboxStub::connect(BLACK_HOLE_ENDPOINT),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let result = outcome.expect(
+        "the dial did not return within 20s: STUB_CONNECT_TIMEOUT is not bounding it any more",
+    );
+    assert!(
+        result.is_err(),
+        "a black-holed address must fail to connect, not succeed"
+    );
+    assert!(
+        elapsed < super::stub::STUB_CONNECT_TIMEOUT + std::time::Duration::from_secs(2),
+        "the dial took {elapsed:?}, past STUB_CONNECT_TIMEOUT ({:?}) plus slack — the kernel's \
+         own SYN-retry ceiling is back in control",
+        super::stub::STUB_CONNECT_TIMEOUT
+    );
+}
+
+/// The two timing constants are sized together, not independently: see
+/// `STUB_CONNECT_TIMEOUT`'s doc in `stub.rs` for why the reconnect inside
+/// `STALE_PLACEMENT_RETRY_BUDGET` has to leave room, in the same budget, for
+/// the `resolve_node` RPC and the retried call that follow it. Mirrors the
+/// style of `RedisStoreConfig::validate`'s paired-field checks
+/// (`src/orchestrator/store/redis/config.rs`), as a plain assertion rather
+/// than a new validation system for two `const`s.
+#[test]
+fn stub_connect_timeout_leaves_headroom_in_the_retry_budget() {
+    assert!(
+        super::stub::STUB_CONNECT_TIMEOUT < super::stub::STALE_PLACEMENT_RETRY_BUDGET,
+        "STUB_CONNECT_TIMEOUT ({:?}) must be smaller than STALE_PLACEMENT_RETRY_BUDGET ({:?}): \
+         otherwise the retry path's own reconnect can consume the whole budget and leave nothing \
+         for the resolve_node RPC or the retried call that follow it",
+        super::stub::STUB_CONNECT_TIMEOUT,
+        super::stub::STALE_PLACEMENT_RETRY_BUDGET
+    );
+}
+
 /// A pause comes back as a reference to bytes on the node, not as a handle.
 #[tokio::test]
 async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {

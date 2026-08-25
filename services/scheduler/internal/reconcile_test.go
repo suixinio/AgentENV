@@ -295,7 +295,12 @@ func TestReconcileSplitsParkedFromLiveLeases(t *testing.T) {
 		{SandboxID: "s5", State: pausedregistry.StateRunning, OriginNodeID: "node-a", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, -time.Minute)},
 		// Live, lapsed, and past its own deadline: the next reclaim acts on it.
 		{SandboxID: "s6", State: pausedregistry.StateRunning, OriginNodeID: "node-a", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, -time.Minute), SandboxExpiresAt: at(f.dbNow, -time.Second)},
-		// Live, lapsed, deadline still ahead: not reclaimable.
+		// Resuming and lapsed, with a deadline still far in the future
+		// (inherited from before the claim, since claim_for_resume never
+		// touches sandbox_expires_at): reclaimable anyway. A stuck claim is
+		// released on its own lapsed lease alone — see
+		// reclaimReleasedResumingSQL's own doc — precisely so this row is not
+		// still waiting on this stale, structurally-often-NULL deadline.
 		{SandboxID: "s7", State: pausedregistry.StateResuming, OriginNodeID: "node-a", ClaimedByNodeID: "node-a", SnapshotID: "snap", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, -time.Minute), SandboxExpiresAt: at(f.dbNow, time.Hour)},
 	}
 
@@ -307,11 +312,30 @@ func TestReconcileSplitsParkedFromLiveLeases(t *testing.T) {
 	if result.liveLeaseLapsed != 3 {
 		t.Fatalf("expected 3 lapsed live leases, got %d", result.liveLeaseLapsed)
 	}
-	if result.reclaimableNow != 1 {
-		t.Fatalf("expected 1 reclaimable row, got %d", result.reclaimableNow)
+	if result.reclaimableNow != 2 {
+		t.Fatalf("expected 2 reclaimable rows (s6 running-past-deadline and s7 resuming-lease-lapsed), got %d", result.reclaimableNow)
 	}
 	if result.strandedRows != 0 {
 		t.Fatalf("expected no stranded rows when every parked row has a snapshot, got %d", result.strandedRows)
+	}
+}
+
+// TestReconcileReclaimableNowCountsAStuckResumingClaimWithNoDeadlineAtAll is
+// the exact shape Defect B's fix targets: a first resume that never
+// completes. claim_for_resume never writes sandbox_expires_at, so a resuming
+// row parked since begin_pause's first pause carries NULL there — and before
+// this fix, NULL < now() never matched, so reclaimableNow (and the SQL it
+// mirrors) never counted such a row no matter how long its lease had lapsed.
+func TestReconcileReclaimableNowCountsAStuckResumingClaimWithNoDeadlineAtAll(t *testing.T) {
+	f := newReconcileFixture()
+	f.sandboxes = []pausedregistry.Sandbox{
+		{SandboxID: "stuck", State: pausedregistry.StateResuming, OriginNodeID: "node-a", ClaimedByNodeID: "node-a", SnapshotID: "snap", UpdatedAt: f.dbNow, LeaseExpiresAt: at(f.dbNow, -time.Minute)},
+	}
+
+	result := f.run(30 * time.Second)
+
+	if result.reclaimableNow != 1 {
+		t.Fatalf("expected the stuck claim to be reclaimable on its lapsed lease alone, got %d", result.reclaimableNow)
 	}
 }
 

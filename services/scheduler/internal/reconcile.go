@@ -159,8 +159,10 @@ type registryReconcileResult struct {
 	// cannot reach the database, and nothing takes those over on a timer.
 	liveLeaseLapsed int
 	// reclaimableNow counts the rows reclaim_expired_holdings will act on next
-	// tick — a live row whose lease has lapsed and whose sandbox has outlived
-	// its own deadline.
+	// tick: a `running` row whose lease has lapsed and whose sandbox has
+	// outlived its own deadline, or a `resuming` row whose lease alone has
+	// lapsed — see reclaimReleasedResumingSQL's own doc for why a stuck claim
+	// needs no second condition.
 	reclaimableNow int
 	// liveLeaseRenewals lists the claimable `running` rows this round found a
 	// fresh, first-party reason to keep alive: the row's own holder has a
@@ -341,7 +343,11 @@ func computeRegistryReconcile(in registryReconcileInput) registryReconcileResult
 			deadlinePassed := sandbox.SandboxExpiresAt != nil && sandbox.SandboxExpiresAt.Before(dbNow)
 			if leaseExpired {
 				result.liveLeaseLapsed++
-				if deadlinePassed {
+				// reclaimReleasedResumingSQL asks nothing of a `resuming` row
+				// but a lapsed lease — see its own doc for why a stuck claim
+				// needs no deadline of its own. reclaimReleasedRunningSQL
+				// still asks both of a `running` row.
+				if sandbox.State == pausedregistry.StateResuming || deadlinePassed {
 					result.reclaimableNow++
 				}
 			} else if sandbox.State == pausedregistry.StateRunning && deadlinePassed {

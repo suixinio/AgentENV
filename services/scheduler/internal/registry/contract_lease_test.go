@@ -357,6 +357,123 @@ func TestContractASandboxWithNoDeadlineIsNeverReclaimed(t *testing.T) {
 	}
 }
 
+// TestContractAStuckFirstResumeClaimIsReleasedOnItsLapsedLeaseAlone is Defect
+// B: a resume claim taken over a first-ever `paused` row, whose claimant then
+// dies before mark_running lands and — the split-role failure mode this
+// protects against — never comes back under the same identity to release its
+// own claim (ReleaseNodeHoldings needs a successor process reporting the same
+// node id, and an api replica's identity is a Kubernetes Deployment pod name
+// that a reschedule never reuses).
+//
+// claim_for_resume never writes sandbox_expires_at (claimForResumeSQL), and a
+// sandbox that has never had a `running` row has never had anything else write
+// it either — so the column is exactly NULL here, and before this fix
+// `NULL < now()` never matched: the row sat in `resuming` forever, unclaimable
+// (ClaimForResume refuses live rows outright) and unreleased.
+func TestContractAStuckFirstResumeClaimIsReleasedOnItsLapsedLeaseAlone(t *testing.T) {
+	env := contractSetup(t)
+	sandboxID := contractUUID(t)
+
+	env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	if claim := env.claim(t, env.cluster, sandboxID, contractNodeB); claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("the claim should have been granted: got %q", claim.Outcome)
+	}
+	if row := env.requireRow(t, env.cluster, sandboxID); row.SandboxExpiresAt != nil {
+		t.Fatalf("expected a first resume's claim to leave sandbox_expires_at NULL, got %v", row.SandboxExpiresAt)
+	}
+
+	time.Sleep(contractPastLease)
+
+	reclaimed := env.reclaim(t, env.cluster)
+	if reclaimed.Released != 1 || reclaimed.Discarded != 0 {
+		t.Fatalf("a stuck resuming claim with no deadline must still be released on its lapsed lease alone: got %+v, want {Released:1 Discarded:0}", reclaimed)
+	}
+
+	row := env.requireRow(t, env.cluster, sandboxID)
+	if row.State != StatePaused {
+		t.Fatalf("a released claim goes back to paused: got %q", row.State)
+	}
+	if row.ClaimedByNodeID != "" {
+		t.Fatalf("a released claim clears the claimer: got %q", row.ClaimedByNodeID)
+	}
+	if row.ExecutionID != "" {
+		t.Fatalf("a released claim clears the incarnation: got %q", row.ExecutionID)
+	}
+}
+
+// TestContractAFreshResumeClaimSurvivesReclaimWhileItsLeaseIsStillLive is the
+// control for the test above: the same claim, but read before its lease has
+// had any chance to lapse. Without this, a bug that released every
+// `resuming` row unconditionally would pass the stuck-claim test above just
+// as well as the real fix does.
+func TestContractAFreshResumeClaimSurvivesReclaimWhileItsLeaseIsStillLive(t *testing.T) {
+	env := contractSetup(t)
+	sandboxID := contractUUID(t)
+
+	env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	if claim := env.claim(t, env.cluster, sandboxID, contractNodeB); claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("the claim should have been granted: got %q", claim.Outcome)
+	}
+
+	// No sleep: the lease claim_for_resume just issued is still live.
+	reclaimed := env.reclaim(t, env.cluster)
+	if reclaimed.Released != 0 || reclaimed.Discarded != 0 {
+		t.Fatalf("a claim still within its lease must not be released: got %+v", reclaimed)
+	}
+	if row := env.requireRow(t, env.cluster, sandboxID); row.State != StateResuming {
+		t.Fatalf("the row must still be resuming: got %q", row.State)
+	}
+}
+
+// TestContractAResumingClaimIsReleasedEvenWithAFarFutureInheritedDeadline is
+// the mutation-sensitive control for the fix itself: a `resuming` row whose
+// sandbox_expires_at is not NULL but an hour in the future — inherited from a
+// `running` row's own renewal before it was paused and re-claimed, since
+// neither begin_pause/complete_pause nor claim_for_resume ever touch that
+// column — must still be released the instant its lease lapses.
+//
+// If a change reintroduced the old running-shaped `AND sandbox_expires_at <
+// now()` arm onto the resuming release, this row's lease lapsing would no
+// longer be enough and this test would go red while
+// TestContractAStuckFirstResumeClaimIsReleasedOnItsLapsedLeaseAlone (whose
+// deadline is NULL either way) might still pass by accident.
+func TestContractAResumingClaimIsReleasedEvenWithAFarFutureInheritedDeadline(t *testing.T) {
+	env := contractSetup(t)
+	sandboxID := contractUUID(t)
+
+	env.pauseAndPublish(t, env.cluster, sandboxID, contractNodeA)
+	env.markRunning(t, env.cluster, sandboxID, contractNodeA)
+	if renewed := env.renew(t, env.cluster, contractNodeA, contractHeldDue(sandboxID, time.Hour)); renewed != 1 {
+		t.Fatalf("expected the running row's renewal to land: renewed %d, want 1", renewed)
+	}
+
+	began := env.beginPause(t, env.cluster, sandboxID, contractNodeA)
+	snapshot := contractUUID(t)
+	if err := env.store.CompletePause(context.Background(), env.cluster, sandboxID, began.Generation, snapshot); err != nil {
+		t.Fatalf("complete the second pause: %v", err)
+	}
+	if row := env.requireRow(t, env.cluster, sandboxID); row.SandboxExpiresAt == nil || !row.SandboxExpiresAt.After(time.Now().Add(30*time.Minute)) {
+		t.Fatalf("expected the pause to leave the hour-future deadline untouched, got %v", row.SandboxExpiresAt)
+	}
+
+	if claim := env.claim(t, env.cluster, sandboxID, contractNodeB); claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("the claim should have been granted: got %q", claim.Outcome)
+	}
+	if row := env.requireRow(t, env.cluster, sandboxID); row.SandboxExpiresAt == nil || !row.SandboxExpiresAt.After(time.Now().Add(30*time.Minute)) {
+		t.Fatalf("expected the claim to leave the inherited deadline untouched, got %v", row.SandboxExpiresAt)
+	}
+
+	time.Sleep(contractPastLease)
+
+	reclaimed := env.reclaim(t, env.cluster)
+	if reclaimed.Released != 1 || reclaimed.Discarded != 0 {
+		t.Fatalf("a stuck resuming claim must be released on its lapsed lease regardless of an inherited future deadline: got %+v, want {Released:1 Discarded:0}", reclaimed)
+	}
+	if row := env.requireRow(t, env.cluster, sandboxID); row.State != StatePaused {
+		t.Fatalf("a released claim goes back to paused: got %q", row.State)
+	}
+}
+
 // Reclamation is scoped to live rows. Parked ones already have a mechanism —
 // the lease lets another node take them over — and rewriting them here would
 // bypass the NotReady redirect that keeps a still-publishing snapshot on its

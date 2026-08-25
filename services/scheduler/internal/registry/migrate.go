@@ -82,6 +82,17 @@ CREATE INDEX IF NOT EXISTS paused_sandboxes_updated_at_idx ON paused_sandboxes (
 CREATE INDEX IF NOT EXISTS paused_sandboxes_reclaim_idx
     ON paused_sandboxes (cluster_id, sandbox_expires_at)
     WHERE state IN ('running', 'resuming') AND sandbox_expires_at IS NOT NULL;
+-- Serves reclaimReleasedResumingSQL, which the row above's index cannot: a
+-- stuck 'resuming' row is exactly the one claim_for_resume never wrote
+-- sandbox_expires_at for (see that statement's own doc), so it is NULL and
+-- excluded from paused_sandboxes_reclaim_idx by that index's own predicate.
+-- Narrow on purpose, the same reasoning as the index above: 'resuming' is an
+-- in-flight claim, a small slice of a large table, and this only has to get a
+-- reclaim pass to the handful of rows worth filtering by lease deadline
+-- afterwards.
+CREATE INDEX IF NOT EXISTS paused_sandboxes_resuming_reclaim_idx
+    ON paused_sandboxes (cluster_id)
+    WHERE state = 'resuming';
 `
 
 // executionAxisViolationsSQL counts the rows paused_sandboxes_execution_check

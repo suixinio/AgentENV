@@ -1511,31 +1511,56 @@ func (s *PostgresStore) RenewLiveLeases(ctx context.Context, clusterID string, h
 // Reclamation
 // ─────────────────────────────────────────────────────────────────────────────
 
-// reclaimReleasedSQL and reclaimDiscardedSQL are the two halves of the
-// cluster's backstop, and neither condition alone would do.
+// reclaimReleasedRunningSQL, reclaimReleasedResumingSQL and
+// reclaimDiscardedSQL are the cluster's backstop for the three ways a live row
+// can be abandoned.
 //
 // The lease alone is what ClaimForResume refuses to act on: it cannot tell a
 // dead node from a partitioned one, and acting on it duplicates live sandboxes.
+// Every one of the three statements below requires it regardless.
 //
-// sandbox_expires_at < now() alone would race the node's own eviction. A
-// reachable node evicts its expired sandboxes itself — pausing them properly
-// and publishing a fresh snapshot — and that is by far the better outcome, so
-// the cluster only steps in once nobody has renewed for a full lease.
+// 🔴 `running` and `resuming` no longer share one condition, and that split is
+// the fix for a first-resume claim that never completes (a node claims a
+// sandbox, dies before its mark_running lands, and the api replica that made
+// the claim is a Kubernetes Deployment pod that is never coming back under
+// that name — see ClaimForResume's own doc on why release_stale_node_holdings
+// cannot reach a `resuming` row by identity in that split). claim_for_resume
+// never writes sandbox_expires_at, so such a row's column is NULL from the
+// moment begin_pause first parked the sandbox, and `NULL < now()` never
+// matches — a resuming row stuck this way used to sit in the table forever,
+// unclaimable (claim_for_resume refuses live rows outright) and unreleased
+// (nothing else releases them), fixable only by an operator's UPDATE.
 //
-// Together they describe a sandbox that has outlived the deadline its own user
-// set, on a node that has not been heard from since before it did. Reclaiming
-// that is enforcing the timeout, not guessing at the node's health.
+// `running` keeps needing both conditions, and the reasoning is what it
+// always was: sandbox_expires_at < now() alone would race the node's own
+// eviction (a reachable node evicts its own expired sandboxes properly,
+// which is the better outcome), so the cluster only steps in once nobody has
+// renewed for a full lease *and* the sandbox has outlived the deadline its
+// own user set. A NULL sandbox_expires_at never matches for `running`, which
+// covers both a sandbox asked never to expire and a row whose holder has not
+// renewed since the column existed — the safe answer for a row that is
+// genuinely still wanted.
 //
-// A NULL sandbox_expires_at never matches, which covers both a sandbox asked
-// never to expire and a row whose holder has not renewed since the column
-// existed. Both are the safe answer: leave it alone.
+// `resuming` is a different kind of row and does not need the second
+// condition at all. It has no owner-set deadline of its own to outlive — it
+// is a claim in flight, not a sandbox somebody asked to keep running — and a
+// claim whose lease has lapsed is, by the lease's own definition, one nobody
+// is still working on. Requiring a second, structurally-often-NULL condition
+// on top of that only ever makes the release *more* conservative than the
+// state machine already is elsewhere: claim_for_resume itself asks nothing
+// but a lapsed lease before taking a `publishing`/`local_only` row from its
+// origin (see claimForResumeSQL). Releasing a stuck `resuming` row the same
+// way — on a lapsed lease alone — is that same rule applied to the row this
+// backstop exists to protect from becoming permanently unclaimable.
+//
 // 🔴 execution_id = NULL is the second of the three seizure paths, and the
 // one the sequence in the design starts from: reclaim parks a live row, the
 // node that was running it comes back, its one-second eviction timer fires,
 // and its begin_pause lands on the row. Blanked, that pause compares against
 // NULL and never matches. Left in place, it matches perfectly and the old
-// incarnation publishes a stale snapshot over the new one's.
-const reclaimReleasedSQL = `
+// incarnation publishes a stale snapshot over the new one's. Both statements
+// below carry it for the same reason.
+const reclaimReleasedRunningSQL = `
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL,
        execution_id = NULL, execution_started_at = NULL,
@@ -1543,10 +1568,39 @@ UPDATE paused_sandboxes
        lease_expires_at = now()
  WHERE cluster_id = $1::uuid
    AND snapshot_id IS NOT NULL
-   AND state IN ('running', 'resuming')
+   AND state = 'running'
    AND ` + leaseExpired + `
    AND sandbox_expires_at < now()`
 
+// reclaimReleasedResumingSQL is reclaimReleasedRunningSQL's sibling for
+// `resuming`, deliberately without the sandbox_expires_at arm — see the
+// shared doc above.
+//
+// snapshot_id IS NOT NULL is kept even though it is not load-bearing today:
+// claim_for_resume's own WHERE requires a non-null snapshot_id before a row
+// can ever become `resuming` in the first place, so no resuming row can fail
+// this check. Stated anyway so this statement's own precondition does not
+// depend on a reader having claimForResumeSQL open in another tab, and so a
+// future change to the claim path that weakens that guarantee fails loudly
+// here instead of silently discarding a resumable row through the wrong
+// branch.
+const reclaimReleasedResumingSQL = `
+UPDATE paused_sandboxes
+   SET state = 'paused', claimed_by_node_id = NULL,
+       execution_id = NULL, execution_started_at = NULL,
+       generation = generation + 1, updated_at = now(),
+       lease_expires_at = now()
+ WHERE cluster_id = $1::uuid
+   AND snapshot_id IS NOT NULL
+   AND state = 'resuming'
+   AND ` + leaseExpired
+
+// reclaimDiscardedSQL is untouched by the running/resuming split above: its
+// `resuming` arm is already unreachable, for the same reason
+// reclaimReleasedResumingSQL's snapshot_id check is redundant — claim_for_resume
+// requires snapshot_id IS NOT NULL, so no resuming row can ever match this
+// statement's own snapshot_id IS NULL. Splitting it would add a second
+// statement with nothing left for either half to match.
 const reclaimDiscardedSQL = `
 DELETE FROM paused_sandboxes
  WHERE cluster_id = $1::uuid
@@ -1601,10 +1655,15 @@ func (s *PostgresStore) reclaimExpiredHoldings(ctx context.Context, clusterID st
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	released, err := tx.Exec(ctx, reclaimReleasedSQL, cluster)
+	releasedRunning, err := tx.Exec(ctx, reclaimReleasedRunningSQL, cluster)
 	if err != nil {
 		return ReleasedHoldings{}, fmt.Errorf("registry reclaim_expired_holdings: %w", err)
 	}
+	releasedResuming, err := tx.Exec(ctx, reclaimReleasedResumingSQL, cluster)
+	if err != nil {
+		return ReleasedHoldings{}, fmt.Errorf("registry reclaim_expired_holdings: %w", err)
+	}
+	released := releasedRunning.RowsAffected() + releasedResuming.RowsAffected()
 
 	var discarded int64
 	if breaker != nil {
@@ -1634,7 +1693,7 @@ func (s *PostgresStore) reclaimExpiredHoldings(ctx context.Context, clusterID st
 		return ReleasedHoldings{}, fmt.Errorf("registry reclaim_expired_holdings: %w", err)
 	}
 
-	out := ReleasedHoldings{Released: uint64(released.RowsAffected()), Discarded: uint64(discarded)}
+	out := ReleasedHoldings{Released: uint64(released), Discarded: uint64(discarded)}
 	if out.Released > 0 || out.Discarded > 0 {
 		registryReclaimReleased.Add(float64(out.Released))
 		registryReclaimDiscarded.Add(float64(out.Discarded))
@@ -1649,7 +1708,7 @@ func (s *PostgresStore) reclaimExpiredHoldings(ctx context.Context, clusterID st
 }
 
 // The third seizure path, and it blanks the identity axis for the same reason
-// reclaimReleasedSQL does — see the note there.
+// reclaimReleasedRunningSQL does — see the note there.
 const releaseHoldingsReleasedSQL = `
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL,

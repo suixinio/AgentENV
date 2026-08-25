@@ -1599,7 +1599,16 @@ mod tests {
         };
 
         assert!(
-            body("async fn async_main() -> anyhow::Result<()>").contains("check_pg_dsn"),
+            // 🔴 Matches the call *expression* (`role.check_pg_dsn(`), not the
+            // bare identifier `check_pg_dsn`. This file's own doc comment on
+            // the call site (`See \`agentenv::pg\` and \`ServerRole::check_pg_dsn\`.`)
+            // contains that bare identifier too — deleting the call while
+            // leaving the comment behind kept a bare-identifier assertion
+            // green, which is exactly backwards for a positive assertion:
+            // a false match here hides the invariant's enforcement going
+            // missing rather than merely giving a false alarm. No comment or
+            // string literal in this file spells the call expression itself.
+            body("async fn async_main() -> anyhow::Result<()>").contains("role.check_pg_dsn("),
             "async_main no longer calls ServerRole::check_pg_dsn — a [pg].dsn could reach \
              --role node with nothing left to refuse it, even though src/role.rs's own tests \
              of the pure function would still report green"

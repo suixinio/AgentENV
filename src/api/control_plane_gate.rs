@@ -440,8 +440,15 @@ mod tests {
         // ...and the file it reads the credential from is the one the server
         // was pointed at. Two halves of one mount; naming them differently
         // fails silently in exactly the same way.
+        //
+        // 🔴 Matches the env entry's own `- name: ` line, not the bare
+        // variable name: a comment a few lines above this env entry
+        // ("...the same reason AENV_API_CONTROL_PLANE_TOKEN_FILE below is a
+        // file...") already spells the bare name in prose, so a bare-name
+        // scan would stay green even if the real `- name:` entry below it
+        // were deleted.
         assert!(
-            MANIFEST.contains("AENV_API_CONTROL_PLANE_TOKEN_FILE"),
+            MANIFEST.contains("- name: AENV_API_CONTROL_PLANE_TOKEN_FILE"),
             "the node must be told where to read the control-plane credential"
         );
         assert!(
@@ -485,10 +492,20 @@ mod tests {
         // The node projects one named key, and names it. Without `items:` the
         // whole Secret lands in the directory and the gateway's own key
         // becomes the node's file the moment it is written.
-        let volume = DAEMONSET
+        let after_marker = DAEMONSET
             .rsplit_once("- name: control-plane-token")
             .expect("the daemonset mounts the control-plane credential")
             .1;
+        // 🔴 Bounded to this one volume entry, not everything after it to the
+        // end of the file. Unbounded, the assertions below could all be
+        // satisfied by a later sibling volume's own `items:`/`optional: true`
+        // (`heartbeat-config`, right after this one) or by a comment further
+        // down that mentions `node-gate-token` in prose — either of which
+        // would keep this test green even if this volume's own projection
+        // were deleted outright.
+        let volume = after_marker
+            .split_once("\n        - name: ")
+            .map_or(after_marker, |(this_volume, _next_sibling)| this_volume);
         assert!(
             volume.contains("items:") && volume.contains(NODE_KEY),
             "the node's credential volume must project `{NODE_KEY}` by name, or creating the \

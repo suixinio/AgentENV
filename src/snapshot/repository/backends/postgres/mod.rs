@@ -581,6 +581,60 @@ mod pg {
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
+    /// The concurrent form of the test above, and the one that actually
+    /// exercises `builds_one_active_per_template` rather than the
+    /// `pg_advisory_xact_lock` serializing two sequential calls that would
+    /// have been refused anyway. Two `try_start_build` calls launched at the
+    /// same instant simulate two `--role api` replicas racing to admit the
+    /// same template's build — under READ COMMITTED, a read-modify-write
+    /// implementation (SELECT the active-build count, then INSERT) would let
+    /// both through, which is exactly the defect `queries_admin.go`'s
+    /// `buildAdmissionKey` comment explains the advisory lock exists to
+    /// close. Only one of the two calls here may succeed.
+    #[tokio::test]
+    async fn two_concurrent_admissions_for_the_same_template_leave_only_one_winner() {
+        let catalog =
+            catalog!("two_concurrent_admissions_for_the_same_template_leave_only_one_winner");
+        let record = template_record(None);
+        catalog
+            .create(record.clone())
+            .await
+            .expect("create should succeed");
+
+        let (first, second) = tokio::join!(
+            catalog.try_start_build(&record.id),
+            catalog.try_start_build(&record.id)
+        );
+
+        let outcomes = [first.is_ok(), second.is_ok()];
+        assert_eq!(
+            outcomes.iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one of two concurrent admissions for the same template must win: {outcomes:?}"
+        );
+
+        // And the loser's own error is the ordinary in-progress refusal, not
+        // some other failure mode (a raw unique-violation leaking through,
+        // for instance).
+        let loser = if first.is_ok() { second } else { first };
+        assert!(matches!(
+            loser.unwrap_err(),
+            RepositoryError::InvalidRequest { .. }
+        ));
+
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM builds WHERE template_id = $1 AND status_group IN ('pending', 'in_progress')",
+        )
+        .bind(record.id.to_uuid())
+        .fetch_one(&catalog.pool)
+        .await
+        .expect("counting active builds should succeed");
+        assert_eq!(
+            active, 1,
+            "the table itself must hold exactly one active build row"
+        );
+    }
+
     #[tokio::test]
     async fn a_retry_after_a_failed_build_is_the_ordinary_case() {
         let catalog = catalog!("a_retry_after_a_failed_build_is_the_ordinary_case");

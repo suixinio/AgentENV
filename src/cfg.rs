@@ -1854,12 +1854,20 @@ impl AppConfig {
             //      `compare_catalog_populations`. It is the only one of the
             //      four that needs no marker and no gauge to be right.
             (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => Ok(()),
-            (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::Postgres) => bail!(
-                "snapshot.catalog: write = \"postgres\" drops the object-store copy, which is the \
-                 only way back from the central catalog. It is allowed once the read side has \
-                 been served from PostgreSQL for an observation period and the mirror lag has \
-                 been 0 throughout; it is not allowed in this build. Set write = \"both\"."
-            ),
+            // 🔴 Legal now that `PostgresSnapshotCatalog` is wired into
+            // `build_central_catalog` (Stage B step 8/9): this pair is no
+            // longer refused for being unserved by this build. It drops the
+            // object-store copy, which is the only way back from the central
+            // catalog, so this layer having nothing left to say about it is
+            // still not the switch being safe on its own — see
+            // `build_snapshot_backend`'s own `write = "postgres"` branch,
+            // which refuses to *start* under this pair unless
+            // `PgReadSideConfirmation` already says the read side was
+            // confirmed onto PostgreSQL first (the "observation period and
+            // zero mirror lag throughout" this error used to describe,
+            // turned into something a start can actually check rather than
+            // an operator's promise).
+            (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::Postgres) => Ok(()),
         }
     }
 
@@ -3750,11 +3758,15 @@ endpoint = "http://second:9000"
         }
     }
 
-    /// 🔴 The legal pairs, and the four illegal ones by name.
+    /// 🔴 The legal pairs, and the two illegal ones by name.
     ///
     /// Every rejected combination fails the same quiet way if it is allowed
     /// through — a read that answers "no such snapshot" rather than an error —
     /// and absence is what callers delete artifacts and refuse resumes on.
+    /// `(Postgres, Postgres)` used to be a third refusal here (unserved by
+    /// this build); it is legal now that `PostgresSnapshotCatalog` is wired
+    /// into `build_central_catalog` — see `validate_snapshot_catalog`'s own
+    /// comment on that arm for what still gates it at runtime.
     #[test]
     fn the_snapshot_catalog_matrix_allows_only_the_pairs_that_are_served() {
         let cases: [(SnapshotCatalogWrite, SnapshotCatalogRead, Option<&str>); 6] = [
@@ -3787,10 +3799,17 @@ endpoint = "http://second:9000"
                 SnapshotCatalogRead::Postgres,
                 None,
             ),
+            // 🔴 Legal now that `PostgresSnapshotCatalog` is wired into
+            // `build_central_catalog` — see `validate_snapshot_catalog`'s own
+            // comment on this arm. This layer having nothing to say about it
+            // is, again, not the switch being safe on its own:
+            // `build_snapshot_backend`'s `write = "postgres"` branch is what
+            // actually refuses to start unless `PgReadSideConfirmation` says
+            // this cluster's read side was already confirmed onto PostgreSQL.
             (
                 SnapshotCatalogWrite::Postgres,
                 SnapshotCatalogRead::Postgres,
-                Some("drops the object-store copy"),
+                None,
             ),
         ];
 

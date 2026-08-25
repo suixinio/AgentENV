@@ -35,7 +35,6 @@ use super::metrics::{record_build_reaper_warmup_pass, record_builds_reaped};
 struct ReapedBuild {
     build_id: Uuid,
     template_id: Uuid,
-    #[allow(dead_code)] // Carried for parity with Go's `ReapedBuild` and future logging use.
     node_id: Option<String>,
 }
 
@@ -111,6 +110,15 @@ pub(crate) fn spawn(
                     Ok(reaped) if reaped.is_empty() => {}
                     Ok(reaped) => {
                         record_builds_reaped(reaped.len() as u64);
+                        for build in &reaped {
+                            info!(
+                                target: "agentenv",
+                                build_id = %build.build_id,
+                                template_id = %build.template_id,
+                                node_id = build.node_id.as_deref().unwrap_or(""),
+                                "snapshot catalog build reaper ended a stalled build"
+                            );
+                        }
                         info!(
                             target: "agentenv",
                             reaped = reaped.len(),

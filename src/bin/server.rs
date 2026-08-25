@@ -463,7 +463,16 @@ async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool
     let Some(settings) = PgPoolSettings::from_config(config.pg.as_ref())? else {
         return Ok(None);
     };
-    Ok(Some(pg::connect(&settings).await?))
+    let pool = pg::connect(&settings).await?;
+    // 🔴 Before this pool reaches anything that queries the catalog tables —
+    // the build reaper (`spawn_pg_singleton_tasks`, started right after this
+    // returns) and `build_snapshot_backend`'s `PostgresSnapshotCatalog`
+    // construction both assume the schema already exists. See
+    // `agentenv::snapshot::repository::backends::migrate_catalog_schema`'s own
+    // doc: idempotent, advisory-lock-guarded, safe on every start and across
+    // a fleet of replicas racing to call it at once.
+    agentenv::snapshot::repository::backends::migrate_catalog_schema(&pool).await?;
+    Ok(Some(pool))
 }
 
 /// The catalog build reaper's own cadence: how often the cluster-elected

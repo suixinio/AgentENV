@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::snapshot::repository::backends::central::{
     alias_conflict, commit_opening_record, CatalogRefusal, CatalogWrite,
 };
-use crate::snapshot::repository::interfaces::StartedBuild;
+use crate::snapshot::repository::interfaces::{CatalogReadScope, SnapshotCommit, StartedBuild};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{
     SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
@@ -62,7 +62,7 @@ fn now_ms() -> i64 {
 /// Opens a row before any bytes exist, and binds its alias in the same
 /// transaction if it has one — matches `insertSnapshotSQL` +
 /// `releaseOtherAliasesSQL` + `bindAliasSQL`.
-async fn begin_snapshot(
+pub(crate) async fn begin_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -227,13 +227,13 @@ async fn commit_snapshot(
     args: CommitArgs<'_>,
     published: bool,
     node_id: &str,
+    updated_at_ms: i64,
 ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
     let origin_node_id = if published {
         None
     } else {
         Some(node_id.to_string())
     };
-    let updated_at_ms = now_ms();
 
     let mut tx = pool
         .begin()
@@ -370,9 +370,9 @@ async fn fail_snapshot(
     cluster_id: Uuid,
     id: &SnapshotId,
     reason: &TemplateBuildErrorReason,
+    updated_at_ms: i64,
     fail_active_build: bool,
 ) -> RepositoryResult<CatalogWrite<()>> {
-    let updated_at_ms = now_ms();
     let error_json = encode_build_error(reason);
 
     let mut tx = pool.begin().await.map_err(backend_error("fail_snapshot"))?;
@@ -427,8 +427,9 @@ async fn delete_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
     id: &SnapshotId,
+    deleted_at_unix_ms: i64,
 ) -> RepositoryResult<bool> {
-    let now = now_ms();
+    let now = deleted_at_unix_ms;
     let mut tx = pool
         .begin()
         .await
@@ -482,15 +483,15 @@ async fn delete_snapshot(
 /// the cap itself is a cluster policy Go reads from
 /// `scheduler.catalog.max_concurrent_builds`; Stage B's caller supplies it
 /// the same way (see `PostgresSnapshotCatalog::new`'s doc).
-async fn start_build(
+pub(crate) async fn start_build(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
     template_id: &SnapshotId,
     build_id: &SnapshotId,
     max_concurrent_builds: u32,
+    started_at_ms: i64,
 ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
-    let started_at_ms = now_ms();
     let mut tx = pool.begin().await.map_err(backend_error("start_build"))?;
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -673,6 +674,7 @@ pub(crate) async fn publish_commit(
         },
         true,
         node_id,
+        now_ms(),
     )
     .await?
     {
@@ -689,7 +691,7 @@ pub(crate) async fn delete_record(
     cluster_id: Uuid,
     record: &SnapshotRecord,
 ) -> RepositoryResult<()> {
-    let deleted = delete_snapshot(pool, cluster_id, &record.id).await?;
+    let deleted = delete_snapshot(pool, cluster_id, &record.id, now_ms()).await?;
     if !deleted {
         tracing::debug!(target: "agentenv", snapshot_id = %record.id, "snapshot catalog had nothing to delete");
     }
@@ -710,6 +712,7 @@ pub(crate) async fn try_start_build(
         id,
         &SnapshotId::generate(),
         max_concurrent_builds,
+        now_ms(),
     )
     .await?
     {
@@ -733,8 +736,119 @@ pub(crate) async fn mark_build_error(
     id: &SnapshotId,
     reason: TemplateBuildErrorReason,
 ) -> RepositoryResult<()> {
-    match fail_snapshot(pool, cluster_id, id, &reason, true).await? {
+    match fail_snapshot(pool, cluster_id, id, &reason, now_ms(), true).await? {
         CatalogWrite::Applied(()) => Ok(()),
         CatalogWrite::Refused(refusal) => Err(refused("mark_build_error", refusal)),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Trait-facing composition — matches `impl CentralCatalogWrites for CentralSnapshotCatalog`
+// (`src/snapshot/repository/mirror/central.rs`). This is the surface that
+// lets `PostgresSnapshotCatalog` stand in as the "central" side of
+// `write = "both"` and `write = "postgres"` — see `postgres::mod`'s
+// `impl CentralCatalogWrites for PostgresSnapshotCatalog`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Flips a row to `ready` from an externally supplied [`SnapshotCommit`],
+/// with no `begin` pre-step — matches `CentralSnapshotCatalog::commit_snapshot`
+/// exactly (the two-step "begin, then commit" sequence a caller like
+/// `publish_commit` above or the mirror's own `publish_commit` wants is
+/// composed by the caller, not by this function).
+pub(crate) async fn commit(
+    pool: &PgPool,
+    cluster_id: Uuid,
+    node_id: &str,
+    commit: &SnapshotCommit,
+    published: bool,
+    updated_at_unix_ms: i64,
+) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+    let committed_payload = encode_committed(&commit.committed)?;
+    commit_snapshot(
+        pool,
+        cluster_id,
+        CommitArgs {
+            id: &commit.id,
+            committed_payload,
+            alias: commit.alias.as_ref(),
+            resources: commit.resources,
+            source: commit_opening_record(commit).source,
+        },
+        published,
+        node_id,
+        updated_at_unix_ms,
+    )
+    .await
+}
+
+/// Moves a row to `error`, and reports the row as it now stands — matches
+/// `CentralSnapshotCatalog::fail_snapshot`'s return shape.
+///
+/// 🔴 `fail_snapshot`'s own `UPDATE` only ever returns the row's id (see its
+/// `RETURNING id::text`), because none of the trait-facing writes above ever
+/// needed the full row back. This is the one caller that does — the mirror
+/// discards it too today (`Ok(CatalogWrite::Applied(_))`), but the trait's
+/// signature promises it, so a follow-up read fills it in rather than
+/// fabricating one from the caller's inputs alone. Not part of the same
+/// transaction as the `UPDATE`; nothing currently depends on the two being
+/// atomic (see the callers cited above), and the alternative — genericizing
+/// every read helper in `reads.rs` over `sqlx::Executor` so this could read
+/// inside the same `Transaction` — is more machinery than the one caller
+/// that needs it justifies today.
+pub(crate) async fn fail(
+    pool: &PgPool,
+    cluster_id: Uuid,
+    id: &SnapshotId,
+    reason: &TemplateBuildErrorReason,
+    updated_at_unix_ms: i64,
+) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+    match fail_snapshot(pool, cluster_id, id, reason, updated_at_unix_ms, true).await? {
+        CatalogWrite::Applied(()) => {
+            let row = super::reads::get_scoped(
+                pool,
+                cluster_id,
+                &id.to_string(),
+                CatalogReadScope::AnyStatus,
+            )
+            .await?
+            .ok_or_else(|| {
+                RepositoryError::backend(
+                    "re-read a row this call just failed",
+                    anyhow!("the row was gone by the time it was read back"),
+                )
+            })?;
+            Ok(CatalogWrite::Applied(row))
+        }
+        CatalogWrite::Refused(refusal) => Ok(CatalogWrite::Refused(refusal)),
+    }
+}
+
+/// Soft-deletes one row, resolving `id_or_alias` the same way `get_scoped`
+/// does: tries it as an id first, and falls back to an alias lookup — an
+/// alias is allowed to look exactly like a uuid, so the shape of the string
+/// is a hint rather than an answer. Idempotent: nothing to delete is
+/// `Ok(false)`, not an error.
+pub(crate) async fn delete(
+    pool: &PgPool,
+    cluster_id: Uuid,
+    id_or_alias: &str,
+    deleted_at_unix_ms: i64,
+) -> RepositoryResult<bool> {
+    if let Ok(id) = SnapshotId::parse(id_or_alias) {
+        if delete_snapshot(pool, cluster_id, &id, deleted_at_unix_ms).await? {
+            return Ok(true);
+        }
+    }
+
+    let Some(id) = super::reads::resolve_alias_scoped(
+        pool,
+        cluster_id,
+        id_or_alias,
+        CatalogReadScope::AnyStatus,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    delete_snapshot(pool, cluster_id, &id, deleted_at_unix_ms).await
 }

@@ -7,16 +7,11 @@
 //! module doc and `crate::role::ServerRole::check_pg_dsn`, which refuses
 //! `--role node` startup outright if `[pg].dsn` is configured at all.
 //!
-//! Not yet wired into `build_snapshot_backend` — see the Stage B report's
-//! "not done" list for what step 8/9 (`docs/proposals/_sd-phase4-stageB-catalog.md`
-//! §7) still needs: primarily implementing `mirror::CentralCatalogWrites`
-//! for this type (the dual-write mirror's raw-write abstraction,
-//! `CentralSnapshotCatalog`'s other trait) so it can stand in as the
-//! "central" side of `write = "both"`. Every method below is implemented and
-//! covered by `pg::` contract tests; only that last wiring step is
-//! outstanding, which is why `#![allow(dead_code)]` is still here — nothing
-//! constructs one of these outside tests yet.
-#![allow(dead_code)]
+//! Wired into `build_snapshot_backend` (`backends/mod.rs::build_central_catalog`):
+//! whenever a `[pg]` pool is available, this type stands in for
+//! [`super::central::CentralSnapshotCatalog`] as the "central" side of
+//! `write = "both"` and `write = "postgres"`, via the [`CentralCatalogWrites`]
+//! impl below.
 
 pub(crate) mod convert;
 pub(crate) mod metrics;
@@ -30,10 +25,12 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::snapshot::repository::backends::central::CatalogWrite;
 use crate::snapshot::repository::interfaces::{
     CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
     StartedBuild,
 };
+use crate::snapshot::repository::mirror::{CatalogCensus, CentralCatalogWrites};
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
@@ -188,6 +185,115 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
         writes::mark_build_error(&self.pool, self.cluster_id, id, reason).await
+    }
+}
+
+/// The central catalog's census asks at the *any status* scope — see
+/// [`CatalogCensus`]'s own doc on [`super::central::CentralSnapshotCatalog`],
+/// which this mirrors exactly: a `waiting` template must be counted here the
+/// same as it is counted in object storage, or the population comparison
+/// that guards the read-side switch refuses every cluster that has ever
+/// built one.
+#[async_trait]
+impl CatalogCensus for PostgresSnapshotCatalog {
+    async fn every_snapshot_id(&self) -> RepositoryResult<Vec<SnapshotId>> {
+        Ok(self
+            .list_scoped(
+                SnapshotListFilter::matches_all(),
+                CatalogReadScope::AnyStatus,
+            )
+            .await?
+            .into_iter()
+            .map(|record| record.id)
+            .collect())
+    }
+}
+
+/// What the double write needs from the central catalog — see
+/// [`CentralCatalogWrites`]'s own doc and
+/// `crate::snapshot::repository::mirror::central`'s identical impl for
+/// [`super::central::CentralSnapshotCatalog`], which this mirrors call for
+/// call. The difference is only how each call reaches PostgreSQL: a direct
+/// query here, a gRPC hop to `services/scheduler` there.
+#[async_trait]
+impl CentralCatalogWrites for PostgresSnapshotCatalog {
+    async fn begin(
+        &self,
+        record: &SnapshotRecord,
+        status: &str,
+        published: bool,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+        writes::begin_snapshot(
+            &self.pool,
+            self.cluster_id,
+            &self.node_id,
+            record,
+            status,
+            published,
+        )
+        .await
+    }
+
+    async fn commit(
+        &self,
+        commit: &SnapshotCommit,
+        published: bool,
+        updated_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+        writes::commit(
+            &self.pool,
+            self.cluster_id,
+            &self.node_id,
+            commit,
+            published,
+            updated_at_unix_ms,
+        )
+        .await
+    }
+
+    async fn start_build(
+        &self,
+        id: &SnapshotId,
+        build_id: &SnapshotId,
+        started_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
+        writes::start_build(
+            &self.pool,
+            self.cluster_id,
+            &self.node_id,
+            id,
+            build_id,
+            self.max_concurrent_builds,
+            started_at_unix_ms,
+        )
+        .await
+    }
+
+    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
+        writes::renew_lease(&self.pool, self.cluster_id, &self.node_id, build_id).await
+    }
+
+    async fn fail(
+        &self,
+        id: &SnapshotId,
+        reason: &TemplateBuildErrorReason,
+        updated_at_unix_ms: i64,
+    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
+        writes::fail(&self.pool, self.cluster_id, id, reason, updated_at_unix_ms).await
+    }
+
+    async fn delete(&self, id_or_alias: &str, deleted_at_unix_ms: i64) -> RepositoryResult<bool> {
+        writes::delete(&self.pool, self.cluster_id, id_or_alias, deleted_at_unix_ms).await
+    }
+
+    async fn get_any_status(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get_scoped(id_or_alias, CatalogReadScope::AnyStatus)
+            .await
+    }
+
+    async fn get_resolvable(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get_scoped(id_or_alias, CatalogReadScope::Resolvable)
+            .await
     }
 }
 
@@ -720,7 +826,9 @@ mod pg {
             "a node that did not admit the build must not be able to renew its lease"
         );
         assert!(
-            catalog.renew_build_lease(&started.build_id).await.unwrap(),
+            SnapshotCatalog::renew_build_lease(&catalog, &started.build_id)
+                .await
+                .unwrap(),
             "the admitting node's own renewal must succeed"
         );
     }

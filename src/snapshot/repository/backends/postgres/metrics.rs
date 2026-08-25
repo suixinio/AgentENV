@@ -19,10 +19,23 @@
 /// there is no gRPC status on this side of Stage B, `code` carries
 /// `"ok"`/`"error"`/the [`crate::snapshot::repository::RepositoryError`]
 /// variant name for a refusal — whichever this build actually has to report.
+///
+/// 🔴 Not wired to anything yet, for the same reason
+/// [`CATALOG_BUILD_CLOCK_SKEW_TOTAL`] below is not: matching Go's label
+/// semantics exactly (`code` carrying a `RepositoryError` variant name on
+/// refusal, not a flat `"error"`) needs a `RepositoryError -> &'static str`
+/// mapping this port does not have yet, and every one of
+/// `PostgresSnapshotCatalog`'s dozen write-path call sites would need to
+/// call this correctly and consistently. Left declared and unused rather
+/// than wired with a guessed label scheme a real dashboard would then have
+/// to unlearn.
+#[allow(dead_code)]
 pub(crate) const CATALOG_RPC_TOTAL: &str = "agentenv_scheduler_catalog_rpc_total";
 
 /// Refusals answered as a decision the caller acts on rather than as a
-/// failure — matches Go's `catalogRejections`.
+/// failure — matches Go's `catalogRejections`. Not wired yet; see
+/// [`CATALOG_RPC_TOTAL`]'s own note just above.
+#[allow(dead_code)]
 pub(crate) const CATALOG_REJECTED_TOTAL: &str = "agentenv_scheduler_catalog_rejected_total";
 
 /// Builds the reaper ended because their heartbeat lapsed.
@@ -59,10 +72,12 @@ pub(crate) const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
 pub(crate) const CATALOG_BUILD_CLOCK_SKEW_TOTAL: &str =
     "agentenv_scheduler_catalog_build_clock_skew_total";
 
+#[allow(dead_code)]
 pub(crate) fn record_catalog_rpc(op: &'static str, code: &str) {
     metrics::counter!(CATALOG_RPC_TOTAL, "rpc" => op, "code" => code.to_string()).increment(1);
 }
 
+#[allow(dead_code)]
 pub(crate) fn record_catalog_rejected(op: &'static str, reason: &'static str) {
     metrics::counter!(CATALOG_REJECTED_TOTAL, "rpc" => op, "reason" => reason).increment(1);
 }

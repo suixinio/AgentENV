@@ -25,17 +25,30 @@
 //! every catalog query then fails on a missing relation with no way forward
 //! short of re-running this file's `DROP` by hand.
 //!
-//! # Deliberately not ported from `migrate.go`
+//! # `preflight` / `verify_applied`, ported after all
 //!
-//! Go's applier also runs a `preflight`/`verifyApplied` pair that refuses to
-//! start against a `snapshots` table this ledger did not create, and a ledger
-//! naming relations this build no longer recognises. That is real defense
-//! against a database shared with something else, but Stage B's tables are
-//! new to this schema (Go's `catalog` package is this file's only ancestor,
-//! and it is not deployed against the same database as this Rust build in any
-//! configuration Stage B ships), so the extra guard is not load-bearing here
-//! yet. Left for whoever first needs it — flagged in the Stage B report as a
-//! deliberate gap, not an oversight.
+//! An earlier version of this module left Go's `preflight`/`verifyApplied`
+//! pair out, on the theory that Stage B's tables are new to whatever database
+//! this build touches. That theory does not hold on every cluster this build
+//! ships to: a cluster already running `services/scheduler` has these exact
+//! tables — `snapshots`/`templates`/`builds`/`aliases`, plus the
+//! `catalog_schema_migrations` ledger itself — created by *Go's* migrate.go,
+//! against the *same* PostgreSQL database this build's `[pg]` now points at.
+//! `migrate()` runs unconditionally at `--role api`/`--role all` startup
+//! whenever `[pg]` is configured (`build_pg_pool` in `src/bin/server.rs`), so
+//! this is not a hypothetical shared-database scenario to defend against —
+//! it is the ordinary shape of a cluster mid-migration off `services/scheduler`.
+//!
+//! Versions 1-3 are copied verbatim from Go's own migration files, so a
+//! database Go already migrated reads as "already applied" here for those —
+//! the two ledgers agree because the SQL is identical. What neither
+//! `preflight` nor `verifyApplied` in Go was written to catch is a version
+//! number the *two* migration sets disagree about (a future Go migration and
+//! this build's `0004_catalog_migration_state.sql` both claiming version 4
+//! but creating different things) — `verify_applied` below still catches
+//! that, generalised rather than narrowed to rollbacks: it checks every
+//! recorded version's *own* relations exist, not only versions this build
+//! just tried to skip.
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPool;
@@ -81,6 +94,15 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 /// The highest version this build carries.
+///
+/// 🔴 Not called from production code yet — `migrate` itself walks
+/// `MIGRATIONS` directly and never needs to ask its own ceiling. Kept `pub`
+/// for whoever first needs a preflight check against it (see this module's
+/// own "Deliberately not ported from `migrate.go`" doc on the
+/// `preflight`/`verifyApplied` pair Go's applier runs and this one does
+/// not), and exercised today only by
+/// `migrations_are_ordered_and_versions_are_dense`.
+#[allow(dead_code)]
 pub fn latest_version() -> i32 {
     MIGRATIONS
         .last()
@@ -159,6 +181,9 @@ async fn apply(conn: &mut sqlx::PgConnection) -> Result<()> {
         .into_iter()
         .collect();
 
+    preflight(conn, &applied).await?;
+    verify_applied(conn, &applied).await?;
+
     for migration in MIGRATIONS {
         if applied.contains(&migration.version) {
             continue;
@@ -166,6 +191,116 @@ async fn apply(conn: &mut sqlx::PgConnection) -> Result<()> {
         apply_one(conn, migration).await?;
     }
     Ok(())
+}
+
+/// The relations each migration version is expected to have created, in
+/// version order — a Rust port of Go's `relationsByVersion`. Version 3
+/// creates no new relation (it only moves a CHECK constraint), matching Go
+/// exactly; version 4 is this build's own addition, absent from Go's set.
+const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
+    (1, &["snapshots"]),
+    (2, &["templates", "builds", "aliases", "active_templates"]),
+    (3, &[]),
+    (4, &["catalog_migration_state"]),
+];
+
+fn owned_relations() -> Vec<&'static str> {
+    RELATIONS_BY_VERSION
+        .iter()
+        .flat_map(|(_, relations)| relations.iter().copied())
+        .collect()
+}
+
+/// `to_regclass` resolves against the connection's `search_path`, same as
+/// Go's identical query — which is what keeps this consistent between a
+/// production connection (the `public` schema) and this module's own
+/// `pg::` tests (each running in its own schema-scoped connection via
+/// `isolated_schema_pool`).
+async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Result<bool> {
+    let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(relation)
+        .fetch_one(&mut *conn)
+        .await
+        .context("inspect the catalog schema")?;
+    Ok(found.is_some())
+}
+
+/// Refuses to create a table that already exists and was not created by this
+/// ledger — a Rust port of Go's `preflight`. Only fires on an empty ledger:
+/// once anything is recorded, these relations are this ledger's by
+/// construction and their existence is expected.
+async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
+    if !applied.is_empty() {
+        return Ok(());
+    }
+
+    let mut existing = Vec::new();
+    for relation in owned_relations() {
+        if relation_exists(conn, relation).await? {
+            existing.push(relation);
+        }
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "catalog table(s) {} already exist, but catalog_schema_migrations has no rows recorded — \
+         these tables were not created by this ledger. Refusing to continue: every migration \
+         statement is IF NOT EXISTS, so continuing would silently leave a schema that looks \
+         migrated but rejects every write on a column this ledger's migrations never added. \
+         Confirm what created these tables before proceeding (a `services/scheduler` deployment \
+         against the same database is one live possibility, not a hypothetical one); in dev/test, \
+         DROP them and restart this process.",
+        existing.join(", ")
+    )
+}
+
+/// Refuses a ledger that claims work the database no longer has — a Rust
+/// port of Go's `verifyApplied`, generalised the same way that function's own
+/// doc already frames it: checked against every recorded version's relations,
+/// not only the ones a half-finished rollback would touch. Versions this
+/// build does not recognise are skipped, same as Go: that is a database a
+/// newer (or differently versioned) migrator touched, and this one has no
+/// idea what those files created.
+async fn verify_applied(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
+    if applied.is_empty() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut claimed = Vec::new();
+    for (version, relations) in RELATIONS_BY_VERSION {
+        if !applied.contains(version) {
+            continue;
+        }
+        let mut gone = false;
+        for relation in *relations {
+            if !relation_exists(conn, relation).await? {
+                missing.push(*relation);
+                gone = true;
+            }
+        }
+        if gone {
+            claimed.push(version.to_string());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "catalog_schema_migrations records version(s) {} as applied, but the relation(s) {} that \
+         version is supposed to have created are not in the database — both cannot be true at \
+         once. The usual cause is a rollback that dropped the tables without dropping \
+         catalog_schema_migrations itself: the next start is then told every version is applied, \
+         creates nothing, and every catalog query then fails on a missing relation, permanently. \
+         Refusing to continue in this state. Finish the rollback, then restart:\n\
+         \x20   DROP TABLE IF EXISTS aliases, builds, templates, snapshots, catalog_migration_state CASCADE;\n\
+         \x20   DROP TABLE IF EXISTS catalog_schema_migrations;",
+        claimed.join(", "),
+        missing.join(", ")
+    )
 }
 
 async fn apply_one(conn: &mut sqlx::PgConnection, migration: &Migration) -> Result<()> {
@@ -356,5 +491,100 @@ mod pg {
             vec![1, 2, 3, 4],
             "no duplicate or missing ledger rows"
         );
+    }
+
+    /// The scenario this pair was reinstated for: a database already holding
+    /// these tables under an empty ledger — exactly what a cluster running
+    /// `services/scheduler`'s own `catalog.Migrate` looks like from this
+    /// build's side, before `catalog_schema_migrations` has a single row in
+    /// it that this build wrote. `migrate()` must refuse rather than march
+    /// ahead over somebody else's table.
+    #[tokio::test]
+    async fn preflight_refuses_a_snapshots_table_that_predates_the_ledger() {
+        let pool = isolated_schema_pool_or_skip!(
+            "preflight_refuses_a_snapshots_table_that_predates_the_ledger"
+        );
+        // A stand-in for a table some other migrator created — no columns
+        // this build would recognize, deliberately, since preflight only
+        // checks existence, never shape.
+        sqlx::query("CREATE TABLE snapshots (id INT)")
+            .execute(&pool)
+            .await
+            .expect("creating the stand-in table should succeed");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("migrate must refuse a pre-existing table under an empty ledger");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("snapshots") && message.contains("not created by this ledger"),
+            "got: {message}"
+        );
+
+        // And it did not quietly create anything else either — the ledger is
+        // still empty, not partially populated.
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("counting the ledger should succeed");
+        assert_eq!(
+            count, 0,
+            "a refused preflight must leave the ledger untouched"
+        );
+    }
+
+    /// The half-finished-rollback shape `verifyApplied` exists for: the four
+    /// owned tables dropped, `catalog_schema_migrations` left behind. A
+    /// second `migrate()` must refuse rather than believe the ledger and
+    /// silently create nothing.
+    #[tokio::test]
+    async fn verify_applied_refuses_a_ledger_whose_tables_are_gone() {
+        let pool =
+            isolated_schema_pool_or_skip!("verify_applied_refuses_a_ledger_whose_tables_are_gone");
+        migrate(&pool).await.expect("migration should succeed");
+
+        // The rollback command's first line, without its second — the exact
+        // mistake this guard exists to catch.
+        sqlx::raw_sql(
+            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots, catalog_migration_state CASCADE;",
+        )
+        .execute(&pool)
+        .await
+        .expect("dropping the four owned tables should succeed");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("migrate must refuse a ledger whose claimed relations are gone");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot be true") || message.contains("not in the database"),
+            "got: {message}"
+        );
+    }
+
+    /// A version this build's own `RELATIONS_BY_VERSION` has no entry for —
+    /// standing in for a migration a *different* migrator applied under a
+    /// version number this build has never heard of — must not be refused.
+    /// Refusing it would mean two independently-versioned migrators (this
+    /// build and a future Go or Rust one) could never share a database
+    /// without this build failing every start the moment the other one gets
+    /// ahead.
+    #[tokio::test]
+    async fn an_unrecognized_version_in_the_ledger_is_skipped_not_refused() {
+        let pool = isolated_schema_pool_or_skip!(
+            "an_unrecognized_version_in_the_ledger_is_skipped_not_refused"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+
+        sqlx::query(
+            "INSERT INTO catalog_schema_migrations (version, applied_at_ms) VALUES (99, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seeding an unrecognized version should succeed");
+
+        migrate(&pool)
+            .await
+            .expect("a ledger row this build does not recognize must not block a start");
     }
 }

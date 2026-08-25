@@ -16,17 +16,20 @@ use crate::cfg::{
 use crate::image::cache::local_image_services_from_app_config;
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::repository::interfaces::SnapshotArtifactStore;
 use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::mirror::{
-    admit_read_side_with_confirmation, CatalogReadSide, CentralCatalogWrites, DualWriteCatalog,
-    MirrorBacklog, MirrorCompensator, MirrorDirection, MirrorTargets, ObjectStoreCensus,
+    admit_read_side_with_confirmation, CatalogCensus, CatalogReadSide, CentralCatalogWrites,
+    DualWriteCatalog, MirrorBacklog, MirrorCompensator, MirrorDirection, MirrorTargets,
+    ObjectStoreCensus, ReadSideConfirmationStore,
 };
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
 pub use oss::OssBackend;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 use postgres::migration_state::PgReadSideConfirmation;
+use postgres::PostgresSnapshotCatalog;
 
 /// Everything the snapshot layer needs from storage, assembled.
 pub struct AssembledSnapshotBackend {
@@ -47,17 +50,19 @@ pub struct AssembledSnapshotBackend {
 pub async fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     // 🔴 `None` for `--role node` always — see
-    // `src/bin/server.rs::build_pg_pool`. Consumed today only by the
-    // read-side admission's shared confirmation (Stage B step 4,
-    // `docs/proposals/_sd-phase4-stageB-catalog.md` §7/§5.1); the
-    // `PostgresSnapshotCatalog` construction that replaces
-    // `build_central_catalog`'s gRPC hop (steps 8-9) is still to come.
+    // `src/bin/server.rs::build_pg_pool`. Consumed by the read-side
+    // admission's shared confirmation (Stage B step 4,
+    // `docs/proposals/_sd-phase4-stageB-catalog.md` §7/§5.1) and, when
+    // present, by `build_central_catalog`, which then builds a
+    // `PostgresSnapshotCatalog` in place of the gRPC hop to
+    // `services/scheduler` for both `write = "both"` and
+    // `write = "postgres"`.
     pg_pool: Option<sqlx::PgPool>,
 ) -> Result<AssembledSnapshotBackend> {
     let config = ConfigManager::global_config();
     let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
 
-    let Some(central) = build_central_catalog(config)? else {
+    let Some(central) = build_central_catalog(config, pg_pool.as_ref())? else {
         // 🔴 A node told to read PostgreSQL with no central catalog wired would
         // otherwise serve every read from object storage while its
         // configuration says otherwise — the quietest possible version of the
@@ -84,6 +89,62 @@ pub async fn build_snapshot_backend(
             runtime_resolver,
         });
     };
+
+    // 🔴 `write = "postgres"` drops the object-store copy of the catalog
+    // entirely — `validate_snapshot_catalog` only lets this pair reach here
+    // with `read = "postgres"` too, so there is nothing for the *ongoing*
+    // mirror to reconcile: object storage never receives a catalog write in
+    // this mode, ever, so no backlog and no compensator are spawned. Byte
+    // storage (`repository.artifacts()`) is untouched — this mode only
+    // changes where catalog rows live.
+    //
+    // 🔴 One check does still run, though: `validate_snapshot_catalog`'s own
+    // doc says this pair "is allowed once the read side has been served from
+    // PostgreSQL for an observation period and the mirror lag has been 0
+    // throughout" — a claim that layer cannot verify (it is a pure config
+    // check, no database access). `PgReadSideConfirmation` is precisely the
+    // record `write = "both", read = "postgres"` writes once its own guard
+    // (`admit_read_side_with_confirmation`'s population comparison) has
+    // passed, so refusing to start here unless that record already says
+    // "confirmed" is what stops an operator from jumping straight from
+    // `object_store`/`object_store` to `postgres`/`postgres` in one step and
+    // silently orphaning every snapshot object storage still holds.
+    if config.snapshot.catalog.write == SnapshotCatalogWrite::Postgres {
+        let node_identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
+        let pool = pg_pool.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "unreachable: build_central_catalog only returns Some for write = \"postgres\" \
+                 when [pg] is configured"
+            )
+        })?;
+        let confirmation =
+            PgReadSideConfirmation::new(pool, node_identity.cluster_id, &node_identity.id);
+        if !confirmation.is_confirmed().await? {
+            anyhow::bail!(
+                "snapshot.catalog.write = \"postgres\" requires this cluster's read side to have \
+                 already been confirmed onto PostgreSQL first — run write = \"both\", read = \
+                 \"postgres\" until admit_read_side_with_confirmation's population comparison has \
+                 passed, then switch write to \"postgres\". Nothing has confirmed that for this \
+                 cluster yet."
+            );
+        }
+
+        let node_id = crate::identity::local_node_id();
+        tracing::info!(
+            target: "agentenv",
+            catalog_write = "postgres",
+            catalog_read = "postgres",
+            node_id = %node_id,
+            "snapshot catalog is served solely by PostgreSQL; object storage holds no catalog \
+             rows"
+        );
+        return Ok(assemble_postgres_only_backend(
+            central.reads,
+            repository.artifacts(),
+            runtime_resolver,
+            node_id,
+        ));
+    }
 
     let backlog = MirrorBacklog::open(&config.snapshot.catalog.mirror_backlog_path).await?;
     let object_store_catalog = repository.catalog();
@@ -118,7 +179,7 @@ pub async fn build_snapshot_backend(
     };
 
     let targets = MirrorTargets::object_store(Arc::clone(&object_store_catalog))
-        .with_central(Arc::clone(&central) as Arc<dyn CentralCatalogWrites>);
+        .with_central(Arc::clone(&central.writes));
 
     // 🔴 Before the guard, because the guard refuses on debt and the only
     // thing that pays debt off used to start after it. A node reading
@@ -159,10 +220,10 @@ pub async fn build_snapshot_backend(
         &backlog,
         &targets,
         &ObjectStoreCensus(object_store_catalog.as_ref()),
-        central.as_ref(),
-        shared_confirmation.as_ref().map(|store| {
-            store as &dyn crate::snapshot::repository::mirror::ReadSideConfirmationStore
-        }),
+        central.census.as_ref(),
+        shared_confirmation
+            .as_ref()
+            .map(|store| store as &dyn ReadSideConfirmationStore),
     )
     .await?;
     if configured_read == CatalogReadSide::Postgres {
@@ -184,11 +245,7 @@ pub async fn build_snapshot_backend(
         std::time::Duration::from_secs(config.snapshot.catalog.mirror_compensator_interval_secs),
     );
 
-    let dual = DualWriteCatalog::new(
-        Arc::clone(&central) as Arc<dyn CentralCatalogWrites>,
-        object_store_catalog,
-        backlog,
-    );
+    let dual = DualWriteCatalog::new(Arc::clone(&central.writes), object_store_catalog, backlog);
     let dual = Arc::new(match configured_read {
         CatalogReadSide::ObjectStore => dual,
         // 🔴 The whole `SnapshotCatalog` surface, so the resolvable scope the
@@ -196,9 +253,7 @@ pub async fn build_snapshot_backend(
         // with it. Reading through the narrower write trait would have meant
         // restating that predicate here, one layer away from the queries that
         // own it.
-        CatalogReadSide::Postgres => {
-            dual.reading_from_central(Arc::clone(&central) as Arc<dyn SnapshotCatalog>)
-        }
+        CatalogReadSide::Postgres => dual.reading_from_central(Arc::clone(&central.reads)),
     });
     let artifacts = repository.artifacts();
     let node_id = crate::identity::local_node_id();
@@ -303,16 +358,66 @@ async fn drain_a_rolled_back_mirror(
 /// fall back to writing one store. The operator asked for a second copy, and a
 /// node that quietly kept only the first would only reveal the difference when
 /// somebody tried to read the second.
-fn build_central_catalog(config: &AppConfig) -> Result<Option<Arc<CentralSnapshotCatalog>>> {
+/// The three faces `build_snapshot_backend` needs from the central catalog,
+/// bundled once so the choice of *which* concrete catalog answers them is
+/// made in exactly one place — [`build_central_catalog`] — rather than at
+/// every call site that would otherwise have needed its own
+/// `Arc<CentralSnapshotCatalog>` vs. `Arc<PostgresSnapshotCatalog>` branch.
+struct CentralCatalogHandle {
+    /// The double write's own narrow surface — see [`CentralCatalogWrites`].
+    writes: Arc<dyn CentralCatalogWrites>,
+    /// The unbounded "every id, any status" listing the read-side switch's
+    /// population comparison needs — see [`CatalogCensus`].
+    census: Arc<dyn CatalogCensus>,
+    /// The ordinary `SnapshotCatalog` surface, for `write = "postgres"`
+    /// (the sole catalog) and for `reading_from_central` under
+    /// `write = "both", read = "postgres"`.
+    reads: Arc<dyn SnapshotCatalog>,
+}
+
+/// The central catalog client, when the configuration asks for one.
+///
+/// 🔴 A missing scheduler endpoint is a startup failure rather than a silent
+/// fall back to writing one store. The operator asked for a second copy, and a
+/// node that quietly kept only the first would only reveal the difference when
+/// somebody tried to read the second.
+///
+/// 🔴 Whenever a `[pg]` pool is available, this picks `PostgresSnapshotCatalog`
+/// over the gRPC hop to `services/scheduler` — a direct, in-process connection
+/// to the same database `services/scheduler` itself would have written,
+/// without a network hop or a second process. This is what lets a `--role api`
+/// (or `--role all`) replica with `[pg]` configured serve `write = "both"`
+/// without ever dialing a scheduler, and it is the *only* way `write =
+/// "postgres"` is servable at all — that mode has no gRPC form, because there
+/// is nothing left to fall back to once the central catalog is the only copy.
+fn build_central_catalog(
+    config: &AppConfig,
+    pg_pool: Option<&sqlx::PgPool>,
+) -> Result<Option<CentralCatalogHandle>> {
     match config.snapshot.catalog.write {
         SnapshotCatalogWrite::ObjectStore => return Ok(None),
-        SnapshotCatalogWrite::Both => {}
-        // Refused by `validate_snapshot_catalog` before this is reached; the
-        // arm exists so adding the mode later is a compile error here rather
-        // than a silent no-op.
-        SnapshotCatalogWrite::Postgres => {
-            anyhow::bail!("snapshot.catalog.write = \"postgres\" is not served by this build")
-        }
+        SnapshotCatalogWrite::Both | SnapshotCatalogWrite::Postgres => {}
+    }
+
+    if let Some(pool) = pg_pool {
+        let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
+        let catalog = Arc::new(PostgresSnapshotCatalog::new(
+            pool.clone(),
+            identity.cluster_id,
+            identity.id,
+        ));
+        return Ok(Some(CentralCatalogHandle {
+            writes: Arc::clone(&catalog) as Arc<dyn CentralCatalogWrites>,
+            census: Arc::clone(&catalog) as Arc<dyn CatalogCensus>,
+            reads: catalog as Arc<dyn SnapshotCatalog>,
+        }));
+    }
+
+    if config.snapshot.catalog.write == SnapshotCatalogWrite::Postgres {
+        anyhow::bail!(
+            "snapshot.catalog.write = \"postgres\" requires [pg] to be configured; there is no \
+             gRPC scheduler fallback for this mode"
+        );
     }
 
     let endpoint = config
@@ -327,15 +432,45 @@ fn build_central_catalog(config: &AppConfig) -> Result<Option<Arc<CentralSnapsho
         )?;
     let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
 
-    Ok(Some(Arc::new(
-        CentralSnapshotCatalog::connect_hot_reloadable(
-            endpoint,
-            &config.cluster,
-            &config.observability.scheduler_report,
-            identity.cluster_id,
-            identity.id,
-        )?,
-    )))
+    let catalog = Arc::new(CentralSnapshotCatalog::connect_hot_reloadable(
+        endpoint,
+        &config.cluster,
+        &config.observability.scheduler_report,
+        identity.cluster_id,
+        identity.id,
+    )?);
+    Ok(Some(CentralCatalogHandle {
+        writes: Arc::clone(&catalog) as Arc<dyn CentralCatalogWrites>,
+        census: Arc::clone(&catalog) as Arc<dyn CatalogCensus>,
+        reads: catalog as Arc<dyn SnapshotCatalog>,
+    }))
+}
+
+/// Assembles the `write = "postgres"` backend: no mirror, no backlog, no
+/// object-store catalog — see `build_snapshot_backend`'s own call site for
+/// why none of that machinery is needed in this mode. Bytes still flow
+/// through whichever artifact store `repository_backend` configured; only
+/// the row half is replaced.
+///
+/// Pulled out of `build_snapshot_backend` because that function reads
+/// `ConfigManager::global_config()` directly and so cannot be driven by a
+/// unit test with an arbitrary `[snapshot.catalog]`; this half has no such
+/// dependency.
+fn assemble_postgres_only_backend(
+    central_reads: Arc<dyn SnapshotCatalog>,
+    artifacts: Arc<dyn SnapshotArtifactStore>,
+    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+    node_id: String,
+) -> AssembledSnapshotBackend {
+    AssembledSnapshotBackend {
+        repository: Arc::new(SnapshotRepository::on_node(
+            central_reads,
+            artifacts,
+            node_id,
+        )),
+        runtime_resolver,
+        mirror_compensator: None,
+    }
 }
 
 /// Starts the catalog build reaper for this process, when `pool` is `Some`
@@ -359,6 +494,26 @@ pub fn spawn_catalog_build_reaper(
     ttl: std::time::Duration,
 ) -> Option<crate::pg::SingletonTaskHandle> {
     postgres::reaper::spawn(pool?, cluster_id, interval, ttl)
+}
+
+/// Brings the catalog schema in `pool`'s database to the shape this build
+/// expects. A thin `pub` bridge to `postgres::migrate::migrate`, which stays
+/// `pub(crate)` like the rest of that module — see
+/// [`spawn_catalog_build_reaper`]'s own doc for why `src/bin/server.rs` (a
+/// separate crate from this library) needs one of these per function it
+/// calls into `postgres::`.
+///
+/// 🔴 Must run to completion before anything else touches the `snapshots` /
+/// `aliases` / `builds` tables through this pool — the catalog build reaper
+/// (`spawn_catalog_build_reaper`) and `build_snapshot_backend`'s
+/// `PostgresSnapshotCatalog` construction both assume the schema already
+/// exists and neither one migrates it itself (see `PostgresSnapshotCatalog`'s
+/// own module doc). Idempotent and safe to call on every start — the
+/// migration runner's own session-scoped advisory lock (`GO_SCHEMA_LOCK_KEY`)
+/// is what lets a fleet of `--role api` replicas call this concurrently
+/// without racing each other.
+pub async fn migrate_catalog_schema(pool: &sqlx::PgPool) -> Result<()> {
+    postgres::migrate::migrate(pool).await
 }
 
 fn build_storage_backend(
@@ -540,5 +695,197 @@ mod tests {
             .expect("the decision should be answerable");
 
         assert!(compensator.is_none());
+    }
+
+    /// `write = "postgres"` wiring, without touching `ConfigManager::global_config()`
+    /// or a real database — `assemble_postgres_only_backend` is pure
+    /// composition, so a `ScriptedCatalog` standing in for `central.reads`
+    /// is enough to prove the two things that matter: no compensator is
+    /// spawned (there is no mirror to run in this mode), and the assembled
+    /// repository actually reads and writes through the catalog it was
+    /// given rather than silently falling back to some other store.
+    #[tokio::test]
+    async fn postgres_only_backend_has_no_compensator_and_reads_its_own_catalog() {
+        let central_reads = Arc::new(ScriptedCatalog::default());
+        let record = record_for(&SnapshotId::generate());
+        central_reads.seed(record.clone());
+
+        let assembled = assemble_postgres_only_backend(
+            Arc::clone(&central_reads) as Arc<dyn SnapshotCatalog>,
+            Arc::new(crate::snapshot::mock::MockSnapshotArtifactStore),
+            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            "test-node".to_string(),
+        );
+
+        assert!(
+            assembled.mirror_compensator.is_none(),
+            "write = \"postgres\" has nothing for a compensator to reconcile"
+        );
+
+        let found = assembled
+            .repository
+            .catalog()
+            .get(&record.id.to_string())
+            .await
+            .expect("read should succeed")
+            .expect("the record seeded into central_reads must be visible through the assembled repository");
+        assert_eq!(found.id, record.id);
+    }
+}
+
+/// `build_central_catalog`'s own pg-vs-grpc choice, against a real database.
+/// Named `pg::` (not folded into `mod tests` above) so `make test-with-postgres`
+/// — a name filter, not a feature check — actually selects it; see Stage B's
+/// own proposal doc §7 step 12 on this exact trap.
+#[cfg(test)]
+mod pg {
+    use super::*;
+    use crate::pg::harness::isolated_schema_pool_or_skip;
+    use crate::snapshot::repository::backends::postgres::migrate::migrate;
+    use crate::snapshot::repository::interfaces::CatalogReadScope;
+    use crate::snapshot::types::{SnapshotId, SnapshotRecord};
+    use crate::types::SandboxResources;
+
+    fn resources() -> SandboxResources {
+        SandboxResources {
+            cpu_count: 1,
+            memory_mib: 512,
+            disk_size_mib: 1024,
+        }
+    }
+
+    /// The write axis alone decides `Some`/`None`; `write = "object_store"`
+    /// must return `None` even when a pool is handed to it — a caller that
+    /// stopped checking `pg_pool.is_some()` first and started trusting this
+    /// function's `Some`-ness alone would otherwise silently double-write
+    /// object-store-only deployments.
+    #[tokio::test]
+    async fn object_store_write_returns_none_even_with_a_pool() {
+        let pool =
+            isolated_schema_pool_or_skip!("object_store_write_returns_none_even_with_a_pool");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let config = AppConfig::default();
+        assert_eq!(
+            config.snapshot.catalog.write,
+            SnapshotCatalogWrite::ObjectStore
+        );
+
+        let handle = build_central_catalog(&config, Some(&pool)).expect("should not error");
+        assert!(handle.is_none());
+    }
+
+    /// The heart of the wiring this module exists for: with `[pg]`
+    /// configured, `write = "both"` must build a `PostgresSnapshotCatalog`
+    /// rather than dialling `services/scheduler` over gRPC. Proven two ways,
+    /// not just inferred:
+    ///
+    /// 1. No `scheduler_endpoint` is configured at all — the gRPC branch
+    ///    would refuse to build with a `requires a scheduler endpoint` error,
+    ///    so a `Some` result here is only possible if the Postgres branch was
+    ///    taken.
+    /// 2. The returned handle is round-tripped against the real database: a
+    ///    `begin` through `writes`, then a `census` listing and a `reads`
+    ///    lookup both see it, proving all three faces of the bundle are wired
+    ///    to the same live pool rather than to three different or dead
+    ///    catalogs.
+    #[tokio::test]
+    async fn write_both_with_a_pg_pool_builds_a_postgres_central_catalog() {
+        let pool = isolated_schema_pool_or_skip!(
+            "write_both_with_a_pg_pool_builds_a_postgres_central_catalog"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+
+        let mut config = AppConfig::default();
+        config.snapshot.catalog.write = SnapshotCatalogWrite::Both;
+        assert!(
+            config.cluster.scheduler_endpoint.is_none(),
+            "the default config must carry no scheduler endpoint for this test's proof to hold"
+        );
+
+        let handle = build_central_catalog(&config, Some(&pool))
+            .expect("building should not error")
+            .expect("write = \"both\" with a pool must produce a central catalog");
+
+        let id = SnapshotId::generate();
+        let record = SnapshotRecord::template_waiting(id.clone(), None, resources());
+        match handle
+            .writes
+            .begin(&record, "waiting", true)
+            .await
+            .expect("begin should succeed")
+        {
+            CatalogWrite::Applied(applied) => assert_eq!(applied.id, id),
+            CatalogWrite::Refused(refusal) => panic!("begin was refused: {refusal}"),
+        }
+
+        let ids = handle
+            .census
+            .every_snapshot_id()
+            .await
+            .expect("census should succeed");
+        assert!(
+            ids.contains(&id),
+            "the census must see the row `begin` just wrote"
+        );
+
+        let found = handle
+            .reads
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("read should succeed")
+            .expect("the row `begin` just wrote must be readable back");
+        assert_eq!(found.id, id);
+    }
+
+    /// `write = "postgres"` has no gRPC fallback — with no `[pg]` pool at
+    /// all, it must refuse outright rather than silently falling through to
+    /// dialling a scheduler (which the pre-Stage-B `bail!` this replaces
+    /// never did either, but for a different reason).
+    #[test]
+    fn write_postgres_without_a_pool_refuses() {
+        let mut config = AppConfig::default();
+        config.snapshot.catalog.write = SnapshotCatalogWrite::Postgres;
+
+        let error = match build_central_catalog(&config, None) {
+            Ok(_) => panic!("write = \"postgres\" without a pool must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("requires [pg] to be configured"),
+            "got: {error}"
+        );
+    }
+
+    /// `write = "postgres"` with a pool takes the same Postgres branch
+    /// `write = "both"` does — proven the same way: no scheduler endpoint
+    /// configured, and the handle is round-tripped against the database.
+    #[tokio::test]
+    async fn write_postgres_with_a_pg_pool_builds_a_postgres_central_catalog() {
+        let pool = isolated_schema_pool_or_skip!(
+            "write_postgres_with_a_pg_pool_builds_a_postgres_central_catalog"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+
+        let mut config = AppConfig::default();
+        config.snapshot.catalog.write = SnapshotCatalogWrite::Postgres;
+
+        let handle = build_central_catalog(&config, Some(&pool))
+            .expect("building should not error")
+            .expect("write = \"postgres\" with a pool must produce a central catalog");
+
+        let id = SnapshotId::generate();
+        let record = SnapshotRecord::template_waiting(id.clone(), None, resources());
+        handle
+            .writes
+            .begin(&record, "waiting", true)
+            .await
+            .expect("begin should succeed");
+        let found = handle
+            .reads
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+            .expect("read should succeed");
+        assert!(found.is_some());
     }
 }

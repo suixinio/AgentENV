@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use prost::Message as _;
 use tonic::transport::Endpoint;
+use tracing::info;
 
 use crate::proto::node::{self as pb, node_sandbox_service_client::NodeSandboxServiceClient};
 use crate::snapshot::repository::StagedSnapshot;
@@ -94,6 +95,22 @@ pub(crate) async fn build_template_on_a_node(
             TemplateBuildErrorReason::new(format!("choose a node for a template build: {err:#}"))
         })?;
 
+    // Saved because `request` is moved into the call below; kept around so
+    // the completion log can still correlate with the one above.
+    //
+    // 🔴 This pair is the only place a template build's dispatch is logged on
+    // the success path: `builds.node_id` (the catalog row `try_start_build`
+    // opened before this function was even called) names this replica, not
+    // `node.node_id` below — see `CentralSnapshotCatalog::node_id`'s doc for
+    // why that column cannot say this instead.
+    let build_id = request.build_snapshot_id.clone();
+    info!(
+        %build_id,
+        node_id = %node.node_id,
+        endpoint = %node.endpoint,
+        "dispatching template build to node"
+    );
+
     let channel = Endpoint::from_shared(node.endpoint.clone())
         .map_err(|err| {
             TemplateBuildErrorReason::new(format!(
@@ -123,7 +140,7 @@ pub(crate) async fn build_template_on_a_node(
         .into_inner();
 
     let staged = response.staged.and_then(|staged| staged.value);
-    wire::serialized(staged.as_ref(), "staged template build")
+    let staged = wire::serialized(staged.as_ref(), "staged template build")
         .map_err(|err| {
             TemplateBuildErrorReason::new(format!(
                 "decode the staged template build node {} returned: {err:#}",
@@ -135,7 +152,14 @@ pub(crate) async fn build_template_on_a_node(
                 "node {} answered a template build with no staged snapshot",
                 node.node_id
             ))
-        })
+        })?;
+
+    info!(
+        %build_id,
+        node_id = %node.node_id,
+        "node returned the staged template build"
+    );
+    Ok(staged)
 }
 
 /// Turns a failed `BuildTemplate` call's status into the reason a template's

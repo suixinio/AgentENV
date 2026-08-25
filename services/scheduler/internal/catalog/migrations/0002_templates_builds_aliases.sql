@@ -68,7 +68,27 @@ CREATE TABLE IF NOT EXISTS builds (
     status_group    TEXT   NOT NULL
                            CHECK (status_group IN ('pending', 'in_progress', 'ready', 'failed')),
 
-    -- Which machine is running this build.
+    -- The process that administers this build's lease: it is the one that
+    -- called StartBuild, and it is the only one allowed to RenewBuildLease
+    -- (see renewBuildLeaseSQL's `node_id = $2`) or let the row go stale.
+    --
+    -- 🔴 Not necessarily the machine that runs the build sandbox. When a
+    -- worker node builds its own template (the historical, still-common
+    -- case) the two are the same node and this column has always answered
+    -- both questions at once. Since template builds can be dispatched to a
+    -- node from an API replica (AgentENV's node_client/build.rs), the two can
+    -- differ: the API replica is what admits the build and heartbeats it —
+    -- because it is the process running the loop that must stop the build if
+    -- the lease is lost — while a different node is what actually runs
+    -- Firecracker. Changing this column to record the executor instead would
+    -- break the heartbeat: RenewBuildLease is sent by the same process that
+    -- called StartBuild, so the two would stop matching the first time an
+    -- admitting replica differs from the node it dispatched to, and the
+    -- reaper would free a build that is still legitimately running. "Which
+    -- machine is actually running this build" is answered by the admitting
+    -- process's own dispatch log (info-level, `node_client/build.rs`: logged
+    -- when the build is sent to a node and again when that node returns the
+    -- staged result) rather than by this column.
     node_id         TEXT   NULL,
 
     -- 🔴 What the reaper stands on, and it is not optional in practice.

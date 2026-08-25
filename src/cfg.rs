@@ -1021,13 +1021,20 @@ pub struct ObservabilitySchedulerReportConfig {
     /// bridge, not a permanent second heartbeat destination, so it does not
     /// inherit that machinery's cost.
     ///
-    /// 🔴 Best-effort and one-way: a failure here is logged and dropped,
-    /// never affects the primary send's success/failure, backoff, or the
-    /// `HeartbeatNodeNotConfigured` handling above — this heartbeat's
-    /// authoritative destination is still, and only, `scheduler_endpoint`.
-    /// The response (including any `cpu_config_json`) is read only far
-    /// enough to log a mismatch; it never overwrites what the primary
-    /// response already stored via `store_cluster_cpu_config`.
+    /// 🔴 Best-effort, one-way, and dispatched *concurrently* with the
+    /// primary send via `tokio::join!` — not awaited serially ahead of it. A
+    /// serial await would add up to `GRPC_CALL_TIMEOUT` (10s) to every
+    /// heartbeat tick whenever this target is unreachable, more than the
+    /// default 5s heartbeat interval itself, turning the primary heartbeat's
+    /// own cadence into a function of this target's health.
+    ///
+    /// A failure here is logged and dropped, never affects the primary
+    /// send's success/failure, backoff, or the `HeartbeatNodeNotConfigured`
+    /// handling above — this heartbeat's authoritative destination is still,
+    /// and only, `scheduler_endpoint`. The response is checked only for
+    /// success/failure to log which one happened; its body — including any
+    /// `cpu_config_json` — is never read at all, and never overwrites what
+    /// the primary response already stored via `store_cluster_cpu_config`.
     #[config(
         default = "",
         env = "AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT",

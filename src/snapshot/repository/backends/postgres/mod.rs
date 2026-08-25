@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod migrate;
+pub(crate) mod migration_state;
 
 use sqlx::PgPool;
 use uuid::Uuid;

@@ -69,7 +69,10 @@ pub use backlog::{
 };
 pub use central::CentralCatalogWrites;
 pub use compensator::{MirrorCompensator, DEFAULT_COMPENSATOR_INTERVAL};
-pub use population::{admit_read_side, CatalogCensus, CatalogPopulations, ObjectStoreCensus};
+pub use population::{
+    admit_read_side, admit_read_side_with_confirmation, CatalogCensus, CatalogPopulations,
+    ObjectStoreCensus, ReadSideConfirmationStore,
+};
 
 use backlog::MirrorOp;
 use metrics::{

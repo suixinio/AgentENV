@@ -411,32 +411,111 @@ pub async fn admit_read_side(
     object_store: &dyn CatalogCensus,
     central: &dyn CatalogCensus,
 ) -> anyhow::Result<CatalogPopulations> {
+    admit_read_side_with_confirmation(configured, backlog, targets, object_store, central, None)
+        .await
+}
+
+/// Whether "the read side has already been confirmed onto PostgreSQL" is a
+/// fact this process can ask something other than its own node-local mirror
+/// store.
+///
+/// 🔴 This is the structural fix for the CrashLoopBackOff
+/// [`admit_read_side`] used to cause on `--role api`. That role's replicas
+/// each hold their own `MirrorBacklog` on `$AENV_HOME`, which is an
+/// `emptyDir` there — so every fresh replica's [`MirrorBacklog::recorded_read_side`]
+/// answers `None`, [`admit_read_side_with_confirmation`] reads that as "this
+/// is the switch", and the full population comparison runs on every single
+/// replica start rather than once for the cluster. An implementation of this
+/// trait backed by a table every replica shares (Stage B's
+/// `catalog_migration_state`, see
+/// `crate::snapshot::repository::backends::postgres::migration_state`) turns
+/// that node-local question into the cluster fact it actually is: once any
+/// one replica's comparison has agreed, every replica after it reads that
+/// confirmation instead of repeating the comparison.
+///
+/// Deliberately narrow — two methods, not a general key/value store — so a
+/// fake for this module's own tests costs nothing to write. `is_confirmed`
+/// and `confirm` are asked in that order and never out of it: see
+/// [`admit_read_side_with_confirmation`]'s doc comment on why `confirm` may
+/// only be called once the population comparison this admission itself just
+/// ran has actually agreed.
+#[async_trait]
+pub trait ReadSideConfirmationStore: Send + Sync {
+    /// Whether the shared record already says the read side has been
+    /// confirmed onto PostgreSQL for this cluster.
+    async fn is_confirmed(&self) -> anyhow::Result<bool>;
+    /// Records that it now has been.
+    async fn confirm(&self) -> anyhow::Result<()>;
+}
+
+/// [`admit_read_side`], but able to ask a cluster-shared store — rather than
+/// only this node's local [`MirrorBacklog`] — whether the switch has already
+/// been confirmed.
+///
+/// `shared_confirmation` is `None` for every caller that predates Stage B
+/// (including every test in this module, which keeps calling
+/// [`admit_read_side`] unchanged) and for `--role api`/`--role all` replicas
+/// with no `[pg]` pool configured: behaviour is then byte-for-byte identical
+/// to before this function existed. When `Some`, the "is this process moving
+/// reads onto PostgreSQL for the first time" question this function's own doc
+/// comment (see [`admit_read_side`]) describes is answered by
+/// `shared_confirmation.is_confirmed()` instead of
+/// `backlog.recorded_read_side()`.
+///
+/// 🔴 `backlog.record_read_side(configured)` still runs unconditionally at
+/// the end either way. It is not only what this function itself reads next
+/// time — [`MirrorBacklog::guard_read_side`]'s own debt/divergence checks
+/// read it too, to tell a genuine switch from a restart on the side already
+/// being read, and that is a **node-local** question about what *this
+/// node's own queue* still owes: it does not become a cluster fact just
+/// because the population comparison's answer now is.
+///
+/// 🔴 `shared_confirmation.confirm()` is called only after the population
+/// comparison in this same call has itself agreed — never speculatively and
+/// never by a caller that skipped the comparison. Writing the confirmation
+/// ahead of a comparison that might still refuse would let a later replica
+/// read "confirmed" over two catalogs that do not actually agree.
+pub async fn admit_read_side_with_confirmation(
+    configured: CatalogReadSide,
+    backlog: &MirrorBacklog,
+    targets: &MirrorTargets,
+    object_store: &dyn CatalogCensus,
+    central: &dyn CatalogCensus,
+    shared_confirmation: Option<&dyn ReadSideConfirmationStore>,
+) -> anyhow::Result<CatalogPopulations> {
     backlog.guard_read_side(configured).await?;
 
     let mut populations = CatalogPopulations::default();
-    if configured == CatalogReadSide::Postgres
-        && backlog.recorded_read_side().await? != Some(CatalogReadSide::Postgres)
-    {
-        populations = CatalogPopulations::compare(
-            &object_store.every_snapshot_id().await?,
-            &central.every_snapshot_id().await?,
-        );
-        if !populations.agree() {
-            let repaired = repair_toward_central(backlog, targets).await;
-            // 🔴 Only when the replay actually moved something. A second full
-            // listing of both catalogs would otherwise be the standing cost of
-            // every refusal, paid for an answer that cannot have changed.
-            if repaired > 0 {
-                populations = CatalogPopulations::compare(
-                    &object_store.every_snapshot_id().await?,
-                    &central.every_snapshot_id().await?,
-                );
-            }
+    if configured == CatalogReadSide::Postgres {
+        let already_confirmed = match shared_confirmation {
+            Some(store) => store.is_confirmed().await?,
+            None => backlog.recorded_read_side().await? == Some(CatalogReadSide::Postgres),
+        };
+        if !already_confirmed {
+            populations = CatalogPopulations::compare(
+                &object_store.every_snapshot_id().await?,
+                &central.every_snapshot_id().await?,
+            );
             if !populations.agree() {
-                anyhow::bail!(populations.refusal(
-                    backlog.repaired_toward(MirrorDirection::Central),
-                    backlog.lag_toward(MirrorDirection::Central),
-                ));
+                let repaired = repair_toward_central(backlog, targets).await;
+                // 🔴 Only when the replay actually moved something. A second full
+                // listing of both catalogs would otherwise be the standing cost of
+                // every refusal, paid for an answer that cannot have changed.
+                if repaired > 0 {
+                    populations = CatalogPopulations::compare(
+                        &object_store.every_snapshot_id().await?,
+                        &central.every_snapshot_id().await?,
+                    );
+                }
+                if !populations.agree() {
+                    anyhow::bail!(populations.refusal(
+                        backlog.repaired_toward(MirrorDirection::Central),
+                        backlog.lag_toward(MirrorDirection::Central),
+                    ));
+                }
+            }
+            if let Some(store) = shared_confirmation {
+                store.confirm().await?;
             }
         }
     }
@@ -500,7 +579,7 @@ mod admission_tests {
     /// a target that *could* have repaired proves less than it looks: the
     /// replay landing nothing has to be a property of the fixture rather than
     /// a hope about the queue being empty.
-    fn no_repair_possible() -> MirrorTargets {
+    pub(super) fn no_repair_possible() -> MirrorTargets {
         MirrorTargets::object_store(std::sync::Arc::new(ScriptedCatalog::default())
             as std::sync::Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>)
     }
@@ -886,16 +965,16 @@ mod admission_tests {
     /// is. `central_also_holds` are rows the central catalog has and object
     /// storage does not: the direction of difference that no replay toward the
     /// central catalog can close.
-    struct FreshStart {
-        backlog: Arc<MirrorBacklog>,
-        object_store: Arc<ScriptedCatalog>,
-        central: Arc<ScriptedCentral>,
-        targets: MirrorTargets,
+    pub(super) struct FreshStart {
+        pub(super) backlog: Arc<MirrorBacklog>,
+        pub(super) object_store: Arc<ScriptedCatalog>,
+        pub(super) central: Arc<ScriptedCentral>,
+        pub(super) targets: MirrorTargets,
         /// What `settle_before_reading_from` left the central catalog owing.
         left_by_the_pre_guard_drain: u64,
     }
 
-    async fn start_with(
+    pub(super) async fn start_with(
         dir: &std::path::Path,
         recorded: Option<CatalogReadSide>,
         history: &[SnapshotId],
@@ -1193,6 +1272,218 @@ mod admission_tests {
             start.backlog.repaired_toward(MirrorDirection::Central),
             5,
             "here the difference did ask, and the replay ran"
+        );
+    }
+}
+
+/// Tests for [`admit_read_side_with_confirmation`]'s `shared_confirmation`
+/// argument specifically — the Stage B addition. Every scenario the plain
+/// `None` path already covers is in `admission_tests` above and is left
+/// untouched by this module; these tests are only about the branch that did
+/// not exist before.
+#[cfg(test)]
+mod shared_confirmation_tests {
+    #[allow(unused_imports)]
+    use super::admission_tests::{no_repair_possible, start_with, FreshStart};
+    use super::*;
+    use crate::snapshot::repository::mirror::backlog::MirrorBacklog;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A fake cluster-shared store: one `AtomicBool` standing in for the
+    /// `catalog_migration_state` row, shared (via `Arc`) across as many
+    /// "replicas" as a test constructs — each replica in these tests gets its
+    /// own, independent, empty `MirrorBacklog` (the node-local half), the same
+    /// way `--role api` replicas each get their own empty `$AENV_HOME`.
+    #[derive(Default)]
+    struct FakeSharedStore {
+        confirmed: AtomicBool,
+        confirm_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReadSideConfirmationStore for FakeSharedStore {
+        async fn is_confirmed(&self) -> anyhow::Result<bool> {
+            Ok(self.confirmed.load(Ordering::SeqCst))
+        }
+
+        async fn confirm(&self) -> anyhow::Result<()> {
+            self.confirm_calls.fetch_add(1, Ordering::SeqCst);
+            self.confirmed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct Unreachable;
+
+    #[async_trait]
+    impl CatalogCensus for Unreachable {
+        async fn every_snapshot_id(&self) -> RepositoryResult<Vec<SnapshotId>> {
+            panic!("the population comparison must not run once the shared store says confirmed");
+        }
+    }
+
+    /// The whole point of D4: a replica whose local `MirrorBacklog` has never
+    /// recorded anything (a fresh `$AENV_HOME`) does not run the comparison
+    /// at all when the shared store already says "confirmed" — unlike the
+    /// `None` path, where exactly this local state means "this is the
+    /// switch" and pays for a full listing of both catalogs.
+    #[tokio::test]
+    async fn a_confirmed_shared_store_skips_the_comparison_even_on_a_fresh_local_backlog() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backlog = MirrorBacklog::open(dir.path().join("mirror"))
+            .await
+            .expect("the backlog should open");
+        backlog
+            .queue_history_toward_central(
+                &crate::snapshot::repository::mirror::test_doubles::ScriptedCatalog::default(),
+            )
+            .await
+            .expect("queuing empty history should succeed");
+        assert_eq!(
+            backlog.recorded_read_side().await.unwrap(),
+            None,
+            "this backlog has never recorded a side -- the fresh-replica case"
+        );
+
+        let shared = FakeSharedStore {
+            confirmed: AtomicBool::new(true),
+            confirm_calls: AtomicUsize::new(0),
+        };
+
+        admit_read_side_with_confirmation(
+            CatalogReadSide::Postgres,
+            &backlog,
+            &no_repair_possible(),
+            &Unreachable,
+            &Unreachable,
+            Some(&shared),
+        )
+        .await
+        .expect("a shared store that already says confirmed must not run the comparison at all");
+
+        assert_eq!(
+            shared.confirm_calls.load(Ordering::SeqCst),
+            0,
+            "already confirmed, so confirming again is pure waste"
+        );
+    }
+
+    /// The other half: a shared store that says "not yet confirmed" still
+    /// runs the real comparison, and calls `confirm()` exactly once it
+    /// agrees -- simulating the first replica to ever admit this cluster.
+    #[tokio::test]
+    async fn an_unconfirmed_shared_store_runs_the_comparison_and_confirms_on_agreement() {
+        let held: Vec<SnapshotId> = (0..5).map(|_| SnapshotId::generate()).collect();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let start = start_with(dir.path(), None, &held, &held).await;
+
+        let shared = FakeSharedStore::default();
+        let populations = admit_read_side_with_confirmation(
+            CatalogReadSide::Postgres,
+            &start.backlog,
+            &start.targets,
+            &ObjectStoreCensus(start.object_store.as_ref()),
+            start.central.as_ref(),
+            Some(&shared),
+        )
+        .await
+        .expect("two catalogs holding the same snapshots may switch");
+
+        assert!(populations.agree());
+        assert_eq!(
+            shared.confirm_calls.load(Ordering::SeqCst),
+            1,
+            "the comparison agreed, so the shared store must be told exactly once"
+        );
+        assert!(shared.is_confirmed().await.unwrap());
+    }
+
+    /// A comparison that still disagrees after the replay must not confirm
+    /// the shared store -- a later replica reading "confirmed" over catalogs
+    /// that do not actually agree would skip the check that exists to catch
+    /// exactly that.
+    #[tokio::test]
+    async fn a_disagreement_that_survives_the_replay_never_confirms_the_shared_store() {
+        let held: Vec<SnapshotId> = (0..5).map(|_| SnapshotId::generate()).collect();
+        let stray = SnapshotId::generate();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // `central_also_holds` carries a row no replay toward the central
+        // catalog can ever produce out of thin air on the object-store side.
+        let start = start_with(dir.path(), None, &held, std::slice::from_ref(&stray)).await;
+
+        let shared = FakeSharedStore::default();
+        let error = admit_read_side_with_confirmation(
+            CatalogReadSide::Postgres,
+            &start.backlog,
+            &start.targets,
+            &ObjectStoreCensus(start.object_store.as_ref()),
+            start.central.as_ref(),
+            Some(&shared),
+        )
+        .await
+        .expect_err("a row the central catalog holds and object storage does not still refuses");
+
+        assert!(error.to_string().contains(&stray.to_string()));
+        assert_eq!(
+            shared.confirm_calls.load(Ordering::SeqCst),
+            0,
+            "a refusal must never confirm the shared store"
+        );
+        assert!(!shared.is_confirmed().await.unwrap());
+    }
+
+    /// The end-to-end story D4 exists for: two "replicas", each with its own
+    /// empty local backlog, sharing one `FakeSharedStore`. The first pays for
+    /// the comparison and confirms; the second, arriving after it with an
+    /// equally empty local backlog, reads the shared confirmation and never
+    /// touches the catalogs at all.
+    #[tokio::test]
+    async fn a_second_replica_with_its_own_empty_backlog_reads_the_first_replicas_confirmation() {
+        let held: Vec<SnapshotId> = (0..5).map(|_| SnapshotId::generate()).collect();
+        let shared = FakeSharedStore::default();
+
+        let first_dir = tempfile::TempDir::new().expect("tempdir");
+        let first = start_with(first_dir.path(), None, &held, &held).await;
+        admit_read_side_with_confirmation(
+            CatalogReadSide::Postgres,
+            &first.backlog,
+            &first.targets,
+            &ObjectStoreCensus(first.object_store.as_ref()),
+            first.central.as_ref(),
+            Some(&shared),
+        )
+        .await
+        .expect("the first replica's comparison agrees");
+        assert_eq!(shared.confirm_calls.load(Ordering::SeqCst), 1);
+
+        // A second, independent replica -- its own backlog, never told
+        // anything about the first replica's local state (an emptyDir mirror
+        // directory has no way to be), reaching the *same* shared store.
+        let second_dir = tempfile::TempDir::new().expect("tempdir");
+        let second_backlog = MirrorBacklog::open(second_dir.path().join("mirror"))
+            .await
+            .expect("the second backlog should open");
+        second_backlog
+            .queue_history_toward_central(
+                &crate::snapshot::repository::mirror::test_doubles::ScriptedCatalog::default(),
+            )
+            .await
+            .expect("queuing empty history should succeed");
+
+        admit_read_side_with_confirmation(
+            CatalogReadSide::Postgres,
+            &second_backlog,
+            &no_repair_possible(),
+            &Unreachable,
+            &Unreachable,
+            Some(&shared),
+        )
+        .await
+        .expect("the second replica must not need to run the comparison itself");
+        assert_eq!(
+            shared.confirm_calls.load(Ordering::SeqCst),
+            1,
+            "the second replica read the confirmation rather than re-confirming"
         );
     }
 }

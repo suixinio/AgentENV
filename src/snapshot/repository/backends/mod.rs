@@ -19,13 +19,14 @@ use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::mirror::{
-    admit_read_side, CatalogReadSide, CentralCatalogWrites, DualWriteCatalog, MirrorBacklog,
-    MirrorCompensator, MirrorDirection, MirrorTargets, ObjectStoreCensus,
+    admit_read_side_with_confirmation, CatalogReadSide, CentralCatalogWrites, DualWriteCatalog,
+    MirrorBacklog, MirrorCompensator, MirrorDirection, MirrorTargets, ObjectStoreCensus,
 };
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
 pub use oss::OssBackend;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
+use postgres::migration_state::PgReadSideConfirmation;
 
 /// Everything the snapshot layer needs from storage, assembled.
 pub struct AssembledSnapshotBackend {
@@ -45,13 +46,13 @@ pub struct AssembledSnapshotBackend {
 /// is what the trait split bought.
 pub async fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-    // 🔴 Unused for now — plumbing only (Stage B step 2,
-    // `docs/proposals/_sd-phase4-stageB-catalog.md` §7). Consumed starting
-    // with the read-side admission move to PostgreSQL (step 4) and the
+    // 🔴 `None` for `--role node` always — see
+    // `src/bin/server.rs::build_pg_pool`. Consumed today only by the
+    // read-side admission's shared confirmation (Stage B step 4,
+    // `docs/proposals/_sd-phase4-stageB-catalog.md` §7/§5.1); the
     // `PostgresSnapshotCatalog` construction that replaces
-    // `build_central_catalog`'s gRPC hop (steps 8-9). `None` for `--role
-    // node` always — see `src/bin/server.rs::build_pg_pool`.
-    _pg_pool: Option<sqlx::PgPool>,
+    // `build_central_catalog`'s gRPC hop (steps 8-9) is still to come.
+    pg_pool: Option<sqlx::PgPool>,
 ) -> Result<AssembledSnapshotBackend> {
     let config = ConfigManager::global_config();
     let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
@@ -144,12 +145,24 @@ pub async fn build_snapshot_backend(
     // starting and one that can never start again: it meets this comparison on
     // every start, and the compensator that would close the difference is
     // spawned below, on a start that never happens.
-    let populations = admit_read_side(
+    // 🔴 Only when a `[pg]` pool exists at all — a replica with no pool
+    // configured falls back to exactly the pre-Stage-B behaviour (the
+    // node-local `MirrorBacklog` question `admit_read_side_with_confirmation`
+    // asks when this is `None`), which matters for any `write = "both"`
+    // deployment that has not yet been given a `[pg]` DSN.
+    let node_identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
+    let shared_confirmation = pg_pool
+        .as_ref()
+        .map(|pool| PgReadSideConfirmation::new(pool, node_identity.cluster_id, &node_identity.id));
+    let populations = admit_read_side_with_confirmation(
         configured_read,
         &backlog,
         &targets,
         &ObjectStoreCensus(object_store_catalog.as_ref()),
         central.as_ref(),
+        shared_confirmation.as_ref().map(|store| {
+            store as &dyn crate::snapshot::repository::mirror::ReadSideConfirmationStore
+        }),
     )
     .await?;
     if configured_read == CatalogReadSide::Postgres {

@@ -2,6 +2,7 @@ pub mod central;
 pub(crate) mod common;
 pub(crate) mod oss;
 pub(crate) mod posixfs;
+pub(crate) mod postgres;
 
 use std::path::PathBuf;
 use std::sync::Arc;

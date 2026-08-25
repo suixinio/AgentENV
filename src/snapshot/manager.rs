@@ -194,6 +194,19 @@ impl SnapshotManager {
         self.repository.create(record).await
     }
 
+    /// Boundedly closes any durable local store this manager's repository
+    /// owns, ahead of process shutdown.
+    ///
+    /// 🔴 A no-op for every repository configuration except the dual-write
+    /// catalog's durable mirror backlog (`SnapshotCatalog::close`'s default is
+    /// a no-op; only `DualWriteCatalog` overrides it) — most deployments have
+    /// nothing here to close, and this call is safe and cheap regardless. See
+    /// `crate::local_store::LocalKvStore::close` for the mechanism this
+    /// exists to bound.
+    pub async fn close_stores(&self, timeout: std::time::Duration) {
+        self.repository.catalog().close(timeout).await;
+    }
+
     #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
     pub async fn publish(
         &self,

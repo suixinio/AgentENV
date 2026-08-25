@@ -100,15 +100,34 @@ struct Assembly {
     grpc: Option<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)>,
 }
 
-/// The machine-local runtime a sandbox-running role owns: the two P2P pieces it
-/// holds by value, plus the process-wide Firecracker pool and ublk daemon it
-/// reaches through their globals.
+/// Bound for each individual step in [`NodeRuntime::shutdown`].
 ///
-/// 🔴 Held as a whole rather than as four independent handles so that the
-/// teardown order — pool, ublk, overlaybd P2P, transport — stays in one place.
+/// 🔴 Shared across four unrelated subsystems (two P2P shutdowns, two RocksDB
+/// store closes) on purpose: an operator reading shutdown logs across a fleet
+/// only has to remember one number, and none of these four steps has ever had
+/// a reason to need a materially different bound from the others — they are
+/// all "stop background work that is already best-effort, and say so if it
+/// didn't finish in time" calls. `crate::local_store::DEFAULT_CLOSE_TIMEOUT`
+/// is the same value for the same reason, one module over; this one is
+/// separate because it also has to bound the two P2P calls, which know
+/// nothing about `local_store`.
+const NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The machine-local runtime a sandbox-running role owns: the two P2P pieces it
+/// holds by value, the process-wide Firecracker pool and ublk daemon it
+/// reaches through their globals, and a handle onto the snapshot manager kept
+/// only so shutdown can close its durable mirror-backlog store.
+///
+/// 🔴 Held as a whole rather than as independent handles so that the teardown
+/// order — pool, ublk, overlaybd P2P, transport, then the two RocksDB stores
+/// this bundle can reach — stays in one place.
 struct NodeRuntime {
     overlaybd_p2p: OverlaybdP2pRuntime,
     p2p_transport: Arc<dyn P2pTransport>,
+    /// Not otherwise used here: every operational use of the manager goes
+    /// through the `Arc` clone `assemble_node_core`'s caller wires into
+    /// `ApiImpl`. This clone exists only for `close_stores` below.
+    snapshot_manager: Arc<SnapshotManager>,
 }
 
 impl NodeRuntime {
@@ -123,14 +142,67 @@ impl NodeRuntime {
         if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
             warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
         }
+
+        // 🔴 Bounded, unlike the plain `.await`s these replaced. Both
+        // subsystems already treat their own failure as best-effort (`warn!`
+        // and move on) — but with P2P enabled, `overlaybd_p2p`'s read facade
+        // and `p2p_transport`'s iroh endpoint each sit on top of a downstream
+        // RPC wait with no timeout of its own (iroh-blobs' storage actor, in
+        // particular), and an unbounded `.await` here is exactly the class of
+        // bug the rest of this shutdown path exists to close off. Disabled P2P
+        // (`DisabledP2pTransport`, most deployments today) returns instantly
+        // either way, so this only changes behaviour where P2P is on.
         info!(target: "agentenv", "shutting down overlaybd p2p runtime");
-        if let Err(err) = self.overlaybd_p2p.shutdown().await {
-            warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
+        match tokio::time::timeout(
+            NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT,
+            self.overlaybd_p2p.shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
+            }
+            Err(_) => {
+                warn!(
+                    target: "agentenv",
+                    timeout_secs = NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT.as_secs(),
+                    "overlaybd p2p runtime did not shut down within timeout; continuing shutdown"
+                );
+            }
         }
         info!(target: "agentenv", "shutting down p2p transport");
-        if let Err(err) = self.p2p_transport.shutdown().await {
-            warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
+        match tokio::time::timeout(
+            NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT,
+            self.p2p_transport.shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
+            }
+            Err(_) => {
+                warn!(
+                    target: "agentenv",
+                    timeout_secs = NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT.as_secs(),
+                    "p2p transport did not shut down within timeout; continuing shutdown"
+                );
+            }
         }
+
+        // 🔴 The two RocksDB stores this bundle can still reach. Neither call
+        // drops the underlying store — both only stop its background
+        // compaction/flush ahead of time (see `LocalKvStore::close`) — so this
+        // is safe even while other clones of the same store (the image cache's
+        // shared-instance registry, in particular) are still live elsewhere in
+        // the process.
+        info!(target: "agentenv", "closing image cache metadata store");
+        agentenv::image::close_image_cache_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT).await;
+        info!(target: "agentenv", "closing snapshot catalog mirror backlog store");
+        self.snapshot_manager
+            .close_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT)
+            .await;
     }
 }
 
@@ -154,8 +226,55 @@ struct NodeCore {
     runtime: NodeRuntime,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Bound for the final `Runtime::shutdown_timeout` call in `main`, below.
+///
+/// 🔴 Deliberately larger than [`NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT`]: by the
+/// time this runs, every shutdown step this file knows to bound has already
+/// run and already had its own timeout, so this bound is what is left over
+/// for whatever *wasn't* individually bounded — a stuck `spawn_blocking`
+/// nothing above reached explicitly. It only needs to be comfortably smaller
+/// than Kubernetes' `terminationGracePeriodSeconds` (observed misconfigured at
+/// 3600s on the cluster this exists for), not tight.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 🔴 Not `#[tokio::main]`. That macro's generated `main` builds the runtime,
+/// `block_on`s the async body, then lets the `Runtime` value fall out of
+/// scope — and `Runtime`'s `Drop` shuts down its blocking-task pool by calling
+/// `BlockingPool::shutdown(None)` (tokio, `runtime/blocking/pool.rs`), and
+/// `None` means *no timeout*: it waits forever for every `spawn_blocking`
+/// closure that has already started to return.
+///
+/// Every RocksDB store this process opens (`LocalKvStore`, see
+/// `crate::local_store`) does its writes, and its own background
+/// compaction/flush, through `spawn_blocking` — so one such closure still
+/// running when the async body below returns was enough to make the whole
+/// process hang past `terminationGracePeriodSeconds`, long after every log
+/// line the graceful shutdown was ever going to print had already printed.
+/// (Observed only on nodes that had actually run a VM: an idle node's stores
+/// have nothing to compact, so `Drop` there really did return immediately —
+/// which is exactly why the hang looked selective rather than universal.)
+///
+/// The explicit `close()` calls the shutdown path below makes — the
+/// persisted-sandboxes store, the image cache metadata store, the snapshot
+/// catalog mirror backlog — are meant to make that background work finish,
+/// and log whether it did, before any of this runs. `shutdown_timeout` here is the
+/// backstop for whatever is still outstanding regardless: unlike plain `Drop`,
+/// it bounds the same wait, and once it returns, `main` returning ends the
+/// process — any `spawn_blocking` closure still running at that point keeps
+/// running on its own OS thread, but nothing waits on it any more, the same
+/// way `storage-util`'s un-joined io_uring worker threads already don't block
+/// process exit today.
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the tokio runtime")?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+async fn async_main() -> anyhow::Result<()> {
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
@@ -411,6 +530,16 @@ async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Res
         None
     };
 
+    // Cloned before `snapshot_manager` moves into `NodeCore` below: the
+    // shutdown path needs its own handle to close the manager's stores, kept
+    // separately from whatever the caller does with the `NodeCore` field (move
+    // it into `ApiImpl`, in every role that reaches this function today).
+    let runtime = NodeRuntime {
+        overlaybd_p2p,
+        p2p_transport,
+        snapshot_manager: Arc::clone(&snapshot_manager),
+    };
+
     Ok(NodeCore {
         orchestrator,
         snapshot_manager,
@@ -419,10 +548,7 @@ async fn assemble_node_core(config: &AppConfig, role: ServerRole) -> anyhow::Res
         observability,
         reporter,
         identity: identity_for_registry,
-        runtime: NodeRuntime {
-            overlaybd_p2p,
-            p2p_transport,
-        },
+        runtime,
     })
 }
 

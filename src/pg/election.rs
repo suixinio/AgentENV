@@ -440,8 +440,33 @@ mod tests {
     ///
     /// `a`'s body panics on its very first run; the test then shuts `a` down
     /// (without waiting out any further ticks, so `a` gets no chance to
-    /// re-contest) and confirms `b` can still take over — proving the panic
-    /// path itself released the lock rather than shutdown's own release.
+    /// re-contest), probes the lock directly from a session that is neither
+    /// `a`'s nor `b`'s, and only then lets `b` compete for it.
+    ///
+    /// 🔴 Two things a weaker version of this test can get right for the
+    /// wrong reason:
+    ///
+    /// * `pool_a` is *cloned* into `spawn_singleton_task_raw`, and the test
+    ///   keeps its own handle on the original alive for the rest of the
+    ///   function. Move the whole pool in instead, and an *unhandled* panic
+    ///   unwinding the spawned task drops that task's only reference to it —
+    ///   tearing the entire pool down, closing every connection it held
+    ///   (including the one that, correctly, still had the advisory lock
+    ///   taken). The connection closing either way is what the manual
+    ///   verification of this fix found: reverting `catch_unwind` back to a
+    ///   bare `body(...).await` still left this test green, because the
+    ///   *pool's* teardown released the lock as a side effect that had
+    ///   nothing to do with `spawn_singleton_task_raw`'s own panic handling.
+    /// * The probe afterward runs on `pool_b` — a pool `pool_or_skip!` always
+    ///   hands back brand new (see its doc comment) — rather than on a second
+    ///   connection borrowed back from `pool_a`. `pg_try_advisory_lock` is
+    ///   reentrant *within one session*: a second call on the very session
+    ///   that already holds the lock reports success too, by incrementing
+    ///   PostgreSQL's per-session hold count rather than by finding the lock
+    ///   free. A probe that happened to reuse the leaked connection would
+    ///   read as "the lock is free" for exactly the wrong reason — because
+    ///   the leak was still there to be reentrant on, not because anything
+    ///   had released it.
     #[tokio::test]
     async fn a_panicking_body_releases_the_lock_for_another_competitor() {
         let pool_a = pool_or_skip!("a_panicking_body_releases_the_lock_for_another_competitor");
@@ -450,7 +475,7 @@ mod tests {
 
         let led_then_panicked = Arc::new(Notify::new());
         let notify = Arc::clone(&led_then_panicked);
-        let handle_a = spawn_singleton_task_raw(pool_a, key, TICK, move |_ctx| {
+        let handle_a = spawn_singleton_task_raw(pool_a.clone(), key, TICK, move |_ctx| {
             let notify = Arc::clone(&notify);
             Box::pin(async move {
                 notify.notify_one();
@@ -463,8 +488,36 @@ mod tests {
 
         // Shut a down immediately so it cannot win a re-acquisition race
         // against b before b even starts — isolating that the panic path
-        // itself, not shutdown's own release, freed the lock.
+        // itself, not shutdown's own release, freed the lock. `pool_a`
+        // itself is still alive here (the clone above, not a move), so this
+        // shutdown cannot hide a leak by tearing the pool down underneath it.
         handle_a.shutdown().await;
+
+        // The direct proof, ahead of ever letting `b` compete: a session
+        // that is neither `a`'s nor `b`'s can take the lock. `NOT
+        // pg_try_advisory_lock` reads oddly on its own, but it is what makes
+        // `assert!(!still_held, ..)` below say the true thing in one
+        // negation instead of two.
+        let mut probe = pool_b
+            .acquire()
+            .await
+            .expect("acquiring a probe connection should succeed");
+        let still_held: bool = sqlx::query_scalar("SELECT NOT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *probe)
+            .await
+            .expect("pg_try_advisory_lock should succeed");
+        assert!(
+            !still_held,
+            "the advisory lock is still held after the leader's body panicked and its task shut \
+             down — the panic path leaked the lock instead of releasing it"
+        );
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *probe)
+            .await
+            .expect("releasing the probe's advisory lock should succeed");
+        drop(probe);
 
         let became_leader_b = Arc::new(Notify::new());
         let notify_b = Arc::clone(&became_leader_b);

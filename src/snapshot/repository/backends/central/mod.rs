@@ -178,8 +178,28 @@ pub enum CatalogWrite<T> {
 pub struct CentralSnapshotCatalog {
     channel: Channel,
     cluster_id: Uuid,
-    /// This machine. It is the `node_id` every write carries, and — for a
-    /// snapshot this node is staging — the `origin_node_id` the row records.
+    /// This process's own identity — never a placement decision.
+    ///
+    /// It is the `node_id` every write carries, and — for a snapshot this
+    /// node is staging — the `origin_node_id` the row records.
+    ///
+    /// 🔴 For `builds.node_id` specifically, "this process" is not always
+    /// "the machine that runs the build". A local build (`--role all`) has
+    /// them coincide. A build `--role api` dispatches to a node
+    /// (`crate::node_client::build_template_on_a_node`) does not: `start_build`
+    /// is called by the API replica *before* a node is even chosen — nothing
+    /// this struct does learns the executor's identity, ever — and
+    /// `renew_build_lease` keeps heartbeating from the same replica for the
+    /// build's whole run (`hold_the_build_lease`,
+    /// `src/api/impls/template.rs`). Both calls must keep sending this same
+    /// value: `renewBuildLeaseSQL`'s `WHERE node_id = $2` is what lets the
+    /// heartbeat reach the row it opened, and the reaper frees a build whose
+    /// heartbeat has gone stale — so a `node_id` that changed between the two
+    /// calls would desync them and have the reaper kill a build that is still
+    /// legitimately running. This column therefore answers "who is
+    /// administering this build's lease", not "which machine is running it";
+    /// see `crate::node_client::build` for a log line that answers the
+    /// second question.
     node_id: String,
     call_timeout: Duration,
 }
@@ -489,6 +509,12 @@ impl CentralSnapshotCatalog {
     /// them equal today. They are sent separately anyway: the table keeps them
     /// in different columns precisely so that stops being true without a
     /// migration.
+    ///
+    /// 🔴 The `node_id` this admits the row under is `self.node_id` — see the
+    /// field doc. It never carries a node placement decision, because none
+    /// has been made yet: this is called from
+    /// `v2_templates_template_id_builds_build_id_post` before
+    /// `run_the_build_on_a_node` ever asks a `NodePlacement` for a node.
     pub async fn start_build(
         &self,
         id: &SnapshotId,
@@ -1220,6 +1246,202 @@ mod tests {
                 "{code} says nothing about whether the write would land next time: {error}"
             );
             assert!(matches!(error, RepositoryError::Backend { .. }));
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // `builds.node_id`: who StartBuild and RenewBuildLease say this is
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // A fake `SnapshotCatalog` gRPC service, real socket and all — matching
+    // `src/node_client/tests.rs`'s harness for the node service next door —
+    // because the fact under test lives entirely in what goes out on the
+    // wire. Nothing above this file ever supplies a node id to `start_build`
+    // or `renew_build_lease`: both read `self.node_id`, so a fake that only
+    // inspected the `SnapshotCatalog` (repository) trait's arguments could
+    // never observe the bug this guards — that trait does not carry a
+    // `node_id` parameter at all.
+    mod node_id_semantics {
+        use std::sync::{Arc, Mutex};
+
+        use tokio::sync::oneshot;
+        use tonic::{Request, Response, Status};
+        use uuid::Uuid;
+
+        use super::super::CentralSnapshotCatalog;
+        use crate::proto::scheduler as pb;
+        use crate::snapshot::types::SnapshotId;
+
+        /// Answers `StartBuild` and `RenewBuildLease` by recording the
+        /// `node_id` each request carried, and refuses everything else —
+        /// this harness exists to answer exactly one question.
+        #[derive(Default)]
+        struct RecordingCatalog {
+            start_build_node_id: Mutex<Option<String>>,
+            renew_build_lease_node_id: Mutex<Option<String>>,
+        }
+
+        #[tonic::async_trait]
+        impl pb::snapshot_catalog_server::SnapshotCatalog for RecordingCatalog {
+            async fn begin_snapshot(
+                &self,
+                _request: Request<pb::BeginSnapshotRequest>,
+            ) -> Result<Response<pb::BeginSnapshotResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn commit_snapshot(
+                &self,
+                _request: Request<pb::CommitSnapshotRequest>,
+            ) -> Result<Response<pb::CommitSnapshotResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn fail_snapshot(
+                &self,
+                _request: Request<pb::FailSnapshotRequest>,
+            ) -> Result<Response<pb::FailSnapshotResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn get_snapshot(
+                &self,
+                _request: Request<pb::GetSnapshotRequest>,
+            ) -> Result<Response<pb::GetSnapshotResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn list_snapshots(
+                &self,
+                _request: Request<pb::ListSnapshotsRequest>,
+            ) -> Result<Response<pb::ListSnapshotsResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn delete_snapshot(
+                &self,
+                _request: Request<pb::DeleteSnapshotRequest>,
+            ) -> Result<Response<pb::DeleteSnapshotResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn resolve_alias(
+                &self,
+                _request: Request<pb::ResolveAliasRequest>,
+            ) -> Result<Response<pb::ResolveAliasResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+            async fn start_build(
+                &self,
+                request: Request<pb::StartBuildRequest>,
+            ) -> Result<Response<pb::StartBuildResponse>, Status> {
+                *self.start_build_node_id.lock().expect("lock") =
+                    Some(request.into_inner().node_id);
+                Err(Status::unimplemented(
+                    "this harness only records what StartBuild carried",
+                ))
+            }
+            async fn renew_build_lease(
+                &self,
+                request: Request<pb::RenewBuildLeaseRequest>,
+            ) -> Result<Response<pb::RenewBuildLeaseResponse>, Status> {
+                *self.renew_build_lease_node_id.lock().expect("lock") =
+                    Some(request.into_inner().node_id);
+                Err(Status::unimplemented(
+                    "this harness only records what RenewBuildLease carried",
+                ))
+            }
+            async fn get_build(
+                &self,
+                _request: Request<pb::GetBuildRequest>,
+            ) -> Result<Response<pb::GetBuildResponse>, Status> {
+                Err(Status::unimplemented("not exercised by this test"))
+            }
+        }
+
+        async fn serve(catalog: Arc<RecordingCatalog>) -> (String, oneshot::Sender<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a port");
+            let addr = listener.local_addr().expect("the bound address");
+            let (tx, rx) = oneshot::channel();
+
+            tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(
+                        pb::snapshot_catalog_server::SnapshotCatalogServer::from_arc(catalog),
+                    )
+                    .serve_with_incoming_shutdown(
+                        tonic::transport::server::TcpIncoming::from(listener),
+                        async {
+                            let _ = rx.await;
+                        },
+                    )
+                    .await;
+            });
+
+            for _ in 0..200 {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            (format!("http://{addr}"), tx)
+        }
+
+        /// 🔴 The regression this guards: `builds.node_id` must keep naming
+        /// the process administering the build's lease — here,
+        /// `"agentenv-api-6968b44f7c-4j5bn"`, standing in for an API
+        /// replica — and never a node a placement decision chose to run the
+        /// build sandbox on, standing in here as `"aenv-worker-01"`. This
+        /// catalog client is never even told about the second value: nothing
+        /// downstream of `CentralSnapshotCatalog::connect_lazy` can make it
+        /// leak in, so a `start_build` or `renew_build_lease` implementation
+        /// that sent anything other than `self.node_id` — a hardcoded
+        /// string, an empty one, or (the change problem one specifically
+        /// warns against) a future `executor_node_id` parameter plumbed in
+        /// from placement — turns one or both assertions below red.
+        ///
+        /// Both calls are asserted, and asserted equal to each other, because
+        /// that equality is precisely what lets `renewBuildLeaseSQL`'s
+        /// `WHERE node_id = $2` find the row `start_build` opened: if a fix
+        /// for "this column should be the executor" changed only one of the
+        /// two call sites, the row `start_build` admits would never renew
+        /// again and the reaper would end a build that is still running.
+        #[tokio::test]
+        async fn start_build_and_its_heartbeats_name_the_lease_holder_not_a_placement_choice() {
+            let catalog = Arc::new(RecordingCatalog::default());
+            let (endpoint, _shutdown) = serve(Arc::clone(&catalog)).await;
+
+            // Never "aenv-worker-01": that name stands for a node a
+            // `NodePlacement` might choose later, which this client is never
+            // told about.
+            let this_replica = "agentenv-api-6968b44f7c-4j5bn".to_string();
+            let client = CentralSnapshotCatalog::connect_lazy(
+                &endpoint,
+                Uuid::new_v4(),
+                this_replica.clone(),
+            )
+            .expect("a lazily-connected client");
+
+            let build_id = SnapshotId::generate();
+            let _ = client
+                .start_build(&build_id, &build_id, 1_700_000_000_000)
+                .await;
+            let _ = client.renew_build_lease(&build_id, 1_700_000_001_000).await;
+
+            assert_eq!(
+                catalog.start_build_node_id.lock().expect("lock").as_deref(),
+                Some(this_replica.as_str()),
+                "StartBuild must name the replica admitting the build, not a node any placement \
+                 decision picked — this client has no such node to send"
+            );
+            assert_eq!(
+                catalog
+                    .renew_build_lease_node_id
+                    .lock()
+                    .expect("lock")
+                    .as_deref(),
+                Some(this_replica.as_str()),
+                "RenewBuildLease must keep sending the exact identity StartBuild admitted the row \
+                 under, or the reaper's `node_id = $2` predicate stops matching a heartbeat this \
+                 build is still sending"
+            );
         }
     }
 }

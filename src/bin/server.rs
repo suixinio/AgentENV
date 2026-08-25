@@ -966,7 +966,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // and an untested refusal branch is the shape this programme has already
     // paid for twice.
     let store_config = cluster_store_config(&config.orchestrator.store)?;
-    let placement = cluster_placement(&config.cluster)?;
+    let placement = cluster_placement(&config.cluster, &config.observability.scheduler_report)?;
     let store = RedisMetadataStore::connect(store_config)
         .await
         .context("connect the cluster metadata store")?;
@@ -1152,6 +1152,7 @@ fn cluster_store_config(
 /// The scheduler-backed placement this half asks where sandboxes go.
 fn cluster_placement(
     config: &agentenv::cfg::ClusterConfig,
+    scheduler_report: &agentenv::cfg::ObservabilitySchedulerReportConfig,
 ) -> anyhow::Result<Arc<dyn agentenv::node_client::NodePlacement>> {
     let endpoint = config
         .scheduler_endpoint
@@ -1166,8 +1167,10 @@ fn cluster_placement(
                  fall back to"
             )
         })?;
-    Ok(Arc::new(SchedulerNodePlacement::connect_lazy(
+    Ok(Arc::new(SchedulerNodePlacement::connect_hot_reloadable(
         endpoint,
+        config,
+        scheduler_report,
         config.node_service_port,
     )?))
 }
@@ -1424,7 +1427,7 @@ mod tests {
             "the default is no endpoint, which is what makes this refusal necessary"
         );
 
-        let err = match cluster_placement(&config.cluster) {
+        let err = match cluster_placement(&config.cluster, &config.observability.scheduler_report) {
             Ok(_) => panic!("there is no machine here to fall back to"),
             Err(err) => err.to_string(),
         };
@@ -1440,7 +1443,7 @@ mod tests {
         // that fails on every call instead of a process that refuses to start.
         config.cluster.scheduler_endpoint = Some("   ".to_string());
         assert!(
-            cluster_placement(&config.cluster).is_err(),
+            cluster_placement(&config.cluster, &config.observability.scheduler_report).is_err(),
             "a blank endpoint is not an endpoint"
         );
 
@@ -1448,7 +1451,7 @@ mod tests {
         // above are about what was missing.
         config.cluster.scheduler_endpoint = Some("http://scheduler:9090".to_string());
         assert!(
-            cluster_placement(&config.cluster).is_ok(),
+            cluster_placement(&config.cluster, &config.observability.scheduler_report).is_ok(),
             "a configured endpoint is what this role runs on"
         );
     }

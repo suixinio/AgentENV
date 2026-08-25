@@ -22,16 +22,17 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
+use crate::scheduler_endpoint::SchedulerEndpointSource;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
 
 /// Placement backed by the cluster scheduler.
 pub struct SchedulerNodePlacement {
-    channel: Channel,
+    endpoint_source: SchedulerEndpointSource,
     /// The port the node sandbox service listens on.
     ///
     /// 🔴 Substituted into the address the scheduler answers with, rather than
@@ -45,20 +46,49 @@ pub struct SchedulerNodePlacement {
 }
 
 impl SchedulerNodePlacement {
-    /// Connects lazily: `connect_lazy` opens no socket, so a scheduler that is
-    /// down at startup delays a create rather than a process.
+    /// Connects lazily: opens no socket, so a scheduler that is down at
+    /// startup delays a create rather than a process. No file-driven
+    /// hot-reload — the static endpoint for the rest of this process's
+    /// lifetime. Production assembly uses
+    /// [`connect_hot_reloadable`](Self::connect_hot_reloadable) instead;
+    /// this constructor stays simple for tests and any caller with no
+    /// reason to reach for the other one.
     pub fn connect_lazy(endpoint: &str, node_service_port: u16) -> Result<Self> {
-        let channel = Endpoint::from_shared(qualified(endpoint))
-            .with_context(|| format!("scheduler endpoint {endpoint:?} is not a valid URI"))?
-            .connect_lazy();
+        let endpoint_source =
+            SchedulerEndpointSource::spawn(qualified(endpoint), None, "create_placement")
+                .with_context(|| format!("scheduler endpoint {endpoint:?} is not a valid URI"))?;
         Ok(Self {
-            channel,
+            endpoint_source,
+            node_service_port,
+        })
+    }
+
+    /// [`connect_lazy`](Self::connect_lazy), but the endpoint can be
+    /// hot-reloaded from `[cluster].scheduler_endpoint_file` (or its
+    /// deprecated fallback) while the process runs — see
+    /// [`SchedulerEndpointSource::spawn_from_config`]. This is what
+    /// `cluster_placement` in `src/bin/server.rs` uses.
+    pub fn connect_hot_reloadable(
+        endpoint: &str,
+        cluster: &crate::cfg::ClusterConfig,
+        scheduler_report: &crate::cfg::ObservabilitySchedulerReportConfig,
+        node_service_port: u16,
+    ) -> Result<Self> {
+        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
+            qualified(endpoint),
+            cluster,
+            scheduler_report,
+            "create_placement",
+        )
+        .with_context(|| format!("scheduler endpoint {endpoint:?} is not a valid URI"))?;
+        Ok(Self {
+            endpoint_source,
             node_service_port,
         })
     }
 
     fn client(&self) -> SchedulerClient<Channel> {
-        SchedulerClient::new(self.channel.clone())
+        SchedulerClient::new(self.endpoint_source.channel())
     }
 
     /// Turns the scheduler's answer into the node service's address.

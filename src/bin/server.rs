@@ -985,18 +985,37 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // this constructs nothing: no registry, no kube client, no gRPC service —
     // see `start_native_node_registry`'s own doc comment.
     let native_node_registry = match config.cluster.node_placement_source {
-        NodePlacementSource::Native => Some(start_native_node_registry(&config.cluster).await?),
+        NodePlacementSource::Native => Some(
+            start_native_node_registry(
+                &config.cluster,
+                &config
+                    .observability
+                    .scheduler_report
+                    .dual_report_api_endpoint,
+            )
+            .await?,
+        ),
         NodePlacementSource::Scheduler => None,
     };
-    let (native_registry_handle, node_registry_grpc_service, mut node_registry_upkeep) =
-        match native_node_registry {
-            Some(bits) => (Some(bits.registry), Some(bits.grpc_service), bits.tasks),
-            None => (None, None, Vec::new()),
-        };
+    let (
+        native_registry_handle,
+        native_warmup_handle,
+        node_registry_grpc_service,
+        mut node_registry_upkeep,
+    ) = match native_node_registry {
+        Some(bits) => (
+            Some(bits.registry),
+            Some(bits.warmup),
+            Some(bits.grpc_service),
+            bits.tasks,
+        ),
+        None => (None, None, None, Vec::new()),
+    };
     let placement = cluster_placement(
         &config.cluster,
         &config.observability.scheduler_report,
         native_registry_handle.as_ref(),
+        native_warmup_handle.as_ref(),
     )?;
     let store = RedisMetadataStore::connect(store_config)
         .await
@@ -1258,6 +1277,7 @@ fn cluster_placement(
     config: &agentenv::cfg::ClusterConfig,
     scheduler_report: &agentenv::cfg::ObservabilitySchedulerReportConfig,
     native_registry: Option<&Arc<AtomicNodeRegistry>>,
+    native_warmup: Option<&Arc<WarmupGate>>,
 ) -> anyhow::Result<Arc<dyn agentenv::node_client::NodePlacement>> {
     let endpoint = config
         .scheduler_endpoint
@@ -1278,12 +1298,15 @@ fn cluster_placement(
         scheduler_report,
         config.node_service_port,
     )?;
-    match (config.node_placement_source, native_registry) {
-        (NodePlacementSource::Native, Some(registry)) => Ok(Arc::new(NativeNodePlacement::new(
-            Arc::clone(registry),
-            config.node_service_port,
-            scheduler,
-        ))),
+    match (config.node_placement_source, native_registry, native_warmup) {
+        (NodePlacementSource::Native, Some(registry), Some(warmup)) => {
+            Ok(Arc::new(NativeNodePlacement::new(
+                Arc::clone(registry),
+                config.node_service_port,
+                Arc::clone(warmup),
+                scheduler,
+            )))
+        }
         _ => Ok(Arc::new(scheduler)),
     }
 }
@@ -1302,6 +1325,13 @@ fn cluster_placement(
 /// default path's dependency footprint must be unchanged.
 struct NativeNodeRegistryBits {
     registry: Arc<AtomicNodeRegistry>,
+    /// The same `Arc` handed to `grpc_service` below — cloned out here too
+    /// so `cluster_placement` can give `NativeNodePlacement` a handle on the
+    /// gate a heartbeat this process actually receives opens. See
+    /// `NativeNodePlacement`'s own module doc for why an unwired gate would
+    /// leave every `resolve_node`/`node_membership` call answering as
+    /// confidently absent as a registry that had just started.
+    warmup: Arc<WarmupGate>,
     grpc_service: NodeRegistryGrpcService,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -1316,6 +1346,7 @@ const KUBE_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 async fn start_native_node_registry(
     config: &agentenv::cfg::ClusterConfig,
+    dual_report_api_endpoint: &str,
 ) -> anyhow::Result<NativeNodeRegistryBits> {
     let discovery = &config.kubernetes_discovery;
     let namespace = discovery.namespace.trim();
@@ -1332,6 +1363,30 @@ async fn start_native_node_registry(
              AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when \
              [cluster].node_placement_source = \"native\": Stage A's node registry has nothing \
              to discover nodes from otherwise"
+        );
+    }
+    // 🔴 P1's second fix: a self-inflicted configuration this process can
+    // see from its own config and must refuse rather than start into. Under
+    // `Native`, this registry's only source of heartbeats is
+    // `[observability.scheduler_report].dual_report_api_endpoint` — the
+    // primary heartbeat always goes to `[cluster].scheduler_endpoint`, never
+    // to this process (`ObservabilityReporter::send_heartbeat`'s dual-report
+    // branch). Leave it unset and `WarmupGate` never sees a single
+    // `reported_in`, so it never leaves warm-up: every `resolve_node`/
+    // `node_membership` call refuses for the entire life of the process,
+    // which is indistinguishable at the call site from a scheduler that is
+    // permanently down. Better to refuse this at startup, loudly, than to
+    // let a replica run for its whole life quietly unable to answer either
+    // question.
+    if dual_report_api_endpoint.trim().is_empty() {
+        anyhow::bail!(
+            "--role api needs [observability.scheduler_report].dual_report_api_endpoint \
+             (AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT) when \
+             [cluster].node_placement_source = \"native\": without it no node heartbeat ever \
+             reaches this registry, so it can never leave warm-up and every resolve_node/ \
+             node_membership call refuses for the life of the process — point it at this \
+             replica's own [cluster].api_grpc_addr, fronted by a Service reaching every \
+             replica (for example http://agentenv-api:8002)"
         );
     }
     let kube_config = KubernetesDiscoveryConfig {
@@ -1376,6 +1431,7 @@ async fn start_native_node_registry(
 
     Ok(NativeNodeRegistryBits {
         registry,
+        warmup,
         grpc_service,
         tasks: vec![discovery_task, metrics_task],
     })
@@ -1674,6 +1730,7 @@ mod tests {
             &config.cluster,
             &config.observability.scheduler_report,
             None,
+            None,
         ) {
             Ok(_) => panic!("there is no machine here to fall back to"),
             Err(err) => err.to_string(),
@@ -1693,6 +1750,7 @@ mod tests {
             cluster_placement(
                 &config.cluster,
                 &config.observability.scheduler_report,
+                None,
                 None
             )
             .is_err(),
@@ -1706,10 +1764,75 @@ mod tests {
             cluster_placement(
                 &config.cluster,
                 &config.observability.scheduler_report,
+                None,
                 None
             )
             .is_ok(),
             "a configured endpoint is what this role runs on"
+        );
+    }
+
+    /// 🔴 P1's second fix: `[cluster].node_placement_source = "native"`
+    /// without `[observability.scheduler_report].dual_report_api_endpoint`
+    /// configured is a self-inflicted configuration — this registry's only
+    /// heartbeat source is the dual report, so without it `WarmupGate` never
+    /// leaves warm-up and every `resolve_node`/`node_membership` call
+    /// refuses for the process's whole life. That must fail loudly at
+    /// startup rather than run silently unable to answer either question.
+    ///
+    /// Both bail-outs live in `start_native_node_registry`, ahead of the
+    /// first line that would touch a network — namespace/service_name are
+    /// checked first (existing behaviour), and this refusal is checked
+    /// second, so a caller that also left those blank still gets the
+    /// existing message rather than this one; the second assertion below is
+    /// the control that proves this test is actually reaching the new
+    /// check and not just re-triggering the first.
+    #[tokio::test]
+    async fn native_placement_without_a_dual_report_endpoint_refuses_to_start() {
+        let mut cluster = agentenv::cfg::ClusterConfig {
+            node_placement_source: NodePlacementSource::Native,
+            ..AppConfig::default().cluster
+        };
+        cluster.kubernetes_discovery.namespace = "agentenv-system".to_string();
+        cluster.kubernetes_discovery.service_name = "agentenv-nodes".to_string();
+
+        // `NativeNodeRegistryBits` (the `Ok` type) does not implement
+        // `Debug` — it holds a live gRPC service and task handles, which is
+        // not something a test wants to print — so this matches by hand
+        // rather than using `expect_err`.
+        let err = match start_native_node_registry(&cluster, "").await {
+            Ok(_) => panic!("no dual_report_api_endpoint means this registry never warms up"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("dual_report_api_endpoint"), "{err}");
+        assert!(
+            err.contains("AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT"),
+            "{err}"
+        );
+
+        // Blank is the same as absent, same convention as
+        // `cluster_placement`'s own scheduler_endpoint refusal above.
+        let err = match start_native_node_registry(&cluster, "   ").await {
+            Ok(_) => panic!("a blank endpoint is not an endpoint"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("dual_report_api_endpoint"));
+
+        // Control: an empty namespace/service_name still gets *that*
+        // refusal first, proving the two checks are ordered and this test
+        // is not accidentally validating the pre-existing one.
+        let unconfigured_discovery = agentenv::cfg::ClusterConfig {
+            node_placement_source: NodePlacementSource::Native,
+            ..AppConfig::default().cluster
+        };
+        let err = match start_native_node_registry(&unconfigured_discovery, "").await {
+            Ok(_) => panic!("neither check passes here"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("kubernetes_discovery"),
+            "an empty namespace/service_name must be refused before the dual-report check \
+             is ever reached: {err}"
         );
     }
 

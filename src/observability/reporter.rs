@@ -1,14 +1,14 @@
 use std::cmp;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 
@@ -17,16 +17,10 @@ use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
 use crate::orchestrator::{SandboxLifecycleEvent, SandboxLifecycleEventType};
 use crate::p2p::P2pEndpoint;
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
+use crate::scheduler_endpoint::SchedulerEndpointSource;
 
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Metric name for [`SchedulerChannelSource::current`]'s file re-read
-/// outcome. Mirrors `agentenv_api_control_plane_token_reload_total`
-/// (`src/api/control_plane_gate.rs`) — same shape of problem, same shape of
-/// answer.
-const SCHEDULER_ENDPOINT_RELOAD_METRIC: &str =
-    "agentenv_observability_scheduler_endpoint_reload_total";
 
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
@@ -39,10 +33,13 @@ struct HeartbeatNodeNotConfigured;
 #[derive(Clone)]
 struct ReporterConfig {
     scheduler_endpoint: String,
-    /// A file re-read once per heartbeat/event tick that, once read
-    /// successfully, overrides `scheduler_endpoint` — see
-    /// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`] for
-    /// why this exists and why it is not a union with the static value.
+    /// Resolved from `[cluster].scheduler_endpoint_file` (falling back to
+    /// the deprecated `[observability.scheduler_report].scheduler_endpoint_file`)
+    /// by [`crate::scheduler_endpoint::resolve_endpoint_file`] — see that
+    /// function, and [`crate::scheduler_endpoint::SchedulerEndpointSource`]
+    /// for what re-reading it while the process runs actually does. Never a
+    /// union with `scheduler_endpoint`: once read successfully at least
+    /// once, it overrides the static value outright.
     scheduler_endpoint_file: Option<PathBuf>,
     interval: Duration,
 }
@@ -50,7 +47,7 @@ struct ReporterConfig {
 pub struct ObservabilityReporter {
     config: ReporterConfig,
     service: Arc<ObservabilityService>,
-    channel_source: Arc<SchedulerChannelSource>,
+    channel_source: SchedulerEndpointSource,
     p2p_endpoint: Option<P2pEndpoint>,
     shutdown_tx: Option<watch::Sender<bool>>,
     heartbeat_join: Option<JoinHandle<()>>,
@@ -71,10 +68,14 @@ impl ObservabilityReporter {
         let Some(config) = ReporterConfig::resolve(config, cluster_config) else {
             return Ok(None);
         };
-        let channel_source = Arc::new(SchedulerChannelSource::new(
+        let channel_source = SchedulerEndpointSource::spawn(
             config.scheduler_endpoint.clone(),
-            config.scheduler_endpoint_file.clone(),
-        )?);
+            config
+                .scheduler_endpoint_file
+                .clone()
+                .map(|path| (path, config.interval)),
+            "heartbeat",
+        )?;
 
         Ok(Some(Self {
             config,
@@ -103,8 +104,8 @@ impl ObservabilityReporter {
         let config = self.config.clone();
         let service = Arc::clone(&self.service);
         let event_service = Arc::clone(&self.service);
-        let channel_source = Arc::clone(&self.channel_source);
-        let event_channel_source = Arc::clone(&self.channel_source);
+        let channel_source = self.channel_source.clone();
+        let event_channel_source = self.channel_source.clone();
         let ever_heartbeat_succeeded = Arc::clone(&self.ever_heartbeat_succeeded);
         let p2p_endpoint = self.p2p_endpoint.clone();
         let mut heartbeat_shutdown_rx = shutdown_rx.clone();
@@ -525,202 +526,6 @@ impl ObservabilityReporter {
     }
 }
 
-/// Where the reporter dials the scheduler right now, and how that can change
-/// while the process runs.
-///
-/// Two sources: [`ReporterConfig::scheduler_endpoint`], fixed for the life of
-/// the process, and an optional file
-/// ([`ReporterConfig::scheduler_endpoint_file`]) re-read once per
-/// heartbeat/event tick by [`current`](Self::current). They do **not**
-/// union — a heartbeat can only go to one place — so a file that has been
-/// read successfully at least once overrides the static value outright,
-/// rather than adding to it the way `ControlPlaneGate`'s two credential
-/// sources do (`src/api/control_plane_gate.rs`).
-///
-/// 🔴 When no file is configured, [`current`](Self::current) never touches
-/// the filesystem: it hands out clones of the one channel built at
-/// construction, forever — exactly what the reporter did before this existed.
-/// That is what keeps every deployment that has not opted into
-/// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` byte-for-byte unchanged.
-struct SchedulerChannelSource {
-    /// `None` when no file is configured — the off position, and the one
-    /// every deployment ships in today.
-    file: Option<PathBuf>,
-    state: Mutex<ChannelSourceState>,
-}
-
-struct ChannelSourceState {
-    /// Modification time and length of the file content backing `endpoint` /
-    /// `channel`. `None` until the file has been read successfully at least
-    /// once; used to skip re-parsing a file that stat says has not changed.
-    fingerprint: Option<(SystemTime, u64)>,
-    /// The endpoint currently backing `channel`. Starts as the static value
-    /// and is only ever replaced by a *successful* file read that also built
-    /// a working channel — see [`SchedulerChannelSource::current`].
-    endpoint: String,
-    channel: Channel,
-}
-
-impl SchedulerChannelSource {
-    /// Builds the initial channel from the static endpoint only — the file,
-    /// if any, is first consulted by the loop's first call to
-    /// [`current`](Self::current), not here. A file that is misconfigured or
-    /// not yet mounted must never fail process startup; only a bad *static*
-    /// endpoint does, which is unchanged from before this type existed.
-    fn new(static_endpoint: String, file: Option<PathBuf>) -> Result<Self> {
-        let channel = Self::build_channel(&static_endpoint)?;
-        Ok(Self {
-            file,
-            state: Mutex::new(ChannelSourceState {
-                fingerprint: None,
-                endpoint: static_endpoint,
-                channel,
-            }),
-        })
-    }
-
-    fn build_channel(endpoint: &str) -> Result<Channel> {
-        let raw_endpoint = endpoint.to_string();
-        let built = Endpoint::from_shared(raw_endpoint.clone())
-            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
-        Ok(built.connect_lazy())
-    }
-
-    /// The channel and endpoint to send the next RPC on.
-    ///
-    /// Infallible by design: any problem reading, parsing, or dialling a
-    /// candidate from the file is logged and metered, and the channel already
-    /// in force is returned unchanged. The file mechanism can only ever hand
-    /// out a channel it built successfully — it can never hand back "no
-    /// channel", and it can never leave a caller with a channel that was
-    /// discarded mid-swap. Building the replacement happens under the same
-    /// lock that publishes it, so a heartbeat and a sandbox-event batch
-    /// racing this at the same moment either both see the old target or both
-    /// see the new one, never a mix, and an in-flight RPC on the outgoing
-    /// channel is unaffected — it already holds its own clone and keeps
-    /// running to completion or failure on it; nothing here cancels it.
-    fn current(&self) -> (Channel, String) {
-        let Some(path) = self.file.as_ref() else {
-            let state = self
-                .state
-                .lock()
-                .expect("scheduler channel state is poisoned");
-            return (state.channel.clone(), state.endpoint.clone());
-        };
-
-        let mut state = self
-            .state
-            .lock()
-            .expect("scheduler channel state is poisoned");
-
-        // Skip the read when the file is byte-for-byte the one already held.
-        // A heartbeat is rare enough that a stat per tick costs nothing, and
-        // this keeps the common case — nobody has touched the file — to
-        // exactly that.
-        let fingerprint = std::fs::metadata(path)
-            .and_then(|meta| Ok((meta.modified()?, meta.len())))
-            .ok();
-        if let (Some(fingerprint), Some(held)) = (fingerprint, state.fingerprint) {
-            if fingerprint == held {
-                metrics::counter!(SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "unchanged")
-                    .increment(1);
-                return (state.channel.clone(), state.endpoint.clone());
-            }
-        }
-
-        match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                let candidate = contents.trim();
-                if candidate.is_empty() {
-                    warn!(
-                        path = %path.display(),
-                        "scheduler endpoint file is empty; keeping the last endpoint that was \
-                         read successfully. An empty file is not a valid target — write a real \
-                         endpoint to change it, or stop mounting the file to fall back to the \
-                         static endpoint at the next restart"
-                    );
-                    metrics::counter!(
-                        SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "empty_kept_previous"
-                    )
-                    .increment(1);
-                    return (state.channel.clone(), state.endpoint.clone());
-                }
-
-                if candidate == state.endpoint {
-                    // Same target, different bytes on disk (e.g. a rewrite
-                    // with identical content, or added trailing whitespace).
-                    // Remember the new fingerprint so the next tick takes the
-                    // fast path above, but there is no channel to rebuild.
-                    state.fingerprint = fingerprint;
-                    metrics::counter!(
-                        SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "same_value"
-                    )
-                    .increment(1);
-                    return (state.channel.clone(), state.endpoint.clone());
-                }
-
-                match Self::build_channel(candidate) {
-                    Ok(channel) => {
-                        info!(
-                            previous_endpoint = %state.endpoint,
-                            new_endpoint = %candidate,
-                            "observability heartbeat target changed"
-                        );
-                        state.fingerprint = fingerprint;
-                        state.endpoint = candidate.to_string();
-                        state.channel = channel.clone();
-                        metrics::counter!(
-                            SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "switched"
-                        )
-                        .increment(1);
-                        (channel, candidate.to_string())
-                    }
-                    Err(err) => {
-                        // 🔴 Never fail open, and never fail *closed* either —
-                        // a malformed edit to the ConfigMap must not stop
-                        // heartbeating. Keep dialling the last endpoint that
-                        // parsed, and do not update the fingerprint: an
-                        // operator fixing the typo produces a new mtime/len,
-                        // which is picked up on the very next tick without
-                        // needing this branch to remember anything.
-                        error!(
-                            path = %path.display(),
-                            candidate_endpoint = candidate,
-                            error = %err,
-                            "scheduler endpoint file names an endpoint that cannot be dialled; \
-                             keeping the previous heartbeat target"
-                        );
-                        metrics::counter!(
-                            SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "invalid_kept_previous"
-                        )
-                        .increment(1);
-                        (state.channel.clone(), state.endpoint.clone())
-                    }
-                }
-            }
-            Err(err) => {
-                // 🔴 Same "never fail open" rule as
-                // `ControlPlaneGate::file_tokens`: a read error is not
-                // evidence the endpoint changed, it is evidence of nothing at
-                // all, and treating it as "fall back to the static value"
-                // would let a single disk hiccup silently redirect every
-                // future heartbeat.
-                warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "cannot read the scheduler endpoint file; keeping the last endpoint that was \
-                     read successfully"
-                );
-                metrics::counter!(
-                    SCHEDULER_ENDPOINT_RELOAD_METRIC, "result" => "error_kept_previous"
-                )
-                .increment(1);
-                (state.channel.clone(), state.endpoint.clone())
-            }
-        }
-    }
-}
-
 impl ReporterConfig {
     fn resolve(
         config: &ObservabilitySchedulerReportConfig,
@@ -743,9 +548,8 @@ impl ReporterConfig {
             return None;
         };
 
-        let scheduler_endpoint_file = Some(config.scheduler_endpoint_file.trim())
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
+        let scheduler_endpoint_file =
+            crate::scheduler_endpoint::resolve_endpoint_file(cluster_config, config);
 
         Some(ReporterConfig {
             scheduler_endpoint,
@@ -764,8 +568,16 @@ mod tests {
     use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
     pub(super) fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
+        make_cluster_config_with_file(endpoint, None)
+    }
+
+    pub(super) fn make_cluster_config_with_file(
+        endpoint: Option<&str>,
+        scheduler_endpoint_file: Option<&str>,
+    ) -> ClusterConfig {
         ClusterConfig {
             scheduler_endpoint: endpoint.map(|s| s.to_string()),
+            scheduler_endpoint_file: scheduler_endpoint_file.unwrap_or_default().to_string(),
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
@@ -1009,123 +821,47 @@ mod tests {
         assert_eq!(result.scheduler_endpoint_file, None);
     }
 
-    /// The behaviour this whole slice exists to add: a channel source with no
-    /// file configured is exactly what the reporter did before it, forever —
-    /// no stat, no re-read, no drift from the static endpoint.
-    #[tokio::test]
-    async fn channel_source_with_no_file_never_changes_its_endpoint() {
-        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), None)
-            .expect("a valid endpoint builds a source");
-
-        let (_channel, endpoint) = source.current();
-        assert_eq!(endpoint, "http://scheduler-a:9090");
-        // A second call must agree, and must not have gone looking for a file
-        // that was never configured.
-        let (_channel, endpoint) = source.current();
-        assert_eq!(endpoint, "http://scheduler-a:9090");
-    }
-
-    #[tokio::test]
-    async fn channel_source_adopts_a_new_endpoint_from_the_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("scheduler-endpoint");
-        std::fs::write(&path, "http://scheduler-b:9090\n").expect("seed the file");
-
-        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
-            .expect("a valid static endpoint builds a source");
-
-        let (_channel, endpoint) = source.current();
-        assert_eq!(
-            endpoint, "http://scheduler-b:9090",
-            "a readable file must override the static endpoint"
+    /// 🔴 Step 0.5's D1 precedence, exercised through the actual integration
+    /// point rather than only against
+    /// `scheduler_endpoint::resolve_endpoint_file` directly: the reporter
+    /// must wire `[cluster].scheduler_endpoint_file` through, and prefer it
+    /// over the deprecated `[observability.scheduler_report]` field when
+    /// both are set.
+    #[test]
+    fn resolve_prefers_the_cluster_endpoint_file_over_the_deprecated_one() {
+        let cluster = make_cluster_config_with_file(
+            Some("http://scheduler:9090"),
+            Some("/etc/cluster/scheduler-endpoint"),
         );
-    }
-
-    #[tokio::test]
-    async fn channel_source_falls_back_to_the_static_endpoint_when_the_file_is_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("does-not-exist");
-
-        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
-            .expect("a valid static endpoint builds a source even if the file is absent");
-
-        let (_channel, endpoint) = source.current();
-        assert_eq!(
-            endpoint, "http://scheduler-a:9090",
-            "a file that was never read successfully must not blank the target"
+        let cfg = make_report_config_with_file(
+            Some(true),
+            None,
+            Some("/etc/deprecated/scheduler-endpoint"),
         );
-    }
-
-    #[tokio::test]
-    async fn channel_source_ignores_an_empty_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("scheduler-endpoint");
-        std::fs::write(&path, "").expect("write an empty file");
-
-        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
-            .expect("a valid static endpoint builds a source");
-
-        let (_channel, endpoint) = source.current();
+        let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
         assert_eq!(
-            endpoint, "http://scheduler-a:9090",
-            "an empty file is not a valid target and must not clear the endpoint"
-        );
-    }
-
-    #[tokio::test]
-    async fn channel_source_ignores_a_file_naming_an_endpoint_that_cannot_be_dialled() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("scheduler-endpoint");
-        std::fs::write(&path, "not a valid endpoint\twith control chars").expect("write junk");
-
-        let source = SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path))
-            .expect("a valid static endpoint builds a source");
-
-        let (_channel, endpoint) = source.current();
-        assert_eq!(
-            endpoint, "http://scheduler-a:9090",
-            "a candidate that fails to parse must keep the previous, working target"
-        );
-    }
-
-    #[tokio::test]
-    async fn channel_source_picks_up_a_second_edit_after_the_first() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("scheduler-endpoint");
-        std::fs::write(&path, "http://scheduler-b:9090").expect("first write");
-
-        let source =
-            SchedulerChannelSource::new("http://scheduler-a:9090".to_string(), Some(path.clone()))
-                .expect("a valid static endpoint builds a source");
-        assert_eq!(source.current().1, "http://scheduler-b:9090");
-
-        // A different length as well as different bytes: the fingerprint this
-        // relies on is (mtime, len), and two writes issued back to back on a
-        // filesystem with coarse mtime resolution could otherwise collide on
-        // both — this makes the length alone enough to tell them apart even
-        // if that ever happens.
-        std::thread::sleep(Duration::from_millis(5));
-        std::fs::write(&path, "http://scheduler-charlie:9090").expect("second write");
-        assert_eq!(
-            source.current().1,
-            "http://scheduler-charlie:9090",
-            "the source must keep tracking the file across more than one edit"
+            result.scheduler_endpoint_file,
+            Some(PathBuf::from("/etc/cluster/scheduler-endpoint")),
+            "[cluster].scheduler_endpoint_file must win when both are set"
         );
     }
 }
 
 /// The one test in this file that goes over a real socket rather than
-/// inspecting [`SchedulerChannelSource`]'s state directly.
+/// inspecting [`crate::scheduler_endpoint::SchedulerEndpointSource`]'s state
+/// directly (that type's own file-reload behavior is covered where it now
+/// lives, `src/scheduler_endpoint.rs`).
 ///
 /// 🔴 It exists because of what a real regression on this repository's dev
 /// cluster looked like: a config-reload change that read the new value fine,
 /// updated every place a human would check, passed every test that asserted
 /// on *values* — and never dialled anywhere else, because nothing rebuilt the
-/// channel. Every test above this one would pass under that bug, because they
-/// all call [`SchedulerChannelSource::current`] directly and that function
-/// was exactly what regressed. This test instead runs the reporter's real
-/// background loop against two real gRPC servers and asks the only question
-/// that matters: after the switch, which one receives the next heartbeat.
+/// channel. A test that only calls `SchedulerEndpointSource::current`
+/// directly would pass under that bug just the same, if `ObservabilityReporter`
+/// itself stopped calling `current()` per tick. This test instead runs the
+/// reporter's real background loop against two real gRPC servers and asks
+/// the only question that matters: after the switch, which one receives the
+/// next heartbeat.
 #[cfg(test)]
 mod against_a_scheduler {
     use std::net::SocketAddr;

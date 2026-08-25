@@ -28,11 +28,12 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::proto::scheduler as pb;
+use crate::scheduler_endpoint::SchedulerEndpointSource;
 use crate::snapshot::repository::interfaces::{
     CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter,
     SnapshotListPage, StartedBuild,
@@ -176,7 +177,7 @@ pub enum CatalogWrite<T> {
 
 /// gRPC-backed [`SnapshotCatalog`].
 pub struct CentralSnapshotCatalog {
-    channel: Channel,
+    endpoint_source: SchedulerEndpointSource,
     cluster_id: Uuid,
     /// This process's own identity — never a placement decision.
     ///
@@ -205,22 +206,58 @@ pub struct CentralSnapshotCatalog {
 }
 
 impl CentralSnapshotCatalog {
-    /// Builds a client pointed at `endpoint`.
+    /// Builds a client pointed at `endpoint`, with no file-driven
+    /// hot-reload — the static endpoint for the rest of this process's
+    /// lifetime. Production assembly uses
+    /// [`connect_hot_reloadable`](Self::connect_hot_reloadable) instead;
+    /// this constructor stays simple for tests and any caller with no
+    /// reason to reach for the other one.
     ///
     /// Lazy, like every other gRPC client here: the endpoint is parsed now and
     /// dialled on first use, so a controller that is still rolling does not
     /// stop the node from starting.
     pub fn connect_lazy(endpoint: &str, cluster_id: Uuid, node_id: String) -> anyhow::Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.to_string())
-            .map_err(|error| anyhow!("invalid scheduler endpoint '{endpoint}': {error}"))?
-            .connect_lazy();
-
-        Ok(Self::over_channel(channel, cluster_id, node_id))
+        let endpoint_source =
+            SchedulerEndpointSource::spawn(endpoint.to_string(), None, "snapshot_catalog")?;
+        Ok(Self::over_endpoint_source(
+            endpoint_source,
+            cluster_id,
+            node_id,
+        ))
     }
 
-    pub fn over_channel(channel: Channel, cluster_id: Uuid, node_id: String) -> Self {
+    /// [`connect_lazy`](Self::connect_lazy), but the endpoint can be
+    /// hot-reloaded from `[cluster].scheduler_endpoint_file` (or its
+    /// deprecated fallback) while the process runs — see
+    /// [`SchedulerEndpointSource::spawn_from_config`]. This is what
+    /// `build_central_catalog` uses.
+    pub fn connect_hot_reloadable(
+        endpoint: &str,
+        cluster: &crate::cfg::ClusterConfig,
+        scheduler_report: &crate::cfg::ObservabilitySchedulerReportConfig,
+        cluster_id: Uuid,
+        node_id: String,
+    ) -> anyhow::Result<Self> {
+        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
+            endpoint.to_string(),
+            cluster,
+            scheduler_report,
+            "snapshot_catalog",
+        )?;
+        Ok(Self::over_endpoint_source(
+            endpoint_source,
+            cluster_id,
+            node_id,
+        ))
+    }
+
+    pub fn over_endpoint_source(
+        endpoint_source: SchedulerEndpointSource,
+        cluster_id: Uuid,
+        node_id: String,
+    ) -> Self {
         Self {
-            channel,
+            endpoint_source,
             cluster_id,
             node_id,
             call_timeout: GRPC_CALL_TIMEOUT,
@@ -237,7 +274,7 @@ impl CentralSnapshotCatalog {
     }
 
     fn client(&self) -> pb::snapshot_catalog_client::SnapshotCatalogClient<Channel> {
-        pb::snapshot_catalog_client::SnapshotCatalogClient::new(self.channel.clone())
+        pb::snapshot_catalog_client::SnapshotCatalogClient::new(self.endpoint_source.channel())
     }
 
     fn request<T>(&self, message: T) -> tonic::Request<T> {

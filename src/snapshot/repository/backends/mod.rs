@@ -306,11 +306,15 @@ fn build_central_catalog(config: &AppConfig) -> Result<Option<Arc<CentralSnapsho
         )?;
     let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
 
-    Ok(Some(Arc::new(CentralSnapshotCatalog::connect_lazy(
-        endpoint,
-        identity.cluster_id,
-        identity.id,
-    )?)))
+    Ok(Some(Arc::new(
+        CentralSnapshotCatalog::connect_hot_reloadable(
+            endpoint,
+            &config.cluster,
+            &config.observability.scheduler_report,
+            identity.cluster_id,
+            identity.id,
+        )?,
+    )))
 }
 
 fn build_storage_backend(

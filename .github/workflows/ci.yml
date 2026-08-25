@@ -79,6 +79,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y redis-server
+      # 🔴 Same gap as the Redis one above, for `src/pg/`: `AENV_PG_TEST_REQUIRED`
+      # is what turns "no postgres server on this machine" into a failure
+      # instead of a `SKIPPED[postgres]` line counted as a pass (see
+      # `src/pg/harness.rs`), and nothing before this job set it or installed a
+      # server — so the election/advisory-lock suite, including the
+      # panic-recovery regression test, had never actually run in CI.
+      # `apt-get install postgresql` (rather than trusting whatever the runner
+      # image happens to preinstall) puts `initdb`/`postgres` under
+      # `/usr/lib/postgresql/<version>/bin/`, which is off `PATH` on
+      # Debian/Ubuntu — `src/pg/harness.rs::find_bin` and `Makefile`'s
+      # `test-with-postgres` preflight both already know to look there.
+      - name: Install PostgreSQL server for the pg advisory-lock election tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
       - name: Unit tests
         env:
           # Naming the binary is what makes a failed install fail this job:
@@ -91,6 +106,9 @@ jobs:
           # inside the harness however it was reached, including a package that
           # installs but will not start.
           AENV_REDIS_TEST_REQUIRED: "1"
+          # The same belt for `src/pg/`'s real-server tests — see the step
+          # above.
+          AENV_PG_TEST_REQUIRED: "1"
         run: make test-unit PROFILE=debug
       # 🔴 The step above is what makes those 67 run; this one is what keeps
       # them running. `test-with-redis` is the target CLAUDE.md names as the one
@@ -105,3 +123,12 @@ jobs:
         env:
           REDIS_SERVER_BIN: /usr/bin/redis-server
         run: make test-with-redis
+      # 🔴 Same belt-and-braces as the Redis step above, for `src/pg/`: this is
+      # the target CLAUDE.md documents as the one to run for anything touching
+      # `src/pg/`, and it checks what the `AENV_PG_TEST_REQUIRED=1` unit-test
+      # run above cannot — that `initdb`/`postgres` were actually found and
+      # runnable *before* the suite started (`make`'s own preflight fails the
+      # job outright otherwise) and that no `SKIPPED[postgres]` line reached
+      # the log by any path.
+      - name: pg tests against a real PostgreSQL
+        run: make test-with-postgres

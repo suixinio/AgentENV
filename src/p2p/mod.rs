@@ -51,6 +51,8 @@ fn peer_discovery_from_config(
 
     SchedulerPeerDiscovery::start(
         scheduler_endpoint,
+        &config.cluster,
+        &config.observability.scheduler_report,
         node_identity.id.clone(),
         node_identity.cluster_id.to_string(),
         p2p.peer_discovery_refresh_interval,

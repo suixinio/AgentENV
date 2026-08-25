@@ -6,14 +6,16 @@ use async_trait::async_trait;
 use rand::RngExt;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint as GrpcEndpoint};
+use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{debug, info, trace, warn};
 
+use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
 use crate::p2p::discovery::P2pPeerDiscovery;
 use crate::p2p::error::Result;
 use crate::p2p::types::{P2pArtifactKey, P2pEndpoint, P2pPeer};
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
+use crate::scheduler_endpoint::SchedulerEndpointSource;
 
 const REFRESH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const ARTIFACT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,15 +23,25 @@ const ARTIFACT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct SchedulerPeerDiscovery {
     peers: Arc<RwLock<Vec<P2pPeer>>>,
     refresh_task: JoinHandle<()>,
-    client: SchedulerClient<Channel>,
+    endpoint_source: SchedulerEndpointSource,
     local_node_id: String,
     cluster_id: String,
     backend: Option<String>,
 }
 
 impl SchedulerPeerDiscovery {
+    /// Starts P2P peer discovery against the scheduler, hot-reloadable from
+    /// `[cluster].scheduler_endpoint_file` (or its deprecated fallback)
+    /// while the process runs — see
+    /// [`SchedulerEndpointSource::spawn_from_config`]. An invalid *static*
+    /// endpoint degrades to [`crate::p2p::discovery::NoopP2pPeerDiscovery`]
+    /// rather than failing this process's startup: unlike the paused
+    /// registry or resume placement, P2P is an optimization this process can
+    /// run correctly without.
     pub fn start(
         scheduler_endpoint: String,
+        cluster: &ClusterConfig,
+        scheduler_report: &ObservabilitySchedulerReportConfig,
         local_node_id: String,
         cluster_id: String,
         refresh_interval: Duration,
@@ -44,8 +56,13 @@ impl SchedulerPeerDiscovery {
             "starting scheduler P2P peer discovery"
         );
         let peers = Arc::new(RwLock::new(Vec::new()));
-        let channel = match GrpcEndpoint::from_shared(scheduler_endpoint.clone()) {
-            Ok(endpoint) => endpoint.connect_lazy(),
+        let endpoint_source = match SchedulerEndpointSource::spawn_from_config(
+            scheduler_endpoint.clone(),
+            cluster,
+            scheduler_report,
+            "p2p_discovery",
+        ) {
+            Ok(source) => source,
             Err(err) => {
                 warn!(
                     scheduler_endpoint,
@@ -55,9 +72,8 @@ impl SchedulerPeerDiscovery {
                 return Arc::new(crate::p2p::discovery::NoopP2pPeerDiscovery);
             }
         };
-        let client = SchedulerClient::new(channel);
         let refresh_task = tokio::spawn(refresh_scheduler_peers(
-            client.clone(),
+            endpoint_source.clone(),
             local_node_id.clone(),
             cluster_id.clone(),
             refresh_interval,
@@ -67,7 +83,7 @@ impl SchedulerPeerDiscovery {
         Arc::new(Self {
             peers: Arc::clone(&peers),
             refresh_task,
-            client,
+            endpoint_source,
             local_node_id,
             cluster_id,
             backend,
@@ -91,7 +107,7 @@ impl P2pPeerDiscovery for SchedulerPeerDiscovery {
         let Some(backend) = self.backend.as_deref() else {
             return Ok(Vec::new());
         };
-        let mut client = self.client.clone();
+        let mut client = SchedulerClient::new(self.endpoint_source.channel());
         let mut request = Request::new(scheduler::LookupP2pArtifactRequest {
             cluster_id: self.cluster_id.clone(),
             backend: backend.to_string(),
@@ -112,7 +128,7 @@ impl P2pPeerDiscovery for SchedulerPeerDiscovery {
         let Some(backend) = self.backend.as_deref() else {
             return Ok(());
         };
-        let mut client = self.client.clone();
+        let mut client = SchedulerClient::new(self.endpoint_source.channel());
         let mut request = Request::new(scheduler::RecordP2pArtifactRequest {
             cluster_id: self.cluster_id.clone(),
             backend: backend.to_string(),
@@ -131,7 +147,7 @@ impl P2pPeerDiscovery for SchedulerPeerDiscovery {
         let Some(backend) = self.backend.as_deref() else {
             return Ok(());
         };
-        let mut client = self.client.clone();
+        let mut client = SchedulerClient::new(self.endpoint_source.channel());
         let mut request = Request::new(scheduler::ForgetP2pArtifactRequest {
             cluster_id: self.cluster_id.clone(),
             backend: backend.to_string(),
@@ -148,7 +164,7 @@ impl P2pPeerDiscovery for SchedulerPeerDiscovery {
 }
 
 async fn refresh_scheduler_peers(
-    mut client: SchedulerClient<Channel>,
+    endpoint_source: SchedulerEndpointSource,
     local_node_id: String,
     cluster_id: String,
     refresh_interval: Duration,
@@ -161,6 +177,15 @@ async fn refresh_scheduler_peers(
     sleep(jitter).await;
 
     loop {
+        // 🔴 The one place in this consumer that has to rebuild the client
+        // every iteration rather than holding one for the loop's lifetime.
+        // `SchedulerPeerDiscovery`'s other three methods each ask
+        // `endpoint_source.channel()` fresh per call already; this loop is
+        // long-running by construction, so a client built once outside it
+        // would keep talking to whatever channel was live at task-spawn time
+        // forever — the hot-reload would take effect for nothing this
+        // process does, `endpoint_source` notwithstanding.
+        let mut client = SchedulerClient::new(endpoint_source.channel());
         match list_scheduler_p2p_peers(
             &mut client,
             &local_node_id,

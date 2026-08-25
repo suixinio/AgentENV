@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -37,6 +37,7 @@ use super::{
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::proto::scheduler as pb;
+use crate::scheduler_endpoint::SchedulerEndpointSource;
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
@@ -57,9 +58,11 @@ const GET_MANY_CHUNK: usize = 1_000;
 
 /// gRPC-backed [`PausedSandboxRegistry`].
 pub struct CentralPausedSandboxRegistry {
-    /// The connection pool. Cloning it is cheap and shares the same
-    /// connection, so each call makes its own client over this.
-    channel: Channel,
+    /// The channel source. Reading it is cheap and shares the same
+    /// underlying channel (unless a hot-reload just swapped it), so each
+    /// call makes its own client over whatever it currently returns —
+    /// see [`SchedulerEndpointSource`].
+    endpoint_source: SchedulerEndpointSource,
     cluster_id: Uuid,
     /// This machine's identity, used by the transitions the trait does not hand
     /// one — the conditional writes, which are arbitrated by generation rather
@@ -84,13 +87,20 @@ pub struct CentralPausedSandboxRegistry {
 }
 
 impl CentralPausedSandboxRegistry {
-    /// Builds a registry pointed at `endpoint`.
+    /// Builds a registry pointed at `endpoint`, with no file-driven
+    /// hot-reload — the static endpoint for the rest of this process's
+    /// lifetime. Production assembly uses
+    /// [`connect_hot_reloadable`](Self::connect_hot_reloadable) instead —
+    /// this type is not re-exported past `crate::orchestrator`, so this
+    /// constructor has no caller outside this crate's own tests, hence
+    /// `#[cfg(test)]`.
     ///
     /// Lazy, like every other gRPC client here: the endpoint is parsed now and
     /// dialled on first use, so a controller that is still rolling does not
     /// stop the node from starting. What that costs — a startup-time release
     /// that fails and used to never be retried — is paid for separately, by
     /// making that release retryable while it is still exact.
+    #[cfg(test)]
     pub fn connect_lazy(
         endpoint: &str,
         cluster_id: Uuid,
@@ -98,12 +108,10 @@ impl CentralPausedSandboxRegistry {
         lease_ttl_secs: u64,
         reconcile_interval_secs: u64,
     ) -> anyhow::Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.to_string())
-            .map_err(|e| anyhow!("invalid scheduler endpoint '{endpoint}': {e}"))?
-            .connect_lazy();
-
-        Ok(Self::over_channel(
-            channel,
+        let endpoint_source =
+            SchedulerEndpointSource::spawn(endpoint.to_string(), None, "paused_registry")?;
+        Ok(Self::over_endpoint_source(
+            endpoint_source,
             cluster_id,
             node_id,
             lease_ttl_secs,
@@ -111,15 +119,44 @@ impl CentralPausedSandboxRegistry {
         ))
     }
 
-    fn over_channel(
-        channel: Channel,
+    /// [`connect_lazy`](Self::connect_lazy), but the endpoint can be
+    /// hot-reloaded from `[cluster].scheduler_endpoint_file` (or its
+    /// deprecated fallback) while the process runs — see
+    /// [`SchedulerEndpointSource::spawn_from_config`]. This is what
+    /// `build_paused_registry` uses.
+    pub fn connect_hot_reloadable(
+        endpoint: &str,
+        cluster: &crate::cfg::ClusterConfig,
+        scheduler_report: &crate::cfg::ObservabilitySchedulerReportConfig,
+        cluster_id: Uuid,
+        node_id: String,
+        lease_ttl_secs: u64,
+        reconcile_interval_secs: u64,
+    ) -> anyhow::Result<Self> {
+        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
+            endpoint.to_string(),
+            cluster,
+            scheduler_report,
+            "paused_registry",
+        )?;
+        Ok(Self::over_endpoint_source(
+            endpoint_source,
+            cluster_id,
+            node_id,
+            lease_ttl_secs,
+            reconcile_interval_secs,
+        ))
+    }
+
+    fn over_endpoint_source(
+        endpoint_source: SchedulerEndpointSource,
         cluster_id: Uuid,
         node_id: String,
         lease_ttl_secs: u64,
         reconcile_interval_secs: u64,
     ) -> Self {
         Self {
-            channel,
+            endpoint_source,
             cluster_id,
             node_id,
             lease_ttl_millis: i64::try_from(lease_ttl_secs.saturating_mul(1_000))
@@ -138,7 +175,7 @@ impl CentralPausedSandboxRegistry {
     }
 
     fn client(&self) -> pb::paused_registry_client::PausedRegistryClient<Channel> {
-        pb::paused_registry_client::PausedRegistryClient::new(self.channel.clone())
+        pb::paused_registry_client::PausedRegistryClient::new(self.endpoint_source.channel())
     }
 
     /// Wraps a message in a request carrying the call budget.
@@ -1384,8 +1421,8 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_outlives_its_budget_is_a_failure_not_an_answer() {
         let harness = harness().await;
-        let registry = CentralPausedSandboxRegistry::over_channel(
-            harness.registry.channel.clone(),
+        let registry = CentralPausedSandboxRegistry::over_endpoint_source(
+            harness.registry.endpoint_source.clone(),
             harness.cluster_id,
             NODE.to_string(),
             90,

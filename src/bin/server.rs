@@ -574,6 +574,7 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
         &config.cluster,
+        &config.observability.scheduler_report,
         &core.identity,
     )
     .await?;
@@ -1034,6 +1035,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
         &config.cluster,
+        &config.observability.scheduler_report,
         &identity_for_registry,
     )
     .await?;

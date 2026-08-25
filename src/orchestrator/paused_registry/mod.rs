@@ -29,7 +29,10 @@ use anyhow::{bail, Context};
 use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
-use crate::cfg::{ClusterConfig, PausedRegistryBackendKind, PausedRegistryConfig};
+use crate::cfg::{
+    ClusterConfig, ObservabilitySchedulerReportConfig, PausedRegistryBackendKind,
+    PausedRegistryConfig,
+};
 use crate::identity::NodeIdentity;
 use crate::orchestrator::PauseOutcome;
 use crate::snapshot::SnapshotId;
@@ -558,6 +561,7 @@ pub(super) fn log_claim_outcome(
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
     cluster: &ClusterConfig,
+    scheduler_report: &ObservabilitySchedulerReportConfig,
     identity: &NodeIdentity,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
     let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
@@ -592,8 +596,10 @@ pub async fn build_paused_registry(
                     )?;
 
                 (
-                    Arc::new(CentralPausedSandboxRegistry::connect_lazy(
+                    Arc::new(CentralPausedSandboxRegistry::connect_hot_reloadable(
                         endpoint,
+                        cluster,
+                        scheduler_report,
                         identity.cluster_id,
                         identity.id.clone(),
                         config.lease_ttl_secs(),
@@ -721,7 +727,7 @@ mod claim_outcome_tests {
 #[cfg(test)]
 mod build_tests {
     use super::*;
-    use crate::cfg::PausedRegistryConfig;
+    use crate::cfg::{ObservabilitySchedulerReportConfig, PausedRegistryConfig};
     use crate::logging::capture::Recorder;
 
     fn config(backend: PausedRegistryBackendKind) -> PausedRegistryConfig {
@@ -735,9 +741,18 @@ mod build_tests {
     fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
             scheduler_endpoint: scheduler_endpoint.map(str::to_string),
+            scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
+        }
+    }
+
+    fn scheduler_report() -> ObservabilitySchedulerReportConfig {
+        ObservabilitySchedulerReportConfig {
+            enabled: false,
+            interval_secs: 5,
+            scheduler_endpoint_file: String::new(),
         }
     }
 
@@ -750,6 +765,7 @@ mod build_tests {
         let registry = build_paused_registry(
             &config(PausedRegistryBackendKind::Local),
             &cluster(None),
+            &scheduler_report(),
             &identity(),
         )
         .await
@@ -763,6 +779,7 @@ mod build_tests {
         let registry = build_paused_registry(
             &config(PausedRegistryBackendKind::Central),
             &cluster(Some("http://scheduler.invalid:9090")),
+            &scheduler_report(),
             &identity(),
         )
         .await
@@ -782,6 +799,7 @@ mod build_tests {
                 build_paused_registry(
                     &config(PausedRegistryBackendKind::Central),
                     &cluster(endpoint),
+                    &scheduler_report(),
                     &identity(),
                 )
                 .await
@@ -807,6 +825,7 @@ mod build_tests {
             // A perfectly usable endpoint, so nothing about *this* is what
             // makes it fail.
             &cluster(Some("http://scheduler.invalid:9090")),
+            &scheduler_report(),
             &identity(),
         )
         .await;
@@ -841,9 +860,14 @@ mod build_tests {
         ] {
             let recorder = Recorder::default();
             let guard = recorder.install();
-            build_paused_registry(&config(backend), &cluster(endpoint), &identity())
-                .await
-                .expect("neither backend dials anything here");
+            build_paused_registry(
+                &config(backend),
+                &cluster(endpoint),
+                &scheduler_report(),
+                &identity(),
+            )
+            .await
+            .expect("neither backend dials anything here");
             drop(guard);
 
             // The backend, so "the switch took" is readable on its own; the

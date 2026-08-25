@@ -35,6 +35,15 @@
 > §8 陷阱 4 的警报**响错了地方**。§5.1 的 bytes-then-commit 劈分**没有任何一个阶段认领**。
 > §4.2.1 挂的那条跨仓依赖被用户裁决**不予考虑**，⇒ 它自己写的退路转正为主路。
 > 逐条处置在 **§13**。
+>
+> **v7（2026-08-25）**：阶段 4 那句「Go 侧 2,143 行量级」错了一个量级 ——
+> 2,143 从来不是 AgentENV 自己代码的量，是**借来的 e2b 数字**（§2.1 表里
+> `placement`/`nodemanager`/`discovery` 的 e2b 行数），当成本仓的移植成本估算用。
+> 实测 `services/scheduler` 非测试 16,991 行，真正对应阶段 4 范围
+> （节点清册/放置/发现）的只有约 1,481 行；差额大头是 `internal/registry`
+> 一个包 4,044 行 ＋ `internal/catalog` 3,613 行，两者都不在「port 五个文件」的范围里，
+> 但也不能假装它们会自己消失——**§4.2 那句「`paused_sandboxes` 表…整个消失」的前提本身不成立**，
+> 见新增 §4.2.3。§7 阶段 4 与 §2.3 都已按实测改写。
 
 ---
 
@@ -165,7 +174,8 @@ node 的 `src/api` 28,520 ＋ `src/orchestrator` 16,016 ＋ `src/snapshot` 14,15
 >
 > 在「不背债、要最优」的前提下，正确答案是**阶段 4 把 `scheduler` 折叠进 `api`**：
 > port `placement` / `filter` / `strategy` / `kubernetes_discovery` / `node_registry`
-> 的等价物（Go 侧 2,143 行量级），换掉一个进程、一份重复清册、一跳 RPC。
+> 的等价物（🔧 v7 实测约 1,481 行，不是 2,143——2,143 是借来的 e2b 数字，
+> 详见 §7 阶段 4），换掉一个进程、一份重复清册、一跳 RPC。
 >
 > ⇒ 最终进程表 = `gateway` / `api` / `node`，**和 e2b 逐个对得上**。
 > 不抄的只剩一件事：`api` 是 Rust 写的。
@@ -447,6 +457,56 @@ contract —— 正是 §2.2 反对的「只为序列化而存在的镜像类型
 > 一处**不必照抄**：e2b 的 store 按 team 分片（`storage/redis/utils.go:62` 的
 > `SameSlot(teamID)`）是 Redis Cluster hash slot 的需求。我们没有租户模型（§4.4），
 > store key 可以是扁平的。**隔离的理由是跨语言契约，不是键推导。**
+
+### 4.2.3 🔴 v7：`paused_sandboxes` 的写路径语义在 Redis 里没有对应物 —— §4.2「整个消失」不成立
+
+上面那句「`paused_sandboxes` 表不是搬到 Redis，是整个消失」说的是**读路径**：
+暂停沙箱不再活在活跃态 store 里，变成一行目录记录，这半没问题。
+没说清的是**写路径**——`paused_sandboxes` 今天不只是一张表，是一套分布式协议：
+claim（`ClaimForResume` 的三分法）、lease（`RenewLease` / `RenewParkedLeases` /
+`RenewLiveLeases` 三条续租语句 ＋ TTL 下限）、fencing（`begin_pause` /
+`mark_running` / `complete_pause` 的 `execution_id` CAS）、reclaim
+（`ReclaimExpiredHoldings` 的「租约过期 **且** deadline 已过」双条件）。
+
+活跃态 store 那半的设计（§4.2 本节 ＋ v6 在 §4.2.1 补的 `origin_node_id` / `published`）
+从头到尾只有 `execution_id` ＋ `node_id`（＋ v6 补的两列），**没有 generation、
+没有续租循环、没有 reclaim 定时器、没有 fencing 谓词**。对照
+`src/orchestrator/store/mod.rs:350-364` 的 `PausedHandle::Remote`——
+它是今天 Redis 侧活跃态 store 对「暂停沙箱在哪」唯一携带的信息：
+
+```rust
+Remote {
+    reference: PausedStateRef,       // 字节在哪
+    origin_node_id: Option<String>,  // 哪台机器
+}
+```
+
+只有「字节在哪台机器上」，不带 generation / lease / claimant。**这不是疏漏，
+是活跃态 store 这个结构从设计上就没打算装它。**
+
+⇒ 「删除批」（§7 阶段 3「删除动作放下一个 release」、阶段 4 折叠 `scheduler`
+时 `internal/registry` 怎么办）的前提原本是「反正这些语义整个消失了，删的是死代码」。
+**这个前提不成立**：`internal/registry` 今天 4,044 行非测试代码（`services/scheduler/internal/registry`，
+2026-08-25 实测），加上对面 `src/orchestrator/paused_registry`（§7 已量过，3,564 行），
+实现的正是上一段那四件事，而这四件事在目标形态里**没有认领方**——
+folding 计划里「port 五个文件」（§7 阶段 4，见下）覆盖的是节点清册/放置/发现，
+从未提过 claim/lease/fencing/reclaim 搬去哪。
+
+真要删，删的不是死代码，是「在 Redis 上重新实现一遍分布式协议」：CAS 生成号、
+三态续租、双条件 reclaim、跨节点 fencing，每一条都要在新后端上重新证明正确性。
+**这个仓库自己的提交历史就是这套协议有多难一次做对的证据**——
+仅最近几次修复就有「让健康节点自己的心跳续上 running 行的租约」
+（`151d00b`）、「照 claimant 而非 holder 判定 Resuming 能不能被 reap」（`91409b0`）、
+「别把 resuming 行路由给它自己的 claimant」（`1fcefbd`）、「靠租约单独放掉一个卡住的
+首次 resume claim」（`7335219`）—— 都是在**今天这套已经跑在生产的 PG 实现**上，
+一次一个语义漏洞地修。把同一套协议在 Redis 上从零实现一遍，
+预算应该按「数千行 + 多轮集群验收驱动的修复」估，不是按「port 几个文件」估。
+
+**结论**：§7 阶段 4 的 1,481 行是「节点清册/放置/发现」这部分真实的 port 成本，
+是准的；但它**不覆盖** `paused_sandboxes` 的写路径协议，那部分要么继续留在
+`internal/registry`（folding 之后 `scheduler` 进程下线、这套逻辑随 `api` 一起搬，
+代码量不变、只是换了个进程边界），要么单独立项重写，**不能假装它已经在
+「整个消失」那句话里被处理掉了**。
 
 ### 4.3 职责边界，逐条
 
@@ -1197,7 +1257,40 @@ src/orchestrator/paused_registry           3,564 行
 **前置**：阶段 3。
 
 **做**：把 `placement` / `filter` / `strategy` / `kubernetes_discovery` / `node_registry`
-的等价物 port 进 `api`（Go 侧 2,143 行量级）；心跳直接打到 `api`；`scheduler` 进程下线。
+的等价物 port 进 `api`；心跳直接打到 `api`；`scheduler` 进程下线。
+
+> 🔧 **v7：规模重估，「Go 侧 2,143 行量级」错了一个量级。** 2,143 从来不是
+> AgentENV 自己代码的量——它是 §2.1 表里 e2b `placement`/`nodemanager`/`discovery`
+> 三个包**自己的** Go 行数，被借来当作本仓 port 成本的估算基数，这个借用本身就不成立。
+>
+> 2026-08-25 实测（`services/scheduler` 非测试代码）：
+>
+> ```
+> services/scheduler 非测试合计              16,991 行
+>   internal/registry                         4,044 行
+>   internal/catalog                          3,613 行
+>                                            --------
+>   减去 registry 后仍剩                     12,947 行
+>
+>   真正对应本节范围（节点清册/放置/发现）：
+>     node_registry.go                          824 行
+>     kubernetes_discovery.go                   379 行
+>     filter.go                                 118 行
+>     strategy.go                                60 行
+>     warmup.go                                 100 行
+>                                            --------
+>                                              1,481 行
+> ```
+>
+> **1,481 行才是本节「port 五个文件」的准确估算**，比借来的 2,143 更小；
+> 但 `internal/registry` 那 4,044 行**不在这五个文件里，也没有别的地方接手它**——
+> 它实现的是 `paused_sandboxes` 的 claim / lease / fencing / reclaim 协议，
+> 而 §4.2 的活跃态 store 设计里没有这套语义的落点（详见新增 §4.2.3）。
+> `scheduler` 进程下线不等于这 4,044 行连同它背后的协议一起消失：
+> 要么随这次折叠原样搬进 `api`（代码量不变，只换进程边界），
+> 要么单独立项在 Redis 上重新实现一遍——按§4.2.3 的证据，那是数千行
+> 加多轮集群验收驱动修复的量级，不能算进本阶段的 port 成本，
+> 也不能当「删除批」的验收判据。
 
 🔴 **硬前提是阶段 3 第 5 条已经落地。** `scheduler` 下线意味着 `LookupNode` 消失，
 而它今天正是 gateway 的未命中回落。冷路径此时必须已经改成「调 `api` 唤醒」，

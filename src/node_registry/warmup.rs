@@ -26,7 +26,7 @@
 //! "unavailable").
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use super::registry::NodeRegistry;
@@ -36,7 +36,13 @@ pub const DEFAULT_WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct WarmupGate {
     nodes: Arc<dyn NodeRegistry>,
-    deadline: SystemTime,
+    /// `RwLock`, not a plain field: [`Self::rebase_deadline`] needs to move
+    /// this after construction — see its own doc comment for why a gate
+    /// constructed once and armed later needs that at all. Reads (every
+    /// [`Self::warmed_up`] call) are far more frequent than the single
+    /// rebase a caller is expected to perform, so an uncontended `RwLock`
+    /// read is the right trade rather than an atomic epoch encoding.
+    deadline: RwLock<SystemTime>,
     /// Latched once warm: nodes come and go afterwards, and a node joining
     /// an hour later must not put the gate back into warm-up.
     warm: AtomicBool,
@@ -49,17 +55,51 @@ pub struct WarmupGate {
 
 impl WarmupGate {
     pub fn new(nodes: Arc<dyn NodeRegistry>, timeout: Duration, now: SystemTime) -> Self {
+        Self {
+            nodes,
+            deadline: RwLock::new(Self::effective_deadline(now, timeout)),
+            warm: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    fn effective_deadline(now: SystemTime, timeout: Duration) -> SystemTime {
         let timeout = if timeout > Duration::ZERO {
             timeout
         } else {
             DEFAULT_WARMUP_TIMEOUT
         };
-        Self {
-            nodes,
-            deadline: now + timeout,
-            warm: AtomicBool::new(false),
-            reported: AtomicBool::new(false),
-        }
+        now + timeout
+    }
+
+    /// Moves the deadline to `now + timeout`, superseding whatever
+    /// [`Self::new`] computed it as.
+    ///
+    /// 🔴 Exists because `start_native_node_registry`
+    /// (`src/bin/server.rs`) has to construct this gate (and hand it to
+    /// `NodeRegistryGrpcService`, which the gRPC listener is built around)
+    /// *before* that listener binds — but the clock this timeout should be
+    /// measured from is when the listener actually starts being able to
+    /// receive a `Heartbeat` RPC, not when the gate happened to be
+    /// constructed earlier in `assemble_api`'s sequence. See
+    /// `AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS`'s own doc comment
+    /// (`cfg.rs`) for the measured cost of getting this wrong: assembly
+    /// between the two points has run over 15s end to end, which is enough
+    /// to expire the whole default timeout before a heartbeat could
+    /// possibly have arrived, latching the gate "warm" on the very first
+    /// `warmed_up` call with zero heartbeats received.
+    ///
+    /// Harmless to call after the gate has already gone warm (every known
+    /// node reported before the listener even finished binding, the
+    /// fast/healthy case): [`Self::warmed_up`] short-circuits on `warm`
+    /// before it ever reads the deadline this moves, so a rebase at that
+    /// point changes a value nothing looks at again.
+    pub fn rebase_deadline(&self, now: SystemTime, timeout: Duration) {
+        let mut deadline = self
+            .deadline
+            .write()
+            .expect("warmup deadline lock poisoned");
+        *deadline = Self::effective_deadline(now, timeout);
     }
 
     /// Records that a node has delivered a heartbeat, and with it the
@@ -81,7 +121,8 @@ impl WarmupGate {
         if self.warm.load(Ordering::SeqCst) {
             return true;
         }
-        if now >= self.deadline {
+        let deadline = *self.deadline.read().expect("warmup deadline lock poisoned");
+        if now >= deadline {
             self.warm.store(true, Ordering::SeqCst);
             return true;
         }
@@ -212,11 +253,51 @@ mod tests {
         heartbeat(&registry, &gate, "node-a", now);
         assert!(gate.warmed_up(now), "expected the gate to open");
 
-        registry.set(vec![node("node-a"), node("node-b")], Vec::new());
+        registry.set(vec![node("node-a"), node("node-b")], Vec::new(), now);
 
         assert!(
             gate.warmed_up(now),
             "a newly discovered node must not reopen warm-up"
+        );
+    }
+
+    // ---- rebase_deadline: the gRPC-bind-not-construction-time fix ----
+
+    #[test]
+    fn rebase_deadline_moves_when_the_deadline_falls() {
+        let registry: Arc<dyn NodeRegistry> = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a")],
+            Duration::from_secs(30),
+        ));
+        // Constructed as if the assembly sequence before the gRPC listener
+        // bound had already burned the whole timeout — exactly the bug
+        // this exists to fix.
+        let constructed_at = unix(0);
+        let gate = WarmupGate::new(registry, Duration::from_secs(15), constructed_at);
+        assert!(
+            gate.warmed_up(constructed_at + Duration::from_secs(15)),
+            "sanity: without a rebase the original deadline would already have passed"
+        );
+
+        // The listener actually binds much later — rebase from there.
+        let bound_at = unix(1_000);
+        let gate = {
+            let registry: Arc<dyn NodeRegistry> = Arc::new(AtomicNodeRegistry::new(
+                vec![node("node-a")],
+                Duration::from_secs(30),
+            ));
+            WarmupGate::new(registry, Duration::from_secs(15), constructed_at)
+        };
+        gate.rebase_deadline(bound_at, Duration::from_secs(15));
+
+        assert!(
+            !gate.warmed_up(bound_at + Duration::from_secs(14)),
+            "the rebased deadline must still hold the gate shut this close to it"
+        );
+        assert!(
+            gate.warmed_up(bound_at + Duration::from_secs(15)),
+            "the rebased deadline, not the original construction-time one, must be what opens \
+             the gate"
         );
     }
 }

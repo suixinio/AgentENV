@@ -1155,6 +1155,28 @@ pub struct ClusterConfig {
     /// [`NodePlacementSource`]'s doc comment.
     #[config(nested)]
     pub kubernetes_discovery: ClusterKubernetesDiscoveryConfig,
+    /// How long [`crate::node_registry::warmup::WarmupGate`] withholds a
+    /// binding-store "not found" answer while waiting for every node
+    /// discovery currently knows about to report at least one heartbeat.
+    /// Mirrors Go's `defaultWarmupTimeout`
+    /// ([`crate::node_registry::warmup::DEFAULT_WARMUP_TIMEOUT`], `15`) as
+    /// the default; `0` also falls back to that default (same convention as
+    /// `WarmupGate::new` already applied to a hardcoded value before this
+    /// existed as a config knob).
+    ///
+    /// 🔴 The clock this timeout is measured from starts when
+    /// `start_native_node_registry`'s (`src/bin/server.rs`) gRPC listener —
+    /// the same listener `Heartbeat` RPCs arrive on — actually binds, not
+    /// when the gate is constructed: constructing it is one of the first
+    /// things `assemble_api` does, well before `RedisMetadataStore::connect`,
+    /// `Orchestrator::new`, `SnapshotManager::new`, `build_paused_registry`,
+    /// and `release_stale_node_holdings` (which makes a network call of its
+    /// own) all run. That assembly sequence has measured over 15s end to
+    /// end; a deadline started that early can expire before the listener a
+    /// heartbeat would arrive on even exists, latching the gate "warm" on
+    /// the very first `warmed_up` call with zero heartbeats received.
+    #[config(default = 15u64, env = "AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS")]
+    pub native_warmup_timeout_secs: u64,
 }
 
 /// Rust-side counterpart of Go's `SchedulerDiscoveryKubernetesConfig`
@@ -1206,6 +1228,30 @@ pub struct ClusterKubernetesDiscoveryConfig {
         env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_NO_SCHEDULE_POD_SELECTOR"
     )]
     pub no_schedule_pod_selector: String,
+    /// [`crate::node_registry::registry::EmptySyncGuard::confirmations`] —
+    /// how many consecutive all-empty discovery syncs in a row confirm that
+    /// the cluster genuinely has no nodes, rather than one sync being a
+    /// transient re-LIST. See
+    /// [`crate::node_registry::registry::AtomicNodeRegistry`]'s own module
+    /// doc comment ("Deliberate divergence from Go") for why this exists.
+    /// `0` and `1` both mean "the first empty sync confirms it immediately"
+    /// — Go's original, unconditional behavior, deliberately still
+    /// reachable rather than special-cased away.
+    #[config(
+        default = 3u32,
+        env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_EMPTY_SYNC_CONFIRMATIONS"
+    )]
+    pub empty_sync_confirmations: u32,
+    /// [`crate::node_registry::registry::EmptySyncGuard::window`], in
+    /// seconds — how long the first all-empty discovery sync may stand
+    /// unconfirmed before wall-clock time alone confirms it, independent of
+    /// [`Self::empty_sync_confirmations`]. `0` means the first call confirms
+    /// it immediately.
+    #[config(
+        default = 60u64,
+        env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_EMPTY_SYNC_WINDOW_SECS"
+    )]
+    pub empty_sync_window_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -4399,6 +4445,7 @@ endpoint = "http://second:9000"
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
             kubernetes_discovery: Default::default(),
+            native_warmup_timeout_secs: 15,
         };
         config.normalize();
         assert_eq!(config.scheduler_endpoint, None);
@@ -4411,6 +4458,7 @@ endpoint = "http://second:9000"
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
             kubernetes_discovery: Default::default(),
+            native_warmup_timeout_secs: 15,
         };
         config.normalize();
         assert_eq!(

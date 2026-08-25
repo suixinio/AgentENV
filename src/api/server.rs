@@ -561,7 +561,13 @@ mod tests {
             "regression control: an existing gated route must still be gated"
         );
         assert_ne!(
-            status(router(), Method::GET, "/debug/example-registry", Some(TOKEN)).await,
+            status(
+                router(),
+                Method::GET,
+                "/debug/example-registry",
+                Some(TOKEN)
+            )
+            .await,
             StatusCode::FORBIDDEN,
             "the correct credential must reach the merged-in debug route"
         );

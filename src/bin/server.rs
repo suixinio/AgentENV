@@ -1193,6 +1193,24 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .await?
     };
 
+    // 🔴 The warm-up clock, for real this time: `start_native_node_registry`
+    // had to arm `WarmupGate` before this listener existed (it hands the
+    // gate to `NodeRegistryGrpcService`, which the closure above serves) —
+    // see that construction's own comment. Now that the listener has
+    // actually bound and can receive a `Heartbeat` RPC, rebase the deadline
+    // to start counting from here, not from wherever assembly happened to
+    // be earlier. A no-op under `[cluster].node_placement_source =
+    // "scheduler"` (`native_warmup_handle` is `None`) and cheap even when it
+    // is not — see `WarmupGate::rebase_deadline`'s own doc comment for why
+    // this is safe to call unconditionally, including on a gate that has
+    // already gone warm.
+    if let Some(warmup) = native_warmup_handle.as_ref() {
+        warmup.rebase_deadline(
+            std::time::SystemTime::now(),
+            Duration::from_secs(config.cluster.native_warmup_timeout_secs),
+        );
+    }
+
     // 🔴 P5: built as its own `Router` and merged into the *generated*
     // control-plane router by `server::new_with_control_plane_routes`,
     // rather than `.route(..)`-ed onto the fully assembled `Router` `server::new`
@@ -1431,10 +1449,24 @@ async fn start_native_node_registry(
         "no_schedule_pod_selector",
     )?;
 
-    let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
+    let registry = Arc::new(AtomicNodeRegistry::with_empty_sync_guard(
+        Vec::new(),
+        Duration::from_secs(30),
+        agentenv::node_registry::registry::EmptySyncGuard {
+            confirmations: discovery.empty_sync_confirmations,
+            window: Duration::from_secs(discovery.empty_sync_window_secs),
+        },
+    ));
+    // 🔴 This is only the gate's *initial* arming — `now` here is when
+    // assembly reached this point, well before the gRPC listener this
+    // registry's `Heartbeat` RPC arrives on actually binds.
+    // `assemble_api` rebases this deadline (`WarmupGate::rebase_deadline`)
+    // once that listener is actually up; see that call site's own comment
+    // and `AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS`'s doc comment (`cfg.rs`)
+    // for why the two clocks must not be the same one.
     let warmup = Arc::new(WarmupGate::new(
         Arc::clone(&registry) as Arc<dyn agentenv::node_registry::registry::NodeRegistry>,
-        Duration::from_secs(15),
+        Duration::from_secs(config.native_warmup_timeout_secs),
         std::time::SystemTime::now(),
     ));
     let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));

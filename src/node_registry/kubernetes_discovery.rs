@@ -747,7 +747,7 @@ fn sync_from_state(
     };
     let (active, lingering) =
         filter_nodes_by_pod_labels(active, lingering, ignore.as_ref(), no_schedule.as_ref());
-    registry.set(active, lingering);
+    registry.set(active, lingering, std::time::SystemTime::now());
 }
 
 #[cfg(test)]
@@ -1118,7 +1118,7 @@ mod tests {
             )],
             &default_cfg(),
         );
-        registry.set(active1, Vec::new());
+        registry.set(active1, Vec::new(), now);
         for node_id in ["agentenv-node-a", "agentenv-node-b"] {
             registry
                 .heartbeat(
@@ -1145,7 +1145,7 @@ mod tests {
             )],
             &default_cfg(),
         );
-        registry.set(active2, Vec::new());
+        registry.set(active2, Vec::new(), now);
 
         let snapshot = registry.snapshot(false);
         assert_eq!(snapshot.len(), 1);

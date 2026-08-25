@@ -6,8 +6,14 @@
 //! [`AtomicNodeRegistry`] is the concrete type; [`NodeRegistry`] is the trait
 //! every consumer should depend on (mirroring Go's implicit interface of the
 //! same name), so a future consumer can be tested against a fake without
-//! reaching for the concrete type. Neither is wired into any runtime path
-//! yet — see the module-level doc comment on `src/node_registry/mod.rs`.
+//! reaching for the concrete type.
+//!
+//! 🔴 Both are wired into a live runtime path from Stage A on:
+//! `start_native_node_registry` (`src/bin/server.rs`) builds an
+//! [`AtomicNodeRegistry`] and hands it to `NodeRegistryGrpcService`, whose
+//! `Heartbeat` RPC is the process's real, network-reachable heartbeat
+//! surface under `[cluster].node_placement_source = "native"`. This matters
+//! below: a bug here is not a bug in a data structure nothing calls yet.
 //!
 //! Two data structures, kept in step under one lock:
 //!
@@ -35,6 +41,78 @@
 //! `cpu_intersection_is_withheld_again_when_a_new_node_joins_the_cluster`
 //! below, must be invalidated again the moment a node this cache never
 //! accounted for reports in for the first time.
+//!
+//! # Deliberate divergence from Go: an all-empty [`AtomicNodeRegistry::set`]
+//! # is not applied immediately
+//!
+//! Go's `AtomicNodeRegistry.Set` (`node_registry.go`) applies every call it
+//! receives immediately and unconditionally, including one that reports zero
+//! active and zero lingering nodes. [`EmptySyncGuard`] below is this port's
+//! one intentional behavioral difference from that, and it exists because of
+//! a difference in what calling `set` with an empty list can mean here that
+//! it never could on the Go side:
+//!
+//! - [`super::kubernetes_discovery::nodes_from_endpoint_slices`]'s own doc
+//!   comment records that an empty result is not only an error path — a
+//!   `Service` rename or recreation, a mistyped label selector, or every
+//!   endpoint transiently reporting non-`Serving` all produce a **successful**
+//!   re-LIST with zero entries, indistinguishable at `set`'s call site from
+//!   "the cluster has genuinely scaled to zero nodes." The watcher rebuild
+//!   this crate performs after `MAX_CONSECUTIVE_WATCH_ERRORS` (see that
+//!   module) republishes exactly this shape on its first `InitDone`.
+//! - Applying that call immediately does not just clear `nodes_by_id`. `set`'s
+//!   own stale-cleanup pass then walks every `observed` record whose node id
+//!   is no longer in the new (empty) `nodes_by_id` — which, for an all-empty
+//!   sync, is every record — and calls `clear_roster` + `observed.remove` +
+//!   `intersection_sent.remove` on each one. That is not a discovery-only
+//!   change: it is this process's only record of which sandboxes exist on
+//!   which node evaporating in one call.
+//! - And it does not self-heal by itself: once a node is out of
+//!   `nodes_by_id`, its `Heartbeat` calls come back `NodeNotInRegistry`
+//!   (`heartbeat`'s own `canonical_id`/lookup below) until the *next*
+//!   successful, non-empty `set`. A registry emptied by one bad sync stays
+//!   empty — and every consumer reading it as "this node is gone" — until
+//!   discovery recovers.
+//!
+//! Go's port never had a live consumer for which any of that mattered — see
+//! this module's own correction above. This build's `Heartbeat` gRPC surface
+//! does, from Stage A on, and its downstream consequence is concrete, not
+//! theoretical: `RemoteSandboxStub::confirm_or_defer` reads "this node is
+//! gone" out of exactly this state and reports `RuntimeConfirmedGone`, which
+//! the orchestrator's pause path (`src/orchestrator/service.rs`) uses to
+//! *delete a paused sandbox's record from the cluster store*. A transient,
+//! self-correcting discovery blip must not be able to trigger that.
+//!
+//! [`EmptySyncGuard`] is the mitigation: an all-empty `set` while the
+//! registry currently holds nodes (or while an earlier all-empty `set` is
+//! already pending) is treated as *suspected*, not authoritative — it is
+//! withheld until either [`EmptySyncGuard::confirmations`] consecutive
+//! all-empty calls have arrived, or [`EmptySyncGuard::window`] has elapsed
+//! since the first one, whichever comes first. Either threshold reaching
+//! zero degrades to Go's original "apply immediately" behavior, which is
+//! deliberately still reachable rather than special-cased away — a real
+//! scale-to-zero must still actually take effect eventually, and does, via
+//! either threshold. A single non-empty `set` call at any point resets the
+//! pending state entirely: discovery reporting real nodes again is itself
+//! proof the empty answer was transient.
+//!
+//! What this module does *not* attempt: making `heartbeat` self-heal by
+//! auto-registering a node the discovery-derived `nodes_by_id` does not
+//! currently know about. `NodeNotInRegistry` — refusing a heartbeat from a
+//! node discovery has not (yet, or no longer) vouched for — mirrors Go's own
+//! `ErrNodeNotInRegistry` deliberately: discovery is this registry's sole
+//! source of truth for *which node ids are real*, matching the same RBAC
+//! -gated `EndpointSlice`/`Pod` watches, not an unauthenticated claim in a
+//! heartbeat payload. Letting a heartbeat insert an id `set` never vouched
+//! for would let anything that can reach the gRPC port assert its own
+//! identity into the registry, bypassing discovery entirely — a materially
+//! larger change to the trust model than delaying a wipe. With
+//! [`EmptySyncGuard`] in place, the remaining window where a genuinely live
+//! node's heartbeat is refused because of a wipe is bounded by the same
+//! confirmation/window thresholds and self-corrects on discovery's own next
+//! successful sync — a live [`super::kubernetes_discovery::KubernetesDiscovery`]
+//! watch re-lists continuously, not on some external trigger, so that next
+//! sync is not something an operator has to cause.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -51,6 +129,43 @@ use super::types::{Node, Roster, RosterEntry};
 pub const DEFAULT_OBSERVED_REPORT_TTL: Duration = Duration::from_secs(30);
 
 const ROSTER_ENTRY_DROPPED_METRIC: &str = "node_registry_roster_entry_dropped_total";
+const EMPTY_SYNC_PENDING_METRIC: &str = "agentenv_api_node_registry_empty_sync_pending";
+
+/// How many consecutive all-empty [`AtomicNodeRegistry::set`] calls, or how
+/// much wall-clock time since the first one — whichever is reached first —
+/// before an all-empty sync is treated as confirmed rather than suspected.
+/// See this module's own doc comment for why an all-empty `set` is not
+/// applied on the first call the way Go's `Set` applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptySyncGuard {
+    /// How many consecutive all-empty `set` calls confirm the wipe. `0` or
+    /// `1` both mean "the first call confirms it" — the same as Go's
+    /// unconditional-apply behavior, reachable deliberately rather than
+    /// special-cased away (see the module doc).
+    pub confirmations: u32,
+    /// How long the first all-empty `set` call may stand unconfirmed before
+    /// wall-clock time alone confirms it, independent of how many calls
+    /// arrived. `Duration::ZERO` means the first call confirms it
+    /// immediately, the same as `confirmations <= 1`.
+    pub window: Duration,
+}
+
+/// Mirrors `services/scheduler/internal/kubernetes_discovery.go`'s own retry
+/// cadence loosely: long enough that one transient re-LIST (a Service
+/// recreation, a momentary label-selector mismatch) is very unlikely to
+/// still be reporting empty, short enough that a real scale-to-zero is not
+/// held stale for long.
+pub const DEFAULT_EMPTY_SYNC_CONFIRMATIONS: u32 = 3;
+pub const DEFAULT_EMPTY_SYNC_WINDOW: Duration = Duration::from_secs(60);
+
+impl Default for EmptySyncGuard {
+    fn default() -> Self {
+        Self {
+            confirmations: DEFAULT_EMPTY_SYNC_CONFIRMATIONS,
+            window: DEFAULT_EMPTY_SYNC_WINDOW,
+        }
+    }
+}
 
 /// Mirrors Go's `ErrNodeNotInRegistry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -162,6 +277,12 @@ struct Inner {
     /// The reverse of the rosters: sandbox id -> the nodes that reported
     /// holding it.
     sandbox_holders: HashMap<String, HashSet<String>>,
+    /// [`EmptySyncGuard`]'s bookkeeping: `None` when there is no pending
+    /// all-empty [`AtomicNodeRegistry::set`] call awaiting confirmation.
+    /// `Some((since, confirmations))` while one is pending — `since` is when
+    /// the *first* consecutive all-empty call arrived, `confirmations` how
+    /// many have arrived since (this one included).
+    pending_empty_sync: Option<(SystemTime, u32)>,
 }
 
 impl Inner {
@@ -335,10 +456,24 @@ impl Inner {
 /// moving between the two implementations recognizes the type).
 pub struct AtomicNodeRegistry {
     inner: RwLock<Inner>,
+    empty_sync_guard: EmptySyncGuard,
 }
 
 impl AtomicNodeRegistry {
     pub fn new(nodes: Vec<Node>, observed_ttl: Duration) -> Self {
+        Self::with_empty_sync_guard(nodes, observed_ttl, EmptySyncGuard::default())
+    }
+
+    /// Same as [`Self::new`], with an explicit [`EmptySyncGuard`] instead of
+    /// [`EmptySyncGuard::default`] — for `start_native_node_registry`
+    /// (`src/bin/server.rs`), which wires `[cluster.kubernetes_discovery]`'s
+    /// configured thresholds through, and for tests exercising the guard's
+    /// own timing.
+    pub fn with_empty_sync_guard(
+        nodes: Vec<Node>,
+        observed_ttl: Duration,
+        empty_sync_guard: EmptySyncGuard,
+    ) -> Self {
         let ttl = if observed_ttl > Duration::ZERO {
             observed_ttl
         } else {
@@ -354,16 +489,73 @@ impl AtomicNodeRegistry {
                 cpu_intersection: HashMap::new(),
                 intersection_sent: HashSet::new(),
                 sandbox_holders: HashMap::new(),
+                pending_empty_sync: None,
             }),
+            empty_sync_guard,
         };
-        registry.set(nodes, Vec::new());
+        // `inner.nodes_by_id` starts empty regardless of `nodes`, so this
+        // first call is never an empty-to-empty transition and the guard
+        // never engages here — not even when `nodes` is itself empty (the
+        // common case: every caller but `start_native_node_registry`'s
+        // bootstrap constructs with `Vec::new()` and populates through the
+        // first real discovery sync). `SystemTime::now()` is inert in
+        // exactly that situation; a test exercising the guard's own timing
+        // constructs with `Vec::new()` and drives `set` explicitly with its
+        // own clock instead.
+        registry.set(nodes, Vec::new(), SystemTime::now());
         registry
     }
 
     /// Replaces the discovered node list. `active` nodes are serving and not
     /// terminating; `lingering` nodes are serving but terminating (graceful
     /// shutdown).
-    pub fn set(&self, active: Vec<Node>, lingering: Vec<Node>) {
+    ///
+    /// An all-empty call (`active` and `lingering` both empty) is not
+    /// applied on the first sighting when the registry currently holds
+    /// nodes, or when an earlier all-empty call is already pending — see
+    /// [`EmptySyncGuard`] and this module's own doc comment for why, and for
+    /// what "applied" means once it is.
+    pub fn set(&self, active: Vec<Node>, lingering: Vec<Node>, now: SystemTime) {
+        let incoming_is_empty = active.is_empty() && lingering.is_empty();
+
+        let mut inner = self.inner.write().expect("node registry lock poisoned");
+
+        if incoming_is_empty {
+            let currently_populated = !inner.nodes_by_id.is_empty();
+            if currently_populated || inner.pending_empty_sync.is_some() {
+                let (since, prior_confirmations) = inner.pending_empty_sync.unwrap_or((now, 0));
+                let confirmations = prior_confirmations + 1;
+                let elapsed = now.duration_since(since).unwrap_or(Duration::ZERO);
+                let confirmed = confirmations >= self.empty_sync_guard.confirmations.max(1)
+                    || elapsed >= self.empty_sync_guard.window;
+
+                if !confirmed {
+                    inner.pending_empty_sync = Some((since, confirmations));
+                    metrics::gauge!(EMPTY_SYNC_PENDING_METRIC).set(1.0);
+                    tracing::warn!(
+                        confirmations,
+                        elapsed_secs = elapsed.as_secs(),
+                        needs_confirmations = self.empty_sync_guard.confirmations,
+                        needs_window_secs = self.empty_sync_guard.window.as_secs(),
+                        "node registry: discovery reported zero nodes; withholding the wipe of \
+                         discovery/observed state until confirmed (see AtomicNodeRegistry::set's \
+                         own doc comment)"
+                    );
+                    return;
+                }
+
+                tracing::warn!(
+                    confirmations,
+                    elapsed_secs = elapsed.as_secs(),
+                    "node registry: an all-empty discovery sync is now confirmed; clearing \
+                     discovery and observed state"
+                );
+            }
+        }
+
+        inner.pending_empty_sync = None;
+        metrics::gauge!(EMPTY_SYNC_PENDING_METRIC).set(0.0);
+
         let mut by_id: HashMap<String, Node> =
             HashMap::with_capacity(active.len() + lingering.len());
         for node in &active {
@@ -383,7 +575,6 @@ impl AtomicNodeRegistry {
             aliases.insert(node.pod_name.clone(), node.id.clone());
         }
 
-        let mut inner = self.inner.write().expect("node registry lock poisoned");
         inner.nodes_by_id = by_id;
         inner.alias_to_id = aliases;
         inner.lingering_ids = lingering_ids;
@@ -1040,7 +1231,7 @@ mod tests {
             .heartbeat(&ready_heartbeat("node-a", "cluster-a"), now)
             .unwrap();
 
-        registry.set(vec![node("node-a", "http://node-a-new")], Vec::new());
+        registry.set(vec![node("node-a", "http://node-a-new")], Vec::new(), now);
 
         let observed = registry
             .get_observed("node-a", "cluster-a", now)
@@ -1232,7 +1423,7 @@ mod tests {
     fn lingering_node_becomes_unhealthy_after_ttl() {
         let registry = AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(1));
         let start = unix(100);
-        registry.set(Vec::new(), vec![node("node-a", "http://node-a")]);
+        registry.set(Vec::new(), vec![node("node-a", "http://node-a")], start);
         registry
             .heartbeat(&ready_heartbeat("node-a", "cluster-a"), start)
             .unwrap();
@@ -1396,6 +1587,7 @@ mod tests {
                 pod_name: "agentenv-node-xk29f".to_string(),
             }],
             Vec::new(),
+            unix(100),
         );
 
         let (node, _) = registry
@@ -1422,6 +1614,7 @@ mod tests {
                 pod_name: "agentenv-node-xk29f".to_string(),
             }],
             Vec::new(),
+            unix(100),
         );
         let now = unix(100);
 
@@ -1447,6 +1640,7 @@ mod tests {
                 node("aenv-worker-02", "http://10.0.0.2:8000"),
             ],
             Vec::new(),
+            unix(100),
         );
 
         let (node, _) = registry
@@ -1466,6 +1660,7 @@ mod tests {
                 pod_name: "agentenv-node-xk29f".to_string(),
             }],
             Vec::new(),
+            unix(100),
         );
 
         let err = registry
@@ -1622,7 +1817,7 @@ mod tests {
         heartbeat_with_roster(&registry, "node-a", "cluster-a", now, &["s1"]);
         heartbeat_with_roster(&registry, "node-b", "cluster-a", now, &["s2"]);
 
-        registry.set(vec![node("node-b", "http://node-b")], Vec::new());
+        registry.set(vec![node("node-b", "http://node-b")], Vec::new(), now);
 
         assert!(registry.nodes_holding("s1").is_empty());
         assert_eq!(registry.nodes_holding("s2"), vec!["node-b"]);
@@ -1677,7 +1872,7 @@ mod tests {
         assert_eq!(z.len(), 1);
         assert_eq!(z[0].node_id, "node-silent");
 
-        registry.set(vec![node("node-a", "http://node-a")], Vec::new());
+        registry.set(vec![node("node-a", "http://node-a")], Vec::new(), now);
         let after = registry.rosters_in_cluster("cluster-a");
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].node_id, "node-a");
@@ -1724,6 +1919,7 @@ mod tests {
                 node("node-c", "http://node-c"),
             ],
             Vec::new(),
+            unix(100),
         );
         let result = heartbeat_with_config(&registry, "node-c", "cluster-1", "");
         assert!(
@@ -1764,6 +1960,7 @@ mod tests {
                 node("node-b", "http://node-b"),
             ],
             vec![node("node-c", "http://node-c")],
+            unix(100),
         );
 
         let no_lingering = registry.snapshot(false);
@@ -1790,8 +1987,18 @@ mod tests {
         assert_eq!(observed.snapshot.unwrap().status(), NodeStatus::Ready);
     }
 
+    /// 🔴 Renamed from `set_removes_observed_nodes_missing_from_discovery`:
+    /// with [`EmptySyncGuard`] in place, one all-empty `set` no longer
+    /// removes anything by itself — see this module's own doc comment on
+    /// the divergence from Go's `Set`. The removal mechanism this test
+    /// covers is unchanged; what changed is that it only fires once
+    /// confirmed. `an_all_empty_sync_is_withheld_until_confirmed` below
+    /// covers the withholding half on its own; this one drives the *default*
+    /// [`EmptySyncGuard`] all the way through confirmation, so production's
+    /// actual configuration is proven to still get there, not just a
+    /// specially-weakened guard built for the test.
     #[test]
-    fn set_removes_observed_nodes_missing_from_discovery() {
+    fn set_removes_observed_nodes_missing_from_discovery_once_the_empty_sync_is_confirmed() {
         let registry = AtomicNodeRegistry::new(
             vec![node("node-a", "http://node-a")],
             DEFAULT_OBSERVED_REPORT_TTL,
@@ -1801,9 +2008,167 @@ mod tests {
             .heartbeat(&ready_heartbeat("node-a", "cluster-a"), now)
             .unwrap();
 
-        registry.set(Vec::new(), Vec::new()); // removed from discovery
+        // The first all-empty sync is only suspected, not applied.
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(
+            registry.get_observed("node-a", "", now).is_some(),
+            "a single empty discovery sync must not immediately remove a previously known node"
+        );
+
+        // Reaching the default confirmation count applies it — one more
+        // call, since the first one above already counted as the first
+        // confirmation.
+        for _ in 1..DEFAULT_EMPTY_SYNC_CONFIRMATIONS {
+            registry.set(Vec::new(), Vec::new(), now);
+        }
 
         assert!(registry.get_observed("node-a", "", now).is_none());
         assert!(registry.list_observed("", now).is_empty());
+    }
+
+    // ---- EmptySyncGuard: the divergence from Go's Set (this module's own
+    //      doc comment) ----
+
+    #[test]
+    fn an_all_empty_sync_is_withheld_until_the_confirmation_count_is_reached() {
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                confirmations: 3,
+                // Large enough that only the count, never the window, can
+                // confirm within this test.
+                window: Duration::from_secs(10_000),
+            },
+        );
+        let now = unix(100);
+
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(
+            registry.snapshot(true).iter().any(|n| n.id == "node-a"),
+            "confirmation 1 of 3 must not yet apply the wipe"
+        );
+
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(
+            registry.snapshot(true).iter().any(|n| n.id == "node-a"),
+            "confirmation 2 of 3 must not yet apply the wipe"
+        );
+
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(
+            registry.snapshot(true).is_empty(),
+            "confirmation 3 of 3 must apply the wipe"
+        );
+    }
+
+    #[test]
+    fn an_all_empty_sync_confirms_via_the_time_window_even_short_of_the_confirmation_count() {
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                // High enough that the count alone never confirms within
+                // this test — only the window may.
+                confirmations: 1_000,
+                window: Duration::from_secs(30),
+            },
+        );
+        let start = unix(100);
+
+        registry.set(Vec::new(), Vec::new(), start);
+        assert!(
+            registry.snapshot(true).iter().any(|n| n.id == "node-a"),
+            "must not apply before the window elapses"
+        );
+
+        registry.set(Vec::new(), Vec::new(), start + Duration::from_secs(29));
+        assert!(
+            registry.snapshot(true).iter().any(|n| n.id == "node-a"),
+            "must not apply one second short of the window"
+        );
+
+        registry.set(Vec::new(), Vec::new(), start + Duration::from_secs(30));
+        assert!(
+            registry.snapshot(true).is_empty(),
+            "the window elapsing must apply the wipe even though the count never came close"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_sync_resets_a_pending_empty_confirmation() {
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                confirmations: 2,
+                window: Duration::from_secs(10_000),
+            },
+        );
+        let now = unix(100);
+
+        // One confirmation in — one more would apply the wipe.
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(registry.snapshot(true).iter().any(|n| n.id == "node-a"));
+
+        // Discovery reports a real (even if different) node list again —
+        // proof the empty answer was transient. This must reset the count,
+        // not merely pause it.
+        registry.set(vec![node("node-a", "http://node-a")], Vec::new(), now);
+        assert!(registry.snapshot(true).iter().any(|n| n.id == "node-a"));
+
+        // A fresh empty sync must need the full count again, not "one more".
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(
+            registry.snapshot(true).iter().any(|n| n.id == "node-a"),
+            "the reset must not be skipped — this is only the first confirmation since the \
+             non-empty sync, not the second"
+        );
+        registry.set(Vec::new(), Vec::new(), now);
+        assert!(
+            registry.snapshot(true).is_empty(),
+            "the second confirmation applies it"
+        );
+    }
+
+    #[test]
+    fn a_node_can_still_heartbeat_while_an_empty_sync_is_pending_confirmation() {
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                confirmations: 5,
+                window: Duration::from_secs(10_000),
+            },
+        );
+        let now = unix(100);
+
+        registry.set(Vec::new(), Vec::new(), now);
+
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), now)
+            .expect(
+                "a node discovery has not (yet) confirmed missing must still be able to \
+                 heartbeat — the withheld sync must not have removed it from nodes_by_id",
+            );
+    }
+
+    #[test]
+    fn a_zero_confirmation_guard_applies_an_empty_sync_immediately_matching_go() {
+        // `EmptySyncGuard::confirmations = 0` (or `1`) with a zero window is
+        // Go's original "apply every Set call unconditionally" behavior —
+        // deliberately still reachable, not special-cased away. See this
+        // module's own doc comment.
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                confirmations: 0,
+                window: Duration::ZERO,
+            },
+        );
+
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        assert!(registry.snapshot(true).is_empty());
     }
 }

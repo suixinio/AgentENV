@@ -14,6 +14,8 @@
 //! `--role node` startup outright if `[pg].dsn` is configured at all.
 #![allow(dead_code)]
 
+pub(crate) mod migrate;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 

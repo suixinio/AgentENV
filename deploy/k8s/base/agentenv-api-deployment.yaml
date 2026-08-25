@@ -317,14 +317,40 @@ spec:
             # 🔴 Left at the code default (`cfg.rs`'s `scheduler`), on
             # purpose, and stated rather than omitted — the same discipline
             # `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` above follows.
-            # Cluster acceptance flips this half to `native` by hand
-            # (`kubectl set env deployment/agentenv-api
-            # AENV_NODE_PLACEMENT_SOURCE=native`) once
-            # `AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT` is live on the
-            # DaemonSet (see the note there) — this manifest only carries the
-            # supporting discovery config so that switch is one `kubectl set
-            # env` away rather than also a rollout. Applying this file alone
-            # changes nothing about which placement source serves traffic.
+            #
+            # Cluster acceptance flips this half to `native` in two steps,
+            # in this order:
+            #   1. Confirm `AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT` is
+            #      live on the DaemonSet (see the note there) — i.e. the
+            #      rollout has actually reached every node Pod, not just
+            #      that the manifest was applied.
+            #   2. `kubectl set env deployment/agentenv-api
+            #      AENV_NODE_PLACEMENT_SOURCE=native`.
+            # Applying this file alone changes nothing about which placement
+            # source serves traffic; this manifest only carries the
+            # supporting discovery config so step 2 is one `kubectl set env`
+            # away rather than also a rollout.
+            #
+            # 🔴 Do NOT also set AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT
+            # on *this* Deployment to "match" the DaemonSet — it is a
+            # node-side setting (`cfg.rs`'s own doc: it lets *a node*
+            # dual-report to api's registry) and nothing on `--role api`
+            # ever reads it (`assemble_api` never starts a reporter). Setting
+            # it here would look tidy and do nothing.
+            #
+            # `start_native_node_registry` (`src/bin/server.rs`) used to hard
+            # -refuse to start when *this Deployment's own* copy of that
+            # setting was empty — which it always is, by the point above —
+            # so following steps 1-2 exactly as written used to
+            # CrashLoopBackOff every time. It now only warns (this process
+            # cannot confirm from its own config whether any node actually
+            # dual-reports to it); step 1 is still real and still matters,
+            # it is just verified operationally rather than enforced at
+            # startup — check `/debug/node-registry` or the
+            # `agentenv_api_node_registry_observed_nodes` metric after step 2
+            # to confirm heartbeats are actually landing, since a registry
+            # that started but never received one looks identical to a
+            # healthy one until queried.
             - name: AENV_NODE_PLACEMENT_SOURCE
               value: "scheduler"
             # The same namespace/Service/port/scheme

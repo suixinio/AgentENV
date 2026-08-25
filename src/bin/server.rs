@@ -1367,28 +1367,51 @@ async fn start_native_node_registry(
              to discover nodes from otherwise"
         );
     }
-    // 🔴 P1's second fix: a self-inflicted configuration this process can
-    // see from its own config and must refuse rather than start into. Under
-    // `Native`, this registry's only source of heartbeats is
-    // `[observability.scheduler_report].dual_report_api_endpoint` — the
-    // primary heartbeat always goes to `[cluster].scheduler_endpoint`, never
-    // to this process (`ObservabilityReporter::send_heartbeat`'s dual-report
-    // branch). Leave it unset and `WarmupGate` never sees a single
-    // `reported_in`, so it never leaves warm-up: every `resolve_node`/
-    // `node_membership` call refuses for the entire life of the process,
-    // which is indistinguishable at the call site from a scheduler that is
-    // permanently down. Better to refuse this at startup, loudly, than to
-    // let a replica run for its whole life quietly unable to answer either
-    // question.
+    // 🔴 P1's second fix, revised: this used to be a hard `anyhow::bail!`
+    // refusing to start. It was refusing on the wrong process's config.
+    // `dual_report_api_endpoint` (`cfg.rs`'s own doc: "lets *a node* report
+    // to both scheduler ... and api's registry") is a *sender*-side setting
+    // — it belongs to whatever process calls `ObservabilityReporter::
+    // send_heartbeat`, i.e. `--role node`/`--role all`, and is read there
+    // from *that* process's own `[observability.scheduler_report]` section.
+    // This function runs on `--role api`, where the same config struct
+    // exists but nothing ever consumes this particular field — `assemble_api`
+    // deliberately never starts a reporter (`reporter: None` in its
+    // `Assembly`; this half receives heartbeats, it does not send them). So
+    // this branch was gating api's own startup on a copy of a setting that
+    // does nothing on api regardless of its value, and the deployment
+    // manifest's own rollout instructions (`agentenv-api-deployment.yaml`)
+    // never set it there — following those instructions exactly as written
+    // hit this bail every time and CrashLoopBackOff'd.
+    //
+    // What is actually true and worth saying out loud: under `Native`, this
+    // registry's only source of heartbeats is some node's dual report to
+    // this replica's own `[cluster].api_grpc_addr` (fronted by a Service
+    // reaching every replica, e.g. http://agentenv-api:8002) — never
+    // `[cluster].scheduler_endpoint`, which is where the primary heartbeat
+    // always goes instead. If no node is configured that way, `WarmupGate`
+    // never sees a single `reported_in`, never leaves warm-up, and every
+    // `resolve_node`/`node_membership` call refuses for the process's whole
+    // life — indistinguishable at the call site from a scheduler that is
+    // permanently down. That is real and worth a loud warning; it is just
+    // not something this process's own config can confirm or deny, so it
+    // cannot be a startup refusal. Whether any node dual-reports here is
+    // verified operationally (`/debug/node-registry`, or the
+    // `agentenv_node_registry_observed_nodes` metric), not from this value.
     if dual_report_api_endpoint.trim().is_empty() {
-        anyhow::bail!(
-            "--role api needs [observability.scheduler_report].dual_report_api_endpoint \
-             (AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT) when \
-             [cluster].node_placement_source = \"native\": without it no node heartbeat ever \
-             reaches this registry, so it can never leave warm-up and every resolve_node/ \
-             node_membership call refuses for the life of the process — point it at this \
-             replica's own [cluster].api_grpc_addr, fronted by a Service reaching every \
-             replica (for example http://agentenv-api:8002)"
+        tracing::warn!(
+            "starting with [cluster].node_placement_source = \"native\" and this replica's own \
+             [observability.scheduler_report].dual_report_api_endpoint unset — that is normal \
+             here (it is a node-side setting; this process never sends heartbeats with it, see \
+             this branch's own comment) and not itself evidence of a problem. What matters is \
+             whether *some* node is configured with \
+             AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT pointed at this replica's own \
+             [cluster].api_grpc_addr (fronted by a Service reaching every replica, for example \
+             http://agentenv-api:8002). If none is, this registry never leaves warm-up and \
+             every resolve_node/node_membership call refuses for this process's whole life; \
+             confirm real heartbeats are landing (/debug/node-registry, or the \
+             agentenv_api_node_registry_observed_nodes metric) before relying on native \
+             placement"
         );
     }
     let kube_config = KubernetesDiscoveryConfig {
@@ -1774,23 +1797,24 @@ mod tests {
         );
     }
 
-    /// 🔴 P1's second fix: `[cluster].node_placement_source = "native"`
-    /// without `[observability.scheduler_report].dual_report_api_endpoint`
-    /// configured is a self-inflicted configuration — this registry's only
-    /// heartbeat source is the dual report, so without it `WarmupGate` never
-    /// leaves warm-up and every `resolve_node`/`node_membership` call
-    /// refuses for the process's whole life. That must fail loudly at
-    /// startup rather than run silently unable to answer either question.
+    /// 🔴 F2: `[observability.scheduler_report].dual_report_api_endpoint` is
+    /// a node-side setting (`cfg.rs`'s own doc: it lets *a node* dual-report
+    /// to api's registry) with no runtime consumer on `--role api` at all
+    /// (`assemble_api` never starts a reporter). Gating api's own startup on
+    /// its own copy of this value — as this function used to, with a hard
+    /// `anyhow::bail!` — meant that following the deployment manifest's own
+    /// rollout instructions exactly as written (set the var on the
+    /// DaemonSet, then flip `AENV_NODE_PLACEMENT_SOURCE=native` on the api
+    /// Deployment, which never sets this var itself) hit that bail on every
+    /// startup and CrashLoopBackOff'd. This asserts the fix: leaving it
+    /// unset now only warns (see the branch's own comment) instead of
+    /// refusing to start.
     ///
-    /// Both bail-outs live in `start_native_node_registry`, ahead of the
-    /// first line that would touch a network — namespace/service_name are
-    /// checked first (existing behaviour), and this refusal is checked
-    /// second, so a caller that also left those blank still gets the
-    /// existing message rather than this one; the second assertion below is
-    /// the control that proves this test is actually reaching the new
-    /// check and not just re-triggering the first.
+    /// The kubernetes_discovery check just above it in the function is
+    /// unrelated to this fix and still a hard refusal; the control at the
+    /// end proves that one is untouched.
     #[tokio::test]
-    async fn native_placement_without_a_dual_report_endpoint_refuses_to_start() {
+    async fn native_placement_without_a_dual_report_endpoint_warns_but_starts() {
         let mut cluster = agentenv::cfg::ClusterConfig {
             node_placement_source: NodePlacementSource::Native,
             ..AppConfig::default().cluster
@@ -1800,35 +1824,41 @@ mod tests {
 
         // `NativeNodeRegistryBits` (the `Ok` type) does not implement
         // `Debug` — it holds a live gRPC service and task handles, which is
-        // not something a test wants to print — so this matches by hand
-        // rather than using `expect_err`.
-        let err = match start_native_node_registry(&cluster, "").await {
-            Ok(_) => panic!("no dual_report_api_endpoint means this registry never warms up"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("dual_report_api_endpoint"), "{err}");
+        // not something a test wants to print — so this checks `.is_ok()`
+        // rather than using `.unwrap()`/`expect_err`.
         assert!(
-            err.contains("AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT"),
-            "{err}"
+            start_native_node_registry(&cluster, "").await.is_ok(),
+            "an empty dual_report_api_endpoint must not stop --role api from starting — this \
+             process never consumes it"
         );
 
         // Blank is the same as absent, same convention as
         // `cluster_placement`'s own scheduler_endpoint refusal above.
-        let err = match start_native_node_registry(&cluster, "   ").await {
-            Ok(_) => panic!("a blank endpoint is not an endpoint"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("dual_report_api_endpoint"));
+        assert!(
+            start_native_node_registry(&cluster, "   ").await.is_ok(),
+            "a blank (whitespace-only) endpoint must be treated the same as an absent one"
+        );
 
-        // Control: an empty namespace/service_name still gets *that*
-        // refusal first, proving the two checks are ordered and this test
-        // is not accidentally validating the pre-existing one.
+        // The control: a configured value obviously must not stop it either
+        // — proves the two assertions above are actually about the value
+        // being empty, not about this function always succeeding regardless
+        // of what is passed.
+        assert!(
+            start_native_node_registry(&cluster, "http://agentenv-api:8002")
+                .await
+                .is_ok(),
+            "a configured endpoint must still start cleanly"
+        );
+
+        // Control: an empty namespace/service_name is still a hard refusal,
+        // unaffected by this change — proves the check ahead of this one in
+        // the function was not also weakened.
         let unconfigured_discovery = agentenv::cfg::ClusterConfig {
             node_placement_source: NodePlacementSource::Native,
             ..AppConfig::default().cluster
         };
         let err = match start_native_node_registry(&unconfigured_discovery, "").await {
-            Ok(_) => panic!("neither check passes here"),
+            Ok(_) => panic!("an empty namespace/service_name must still be refused"),
             Err(err) => err.to_string(),
         };
         assert!(

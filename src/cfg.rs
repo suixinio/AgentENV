@@ -1002,8 +1002,33 @@ pub struct ObservabilitySchedulerReportConfig {
     pub scheduler_endpoint_file: String,
 }
 
+/// Where `--role api` resolves a known node's current address for
+/// [`crate::node_client::placement::NodePlacement::resolve_node`] (and, once
+/// wired up, [`crate::node_client::placement::NodePlacement::node_membership`]).
+///
+/// 🔴 Stage A of the scheduler fold
+/// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): `Scheduler` (the
+/// default) asks `[cluster].scheduler_endpoint` over gRPC, byte-for-byte
+/// today's behavior. `Native` would answer from api's own
+/// `src/node_registry` node registry instead — no such consumer exists yet;
+/// `cluster_placement` in `src/bin/server.rs` does not read this field, so
+/// setting it to `Native` currently changes nothing. It is declared ahead of
+/// that wiring so the config surface, its env binding, and its default are
+/// settled and tested in isolation first, the same order every other
+/// `node_registry` piece landed in.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePlacementSource {
+    Scheduler,
+    Native,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
+    /// Which backend `resolve_node` reads a known node's address from. See
+    /// [`NodePlacementSource`].
+    #[config(default = "scheduler", env = "AENV_NODE_PLACEMENT_SOURCE")]
+    pub node_placement_source: NodePlacementSource,
     /// Shared gRPC scheduler endpoint for cluster-level services.
     #[config(
         env = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
@@ -2563,6 +2588,60 @@ mod tests {
                  environment has to win or `kubectl set env` stops being a rollback"
             );
         }
+    }
+
+    /// Stage A of the scheduler fold
+    /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): the switch that
+    /// will move `resolve_node` off the scheduler once a native backend
+    /// exists. Nothing reads this field's `Native` value yet — see
+    /// [`NodePlacementSource`]'s doc comment — but the config surface itself
+    /// (default, env override, and rejection of an unrecognized value) has to
+    /// hold up on its own before anything is wired to depend on it.
+    #[test]
+    fn node_placement_source_defaults_to_scheduler_and_is_settable_from_the_environment() {
+        let _env = env_guard();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bundled = workspace.join("config/default.toml");
+
+        assert_eq!(
+            ConfigManager::new_from_path(&bundled)
+                .expect("load without the override")
+                .config()
+                .cluster
+                .node_placement_source,
+            NodePlacementSource::Scheduler,
+            "the default must leave every existing deployment on the scheduler-backed path"
+        );
+
+        for (value, expected) in [
+            ("native", NodePlacementSource::Native),
+            ("scheduler", NodePlacementSource::Scheduler),
+        ] {
+            std::env::set_var("AENV_NODE_PLACEMENT_SOURCE", value);
+            let overridden = ConfigManager::new_from_path(&bundled);
+            std::env::remove_var("AENV_NODE_PLACEMENT_SOURCE");
+
+            assert_eq!(
+                overridden
+                    .unwrap_or_else(|err| panic!("load with node_placement_source={value}: {err}"))
+                    .config()
+                    .cluster
+                    .node_placement_source,
+                expected,
+                "AENV_NODE_PLACEMENT_SOURCE={value} did not reach the config"
+            );
+        }
+
+        // A typo must stop the process rather than silently falling back to
+        // `scheduler` — the same "fail loud, not quiet" rule the snapshot
+        // repository backend's own env override follows.
+        std::env::set_var("AENV_NODE_PLACEMENT_SOURCE", "natve");
+        let loaded = ConfigManager::new_from_path(&bundled);
+        std::env::remove_var("AENV_NODE_PLACEMENT_SOURCE");
+        assert!(
+            loaded.is_err(),
+            "node_placement_source=natve was accepted instead of refused"
+        );
     }
 
     /// The three local-disk budgets are per-machine numbers, and the file they
@@ -4204,6 +4283,7 @@ endpoint = "http://second:9000"
     #[test]
     fn cluster_normalize_trims_and_drops_blank_scheduler_endpoint() {
         let mut config = ClusterConfig {
+            node_placement_source: NodePlacementSource::Scheduler,
             scheduler_endpoint: Some("  ".to_string()),
             scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),
@@ -4214,6 +4294,7 @@ endpoint = "http://second:9000"
         assert_eq!(config.scheduler_endpoint, None);
 
         let mut config = ClusterConfig {
+            node_placement_source: NodePlacementSource::Scheduler,
             scheduler_endpoint: Some("  http://scheduler:9090  ".to_string()),
             scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),

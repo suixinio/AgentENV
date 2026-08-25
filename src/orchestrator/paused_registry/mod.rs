@@ -740,6 +740,7 @@ mod build_tests {
 
     fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
+            node_placement_source: crate::cfg::NodePlacementSource::Scheduler,
             scheduler_endpoint: scheduler_endpoint.map(str::to_string),
             scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),

@@ -85,7 +85,15 @@ go test ./...
 ```
 
 `make test` runs the paused-sandbox registry suite without a database, and every
-test in it that touches SQL skips — 125 of them, all reported as passes.
+test in it that touches SQL skips — as measured 2026-08-25 at `56de492`, **257
+top-level tests (271 counting subtests), all reported as passes**, spread
+across `scheduler/internal/registry` (166), `scheduler/internal/catalog` (83),
+`catalog_service_test.go` (7), and `cmd/catalog_gate_test.go` (1). This number
+drifts with the commit — it was ~125, covering only the `registry` package,
+when `4f9c70b` first wrote it down; the `catalog` tests were added later and
+are DSN-gated the same way. See
+`docs/proposals/_sd-phase4-go-test-baseline.md` for the full recount and
+methodology before quoting a specific figure.
 `test-with-postgres` reproduces the coverage CI has: it starts a throwaway
 PostgreSQL, points `SCHEDULER_REGISTRY_TEST_DSN` at it, and sets
 `SCHEDULER_REGISTRY_TEST_REQUIRED=1`, which turns a missing database into a

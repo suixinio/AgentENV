@@ -74,6 +74,16 @@ impl<F> SingletonTaskBody for F where
 /// during graceful shutdown so a currently-leading replica releases the lock
 /// promptly instead of making the next election wait out this process's own
 /// connection eventually timing out on the server side.
+///
+/// 🔴 `shutdown` does not interrupt a `body` call already in flight. The
+/// loop's `tokio::select!` only observes the shutdown signal once, at the
+/// top of each iteration — `body(LeaderContext { .. }).await` itself sits
+/// outside that `select!`, uninterruptible once started. So a long-running
+/// `body` (Stage B's build reaper, Stage C's reclaim pass) delays graceful
+/// shutdown until that call returns on its own; `shutdown` waiting on it is
+/// exactly [`Self::shutdown`]'s `self.join.await`. Callers on a shutdown
+/// budget should bound `body`'s own runtime rather than assume `shutdown`
+/// can cut it off.
 pub struct SingletonTaskHandle {
     shutdown_tx: watch::Sender<bool>,
     join: JoinHandle<()>,
@@ -82,6 +92,11 @@ pub struct SingletonTaskHandle {
 impl SingletonTaskHandle {
     /// Requests the loop stop, releases the advisory lock if this replica is
     /// currently leader, and waits for the background task to exit.
+    ///
+    /// Does not preempt a `body` call already running — see the 🔴 note on
+    /// [`SingletonTaskHandle`] itself. This call resolves only once the
+    /// current iteration (including any in-flight `body`) finishes and the
+    /// loop observes the shutdown signal at its next check.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         if let Err(err) = self.join.await {

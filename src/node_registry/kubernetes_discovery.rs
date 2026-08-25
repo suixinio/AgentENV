@@ -43,6 +43,7 @@ use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointPort, EndpointSlice};
 use kube::runtime::watcher::{self, Event};
+use kube::runtime::WatchStreamExt;
 use kube::{Api, Client};
 use tracing::warn;
 
@@ -51,6 +52,22 @@ use super::types::Node;
 
 /// `discoveryv1.LabelServiceName` (`k8s.io/api/discovery/v1/well_known_labels.go`).
 const LABEL_SERVICE_NAME: &str = "kubernetes.io/service-name";
+
+/// 🔴 P2: how many *consecutive* watch errors a single stream may absorb
+/// before this task gives up and returns `Err`, ending `KubernetesDiscovery::run`
+/// (its `tokio::join!` propagates the first task error) so
+/// `run_kubernetes_discovery_with_retry` (`src/bin/server.rs`) tears the whole
+/// `KubernetesDiscovery` down and rebuilds it — a fresh `kube::Client`, not
+/// just a fresh watch — rather than the same task looping on the same
+/// connection forever. `.default_backoff()` below throttles *how fast* those
+/// errors can arrive (kube-runtime 4.2.0's `watcher()` has no backoff of its
+/// own: an unrecoverable failure, e.g. RBAC that will never resolve without
+/// an operator, would otherwise be an unthrottled LIST/WATCH loop against the
+/// apiserver); this constant is what stops the throttled loop from running
+/// forever in the first place. Reset to zero on any non-`Err` item, so a
+/// flaky connection that recovers between failures never accumulates toward
+/// this — only an unbroken run of failures does.
+const MAX_CONSECUTIVE_WATCH_ERRORS: u32 = 5;
 
 /// Stage A-local stand-in for `services/shared/config.SchedulerDiscoveryKubernetesConfig`.
 /// Not yet registered on [`crate::cfg::AppConfig`] — same deferral as
@@ -447,7 +464,8 @@ impl KubernetesDiscovery {
             let config = self.config.clone();
             let api: Api<EndpointSlice> = Api::namespaced(self.client.clone(), &config.namespace);
             let label_selector = format!("{LABEL_SERVICE_NAME}={}", config.service_name);
-            let stream = watcher::watcher(api, watcher::Config::default().labels(&label_selector));
+            let stream = watcher::watcher(api, watcher::Config::default().labels(&label_selector))
+                .default_backoff();
             tokio::spawn(watch_endpoint_slices(stream, state, registry, config))
         };
 
@@ -488,7 +506,8 @@ impl KubernetesDiscovery {
             return tokio::spawn(async { Ok(()) });
         }
         let api: Api<Pod> = Api::namespaced(self.client.clone(), &config.namespace);
-        let stream = watcher::watcher(api, watcher::Config::default().labels(&selector));
+        let stream =
+            watcher::watcher(api, watcher::Config::default().labels(&selector)).default_backoff();
         tokio::spawn(watch_pod_selector(stream, state, registry, config, kind))
     }
 }
@@ -513,7 +532,13 @@ async fn watch_endpoint_slices(
 ) -> Result<()> {
     let mut stream = Box::pin(stream);
     let mut pending: Vec<EndpointSlice> = Vec::new();
+    // 🔴 P2: reset on every non-`Err` item, incremented and checked only in
+    // the `Err` arm below — see [`MAX_CONSECUTIVE_WATCH_ERRORS`]'s own doc.
+    let mut consecutive_errors: u32 = 0;
     while let Some(event) = stream.next().await {
+        if event.is_ok() {
+            consecutive_errors = 0;
+        }
         match event {
             Ok(Event::Init) => pending.clear(),
             Ok(Event::InitApply(obj)) => pending.push(obj),
@@ -558,7 +583,21 @@ async fn watch_endpoint_slices(
                     .remove(&key);
                 sync_from_state(&state, &registry, &config);
             }
-            Err(err) => warn!(error = %err, "kubernetes discovery: endpointslice watch error"),
+            Err(err) => {
+                consecutive_errors += 1;
+                warn!(
+                    error = %err,
+                    consecutive_errors,
+                    "kubernetes discovery: endpointslice watch error"
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_WATCH_ERRORS {
+                    bail!(
+                        "endpointslice watch failed {consecutive_errors} times in a row (last \
+                         error: {err}); ending discovery so the caller rebuilds the watch from \
+                         scratch"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -573,7 +612,11 @@ async fn watch_pod_selector(
 ) -> Result<()> {
     let mut stream = Box::pin(stream);
     let mut pending: Vec<String> = Vec::new();
+    let mut consecutive_errors: u32 = 0;
     while let Some(event) = stream.next().await {
+        if event.is_ok() {
+            consecutive_errors = 0;
+        }
         match event {
             Ok(Event::Init) => pending.clear(),
             Ok(Event::InitApply(obj)) => {
@@ -604,7 +647,21 @@ async fn watch_pod_selector(
                     sync_from_state(&state, &registry, &config);
                 }
             }
-            Err(err) => warn!(error = %err, "kubernetes discovery: pod selector watch error"),
+            Err(err) => {
+                consecutive_errors += 1;
+                warn!(
+                    error = %err,
+                    consecutive_errors,
+                    "kubernetes discovery: pod selector watch error"
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_WATCH_ERRORS {
+                    bail!(
+                        "pod selector watch failed {consecutive_errors} times in a row (last \
+                         error: {err}); ending discovery so the caller rebuilds the watch from \
+                         scratch"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1062,5 +1119,117 @@ mod tests {
         let snapshot = registry.snapshot(false);
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].id, "agentenv-node-b");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P2: the consecutive-watch-error guard. `watch_endpoint_slices` and
+    // `watch_pod_selector` both accept any `impl Stream<Item =
+    // watcher::Result<Event<K>>>`, so these feed a synthetic, finite stream
+    // built with `futures::stream::iter` rather than a real apiserver —
+    // exactly the seam that makes this guard unit-testable at all without a
+    // live cluster (see the module doc's own note on what is and is not
+    // exercised against one).
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn empty_state() -> Arc<Mutex<DiscoveryState>> {
+        Arc::new(Mutex::new(DiscoveryState::default()))
+    }
+
+    fn empty_registry() -> Arc<AtomicNodeRegistry> {
+        Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)))
+    }
+
+    /// 🔴 The core of P2: an unbroken run of watch errors — RBAC that will
+    /// never resolve without an operator, say — must end this task with an
+    /// `Err` rather than loop on the same broken stream forever. That `Err`
+    /// is what makes `KubernetesDiscovery::run`'s `tokio::join!` return
+    /// `Err`, which is what makes `run_kubernetes_discovery_with_retry`
+    /// (`src/bin/server.rs`) actually rebuild the client and the watch
+    /// instead of a healthy-looking task quietly never doing either again.
+    #[tokio::test]
+    async fn endpoint_slice_watch_ends_after_consecutive_errors() {
+        let events: Vec<watcher::Result<Event<EndpointSlice>>> = (0..MAX_CONSECUTIVE_WATCH_ERRORS)
+            .map(|_| Err(watcher::Error::NoResourceVersion))
+            .collect();
+        let result = watch_endpoint_slices(
+            futures::stream::iter(events),
+            empty_state(),
+            empty_registry(),
+            default_cfg(),
+        )
+        .await;
+        let err = result.expect_err("an unbroken run of watch errors must end the task");
+        assert!(err.to_string().contains("times in a row"), "{err}");
+    }
+
+    /// The control for the test above: one error short of the threshold
+    /// must not end the task — otherwise the test above would pass just as
+    /// well against a guard that fires on the very first error, which is a
+    /// stream that never recovers under real backoff either way and defeats
+    /// the whole point of *consecutive*.
+    #[tokio::test]
+    async fn endpoint_slice_watch_survives_a_run_of_errors_below_the_threshold() {
+        let events: Vec<watcher::Result<Event<EndpointSlice>>> = (0..MAX_CONSECUTIVE_WATCH_ERRORS
+            - 1)
+            .map(|_| Err(watcher::Error::NoResourceVersion))
+            .collect();
+        let result = watch_endpoint_slices(
+            futures::stream::iter(events),
+            empty_state(),
+            empty_registry(),
+            default_cfg(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a run one short of the threshold must not end the task: {result:?}"
+        );
+    }
+
+    /// The streak resets on any non-error item, so a flaky connection that
+    /// recovers between failures never accumulates toward the threshold —
+    /// only an *unbroken* run does. Twice the threshold's worth of errors,
+    /// split by one successful event, must survive.
+    #[tokio::test]
+    async fn endpoint_slice_watch_error_streak_resets_on_a_successful_event() {
+        let mut events: Vec<watcher::Result<Event<EndpointSlice>>> = Vec::new();
+        for _ in 0..MAX_CONSECUTIVE_WATCH_ERRORS - 1 {
+            events.push(Err(watcher::Error::NoResourceVersion));
+        }
+        events.push(Ok(Event::Init));
+        for _ in 0..MAX_CONSECUTIVE_WATCH_ERRORS - 1 {
+            events.push(Err(watcher::Error::NoResourceVersion));
+        }
+        let result = watch_endpoint_slices(
+            futures::stream::iter(events),
+            empty_state(),
+            empty_registry(),
+            default_cfg(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a successful event must reset the consecutive-error streak: {result:?}"
+        );
+    }
+
+    /// Same guard, the pod-selector watch's independent implementation of
+    /// it — a change that fixed `watch_endpoint_slices` and forgot
+    /// `watch_pod_selector` would pass every test above.
+    #[tokio::test]
+    async fn pod_selector_watch_ends_after_consecutive_errors() {
+        let events: Vec<watcher::Result<Event<Pod>>> = (0..MAX_CONSECUTIVE_WATCH_ERRORS)
+            .map(|_| Err(watcher::Error::NoResourceVersion))
+            .collect();
+        let result = watch_pod_selector(
+            futures::stream::iter(events),
+            empty_state(),
+            empty_registry(),
+            default_cfg(),
+            PodSelectorKind::Ignore,
+        )
+        .await;
+        let err = result.expect_err("an unbroken run of watch errors must end the task");
+        assert!(err.to_string().contains("times in a row"), "{err}");
     }
 }

@@ -107,6 +107,37 @@ impl PublishedArtifactCatalog {
         let removed = self.inner.write().await.remove(key);
         Ok(removed)
     }
+
+    /// Boundedly stops background RocksDB compaction/flush on the catalog's
+    /// local store, ahead of process shutdown.
+    ///
+    /// 🔴 This is the fourth `LocalKvStore` a node can open (alongside the
+    /// persisted-sandboxes store, the image cache metadata store, and the
+    /// snapshot catalog mirror backlog) and, unlike the other three, nothing
+    /// used to call this before `IrohBlobsP2pTransport::shutdown` started
+    /// doing so. See `crate::local_store::LocalKvCloseOutcome::TimedOut`'s
+    /// doc for why leaving a store's background work unbounded here is not
+    /// merely a slow shutdown: it is a wait nothing else in the process
+    /// bounds either.
+    pub(super) async fn close(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::local_store::LocalKvCloseOutcome {
+        let outcome = self.store.close(timeout).await;
+        match outcome {
+            crate::local_store::LocalKvCloseOutcome::Closed => {
+                tracing::info!("closed P2P artifact catalog store");
+            }
+            crate::local_store::LocalKvCloseOutcome::TimedOut => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "P2P artifact catalog store did not finish closing within timeout; \
+                     background RocksDB compaction/flush may still be running"
+                );
+            }
+        }
+        outcome
+    }
 }
 
 #[derive(Debug, Clone)]

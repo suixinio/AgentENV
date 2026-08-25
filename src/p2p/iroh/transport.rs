@@ -663,10 +663,23 @@ impl P2pTransport for IrohBlobsP2pTransport {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        self.router
+        let router_result = self
+            .router
             .shutdown()
             .await
-            .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err))
+            .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err));
+        // 🔴 Attempted regardless of the router's own outcome. This only
+        // stops the catalog's RocksDB background compaction/flush ahead of
+        // time (see `PublishedArtifactCatalog::close`) and never touches the
+        // network, so a failed router shutdown is not a reason to skip it —
+        // and skipping it would leave this the one local RocksDB store in
+        // the process nothing ever closes, unlike the persisted-sandboxes
+        // store, the image cache metadata store, and the snapshot catalog
+        // mirror backlog, all reached from `NodeRuntime::shutdown`.
+        self.published_catalog
+            .close(crate::local_store::DEFAULT_CLOSE_TIMEOUT)
+            .await;
+        router_result
     }
 }
 
@@ -887,6 +900,52 @@ mod tests {
         // down after a failed start uses.
         drop(runtime);
         drop(transport);
+    }
+
+    /// 🔴 Guards `shutdown`'s call to `published_catalog.close(...)`. This is
+    /// the fourth `LocalKvStore` a node can open — alongside the
+    /// persisted-sandboxes store, the image cache metadata store, and the
+    /// snapshot catalog mirror backlog — and, unlike the other three, nothing
+    /// closed it until this call was added. Deleting it leaves this file's
+    /// other tests green: `published_catalog_survives_transport_restart`
+    /// exercises `shutdown` too, but what makes that test pass is `drop`
+    /// releasing the store's RocksDB lock, not this bounded close — a slow or
+    /// hung background compaction on that store would only ever show up as
+    /// an unbounded wait at real process shutdown, never in that test. See
+    /// `crate::local_store::LocalKvCloseOutcome::TimedOut`'s doc for why that
+    /// wait is not caught by anything else either. Scanning the source text
+    /// directly is the same technique
+    /// `src/bin/server.rs::tests::the_shutdown_bounds_are_still_wired` uses
+    /// for the other three stores' closes.
+    #[test]
+    fn shutdown_still_closes_the_catalog_store() {
+        let source = include_str!("transport.rs");
+        let start = source
+            .find("async fn shutdown(&self) -> Result<()> {")
+            .expect("IrohBlobsP2pTransport::shutdown is no longer in this file");
+        let open = source[start..].find('{').expect("a body") + start;
+        let mut depth = 0usize;
+        let body = 'body: {
+            for (offset, byte) in source[open..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break 'body source[open..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("shutdown has no closing brace");
+        };
+
+        assert!(
+            body.contains("published_catalog") && body.contains(".close("),
+            "IrohBlobsP2pTransport::shutdown no longer closes the P2P artifact catalog's \
+             RocksDB store before process exit"
+        );
     }
 
     fn invalid_endpoint() -> P2pEndpoint {

@@ -1462,4 +1462,62 @@ mod tests {
              nowhere to ask"
         );
     }
+
+    /// 🔴 Guards the shutdown bounds `NodeRuntime::shutdown` and `main` are
+    /// each responsible for. Every one of the three calls this asserts on can
+    /// be deleted without a single one of this binary's other tests noticing
+    /// — nothing exercises the real graceful-shutdown path under test, the
+    /// same gap `only_the_split_roles_bind_a_second_listener` closes for the
+    /// `--role` split — so this scans the source text directly, the same way
+    /// that test does.
+    ///
+    /// See [`RUNTIME_SHUTDOWN_TIMEOUT`]'s doc for why `main`'s call matters —
+    /// without it a stuck `spawn_blocking` closure (RocksDB background
+    /// compaction/flush, observed on nodes that had actually run a VM) hangs
+    /// the process well past `terminationGracePeriodSeconds` — and
+    /// [`NodeRuntime::shutdown`]'s own doc for why the two store closes come
+    /// before that backstop rather than relying on it.
+    #[test]
+    fn the_shutdown_bounds_are_still_wired() {
+        let source = include_str!("server.rs");
+        let body = |name: &str| {
+            let start = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+            let open = source[start..].find('{').expect("a body") + start;
+            let mut depth = 0usize;
+            for (offset, byte) in source[open..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return source[open..open + offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{name} has no closing brace");
+        };
+
+        let shutdown = body("async fn shutdown(self)");
+        assert!(
+            shutdown.contains("close_image_cache_stores"),
+            "NodeRuntime::shutdown no longer closes the image cache metadata store's RocksDB \
+             handle before process exit"
+        );
+        assert!(
+            shutdown.contains("close_stores"),
+            "NodeRuntime::shutdown no longer closes the snapshot manager's RocksDB stores \
+             before process exit"
+        );
+
+        let main = body("fn main() -> anyhow::Result<()>");
+        assert!(
+            main.contains("shutdown_timeout"),
+            "main no longer bounds Runtime::shutdown_timeout after block_on returns — an \
+             un-bounded fallback here reintroduces the node-never-exits hang"
+        );
+    }
 }

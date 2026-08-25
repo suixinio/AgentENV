@@ -25,9 +25,27 @@ pub enum LocalKvCloseOutcome {
     /// request has already been made — RocksDB is still winding down on its
     /// own, in the background — but nothing is waiting for it any more, so a
     /// later, unbounded `Drop` of the last reference could still block for as
-    /// long as that work takes. (In this process that later `Drop` is itself
-    /// bounded — see `shutdown_timeout` in `src/bin/server.rs` — so a
-    /// `TimedOut` here is a fact worth logging, not a leak.)
+    /// long as that work takes.
+    ///
+    /// 🔴 In this process that later `Drop` is **not** bounded by
+    /// `shutdown_timeout` in `src/bin/server.rs`, whatever a stale version of
+    /// this comment used to claim. `main` there is `let result =
+    /// runtime.block_on(async_main()); runtime.shutdown_timeout(...);` —
+    /// `shutdown_timeout` only starts once `block_on` has already *returned*.
+    /// But the last `Arc<DB>` reference for a store like this one is dropped
+    /// from inside `async_main` itself: either directly, when a local holding
+    /// a clone (the API app's `Arc<SnapshotManager>`, say) goes out of scope,
+    /// or via `shutdown_cleanup.await?` joining a spawned task that drops its
+    /// own clone (`NodeRuntime::shutdown` consuming `self`). Either way that
+    /// drop — and, if it is the last reference, RocksDB's blocking close
+    /// inside it — has to finish before `async_main` can return, which is
+    /// before `block_on` can return, which is before `shutdown_timeout` is
+    /// even called. So a `TimedOut` here is not "logged and then bounded
+    /// later": if this store's last reference drops during this process's own
+    /// shutdown sequence, rather than being kept alive by something that
+    /// outlives it, that drop can hang `block_on` — and with it the whole
+    /// process — for as long as the outstanding compaction/flush work takes,
+    /// with nothing left in this file or `server.rs` to cut it short.
     TimedOut,
 }
 

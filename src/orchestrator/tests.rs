@@ -4839,6 +4839,50 @@ async fn auto_evict_task_does_not_keep_orchestrator_alive() -> anyhow::Result<()
     Ok(())
 }
 
+/// 🔴 Guards `Orchestrator::shutdown`'s call to `persister.close(...)` — the
+/// line that stops this store's RocksDB background compaction/flush ahead of
+/// process exit. Deleting it leaves every test above and below this one
+/// green: nothing here drives a real multi-gigabyte RocksDB store far enough
+/// into background work for its absence to show up as a hang, and
+/// `RecordingPersister`'s `close` is a no-op anyway. `src/bin/server.rs`'s
+/// `the_shutdown_bounds_are_still_wired` closes the same gap for the other
+/// two RocksDB-store closes and the final `Runtime::shutdown_timeout`
+/// backstop; this is the one call in that trio that lives in this file
+/// instead, so it needs its own copy of the same technique rather than a
+/// cross-file scan of `server.rs`'s unrelated shutdown path.
+#[test]
+fn shutdown_still_closes_the_persister_store() {
+    let source = include_str!("service.rs");
+    let body = |name: &str| {
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+        let open = source[start..].find('{').expect("a body") + start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[open..open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} has no closing brace");
+    };
+
+    let shutdown = body("pub async fn shutdown(self: &Arc<Self>) -> Result<()>");
+    assert!(
+        shutdown.contains("persister") && shutdown.contains(".close("),
+        "Orchestrator::shutdown no longer closes the persister's RocksDB store before process \
+         exit — see local_store::LocalKvCloseOutcome::TimedOut's doc for why an un-bounded \
+         Drop of that store later is not caught by anything else"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations() -> Result<()> {
     setup();

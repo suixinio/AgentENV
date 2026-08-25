@@ -310,6 +310,50 @@ spec:
             # registry above speaks to the scheduler over this endpoint.
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
               value: http://agentenv-scheduler:9090
+            # Stage A of the scheduler fold
+            # (docs/proposals/_sd-phase4-stageA-node-inventory.md): the
+            # switch and the Kubernetes discovery it needs once flipped.
+            #
+            # 🔴 Left at the code default (`cfg.rs`'s `scheduler`), on
+            # purpose, and stated rather than omitted — the same discipline
+            # `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` above follows.
+            # Cluster acceptance flips this half to `native` by hand
+            # (`kubectl set env deployment/agentenv-api
+            # AENV_NODE_PLACEMENT_SOURCE=native`) once
+            # `AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT` is live on the
+            # DaemonSet (see the note there) — this manifest only carries the
+            # supporting discovery config so that switch is one `kubectl set
+            # env` away rather than also a rollout. Applying this file alone
+            # changes nothing about which placement source serves traffic.
+            - name: AENV_NODE_PLACEMENT_SOURCE
+              value: "scheduler"
+            # The same namespace/Service/port/scheme
+            # `deploy/k8s/base/config/scheduler.json`'s
+            # `scheduler.discovery.kubernetes` already discovers nodes from
+            # (mounted there as a file, not env — confirmed against that file
+            # rather than assumed). `--role api` refuses to start under
+            # `node_placement_source = "native"` with the namespace/service
+            # name unset (`src/bin/server.rs`), so these three have no
+            # default of their own; port/scheme are written out explicitly
+            # even though they already match `cfg.rs`'s defaults, so a reader
+            # comparing this file against scheduler.json does not have to
+            # know that.
+            - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE
+              value: "agentenv-system"
+            - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME
+              value: "agentenv-nodes"
+            - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_PORT
+              value: "8000"
+            - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_SCHEME
+              value: "http"
+            # 🔴 No AENV_CLUSTER_KUBERNETES_DISCOVERY_IGNORE_POD_SELECTOR /
+            # ..._NO_SCHEDULE_POD_SELECTOR here, matching
+            # scheduler.json today: neither is set there either, and the
+            # Rust port's cache-sync gate across the three watchers
+            # (EndpointSlice, and one Pod watch per selector) is not wired
+            # yet — see `src/node_registry/kubernetes_discovery.rs`'s module
+            # doc. Setting a selector before that gate exists risks a window
+            # where it filters nothing instead of everything.
             # Where this half's control-plane credential is read from, re-read
             # while the process runs. A volume rather than a secretKeyRef for
             # the reason the DaemonSet gives: kubelet refreshes volumes and does

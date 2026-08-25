@@ -15,11 +15,19 @@
 # 🔴 `--role api` assembles now (`src/bin/server.rs::assemble_api`): the cluster
 # metadata store, the remote backend factory and both gRPC listeners are wired.
 # What it still refuses, and refuses loudly rather than half-doing, is a cold
-# create (`POST /sandboxes-cold`), resuming a paused sandbox whose capture lives
-# on a machine this replica cannot ask to reopen it, and building a template —
-# that one drives a Firecracker sandbox directly and would reach for a /dev/kvm
-# this Pod does not have. Everything the gateway is pointed at in 3a works;
-# those three are why 3a is a shadow rollout rather than the end of the split.
+# create (`POST /sandboxes-cold`) and resuming a paused sandbox whose capture
+# lives on a machine this replica cannot ask to reopen it. Everything the
+# gateway is pointed at in 3a works; those two are why 3a is a shadow rollout
+# rather than the end of the split.
+#
+# 🔴 Building a template (`POST /v2/templates/{id}/builds/{id}`) is no longer
+# on that list in code — `run_the_build_on_a_node` dispatches it to a node
+# instead of refusing at the door — but it still cannot succeed in 3a as
+# deployed here: dispatching needs a node serving `NodeSandboxService`, which
+# is `--role node`, and 3a deliberately keeps the DaemonSet on `--role all`
+# (see the 3b note above). This Deployment answering the build route is
+# necessary and not sufficient; it starts working the moment 3b flips the
+# DaemonSet, with no change to this file.
 #
 # 🔴 It also has one precondition no other workload in this tree has: the
 # `agentenv-runtime-secrets` Secret must carry `sandbox-access-token-hash-seed`,

@@ -787,14 +787,21 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
 ///   used locally), and a failure on either side is returned to the `PATCH`
 ///   caller with the metadata store left untouched — see
 ///   `Orchestrator::apply_custom_extension_params`.
-/// - **Building a template.** `TemplateBuilder` drives a `FirecrackerSandbox`
-///   directly, outside the orchestrator entirely, so a build here would reach
-///   for `/dev/kvm` in a Pod that has none. It is now refused at the door
-///   instead: `POST /v2/templates/{id}/builds/{id}` answers the caller rather
-///   than accepting the build and losing it in a background task
-///   (`crate::api::impls` — the refusal reads `ServerRole::runs_sandbox_runtime`
-///   and names where the build can be run). The capability is still missing;
-///   what changed is that its absence is now something the caller is told.
+/// - **Building a template — retired.** This bullet used to say
+///   `TemplateBuilder` drives a `FirecrackerSandbox` directly, outside the
+///   orchestrator entirely, so a build here would reach for `/dev/kvm` in a
+///   Pod that has none — and that `POST /v2/templates/{id}/builds/{id}`
+///   refused at the door instead of losing the build in a background task.
+///   Kept here rather than deleted so it is not re-derived from the same
+///   reasoning. It no longer holds: `TemplateBuildRunner` (the piece that
+///   needs `/dev/kvm`) is ordinary Rust that runs wherever it is called, so
+///   the door now dispatches to a node instead of refusing —
+///   `run_the_build_on_a_node` in `src/api/impls/template.rs`, using this
+///   function's own `placement` to pick one and
+///   `NodeSandboxService::build_template` (`src/node_server/service.rs`) to
+///   run it there. The door still refuses, but only when there is truly
+///   nowhere to send the build — see `ApiImpl::node_placement` and the
+///   refusal's own condition in `v2_templates_template_id_builds_build_id_post`.
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::Api;
     // The four this role answers `false` to, stated where somebody adding a

@@ -9,3 +9,21 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: agentenv-scheduler-discovery
+---
+# Same rules as above (`role.yaml`'s `agentenv-scheduler-discovery` Role —
+# endpointslices/pods get/list/watch), bound to `agentenv-api` instead of
+# `agentenv-scheduler`. Reusing the Role rather than declaring a second,
+# identical one is deliberate: the two processes need exactly the same read
+# access during the Stage A rollout, and a second Role that happened to match
+# is a second thing to keep matching by hand.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentenv-api-discovery
+subjects:
+  - kind: ServiceAccount
+    name: agentenv-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agentenv-scheduler-discovery

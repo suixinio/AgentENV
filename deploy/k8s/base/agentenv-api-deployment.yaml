@@ -59,6 +59,14 @@ spec:
       # would make every api rollout take an hour to finish for no reason at
       # all, and would hide a hung shutdown behind a wait nobody watches.
       terminationGracePeriodSeconds: 60
+      # Stage A of the scheduler fold
+      # (docs/proposals/_sd-phase4-stageA-node-inventory.md): grants
+      # src/node_registry/kubernetes_discovery.rs the same
+      # endpointslices/pods get/list/watch access agentenv-scheduler already
+      # has, via serviceaccount.yaml/rolebinding.yaml's agentenv-api identity
+      # — a prerequisite for [cluster].node_placement_source = "native", not
+      # yet this deployment's default.
+      serviceAccountName: agentenv-api
       nodeSelector:
         kubernetes.io/os: linux
       affinity:

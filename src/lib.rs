@@ -17,6 +17,7 @@ pub mod privileges;
 mod proto;
 pub mod role;
 pub mod sandbox;
+pub mod scheduler_endpoint;
 pub mod setup;
 pub mod snapshot;
 pub mod template;

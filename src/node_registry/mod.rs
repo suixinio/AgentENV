@@ -11,5 +11,6 @@
 
 pub mod cpu_template;
 pub mod filter;
+pub mod registry;
 pub mod strategy;
 pub mod types;

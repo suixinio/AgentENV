@@ -42,7 +42,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
 use super::paused_recovery::{CrossNodeResume, MissingLocalResume};
@@ -52,6 +51,7 @@ use crate::orchestrator::{
     ClaimedExecution, NewTimeout, OrchestratorError, PausedSandboxEntry, SandboxMetadata,
 };
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
+use crate::scheduler_endpoint::SchedulerEndpointSource;
 use crate::types::{ExecutionId, SandboxId};
 
 /// A node the placement source named.
@@ -237,9 +237,11 @@ impl ResumeWiring {
     /// Builds the scheduler-backed wiring from configuration, or the node-local
     /// one when no scheduler endpoint is configured.
     ///
-    /// 🔴 Lazy connect. `Endpoint::connect_lazy` does not touch the network, so
-    /// a scheduler that is down at startup delays a resume rather than a
-    /// process.
+    /// 🔴 Lazy connect. [`SchedulerEndpointSource::spawn_from_config`] does not
+    /// touch the network to build the channel, so a scheduler that is down at
+    /// startup delays a resume rather than a process. The endpoint can also be
+    /// hot-reloaded afterward from `[cluster].scheduler_endpoint_file` (or its
+    /// deprecated fallback), with no restart.
     pub fn from_config(node_id: impl Into<String>) -> anyhow::Result<Self> {
         let node_id = node_id.into();
         let config = ConfigManager::global_config();
@@ -260,9 +262,14 @@ impl ResumeWiring {
         // older snapshot and answering 200, with the user's last session gone.
         // Refusing to start is loud; the alternative is silent and
         // irreversible.
-        let channel = Endpoint::from_shared(qualified_endpoint(endpoint))?.connect_lazy();
+        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
+            qualified_endpoint(endpoint),
+            &config.cluster,
+            &config.observability.scheduler_report,
+            "resume_placement",
+        )?;
         Ok(Self {
-            placement: Some(Arc::new(SchedulerPlacementSource::new(channel))),
+            placement: Some(Arc::new(SchedulerPlacementSource::new(endpoint_source))),
             wake_site: WakeSite::Local(node_id),
         })
     }
@@ -289,9 +296,14 @@ impl ResumeWiring {
                      there is no machine here to fall back to"
                 )
             })?;
-        let channel = Endpoint::from_shared(qualified_endpoint(endpoint))?.connect_lazy();
+        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
+            qualified_endpoint(endpoint),
+            &config.cluster,
+            &config.observability.scheduler_report,
+            "resume_placement",
+        )?;
         Ok(Self {
-            placement: Some(Arc::new(SchedulerPlacementSource::new(channel))),
+            placement: Some(Arc::new(SchedulerPlacementSource::new(endpoint_source))),
             // 🔴 The pin is honoured by the orchestration surface below this
             // one — the remote backend factory places the wake-up on the node
             // the paused state names — rather than by a check here, which is
@@ -356,19 +368,19 @@ fn qualified_endpoint(endpoint: &str) -> String {
 
 /// The scheduler's `LookupNode`, read as a placement answer.
 struct SchedulerPlacementSource {
-    channel: Channel,
+    endpoint_source: SchedulerEndpointSource,
 }
 
 impl SchedulerPlacementSource {
-    fn new(channel: Channel) -> Self {
-        Self { channel }
+    fn new(endpoint_source: SchedulerEndpointSource) -> Self {
+        Self { endpoint_source }
     }
 }
 
 #[async_trait]
 impl ResumePlacementSource for SchedulerPlacementSource {
     async fn locate(&self, sandbox_id: SandboxId) -> Result<ResumePlacement, PlacementRefusal> {
-        let mut client = SchedulerClient::new(self.channel.clone());
+        let mut client = SchedulerClient::new(self.endpoint_source.channel());
         match client
             .lookup_node(scheduler::LookupNodeRequest {
                 sandbox_id: sandbox_id.to_string(),

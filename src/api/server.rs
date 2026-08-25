@@ -88,6 +88,57 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
+    new_with_control_plane_routes_and_gate::<I, A, E, C>(
+        api_impl,
+        role,
+        extra_control_plane_routes,
+        Arc::new(ControlPlaneGate::from_global_config()),
+    )
+}
+
+/// The actual body of [`new_with_control_plane_routes`], with the gate taken
+/// as a parameter rather than built from process-global config.
+///
+/// 🔴 P5 follow-up. `extra_control_plane_routes_are_merged_before_assemble_is_called`
+/// proves the merge call's byte offset falls between `assemble(`'s parens,
+/// but `assemble` takes *two* router arguments and the scan cannot tell which
+/// one the merge landed on — a merge onto `data_plane` (the argument
+/// `assemble`'s own doc says is deliberately never gated) still passes that
+/// scan, because it is still textually "inside" the call. That regression is
+/// invisible to a source scan by construction; it is not invisible to a real
+/// request. Splitting the gate out as a parameter here is what lets a test
+/// fire a real HTTP request at this function's actual composition with an
+/// injected, request-scoped `ControlPlaneGate` — closing the blind spot
+/// without the test having to mutate `ConfigManager`'s process-global state
+/// that `ControlPlaneGate::from_global_config` reads.
+///
+/// Not `pub`: `ControlPlaneGate` does not cross the crate boundary (its
+/// defining module is private to `crate::api`), so a function taking one as a
+/// parameter cannot be `pub` either without exposing a type `src/bin/server.rs`
+/// — a separate crate — cannot name. `new_with_control_plane_routes` stays the
+/// only crate-external entry point, unchanged, and forwards here with the
+/// default gate.
+fn new_with_control_plane_routes_and_gate<I, A, E, C>(
+    api_impl: I,
+    role: ServerRole,
+    extra_control_plane_routes: Router,
+    gate: Arc<ControlPlaneGate>,
+) -> Router
+where
+    I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+    A: apis::admin::Admin<E, Claims = C>
+        + apis::default::Default<E>
+        + apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::snapshots::Snapshots<E, Claims = C>
+        + apis::templates::Templates<E, Claims = C>
+        + apis::ApiKeyAuthHeader<Claims = C>
+        + apis::ApiAuthBasic<Claims = C>
+        + Send
+        + Sync
+        + 'static,
+    E: std::fmt::Debug + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+{
     // 🔴 The role now has two carriers: this parameter, which the role gate
     // reads, and the `ApiImpl`, which the data plane's auto-resume arm reads
     // (`crate::api::proxy::resolve_proxy_request`). Every assembly in
@@ -111,7 +162,7 @@ where
         agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
             .merge(extra_control_plane_routes),
         proxy::router(api_impl.clone()),
-        Arc::new(ControlPlaneGate::from_global_config()),
+        gate,
         role,
     )
     .route("/metrics", get(metrics_handler))
@@ -331,26 +382,30 @@ mod tests {
 
     /// 🔴 P5, the other half of the guard: the test above proves the
     /// *mechanism* (`assemble` gates whatever `generated` already contains);
-    /// this proves `new_with_control_plane_routes` still actually hands
-    /// `assemble` the merged router rather than merging
-    /// `extra_control_plane_routes` onto `assemble`'s return value — which
-    /// would compile, pass every other test in this file (none of them
-    /// exercise `new_with_control_plane_routes` with a non-empty extra
-    /// router; `new` always passes `Router::new()`), and silently
-    /// reintroduce the exact bug `/debug/node-registry` originally had.
+    /// this proves `new_with_control_plane_routes_and_gate` — the function
+    /// that actually does the composing; `new_with_control_plane_routes` is
+    /// now a thin forwarder to it — still hands `assemble` the merged router
+    /// rather than merging `extra_control_plane_routes` onto `assemble`'s
+    /// return value. Getting that wrong would compile and pass every other
+    /// test in this file that predates
+    /// `extra_control_plane_routes_require_the_control_plane_credential`
+    /// below (none of them exercised a non-empty extra router), silently
+    /// reintroducing the exact bug `/debug/node-registry` originally had.
     ///
-    /// A real end-to-end HTTP check would need a real `ApiImpl` behind a
-    /// mutated global control-plane token — disproportionate for a defect
-    /// that is one line of composition — so this reads this file's own
-    /// source instead, the same technique
-    /// `only_the_split_roles_bind_a_second_listener`
-    /// (`src/bin/server.rs`) uses for the same reason.
+    /// 🔴 What this scan *cannot* see: `assemble` takes two router arguments,
+    /// and a merge onto the wrong one (`data_plane`, deliberately never
+    /// gated) is still textually "at or after `assemble(` starts" and still
+    /// "inside `assemble(...)`'s matching parens" — every check below would
+    /// still pass. That is exactly the blind spot
+    /// `extra_control_plane_routes_require_the_control_plane_credential`
+    /// exists to close with a real request instead of a source scan; keep
+    /// both, not either.
     #[test]
     fn extra_control_plane_routes_are_merged_before_assemble_is_called() {
         let source = include_str!("server.rs");
         let start = source
-            .find("pub fn new_with_control_plane_routes")
-            .expect("new_with_control_plane_routes is no longer in this file");
+            .find("fn new_with_control_plane_routes_and_gate")
+            .expect("new_with_control_plane_routes_and_gate is no longer in this file");
         let open = source[start..].find('{').expect("a body") + start;
         let mut depth = 0usize;
         let mut body = "";
@@ -412,6 +467,113 @@ mod tests {
              attached — not chained onto assemble's return value. Chaining it after is exactly \
              the bug /debug/node-registry originally had: a route added after every layer runs \
              is a route no layer ever covers."
+        );
+    }
+
+    /// A real `ApiImpl`, built the same way `crate::api::proxy`'s own test
+    /// module builds one — in-memory metadata store, file-backed persister
+    /// over a scratch temp dir, a mock snapshot manager. Needed here (rather
+    /// than reusing `proxy`'s copy) because that one is `pub(super)` to
+    /// `proxy` and not reachable from this sibling module.
+    async fn build_api_impl_for_gate_test() -> Arc<ApiImpl> {
+        let root = tempfile::tempdir().unwrap();
+        let orchestrator = crate::orchestrator::Orchestrator::new(
+            ServerRole::All,
+            crate::orchestrator::InMemoryMetadataStore::new(),
+            crate::sandbox::FirecrackerSandboxFactory::new(),
+            crate::orchestrator::FileBackedSandboxPersister::new_for_test(
+                root.path().to_path_buf(),
+            ),
+        )
+        .await
+        .unwrap();
+        let snapshot_manager = Arc::new(crate::snapshot::mock::mock_snapshot_manager());
+        let template_builder = Arc::new(crate::template::TemplateBuilder::new());
+        let image_resolver = Arc::new(crate::image::ImageResolver::new(
+            &crate::cfg::AppConfig::default(),
+        ));
+        let identity = crate::identity::NodeIdentity::from_config(&Default::default());
+        Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            template_builder,
+            image_resolver,
+            None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),
+                snapshot_manager,
+                &identity,
+            ),
+            Vec::new(),
+            ServerRole::All,
+            crate::api::ResumeWiring::node_local(identity.id),
+        ))
+    }
+
+    /// A stand-in for `/debug/node-registry`, merged in exactly the way
+    /// `assemble_api` (`src/bin/server.rs`) merges the real one.
+    fn stand_in_debug_route() -> Router {
+        Router::new().route("/debug/example-registry", get(|| async { "debug" }))
+    }
+
+    /// 🔴 P5, request-level. Closes the blind spot
+    /// `extra_control_plane_routes_are_merged_before_assemble_is_called` cannot
+    /// see: that scan only proves the merge call sits textually inside
+    /// `assemble(...)`'s parens, and `assemble` takes *two* router arguments —
+    /// a merge onto `data_plane` (the one `assemble`'s own doc says is
+    /// deliberately never gated) still sits inside those parens and still
+    /// passes the scan. A real request against the composed router does not
+    /// have that blind spot, which is why this exercises
+    /// `new_with_control_plane_routes_and_gate` — the function the bug would
+    /// actually live in — with an injected gate, rather than reading source
+    /// text or touching `ConfigManager`'s process-global config.
+    ///
+    /// Four assertions, not one: a debug route wired the intended way must be
+    /// gated (this is the fix `/debug/node-registry` needed); an existing
+    /// gated route must *stay* gated (so this test cannot pass by the new
+    /// composition accidentally opening everything); the correct credential
+    /// must reach both; and `/health` must stay reachable regardless, so a
+    /// gate that refuses everything cannot pass this either.
+    #[tokio::test]
+    async fn extra_control_plane_routes_require_the_control_plane_credential() {
+        let api_impl = build_api_impl_for_gate_test().await;
+        let gate = Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], ""));
+        let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
+
+        let router = || {
+            new_with_control_plane_routes_and_gate(
+                Arc::clone(&api_impl),
+                ServerRole::All,
+                stand_in_debug_route(),
+                Arc::clone(&gate),
+            )
+        };
+
+        assert_eq!(
+            status(router(), Method::GET, "/debug/example-registry", None).await,
+            StatusCode::FORBIDDEN,
+            "a route merged in through new_with_control_plane_routes must require the \
+             control-plane credential, same as /debug/node-registry"
+        );
+        assert_eq!(
+            status(router(), Method::POST, sandbox_path, None).await,
+            StatusCode::FORBIDDEN,
+            "regression control: an existing gated route must still be gated"
+        );
+        assert_ne!(
+            status(router(), Method::GET, "/debug/example-registry", Some(TOKEN)).await,
+            StatusCode::FORBIDDEN,
+            "the correct credential must reach the merged-in debug route"
+        );
+        assert_ne!(
+            status(router(), Method::POST, sandbox_path, Some(TOKEN)).await,
+            StatusCode::FORBIDDEN,
+            "the correct credential must still reach the pre-existing gated route"
+        );
+        assert_ne!(
+            status(router(), Method::GET, "/health", None).await,
+            StatusCode::FORBIDDEN,
+            "/health must stay ungated regardless"
         );
     }
 

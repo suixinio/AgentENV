@@ -338,6 +338,29 @@ fn build_central_catalog(config: &AppConfig) -> Result<Option<Arc<CentralSnapsho
     )))
 }
 
+/// Starts the catalog build reaper for this process, when `pool` is `Some`
+/// (i.e. `[pg]` is configured) — a thin `pub` bridge so `src/bin/server.rs`
+/// (a separate crate from this library) can reach
+/// `postgres::reaper::spawn`, which stays `pub(crate)` like the rest of that
+/// module. `None` (no interval/ttl configured, or no pool at all) means
+/// nothing was started, matching [`postgres::reaper::spawn`]'s own `None`
+/// case.
+///
+/// 🔴 The returned handle must be shut down through
+/// `agentenv::pg::SingletonTaskHandle::shutdown()`, never pushed into a
+/// `Vec<tokio::task::JoinHandle<()>>` and `.abort()`-ed — see that type's
+/// own documentation on why: this replica's PostgreSQL advisory lock, if it
+/// is currently leader, would otherwise leak until the pool itself is torn
+/// down.
+pub fn spawn_catalog_build_reaper(
+    pool: Option<sqlx::PgPool>,
+    cluster_id: uuid::Uuid,
+    interval: std::time::Duration,
+    ttl: std::time::Duration,
+) -> Option<crate::pg::SingletonTaskHandle> {
+    postgres::reaper::spawn(pool?, cluster_id, interval, ttl)
+}
+
 fn build_storage_backend(
     config: &AppConfig,
     p2p_transport: Option<Arc<dyn P2pTransport>>,

@@ -94,6 +94,15 @@ struct Assembly {
     orchestration: Arc<dyn SandboxOrchestration>,
     /// Background tasks to stop before the shutdown pauses start.
     upkeep: Vec<tokio::task::JoinHandle<()>>,
+    /// PostgreSQL-elected singleton background tasks (Stage B: the catalog
+    /// build reaper). Kept apart from `upkeep` deliberately —
+    /// `agentenv::pg::SingletonTaskHandle::shutdown()` is `async`, consumes
+    /// `self`, and releases this replica's advisory lock (if it is
+    /// currently leader) before returning; pushing one into `upkeep` and
+    /// letting the shutdown loop `.abort()` it would skip that release
+    /// entirely and strand the lock until the pool itself is torn down.
+    /// Empty for `--role node`, which never holds a `[pg]` pool at all.
+    pg_singleton_tasks: Vec<agentenv::pg::SingletonTaskHandle>,
     /// The heartbeat sender, for roles that report themselves as a machine.
     reporter: Option<ObservabilityReporter>,
     /// The machine-local runtime, for roles that brought one up.
@@ -326,6 +335,7 @@ async fn async_main() -> anyhow::Result<()> {
         app,
         orchestration,
         upkeep,
+        pg_singleton_tasks,
         mut reporter,
         runtime,
         grpc,
@@ -372,6 +382,14 @@ async fn async_main() -> anyhow::Result<()> {
             // paused records these tasks would otherwise be racing to inspect.
             for task in &upkeep {
                 task.abort();
+            }
+            // 🔴 Awaited, never `.abort()`-ed — see `Assembly::pg_singleton_tasks`'s
+            // own doc comment: `shutdown()` releases this replica's
+            // PostgreSQL advisory lock if it is currently leader, which an
+            // abort would skip entirely.
+            for task in pg_singleton_tasks {
+                info!(target: "agentenv", "stopping a pg-elected singleton task before process exit");
+                task.shutdown().await;
             }
             info!(target: "agentenv", "stopping sandboxes before process exit");
             if let Err(err) = shutdown_orchestration.shutdown().await {
@@ -446,6 +464,45 @@ async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool
         return Ok(None);
     };
     Ok(Some(pg::connect(&settings).await?))
+}
+
+/// The catalog build reaper's own cadence: how often the cluster-elected
+/// leader scans for stale builds, and how far behind a heartbeat may fall
+/// before the leader ends the build it belongs to.
+///
+/// 🔴 No dedicated config knob (Stage B, per its own docs/proposals, adds no
+/// new config axis beyond what `snapshot.catalog.{write,read}` already
+/// give). `ttl` is derived from the existing
+/// `[snapshot.catalog].build_heartbeat_interval_secs` — the node-side
+/// cadence a builder renews its lease on — the same "roughly a third of the
+/// TTL is the usual margin" reasoning that field's own doc comment states,
+/// inverted: two renewals may be lost to a rollout or a slow network before
+/// a build that is still running gets taken away from it.
+fn reaper_cadence(config: &AppConfig) -> (std::time::Duration, std::time::Duration) {
+    let heartbeat_interval = config.snapshot.catalog.build_heartbeat_interval_secs.max(1);
+    let interval = std::time::Duration::from_secs(30);
+    let ttl = std::time::Duration::from_secs(heartbeat_interval.saturating_mul(3));
+    (interval, ttl)
+}
+
+/// Starts the catalog build reaper for this process when `pg_pool` is
+/// `Some`. See `agentenv::snapshot::repository::backends::spawn_catalog_build_reaper`'s
+/// own doc on why the handle must be shut down through its own `shutdown()`
+/// path rather than folded into `paused_upkeep`.
+fn spawn_pg_singleton_tasks(
+    config: &AppConfig,
+    pg_pool: Option<sqlx::PgPool>,
+) -> Vec<agentenv::pg::SingletonTaskHandle> {
+    let (interval, ttl) = reaper_cadence(config);
+    let identity = agentenv::identity::NodeIdentity::from_config(&config.node_identity);
+    agentenv::snapshot::repository::backends::spawn_catalog_build_reaper(
+        pg_pool,
+        identity.cluster_id,
+        interval,
+        ttl,
+    )
+    .into_iter()
+    .collect()
 }
 
 /// Brings up everything a role that runs sandboxes on this machine needs.
@@ -598,6 +655,7 @@ async fn assemble_node_core(
 async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::All;
     let pg_pool = build_pg_pool(config).await?;
+    let pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
     let core = assemble_node_core(config, role, pg_pool).await?;
 
     debug_assert!(role.arbitrates_paused_sandbox_ownership());
@@ -674,6 +732,7 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
         app: server::new(api_impl, role),
         orchestration,
         upkeep: paused_upkeep,
+        pg_singleton_tasks,
         reporter: core.reporter,
         runtime: Some(core.runtime),
         // 🔴 Not "not yet": never. This role is the rollback target and is
@@ -850,6 +909,7 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         // 🔴 No upkeep: renewing a lease and reconciling local records against
         // the cluster are both decisions, and this role takes none.
         upkeep: Vec::new(),
+        pg_singleton_tasks: Vec::new(),
         reporter: core.reporter,
         runtime: Some(core.runtime),
         grpc: Some(grpc),
@@ -1083,6 +1143,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // consulted: P2P moves bytes between machines that hold them, and this
     // process holds none.
     let pg_pool = build_pg_pool(config).await?;
+    let pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
     let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool).await?);
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));
@@ -1266,6 +1327,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         app: server::new_with_control_plane_routes(api_impl, role, node_registry_debug_routes),
         orchestration,
         upkeep: paused_upkeep,
+        pg_singleton_tasks,
         reporter: None,
         runtime: None,
         grpc: Some(grpc),

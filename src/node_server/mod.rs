@@ -37,15 +37,31 @@ mod service;
 mod tests;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use tracing::info;
 
+use crate::image::ImageResolver;
 use crate::orchestrator::SandboxOrchestration;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxServiceServer;
 use crate::snapshot::SnapshotManager;
+use crate::template::TemplateBuilder;
 
 pub use service::NodeSandboxService;
+
+/// How often this server pings an otherwise-quiet HTTP/2 connection, and how
+/// long it waits for the reply before dropping it.
+///
+/// 🔴 Exists for one RPC on this service — `BuildTemplate` — which can sit
+/// with nothing on the wire for most of ten minutes while a build sandbox
+/// runs. Every other call here is a handful of round trips and would never
+/// notice this setting either way, so applying it to the whole server rather
+/// than one route costs those calls nothing: see
+/// `src/node_client/build.rs`'s matching client-side constants for the other
+/// half of the argument.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reachable from `crate::node_client`'s tests, which drive a create through
 /// the wire and then ask this side whether the sandbox came out owned.
@@ -58,12 +74,26 @@ pub use service::NodeSandboxService;
 pub(crate) use ownership::owned_by_control_plane;
 
 /// Builds the tonic server for one node's orchestrator.
+///
+/// 🔴 Always wired for `BuildTemplate`: every `--role node` process has its
+/// own `ImageResolver` and `TemplateBuilder` regardless of whether a template
+/// build ever reaches it (`assemble_node_core` builds both unconditionally,
+/// the same as `--role all` always has), so there is no configuration under
+/// which this server should answer `Unimplemented` for it. See
+/// `NodeSandboxService::with_template_build`'s doc for why the *type* still
+/// allows a service with neither wired — that is for this function's own
+/// tests, not for production.
 pub(crate) fn server(
     orchestration: Arc<dyn SandboxOrchestration>,
     snapshots: Arc<SnapshotManager>,
     node_id: String,
+    image_resolver: Arc<ImageResolver>,
+    template_builder: Arc<TemplateBuilder>,
 ) -> NodeSandboxServiceServer<NodeSandboxService> {
-    NodeSandboxServiceServer::new(NodeSandboxService::new(orchestration, snapshots, node_id))
+    NodeSandboxServiceServer::new(
+        NodeSandboxService::new(orchestration, snapshots, node_id)
+            .with_template_build(image_resolver, template_builder),
+    )
 }
 
 /// Serves the node service on a listener somebody else bound, until `shutdown`
@@ -81,17 +111,28 @@ pub(crate) fn server(
 /// API half cannot reach — which from the outside is indistinguishable from an
 /// API half that has nothing to say. Bound by the assembly, that is a process
 /// that does not start.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     orchestration: Arc<dyn SandboxOrchestration>,
     snapshots: Arc<SnapshotManager>,
     node_id: String,
+    image_resolver: Arc<ImageResolver>,
+    template_builder: Arc<TemplateBuilder>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let addr = listener.local_addr().ok();
     info!(target: "agentenv", ?addr, "serving the node sandbox service");
     tonic::transport::Server::builder()
-        .add_service(server(orchestration, snapshots, node_id))
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+        .add_service(server(
+            orchestration,
+            snapshots,
+            node_id,
+            image_resolver,
+            template_builder,
+        ))
         .serve_with_incoming_shutdown(
             tonic::transport::server::TcpIncoming::from(listener),
             shutdown,

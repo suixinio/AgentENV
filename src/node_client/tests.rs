@@ -343,6 +343,21 @@ impl NodeSandboxService for Arc<ScriptedNode> {
             sandboxes: Vec::new(),
         }))
     }
+
+    // 🔴 Not scripted like the calls above: nothing in this module drives
+    // `BuildTemplate` through a `ScriptedNode` — the node-side behavior is
+    // covered directly in `src/node_server/tests.rs`, against the real
+    // `NodeSandboxService`, and this fake exists to test `RemoteSandboxStub`
+    // against the *other* RPCs. Unimplemented rather than unreachable so a
+    // future test that does script this call fails loudly instead of hanging.
+    async fn build_template(
+        &self,
+        _request: Request<pb::TemplateBuildRequest>,
+    ) -> Result<Response<pb::TemplateBuildResponse>, Status> {
+        Err(Status::unimplemented(
+            "ScriptedNode does not script build_template",
+        ))
+    }
 }
 
 async fn scripted_node() -> (Arc<ScriptedNode>, RunningNode) {
@@ -1711,6 +1726,10 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
             served,
             Arc::new(resolvable_snapshot_manager()),
             "node-under-test".to_string(),
+            Arc::new(crate::image::ImageResolver::new(
+                &crate::cfg::AppConfig::default(),
+            )),
+            Arc::new(crate::template::TemplateBuilder::new()),
             async {
                 let _ = stopped.await;
             },

@@ -18,12 +18,12 @@ pub(crate) enum TemplateBuildRootfsBase {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TemplateBuildStep {
     pub(crate) kind: TemplateBuildStepKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum TemplateBuildStepKind {
     Run { cmd: String },
     Env { key: String, value: String },
@@ -236,6 +236,19 @@ impl TemplateBuildSpec {
 
     pub(crate) fn steps(&self) -> &[TemplateBuildStep] {
         &self.steps
+    }
+
+    /// Replaces the step list wholesale.
+    ///
+    /// 🔴 For `NodeSandboxService::build_template`, which receives an already
+    /// fully-formed `Vec<TemplateBuildStep>` off the wire (decoded from the
+    /// same type this crate serialises) rather than the individual
+    /// `RUN`/`ENV`/... calls that build one up locally. Re-deriving those
+    /// calls from the decoded kinds would just reconstruct the vector this
+    /// method sets directly, one match arm at a time, for no benefit.
+    pub(crate) fn with_steps(mut self, steps: Vec<TemplateBuildStep>) -> Self {
+        self.steps = steps;
+        self
     }
 
     pub(crate) fn resources_ref(&self) -> Option<&SandboxResources> {

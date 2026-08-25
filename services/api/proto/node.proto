@@ -111,6 +111,36 @@ service NodeSandboxService {
   // the control plane's sandboxes, and it is consumed as evidence for deciding
   // that a sandbox is an orphan.
   rpc ListSandboxes (ListSandboxesRequest) returns (SandboxListResponse);
+
+  // Runs one template build — a throwaway sandbox driven through RUN/ENV/...
+  // steps and captured at the end — entirely on this node, and stages the
+  // result for the caller to announce.
+  //
+  // 🔴 **Not a sandbox, and not on the `ListSandboxes` roster.** The build VM
+  // this spins up never goes through `Create`, carries no
+  // `control_plane_config`, and is torn down before this call returns either
+  // way. It exists so `--role api`, which has no `/dev/kvm`, no `regctl` and
+  // no Firecracker binary of its own, can still build templates — see
+  // `TemplateBuildRunner` (`src/template/runner.rs`), which is what actually
+  // runs on this node and is otherwise reached only from `--role all`.
+  //
+  // 🔴 **Stages, and does not commit.** The same split as `Pause`'s `staged`
+  // arm and `Checkpoint`: the bytes are durable on this node's repository
+  // backend the moment this call returns successfully, but no catalog row
+  // exists until the caller announces `TemplateBuildResponse.staged`. See
+  // `NodeSandboxService::build_template` for how that reuses
+  // `SnapshotManager::stage_captured`'s `adopt_staged` path rather than
+  // inventing a second "remote commit" mechanism.
+  //
+  // 🔴 **This is the long call on this service.** A build can legitimately
+  // run for most of `TemplateBuildRunner::READY_TIMEOUT` (ten minutes) with
+  // nothing on the wire in either direction, which is nothing like this
+  // service's other RPCs. The caller (`src/node_client/build.rs`) dials a
+  // dedicated connection carrying its own generous call timeout and HTTP/2
+  // keepalive, precisely so a connection this quiet is never mistaken for
+  // idle by whatever sits between the two Pods, and so a genuinely dead peer
+  // is still noticed well inside that timeout.
+  rpc BuildTemplate (TemplateBuildRequest) returns (TemplateBuildResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -641,4 +671,99 @@ message NodeSandbox {
   // control plane's, and is left out of the listing entirely rather than
   // reported with an empty one.
   bytes control_plane_config = 10;
+}
+
+// ---------------------------------------------------------------------------
+// BuildTemplate
+// ---------------------------------------------------------------------------
+
+// A rootfs to resolve from an OCI image reference, node-side.
+//
+// 🔴 The reference, and not a resolved path — same rule as `SnapshotSource`
+// and `ImageSource` above. Resolving an image reaches a registry through
+// `regctl` and writes local overlaybd artifacts, both of which are this
+// node's to do; the caller only ever gets to name what it wants.
+message TemplateBuildImageBase {
+  // Empty means this node's own configured default
+  // (`[image.resolver].default_image`), matching `ImageResolver::resolve`'s
+  // existing reading of an absent image reference.
+  string image_ref = 1;
+}
+
+message TemplateBuildRequest {
+  // The snapshot id the built template will be staged under and, once the
+  // caller commits `TemplateBuildResponse.staged`, committed under.
+  //
+  // 🔴 Chosen by the caller, not minted here — same rule as `Create`'s
+  // `sandbox_id`. The caller's own catalog row already names this id before
+  // this call is made (`SnapshotManager::try_start_build`), and a node that
+  // minted its own would stage bytes that row can never point at.
+  string build_snapshot_id = 1;
+
+  // 🔴 Never a resolved snapshot, matching `SnapshotSource` above and for the
+  // same reason: resolving one opens local artifacts that belong to whichever
+  // machine boots the build sandbox, which after this call exists is this
+  // node and not the caller.
+  oneof base {
+    TemplateBuildImageBase image = 2;
+    // A committed snapshot to build on top of, by id or alias. Resolved
+    // node-side through the same `SnapshotManager::load_runnable` a `Create`
+    // with a `SnapshotSource` resolves its base through.
+    string base_snapshot_ref = 3;
+  }
+
+  // Build steps (RUN/ENV/WORKDIR/USER/EXPOSE/VOLUME/LABEL), as
+  // `Vec<TemplateBuildStep>` (`src/template/build_spec.rs`) serialises.
+  //
+  // 🔴 `SerializedValue`, not one proto message per step kind. Both ends of
+  // this call are Rust and are deployed from one image — the precondition
+  // `SerializedValue`'s own doc names — and `TemplateBuildStep`/
+  // `TemplateBuildStepKind` are already a closed, internal, serialisable Rust
+  // enum with no representation outside this process: the public HTTP
+  // surface speaks its own DTOs (`models::TemplateStep` and friends) and
+  // never this type. Mirroring seven step kinds as a second oneof here would
+  // be a second schema for a type that already has one, kept in step by
+  // hand, to serve a caller this type was never going to reach.
+  SerializedValue steps = 4;
+
+  SandboxResources resources = 5;
+
+  // Empty means "no override": the build ends running whatever the base
+  // image or base snapshot already runs. Same rule as
+  // `TemplateBuildSpec::start_cmd`/`ready_cmd` apply to these same two
+  // strings locally — this call does not restate it as a separate bool,
+  // because the node applies the identical rule to the identical input.
+  string start_cmd = 6;
+  string ready_cmd = 7;
+
+  // 🔴 **No alias field, on purpose.** Staging never applies one — see
+  // `capture_publish_metadata(metadata, None)` and `stage_for_caller`'s note
+  // that alias is "the single field staging never reads, so it stays the
+  // committer's to apply" — and a template build follows the same rule
+  // rather than a new one: the caller's `adopt_staged` overwrites
+  // `staged.commit.alias` unconditionally at commit time regardless of what
+  // this node wrote, so sending one here would be a value nobody reads.
+}
+
+message TemplateBuildResponse {
+  // 🔴 Always present on success: a build's whole product is the staged row,
+  // matching `SandboxCheckpointResponse` above. A failed build fails the
+  // call — see `TemplateBuildFailureDetail` — there is no third answer to
+  // encode here the way a pause's `staging_error` needs one for.
+  StagedSnapshot staged = 1;
+}
+
+// Which build step a failed `BuildTemplate` call failed on, carried in the
+// gRPC `Status` details so it survives the hop back to the caller.
+//
+// 🔴 In details and not folded into the status message string, matching
+// `SandboxCaptureFailure` above: a template's build-status API answers with
+// this value verbatim (`TemplateBuildErrorReason.step` /
+// `models::BuildStatusReason.step`), and a caller that had to re-parse prose
+// to recover it would be one string-format change away from losing it.
+message TemplateBuildFailureDetail {
+  // Empty means the failure was not scoped to one step — resolving the base
+  // image or base snapshot, or staging the built artifacts, rather than a
+  // RUN/ENV/... step failing.
+  string step = 1;
 }

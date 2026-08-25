@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
+use crate::image::ImageResolver;
 use crate::orchestrator::{
     ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
     NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
@@ -30,8 +31,11 @@ use crate::orchestrator::{
 };
 use crate::proto::node as pb;
 use crate::sandbox::{CustomExtensionParams, SandboxCaptureError, SandboxNetworkPolicy};
-use crate::snapshot::SnapshotManager;
-use crate::types::{ExecutionId, SandboxId};
+use crate::snapshot::{
+    CommandContext, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
+};
+use crate::template::{TemplateBuildRunner, TemplateBuildSpec, TemplateBuildStep, TemplateBuilder};
+use crate::types::{ExecutionId, ImageConfigs, SandboxId};
 
 use super::convert;
 use super::ownership::owned_by_control_plane;
@@ -49,6 +53,27 @@ pub struct NodeSandboxService {
     /// the node decides what that means on its disk.
     snapshots: Arc<SnapshotManager>,
     node_id: String,
+    /// What `build_template` needs beyond the above, or `None` on a service
+    /// nobody wired to build templates.
+    ///
+    /// 🔴 A builder step (`with_template_build`) rather than two more
+    /// constructor parameters, and deliberately so: every test in this module
+    /// but the ones that specifically exercise a build constructs a service
+    /// through `new(...)` alone, and a required fourth and fifth argument
+    /// would be pure churn for all of them. Production always calls
+    /// `with_template_build` — see `node_server::server`.
+    template_build: Option<TemplateBuildWiring>,
+}
+
+/// What [`NodeSandboxService::build_template`] needs beyond the orchestrator
+/// and the snapshot manager every other call already has.
+struct TemplateBuildWiring {
+    /// Resolves an image reference into local overlaybd, node-side — the
+    /// piece `--role api` cannot do for itself: see the note on
+    /// `TemplateBuildImageBase` in `node.proto`.
+    image_resolver: Arc<ImageResolver>,
+    /// Drives `TemplateBuildRunner` and validates the build's `TemplateBuildContext`.
+    template_builder: Arc<TemplateBuilder>,
 }
 
 impl NodeSandboxService {
@@ -61,7 +86,27 @@ impl NodeSandboxService {
             orchestration,
             snapshots,
             node_id,
+            template_build: None,
         }
+    }
+
+    /// Wires this service to serve `BuildTemplate`.
+    ///
+    /// 🔴 Not called by most of this file's own tests, and that is the
+    /// point — see the note on `template_build`'s field. A service nobody
+    /// called this on answers `build_template` with `Unimplemented` rather
+    /// than panicking on a `None`, which is why that path is a refusal and
+    /// not an `.unwrap()`.
+    pub fn with_template_build(
+        mut self,
+        image_resolver: Arc<ImageResolver>,
+        template_builder: Arc<TemplateBuilder>,
+    ) -> Self {
+        self.template_build = Some(TemplateBuildWiring {
+            image_resolver,
+            template_builder,
+        });
+        self
     }
 
     /// Refuses a call addressed to a run this node is not the one running.
@@ -179,6 +224,139 @@ impl NodeSandboxService {
             %sandbox_id,
             snapshot_id = %staged.commit.id,
             "staged a snapshot for its caller to announce"
+        );
+
+        Ok(pb::StagedSnapshot { value: Some(value) })
+    }
+
+    /// [`NodeSandboxService::build_template`]'s body, once wiring has been
+    /// confirmed present.
+    ///
+    /// # 🔴 What this mirrors, and what it does not
+    ///
+    /// The "resolve the base, execute, stage" shape is exactly
+    /// `run_the_build` -> `TemplateBuilder::execute_and_publish`'s local path
+    /// in `src/api/impls/template.rs`, moved here because resolving an image
+    /// needs `regctl` and `--role api` has none. It stops one step short of
+    /// that path, at `SnapshotManager::stage` rather than `publish`: a build
+    /// run for `--role api` has no catalog row of its own to write into —
+    /// only the caller's `try_start_build` row does, and only the caller can
+    /// write it. What crosses back is therefore a `StagedSnapshot` for the
+    /// caller to commit, exactly like `stage_for_caller` above.
+    async fn build_template_impl(
+        &self,
+        wiring: &TemplateBuildWiring,
+        request: pb::TemplateBuildRequest,
+    ) -> Result<pb::StagedSnapshot, Status> {
+        let build_snapshot_id = SnapshotId::parse(&request.build_snapshot_id).map_err(|err| {
+            Status::invalid_argument(format!(
+                "build_snapshot_id {:?}: {err}",
+                request.build_snapshot_id
+            ))
+        })?;
+
+        let resources = request
+            .resources
+            .ok_or_else(|| Status::invalid_argument("resources is required"))?;
+        if resources.cpu_count == 0 || resources.memory_mib == 0 {
+            return Err(Status::invalid_argument(
+                "resources.cpu_count and resources.memory_mib must be greater than 0",
+            ));
+        }
+
+        let steps: Vec<TemplateBuildStep> =
+            convert::serialized(request.steps.as_ref(), "steps")?.unwrap_or_default();
+
+        let mut spec = TemplateBuildSpec::new()
+            .resources(resources.cpu_count, resources.memory_mib)
+            .with_steps(steps);
+        if !request.start_cmd.is_empty() {
+            spec = spec.start_cmd(request.start_cmd.clone());
+        }
+        if !request.ready_cmd.is_empty() {
+            spec = spec.ready_cmd(request.ready_cmd.clone());
+        }
+
+        let base_snapshot = match request.base {
+            Some(pb::template_build_request::Base::Image(image)) => {
+                let image_ref = (!image.image_ref.is_empty()).then_some(image.image_ref.as_str());
+                let resolved = resolve_build_image(&wiring.image_resolver, image_ref).await?;
+                spec = apply_image_base(spec, resolved);
+                None
+            }
+            Some(pb::template_build_request::Base::BaseSnapshotRef(base_ref)) => {
+                if base_ref.is_empty() {
+                    return Err(Status::invalid_argument("base_snapshot_ref is required"));
+                }
+                let runnable = self
+                    .snapshots
+                    .load_runnable(&base_ref)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!("resolve base template {base_ref}: {err:#}"))
+                    })?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("base template {base_ref} not found"))
+                    })?;
+                Some(runnable)
+            }
+            None => return Err(Status::invalid_argument("base is required")),
+        };
+
+        let context = wiring
+            .template_builder
+            .prepare_remote_context(&spec, build_snapshot_id.clone(), base_snapshot.as_ref())
+            .map_err(prepare_context_status)?;
+
+        // 🔴 Synchronous and blocking, matching `execute_and_publish`'s own
+        // call to it exactly — see that function in `src/template/builder.rs`.
+        // `execute` spawns its own OS thread and joins it, so this does hold
+        // the async task (and the worker thread under it) for as long as the
+        // build sandbox runs; nothing about the split changes that trade-off,
+        // and `TemplateBuildRunner::execute`'s own code is untouched here.
+        let build_execution = TemplateBuildRunner::new()
+            .execute(&context)
+            .map_err(|err| execute_status(&err))?;
+
+        let (metadata, manifest) = template_build_publish_metadata(
+            context.build_snapshot_id.clone(),
+            context.resources,
+            context.virtualization_mode,
+            build_execution,
+        );
+
+        // 🔴 `stage`, not `stage_captured`: this build produced a manifest
+        // directly, not a `CapturedSandboxSnapshot` — see `SnapshotManager::stage`'s
+        // own doc, "for artifacts that were built rather than captured".
+        // `execution_id: None`, matching the local publish path
+        // (`TemplateBuilder::execute_and_publish` calls `publish` ->
+        // `stage(metadata, manifest, None)`): a template build fences on
+        // nothing, because there is no sandbox run for a later caller to name.
+        let staged = self
+            .snapshots
+            .stage(metadata, manifest, None)
+            .await
+            .map_err(|err| {
+                Status::internal(format!("stage template build {build_snapshot_id}: {err:#}"))
+            })?
+            // 🔴 Drops the local half here, same as `stage_for_caller` above:
+            // by the time `stage` returns, `import_built_artifacts` has
+            // already copied the build's artifacts into this node's durable
+            // repository storage, so `context`'s temporary workspace (which
+            // goes out of scope at the end of this function) has nothing left
+            // that matters.
+            .into_staged();
+
+        let value = crate::proto::node::encode_value(&staged).map_err(|err| {
+            Status::internal(format!(
+                "encode the staged template build {build_snapshot_id}: {err} (its bytes are \
+                 staged on this node and nothing will announce them)"
+            ))
+        })?;
+
+        info!(
+            snapshot_id = %staged.commit.id,
+            "staged a template build for its caller to announce"
         );
 
         Ok(pb::StagedSnapshot { value: Some(value) })
@@ -369,6 +547,140 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
         }
         other => Status::internal(other.to_string()),
     }
+}
+
+/// Resolves a template build's image base, node-side.
+///
+/// 🔴 Mirrors `resolve_template_rootfs_image` in
+/// `src/api/impls/template.rs` rather than sharing code with it: that
+/// function speaks `models::Error`, an HTTP type this gRPC surface has no
+/// business depending on, and the part that is not the four-line translation
+/// of an `ImageResolutionError` into a status — `ImageResolver::resolve`
+/// itself — is already shared, being the one and only implementation either
+/// caller drives.
+async fn resolve_build_image(
+    image_resolver: &ImageResolver,
+    image_ref: Option<&str>,
+) -> Result<crate::image::ResolvedBlockImage, Status> {
+    let image_ref = image_ref.unwrap_or_else(|| image_resolver.default_image());
+    image_resolver.resolve(image_ref).await.map_err(|err| {
+        let code = if err.is_user_error() {
+            tonic::Code::InvalidArgument
+        } else {
+            tonic::Code::Internal
+        };
+        Status::new(code, format!("resolve image {image_ref}: {err}"))
+    })
+}
+
+/// Applies a resolved image base to a `TemplateBuildSpec`, matching the
+/// `raw_config` -> `ImageConfigs` and `base_context` -> `CommandContext`
+/// translation `resolve_template_rootfs_image`'s caller performs today in
+/// `src/api/impls/template.rs`'s `run_the_build`.
+fn apply_image_base(
+    spec: TemplateBuildSpec,
+    resolved: crate::image::ResolvedBlockImage,
+) -> TemplateBuildSpec {
+    let mut image_configs = ImageConfigs::new();
+    if let Some(config) = &resolved.raw_config {
+        image_configs.add(None::<String>, "/", config.clone());
+    }
+    let base = resolved.base_context;
+    let base_context = CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
+        .with_user(base.user)
+        .with_exposed_ports(base.exposed_ports)
+        .with_entrypoint(base.entrypoint)
+        .with_cmd(base.cmd)
+        .with_volumes(base.volumes)
+        .with_labels(base.labels);
+    spec.with_resolved_overlaybd_image(resolved.overlaybd_config_path, image_configs)
+        .with_base_context(base_context)
+}
+
+/// Splits a finished build into the two things `SnapshotManager::stage` wants
+/// — the metadata describing it, and the manifest naming its artifacts — and
+/// derives `resources.disk_size_mib` from the manifest the way
+/// `TemplateBuilder::execute_and_publish` does for the local build path.
+///
+/// 🔴 Pure and free of `self` on purpose: `TemplateBuildRunner::execute`
+/// (which produces the `TemplateBuildExecution` this consumes) boots a real
+/// Firecracker VM and cannot run inside `cargo test --lib`, but everything
+/// downstream of it — this function, `SnapshotManager::stage`, encoding for
+/// the wire, and `commit_staged` on the other end — is ordinary Rust that
+/// can. See `a_built_templates_metadata_survives_stage_encode_decode_and_commit`
+/// in `tests.rs`, which drives exactly that: a hand-built
+/// `TemplateBuildExecution` through this function and a real
+/// (PosixFs-backed) `SnapshotManager`.
+///
+/// 🔴 `alias: None`, deliberately — see `TemplateBuildRequest`'s doc in
+/// `node.proto`. Staging never reads it: the caller's `adopt_staged`
+/// overwrites `staged.commit.alias` unconditionally once this row is
+/// committed, so a value written here would never be read back.
+pub(super) fn template_build_publish_metadata(
+    build_snapshot_id: SnapshotId,
+    resources: crate::types::SandboxResources,
+    virtualization_mode: crate::virtualization::VirtualizationMode,
+    build_execution: crate::template::TemplateBuildExecution,
+) -> (
+    SnapshotPublishMetadata,
+    crate::sandbox::FirecrackerSnapshotManifest,
+) {
+    let mut resources = resources;
+    resources.disk_size_mib = build_execution
+        .manifest
+        .rootfs
+        .virtual_size
+        .div_ceil(1 << 20)
+        .try_into()
+        .unwrap_or(u32::MAX);
+
+    let metadata = SnapshotPublishMetadata {
+        id: build_snapshot_id,
+        alias: None,
+        source: SnapshotPublishSource::Template,
+        context: build_execution.build_context,
+        startup: build_execution.startup,
+        resources,
+        runtime_versions: build_execution.runtime_versions,
+        virtualization_mode,
+        image_configs: build_execution.image_configs,
+        custom_extension_params: None,
+    };
+    (metadata, build_execution.manifest)
+}
+
+/// Maps a `TemplateBuildContext` preparation failure — the id colliding with
+/// its base, a virtualization mode mismatch, resources changing under a
+/// snapshot base, or a local I/O failure creating the build's workspace — onto
+/// a status. Never step-scoped: `TemplateBuildFailure`'s `step` field is only
+/// ever attached by `step_executor.rs`, once a build sandbox is actually
+/// running, which none of these failures reach.
+fn prepare_context_status(err: crate::template::TemplateBuildError) -> Status {
+    match err {
+        crate::template::TemplateBuildError::InvalidInput { reason } => {
+            crate::proto::node::build_failure_status(tonic::Code::InvalidArgument, reason, None)
+        }
+        crate::template::TemplateBuildError::System { reason, .. } => {
+            crate::proto::node::build_failure_status(
+                tonic::Code::Internal,
+                reason.message,
+                reason.step.as_deref(),
+            )
+        }
+    }
+}
+
+/// Maps a `TemplateBuildRunner::execute` failure onto a status, preserving
+/// which build step it failed on the same way `TemplateBuilder::execute_and_publish`
+/// preserves it locally — by unwrapping the `TemplateBuildFailure` `execute`'s
+/// error chain carries, when there is one.
+fn execute_status(err: &anyhow::Error) -> Status {
+    let reason = TemplateBuilder::build_failure_reason(err);
+    crate::proto::node::build_failure_status(
+        tonic::Code::Internal,
+        reason.message,
+        reason.step.as_deref(),
+    )
 }
 
 #[tonic::async_trait]
@@ -1086,5 +1398,23 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .collect();
 
         Ok(Response::new(pb::SandboxListResponse { sandboxes }))
+    }
+
+    async fn build_template(
+        &self,
+        request: Request<pb::TemplateBuildRequest>,
+    ) -> Result<Response<pb::TemplateBuildResponse>, Status> {
+        let Some(wiring) = self.template_build.as_ref() else {
+            return Err(Status::unimplemented(
+                "this node was not wired to build templates \
+                 (NodeSandboxService::with_template_build was not called)",
+            ));
+        };
+        let staged = self
+            .build_template_impl(wiring, request.into_inner())
+            .await?;
+        Ok(Response::new(pb::TemplateBuildResponse {
+            staged: Some(staged),
+        }))
     }
 }

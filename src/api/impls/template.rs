@@ -16,12 +16,16 @@ use super::template_helpers::{
 };
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
+use crate::proto::node as pb;
+use crate::sandbox::CapturedSandboxSnapshot;
 use crate::snapshot::{
     CatalogReadScope, CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotRecord, SnapshotSource, TemplateBuildErrorReason, TemplateBuildStatus,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
+    SnapshotSource, TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{TemplateBuildError, TemplateBuildFailure, TemplatePipelineError};
-use crate::types::ImageConfigs;
+use crate::types::{ImageConfigs, SandboxResources};
+use crate::virtualization::VirtualizationMode;
 
 fn pipeline_build_error(err: &TemplatePipelineError) -> models::Error {
     match err {
@@ -611,25 +615,28 @@ impl Templates<()> for ApiImpl {
         body: &models::TemplateBuildStartV2,
     ) -> Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, ()> {
         // 🔴 First, before the request is read at all, because the answer does
-        // not depend on the request: a build drives a real Firecracker VM from
+        // not depend on the request. A build drives a real Firecracker VM from
         // `TemplateBuildRunner`, outside the orchestrator and therefore outside
-        // everything the split made remote. On `--role api` there is no
-        // `/dev/kvm`, no ublk and no Firecracker binary, so the build the 202
-        // promised dies in a background task minutes later and the only account
-        // of why is a `warn!` line on a Pod nobody is tailing — the status
-        // endpoint reports the generic `template build failed while running the
-        // build sandbox` (`TemplateBuilder::build_failure_reason`), which reads
-        // the same as a user's `RUN` step failing.
+        // everything else the split made remote — but unlike a cold create,
+        // this one *can* be forwarded: `TemplateBuildRunner` is ordinary Rust
+        // that runs wherever it is called, and a node has `/dev/kvm`, `regctl`
+        // and a Firecracker binary even when this process does not. So
+        // `--role api` does not refuse here — it dispatches to a node instead
+        // (`run_the_build_on_a_node`, below). What is refused is the one
+        // configuration that can do neither: no local sandbox runtime *and* no
+        // node placement to send the build to, which today only happens if
+        // `assemble_api` is ever changed to construct an `ApiImpl` without one.
         //
         // Refusing here is not a smaller version of running it elsewhere. It is
         // the whole difference between an answer the caller gets and an answer
         // only a log has. Nothing has been mutated at this point, so the
         // template row is left exactly as it was found, in `waiting`.
-        if !self.role().runs_sandbox_runtime() {
+        if !self.role().runs_sandbox_runtime() && self.node_placement().is_none() {
             warn!(
                 template_id = %path_params.template_id,
                 role = self.role().as_str(),
-                "refused a template build: this role runs no sandbox runtime"
+                "refused a template build: this role runs no sandbox runtime and has no node \
+                 placement source to forward the build to"
             );
             return Ok(v2_start_build_error(Self::error(
                 // 🔴 500 because it is the only code this operation declares
@@ -640,12 +647,9 @@ impl Templates<()> for ApiImpl {
                 // disagree — `v2_start_build_error` maps anything unrecognised
                 // to 500 regardless.
                 500,
-                "template builds are not available on --role api: building a template runs a \
-                 Firecracker VM on the machine that serves this call, and this process has no \
-                 /dev/kvm, no ublk and no Firecracker binary. Run the build against a server \
-                 started with --role all; a --role node server does not answer this route \
-                 either, so there is no node for this one to forward it to. The template was \
-                 left untouched and is still waiting to be built.",
+                "template builds are not available on this replica: it runs no sandbox runtime \
+                 of its own and has no node placement source configured to forward the build to. \
+                 The template was left untouched and is still waiting to be built.",
             )));
         }
 
@@ -848,7 +852,28 @@ async fn hold_a_lease<Renew, Answer>(
     }
 }
 
+/// Runs a template build wherever this process can run one — locally, when
+/// `--role all` gave it a sandbox runtime, or on a node it dials, when
+/// `--role api` gave it a placement source instead. Every failure either arm
+/// can raise ends the same way: `mark_v2_build_error` on `build_id`, and the
+/// template row stays `waiting` for the reaper to hand to another build if
+/// nothing else claims it first.
 async fn run_the_build(
+    api: ApiImpl,
+    build_id: SnapshotId,
+    base_source: TemplateBuildStartBaseSource,
+    spec: crate::template::TemplateBuildSpec,
+) {
+    if api.role().runs_sandbox_runtime() {
+        run_the_build_locally(api, build_id, base_source, spec).await
+    } else {
+        run_the_build_on_a_node(api, build_id, base_source, spec).await
+    }
+}
+
+/// `run_the_build`'s local arm: drives `TemplateBuildRunner` in this process,
+/// exactly as it did before `--role api` existed.
+async fn run_the_build_locally(
     api: ApiImpl,
     build_id: SnapshotId,
     base_source: TemplateBuildStartBaseSource,
@@ -974,6 +999,199 @@ async fn run_the_build(
                 }
             }
         }
+    }
+}
+
+/// `run_the_build`'s remote arm, for `--role api`: picks a node through
+/// `api.node_placement()`, asks it to run the build
+/// (`crate::node_client::build_template_on_a_node`), and commits what comes
+/// back.
+///
+/// # 🔴 Alias ownership
+///
+/// The node never applies an alias when it stages this build — see
+/// `TemplateBuildRequest`'s doc in `node.proto`. This is where the alias this
+/// build actually gets is decided: `adopted_build_metadata` builds a
+/// `SnapshotPublishMetadata` carrying `spec`'s own alias, and
+/// `SnapshotManager::publish_captured` -> `stage_captured` -> `adopt_staged`
+/// writes it into `staged.commit.alias` unconditionally, discarding whatever
+/// (nothing) the node wrote there. This is not a new rule invented for
+/// template builds — it is the same rule a published pause capture already
+/// follows (`capture_publish_metadata(metadata, None)` at the node, the real
+/// alias applied by the committer in `stage_for_caller`'s caller), reused
+/// unchanged because the reason is identical: alias names a row in *this
+/// process's* catalog, and only the process that owns the catalog gets to
+/// decide what a row is called.
+async fn run_the_build_on_a_node(
+    api: ApiImpl,
+    build_id: SnapshotId,
+    base_source: TemplateBuildStartBaseSource,
+    spec: crate::template::TemplateBuildSpec,
+) {
+    let Some(placement) = api.node_placement() else {
+        // 🔴 Loud rather than silently falling back to a local run this role
+        // cannot perform: see the door refusal in
+        // `v2_templates_template_id_builds_build_id_post`, which is meant to
+        // catch this before a build is ever admitted. Reaching here means that
+        // refusal's premise changed without this arm changing with it.
+        warn!(
+            build_id = %build_id,
+            "template build failed: this replica has no node placement source configured"
+        );
+        mark_v2_build_error(
+            &api,
+            &build_id,
+            TemplateBuildErrorReason::new(
+                "this replica has no node placement source configured and cannot run a template \
+                 build remotely",
+            ),
+        )
+        .await;
+        return;
+    };
+
+    let resources = match spec.resources_ref().copied() {
+        Some(resources) => resources,
+        None => {
+            mark_v2_build_error(
+                &api,
+                &build_id,
+                TemplateBuildErrorReason::new("template build spec has no resources set"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let request = match build_template_wire_request(&build_id, &base_source, &spec, resources) {
+        Ok(request) => request,
+        Err(reason) => {
+            mark_v2_build_error(&api, &build_id, reason).await;
+            return;
+        }
+    };
+
+    let staged =
+        match crate::node_client::build_template_on_a_node(placement.as_ref(), resources, request)
+            .await
+        {
+            Ok(staged) => staged,
+            Err(reason) => {
+                warn!(
+                    build_id = %build_id,
+                    reason = %reason.message,
+                    failed_step = ?reason.step,
+                    "template build failed while running on a node"
+                );
+                mark_v2_build_error(&api, &build_id, reason).await;
+                return;
+            }
+        };
+
+    let alias = match spec.parsed_alias() {
+        Ok(alias) => alias,
+        Err(err) => {
+            mark_v2_build_error(
+                &api,
+                &build_id,
+                TemplateBuildErrorReason::new(err.to_string()),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let metadata = adopted_build_metadata(&build_id, alias);
+    let captured = CapturedSandboxSnapshot::new(staged);
+    match api
+        .snapshot_manager
+        .publish_captured(metadata, captured)
+        .await
+    {
+        Ok(record) => {
+            info!(build_id = %build_id, snapshot_id = %record.id, "template build completed");
+        }
+        Err(error) => {
+            mark_v2_build_error(
+                &api,
+                &build_id,
+                TemplateBuildErrorReason::new(format!("commit staged template build: {error}")),
+            )
+            .await;
+        }
+    }
+}
+
+/// Turns a `TemplateBuildSpec` and its base source into the wire request
+/// `NodeSandboxService::build_template` accepts.
+fn build_template_wire_request(
+    build_id: &SnapshotId,
+    base_source: &TemplateBuildStartBaseSource,
+    spec: &crate::template::TemplateBuildSpec,
+    resources: SandboxResources,
+) -> Result<pb::TemplateBuildRequest, TemplateBuildErrorReason> {
+    let steps = pb::encode_value(&spec.steps().to_vec()).map_err(|err| {
+        TemplateBuildErrorReason::new(format!("encode template build steps: {err}"))
+    })?;
+    let base = match base_source {
+        TemplateBuildStartBaseSource::DefaultImage => {
+            pb::template_build_request::Base::Image(pb::TemplateBuildImageBase {
+                image_ref: String::new(),
+            })
+        }
+        TemplateBuildStartBaseSource::Image(image_ref) => {
+            pb::template_build_request::Base::Image(pb::TemplateBuildImageBase {
+                image_ref: image_ref.clone(),
+            })
+        }
+        TemplateBuildStartBaseSource::Template(alias) => {
+            pb::template_build_request::Base::BaseSnapshotRef(alias.to_string())
+        }
+    };
+    Ok(pb::TemplateBuildRequest {
+        build_snapshot_id: build_id.to_string(),
+        base: Some(base),
+        steps: Some(steps),
+        resources: Some(pb::SandboxResources {
+            cpu_count: resources.cpu_count,
+            memory_mib: resources.memory_mib,
+            disk_size_mib: resources.disk_size_mib,
+        }),
+        start_cmd: spec.start_cmd_ref().unwrap_or_default().to_string(),
+        ready_cmd: spec.ready_cmd_ref().unwrap_or_default().to_string(),
+    })
+}
+
+/// A `SnapshotPublishMetadata` for `adopt_staged` to apply over a node-staged
+/// template build.
+///
+/// 🔴 Only two of its fields ever reach `adopt_staged`: `source`, checked
+/// against the row the node staged (both sides are always
+/// `SnapshotPublishSource::Template`, so this check can never fail here the
+/// way it can for a sandbox capture), and `alias`, applied unconditionally.
+/// Everything else is discarded — `adopt_staged` commits the *node's*
+/// richly-populated row, never this one's — so the placeholders below are
+/// never read by anything.
+fn adopted_build_metadata(
+    build_id: &SnapshotId,
+    alias: Option<SnapshotAlias>,
+) -> SnapshotPublishMetadata {
+    SnapshotPublishMetadata {
+        id: build_id.clone(),
+        alias,
+        source: SnapshotPublishSource::Template,
+        context: CommandContext::default(),
+        startup: None,
+        resources: SandboxResources::default(),
+        runtime_versions: SnapshotRuntimeVersions {
+            kernel_version: String::new(),
+            firecracker_version: String::new(),
+            envd_version: String::new(),
+            tools_drive_version: String::new(),
+        },
+        virtualization_mode: VirtualizationMode::default(),
+        image_configs: ImageConfigs::new(),
+        custom_extension_params: None,
     }
 }
 
@@ -1198,10 +1416,11 @@ mod template_read_scope_tests {
     use agentenv_http_server::apis::templates::*;
     use agentenv_http_server::models;
 
-    use super::ApiImpl;
+    use super::{run_the_build_on_a_node, ApiImpl, TemplateBuildStartBaseSource};
     use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
     use crate::image::ImageResolver;
+    use crate::node_client::{FixedNodePlacement, NodeEndpoint, NodePlacement};
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
@@ -1218,7 +1437,7 @@ mod template_read_scope_tests {
         CatalogReadScope, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotRecord,
         SnapshotSource, TemplateBuildErrorReason, TemplateBuildInfo,
     };
-    use crate::template::TemplateBuilder;
+    use crate::template::{TemplateBuildSpec, TemplateBuilder};
 
     /// A catalog that hides a `waiting` row from a resolvable read, and shows
     /// it to a scoped one. The central catalog, in the one respect these tests
@@ -1339,18 +1558,22 @@ mod template_read_scope_tests {
 
     /// The surface as the role every fixture here predates the split with.
     async fn surface() -> Surface {
-        surface_as(ServerRole::All).await
+        surface_as(ServerRole::All, None).await
     }
 
-    /// The same surface, differing in exactly one value: which half of the
-    /// split the process serving it runs as.
+    /// The same surface, differing in two values: which half of the split the
+    /// process serving it runs as, and — for the halves that need one to
+    /// build a template remotely — where that half sends the build.
     ///
     /// 🔴 The orchestrator stays `All` in every case. It is not what the build
     /// route reads — the handler asks `ApiImpl::role()` — and an `Orchestrator`
     /// built as `Api` refuses to construct without a configured envd access
     /// -token seed, which would make the refusing half of these tests fail on
     /// the fixture rather than on the thing under test.
-    async fn surface_as(role: ServerRole) -> Surface {
+    async fn surface_as(
+        role: ServerRole,
+        node_placement: Option<Arc<dyn NodePlacement>>,
+    ) -> Surface {
         let id = SnapshotId::generate();
         let alias = SnapshotAlias::parse("pending-template").expect("alias parses");
         let now = 1_700_000_000_000;
@@ -1397,7 +1620,7 @@ mod template_read_scope_tests {
             None,
         ));
 
-        let api = Arc::new(ApiImpl::new(
+        let api = ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
             Arc::new(TemplateBuilder::new()),
@@ -1414,7 +1637,13 @@ mod template_read_scope_tests {
             // which is what `all` is defined as.
             role,
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
-        ));
+        );
+        // 🔴 A builder step, matching `assemble_api`'s own use of it — see
+        // `ApiImpl::with_node_placement`.
+        let api = Arc::new(match node_placement {
+            Some(placement) => api.with_node_placement(placement),
+            None => api,
+        });
 
         Surface {
             api,
@@ -1463,7 +1692,9 @@ mod template_read_scope_tests {
     fn role_refusal(response: &V2TemplatesTemplateIdBuildsBuildIdPostResponse) -> Option<&str> {
         match response {
             V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status500_ServerError(error)
-                if error.message.contains("--role api") =>
+                if error
+                    .message
+                    .contains("no node placement source configured") =>
             {
                 Some(error.message.as_str())
             }
@@ -1654,37 +1885,47 @@ mod template_read_scope_tests {
         );
     }
 
-    /// 🔴 The same call on each half of the split, and the point is that the
-    /// three do not answer alike.
+    /// A placement source a build can be sent to — its address is never
+    /// dialled by the tests that use it below, which only check whether the
+    /// *door* let the build past the refusal.
+    fn unreachable_placement() -> Arc<dyn NodePlacement> {
+        Arc::new(FixedNodePlacement::new(NodeEndpoint::same_address(
+            "unreachable-test-node",
+            "http://127.0.0.1:1",
+        )))
+    }
+
+    /// 🔴 Only a role with **neither** a local sandbox runtime **nor** a node
+    /// to send the build to is refused at the door — and the point of this
+    /// test is that `--role api` is only in that set when it was not given a
+    /// placement source, which `assemble_api` always gives it in production.
     ///
-    /// A build drives a Firecracker VM directly, outside the orchestrator, so
-    /// on `--role api` it cannot work — and until this refusal existed it did
-    /// not *fail* either: the 202 went out, the build died in a background task
-    /// and the status endpoint reported the same generic reason a user's broken
-    /// `RUN` step reports. What is asserted below is that the caller is told,
-    /// and told before anything is started.
+    /// Before `run_the_build_on_a_node` existed, `--role api` refused
+    /// unconditionally: the 202 would otherwise have gone out, the build would
+    /// have died in a background task with no machine to run it on, and the
+    /// status endpoint would have reported the same generic reason a user's
+    /// broken `RUN` step reports. This is the regression that refusal existed
+    /// to prevent, restated as "still true when there is truly nowhere to
+    /// send the build" rather than "true for `--role api` unconditionally".
     ///
-    /// Both faces in one test, because either alone is satisfied by a constant:
-    /// "api is refused" passes on a gate that is always true, "all is admitted"
-    /// passes on one that is always false. And the discriminator is the
-    /// admission counter rather than the status code, because a refusal and a
-    /// failed admission are both 500 — only one of them got as far as asking
-    /// the catalog to start a build.
+    /// The discriminator is the admission counter rather than the status
+    /// code, because a refusal and a failed admission are both 500 — only one
+    /// of them got as far as asking the catalog to start a build.
     #[tokio::test]
-    async fn a_build_is_refused_by_the_half_that_runs_no_sandboxes_and_admitted_by_the_halves_that_do(
-    ) {
-        let s = surface_as(ServerRole::Api).await;
+    async fn a_build_is_refused_only_when_it_can_run_nowhere_at_all() {
+        let s = surface_as(ServerRole::Api, None).await;
         let response = start_a_build(&s).await;
         let refusal = role_refusal(&response).unwrap_or_else(|| {
             panic!(
-                "--role api has no /dev/kvm to run the build on, and answering anything but a \
-                 refusal here is what made the failure arrive minutes later as a log line, got \
-                 {response:?}"
+                "--role api with no node placement source has no /dev/kvm and nowhere to send \
+                 the build, and answering anything but a refusal here is what made the failure \
+                 arrive minutes later as a log line, got {response:?}"
             )
         });
         assert!(
-            refusal.contains("--role all"),
-            "a refusal that does not say where the build can be run is a dead end, got {refusal:?}"
+            refusal.contains("no sandbox runtime"),
+            "a refusal that does not say why must not be mistaken for a generic 500, got \
+             {refusal:?}"
         );
         assert_eq!(
             s.build_starts.load(Ordering::SeqCst),
@@ -1694,7 +1935,7 @@ mod template_read_scope_tests {
         );
 
         for role in [ServerRole::All, ServerRole::Node] {
-            let s = surface_as(role).await;
+            let s = surface_as(role, None).await;
             let response = start_a_build(&s).await;
             assert!(
                 role_refusal(&response).is_none(),
@@ -1709,6 +1950,74 @@ mod template_read_scope_tests {
                  a status code that is not the refusal's"
             );
         }
+    }
+
+    /// 🔴 The regression guard for the gap this whole feature closes:
+    /// `--role api` given a node to send the build to is admitted exactly
+    /// like `--role all`, not refused the way it always was before
+    /// `run_the_build_on_a_node` existed. Deleting the `node_placement`
+    /// half of the door's refusal condition (leaving only
+    /// `!role.runs_sandbox_runtime()`, which is what this repository shipped
+    /// before this change) turns this assertion red — `--role api` would go
+    /// back to refusing every build regardless of whether it has somewhere to
+    /// send one.
+    #[tokio::test]
+    async fn an_api_replica_with_a_node_to_send_the_build_to_is_admitted() {
+        let s = surface_as(ServerRole::Api, Some(unreachable_placement())).await;
+        let response = start_a_build(&s).await;
+        assert!(
+            role_refusal(&response).is_none(),
+            "a replica with a node placement source can dispatch the build remotely and must \
+             not be refused at the door, got {response:?}"
+        );
+        assert_eq!(
+            s.build_starts.load(Ordering::SeqCst),
+            1,
+            "it must reach the admission exactly like --role all does"
+        );
+    }
+
+    /// 🔴 The requirement this feature's build lease safety rests on: a node
+    /// this process cannot reach must not leave `run_the_build`'s future
+    /// pending forever. `hold_the_build_lease` only stops renewing once that
+    /// future resolves — see `hold_a_lease`'s tests above, which cover *that*
+    /// half generically against a synthetic build future — so what has to be
+    /// true for a real remote build is that `run_the_build_on_a_node` itself
+    /// resolves when the node cannot be reached. This drives it directly
+    /// against a node nothing is listening on (a dial failure — the fast,
+    /// common shape of "the node is gone"; a node that accepts the
+    /// connection and then dies mid-build is bounded instead by
+    /// `node_client::build`'s HTTP/2 keepalive and call timeout, which is a
+    /// property of those constants rather than something a fast unit test
+    /// can observe without waiting them out) and asserts it returns well
+    /// inside a bound a build lease can survive.
+    ///
+    /// Replacing `CONNECT_TIMEOUT`'s use in `build_template_on_a_node` with
+    /// an unbounded `.connect()` — or deleting the `.map_err` that turns a
+    /// dial failure into an `Err` `run_the_build_on_a_node` can act on —
+    /// turns this test red or makes it hang; either way it stops passing
+    /// quietly.
+    #[tokio::test]
+    async fn a_node_nobody_answers_does_not_hang_the_remote_build() {
+        let s = surface_as(ServerRole::Api, Some(unreachable_placement())).await;
+        let spec = TemplateBuildSpec::new().resources(1, 128);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run_the_build_on_a_node(
+                (*s.api).clone(),
+                s.id.clone(),
+                TemplateBuildStartBaseSource::DefaultImage,
+                spec,
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a node refusing the connection must not hang the build lease loop: \
+             run_the_build_on_a_node did not return within 15s"
+        );
     }
 
     /// `DELETE /templates/{id}` — the failure that reports success.

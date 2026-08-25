@@ -2662,3 +2662,139 @@ async fn a_sandbox_paused_through_the_rpc_is_reopened_through_the_rpc() {
     assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
     assert_eq!(live[0].execution_id, claimed.to_string());
 }
+
+/// 🔴 `NodeSandboxService::build_template`'s whole reason to exist, covered
+/// without booting a real Firecracker VM.
+///
+/// `TemplateBuildRunner::execute` — the one piece of `build_template_impl`
+/// this test does not drive — boots a real build sandbox and cannot run
+/// inside `cargo test --lib`; that is exactly why
+/// `template_build_publish_metadata` exists as a function of its own (see its
+/// doc in `service.rs`). This test drives everything *around* it: a
+/// hand-built `TemplateBuildExecution` (standing in for what `execute` would
+/// have returned) goes through `template_build_publish_metadata`, then
+/// through a real `SnapshotManager::stage` against a `PosixFsBackend` — the
+/// same call `build_template_impl` makes — then through the exact
+/// `encode_value`/`convert::serialized` pair that carries a `StagedSnapshot`
+/// across the wire in production, and finally through `commit_staged`, which
+/// is the one call on the other side of this RPC that decides whether any of
+/// it was worth doing.
+///
+/// # 🔴 What breaking each of the things this test touches looks like
+///
+/// - Forget to compute `resources.disk_size_mib` from the manifest (or divide
+///   it wrong): `committed.resources.disk_size_mib` below is wrong.
+/// - Thread the wrong `virtualization_mode`, `image_configs`, or `context`
+///   through: the corresponding assertion below is wrong.
+/// - Stop passing `alias: None` (see the doc on `TemplateBuildRequest` in
+///   `node.proto` for why that has to stay `None`): the committed row's alias
+///   assertion is wrong — it must be *unset*, because nothing on this side of
+///   the wire is the alias's owner.
+/// - Break `encode_value` or `convert::serialized`'s pairing (a schema
+///   version mismatch, a field that stops round-tripping): the `unwrap()` on
+///   the decode fails outright.
+/// - Stage a manifest `commit_staged` cannot read back (wrong artifact
+///   layout, a path that does not survive staging): `commit_staged` fails
+///   outright.
+#[tokio::test]
+async fn a_built_templates_metadata_survives_stage_encode_decode_and_commit() {
+    use crate::sandbox::FirecrackerSnapshotManifest;
+    use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::repository::StagedSnapshot;
+    use crate::snapshot::{CommandContext, SnapshotId, SnapshotRuntimeVersions};
+    use crate::template::TemplateBuildExecution;
+    use crate::types::{ImageConfigs, SandboxResources};
+    use crate::virtualization::VirtualizationMode;
+
+    let repo_root = tempfile::tempdir().expect("tempdir");
+    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+        root: repo_root.path().join("repository"),
+        cache_root: Some(repo_root.path().join("runtime-cache")),
+        runtime_cache_root: Some(repo_root.path().join("runtime-cache").join("runtime")),
+    })
+    .expect("posix backend");
+    let (repository, runtime_resolver) = backend.into_parts();
+    let snapshot_manager =
+        crate::snapshot::SnapshotManager::from_parts(repository, runtime_resolver, None);
+
+    let artifacts_workspace = tempfile::tempdir().expect("tempdir");
+    let (_, _, manifest): (_, _, FirecrackerSnapshotManifest) =
+        write_mock_built_artifacts(artifacts_workspace.path()).expect("mock built artifacts");
+    // 🔴 A distinctive, non-round-number virtual size, so a disk-size
+    // calculation that silently used a different field (or the wrong shift)
+    // would not coincidentally still pass.
+    let mut manifest = manifest;
+    manifest.rootfs.virtual_size = 5 * (1 << 20) + 1;
+
+    let build_snapshot_id = SnapshotId::generate();
+    let resources = SandboxResources {
+        cpu_count: 2,
+        memory_mib: 256,
+        // Deliberately wrong on the way in: this is what `TemplateBuildContext`
+        // carries *before* a build runs, and `execute_and_publish`'s own
+        // comment names 0 as "disk size is determined after build" — the
+        // point of `template_build_publish_metadata` is that it corrects
+        // this, so seeding it with the pre-build value here is what proves
+        // the correction happened rather than merely surviving.
+        disk_size_mib: 0,
+    };
+    let build_execution = TemplateBuildExecution {
+        runtime_versions: SnapshotRuntimeVersions {
+            kernel_version: "test-kernel".to_string(),
+            firecracker_version: "test-firecracker".to_string(),
+            envd_version: "test-envd".to_string(),
+            tools_drive_version: "test-tools".to_string(),
+        },
+        manifest,
+        build_context: CommandContext::default(),
+        startup: None,
+        image_configs: ImageConfigs::new(),
+    };
+
+    let (metadata, manifest) = super::service::template_build_publish_metadata(
+        build_snapshot_id.clone(),
+        resources,
+        VirtualizationMode::Kvm,
+        build_execution,
+    );
+    assert!(
+        metadata.alias.is_none(),
+        "a node must never apply an alias when staging a template build — that is the \
+         committer's to do at `adopt_staged` time"
+    );
+    assert_eq!(
+        metadata.resources.disk_size_mib, 6,
+        "5 MiB + 1 byte must round up to 6 MiB, matching execute_and_publish's own div_ceil"
+    );
+
+    let staged = snapshot_manager
+        .stage(metadata, manifest, None)
+        .await
+        .expect("a freshly built template's artifacts must stage")
+        .into_staged();
+
+    // The exact pair `NodeSandboxService::build_template` and the caller that
+    // decodes its response use — not a generic `serde_json` round trip.
+    let encoded = crate::proto::node::encode_value(&staged).expect("a staged value must encode");
+    let decoded: StagedSnapshot = super::convert::serialized(Some(&encoded), "test")
+        .expect("decoding must not be refused")
+        .expect("an encoded value must decode to something");
+
+    let record = snapshot_manager
+        .commit_staged(decoded)
+        .await
+        .expect("a node-staged template build must be acceptable to commit_staged");
+
+    assert_eq!(record.id, build_snapshot_id);
+    assert!(
+        record.alias.is_none(),
+        "nothing supplied an alias on this path, so the committed row must have none either"
+    );
+    assert_eq!(record.resources.disk_size_mib, 6);
+    let committed = record
+        .committed
+        .expect("a committed build has committed state");
+    assert_eq!(committed.virtualization_mode, VirtualizationMode::Kvm);
+    assert_eq!(committed.runtime_versions.kernel_version, "test-kernel");
+}

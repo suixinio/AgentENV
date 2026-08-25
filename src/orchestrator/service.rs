@@ -18,8 +18,9 @@ use crate::role::ServerRole;
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
     FreshSandboxBuildSpec, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
-    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo, UnresolvedImageBuildSpec,
+    RuntimeConfirmedGone, SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory,
+    SandboxForkSpec, SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    UnresolvedImageBuildSpec,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
@@ -157,9 +158,13 @@ enum AbsentHandle {
     /// drive it with has been rebuilt from the record. Usable exactly like the
     /// handle that was not here.
     Adopted(SandboxHandle),
-    /// There is a record, and this factory's sandboxes live in the process that
-    /// started them — so the runtime the record describes is gone. This is the
-    /// only answer that entitles a caller to clean the record up.
+    /// The runtime the record describes is gone, on either of two grounds
+    /// this factory can establish on its own: this factory's sandboxes live
+    /// in the process that started them, and there is none here; or its
+    /// sandboxes live elsewhere and the placement source has independently
+    /// confirmed — via [`RuntimeConfirmedGone`] — that the machine they
+    /// depended on has left the cluster. This is the only answer that
+    /// entitles a caller to clean the record up.
     RuntimeGone,
     /// The store has no record under this id: the sandbox does not exist. There
     /// is nothing to drive and nothing to clean up.
@@ -393,12 +398,27 @@ where
             return Ok(AbsentHandle::RuntimeGone);
         };
 
-        backend.start().await.map_err(|error| {
-            OrchestratorError::InternalError(format!(
+        if let Err(error) = backend.start().await {
+            // 🔴 Downcast before the message below stringifies it away.
+            // `start` is shared by every backend, local and remote, and only a
+            // remote stub's `attach` can ever tag a failure this way — see
+            // `RuntimeConfirmedGone`'s doc. It means the placement source has
+            // independently confirmed the node this sandbox depended on is no
+            // longer part of the cluster, which is the one case a caller here
+            // may treat as more than "could not reach it this time".
+            if error.downcast_ref::<RuntimeConfirmedGone>().is_some() {
+                warn!(
+                    %sandbox_id,
+                    error = %error,
+                    "the node holding this sandbox has left the cluster; treating its runtime as gone"
+                );
+                return Ok(AbsentHandle::RuntimeGone);
+            }
+            return Err(OrchestratorError::InternalError(format!(
                 "sandbox {sandbox_id} is not running in this process and the machine running it \
                  could not be reached: {error:#}"
-            ))
-        })?;
+            )));
+        }
         debug!(%sandbox_id, "adopted a sandbox this process did not start");
         Ok(AbsentHandle::Adopted(Arc::new(Mutex::new(backend))))
     }

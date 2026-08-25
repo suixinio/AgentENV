@@ -32,13 +32,14 @@ use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
 use crate::sandbox::{
     CapturedSandboxSnapshot, CustomExtensionParams, PausedSandboxCapture, ResolvedImageFacts,
-    RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
-    SandboxForkResult, SandboxForkSpec, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    RuntimeArtifactSet, RuntimeConfirmedGone, SandboxBackend, SandboxCaptureError,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxNetworkPolicy,
+    SandboxRuntimeInfo,
 };
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::paused_state::RemotePausedState;
-use super::placement::{NodeEndpoint, NodePlacement};
+use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
 use super::wire::{self, RemoteResumeFailure};
 
 use std::sync::Arc;
@@ -267,9 +268,12 @@ impl RemoteSandboxStub {
                      so this is a retry rather than a verdict"
                 )
             })?;
-        let mut client = Self::connect(&node.endpoint)
-            .await
-            .with_context(|| format!("reach node {} for sandbox {sandbox_id}", node.node_id))?;
+        let mut client = match Self::connect(&node.endpoint).await {
+            Ok(client) => client,
+            Err(dial_error) => {
+                return Err(self.confirm_or_defer(node, sandbox_id, dial_error).await)
+            }
+        };
 
         // 🔴 Before the stub is placed, not after. `placed` is what every other
         // method on this type reads its address out of, and a stub that were
@@ -289,6 +293,51 @@ impl RemoteSandboxStub {
             resolved_image_facts: None,
         });
         Ok(())
+    }
+
+    /// A dial to a *known* node failed. Before that becomes "could not reach
+    /// the sandbox right now" — today's answer, and the safe default — ask
+    /// the placement source about the node's own cluster membership: a dial
+    /// failure alone says nothing about whether the node is still part of the
+    /// cluster, only whether this one attempt landed.
+    ///
+    /// # 🔴 Node membership, never sandbox placement
+    ///
+    /// [`NodePlacement::node_membership`], not another call to
+    /// `place_existing`. This process already learned a node id and address
+    /// from `place_existing` moments ago; asking it the same question again
+    /// would consult the same binding and could easily get the same stale
+    /// answer back. `node_membership` asks discovery instead, which is the
+    /// one place this fact can come from — see that method's doc for why the
+    /// two are not interchangeable.
+    ///
+    /// # 🔴 Only `Gone` is acted on
+    ///
+    /// [`NodeMembership::Present`] and `Err` both keep today's behaviour: a
+    /// node the registry still lists may yet answer, and a question that
+    /// could not be asked is not licence to conclude it will not. Only a
+    /// registry that has itself stopped listing the node earns
+    /// [`RuntimeConfirmedGone`] — the marker the orchestrator's
+    /// `absent_handle` downcasts for, to tell a sandbox whose runtime is
+    /// confirmed gone from one this call simply could not reach.
+    async fn confirm_or_defer(
+        &self,
+        node: NodeEndpoint,
+        sandbox_id: SandboxId,
+        dial_error: anyhow::Error,
+    ) -> anyhow::Error {
+        let unreachable = dial_error.context(format!(
+            "reach node {} for sandbox {sandbox_id}",
+            node.node_id
+        ));
+        match self.placement.node_membership(&node.node_id).await {
+            Ok(NodeMembership::Gone) => RuntimeConfirmedGone(unreachable.context(format!(
+                "node {} is no longer part of the cluster",
+                node.node_id
+            )))
+            .into(),
+            Ok(NodeMembership::Present) | Err(_) => unreachable,
+        }
     }
 
     /// The live facts for a sandbox this process did not start, read off the

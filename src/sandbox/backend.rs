@@ -93,6 +93,35 @@ impl From<anyhow::Error> for SandboxCaptureError {
     }
 }
 
+/// Downcast marker on an `anyhow::Error` out of [`SandboxBackend::start`]:
+/// more than "could not reach this runtime right now" — the caller has
+/// independently confirmed that the machine the runtime depends on is no
+/// longer part of the cluster, so nothing about it is coming back on its own.
+///
+/// # 🔴 A marker on the error, not a new branch on `start`'s signature
+///
+/// `start` is shared by every backend — a fresh boot, a resume, a fork child
+/// readying, and a stub *attaching* to a sandbox this process never started —
+/// and only the last of those, driven against a machine that can be asked
+/// about its own node's cluster membership, can ever produce this. Widening
+/// `start`'s return type for one caller's one outcome would be a branch every
+/// other implementer has to answer for and never can. Downcast out of the
+/// plain error instead, the same way [`SandboxCaptureError`] is recovered
+/// from an error `pause` never typed as one.
+///
+/// # Where this is raised and where it is read
+///
+/// The remote node-client stub raises it out of `attach` once the placement
+/// source has answered that the node it could not dial is gone from the
+/// cluster's own registry — not merely unreachable this instant. The
+/// orchestrator's `absent_handle` is the one place that downcasts for it: it
+/// is what turns "could not reach the sandbox, leave the record alone" into
+/// "the runtime is gone, the record may be forgotten" for a sandbox this
+/// process never started itself.
+#[derive(thiserror::Error, Debug)]
+#[error("{0}")]
+pub struct RuntimeConfirmedGone(#[source] pub anyhow::Error);
+
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 

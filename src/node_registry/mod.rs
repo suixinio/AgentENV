@@ -10,3 +10,6 @@
 //! then this tree is inert, load-bearing only for its own tests.
 
 pub mod cpu_template;
+pub mod filter;
+pub mod strategy;
+pub mod types;

@@ -8,6 +8,32 @@ pub(crate) mod scheduler {
     #![allow(clippy::large_enum_variant)]
 
     tonic::include_proto!("scheduler.v1");
+
+    // Hand-written, mirroring `services/api/proto/node_status.go`: a method
+    // can only be attached to `NodeStatus` from the module that declares it,
+    // and codegen would clobber anything placed in the generated file itself.
+    //
+    // Port of `NodeStatus.CanAcceptNewRequests()` — see the Go doc comment on
+    // that method for the full rationale (`node_status.go`). Kept in lockstep
+    // with `src/node_registry/filter.rs`'s `FilterUnschedulable` port, the
+    // one caller in this codebase so far.
+    impl NodeStatus {
+        /// Reports whether a node in this status may be given new work — a
+        /// fresh sandbox, a fork, or a resume that would start a VM there.
+        ///
+        /// Answers "may I send this node something new", not "is this node
+        /// still working": a draining node keeps serving what it already
+        /// holds, so paths that act on existing sandboxes must not gate on
+        /// this.
+        ///
+        /// `Unspecified` deliberately answers `false` — it is the zero value,
+        /// so a caller with no snapshot at all must decide for itself whether
+        /// a node that has never reported is a candidate, rather than getting
+        /// an accidental "yes" from a missing field.
+        pub(crate) fn can_accept_new_requests(self) -> bool {
+            matches!(self, NodeStatus::Ready)
+        }
+    }
 }
 
 pub(crate) mod node {

@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
-use crate::scheduler_endpoint::SchedulerEndpointSource;
+use crate::scheduler_endpoint::{qualified, SchedulerEndpointSource};
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
@@ -316,14 +316,6 @@ impl NodePlacement for SchedulerNodePlacement {
 /// The same ceiling the gateway applies to its own copy of this call
 /// (`maxRecordAssignmentTimeout`).
 const RECORD_PLACEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn qualified(endpoint: &str) -> String {
-    if endpoint.contains("://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    }
-}
 
 /// Replaces the port in an `scheme://host:port` address, keeping everything
 /// else the scheduler said.

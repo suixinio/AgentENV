@@ -263,7 +263,7 @@ impl ResumeWiring {
         // Refusing to start is loud; the alternative is silent and
         // irreversible.
         let endpoint_source = SchedulerEndpointSource::spawn_from_config(
-            qualified_endpoint(endpoint),
+            endpoint.to_string(),
             &config.cluster,
             &config.observability.scheduler_report,
             "resume_placement",
@@ -297,7 +297,7 @@ impl ResumeWiring {
                 )
             })?;
         let endpoint_source = SchedulerEndpointSource::spawn_from_config(
-            qualified_endpoint(endpoint),
+            endpoint.to_string(),
             &config.cluster,
             &config.observability.scheduler_report,
             "resume_placement",
@@ -355,14 +355,6 @@ fn announce_unenforced_placement(backend: crate::cfg::PausedRegistryBackendKind)
             "no [cluster].scheduler_endpoint is configured; placement is unconstrained, which \
              is what a single-node deployment expects"
         );
-    }
-}
-
-fn qualified_endpoint(endpoint: &str) -> String {
-    if endpoint.contains("://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
     }
 }
 
@@ -1279,26 +1271,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Endpoint normalisation
-    // -----------------------------------------------------------------------
-
-    /// A bare `host:port` is what `[cluster].scheduler_endpoint` usually holds,
-    /// and `Endpoint::from_shared` rejects it without a scheme.
-    #[test]
-    fn a_scheme_is_added_only_when_one_is_missing() {
-        assert_eq!(
-            qualified_endpoint("scheduler:9090"),
-            "http://scheduler:9090"
-        );
-        assert_eq!(
-            qualified_endpoint("http://scheduler:9090"),
-            "http://scheduler:9090"
-        );
-        assert_eq!(
-            qualified_endpoint("https://scheduler:9090"),
-            "https://scheduler:9090",
-            "a configured TLS endpoint must not be downgraded to plaintext"
-        );
-    }
+    // Endpoint scheme normalisation used to be tested here via a local
+    // `qualified_endpoint` duplicate. That duplicate is gone — both spawn
+    // paths below now route through `SchedulerEndpointSource::spawn_from_config`,
+    // which qualifies internally (see `crate::scheduler_endpoint::qualified`
+    // and its own `a_scheme_is_added_only_when_one_is_missing` test).
 }

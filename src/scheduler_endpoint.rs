@@ -114,7 +114,20 @@ impl SchedulerEndpointSource {
         file_watch: Option<(PathBuf, Duration)>,
         component: &'static str,
     ) -> Result<Self> {
-        let channel = build_channel(&static_endpoint)?;
+        // 🔴 `build_channel` is the only place this qualifies its input
+        // (see [`qualified`] and `build_channel`'s own doc comment): three of
+        // this type's six consumers (`central.rs`'s paused registry, the
+        // snapshot catalog client, and the P2P discovery backend) pass their
+        // configured endpoint straight through with no scheme handling of
+        // their own, and `http::Uri` happily parses a bare `host:port` as an
+        // *authority-form* URI (`Endpoint::from_shared` returns `Ok`,
+        // `scheme() == None`) — so without that, those three would build a
+        // channel that fails every RPC with "invalid URL, scheme is
+        // missing" instead of refusing to start. The qualified string comes
+        // back out of `build_channel` rather than being recomputed here, so
+        // what gets published through `current()` is provably the same
+        // string the channel was built from.
+        let (channel, static_endpoint) = build_channel(&static_endpoint)?;
         let (tx, rx) = watch::channel((channel, static_endpoint));
 
         if let Some((path, interval)) = file_watch {
@@ -172,11 +185,47 @@ impl SchedulerEndpointSource {
     }
 }
 
-fn build_channel(endpoint: &str) -> Result<Channel> {
-    let raw_endpoint = endpoint.to_string();
+/// Prefixes `http://` onto `endpoint` unless it already names a scheme.
+///
+/// # 🔴 Why this exists
+///
+/// `http::Uri` — what `tonic::transport::Endpoint::from_shared` parses
+/// through — accepts a schemeless `host:port` as a valid *authority-form*
+/// URI. `Endpoint::from_shared("scheduler:9090")` therefore returns `Ok`
+/// with `scheme() == None`: construction succeeds, `connect_lazy()`
+/// succeeds, and the failure only shows up later, on the first RPC, as
+/// `transport error: invalid URL, scheme is missing`. A bare `host:port` is
+/// exactly what a static discovery list, this source's own hot-reload file,
+/// and the scheduler's own `ListNodes`/`Heartbeat` answers commonly carry,
+/// so every path that can end up inside [`build_channel`] has to be
+/// qualified before it gets there — that function is this type's one choke
+/// point, so qualifying inside it (both in [`SchedulerEndpointSource::spawn`]
+/// for the static endpoint and in [`check_and_publish`] for a hot-reloaded
+/// one) is what makes every consumer, and every reload, behave the same way.
+pub fn qualified(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+/// Builds a channel from `endpoint`, qualifying it first if it names no
+/// scheme (see [`qualified`]) — the one place, of every caller in this
+/// module, that actually invokes [`Endpoint::from_shared`]. Both
+/// [`SchedulerEndpointSource::spawn`] (the static endpoint) and
+/// [`check_and_publish`] (a hot-reloaded one) route through here rather than
+/// qualifying their own input, so a static endpoint and a file-driven reload
+/// can never disagree about whether a bare `host:port` dials.
+///
+/// Returns the qualified endpoint alongside the channel — callers publish
+/// and log that string rather than re-deriving it, so what `current()` hands
+/// back is provably the same string the channel was actually built from.
+fn build_channel(endpoint: &str) -> Result<(Channel, String)> {
+    let raw_endpoint = qualified(endpoint);
     let built = Endpoint::from_shared(raw_endpoint.clone())
         .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
-    Ok(built.connect_lazy())
+    Ok((built.connect_lazy(), raw_endpoint))
 }
 
 /// Resolves the hot-reload file location per the `[cluster]` /
@@ -302,26 +351,39 @@ fn check_and_publish(
                 return;
             }
 
-            if candidate == state.endpoint {
-                // Same target, different bytes on disk (e.g. a rewrite with
-                // identical content, or added trailing whitespace).
-                // Remember the new fingerprint so the next tick takes the
-                // fast path above, but there is no channel to rebuild.
-                state.fingerprint = fingerprint;
-                record_reload_metric(component, "same_value");
-                return;
-            }
-
+            // `candidate` is whatever the file said, not yet qualified —
+            // that happens once, inside `build_channel`, which is why this
+            // is built before the same-value comparison below rather than
+            // compared to `state.endpoint` directly: `state.endpoint` always
+            // holds a *qualified* value (see `build_channel`'s doc comment),
+            // and comparing it against a raw `contents.trim()` would make
+            // the fast path below never fire for a deployment whose file
+            // carries a bare `host:port` — every tick would look like a
+            // change and rebuild a channel, even when the file's content
+            // never moved.
             match build_channel(candidate) {
-                Ok(channel) => {
+                Ok((channel, qualified_candidate)) => {
+                    if qualified_candidate == state.endpoint {
+                        // Same target, different bytes on disk (e.g. a
+                        // rewrite with identical content, or added trailing
+                        // whitespace, or a scheme added/removed that
+                        // `qualified` normalises away). Remember the new
+                        // fingerprint so the next tick takes the fast path
+                        // above, and drop the channel `build_channel` just
+                        // built — nothing downstream needs a second one.
+                        state.fingerprint = fingerprint;
+                        record_reload_metric(component, "same_value");
+                        return;
+                    }
+
                     info!(
                         component,
                         previous_endpoint = %state.endpoint,
-                        new_endpoint = %candidate,
+                        new_endpoint = %qualified_candidate,
                         "scheduler endpoint target changed"
                     );
                     state.fingerprint = fingerprint;
-                    state.endpoint = candidate.to_string();
+                    state.endpoint = qualified_candidate.clone();
                     // 🔴 Ignored on purpose: an `Err` here means every
                     // receiver — every clone this source ever handed out —
                     // has been dropped, which only happens once whatever
@@ -329,7 +391,7 @@ fn check_and_publish(
                     // running rather than trying to detect that and stop;
                     // see the module docs on why nothing here has a
                     // shutdown handle.
-                    let _ = tx.send((channel, candidate.to_string()));
+                    let _ = tx.send((channel, qualified_candidate));
                     record_reload_metric(component, "switched");
                 }
                 Err(err) => {
@@ -390,6 +452,23 @@ mod tests {
             interval_secs: 5,
             scheduler_endpoint_file: endpoint_file.to_string(),
         }
+    }
+
+    /// A bare `host:port` is what `[cluster].scheduler_endpoint` and this
+    /// source's own hot-reload file usually hold, and `http::Uri` parses it
+    /// without complaint as an authority-form URI with no scheme —
+    /// `Endpoint::from_shared` never rejects it, so nothing downstream of
+    /// `qualified` catches the omission either. See [`qualified`]'s doc
+    /// comment for what that costs when it is skipped.
+    #[test]
+    fn a_scheme_is_added_only_when_one_is_missing() {
+        assert_eq!(qualified("scheduler:9090"), "http://scheduler:9090");
+        assert_eq!(qualified("http://scheduler:9090"), "http://scheduler:9090");
+        assert_eq!(
+            qualified("https://scheduler:9090"),
+            "https://scheduler:9090",
+            "a configured TLS endpoint must not be downgraded to plaintext"
+        );
     }
 
     #[test]
@@ -493,6 +572,35 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("scheduler-endpoint");
         std::fs::write(&path, "http://scheduler-b:9090\n").expect("seed the file");
+
+        let source = SchedulerEndpointSource::spawn(
+            "http://scheduler-a:9090".to_string(),
+            Some((path, Duration::from_millis(20))),
+            "test",
+        )
+        .expect("a valid static endpoint builds a source");
+
+        wait_for(|| source.current().1 == "http://scheduler-b:9090").await;
+    }
+
+    /// 🔴 The regression this guards: `http::Uri` parses a schemeless
+    /// `host:port` as a valid *authority-form* URI, so a hot-reload file
+    /// naming one used to build fine (`Endpoint::from_shared` returns `Ok`)
+    /// and switch the published channel — logging and metering exactly like
+    /// a healthy reload — while every RPC on that channel then failed with
+    /// "invalid URL, scheme is missing". A file carrying a bare `host:port`
+    /// is not a hypothetical: it is what an operator copying the endpoint
+    /// out of the *static* `[cluster].scheduler_endpoint` config (which
+    /// worked, because its callers used to qualify it themselves before
+    /// this type existed) would naturally paste in. This asserts on the
+    /// published endpoint *string*, not just that a channel was returned —
+    /// a scheme-less channel and a qualified one both come back as `Ok`, so
+    /// only the string tells them apart from a test.
+    #[tokio::test]
+    async fn a_hot_reloaded_bare_host_port_is_qualified_before_it_is_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scheduler-endpoint");
+        std::fs::write(&path, "scheduler-b:9090").expect("seed the file with a bare host:port");
 
         let source = SchedulerEndpointSource::spawn(
             "http://scheduler-a:9090".to_string(),

@@ -250,6 +250,34 @@ impl ServerRole {
              configuration, or from whatever file AENV_CONFIG_OVERLAY_PATH names for it"
         )
     }
+
+    /// Whether this role must never construct a central snapshot catalog of
+    /// its own — no `PostgresSnapshotCatalog` (it cannot: [`check_pg_dsn`]
+    /// above already refuses `--role node` any `[pg]` DSN to build one
+    /// from) and no `CentralSnapshotCatalog` gRPC client either.
+    ///
+    /// 🔴 P2 (task's own "phase4-close"): `--role node` has exactly two
+    /// request-time catalog reads (`create`'s snapshot-source arm,
+    /// `build_template`'s base-snapshot arm), and both are already served
+    /// by a record api pre-resolves and sends down with the request
+    /// (`SnapshotSource.resolved_record` / `TemplateBuildRequest.base_snapshot_resolved`)
+    /// — see `services/api/proto/node.proto`'s own doc on those fields.
+    /// Before this gate existed, `build_snapshot_backend` had no
+    /// role-awareness at all and built the *same* central-catalog matrix
+    /// on `--role node` as on `--role api`/`--role all`, differing only in
+    /// always passing a `None` `pg_pool` — which made
+    /// `[snapshot.catalog].write = "postgres"` (the configuration this
+    /// project's own decommissioning of `services/scheduler` needs) an
+    /// unconditional `--role node` startup crash: that mode refuses to run
+    /// without `[pg]`, with no gRPC fallback, and a node can never have
+    /// `[pg]` at all. `[snapshot.catalog].write = "both"` did not crash —
+    /// `CentralSnapshotCatalog` dials lazily — but still built a live gRPC
+    /// client to a scheduler `--role node` never actually needs, for a
+    /// fallback path (an unresolved pre-resolved field) that only exists
+    /// to cover a mixed-version rolling upgrade window.
+    pub fn never_constructs_a_central_snapshot_catalog(self) -> bool {
+        matches!(self, Self::Node)
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +368,12 @@ mod tests {
         assert!(!all.reclaims_host_leftovers_at_startup());
         assert!(all.check_setup_flags(true, false).is_ok());
         assert!(all.check_setup_flags(false, true).is_ok());
+        // The other new-behaviour gate (P2, task's own "phase4-close"):
+        // `all` has always had unrestricted `[pg]` access and must keep
+        // building a real central snapshot catalog when one is configured
+        // — this is not a capability `node` had that `all` also has, it is
+        // the thing `node` never had at all.
+        assert!(!all.never_constructs_a_central_snapshot_catalog());
     }
 
     #[test]
@@ -354,6 +388,7 @@ mod tests {
         assert!(api.arbitrates_paused_sandbox_ownership());
         assert!(api.serves_user_facing_rest());
         assert!(api.serves_wake_decisions());
+        assert!(!api.never_constructs_a_central_snapshot_catalog());
     }
 
     #[test]
@@ -370,6 +405,12 @@ mod tests {
         // looked like it had landed.
         assert!(!node.serves_wake_decisions());
         assert!(node.reclaims_host_leftovers_at_startup());
+        // P2 (task's own "phase4-close"): the gate that keeps `--role node`
+        // from ever building a central snapshot catalog -- Postgres (it
+        // structurally cannot: `check_pg_dsn` above refuses it any `[pg]`
+        // DSN) or a gRPC client to a scheduler this role has no reason to
+        // reach.
+        assert!(node.never_constructs_a_central_snapshot_catalog());
     }
 
     /// 🔴 Both faces in one test, because either one alone is satisfied by a

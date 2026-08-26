@@ -58,9 +58,42 @@ pub async fn build_snapshot_backend(
     // `services/scheduler` for both `write = "both"` and
     // `write = "postgres"`.
     pg_pool: Option<sqlx::PgPool>,
+    role: crate::role::ServerRole,
 ) -> Result<AssembledSnapshotBackend> {
     let config = ConfigManager::global_config();
     let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
+
+    // 🔴 P2 (task's own "phase4-close"): `--role node` never queries this
+    // catalog at all -- both of its request-time reads
+    // (`create`'s `Source::Snapshot` arm, `build_template`'s
+    // `Base::BaseSnapshotRef` arm) are pre-resolved by api and sent down
+    // with the request, and only ever fall back to `repository.get_scoped`
+    // (served by whatever `build_storage_backend` above already built,
+    // object-storage-backed) during a mixed-version rolling upgrade
+    // window -- never to a central Postgres/gRPC catalog. See
+    // `ServerRole::never_constructs_a_central_snapshot_catalog`'s own doc
+    // for why this skips *both* the `write = "postgres"` bail below (no
+    // `[pg]`, ever, on this role) and the `write = "both"` gRPC client (a
+    // live dependency on a scheduler this role has no reason to reach),
+    // and why it also skips the `read == "postgres"` refusal a few lines
+    // down: that refusal exists to catch reads this backend actually
+    // serves silently diverging from the configured read side, and a node
+    // role serves none through this catalog at all.
+    if role.never_constructs_a_central_snapshot_catalog() {
+        let compensator = drain_a_rolled_back_mirror(
+            &config.snapshot.catalog.mirror_backlog_path,
+            std::time::Duration::from_secs(
+                config.snapshot.catalog.mirror_compensator_interval_secs,
+            ),
+            repository.catalog(),
+        )
+        .await?;
+        return Ok(AssembledSnapshotBackend {
+            mirror_compensator: compensator,
+            repository,
+            runtime_resolver,
+        });
+    }
 
     let Some(central) = build_central_catalog(config, pg_pool.as_ref())? else {
         // 🔴 A node told to read PostgreSQL with no central catalog wired would

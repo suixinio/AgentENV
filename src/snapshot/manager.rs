@@ -168,11 +168,16 @@ impl SnapshotManager {
     /// have `[pg]` configured — see `src/bin/server.rs::build_pg_pool`.
     /// `--role node` always passes `None`: it must never hold PostgreSQL
     /// credentials, see `src/pg/mod.rs`'s own module doc.
+    ///
+    /// `role` gates whether a central snapshot catalog (Postgres or the
+    /// scheduler's gRPC one) is built at all — see
+    /// `ServerRole::never_constructs_a_central_snapshot_catalog`'s own doc.
     pub async fn new(
         p2p_transport: Option<Arc<dyn P2pTransport>>,
         pg_pool: Option<sqlx::PgPool>,
+        role: crate::role::ServerRole,
     ) -> anyhow::Result<Self> {
-        let assembled = build_snapshot_backend(p2p_transport.clone(), pg_pool).await?;
+        let assembled = build_snapshot_backend(p2p_transport.clone(), pg_pool, role).await?;
         Ok(Self {
             repository: assembled.repository,
             runtime_resolver: assembled.runtime_resolver,

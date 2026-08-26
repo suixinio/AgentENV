@@ -45,16 +45,28 @@
 //! `src/bin/server.rs`'s real wiring until the config/assembly commit that
 //! follows this one) keeps answering `Unimplemented`, unchanged.
 //!
-//! # 🔴 What `Heartbeat`/`UnregisterNode` still do *not* do (task's own
+//! # `Heartbeat`/`UnregisterNode`'s `ReconcileNode` half (task's own
 //! "D3"/"D6" — `_sd-phase4-stageA-node-inventory.md` §7 risk 1, §10)
 //!
 //! The real Go `Heartbeat` calls `s.store.ReconcileNode(node, roster, now)`
-//! right after `s.nodes.Heartbeat(...)` succeeds, and `UnregisterNode` calls
-//! the same `ReconcileNode` plus `s.artifacts.ForgetNode(nodeID)` after
-//! `UnregisterObserved`. This file does not call either equivalent yet —
-//! that wiring, plus the `ArtifactStore`-backed P2P RPCs above, is the next
-//! commit, once `with_binding_store` has a real caller to also thread
-//! through an `ArtifactStore` handle.
+//! right after `s.nodes.Heartbeat(...)` succeeds — ported here too now,
+//! gated the same way `report_sandbox_event` is (`None` binding store ->
+//! today's pre-D3 behavior unchanged: warm-up just means "the registry
+//! accepted a heartbeat"). Unlike `report_sandbox_event`, a `ReconcileNode`
+//! failure here **does** fail the RPC (`Unavailable`), matching Go exactly
+//! — a heartbeat whose roster never reached the binding store must not be
+//! silently treated as caught up.
+//!
+//! `UnregisterNode` also now calls `ReconcileNode` with an empty roster
+//! (deletes every binding the node owns), but treats its failure as
+//! best-effort rather than fatal: by the point it runs, the node's
+//! *identity* is already unregistered, and failing the whole call over a
+//! routes-cleanup hiccup would leave a caller unsure whether to retry an
+//! unregister that already took effect. `s.artifacts.ForgetNode(nodeID)`
+//! (the `ArtifactStore`-backed P2P index) is still not called — that, plus
+//! the `RecordP2pArtifact`/`ForgetP2pArtifact`/`LookupP2pArtifact` RPCs
+//! above, is the next commit, once `with_binding_store` has a real caller
+//! to also thread an `ArtifactStore` handle through.
 //!
 //! The heartbeat-admission race this paragraph used to describe (a node
 //! whose Pod is not yet `Serving` in discovery gets no binding refresh from
@@ -266,6 +278,9 @@ const OBSERVED_NODES_METRIC: &str = "agentenv_api_node_registry_observed_nodes";
 /// `agentenv_scheduler_observed_nodes` -> `OBSERVED_NODES_METRIC` above for
 /// the precedent).
 const SANDBOX_EVENT_METRIC: &str = "agentenv_api_sandbox_event_total";
+/// Ports `agentenv_scheduler_heartbeat_legacy_roster_total`, renamed per
+/// this module's own `scheduler` -> `api` convention.
+const HEARTBEAT_LEGACY_ROSTER_METRIC: &str = "agentenv_api_heartbeat_legacy_roster_total";
 
 fn node_status_label(status: scheduler::NodeStatus) -> &'static str {
     match status {
@@ -314,7 +329,7 @@ impl Scheduler for NodeRegistryGrpcService {
         }
 
         let now = SystemTime::now();
-        let (_node, cpu_config_json) = match self.registry.heartbeat(&req, now) {
+        let (node, cpu_config_json) = match self.registry.heartbeat(&req, now) {
             Ok(result) => result,
             Err(NodeNotInRegistry) => {
                 // 🔴 Matches the real scheduler's exact message
@@ -329,14 +344,38 @@ impl Scheduler for NodeRegistryGrpcService {
             }
         };
 
-        // Warm-up is about the bindings being seeded in the real scheduler
-        // (`s.warmup.reportedIn(now)` runs only after `ReconcileNode`
-        // succeeds there); this half has no binding store to seed, so
-        // `reported_in` here only means "the registry accepted a heartbeat
-        // for this node", not "routing state is caught up". Stage D's
-        // consumer (`docs/proposals/_sd-phase4-stageA-node-inventory.md` §7
-        // risk 7) is what will give this call its real meaning.
-        self.warmup.reported_in(now);
+        // Task's own "D3": ports the `ReconcileNode` half of `Heartbeat`
+        // (`service.go:538-553`) that `grpc_service.rs`'s module doc used to
+        // list as still missing. `None` (no binding store wired yet, every
+        // default path today) falls back to the pre-D3 behavior: warm-up
+        // means "the registry accepted a heartbeat," nothing more.
+        if let Some(binding_store) = &self.binding_store {
+            let (roster, legacy) = super::registry::roster_from_heartbeat(&req);
+            if legacy {
+                // 🔴 Counted per node, not merely logged — mirrors Go's own
+                // comment on `recordLegacyRoster`: this is the number that
+                // has to reach zero before any consumer can refuse an
+                // incarnation-less roster, and a log line does not answer
+                // "how many nodes are still on the old build."
+                metrics::counter!(HEARTBEAT_LEGACY_ROSTER_METRIC, "node" => node.id.clone())
+                    .increment(1);
+            }
+            if let Err(err) = binding_store.reconcile_node(node, roster, now).await {
+                tracing::warn!(
+                    node_id = %node_id,
+                    error = %err,
+                    "scheduler heartbeat binding reconcile failed"
+                );
+                return Err(Status::unavailable("binding store unavailable"));
+            }
+            // Only now, with the roster actually applied to the store:
+            // warm-up is about the bindings being seeded, not about the
+            // node having said hello (matches Go's own comment on this
+            // exact ordering).
+            self.warmup.reported_in(now);
+        } else {
+            self.warmup.reported_in(now);
+        }
 
         Ok(Response::new(HeartbeatResponse { cpu_config_json }))
     }
@@ -400,7 +439,41 @@ impl Scheduler for NodeRegistryGrpcService {
             .registry
             .unregister_observed(&canonical_id, service_instance_id)
         {
-            Ok(()) => Ok(Response::new(UnregisterNodeResponse {})),
+            Ok(()) => {
+                // Task's own "D3": ports the `ReconcileNode` half of
+                // `UnregisterNode` (`service.go:814-847`) — an empty roster
+                // deletes every binding this node owns, the same as a
+                // heartbeat reporting nothing held. Best-effort, not fatal
+                // to the RPC: the node's identity is already unregistered
+                // by this point, and failing the whole call because
+                // cleanup of its *routes* hiccuped would leave a caller
+                // unsure whether to retry an unregister that already took
+                // effect. A stale binding this leaves behind still expires
+                // on its own TTL.
+                //
+                // 🔴 `ArtifactStore::forget_node` (Go's
+                // `s.artifacts.ForgetNode(nodeID)`) is not called here yet
+                // — the P2P artifact index this Stage also builds is a
+                // separate commit.
+                if let Some(binding_store) = &self.binding_store {
+                    let node = crate::node_registry::types::Node {
+                        id: canonical_id.clone(),
+                        ..Default::default()
+                    };
+                    if let Err(err) = binding_store
+                        .reconcile_node(node, Vec::new(), SystemTime::now())
+                        .await
+                    {
+                        tracing::warn!(
+                            node_id = %canonical_id,
+                            error = %err,
+                            "scheduler unregister_node binding cleanup failed; any bindings it \
+                             still owns will expire on their own TTL"
+                        );
+                    }
+                }
+                Ok(Response::new(UnregisterNodeResponse {}))
+            }
             Err(ServiceInstanceMismatch) => {
                 Err(Status::failed_precondition("service instance mismatch"))
             }
@@ -1142,5 +1215,171 @@ mod tests {
             .await
             .expect_err("ListP2pPeers stays on the scheduler");
         assert_eq!(status.code(), tonic::Code::Unimplemented);
+    }
+
+    // ---- heartbeat/unregister_node's ReconcileNode wiring: task's own "D3" ----
+
+    /// A `BindingStore` double that always fails, for proving the two
+    /// different failure disciplines `heartbeat` and `unregister_node` use
+    /// (fatal vs. best-effort) without needing to actually take a real
+    /// Redis down mid-test.
+    struct FailingBindingStore;
+
+    #[async_trait::async_trait]
+    impl BindingStore for FailingBindingStore {
+        async fn get(
+            &self,
+            _sandbox_id: &str,
+            _now: SystemTime,
+        ) -> Result<Option<Binding>, crate::binding_store::BindingStoreError> {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
+        async fn record(
+            &self,
+            _sandbox_id: &str,
+            _binding: Binding,
+            _now: SystemTime,
+        ) -> Result<crate::binding_store::BindingDecision, crate::binding_store::BindingStoreError>
+        {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
+        async fn reconcile_node(
+            &self,
+            _node: crate::node_registry::types::Node,
+            _roster: Vec<crate::node_registry::types::RosterEntry>,
+            _now: SystemTime,
+        ) -> Result<
+            Vec<(String, crate::binding_store::BindingDecision)>,
+            crate::binding_store::BindingStoreError,
+        > {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
+        async fn delete(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reconciles_the_roster_into_the_binding_store() {
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        let (mut client, _stop) = service_with_binding_store(
+            vec![node("node-a", "http://node-a")],
+            Arc::clone(&store),
+            true,
+        )
+        .await;
+
+        client
+            .heartbeat(crate::proto::scheduler::HeartbeatRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+                roster: vec![crate::proto::scheduler::SandboxRosterEntry {
+                    sandbox_id: "sbx-1".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("node-a heartbeats");
+
+        let binding = store
+            .get("sbx-1", SystemTime::now())
+            .await
+            .unwrap()
+            .expect("the roster entry must have been reconciled into the binding store");
+        assert_eq!(binding.node.id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_fails_with_unavailable_when_the_binding_store_reconcile_fails() {
+        let store: Arc<dyn BindingStore> = Arc::new(FailingBindingStore);
+        let (mut client, _stop) =
+            service_with_binding_store(vec![node("node-a", "http://node-a")], store, true).await;
+
+        let status = client
+            .heartbeat(heartbeat_with_cpu_config("node-a", ""))
+            .await
+            .expect_err("a ReconcileNode failure must fail the RPC, unlike ReportSandboxEvent");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "binding store unavailable");
+    }
+
+    #[tokio::test]
+    async fn unregister_node_removes_the_bindings_it_owns() {
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        store
+            .record(
+                "sbx-1",
+                Binding {
+                    node: node("node-a", "http://node-a"),
+                    ..Default::default()
+                },
+                SystemTime::now(),
+            )
+            .await
+            .unwrap();
+        let (mut client, _stop) = service_with_binding_store(
+            vec![node("node-a", "http://node-a")],
+            Arc::clone(&store),
+            true,
+        )
+        .await;
+        client
+            .heartbeat(heartbeat_with_cpu_config("node-a", ""))
+            .await
+            .expect("node-a heartbeats so unregister_node can resolve its identity");
+
+        client
+            .unregister_node(UnregisterNodeRequest {
+                node_id: "node-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+            })
+            .await
+            .expect("unregister succeeds");
+
+        assert!(
+            store
+                .get("sbx-1", SystemTime::now())
+                .await
+                .unwrap()
+                .is_none(),
+            "unregistering a node must release the bindings it owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_node_still_succeeds_when_binding_cleanup_fails() {
+        let store: Arc<dyn BindingStore> = Arc::new(FailingBindingStore);
+        let (mut client, _stop) =
+            service_with_binding_store(vec![node("node-a", "http://node-a")], store, true).await;
+        client
+            .heartbeat(heartbeat_with_cpu_config("node-a", ""))
+            .await
+            .expect_err("FailingBindingStore also fails the heartbeat reconcile in this setup");
+
+        // The node is still discoverable even though the heartbeat above
+        // never got recorded as observed (ReconcileNode failed before
+        // warmup/observed state would matter here) -- unregister_node only
+        // needs `resolve`, which comes from discovery, not from a
+        // successful heartbeat.
+        client
+            .unregister_node(UnregisterNodeRequest {
+                node_id: "node-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+            })
+            .await
+            .expect("a binding-cleanup failure must not fail unregister_node itself");
     }
 }

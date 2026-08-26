@@ -1068,7 +1068,7 @@ fn normalize_heartbeat_roster(req: &HeartbeatRequest) -> Vec<RosterEntry> {
 /// `//nolint:staticcheck` on the same line: the deprecated field is the
 /// rollout fallback, not dead code to warn about.
 #[allow(deprecated)]
-fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool) {
+pub(crate) fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool) {
     if !req.roster.is_empty() {
         let mut out = Vec::with_capacity(req.roster.len());
         let mut seen: HashSet<String> = HashSet::with_capacity(req.roster.len());

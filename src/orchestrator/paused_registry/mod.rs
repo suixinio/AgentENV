@@ -615,7 +615,7 @@ pub async fn build_paused_registry(
                          sandboxes' registry leases have no renewal path and will eventually be \
                          wrongly reclaimed even while healthy (this is the exact failure Fix A, \
                          commit 151d00b, closed for the central/gRPC backend). Set \
-                         AENV_CLUSTER_NODE_PLACEMENT_SOURCE=native, or keep this backend on \
+                         AENV_NODE_PLACEMENT_SOURCE=native, or keep this backend on \
                          \"central\"",
                     )?;
                 }

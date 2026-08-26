@@ -13,11 +13,17 @@
 # gets there. `TestNoPgDsnIsCommittedToTheRepository`
 # (`services/shared/config`) fails if `dsn` ever appears in a tracked file.
 #
-# Empty today: `max_connections` (default 8 per replica) and
-# `connect_timeout_secs` (default 5) have not needed a cluster-specific value
-# yet. Uncomment and set them here, not in the Secret, the day one does — see
+# `connect_timeout_secs` (default 5) has not needed a cluster-specific value
+# yet. Uncomment and set it here, not in the Secret, the day one does — see
 # `config/default.toml`'s own `[pg]` section for what each one means.
 #
-# [pg]
-# max_connections = 8
+# `max_connections` (P4/P6, task's own "phase4-close") is set explicitly at
+# its own default, 8 per replica: `--role api` runs `replicas: 2`
+# (`agentenv-api-deployment.yaml`), each with its own pool against the same
+# database, so this cluster's real ceiling is `max_connections * replicas`
+# against whatever PostgreSQL itself allows — a value worth reading off this
+# file rather than off `config/default.toml`'s code default once a second
+# replica-count-aware deployment exists to compare it against.
+[pg]
+max_connections = 8
 # connect_timeout_secs = 5

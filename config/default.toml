@@ -152,6 +152,27 @@ peer_discovery_refresh_interval_secs = 5
 # timeout_ms = 5000
 
 [cluster]
+# Where `--role api` resolves node placement (`Schedule`/`LookupNode`/
+# `RecordAssignment`, and a known node's own address) from.
+#
+#   node_placement_source = "scheduler"  (the default) dials
+#                           [cluster].scheduler_endpoint below for all of it,
+#                           byte-for-byte the pre-fold behaviour.
+#   node_placement_source = "native"     answers every one of those from
+#                           api's own process instead (task's own
+#                           "phase4-close" P1): a local node registry fed by
+#                           Kubernetes discovery and node heartbeats
+#                           (requires [cluster.kubernetes_discovery] below),
+#                           and [binding_store] for the routing table
+#                           `Schedule`/`LookupNode`/`RecordAssignment`
+#                           answer from. No [cluster].scheduler_endpoint is
+#                           required in this mode. See
+#                           `src/node_client/native_placement.rs`'s module
+#                           doc for the full argument, and
+#                           `deploy/k8s/base/agentenv-api-deployment.yaml`
+#                           for the two-step rollout this flips with.
+# node_placement_source = "scheduler"
+
 # Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
 # A file holding a replacement for scheduler_endpoint above, re-read on the
@@ -208,6 +229,35 @@ node_service_port = 8001
 # Bounds the pool's initial connection attempt and every later acquire.
 # Defaults to 5 seconds when unset.
 # connect_timeout_secs = 5
+
+[binding_store]
+# The sandbox-to-node routing table `[cluster].node_placement_source =
+# "native"` answers `Schedule`/`LookupNode`/`RecordAssignment` from (task's
+# own "phase4-close" P1/D), and the same key space gateway's routing-
+# projection read path already speaks to.
+#
+#   backend = "in_memory"  (the code default) one replica's own table, lost
+#                           when it exits. Correct only for a single-replica
+#                           deployment.
+#   backend = "redis"      the shared table every `--role api` replica reads
+#                           and writes. `--role api` runs more than one
+#                           replica (`agentenv-api-deployment.yaml`'s
+#                           `replicas: 2`), so this is the only backend that
+#                           deployment may run under `node_placement_source =
+#                           "native"` — `build_binding_store`
+#                           (`src/bin/server.rs`) refuses to start on
+#                           "in_memory" in that mode, the same guard
+#                           [orchestrator.store] already has for the sandbox
+#                           ledger.
+# backend = "redis"
+#
+# redis_url = "redis://127.0.0.1:6379"
+#
+# 🔴 Deliberately the same key prefix `services/scheduler`'s Go bindings
+# already used — gateway's routing-projection read path
+# (GATEWAY_ROUTING_PROJECTION_READ=on) speaks to this exact keyspace. Do not
+# rename it; nothing else knows to follow.
+# redis_key_prefix = "agentenv:scheduler:bindings"
 
 [api]
 # Credentials that prove a control-plane call arrived through the gateway.
@@ -408,11 +458,24 @@ p2p_enabled = true
 #   write = "both"          both catalogs are written; the central one gets a
 #                           second, checkable copy. Requires
 #                           [cluster].scheduler_endpoint.
+#   write = "postgres"      PostgreSQL is the only catalog; object storage
+#                           receives no more catalog writes. No gRPC fallback
+#                           and no scheduler dependency — [pg] alone. Refused
+#                           at startup unless the read side was already
+#                           confirmed onto PostgreSQL first (see below).
+#                           --role node never builds a catalog of any kind
+#                           under this backend or any other: its two
+#                           request-time catalog reads are pre-resolved by
+#                           api and sent down with the request (task's own
+#                           "phase4-close" P2).
 #   read  = "object_store"  object storage answers reads. Always available, and
 #                           the way back from the line below.
 #   read  = "postgres"      the central catalog answers reads. Requires
-#                           write = "both", so object storage stays a complete
-#                           copy and the rollback is a config change.
+#                           write = "both" or write = "postgres" (the latter
+#                           forces it: there is no object-store copy left to
+#                           read), so object storage stays a complete copy
+#                           under "both" and the rollback there is a config
+#                           change.
 #
 # Moving `read` onto PostgreSQL is refused unless PostgreSQL actually holds what
 # object storage does, and the node checks four separate things before serving:

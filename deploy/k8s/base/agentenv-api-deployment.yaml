@@ -361,6 +361,26 @@ spec:
             # healthy one until queried.
             - name: AENV_NODE_PLACEMENT_SOURCE
               value: "scheduler"
+            # 🔴 P4 (task's own "phase4-close"): carried here now, ahead of
+            # the `native` flip above, precisely so that flip is the single
+            # `kubectl set env` step 2 already describes it as — not also a
+            # second one to remember for this. `[binding_store]` backs
+            # `Schedule`/`LookupNode`/`RecordAssignment` once native
+            # placement answers them locally (`NativeNodePlacement`,
+            # `src/node_client/native_placement.rs`), and this Deployment
+            # runs `replicas: 2`: the code default (`in_memory`) is one
+            # replica's private routing table, and `build_binding_store`
+            # (`src/bin/server.rs`) now refuses to start on it under
+            # `node_placement_source = "native"` — the same refusal
+            # `AENV_ORCHESTRATOR_STORE_BACKEND`'s own comment above
+            # describes for the sandbox ledger. The same Redis, the same
+            # key prefix the store defaults to (`agentenv:scheduler:bindings`)
+            # and gateway's routing-projection read path already speaks to
+            # — do not rename it here; nothing else knows to follow.
+            - name: AENV_BINDING_STORE_BACKEND
+              value: "redis"
+            - name: AENV_BINDING_STORE_REDIS_URL
+              value: redis://agentenv-redis:6379
             # The same namespace/Service/port/scheme
             # `deploy/k8s/base/config/scheduler.json`'s
             # `scheduler.discovery.kubernetes` already discovers nodes from

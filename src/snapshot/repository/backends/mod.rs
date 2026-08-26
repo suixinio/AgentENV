@@ -20,9 +20,9 @@ use crate::snapshot::repository::interfaces::SnapshotArtifactStore;
 use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::mirror::{
-    admit_read_side_with_confirmation, require_read_side_confirmed, CatalogCensus,
-    CatalogReadSide, CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorCompensator,
-    MirrorDirection, MirrorTargets, ObjectStoreCensus, ReadSideConfirmationStore,
+    admit_read_side_with_confirmation, require_read_side_confirmed, CatalogCensus, CatalogReadSide,
+    CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorCompensator, MirrorDirection,
+    MirrorTargets, ObjectStoreCensus, ReadSideConfirmationStore,
 };
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
@@ -909,7 +909,8 @@ mod pg {
     /// `with_max_concurrent_builds` call) fails only here.
     #[tokio::test]
     async fn max_concurrent_builds_from_config_reaches_admission() {
-        let pool = isolated_schema_pool_or_skip!("max_concurrent_builds_from_config_reaches_admission");
+        let pool =
+            isolated_schema_pool_or_skip!("max_concurrent_builds_from_config_reaches_admission");
         migrate(&pool).await.expect("migration should succeed");
 
         let mut config = AppConfig::default();

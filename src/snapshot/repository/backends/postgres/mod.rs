@@ -902,10 +902,9 @@ mod pg {
             .create(one_more.clone())
             .await
             .expect("create should succeed");
-        let error = catalog
-            .try_start_build(&one_more.id)
-            .await
-            .expect_err("the 21st build must be refused: 0 resolves to a ceiling of 20, not unlimited");
+        let error = catalog.try_start_build(&one_more.id).await.expect_err(
+            "the 21st build must be refused: 0 resolves to a ceiling of 20, not unlimited",
+        );
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
@@ -926,12 +925,15 @@ mod pg {
                 .create(record.clone())
                 .await
                 .unwrap_or_else(|e| panic!("create #{n} should succeed: {e}"));
-            catalog.try_start_build(&record.id).await.unwrap_or_else(|e| {
-                panic!(
+            catalog
+                .try_start_build(&record.id)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
                     "build #{n} should be admitted: a negative ceiling must not refuse anything, \
                      even past where 0's own default would have: {e}"
                 )
-            });
+                });
         }
     }
 

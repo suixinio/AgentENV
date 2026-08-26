@@ -346,11 +346,11 @@ redis_distributed_lock_enabled = true
 #   original ID. The registry is reached over gRPC through the scheduler, which
 #   owns the database. Requires [cluster].scheduler_endpoint; a "central"
 #   backend with no endpoint fails startup rather than falling back.
-#
-# The former "postgres" backend, where each node connected to the registry
-# database itself, has been removed. A node still configured with it refuses to
-# start and says what to set instead — the credentials, the connection budget
-# and the schema are no longer every node's business.
+# - "postgres": --role api (and --role all) connect directly to the registry
+#   database over the shared [pg] pool, folding the scheduler's registry
+#   service into this process. --role api requires a heartbeat roster source
+#   ([cluster].node_placement_source = "native") to select this backend;
+#   --role all does not.
 #
 # 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
 # editing the copy of this file that lands in the cluster ConfigMap — see
@@ -366,6 +366,12 @@ reconcile_interval_secs = 30
 # a lease shorter than the cadence that renews it expires on a healthy node.
 # A live sandbox is never handed to another node on this alone.
 lease_ttl_secs = 90
+
+# How often the "postgres" backend's cluster-wide reclaim pass runs. Ignored
+# by every other backend. A separate knob from reconcile_interval_secs on
+# purpose -- reconcile keeps healthy leases alive, reclaim is a backstop for
+# rows nothing has renewed in a lease's worth of time already.
+reclaim_interval_secs = 30
 
 [snapshot]
 # Node-local cache for snapshot artifacts.

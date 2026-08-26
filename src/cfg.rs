@@ -2546,7 +2546,12 @@ mod tests {
             .and_then(toml::Value::as_table)
             .expect("config/default.toml must carry an [orchestrator.paused_registry] section");
 
-        for key in ["backend", "reconcile_interval_secs", "lease_ttl_secs"] {
+        for key in [
+            "backend",
+            "reconcile_interval_secs",
+            "lease_ttl_secs",
+            "reclaim_interval_secs",
+        ] {
             assert!(
                 section.contains_key(key),
                 "[orchestrator.paused_registry] is missing {key}"

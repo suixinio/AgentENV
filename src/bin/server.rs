@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
 use agentenv::binding_store::{
-    ArbitrationMode, BindingStore, BindingStoreSettings, InMemoryBindingStore, RedisBindingStore,
-    RedisBindingStoreConfig,
+    ArbitrationMode, BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
 use agentenv::cfg::{
     AppConfig, BindingStoreBackendKind, BindingStoreConfig, MetadataStoreBackendKind,
@@ -567,7 +566,8 @@ async fn assemble_node_core(
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport, pg_pool).await?);
+    let snapshot_manager =
+        Arc::new(SnapshotManager::new(snapshot_p2p_transport, pg_pool, role).await?);
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     // The handle the cold-boot paths read the CPUID intersection from.
     //
@@ -666,6 +666,24 @@ async fn assemble_node_core(
 /// 🔴 This is the rollback target, so it is defined as *today's behaviour* and
 /// not as the union of `api` and `node`. Nothing belongs here that was not
 /// here before the split.
+///
+/// 🔴 P5 (task's own "phase4-close"): `build_pg_pool` below is an eager,
+/// fail-fast dependency — a `[pg].dsn` that is configured but transiently
+/// unreachable at boot (Postgres still starting, a network blip) aborts
+/// this process's startup entirely, same as `assemble_api`. This predates
+/// the scheduler fold (`92976be`, "thread an optional PgPool through
+/// snapshot backend assembly") and is not a failure source phase 4 added,
+/// so it does not violate this function's own "nothing new" doc above —
+/// but it is worth naming, since a rollback to `--role all` under a flaky
+/// `[pg]` would carry it forward unchanged. Deliberately left eager rather
+/// than made lazy here: `build_pg_pool` also runs
+/// `migrate_catalog_schema`, which `build_snapshot_backend`'s Postgres
+/// paths (and `spawn_pg_singleton_tasks`'s reaper) assume has already
+/// completed by the time they run — a lazy/retrying pool would have to
+/// either block the same callers on the same migration anyway or risk
+/// running against an unmigrated schema, and reworking that ordering is
+/// out of scope for this task. `[pg]` unset (`None`) is unaffected either
+/// way — this is only a cost an operator opts into by configuring it.
 async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::All;
     let pg_pool = build_pg_pool(config).await?;
@@ -1171,11 +1189,65 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         }
         None => None,
     };
+    // 🔴 P1 (task's own "phase4-close"): moved up from after
+    // `Orchestrator::new` (see the historical comments still attached to
+    // `pg_pool`/`node_registry_for_paused`/`build_paused_registry` below).
+    // `NativeNodePlacement`'s `place_existing` now answers `LookupNode`'s
+    // paused-registry stage in-process through the same
+    // `node_registry_grpc_service` `cluster_placement` is about to hand it
+    // a clone of, so that service has to be `.with_paused_registry(...)`
+    // *before* `cluster_placement` runs rather than after — which means
+    // `paused_registry`, and the `pg_pool` its `postgres` backend needs,
+    // now have to exist this early too. Nothing between here and their old
+    // position needed either built any later than this.
+    //
+    // The commit side of snapshots, the resolver, and the builder's
+    // scheduling half all still need this same `pg_pool` — see the
+    // (unmoved) `snapshot_manager` construction below. No P2P transport is
+    // passed there, and `[snapshot].p2p_enabled` is not consulted: P2P
+    // moves bytes between machines that hold them, and this process holds
+    // none.
+    let pg_pool = build_pg_pool(config).await?;
+    let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
+    // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
+    // coerced to `Arc<dyn NodeRegistry>`, cloned rather than moved --
+    // `native_registry_handle` itself is still needed below by
+    // `node_registry_dump_source`.
+    let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> = native_registry_handle
+        .clone()
+        .map(|registry| registry as Arc<dyn NodeRegistry>);
+    let paused_registry = build_paused_registry(
+        &config.orchestrator.paused_registry,
+        &config.cluster,
+        &config.observability.scheduler_report,
+        &identity_for_registry,
+        role,
+        pg_pool.clone(),
+        node_registry_for_paused.clone(),
+    )
+    .await?;
+    // Task's own "Stage D remainder": `lookup_node`'s stage 3. Wired onto
+    // the same service `cluster_placement` is about to hand
+    // `NativeNodePlacement` a clone of -- a no-op under
+    // `[cluster].node_placement_source = "scheduler"`
+    // (`node_registry_grpc_service` is `None` there).
+    let node_registry_grpc_service = node_registry_grpc_service
+        .map(|service| service.with_paused_registry(Arc::clone(&paused_registry)));
+
+    // 🔴 P1: under `[cluster].node_placement_source = "native"`,
+    // `NativeNodePlacement` answers `place_new`/`place_existing`/
+    // `record_placement` from this same in-process
+    // `node_registry_grpc_service` (a clone -- `spawn_grpc_surface` below
+    // still gets the original, moved in) instead of dialling a scheduler
+    // this deployment no longer has to run at all. See `cluster_placement`'s
+    // own doc comment for why `[cluster].scheduler_endpoint` is no longer
+    // required in that mode.
     let placement = cluster_placement(
         &config.cluster,
         &config.observability.scheduler_report,
         native_registry_handle.as_ref(),
         native_warmup_handle.as_ref(),
+        node_registry_grpc_service.as_ref(),
     )?;
     let store = RedisMetadataStore::connect(store_config)
         .await
@@ -1208,23 +1280,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
 
-    // The commit side of snapshots, the resolver, and the builder's scheduling
-    // half. None of the three needs a machine; what they need is the
-    // repository, which is shared.
-    //
-    // 🔴 No P2P transport is passed, and `[snapshot].p2p_enabled` is not
-    // consulted: P2P moves bytes between machines that hold them, and this
-    // process holds none.
-    let pg_pool = build_pg_pool(config).await?;
-    let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
-    // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
-    // coerced to `Arc<dyn NodeRegistry>`, cloned rather than moved --
-    // `native_registry_handle` itself is still needed below by
-    // `cluster_placement` and `node_registry_dump_source`.
-    let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> = native_registry_handle
-        .clone()
-        .map(|registry| registry as Arc<dyn NodeRegistry>);
-    let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool.clone()).await?);
+    let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool.clone(), role).await?);
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));
 
@@ -1251,24 +1307,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         None
     };
 
-    let paused_registry = build_paused_registry(
-        &config.orchestrator.paused_registry,
-        &config.cluster,
-        &config.observability.scheduler_report,
-        &identity_for_registry,
-        role,
-        pg_pool.clone(),
-        node_registry_for_paused.clone(),
-    )
-    .await?;
-    // Task's own "Stage D remainder": `lookup_node`'s stage 3. Built here,
-    // strictly between `node_registry_grpc_service`'s own construction
-    // (`with_binding_store`, above) and its only consumer
-    // (`spawn_grpc_surface`, below) -- a no-op under
-    // `[cluster].node_placement_source = "scheduler"`
-    // (`node_registry_grpc_service` is `None` there).
-    let node_registry_grpc_service = node_registry_grpc_service
-        .map(|service| service.with_paused_registry(Arc::clone(&paused_registry)));
     let paused_registry_tasks = spawn_paused_registry_background_tasks(
         &config.orchestrator.paused_registry,
         &identity_for_registry,
@@ -1492,54 +1530,70 @@ fn cluster_store_config(
     })
 }
 
-/// The scheduler-backed placement this half asks where sandboxes go —
-/// wrapped in [`NativeNodePlacement`] under `Native` so `resolve_node`/
-/// `node_membership` answer from `node_registry` instead, while `place_new`/
-/// `place_existing`/`record_placement` keep going through this same
-/// `SchedulerNodePlacement` either way. See
-/// `docs/proposals/_sd-phase4-stageA-node-inventory.md` §5 and
-/// [`NodePlacementSource`]'s own doc comment for why the split is drawn
-/// there.
+/// Where this half asks where sandboxes go. Under `Native`, every method
+/// answers from api's own process — [`NativeNodePlacement`] wraps the local
+/// node registry (`resolve_node`/`node_membership`) and a clone of the same
+/// `node_registry_grpc_service` `assemble_api` serves `Schedule`/
+/// `LookupNode`/`RecordAssignment` from over the wire (`place_new`/
+/// `place_existing`/`record_placement`) — see that type's own module doc
+/// for the P1 fix this replaced ("all five forward to the scheduler" ->
+/// "all five answer locally"). Under `Scheduler` (the default), this is
+/// unchanged from before P1: a `SchedulerNodePlacement` dialling
+/// `[cluster].scheduler_endpoint`, byte-for-byte.
 ///
-/// 🔴 `[cluster].scheduler_endpoint` is required regardless of
-/// `node_placement_source`: even under `Native`, three of five
-/// `NodePlacement` methods still need a working `SchedulerNodePlacement`, so
-/// `Native` is not a way to run `--role api` without a scheduler.
+/// 🔴 P1 (task's own "phase4-close"): `[cluster].scheduler_endpoint` is now
+/// required *only* under `Scheduler` — the doc comment this replaced said
+/// "`Native` is not a way to run `--role api` without a scheduler," and
+/// that was the bug: three of `NativeNodePlacement`'s five methods used to
+/// forward to a `SchedulerNodePlacement` regardless, so `--role api` under
+/// `Native` was simultaneously the gRPC server for `Schedule`/`LookupNode`/
+/// `RecordAssignment` (Stage D) and a client of the Go scheduler for those
+/// same three calls, never reaching its own answers. Scaling that scheduler
+/// to zero left every create failing. `Native` now needs no scheduler
+/// endpoint at all.
 fn cluster_placement(
     config: &agentenv::cfg::ClusterConfig,
     scheduler_report: &agentenv::cfg::ObservabilitySchedulerReportConfig,
     native_registry: Option<&Arc<AtomicNodeRegistry>>,
     native_warmup: Option<&Arc<WarmupGate>>,
+    native_grpc_service: Option<&NodeRegistryGrpcService>,
 ) -> anyhow::Result<Arc<dyn agentenv::node_client::NodePlacement>> {
-    let endpoint = config
-        .scheduler_endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--role api needs [cluster].scheduler_endpoint \
-                 (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not run, so \
-                 every create has to be placed by the scheduler and there is no machine here to \
-                 fall back to"
-            )
-        })?;
-    let scheduler = SchedulerNodePlacement::connect_hot_reloadable(
-        endpoint,
-        config,
-        scheduler_report,
-        config.node_service_port,
-    )?;
-    match (config.node_placement_source, native_registry, native_warmup) {
-        (NodePlacementSource::Native, Some(registry), Some(warmup)) => {
+    match (
+        config.node_placement_source,
+        native_registry,
+        native_warmup,
+        native_grpc_service,
+    ) {
+        (NodePlacementSource::Native, Some(registry), Some(warmup), Some(local)) => {
             Ok(Arc::new(NativeNodePlacement::new(
                 Arc::clone(registry),
                 config.node_service_port,
                 Arc::clone(warmup),
-                scheduler,
+                local.clone(),
             )))
         }
-        _ => Ok(Arc::new(scheduler)),
+        _ => {
+            let endpoint = config
+                .scheduler_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--role api needs [cluster].scheduler_endpoint \
+                         (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not \
+                         run, so every create has to be placed by the scheduler and there is no \
+                         machine here to fall back to"
+                    )
+                })?;
+            let scheduler = SchedulerNodePlacement::connect_hot_reloadable(
+                endpoint,
+                config,
+                scheduler_report,
+                config.node_service_port,
+            )?;
+            Ok(Arc::new(scheduler))
+        }
     }
 }
 
@@ -1713,6 +1767,13 @@ async fn start_native_node_registry(
 /// failure here is a startup refusal, not a background retry, the same
 /// discipline `cluster_placement`'s own comment names for every other
 /// config-driven refusal in this function.
+///
+/// 🔴 P4 (task's own "phase4-close"): also mirrors `cluster_store_config`'s
+/// own refusal of the in-memory metadata store — `BindingStoreBackendKind::InMemory`
+/// is refused here the same way, for the same reason (one replica's private
+/// state, `--role api` runs as more than one replica), and unconditionally
+/// for the same reason: nothing at this layer can distinguish "one replica,
+/// alone, safe" from "one of several, silently wrong."
 async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<dyn BindingStore>> {
     let settings = BindingStoreSettings {
         binding_ttl: Duration::from_secs(config.binding_ttl_secs),
@@ -1720,8 +1781,29 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
         projection_authoritative: config.projection_authoritative,
     };
     match config.backend {
+        // 🔴 P4 (task's own "phase4-close"): refused unconditionally, the
+        // same discipline `cluster_store_config` already applies to
+        // `[orchestrator.store].backend` above -- `--role api` is a
+        // multi-replica Deployment (`deploy/k8s/base/agentenv-api-deployment.yaml`'s
+        // `replicas: 2`), and an in-memory binding store is one replica's
+        // private routing table: `Schedule`/`LookupNode`/`RecordAssignment`
+        // answers from it, and nothing propagates a write on one replica to
+        // any other. Two replicas each holding a different, invisible
+        // answer for the same sandbox is not a degraded mode this process
+        // may run in — every symptom is silent (a gateway routing-projection
+        // read, or `NativeNodePlacement::place_existing` on *this* replica,
+        // simply missing a binding another replica wrote) — and nothing
+        // here can tell whether this process is one replica of many or
+        // genuinely alone, so this refuses regardless of how many are
+        // actually running.
         BindingStoreBackendKind::InMemory => {
-            Ok(Arc::new(InMemoryBindingStore::new(settings)) as Arc<dyn BindingStore>)
+            anyhow::bail!(
+                "[cluster].node_placement_source = \"native\" needs [binding_store].backend = \
+                 \"redis\" (AENV_BINDING_STORE_BACKEND): the in-memory binding store is one \
+                 replica's private routing table, and --role api runs as more than one \
+                 replica. Set AENV_BINDING_STORE_BACKEND=redis, or keep \
+                 [cluster].node_placement_source = \"scheduler\""
+            );
         }
         BindingStoreBackendKind::Redis => {
             let redis_config = RedisBindingStoreConfig {
@@ -2032,6 +2114,7 @@ mod tests {
             &config.observability.scheduler_report,
             None,
             None,
+            None,
         ) {
             Ok(_) => panic!("there is no machine here to fall back to"),
             Err(err) => err.to_string(),
@@ -2052,6 +2135,7 @@ mod tests {
                 &config.cluster,
                 &config.observability.scheduler_report,
                 None,
+                None,
                 None
             )
             .is_err(),
@@ -2066,10 +2150,96 @@ mod tests {
                 &config.cluster,
                 &config.observability.scheduler_report,
                 None,
+                None,
                 None
             )
             .is_ok(),
             "a configured endpoint is what this role runs on"
+        );
+    }
+
+    /// 🔴 P1 (task's own "phase4-close"): the other half of the same claim —
+    /// under `Native`, with a real local registry/warmup/gRPC service handed
+    /// in, `cluster_placement` must succeed with **no**
+    /// `[cluster].scheduler_endpoint` configured at all. Before P1,
+    /// `cluster_placement` read and refused on a missing endpoint
+    /// unconditionally, before it ever looked at `node_placement_source` —
+    /// so this exact call would have failed with "needs
+    /// [cluster].scheduler_endpoint", even though nothing in this test's
+    /// setup ever needs to dial one.
+    #[test]
+    fn native_placement_needs_no_scheduler_endpoint() {
+        let mut config = AppConfig::default();
+        config.cluster.node_placement_source = NodePlacementSource::Native;
+        assert_eq!(
+            config.cluster.scheduler_endpoint, None,
+            "the whole point of this test is that native mode does not need one"
+        );
+
+        let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn agentenv::node_registry::registry::NodeRegistry>,
+            Duration::from_secs(15),
+            std::time::SystemTime::now(),
+        ));
+        let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));
+
+        let placement = cluster_placement(
+            &config.cluster,
+            &config.observability.scheduler_report,
+            Some(&registry),
+            Some(&warmup),
+            Some(&grpc_service),
+        );
+        assert!(
+            placement.is_ok(),
+            "[cluster].node_placement_source = \"native\" must not require \
+             [cluster].scheduler_endpoint: {:?}",
+            placement.err()
+        );
+    }
+
+    /// 🔴 P4 (task's own "phase4-close"): the binding store's own copy of
+    /// `the_api_half_refuses_a_ledger_no_other_replica_can_see` above —
+    /// same shape, same reasoning, a different multi-replica ledger.
+    /// `[binding_store]`'s own doc comment on `backend` already named this
+    /// exact risk ("every replica answers LookupNode ... out of its own,
+    /// mutually invisible table") with nothing enforcing it; before this
+    /// guard existed, `build_binding_store` happily built an
+    /// `InMemoryBindingStore` for `--role api` regardless of how many
+    /// replicas were actually running.
+    #[tokio::test]
+    async fn the_api_half_refuses_a_binding_ledger_no_other_replica_can_see() {
+        let config = AppConfig::default().binding_store;
+        assert_eq!(
+            config.backend,
+            BindingStoreBackendKind::InMemory,
+            "the default is the per-replica table, which is what makes this refusal necessary"
+        );
+
+        let err = match build_binding_store(&config).await {
+            Ok(_) => panic!("the in-memory binding store is one replica's private routing table"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("binding_store"), "{err}");
+        assert!(err.contains("AENV_BINDING_STORE_BACKEND"), "{err}");
+        assert!(err.contains("redis"), "{err}");
+
+        // 🔴 The control, again: the redis backend at least attempts to
+        // connect rather than being refused outright — proven by getting a
+        // *different* error (a connection failure, not the multi-replica
+        // refusal) against a URL nothing is listening on.
+        let mut redis_config = AppConfig::default().binding_store;
+        redis_config.backend = BindingStoreBackendKind::Redis;
+        redis_config.redis_url = "redis://127.0.0.1:1/0".to_string();
+        let connect_err = match build_binding_store(&redis_config).await {
+            Ok(_) => panic!("nothing is listening on this port"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !connect_err.contains("more than one replica"),
+            "a redis backend must fail on the connection, not on the multi-replica refusal: \
+             {connect_err}"
         );
     }
 

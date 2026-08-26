@@ -11,6 +11,7 @@ APT_MIRROR_BASE ?=
 KUBECTL ?= kubectl
 K8S_NAMESPACE ?= agentenv-system
 K8S_RUNTIME_IMAGE ?= agentenv-runtime:latest
+K8S_API_IMAGE ?= agentenv-api:latest
 K8S_GATEWAY_IMAGE ?= agentenv-gateway:latest
 K8S_SCHEDULER_IMAGE ?= agentenv-scheduler:latest
 K3S_CTR ?= sudo k3s ctr
@@ -409,7 +410,8 @@ deploy-ps:
 	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) ps
 
 k8s-build:
-	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.agentenv -t $(K8S_RUNTIME_IMAGE) .
+	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.aenv-node -t $(K8S_RUNTIME_IMAGE) .
+	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.aenv-api -t $(K8S_API_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
 
@@ -425,6 +427,7 @@ k8s-redeploy:
 
 k8s-load-dev:
 	$(DOCKER) save $(K8S_RUNTIME_IMAGE) | $(K3S_CTR) images import -
+	$(DOCKER) save $(K8S_API_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_GATEWAY_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_SCHEDULER_IMAGE) | $(K3S_CTR) images import -
 

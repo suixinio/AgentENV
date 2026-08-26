@@ -15,7 +15,7 @@ x-agentenv-base: &agentenv-base
   volumes:
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
-    # Runtime assets are baked into the image by `server --setup-only`; compose
+    # Runtime assets are baked into the image by `aenv-node --setup-only`; compose
     # persists only committed snapshots across container restarts.
     - agentenv-snapshot-store:/workspace/env/snapshot-store
   devices:
@@ -33,6 +33,79 @@ x-control-plane-config-volume: &control-plane-config-volume
   - ./docker/config/default.json:/config/default.json:ro
 
 services:
+  # 🔴 New in the crate split, and the stack does not serve the user-facing
+  # REST API without it. `agentenv-a`/`agentenv-b` used to run `--role all` and
+  # answer `/sandboxes`, `/snapshots` and `/templates` themselves; they are
+  # `aenv-node` now, which 404s all three. Everything a user calls goes to
+  # `agentenv-api`, which holds no `/dev/kvm` and boots nothing.
+  #
+  # 🔴 Two images, one tag. `agentenv-api:latest` and `agentenv-runtime:latest`
+  # must be built from the same commit — see
+  # `deploy/k8s/base/agentenv-api-deployment.yaml`'s note on
+  # `SerializedValue`'s single schema counter. `make deploy-up` builds both
+  # from this file, so a compose stack cannot skew on its own.
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  agentenv-api:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.aenv-api
+      args:
+        APT_MIRROR_BASE: ${APT_MIRROR_BASE:-}
+    image: agentenv-api:latest
+    container_name: agentenv-api
+    init: true
+    depends_on:
+      redis:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+    environment:
+      AENV_CONFIG_PATH: /workspace/config/default.toml
+      API_ADDR: 0.0.0.0:8000
+      AENV_API_GRPC_ADDR: 0.0.0.0:8002
+      # 🔴 Refused in-memory: several replicas each with their own ledger would
+      # each answer for sandboxes the others also answer for.
+      AENV_ORCHESTRATOR_STORE_BACKEND: redis
+      AENV_ORCHESTRATOR_STORE_REDIS_URL: redis://redis:6379
+      AENV_BINDING_STORE_BACKEND: redis
+      AENV_BINDING_STORE_REDIS_URL: redis://redis:6379
+      # 🔴 Mandatory on this half: envd access tokens are HMAC(seed, sandbox_id),
+      # so a seed invented per replica hands out tokens the others cannot
+      # verify. Fixed here because this is a local dev stack; never reuse it.
+      AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED: agentenv-compose-dev-access-token-hash-seed
+      AENV_NODE_PLACEMENT_SOURCE: scheduler
+      AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
+      AENV_NODE_ID: api-0
+      RUST_LOG: ${RUST_LOG:-agentenv=info}
+    volumes:
+      - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+    # 🔴 Published directly, and the gateway is not yet in front of it. The
+    # gateway (`GATEWAY_SCHEDULER_ADDR`) routes sandbox *data-plane* traffic to
+    # whichever node holds the sandbox, which is unchanged; what used to also
+    # arrive on a node — the user-facing REST surface — now lives here. Point a
+    # client at http://localhost:8010 for `/sandboxes`, `/snapshots` and
+    # `/templates`. Wiring the gateway's control path to this service is a
+    # gateway-config change and is not part of this commit.
+    ports:
+      - "8010:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
   scheduler:
     build:
       context: ..
@@ -80,7 +153,7 @@ services:
     <<: *agentenv-base
     build:
       context: ..
-      dockerfile: deploy/docker/Dockerfile.agentenv
+      dockerfile: deploy/docker/Dockerfile.aenv-node
       args:
         APT_MIRROR_BASE: ${APT_MIRROR_BASE:-}
     container_name: agentenv-a

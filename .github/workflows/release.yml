@@ -292,17 +292,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push server image
+      # 🔴 Two images, published from one job so they cannot be released from
+      # two commits. `services/api/proto/node.proto`'s eleven `SerializedValue`
+      # fields carry Rust `serde` encodings behind one
+      # `SERIALIZED_VALUE_SCHEMA_VERSION`; a skew fails every cross-half RPC at
+      # once. They must also be *deployed* on one tag — see
+      # `deploy/k8s/base/agentenv-api-deployment.yaml`.
+      - name: Build and push node image
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/docker/Dockerfile.agentenv
+          file: deploy/docker/Dockerfile.aenv-node
           platforms: ${{ matrix.platform }}
           push: true
           build-args: |
             AENV_VIRTUALIZATION_MODE=kvm
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}-${{ matrix.arch }}
+
+      - name: Build and push api image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.aenv-api
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER }}/aenv-api:${{ github.ref_name }}-${{ matrix.arch }}
 
   docker-publish-kvm-manifest:
     name: Publish multi-architecture KVM Docker image
@@ -370,7 +386,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/docker/Dockerfile.agentenv
+          file: deploy/docker/Dockerfile.aenv-node
           platforms: linux/amd64
           push: true
           cache-from: type=gha,scope=agentenv-runtime

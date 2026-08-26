@@ -354,3 +354,200 @@ pub(crate) mod apiproxy {
     /// up in every request log that prints the request.
     pub(crate) const ACCESS_TOKEN_METADATA: &str = "x-access-token";
 }
+
+/// 🔴 The wire encoding of every Rust type `SerializedValue` carries, pinned.
+///
+/// # What this exists to catch, and what it does not
+///
+/// `SerializedValue.schema_version` refuses a blob written by a *different*
+/// version. It cannot notice a blob written by a different *schema* under the
+/// same version — which is what a renamed field, a changed `#[serde(rename)]`,
+/// a variant reordering on an externally-tagged enum, or a newly-`skip`ped
+/// field all produce. Both halves would say "version 1" and mean two things.
+///
+/// That was survivable while one binary served both roles: the two sides were
+/// compiled from one commit, so they could not disagree. Since the crate split
+/// they are two binaries in two images, and a schema change that nobody thought
+/// to pair with a version bump is a real rolling-upgrade hazard —
+/// `node.proto`'s own doc on [`node::SerializedValue`] states the deployment
+/// rule that follows from it.
+///
+/// So each carried type's encoding is written down here. Changing one of these
+/// types fails this test, and the failure says the one thing a reader needs:
+/// **if the change is intended, bump
+/// [`SERIALIZED_VALUE_VERSION`][node::SERIALIZED_VALUE_VERSION] with it**.
+///
+/// 🔴 Coverage is partial and stated rather than implied. Pinned here:
+/// `SandboxNetworkPolicy`, `CustomExtensionParams`, `CommandContext`,
+/// `ImageConfigs` and `Vec<TemplateBuildStep>` — the five carried types whose
+/// shape is entirely their own. Not pinned: `SnapshotRecord` and
+/// `StagedSnapshot` (their encodings are the snapshot catalog's, already
+/// exercised end to end by the repository round-trip tests), and the paused
+/// state, which is deliberately opaque to this layer — it is the sandbox
+/// backend's own document, and pinning it here would be this module asserting
+/// something it is not allowed to know.
+#[cfg(test)]
+mod serialized_value_golden {
+    use serde_json::json;
+
+    /// The one sentence every failure in this module should be read with.
+    const BUMP: &str = "this type's serde encoding changed. Both halves of the split decode each \
+                        other's blobs by this shape, and they are separate images now, so a \
+                        change here without a matching SERIALIZED_VALUE_VERSION bump is a \
+                        rolling upgrade in which one half silently misreads the other. If the \
+                        change is intended: update this golden AND bump \
+                        crate::proto::node::SERIALIZED_VALUE_VERSION";
+
+    #[test]
+    fn a_sandbox_network_policy_still_encodes_the_way_the_other_half_reads_it() {
+        use crate::sandbox::{
+            BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+        };
+
+        let policy = SandboxNetworkPolicy {
+            base_policy: BaseSandboxNetworkPolicy::Deny,
+            egress: SandboxNetworkEgressPolicy {
+                allowed_cidrs: vec!["10.0.0.0/8".to_string()],
+                allowed_domains: vec!["example.invalid".to_string()],
+                denied_cidrs: vec!["192.168.0.0/16".to_string()],
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(&policy).expect("a policy serialises"),
+            json!({
+                "base_policy": "Deny",
+                "egress": {
+                    "allowed_cidrs": ["10.0.0.0/8"],
+                    "allowed_domains": ["example.invalid"],
+                    "denied_cidrs": ["192.168.0.0/16"],
+                }
+            }),
+            "{BUMP}"
+        );
+    }
+
+    #[test]
+    fn custom_extension_params_still_encode_the_way_the_other_half_reads_them() {
+        use crate::types::CustomExtensionParams;
+
+        let mut params = CustomExtensionParams::new();
+        params.insert("opaque".to_string(), json!({"to": ["this", "layer"]}));
+
+        assert_eq!(
+            serde_json::to_value(&params).expect("params serialise"),
+            json!({"opaque": {"to": ["this", "layer"]}}),
+            "{BUMP}"
+        );
+    }
+
+    #[test]
+    fn a_command_context_still_encodes_the_way_the_other_half_reads_it() {
+        use crate::snapshot::CommandContext;
+
+        let context = CommandContext {
+            env_vars: [("KEY".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+            workdir: "/work".to_string(),
+            user: Some("1000:1000".to_string()),
+            exposed_ports: vec!["8080/tcp".to_string()],
+            entrypoint: Some(vec!["/bin/sh".to_string()]),
+            cmd: Some(vec!["-c".to_string(), "true".to_string()]),
+            volumes: vec!["/data".to_string()],
+            labels: [("owner".to_string(), "aenv".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&context).expect("a context serialises"),
+            json!({
+                "env_vars": {"KEY": "value"},
+                "workdir": "/work",
+                "user": "1000:1000",
+                "exposed_ports": ["8080/tcp"],
+                "entrypoint": ["/bin/sh"],
+                "cmd": ["-c", "true"],
+                "volumes": ["/data"],
+                "labels": {"owner": "aenv"},
+            }),
+            "{BUMP}"
+        );
+
+        // 🔴 And the default shape too: every optional field here is
+        // `skip_serializing_if`, so what the other half receives for a default
+        // context is a *shorter document*, not one full of nulls. A field
+        // losing or gaining that attribute is exactly the kind of change the
+        // version counter cannot see.
+        //
+        // 🔴 `ImageConfigs` below is the counter-example in the same family:
+        // its fields are `#[serde(rename)]`d to camelCase one at a time, so its
+        // wire names do not match its Rust names at all. Two carried types, two
+        // conventions — which is precisely why each is written down rather than
+        // assumed.
+        assert_eq!(
+            serde_json::to_value(CommandContext::default()).expect("a default context serialises"),
+            json!({"env_vars": {}, "workdir": "/"}),
+            "{BUMP}"
+        );
+    }
+
+    #[test]
+    fn image_configs_still_encode_the_way_the_other_half_reads_them() {
+        use crate::types::ImageConfigs;
+
+        let mut configs = ImageConfigs::new();
+        configs.add(None::<String>, "/", json!({"lowers": []}));
+        configs.add(
+            Some("data"),
+            "/mnt/data",
+            json!({"lowers": [{"dir": "/x"}]}),
+        );
+
+        assert_eq!(
+            serde_json::to_value(&configs).expect("configs serialise"),
+            json!([
+                {"mountPath": "/", "config": {"lowers": []}},
+                {
+                    "driveId": "data",
+                    "mountPath": "/mnt/data",
+                    "config": {"lowers": [{"dir": "/x"}]}
+                }
+            ]),
+            "{BUMP}"
+        );
+    }
+
+    #[test]
+    fn template_build_steps_still_encode_the_way_the_other_half_reads_them() {
+        use crate::template::TemplateBuildStep;
+
+        // 🔴 Every variant, not a representative one. `TemplateBuildStepKind`
+        // is externally tagged, so each variant's tag *is* its Rust variant
+        // name: renaming one is a wire change that compiles everywhere.
+        let steps = vec![
+            TemplateBuildStep::run("echo hi"),
+            TemplateBuildStep::env("KEY", "value"),
+            TemplateBuildStep::workdir("/work"),
+            TemplateBuildStep::user("1000"),
+            TemplateBuildStep::exposed_port("8080/tcp"),
+            TemplateBuildStep::volume("/data"),
+            TemplateBuildStep::label("owner", "aenv"),
+        ];
+
+        assert_eq!(
+            serde_json::to_value(&steps).expect("steps serialise"),
+            json!([
+                {"kind": {"Run": {"cmd": "echo hi"}}},
+                {"kind": {"Env": {"key": "KEY", "value": "value"}}},
+                {"kind": {"Workdir": {"path": "/work"}}},
+                {"kind": {"User": {"value": "1000"}}},
+                {"kind": {"ExposedPort": {"port": "8080/tcp"}}},
+                {"kind": {"Volume": {"path": "/data"}}},
+                {"kind": {"Label": {"key": "owner", "value": "aenv"}}},
+            ]),
+            "{BUMP}"
+        );
+    }
+}

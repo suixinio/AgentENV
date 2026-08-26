@@ -660,8 +660,19 @@ images:
   - name: agentenv-scheduler
     newName: agentenv-scheduler
     newTag: latest
+  # 🔴 Two images, one tag. The node half and the api half are separate
+  # binaries now (`aenv-node` links overlaybd/ublk/Firecracker; `aenv-api`
+  # links none of it), so they are separate images — and the tag has to move on
+  # both together. `services/api/proto/node.proto`'s eleven `SerializedValue`
+  # fields carry Rust `serde` encodings behind a single
+  # `SERIALIZED_VALUE_SCHEMA_VERSION` that both sides enforce, so a skew fails
+  # loudly on *every* cross-half RPC rather than quietly on one field. See
+  # `agentenv-api-deployment.yaml`'s own note.
   - name: agentenv-runtime
     newName: agentenv-runtime
+    newTag: latest
+  - name: agentenv-api
+    newName: agentenv-api
     newTag: latest
 
 generatorOptions:

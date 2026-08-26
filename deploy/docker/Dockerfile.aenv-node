@@ -1,4 +1,15 @@
 # syntax=docker/dockerfile:1.7
+#
+# The node half: the process that boots microVMs.
+#
+# 🔴 This image and `Dockerfile.aenv-api` must be built and released from the
+# same commit and deployed on the same tag. The two halves talk over
+# `services/api/proto/node.proto`, eleven of whose fields carry Rust `serde`
+# encodings rather than proto messages — see that file's own note on
+# `SerializedValue`. Those fields are guarded by one global
+# `SERIALIZED_VALUE_SCHEMA_VERSION`, checked in both directions, so a version
+# skew fails loudly rather than decoding wrong data — but it fails *every*
+# cross-half RPC at once, not just the field that changed.
 
 ARG AENV_VIRTUALIZATION_MODE=kvm
 
@@ -46,8 +57,8 @@ FROM build-deps AS builder
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
-    && cp /build/target/release/server /out-server \
+    cargo build --release -p agentenv --bin aenv-node -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+    && cp /build/target/release/aenv-node /out-aenv-node \
     && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon
 
 FROM ubuntu:24.04 AS runtime-base
@@ -85,18 +96,18 @@ RUN mkdir -p /workspace/config
 
 
 # deps-stage: best-effort deps pre-bake. Runs `--setup-only` against a freshly
-# built server purely to materialize the runtime deps tree (firecracker,
+# built node binary purely to materialize the runtime deps tree (firecracker,
 # kernel, tools.ext4, overlaybd CLI) and regctl into `/workspace/env` and
 # `/usr/local/bin/regctl`. The final stage copies that tree as its own clean
 # layer, keeping the deps payload independent of the server binary.
 FROM runtime-base AS deps-stage
 ARG AENV_VIRTUALIZATION_MODE
-COPY --from=builder --chmod=0755 /out-server /server
+COPY --from=builder --chmod=0755 /out-aenv-node /aenv-node
 COPY config/default.toml /workspace/config/default.toml
 ENV AENV_CONFIG_PATH=/workspace/config/default.toml
 ENV AENV_HOME_PATH=/workspace/env
 ENV AENV_VIRTUALIZATION_MODE=${AENV_VIRTUALIZATION_MODE}
-RUN DEBIAN_FRONTEND=noninteractive /server --setup-only
+RUN DEBIAN_FRONTEND=noninteractive /aenv-node --setup-only
 
 
 # final image.
@@ -112,11 +123,11 @@ RUN mkdir -p /etc/overlaybd \
 # produces; see src/setup/deps.rs and src/setup/overlaybd.rs.
 COPY --from=deps-stage /workspace/env /workspace/env
 
-# Binaries: ublk-daemon first (less likely to change) so a server-only code
+# Binaries: ublk-daemon first (less likely to change) so a node-only code
 # change does not invalidate its layer. `--chmod=0755` avoids a separate
 # `RUN chmod` layer that would duplicate every binary.
 COPY --from=builder --chmod=0755 /out-uvm-ublk-daemon /usr/local/bin/uvm-ublk-daemon
-COPY --from=builder --chmod=0755 /out-server /server
+COPY --from=builder --chmod=0755 /out-aenv-node /aenv-node
 
 COPY config/default.toml /workspace/config/default.toml
 ENV AENV_CONFIG_PATH=/workspace/config/default.toml
@@ -129,6 +140,6 @@ ENV AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon
 # "already present, skipping" branch). If anything is missing or stale, it
 # is downloaded/regenerated here, so the resulting image is always correct
 # regardless of whether the pre-bake was perfect.
-RUN DEBIAN_FRONTEND=noninteractive /server --setup-only
+RUN DEBIAN_FRONTEND=noninteractive /aenv-node --setup-only
 
-ENTRYPOINT ["/server"]
+ENTRYPOINT ["/aenv-node"]

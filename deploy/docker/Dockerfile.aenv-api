@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1.7
+#
+# The api half: the process that owns the cluster's ledger and boots nothing.
+#
+# 🔴 This image and `Dockerfile.aenv-node` must be built and released from the
+# same commit and deployed on the same tag. The two halves talk over
+# `services/api/proto/node.proto`, eleven of whose fields carry Rust `serde`
+# encodings rather than proto messages — see that file's own note on
+# `SerializedValue`. Those fields are guarded by one global
+# `SERIALIZED_VALUE_SCHEMA_VERSION`, checked in both directions, so a version
+# skew fails loudly rather than decoding wrong data — but it fails *every*
+# cross-half RPC at once, not just the field that changed.
+#
+# 🔴 What this image deliberately does not contain, and why it is a separate
+# Dockerfile rather than a second ENTRYPOINT on the node image:
+#
+#   * no `--setup-only` pre-bake — no Firecracker, no guest kernel, no
+#     tools.ext4, no overlaybd CLI. Those are ~hundreds of MB of runtime assets
+#     for a process that never boots a VM.
+#   * no `uvm-ublk-daemon`, no `/dev/kvm`, no privileged runtime packages
+#     (`e2fsprogs`, `iptables`, `iproute2`, `umoci`, `zstd`).
+#   * no `regctl`. Resolving an image reference is the node's job
+#     (`RefusingImageResolver` is what this half holds).
+#
+# `cargo tree -p aenv-api -e normal` names none of overlaybd, uvm-ublk,
+# uvm-ublk-daemon or storage-util, which is the same statement one layer down.
+
+FROM rust:1-bookworm AS chef
+
+WORKDIR /build
+ENV CARGO_TARGET_DIR=/build/target
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+ARG APT_MIRROR_BASE
+COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
+
+# envd build scripts require protoc during Rust compilation.
+RUN sh /usr/local/bin/apply_apt_mirror.sh "${APT_MIRROR_BASE}" \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        libprotobuf-dev \
+        protobuf-compiler \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install cargo-chef --locked
+
+FROM chef AS planner
+
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build-deps
+
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --release --recipe-path recipe.json
+
+FROM build-deps AS builder
+
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release -p agentenv --bin aenv-api \
+    && cp /build/target/release/aenv-api /out-aenv-api
+
+FROM ubuntu:24.04
+ARG APT_MIRROR_BASE
+COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
+
+# 🔴 `curl` is here for the container healthcheck and nothing else.
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && sh /usr/local/bin/apply_apt_mirror.sh "${APT_MIRROR_BASE}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+RUN mkdir -p /workspace/config
+
+COPY --from=builder --chmod=0755 /out-aenv-api /aenv-api
+COPY config/default.toml /workspace/config/default.toml
+ENV AENV_CONFIG_PATH=/workspace/config/default.toml
+ENV AENV_HOME_PATH=/workspace/env
+
+ENTRYPOINT ["/aenv-api"]

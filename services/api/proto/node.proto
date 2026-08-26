@@ -154,7 +154,47 @@ service NodeSandboxService {
 // for values that are already defined as serialisable Rust types with their own
 // compatibility rules, where a mirrored proto message would be a second
 // definition of the same schema that has to be kept in step by hand. Both ends
-// of this service are Rust and are deployed from one image.
+// of this service are Rust.
+//
+// 🔴 They are no longer deployed from one image, and that changed what this
+// exception costs.
+//
+// This doc used to say "deployed from one image", and while that was true it
+// made the exception nearly free: one binary served both roles, so the two
+// sides of every field below were compiled from one commit and could not
+// disagree. The crate split ended that. `aenv-node` links a sandbox runtime and
+// `aenv-api` does not, so they are two binaries in two images, and an operator
+// can now roll one without the other.
+//
+// What did *not* change is the failure mode, and that is the part worth being
+// precise about. `schema_version` is enforced in both directions
+// (`src/node_server/convert.rs`, `src/node_client/wire.rs`, each with its own
+// `a_blob_from_another_schema_version_is_refused` test), so a skew is a loud
+// refusal with the two versions named in the error — never a silent decode of
+// a document written by a different schema.
+//
+// What it costs instead is an operational rule, and it is a blunt one: there is
+// a *single* `SERIALIZED_VALUE_SCHEMA_VERSION` covering all eleven fields
+// below, so bumping it for any one of them makes every cross-half RPC fail
+// while the two tags disagree — creates, pauses, resumes, template builds, all
+// of it. So:
+//
+//   1. the two images MUST be built from one commit and deployed on one tag
+//      (`deploy/k8s/base/kustomization.yaml`, `agentenv-api-deployment.yaml`,
+//      and `.github/workflows/release.yml` all say so where an operator reads
+//      them); and
+//   2. a change to any Rust type carried below is a change to the wire
+//      contract of *all* of them. Treat bumping the counter as a coordinated
+//      release, not a field-level edit.
+//
+// 🔴 The alternative — per-field version counters, so a bump quarantines one
+// field — is deliberately not taken here. Eleven counters make eleven ways to
+// get the pairing wrong, and the failure they would buy (some RPCs work, some
+// do not, during a roll) is harder to diagnose than the one they replace (a
+// roll where nothing crosses the seam until both halves are on the same tag).
+// If a rolling upgrade across a schema bump ever has to work, the thing to add
+// is a node that accepts *two* adjacent versions for a bounded window, not a
+// counter per field.
 //
 // 🔴 `schema_version` is not decoration. A receiver that does not recognise it
 // must refuse the message rather than attempt the decode: serde is perfectly
@@ -234,8 +274,13 @@ message SnapshotSource {
   // The catalog row for `snapshot_id`, resolved by the API half at dispatch
   // time and carried as `SerializedValue` (`crate::snapshot::SnapshotRecord`,
   // JSON) rather than mirrored as proto fields — same reasoning as
-  // `TemplateBuildRequest.steps` below: both ends of this call are Rust,
-  // deployed from one image.
+  // `TemplateBuildRequest.steps` below: both ends of this call are Rust and
+  // `SnapshotRecord` already has exactly one schema, which serde owns.
+  //
+  // 🔴 Not "deployed from one image" any more. The two halves are two images
+  // since the crate split, and what keeps this field safe is
+  // `SerializedValue.schema_version`'s two-way enforcement plus the
+  // deploy-on-one-tag rule — see `SerializedValue`'s own doc for both.
   //
   // 🔴 Why this exists at all: `--role node` has no catalog access of its own
   // once the central catalog moves behind `[pg]` (see
@@ -780,8 +825,9 @@ message TemplateBuildRequest {
   // `Vec<TemplateBuildStep>` (`src/template/build_spec.rs`) serialises.
   //
   // 🔴 `SerializedValue`, not one proto message per step kind. Both ends of
-  // this call are Rust and are deployed from one image — the precondition
-  // `SerializedValue`'s own doc names — and `TemplateBuildStep`/
+  // this call are Rust — and since the crate split they are two images, so the
+  // precondition `SerializedValue`'s own doc now names is *deployed on one
+  // tag*, not built into one binary — and `TemplateBuildStep`/
   // `TemplateBuildStepKind` are already a closed, internal, serialisable Rust
   // enum with no representation outside this process: the public HTTP
   // surface speaks its own DTOs (`models::TemplateStep` and friends) and

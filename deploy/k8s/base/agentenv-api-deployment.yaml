@@ -84,20 +84,35 @@ spec:
                     app.kubernetes.io/name: agentenv-api
       containers:
         - name: agentenv
-          # 🔴 The same image as agentenv-daemonset.yaml, deliberately. One
-          # binary, two roles: an api image that could drift from the node image
-          # would mean the node gRPC contract has two sides built from two
-          # commits, and nothing would report it.
-          image: agentenv-runtime:latest
+          # 🔴 Its own image now, and the coupling that used to be free has
+          # become an operational rule.
+          #
+          # This used to be `agentenv-runtime:latest` — the same image as
+          # agentenv-daemonset.yaml — because one binary served both roles, so
+          # the two sides of the node gRPC contract could not be built from two
+          # commits. They can now: `aenv-api` links no sandbox runtime and
+          # `aenv-node` does, which is the whole point of the split and is why
+          # they cannot share an image.
+          #
+          # 🔴 So the two images MUST be released from one commit and rolled to
+          # one tag. `services/api/proto/node.proto` carries eleven fields whose
+          # payload is a Rust `serde` encoding rather than a proto message
+          # (`SerializedValue`), guarded by one global
+          # `SERIALIZED_VALUE_SCHEMA_VERSION` that both sides check. A skew
+          # therefore fails *loudly* — a node refuses a blob from another schema
+          # version and says so — rather than decoding wrong data. But one
+          # counter covers all eleven fields, so the failure is every cross-half
+          # RPC at once: no creates, no pauses, no resumes, for as long as the
+          # two tags disagree. Roll them together.
+          image: agentenv-api:latest
           imagePullPolicy: IfNotPresent
-          # 🔴 The role travels as an argument rather than as AENV_ROLE, and the
-          # asymmetry with the DaemonSet is intentional. `--role` wins over the
-          # environment (`ServerRole::resolve`), so a Pod that must never be
-          # anything else says so where an env edit cannot reach — and this Pod
-          # must never be anything else: `--role all` here would run
-          # `require_runtime_capabilities` and reach for /dev/kvm on a container
-          # that has neither. The role that has to stay flippable is the
-          # DaemonSet's (3b's rollback), and that one is not set here.
+          # 🔴 Kept, and it no longer selects anything. `aenv-api` *is* the api
+          # half — it links no sandbox runtime, so no flag could make it the
+          # other one — and `ServerRole::confirm` checks this argument against
+          # the binary rather than obeying it. Left in place because it still
+          # says what this Pod is where an operator reads it, and because a
+          # manifest that kept `--role node` here would now fail to start with a
+          # message naming `aenv-node`, which is the outcome worth having.
           args:
             - --role
             - api

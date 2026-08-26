@@ -55,6 +55,36 @@ async fn service_with(
     (orchestration, service)
 }
 
+/// [`service`], but also hands back the concrete [`MockSnapshotCatalog`]
+/// instance wired into the service's snapshot manager — for the
+/// fallback/skip pairs below, which assert on
+/// [`crate::snapshot::mock::MockSnapshotCatalog::get_calls`] rather than on
+/// the wording of whatever the mock catalog and mock runtime resolver
+/// refused with. See those tests' own doc comments for why.
+async fn service_with_catalog() -> (
+    Arc<dyn SandboxOrchestration>,
+    NodeSandboxService,
+    Arc<crate::snapshot::mock::MockSnapshotCatalog>,
+) {
+    crate::logging::init_for_tests();
+    let orchestrator = Orchestrator::new(
+        ServerRole::All,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let (manager, catalog) = crate::snapshot::mock::mock_snapshot_manager_with_catalog();
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(manager),
+        NODE.to_string(),
+    );
+    (orchestration, service, catalog)
+}
+
 fn launch(marker: Option<&[u8]>) -> CreateSandboxRequest {
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
@@ -878,18 +908,26 @@ async fn a_create_uses_the_id_the_caller_chose() {
 /// Q3's whole point, proven rather than asserted in prose: a `SnapshotSource`
 /// carrying `resolved_record` never reaches this node's own catalog.
 ///
-/// `mock_snapshot_manager()`'s catalog (`MockSnapshotCatalog`) and runtime
-/// resolver (`MockSnapshotRuntimeResolver`) both fail every call, each with
-/// its own distinct message — "should not be called in this test" naming
-/// which one. That difference is the whole test: `load_runnable` (the
+/// The service's mock catalog (`MockSnapshotCatalog`) and runtime resolver
+/// (`MockSnapshotRuntimeResolver`) both fail every call. `load_runnable` (the
 /// pre-Stage-B path) would fail at the *catalog* step, before ever reaching
 /// the resolver; `resolve_runnable` (the path this test exercises) skips the
-/// catalog and fails at the *resolver* step instead. A create with
-/// `resolved_record` set failing with the resolver's message rather than the
-/// catalog's is the node never having asked its catalog anything.
+/// catalog and fails at the *resolver* step instead.
+///
+/// 🔴 Proven with `MockSnapshotCatalog::get_calls()`, not by matching on
+/// which of the two refusal messages came back. A string match cannot tell
+/// "the catalog was consulted and refused" from "the catalog was never asked
+/// in the first place" once the wording changes — and it will: Phase 4's own
+/// direction is `--role node` ending up with no catalog access at all, at
+/// which point this fallback is deleted outright and the refusal becomes
+/// something like "no catalog access on `--role node`", which still contains
+/// the substring "catalog" and would keep a string-matching assertion green
+/// over behaviour that no longer exists. A call count does not have that
+/// blind spot: it reads zero the moment nothing calls `get` any more,
+/// whatever the message says.
 #[tokio::test]
 async fn a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup() {
-    let (_orchestration, service) = service().await;
+    let (_orchestration, service, catalog) = service_with_catalog().await;
     let record =
         crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
     let resolved_record = pb::encode_value(&record).expect("encode should succeed");
@@ -917,9 +955,10 @@ async fn a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup() {
         err.message().contains("runtime resolver"),
         "a resolved_record must reach resolve_runnable directly, never the catalog: {err}"
     );
-    assert!(
-        !err.message().contains("catalog"),
-        "a resolved_record must never touch the node's own catalog: {err}"
+    assert_eq!(
+        catalog.get_calls(),
+        0,
+        "a resolved_record must never touch the node's own catalog"
     );
 }
 
@@ -930,9 +969,13 @@ async fn a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup() {
 /// specifically guards: an API replica built before this field existed (or a
 /// caller that simply has nothing resolved yet) must not be refused for
 /// omitting it.
+///
+/// 🔴 Proven with `MockSnapshotCatalog::get_calls()` — see the skip test
+/// above's doc for why a message match on "catalog" cannot be trusted to
+/// keep detecting this once `--role node` stops holding a catalog at all.
 #[tokio::test]
 async fn a_snapshot_source_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
-    let (_orchestration, service) = service().await;
+    let (_orchestration, service, catalog) = service_with_catalog().await;
 
     let err = service
         .create(Request::new(pb::SandboxCreateRequest {
@@ -954,8 +997,8 @@ async fn a_snapshot_source_with_no_resolved_record_falls_back_to_the_nodes_own_c
         .expect_err("the mock catalog fails every call");
     assert_eq!(err.code(), Code::Internal);
     assert!(
-        err.message().contains("catalog"),
-        "an absent resolved_record must fall back to this node's own catalog lookup: {err}"
+        catalog.get_calls() >= 1,
+        "an absent resolved_record must fall back to this node's own catalog lookup"
     );
 }
 
@@ -992,9 +1035,10 @@ async fn a_resolved_record_naming_a_different_snapshot_is_refused() {
 
 /// [`a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup`]'s pair,
 /// for `BuildTemplate`'s `base_snapshot_resolved` instead of `Create`'s
-/// `resolved_record`. Same proof, same mock manager, same two distinct
-/// failure messages telling the catalog and the runtime resolver apart — see
-/// that test's own doc for why the message is the whole test.
+/// `resolved_record`. Same proof, same mock manager — see that test's own
+/// doc for why `MockSnapshotCatalog::get_calls()` is what settles this,
+/// rather than matching on which of the catalog's and the runtime
+/// resolver's differently-worded refusals came back.
 ///
 /// The request never reaches `TemplateBuildRunner::execute` (which would
 /// need a real Firecracker VM): resolving the base fails first, inside
@@ -1002,7 +1046,7 @@ async fn a_resolved_record_naming_a_different_snapshot_is_refused() {
 /// starts.
 #[tokio::test]
 async fn a_resolved_base_snapshot_skips_the_nodes_own_catalog_lookup() {
-    let (orchestration, mut service) = service().await;
+    let (orchestration, mut service, catalog) = service_with_catalog().await;
     service = service.with_template_build(
         Arc::new(crate::image::ImageResolver::new(
             &crate::cfg::AppConfig::default(),
@@ -1038,17 +1082,23 @@ async fn a_resolved_base_snapshot_skips_the_nodes_own_catalog_lookup() {
         err.message().contains("runtime resolver"),
         "base_snapshot_resolved must reach resolve_runnable directly, never the catalog: {err}"
     );
-    assert!(
-        !err.message().contains("catalog"),
-        "base_snapshot_resolved must never touch the node's own catalog: {err}"
+    assert_eq!(
+        catalog.get_calls(),
+        0,
+        "base_snapshot_resolved must never touch the node's own catalog"
     );
 }
 
 /// The fallback half of the pair above: no `base_snapshot_resolved`, so the
 /// node resolves `base_snapshot_ref` itself, exactly the pre-Stage-B path.
+///
+/// 🔴 Proven with `MockSnapshotCatalog::get_calls()` — see
+/// `a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup`'s doc for
+/// why a message match on "catalog" cannot be trusted to keep detecting this
+/// once `--role node` stops holding a catalog at all.
 #[tokio::test]
 async fn a_base_snapshot_ref_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
-    let (orchestration, mut service) = service().await;
+    let (orchestration, mut service, catalog) = service_with_catalog().await;
     service = service.with_template_build(
         Arc::new(crate::image::ImageResolver::new(
             &crate::cfg::AppConfig::default(),
@@ -1077,8 +1127,8 @@ async fn a_base_snapshot_ref_with_no_resolved_record_falls_back_to_the_nodes_own
         .expect_err("the mock catalog fails every call");
     assert_eq!(err.code(), Code::Internal);
     assert!(
-        err.message().contains("catalog"),
-        "an absent base_snapshot_resolved must fall back to this node's own catalog lookup: {err}"
+        catalog.get_calls() >= 1,
+        "an absent base_snapshot_resolved must fall back to this node's own catalog lookup"
     );
 }
 

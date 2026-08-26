@@ -403,7 +403,7 @@ mod tests {
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         SnapshotImageService {
-            catalog: Arc::new(MockSnapshotCatalog),
+            catalog: Arc::new(MockSnapshotCatalog::default()),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new(regctl),
         }

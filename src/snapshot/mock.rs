@@ -16,14 +16,33 @@ use super::{
 use crate::sandbox::FirecrackerSnapshotManifest;
 
 /// Test double for catalog interactions that should stay unreachable.
-#[derive(Clone, Debug, Default)]
-pub struct MockSnapshotCatalog;
+///
+/// `get_calls` — see [`Self::get_calls`] — is what
+/// `node_server::tests`'s fallback/skip pairs assert on rather than matching
+/// on this catalog's and [`MockSnapshotRuntimeResolver`]'s differently-worded
+/// refusals: a string match cannot tell "the catalog was consulted and
+/// refused" from "the catalog was never asked" once the wording changes (for
+/// instance, when `--role node` stops holding a catalog at all and the
+/// refusal becomes something like "no catalog access on `--role node`" —
+/// still containing the substring "catalog"), while a call count goes to
+/// zero the moment nothing calls [`Self::get`] any more, whatever the
+/// message says.
+#[derive(Debug, Default)]
+pub struct MockSnapshotCatalog {
+    get_calls: std::sync::atomic::AtomicUsize,
+}
 
 impl MockSnapshotCatalog {
     fn unsupported() -> RepositoryError {
         RepositoryError::Unsupported {
             feature: "mock snapshot catalog should not be called in this test".to_string(),
         }
+    }
+
+    /// How many times [`SnapshotCatalog::get`] has actually been called
+    /// against this instance.
+    pub fn get_calls(&self) -> usize {
+        self.get_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -38,6 +57,8 @@ impl SnapshotCatalog for MockSnapshotCatalog {
     }
 
     async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(Self::unsupported())
     }
 
@@ -259,14 +280,25 @@ pub fn recording_snapshot_manager() -> (SnapshotManager, Arc<RecordingSnapshotRe
 
 /// Builds a snapshot manager backed by snapshot test doubles.
 pub fn mock_snapshot_manager() -> SnapshotManager {
-    SnapshotManager::from_parts(
+    mock_snapshot_manager_with_catalog().0
+}
+
+/// [`mock_snapshot_manager`], but also hands back the concrete
+/// [`MockSnapshotCatalog`] instance it wired in — for tests that need to
+/// read [`MockSnapshotCatalog::get_calls`] after driving a request, rather
+/// than inferring whether the catalog was consulted from the wording of
+/// whatever it refused with.
+pub fn mock_snapshot_manager_with_catalog() -> (SnapshotManager, Arc<MockSnapshotCatalog>) {
+    let catalog = Arc::new(MockSnapshotCatalog::default());
+    let manager = SnapshotManager::from_parts(
         Arc::new(SnapshotRepository::new(
-            Arc::new(MockSnapshotCatalog),
+            Arc::clone(&catalog) as Arc<dyn SnapshotCatalog>,
             Arc::new(MockSnapshotArtifactStore),
         )),
         Arc::new(MockSnapshotRuntimeResolver),
         None,
-    )
+    );
+    (manager, catalog)
 }
 
 /// Writes a minimal exported snapshot artifact set for snapshot publish/resolve tests.

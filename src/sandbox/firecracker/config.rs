@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use super::mmds::MmdsMetadata;
 use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
 use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
 };
-use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
@@ -398,7 +398,7 @@ impl FirecrackerSandboxConfig {
         let kernel_image = config.resolved_kernel_image_path();
 
         let ublk = &config.ublk;
-        let runtime_upper_mode = ublk.overlaybd.runtime_upper_mode;
+        let runtime_upper_mode = ublk.overlaybd.runtime_upper_mode.into();
         user_image_config.runtime_upper_mode = runtime_upper_mode;
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
@@ -515,7 +515,7 @@ impl FirecrackerSnapshotConfig {
         let rootfs_image_config = OverlaybdConfig {
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,
-            runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode,
+            runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode.into(),
         };
         let overlaybd_ublk_config = UblkConfig::overlaybd_with_runtime_upper_mode(
             rootfs_image_config.image_config_path.clone(),
@@ -744,7 +744,7 @@ mod tests {
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),
                 read_only: false,
-                runtime_upper_mode: UpperMode::Sparse,
+                runtime_upper_mode: crate::cfg::RuntimeUpperMode::Sparse,
                 ..Default::default()
             },
             ..UblkTomlConfig::default()

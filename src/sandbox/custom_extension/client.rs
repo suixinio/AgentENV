@@ -41,7 +41,7 @@ use custom_extension_client::models;
 use tracing::{debug, warn};
 
 use crate::cfg::ConfigManager;
-use crate::types::{ExecutionId, SandboxId};
+use crate::types::{CustomExtensionParams, ExecutionId, SandboxId};
 
 // 🔴 The `sandboxInstanceId` field on the wire carries an
 // [`ExecutionId`][crate::types::ExecutionId] — the sandbox's incarnation, as
@@ -347,10 +347,6 @@ impl Drop for CustomExtensionHookGuard {
         }
     }
 }
-
-/// Custom extension params: an opaque JSON object interpreted only by the
-/// custom extension. `None` and an empty map are equivalent (empty params).
-pub(crate) type CustomExtensionParams = serde_json::Map<String, serde_json::Value>;
 
 /// Empty custom extension params (`{}`).
 fn empty_params() -> serde_json::Value {

@@ -10,7 +10,7 @@ use tokio::fs;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::warn;
 
-use crate::snapshot::types::RuntimeArtifactLease;
+use crate::runtime_snapshot::RuntimeArtifactLease;
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const EVICTION_TARGET_RATIO: f64 = 0.8;

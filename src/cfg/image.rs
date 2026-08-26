@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use confique::Config;
-use overlaybd::config::lexically_normalize_path;
+use shell_util::lexically_normalize_path;
 
 const IMAGE_CACHE_COMMIT_DIR: &str = "commits";
 const IMAGE_CACHE_REMOTE_BLOCKS_DIR: &str = "remote-blocks";

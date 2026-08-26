@@ -5,13 +5,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::errors::RepositoryResult;
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::snapshot::types::{
     CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, RunnableSnapshot, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildErrorReason,
+    TemplateBuildStatus,
 };
+use crate::types::FirecrackerSnapshotManifest;
 use crate::types::{ExecutionId, SandboxResources};
 
 /// How many rows a listing returns when the caller asks for no particular

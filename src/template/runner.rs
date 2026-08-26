@@ -11,6 +11,7 @@ use tracing::{debug, warn, Span};
 
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
+use super::runtime_versions::probe_runtime_versions;
 use super::step_executor::TemplateStepExecutor;
 use crate::sandbox::{
     FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
@@ -232,7 +233,7 @@ impl TemplateBuildRunner {
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref()).await?;
-                        let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
+                        let runtime_versions = probe_runtime_versions(&sandbox).await?;
 
                         debug!("capturing template snapshot");
                         let (_, manifest) = sandbox.pause_to_dir(&output_dir).await?;

@@ -2,6 +2,7 @@ mod build_spec;
 mod builder;
 mod errors;
 mod runner;
+mod runtime_versions;
 mod step_executor;
 
 pub use build_spec::TemplateBuildSpec;

@@ -28,7 +28,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{
     CatalogReadScope, SnapshotAbsence, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
     SnapshotListFilter, SnapshotListPage, StagedSnapshot, StartedBuild,
@@ -39,6 +38,7 @@ use crate::snapshot::types::{
     TemplateBuildErrorReason,
 };
 use crate::types::ExecutionId;
+use crate::types::FirecrackerSnapshotManifest;
 
 /// Durable snapshot repository: a [`SnapshotCatalog`] and a
 /// [`SnapshotArtifactStore`], sequenced.
@@ -372,13 +372,13 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::sandbox::ExtraDrive;
     use crate::snapshot::repository::interfaces::{ImportedSnapshotArtifacts, SnapshotCatalog};
     use crate::snapshot::types::{
         CommittedSnapshot, PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishSource,
         TemplateBuildStatus,
     };
     use crate::types::ExecutionId;
+    use crate::types::ExtraDrive;
 
     /// Every call either half receives, in order, so a test can assert that the
     /// bytes were written before the row and not merely that both happened.

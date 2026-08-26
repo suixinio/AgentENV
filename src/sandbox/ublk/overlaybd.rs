@@ -96,6 +96,24 @@ fn default_runtime_upper_mode() -> UpperMode {
     UpperMode::LogStructured
 }
 
+/// Converts the configuration layer's upper-mode vocabulary into the storage
+/// engine's.
+///
+/// 🔴 The two enums are deliberately separate: `crate::cfg` is read by every
+/// role, including the one that links no storage engine, so it cannot name
+/// `overlaybd`'s type. This is the single boundary that turns one into the
+/// other, and it is exhaustive by construction — adding a variant on either
+/// side fails to compile until it is added here too.
+impl From<crate::cfg::RuntimeUpperMode> for UpperMode {
+    fn from(mode: crate::cfg::RuntimeUpperMode) -> Self {
+        match mode {
+            crate::cfg::RuntimeUpperMode::Sparse => Self::Sparse,
+            crate::cfg::RuntimeUpperMode::LogStructured => Self::LogStructured,
+            crate::cfg::RuntimeUpperMode::HybridLogStructured => Self::HybridLogStructured,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct OverlaybdRuntimeHandle {
     pub(crate) device: UblkDevice,
@@ -180,6 +198,54 @@ pub(crate) async fn compact_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 The one thing splitting `UpperMode` into a configuration mirror can
+    /// silently get wrong.
+    ///
+    /// Before the split there was no conversion at all — `crate::cfg` named
+    /// the storage crate's enum directly, so a wrong mapping was not
+    /// expressible. Now it is, and only the `sparse` arm happens to be covered
+    /// by an existing assertion (`sandbox_config_binds_overlaybd_to_user_image`);
+    /// mutating either of the other two arms left the whole unit suite green.
+    /// This asserts both halves of the boundary: the accepted TOML spellings,
+    /// and the arm-for-arm translation.
+    #[test]
+    fn runtime_upper_mode_mirrors_the_storage_enum() {
+        for (spelling, configured, expected) in [
+            (
+                "\"sparse\"",
+                crate::cfg::RuntimeUpperMode::Sparse,
+                UpperMode::Sparse,
+            ),
+            (
+                "\"logStructured\"",
+                crate::cfg::RuntimeUpperMode::LogStructured,
+                UpperMode::LogStructured,
+            ),
+            (
+                "\"hybridLogStructured\"",
+                crate::cfg::RuntimeUpperMode::HybridLogStructured,
+                UpperMode::HybridLogStructured,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<crate::cfg::RuntimeUpperMode>(spelling)
+                    .expect("configuration spelling must parse"),
+                configured,
+                "configuration spelling {spelling} must parse to its own variant"
+            );
+            assert_eq!(
+                serde_json::from_str::<UpperMode>(spelling).expect("storage spelling must parse"),
+                expected,
+                "the storage enum must accept the same spelling {spelling}"
+            );
+            assert_eq!(
+                UpperMode::from(configured),
+                expected,
+                "conversion of {spelling} must not change the upper format"
+            );
+        }
+    }
     use overlaybd::backend::switch::new_switch_file;
     use overlaybd::backend::tar::new_tar_file_adaptor;
     use overlaybd::index_file::{LSMTFile, LSMTReadOnlyFile};

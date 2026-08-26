@@ -341,7 +341,7 @@ impl TemplateBuilder {
         UblkConfig::overlaybd_with_runtime_upper_mode(
             image_config_path.to_path_buf(),
             ublk.overlaybd.read_only,
-            ublk.overlaybd.runtime_upper_mode,
+            ublk.overlaybd.runtime_upper_mode.into(),
         )
     }
 

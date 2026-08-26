@@ -1,21 +1,16 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(test)]
-use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::CustomExtensionParams;
+use crate::types::CustomExtensionParams;
 use crate::virtualization::VirtualizationMode;
 use shell_util::shell_quote;
 
-use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
+use super::drive::CommittedAttachedDrive;
 use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
-use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 
 /// 🔴 `Serialize`/`Deserialize` because phase 3 sends this *to* the node.
@@ -460,123 +455,6 @@ const SNAPSHOT_IMAGE_TAG_PREFIX: &str = "agentenv-snapshot-";
 /// OCI tag used when publishing a snapshot rootfs image to its source registry.
 pub(crate) fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
     format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
-}
-
-pub(crate) trait RuntimeArtifactLease: Send + Sync {}
-
-#[derive(Clone, Default)]
-#[cfg(test)]
-struct EmptyRuntimeArtifactLease;
-
-#[cfg(test)]
-impl RuntimeArtifactLease for EmptyRuntimeArtifactLease {}
-
-#[cfg(test)]
-fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
-    static INSTANCE: OnceLock<Arc<dyn RuntimeArtifactLease>> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| Arc::new(EmptyRuntimeArtifactLease))
-        .clone()
-}
-
-#[derive(Clone)]
-/// Runtime-ready snapshot with node-local artifact paths.
-pub struct RunnableSnapshot {
-    record: SnapshotRecord,
-    manifest: FirecrackerSnapshotManifest,
-    _lease: Arc<dyn RuntimeArtifactLease>,
-}
-
-impl RunnableSnapshot {
-    pub(crate) fn new(
-        record: SnapshotRecord,
-        manifest: FirecrackerSnapshotManifest,
-        lease: Arc<dyn RuntimeArtifactLease>,
-    ) -> Self {
-        Self {
-            record,
-            manifest,
-            _lease: lease,
-        }
-    }
-
-    /// Returns the runtime-resolved attached drives for this snapshot.
-    pub fn attached_drives(&self) -> Vec<ResolvedAttachedDrive> {
-        self.manifest
-            .attached_drives
-            .iter()
-            .map(|drive| ResolvedAttachedDrive::Overlaybd {
-                drive_id: drive.drive_id.clone(),
-                image_config_path: drive.image_config_path.clone(),
-                read_only: drive.read_only,
-                virtual_size: drive.virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
-                    &drive.drive_id,
-                    drive.mount_path.clone(),
-                )
-                .unwrap_or_else(|_| {
-                    crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                }),
-                sub_path: drive.sub_path.clone(),
-            })
-            .collect()
-    }
-
-    pub fn manifest(&self) -> &FirecrackerSnapshotManifest {
-        &self.manifest
-    }
-
-    /// Returns the committed snapshot record backing this runnable snapshot.
-    pub fn record(&self) -> &SnapshotRecord {
-        &self.record
-    }
-
-    /// Returns the committed snapshot artifact payload backing this runnable snapshot.
-    pub fn committed(&self) -> &CommittedSnapshot {
-        self.record
-            .committed
-            .as_ref()
-            .expect("runnable snapshots always have committed artifact payloads")
-    }
-
-    /// Returns the CPU and memory settings for this runnable snapshot.
-    pub fn resources(&self) -> &SandboxResources {
-        &self.record.resources
-    }
-
-    #[cfg(test)]
-    pub fn mock() -> Self {
-        Self::from_test_manifest(
-            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
-            Vec::new(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_test_manifest(
-        record: SnapshotRecord,
-        attached_drives: Vec<ResolvedAttachedDrive>,
-    ) -> Self {
-        let extra_drives: Vec<crate::sandbox::ExtraDrive> = attached_drives
-            .iter()
-            .map(ResolvedAttachedDrive::to_extra_drive)
-            .collect();
-
-        Self {
-            record,
-            manifest: FirecrackerSnapshotManifest::for_test(0, &extra_drives),
-            _lease: default_runtime_artifact_lease(),
-        }
-    }
-}
-
-impl fmt::Debug for RunnableSnapshot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RunnableSnapshot")
-            .field("record", &self.record)
-            .field("manifest", &self.manifest)
-            .finish_non_exhaustive()
-    }
 }
 
 #[cfg(test)]

@@ -22,8 +22,8 @@ use super::backend::{
     SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::RunnableSnapshot;
 use crate::types::ExecutionId;
 
 #[derive(Debug)]

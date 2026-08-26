@@ -12,13 +12,13 @@ use tracing::warn;
 use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
-use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::interfaces::{ImportedSnapshotArtifacts, SnapshotArtifactStore};
 use crate::snapshot::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
     RepositoryError, RepositoryResult, SnapshotId, SnapshotPublishMetadata,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::types::FirecrackerSnapshotManifest;
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
 ///
@@ -80,12 +80,12 @@ impl PosixFsArtifactStore {
                     layers: rootfs_layers,
                     read_only: drive.read_only,
                     virtual_size: drive.virtual_size,
-                    mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                    mount_path: crate::types::normalize_mount_path_for_drive(
                         &drive.drive_id,
                         drive.mount_path.clone(),
                     )
                     .unwrap_or_else(|_| {
-                        crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
+                        crate::types::ExtraDrive::default_mount_path(&drive.drive_id)
                     }),
                     sub_path: drive.sub_path.clone(),
                 })
@@ -118,7 +118,7 @@ impl PosixFsArtifactStore {
     fn persist_firecracker_manifest(
         &self,
         destination: PathBuf,
-        manifest: &crate::sandbox::FirecrackerSnapshotManifest,
+        manifest: &crate::types::FirecrackerSnapshotManifest,
     ) -> RepositoryResult<()> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -897,14 +897,14 @@ mod tests {
         .expect("write drive image config");
 
         manifest = manifest
-            .with_extra_drives(&[crate::sandbox::ExtraDrive::Overlaybd {
+            .with_extra_drives(&[crate::types::ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
                 image_config_path: local_dir
                     .join(SNAPSHOT_ARTIFACT_LAYOUT.drives_dir)
                     .join("data")
                     .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
                 read_only: true,
-                mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
+                mount_path: crate::types::ExtraDrive::default_mount_path("data"),
                 virtual_size: Some(4096),
                 sub_path: None,
             }])

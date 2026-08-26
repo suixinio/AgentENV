@@ -10,7 +10,6 @@ pub use image::{
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
 };
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
-use overlaybd::config::UpperMode;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -914,6 +913,23 @@ pub struct UblkTomlConfig {
     pub overlaybd: UblkOverlaybdTomlConfig,
 }
 
+/// Runtime upper format for newly materialized writable OverlayBD images.
+///
+/// 🔴 Mirrors the storage crate's `UpperMode` instead of re-using it. This
+/// module is read by every role, including the one that runs no sandbox and
+/// therefore links no storage engine, so the configuration vocabulary is
+/// defined here and converted at the boundary
+/// (a `From<RuntimeUpperMode>` impl in `crate::sandbox::ublk`). The serde
+/// representation is identical to the storage crate's, so the accepted TOML
+/// spellings are unchanged.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeUpperMode {
+    Sparse,
+    LogStructured,
+    HybridLogStructured,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct UblkOverlaybdTomlConfig {
     #[config(default = "$AENV_HOME/overlaybd/overlaybd-global.json")]
@@ -923,7 +939,7 @@ pub struct UblkOverlaybdTomlConfig {
     /// Runtime upper format for newly materialized writable OverlayBD images.
     /// Existing source uppers keep their own mode. Default: `hybridLogStructured`.
     #[config(default = "hybridLogStructured")]
-    pub runtime_upper_mode: UpperMode,
+    pub runtime_upper_mode: RuntimeUpperMode,
     /// Permit shrinking a fresh cold-sandbox rootfs. Default: `false`.
     #[config(default = false)]
     pub allow_shrink: bool,
@@ -989,26 +1005,6 @@ pub struct MemorySnapshotBackgroundDownloadConfig {
     /// per-image overrides never resize it.
     #[config(default = 16usize)]
     pub max_inflight_blocks: usize,
-}
-
-impl MemorySnapshotBackgroundDownloadConfig {
-    pub(crate) fn to_overlaybd_download_config(&self) -> overlaybd::config::DownloadConfig {
-        overlaybd::config::DownloadConfig {
-            enable: self.enable,
-            delay: self.delay,
-            delay_extra: self.delay_extra,
-            // Memory-snapshot background download is intentionally unthrottled;
-            // OSS/registry image configs may still carry maxMBps and it keeps
-            // working there via the shared throttle.
-            max_mbps: 0,
-            try_cnt: self.try_cnt,
-            block_size: self.block_size,
-            concurrency: self.concurrency,
-            max_inflight_blocks: self.max_inflight_blocks,
-            // Not a memory-snapshot knob: the cache scheduler default applies.
-            max_concurrent_files: overlaybd::config::DownloadConfig::default().max_concurrent_files,
-        }
-    }
 }
 
 #[derive(Debug, Config, Clone)]
@@ -2268,7 +2264,7 @@ impl AppConfig {
             ),
         ];
         let normalized =
-            paths.map(|(name, path)| (name, overlaybd::config::lexically_normalize_path(path)));
+            paths.map(|(name, path)| (name, shell_util::lexically_normalize_path(path)));
         let canonical = normalized
             .clone()
             .map(|(name, path)| (name, std::fs::canonicalize(&path).ok()));

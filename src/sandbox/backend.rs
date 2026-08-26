@@ -17,8 +17,8 @@ use super::{
     EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
     SandboxLaunchConfig, SandboxNetworkPolicy, UnresolvedImageBuildSpec,
 };
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::RunnableSnapshot;
 use crate::types::{ExecutionId, SandboxId};
 
 /// A concrete sandbox backend's paused state.

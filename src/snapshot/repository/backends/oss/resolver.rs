@@ -11,6 +11,7 @@ use super::client::OssClient;
 use super::layout::OssSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
+use crate::runtime_snapshot::RuntimeArtifactLease;
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
 use crate::snapshot::p2p;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
@@ -18,7 +19,6 @@ use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, materialize_image_config_error, parse_firecracker_manifest,
     runtime_image_cache_key, RuntimeImageMaterializer,
 };
-use crate::snapshot::types::RuntimeArtifactLease;
 use crate::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, RepositoryError, RepositoryResult,
     ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -348,13 +348,11 @@ impl OssRuntimeResolver {
                         image_config_path,
                         read_only: *read_only,
                         virtual_size: *virtual_size,
-                        mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                        mount_path: crate::types::normalize_mount_path_for_drive(
                             drive_id,
                             mount_path.clone(),
                         )
-                        .unwrap_or_else(|_| {
-                            crate::sandbox::ExtraDrive::default_mount_path(drive_id)
-                        }),
+                        .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(drive_id)),
                         sub_path: sub_path.clone(),
                     });
                 }
@@ -368,7 +366,7 @@ impl OssRuntimeResolver {
         &self,
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
+    ) -> RepositoryResult<crate::types::FirecrackerSnapshotManifest> {
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
         if let Some(transport) = self.p2p_transport.as_ref() {

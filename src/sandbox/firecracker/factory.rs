@@ -13,11 +13,11 @@ use serde_json::Value;
 use super::config::FirecrackerSandboxConfig;
 use super::sandbox::{FirecrackerPausedState, FirecrackerSandbox};
 use crate::cfg::ConfigManager;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackendFactory};
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
 };
-use crate::snapshot::RunnableSnapshot;
 use crate::types::{ExecutionId, SandboxId};
 
 pub struct FirecrackerSandboxFactory {

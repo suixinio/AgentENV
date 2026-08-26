@@ -6,13 +6,13 @@ use overlaybd::config::{DownloadConfig, LayerConfig};
 
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
+use crate::runtime_snapshot::RuntimeArtifactLease;
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, load_firecracker_manifest_from_path, materialize_image_config_error,
     runtime_image_cache_key, RuntimeImageMaterializer,
 };
-use crate::snapshot::types::RuntimeArtifactLease;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, RepositoryError,
     RepositoryResult, ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord,
@@ -129,7 +129,7 @@ impl PosixFsRuntimeResolver {
     async fn load_committed_firecracker_manifest(
         &self,
         snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
+    ) -> RepositoryResult<crate::types::FirecrackerSnapshotManifest> {
         let manifest_path = self
             .snapshot_layout(snapshot_id)
             .path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
@@ -193,13 +193,11 @@ impl PosixFsRuntimeResolver {
                         image_config_path,
                         read_only: *read_only,
                         virtual_size: *virtual_size,
-                        mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                        mount_path: crate::types::normalize_mount_path_for_drive(
                             drive_id,
                             mount_path.clone(),
                         )
-                        .unwrap_or_else(|_| {
-                            crate::sandbox::ExtraDrive::default_mount_path(drive_id)
-                        }),
+                        .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(drive_id)),
                         sub_path: sub_path.clone(),
                     });
                 }

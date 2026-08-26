@@ -18,6 +18,7 @@ pub mod pg;
 pub mod privileges;
 mod proto;
 pub mod role;
+pub mod runtime_snapshot;
 pub mod sandbox;
 pub mod scheduler_endpoint;
 pub mod setup;

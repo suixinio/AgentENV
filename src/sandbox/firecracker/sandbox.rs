@@ -16,7 +16,6 @@ use super::config::{
     FirecrackerSandboxConfig, FirecrackerSnapshotConfig, PersistentSnapshotRootGuard,
     MAX_EXTRA_DRIVES,
 };
-use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
@@ -27,8 +26,10 @@ use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
+use crate::types::FirecrackerSnapshotManifest;
 
 use crate::cfg::ConfigManager;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
@@ -47,7 +48,6 @@ use crate::sandbox::ublk::{
     UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
-use crate::snapshot::RunnableSnapshot;
 use crate::types::{ExecutionId, SandboxId};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -1337,7 +1337,7 @@ impl FirecrackerSandbox {
                 (Vec::new(), Vec::new())
             } else {
                 let overlaybd_global = global_config.ublk.overlaybd.global_config_path.clone();
-                let runtime_upper_mode = global_config.ublk.overlaybd.runtime_upper_mode;
+                let runtime_upper_mode = global_config.ublk.overlaybd.runtime_upper_mode.into();
                 let allow_shrink = global_config.ublk.overlaybd.allow_shrink;
                 prepare_extra_drives(
                     &config.common.extra_drives,
@@ -1856,7 +1856,7 @@ impl FirecrackerSandbox {
         let global_config = ConfigManager::global_config();
         let ublk_config = &global_config.ublk;
         let overlaybd_global = ublk_config.overlaybd.global_config_path.clone();
-        let runtime_upper_mode = ublk_config.overlaybd.runtime_upper_mode;
+        let runtime_upper_mode = ublk_config.overlaybd.runtime_upper_mode.into();
         let prepared_extra_drives = prepare_extra_drives(
             extra_drives,
             &overlaybd_global,
@@ -1978,8 +1978,9 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cfg::ToolsConfig;
+    use crate::runtime_snapshot::RunnableSnapshot;
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
-    use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
+    use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
     use std::collections::HashMap;
 
     fn fresh_config() -> FirecrackerSandboxConfig {

@@ -13,7 +13,7 @@ use super::{
     PersistedDiskImagePublication, RunnableSnapshot, SnapshotId, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::types::FirecrackerSnapshotManifest;
 
 /// Test double for catalog interactions that should stay unreachable.
 ///

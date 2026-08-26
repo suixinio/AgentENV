@@ -307,6 +307,32 @@ async fn ensure_regctl(deps_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Turns the memory-snapshot background-download knobs into the storage
+/// engine's `DownloadConfig`.
+///
+/// 🔴 Lives here rather than on `MemorySnapshotBackgroundDownloadConfig`
+/// itself: `crate::cfg` is read by every role, including the one that links no
+/// storage engine, and this is the only place the conversion is needed.
+fn to_overlaybd_download_config(
+    config: &crate::cfg::MemorySnapshotBackgroundDownloadConfig,
+) -> DownloadConfig {
+    DownloadConfig {
+        enable: config.enable,
+        delay: config.delay,
+        delay_extra: config.delay_extra,
+        // Memory-snapshot background download is intentionally unthrottled;
+        // OSS/registry image configs may still carry maxMBps and it keeps
+        // working there via the shared throttle.
+        max_mbps: 0,
+        try_cnt: config.try_cnt,
+        block_size: config.block_size,
+        concurrency: config.concurrency,
+        max_inflight_blocks: config.max_inflight_blocks,
+        // Not a memory-snapshot knob: the cache scheduler default applies.
+        max_concurrent_files: DownloadConfig::default().max_concurrent_files,
+    }
+}
+
 pub(crate) fn write_generated_overlaybd_global_configs(
     config: &AppConfig,
     p2p_facade_address: Option<&str>,
@@ -315,10 +341,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         enable: config.ublk.overlaybd.download_enable,
         ..Default::default()
     };
-    let memory_download = config
-        .memory_snapshot
-        .background_download
-        .to_overlaybd_download_config();
+    let memory_download = to_overlaybd_download_config(&config.memory_snapshot.background_download);
 
     let image_cache = config.image_cache_layout();
     write_generated_overlaybd_global_config(
@@ -791,8 +814,8 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 mod tests {
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_tools, file_exists_nonempty,
-        overlaybd_runtime_oss_config, validate_explicit_file, version_output_mentions_exact_token,
-        write_generated_overlaybd_global_configs,
+        overlaybd_runtime_oss_config, to_overlaybd_download_config, validate_explicit_file,
+        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
     };
     use overlaybd::config::DownloadConfig;
 
@@ -1064,9 +1087,8 @@ mod tests {
         let rootfs_value = read_global_config_value(&rootfs);
         assert_eq!(rootfs_value["download"]["enable"], false);
         assert_eq!(rootfs_value["download"]["concurrency"], 1);
-        let expected_memory = MemorySnapshotConfig::default()
-            .background_download
-            .to_overlaybd_download_config();
+        let expected_memory =
+            to_overlaybd_download_config(&MemorySnapshotConfig::default().background_download);
         let memory_value = read_global_config_value(&mem);
         assert_download_json(&memory_value, &expected_memory);
     }
@@ -1182,9 +1204,7 @@ mod tests {
             enable: false,
             block_size: 2 * 1024 * 1024,
             concurrency: 7,
-            ..MemorySnapshotConfig::default()
-                .background_download
-                .to_overlaybd_download_config()
+            ..to_overlaybd_download_config(&MemorySnapshotConfig::default().background_download)
         };
         assert_download_json(&read_global_config_value(&mem), &expected_memory);
     }

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
 
 use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
-use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult, ResolvedAttachedDrive,
     SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::types::FirecrackerSnapshotManifest;
 
 struct MaterializedLower {
     config: LayerConfig,

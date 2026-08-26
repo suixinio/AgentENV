@@ -8,9 +8,7 @@ use tracing::warn;
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
-use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
-};
+use crate::sandbox::{CapturedSandboxSnapshot, FirecrackerCapturedSnapshot};
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
@@ -19,7 +17,7 @@ use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord,
 };
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, FirecrackerSnapshotManifest};
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
 const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;

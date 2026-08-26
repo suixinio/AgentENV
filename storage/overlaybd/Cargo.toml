@@ -13,6 +13,7 @@ full = [
 
 [dependencies]
 storage-util = { path = "../util" }
+shell-util = { path = "../../crates/shell-util" }
 tokio = { version = "1.44.2", features = ["full"] }
 async-trait = "0.1.88"
 futures-util = "0.3.31"

@@ -1,9 +1,17 @@
+//! On-disk layout of a Firecracker snapshot's artifacts.
+//!
+//! 🔴 A leaf on purpose: the sandbox backend writes this manifest and the
+//! snapshot layer reads it back, so it belongs to neither. Living here is what
+//! lets `crate::snapshot` describe a committed snapshot without depending on
+//! `crate::sandbox`. `crate::sandbox` re-exports the type, so its callers see
+//! no change.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::ExtraDrive;
+use super::drive::{normalize_mount_path_for_drive, ExtraDrive};
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 
@@ -97,7 +105,7 @@ impl FirecrackerSnapshotManifest {
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
                 virtual_size: Some(drive.virtual_size),
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: normalize_mount_path_for_drive(
                     &drive.drive_id,
                     drive.mount_path.clone(),
                 )

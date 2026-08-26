@@ -110,7 +110,6 @@ mod tests {
     use super::super::runtime::PosixFsRuntimeResolver;
     use super::{posixfs_repository, PosixFsBackend, PosixFsBackendConfig};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
-    use crate::sandbox::{ExtraDrive, FirecrackerSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::repository::{
@@ -121,6 +120,7 @@ mod tests {
         SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
     };
+    use crate::types::{ExtraDrive, FirecrackerSnapshotManifest};
 
     #[derive(Debug)]
     struct TestOverlaybdLayerStore;

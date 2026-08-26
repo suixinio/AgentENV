@@ -24,7 +24,6 @@ use tracing::{debug, info, warn};
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::SnapshotImageStoragePolicy;
-use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
@@ -35,6 +34,7 @@ use crate::snapshot::{
     CommittedAttachedDrive, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::types::FirecrackerSnapshotManifest;
 
 /// Snapshot bytes stored in OSS, plus the source-registry export path.
 pub(crate) struct OssSnapshotArtifactStore {
@@ -386,13 +386,11 @@ impl OssSnapshotArtifactStore {
                 layers: outcome.layers,
                 read_only: drive.read_only,
                 virtual_size: drive.virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::types::normalize_mount_path_for_drive(
                     &drive.drive_id,
                     drive.mount_path.clone(),
                 )
-                .unwrap_or_else(|_| {
-                    crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                }),
+                .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
             });
         }

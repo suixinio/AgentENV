@@ -1,6 +1,6 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 pub const MAX_LAYER_CNT: usize = 256;
 const DEFAULT_LOG_SIZE_MB: u32 = 10;
@@ -505,19 +505,10 @@ fn resolve_path_field(base_dir: &Path, value: &mut String) {
     *value = lexically_normalize_path(&resolved).display().to_string();
 }
 
-pub fn lexically_normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
-}
+/// Re-exported so `overlaybd::config::lexically_normalize_path` keeps working.
+/// The definition moved to `shell-util` because `crate::cfg` normalizes the
+/// same paths and must not depend on this crate.
+pub use shell_util::lexically_normalize_path;
 
 /// Chunk knobs that are honored in every `DownloadConfig` context, including
 /// per-image overrides: chunk size and per-layer concurrency.

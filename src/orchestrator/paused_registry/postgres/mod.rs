@@ -207,6 +207,10 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         writes::remove(self, sandbox_id, generation).await
     }
 
+    async fn list_all(&self) -> RegistryResult<super::PausedRegistryListing> {
+        reads::list_all(self).await
+    }
+
     fn is_cluster_backed(&self) -> bool {
         true
     }

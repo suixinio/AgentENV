@@ -58,6 +58,23 @@ pub(super) fn get_many_sql() -> String {
     )
 }
 
+/// [`super::reads::list_all`]'s row query -- the `ListRegistrySandboxes`
+/// listing, ported from Go's `PostgresReader.List` (`postgres.go:135-183`,
+/// the `selectColumns`/`WHERE cluster_id = $1` half; the `SELECT now()`
+/// half of that same read-only transaction is issued separately, see that
+/// function's own doc for why one transaction still covers both). No
+/// `ORDER BY`: [`super::reads::list_all`]'s caller
+/// (`src/node_registry/grpc_service.rs::list_registry_sandboxes`) sorts
+/// after filtering, the same layering Go's own `listRegistrySandboxes`
+/// uses (`service.go:915-918`) rather than this query's.
+pub(super) fn list_all_sql() -> String {
+    format!(
+        "SELECT {ENTRY_COLUMNS}
+  FROM paused_sandboxes
+ WHERE cluster_id = $1::uuid"
+    )
+}
+
 /// `beginPauseFencedSQL` (`store_postgres.go:402-468`), verbatim modulo the
 /// timestamp binding: Go relies on the driver's own array/uuid casts and
 /// sqlx binds the same way, so no adaptation was needed beyond formatting.

@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::super::types::PausedRegistryState;
+use super::super::types::{PausedRegistryListEntry, PausedRegistryState};
 use super::super::{PausedRegistryError, PausedSandboxEntry, RegistryResult};
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
@@ -226,6 +226,29 @@ pub(super) fn decode_entry(row: EntryRow) -> RegistryResult<PausedSandboxEntry> 
         execution_id: identity.execution_id,
         paused_at: row.paused_at,
         updated_at: row.updated_at,
+    })
+}
+
+/// The `ListRegistrySandboxes` decode: [`PausedRegistryListEntry`]'s
+/// columns -- the lease/execution-id fields [`decode_entry`] leaves out
+/// (see that struct's own doc), metadata left undecoded like
+/// [`decode_registry_row`] (the wire response has no field for it and
+/// nothing downstream reads it).
+pub(super) fn decode_list_entry(row: EntryRow) -> RegistryResult<PausedRegistryListEntry> {
+    let identity = parse_identity(&row)?;
+    Ok(PausedRegistryListEntry {
+        sandbox_id: identity.sandbox_id,
+        cluster_id: identity.cluster_id,
+        state: identity.state,
+        generation: row.generation,
+        origin_node_id: row.origin_node_id,
+        claimed_by_node_id: row.claimed_by_node_id.filter(|node| !node.is_empty()),
+        snapshot_id: identity.snapshot_id,
+        paused_at: row.paused_at,
+        updated_at: row.updated_at,
+        lease_expires_at: row.lease_expires_at,
+        sandbox_expires_at: row.sandbox_expires_at,
+        execution_id: identity.execution_id,
     })
 }
 

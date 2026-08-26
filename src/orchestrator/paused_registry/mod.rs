@@ -46,7 +46,8 @@ pub use disabled::DisabledPausedSandboxRegistry;
 pub use postgres::PostgresPausedSandboxRegistry;
 pub use types::{
     BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
-    PausedRegistryState, PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
+    PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState, PausedSandboxEntry,
+    ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
 };
 
 pub type RegistryResult<T> = std::result::Result<T, PausedRegistryError>;
@@ -363,6 +364,33 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// The `bool` is whether it matched. Not matching is not an error: the row
     /// this caller meant to delete is already gone, which is what it wanted.
     async fn remove(&self, sandbox_id: &SandboxId, generation: i64) -> RegistryResult<bool>;
+
+    /// Reads every row in scope, plus the database clock they were read
+    /// against — the cluster-wide debug/admin listing this registry answers
+    /// as `ListRegistrySandboxes` (`src/node_registry/grpc_service.rs`) and,
+    /// through it, the gateway's `GET /registry/sandboxes`
+    /// (`services/gateway/internal/registry_list.go`). Ports Go's
+    /// `Reader.List` (`registry.go:179-186`, `PostgresReader.List` in
+    /// `postgres.go:135-183`).
+    ///
+    /// No pagination, no filtering: this hands back the whole scoped table
+    /// exactly like `PostgresReader.List` does, and `state`/`node_id`
+    /// filtering plus keyset paging are the RPC layer's job — mirrors Go's
+    /// own `listRegistrySandboxes` (`service.go:849-943`), which rejects an
+    /// unknown `state` filter before ever consulting the reader so that
+    /// answer does not depend on whether a registry happens to be
+    /// configured.
+    ///
+    /// 🔴 Callers must gate this on [`Self::is_cluster_backed`] first, the
+    /// same way `lookup_node`'s stage 3 does
+    /// (`crate::binding_store::lookup`'s module doc): a registry that
+    /// cannot speak for the whole cluster has nothing here worth trusting an
+    /// empty answer from. This mirrors Go's own default -- `Service.registry`
+    /// is never a literal nil pointer, it defaults to `pausedregistry.Disabled()`,
+    /// whose `List` answers `ErrDisabled` rather than an empty slice, so
+    /// "not configured" and "configured, holds nothing" can never be
+    /// confused for one another.
+    async fn list_all(&self) -> RegistryResult<PausedRegistryListing>;
 
     /// Whether this registry actually tracks sandboxes cluster-wide.
     ///

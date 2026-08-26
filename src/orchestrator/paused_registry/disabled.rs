@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use super::{
-    BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedSandboxEntry,
-    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedRegistryListing,
+    PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
+    ResumeClaim,
 };
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
@@ -113,5 +114,19 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
 
     async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
         Ok(false)
+    }
+
+    async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
+        // Consistent with every other read above: nothing was ever recorded,
+        // so an empty listing is the truth, not a stub. `is_cluster_backed`
+        // stays `false` (this impl never overrides the trait default), so
+        // `list_registry_sandboxes` never actually reaches this in practice
+        // -- it answers `FailedPrecondition` straight off that guard,
+        // mirroring Go's `ErrDisabled` -- but this must still answer
+        // honestly on its own if ever called directly.
+        Ok(PausedRegistryListing {
+            sandboxes: Vec::new(),
+            now: chrono::Utc::now(),
+        })
     }
 }

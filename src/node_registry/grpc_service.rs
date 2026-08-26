@@ -35,10 +35,16 @@
 //! the method (`list_p2p_peers`, `src/node_registry/registry.rs`) with its
 //! own test coverage, and the only work Stage A skipped was wiring this one
 //! RPC body to it — now done, the same shape as `list_nodes` just above.
-//! `list_registry_sandboxes` is still Stage C's and stays `unimplemented`
-//! here, naming which Stage owns it rather than silently accepting and doing
-//! nothing — a caller that dials the wrong half of this split by mistake
-//! gets an answer that says so.
+//! `list_registry_sandboxes` was Stage C's own paused registry and stayed
+//! `unimplemented` here through Stage C for the identical reason
+//! `list_p2p_peers` did -- naming which Stage owns it rather than silently
+//! accepting and doing nothing, so a caller that dials the wrong half of
+//! this split by mistake gets an answer that says so. It now answers for
+//! real too, against [`PausedSandboxRegistry::list_all`]
+//! (`src/orchestrator/paused_registry/mod.rs`), the same shape
+//! `list_p2p_peers` follows: filtering/paging live in this file (mirroring
+//! Go's own `listRegistrySandboxes`, `service.go:849-943`), the actual read
+//! in the trait method's own backend.
 //!
 //! `schedule`/`lookup_node` (Stage D's remainder) **are** now implemented
 //! too, against [`crate::binding_store::lookup`]'s pure port of
@@ -104,7 +110,7 @@ use crate::binding_store::lookup::{
     self as lookup_logic, LookupDeps, LookupOutcome, LookupResultLabel, ScheduleDeps,
 };
 use crate::binding_store::{BindingDecision, BindingDeleteOutcome, BindingStore};
-use crate::orchestrator::PausedSandboxRegistry;
+use crate::orchestrator::{PausedRegistryListEntry, PausedRegistryState, PausedSandboxRegistry};
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
     self, ForgetP2pArtifactRequest, ForgetP2pArtifactResponse, GetNodeRequest, GetNodeResponse,
@@ -279,6 +285,27 @@ impl NodeRegistryGrpcService {
             None => String::new(),
         };
         Ok((cluster_id, backend, key, resolved_node_id))
+    }
+
+    /// Ports `canonicalNodeID` (`reconcile.go:636-646`): resolves a node
+    /// identity the same way every other lookup in this service does, so a
+    /// row (or a caller's `node_id` filter) written under a node's previous
+    /// name is still attributed to that node. `""` in, `""` out -- an empty
+    /// filter/holder must never resolve to some node's real identity.
+    ///
+    /// Used by [`Self::list_registry_sandboxes`] to canonicalise both sides
+    /// of its `node_id` filter comparison before comparing them, exactly
+    /// like [`Self::validate_p2p_artifact_fields`]'s identical resolve does
+    /// for a single id above.
+    fn canonical_node_id(&self, node_id: &str) -> String {
+        let trimmed = node_id.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        self.registry
+            .resolve(trimmed)
+            .map(|n| n.id)
+            .unwrap_or_else(|| trimmed.to_string())
     }
 
     fn record_projection_ttl_source(source: &str) {
@@ -903,12 +930,11 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ReportSandboxEventResponse {}))
     }
 
-    // ── `list_p2p_peers` right below now answers for real (see the module
-    // doc's correction above); `list_registry_sandboxes` further down is
-    // still Stage C's and always refuses -- see its own doc comment.
-    // Everything else from here on (the P2P artifact RPCs) is Stage D's own,
-    // gated behind whichever builder wires its dependency, the same as every
-    // RPC above this line.
+    // ── `list_p2p_peers` right below and `list_registry_sandboxes` further
+    // down both now answer for real (see the module doc's correction
+    // above). Everything else from here on (the P2P artifact RPCs) is Stage
+    // D's own, gated behind whichever builder wires its dependency, the
+    // same as every RPC above this line.
 
     /// Ports `service.go:728-734` — `s.nodes.ListP2pPeers(...)`, direct
     /// proto translation, no side effects. See
@@ -1008,13 +1034,183 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(LookupP2pArtifactResponse { peers }))
     }
 
+    /// Ports `listRegistrySandboxes` (`service.go:849-943`) against
+    /// [`PausedSandboxRegistry::list_all`]. Argument validation
+    /// (`page_size`, `state`) runs before the registry is even consulted,
+    /// matching Go: the answer to a bad request must not depend on whether
+    /// this deployment happens to run a registry at all.
+    ///
+    /// `self.paused_registry` being unwired and a wired registry whose
+    /// [`is_cluster_backed`](PausedSandboxRegistry::is_cluster_backed) is
+    /// `false` answer identically -- `FailedPrecondition` -- mirroring Go's
+    /// own default: `Service.registry` is never a literal nil pointer, it
+    /// defaults to `pausedregistry.Disabled()`, whose `List` answers
+    /// `ErrDisabled` the same way. See `crate::binding_store::lookup`'s
+    /// module doc for the identical reasoning `lookup_node`'s stage 3
+    /// already applies to this exact pair of cases.
+    ///
+    /// Filtering (`state` exact match, `node_id` matched against each row's
+    /// [`holder`](crate::orchestrator::PausedRegistryListEntry::holder),
+    /// both canonicalised through [`Self::canonical_node_id`] the same way
+    /// Go's `canonicalNodeID` is) and keyset paging (`page_token` a
+    /// strictly-greater sandbox id) happen here, over the unfiltered,
+    /// unpaginated listing [`PausedSandboxRegistry::list_all`] hands back --
+    /// that method carries no pagination of its own, matching Go's
+    /// `PostgresReader.List` having none either.
     async fn list_registry_sandboxes(
         &self,
-        _request: Request<ListRegistrySandboxesRequest>,
+        request: Request<ListRegistrySandboxesRequest>,
     ) -> Result<Response<ListRegistrySandboxesResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "ListRegistrySandboxes is Stage C's paused registry: {NOT_STAGE_A}"
-        )))
+        let req = request.into_inner();
+        if req.page_size < 0 {
+            return Err(Status::invalid_argument("page_size must not be negative"));
+        }
+        let state_filter = parse_registry_state_filter(&req.state)?;
+
+        let registry = match &self.paused_registry {
+            Some(registry) if registry.is_cluster_backed() => registry,
+            _ => {
+                return Err(Status::failed_precondition(
+                    "paused registry is not configured",
+                ))
+            }
+        };
+
+        let listing = registry
+            .list_all()
+            .await
+            .map_err(|err| Status::unavailable(format!("paused registry unavailable: {err}")))?;
+
+        let node_filter = self.canonical_node_id(&req.node_id);
+        let page_token = req.page_token.trim();
+
+        let mut matched: Vec<_> = listing
+            .sandboxes
+            .into_iter()
+            .filter(|entry| state_filter.is_none_or(|state| entry.state == state))
+            .filter(|entry| {
+                node_filter.is_empty() || self.canonical_node_id(entry.holder()) == node_filter
+            })
+            .filter(|entry| {
+                page_token.is_empty() || entry.sandbox_id.to_string().as_str() > page_token
+            })
+            .collect();
+
+        // The registry promises no ordering; paging over an unordered list
+        // would silently skip rows -- matches Go's own comment
+        // (`service.go:911-914`) verbatim.
+        matched.sort_by_key(|entry| entry.sandbox_id);
+
+        let mut next_page_token = String::new();
+        let page_size = req.page_size as usize;
+        if page_size > 0 && page_size < matched.len() {
+            matched.truncate(page_size);
+            next_page_token = matched
+                .last()
+                .expect("truncate to a positive page_size leaves at least one row")
+                .sandbox_id
+                .to_string();
+        }
+
+        let sandboxes = matched.iter().map(registry_sandbox_to_proto).collect();
+
+        Ok(Response::new(ListRegistrySandboxesResponse {
+            sandboxes,
+            next_page_token,
+            database_now_unix_ms: listing.now.timestamp_millis(),
+        }))
+    }
+}
+
+/// The five values [`PausedRegistryState`]'s `state` column may hold, in
+/// the order Go's `KnownStates()` presents them (`registry.go:44-46`) --
+/// used both to encode a row's state onto the wire and to name the
+/// accepted set in a `ListRegistrySandboxes` "unknown state" error.
+const KNOWN_REGISTRY_STATES: [PausedRegistryState; 5] = [
+    PausedRegistryState::Publishing,
+    PausedRegistryState::Paused,
+    PausedRegistryState::Resuming,
+    PausedRegistryState::LocalOnly,
+    PausedRegistryState::Running,
+];
+
+/// The literal each state encodes as on the wire -- matches the column's own
+/// CHECK-constrained values (`sql::ENTRY_COLUMNS`' decode side,
+/// `PausedRegistryState::parse`), duplicated here rather than reused because
+/// that decode is private to `orchestrator::paused_registry` -- the same
+/// duplication `binding_store::lookup::paused_state_label` and
+/// `paused_registry::postgres::reconcile`'s own copy already carry.
+fn registry_state_str(state: PausedRegistryState) -> &'static str {
+    match state {
+        PausedRegistryState::Publishing => "publishing",
+        PausedRegistryState::Paused => "paused",
+        PausedRegistryState::Resuming => "resuming",
+        PausedRegistryState::LocalOnly => "local_only",
+        PausedRegistryState::Running => "running",
+    }
+}
+
+/// Ports `parseRegistryStateFilter` (`service.go:947-965`): an empty filter
+/// means every state; anything else is matched case-insensitively (Go's
+/// `ParseState` uses `strings.EqualFold`) against the five known values, and
+/// anything that matches none of them is refused by name rather than
+/// silently matching no row -- see [`PausedRegistryState::parse`]'s own doc
+/// (via `ParseState`'s identical Go-side comment) for why a state no row can
+/// hold must never be filtered on.
+fn parse_registry_state_filter(raw: &str) -> Result<Option<PausedRegistryState>, Status> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    for state in KNOWN_REGISTRY_STATES {
+        if registry_state_str(state).eq_ignore_ascii_case(trimmed) {
+            return Ok(Some(state));
+        }
+    }
+    let known: Vec<&str> = KNOWN_REGISTRY_STATES
+        .iter()
+        .copied()
+        .map(registry_state_str)
+        .collect();
+    Err(Status::invalid_argument(format!(
+        "unknown state '{trimmed}', must be one of {}",
+        known.join(", ")
+    )))
+}
+
+/// Ports `registrySandboxToProto` (`service.go:966-984`): direct field
+/// translation, `Option`s collapsing to the wire's own "empty/zero means
+/// absent" convention (matches every other proto conversion in this file --
+/// `claimed_by_node_id`/`snapshot_id`/`execution_id`, and the lease/deadline
+/// pair, all follow the same rule the response's own proto comments name).
+fn registry_sandbox_to_proto(entry: &PausedRegistryListEntry) -> scheduler::RegistrySandbox {
+    scheduler::RegistrySandbox {
+        sandbox_id: entry.sandbox_id.to_string(),
+        cluster_id: entry.cluster_id.to_string(),
+        state: registry_state_str(entry.state).to_string(),
+        generation: entry.generation,
+        origin_node_id: entry.origin_node_id.clone(),
+        claimed_by_node_id: entry.claimed_by_node_id.clone().unwrap_or_default(),
+        snapshot_id: entry
+            .snapshot_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        paused_at_unix_ms: entry.paused_at.timestamp_millis(),
+        updated_at_unix_ms: entry.updated_at.timestamp_millis(),
+        lease_expires_at_unix_ms: entry
+            .lease_expires_at
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0),
+        sandbox_expires_at_unix_ms: entry
+            .sandbox_expires_at
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0),
+        holder_node_id: entry.holder().to_string(),
+        execution_id: entry
+            .execution_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -2280,8 +2476,8 @@ mod tests {
     use crate::binding_store::{BindingStoreSettings, InMemoryBindingStore};
     use crate::orchestrator::{
         BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
-        PausedRegistryState, PausedSandboxEntry, ReclaimedHoldings, RegistryResult,
-        ReleasedHoldings, ResumeClaim,
+        PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState, PausedSandboxEntry,
+        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::types::{ExecutionId, SandboxId};
 
@@ -2401,6 +2597,9 @@ mod tests {
         async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
             unimplemented!("lookup_node never calls this")
         }
+        async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
+            unimplemented!("lookup_node never calls this")
+        }
     }
 
     fn paused_entry(
@@ -2460,6 +2659,178 @@ mod tests {
 
     fn in_memory_binding_store() -> Arc<dyn BindingStore> {
         Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()))
+    }
+
+    /// A minimal `PausedSandboxRegistry` test double for
+    /// `list_registry_sandboxes`: `list_all`/`is_cluster_backed` answer from
+    /// a fixed listing, everything else panics -- mirrors `FakePausedRegistry`'s
+    /// own shape/doc for `lookup_node` above: one RPC group per fake, so a
+    /// test that (incorrectly) drives this one into a write path fails
+    /// loudly instead of silently getting a made-up default.
+    struct FakeListingRegistry {
+        listing: PausedRegistryListing,
+        cluster_backed: bool,
+        erroring: bool,
+    }
+
+    impl FakeListingRegistry {
+        fn new(
+            sandboxes: Vec<PausedRegistryListEntry>,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Self {
+            Self {
+                listing: PausedRegistryListing { sandboxes, now },
+                cluster_backed: true,
+                erroring: false,
+            }
+        }
+
+        fn not_cluster_backed() -> Self {
+            Self {
+                listing: PausedRegistryListing {
+                    sandboxes: Vec::new(),
+                    now: chrono::Utc::now(),
+                },
+                cluster_backed: false,
+                erroring: false,
+            }
+        }
+
+        fn erroring() -> Self {
+            Self {
+                listing: PausedRegistryListing {
+                    sandboxes: Vec::new(),
+                    now: chrono::Utc::now(),
+                },
+                cluster_backed: true,
+                erroring: true,
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl PausedSandboxRegistry for FakeListingRegistry {
+        async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
+            // 🔴 The RPC must never reach here while `cluster_backed` is
+            // `false` -- it has to answer `FailedPrecondition` straight off
+            // the `is_cluster_backed` gate instead. A mutant that dropped or
+            // inverted that guard would sail past every assertion in
+            // `list_registry_sandboxes_...not_cluster_backed...` if this
+            // just quietly answered too; panicking here turns "the guard
+            // was skipped" into a hard test failure instead of a passing
+            // test with the wrong reason.
+            assert!(
+                self.cluster_backed,
+                "list_registry_sandboxes must gate on is_cluster_backed before calling list_all"
+            );
+            if self.erroring {
+                return Err(PausedRegistryError::Backend {
+                    operation: "test",
+                    source: anyhow::anyhow!("boom"),
+                });
+            }
+            Ok(self.listing.clone())
+        }
+
+        fn is_cluster_backed(&self) -> bool {
+            self.cluster_backed
+        }
+
+        async fn get(&self, _sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn begin_pause(&self, _entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn complete_pause(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+            _snapshot_id: &crate::snapshot::SnapshotId,
+        ) -> RegistryResult<()> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn mark_local_only(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> RegistryResult<()> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn get_many(
+            &self,
+            _sandbox_ids: &[SandboxId],
+        ) -> RegistryResult<StdHashMap<SandboxId, PausedSandboxEntry>> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn claim_for_resume(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _execution_id: ExecutionId,
+        ) -> RegistryResult<ResumeClaim> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn release_claim(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> RegistryResult<bool> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn mark_running(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _holder_node_id: &str,
+            _execution_id: ExecutionId,
+            _expires_at: Option<SystemTime>,
+        ) -> RegistryResult<MarkRunningOutcome> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn renew_sandbox_deadline(
+            &self,
+            _sandbox_id: &SandboxId,
+            _execution_id: ExecutionId,
+            _expires_at: Option<SystemTime>,
+        ) -> RegistryResult<DeadlineRenewalOutcome> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+        async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
+            unimplemented!("list_registry_sandboxes never calls this")
+        }
+    }
+
+    fn list_entry(
+        sandbox_id: SandboxId,
+        state: PausedRegistryState,
+        origin_node_id: &str,
+        generation: i64,
+    ) -> PausedRegistryListEntry {
+        let now = chrono::Utc::now();
+        PausedRegistryListEntry {
+            sandbox_id,
+            cluster_id: uuid::Uuid::nil(),
+            state,
+            generation,
+            origin_node_id: origin_node_id.to_string(),
+            claimed_by_node_id: None,
+            snapshot_id: Some(crate::snapshot::SnapshotId::generate()),
+            paused_at: now,
+            updated_at: now,
+            lease_expires_at: None,
+            sandbox_expires_at: None,
+            execution_id: None,
+        }
     }
 
     /// `status: Ready` is deliberate, not incidental: `schedulable_node`
@@ -3043,6 +3414,307 @@ mod tests {
         assert!(
             by_source.get("heartbeat").copied().unwrap_or(0) >= 1,
             "heartbeat's reconcile_node must report a decision under source=heartbeat: {by_source:?}"
+        );
+    }
+
+    // ---- list_registry_sandboxes: ports `listRegistrySandboxes`
+    //      (`service.go:849-943`) against `PausedSandboxRegistry::list_all`.
+    //      Every test below calls the service directly, mirroring the
+    //      `Schedule`/`LookupNode` section's own reasoning: there is
+    //      nothing gRPC-transport-specific left to prove once this file's
+    //      socket-based tests elsewhere already cover server wiring. ----
+
+    fn fixed_sandbox_id(n: u8) -> SandboxId {
+        SandboxId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}"))
+            .expect("a well-formed fixed uuid")
+    }
+
+    #[tokio::test]
+    async fn list_registry_sandboxes_without_a_paused_registry_is_failed_precondition() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
+
+        let status = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest::default()))
+            .await
+            .expect_err("no paused registry wired");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// Mirrors Go's own default: `Service.registry` is never a literal nil
+    /// pointer, it defaults to `pausedregistry.Disabled()`, whose `List`
+    /// answers `ErrDisabled` (-> `FailedPrecondition`) exactly the same way
+    /// a registry that is wired but not cluster-backed does here. The fake's
+    /// own `list_all` panics if this ever reaches it -- see its doc.
+    #[tokio::test]
+    async fn list_registry_sandboxes_with_a_non_cluster_backed_registry_is_failed_precondition() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::not_cluster_backed()));
+
+        let status = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest::default()))
+            .await
+            .expect_err("a non-cluster-backed registry must refuse, not answer empty");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn list_registry_sandboxes_maps_a_backend_error_to_unavailable() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::erroring()));
+
+        let status = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest::default()))
+            .await
+            .expect_err("the backend failed");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn list_registry_sandboxes_rejects_a_negative_page_size() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::new(
+                Vec::new(),
+                chrono::Utc::now(),
+            )));
+
+        let status = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest {
+                page_size: -1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("negative page_size");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Argument validation must run before the registry is even consulted --
+    /// mirrors Go's own comment on `parseRegistryStateFilter` running first:
+    /// the answer to a bad request must not depend on whether a registry
+    /// happens to be configured. Proved here by using the exact same
+    /// "no paused registry wired" service the `FailedPrecondition` test
+    /// above uses: an unknown state must still come back `InvalidArgument`,
+    /// never `FailedPrecondition`.
+    #[tokio::test]
+    async fn list_registry_sandboxes_rejects_an_unknown_state_before_consulting_the_registry() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
+
+        let status = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest {
+                state: "not_a_real_state".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("unknown state");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("not_a_real_state"),
+            "the refusal must name the bad value, got: {}",
+            status.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_registry_sandboxes_returns_every_row_with_the_database_clock() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let now = chrono::Utc::now();
+        let sandbox_id = fixed_sandbox_id(1);
+        let entries = vec![list_entry(
+            sandbox_id,
+            PausedRegistryState::Running,
+            "node-a",
+            7,
+        )];
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::new(entries, now)));
+
+        let resp = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest::default()))
+            .await
+            .expect("a cluster-backed registry with one row")
+            .into_inner();
+
+        assert_eq!(resp.sandboxes.len(), 1);
+        let row = &resp.sandboxes[0];
+        assert_eq!(row.sandbox_id, sandbox_id.to_string());
+        assert_eq!(row.state, "running");
+        assert_eq!(row.generation, 7);
+        assert_eq!(row.origin_node_id, "node-a");
+        assert_eq!(
+            row.holder_node_id, "node-a",
+            "holder_node_id must be origin_node_id, never claimed_by_node_id"
+        );
+        assert_eq!(resp.database_now_unix_ms, now.timestamp_millis());
+        assert_eq!(resp.next_page_token, "");
+    }
+
+    #[tokio::test]
+    async fn list_registry_sandboxes_filters_by_state_case_insensitively() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let entries = vec![
+            list_entry(
+                fixed_sandbox_id(1),
+                PausedRegistryState::Paused,
+                "node-a",
+                1,
+            ),
+            list_entry(
+                fixed_sandbox_id(2),
+                PausedRegistryState::Running,
+                "node-a",
+                1,
+            ),
+            list_entry(
+                fixed_sandbox_id(3),
+                PausedRegistryState::LocalOnly,
+                "node-a",
+                1,
+            ),
+        ];
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::new(
+                entries,
+                chrono::Utc::now(),
+            )));
+
+        let resp = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest {
+                state: "RUNNING".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("a known state, differently cased")
+            .into_inner();
+
+        assert_eq!(resp.sandboxes.len(), 1, "only the running row must match");
+        assert_eq!(
+            resp.sandboxes[0].sandbox_id,
+            fixed_sandbox_id(2).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_registry_sandboxes_filters_by_node_id() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let entries = vec![
+            list_entry(
+                fixed_sandbox_id(1),
+                PausedRegistryState::Running,
+                "node-a",
+                1,
+            ),
+            list_entry(
+                fixed_sandbox_id(2),
+                PausedRegistryState::Running,
+                "node-b",
+                1,
+            ),
+        ];
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::new(
+                entries,
+                chrono::Utc::now(),
+            )));
+
+        let resp = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest {
+                node_id: "node-b".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("a node_id filter")
+            .into_inner();
+
+        assert_eq!(resp.sandboxes.len(), 1);
+        assert_eq!(
+            resp.sandboxes[0].sandbox_id,
+            fixed_sandbox_id(2).to_string()
+        );
+        assert_eq!(resp.sandboxes[0].origin_node_id, "node-b");
+    }
+
+    /// Keyset paging: `page_size` truncates the sorted (by sandbox id)
+    /// listing and reports the last row's id as `next_page_token`; a
+    /// second call with that token as `page_token` picks up exactly where
+    /// the first left off. Sandbox ids are fixed (not `SandboxId::new()`)
+    /// so the expected page split is deterministic rather than depending
+    /// on UUIDv7 generation order within the same test.
+    #[tokio::test]
+    async fn list_registry_sandboxes_pages_with_a_token() {
+        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
+        let entries = vec![
+            list_entry(
+                fixed_sandbox_id(3),
+                PausedRegistryState::Running,
+                "node-a",
+                1,
+            ),
+            list_entry(
+                fixed_sandbox_id(1),
+                PausedRegistryState::Running,
+                "node-a",
+                1,
+            ),
+            list_entry(
+                fixed_sandbox_id(2),
+                PausedRegistryState::Running,
+                "node-a",
+                1,
+            ),
+        ];
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_paused_registry(Arc::new(FakeListingRegistry::new(
+                entries,
+                chrono::Utc::now(),
+            )));
+
+        let first = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest {
+                page_size: 2,
+                ..Default::default()
+            }))
+            .await
+            .expect("first page")
+            .into_inner();
+        assert_eq!(
+            first
+                .sandboxes
+                .iter()
+                .map(|s| s.sandbox_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                fixed_sandbox_id(1).to_string(),
+                fixed_sandbox_id(2).to_string()
+            ],
+            "the first page must be the two lowest ids, sorted"
+        );
+        assert_eq!(first.next_page_token, fixed_sandbox_id(2).to_string());
+
+        let second = service
+            .list_registry_sandboxes(Request::new(ListRegistrySandboxesRequest {
+                page_size: 2,
+                page_token: first.next_page_token,
+                ..Default::default()
+            }))
+            .await
+            .expect("second page")
+            .into_inner();
+        assert_eq!(
+            second
+                .sandboxes
+                .iter()
+                .map(|s| s.sandbox_id.clone())
+                .collect::<Vec<_>>(),
+            vec![fixed_sandbox_id(3).to_string()],
+            "the second page must hold exactly the row the first page did not"
+        );
+        assert_eq!(
+            second.next_page_token, "",
+            "the last page must report no further token"
         );
     }
 }

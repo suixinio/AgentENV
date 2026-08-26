@@ -13,9 +13,9 @@ transformer). `--role api` (`agentenv-api-deployment.yaml`) runs with
 node discovery, heartbeat receipt, placement, and the paused-sandbox registry
 into itself over the shared `[pg]` pool instead of dialling a scheduler
 process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
-instead of `agentenv-scheduler:9090` for the same reason. The one RPC that
-gap does not close is `ListRegistrySandboxes`
-(`services/gateway/internal/registry_list.go`'s debug endpoint) — see
+instead of `agentenv-scheduler:9090` for the same reason, including for
+`ListRegistrySandboxes` (`services/gateway/internal/registry_list.go`'s
+debug endpoint), which `--role api` now answers too — see
 `services/README.md` for the current status and how to bring the scheduler
 workload back if you need it. The rest of this page describes the
 architecture as it runs today; where it still names `agentenv-scheduler`

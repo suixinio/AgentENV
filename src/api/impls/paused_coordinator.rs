@@ -1832,6 +1832,35 @@ mod tests {
         fn is_cluster_backed(&self) -> bool {
             self.cluster_backed
         }
+
+        async fn list_all(&self) -> RegistryResult<crate::orchestrator::PausedRegistryListing> {
+            let sandboxes = self
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .map(|entry| crate::orchestrator::PausedRegistryListEntry {
+                    sandbox_id: entry.sandbox_id,
+                    cluster_id: entry.cluster_id,
+                    state: entry.state,
+                    generation: entry.generation,
+                    origin_node_id: entry.origin_node_id.clone(),
+                    claimed_by_node_id: entry.claimed_by_node_id.clone(),
+                    snapshot_id: entry.snapshot_id.clone(),
+                    paused_at: entry.paused_at,
+                    updated_at: entry.updated_at,
+                    // This fake's rows never carry lease/deadline state --
+                    // nothing in this file's own tests reads either back.
+                    lease_expires_at: None,
+                    sandbox_expires_at: None,
+                    execution_id: entry.execution_id,
+                })
+                .collect();
+            Ok(crate::orchestrator::PausedRegistryListing {
+                sandboxes,
+                now: chrono::Utc::now(),
+            })
+        }
     }
 
     /// A paused state that says where its bytes are, and nothing else.
@@ -2924,6 +2953,15 @@ pub(super) mod test_support {
         async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
             self.remove_calls.fetch_add(1, Ordering::SeqCst);
             Ok(true)
+        }
+
+        async fn list_all(&self) -> RegistryResult<crate::orchestrator::PausedRegistryListing> {
+            // Not one of the two calls this double is built around -- answers
+            // the way the disabled registry does, per this struct's own doc.
+            Ok(crate::orchestrator::PausedRegistryListing {
+                sandboxes: Vec::new(),
+                now: chrono::Utc::now(),
+            })
         }
 
         fn is_cluster_backed(&self) -> bool {

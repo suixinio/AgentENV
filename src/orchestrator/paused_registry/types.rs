@@ -282,3 +282,57 @@ pub enum DeadlineRenewalOutcome {
     /// named — it moved on since. The deadline was not written.
     Superseded,
 }
+
+/// One row of the cluster-wide debug/admin listing (`ListRegistrySandboxes`,
+/// `src/node_registry/grpc_service.rs`; `GET /registry/sandboxes` on the
+/// gateway, `services/gateway/internal/registry_list.go`) — mirrors Go's
+/// `Sandbox` (`registry.go:73-116`) rather than the narrower
+/// [`PausedSandboxEntry`].
+///
+/// It deliberately carries the lease/execution columns
+/// [`PausedSandboxEntry`]'s own doc says node-side reads never see: this
+/// listing *is* the one reader that is meant to. No `metadata` — the wire
+/// response (`RegistrySandbox` in `scheduler.proto`) has no field for it and
+/// no consumer of this type ever asks.
+#[derive(Clone, Debug)]
+pub struct PausedRegistryListEntry {
+    pub sandbox_id: SandboxId,
+    pub cluster_id: Uuid,
+    pub state: PausedRegistryState,
+    pub generation: i64,
+    pub origin_node_id: String,
+    pub claimed_by_node_id: Option<String>,
+    pub snapshot_id: Option<SnapshotId>,
+    pub paused_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// `None` when the column is NULL, which the nodes treat as already
+    /// expired — see `RegistryRow::lease_expired`'s identical column.
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    /// `None` means the sandbox was asked never to expire, never "unknown".
+    pub sandbox_expires_at: Option<DateTime<Utc>>,
+    /// The incarnation this row is fenced against, `None` when the row's
+    /// state pins the column to NULL.
+    pub execution_id: Option<ExecutionId>,
+}
+
+impl PausedRegistryListEntry {
+    /// The node this row makes authoritative for the sandbox — mirrors Go's
+    /// `Sandbox.Holder()` (`registry.go:126-139`): always `origin_node_id`,
+    /// never `claimed_by_node_id`. See that method's own doc for why.
+    pub fn holder(&self) -> &str {
+        &self.origin_node_id
+    }
+}
+
+/// One read of the whole registry: every row in scope, plus the database
+/// clock they were read against. Mirrors Go's `Listing` (`registry.go:165-170`).
+///
+/// The two travel together deliberately — every lease judgement
+/// (`LeaseExpiresAtUnixMs`/`SandboxExpiresAtUnixMs` against
+/// `DatabaseNowUnixMs` on the wire) is a comparison against the database
+/// clock the rows were actually read against, never the reader's own.
+#[derive(Clone, Debug)]
+pub struct PausedRegistryListing {
+    pub sandboxes: Vec<PausedRegistryListEntry>,
+    pub now: DateTime<Utc>,
+}

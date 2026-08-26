@@ -1029,6 +1029,74 @@ mod pg {
         assert!(registry.get(&sandbox_id).await.unwrap().is_none());
     }
 
+    // ---------------------------------------------------------------------
+    // list_all
+    // ---------------------------------------------------------------------
+
+    /// `ListRegistrySandboxes`'s own read carries what [`PausedSandboxEntry`]
+    /// deliberately does not: `lease_expires_at`/`sandbox_expires_at`/
+    /// `execution_id`, scoped to this registry's own cluster, alongside a
+    /// database clock reading a real transaction was read against.
+    #[tokio::test]
+    async fn list_all_carries_lease_and_execution_columns_scoped_to_the_cluster() {
+        let pool = isolated_schema_pool_or_skip!(
+            "list_all_carries_lease_and_execution_columns_scoped_to_the_cluster"
+        );
+        let cluster_id = Uuid::new_v4();
+        let other_cluster_id = Uuid::new_v4();
+        let reg = registry(pool.clone(), cluster_id).await;
+        let other_reg = registry(pool, other_cluster_id).await;
+
+        let sandbox_id = SandboxId::new();
+        let expires_at = SystemTime::now() + Duration::from_secs(3600);
+        bring_to_running_with_snapshot(&reg, sandbox_id, cluster_id, "node-a", Some(expires_at))
+            .await;
+
+        // A row in a different cluster must never appear in this cluster's
+        // listing -- the same isolation `get`/`get_many` already enforce via
+        // their own `cluster_id` bind.
+        let other_sandbox = SandboxId::new();
+        bring_to_running_with_snapshot(&other_reg, other_sandbox, other_cluster_id, "node-z", None)
+            .await;
+
+        let before = Utc::now();
+        let listing = reg.list_all().await.expect("list_all should succeed");
+        let after = Utc::now();
+
+        assert_eq!(
+            listing.sandboxes.len(),
+            1,
+            "must not see the other cluster's row"
+        );
+        let row = &listing.sandboxes[0];
+        assert_eq!(row.sandbox_id, sandbox_id);
+        assert_eq!(row.state, PausedRegistryState::Running);
+        assert_eq!(row.origin_node_id, "node-a");
+        assert_eq!(row.holder(), "node-a");
+        assert!(
+            row.snapshot_id.is_some(),
+            "a running row still names its snapshot"
+        );
+        assert!(
+            row.execution_id.is_some(),
+            "a running row is fenced to an incarnation"
+        );
+        assert!(
+            row.sandbox_expires_at.is_some(),
+            "mark_running's own expires_at must have been stored"
+        );
+
+        // The database clock the rows were read against must be a real,
+        // recent reading -- not a zero value, and not this process's own
+        // clock read at a different instant than the query.
+        assert!(
+            listing.now >= before && listing.now <= after,
+            "list_all's `now` ({}) must fall between this test's own before/after readings \
+             ({before}, {after})",
+            listing.now
+        );
+    }
+
     #[tokio::test]
     async fn release_claim_returns_a_resuming_row_to_paused() {
         let pool = isolated_schema_pool_or_skip!("release_claim_returns_a_resuming_row_to_paused");

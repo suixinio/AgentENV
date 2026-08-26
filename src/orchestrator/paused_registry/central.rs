@@ -32,8 +32,9 @@ use uuid::Uuid;
 
 use super::{
     log_claim_outcome, BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox,
-    MarkRunningOutcome, PausedRegistryError, PausedRegistryState, PausedSandboxEntry,
-    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    MarkRunningOutcome, PausedRegistryError, PausedRegistryListing, PausedRegistryState,
+    PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
+    ResumeClaim,
 };
 use crate::orchestrator::store::SandboxMetadata;
 use crate::proto::scheduler as pb;
@@ -941,6 +942,39 @@ impl PausedSandboxRegistry for CentralPausedSandboxRegistry {
             .await?;
 
         Ok(response.removed)
+    }
+
+    /// Deliberately refuses rather than dialing anything.
+    ///
+    /// This backend's whole surface (this module's own doc: "five methods
+    /// for the thirteen") is the narrow `scheduler.v1.PausedRegistry`
+    /// service — `begin_pause`/`get`/... above all go there.
+    /// `ListRegistrySandboxes` is not one of the five: it lives on
+    /// `scheduler.v1.Scheduler`, the service the real scheduler's own
+    /// `internal/service.go` answers it from directly, and this backend has
+    /// no channel open to that service at all (`self.client()` dials
+    /// `PausedRegistryClient`, never `SchedulerClient`) -- so proxying this
+    /// call would mean opening a second connection this backend has never
+    /// needed for anything else, to reach a request the caller could have
+    /// dialled the scheduler for directly.
+    ///
+    /// And in practice it never has to: a deployment running
+    /// `paused_registry.backend = "central"` is the phase-4 rollback
+    /// configuration, and on that configuration the gateway's own
+    /// `ListRegistrySandboxes` client (`services/gateway/internal/registry_list.go`)
+    /// is still pointed at the real scheduler, not at this process's api
+    /// surface (`deploy/k8s/kustomization.yaml`) -- so this method exists to
+    /// satisfy the trait, not to be reached by that request path.
+    async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
+        Err(PausedRegistryError::backend(
+            "list_all",
+            anyhow!(
+                "the central paused-registry backend does not serve ListRegistrySandboxes -- \
+                 it dials only the narrow PausedRegistry service, never Scheduler, and a \
+                 central-backed deployment's gateway is routed straight to the scheduler for \
+                 this call anyway"
+            ),
+        ))
     }
 
     fn is_cluster_backed(&self) -> bool {
@@ -2654,5 +2688,25 @@ mod tests {
     #[tokio::test]
     async fn the_central_registry_is_cluster_backed() {
         assert!(harness().await.registry.is_cluster_backed());
+    }
+
+    /// `list_all` refuses without dialing anything -- `unreachable_registry`
+    /// points at a privileged, unlistened port, so a version of this method
+    /// that tried to reach the controller (rather than refusing outright)
+    /// would hang or fail with a transport error instead of returning
+    /// promptly. This backend has no channel to the `Scheduler` service
+    /// `ListRegistrySandboxes` actually lives on -- see this method's own
+    /// doc comment for why proxying it is out of scope for this backend.
+    #[tokio::test]
+    async fn list_all_refuses_without_dialing_the_controller() {
+        let err = unreachable_registry()
+            .list_all()
+            .await
+            .expect_err("central must refuse ListRegistrySandboxes rather than answer it");
+        assert!(
+            err.to_string()
+                .contains("does not serve ListRegistrySandboxes"),
+            "the refusal must name what it refuses, got: {err}"
+        );
     }
 }

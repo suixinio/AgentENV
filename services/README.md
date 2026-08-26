@@ -18,10 +18,13 @@ of `agentenv-scheduler`.
 This Go source is **kept, not deleted**, as the rollback target: everything
 below still describes real, working, tested code, and `make -C services
 test` / `test-with-postgres` still exercise it. What has changed is only
-which process answers the RPCs on a deployed cluster. The one RPC group the
-Rust side has not ported is `ListRegistrySandboxes` (`internal/registry_list.go`'s
-gateway-facing debug endpoint) — that one still needs a real scheduler
-process reachable at `gateway.scheduler_addr` to answer.
+which process answers the RPCs on a deployed cluster. `ListRegistrySandboxes`
+(`internal/registry_list.go`'s gateway-facing debug endpoint) was the last RPC
+group the Rust side had not ported; `src/node_registry/grpc_service.rs`'s
+`list_registry_sandboxes` now answers it too, against
+`PausedSandboxRegistry::list_all` (`src/orchestrator/paused_registry/mod.rs`),
+so no RPC on this contract still requires a real scheduler process reachable
+at `gateway.scheduler_addr` on the default deploy.
 
 ## Features
 

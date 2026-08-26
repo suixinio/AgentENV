@@ -24,9 +24,11 @@ resources:
   # `AENV_NODE_PLACEMENT_SOURCE=native` with
   # `AENV_PAUSED_REGISTRY_BACKEND=postgres`, and `gateway-k8s-config`'s
   # `config/gateway.json` now dials `agentenv-api:8002` instead of this
-  # Service. See CLAUDE.md's "Distributed Control Plane" section and
-  # `services/README.md` for the one gap that remains open
-  # (`ListRegistrySandboxes`, gateway-k8s-config's own comment above).
+  # Service, including `ListRegistrySandboxes` (gateway-k8s-config's own
+  # comment above) -- `src/node_registry/grpc_service.rs`'s
+  # `list_registry_sandboxes` now answers it for real, so every RPC the
+  # gateway sends this way is covered. See CLAUDE.md's "Distributed Control
+  # Plane" section and `services/README.md` for the current deploy status.
   # - scheduler-service.yaml
   # - scheduler-deployment.yaml
   # - scheduler-pdb.yaml
@@ -117,14 +119,12 @@ configMapGenerator:
       # `NodeRegistryGrpcService` implements, so pointing it at the api
       # Deployment's own gRPC listener answers `ListNodes`/
       # `ListObservedNodes`/`GetNode`/`Schedule`/`RecordAssignment`/
-      # `LookupNode` for real with no scheduler process running. The one
-      # exception is `ListRegistrySandboxes`
-      # (`services/gateway/internal/registry_list.go`): that RPC is still
-      # `Status::unimplemented` on the Rust side (Stage C's own, never
-      # ported — see `src/node_registry/grpc_service.rs`'s module doc and
-      # `list_registry_sandboxes`'s own body) and answers `Unimplemented`
-      # through this endpoint until someone ports it; every other
-      # gateway-to-scheduler RPC is covered.
+      # `LookupNode`/`ListRegistrySandboxes` for real with no scheduler
+      # process running. `ListRegistrySandboxes`
+      # (`services/gateway/internal/registry_list.go`) was the last gap --
+      # `src/node_registry/grpc_service.rs`'s `list_registry_sandboxes` now
+      # answers it against `PausedSandboxRegistry::list_all`, so every
+      # gateway-to-scheduler RPC this endpoint sends is covered.
       # `gateway.query_only_scheduler_addr` stays unset — it already falls
       # back to `scheduler_addr` when empty
       # (`services/gateway/cmd/main.go`), so there is nothing separate to

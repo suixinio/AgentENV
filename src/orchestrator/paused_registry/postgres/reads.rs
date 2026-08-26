@@ -16,11 +16,12 @@ use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::row::{decode_entry, decode_registry_row, EntryRow, RegistryRow};
+use super::row::{decode_entry, decode_list_entry, decode_registry_row, EntryRow, RegistryRow};
 use super::sql;
 use super::PostgresPausedSandboxRegistry;
 use crate::orchestrator::paused_registry::{
-    PausedRegistryError, PausedSandboxEntry, RegistryResult,
+    PausedRegistryError, PausedRegistryListEntry, PausedRegistryListing, PausedSandboxEntry,
+    RegistryResult,
 };
 use crate::types::SandboxId;
 
@@ -194,6 +195,90 @@ fn skip_bad_registry_rows(rows: Vec<EntryRow>) -> (Vec<RegistryRow>, u32) {
     (out, skipped)
 }
 
+/// `ListRegistrySandboxes`' own read -- every row in `cluster_id`, plus the
+/// database clock they were read against, in one read-only transaction.
+/// Ports Go's `PostgresReader.List` (`postgres.go:135-183`).
+///
+/// The two come from the same transaction deliberately, mirroring Go's own
+/// comment on that method: `now()` is fixed at the transaction's start
+/// regardless of isolation level, so reading it over a second round trip
+/// would risk pairing a row set against a clock reading taken at a
+/// different instant -- and every lease judgement downstream
+/// (`LeaseExpiresAtUnixMs`/`SandboxExpiresAtUnixMs` against
+/// `DatabaseNowUnixMs` on the wire) depends on that not happening. Rolled
+/// back rather than committed when it succeeds, same as Go's `defer
+/// tx.Rollback(ctx)`: read-only, so there is nothing to keep.
+///
+/// No pagination, matching [`list_registry_rows`]'s own reasoning (and
+/// Go's `PostgresReader.List` having none either): filtering and paging are
+/// `list_registry_sandboxes`'s job (`src/node_registry/grpc_service.rs`),
+/// not this read's.
+pub(super) async fn list_all(
+    registry: &PostgresPausedSandboxRegistry,
+) -> RegistryResult<PausedRegistryListing> {
+    let mut tx = registry
+        .pool
+        .begin()
+        .await
+        .map_err(|e| backend_err("list_all", e))?;
+
+    let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| backend_err("list_all", e))?;
+
+    let rows: Vec<EntryRow> = sqlx::query_as(&sql::list_all_sql())
+        .bind(registry.cluster_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| backend_err("list_all", e))?;
+
+    // Read-only: nothing to keep, so a rollback (matching Go's own
+    // `defer tx.Rollback(ctx)`) is exactly as correct as a commit here and
+    // costs nothing to prefer -- there is no write on this path to lose.
+    tx.rollback()
+        .await
+        .map_err(|e| backend_err("list_all", e))?;
+
+    let (out, skipped) = skip_bad_list_entries(rows);
+    if skipped > 0 {
+        warn!(
+            target: "agentenv",
+            skipped,
+            total = out.len() + skipped as usize,
+            "paused registry list_all: some rows were skipped rather than failing the whole listing"
+        );
+    }
+    Ok(PausedRegistryListing {
+        sandboxes: out,
+        now,
+    })
+}
+
+/// The pure skip-and-count loop [`list_all`] runs -- see [`skip_bad_entries`]'s
+/// identical shape and reasoning: one row this build cannot decode must not
+/// take an admin/debug listing of every other row down with it.
+fn skip_bad_list_entries(rows: Vec<EntryRow>) -> (Vec<PausedRegistryListEntry>, u32) {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut skipped = 0u32;
+    for row in rows {
+        let sandbox_id = row.sandbox_id.clone();
+        match decode_list_entry(row) {
+            Ok(entry) => out.push(entry),
+            Err(err) => {
+                skipped += 1;
+                warn!(
+                    target: "agentenv",
+                    sandbox_id,
+                    error = %err,
+                    "paused registry list_all: skipping a row this build cannot decode"
+                );
+            }
+        }
+    }
+    (out, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -300,5 +385,64 @@ mod tests {
         assert_eq!(skipped, 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].sandbox_id.to_string(), good_id.to_string());
+    }
+
+    /// The identical claim for [`list_all`]'s own loop -- `ListRegistrySandboxes`
+    /// is an admin/debug listing of the whole table, and one row this build
+    /// cannot decode must not blank out every other sandbox in the answer.
+    #[test]
+    fn skip_bad_list_entries_keeps_the_good_row_and_counts_the_bad_one() {
+        let cluster_id = Uuid::new_v4();
+        let good_id = Uuid::new_v4();
+        let bad_id = Uuid::new_v4();
+        let rows = vec![
+            good_row(good_id, cluster_id),
+            unreadable_row(bad_id, cluster_id),
+        ];
+
+        let (out, skipped) = skip_bad_list_entries(rows);
+        assert_eq!(skipped, 1, "exactly the one unreadable row must be skipped");
+        assert_eq!(out.len(), 1, "the good row must still be present");
+        assert_eq!(out[0].sandbox_id.to_string(), good_id.to_string());
+    }
+
+    /// A clean batch must report zero skipped -- mirrors
+    /// `skip_bad_entries_reports_nothing_skipped_when_every_row_decodes`.
+    #[test]
+    fn skip_bad_list_entries_reports_nothing_skipped_when_every_row_decodes() {
+        let cluster_id = Uuid::new_v4();
+        let rows = vec![
+            good_row(Uuid::new_v4(), cluster_id),
+            good_row(Uuid::new_v4(), cluster_id),
+        ];
+
+        let (out, skipped) = skip_bad_list_entries(rows);
+        assert_eq!(skipped, 0);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// [`decode_list_entry`] must carry the lease/execution-id columns
+    /// [`decode_entry`] leaves out -- the whole reason this listing exists
+    /// as its own decode rather than reusing that one. A row with every one
+    /// of those columns populated must come back with all of them, not
+    /// silently dropped the way the trait-facing `PausedSandboxEntry` drops
+    /// them.
+    #[test]
+    fn decode_list_entry_carries_the_lease_and_execution_columns() {
+        let cluster_id = Uuid::new_v4();
+        let sandbox_id = Uuid::new_v4();
+        let mut row = good_row(sandbox_id, cluster_id);
+        let lease_expires_at = Utc::now();
+        let sandbox_expires_at = Utc::now();
+        let execution_id = ExecutionId::new();
+        row.lease_expires_at = Some(lease_expires_at);
+        row.sandbox_expires_at = Some(sandbox_expires_at);
+        row.execution_id = Some(execution_id.to_string());
+
+        let entry = decode_list_entry(row).expect("a well-formed row must decode");
+        assert_eq!(entry.lease_expires_at, Some(lease_expires_at));
+        assert_eq!(entry.sandbox_expires_at, Some(sandbox_expires_at));
+        assert_eq!(entry.execution_id, Some(execution_id));
+        assert_eq!(entry.holder(), "node-a", "Holder() must be origin_node_id");
     }
 }

@@ -182,6 +182,19 @@ func TestNoObjectStorageCredentialIsCommittedToTheRepository(t *testing.T) {
 // commented-out example (`# dsn = "postgres://user:password@host:5432/dbname"`)
 // and that line is this test's negative control, the same way
 // `# access_key_id` is the object-storage scan's.
+//
+// 🔴 The scan checks every section's `dsn` key, not only `assignments["pg"]`.
+// `deploy/k8s/base/config/pg-overlay.toml` documents `[pg]` as a *fully
+// commented* block, header included — unlike `[backend.oss]` in
+// `config/default.toml`, whose header is live and only the example
+// assignments are commented. The most likely hand-edit of that file is
+// uncommenting the `dsn = "..."` line alone and leaving `# [pg]` on the line
+// above it untouched: `tomlAssignments` then has no live section to file the
+// assignment under (the header is still a comment), so it lands under
+// whichever section — commonly the empty one — was open before the comment
+// block. A scan that only ever looks at `assignments["pg"]["dsn"]` never sees
+// that: the credential sails through under a `dsn` key it simply never
+// checks.
 func TestNoPgDsnIsCommittedToTheRepository(t *testing.T) {
 	// 🔴 The non-empty half, ahead of the scan — see the identical note on
 	// TestNoObjectStorageCredentialIsCommittedToTheRepository for why this
@@ -192,6 +205,28 @@ func TestNoPgDsnIsCommittedToTheRepository(t *testing.T) {
 	}, "\n"))
 	if got := planted["pg"]["dsn"]; got != "postgres://aenv:SOMETHINGSOMETHING@host:5432/aenv" {
 		t.Fatalf("the scanner cannot see a dsn assignment it is meant to catch: got %q", got)
+	}
+
+	// 🔴 The blind-spot control: `[pg]`'s header commented out, only `dsn`
+	// uncommented — exactly the hand-edit of `pg-overlay.toml` described
+	// above. The assignment must still be visible *somewhere* in the parsed
+	// sections, or the walk below (which now checks every section, not just
+	// "pg") has nothing to find either.
+	blindSpot := tomlAssignments(t, strings.Join([]string{
+		"# [pg]",
+		`dsn = "postgres://aenv:SOMETHINGSOMETHING@host:5432/aenv"`,
+	}, "\n"))
+	foundBlindSpot := false
+	for _, assignments := range blindSpot {
+		if dsn := assignments["dsn"]; dsn != "" {
+			foundBlindSpot = true
+		}
+	}
+	if !foundBlindSpot {
+		t.Fatal("the scanner cannot see a dsn assignment that lands outside the [pg] section " +
+			"because the section header itself is commented out — this is the exact shape a " +
+			"hand-edit of pg-overlay.toml produces by uncommenting only the dsn line and leaving " +
+			"\"# [pg]\" alone on the line above it")
 	}
 
 	runtimeRaw, err := os.ReadFile(runtimeConfigPath)
@@ -225,11 +260,16 @@ func TestNoPgDsnIsCommittedToTheRepository(t *testing.T) {
 			return nil
 		}
 		scanned++
-		if dsn, found := tomlAssignments(t, string(raw))["pg"]["dsn"]; found && dsn != "" {
-			t.Errorf("%s carries a committed credential: [pg].dsn. Credentials belong in the "+
-				"`agentenv-postgres` Secret, reaching the process as the overlay file "+
-				"AENV_CONFIG_OVERLAY_PATH names — never in a file this repository tracks, and "+
-				"never in the ConfigMap run.sh generates from one.", path)
+		// 🔴 Every section, not just "pg" — see the func doc above for why a
+		// `dsn` that landed outside a live `[pg]` header still has to be
+		// caught.
+		for section, assignments := range tomlAssignments(t, string(raw)) {
+			if dsn, found := assignments["dsn"]; found && dsn != "" {
+				t.Errorf("%s carries a committed credential: [%s].dsn. Credentials belong in the "+
+					"`agentenv-postgres` Secret, reaching the process as the overlay file "+
+					"AENV_CONFIG_OVERLAY_PATH names — never in a file this repository tracks, and "+
+					"never in the ConfigMap run.sh generates from one.", path, section)
+			}
 		}
 		return nil
 	}
@@ -694,6 +734,191 @@ func TestNoSingleLostSwitchLandsTheClusterOnPosixFs(t *testing.T) {
 			t.Errorf("the tracked overlay carries %s. The credentials come from the "+
 				"rustfs-credentials Secret and from nowhere else; the deep merge exists so that "+
 				"this file does not have to hold them.", credential)
+		}
+	}
+}
+
+// 🔴 Order, not membership.
+//
+// TestEveryWorkloadReadingTheBackendMountsTheOverlaysItNames's superset check
+// (its final block, comparing apiChain against shared) uses a
+// `map[string]bool`, which cannot see order at all. Writing
+// AENV_API_CONFIG_OVERLAY_PATH's four segments as
+// "...backend-oss.toml:...oss-overlay.toml:...pg-dsn.toml:...pg-overlay.toml"
+// — both tracked-then-secret pairs reversed — passes that superset check and
+// every other assertion in this file (each segment still exists, is still
+// mounted, is still a superset of the shared chain), while silently
+// reversing precedence: kustomization.yaml's own comment on
+// `config/oss-overlay.toml` and on `config/pg-overlay.toml` both say the
+// Secret-backed file is "listed last so it wins where they overlap" — with
+// the pair reversed the credential-free tracked file would win instead, and
+// the Secret's endpoint/dsn would be silently discarded by the merge.
+func TestApiOverlayChainListsEachSecretFileAfterItsTrackedFile(t *testing.T) {
+	chain := overlayPathsFromManifestsFor(t, apiConfigOverlayLiteral)
+	if len(chain) == 0 {
+		t.Fatal("no manifest sets " + apiConfigOverlayLiteral + ", so its ordering cannot be checked")
+	}
+
+	indexOfSuffix := func(suffix string) int {
+		for i, seg := range chain {
+			if strings.HasSuffix(seg, suffix) {
+				return i
+			}
+		}
+		t.Fatalf("the api overlay chain %v names no segment ending in %q", chain, suffix)
+		return -1
+	}
+
+	ossTracked := indexOfSuffix("oss-overlay.toml")
+	ossSecret := indexOfSuffix("backend-oss.toml")
+	pgTracked := indexOfSuffix("pg-overlay.toml")
+	pgSecret := indexOfSuffix("pg-dsn.toml")
+
+	if ossSecret < ossTracked {
+		t.Errorf("backend-oss.toml (position %d) is listed before oss-overlay.toml (position %d) "+
+			"in %v: the credential-free tracked file would win over the Secret in the deep merge, "+
+			"silently discarding whatever endpoint/bucket/credentials the Secret carries",
+			ossSecret, ossTracked, chain)
+	}
+	if pgSecret < pgTracked {
+		t.Errorf("pg-dsn.toml (position %d) is listed before pg-overlay.toml (position %d) in %v: "+
+			"the tracked file would win over the Secret's dsn in the deep merge, and [pg] would "+
+			"never see a connection string", pgSecret, pgTracked, chain)
+	}
+}
+
+// envNameForConfigMapKey returns the `name:` of the env entry whose
+// `configMapKeyRef.key` is exactly `targetKey`, or "" if no entry reads that
+// key. Scanned rather than parsed, like the rest of this file: a `- name:`
+// line (the dash marks a new env-list entry) sets the current entry's own
+// name, and everything after it up to the next `- name:` line — including
+// the nested `configMapKeyRef.name`, which is a ConfigMap name, not an env
+// var name — belongs to that entry.
+func envNameForConfigMapKey(manifest, targetKey string) string {
+	current := ""
+	for _, line := range strings.Split(manifest, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- name: ") {
+			current = strings.TrimSpace(strings.TrimPrefix(trimmed, "- name: "))
+			continue
+		}
+		if trimmed == "key: "+targetKey {
+			return current
+		}
+	}
+	return ""
+}
+
+// 🔴 The `name:`/`key:` pairing, not just the key's presence.
+//
+// TestEveryWorkloadReadingTheBackendMountsTheOverlaysItNames only checks that
+// `"key: "+literalKey+"\n"` appears somewhere in the manifest — it never
+// checks which env var's `name:` that `key:` sits under. `src/cfg.rs` reads
+// `AENV_CONFIG_OVERLAY_PATH` and nothing else; both workloads' ConfigMap keys
+// (the shared `AENV_CONFIG_OVERLAY_PATH` key and api's own
+// `AENV_API_CONFIG_OVERLAY_PATH` key, chosen precisely so a plain ConfigMap
+// value could carry api's longer, four-segment list without the DaemonSet
+// ever seeing it — see kustomization.yaml's own note on
+// `AENV_API_CONFIG_OVERLAY_PATH` under snapshot-storage-config) must both be
+// projected into an env var whose own `name:` is the literal
+// `AENV_CONFIG_OVERLAY_PATH`. A rename of the *env var's* `name:` alone (the
+// ConfigMap key left untouched) passes every existing check in this file —
+// the key is still there, the file is still mounted — while the workload
+// silently stops reading any overlay at all: no `[backend.oss]`, and for
+// agentenv-api-deployment.yaml, no `[pg]` either.
+func TestConfigOverlayEnvNameMatchesWhatTheProcessReads(t *testing.T) {
+	// 🔴 The non-empty half: prove the helper can tell two entries in the
+	// same block apart before trusting its verdict on the real manifests.
+	probe := strings.Join([]string{
+		"        env:",
+		"          - name: SOME_OTHER_VAR",
+		"            valueFrom:",
+		"              configMapKeyRef:",
+		"                name: some-config",
+		"                key: SOME_OTHER_KEY",
+		"          - name: AENV_CONFIG_OVERLAY_PATH",
+		"            valueFrom:",
+		"              configMapKeyRef:",
+		"                name: snapshot-storage-config",
+		"                key: AENV_API_CONFIG_OVERLAY_PATH",
+	}, "\n")
+	if got := envNameForConfigMapKey(probe, "AENV_API_CONFIG_OVERLAY_PATH"); got != "AENV_CONFIG_OVERLAY_PATH" {
+		t.Fatalf("envNameForConfigMapKey misreads a planted two-entry block: got %q, want "+
+			"\"AENV_CONFIG_OVERLAY_PATH\" — its verdict on the real manifests means nothing until "+
+			"it reads this correctly", got)
+	}
+	if got := envNameForConfigMapKey(probe, "SOME_OTHER_KEY"); got != "SOME_OTHER_VAR" {
+		t.Fatalf("envNameForConfigMapKey misreads the first entry in a planted two-entry block: "+
+			"got %q, want \"SOME_OTHER_VAR\"", got)
+	}
+	if got := envNameForConfigMapKey(probe, "no-such-key"); got != "" {
+		t.Fatalf("envNameForConfigMapKey found a name for a key that is not in the block: %q", got)
+	}
+
+	for _, workload := range []struct {
+		manifest string
+		key      string
+	}{
+		{"agentenv-api-deployment.yaml", "AENV_API_CONFIG_OVERLAY_PATH"},
+		{"agentenv-daemonset.yaml", "AENV_CONFIG_OVERLAY_PATH"},
+	} {
+		raw, err := os.ReadFile(filepath.Join(manifestDir, workload.manifest))
+		if err != nil {
+			t.Fatalf("reading %s failed: %v", workload.manifest, err)
+		}
+		got := envNameForConfigMapKey(string(raw), workload.key)
+		if got != "AENV_CONFIG_OVERLAY_PATH" {
+			t.Errorf("%s: the env entry reading ConfigMap key %s is named %q, want "+
+				"\"AENV_CONFIG_OVERLAY_PATH\" — that is the exact variable name src/cfg.rs reads; "+
+				"anything else and this workload silently stops seeing any overlay file at all",
+				workload.manifest, workload.key, got)
+		}
+	}
+}
+
+// 🔴 `--role node` must never hold `[pg]` — `ServerRole::check_pg_dsn`
+// refuses startup outright the moment `[pg].dsn` is configured at all, which
+// on a DaemonSet means every node Pod in the fleet CrashLoops at once, not
+// just the one workload that made the mistake.
+//
+// Nothing in this file asserted that before: the generic overlay/mount tests
+// above are satisfied as long as whatever AENV_CONFIG_OVERLAY_PATH names is
+// actually mounted, and would stay green even if `[pg]`'s two files were
+// appended to the *shared* ConfigMap key and agentenv-daemonset.yaml grew the
+// matching volume mounts to go with them — every existing assertion in this
+// file passes on that tree, and every node in the fleet fails to start.
+func TestDaemonSetNeverReadsPg(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(manifestDir, "agentenv-daemonset.yaml"))
+	if err != nil {
+		t.Fatalf("reading agentenv-daemonset.yaml failed: %v", err)
+	}
+	manifest := string(raw)
+
+	for _, forbidden := range []string{
+		"pg-overlay.toml",
+		"pg-dsn.toml",
+		"pg-credentials",
+		"[pg]",
+		"AENV_API_CONFIG_OVERLAY_PATH",
+	} {
+		if strings.Contains(manifest, forbidden) {
+			t.Errorf("agentenv-daemonset.yaml mentions %q. --role node must never hold [pg]: "+
+				"ServerRole::check_pg_dsn refuses startup outright the moment [pg].dsn is "+
+				"configured, which on a DaemonSet CrashLoops every node Pod in the fleet at once.",
+				forbidden)
+		}
+	}
+
+	// 🔴 Belt and suspenders: even if a future rename stops literally saying
+	// "pg" in agentenv-daemonset.yaml's own text, the *resolved* overlay
+	// chain it reads (the shared AENV_CONFIG_OVERLAY_PATH key, read from
+	// kustomization.yaml's configMapGenerator) must not carry a pg segment
+	// either — this is what would actually reach the process at runtime.
+	for _, seg := range overlayPathsFromManifests(t) {
+		if strings.Contains(strings.ToLower(seg), "pg") {
+			t.Errorf("the shared AENV_CONFIG_OVERLAY_PATH chain %v names %q, which --role node "+
+				"(agentenv-daemonset.yaml) also reads — that chain must never carry a pg segment",
+				overlayPathsFromManifests(t), seg)
 		}
 	}
 }

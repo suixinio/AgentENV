@@ -413,6 +413,25 @@ spec:
               value: "redis"
             - name: AENV_BINDING_STORE_REDIS_URL
               value: redis://agentenv-redis:6379
+            # The shared-roster fix: this Deployment's `replicas: 2` means a
+            # node's gRPC heartbeat (a long-lived HTTP/2 stream through the
+            # agentenv-api Service) is pinned to exactly one replica for its
+            # whole life, so the in-memory default (`AtomicNodeRegistry`'s
+            # `Inner.observed`) would leave each replica seeing only the
+            # nodes whose heartbeat happens to land on it — this is what
+            # `gateway`'s own `/nodes` split in half under two replicas.
+            # `wire_shared_node_observed_store` (`src/bin/server.rs`) now
+            # refuses to start under `node_placement_source = "native"` on
+            # the in-memory default, the same discipline
+            # `AENV_BINDING_STORE_BACKEND`'s own comment above describes.
+            # The same Redis, a namespace of its own
+            # (`agentenv:node-registry`, not `agentenv:scheduler:bindings`
+            # or `agentenv:api`) — do not rename it here; nothing else knows
+            # to follow.
+            - name: AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND
+              value: "redis"
+            - name: AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_URL
+              value: redis://agentenv-redis:6379
             # The same namespace/Service/port/scheme
             # `deploy/k8s/base/config/scheduler.json`'s
             # `scheduler.discovery.kubernetes` already discovers nodes from

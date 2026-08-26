@@ -153,12 +153,13 @@ test-unit:
 #     silently skipped 152 tests and reported ok, and two of them were the only
 #     tests that would have caught a `KEEPTTL` being dropped.
 #
-# Covers both Redis-backed suites in this crate: orchestrator::store (api's
-# own sandbox-metadata store) and binding_store::redis (the routing/binding
+# Covers every Redis-backed suite in this crate: orchestrator::store (api's
+# own sandbox-metadata store), binding_store::redis (the routing/binding
 # store, task's own "D3" -- see that module's own KEEPTTL fix, the same
-# defect class this target exists to keep catching). A filter naming only
-# one of the two would let the newer suite silently skip the same way the
-# incident above did for the first one.
+# defect class this target exists to keep catching), and node_registry::redis
+# (the shared-roster fix's cross-replica observed-state store). A filter
+# naming only some of these would let a newer suite silently skip the same
+# way the incident above did for the first one.
 REDIS_TEST_LOG ?= target/redis-store-tests.log
 
 test-with-redis:
@@ -168,7 +169,7 @@ test-with-redis:
 	  exit 1; }
 	@mkdir -p $(dir $(REDIS_TEST_LOG))
 	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p agentenv --lib -- --nocapture \
-	  orchestrator::store:: binding_store::redis:: \
+	  orchestrator::store:: binding_store::redis:: node_registry::redis:: \
 	  > $(REDIS_TEST_LOG) 2>&1; status=$$?; \
 	  cat $(REDIS_TEST_LOG); \
 	  if grep -q 'SKIPPED\[redis\]' $(REDIS_TEST_LOG); then \

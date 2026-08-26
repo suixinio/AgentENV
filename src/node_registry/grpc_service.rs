@@ -28,13 +28,17 @@
 //! `record_assignment`/`record_p2p_artifact`/`forget_p2p_artifact`/
 //! `lookup_p2p_artifact` **are** implemented (task's own "D3"/"D4" — see
 //! below), each gated the same way `report_sandbox_event` is.
-//! `list_p2p_peers` stays on the scheduler permanently
+//! `list_p2p_peers` was deliberately left `unimplemented` by Stage A
 //! (`_sd-phase4-stageA-node-inventory.md` §7 risk 3 — explicitly not to be
-//! "helpfully" ported alongside Stage A, and this file's own test proves it
-//! still refuses); `list_registry_sandboxes` is Stage C's. Every one of
-//! those returns `Status::unimplemented` naming which Stage owns it, rather
-//! than silently accepting and doing nothing — a caller that dials the
-//! wrong half of this split by mistake gets an answer that says so.
+//! "helpfully" ported alongside the rest of Stage A) with a comment that
+//! called that "permanent." It was not: `AtomicNodeRegistry` already carries
+//! the method (`list_p2p_peers`, `src/node_registry/registry.rs`) with its
+//! own test coverage, and the only work Stage A skipped was wiring this one
+//! RPC body to it — now done, the same shape as `list_nodes` just above.
+//! `list_registry_sandboxes` is still Stage C's and stays `unimplemented`
+//! here, naming which Stage owns it rather than silently accepting and doing
+//! nothing — a caller that dials the wrong half of this split by mistake
+//! gets an answer that says so.
 //!
 //! `schedule`/`lookup_node` (Stage D's remainder) **are** now implemented
 //! too, against [`crate::binding_store::lookup`]'s pure port of
@@ -899,21 +903,31 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ReportSandboxEventResponse {}))
     }
 
-    // ── `list_p2p_peers` right below, and `list_registry_sandboxes` further
-    // down, belong to another Stage permanently and always refuse -- see
-    // each one's own doc comment for which Stage and why. Everything else
-    // from here on (the P2P artifact RPCs) is Stage D's own, gated behind
-    // whichever builder wires its dependency, the same as every RPC above
-    // this line.
+    // ── `list_p2p_peers` right below now answers for real (see the module
+    // doc's correction above); `list_registry_sandboxes` further down is
+    // still Stage C's and always refuses -- see its own doc comment.
+    // Everything else from here on (the P2P artifact RPCs) is Stage D's own,
+    // gated behind whichever builder wires its dependency, the same as every
+    // RPC above this line.
 
+    /// Ports `service.go:728-734` — `s.nodes.ListP2pPeers(...)`, direct
+    /// proto translation, no side effects. See
+    /// [`NodeRegistry::list_p2p_peers`] for the filtering (ready peers,
+    /// matching backend, TTL-derived liveness) it delegates to; this method
+    /// exists only to unwrap the request and re-wrap the response, the same
+    /// shape as [`Self::list_nodes`] just above.
     async fn list_p2p_peers(
         &self,
-        _request: Request<ListP2pPeersRequest>,
+        request: Request<ListP2pPeersRequest>,
     ) -> Result<Response<ListP2pPeersResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "ListP2pPeers stays on the scheduler with the rest of the P2P discovery group \
-             (Stage A explicitly does not split this RPC group): {NOT_STAGE_A}"
-        )))
+        let req = request.into_inner();
+        let peers = self.registry.list_p2p_peers(
+            &req.cluster_id,
+            &req.backend,
+            &req.exclude_node_id,
+            SystemTime::now(),
+        );
+        Ok(Response::new(ListP2pPeersResponse { peers }))
     }
 
     /// Ports `RecordP2pArtifact` (`service.go:739-760`, task's own "D4"):
@@ -1670,25 +1684,69 @@ mod tests {
         );
     }
 
-    /// The one RPC this Stage never owns refuses with `Unimplemented` rather
-    /// than a stub success — a caller that dialled it by mistake gets told
-    /// so instead of silently getting nothing done. `Schedule`/`LookupNode`
-    /// used to be asserted here too; `Schedule` now answers for real even
-    /// against this bare (no binding store, no paused registry) service --
-    /// see `schedule_places_a_node_with_no_binding_store_wired` -- and
-    /// `LookupNode`'s own `Unimplemented` case (binding store still
-    /// unwired) has its own test,
-    /// `lookup_node_without_a_binding_store_is_unimplemented`, mirroring
-    /// `report_sandbox_event_without_a_binding_store_is_unimplemented`.
+    /// E2 (task's own label): `ListP2pPeers` now answers for real, end to
+    /// end through the actual gRPC service rather than through
+    /// `AtomicNodeRegistry::list_p2p_peers` directly (already covered in
+    /// `super::super::registry`'s own tests,
+    /// `list_p2p_peers_returns_only_ready_matching_peers` /
+    /// `list_p2p_peers_drops_expired_and_unregistered_nodes`). Three nodes
+    /// heartbeat as ready P2P peers, one under a different backend and one
+    /// excluded by id, and the response must reflect both filters — a
+    /// mutant that dropped either filter (e.g. ignored `backend` or
+    /// `exclude_node_id`, or returned every discovered node regardless of
+    /// whether it ever heartbeated) would still pass a test that only
+    /// checked "the RPC no longer errors."
     #[tokio::test]
-    async fn list_p2p_peers_stays_on_the_scheduler_permanently() {
-        let (_registry, mut client, _stop) = service_on_a_socket(vec![]).await;
+    async fn list_p2p_peers_answers_from_the_registry() {
+        let (_registry, mut client, _stop) = service_on_a_socket(vec![
+            node("node-a", "http://10.0.0.1:8000"),
+            node("node-b", "http://10.0.0.2:8000"),
+            node("node-c", "http://10.0.0.3:8000"),
+        ])
+        .await;
 
-        let status = client
-            .list_p2p_peers(ListP2pPeersRequest::default())
+        client
+            .heartbeat(heartbeat_as_a_ready_p2p_peer("node-a"))
             .await
-            .expect_err("ListP2pPeers stays on the scheduler");
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
+            .expect("node-a heartbeats in");
+        client
+            .heartbeat(heartbeat_as_a_ready_p2p_peer("node-b"))
+            .await
+            .expect("node-b heartbeats in");
+        // node-c heartbeats under a different P2P backend, and must not show
+        // up in an "iroh" lookup.
+        let mut other_backend = heartbeat_as_a_ready_p2p_peer("node-c");
+        other_backend.p2p_endpoint = Some(crate::proto::scheduler::P2pEndpoint {
+            backend: "smb".to_string(),
+            address: "node-c-smb-address".to_string(),
+        });
+        client
+            .heartbeat(other_backend)
+            .await
+            .expect("node-c heartbeats in under a different backend");
+
+        let response = client
+            .list_p2p_peers(ListP2pPeersRequest {
+                cluster_id: "cluster-a".to_string(),
+                backend: "iroh".to_string(),
+                exclude_node_id: "node-a".to_string(),
+            })
+            .await
+            .expect("list_p2p_peers answers")
+            .into_inner();
+
+        assert_eq!(
+            response.peers,
+            vec![crate::proto::scheduler::P2pPeer {
+                node_id: "node-b".to_string(),
+                endpoint: Some(crate::proto::scheduler::P2pEndpoint {
+                    backend: "iroh".to_string(),
+                    address: "node-b-p2p-address".to_string(),
+                }),
+            }],
+            "must exclude node-a (excluded by id), node-c (different backend), and never \
+             invent a peer for a node that has not heartbeated"
+        );
     }
 
     // ---- heartbeat/unregister_node's ReconcileNode wiring: task's own "D3" ----

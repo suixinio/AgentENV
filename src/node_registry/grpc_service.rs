@@ -26,44 +26,50 @@
 //! # What is deliberately `unimplemented`
 //!
 //! `schedule`/`lookup_node`/`record_assignment` need the binding store
-//! (Stage D); `list_p2p_peers`/`record_p2p_artifact`/`forget_p2p_artifact`/
+//! (Stage D, still pending in this file — see below);
+//! `list_p2p_peers`/`record_p2p_artifact`/`forget_p2p_artifact`/
 //! `lookup_p2p_artifact` are the P2P discovery group
 //! (`_sd-phase4-stageA-node-inventory.md` §7 risk 3 — explicitly not to be
-//! "helpfully" ported alongside Stage A);
-//! `report_sandbox_event`/`list_registry_sandboxes` are Stage C/D. Every one
-//! of those returns `Status::unimplemented` naming which Stage owns it,
-//! rather than silently accepting and doing nothing — a caller that dials
-//! the wrong half of this split by mistake gets an answer that says so.
+//! "helpfully" ported alongside Stage A, `list_p2p_peers` stays on the
+//! scheduler permanently, the artifact-index RPCs are still pending here);
+//! `list_registry_sandboxes` is Stage C's. Every one of those returns
+//! `Status::unimplemented` naming which Stage owns it, rather than silently
+//! accepting and doing nothing — a caller that dials the wrong half of this
+//! split by mistake gets an answer that says so.
 //!
-//! # 🔴 What `Heartbeat`/`UnregisterNode` deliberately do *not* do (task's
-//! own "D2"/"D6" — `_sd-phase4-stageA-node-inventory.md` §7 risk 1, §10)
+//! `report_sandbox_event` (task's own "D1") **is** implemented here now: it
+//! ports `applyProjectionDelete` (`service.go:602-643`) against
+//! [`crate::binding_store::BindingStore`], wired in via
+//! [`NodeRegistryGrpcService::with_binding_store`]. Every default path that
+//! does not call that builder method (every test that only calls `new`, and
+//! `src/bin/server.rs`'s real wiring until the config/assembly commit that
+//! follows this one) keeps answering `Unimplemented`, unchanged.
+//!
+//! # 🔴 What `Heartbeat`/`UnregisterNode` still do *not* do (task's own
+//! "D3"/"D6" — `_sd-phase4-stageA-node-inventory.md` §7 risk 1, §10)
 //!
 //! The real Go `Heartbeat` calls `s.store.ReconcileNode(node, roster, now)`
 //! right after `s.nodes.Heartbeat(...)` succeeds, and `UnregisterNode` calls
 //! the same `ReconcileNode` plus `s.artifacts.ForgetNode(nodeID)` after
-//! `UnregisterObserved`. Both are `BindingStore`/`ArtifactStore` methods —
-//! Stage D's, not Stage A's — and this file does not call any equivalent.
-//! This is not an oversight to "helpfully" fix: doing so here would give
-//! Stage A's heartbeat receiver routing-write side effects the design
-//! documents (and the task's own instructions) explicitly reserve for
-//! Stage D, on top of a binding store this half does not hold a handle to
-//! at all.
+//! `UnregisterObserved`. This file does not call either equivalent yet —
+//! that wiring, plus the `ArtifactStore`-backed P2P RPCs above, is the next
+//! commit, once `with_binding_store` has a real caller to also thread
+//! through an `ArtifactStore` handle.
 //!
-//! One consequence carries over unmodified from the real scheduler and is
-//! **not** patched here, on the same "port faithfully, do not improve known
-//! warts in this change" instruction: `errors.Is(err, ErrNodeNotInRegistry)`
-//! makes the real `Heartbeat` `return` before `ReconcileNode` ever runs, so a
-//! node whose Pod is not yet `Serving` in discovery gets no binding refresh
-//! from that heartbeat. Since this file never calls a `ReconcileNode`
-//! equivalent regardless of outcome, the race is structurally still there —
-//! ported here as "nothing routing-related happens on this path", the same
-//! shape the real scheduler produces for the same input.
+//! The heartbeat-admission race this paragraph used to describe (a node
+//! whose Pod is not yet `Serving` in discovery gets no binding refresh from
+//! its heartbeat, `errors.Is(err, ErrNodeNotInRegistry)`) has been fixed —
+//! see `AtomicNodeRegistry::admit_pending`'s own doc comment (task's own
+//! "D2"). This file already benefits from that fix without any change of
+//! its own: `self.registry.heartbeat(&req, now)` now succeeds for a pending
+//! node the same way it does for an active one.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tonic::{Request, Response, Status};
 
+use crate::binding_store::{BindingDeleteOutcome, BindingStore};
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
     self, ForgetP2pArtifactRequest, ForgetP2pArtifactResponse, GetNodeRequest, GetNodeResponse,
@@ -72,8 +78,9 @@ use crate::proto::scheduler::{
     ListRegistrySandboxesRequest, ListRegistrySandboxesResponse, LookupNodeRequest,
     LookupNodeResponse, LookupP2pArtifactRequest, LookupP2pArtifactResponse,
     RecordAssignmentRequest, RecordAssignmentResponse, RecordP2pArtifactRequest,
-    RecordP2pArtifactResponse, ReportSandboxEventRequest, ReportSandboxEventResponse,
-    ScheduleRequest, ScheduleResponse, UnregisterNodeRequest, UnregisterNodeResponse,
+    RecordP2pArtifactResponse, ReportSandboxEventRequest, ReportSandboxEventResponse, SandboxEvent,
+    SandboxEventType, ScheduleRequest, ScheduleResponse, UnregisterNodeRequest,
+    UnregisterNodeResponse,
 };
 
 use super::registry::{
@@ -95,11 +102,123 @@ const NOT_STAGE_A: &str = "not served by api's Stage A node-registry service —
 pub struct NodeRegistryGrpcService {
     registry: Arc<AtomicNodeRegistry>,
     warmup: Arc<WarmupGate>,
+    /// Task's own "D1"/"D3": `None` until `with_binding_store` wires one in
+    /// -- every default path that does not call it (every pre-existing
+    /// test, and `src/bin/server.rs`'s real wiring until the config/
+    /// assembly commit that follows this one) keeps `report_sandbox_event`
+    /// answering `Unimplemented`, unchanged.
+    binding_store: Option<Arc<dyn BindingStore>>,
+    /// Mirrors Go's `Service.projectionAuthoritative`
+    /// (`WithAuthoritativeProjection`). Must agree with whatever value the
+    /// binding store passed to `with_binding_store` was itself constructed
+    /// with -- the two are not the same runtime pointer, matching Go: it is
+    /// a construction-time value the process wiring passes to both, not
+    /// re-derived from one at call time.
+    projection_authoritative: bool,
+    /// Mirrors Go's `Service.maxProjectionTTL`, used by a caller this Stage
+    /// has not wired yet (`RecordAssignment`'s `resolveProjectionTTL`) --
+    /// carried here now so that wiring is additive when it lands.
+    #[allow(dead_code)]
+    max_projection_ttl: Duration,
 }
 
 impl NodeRegistryGrpcService {
     pub fn new(registry: Arc<AtomicNodeRegistry>, warmup: Arc<WarmupGate>) -> Self {
-        Self { registry, warmup }
+        Self {
+            registry,
+            warmup,
+            binding_store: None,
+            projection_authoritative: false,
+            max_projection_ttl: Duration::ZERO,
+        }
+    }
+
+    /// Task's own "D1"/"D3": wires the binding store this Stage builds.
+    /// Ports the construction-time half of Go's `WithAuthoritativeProjection`
+    /// `ServiceOption` (`service.go:166-173`) — see the struct field docs
+    /// above for why `projection_authoritative` is a separate argument
+    /// rather than read off the store.
+    #[must_use]
+    pub fn with_binding_store(
+        mut self,
+        binding_store: Arc<dyn BindingStore>,
+        projection_authoritative: bool,
+        max_projection_ttl: Duration,
+    ) -> Self {
+        self.binding_store = Some(binding_store);
+        self.projection_authoritative = projection_authoritative;
+        self.max_projection_ttl = max_projection_ttl;
+        self
+    }
+
+    /// Ports `sandboxEventTypeLabel` (`metrics.go`, used from
+    /// `applyProjectionDelete`/`ReportSandboxEvent`).
+    fn sandbox_event_type_label(event_type: SandboxEventType) -> &'static str {
+        match event_type {
+            SandboxEventType::Create => "create",
+            SandboxEventType::Delete => "delete",
+            SandboxEventType::Pause => "pause",
+            SandboxEventType::Resume => "resume",
+            SandboxEventType::Fork => "fork",
+            SandboxEventType::Unspecified => "other",
+        }
+    }
+
+    fn record_sandbox_event(event_type: &str, outcome: &str) {
+        metrics::counter!(
+            SANDBOX_EVENT_METRIC,
+            "event_type" => event_type.to_string(),
+            "outcome" => outcome.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Ports `applyProjectionDelete` (`service.go:602-643`) exactly,
+    /// including the metric outcome labels it emits at every early return.
+    /// Returns whether the delete actually removed something (`Deleted` or
+    /// `DeletedUnknownIncumbent`) — Go's own return value, currently unused
+    /// by its only caller (`ReportSandboxEvent` never inspects it either;
+    /// events are best-effort and the RPC never fails on their account) but
+    /// kept for parity and for tests to assert against directly.
+    async fn apply_projection_delete(
+        &self,
+        binding_store: &Arc<dyn BindingStore>,
+        event: &SandboxEvent,
+        now: SystemTime,
+    ) -> bool {
+        let label = Self::sandbox_event_type_label(event.event_type());
+        if !self.projection_authoritative {
+            Self::record_sandbox_event(label, "ignored_switch_off");
+            return false;
+        }
+        let sandbox_id = event.sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            Self::record_sandbox_event(label, "ignored_no_sandbox");
+            return false;
+        }
+        // 🔴 `normalize_execution_id_reason`, not `normalize_execution_id`:
+        // this is the event path, not the roster path, and must not double
+        // count a dropped value into `node_registry_roster_entry_dropped_total`
+        // — see `binding_store::record`'s own doc comment on this function.
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(&event.execution_id);
+        if execution.is_empty() {
+            Self::record_sandbox_event(label, "ignored_unknown_execution");
+            return false;
+        }
+        match binding_store.delete(sandbox_id, &execution, now).await {
+            Err(_) => {
+                Self::record_sandbox_event(label, "store_error");
+                false
+            }
+            Ok(outcome) => {
+                Self::record_sandbox_event(label, outcome.as_str());
+                matches!(
+                    outcome,
+                    BindingDeleteOutcome::Deleted | BindingDeleteOutcome::DeletedUnknownIncumbent
+                )
+            }
+        }
     }
 
     pub fn describe_metrics() {
@@ -141,6 +260,12 @@ impl NodeRegistryGrpcService {
 }
 
 const OBSERVED_NODES_METRIC: &str = "agentenv_api_node_registry_observed_nodes";
+/// Task's own "D1". Ports `agentenv_scheduler_sandbox_event_total`, renamed
+/// per this codebase's own convention for a ported scheduler metric (drop
+/// `scheduler`, use the Rust subsystem's own name — see
+/// `agentenv_scheduler_observed_nodes` -> `OBSERVED_NODES_METRIC` above for
+/// the precedent).
+const SANDBOX_EVENT_METRIC: &str = "agentenv_api_sandbox_event_total";
 
 fn node_status_label(status: scheduler::NodeStatus) -> &'static str {
     match status {
@@ -313,13 +438,41 @@ impl Scheduler for NodeRegistryGrpcService {
         )))
     }
 
+    /// Ports `service.go:576-598` (`ReportSandboxEvent`): PAUSE/DELETE
+    /// events go through the guarded `apply_projection_delete`, every other
+    /// event type is only observed (a metric, not a state change). Never
+    /// fails on an individual event's account — events are best-effort
+    /// (`src/observability/reporter.rs`'s sender drops on failure without
+    /// retrying), so an unreachable binding store degrades this to "PAUSE/
+    /// DELETE stop refreshing bindings until the next heartbeat
+    /// reconciliation," not an RPC error.
     async fn report_sandbox_event(
         &self,
-        _request: Request<ReportSandboxEventRequest>,
+        request: Request<ReportSandboxEventRequest>,
     ) -> Result<Response<ReportSandboxEventResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "ReportSandboxEvent is Stage D's projection-delete path: {NOT_STAGE_A}"
-        )))
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "ReportSandboxEvent needs a binding store, and this deployment has not wired \
+                 one in yet: {NOT_STAGE_A}"
+            )));
+        };
+        let req = request.into_inner();
+        let now = SystemTime::now();
+        for event in &req.events {
+            match event.event_type() {
+                SandboxEventType::Pause | SandboxEventType::Delete => {
+                    self.apply_projection_delete(&binding_store, event, now)
+                        .await;
+                }
+                other => {
+                    Self::record_sandbox_event(
+                        Self::sandbox_event_type_label(other),
+                        "observed_only",
+                    );
+                }
+            }
+        }
+        Ok(Response::new(ReportSandboxEventResponse {}))
     }
 
     async fn list_p2p_peers(
@@ -373,6 +526,8 @@ impl Scheduler for NodeRegistryGrpcService {
 mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    use crate::binding_store::Binding;
 
     use tokio::sync::oneshot;
     use tonic::transport::Channel;
@@ -436,6 +591,335 @@ mod tests {
             endpoint: endpoint.to_string(),
             pod_name: String::new(),
         }
+    }
+
+    // ---- report_sandbox_event: task's own "D1", parametrized over BOTH
+    //      binding store backends -- the exact RPC-layer gap the task
+    //      called out in Go's own test suite (every
+    //      `projection_service_test.go` `Service` used
+    //      `NewInMemoryBindingStore`; the Redis backend was only ever
+    //      exercised at the store layer). ----
+
+    async fn service_with_binding_store(
+        nodes: Vec<Node>,
+        binding_store: Arc<dyn BindingStore>,
+        projection_authoritative: bool,
+    ) -> (SchedulerClient<Channel>, oneshot::Sender<()>) {
+        let registry = Arc::new(AtomicNodeRegistry::new(nodes, Duration::from_secs(30)));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            SystemTime::now(),
+        ));
+        let service = NodeRegistryGrpcService::new(registry, warmup).with_binding_store(
+            binding_store,
+            projection_authoritative,
+            Duration::ZERO,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let addr: SocketAddr = listener.local_addr().expect("the bound address");
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(SchedulerServer::new(service))
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await;
+        });
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to the service");
+        (SchedulerClient::new(channel), tx)
+    }
+
+    fn sandbox_event(
+        sandbox_id: &str,
+        event_type: crate::proto::scheduler::SandboxEventType,
+        execution_id: &str,
+    ) -> crate::proto::scheduler::SandboxEvent {
+        crate::proto::scheduler::SandboxEvent {
+            sandbox_id: sandbox_id.to_string(),
+            event_type: event_type as i32,
+            execution_id: execution_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn report(
+        client: &mut SchedulerClient<Channel>,
+        events: Vec<crate::proto::scheduler::SandboxEvent>,
+    ) {
+        client
+            .report_sandbox_event(crate::proto::scheduler::ReportSandboxEventRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+                events,
+            })
+            .await
+            .expect("ReportSandboxEvent must never fail on an individual event's account");
+    }
+
+    /// The full `applyProjectionDelete` behavior matrix, run once per
+    /// backend by the two `#[tokio::test]`s below. `binding_store` is
+    /// asserted against directly (not only through the RPC) so a failure
+    /// names exactly which guard broke.
+    async fn assert_report_sandbox_event_behavior_matrix(binding_store: Arc<dyn BindingStore>) {
+        use crate::proto::scheduler::SandboxEventType;
+        const EXEC_1: &str = "00000000-0000-7000-8000-000000000001";
+        const EXEC_2: &str = "00000000-0000-7000-8000-000000000002";
+
+        // 1. Switch off: even a matching PAUSE must not delete.
+        {
+            let (mut client, _stop) = service_with_binding_store(
+                vec![],
+                Arc::clone(&binding_store),
+                /* projection_authoritative = */ false,
+            )
+            .await;
+            binding_store
+                .record(
+                    "sbx-off",
+                    Binding {
+                        node: node("node-a", "http://node-a"),
+                        execution_id: EXEC_1.to_string(),
+                        projection_ttl: Duration::ZERO,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .unwrap();
+            report(
+                &mut client,
+                vec![sandbox_event("sbx-off", SandboxEventType::Pause, EXEC_1)],
+            )
+            .await;
+            assert!(
+                binding_store.get("sbx-off", SystemTime::now()).await.unwrap().is_some(),
+                "projection_authoritative=false must leave the switch off, even for a matching event"
+            );
+        }
+
+        // 2. Switch on, matching incarnation, PAUSE: deletes.
+        {
+            let (mut client, _stop) =
+                service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
+            binding_store
+                .record(
+                    "sbx-pause",
+                    Binding {
+                        node: node("node-a", "http://node-a"),
+                        execution_id: EXEC_1.to_string(),
+                        projection_ttl: Duration::ZERO,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .unwrap();
+            report(
+                &mut client,
+                vec![sandbox_event("sbx-pause", SandboxEventType::Pause, EXEC_1)],
+            )
+            .await;
+            assert!(
+                binding_store
+                    .get("sbx-pause", SystemTime::now())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a matching PAUSE event must delete the binding"
+            );
+        }
+
+        // 3. Switch on, matching incarnation, DELETE: also deletes (not
+        //    PAUSE-only).
+        {
+            let (mut client, _stop) =
+                service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
+            binding_store
+                .record(
+                    "sbx-delete",
+                    Binding {
+                        node: node("node-a", "http://node-a"),
+                        execution_id: EXEC_1.to_string(),
+                        projection_ttl: Duration::ZERO,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .unwrap();
+            report(
+                &mut client,
+                vec![sandbox_event(
+                    "sbx-delete",
+                    SandboxEventType::Delete,
+                    EXEC_1,
+                )],
+            )
+            .await;
+            assert!(binding_store
+                .get("sbx-delete", SystemTime::now())
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        // 4. Switch on, stale incarnation: the record survives -- "the
+        //    guard is the whole point," end to end through the actual RPC.
+        {
+            let (mut client, _stop) =
+                service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
+            binding_store
+                .record(
+                    "sbx-stale",
+                    Binding {
+                        node: node("node-a", "http://node-a"),
+                        execution_id: EXEC_2.to_string(),
+                        projection_ttl: Duration::ZERO,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .unwrap();
+            report(
+                &mut client,
+                vec![sandbox_event("sbx-stale", SandboxEventType::Pause, EXEC_1)],
+            )
+            .await;
+            let binding = binding_store
+                .get("sbx-stale", SystemTime::now())
+                .await
+                .unwrap()
+                .expect("a stale event must not delete the live record");
+            assert_eq!(binding.execution_id, EXEC_2);
+        }
+
+        // 5. Switch on, empty execution id (an old reporter): ignored, not
+        //    an unguarded delete.
+        {
+            let (mut client, _stop) =
+                service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
+            binding_store
+                .record(
+                    "sbx-unnamed",
+                    Binding {
+                        node: node("node-a", "http://node-a"),
+                        execution_id: EXEC_1.to_string(),
+                        projection_ttl: Duration::ZERO,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .unwrap();
+            report(
+                &mut client,
+                vec![sandbox_event("sbx-unnamed", SandboxEventType::Pause, "")],
+            )
+            .await;
+            assert!(
+                binding_store.get("sbx-unnamed", SystemTime::now()).await.unwrap().is_some(),
+                "an event with no execution id must never delete -- that would be the                  unguarded delete the guard exists to prevent"
+            );
+        }
+
+        // 6. Switch on, a non-PAUSE/DELETE type naming the same sandbox and
+        //    a matching execution id: observed only, never deletes.
+        {
+            let (mut client, _stop) =
+                service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
+            binding_store
+                .record(
+                    "sbx-create",
+                    Binding {
+                        node: node("node-a", "http://node-a"),
+                        execution_id: EXEC_1.to_string(),
+                        projection_ttl: Duration::ZERO,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .unwrap();
+            report(
+                &mut client,
+                vec![sandbox_event(
+                    "sbx-create",
+                    SandboxEventType::Create,
+                    EXEC_1,
+                )],
+            )
+            .await;
+            assert!(
+                binding_store
+                    .get("sbx-create", SystemTime::now())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "CREATE/RESUME/FORK events must never delete a binding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn report_sandbox_event_behavior_matrix_in_memory() {
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        assert_report_sandbox_event_behavior_matrix(store).await;
+    }
+
+    #[tokio::test]
+    async fn report_sandbox_event_behavior_matrix_redis() {
+        let Some(store) = crate::binding_store::redis::harness::store_for(
+            "report_sandbox_event_behavior_matrix_redis",
+            crate::binding_store::BindingStoreSettings::default(),
+            |_| {},
+        )
+        .await
+        else {
+            return;
+        };
+        let store: Arc<dyn BindingStore> = Arc::new(store);
+        assert_report_sandbox_event_behavior_matrix(store).await;
+    }
+
+    /// Before `with_binding_store` is called (every default path today),
+    /// `ReportSandboxEvent` must answer `Unimplemented`, not silently
+    /// accept and do nothing -- same discipline as every other
+    /// not-yet-wired RPC in this file.
+    #[tokio::test]
+    async fn report_sandbox_event_without_a_binding_store_is_unimplemented() {
+        let (_registry, mut client, _stop) = service_on_a_socket(vec![]).await;
+        let status = client
+            .report_sandbox_event(crate::proto::scheduler::ReportSandboxEventRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+                events: vec![sandbox_event(
+                    "sbx-1",
+                    crate::proto::scheduler::SandboxEventType::Pause,
+                    "exec-1",
+                )],
+            })
+            .await
+            .expect_err("no binding store has been wired in");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
     }
 
     fn heartbeat_with_cpu_config(node_id: &str, cpu_config_json: &str) -> HeartbeatRequest {

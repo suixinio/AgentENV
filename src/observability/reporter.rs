@@ -714,6 +714,7 @@ mod tests {
             node_service_port: 8001,
             kubernetes_discovery: Default::default(),
             native_warmup_timeout_secs: 15,
+            node_registry_store: Default::default(),
         }
     }
 

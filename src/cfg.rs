@@ -1143,6 +1143,80 @@ pub enum NodePlacementSource {
     Native,
 }
 
+/// The shared-roster fix: which backend
+/// [`crate::node_registry::registry::AtomicNodeRegistry`]'s
+/// heartbeat-derived ("observed") state — machine info, CPU config,
+/// sandbox roster, `last_seen` — is mirrored into so every `--role api`
+/// replica sees the whole cluster's roster, not just the nodes whose
+/// heartbeat happens to be pinned to it (a node's gRPC heartbeat is a
+/// long-lived HTTP/2 stream through the `agentenv-api` Service, so it
+/// sticks to one replica for its whole life). See
+/// [`crate::node_registry::redis`]'s own module doc for the full design.
+///
+/// Mirrors [`BindingStoreBackendKind`]/[`MetadataStoreBackendKind`]'s
+/// two-value shape deliberately kept as its own type rather than reused —
+/// this codebase's established choice (see [`BindingStoreConfig`]'s own doc
+/// comment) for one enum per shared-state subsystem.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRegistryObservedBackendKind {
+    /// One replica's own heartbeat shard, lost when it exits and invisible
+    /// to every other replica. Correct only for `--role all`/a single-node
+    /// deployment — `--role all` never even constructs
+    /// `AtomicNodeRegistry`'s native-placement wiring, so this default
+    /// never matters there; under `--role api` with
+    /// `[cluster].node_placement_source = "native"`, it is the exact split
+    /// roster this fix exists to close, and `wire_shared_node_observed_store`
+    /// (`src/bin/server.rs`) refuses to start on it unconditionally — the
+    /// same discipline `build_binding_store` already applies to
+    /// [`BindingStoreBackendKind::InMemory`], for the same reason: nothing
+    /// at this layer can distinguish "one replica, alone, safe" from "one
+    /// of several, silently split."
+    InMemory,
+    /// A single Redis hash (`{redis_key_prefix}:observed`, one field per
+    /// node id) every replica publishes its own heartbeats to and
+    /// periodically pulls in full — see
+    /// [`crate::node_registry::redis::SharedObservedStore`].
+    Redis,
+}
+
+/// The shared-roster fix's own tuning, nested under [`ClusterConfig`]
+/// because it only ever matters alongside
+/// [`NodePlacementSource::Native`] (`[cluster.kubernetes_discovery]`'s own
+/// sibling). Never read under [`NodePlacementSource::Scheduler`] (the
+/// default) — see [`NodePlacementSource`]'s own doc comment.
+#[derive(Debug, Config, Clone)]
+pub struct ClusterNodeRegistryStoreConfig {
+    /// See [`NodeRegistryObservedBackendKind`].
+    #[config(
+        default = "in_memory",
+        env = "AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND"
+    )]
+    pub backend: NodeRegistryObservedBackendKind,
+    /// `redis://host:port[/db]`, read only when `backend = "redis"`.
+    #[config(
+        default = "redis://127.0.0.1:6379",
+        env = "AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_URL",
+        parse_env = parse_trimmed_string
+    )]
+    pub redis_url: String,
+    /// 🔴 Deliberately its own namespace — neither
+    /// `[binding_store].redis_key_prefix`'s fixed
+    /// `agentenv:scheduler:bindings` (gateway's own read path) nor
+    /// `[orchestrator.store].redis_key_prefix`'s `agentenv:api` (the
+    /// sandbox ledger). A third independent piece of shared state gets a
+    /// third independent prefix, the same way the other two each got their
+    /// own rather than being folded together — see
+    /// `src/binding_store/mod.rs`'s own module doc for why this codebase
+    /// keeps Redis-backed subsystems apart rather than sharing plumbing.
+    #[config(
+        default = "agentenv:node-registry",
+        env = "AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_KEY_PREFIX",
+        parse_env = parse_trimmed_string
+    )]
+    pub redis_key_prefix: String,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
     /// Which backend `resolve_node` reads a known node's address from. See
@@ -1251,6 +1325,9 @@ pub struct ClusterConfig {
     /// the very first `warmed_up` call with zero heartbeats received.
     #[config(default = 15u64, env = "AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS")]
     pub native_warmup_timeout_secs: u64,
+    /// The shared-roster fix: see [`ClusterNodeRegistryStoreConfig`].
+    #[config(nested)]
+    pub node_registry_store: ClusterNodeRegistryStoreConfig,
 }
 
 /// Rust-side counterpart of Go's `SchedulerDiscoveryKubernetesConfig`
@@ -1658,6 +1735,7 @@ impl_config_default!(
     ObservabilitySchedulerReportConfig,
     ClusterConfig,
     ClusterKubernetesDiscoveryConfig,
+    ClusterNodeRegistryStoreConfig,
     NodeIdentityConfig,
     OrchestratorConfig,
     P2pConfig,
@@ -4696,6 +4774,7 @@ endpoint = "http://second:9000"
             node_service_port: 8001,
             kubernetes_discovery: Default::default(),
             native_warmup_timeout_secs: 15,
+            node_registry_store: Default::default(),
         };
         config.normalize();
         assert_eq!(config.scheduler_endpoint, None);
@@ -4709,6 +4788,7 @@ endpoint = "http://second:9000"
             node_service_port: 8001,
             kubernetes_discovery: Default::default(),
             native_warmup_timeout_secs: 15,
+            node_registry_store: Default::default(),
         };
         config.normalize();
         assert_eq!(

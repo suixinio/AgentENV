@@ -2,8 +2,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
+use agentenv::binding_store::{
+    ArbitrationMode, BindingStore, BindingStoreSettings, InMemoryBindingStore, RedisBindingStore,
+    RedisBindingStoreConfig,
+};
 use agentenv::cfg::{
-    AppConfig, MetadataStoreBackendKind, NodePlacementSource, PausedRegistryBackendKind,
+    AppConfig, BindingStoreBackendKind, BindingStoreConfig, MetadataStoreBackendKind,
+    NodePlacementSource, PausedRegistryBackendKind,
 };
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
@@ -1135,6 +1140,25 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         ),
         None => (None, None, None, Vec::new()),
     };
+    // Task's own "D3": wires the binding store into the Scheduler-compatible
+    // gRPC surface this replica serves natively. Gated the same way the
+    // service itself is — `node_registry_grpc_service` is only `Some` under
+    // `[cluster].node_placement_source = "native"` — because without that
+    // surface there is nowhere for `report_sandbox_event`/`heartbeat`/
+    // `record_assignment` to run at all.
+    let node_registry_grpc_service = match node_registry_grpc_service {
+        Some(service) => {
+            let binding_store = build_binding_store(&config.binding_store).await?;
+            let max_projection_ttl =
+                Duration::from_secs(config.binding_store.max_projection_ttl_secs);
+            Some(service.with_binding_store(
+                binding_store,
+                config.binding_store.projection_authoritative,
+                max_projection_ttl,
+            ))
+        }
+        None => None,
+    };
     let placement = cluster_placement(
         &config.cluster,
         &config.observability.scheduler_report,
@@ -1641,6 +1665,38 @@ async fn start_native_node_registry(
         grpc_service,
         tasks: vec![discovery_task, metrics_task],
     })
+}
+
+/// Task's own "D3": constructs the binding store `assemble_api` wires into
+/// `NodeRegistryGrpcService` (`with_binding_store`) under
+/// `[cluster].node_placement_source = "native"`. Mirrors
+/// `RedisMetadataStore::connect`'s own error-wrapping style — a connection
+/// failure here is a startup refusal, not a background retry, the same
+/// discipline `cluster_placement`'s own comment names for every other
+/// config-driven refusal in this function.
+async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<dyn BindingStore>> {
+    let settings = BindingStoreSettings {
+        binding_ttl: Duration::from_secs(config.binding_ttl_secs),
+        arbitration: ArbitrationMode::from_str_relaxed(&config.arbitration),
+        projection_authoritative: config.projection_authoritative,
+    };
+    match config.backend {
+        BindingStoreBackendKind::InMemory => {
+            Ok(Arc::new(InMemoryBindingStore::new(settings)) as Arc<dyn BindingStore>)
+        }
+        BindingStoreBackendKind::Redis => {
+            let redis_config = RedisBindingStoreConfig {
+                url: config.redis_url.clone(),
+                key_prefix: config.redis_key_prefix.clone(),
+                node_index_ttl: Duration::from_secs(config.redis_node_index_ttl_secs),
+                ..Default::default()
+            };
+            let store = RedisBindingStore::connect(redis_config, settings)
+                .await
+                .map_err(|err| anyhow::anyhow!("connecting the binding store to redis: {err}"))?;
+            Ok(Arc::new(store) as Arc<dyn BindingStore>)
+        }
+    }
 }
 
 /// Mirrors `services/scheduler/cmd/main.go`'s `runKubernetesDiscoveryWithRetry`:

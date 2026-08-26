@@ -193,6 +193,14 @@ pub struct AppConfig {
     pub custom_extension: CustomExtensionConfig,
     #[config(nested)]
     pub api: ApiConfig,
+    /// Task's own "D3": the routing/binding store
+    /// (`src/binding_store/`) — a top-level section, not nested under
+    /// `[orchestrator]`, because it is deliberately a different subsystem
+    /// with a different lifetime than `[orchestrator.store]` (that struct's
+    /// own doc comment on `redis_key_prefix` explains why the two Redis
+    /// key spaces must stay disjoint).
+    #[config(nested)]
+    pub binding_store: BindingStoreConfig,
 }
 
 /// The node's own HTTP API.
@@ -1416,6 +1424,91 @@ impl MetadataStoreBackendKind {
             Self::Redis => "redis",
         }
     }
+}
+
+/// Task's own "D3": which [`crate::binding_store::BindingStore`]
+/// implementation `--role api` constructs. Mirrors
+/// [`MetadataStoreBackendKind`]'s two-value shape, but the two are not
+/// interchangeable — see [`BindingStoreConfig`]'s own doc comment.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingStoreBackendKind {
+    /// A single replica's own routing table, lost when it exits. Correct
+    /// only for `--role all`/a single-node deployment — the whole point of
+    /// the Redis backend is letting gateway read bindings without asking
+    /// any particular api replica, which an in-memory table cannot do.
+    InMemory,
+    /// `services/shared/routing`'s key space
+    /// (`agentenv:scheduler:bindings:*`) — gateway's read path
+    /// (`GATEWAY_ROUTING_PROJECTION_READ=on`) already speaks to this
+    /// exact keyspace.
+    Redis,
+}
+
+/// Task's own "D3": tuning for `src/binding_store/`. A top-level TOML
+/// section (`[binding_store]`), not nested under `[orchestrator]` — see
+/// [`AppConfig::binding_store`]'s own doc comment.
+#[derive(Debug, Config, Clone)]
+pub struct BindingStoreConfig {
+    /// The default matches `--role all`/a single-node deployment; a
+    /// multi-replica `--role api` deployment must set this to `"redis"` or
+    /// every replica answers `LookupNode`/reconciles heartbeats out of its
+    /// own, mutually invisible table.
+    #[config(default = "in_memory", env = "AENV_BINDING_STORE_BACKEND")]
+    pub backend: BindingStoreBackendKind,
+    /// `redis://host:port[/db]`, read only when `backend = "redis"`.
+    #[config(
+        default = "redis://127.0.0.1:6379",
+        env = "AENV_BINDING_STORE_REDIS_URL",
+        parse_env = parse_trimmed_string
+    )]
+    pub redis_url: String,
+    /// 🔴 Deliberately the exact Go value
+    /// (`crate::binding_store::record::DEFAULT_KEY_PREFIX`) by default —
+    /// this is gateway's existing read path, not an internal choice this
+    /// deployment is free to rename without also updating gateway's own
+    /// `GATEWAY_REDIS_ADDR`-adjacent configuration.
+    #[config(
+        default = "agentenv:scheduler:bindings",
+        env = "AENV_BINDING_STORE_REDIS_KEY_PREFIX",
+        parse_env = parse_trimmed_string
+    )]
+    pub redis_key_prefix: String,
+    /// How long a node's reverse-index set lives without a refresh. Not
+    /// tied to `binding_ttl_secs` — it is reconciliation bookkeeping, not a
+    /// route (Go's `defaultRedisNodeIndexTTL`, one hour).
+    #[config(
+        default = 3600u64,
+        env = "AENV_BINDING_STORE_REDIS_NODE_INDEX_TTL_SECS"
+    )]
+    pub redis_node_index_ttl_secs: u64,
+    /// The TTL a binding gets when its writer does not supply its own
+    /// (`RecordAssignmentRequest.projection_ttl_secs <= 0`, or a roster
+    /// entry with no budget of its own).
+    #[config(default = 30u64, env = "AENV_BINDING_STORE_BINDING_TTL_SECS")]
+    pub binding_ttl_secs: u64,
+    /// `"fenced"` (the safe default), `"observe"` (compares but always
+    /// accepts, for measuring what fencing would have refused before
+    /// turning it on), or `"off"` (always accepts, records no decision —
+    /// the rollback target). Anything else is treated as `"fenced"`,
+    /// matching `crate::binding_store::ArbitrationMode::from_str_relaxed`.
+    #[config(default = "fenced", env = "AENV_BINDING_STORE_ARBITRATION")]
+    pub arbitration: String,
+    /// Mirrors Go's `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE`. Off is
+    /// the safe default (every write always re-arms a fresh deadline); on
+    /// lets a heartbeat refresh of the same incarnation keep the existing
+    /// deadline (`KEEPTTL` on the Redis backend) instead.
+    #[config(default = false, env = "AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE")]
+    pub projection_authoritative: bool,
+    /// The ceiling `RecordAssignment`'s `resolve_projection_ttl` clamps a
+    /// node-supplied budget to. `0` means no ceiling. Go's own default is
+    /// 25 hours (`defaultMaxProjectionTTL`) — one hour past a day, the
+    /// node-grace window past the longest ordinary sandbox lifetime.
+    #[config(
+        default = 90_000u64,
+        env = "AENV_BINDING_STORE_MAX_PROJECTION_TTL_SECS"
+    )]
+    pub max_projection_ttl_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -2681,6 +2774,49 @@ mod tests {
                 .backend,
             PausedRegistryBackendKind::Local,
             "the file's value must stand when the environment says nothing"
+        );
+    }
+
+    #[test]
+    fn the_binding_store_backend_is_settable_from_the_environment_and_defaults_to_in_memory() {
+        let _env = env_guard();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        assert_eq!(
+            ConfigManager::new_from_path(&workspace.join("config/default.toml"))
+                .expect("load without the override")
+                .config()
+                .binding_store
+                .backend,
+            BindingStoreBackendKind::InMemory,
+            "the safe, --role all-compatible default must stand when nothing overrides it"
+        );
+
+        std::env::set_var("AENV_BINDING_STORE_BACKEND", "redis");
+        let overridden = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
+        std::env::remove_var("AENV_BINDING_STORE_BACKEND");
+        assert_eq!(
+            overridden
+                .expect("load with backend=redis")
+                .config()
+                .binding_store
+                .backend,
+            BindingStoreBackendKind::Redis
+        );
+    }
+
+    #[test]
+    fn the_binding_store_redis_key_prefix_defaults_to_the_go_value() {
+        let _env = env_guard();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            ConfigManager::new_from_path(&workspace.join("config/default.toml"))
+                .expect("load without the override")
+                .config()
+                .binding_store
+                .redis_key_prefix,
+            "agentenv:scheduler:bindings",
+            "this is gateway's existing read path, not a name this deployment may rename freely"
         );
     }
 

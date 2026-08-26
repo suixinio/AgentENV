@@ -1524,6 +1524,15 @@ pub struct BindingStoreConfig {
     /// (`defaultBindingSweepSilence`) is 5 minutes.
     #[config(default = 300u64, env = "AENV_BINDING_STORE_SWEEP_SILENCE_SECS")]
     pub sweep_silence_secs: u64,
+    /// Task's own "D4": how many artifact keys the P2P artifact-to-node
+    /// hint index (`src/binding_store/artifact_index.rs`) holds before it
+    /// starts evicting the least-recently-touched one. Go's own default is
+    /// 1,000,000.
+    #[config(
+        default = 1_000_000u64,
+        env = "AENV_BINDING_STORE_ARTIFACT_INDEX_CAPACITY"
+    )]
+    pub artifact_index_capacity: u64,
 }
 
 #[derive(Debug, Config, Clone)]

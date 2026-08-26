@@ -27,17 +27,17 @@
 //!
 //! `schedule`/`lookup_node` need the binding store's write and the
 //! three-stage lookup ladder respectively (still pending in this file —
-//! see below); `record_assignment` **is** implemented (task's own "D3"
-//! — see below), gated the same way `report_sandbox_event` is.
-//! `list_p2p_peers`/`record_p2p_artifact`/`forget_p2p_artifact`/
-//! `lookup_p2p_artifact` are the P2P discovery group
-//! (`_sd-phase4-stageA-node-inventory.md` §7 risk 3 — explicitly not to be
-//! "helpfully" ported alongside Stage A, `list_p2p_peers` stays on the
-//! scheduler permanently, the artifact-index RPCs are still pending here);
-//! `list_registry_sandboxes` is Stage C's. Every one of those returns
-//! `Status::unimplemented` naming which Stage owns it, rather than silently
-//! accepting and doing nothing — a caller that dials the wrong half of this
-//! split by mistake gets an answer that says so.
+//! see below); `record_assignment`/`record_p2p_artifact`/
+//! `forget_p2p_artifact`/`lookup_p2p_artifact` **are** implemented (task's
+//! own "D3"/"D4" — see below), each gated the same way
+//! `report_sandbox_event` is. `list_p2p_peers` stays on the scheduler
+//! permanently (`_sd-phase4-stageA-node-inventory.md` §7 risk 3 —
+//! explicitly not to be "helpfully" ported alongside Stage A, and this
+//! file's own test proves it still refuses); `list_registry_sandboxes` is
+//! Stage C's. Every one of those returns `Status::unimplemented` naming
+//! which Stage owns it, rather than silently accepting and doing nothing —
+//! a caller that dials the wrong half of this split by mistake gets an
+//! answer that says so.
 //!
 //! `report_sandbox_event` (task's own "D1") **is** implemented here now: it
 //! ports `applyProjectionDelete` (`service.go:602-643`) against
@@ -64,11 +64,12 @@
 //! best-effort rather than fatal: by the point it runs, the node's
 //! *identity* is already unregistered, and failing the whole call over a
 //! routes-cleanup hiccup would leave a caller unsure whether to retry an
-//! unregister that already took effect. `s.artifacts.ForgetNode(nodeID)`
-//! (the `ArtifactStore`-backed P2P index) is still not called — that, plus
-//! the `RecordP2pArtifact`/`ForgetP2pArtifact`/`LookupP2pArtifact` RPCs
-//! above, is the next commit, once `with_binding_store` has a real caller
-//! to also thread an `ArtifactStore` handle through.
+//! unregister that already took effect. `ArtifactStore::forget_node`
+//! (Go's `s.artifacts.ForgetNode(nodeID)`) is now also called there,
+//! wired in via `with_artifact_store` alongside `with_binding_store` —
+//! infallible (the in-memory index has no failure mode), so there is no
+//! best-effort/fatal distinction to make for it the way there is for the
+//! binding-store cleanup next to it.
 //!
 //! The heartbeat-admission race this paragraph used to describe (a node
 //! whose Pod is not yet `Serving` in discovery gets no binding refresh from
@@ -83,6 +84,7 @@ use std::time::{Duration, SystemTime};
 
 use tonic::{Request, Response, Status};
 
+use crate::binding_store::artifact_index::ArtifactStore;
 use crate::binding_store::{BindingDeleteOutcome, BindingStore};
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
@@ -132,6 +134,11 @@ pub struct NodeRegistryGrpcService {
     /// Mirrors Go's `Service.maxProjectionTTL`, consumed by
     /// `resolve_projection_ttl` (`RecordAssignment`).
     max_projection_ttl: Duration,
+    /// Task's own "D4": `None` until `with_artifact_store` wires one in --
+    /// gates `record_p2p_artifact`/`forget_p2p_artifact`/
+    /// `lookup_p2p_artifact` the same way `binding_store` gates
+    /// `report_sandbox_event` et al.
+    artifact_store: Option<Arc<dyn ArtifactStore>>,
 }
 
 impl NodeRegistryGrpcService {
@@ -142,7 +149,17 @@ impl NodeRegistryGrpcService {
             binding_store: None,
             projection_authoritative: false,
             max_projection_ttl: Duration::ZERO,
+            artifact_store: None,
         }
+    }
+
+    /// Task's own "D4": wires the P2P artifact index. Independent of
+    /// `with_binding_store` -- a deployment could in principle wire one
+    /// without the other, though `src/bin/server.rs` wires both together.
+    #[must_use]
+    pub fn with_artifact_store(mut self, artifact_store: Arc<dyn ArtifactStore>) -> Self {
+        self.artifact_store = Some(artifact_store);
+        self
     }
 
     /// Task's own "D1"/"D3": wires the binding store this Stage builds.
@@ -177,6 +194,41 @@ impl NodeRegistryGrpcService {
             return (self.max_projection_ttl, "clamped");
         }
         (raw, "node")
+    }
+
+    /// Shared validation for the three P2P artifact RPCs: `cluster_id`/
+    /// `backend`/`key` are always required; `node_id` is required and
+    /// resolved through discovery only when the caller passes `Some`
+    /// (`LookupP2pArtifact` has no node id of its own to resolve).
+    fn validate_p2p_artifact_fields<'a>(
+        &self,
+        cluster_id: &'a str,
+        backend: &'a str,
+        key: &'a str,
+        node_id: Option<&str>,
+    ) -> Result<(&'a str, &'a str, &'a str, String), Status> {
+        let cluster_id = cluster_id.trim();
+        let backend = backend.trim();
+        let key = key.trim();
+        if cluster_id.is_empty() || backend.is_empty() || key.is_empty() {
+            return Err(Status::invalid_argument(
+                "cluster_id, backend, and key are required",
+            ));
+        }
+        let resolved_node_id = match node_id {
+            Some(raw) => {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    return Err(Status::invalid_argument("node_id is required"));
+                }
+                self.registry
+                    .resolve(raw)
+                    .map(|n| n.id)
+                    .unwrap_or_else(|| raw.to_string())
+            }
+            None => String::new(),
+        };
+        Ok((cluster_id, backend, key, resolved_node_id))
     }
 
     fn record_projection_ttl_source(source: &str) {
@@ -487,10 +539,6 @@ impl Scheduler for NodeRegistryGrpcService {
                 // effect. A stale binding this leaves behind still expires
                 // on its own TTL.
                 //
-                // 🔴 `ArtifactStore::forget_node` (Go's
-                // `s.artifacts.ForgetNode(nodeID)`) is not called here yet
-                // — the P2P artifact index this Stage also builds is a
-                // separate commit.
                 if let Some(binding_store) = &self.binding_store {
                     let node = crate::node_registry::types::Node {
                         id: canonical_id.clone(),
@@ -507,6 +555,13 @@ impl Scheduler for NodeRegistryGrpcService {
                              still owns will expire on their own TTL"
                         );
                     }
+                }
+                // Ports Go's `s.artifacts.ForgetNode(nodeID)` — drops every
+                // P2P artifact association this node held. Infallible (the
+                // in-memory index has no failure mode to report), so
+                // there is no best-effort/fatal distinction to make here.
+                if let Some(artifact_store) = &self.artifact_store {
+                    artifact_store.forget_node(&canonical_id);
                 }
                 Ok(Response::new(UnregisterNodeResponse {}))
             }
@@ -654,31 +709,82 @@ impl Scheduler for NodeRegistryGrpcService {
         )))
     }
 
+    /// Ports `RecordP2pArtifact` (`service.go:739-760`, task's own "D4"):
+    /// validates the four required fields, resolves the caller's node
+    /// identity through discovery when possible (falling back to the
+    /// supplied id verbatim otherwise -- this index is a soft accelerator,
+    /// see `artifact_index`'s own module doc, and refusing a record over an
+    /// unresolvable identity would cost more hit rate than a
+    /// slightly-stale key ever would), and records the association.
     async fn record_p2p_artifact(
         &self,
-        _request: Request<RecordP2pArtifactRequest>,
+        request: Request<RecordP2pArtifactRequest>,
     ) -> Result<Response<RecordP2pArtifactResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "RecordP2pArtifact is Stage D's ArtifactStore: {NOT_STAGE_A}"
-        )))
+        let Some(artifact_store) = self.artifact_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "RecordP2pArtifact needs an ArtifactStore, and this deployment has not wired                  one in yet: {NOT_STAGE_A}"
+            )));
+        };
+        let req = request.into_inner();
+        let (cluster_id, backend, key, node_id) = self.validate_p2p_artifact_fields(
+            &req.cluster_id,
+            &req.backend,
+            &req.key,
+            Some(&req.node_id),
+        )?;
+        artifact_store.record(cluster_id, backend, key, &node_id);
+        Ok(Response::new(RecordP2pArtifactResponse {}))
     }
 
+    /// Ports `ForgetP2pArtifact` (`service.go:762-782`).
     async fn forget_p2p_artifact(
         &self,
-        _request: Request<ForgetP2pArtifactRequest>,
+        request: Request<ForgetP2pArtifactRequest>,
     ) -> Result<Response<ForgetP2pArtifactResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "ForgetP2pArtifact is Stage D's ArtifactStore: {NOT_STAGE_A}"
-        )))
+        let Some(artifact_store) = self.artifact_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "ForgetP2pArtifact needs an ArtifactStore, and this deployment has not wired                  one in yet: {NOT_STAGE_A}"
+            )));
+        };
+        let req = request.into_inner();
+        let (cluster_id, backend, key, node_id) = self.validate_p2p_artifact_fields(
+            &req.cluster_id,
+            &req.backend,
+            &req.key,
+            Some(&req.node_id),
+        )?;
+        artifact_store.forget(cluster_id, backend, key, &node_id);
+        Ok(Response::new(ForgetP2pArtifactResponse {}))
     }
 
+    /// Ports `LookupP2pArtifact` (`service.go:784-798`): the index lookup,
+    /// then `NodeRegistry::filter_p2p_peers` to turn raw node ids into live
+    /// peer descriptors -- `artifact_index::lookup_p2p_artifact_peers`
+    /// carries both halves so the same logic is reachable from a test
+    /// without a gRPC round trip.
     async fn lookup_p2p_artifact(
         &self,
-        _request: Request<LookupP2pArtifactRequest>,
+        request: Request<LookupP2pArtifactRequest>,
     ) -> Result<Response<LookupP2pArtifactResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "LookupP2pArtifact is Stage D's ArtifactStore: {NOT_STAGE_A}"
-        )))
+        let Some(artifact_store) = self.artifact_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "LookupP2pArtifact needs an ArtifactStore, and this deployment has not wired                  one in yet: {NOT_STAGE_A}"
+            )));
+        };
+        let req = request.into_inner();
+        let (cluster_id, backend, key, _) =
+            self.validate_p2p_artifact_fields(&req.cluster_id, &req.backend, &req.key, None)?;
+        let peers = crate::binding_store::artifact_index::lookup_p2p_artifact_peers(
+            artifact_store.as_ref(),
+            self.registry.as_ref(),
+            cluster_id,
+            backend,
+            key,
+            req.exclude_node_id.trim(),
+            0,
+            SystemTime::now(),
+        );
+        Ok(Response::new(LookupP2pArtifactResponse { peers }))
     }
 
     async fn list_registry_sandboxes(
@@ -815,6 +921,54 @@ mod tests {
             .await
             .expect("connect to the service");
         (SchedulerClient::new(channel), tx)
+    }
+
+    async fn service_with_artifact_store(
+        nodes: Vec<Node>,
+        artifact_store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore>,
+    ) -> (
+        Arc<AtomicNodeRegistry>,
+        SchedulerClient<Channel>,
+        oneshot::Sender<()>,
+    ) {
+        let registry = Arc::new(AtomicNodeRegistry::new(nodes, Duration::from_secs(30)));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            SystemTime::now(),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warmup)
+            .with_artifact_store(artifact_store);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let addr: SocketAddr = listener.local_addr().expect("the bound address");
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(SchedulerServer::new(service))
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await;
+        });
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to the service");
+        (registry, SchedulerClient::new(channel), tx)
     }
 
     fn sandbox_event(
@@ -1099,6 +1253,28 @@ mod tests {
             machine_info: Some(MachineInfo {
                 cpu_config_json: cpu_config_json.to_string(),
                 ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A heartbeat that makes its node a live P2P peer:
+    /// `filter_p2p_peers_locked` requires `NodeStatus::Ready` *and* a
+    /// non-empty `P2pEndpoint`, neither of which `heartbeat_with_cpu_config`
+    /// sets (its snapshot is absent, which lands on `Connecting`, not
+    /// `Ready`).
+    fn heartbeat_as_a_ready_p2p_peer(node_id: &str) -> HeartbeatRequest {
+        HeartbeatRequest {
+            node_id: node_id.to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: format!("{node_id}-instance"),
+            snapshot: Some(crate::proto::scheduler::NodeSnapshot {
+                status: scheduler::NodeStatus::Ready as i32,
+                ..Default::default()
+            }),
+            p2p_endpoint: Some(crate::proto::scheduler::P2pEndpoint {
+                backend: "iroh".to_string(),
+                address: format!("{node_id}-p2p-address"),
             }),
             ..Default::default()
         }
@@ -1616,5 +1792,214 @@ mod tests {
             (Duration::from_secs(3600), "clamped"),
             "a raw value over the ceiling is clamped to it"
         );
+    }
+
+    // ---- P2P artifact index RPCs: task's own "D4" ----
+
+    #[tokio::test]
+    async fn record_then_lookup_p2p_artifact_round_trips_through_the_rpc() {
+        let store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore> =
+            Arc::new(crate::binding_store::artifact_index::InMemoryArtifactStore::new(10));
+        let (_registry, mut client, _stop) =
+            service_with_artifact_store(vec![node("node-a", "http://10.0.0.7:8000")], store).await;
+        // filter_p2p_peers (LookupP2pArtifact's second half) requires the
+        // node to be a live, Ready P2P peer -- see
+        // heartbeat_as_a_ready_p2p_peer's own doc comment.
+        client
+            .heartbeat(heartbeat_as_a_ready_p2p_peer("node-a"))
+            .await
+            .expect("node-a heartbeats");
+
+        client
+            .record_p2p_artifact(RecordP2pArtifactRequest {
+                cluster_id: "cluster-a".to_string(),
+                backend: "iroh".to_string(),
+                key: "sha256:abc".to_string(),
+                node_id: "node-a".to_string(),
+            })
+            .await
+            .expect("record succeeds");
+
+        let response = client
+            .lookup_p2p_artifact(LookupP2pArtifactRequest {
+                cluster_id: "cluster-a".to_string(),
+                backend: "iroh".to_string(),
+                key: "sha256:abc".to_string(),
+                exclude_node_id: String::new(),
+            })
+            .await
+            .expect("lookup succeeds")
+            .into_inner();
+
+        assert_eq!(response.peers.len(), 1);
+        assert_eq!(response.peers[0].node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn lookup_p2p_artifact_excludes_the_requested_node() {
+        let artifact_store =
+            Arc::new(crate::binding_store::artifact_index::InMemoryArtifactStore::new(10));
+        artifact_store.record("cluster-a", "iroh", "sha256:abc", "node-a");
+        artifact_store.record("cluster-a", "iroh", "sha256:abc", "node-b");
+        let store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore> = artifact_store;
+        let (_registry, mut client, _stop) = service_with_artifact_store(
+            vec![
+                node("node-a", "http://10.0.0.7:8000"),
+                node("node-b", "http://10.0.0.9:8000"),
+            ],
+            store,
+        )
+        .await;
+        // node-a is also a live P2P peer -- proves the exclusion filters
+        // it out specifically, rather than the index simply having nothing
+        // for it.
+        client
+            .heartbeat(heartbeat_as_a_ready_p2p_peer("node-a"))
+            .await
+            .expect("node-a heartbeats");
+        client
+            .heartbeat(heartbeat_as_a_ready_p2p_peer("node-b"))
+            .await
+            .expect("node-b heartbeats");
+
+        let response = client
+            .lookup_p2p_artifact(LookupP2pArtifactRequest {
+                cluster_id: "cluster-a".to_string(),
+                backend: "iroh".to_string(),
+                key: "sha256:abc".to_string(),
+                exclude_node_id: "node-a".to_string(),
+            })
+            .await
+            .expect("lookup succeeds")
+            .into_inner();
+
+        assert_eq!(
+            response
+                .peers
+                .iter()
+                .map(|p| p.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["node-b".to_string()],
+            "node-b must appear and node-a must be excluded -- not both empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_p2p_artifact_removes_the_association() {
+        let artifact_store =
+            Arc::new(crate::binding_store::artifact_index::InMemoryArtifactStore::new(10));
+        artifact_store.record("cluster-a", "iroh", "sha256:abc", "node-a");
+        let store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore> = artifact_store;
+        let (_registry, mut client, _stop) =
+            service_with_artifact_store(vec![node("node-a", "http://10.0.0.7:8000")], store).await;
+
+        client
+            .forget_p2p_artifact(ForgetP2pArtifactRequest {
+                cluster_id: "cluster-a".to_string(),
+                backend: "iroh".to_string(),
+                key: "sha256:abc".to_string(),
+                node_id: "node-a".to_string(),
+            })
+            .await
+            .expect("forget succeeds");
+
+        let response = client
+            .lookup_p2p_artifact(LookupP2pArtifactRequest {
+                cluster_id: "cluster-a".to_string(),
+                backend: "iroh".to_string(),
+                key: "sha256:abc".to_string(),
+                exclude_node_id: String::new(),
+            })
+            .await
+            .expect("lookup succeeds")
+            .into_inner();
+        assert!(response.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unregister_node_forgets_its_p2p_artifact_associations() {
+        let artifact_store =
+            Arc::new(crate::binding_store::artifact_index::InMemoryArtifactStore::new(10));
+        artifact_store.record("cluster-a", "iroh", "sha256:abc", "node-a");
+        let store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore> =
+            Arc::clone(&artifact_store)
+                as Arc<dyn crate::binding_store::artifact_index::ArtifactStore>;
+        let (_registry, mut client, _stop) =
+            service_with_artifact_store(vec![node("node-a", "http://10.0.0.7:8000")], store).await;
+        client
+            .heartbeat(heartbeat_with_cpu_config("node-a", ""))
+            .await
+            .expect("node-a heartbeats");
+
+        client
+            .unregister_node(UnregisterNodeRequest {
+                node_id: "node-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+            })
+            .await
+            .expect("unregister succeeds");
+
+        assert!(
+            artifact_store
+                .lookup("cluster-a", "iroh", "sha256:abc", 0)
+                .is_empty(),
+            "unregistering a node must forget its P2P artifact associations too"
+        );
+    }
+
+    #[tokio::test]
+    async fn p2p_artifact_rpcs_without_an_artifact_store_are_unimplemented() {
+        let (_registry, mut client, _stop) = service_on_a_socket(vec![]).await;
+
+        let status = client
+            .record_p2p_artifact(RecordP2pArtifactRequest {
+                cluster_id: "c".to_string(),
+                backend: "b".to_string(),
+                key: "k".to_string(),
+                node_id: "node-a".to_string(),
+            })
+            .await
+            .expect_err("no artifact store wired");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+        let status = client
+            .lookup_p2p_artifact(LookupP2pArtifactRequest {
+                cluster_id: "c".to_string(),
+                backend: "b".to_string(),
+                key: "k".to_string(),
+                exclude_node_id: String::new(),
+            })
+            .await
+            .expect_err("no artifact store wired");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn record_p2p_artifact_rejects_missing_required_fields() {
+        let store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore> =
+            Arc::new(crate::binding_store::artifact_index::InMemoryArtifactStore::new(10));
+        let (_registry, mut client, _stop) = service_with_artifact_store(vec![], store).await;
+
+        let status = client
+            .record_p2p_artifact(RecordP2pArtifactRequest {
+                cluster_id: String::new(),
+                backend: "b".to_string(),
+                key: "k".to_string(),
+                node_id: "node-a".to_string(),
+            })
+            .await
+            .expect_err("empty cluster_id");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        let status = client
+            .record_p2p_artifact(RecordP2pArtifactRequest {
+                cluster_id: "c".to_string(),
+                backend: "b".to_string(),
+                key: "k".to_string(),
+                node_id: String::new(),
+            })
+            .await
+            .expect_err("empty node_id");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }

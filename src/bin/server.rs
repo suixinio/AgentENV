@@ -1153,11 +1153,21 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             binding_store_handle = Some(Arc::clone(&binding_store));
             let max_projection_ttl =
                 Duration::from_secs(config.binding_store.max_projection_ttl_secs);
-            Some(service.with_binding_store(
-                binding_store,
-                config.binding_store.projection_authoritative,
-                max_projection_ttl,
-            ))
+            let artifact_store: Arc<dyn agentenv::binding_store::artifact_index::ArtifactStore> =
+                Arc::new(
+                    agentenv::binding_store::artifact_index::InMemoryArtifactStore::new(
+                        config.binding_store.artifact_index_capacity as usize,
+                    ),
+                );
+            Some(
+                service
+                    .with_binding_store(
+                        binding_store,
+                        config.binding_store.projection_authoritative,
+                        max_projection_ttl,
+                    )
+                    .with_artifact_store(artifact_store),
+            )
         }
         None => None,
     };

@@ -301,6 +301,75 @@ pub fn mock_snapshot_manager_with_catalog() -> (SnapshotManager, Arc<MockSnapsho
     (manager, catalog)
 }
 
+/// A catalog that answers every read with one committed row, and refuses
+/// every write.
+///
+/// 🔴 Exists to be paired with [`MockSnapshotRuntimeResolver`] by
+/// [`unresolvable_snapshot_manager`], and the pairing is the whole point: the
+/// catalog says yes, the resolver says no. Over that manager, a flow that
+/// completes is a flow that never resolved anything — not because a string in
+/// an error message says so, but because resolving would have returned `Err`
+/// and the flow would have failed. See
+/// `MockSnapshotRuntimeResolver::resolve`.
+pub struct OneRowSnapshotCatalog {
+    row: SnapshotRecord,
+}
+
+#[async_trait]
+impl SnapshotCatalog for OneRowSnapshotCatalog {
+    async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        Err(MockSnapshotCatalog::unsupported())
+    }
+
+    async fn publish_commit(&self, _commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+        Err(MockSnapshotCatalog::unsupported())
+    }
+
+    async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        Ok(Some(self.row.clone()))
+    }
+
+    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+        Ok(vec![self.row.clone()])
+    }
+
+    async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
+        Err(MockSnapshotCatalog::unsupported())
+    }
+
+    async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        Ok(Some(self.row.id.clone()))
+    }
+
+    async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+        Err(MockSnapshotCatalog::unsupported())
+    }
+
+    async fn mark_build_error(
+        &self,
+        _id: &SnapshotId,
+        _reason: crate::snapshot::TemplateBuildErrorReason,
+    ) -> RepositoryResult<()> {
+        Err(MockSnapshotCatalog::unsupported())
+    }
+}
+
+/// A snapshot manager whose catalog holds `row` and whose runtime resolver
+/// refuses every call.
+///
+/// This is the shape of `--role api`'s world once it stops resolving: it can
+/// read the catalog, and it has no business turning a row into local bytes.
+pub fn unresolvable_snapshot_manager(row: SnapshotRecord) -> SnapshotManager {
+    SnapshotManager::from_parts(
+        Arc::new(SnapshotRepository::new(
+            Arc::new(OneRowSnapshotCatalog { row }) as Arc<dyn SnapshotCatalog>,
+            Arc::new(MockSnapshotArtifactStore),
+        )),
+        Arc::new(MockSnapshotRuntimeResolver),
+        None,
+    )
+}
+
 /// Writes a minimal exported snapshot artifact set for snapshot publish/resolve tests.
 pub fn write_mock_built_artifacts(
     root: &Path,

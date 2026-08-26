@@ -11,7 +11,7 @@ use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxLaunchConfig, UnresolvedImageBuildSpec,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{RunnableSnapshot, SnapshotRecord};
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::paused_state::RemotePausedState;
@@ -86,8 +86,33 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
         launch_config: SandboxLaunchConfig,
         execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>> {
-        let record = snapshot.record();
-        let resources = *snapshot.resources();
+        // 🔴 Everything this arm ever read out of the `RunnableSnapshot` is the
+        // catalog row inside it. The manifest, the local artifact paths and the
+        // cache lease resolving produced are dropped here unread — which is
+        // what `build_from_snapshot_record` below exists to let a caller skip
+        // paying for. Delegating rather than duplicating is what makes "the two
+        // produce the same request" a fact of construction instead of a claim.
+        self.build_from_snapshot_record(snapshot.record(), launch_config, execution_id)
+    }
+
+    /// The unresolved counterpart of [`build_from_snapshot`](Self::build_from_snapshot).
+    ///
+    /// # 🔴 Why this one does not refuse
+    ///
+    /// Same argument as [`build_from_image_ref`](Self::build_from_image_ref),
+    /// one rung further in. A factory that boots the VM itself has to resolve
+    /// the row before it can build anything; this one never touches the bytes,
+    /// so resolving on this machine downloads a `vm_state.bin` and materializes
+    /// two overlaybd image configs that nothing on this machine will open. The
+    /// node does its own `resolve_runnable` on the row it is sent
+    /// (`NodeSandboxService::create`), against the cache its VM actually reads.
+    fn build_from_snapshot_record(
+        &self,
+        record: &SnapshotRecord,
+        launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        let resources = record.resources;
 
         let request = pb::SandboxCreateRequest {
             sandbox_id: launch_config.sandbox_id.to_string(),
@@ -98,9 +123,12 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
                     // 🔴 The catalog row this half already holds, so the node
                     // does not have to ask its own catalog for it — see
                     // `SnapshotSource.resolved_record`'s own doc in
-                    // node.proto. `record` is the exact row this
-                    // `RunnableSnapshot` was resolved from; forwarding it is
-                    // free, `snapshot` already paid for the lookup.
+                    // node.proto. Forwarding it is free: whichever caller got
+                    // here already paid for the lookup that produced it, and
+                    // the row is the *whole* of what this request carries
+                    // about the snapshot — which is why an api half that never
+                    // resolved it sends byte-for-byte the same bytes as one
+                    // that did.
                     resolved_record: Some(wire::serialize(record, "resolved snapshot record")?),
                 },
             )),

@@ -475,6 +475,39 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         execution_id: ExecutionId,
     ) -> Result<Box<dyn SandboxBackend>>;
 
+    /// Build a sandbox backend from a committed snapshot's catalog row that
+    /// this factory has not resolved into local artifacts.
+    ///
+    /// # 🔴 Default refuses, and that is the answer for every factory that
+    /// resolves snapshots itself
+    ///
+    /// Exactly the shape of [`build_from_image_ref`](Self::build_from_image_ref)
+    /// above, one rung further in. [`build_from_snapshot`](Self::build_from_snapshot)
+    /// already covers "build from a snapshot": a factory that runs sandboxes
+    /// locally resolves the catalog row into a [`RunnableSnapshot`] — which
+    /// means downloading `vm_state.bin`, materializing overlaybd image configs
+    /// and taking a lease over them — before it ever reaches a factory, because
+    /// it is about to mmap those bytes. This method exists for the one factory
+    /// that will not: `RemoteSandboxBackendFactory`, whose sandboxes run on a
+    /// machine that does its own resolving, and which reads nothing out of a
+    /// `RunnableSnapshot` but the catalog row it was resolved from. It is the
+    /// only implementation that should ever override the refusal below; every
+    /// local factory, and every test mock that builds locally, is correct to
+    /// inherit it unchanged.
+    fn build_from_snapshot_record(
+        &self,
+        _record: &crate::snapshot::SnapshotRecord,
+        _launch_config: SandboxLaunchConfig,
+        _execution_id: ExecutionId,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        bail!(
+            "this factory builds sandboxes on this machine and resolves committed snapshots \
+             itself, so an unresolved snapshot record should never have reached it: see \
+             SandboxBackendFactory::build_from_snapshot for the path a local create from a \
+             snapshot actually takes"
+        )
+    }
+
     /// Whether the sandboxes this factory builds need the control plane's
     /// ownership marker sent with them.
     ///

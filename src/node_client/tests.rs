@@ -623,6 +623,75 @@ async fn a_node_that_started_another_run_fails_the_start_and_is_told_to_stop() {
     );
 }
 
+/// 🔴 The api half sends the same bytes whether or not it resolved the
+/// snapshot first.
+///
+/// `--role api` used to reach `SnapshotRuntimeResolver::resolve` before every
+/// warm create — downloading `vm_state.bin` onto its own disk, materializing
+/// two overlaybd `image.json` files and leasing them — and then throw all of
+/// it away here, because a `SnapshotSource` carries the catalog row and
+/// nothing else. `build_from_snapshot_record` is that create without the
+/// download, and the *only* thing that makes it safe to switch a live
+/// deployment onto it is that the node cannot tell the difference.
+///
+/// So this compares the encoded request, not a field of it: a divergence in
+/// any field, including one added later, changes these bytes.
+#[tokio::test]
+async fn a_create_from_an_unresolved_record_is_the_same_bytes_as_one_from_a_resolved_snapshot() {
+    use prost::Message;
+
+    let snapshot = RunnableSnapshot::mock();
+    let config = launch_config();
+    let execution_id = ExecutionId::new();
+
+    async fn one_create(
+        build: impl FnOnce(
+            &RemoteSandboxBackendFactory,
+        ) -> anyhow::Result<Box<dyn crate::sandbox::SandboxBackend>>,
+        config: &SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> pb::SandboxCreateRequest {
+        let (script, node) = scripted_node().await;
+        *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+            sandbox_id: config.sandbox_id.to_string(),
+            execution_id: execution_id.to_string(),
+            ..Default::default()
+        }));
+        let factory = RemoteSandboxBackendFactory::new(node.placement());
+        let mut backend = build(&factory).expect("building a stub should not fail");
+        backend.start().await.expect("start");
+        let creates = script.seen_create.lock().expect("lock").clone();
+        assert_eq!(creates.len(), 1, "one create, one request");
+        creates.into_iter().next().expect("the one create")
+    }
+
+    let resolved = one_create(
+        |factory| factory.build_from_snapshot(&snapshot, config.clone(), execution_id),
+        &config,
+        execution_id,
+    )
+    .await;
+    let unresolved = one_create(
+        |factory| {
+            factory.build_from_snapshot_record(snapshot.record(), config.clone(), execution_id)
+        },
+        &config,
+        execution_id,
+    )
+    .await;
+
+    assert_eq!(
+        resolved, unresolved,
+        "🔴 the api half resolving a snapshot changed what the node was asked for, which means          the deployment that stops resolving is not the deployment that was running"
+    );
+    assert_eq!(
+        resolved.encode_to_vec(),
+        unresolved.encode_to_vec(),
+        "the two requests compare equal but do not encode equal, so what reaches the node over \
+         the wire is not the same"
+    );
+}
+
 /// The create carries the incarnation the factory was built for.
 #[tokio::test]
 async fn the_create_names_the_run_the_caller_minted() {

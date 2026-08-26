@@ -45,6 +45,36 @@ pub enum SandboxLaunchSource {
         attached_drives: Vec<crate::sandbox::UnresolvedAttachedDrive>,
         extra_boot_args: Option<String>,
     },
+    /// A create from a committed snapshot this orchestrator has *not* resolved
+    /// into local bytes.
+    ///
+    /// # 🔴 The unresolved counterpart to [`Self::Snapshot`]
+    ///
+    /// [`Self::Snapshot`] above carries a [`RunnableSnapshot`], and obtaining
+    /// one is not a lookup: `SnapshotRuntimeResolver::resolve` downloads
+    /// `vm_state.bin` onto *this* machine's disk, materializes the memory and
+    /// rootfs overlaybd `image.json` files, and returns a lease pinning all of
+    /// it in this process's local artifact cache. That is exactly right for a
+    /// process that is about to boot a Firecracker VM from those bytes, and
+    /// pure waste for one that is not: `--role api` hands the create to a node
+    /// over gRPC, and `RemoteSandboxBackendFactory::build_from_snapshot` reads
+    /// only `record.id`, the serialized catalog row and `record.resources`
+    /// back out of the `RunnableSnapshot` — the manifest, the lease and every
+    /// downloaded file are dropped unread. The node resolves the row itself
+    /// (`NodeSandboxService::create` calls `resolve_runnable` on the row this
+    /// variant carries), against the local cache whose bytes its VM will
+    /// actually mmap.
+    ///
+    /// So this variant carries the catalog row and nothing else — the same row
+    /// `SnapshotSource.resolved_record` already puts on the wire, which is why
+    /// the request a node receives is byte-for-byte what the resolving path
+    /// used to send. `create_sandbox_inner` routes it to
+    /// [`SandboxBackendFactory::build_from_snapshot_record`], whose only real
+    /// implementation ships it to a node that can resolve it.
+    ///
+    /// [`RunnableSnapshot`]: crate::snapshot::RunnableSnapshot
+    /// [`SandboxBackendFactory::build_from_snapshot_record`]: crate::sandbox::SandboxBackendFactory::build_from_snapshot_record
+    SnapshotRecord(Box<crate::snapshot::SnapshotRecord>),
 }
 
 /// Who keeps a new sandbox's deadline, and — when it is this orchestrator —

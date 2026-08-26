@@ -6,7 +6,7 @@ use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
     UnresolvedImageBuildSpec,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{RunnableSnapshot, SnapshotRecord};
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 /// A resume claim that has been granted, carrying the incarnation the claim
@@ -88,8 +88,8 @@ impl ClaimedExecution {
 pub(super) struct CreateLaunchPlan {
     pub sandbox_id: SandboxId,
     /// 🔴 Private: a struct literal with a private field cannot be written
-    /// outside this module, so the three `for_*` constructors below are the
-    /// only way to build a plan, and each of them accounts for exactly one
+    /// outside this module, so the `for_*` constructors below are the only way
+    /// to build a plan, and each of them accounts for exactly one
     /// incarnation.
     execution_id: ExecutionId,
     pub source: CreateLaunchSource,
@@ -101,6 +101,15 @@ pub(super) struct CreateLaunchPlan {
 pub(super) enum CreateLaunchSource {
     Snapshot {
         snapshot: Box<RunnableSnapshot>,
+    },
+    /// See `SandboxLaunchSource::SnapshotRecord` for why this is not folded
+    /// into `Snapshot`: `build_sandbox` routes it to
+    /// `SandboxBackendFactory::build_from_snapshot_record` rather than
+    /// `build_from_snapshot`, because the two carry different information (a
+    /// catalog row versus a row plus the local bytes resolving it produced)
+    /// for two different kinds of factory.
+    SnapshotRecord {
+        record: Box<SnapshotRecord>,
     },
     Fresh {
         build_spec: Box<FreshSandboxBuildSpec>,
@@ -168,6 +177,28 @@ impl LaunchPlan {
             sandbox_id,
             execution_id,
             source: CreateLaunchSource::Snapshot { snapshot },
+            launch_config,
+            metadata,
+            timeout,
+        }))
+    }
+
+    /// The unresolved counterpart of [`Self::for_create_from_snapshot`]; see
+    /// [`CreateLaunchSource::SnapshotRecord`].
+    pub(super) fn for_create_from_snapshot_record(
+        sandbox_id: SandboxId,
+        record: Box<SnapshotRecord>,
+        launch_config: SandboxLaunchConfig,
+        mut metadata: SandboxMetadata,
+        timeout: NewTimeout,
+        run_as: Option<ExecutionId>,
+    ) -> Self {
+        let execution_id = run_as.unwrap_or_else(ExecutionId::new);
+        metadata.execution_id = execution_id;
+        Self::Create(Box::new(CreateLaunchPlan {
+            sandbox_id,
+            execution_id,
+            source: CreateLaunchSource::SnapshotRecord { record },
             launch_config,
             metadata,
             timeout,

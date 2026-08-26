@@ -598,6 +598,27 @@ impl SandboxBackendFactory for MockBackendFactory {
         )))
     }
 
+    /// 🔴 Overridden, where every *local* factory is correct to inherit the
+    /// trait's refusal. This one is not a local factory: it is the in-process
+    /// stand-in for whichever factory a test's orchestrator would really have
+    /// had, and the only real implementation of this method
+    /// (`RemoteSandboxBackendFactory`) accepts. A mock that refused here would
+    /// make "the api half handed a create to a node without resolving it"
+    /// untestable without a socket.
+    fn build_from_snapshot_record(
+        &self,
+        _record: &crate::snapshot::SnapshotRecord,
+        _launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> Result<Box<dyn SandboxBackend>> {
+        self.behavior.apply_sync(MockOperation::Build)?;
+        Ok(Box::new(MockSandboxBackend::new_with_host_ip(
+            Arc::clone(&self.behavior),
+            self.host_ip,
+            execution_id,
+        )))
+    }
+
     fn build_from_paused_state(
         &self,
         _sandbox_id: crate::types::SandboxId,

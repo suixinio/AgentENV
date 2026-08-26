@@ -242,8 +242,16 @@ message SnapshotSource {
   // `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3) — every write
   // it could make already goes through bytes-only paths, and node must never
   // hold `[pg].dsn`. Rather than stand up a new node<->api RPC face for two
-  // read-only lookups, the API half — which already resolves this snapshot
-  // for its own purposes before dispatch — forwards the row it already has.
+  // read-only lookups, the API half forwards the row it already read out of
+  // the catalog in order to answer the request at all.
+  //
+  // 🔴 The row, and *only* the row — the same rule `ImageSource` states below.
+  // The API half used to resolve this snapshot into local bytes before
+  // dispatch (downloading `vm_state.bin`, materializing overlaybd image
+  // configs, leasing them) and then send this field out of the result; it no
+  // longer does, and nothing on the wire changed, because the row was always
+  // the whole of what this message carried. The node resolves it on its own
+  // disk, which is the disk its VM actually reads.
   //
   // 🔴 Absent is not an error. A node built before this field existed ignores
   // it (proto3 forward compatibility); a node built after it exists, talking

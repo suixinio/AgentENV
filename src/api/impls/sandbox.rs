@@ -692,14 +692,46 @@ impl Sandboxes<()> for ApiImpl {
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
         let timer = SandboxStageTimer::new("create_warm");
-        let snapshot = match timer
-            .time(
-                "load_snapshot",
-                self.snapshot_manager.load_runnable(&body.template_id),
-            )
-            .await
-        {
-            Ok(Some(snapshot)) => snapshot,
+        // 🔴 The same fork, and the same one line, as `sandboxes_cold_post`
+        // above — one rung further in. A warm create's first act used to be
+        // `load_runnable`, which is not a catalog lookup: it downloads
+        // `vm_state.bin` onto this machine's disk, materializes the memory and
+        // rootfs overlaybd `image.json` files, and takes a lease pinning all of
+        // it in this process's local artifact cache. That is right for a
+        // process about to boot a Firecracker VM from those bytes.
+        //
+        // `--role api` is not that process. It hands the create to a node, and
+        // `RemoteSandboxBackendFactory` reads exactly one thing back out of the
+        // `RunnableSnapshot` it is given: the catalog row. The manifest, the
+        // lease and every downloaded byte are dropped unread, and the node
+        // resolves the row itself against the cache its VM actually mmaps. So
+        // the api half asks the catalog for the row and stops there — the node
+        // receives byte-for-byte the request it always did, because the row was
+        // already the whole of what `SnapshotSource` carried.
+        let loaded: anyhow::Result<Option<SandboxLaunchSource>> =
+            if self.role().runs_sandbox_runtime() {
+                timer
+                    .time(
+                        "load_snapshot",
+                        self.snapshot_manager.load_runnable(&body.template_id),
+                    )
+                    .await
+                    .map(|found| {
+                        found.map(|snapshot| SandboxLaunchSource::Snapshot(Box::new(snapshot)))
+                    })
+            } else {
+                timer
+                    .time(
+                        "load_snapshot",
+                        self.snapshot_manager.get(&body.template_id),
+                    )
+                    .await
+                    .map(|found| {
+                        found.map(|record| SandboxLaunchSource::SnapshotRecord(Box::new(record)))
+                    })
+            };
+        let source = match loaded {
+            Ok(Some(source)) => source,
             Ok(None) => {
                 return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
                     400,
@@ -737,7 +769,7 @@ impl Sandboxes<()> for ApiImpl {
         }
 
         let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+            source,
             expiry: requested_expiry(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -2479,6 +2511,162 @@ mod cold_start_role_tests {
                  and the caller is told about the image rather than about the server, got \
                  {response:?}"
             );
+        }
+    }
+}
+
+/// 🔴 Whether `--role api` turns a snapshot into bytes on its own disk.
+///
+/// `POST /sandboxes` used to answer that with an unconditional
+/// `load_runnable`, which is not a catalog lookup: `SnapshotRuntimeResolver`
+/// downloads `vm_state.bin` onto this machine, materializes the memory and
+/// rootfs overlaybd `image.json` files and leases all of it in the local
+/// artifact cache. The api Pod boots no VM from any of it — it hands the
+/// create to a node, and `RemoteSandboxBackendFactory` reads exactly one thing
+/// back out of the `RunnableSnapshot`: the catalog row.
+///
+/// # 🔴 Why the fixture proves it rather than describing it
+///
+/// The resolver here is [`MockSnapshotRuntimeResolver`], which fails every
+/// call. So "did this create resolve" is not a string to match or a counter to
+/// read: a create that resolved *cannot* have succeeded, because the failure
+/// propagates and ends the request. `--role api` answering 201 over a resolver
+/// that refuses is the whole proof, and it stays the proof if every error
+/// message in the tree is reworded.
+///
+/// The `--role all` arm is the other half of it, and it is what stops this
+/// from passing on a tree where nothing resolves anywhere: the same fixture,
+/// the same catalog row, the same request, and it fails — because that half
+/// still resolves, and the resolver still refuses.
+#[cfg(test)]
+mod warm_start_role_tests {
+    use std::sync::Arc;
+
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+    use http::Method;
+
+    use agentenv_http_server::apis::sandboxes::*;
+    use agentenv_http_server::models;
+
+    use super::ApiImpl;
+    use crate::cfg::AppConfig;
+    use crate::identity::NodeIdentity;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{
+        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
+        Orchestrator,
+    };
+    use crate::role::ServerRole;
+    use crate::sandbox::mock::MockBackendFactory;
+    use crate::snapshot::mock::unresolvable_snapshot_manager;
+    use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
+    use crate::template::TemplateBuilder;
+
+    /// One API surface whose catalog holds a ready snapshot and whose runtime
+    /// resolver refuses every call.
+    ///
+    /// 🔴 The orchestrator is built as `All` in every case, for the reason
+    /// `cold_start_role_tests::surface_as` gives: the route under test asks
+    /// `ApiImpl::role()`, and an `Orchestrator` built as `Api` has
+    /// construction-time demands that would make this fail on the fixture
+    /// rather than on the fork.
+    ///
+    /// 🔴 The factory is `MockBackendFactory` rather than
+    /// `FirecrackerSandboxFactory` because the question is what the api half
+    /// *sends*, not whether this machine can run a VM — and
+    /// `MockBackendFactory` is the one factory in the tree that, like the real
+    /// `RemoteSandboxBackendFactory`, accepts both snapshot launch sources.
+    async fn surface_as(role: ServerRole, row: SnapshotRecord) -> Arc<ApiImpl> {
+        let root = tempfile::tempdir().expect("a temp dir");
+
+        let orchestrator = Orchestrator::new(
+            ServerRole::All,
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
+        )
+        .await
+        .expect("an orchestrator");
+
+        let snapshot_manager = Arc::new(unresolvable_snapshot_manager(row));
+
+        let api = Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(DisabledPausedSandboxRegistry),
+                Arc::clone(&snapshot_manager),
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+            // 🔴 The one value this fixture varies.
+            role,
+            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+        ));
+
+        // Held for the process's lifetime: the persister above goes on reading it.
+        std::mem::forget(root);
+
+        api
+    }
+
+    /// A committed, launchable catalog row — the thing a template id resolves
+    /// to, before anything downloads a byte of it.
+    fn ready_row() -> SnapshotRecord {
+        SnapshotRecord::mock_ready(CommittedSnapshot::mock())
+    }
+
+    async fn create_from_template(api: &ApiImpl) -> SandboxesPostResponse {
+        api.sandboxes_post(
+            &Method::POST,
+            &Host::from(http::uri::Authority::from_static("localhost")),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &models::NewSandbox::new("tpl-warm-start".to_string()),
+        )
+        .await
+        .expect("the handler answers")
+    }
+
+    #[tokio::test]
+    async fn a_warm_start_resolves_locally_or_ships_the_catalog_row_depending_on_role() {
+        let api = surface_as(ServerRole::Api, ready_row()).await;
+        let response = create_from_template(&api).await;
+        assert!(
+            matches!(
+                response,
+                SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully { .. }
+            ),
+            "🔴 the assertion. This manager's runtime resolver fails every call, so a create \
+             that touched it could not have got here — --role api answering 201 over it is the \
+             proof that it never turned the catalog row into local bytes, got {response:?}"
+        );
+
+        for role in [ServerRole::All, ServerRole::Node] {
+            let api = surface_as(role, ready_row()).await;
+            let response = create_from_template(&api).await;
+            match &response {
+                SandboxesPostResponse::Status500_ServerError(error) => {
+                    assert!(
+                        error.message.contains("mock snapshot runtime resolver"),
+                        "--role {} must still resolve the snapshot itself, so it must fail \
+                         exactly where this fixture's resolver refuses; failing anywhere else \
+                         would mean the fixture, not the fork, decided this test: got {:?}",
+                        role.as_str(),
+                        error.message
+                    );
+                }
+                other => panic!(
+                    "--role {} still resolves, and this fixture's resolver refuses every call, \
+                     so this create cannot succeed — if it did, nothing here would be resolving \
+                     anywhere and the api-role assertion above would be vacuous: got {other:?}",
+                    role.as_str()
+                ),
+            }
         }
     }
 }

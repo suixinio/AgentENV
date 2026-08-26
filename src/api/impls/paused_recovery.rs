@@ -96,6 +96,7 @@ fn missing_local_verdict(
 }
 
 /// Outcome of rebuilding a sandbox from a claim this node already holds.
+#[derive(Debug)]
 pub(super) enum CrossNodeResume {
     /// The sandbox is running here again, under its original ID.
     Restored(Box<SandboxMetadata>),
@@ -494,17 +495,32 @@ impl ApiImpl {
             }
         };
 
-        let snapshot = match self.snapshot_manager.resolve_runnable(record).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                warn!(error = ?err, %sandbox_id, %snapshot_id, "failed to resolve paused snapshot");
-                self.release_claim(&sandbox_id, entry.generation).await;
+        // 🔴 The same fork as `sandboxes_post`'s, written on the same one line,
+        // and for the same reason: `resolve_runnable` is not a lookup. It
+        // downloads `vm_state.bin` onto this machine's disk, materializes the
+        // memory and rootfs overlaybd `image.json` files, and leases all of it
+        // in this process's local artifact cache. A restore driven from
+        // `--role api` boots nothing here — `RemoteSandboxBackendFactory` reads
+        // only the catalog row back out and sends it on, and the node resolves
+        // it against the cache its own VM mmaps. `record` is already in hand
+        // from the read above, so the unresolved half costs nothing at all.
+        let source = if self.role().runs_sandbox_runtime() {
+            match self.snapshot_manager.resolve_runnable(record).await {
+                Ok(snapshot) => SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+                Err(err) => {
+                    warn!(error = ?err, %sandbox_id, %snapshot_id, "failed to resolve paused snapshot");
+                    self.release_claim(&sandbox_id, entry.generation).await;
 
-                return CrossNodeResume::Failed(format!("failed to load paused snapshot: {err}"));
+                    return CrossNodeResume::Failed(format!(
+                        "failed to load paused snapshot: {err}"
+                    ));
+                }
             }
+        } else {
+            SandboxLaunchSource::SnapshotRecord(Box::new(record))
         };
 
-        let request = restore_request(&metadata, snapshot, timeout);
+        let request = restore_request(&metadata, source, timeout);
 
         match self
             .orchestrator()
@@ -1328,13 +1344,18 @@ fn running_supersession(
 /// restored sandbox keeps the timeout policy, metadata, network policy and
 /// extension params it had. `env_vars` is intentionally absent: environment is
 /// applied at first boot and is already baked into the snapshot.
+///
+/// 🔴 `source` is passed in rather than built here, because which of the two
+/// snapshot launch sources a restore uses is a property of the half doing the
+/// restoring and not of the paused record. Everything else about the request
+/// is identical either way, which is the point.
 fn restore_request(
     metadata: &SandboxMetadata,
-    snapshot: crate::snapshot::RunnableSnapshot,
+    source: SandboxLaunchSource,
     timeout: NewTimeout,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
-        source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+        source,
         // A restore is a resume: the request's timeout wins when it set one,
         // otherwise the sandbox keeps the timeout it was paused with.
         //
@@ -2901,5 +2922,156 @@ mod cross_node_resume_scope_tests {
             1,
             "and the dangling row goes with it"
         );
+    }
+}
+
+/// 🔴 Whether `--role api` turns a paused sandbox's snapshot into bytes on its
+/// own disk before asking a node to bring the sandbox back.
+///
+/// A cross-node resume already has the catalog row in hand — it just read it,
+/// at `AnyStatus`, to decide whether the registry row was still worth keeping.
+/// What followed used to be an unconditional `resolve_runnable` on that row,
+/// which is not a second lookup: it downloads `vm_state.bin` onto this
+/// machine, materializes the memory and rootfs overlaybd `image.json` files and
+/// leases all of it in the local artifact cache. The api Pod reopens none of
+/// it. `RemoteSandboxBackendFactory` reads the catalog row back out of the
+/// `RunnableSnapshot` and sends exactly that, and the node resolves it against
+/// the cache its own VM mmaps.
+///
+/// # 🔴 Why the fixture proves it rather than describing it
+///
+/// Same construction as `sandbox::warm_start_role_tests`: the resolver is
+/// `MockSnapshotRuntimeResolver`, which fails every call, so a restore that
+/// resolved could not have completed. `--role api` answering `Restored` over a
+/// resolver that refuses is the proof; the `--role all` arm, which still
+/// resolves and therefore still fails, is what keeps that proof from being
+/// vacuous.
+#[cfg(test)]
+mod cross_node_resume_role_tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+
+    use super::super::paused_coordinator::test_support::CountingRegistry;
+    use super::*;
+    use crate::cfg::AppConfig;
+    use crate::identity::NodeIdentity;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{
+        FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
+    };
+    use crate::role::ServerRole;
+    use crate::sandbox::mock::MockBackendFactory;
+    use crate::snapshot::mock::unresolvable_snapshot_manager;
+    use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
+    use crate::template::TemplateBuilder;
+
+    /// One API surface whose catalog holds a ready snapshot and whose runtime
+    /// resolver refuses every call.
+    ///
+    /// 🔴 The orchestrator is `All` in both cases and only `ApiImpl`'s role
+    /// varies, for the reason `sandbox::cold_start_role_tests::surface_as`
+    /// gives; and the factory is `MockBackendFactory` because the question is
+    /// what the api half *sends*, not whether this machine can run a VM.
+    async fn api_as(role: ServerRole, row: SnapshotRecord) -> Arc<ApiImpl> {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let orchestrator = Orchestrator::new(
+            ServerRole::All,
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+        )
+        .await
+        .expect("an orchestrator");
+        std::mem::forget(root);
+
+        let snapshot_manager: Arc<SnapshotManager> = Arc::new(unresolvable_snapshot_manager(row));
+        let registry = Arc::new(CountingRegistry::new(0, false)) as Arc<dyn PausedSandboxRegistry>;
+
+        Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                registry,
+                Arc::clone(&snapshot_manager),
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+            // 🔴 The one value this fixture varies.
+            role,
+            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+        ))
+    }
+
+    /// The claim a resume arrives with: a row this node already won, naming the
+    /// snapshot the sandbox was paused into.
+    fn claimed_entry(snapshot_id: SnapshotId) -> PausedSandboxEntry {
+        let sandbox_id = SandboxId::new();
+        PausedSandboxEntry {
+            sandbox_id,
+            cluster_id: uuid::Uuid::nil(),
+            state: PausedRegistryState::Resuming,
+            generation: 1,
+            origin_node_id: "node-b".to_string(),
+            claimed_by_node_id: Some("node-a".to_string()),
+            snapshot_id: Some(snapshot_id),
+            metadata: Some(SandboxMetadata {
+                id: sandbox_id,
+                ..Default::default()
+            }),
+            execution_id: Some(ExecutionId::new()),
+            paused_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_node_resume_resolves_locally_or_ships_the_catalog_row_depending_on_role() {
+        let row = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let snapshot_id = row.id.clone();
+
+        let api = api_as(ServerRole::Api, row.clone()).await;
+        let outcome = api
+            .restore_claimed_sandbox(claimed_entry(snapshot_id.clone()), NewTimeout::None)
+            .await;
+        assert!(
+            matches!(outcome, CrossNodeResume::Restored(_)),
+            "🔴 the assertion. This manager's runtime resolver fails every call, so a restore \
+             that touched it could not have got here — --role api restoring over it is the proof \
+             that it never turned the catalog row into local bytes, got {outcome:?}"
+        );
+
+        for role in [ServerRole::All, ServerRole::Node] {
+            let api = api_as(role, row.clone()).await;
+            let outcome = api
+                .restore_claimed_sandbox(claimed_entry(snapshot_id.clone()), NewTimeout::None)
+                .await;
+            match &outcome {
+                // 🔴 The context `SnapshotManager::resolve_runnable` and
+                // nothing else in the tree adds, so this says *the resolver
+                // was called* rather than merely *something failed*. The
+                // resolver's own wording does not survive to here — the
+                // failure is reported with `{err}`, which prints only the
+                // outermost context — and matching on "failed to load paused
+                // snapshot" would have matched three other branches of this
+                // same function.
+                CrossNodeResume::Failed(reason) => assert!(
+                    reason.contains("resolve committed snapshot into runnable runtime paths"),
+                    "--role {} must still resolve the snapshot itself, so it must fail exactly \
+                     where this fixture's resolver refuses; failing anywhere else would mean the \
+                     fixture, not the fork, decided this test: got {reason:?}",
+                    role.as_str()
+                ),
+                other => panic!(
+                    "--role {} still resolves, and this fixture's resolver refuses every call, \
+                     so this restore cannot succeed — if it did, nothing here would be resolving \
+                     anywhere and the api-role assertion above would be vacuous: got {other:?}",
+                    role.as_str()
+                ),
+            }
+        }
     }
 }

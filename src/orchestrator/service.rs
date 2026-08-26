@@ -567,66 +567,75 @@ where
 
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
-                let record = snapshot.record();
-                let committed = snapshot.committed();
-                let configured_mode = ConfigManager::global_config().virtualization_mode;
-                if committed.virtualization_mode != configured_mode {
-                    self.counters.record_create_fail(1);
-                    return Err(OrchestratorError::VirtualizationModeMismatch {
-                        resource: format!("snapshot {}", record.id),
-                        resource_mode: committed.virtualization_mode,
-                        node_mode: configured_mode,
-                    });
-                }
-                let launch_image_configs = committed.image_configs.clone();
-                let mut extra_mmds = serde_json::Map::new();
-                if !launch_image_configs.is_empty() {
-                    extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
-                };
-                // Effective custom config: a launch-provided value overrides the
-                // one persisted in the source snapshot; otherwise inherit it.
-                // Store the effective value so publishing a snapshot from this
-                // sandbox keeps the inherited config instead of dropping it.
-                let effective_custom_extension_params = custom_extension_params
-                    .clone()
-                    .or_else(|| committed.custom_extension_params.clone());
-                let launch_config = SandboxLaunchConfig {
-                    sandbox_id,
-                    snapshot_id: record.id.to_string(),
-                    env_vars,
-                    network: network_policy.runtime_policy(),
-                    extra_mmds,
-                    custom_extension_params: effective_custom_extension_params.clone(),
-                    envd_access_token: envd_access_token.clone(),
-                    // Filled in by `stamp_control_plane_ownership` once the
-                    // record this marker encodes is complete; see there.
-                    control_plane_config: None,
-                };
-
-                let transitional_metadata = SandboxMetadata {
-                    id: sandbox_id,
-                    snapshot_id: record.id.to_string(),
-                    snapshot_alias: record.alias.as_ref().map(ToString::to_string),
-                    virtualization_mode: committed.virtualization_mode,
-                    runtime_versions: committed.runtime_versions.clone(),
-                    resources: *snapshot.resources(),
-                    context: committed.context.clone(),
-                    startup: committed.startup.clone(),
-                    image_configs: launch_image_configs,
-                    timeout_action,
-                    auto_resume,
-                    user_metadata,
-                    network_policy,
-                    custom_extension_params: effective_custom_extension_params,
-                    secure,
-                    control_plane_config,
-                    max_lifetime: configured_max_sandbox_lifetime(),
-                    ..Default::default()
+                let SnapshotCreateParts {
+                    launch_config,
+                    transitional_metadata,
+                } = match snapshot_create_parts(
+                    snapshot.record(),
+                    SnapshotCreateInputs {
+                        sandbox_id,
+                        envd_access_token,
+                        env_vars,
+                        user_metadata,
+                        network_policy,
+                        custom_extension_params,
+                        timeout_action,
+                        auto_resume,
+                        secure,
+                        control_plane_config,
+                    },
+                ) {
+                    Ok(parts) => parts,
+                    Err(err) => {
+                        self.counters.record_create_fail(1);
+                        return Err(err);
+                    }
                 };
 
                 self.launch_sandbox(LaunchPlan::for_create_from_snapshot(
                     sandbox_id,
                     snapshot,
+                    launch_config,
+                    transitional_metadata,
+                    new_timeout,
+                    execution_id,
+                ))
+                .await
+            }
+            // 🔴 The same record, the same launch config and the same
+            // transitional metadata as the arm above — built by the same
+            // function, from the same catalog row — with the one difference
+            // that nothing here has resolved that row into local bytes. See
+            // `SandboxLaunchSource::SnapshotRecord`.
+            SandboxLaunchSource::SnapshotRecord(record) => {
+                let SnapshotCreateParts {
+                    launch_config,
+                    transitional_metadata,
+                } = match snapshot_create_parts(
+                    &record,
+                    SnapshotCreateInputs {
+                        sandbox_id,
+                        envd_access_token,
+                        env_vars,
+                        user_metadata,
+                        network_policy,
+                        custom_extension_params,
+                        timeout_action,
+                        auto_resume,
+                        secure,
+                        control_plane_config,
+                    },
+                ) {
+                    Ok(parts) => parts,
+                    Err(err) => {
+                        self.counters.record_create_fail(1);
+                        return Err(err);
+                    }
+                };
+
+                self.launch_sandbox(LaunchPlan::for_create_from_snapshot_record(
+                    sandbox_id,
+                    record,
                     launch_config,
                     transitional_metadata,
                     new_timeout,
@@ -3454,6 +3463,9 @@ where
                     plan.launch_config.clone(),
                     execution_id,
                 ),
+                CreateLaunchSource::SnapshotRecord { record } => self
+                    .factory
+                    .build_from_snapshot_record(record, plan.launch_config.clone(), execution_id),
                 CreateLaunchSource::Fresh { build_spec } => self.factory.build(
                     (**build_spec).clone(),
                     plan.launch_config.clone(),
@@ -4089,6 +4101,128 @@ where
         self.upsert_proxy_route(sandbox_id, target, execution_id)
             .await;
     }
+}
+
+/// Everything a create from a committed snapshot needs beyond the catalog row.
+///
+/// 🔴 A struct rather than ten arguments because it has exactly two callers
+/// and they must not drift: `SandboxLaunchSource::Snapshot` and
+/// `SandboxLaunchSource::SnapshotRecord` differ only in whether this process
+/// resolved the row into local bytes, and everything the sandbox's record says
+/// about itself has to come out the same either way. Adding a field here is
+/// a compile error in both arms; adding one to a per-arm struct literal would
+/// have been a silent divergence in one.
+struct SnapshotCreateInputs {
+    sandbox_id: SandboxId,
+    envd_access_token: Option<EnvdAccessToken>,
+    env_vars: Option<HashMap<String, String>>,
+    user_metadata: Option<HashMap<String, String>>,
+    network_policy: SandboxNetworkPolicy,
+    custom_extension_params: Option<CustomExtensionParams>,
+    timeout_action: super::SandboxTimeoutAction,
+    auto_resume: bool,
+    secure: bool,
+    control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
+}
+
+struct SnapshotCreateParts {
+    launch_config: SandboxLaunchConfig,
+    transitional_metadata: SandboxMetadata,
+}
+
+/// Turns one committed snapshot's catalog row into the launch config and
+/// transitional record a create from it starts with.
+///
+/// Reads nothing but the row: every value here comes from `record` or from the
+/// caller's request, which is what lets the unresolved arm produce the same
+/// record as the resolved one.
+fn snapshot_create_parts(
+    record: &crate::snapshot::SnapshotRecord,
+    inputs: SnapshotCreateInputs,
+) -> Result<SnapshotCreateParts> {
+    let SnapshotCreateInputs {
+        sandbox_id,
+        envd_access_token,
+        env_vars,
+        user_metadata,
+        network_policy,
+        custom_extension_params,
+        timeout_action,
+        auto_resume,
+        secure,
+        control_plane_config,
+    } = inputs;
+
+    // 🔴 Refused rather than unwrapped. `RunnableSnapshot::committed` may
+    // `expect` here because resolving a row without a committed payload fails
+    // before a `RunnableSnapshot` exists; this function is also reached with a
+    // row nothing has resolved, so the same absence has to be an answer rather
+    // than a panic — and a 400, because a caller naming a template that is
+    // still building is a caller asking for something that cannot be built.
+    let Some(committed) = record.committed.as_ref() else {
+        return Err(OrchestratorError::InvalidRequest(format!(
+            "snapshot {} is not ready to launch from: it has no committed artifacts",
+            record.id
+        )));
+    };
+
+    let configured_mode = ConfigManager::global_config().virtualization_mode;
+    if committed.virtualization_mode != configured_mode {
+        return Err(OrchestratorError::VirtualizationModeMismatch {
+            resource: format!("snapshot {}", record.id),
+            resource_mode: committed.virtualization_mode,
+            node_mode: configured_mode,
+        });
+    }
+    let launch_image_configs = committed.image_configs.clone();
+    let mut extra_mmds = serde_json::Map::new();
+    if !launch_image_configs.is_empty() {
+        extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
+    };
+    // Effective custom config: a launch-provided value overrides the
+    // one persisted in the source snapshot; otherwise inherit it.
+    // Store the effective value so publishing a snapshot from this
+    // sandbox keeps the inherited config instead of dropping it.
+    let effective_custom_extension_params =
+        custom_extension_params.or_else(|| committed.custom_extension_params.clone());
+    let launch_config = SandboxLaunchConfig {
+        sandbox_id,
+        snapshot_id: record.id.to_string(),
+        env_vars,
+        network: network_policy.runtime_policy(),
+        extra_mmds,
+        custom_extension_params: effective_custom_extension_params.clone(),
+        envd_access_token,
+        // Filled in by `stamp_control_plane_ownership` once the
+        // record this marker encodes is complete; see there.
+        control_plane_config: None,
+    };
+
+    let transitional_metadata = SandboxMetadata {
+        id: sandbox_id,
+        snapshot_id: record.id.to_string(),
+        snapshot_alias: record.alias.as_ref().map(ToString::to_string),
+        virtualization_mode: committed.virtualization_mode,
+        runtime_versions: committed.runtime_versions.clone(),
+        resources: record.resources,
+        context: committed.context.clone(),
+        startup: committed.startup.clone(),
+        image_configs: launch_image_configs,
+        timeout_action,
+        auto_resume,
+        user_metadata,
+        network_policy,
+        custom_extension_params: effective_custom_extension_params,
+        secure,
+        control_plane_config,
+        max_lifetime: configured_max_sandbox_lifetime(),
+        ..Default::default()
+    };
+
+    Ok(SnapshotCreateParts {
+        launch_config,
+        transitional_metadata,
+    })
 }
 
 fn default_fresh_sandbox_resources() -> SandboxResources {

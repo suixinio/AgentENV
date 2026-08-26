@@ -2026,7 +2026,7 @@ mod tests {
                 Arc::new(JournallingArtifacts(journal)),
                 THIS_REPLICA.to_string(),
             )),
-            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            Some(Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver)),
             None,
         ))
     }

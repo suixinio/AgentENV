@@ -62,23 +62,11 @@ impl OssBackend {
         store: Arc<dyn OverlaybdLayerStore>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Result<Self> {
-        let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
-        let managed_layers_repo_blob_url = config.managed_layers_repo_blob_url();
-        let client = Arc::new(OssClient::new(
-            config.bucket().to_string(),
-            config.endpoint().to_string(),
-            config.region().to_string(),
-            config.prefix().to_string(),
-            config.credential_source(),
-        )?);
-
-        let repository = Arc::new(SnapshotRepository::new(
-            Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
-            Arc::new(OssSnapshotArtifactStore::new(
-                Arc::clone(&client),
-                config.snapshot_image_storage(),
-            )),
-        ));
+        let OssDurableParts {
+            repository,
+            client,
+            managed_layers_repo_blob_url,
+        } = Self::durable_parts(config, snapshot_image_storage)?;
 
         std::fs::create_dir_all(&runtime_root)
             .with_context(|| format!("create oss runtime root '{}'", runtime_root.display()))?;
@@ -97,8 +85,73 @@ impl OssBackend {
         })
     }
 
+    /// The durable halves on their own: the catalog and the artifact store,
+    /// already composed into a [`SnapshotRepository`].
+    ///
+    /// 🔴 Split out of [`OssBackend::from_parts`] so a process that never turns
+    /// a snapshot into local bytes can still *delete* one. Deleting is
+    /// `catalog.delete_record` followed by `artifacts.delete_artifacts`, and on
+    /// this backend the second half is a pure network operation — an
+    /// object-store `DELETE` under the snapshot's prefix, plus
+    /// `rollback_publication` against the source registry (see
+    /// [`OssSnapshotArtifactStore::delete_artifacts`]). It never needed an
+    /// [`OverlaybdLayerStore`], a [`LocalArtifactCache`], or a runtime root; it
+    /// was coupled to all three only because `from_parts` took one set of
+    /// arguments for both halves and the *other* half — materializing layers
+    /// onto local disk — is what actually consumes them.
+    ///
+    /// The delete has to stay here rather than being shipped to the node that
+    /// owns the bytes: that node may be gone (hard death, or rolled), and a
+    /// delete with nowhere to go leaves the row removed, the bytes orphaned,
+    /// and nobody holding a record of either.
+    pub(crate) fn durable_parts(
+        config: &OssBackendConfig,
+        snapshot_image_storage: SnapshotImageStoragePolicy,
+    ) -> Result<OssDurableParts> {
+        let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
+        let managed_layers_repo_blob_url = config.managed_layers_repo_blob_url();
+        let client = Arc::new(OssClient::new(
+            config.bucket().to_string(),
+            config.endpoint().to_string(),
+            config.region().to_string(),
+            config.prefix().to_string(),
+            config.credential_source(),
+        )?);
+
+        let repository = Arc::new(SnapshotRepository::new(
+            Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
+            Arc::new(OssSnapshotArtifactStore::new(
+                Arc::clone(&client),
+                config.snapshot_image_storage(),
+            )),
+        ));
+
+        Ok(OssDurableParts {
+            repository,
+            client,
+            managed_layers_repo_blob_url,
+        })
+    }
+
     /// Splits the backend into its repository and runtime-resolution components.
     pub fn into_parts(self) -> (Arc<SnapshotRepository>, Arc<dyn SnapshotRuntimeResolver>) {
         (self.repository, self.runtime_resolver)
+    }
+}
+
+/// What [`OssBackend::durable_parts`] hands back: the durable repository, plus
+/// the two values the runtime resolver needs on top of it. Only
+/// [`OssBackend::from_parts`] consumes the latter two — every other caller
+/// wants [`Self::into_repository`].
+pub(crate) struct OssDurableParts {
+    repository: Arc<SnapshotRepository>,
+    client: Arc<OssClient>,
+    managed_layers_repo_blob_url: String,
+}
+
+impl OssDurableParts {
+    /// The repository on its own, dropping what only the resolver would use.
+    pub(crate) fn into_repository(self) -> Arc<SnapshotRepository> {
+        self.repository
     }
 }

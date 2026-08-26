@@ -261,7 +261,7 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
             Arc::new(OneSnapshot),
             Arc::new(MockSnapshotArtifactStore),
         )),
-        Arc::new(AlwaysRunnable),
+        Some(Arc::new(AlwaysRunnable)),
         None,
     )
 }

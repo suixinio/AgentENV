@@ -1994,7 +1994,7 @@ mod bytes_then_commit {
                 backend.repository().artifacts(),
                 "test-node-a".to_string(),
             )),
-            backend.runtime_resolver(),
+            Some(backend.runtime_resolver()),
             None,
         );
 

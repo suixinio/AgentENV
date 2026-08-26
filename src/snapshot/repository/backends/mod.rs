@@ -27,6 +27,7 @@ use crate::snapshot::repository::mirror::{
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
 pub use oss::OssBackend;
+use posixfs::posixfs_repository;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 use postgres::migration_state::PgReadSideConfirmation;
 use postgres::PostgresSnapshotCatalog;
@@ -34,7 +35,13 @@ use postgres::PostgresSnapshotCatalog;
 /// Everything the snapshot layer needs from storage, assembled.
 pub struct AssembledSnapshotBackend {
     pub repository: Arc<SnapshotRepository>,
-    pub runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+    /// 🔴 `None` on every role that runs no sandbox runtime — today that is
+    /// `--role api`. Resolving a snapshot is not a lookup: it downloads
+    /// `vm_state.bin` onto this machine's disk, materializes the memory and
+    /// rootfs overlaybd `image.json` files, and leases all of it in this
+    /// process's local artifact cache. An api replica boots nothing, so it
+    /// builds none of that; see `build_storage_for_role`.
+    pub runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
     /// Alive only while the catalog is double-written. Dropping it stops the
     /// replay, so it is held for as long as the manager is.
     pub mirror_compensator: Option<Arc<MirrorCompensator>>,
@@ -61,7 +68,7 @@ pub async fn build_snapshot_backend(
     role: crate::role::ServerRole,
 ) -> Result<AssembledSnapshotBackend> {
     let config = ConfigManager::global_config();
-    let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
+    let (repository, runtime_resolver) = build_storage_for_role(config, p2p_transport, role)?;
 
     // 🔴 P2 (task's own "phase4-close"): `--role node` never queries this
     // catalog at all -- both of its request-time reads
@@ -499,7 +506,7 @@ fn build_central_catalog(
 fn assemble_postgres_only_backend(
     central_reads: Arc<dyn SnapshotCatalog>,
     artifacts: Arc<dyn SnapshotArtifactStore>,
-    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+    runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
     node_id: String,
 ) -> AssembledSnapshotBackend {
     AssembledSnapshotBackend {
@@ -554,6 +561,88 @@ pub fn spawn_catalog_build_reaper(
 /// without racing each other.
 pub async fn migrate_catalog_schema(pool: &sqlx::PgPool) -> Result<()> {
     postgres::migrate::migrate(pool).await
+}
+
+/// What [`build_storage_for_role`] hands back: the durable repository, and a
+/// runtime resolver only for a role that has somewhere to run a sandbox.
+type RoleStorage = (
+    Arc<SnapshotRepository>,
+    Option<Arc<dyn SnapshotRuntimeResolver>>,
+);
+
+/// The storage halves this role actually needs.
+///
+/// 🔴 The single gate between `--role api` and the byte half. `--role api`
+/// keeps a repository — it creates template rows, publishes commits staged on
+/// a node, lists, and deletes — but it never materializes a snapshot onto
+/// local disk, so it gets no [`SnapshotRuntimeResolver`] and, with it, none of
+/// the machinery a resolver drags in: the process-wide overlaybd layer store,
+/// the node-local artifact cache, and the runtime cache root they write into.
+///
+/// The early return below is what makes [`build_storage_backend`] unreachable
+/// on that role. It is a runtime gate rather than a compile-time one: the byte
+/// half is reached through the same crate, so nothing but this branch stops it
+/// today. `only_a_role_that_runs_sandboxes_builds_the_byte_half` is the
+/// assertion that keeps it the *only* branch; the compile-time version of this
+/// property is the later step that moves the byte half behind its own crate
+/// boundary.
+///
+/// 🔴 Delete stays on this side of the gate on purpose, and that is why the
+/// api arm still gets a real artifact store rather than a stub. A snapshot's
+/// origin node can be gone — hard death, or simply rolled — and a delete that
+/// had to be dispatched there would leave the row removed, the bytes orphaned,
+/// and nobody holding a record of either. See
+/// [`OssBackend::durable_parts`][oss::OssBackend::durable_parts] for the
+/// matching split on the OSS backend, whose byte deletion is a pure network
+/// operation and never needed overlaybd at all.
+fn build_storage_for_role(
+    config: &AppConfig,
+    p2p_transport: Option<Arc<dyn P2pTransport>>,
+    role: crate::role::ServerRole,
+) -> Result<RoleStorage> {
+    if !role.runs_sandbox_runtime() {
+        return Ok((build_catalog_only_repository(config)?, None));
+    }
+
+    let (repository, runtime_resolver) = build_storage_backend(config, p2p_transport)?;
+    Ok((repository, Some(runtime_resolver)))
+}
+
+/// The durable repository — rows and byte *lifecycle* — with nothing that
+/// turns bytes into something a VM can mmap.
+///
+/// Both backends already had the seam: POSIX's repository is
+/// [`posixfs_repository`], two stores rooted at one directory, and the OSS one
+/// is [`OssBackend::durable_parts`][oss::OssBackend::durable_parts]. What
+/// each of them *doesn't* build is the resolver, which is the only consumer of
+/// the overlaybd layer store, the shared artifact cache, and the runtime cache
+/// root.
+fn build_catalog_only_repository(config: &AppConfig) -> Result<Arc<SnapshotRepository>> {
+    match config.snapshot.repository_backend {
+        SnapshotRepositoryBackendKind::PosixFs => {
+            let root = config
+                .backend
+                .posix_fs
+                .as_ref()
+                .context("backend.posix_fs config is required when repository_backend = posix_fs")?
+                .snapshot_store
+                .join("repository");
+            Ok(Arc::new(posixfs_repository(&root)))
+        }
+        SnapshotRepositoryBackendKind::Oss => {
+            let oss_config = config
+                .backend
+                .oss
+                .as_ref()
+                .context("backend.oss config is required when repository_backend = oss")?;
+            let snapshot_image_storage = if config.snapshot.image_publish.enabled {
+                SnapshotImageStoragePolicy::SourceRegistry
+            } else {
+                SnapshotImageStoragePolicy::ObjectStorage
+            };
+            Ok(OssBackend::durable_parts(oss_config, snapshot_image_storage)?.into_repository())
+        }
+    }
 }
 
 fn build_storage_backend(
@@ -624,6 +713,181 @@ mod tests {
     use crate::snapshot::repository::interfaces::SnapshotCatalog;
     use crate::snapshot::repository::mirror::test_doubles::{record_for, ScriptedCatalog};
     use crate::snapshot::types::SnapshotId;
+
+    use crate::snapshot::repository::interfaces::CatalogReadScope;
+
+    /// 🔴 The step's own acceptance criterion: `--role api` assembles the byte
+    /// half's *lifecycle* and none of its *materialization*.
+    ///
+    /// Two claims, and the second is why the first is safe:
+    ///
+    /// 1. no [`SnapshotRuntimeResolver`] is built at all, so nothing on this
+    ///    process holds an overlaybd layer store, a shared artifact cache, or
+    ///    a runtime cache root on api's behalf; and
+    /// 2. `delete` still works over what *is* built — the row goes, and the
+    ///    committed bytes go with it. That half must stay on api: a snapshot's
+    ///    origin node can be gone, and a delete that had to be dispatched
+    ///    there would leave the row removed and the bytes orphaned.
+    ///
+    /// The publish is here to give the delete something real to remove; it is
+    /// not a claim that api publishes (staging happens where the sandbox is).
+    #[tokio::test]
+    async fn an_api_role_assembles_no_runtime_resolver_and_still_deletes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = AppConfig::default();
+        config.snapshot.repository_backend = SnapshotRepositoryBackendKind::PosixFs;
+        config.backend.posix_fs = Some(crate::cfg::PosixFsBackendConfig {
+            snapshot_store: dir.path().join("store"),
+        });
+
+        let (repository, runtime_resolver) =
+            build_storage_for_role(&config, None, crate::role::ServerRole::Api)
+                .expect("the api role should assemble a storage backend");
+
+        assert!(
+            runtime_resolver.is_none(),
+            "--role api built a snapshot runtime resolver; it resolves nothing and must hold \
+             none of what a resolver drags in"
+        );
+
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let (_, _, manifest) = crate::snapshot::mock::write_mock_built_artifacts(workspace.path())
+            .expect("mock built artifacts should write");
+        let id = SnapshotId::generate();
+        repository
+            .publish(
+                crate::snapshot::SnapshotPublishMetadata {
+                    id: id.clone(),
+                    ..crate::snapshot::SnapshotPublishMetadata::mock()
+                },
+                manifest,
+            )
+            .await
+            .expect("the api-assembled repository should own a real artifact store");
+
+        let committed_dir = dir
+            .path()
+            .join("store")
+            .join("repository")
+            .join("snapshots")
+            .join(id.to_string());
+        assert!(
+            committed_dir.exists(),
+            "the committed bytes should be on disk before the delete"
+        );
+
+        repository
+            .delete(&id.to_string())
+            .await
+            .expect("delete must work on a process with no runtime resolver");
+
+        assert!(
+            repository
+                .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                .await
+                .expect("the catalog should answer")
+                .is_none(),
+            "the row survived a delete on --role api"
+        );
+        assert!(
+            !committed_dir.exists(),
+            "the bytes survived a delete on --role api — this is the orphan the whole \
+             api-side delete exists to prevent"
+        );
+    }
+
+    /// 🔴 The byte half must not be on `--role api`'s call graph.
+    ///
+    /// [`build_storage_for_role`]'s early return is the only thing that makes
+    /// that true, and a unit test cannot prove it by running the other arm:
+    /// the byte half opens the process-wide image-cache RocksDB rooted at
+    /// `home_path`, which a unit test has no business creating. So this reads
+    /// this file's own source text, the same way `src/bin/server.rs`'s
+    /// `only_the_split_roles_bind_a_second_listener` does, and asserts three
+    /// things at once:
+    ///
+    /// * there is exactly **one** call site in this file (plus the `fn`
+    ///   definition). A second one — for instance putting the call back at the
+    ///   top of `build_snapshot_backend`, where it was before this step —
+    ///   fails here even though [`build_storage_for_role`] itself would still
+    ///   look correct;
+    /// * that call site is inside [`build_storage_for_role`]'s body; and
+    /// * inside that body, the role gate opens and returns *before* it.
+    ///
+    /// The count assertion is also what stops the opposite mutation: a gate
+    /// that returned `None` for every role would leave zero call sites.
+    ///
+    /// Matching is on the call expression — the name followed by an opening
+    /// parenthesis — rather than on the bare identifier, because this file's
+    /// prose names the function in several comments and a bare-identifier
+    /// match would count every one of them. The needle is assembled from two
+    /// halves so this test's own source does not match itself; a comment that
+    /// did spell the call expression would over-count and fail here, which is
+    /// a false alarm and never a false pass.
+    #[test]
+    fn only_a_role_that_runs_sandboxes_builds_the_byte_half() {
+        let source = include_str!("mod.rs");
+
+        let body_range = |name: &str| -> std::ops::Range<usize> {
+            let start = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+            let open = source[start..].find('{').expect("a body") + start;
+            let mut depth = 0usize;
+            for (offset, byte) in source[open..].bytes().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return open..open + offset;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{name} has no closing brace");
+        };
+
+        // 🔴 Spelled in halves so this test's own source text does not count
+        // as a call site — it is `include_str!`-ing the file it lives in.
+        let needle = concat!("build_storage_", "backend(");
+        let definition = source
+            .find(&format!("fn {needle}"))
+            .expect("the byte half's definition is no longer in this file")
+            + "fn ".len();
+        let call_sites: Vec<usize> = source
+            .match_indices(needle)
+            .map(|(at, _)| at)
+            .filter(|at| *at != definition)
+            .collect();
+
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "the byte half has {} call sites in this file; it must have exactly one, inside \
+             build_storage_for_role, or --role api can reach it again",
+            call_sites.len()
+        );
+        let call = call_sites[0];
+
+        let gate = body_range("fn build_storage_for_role(");
+        assert!(
+            gate.contains(&call),
+            "the call to the byte half has moved out of build_storage_for_role, so nothing \
+             gates it on the role any more"
+        );
+
+        let before = &source[gate.start..call];
+        let opened = before.find("if !role.runs_sandbox_runtime() {").expect(
+            "build_storage_for_role no longer refuses the byte half for a role that runs no \
+             sandbox runtime",
+        );
+        assert!(
+            before[opened..].contains("return "),
+            "the role gate no longer returns early, so the byte half is built on every role"
+        );
+    }
 
     /// 🔴 A node that has never double-written must not have a backlog created
     /// underneath it. Creating one here would put a RocksDB directory on every
@@ -753,7 +1017,7 @@ mod tests {
         let assembled = assemble_postgres_only_backend(
             Arc::clone(&central_reads) as Arc<dyn SnapshotCatalog>,
             Arc::new(crate::snapshot::mock::MockSnapshotArtifactStore),
-            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            Some(Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver)),
             "test-node".to_string(),
         );
 

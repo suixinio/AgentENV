@@ -3090,7 +3090,7 @@ async fn a_built_templates_metadata_survives_stage_encode_decode_and_commit() {
     .expect("posix backend");
     let (repository, runtime_resolver) = backend.into_parts();
     let snapshot_manager =
-        crate::snapshot::SnapshotManager::from_parts(repository, runtime_resolver, None);
+        crate::snapshot::SnapshotManager::from_parts(repository, Some(runtime_resolver), None);
 
     let artifacts_workspace = tempfile::tempdir().expect("tempdir");
     let (_, _, manifest): (_, _, FirecrackerSnapshotManifest) =

@@ -528,7 +528,7 @@ mod operator_snapshot_delete_tests {
                     deletes: Arc::clone(&artifact_deletes),
                 }),
             )),
-            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            Some(Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver)),
             None,
         ));
 

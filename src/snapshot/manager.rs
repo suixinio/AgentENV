@@ -151,7 +151,11 @@ pub struct LocalSnapshotStaging {
 /// local image ref pins.
 pub struct SnapshotManager {
     repository: Arc<SnapshotRepository>,
-    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+    /// 🔴 `None` on a role that runs no sandbox runtime — see
+    /// [`AssembledSnapshotBackend::runtime_resolver`][crate::snapshot::repository::backends::AssembledSnapshotBackend].
+    /// [`Self::resolve_runnable`] is the only reader, and it refuses rather
+    /// than unwrapping.
+    runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     /// Held, not used. The replay of owed object-store writes stops when the
     /// last handle is dropped, so it lives as long as the manager does.
@@ -187,9 +191,15 @@ impl SnapshotManager {
     }
 
     /// Builds a manager from the given components.
+    ///
+    /// `runtime_resolver` is `None` for a process that never turns a snapshot
+    /// into local bytes; [`Self::resolve_runnable`] then refuses instead of
+    /// resolving. See
+    /// [`build_storage_for_role`][crate::snapshot::repository::backends]'s own
+    /// doc for which roles that is.
     pub fn from_parts(
         repository: Arc<SnapshotRepository>,
-        runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+        runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {
         Self {
@@ -605,11 +615,31 @@ impl SnapshotManager {
     }
 
     /// Resolves a committed snapshot into node-local runnable artifact paths.
+    ///
+    /// 🔴 Refuses, rather than panicking, when this process was assembled
+    /// without a runtime resolver. That is not a defensive `unwrap` dressed up:
+    /// `--role api` is assembled that way on purpose (see
+    /// [`build_storage_for_role`][crate::snapshot::repository::backends]) and
+    /// every one of its callers already forks on
+    /// `ServerRole::runs_sandbox_runtime` and ships the catalog row to a node
+    /// instead. A typed [`RepositoryError::Unsupported`] is what a future
+    /// caller that forgets the fork gets back — a 5xx with a legible reason,
+    /// on one request, rather than the whole api process aborting.
     pub async fn resolve_runnable(
         &self,
         snapshot: SnapshotRecord,
     ) -> anyhow::Result<RunnableSnapshot> {
-        self.runtime_resolver
+        let Some(runtime_resolver) = self.runtime_resolver.as_ref() else {
+            return Err(anyhow::Error::new(RepositoryError::Unsupported {
+                feature: format!(
+                    "resolve snapshot '{}' into runnable runtime paths: this process was \
+                     assembled without a snapshot runtime resolver, because it runs no sandbox \
+                     runtime",
+                    snapshot.id
+                ),
+            }));
+        };
+        runtime_resolver
             .resolve(Arc::new(snapshot))
             .await
             .context("resolve committed snapshot into runnable runtime paths")
@@ -680,7 +710,66 @@ mod tests {
         })
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
-        SnapshotManager::from_parts(repository, runtime_resolver, None)
+        SnapshotManager::from_parts(repository, Some(runtime_resolver), None)
+    }
+
+    /// 🔴 A manager assembled without a runtime resolver — which is what
+    /// `--role api` gets — must *refuse* a resolve, not abort the process.
+    ///
+    /// The refusal is typed: `RepositoryError::Unsupported`, downcastable, so
+    /// a caller that forgot to fork on `ServerRole::runs_sandbox_runtime` gets
+    /// a legible 5xx on one request instead of taking every in-flight request
+    /// down with it.
+    ///
+    /// The control is the second half: the *same* record through a manager
+    /// that does hold a resolver reaches the resolver and fails on the missing
+    /// artifacts instead. Without it, "returns an error" would be satisfied by
+    /// a manager that can never resolve anything at all.
+    #[tokio::test]
+    async fn a_manager_with_no_runtime_resolver_refuses_rather_than_panicking() {
+        let record = SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = {
+            let backend = PosixFsBackend::new(PosixFsBackendConfig {
+                root: tempdir.path().join("repository"),
+                cache_root: Some(tempdir.path().join("runtime-cache")),
+                runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+            })
+            .expect("posix backend");
+            let (repository, _) = backend.into_parts();
+            repository
+        };
+
+        let without = SnapshotManager::from_parts(Arc::clone(&repository), None, None);
+        let err = without
+            .resolve_runnable(record.clone())
+            .await
+            .expect_err("a manager with no runtime resolver must refuse to resolve");
+        let typed = err
+            .downcast_ref::<crate::snapshot::RepositoryError>()
+            .unwrap_or_else(|| panic!("the refusal must be a typed RepositoryError: {err:?}"));
+        assert!(
+            matches!(typed, crate::snapshot::RepositoryError::Unsupported { .. }),
+            "the refusal must say the operation is unsupported here, not that something \
+             went wrong reaching it: {typed:?}"
+        );
+
+        // The control: the same record, through a manager that *does* hold a
+        // resolver, gets past the gate and fails on the artifacts instead.
+        let with = test_manager(tempdir.path());
+        let err = with
+            .resolve_runnable(record)
+            .await
+            .expect_err("nothing was ever published, so resolving must fail");
+        let typed = err
+            .downcast_ref::<crate::snapshot::RepositoryError>()
+            .unwrap_or_else(|| panic!("the resolver's own failure is typed too: {err:?}"));
+        assert!(
+            !matches!(typed, crate::snapshot::RepositoryError::Unsupported { .. }),
+            "a manager that holds a resolver reported the no-resolver refusal, so the \
+             assertion above proves nothing: {typed:?}"
+        );
     }
 
     async fn seed_built_snapshot(manager: &SnapshotManager, snapshot_id: SnapshotId, alias: &str) {
@@ -886,7 +975,8 @@ mod tests {
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
         let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
+        let manager =
+            SnapshotManager::from_parts(repository, Some(runtime_resolver), Some(p2p.clone()));
 
         let workspace = TempDir::new().expect("tempdir should exist");
         let (rootfs_lower, _, manifest) =
@@ -1141,7 +1231,8 @@ mod tests {
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
         let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
+        let manager =
+            SnapshotManager::from_parts(repository, Some(runtime_resolver), Some(p2p.clone()));
         let sandbox = "one-sandbox";
 
         let staged_id = SnapshotId::generate();

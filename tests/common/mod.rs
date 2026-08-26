@@ -97,7 +97,7 @@ pub fn snapshot_test_parts(
     let runtime_resolver = backend.runtime_resolver();
     let snapshot_manager = Arc::new(SnapshotManager::from_parts(
         Arc::clone(&repository),
-        Arc::clone(&runtime_resolver),
+        Some(Arc::clone(&runtime_resolver)),
         None,
     ));
     (

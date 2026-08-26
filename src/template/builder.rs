@@ -374,7 +374,7 @@ mod tests {
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
         let snapshot_manager =
-            SnapshotManager::from_parts(repository.clone(), runtime_resolver.clone(), None);
+            SnapshotManager::from_parts(repository.clone(), Some(runtime_resolver.clone()), None);
         (TemplateBuilder::new(), snapshot_manager)
     }
 

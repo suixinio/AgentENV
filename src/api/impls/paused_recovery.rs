@@ -2757,7 +2757,7 @@ mod cross_node_resume_scope_tests {
                 catalog,
                 Arc::new(crate::snapshot::mock::MockSnapshotArtifactStore),
             )),
-            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            Some(Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver)),
             None,
         ));
 

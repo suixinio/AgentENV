@@ -272,7 +272,7 @@ pub fn recording_snapshot_manager() -> (SnapshotManager, Arc<RecordingSnapshotRe
             Arc::clone(&repository) as Arc<dyn SnapshotCatalog>,
             Arc::clone(&repository) as Arc<dyn SnapshotArtifactStore>,
         )),
-        Arc::new(MockSnapshotRuntimeResolver),
+        Some(Arc::new(MockSnapshotRuntimeResolver)),
         None,
     );
     (manager, repository)
@@ -295,7 +295,7 @@ pub fn mock_snapshot_manager_with_catalog() -> (SnapshotManager, Arc<MockSnapsho
             Arc::clone(&catalog) as Arc<dyn SnapshotCatalog>,
             Arc::new(MockSnapshotArtifactStore),
         )),
-        Arc::new(MockSnapshotRuntimeResolver),
+        Some(Arc::new(MockSnapshotRuntimeResolver)),
         None,
     );
     (manager, catalog)
@@ -359,13 +359,21 @@ impl SnapshotCatalog for OneRowSnapshotCatalog {
 ///
 /// This is the shape of `--role api`'s world once it stops resolving: it can
 /// read the catalog, and it has no business turning a row into local bytes.
+///
+/// 🔴 A resolver that refuses, deliberately, rather than the `None` a real
+/// `--role api` is now assembled with (see `build_storage_for_role`). This
+/// fixture is handed to `--role all` and `--role node` in the same tests, and
+/// for those two the refusal is the *positive* control: they must fail exactly
+/// here, which is what proves they resolved rather than shipped the row. A
+/// `None` would make both roles fail with the same message and the fork would
+/// stop being observable.
 pub fn unresolvable_snapshot_manager(row: SnapshotRecord) -> SnapshotManager {
     SnapshotManager::from_parts(
         Arc::new(SnapshotRepository::new(
             Arc::new(OneRowSnapshotCatalog { row }) as Arc<dyn SnapshotCatalog>,
             Arc::new(MockSnapshotArtifactStore),
         )),
-        Arc::new(MockSnapshotRuntimeResolver),
+        Some(Arc::new(MockSnapshotRuntimeResolver)),
         None,
     )
 }

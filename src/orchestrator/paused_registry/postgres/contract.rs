@@ -263,6 +263,79 @@ mod pg {
         assert!(matches!(err, PausedRegistryError::ExecutionFenced { .. }));
     }
 
+    /// **H2(b)**: the two refusals this backend can give a caller mean
+    /// opposite things -- `GenerationConflict` says "your view of the row is
+    /// stale, re-read and try again"; `ExecutionFenced` says "the run you
+    /// are writing on behalf of is over, stop retrying for good". Every
+    /// other test in this file only asserts the variant it *expects*; this
+    /// one also asserts the *other* variant did not come back instead, for
+    /// both scenarios. Mirrors Go's `TestTwoRefusalsAreToldApart`: "a build
+    /// that wrapped one in the other would look correct in every test that
+    /// asserts 'the write was refused', and would send a node into a
+    /// re-read loop that walks straight around the fence."
+    #[tokio::test]
+    async fn two_refusals_are_told_apart() {
+        let pool = isolated_schema_pool_or_skip!("two_refusals_are_told_apart");
+        let cluster_id = Uuid::new_v4();
+        let registry = registry(pool, cluster_id).await;
+
+        // Scenario 1: a stale generation on `complete_pause` -- the row is
+        // still under the *same* incarnation, just a different generation
+        // than the caller last observed. Must be `GenerationConflict`, never
+        // `ExecutionFenced`.
+        let sandbox_a = SandboxId::new();
+        let execution_a = ExecutionId::new();
+        registry
+            .begin_pause(&entry(sandbox_a, cluster_id, "node-a", execution_a))
+            .await
+            .unwrap();
+        let generation_err = registry
+            .complete_pause(&sandbox_a, 999, &snapshot_id())
+            .await
+            .expect_err("a stale generation must be refused");
+        assert!(
+            matches!(
+                generation_err,
+                PausedRegistryError::GenerationConflict { .. }
+            ),
+            "expected GenerationConflict, got {generation_err:?}"
+        );
+        assert!(
+            !matches!(generation_err, PausedRegistryError::ExecutionFenced { .. }),
+            "a stale generation on an otherwise-current incarnation must never read as \
+             ExecutionFenced -- that would tell the caller to stop retrying for good, when a \
+             fresh re-read and retry is exactly right"
+        );
+
+        // Scenario 2: a pause sent under an incarnation the row has already
+        // moved past (a cross-node resume happened since). Must be
+        // `ExecutionFenced`, never `GenerationConflict`.
+        let sandbox_b = SandboxId::new();
+        let first_execution = ExecutionId::new();
+        registry
+            .begin_pause(&entry(sandbox_b, cluster_id, "node-a", first_execution))
+            .await
+            .unwrap();
+        let second_execution = ExecutionId::new();
+        registry
+            .mark_running(&sandbox_b, "node-a", "node-a", second_execution, None)
+            .await
+            .unwrap();
+        let fenced_err = registry
+            .begin_pause(&entry(sandbox_b, cluster_id, "node-a", first_execution))
+            .await
+            .expect_err("a pause under a superseded incarnation must be fenced");
+        assert!(
+            matches!(fenced_err, PausedRegistryError::ExecutionFenced { .. }),
+            "expected ExecutionFenced, got {fenced_err:?}"
+        );
+        assert!(
+            !matches!(fenced_err, PausedRegistryError::GenerationConflict { .. }),
+            "a superseded incarnation must never read as GenerationConflict -- that would send \
+             this caller into a re-read-and-retry loop that walks straight around the fence"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // claim_for_resume
     // ---------------------------------------------------------------------
@@ -433,6 +506,49 @@ mod pg {
         };
         assert_eq!(origin_node_id, "node-a");
         assert_eq!(reason, ConflictReason::LiveElsewhere);
+    }
+
+    /// **H2(d)**: `ResumeClaim::NotReady` had never once been constructed or
+    /// asserted on anywhere in this suite before this test -- an entire
+    /// result variant with zero coverage. A `publishing` row whose lease has
+    /// *not* yet lapsed is claimable by nobody (only its origin node can
+    /// serve it while the upload is still in flight): calls
+    /// `writes::claim_for_resume` directly with `durable_only: false` so the
+    /// outcome is decided purely by the row's own state/lease, independent
+    /// of this cluster's restart-grace phase (`super::grace`), which this
+    /// test is not about.
+    #[tokio::test]
+    async fn claiming_a_fresh_publishing_sandbox_reports_not_ready() {
+        let pool =
+            isolated_schema_pool_or_skip!("claiming_a_fresh_publishing_sandbox_reports_not_ready");
+        let cluster_id = Uuid::new_v4();
+        let registry = registry(pool, cluster_id).await;
+
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        registry
+            .begin_pause(&entry(sandbox_id, cluster_id, "node-a", execution_id))
+            .await
+            .unwrap();
+
+        // The row is `publishing` with a fresh (default 90s) lease -- not
+        // claimable by a degraded takeover, and never claimable outright
+        // (publishing/local_only never are -- only a lapsed lease makes them
+        // eligible, and only when `durable_only` is false).
+        let claim = super::super::writes::claim_for_resume(
+            &registry,
+            false,
+            &sandbox_id,
+            "node-b",
+            ExecutionId::new(),
+        )
+        .await
+        .expect("the read path itself must succeed");
+
+        let ResumeClaim::NotReady { origin_node_id } = claim else {
+            panic!("expected NotReady, got {claim:?}");
+        };
+        assert_eq!(origin_node_id, "node-a");
     }
 
     // ---------------------------------------------------------------------
@@ -652,6 +768,53 @@ mod pg {
             stale_retry,
             PausedRegistryError::ExecutionFenced { .. }
         ));
+    }
+
+    /// **H2(c)**: the one cell of `mark_running`'s outcome table this suite
+    /// had zero coverage for -- a `running` row held by a *different* node
+    /// entirely (not a stale retry of the same incarnation, which is
+    /// `ExecutionFenced` above, and not a `resuming` claim someone else
+    /// holds, which `mark_running_a_claim_another_node_holds_reports_held_
+    /// elsewhere` already covers). This is
+    /// `writes.rs::mark_running`'s `(entry.state == Running &&
+    /// entry.origin_node_id == holder)` branch's *false* half: without it,
+    /// a build that swapped the two outcomes for this specific cell (`Held
+    /// Elsewhere` versus `ExecutionFenced`) would pass every other test in
+    /// this file.
+    #[tokio::test]
+    async fn mark_running_a_running_row_held_by_a_different_node_reports_held_elsewhere() {
+        let pool = isolated_schema_pool_or_skip!(
+            "mark_running_a_running_row_held_by_a_different_node_reports_held_elsewhere"
+        );
+        let cluster_id = Uuid::new_v4();
+        let registry = registry(pool, cluster_id).await;
+
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        bring_to_running(
+            &registry,
+            sandbox_id,
+            cluster_id,
+            "node-a",
+            execution_id,
+            None,
+        )
+        .await;
+
+        // node-c never held any claim on this sandbox and is not its
+        // current holder -- this must read as the healthy "somebody else
+        // has it" case, not as this node's own incarnation having gone
+        // stale.
+        let outcome = registry
+            .mark_running(&sandbox_id, "node-c", "node-c", ExecutionId::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, MarkRunningOutcome::HeldElsewhere);
+
+        // And the row itself must be untouched -- node-a still holds it.
+        let row = registry.get(&sandbox_id).await.unwrap().unwrap();
+        assert_eq!(row.state, PausedRegistryState::Running);
+        assert_eq!(row.origin_node_id, "node-a");
     }
 
     // ---------------------------------------------------------------------
@@ -1065,6 +1228,167 @@ mod pg {
         assert_eq!(outcome.released, 1);
         let row = registry.get(&sandbox_id).await.unwrap().unwrap();
         assert_eq!(row.state, PausedRegistryState::Paused);
+    }
+
+    /// **H2(a)**, half one: Go's `TestContractAResumingClaimIsReleasedEven
+    /// WithAFarFutureInheritedDeadline` -- the resuming SQL arm's own
+    /// omission of `sandbox_expires_at` is proved with a row that actually
+    /// *carries* a non-null, far-future deadline (inherited from a previous
+    /// `running` incarnation -- `begin_pause`/`complete_pause`/
+    /// `claim_for_resume` none of them touch that column, so it survives an
+    /// ordinary pause/resume cycle untouched), not merely a row where the
+    /// column happens to be `NULL`
+    /// (`a_resuming_row_with_a_lapsed_lease_and_no_deadline_is_reclaimed`,
+    /// above). Without this test, a "fix" that re-merged the two reclaim
+    /// statements behind a `COALESCE(sandbox_expires_at, 'epoch')` guard
+    /// would still pass every other test in this file while leaving a
+    /// resuming row with a real future deadline permanently stuck.
+    #[tokio::test]
+    async fn a_resuming_row_with_an_inherited_far_future_deadline_is_still_reclaimed_on_lease_alone(
+    ) {
+        let pool = isolated_schema_pool_or_skip!(
+            "a_resuming_row_with_an_inherited_far_future_deadline_is_still_reclaimed_on_lease_alone"
+        );
+        let cluster_id = Uuid::new_v4();
+        let registry =
+            PostgresPausedSandboxRegistry::new(pool.clone(), cluster_id, Duration::from_millis(50));
+        super::super::schema::migrate(&pool).await.unwrap();
+
+        let sandbox_id = SandboxId::new();
+        let far_future = Some(SystemTime::now() + Duration::from_secs(3600));
+        bring_to_running_with_snapshot(&registry, sandbox_id, cluster_id, "node-a", far_future)
+            .await;
+        let running_row = registry.get(&sandbox_id).await.unwrap().unwrap();
+        assert_eq!(running_row.state, PausedRegistryState::Running);
+        let running_execution = running_row
+            .execution_id
+            .expect("a running row always carries an incarnation");
+
+        // An ordinary pause -- sandbox_expires_at is not in either
+        // statement's SET list, so it carries over untouched.
+        let began = registry
+            .begin_pause(&entry(sandbox_id, cluster_id, "node-a", running_execution))
+            .await
+            .unwrap();
+        registry
+            .complete_pause(&sandbox_id, began.generation, &snapshot_id())
+            .await
+            .unwrap();
+
+        // A cross-node resume claim -- `claim_for_resume` does not touch
+        // sandbox_expires_at either.
+        registry
+            .claim_for_resume(&sandbox_id, "node-b", ExecutionId::new())
+            .await
+            .unwrap();
+        let resuming_row = registry.get(&sandbox_id).await.unwrap().unwrap();
+        assert_eq!(resuming_row.state, PausedRegistryState::Resuming);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let outcome = registry.reclaim_expired_holdings().await.unwrap();
+        assert_eq!(
+            outcome.released, 1,
+            "a resuming row must reclaim on a lapsed lease alone even while carrying a real, \
+             far-future inherited deadline"
+        );
+        let row = registry.get(&sandbox_id).await.unwrap().unwrap();
+        assert_eq!(row.state, PausedRegistryState::Paused);
+    }
+
+    /// **H2(a)**, half two: Go's `TestContractAFreshResumeClaimSurvivesRe
+    /// claimWhileItsLeaseIsStillLive`. Without this test, a "fix" that made
+    /// reclaim release *every* `resuming` row unconditionally (ignoring the
+    /// lease entirely) would still pass every other reclaim test in this
+    /// file -- they all reclaim only after sleeping past a short lease.
+    #[tokio::test]
+    async fn a_freshly_claimed_resuming_row_with_a_live_lease_survives_a_reclaim_pass() {
+        let pool = isolated_schema_pool_or_skip!(
+            "a_freshly_claimed_resuming_row_with_a_live_lease_survives_a_reclaim_pass"
+        );
+        let cluster_id = Uuid::new_v4();
+        let registry = registry(pool, cluster_id).await;
+
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        let began = registry
+            .begin_pause(&entry(sandbox_id, cluster_id, "node-a", execution_id))
+            .await
+            .unwrap();
+        registry
+            .complete_pause(&sandbox_id, began.generation, &snapshot_id())
+            .await
+            .unwrap();
+        registry
+            .claim_for_resume(&sandbox_id, "node-b", ExecutionId::new())
+            .await
+            .unwrap();
+
+        // No sleep -- the (default, 90s) lease is still live.
+        let outcome = registry.reclaim_expired_holdings().await.unwrap();
+        assert_eq!(
+            outcome.released, 0,
+            "a resuming row with a still-live lease must not be reclaimed"
+        );
+        let row = registry.get(&sandbox_id).await.unwrap().unwrap();
+        assert_eq!(row.state, PausedRegistryState::Resuming);
+    }
+
+    /// **H2(d)**: `ReleasedHoldings::discarded` had only ever been asserted
+    /// `== 0` in this file -- the non-zero path had never actually run. A
+    /// `running` row with no durable snapshot behind it (a pause that never
+    /// got as far as `complete_pause`) whose lease *and* deadline have both
+    /// passed is gone for good, not merely parked -- `RECLAIM_DISCARDED_SQL`
+    /// deletes it outright rather than releasing it to `paused`.
+    #[tokio::test]
+    async fn a_running_row_with_no_snapshot_and_a_passed_deadline_is_discarded() {
+        let pool = isolated_schema_pool_or_skip!(
+            "a_running_row_with_no_snapshot_and_a_passed_deadline_is_discarded"
+        );
+        let cluster_id = Uuid::new_v4();
+        let registry =
+            PostgresPausedSandboxRegistry::new(pool.clone(), cluster_id, Duration::from_millis(50));
+        super::super::schema::migrate(&pool).await.unwrap();
+
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        registry
+            .begin_pause(&entry(sandbox_id, cluster_id, "node-a", execution_id))
+            .await
+            .unwrap();
+        // No `complete_pause` -- snapshot_id stays NULL.
+        let past_deadline = SystemTime::now() - Duration::from_secs(10);
+        let outcome = registry
+            .mark_running(
+                &sandbox_id,
+                "node-a",
+                "node-a",
+                execution_id,
+                Some(past_deadline),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, MarkRunningOutcome::Adopted);
+
+        let precondition = registry.get(&sandbox_id).await.unwrap().unwrap();
+        assert!(
+            precondition.snapshot_id.is_none(),
+            "precondition: no durable snapshot exists behind this row"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let reclaim_outcome = registry.reclaim_expired_holdings().await.unwrap();
+        assert_eq!(
+            reclaim_outcome.discarded, 1,
+            "a running row with no snapshot, a lapsed lease and a passed deadline must be \
+             discarded, not released"
+        );
+        assert_eq!(reclaim_outcome.released, 0);
+        assert!(
+            registry.get(&sandbox_id).await.unwrap().is_none(),
+            "a discarded row must be gone entirely, not merely reset"
+        );
     }
 
     // ---------------------------------------------------------------------

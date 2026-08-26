@@ -472,33 +472,55 @@ async fn delete_snapshot(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Admits one build: the cluster-wide ceiling, the per-template exclusion,
-/// and the template's `waiting|error -> building` transition, all under one
-/// `pg_advisory_xact_lock` — matches `queries_admin.go`'s "Build admission"
-/// section exactly, including the reasoning in `buildAdmissionKey`'s comment
-/// for why this is a lock rather than "insert, then count": under READ
+/// and the template's `waiting|error -> building` transition, all in one
+/// transaction — matches `queries_admin.go`'s "Build admission" section
+/// exactly, down to the ceiling check running under a `pg_advisory_xact_lock`
+/// and the reasoning in `buildAdmissionKey`'s comment for why: under READ
 /// COMMITTED two concurrent admissions cannot see each other's uncommitted
-/// rows, so counting after inserting lets both through.
+/// rows, so counting after inserting lets both through. The per-template
+/// exclusion needs no such lock — it is fenced by the row-level lock the
+/// `UPDATE` below already takes on the template's own row, the same
+/// guarantee `builds_one_active_per_template`'s unique index gives Go's
+/// insert.
 ///
-/// 🔴 `max_concurrent_builds` has no Go-side equivalent constant read here —
-/// the cap itself is a cluster policy Go reads from
-/// `scheduler.catalog.max_concurrent_builds`; Stage B's caller supplies it
-/// the same way (see `PostgresSnapshotCatalog::new`'s doc).
+/// `max_concurrent_builds` is the *already-resolved* ceiling — 0 meaning
+/// "enforce a ceiling of zero", not "unlimited" — matching
+/// [`super::PostgresSnapshotCatalog::with_max_concurrent_builds`]'s own
+/// resolution of a configured `0` up to the default before it ever reaches
+/// here; only a negative value disables the check. That mirrors
+/// `store_postgres.go:809`'s `if s.maxConcurrentBuilds > 0`, including
+/// skipping the lock and the cluster-wide `count(*)` entirely once the
+/// ceiling is off — `store_postgres.go`'s own version of the same skip.
 pub(crate) async fn start_build(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
     template_id: &SnapshotId,
     build_id: &SnapshotId,
-    max_concurrent_builds: u32,
+    max_concurrent_builds: i32,
     started_at_ms: i64,
 ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
     let mut tx = pool.begin().await.map_err(backend_error("start_build"))?;
 
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(GO_BUILD_ADMISSION_LOCK_KEY)
-        .execute(&mut *tx)
+    if max_concurrent_builds > 0 {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(GO_BUILD_ADMISSION_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend_error("start_build"))?;
+
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM builds WHERE cluster_id = $1 AND status_group IN ('pending', 'in_progress')",
+        )
+        .bind(cluster_id)
+        .fetch_one(&mut *tx)
         .await
         .map_err(backend_error("start_build"))?;
+        if active_count >= max_concurrent_builds as i64 {
+            let _ = tx.rollback().await;
+            return Ok(CatalogWrite::Refused(CatalogRefusal::BuildQueueFull));
+        }
+    }
 
     let active_for_template: Option<(String,)> = sqlx::query_as(
         "SELECT id::text FROM builds
@@ -515,17 +537,6 @@ pub(crate) async fn start_build(
         return Ok(CatalogWrite::Refused(CatalogRefusal::BuildInProgress {
             active_build_id,
         }));
-    }
-
-    let active_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM builds WHERE cluster_id = $1 AND status_group IN ('pending', 'in_progress')")
-            .bind(cluster_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(backend_error("start_build"))?;
-    if max_concurrent_builds > 0 && active_count >= max_concurrent_builds as i64 {
-        let _ = tx.rollback().await;
-        return Ok(CatalogWrite::Refused(CatalogRefusal::BuildQueueFull));
     }
 
     let marked: Option<(String,)> = sqlx::query_as(
@@ -703,7 +714,7 @@ pub(crate) async fn try_start_build(
     cluster_id: Uuid,
     node_id: &str,
     id: &SnapshotId,
-    max_concurrent_builds: u32,
+    max_concurrent_builds: i32,
 ) -> RepositoryResult<StartedBuild> {
     match start_build(
         pool,

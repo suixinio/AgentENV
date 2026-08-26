@@ -34,11 +34,15 @@ use crate::snapshot::repository::mirror::{CatalogCensus, CentralCatalogWrites};
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
-/// Default cluster-wide concurrent-build ceiling when the caller does not
-/// override it — mirrors Go's own default
-/// (`scheduler.catalog.max_concurrent_builds`); `0` means unlimited, matching
-/// `writes.rs::start_build`'s own reading of the value.
-pub(crate) const DEFAULT_MAX_CONCURRENT_BUILDS: u32 = 0;
+/// Cluster-wide concurrent-build ceiling `PostgresSnapshotCatalog::new`
+/// starts at, and what an explicit `0` passed to
+/// [`PostgresSnapshotCatalog::with_max_concurrent_builds`] resolves to —
+/// mirrors Go's own default (`defaultMaxConcurrentBuilds`,
+/// `store_postgres.go:27`, re-read from `config.snapshot.catalog` at
+/// `build_central_catalog`'s call site). A *negative* value removes the
+/// ceiling entirely (see `with_max_concurrent_builds`'s own doc); `0` is
+/// never unlimited on either side.
+pub(crate) const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 20;
 
 /// A `SnapshotCatalog` backed by a direct, in-process connection pool to the
 /// shared control-plane PostgreSQL database, rather than an RPC hop to
@@ -47,7 +51,7 @@ pub(crate) struct PostgresSnapshotCatalog {
     pool: PgPool,
     cluster_id: Uuid,
     node_id: String,
-    max_concurrent_builds: u32,
+    max_concurrent_builds: i32,
 }
 
 impl PostgresSnapshotCatalog {
@@ -66,9 +70,29 @@ impl PostgresSnapshotCatalog {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_max_concurrent_builds(mut self, max: u32) -> Self {
-        self.max_concurrent_builds = max;
+    /// Overrides the cluster-wide build ceiling `new` started at — the
+    /// production caller is `build_central_catalog`
+    /// (`backends/mod.rs`), which passes
+    /// `config.snapshot.catalog.max_concurrent_builds` here on every
+    /// `PostgresSnapshotCatalog` it builds; tests call it directly to drive
+    /// admission at a ceiling other than the default.
+    ///
+    /// Mirrors Go's own resolution in `NewStoreWithPool`
+    /// (`store_postgres.go:134-137`): `0` takes [`DEFAULT_MAX_CONCURRENT_BUILDS`]
+    /// — matching a config that was left unset, not "no ceiling" — while any
+    /// other value, including negative, passes straight through. A negative
+    /// value is what actually removes the ceiling: `writes::start_build`
+    /// only takes the advisory lock and runs the cluster-wide `count(*)`
+    /// when `max_concurrent_builds > 0` (`store_postgres.go:809`'s
+    /// `if s.maxConcurrentBuilds > 0`), so 0 and a positive number are both
+    /// enforced and only a negative number skips the check (and its cost)
+    /// entirely.
+    pub(crate) fn with_max_concurrent_builds(mut self, max: i32) -> Self {
+        self.max_concurrent_builds = if max == 0 {
+            DEFAULT_MAX_CONCURRENT_BUILDS
+        } else {
+            max
+        };
         self
     }
 
@@ -798,6 +822,76 @@ mod pg {
             .await
             .expect_err("a cluster already at its ceiling must refuse a second template's build");
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
+    }
+
+    /// 🔴 Regression for the exact defect P1 fixes: an explicit `0` used to
+    /// mean "no ceiling" (`writes.rs`'s old `max_concurrent_builds > 0 &&`
+    /// guard never fired for `0`), which silently dropped Go's cluster-wide
+    /// ceiling the moment `write = "both"`/`"postgres"` came up with no
+    /// override. `with_max_concurrent_builds(0)` must resolve to exactly
+    /// [`DEFAULT_MAX_CONCURRENT_BUILDS`] (20, matching Go's own default) —
+    /// admitting the 20th build and refusing the 21st proves both halves at
+    /// once: `0` is *bounded* (not unlimited) and bounded at the *right*
+    /// number, not some other finite one.
+    #[tokio::test]
+    async fn zero_resolves_to_the_default_ceiling_not_to_unlimited() {
+        let pool =
+            isolated_schema_pool_or_skip!("zero_resolves_to_the_default_ceiling_not_to_unlimited");
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+        let catalog = PostgresSnapshotCatalog::new(pool, cluster_id, "node-a".to_string())
+            .with_max_concurrent_builds(0);
+
+        for n in 0..DEFAULT_MAX_CONCURRENT_BUILDS {
+            let record = template_record(None);
+            catalog
+                .create(record.clone())
+                .await
+                .unwrap_or_else(|e| panic!("create #{n} should succeed: {e}"));
+            catalog
+                .try_start_build(&record.id)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("build #{n} should be admitted under the default ceiling: {e}")
+                });
+        }
+
+        let one_more = template_record(None);
+        catalog
+            .create(one_more.clone())
+            .await
+            .expect("create should succeed");
+        let error = catalog
+            .try_start_build(&one_more.id)
+            .await
+            .expect_err("the 21st build must be refused: 0 resolves to a ceiling of 20, not unlimited");
+        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
+    }
+
+    /// The other half of the same proof: a *negative* ceiling — not `0` — is
+    /// what actually removes the check, past the point `0`'s own default
+    /// would have refused at.
+    #[tokio::test]
+    async fn a_negative_ceiling_removes_it_entirely() {
+        let pool = isolated_schema_pool_or_skip!("a_negative_ceiling_removes_it_entirely");
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+        let catalog = PostgresSnapshotCatalog::new(pool, cluster_id, "node-a".to_string())
+            .with_max_concurrent_builds(-1);
+
+        for n in 0..(DEFAULT_MAX_CONCURRENT_BUILDS + 2) {
+            let record = template_record(None);
+            catalog
+                .create(record.clone())
+                .await
+                .unwrap_or_else(|e| panic!("create #{n} should succeed: {e}"));
+            catalog.try_start_build(&record.id).await.unwrap_or_else(|e| {
+                panic!(
+                    "build #{n} should be admitted: a negative ceiling must not refuse anything, \
+                     even past where 0's own default would have: {e}"
+                )
+            });
+        }
     }
 
     #[tokio::test]

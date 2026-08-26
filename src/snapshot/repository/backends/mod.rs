@@ -401,11 +401,26 @@ fn build_central_catalog(
 
     if let Some(pool) = pg_pool {
         let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
-        let catalog = Arc::new(PostgresSnapshotCatalog::new(
-            pool.clone(),
-            identity.cluster_id,
-            identity.id,
-        ));
+        let catalog = Arc::new(
+            PostgresSnapshotCatalog::new(pool.clone(), identity.cluster_id, identity.id)
+                .with_max_concurrent_builds(config.snapshot.catalog.max_concurrent_builds),
+        );
+        if config.snapshot.catalog.max_concurrent_builds < 0 {
+            // 🔴 Legal, and deliberate (see `SnapshotCatalogConfig::max_concurrent_builds`'s
+            // own doc for why negative rather than zero means this) — still
+            // worth a line at startup, matching
+            // `services/scheduler/cmd/main.go::announceBuildQueue`'s own
+            // warning: with no ceiling the only thing bounding concurrent
+            // builds is how many VMs the fleet can boot, and the first
+            // symptom is nodes running out of memory rather than a refusal
+            // anybody can read.
+            tracing::warn!(
+                target: "agentenv",
+                max_concurrent_builds = config.snapshot.catalog.max_concurrent_builds,
+                "snapshot catalog build queue has no cluster-wide ceiling: nothing but the \
+                 fleet's capacity limits how many builds run at once"
+            );
+        }
         return Ok(Some(CentralCatalogHandle {
             writes: Arc::clone(&catalog) as Arc<dyn CentralCatalogWrites>,
             census: Arc::clone(&catalog) as Arc<dyn CatalogCensus>,
@@ -887,5 +902,73 @@ mod pg {
             .await
             .expect("read should succeed");
         assert!(found.is_some());
+    }
+
+    /// 🔴 P1's actual production path: `config.snapshot.catalog.max_concurrent_builds`
+    /// has to reach the `PostgresSnapshotCatalog` `build_central_catalog`
+    /// constructs, not just the test-only constructor in `postgres::mod::pg`.
+    /// A ceiling of `1` set on the `AppConfig` passed in here must refuse a
+    /// second *different* template's build the same way
+    /// `the_cluster_wide_build_ceiling_refuses_once_it_is_reached` proves the
+    /// underlying store does — this test is the only one that goes through
+    /// `build_central_catalog` itself to get there, so a regression that
+    /// stops the config value from being read (for instance, `build_central_catalog`
+    /// going back to `PostgresSnapshotCatalog::new` without the
+    /// `with_max_concurrent_builds` call) fails only here.
+    #[tokio::test]
+    async fn max_concurrent_builds_from_config_reaches_admission() {
+        let pool = isolated_schema_pool_or_skip!("max_concurrent_builds_from_config_reaches_admission");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let mut config = AppConfig::default();
+        config.snapshot.catalog.write = SnapshotCatalogWrite::Both;
+        config.snapshot.catalog.max_concurrent_builds = 1;
+
+        let handle = build_central_catalog(&config, Some(&pool))
+            .expect("building should not error")
+            .expect("write = \"both\" with a pool must produce a central catalog");
+
+        let first_id = SnapshotId::generate();
+        let first = SnapshotRecord::template_waiting(first_id.clone(), None, resources());
+        handle
+            .writes
+            .begin(&first, "waiting", true)
+            .await
+            .expect("begin should succeed");
+        match handle
+            .writes
+            .start_build(&first_id, &SnapshotId::generate(), central::now_unix_ms())
+            .await
+            .expect("start_build should not error")
+        {
+            CatalogWrite::Applied(_) => {}
+            CatalogWrite::Refused(refusal) => {
+                panic!("the first build must be admitted under the ceiling: {refusal}")
+            }
+        }
+
+        let second_id = SnapshotId::generate();
+        let second = SnapshotRecord::template_waiting(second_id.clone(), None, resources());
+        handle
+            .writes
+            .begin(&second, "waiting", true)
+            .await
+            .expect("begin should succeed");
+        match handle
+            .writes
+            .start_build(&second_id, &SnapshotId::generate(), central::now_unix_ms())
+            .await
+            .expect("start_build should not error")
+        {
+            CatalogWrite::Applied(_) => panic!(
+                "a second, different template's build must be refused once the configured \
+                 ceiling of 1 is reached — this only happens if `config.snapshot.catalog.\
+                 max_concurrent_builds` actually reached the store"
+            ),
+            CatalogWrite::Refused(CatalogRefusal::BuildQueueFull) => {}
+            CatalogWrite::Refused(other) => {
+                panic!("expected BuildQueueFull, got a different refusal: {other}")
+            }
+        }
     }
 }

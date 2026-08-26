@@ -527,6 +527,35 @@ pub struct SnapshotCatalogConfig {
     pub write: SnapshotCatalogWrite,
     #[config(default = "object_store", env = "AENV_SNAPSHOT_CATALOG_READ")]
     pub read: SnapshotCatalogRead,
+    /// The cluster-wide ceiling on builds that are `pending`/`in_progress` at
+    /// once, enforced by [`crate::snapshot::repository::backends::postgres::PostgresSnapshotCatalog`]
+    /// — mirrors `scheduler.catalog.max_concurrent_builds`
+    /// (`services/shared/config/config.go`), including its default (20) and
+    /// its two special values:
+    ///
+    /// 🔴 `0` takes the default rather than meaning "no ceiling" — matching a
+    /// config that was left unset, exactly like Go's own
+    /// `NewStoreWithPool`/`store_postgres.go:134-137` re-applying that
+    /// fallback even though the top-level default (this field's own `20`) is
+    /// already supposed to have supplied it: an explicit `0` (from
+    /// `AENV_SNAPSHOT_CATALOG_MAX_CONCURRENT_BUILDS=0`, say) must land on the
+    /// same value as leaving the field out entirely.
+    ///
+    /// 🔴 A *negative* value removes the ceiling entirely — and with it the
+    /// advisory lock and the cluster-wide `count(*)` that exist only to
+    /// enforce one (`postgres::writes::start_build`'s own `> 0` gate,
+    /// matching `store_postgres.go:809`'s `if s.maxConcurrentBuilds > 0`). This
+    /// is a thing to do knowingly, never by leaving the field at its
+    /// zero-value, hence negative rather than zero disables it — matching
+    /// `SchedulerCatalogConfig.MaxConcurrentBuilds`'s own doc.
+    ///
+    /// Settable from the environment for the same reason `write`/`read` are:
+    /// this is one of the two knobs `SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS`
+    /// lets a Go operator reach for during an incident, and a value edited
+    /// directly into `config/default.toml` is rolled back by the next
+    /// `deploy/k8s/run.sh` apply.
+    #[config(default = 20i32, env = "AENV_SNAPSHOT_CATALOG_MAX_CONCURRENT_BUILDS")]
+    pub max_concurrent_builds: i32,
     /// How often owed object-store writes are replayed.
     #[config(default = 30u64)]
     pub mirror_compensator_interval_secs: u64,

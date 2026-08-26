@@ -312,6 +312,18 @@ impl NodeSandboxService {
                 )?;
                 let runnable = match resolved {
                     Some(record) => {
+                        if !record_names(&record, &base_ref) {
+                            return Err(Status::invalid_argument(format!(
+                                "base_snapshot_resolved names snapshot {}{}, not \
+                                 base_snapshot_ref {base_ref}",
+                                record.id,
+                                record
+                                    .alias
+                                    .as_ref()
+                                    .map(|alias| format!(" (alias {alias})"))
+                                    .unwrap_or_default(),
+                            )));
+                        }
                         self.snapshots
                             .resolve_runnable(record)
                             .await
@@ -699,6 +711,25 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
 /// of an `ImageResolutionError` into a status — `ImageResolver::resolve`
 /// itself — is already shared, being the one and only implementation either
 /// caller drives.
+/// Whether `record` is the snapshot `id_or_alias` names — by id or by the
+/// record's own current alias, since a caller may name either one.
+///
+/// 🔴 What stands between `BuildTemplate`'s `base_snapshot_resolved` and
+/// silently building on top of the wrong snapshot: unlike `Create`'s
+/// `resolved_record` (checked against `snapshot_id` alone, because
+/// `SnapshotSource.snapshot_id` is always an id), `base_snapshot_ref` is
+/// documented to accept either an id or an alias — see its own doc in
+/// node.proto — so the cross-check has to accept whichever one a caller
+/// actually sent, or a legitimate alias-named build would be refused as a
+/// mismatch.
+fn record_names(record: &SnapshotRecord, id_or_alias: &str) -> bool {
+    record.id.to_string() == id_or_alias
+        || record
+            .alias
+            .as_ref()
+            .is_some_and(|alias| alias.to_string() == id_or_alias)
+}
+
 async fn resolve_build_image(
     image_resolver: &ImageResolver,
     image_ref: Option<&str>,

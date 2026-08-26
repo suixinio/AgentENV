@@ -1062,8 +1062,13 @@ async fn a_resolved_base_snapshot_skips_the_nodes_own_catalog_lookup() {
     let err = service
         .build_template(Request::new(pb::TemplateBuildRequest {
             build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
+            // 🔴 Must name the resolved record (its id, here) now that the
+            // template arm cross-checks `base_snapshot_ref` against
+            // `base_snapshot_resolved` — see
+            // `a_base_snapshot_ref_naming_a_different_snapshot_is_refused`
+            // for the case where it does not.
             base: Some(pb::template_build_request::Base::BaseSnapshotRef(
-                "irrelevant-alias".to_string(),
+                record.id.to_string(),
             )),
             base_snapshot_resolved: Some(base_snapshot_resolved),
             steps: None,
@@ -1086,6 +1091,110 @@ async fn a_resolved_base_snapshot_skips_the_nodes_own_catalog_lookup() {
         catalog.get_calls(),
         0,
         "base_snapshot_resolved must never touch the node's own catalog"
+    );
+}
+
+/// P4: the template arm's counterpart to
+/// `a_resolved_record_naming_a_different_snapshot_is_refused` — a
+/// `base_snapshot_resolved` naming a different snapshot than
+/// `base_snapshot_ref` is a malformed request, refused loudly rather than
+/// silently building on top of whichever snapshot the record actually names.
+///
+/// Before this test (and the check it guards) existed, nothing compared the
+/// two at all: a misrouted or buggy API replica could send a
+/// `base_snapshot_resolved` for one snapshot alongside a `base_snapshot_ref`
+/// naming a different one, and the node would build on top of the resolved
+/// record without ever noticing the mismatch.
+#[tokio::test]
+async fn a_base_snapshot_ref_naming_a_different_snapshot_is_refused() {
+    let (orchestration, mut service, _catalog) = service_with_catalog().await;
+    service = service.with_template_build(
+        Arc::new(crate::image::ImageResolver::new(
+            &crate::cfg::AppConfig::default(),
+        )),
+        Arc::new(crate::template::TemplateBuilder::new()),
+    );
+    let _ = &orchestration;
+
+    let record =
+        crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+    let base_snapshot_resolved = pb::encode_value(&record).expect("encode should succeed");
+
+    let err = service
+        .build_template(Request::new(pb::TemplateBuildRequest {
+            build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
+            base: Some(pb::template_build_request::Base::BaseSnapshotRef(
+                "a-different-snapshot-id".to_string(),
+            )),
+            base_snapshot_resolved: Some(base_snapshot_resolved),
+            steps: None,
+            resources: Some(pb::SandboxResources {
+                cpu_count: 1,
+                memory_mib: 512,
+                disk_size_mib: 1024,
+            }),
+            start_cmd: String::new(),
+            ready_cmd: String::new(),
+        }))
+        .await
+        .expect_err("a base_snapshot_resolved naming a different snapshot must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+/// The other half of the same guard: `base_snapshot_ref` may name the
+/// resolved record either by id (proven above and by the skip test) or by
+/// its alias — `base_snapshot_ref`'s own doc in node.proto says either is
+/// accepted, unlike `Create`'s `snapshot_id`, which is always an id. A record
+/// matched only by alias must not be refused as a mismatch.
+#[tokio::test]
+async fn a_base_snapshot_ref_matching_the_records_alias_is_accepted() {
+    let (orchestration, mut service, catalog) = service_with_catalog().await;
+    service = service.with_template_build(
+        Arc::new(crate::image::ImageResolver::new(
+            &crate::cfg::AppConfig::default(),
+        )),
+        Arc::new(crate::template::TemplateBuilder::new()),
+    );
+    let _ = &orchestration;
+
+    let mut record =
+        crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+    record.alias = Some(crate::snapshot::SnapshotAlias::parse("my-template").unwrap());
+    let base_snapshot_resolved = pb::encode_value(&record).expect("encode should succeed");
+
+    let err = service
+        .build_template(Request::new(pb::TemplateBuildRequest {
+            build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
+            // Names the record by its alias, not its id — the cross-check
+            // must accept this, not just an id match.
+            base: Some(pb::template_build_request::Base::BaseSnapshotRef(
+                "my-template".to_string(),
+            )),
+            base_snapshot_resolved: Some(base_snapshot_resolved),
+            steps: None,
+            resources: Some(pb::SandboxResources {
+                cpu_count: 1,
+                memory_mib: 512,
+                disk_size_mib: 1024,
+            }),
+            start_cmd: String::new(),
+            ready_cmd: String::new(),
+        }))
+        .await
+        .expect_err("the mock runtime resolver fails every call");
+    assert_eq!(
+        err.code(),
+        Code::Internal,
+        "an alias match must reach resolve_runnable, not be refused as a mismatch: {err}"
+    );
+    assert!(
+        err.message().contains("runtime resolver"),
+        "an alias match must reach resolve_runnable directly, never the catalog: {err}"
+    );
+    assert_eq!(
+        catalog.get_calls(),
+        0,
+        "an alias match must never touch the node's own catalog"
     );
 }
 

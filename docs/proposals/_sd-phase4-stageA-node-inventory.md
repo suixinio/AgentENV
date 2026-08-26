@@ -145,7 +145,7 @@ api → node 的驱动侧（`SandboxService`），与节点清册无关，Stage 
 
 **没有字面意义上的重复。** 现状是 `--role api` 完全没有本地节点状态——`assemble_api`
 （`src/bin/server.rs:939`）里 `debug_assert!(!role.sends_heartbeats())`，`ObservabilityService`
-只描述自己（§2.1），`cluster_placement`（`src/bin/server.rs:1148`）无条件构造
+只描述自己（§2.1），`cluster_placement`（`src/bin/aenv-api.rs:1148`）无条件构造
 `SchedulerNodePlacement`，每次都要打一次 RPC。
 
 用户任务描述里"消掉重复清册"更准确的读法是**前瞻性的**，出自
@@ -236,7 +236,7 @@ SQL，不再扇出"**，并把 `internal/{node,cluster,registry}_list` 标为**�
   store 折 Redis）的先例，不是节点清册的先例——`QueryOnlyService` 完全没有 `NodeRegistry`
   （`cmd/main.go:315` 的注释直说"a query-only replica never reaches this. It has no node
   registry, no ..."）。可以类比但不能照搬。
-- **Rust `[cluster].scheduler_endpoint` + `cluster_placement`**（`src/bin/server.rs:1148`）：
+- **Rust `[cluster].scheduler_endpoint` + `cluster_placement`**（`src/bin/aenv-api.rs:1148`）：
   这是 Stage A 真正要改的挂载点。今天它无条件构造 `SchedulerNodePlacement`；Stage A 要在这里
   加一个分支。
 
@@ -447,7 +447,7 @@ Stage A 需要新增：
 7. **`NativeNodePlacement` 实现 `resolve_node`**：`src/node_client/` 下新增实现，`resolve_node`
    读 §3/§5/§6 搭好的本地注册表；其余三个 `NodePlacement` 方法委托给内部持有的
    `SchedulerNodePlacement`。加 `[cluster].node_placement_source` 开关（默认 `"scheduler"`），
-   `cluster_placement`（`src/bin/server.rs:1148`）按开关分流。**回退**：开关改回
+   `cluster_placement`（`src/bin/aenv-api.rs:1148`）按开关分流。**回退**：开关改回
    `"scheduler"`（或干脆不设置，用默认值），行为与 Stage A 之前完全一致，无需重新部署代码——
    只改配置、重启 api 副本（api 本来就滚动重启）。
 

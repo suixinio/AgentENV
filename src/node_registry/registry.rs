@@ -9,7 +9,7 @@
 //! reaching for the concrete type.
 //!
 //! 🔴 Both are wired into a live runtime path from Stage A on:
-//! `start_native_node_registry` (`src/bin/server.rs`) builds an
+//! `start_native_node_registry` (`src/bin/aenv-api.rs`) builds an
 //! [`AtomicNodeRegistry`] and hands it to `NodeRegistryGrpcService`, whose
 //! `Heartbeat` RPC is the process's real, network-reachable heartbeat
 //! surface under `[cluster].node_placement_source = "native"`. This matters
@@ -696,7 +696,7 @@ pub struct AtomicNodeRegistry {
     /// `Some` for exactly as long as `super::redis`'s shared observed store
     /// is wired up (`[cluster].node_placement_source = "native"` with
     /// `[cluster.node_registry_store].backend = "redis"`; see
-    /// `src/bin/server.rs`'s `wire_shared_node_observed_store`). `None`
+    /// `src/bin/aenv-api.rs`'s `wire_shared_node_observed_store`). `None`
     /// (the default for every other caller, including every test in this
     /// module) makes [`Self::publish_upsert`]/[`Self::publish_remove`]
     /// no-ops, so nothing about local behavior changes when no shared store
@@ -713,7 +713,7 @@ impl AtomicNodeRegistry {
 
     /// Same as [`Self::new`], with an explicit [`EmptySyncGuard`] instead of
     /// [`EmptySyncGuard::default`] — for `start_native_node_registry`
-    /// (`src/bin/server.rs`), which wires `[cluster.kubernetes_discovery]`'s
+    /// (`src/bin/aenv-api.rs`), which wires `[cluster.kubernetes_discovery]`'s
     /// configured thresholds through, and for tests exercising the guard's
     /// own timing.
     pub fn with_empty_sync_guard(
@@ -757,7 +757,7 @@ impl AtomicNodeRegistry {
 
     /// Turns on publishing of local `observed` writes to `super::redis`'s
     /// shared store. Returns the receiving half of the channel — the caller
-    /// (`src/bin/server.rs`'s `wire_shared_node_observed_store`) drives
+    /// (`src/bin/aenv-api.rs`'s `wire_shared_node_observed_store`) drives
     /// `super::redis::run_shared_observed_sync` with it as a background
     /// task.
     ///

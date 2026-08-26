@@ -140,7 +140,7 @@ impl SnapshotManager {
     /// write's durable backlog and check it before anything is served.
     ///
     /// `pg_pool` is `Some` only for `--role api` / `--role all` replicas that
-    /// have `[pg]` configured — see `src/bin/server.rs::build_pg_pool`.
+    /// have `[pg]` configured — see `src/bin/aenv-api.rs::build_pg_pool`.
     /// `--role node` always passes `None`: it must never hold PostgreSQL
     /// credentials, see `src/pg/mod.rs`'s own module doc.
     ///

@@ -82,7 +82,7 @@ use super::{
 
 /// A direct PostgreSQL-backed [`PausedSandboxRegistry`]. One shared `[pg]`
 /// pool (built once per `--role api`/`--role all` process by
-/// `src/bin/server.rs::build_pg_pool`, the same pool Stage B's catalog
+/// `src/bin/aenv-api.rs::build_pg_pool`, the same pool Stage B's catalog
 /// backend uses) covers both the per-request CRUD paths in this struct's
 /// trait impl and the two background leader tasks
 /// [`spawn_background_tasks`] starts.
@@ -224,7 +224,7 @@ pub(super) struct BackgroundTasks {
     /// The reconcile and reclaim leader loops. Belongs in the same
     /// `pg_singleton_tasks` bucket every other PostgreSQL-elected background
     /// task in this process shuts down through
-    /// (`src/bin/server.rs::Assembly::pg_singleton_tasks`).
+    /// (`src/bin/aenv-api.rs::Assembly::pg_singleton_tasks`).
     pub(super) singleton: Vec<SingletonTaskHandle>,
     /// B1's per-replica renewal loop, present only when a
     /// [`NodeRegistry`] was supplied. Belongs in `Assembly::upkeep`
@@ -254,7 +254,7 @@ pub(super) struct BackgroundTasks {
 /// [`crate::node_registry::registry::AtomicNodeRegistry`] at all: there,
 /// this process's own identity coincides with `origin_node_id` for
 /// everything it runs, so the ordinary `renew_lease` trait method (driven by
-/// `spawn_paused_record_upkeep` in `src/bin/server.rs`) already renews those
+/// `spawn_paused_record_upkeep` in `src/bin/aenv-api.rs`) already renews those
 /// rows under matching identity -- `--role all` never needed Fix A in the
 /// first place. See [`replica_renewal`]'s own module doc for the full
 /// argument.

@@ -12,7 +12,7 @@
 # one to reverse, and nothing here may borrow from it
 # (`_sd-impl-phase3-role.md` §11.1, §11.2).
 #
-# 🔴 `--role api` assembles now (`src/bin/server.rs::assemble_api`): the cluster
+# 🔴 `--role api` assembles now (`src/bin/aenv-api.rs::assemble_api`): the cluster
 # metadata store, the remote backend factory and both gRPC listeners are wired.
 # What it still refuses, and refuses loudly rather than half-doing, is a cold
 # create (`POST /sandboxes-cold`) and resuming a paused sandbox whose capture
@@ -420,7 +420,7 @@ spec:
             # `Inner.observed`) would leave each replica seeing only the
             # nodes whose heartbeat happens to land on it — this is what
             # `gateway`'s own `/nodes` split in half under two replicas.
-            # `wire_shared_node_observed_store` (`src/bin/server.rs`) now
+            # `wire_shared_node_observed_store` (`src/bin/aenv-api.rs`) now
             # refuses to start under `node_placement_source = "native"` on
             # the in-memory default, the same discipline
             # `AENV_BINDING_STORE_BACKEND`'s own comment above describes.
@@ -593,7 +593,7 @@ spec:
         # DaemonSet (see the note on `regctl-config` in kustomization.yaml).
         # Both exist only to make `regctl` find this cluster's plain-HTTP
         # registry, and this half never calls `regctl`: the doc comment on
-        # `assemble_api` in `src/bin/server.rs` is explicit that `--role api`
+        # `assemble_api` in `src/bin/aenv-api.rs` is explicit that `--role api`
         # "installs no regctl — by design, that is a node's tooling", and the
         # two routes that would otherwise resolve an image
         # (`POST /sandboxes-cold`, a template build) refuse at the door on

@@ -75,10 +75,10 @@ release:
 	$(CARGO) build --release
 
 build-server:
-	$(CARGO) build -p agentenv --bin server
+	$(CARGO) build -p agentenv --bin aenv-node --bin aenv-api
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin server
+	$(CARGO) build --release -p agentenv --bin aenv-node --bin aenv-api
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
@@ -295,7 +295,7 @@ test-snapshot-catalog:
 	exit $$status
 
 prepare-agent-test-state:
-	$(CAPABILITY_TEST_ENV) $(CARGO) run --bin server -- --setup-only
+	$(CAPABILITY_TEST_ENV) $(CARGO) run --bin aenv-node -- --setup-only
 
 test-agent: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
@@ -379,13 +379,16 @@ test-e2e-k8s:
 
 test-e2e-all: test-e2e test-e2e-compose test-e2e-k8s
 
+# 🔴 The node half only. `--role all` had one process; the split has two
+# binaries, and a developer running one machine wants the one that boots VMs.
+# Run `aenv-api` beside it when the cluster half is wanted too.
 start-server:
 	$(MAKE) install-ublk PROFILE=debug
-	$(CAPABILITY_RUNNER) $(CARGO) run --bin server
+	$(CAPABILITY_RUNNER) $(CARGO) run --bin aenv-node
 
 start-server-release:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server
+	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin aenv-node
 
 deploy-up:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d

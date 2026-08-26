@@ -21,7 +21,7 @@
 //! is the same invariant generalized to *any* `[pg]` DSN: `--role node`
 //! refuses to start with one configured at all, checked by
 //! [`crate::role::ServerRole::check_pg_dsn`] before any role-specific
-//! assembly runs in `src/bin/server.rs`.
+//! assembly runs in `src/bin/aenv-api.rs`.
 
 pub mod election;
 pub mod lock_keys;

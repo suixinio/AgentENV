@@ -57,7 +57,7 @@ pub struct AssembledSnapshotBackend {
 pub async fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     // 🔴 `None` for `--role node` always — see
-    // `src/bin/server.rs::build_pg_pool`. Consumed by the read-side
+    // `src/bin/aenv-api.rs::build_pg_pool`. Consumed by the read-side
     // admission's shared confirmation (Stage B step 4,
     // `docs/proposals/_sd-phase4-stageB-catalog.md` §7/§5.1) and, when
     // present, by `build_central_catalog`, which then builds a
@@ -521,7 +521,7 @@ fn assemble_postgres_only_backend(
 }
 
 /// Starts the catalog build reaper for this process, when `pool` is `Some`
-/// (i.e. `[pg]` is configured) — a thin `pub` bridge so `src/bin/server.rs`
+/// (i.e. `[pg]` is configured) — a thin `pub` bridge so `src/bin/aenv-api.rs`
 /// (a separate crate from this library) can reach
 /// `postgres::reaper::spawn`, which stays `pub(crate)` like the rest of that
 /// module. `None` (no interval/ttl configured, or no pool at all) means
@@ -546,7 +546,7 @@ pub fn spawn_catalog_build_reaper(
 /// Brings the catalog schema in `pool`'s database to the shape this build
 /// expects. A thin `pub` bridge to `postgres::migrate::migrate`, which stays
 /// `pub(crate)` like the rest of that module — see
-/// [`spawn_catalog_build_reaper`]'s own doc for why `src/bin/server.rs` (a
+/// [`spawn_catalog_build_reaper`]'s own doc for why `src/bin/aenv-api.rs` (a
 /// separate crate from this library) needs one of these per function it
 /// calls into `postgres::`.
 ///
@@ -837,7 +837,7 @@ mod tests {
     /// that true, and a unit test cannot prove it by running the other arm:
     /// the byte half opens the process-wide image-cache RocksDB rooted at
     /// `home_path`, which a unit test has no business creating. So this reads
-    /// this file's own source text, the same way `src/bin/server.rs`'s
+    /// this file's own source text, the same way `src/bin/aenv-api.rs`'s
     /// `only_the_split_roles_bind_a_second_listener` does, and asserts three
     /// things at once:
     ///

@@ -28,7 +28,7 @@ pub enum LocalKvCloseOutcome {
     /// long as that work takes.
     ///
     /// 🔴 In this process that later `Drop` is **not** bounded by
-    /// `shutdown_timeout` in `src/bin/server.rs`, whatever a stale version of
+    /// `shutdown_timeout` in `src/bin/aenv-node.rs`, whatever a stale version of
     /// this comment used to claim. `main` there is `let result =
     /// runtime.block_on(async_main()); runtime.shutdown_timeout(...);` —
     /// `shutdown_timeout` only starts once `block_on` has already *returned*.

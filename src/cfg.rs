@@ -1118,7 +1118,7 @@ pub struct ObservabilitySchedulerReportConfig {
 /// 🔴 Stage A of the scheduler fold
 /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): `Scheduler` (the
 /// default) asks `[cluster].scheduler_endpoint` over gRPC, byte-for-byte
-/// today's behavior — `cluster_placement` in `src/bin/server.rs` builds no
+/// today's behavior — `cluster_placement` in `src/bin/aenv-api.rs` builds no
 /// registry, no kube client, nothing. `Native` answers every
 /// `NodePlacement` method from api's own process instead
 /// (`crate::node_client::NativeNodePlacement`): `resolve_node`/
@@ -1163,7 +1163,7 @@ pub enum NodeRegistryObservedBackendKind {
     /// never matters there; under `--role api` with
     /// `[cluster].node_placement_source = "native"`, it is the exact split
     /// roster this fix exists to close, and `wire_shared_node_observed_store`
-    /// (`src/bin/server.rs`) refuses to start on it unconditionally — the
+    /// (`src/bin/aenv-api.rs`) refuses to start on it unconditionally — the
     /// same discipline `build_binding_store` already applies to
     /// [`BindingStoreBackendKind::InMemory`], for the same reason: nothing
     /// at this layer can distinguish "one replica, alone, safe" from "one
@@ -1309,7 +1309,7 @@ pub struct ClusterConfig {
     /// existed as a config knob).
     ///
     /// 🔴 The clock this timeout is measured from starts when
-    /// `start_native_node_registry`'s (`src/bin/server.rs`) gRPC listener —
+    /// `start_native_node_registry`'s (`src/bin/aenv-api.rs`) gRPC listener —
     /// the same listener `Heartbeat` RPCs arrive on — actually binds, not
     /// when the gate is constructed: constructing it is one of the first
     /// things `assemble_api` does, well before `RedisMetadataStore::connect`,
@@ -3070,7 +3070,7 @@ mod tests {
     /// Stage A of the scheduler fold
     /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): the switch
     /// that moves `resolve_node`/`node_membership` off the scheduler onto
-    /// api's own node registry (`NativeNodePlacement`, `src/bin/server.rs`'s
+    /// api's own node registry (`NativeNodePlacement`, `src/bin/aenv-api.rs`'s
     /// `cluster_placement`) once set to `Native`. 🔴 P6-d correction: this
     /// used to say "nothing reads this field's `Native` value yet" — that
     /// stopped being true once `cluster_placement` and
@@ -3893,7 +3893,7 @@ endpoint = "http://second:9000"
             ("AENV_LOG_FORMAT", "src/logging.rs"),
             ("AENV_LOG_SPAN_EVENTS", "src/logging.rs"),
             ("AENV_FORCE_SYSCTL_TUNING", "src/setup/network_capacity.rs"),
-            ("API_ADDR", "src/bin/server.rs"),
+            ("API_ADDR", "src/server_main.rs"),
         ];
 
         let unkept: Vec<&String> = documented
@@ -4908,9 +4908,10 @@ endpoint = "http://second:9000"
     ///
     /// `AENV_NODE_SERVICE_ENABLED` was a seam for a design this tree decided
     /// against: letting `--role all` serve the node sandbox service. Nothing in
-    /// the Rust tree ever read it, and `only_the_split_roles_bind_a_second_listener`
-    /// in `src/bin/server.rs` fails if `assemble_all` ever grows the listener —
-    /// so setting the variable could not change behaviour even in principle.
+    /// the Rust tree ever read it, and there is no longer a role that could:
+    /// `aenv-node` always serves the node sandbox service and `aenv-api` never
+    /// does, so setting the variable could not change behaviour even in
+    /// principle.
     ///
     /// What it did cost was real. Being read by every node in the fleet, two
     /// runbooks costed flipping it at a serial DaemonSet roll with a drain per

@@ -6,7 +6,7 @@
 //! — can be assembled against machines it is not running on, by being handed
 //! [`RemoteSandboxBackendFactory`] instead of the Firecracker one.
 //!
-//! 🔴 **`--role api` assembles this now** (`src/bin/server.rs`,
+//! 🔴 **`--role api` assembles this now** (`src/bin/aenv-api.rs`,
 //! `assemble_api`), which changes what is unproven about it rather than
 //! removing it. What is exercised is this module against a node service
 //! running in the same process, over a real socket; what it has still never

@@ -25,7 +25,6 @@ use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnection, PgPool, Postgres};
 use sqlx::Connection as _;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -84,26 +83,7 @@ impl<F> SingletonTaskBody for F where
 /// exactly [`Self::shutdown`]'s `self.join.await`. Callers on a shutdown
 /// budget should bound `body`'s own runtime rather than assume `shutdown`
 /// can cut it off.
-pub struct SingletonTaskHandle {
-    shutdown_tx: watch::Sender<bool>,
-    join: JoinHandle<()>,
-}
-
-impl SingletonTaskHandle {
-    /// Requests the loop stop, releases the advisory lock if this replica is
-    /// currently leader, and waits for the background task to exit.
-    ///
-    /// Does not preempt a `body` call already running — see the 🔴 note on
-    /// [`SingletonTaskHandle`] itself. This call resolves only once the
-    /// current iteration (including any in-flight `body`) finishes and the
-    /// loop observes the shutdown signal at its next check.
-    pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
-        if let Err(err) = self.join.await {
-            warn!(error = %err, "pg singleton task join failed");
-        }
-    }
-}
+pub use crate::leader_task::LeaderTaskHandle as SingletonTaskHandle;
 
 /// Runs `body` on a fixed `interval`, but only on whichever `--role api`
 /// replica currently holds `key`'s session-scoped advisory lock.
@@ -238,7 +218,7 @@ where
         }
     });
 
-    SingletonTaskHandle { shutdown_tx, join }
+    SingletonTaskHandle::new(shutdown_tx, join)
 }
 
 /// Best-effort text for a caught `body` panic payload, for the log line only

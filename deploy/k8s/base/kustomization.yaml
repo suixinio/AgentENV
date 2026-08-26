@@ -639,7 +639,7 @@ configMapGenerator:
   # ship instead, and is what a fork of this tree pointed at a different
   # registry should replace this file's contents with.
   #
-  # 🔴 Only the node reads it. `assemble_api` in `src/bin/server.rs` states
+  # 🔴 Only the node reads it. `assemble_api` in `src/bin/aenv-api.rs` states
   # outright that `--role api` "installs no regctl — by design, that is a
   # node's tooling", and both call sites that would otherwise reach for one —
   # `POST /sandboxes-cold` and a template build — refuse at the door on

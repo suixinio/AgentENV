@@ -87,7 +87,7 @@ Stage E 下线之前，api 的新清册与 scheduler 原有 `NodeRegistry` 会�
   （110-117 行）调 `s.scheduler.ListNodes(...)` 拿节点表后 `fetchClusterList` 逐节点扇出。
   `listedSandbox` 结构体（23-47 行）字段是 `TemplateID`/`SandboxID`/`State`/`ExecutionID` 等——
   确认这是沙箱清单，不是节点清单。
-- `56de492:src/bin/server.rs:939-944`（`assemble_api`）：
+- `56de492:src/bin/aenv-api.rs:939-944`（`assemble_api`）：
   `debug_assert!(!role.sends_heartbeats())` —— `--role api` 今天完全不维护本地节点状态。
 - `56de492:docs/proposals/2026-08-20-service-decomposition.md:171-178`：
   > 目标形态里 `api` 需要节点清册来解析 node endpoint，`scheduler` 也需要节点清册来放置 ——
@@ -183,7 +183,7 @@ Stage B 不需要在范围内新建 node→api RPC 面这项额外工作量（�
    （`build_central_catalog`）：`CentralSnapshotCatalog::connect_lazy(endpoint, ...)`，由
    `build_snapshot_backend`→`SnapshotManager::new()` 在进程启动时调一次（`src/bin/server.rs:461`
    `assemble_node_core` 与 `1002` 行 `assemble_api` 各自建一个实例，两边都不会重连）。
-5. **创建放置客户端** —— `src/bin/server.rs:1146-1166`（`cluster_placement`）：
+5. **创建放置客户端** —— `src/bin/aenv-api.rs:1146-1166`（`cluster_placement`）：
    `SchedulerNodePlacement::connect_lazy(endpoint, ...)`，`assemble_api` 装配时调一次，覆盖
    `Schedule`/`LookupNode`（一跳解析）/`RecordAssignment`/`GetNode`。
 6. **resume 放置客户端** —— `src/api/impls/resume_surface.rs:243-301`

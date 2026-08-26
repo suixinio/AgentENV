@@ -210,7 +210,7 @@ spawn 的——于是比对必拒、拒了就 `bail!`、`bail!` 让 `build_snaps
 
 - **触发点**：`build_snapshot_backend`（`src/snapshot/repository/backends/mod.rs:45`）
   是 `SnapshotManager::new`（`src/snapshot/manager.rs:166`）唯一的装配路径，
-  在 `--role api`（`assemble_api`，`src/bin/server.rs:956`）与 `--role all`
+  在 `--role api`（`assemble_api`，`src/bin/aenv-api.rs:956`）与 `--role all`
   （`assemble_node_core` 内部共享路径，`server.rs:434`，调用点 `:477`）启动时同步调用；
   返回 `Err` 会让 `async_main` 直接失败退出（K8s 视为 Pod 启动失败 → CrashLoopBackOff）。
 - **比什么**：`CatalogPopulations::compare`（`population.rs:69-88`）——对象存储的
@@ -420,7 +420,7 @@ catalog store 直接借用 registry 的连接池，并且总是接一个真实�
 Stage A（`docs/proposals/_sd-phase4-stageA-node-inventory.md`）已经踩过几个 Stage B
 会再踩一遍的坑，模式可以直接借，但有的地方借的时候必须带上限制条件一起借，不能只抄形状：
 
-- **开关驱动的子系统构造**：`assemble_api`（`src/bin/server.rs:956`）里
+- **开关驱动的子系统构造**：`assemble_api`（`src/bin/aenv-api.rs:956`）里
   `match config.cluster.node_placement_source { Native => Some(...), Scheduler => None }`
   这段（`server.rs:987-1012`）是「一个配置开关决定要不要装配一整套子系统（发现客户端、
   gRPC 服务、后台任务）」的现成形状，`write != ObjectStore` 时要不要装配
@@ -476,7 +476,7 @@ PG，它单独就是 CrashLoopBackOff 的结构性修复）。步骤编号已按
    新建（如果还没有）`src/snapshot/repository/backends/postgres/` 模块骨架用于放
    `PostgresSnapshotCatalog` 本身，`cargo build` 通过，不接入任何调用路径。
 2. **接池（新增步骤，原文档没有）**：`src/pg` 目前零生产调用方——`build_snapshot_backend`
-   （`src/bin/server.rs:956` 的 `assemble_api` → `SnapshotManager::new(None)`
+   （`src/bin/aenv-api.rs:956` 的 `assemble_api` → `SnapshotManager::new(None)`
    `:1058` → `manager.rs:166` → `build_snapshot_backend`
    `backends/mod.rs:45` → `build_central_catalog` `:285`）只收
    `Option<Arc<dyn P2pTransport>>`，配置靠 `ConfigManager::global_config()` 读，没有

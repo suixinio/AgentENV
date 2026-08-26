@@ -2,7 +2,7 @@
 //! (`--role api` / `--role all`).
 //!
 //! `--role node` must never build one of these — see
-//! [`crate::role::ServerRole::check_pg_dsn`], enforced in `src/bin/server.rs`
+//! [`crate::role::ServerRole::check_pg_dsn`], enforced in `src/bin/aenv-node.rs`
 //! before any role-specific assembly runs.
 
 use std::time::Duration;

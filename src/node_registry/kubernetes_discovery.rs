@@ -31,7 +31,7 @@
 //!   controller's output.
 //! - 🔴 P6-d correction: the line that used to stand here — "nothing in
 //!   this file is wired into any assembly path" — stopped being true the
-//!   moment `src/bin/server.rs`'s `start_native_node_registry` started
+//!   moment `src/bin/aenv-api.rs`'s `start_native_node_registry` started
 //!   calling [`KubernetesDiscovery::connect`] under
 //!   `[cluster].node_placement_source = "native"`. It is wired in now; what
 //!   is still true from the paragraph above is that none of that wiring has
@@ -87,7 +87,7 @@ const LABEL_SERVICE_NAME: &str = "kubernetes.io/service-name";
 /// 🔴 P2: how many *consecutive* watch errors a single stream may absorb
 /// before this task gives up and returns `Err`, ending `KubernetesDiscovery::run`
 /// (its `tokio::join!` propagates the first task error) so
-/// `run_kubernetes_discovery_with_retry` (`src/bin/server.rs`) tears the whole
+/// `run_kubernetes_discovery_with_retry` (`src/bin/aenv-api.rs`) tears the whole
 /// `KubernetesDiscovery` down and rebuilds it — a fresh `kube::Client`, not
 /// just a fresh watch — rather than the same task looping on the same
 /// connection forever. `.default_backoff()` below throttles *how fast* those
@@ -1363,7 +1363,7 @@ mod tests {
     /// `Err` rather than loop on the same broken stream forever. That `Err`
     /// is what makes `KubernetesDiscovery::run`'s `tokio::join!` return
     /// `Err`, which is what makes `run_kubernetes_discovery_with_retry`
-    /// (`src/bin/server.rs`) actually rebuild the client and the watch
+    /// (`src/bin/aenv-api.rs`) actually rebuild the client and the watch
     /// instead of a healthy-looking task quietly never doing either again.
     #[tokio::test]
     async fn endpoint_slice_watch_ends_after_consecutive_errors() {

@@ -67,7 +67,7 @@ impl SchedulerNodePlacement {
     /// hot-reloaded from `[cluster].scheduler_endpoint_file` (or its
     /// deprecated fallback) while the process runs — see
     /// [`SchedulerEndpointSource::spawn_from_config`]. This is what
-    /// `cluster_placement` in `src/bin/server.rs` uses.
+    /// `cluster_placement` in `src/bin/aenv-api.rs` uses.
     pub fn connect_hot_reloadable(
         endpoint: &str,
         cluster: &crate::cfg::ClusterConfig,

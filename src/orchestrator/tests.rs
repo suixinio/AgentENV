@@ -789,7 +789,7 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
 /// sees is a few seconds of 404s that look like a cold cache.
 ///
 /// The ordering that prevents it is that `Orchestrator::new` finishes the
-/// restore before it returns, and `src/bin/server.rs` starts the reporter after
+/// restore before it returns, and `src/bin/aenv-node.rs` starts the reporter after
 /// that await. Nothing else pins it, so this does.
 #[tokio::test]
 async fn the_roster_is_complete_the_moment_new_returns() -> Result<()> {
@@ -4944,7 +4944,7 @@ async fn auto_evict_task_does_not_keep_orchestrator_alive() -> anyhow::Result<()
 /// process exit. Deleting it leaves every test above and below this one
 /// green: nothing here drives a real multi-gigabyte RocksDB store far enough
 /// into background work for its absence to show up as a hang, and
-/// `RecordingPersister`'s `close` is a no-op anyway. `src/bin/server.rs`'s
+/// `RecordingPersister`'s `close` is a no-op anyway. `src/bin/aenv-node.rs`'s
 /// `the_shutdown_bounds_are_still_wired` closes the same gap for the other
 /// two RocksDB-store closes and the final `Runtime::shutdown_timeout`
 /// backstop; this is the one call in that trio that lives in this file

@@ -201,7 +201,7 @@ the node no longer connects to the registry database...")`。这是 D11（`_impl
 「进程直连 registry 数据库」，只是原来那个进程是 `node`（D11 判定不安全，删除），现在换成 `api`
 （Stage C 判定安全，因为 api 本来就不运行用户代码）。
 
-调用点：`src/bin/server.rs` 只有 `assemble_all`（1 副本）和 `assemble_api`（N 副本）会调
+调用点：`src/bin/aenv-api.rs` 只有 `assemble_all`（1 副本）和 `assemble_api`（N 副本）会调
 `build_paused_registry`；`assemble_node` 从不调，恒用 `DisabledPausedSandboxRegistry`（硬编码，
 不读配置）——这一点不受 Stage C 影响。
 

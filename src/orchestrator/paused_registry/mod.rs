@@ -595,7 +595,7 @@ pub(super) fn log_claim_outcome(
 /// every caller not selecting `postgres` (the `Local`/`Central` arms never
 /// touch either). `node_registry` is `Some` only when `--role api` built a
 /// real `crate::node_registry::registry::AtomicNodeRegistry`
-/// (`[cluster].node_placement_source = "native"`, `src/bin/server.rs`'s
+/// (`[cluster].node_placement_source = "native"`, `src/bin/aenv-api.rs`'s
 /// `assemble_api`) -- `--role all` never builds one at all.
 ///
 /// `role` (M1) decides whether a missing `node_registry` is refused: see the
@@ -626,7 +626,7 @@ pub async fn build_paused_registry(
                 // `origin_node_id` for everything it runs, so the ordinary
                 // `renew_lease` trait method (this process's own periodic
                 // self-renewal, `spawn_paused_record_upkeep` in
-                // `src/bin/server.rs`) already covers what D2 Fix A exists
+                // `src/bin/aenv-api.rs`) already covers what D2 Fix A exists
                 // to cover under the split node/api identity model -- see
                 // `postgres::replica_renewal`'s own module doc for the full
                 // argument. Under `--role api` (`runs_sandbox_runtime() ==
@@ -653,7 +653,7 @@ pub async fn build_paused_registry(
                 // [`spawn_paused_registry_background_tasks`] starts, which
                 // this function's caller must invoke separately (mirroring
                 // `spawn_pg_singleton_tasks` alongside `build_pg_pool` in
-                // `src/bin/server.rs`) so their task handles land in the
+                // `src/bin/aenv-api.rs`) so their task handles land in the
                 // same buckets every other PostgreSQL-backed background task
                 // already shuts down through. Validated present here
                 // anyway, under `--role api`, so a `postgres` backend that
@@ -749,7 +749,7 @@ pub async fn build_paused_registry(
 /// mechanism, mirroring `postgres::BackgroundTasks` (which this simply
 /// forwards): `singleton` needs `SingletonTaskHandle::shutdown()`'s async
 /// advisory-lock release and belongs in `Assembly::pg_singleton_tasks`
-/// (`src/bin/server.rs`); `plain` is safe to `.abort()` and belongs in
+/// (`src/bin/aenv-api.rs`); `plain` is safe to `.abort()` and belongs in
 /// `Assembly::upkeep` alongside `spawn_paused_record_upkeep`'s own tasks.
 #[derive(Default)]
 pub struct PausedRegistryBackgroundTasks {
@@ -764,7 +764,7 @@ pub struct PausedRegistryBackgroundTasks {
 /// returns everything empty.
 ///
 /// Kept separate from [`build_paused_registry`] deliberately, mirroring
-/// `src/bin/server.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
+/// `src/bin/aenv-api.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
 /// split: the registry itself has to exist before `ApiImpl`/`Orchestrator`
 /// can be constructed, but the resulting task handles belong in the buckets
 /// every other PostgreSQL-backed background task in this process already

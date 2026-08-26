@@ -58,7 +58,7 @@ use crate::types::SandboxId;
 /// How long a heartbeat-reported roster entry stays "fresh enough to route
 /// to" -- mirrors Go's `Service.reportTTL`, which defaults to
 /// `defaultObservedReportTTL` (`lookup.go`'s `rosterFresh`) and, in this
-/// codebase, is the same 30s literal `src/bin/server.rs`'s
+/// codebase, is the same 30s literal `src/bin/aenv-api.rs`'s
 /// `start_native_node_registry` already passes as `AtomicNodeRegistry`'s own
 /// `observed_ttl`.
 pub use crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL as ROSTER_FRESH_TTL;

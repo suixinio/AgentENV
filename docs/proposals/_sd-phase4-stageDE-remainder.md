@@ -32,7 +32,7 @@ catalog 移植进 api 的 PG catalog、paused registry 移植进 api 的 PG regi
 （1,806+4,588+5,817+4,977 = 17,188，与实测总量吻合，逐文件表见 §2。）
 
 **Stage D 的 4,977 行里，能直接删的约 827 行（17%）**——`cmd/main.go` 的 Go 进程自举/参数解析/
-gRPC 服务注册，在 Rust 里没有逐行对应物，会被已经存在的 `assemble_api`（`src/bin/server.rs`）
+gRPC 服务注册，在 Rust 里没有逐行对应物，会被已经存在的 `assemble_api`（`src/bin/aenv-api.rs`）
 吸收，而不是被"翻译"过去。**其余约 4,150 行（83%）必须移植**，且移植后大多数不是原样的
 "Go 翻译成 Rust"，而是**因为进程边界消失而被真实简化**（gRPC 往返变成进程内函数调用，见 §3、§4）
 ——但状态机本身（哪个来源优先、什么时候答 Unavailable 而不是 NotFound、TTL 语义）必须原样保留，

@@ -37,7 +37,7 @@
 //! synchronous — no `async fn` in the trait, no ripple into
 //! `grpc_service.rs`, `dump.rs`, `warmup.rs`, or any test that constructs an
 //! `AtomicNodeRegistry` directly. The only asynchrony this module adds is
-//! this one background task, wired up by `src/bin/server.rs` alongside the
+//! this one background task, wired up by `src/bin/aenv-api.rs` alongside the
 //! kube-discovery and metrics tasks `start_native_node_registry` already
 //! spawns.
 //!
@@ -246,7 +246,7 @@ pub struct SharedObservedStore {
 
 impl SharedObservedStore {
     /// Connects to Redis. A failure here is a startup refusal for whichever
-    /// caller awaits it (`src/bin/server.rs`'s `wire_shared_node_observed_store`),
+    /// caller awaits it (`src/bin/aenv-api.rs`'s `wire_shared_node_observed_store`),
     /// never a background retry — the same discipline
     /// `RedisBindingStore::connect`/`RedisMetadataStore::connect` already
     /// apply: a replica that cannot reach its shared store at all should
@@ -339,7 +339,7 @@ impl SharedObservedStore {
 /// Drains [`PublishOp`]s (writing them best-effort) and, on
 /// [`DEFAULT_PULL_INTERVAL`]'s own timer, pulls the whole shared hash and
 /// merges it into `registry`'s local view. Runs for the lifetime of the
-/// process — callers drive it as a background task (`src/bin/server.rs`'s
+/// process — callers drive it as a background task (`src/bin/aenv-api.rs`'s
 /// `wire_shared_node_observed_store`), the same way
 /// `start_native_node_registry` already spawns the kube-discovery and
 /// metrics tasks. Returns only when `rx`'s sender is dropped, i.e. when the

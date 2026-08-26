@@ -41,7 +41,7 @@ where
 /// gate are attached — so anything registered on it is covered by both, the
 /// same as every generated route.
 ///
-/// 🔴 P5: `src/bin/server.rs`'s `assemble_api` is the one caller that needs
+/// 🔴 P5: `src/bin/aenv-api.rs`'s `assemble_api` is the one caller that needs
 /// this — `/debug/node-registry`, Stage A's equivalence-dump debug endpoint
 /// (`node_registry::dump`'s own module doc), used to be `.route(...)`-ed onto
 /// the `Router` *this function itself returns*, i.e. after every layer
@@ -114,7 +114,7 @@ where
 ///
 /// Not `pub`: `ControlPlaneGate` does not cross the crate boundary (its
 /// defining module is private to `crate::api`), so a function taking one as a
-/// parameter cannot be `pub` either without exposing a type `src/bin/server.rs`
+/// parameter cannot be `pub` either without exposing a type `src/bin/aenv-api.rs`
 /// — a separate crate — cannot name. `new_with_control_plane_routes` stays the
 /// only crate-external entry point, unchanged, and forwards here with the
 /// default gate.
@@ -142,7 +142,7 @@ where
     // 🔴 The role now has two carriers: this parameter, which the role gate
     // reads, and the `ApiImpl`, which the data plane's auto-resume arm reads
     // (`crate::api::proxy::resolve_proxy_request`). Every assembly in
-    // `src/bin/server.rs` passes one variable to both, and this catches the day
+    // `src/bin/aenv-api.rs` passes one variable to both, and this catches the day
     // one of them stops doing so — a router gated as `node` whose `ApiImpl`
     // still believes it is `all` would refuse user REST while going on waking
     // sandboxes on its own initiative, which is the precise half-landed state
@@ -510,7 +510,7 @@ mod tests {
     }
 
     /// A stand-in for `/debug/node-registry`, merged in exactly the way
-    /// `assemble_api` (`src/bin/server.rs`) merges the real one.
+    /// `assemble_api` (`src/bin/aenv-api.rs`) merges the real one.
     fn stand_in_debug_route() -> Router {
         Router::new().route("/debug/example-registry", get(|| async { "debug" }))
     }

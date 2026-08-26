@@ -11,7 +11,7 @@
 //!   `resolve_node`/`node_membership`.
 //! - `Scheduler` (the default): `assemble_api` builds no local registry at
 //!   all under this mode (Task 1's "connect nothing under Scheduler"
-//!   constraint — see `src/bin/server.rs`'s `start_native_node_registry`),
+//!   constraint — see `src/bin/aenv-api.rs`'s `start_native_node_registry`),
 //!   so there is nothing local to read. This mode instead makes a live
 //!   `ListNodes` + `ListObservedNodes` RPC pair against the real scheduler,
 //!   over api's already-configured `[cluster].scheduler_endpoint`, and
@@ -89,7 +89,7 @@ use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 
 /// Where [`dump`] reads from — built once at `assemble_api` time (see
-/// `src/bin/server.rs`) from whichever of the two the placement switch and
+/// `src/bin/aenv-api.rs`) from whichever of the two the placement switch and
 /// configuration make available.
 #[derive(Clone)]
 pub enum NodeRegistryDumpSource {

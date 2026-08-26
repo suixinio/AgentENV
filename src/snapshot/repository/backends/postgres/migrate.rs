@@ -35,7 +35,7 @@
 //! `catalog_schema_migrations` ledger itself — created by *Go's* migrate.go,
 //! against the *same* PostgreSQL database this build's `[pg]` now points at.
 //! `migrate()` runs unconditionally at `--role api`/`--role all` startup
-//! whenever `[pg]` is configured (`build_pg_pool` in `src/bin/server.rs`), so
+//! whenever `[pg]` is configured (`build_pg_pool` in `src/bin/aenv-api.rs`), so
 //! this is not a hypothetical shared-database scenario to defend against —
 //! it is the ordinary shape of a cluster mid-migration off `services/scheduler`.
 //!

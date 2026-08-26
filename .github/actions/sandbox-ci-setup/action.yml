@@ -124,7 +124,7 @@ runs:
     # no-op checks when the caches above are warm, downloads on miss.
     - name: Provision sandbox prerequisites
       shell: bash
-      run: cargo run --bin server -- --setup-only
+      run: cargo run --bin aenv-node -- --setup-only
 
     - name: Provision non-root host access
       shell: bash

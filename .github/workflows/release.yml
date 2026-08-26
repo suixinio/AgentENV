@@ -137,7 +137,7 @@ jobs:
           OPENSSL_STATIC: "1"
         run: |
           cargo build --release --locked \
-            -p agentenv --bin server \
+            -p agentenv --bin aenv-node --bin aenv-api \
             -p uvm-ublk-daemon --bin uvm-ublk-daemon \
             --features vendored-openssl
 
@@ -148,8 +148,10 @@ jobs:
           for MODE in ${{ matrix.modes }}; do
             BUNDLE="dist/bundle-$MODE"
             mkdir -p "$BUNDLE/ublk"
-            cp target/release/server "$BUNDLE/server"
-            strip "$BUNDLE/server"
+            cp target/release/aenv-node "$BUNDLE/aenv-node"
+            strip "$BUNDLE/aenv-node"
+            cp target/release/aenv-api "$BUNDLE/aenv-api"
+            strip "$BUNDLE/aenv-api"
             cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"
             cp config/default.toml "$BUNDLE/default.toml"
@@ -167,7 +169,7 @@ jobs:
             mkdir -p "$STAGE_HOME"
             AENV_VIRTUALIZATION_MODE="$MODE" \
               AENV_HOME_PATH="$STAGE_HOME" \
-              "$BUNDLE/server" --setup-only || {
+              "$BUNDLE/aenv-node" --setup-only || {
                 echo "ERROR: $MODE --setup-only failed; check network and dependency downloads"
                 exit 1
               }

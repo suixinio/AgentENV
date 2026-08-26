@@ -76,7 +76,7 @@ impl WarmupGate {
     /// [`Self::new`] computed it as.
     ///
     /// 🔴 Exists because `start_native_node_registry`
-    /// (`src/bin/server.rs`) has to construct this gate (and hand it to
+    /// (`src/bin/aenv-api.rs`) has to construct this gate (and hand it to
     /// `NodeRegistryGrpcService`, which the gRPC listener is built around)
     /// *before* that listener binds — but the clock this timeout should be
     /// measured from is when the listener actually starts being able to

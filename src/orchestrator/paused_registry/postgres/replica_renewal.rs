@@ -42,7 +42,7 @@
 //! taking `Option<Arc<dyn NodeRegistry>>`), and under `--role all` the
 //! process's own identity coincides with `origin_node_id` for everything it
 //! runs -- `renew_lease` (the ordinary trait method, driven by
-//! `spawn_paused_record_upkeep` in `src/bin/server.rs`) already renews those
+//! `spawn_paused_record_upkeep` in `src/bin/aenv-api.rs`) already renews those
 //! rows under matching identity, so Fix A has nothing to add there.
 
 use std::sync::Arc;
@@ -142,7 +142,7 @@ pub(super) async fn renew_once(
 /// (see the module doc). Returns a plain [`tokio::task::JoinHandle`] rather
 /// than a [`crate::pg::SingletonTaskHandle`]: there is no advisory lock to
 /// release on shutdown, so this belongs in `Assembly::upkeep`
-/// (`src/bin/server.rs`), which simply aborts it -- safe here since every
+/// (`src/bin/aenv-api.rs`), which simply aborts it -- safe here since every
 /// statement this loop issues is a single idempotent `UPDATE`, and aborting
 /// mid-tick loses at most one renewal cycle's worth of freshness, not
 /// correctness.
@@ -155,7 +155,7 @@ pub(super) fn spawn(
         loop {
             // `tokio::time::interval` fires its first `tick()` immediately --
             // deliberately not skipped here (unlike
-            // `spawn_paused_record_upkeep`'s ticker in `src/bin/server.rs`):
+            // `spawn_paused_record_upkeep`'s ticker in `src/bin/aenv-api.rs`):
             // a freshly started replica's roster may already hold entries
             // this pass should act on right away, not after waiting out a
             // full interval first.

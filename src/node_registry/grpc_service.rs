@@ -65,7 +65,7 @@
 //! [`crate::binding_store::BindingStore`], wired in via
 //! [`NodeRegistryGrpcService::with_binding_store`]. Every default path that
 //! does not call that builder method (every test that only calls `new`, and
-//! `src/bin/server.rs`'s real wiring until the config/assembly commit that
+//! `src/bin/aenv-api.rs`'s real wiring until the config/assembly commit that
 //! follows this one) keeps answering `Unimplemented`, unchanged.
 //!
 //! # `Heartbeat`/`UnregisterNode`'s `ReconcileNode` half (task's own
@@ -138,7 +138,7 @@ const NOT_STAGE_A: &str = "not served by api's Stage A node-registry service —
 /// of its RPCs. See the module doc for the split.
 ///
 /// `Clone` is cheap and intentional: both fields are `Arc`s, so a second
-/// handle (`src/bin/server.rs`'s observed-nodes metrics loop needs one
+/// handle (`src/bin/aenv-api.rs`'s observed-nodes metrics loop needs one
 /// alongside the copy `SchedulerServer::new` takes ownership of) is two
 /// atomic increments, not a second registry.
 #[derive(Clone)]
@@ -147,7 +147,7 @@ pub struct NodeRegistryGrpcService {
     warmup: Arc<WarmupGate>,
     /// Task's own "D1"/"D3": `None` until `with_binding_store` wires one in
     /// -- every default path that does not call it (every pre-existing
-    /// test, and `src/bin/server.rs`'s real wiring until the config/
+    /// test, and `src/bin/aenv-api.rs`'s real wiring until the config/
     /// assembly commit that follows this one) keeps `report_sandbox_event`
     /// answering `Unimplemented`, unchanged.
     binding_store: Option<Arc<dyn BindingStore>>,
@@ -200,7 +200,7 @@ impl NodeRegistryGrpcService {
 
     /// `lookup_node`'s stage 3. Independent of `with_binding_store` -- a
     /// deployment could in principle wire one without the other, though
-    /// `src/bin/server.rs` wires both (`build_paused_registry` always runs
+    /// `src/bin/aenv-api.rs` wires both (`build_paused_registry` always runs
     /// once native mode is on, even when its backend is the node-local
     /// `Local`/disabled one).
     #[must_use]
@@ -211,7 +211,7 @@ impl NodeRegistryGrpcService {
 
     /// Task's own "D4": wires the P2P artifact index. Independent of
     /// `with_binding_store` -- a deployment could in principle wire one
-    /// without the other, though `src/bin/server.rs` wires both together.
+    /// without the other, though `src/bin/aenv-api.rs` wires both together.
     #[must_use]
     pub fn with_artifact_store(mut self, artifact_store: Arc<dyn ArtifactStore>) -> Self {
         self.artifact_store = Some(artifact_store);
@@ -450,7 +450,7 @@ impl NodeRegistryGrpcService {
     /// Ports Go's `refreshObservedNodesMetrics`/`recordObservedNodes`
     /// (`service.go:700-720`, `metrics.go`'s `schedulerObservedNodes`).
     /// Called once at startup and then on the interval `RunObservedNodesMetrics`
-    /// wraps it in, by the caller in `src/bin/server.rs`.
+    /// wraps it in, by the caller in `src/bin/aenv-api.rs`.
     pub fn refresh_observed_nodes_metric(&self) {
         let mut counts: std::collections::HashMap<&'static str, u32> = [
             ("ready", 0),

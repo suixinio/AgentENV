@@ -1883,7 +1883,7 @@ fn the_blank_ownership_marker_outlives_only_an_api_role_that_cannot_start() {
     const BLANK_MARKER: &str = "control_plane_config: Vec::new()";
 
     let factory = include_str!("factory.rs");
-    let server = include_str!("../bin/server.rs");
+    let server = include_str!("../bin/aenv-api.rs");
 
     if server.contains(UNASSEMBLABLE) {
         // 🔴 Resolution. Without this half the test is a scan for a string that

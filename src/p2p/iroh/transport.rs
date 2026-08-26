@@ -915,7 +915,7 @@ mod tests {
     /// `crate::local_store::LocalKvCloseOutcome::TimedOut`'s doc for why that
     /// wait is not caught by anything else either. Scanning the source text
     /// directly is the same technique
-    /// `src/bin/server.rs::tests::the_shutdown_bounds_are_still_wired` uses
+    /// `src/bin/aenv-node.rs::tests::the_shutdown_bounds_are_still_wired` uses
     /// for the other three stores' closes.
     #[test]
     fn shutdown_still_closes_the_catalog_store() {

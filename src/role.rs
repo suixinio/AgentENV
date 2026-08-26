@@ -62,6 +62,59 @@ impl ServerRole {
         Self::from_env(std::env::var(ROLE_ENV_VAR).ok().as_deref())
     }
 
+    /// Confirms that whatever `--role`/[`ROLE_ENV_VAR`] asked for is the role
+    /// *this binary is*.
+    ///
+    /// # 🔴 The transition, stated where a startup can fail on it
+    ///
+    /// There is no longer one binary that can be any role: `aenv-node` links a
+    /// sandbox runtime and `aenv-api` does not, which is the whole point of the
+    /// split and is a fact about the dependency graph rather than a flag. So
+    /// `--role` no longer *selects* anything — it is accepted (every existing
+    /// manifest and runbook passes it) and checked, and a mismatch names the
+    /// binary the caller actually wanted rather than starting the wrong half.
+    ///
+    /// 🔴 `all` therefore has no binary at all. It was defined as "the process
+    /// that ran before the split", and after the split no process holds both
+    /// halves. A deployment that needs it needs the pre-split image; see
+    /// `services/README.md` for the rollback.
+    pub fn confirm(self, flag: Option<Self>) -> Result<Self> {
+        self.confirm_with(flag, std::env::var(ROLE_ENV_VAR).ok().as_deref())
+    }
+
+    /// The pure half of [`confirm`](Self::confirm), split out so every arm is
+    /// testable without touching the process environment.
+    pub fn confirm_with(self, flag: Option<Self>, env: Option<&str>) -> Result<Self> {
+        let asked = match flag {
+            Some(role) => Some(role),
+            None => match env {
+                Some(raw) if !raw.trim().is_empty() => Some(Self::from_env(Some(raw))?),
+                _ => None,
+            },
+        };
+        match asked {
+            None => Ok(self),
+            Some(role) if role == self => Ok(self),
+            Some(other) => anyhow::bail!(
+                "this binary is the {} half and was asked to run as {}: the two halves are two \
+                 binaries now, so run {} instead{}",
+                self.as_str(),
+                other.as_str(),
+                match other {
+                    Self::All => "aenv-node and aenv-api",
+                    Self::Api => "aenv-api",
+                    Self::Node => "aenv-node",
+                },
+                match other {
+                    Self::All =>
+                        " — or, for the single-process shape, the pre-split image (see \
+                         services/README.md's rollback)",
+                    _ => "",
+                }
+            ),
+        }
+    }
+
     /// The environment half of [`resolve`](Self::resolve), split out so it can
     /// be tested without touching the process environment.
     pub fn from_env(value: Option<&str>) -> Result<Self> {
@@ -277,6 +330,72 @@ impl ServerRole {
     /// to cover a mixed-version rolling upgrade window.
     pub fn never_constructs_a_central_snapshot_catalog(self) -> bool {
         matches!(self, Self::Node)
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+
+    /// 🔴 Every arm, because the failing one is the one that matters: a
+    /// deployment that still passes `--role api` to the node image must be
+    /// told which binary it wanted, not started as something it is not.
+    #[test]
+    fn a_binary_confirms_its_own_half_and_refuses_the_other() {
+        for binary in [ServerRole::Node, ServerRole::Api] {
+            assert_eq!(
+                binary.confirm_with(None, None).unwrap(),
+                binary,
+                "with nothing asked for, a binary is its own half"
+            );
+            assert_eq!(
+                binary.confirm_with(None, Some("   ")).unwrap(),
+                binary,
+                "an empty AENV_ROLE is the same as no AENV_ROLE"
+            );
+            assert_eq!(binary.confirm_with(Some(binary), None).unwrap(), binary);
+            assert_eq!(
+                binary.confirm_with(None, Some(binary.as_str())).unwrap(),
+                binary,
+                "AENV_ROLE naming this binary's own half is accepted"
+            );
+        }
+
+        let err = ServerRole::Node
+            .confirm_with(Some(ServerRole::Api), None)
+            .expect_err("the node binary cannot run as api")
+            .to_string();
+        assert!(
+            err.contains("aenv-api"),
+            "the refusal must name the binary the caller wanted: {err}"
+        );
+
+        let err = ServerRole::Api
+            .confirm_with(None, Some("node"))
+            .expect_err("the api binary cannot run as node")
+            .to_string();
+        assert!(
+            err.contains("aenv-node"),
+            "AENV_ROLE is checked exactly like --role: {err}"
+        );
+
+        // 🔴 `all` has no binary. It was defined as the process that ran before
+        // the split, and no process links both halves now.
+        for binary in [ServerRole::Node, ServerRole::Api] {
+            let err = binary
+                .confirm_with(Some(ServerRole::All), None)
+                .expect_err("--role all has no binary after the split")
+                .to_string();
+            assert!(
+                err.contains("aenv-node and aenv-api") && err.contains("pre-split image"),
+                "a request for `all` must name both binaries and the rollback: {err}"
+            );
+        }
+
+        assert!(
+            ServerRole::Api.confirm_with(None, Some("gateway")).is_err(),
+            "an unparseable AENV_ROLE is still an error rather than a silent default"
+        );
     }
 }
 

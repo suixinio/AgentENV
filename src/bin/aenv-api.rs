@@ -1,3 +1,15 @@
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc tuning: purge dirty/muzzy pages after 1s instead of the default
+// 10s, and do the purging on a background thread (the `background_threads`
+// cargo feature is already enabled). Burst allocations (RocksDB opens, image
+// resolution, template builds) otherwise linger as retained RSS long after
+// the burst is over.
+#[used]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true\0";
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -8,7 +20,6 @@ use agentenv::binding_store::{
 use agentenv::cfg::{
     AppConfig, BindingStoreBackendKind, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
     MetadataStoreBackendKind, NodePlacementSource, NodeRegistryObservedBackendKind,
-    PausedRegistryBackendKind,
 };
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
@@ -25,281 +36,46 @@ use agentenv::node_registry::redis::{
 };
 use agentenv::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use agentenv::node_registry::warmup::WarmupGate;
-use agentenv::observability::{ObservabilityReporter, ObservabilityService};
+use agentenv::observability::ObservabilityService;
 use agentenv::orchestrator::{
-    build_paused_registry, spawn_paused_registry_background_tasks, DisabledPausedSandboxRegistry,
-    DisabledSandboxPersister, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
-    RedisMetadataStore, SandboxOrchestration,
+    build_paused_registry, spawn_paused_registry_background_tasks, DisabledSandboxPersister,
+    Orchestrator, RedisMetadataStore, SandboxOrchestration,
 };
-use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::p2p::P2pTransport;
 use agentenv::pg::{self, PgPoolSettings};
 use agentenv::role::ServerRole;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use agentenv::server_main::{self, spawn_grpc_surface, Assembly};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use anyhow::Context as _;
-use axum::serve::ListenerExt;
 use clap::Parser;
-use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-// jemalloc tuning: purge dirty/muzzy pages after 1s instead of the default
-// 10s, and do the purging on a background thread (the `background_threads`
-// cargo feature is already enabled). Burst allocations (RocksDB opens, image
-// resolution, template builds) otherwise linger as retained RSS long after
-// the burst is over.
-#[used]
-#[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true\0";
-
-/// The orchestrator a machine-local role assembles: this node's own ledger,
-/// this node's Firecracker, this node's files.
-type LocalOrchestrator =
-    Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, FileBackedSandboxPersister>;
-
+/// 🔴 `--role` is accepted and checked, not obeyed. See
+/// [`ServerRole::confirm`]: this binary *is* the api half, and it is that
+/// because of what it does not link — no overlaybd, no ublk, no Firecracker.
 #[derive(Debug, Parser)]
-#[command(name = "agentenv server")]
-struct ServerCli {
-    /// Which half of the split this process runs: api, node, or all.
-    ///
-    /// Defaults to `all` — one process holding both halves, which is what has
-    /// always run. Also readable from AENV_ROLE; an explicit --role wins.
+#[command(name = "aenv-api")]
+struct ApiCli {
+    /// Which half of the split this process runs. Only `api` is accepted
+    /// here; also read from AENV_ROLE.
     #[arg(long, value_enum)]
     role: Option<ServerRole>,
-
-    /// Run setup/provisioning only, then exit.
-    #[arg(long)]
-    setup_only: bool,
-
-    /// Provision machine-wide KVM, ublk, and networking prerequisites.
-    #[arg(long, conflicts_with = "setup_only")]
-    setup_host: bool,
-
-    /// Account that will run AENV after host provisioning.
-    #[arg(long, default_value = "aenv", requires = "setup_host")]
-    runtime_user: String,
-
-    /// Runtime service group; owns AENV state and receives ublk device access.
-    #[arg(long, default_value = "aenv", requires = "setup_host")]
-    runtime_group: String,
 
     /// Path to config file (same as AENV_CONFIG_PATH).
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 }
 
-/// What an assembled role hands back to `main`: the router it serves and the
-/// four things the shutdown path has to stand down, in that order.
-struct Assembly {
-    app: axum::Router,
-    /// The orchestration surface this process drives. Which concrete
-    /// `Orchestrator` is behind it is the role's decision.
-    orchestration: Arc<dyn SandboxOrchestration>,
-    /// Background tasks to stop before the shutdown pauses start.
-    upkeep: Vec<tokio::task::JoinHandle<()>>,
-    /// PostgreSQL-elected singleton background tasks (Stage B: the catalog
-    /// build reaper). Kept apart from `upkeep` deliberately —
-    /// `agentenv::pg::SingletonTaskHandle::shutdown()` is `async`, consumes
-    /// `self`, and releases this replica's advisory lock (if it is
-    /// currently leader) before returning; pushing one into `upkeep` and
-    /// letting the shutdown loop `.abort()` it would skip that release
-    /// entirely and strand the lock until the pool itself is torn down.
-    /// Empty for `--role node`, which never holds a `[pg]` pool at all.
-    pg_singleton_tasks: Vec<agentenv::pg::SingletonTaskHandle>,
-    /// The heartbeat sender, for roles that report themselves as a machine.
-    reporter: Option<ObservabilityReporter>,
-    /// The machine-local runtime, for roles that brought one up.
-    runtime: Option<NodeRuntime>,
-    /// The gRPC surface this role serves alongside the HTTP one, already
-    /// accepting: the task serving it, and the channel that stops it.
-    ///
-    /// 🔴 Already bound by the time this is built. A listener that binds inside
-    /// a spawned task turns "the port is taken" into a task that quietly ended,
-    /// and the process goes on serving HTTP with a gRPC surface nobody can
-    /// reach — which is indistinguishable from a surface nobody is calling.
-    ///
-    /// 🔴 `None` for `--role all`, and that is the rollback showing through
-    /// rather than an omission. `all` is defined as the process that ran before
-    /// the split, and that process listened on one port.
-    grpc: Option<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)>,
-}
-
-/// Bound for each individual step in [`NodeRuntime::shutdown`].
-///
-/// 🔴 Shared across four unrelated subsystems (two P2P shutdowns, two RocksDB
-/// store closes) on purpose: an operator reading shutdown logs across a fleet
-/// only has to remember one number, and none of these four steps has ever had
-/// a reason to need a materially different bound from the others — they are
-/// all "stop background work that is already best-effort, and say so if it
-/// didn't finish in time" calls. `crate::local_store::DEFAULT_CLOSE_TIMEOUT`
-/// is the same value for the same reason, one module over; this one is
-/// separate because it also has to bound the two P2P calls, which know
-/// nothing about `local_store`.
-const NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// The machine-local runtime a sandbox-running role owns: the two P2P pieces it
-/// holds by value, the process-wide Firecracker pool and ublk daemon it
-/// reaches through their globals, and a handle onto the snapshot manager kept
-/// only so shutdown can close its durable mirror-backlog store.
-///
-/// 🔴 Held as a whole rather than as independent handles so that the teardown
-/// order — pool, ublk, overlaybd P2P, transport, then the two RocksDB stores
-/// this bundle can reach — stays in one place.
-struct NodeRuntime {
-    overlaybd_p2p: OverlaybdP2pRuntime,
-    p2p_transport: Arc<dyn P2pTransport>,
-    /// Not otherwise used here: every operational use of the manager goes
-    /// through the `Arc` clone `assemble_node_core`'s caller wires into
-    /// `ApiImpl`. This clone exists only for `close_stores` below.
-    snapshot_manager: Arc<SnapshotManager>,
-}
-
-impl NodeRuntime {
-    async fn shutdown(self) {
-        if let Some(pool) = FirecrackerPool::global() {
-            info!(target: "agentenv", "shutting down firecracker pool");
-            if let Err(err) = pool.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
-            }
-        }
-        info!(target: "agentenv", "shutting down ublk daemon");
-        if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
-            warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
-        }
-
-        // 🔴 Bounded, unlike the plain `.await`s these replaced. Both
-        // subsystems already treat their own failure as best-effort (`warn!`
-        // and move on) — but with P2P enabled, `overlaybd_p2p`'s read facade
-        // and `p2p_transport`'s iroh endpoint each sit on top of a downstream
-        // RPC wait with no timeout of its own (iroh-blobs' storage actor, in
-        // particular), and an unbounded `.await` here is exactly the class of
-        // bug the rest of this shutdown path exists to close off. Disabled P2P
-        // (`DisabledP2pTransport`, most deployments today) returns instantly
-        // either way, so this only changes behaviour where P2P is on.
-        info!(target: "agentenv", "shutting down overlaybd p2p runtime");
-        match tokio::time::timeout(
-            NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT,
-            self.overlaybd_p2p.shutdown(),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
-            }
-            Err(_) => {
-                warn!(
-                    target: "agentenv",
-                    timeout_secs = NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT.as_secs(),
-                    "overlaybd p2p runtime did not shut down within timeout; continuing shutdown"
-                );
-            }
-        }
-        info!(target: "agentenv", "shutting down p2p transport");
-        match tokio::time::timeout(
-            NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT,
-            self.p2p_transport.shutdown(),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
-            }
-            Err(_) => {
-                warn!(
-                    target: "agentenv",
-                    timeout_secs = NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT.as_secs(),
-                    "p2p transport did not shut down within timeout; continuing shutdown"
-                );
-            }
-        }
-
-        // 🔴 The two RocksDB stores this bundle can still reach. Neither call
-        // drops the underlying store — both only stop its background
-        // compaction/flush ahead of time (see `LocalKvStore::close`) — so this
-        // is safe even while other clones of the same store (the image cache's
-        // shared-instance registry, in particular) are still live elsewhere in
-        // the process.
-        info!(target: "agentenv", "closing image cache metadata store");
-        agentenv::image::close_image_cache_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT).await;
-        info!(target: "agentenv", "closing snapshot catalog mirror backlog store");
-        self.snapshot_manager
-            .close_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT)
-            .await;
-    }
-}
-
-/// Everything a machine-local role builds before the question of who owns a
-/// paused sandbox comes up.
-///
-/// 🔴 `--role node` and `--role all` share this, deliberately: it is the part
-/// where the two are *supposed* to be identical, and a second copy of it would
-/// be a second thing to keep in step with the first. What the two roles differ
-/// on comes after, in `assemble_node` and `assemble_all`.
-struct NodeCore {
-    orchestrator: Arc<LocalOrchestrator>,
-    snapshot_manager: Arc<SnapshotManager>,
-    template_builder: Arc<TemplateBuilder>,
-    image_resolver: Arc<ImageResolver>,
-    observability: Option<Arc<ObservabilityService>>,
-    reporter: Option<ObservabilityReporter>,
-    /// The identity the paused-registry wiring needs after the observability
-    /// service has taken ownership of the original.
-    identity: NodeIdentity,
-    runtime: NodeRuntime,
-}
-
-/// Bound for the final `Runtime::shutdown_timeout` call in `main`, below.
-///
-/// 🔴 Deliberately larger than [`NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT`]: by the
-/// time this runs, every shutdown step this file knows to bound has already
-/// run and already had its own timeout, so this bound is what is left over
-/// for whatever *wasn't* individually bounded — a stuck `spawn_blocking`
-/// nothing above reached explicitly. It only needs to be comfortably smaller
-/// than Kubernetes' `terminationGracePeriodSeconds` (observed misconfigured at
-/// 3600s on the cluster this exists for), not tight.
-const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 🔴 Not `#[tokio::main]`. That macro's generated `main` builds the runtime,
-/// `block_on`s the async body, then lets the `Runtime` value fall out of
-/// scope — and `Runtime`'s `Drop` shuts down its blocking-task pool by calling
-/// `BlockingPool::shutdown(None)` (tokio, `runtime/blocking/pool.rs`), and
-/// `None` means *no timeout*: it waits forever for every `spawn_blocking`
-/// closure that has already started to return.
-///
-/// Every RocksDB store this process opens (`LocalKvStore`, see
-/// `crate::local_store`) does its writes, and its own background
-/// compaction/flush, through `spawn_blocking` — so one such closure still
-/// running when the async body below returns was enough to make the whole
-/// process hang past `terminationGracePeriodSeconds`, long after every log
-/// line the graceful shutdown was ever going to print had already printed.
-/// (Observed only on nodes that had actually run a VM: an idle node's stores
-/// have nothing to compact, so `Drop` there really did return immediately —
-/// which is exactly why the hang looked selective rather than universal.)
-///
-/// The explicit `close()` calls the shutdown path below makes — the
-/// persisted-sandboxes store, the image cache metadata store, the snapshot
-/// catalog mirror backlog — are meant to make that background work finish,
-/// and log whether it did, before any of this runs. `shutdown_timeout` here is the
-/// backstop for whatever is still outstanding regardless: unlike plain `Drop`,
-/// it bounds the same wait, and once it returns, `main` returning ends the
-/// process — any `spawn_blocking` closure still running at that point keeps
-/// running on its own OS thread, but nothing waits on it any more, the same
-/// way `storage-util`'s un-joined io_uring worker threads already don't block
-/// process exit today.
+/// 🔴 Not `#[tokio::main]` — see `aenv-node`'s `main` for the whole argument.
+/// This half opens fewer RocksDB stores than the node one does, but it opens
+/// the snapshot catalog's mirror backlog, so the same bound applies.
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build the tokio runtime")?;
     let result = runtime.block_on(async_main());
-    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    runtime.shutdown_timeout(server_main::RUNTIME_SHUTDOWN_TIMEOUT);
     result
 }
 
@@ -307,8 +83,8 @@ async fn async_main() -> anyhow::Result<()> {
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
-    let cli = ServerCli::parse();
-    let role = ServerRole::resolve(cli.role)?;
+    let cli = ApiCli::parse();
+    let role = ServerRole::Api.confirm(cli.role)?;
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
@@ -316,145 +92,9 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
-    // Before either provisioning path runs, not after: the point of the check
-    // is that the process was pointed at the wrong workload, and provisioning a
-    // host on the way to finding that out helps nobody.
-    role.check_setup_flags(cli.setup_only, cli.setup_host)?;
-
-    // 🔴 Security invariant, checked before any role-specific assembly runs:
-    // a machine that runs user code must never hold database credentials.
-    // See `agentenv::pg` and `ServerRole::check_pg_dsn`.
-    role.check_pg_dsn(config.pg.as_ref().and_then(agentenv::cfg::PgConfig::dsn))?;
-
-    if cli.setup_only {
-        agentenv::setup::ensure_provisioning(config).await?;
-        info!(target: "agentenv", "dependency setup complete (setup-only mode)");
-        return Ok(());
-    }
-
-    if cli.setup_host {
-        agentenv::setup::ensure_host(config, &cli.runtime_user, &cli.runtime_group)?;
-        info!(target: "agentenv", "host setup complete");
-        return Ok(());
-    }
-
     info!(target: "agentenv", role = role.as_str(), "assembling server");
-    let Assembly {
-        app,
-        orchestration,
-        upkeep,
-        pg_singleton_tasks,
-        mut reporter,
-        runtime,
-        grpc,
-    } = match role {
-        ServerRole::All => assemble_all(config).await?,
-        ServerRole::Node => assemble_node(config).await?,
-        ServerRole::Api => assemble_api(config).await?,
-    };
-
-    // Split so the stop signal can travel into the graceful-shutdown closure
-    // while the task stays here to be joined after it.
-    let (grpc_task, grpc_shutdown) = match grpc {
-        Some((task, shutdown)) => (Some(task), Some(shutdown)),
-        None => (None, None),
-    };
-
-    let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
-    let shutdown_orchestration = Arc::clone(&orchestration);
-    let drain_orchestration = Arc::clone(&orchestration);
-    let drains_on_shutdown = role.drains_on_shutdown();
-    let drain_propagation =
-        Duration::from_secs(config.orchestrator.shutdown_drain_propagation_secs);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-    // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
-    // With Nagle left on, the frame after the first one waits for the client's
-    // delayed ACK, adding a ~40ms floor to every short-lived command.
-    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            warn!(target: "agentenv", error = %err, "failed to set TCP_NODELAY on incoming connection");
-        }
-    });
-    info!(target: "agentenv", addr = %addr, "API server listening");
-
-    let shutdown_cleanup = tokio::spawn(async move {
-        if let Ok(()) = shutdown_rx.await {
-            if let Some(mut handle) = reporter.take() {
-                info!(target: "agentenv", "stopping observability reporter before process exit");
-                if let Err(err) = handle.shutdown().await {
-                    warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
-                }
-            }
-            // Stop reconciling before the shutdown pauses start: those write
-            // paused records these tasks would otherwise be racing to inspect.
-            for task in &upkeep {
-                task.abort();
-            }
-            // 🔴 Awaited, never `.abort()`-ed — see `Assembly::pg_singleton_tasks`'s
-            // own doc comment: `shutdown()` releases this replica's
-            // PostgreSQL advisory lock if it is currently leader, which an
-            // abort would skip entirely.
-            for task in pg_singleton_tasks {
-                info!(target: "agentenv", "stopping a pg-elected singleton task before process exit");
-                task.shutdown().await;
-            }
-            info!(target: "agentenv", "stopping sandboxes before process exit");
-            if let Err(err) = shutdown_orchestration.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
-            }
-            if let Some(runtime) = runtime {
-                runtime.shutdown().await;
-            }
-        }
-    });
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-
-            // Take the node out of rotation before tearing anything down, and
-            // give the scheduler time to hear about it. Without this pause a
-            // sandbox can be placed here in the moments after the signal and be
-            // paused again before the caller has finished starting it.
-            //
-            // Isolation set through the admin API is left alone: it is already
-            // the state we want, and re-announcing it would reset the timestamp
-            // an operator is watching.
-            //
-            // 🔴 Only a role that can be scheduled onto has anything to
-            // withdraw; an API replica is not a placement target.
-            if drains_on_shutdown && drain_orchestration.set_scheduling_disabled(true) {
-                info!(
-                    target: "agentenv",
-                    wait_secs = drain_propagation.as_secs(),
-                    "isolated the node for shutdown; waiting for the scheduler to notice"
-                );
-                if !drain_propagation.is_zero() {
-                    tokio::time::sleep(drain_propagation).await;
-                }
-            }
-
-            // Stops accepting on the second listener at the same moment the
-            // HTTP one stops: both carry work that the teardown below is about
-            // to make impossible to finish.
-            if let Some(shutdown) = grpc_shutdown {
-                let _ = shutdown.send(());
-            }
-
-            let _ = shutdown_tx.send(());
-        })
-        .await?;
-
-    if let Some(task) = grpc_task {
-        if let Err(err) = task.await {
-            warn!(target: "agentenv", error = %err, "the gRPC surface did not stop cleanly");
-        }
-    }
-
-    shutdown_cleanup.await?;
-
-    Ok(())
+    let assembly = assemble_api(config).await?;
+    server_main::serve(role, config, assembly).await
 }
 
 /// This replica's `[pg]` connection pool, or `None` when PostgreSQL is not
@@ -520,478 +160,6 @@ fn spawn_pg_singleton_tasks(
     )
     .into_iter()
     .collect()
-}
-
-/// Brings up everything a role that runs sandboxes on this machine needs.
-async fn assemble_node_core(
-    config: &AppConfig,
-    role: ServerRole,
-    pg_pool: Option<sqlx::PgPool>,
-) -> anyhow::Result<NodeCore> {
-    // Both roles that reach here run the machine and report it as one; the API
-    // half never does, and never calls this.
-    debug_assert!(role.runs_sandbox_runtime());
-    debug_assert!(role.sends_heartbeats());
-
-    agentenv::privileges::require_runtime_capabilities()?;
-    agentenv::privileges::clear_ambient_capabilities()?;
-
-    // 🔴 First, before anything else this process constructs, and in
-    // particular before `setup::ensure_environment` — which unlinks every
-    // stale network namespace, and a namespace must not be unlinked while a
-    // VMM is still running inside it. The sweep is sound only while this
-    // process holds nothing on the machine, and that window is widest here.
-    // See `src/node_reclaim/` for the whole argument.
-    agentenv::node_reclaim::run(role, config).await;
-
-    let identity = NodeIdentity::from_config(&config.node_identity);
-    // `identity` is moved into the observability service below; the registry
-    // wiring needs the same node/cluster identity afterwards.
-    let identity_for_registry = identity.clone();
-    let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
-    let p2p_local_endpoint = p2p_transport.local_endpoint();
-    let overlaybd_p2p =
-        OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
-
-    agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
-
-    // Initialize the global ublk device manager (spawns daemon if configured).
-    UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
-        config,
-        overlaybd_p2p.publish_address(),
-    )
-    .await?;
-
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
-    }
-
-    let snapshot_p2p_transport = config
-        .snapshot
-        .p2p_enabled
-        .then(|| Arc::clone(&p2p_transport));
-    // 🔴 Two handles on the same transport, and they answer different
-    // questions. The first is how the *resolver* fetches a snapshot's fixed
-    // artifacts from a peer; the second is how this node offers the ones it
-    // just wrote. Only the machine that holds bytes has anything to offer, so
-    // only this assembly builds an advertiser — `assemble_api` passes `None`.
-    let snapshot_advertiser = snapshot_p2p_transport.clone().map(|transport| {
-        Arc::new(agentenv::snapshot::P2pSnapshotAdvertiser::new(transport))
-            as Arc<dyn agentenv::snapshot::SnapshotArtifactAdvertiser>
-    });
-    let snapshot_manager = Arc::new(
-        SnapshotManager::new(snapshot_p2p_transport, snapshot_advertiser, pg_pool, role).await?,
-    );
-    let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-    // The handle the cold-boot paths read the CPUID intersection from.
-    //
-    // 🔴 Separate from the one the reporter writes, and only when the setting
-    // is off. Reporting keeps running either way — the scheduler still collects
-    // this node's CPU config and still computes the cluster intersection, so
-    // the observability surface does not go dark and turning the setting back
-    // on needs no other change. What stops is applying it to a booting microVM,
-    // which is the half a host can refuse: see
-    // `FirecrackerConfig::apply_cluster_cpu_template` for the Granite Rapids
-    // failure this exists for.
-    let applied_cpu_arc: Arc<RwLock<Option<String>>> =
-        if config.firecracker.apply_cluster_cpu_template {
-            Arc::clone(&cluster_cpu_arc)
-        } else {
-            warn!(
-                target: "agentenv",
-                "cluster CPU template will not be applied to cold-booting microVMs \
-                 (firecracker.apply_cluster_cpu_template = false); this is only safe \
-                 while every node in the cluster has the same CPU"
-            );
-            Arc::new(RwLock::new(None))
-        };
-    let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
-        &applied_cpu_arc,
-    )));
-    let image_resolver = Arc::new(ImageResolver::new(config));
-    let factory = FirecrackerSandboxFactory::with_cpu_config(applied_cpu_arc);
-    // 🔴 This await, and the `reporter.start()` below it, are in this order on
-    // purpose. `Orchestrator::new` restores the persisted paused sandboxes
-    // before it returns, so by the time the reporter sends its first heartbeat
-    // the roster is already complete.
-    //
-    // The scheduler deletes every routing binding a node owns when that node
-    // reports an empty roster — which is what makes a node's disappearance
-    // clear its records rather than leave them pointing at nothing. Start the
-    // reporter first and a restart would wipe this node's own records, and do
-    // it quietly: the next heartbeat puts them back, so all anyone sees is a
-    // few seconds of 404s indistinguishable from a cold cache. Pinned by
-    // `the_roster_is_complete_the_moment_new_returns` in
-    // `src/orchestrator/tests.rs`.
-    // 🔴 The node half's own layer cache, named here rather than defaulted
-    // inside the orchestrator. This is the process that has one.
-    let image_refs = agentenv::image::local_runtime_image_refs();
-    let orchestrator =
-        Orchestrator::with_file_backed_store_and_factory(role, factory, image_refs).await?;
-    let observability_config = &config.observability;
-    let observability = if observability_config.enabled {
-        Some(Arc::new(
-            ObservabilityService::new(
-                identity,
-                Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>,
-                config.resolved_cpu_template_helper(),
-                cluster_cpu_arc,
-            )
-            .await,
-        ))
-    } else {
-        None
-    };
-    let reporter = if let Some(service) = observability.as_ref() {
-        let mut reporter = ObservabilityReporter::new(
-            Arc::clone(service),
-            &observability_config.scheduler_report,
-            &config.cluster,
-            p2p_local_endpoint,
-        )?;
-        if let Some(inner) = reporter.as_mut() {
-            inner.start();
-        }
-        reporter
-    } else {
-        None
-    };
-
-    // Cloned before `snapshot_manager` moves into `NodeCore` below: the
-    // shutdown path needs its own handle to close the manager's stores, kept
-    // separately from whatever the caller does with the `NodeCore` field (move
-    // it into `ApiImpl`, in every role that reaches this function today).
-    let runtime = NodeRuntime {
-        overlaybd_p2p,
-        p2p_transport,
-        snapshot_manager: Arc::clone(&snapshot_manager),
-    };
-
-    Ok(NodeCore {
-        orchestrator,
-        snapshot_manager,
-        template_builder,
-        image_resolver,
-        observability,
-        reporter,
-        identity: identity_for_registry,
-        runtime,
-    })
-}
-
-/// `--role all`: both halves in one process, which is what has always run.
-///
-/// 🔴 This is the rollback target, so it is defined as *today's behaviour* and
-/// not as the union of `api` and `node`. Nothing belongs here that was not
-/// here before the split.
-///
-/// 🔴 P5 (task's own "phase4-close"): `build_pg_pool` below is an eager,
-/// fail-fast dependency — a `[pg].dsn` that is configured but transiently
-/// unreachable at boot (Postgres still starting, a network blip) aborts
-/// this process's startup entirely, same as `assemble_api`. This predates
-/// the scheduler fold (`92976be`, "thread an optional PgPool through
-/// snapshot backend assembly") and is not a failure source phase 4 added,
-/// so it does not violate this function's own "nothing new" doc above —
-/// but it is worth naming, since a rollback to `--role all` under a flaky
-/// `[pg]` would carry it forward unchanged. Deliberately left eager rather
-/// than made lazy here: `build_pg_pool` also runs
-/// `migrate_catalog_schema`, which `build_snapshot_backend`'s Postgres
-/// paths (and `spawn_pg_singleton_tasks`'s reaper) assume has already
-/// completed by the time they run — a lazy/retrying pool would have to
-/// either block the same callers on the same migration anyway or risk
-/// running against an unmigrated schema, and reworking that ordering is
-/// out of scope for this task. `[pg]` unset (`None`) is unaffected either
-/// way — this is only a cost an operator opts into by configuring it.
-async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
-    let role = ServerRole::All;
-    let pg_pool = build_pg_pool(config).await?;
-    let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
-    // 🔴 Cloned before the move into `assemble_node_core` below: `--role all`
-    // never builds Stage A's native node registry (see `assemble_api`'s own
-    // `native_node_registry` wiring, which this function has no equivalent
-    // of), so `build_paused_registry`'s `node_registry` argument is always
-    // `None` here. M1: unlike `--role api`, that no longer refuses the
-    // `postgres` backend -- `role` (`ServerRole::All`,
-    // `runs_sandbox_runtime() == true`) is what tells `build_paused_registry`
-    // this process's own identity already coincides with `origin_node_id`
-    // for everything it runs, so it does not need D2 Fix A's roster-driven
-    // renewal at all. See that function's own doc.
-    let pg_pool_for_registry = pg_pool.clone();
-    let core = assemble_node_core(config, role, pg_pool).await?;
-
-    debug_assert!(role.arbitrates_paused_sandbox_ownership());
-    // The rollback target serves everything it ever served: no RoleGate is
-    // attached for this role at all (`crate::api::role_gate::attach`).
-    debug_assert!(role.serves_user_facing_rest());
-    debug_assert!(!role.reclaims_host_leftovers_at_startup());
-    let paused_registry = build_paused_registry(
-        &config.orchestrator.paused_registry,
-        &config.cluster,
-        &config.observability.scheduler_report,
-        &core.identity,
-        role,
-        pg_pool_for_registry.clone(),
-        None,
-    )
-    .await?;
-    let paused_registry_tasks = spawn_paused_registry_background_tasks(
-        &config.orchestrator.paused_registry,
-        &core.identity,
-        pg_pool_for_registry,
-        None,
-    );
-    pg_singleton_tasks.extend(paused_registry_tasks.singleton);
-    let mut paused_registry_upkeep = paused_registry_tasks.plain;
-    let paused_wiring = PausedSandboxWiring::new(
-        paused_registry,
-        Arc::clone(&core.snapshot_manager),
-        &core.identity,
-    );
-    // The orchestrator publishes every pause it performs, including the ones no
-    // API request asked for (expiry, shutdown).
-    core.orchestrator
-        .set_paused_publisher(paused_wiring.publisher());
-    let orchestration: Arc<dyn SandboxOrchestration> =
-        Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
-    let api_impl = Arc::new(ApiImpl::new(
-        Arc::clone(&orchestration),
-        core.snapshot_manager,
-        core.template_builder,
-        core.image_resolver,
-        core.observability,
-        paused_wiring,
-        config.sandbox_proxy.domains.clone(),
-        role,
-        // 🔴 The real placement source, even though nothing serves the wake-up
-        // gRPC surface on this role today. `all` is the one role that both
-        // answers wake decisions and runs the sandboxes, so if that surface is
-        // ever exposed here it must arrive with the pin check already wired:
-        // an unpublished pause woken on the wrong machine does not fail, it
-        // rebuilds from an older snapshot and loses the last pause silently.
-        //
-        // Costs nothing at startup — `connect_lazy` opens no socket — and the
-        // startup-sequence gate accounts for it by name.
-        ResumeWiring::from_config(&core.identity.id)?,
-    ));
-    // All three run before the listener opens, and the order is load-bearing.
-    //
-    // Releasing goes first, and only here: it hands back every sandbox a
-    // previous process on this machine died holding, which is sound precisely
-    // because this process holds nothing yet. Once the listener is open that
-    // stops being true and the same call would be giving away live sandboxes.
-    //
-    // Renewing then stops this node's own remaining records from looking
-    // abandoned during startup, and reconciling makes sure a resume arriving
-    // first does not find a paused record the cluster has already moved past.
-    let stale_release = api_impl.release_stale_node_holdings().await;
-    api_impl.renew_paused_leases().await;
-    api_impl.reconcile_local_records().await;
-    let mut paused_upkeep = spawn_paused_record_upkeep(
-        Arc::clone(&api_impl),
-        config.orchestrator.paused_registry.reconcile_interval(),
-    );
-    // Only a registry that could not be reached is worth retrying, and only
-    // from here: the retry is bounded by the same fence the startup call is,
-    // and that fence closes the moment this node takes a sandbox live.
-    if stale_release == StaleReleaseOutcome::Failed {
-        let retrier = Arc::clone(&api_impl);
-        paused_upkeep.push(tokio::spawn(async move {
-            retrier.retry_stale_node_holdings_release().await;
-        }));
-    }
-    // B1: the postgres backend's per-replica renewal loop (empty for every
-    // other backend, and for `--role all` with `node_placement_source` not
-    // set to native -- see `spawn_paused_registry_background_tasks`'s own
-    // doc). Stops the same way, at the same point, as the rest of this
-    // role's upkeep.
-    paused_upkeep.append(&mut paused_registry_upkeep);
-
-    Ok(Assembly {
-        app: server::new(api_impl, role),
-        orchestration,
-        upkeep: paused_upkeep,
-        pg_singleton_tasks,
-        reporter: core.reporter,
-        runtime: Some(core.runtime),
-        // 🔴 Not "not yet": never. This role is the rollback target and is
-        // defined as the process that ran before the split, which listened on
-        // one port. The node service belongs to `--role node`; see
-        // `assemble_node`.
-        grpc: None,
-    })
-}
-
-/// `--role node`: the half that runs sandboxes, and decides nothing about who
-/// owns them.
-///
-/// What it drops relative to `all` is one thing, arrived at from one rule: a
-/// node executes, the API decides. So the cluster paused registry, the three
-/// startup passes over it and the four upkeep tasks that keep this node's claim
-/// on a paused sandbox alive are all gone; the API half holds those records now.
-///
-/// 🔴 What that leaves is a node that never takes a lease it will not renew.
-/// The registry it wires in is the disabled one regardless of configuration,
-/// which is the fail-closed direction: a node that claimed rows in a shared
-/// registry and then never renewed them would have other nodes waiting out a
-/// TTL for sandboxes nobody was coming back for.
-///
-/// 🔴 The three slices this comment used to list as missing have all landed,
-/// and each of them is constructed or asserted a few lines below rather than
-/// described here — read the code, not this paragraph:
-///
-/// - the **node gRPC service** the API half drives it through is bound by
-///   `spawn_grpc_surface` before `ApiImpl` takes the snapshot manager, and
-///   returned as `grpc: Some(..)`;
-/// - the **RoleGate** that stops user-facing REST being served from this port
-///   is attached by `server::new(api_impl, role)` (`src/api/role_gate.rs`),
-///   which is what `debug_assert!(!role.serves_user_facing_rest())` is naming;
-/// - the **startup reclaim of host leftovers** already ran, inside
-///   `assemble_node_core`, which is what
-///   `debug_assert!(role.reclaims_host_leftovers_at_startup())` is naming.
-///
-/// So this role is driven, and what it cannot do is now a property of the API
-/// half rather than of this one — see the list on [`assemble_api`].
-async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
-    let role = ServerRole::Node;
-    // 🔴 Always `None`, never `build_pg_pool(config)`. `--role node` must
-    // never hold PostgreSQL credentials — see `build_pg_pool`'s own doc
-    // comment — and this is that invariant enforced by construction here,
-    // not only by `ServerRole::check_pg_dsn` at startup.
-    let core = assemble_node_core(config, role, None).await?;
-
-    debug_assert!(!role.arbitrates_paused_sandbox_ownership());
-    // Both are `role`'s to decide and both are read from it below rather than
-    // spelled out again: the user-facing REST surface is refused by the layer
-    // `server::new` attaches, and the host sweep already ran inside
-    // `assemble_node_core`.
-    debug_assert!(!role.serves_user_facing_rest());
-    debug_assert!(role.reclaims_host_leftovers_at_startup());
-    let configured_backend = config.orchestrator.paused_registry.backend;
-    let cluster_registry_configured =
-        !matches!(configured_backend, PausedRegistryBackendKind::Local);
-    // Published either way, so "this node has holdings nobody is going to
-    // release" is answerable from a scrape rather than from a log line that
-    // scrolled past during startup.
-    metrics::gauge!("agentenv_node_unreleased_cluster_holdings").set(
-        if cluster_registry_configured {
-            1.0
-        } else {
-            0.0
-        },
-    );
-    if cluster_registry_configured {
-        // 🔴 Two consequences, and the second is the one that is easy to miss.
-        //
-        // Forward: this process claims nothing, so it can never fail to renew
-        // a lease. That is the fail-closed direction and it is why the
-        // disabled registry is wired in regardless of configuration.
-        //
-        // Backward: whatever *the previous process on this machine* claimed
-        // while it ran as `--role all` stays claimed. `--role all` calls
-        // `release_stale_node_holdings` at startup to hand those back; this
-        // role does not, and deliberately — releasing rows by node identity is
-        // a statement about who owns a paused sandbox, which is the one thing
-        // `ServerRole::Node` answers `false` to
-        // (`arbitrates_paused_sandbox_ownership`). Putting it back here would
-        // reintroduce exactly the split this role exists to end.
-        //
-        // The successor for it is the API half's reconciliation, which has a
-        // proof this process does not: it can see from the scheduler that this
-        // node is gone. Until that lands, an `all` → `node` switch strands the
-        // previous process's rows until their leases lapse.
-        warn!(
-            target: "agentenv",
-            configured = ?configured_backend,
-            "--role node ignores the configured paused-sandbox registry: cluster-wide records \
-             belong to the API half. Paused sandboxes stay resumable on this node, and this \
-             process claims nothing new — but anything this machine was holding from a previous \
-             --role all process is not released by this one and stays held until its lease lapses."
-        );
-    }
-    // `ApiImpl` needs a coordinator either way; this one is wired to a registry
-    // that answers nothing and records nothing, so every cluster-facing call
-    // through it is a no-op.
-    //
-    // 🔴 Including the publish. This comment used to say that publishing the
-    // *bytes* of a pause still happened here — that it was the node's job and
-    // only the bookkeeping was dropped — and that is exactly what leaked: the
-    // capture went to the shared repository on every pause, and with no row to
-    // name it, no resume could find it and no delete could collect it. The
-    // coordinator now asks whether anything could reference an upload before
-    // making one (`PausedSandboxCoordinator::publish`); a pause here stays
-    // durable through the node-local persister, which is what the resume on
-    // this half reads anyway.
-    let paused_wiring = PausedSandboxWiring::new(
-        Arc::new(DisabledPausedSandboxRegistry),
-        Arc::clone(&core.snapshot_manager),
-        &core.identity,
-    );
-    core.orchestrator
-        .set_paused_publisher(paused_wiring.publisher());
-    let orchestration: Arc<dyn SandboxOrchestration> =
-        Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
-
-    // The half the API half drives this machine through, bound before the
-    // `ApiImpl` below takes ownership of the snapshot manager it needs.
-    //
-    // 🔴 Bound here rather than inside the task that serves it, so a port
-    // already in use stops this process instead of leaving it serving HTTP and
-    // unreachable to the control plane — which looks, from the control plane,
-    // exactly like a node with nothing on it.
-    let grpc = {
-        let orchestration = Arc::clone(&orchestration);
-        let snapshots = Arc::clone(&core.snapshot_manager);
-        let node_id = core.identity.id.clone();
-        let image_resolver = Arc::clone(&core.image_resolver);
-        let template_builder = Arc::clone(&core.template_builder);
-        spawn_grpc_surface(
-            &config.cluster.node_service_addr,
-            "node sandbox service",
-            move |listener, shutdown| {
-                agentenv::node_server::serve_on(
-                    listener,
-                    orchestration,
-                    snapshots,
-                    node_id,
-                    image_resolver,
-                    template_builder,
-                    shutdown,
-                )
-            },
-        )
-        .await?
-    };
-
-    let api_impl = Arc::new(ApiImpl::new(
-        Arc::clone(&orchestration),
-        core.snapshot_manager,
-        core.template_builder,
-        core.image_resolver,
-        core.observability,
-        paused_wiring,
-        config.sandbox_proxy.domains.clone(),
-        role,
-        // 🔴 No placement source, and that is the role showing through rather
-        // than an omission: `serves_wake_decisions()` is false here, so nothing
-        // on this process may consult a placement. Handing it one would be
-        // handing it the means to decide something it must not decide.
-        ResumeWiring::node_local(&core.identity.id),
-    ));
-
-    Ok(Assembly {
-        // 🔴 The role is what attaches the RoleGate: the user-facing REST
-        // surface is still compiled in and still routed, and is answered with
-        // 404 on this half. See `src/api/role_gate.rs`.
-        app: server::new(api_impl, role),
-        orchestration,
-        // 🔴 No upkeep: renewing a lease and reconciling local records against
-        // the cluster are both decisions, and this role takes none.
-        upkeep: Vec::new(),
-        pg_singleton_tasks: Vec::new(),
-        reporter: core.reporter,
-        runtime: Some(core.runtime),
-        grpc: Some(grpc),
-    })
 }
 
 /// `--role api`: the deciding half.
@@ -1967,57 +1135,6 @@ async fn run_kubernetes_discovery_with_retry(
     }
 }
 
-/// Binds a gRPC listener and spawns the server that answers on it.
-///
-/// 🔴 The bind happens here, in the assembly, and not inside the spawned task.
-/// A `serve(addr, ..)` that binds inside its own future turns "the port is
-/// already in use" into a task that ended: the process goes on serving HTTP,
-/// the surface is unreachable, and from the outside that is the same picture as
-/// a surface nobody is calling. See §15.4 ③ — a reading of zero that means two
-/// different things.
-async fn spawn_grpc_surface<F, Fut>(
-    addr: &str,
-    surface: &'static str,
-    serve: F,
-) -> anyhow::Result<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)>
-where
-    F: FnOnce(tokio::net::TcpListener, GrpcShutdown) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind the {surface} to {addr}"))?;
-    let bound = listener.local_addr().ok();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let serving = serve(
-        listener,
-        Box::pin(async move {
-            let _ = shutdown_rx.await;
-        }),
-    );
-    let task = tokio::spawn(async move {
-        if let Err(err) = serving.await {
-            // 🔴 `error`, not `warn`. Reaching here means the surface stopped
-            // answering while the process kept running, which is the state this
-            // whole arrangement exists to make impossible to reach quietly.
-            tracing::error!(
-                target: "agentenv",
-                surface,
-                error = %format_args!("{err:#}"),
-                "a gRPC surface stopped serving"
-            );
-        }
-    });
-    info!(target: "agentenv", surface, addr = ?bound, "gRPC surface listening");
-    Ok((task, shutdown_tx))
-}
-
-/// The stop signal a gRPC surface waits on.
-///
-/// Boxed so that [`spawn_grpc_surface`] can hand the same concrete type to
-/// every `serve_on`, each of which takes an opaque `impl Future`.
-type GrpcShutdown = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-
 /// Keeps this node's standing in the cluster registry current, in both
 /// directions.
 ///
@@ -2071,59 +1188,36 @@ fn spawn_paused_record_upkeep(
     vec![renew, reconcile]
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            info!(target: "agentenv", "received Ctrl+C, starting graceful shutdown");
-        }
-        _ = terminate => {
-            info!(target: "agentenv", "received SIGTERM, starting graceful shutdown");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// 🔴 `--role` no longer selects anything; it confirms. See
+    /// [`ServerRole::confirm`] and `role::confirm_tests` for the arms.
     #[test]
-    fn the_cli_parses_and_defaults_the_role() {
-        ServerCli::command().debug_assert();
+    fn the_api_binary_is_the_api_half() {
+        ApiCli::command().debug_assert();
 
-        let bare = ServerCli::parse_from(["server"]);
-        assert_eq!(bare.role, None, "no --role means fall through to AENV_ROLE");
+        let bare = ApiCli::parse_from(["aenv-api"]);
+        assert_eq!(bare.role, None, "no --role means this binary's own half");
         assert_eq!(
-            ServerRole::from_env(None).unwrap(),
-            ServerRole::All,
-            "and with no AENV_ROLE set, to the process that has always run"
+            ServerRole::Api.confirm_with(bare.role, None).unwrap(),
+            ServerRole::Api
+        );
+        assert!(
+            ServerRole::Api
+                .confirm_with(Some(ServerRole::Node), None)
+                .is_err(),
+            "this binary links no sandbox runtime; it cannot be the node half"
         );
 
-        for spelling in ["api", "node", "all"] {
-            let parsed = ServerCli::parse_from(["server", "--role", spelling]);
-            assert_eq!(parsed.role.unwrap().as_str(), spelling);
-        }
-
+        // 🔴 The provisioning flags are gone from this binary rather than
+        // refused by it. `--setup-host` provisions KVM, ublk and host
+        // networking; there is nothing here that could use any of it.
         assert!(
-            ServerCli::try_parse_from(["server", "--role", "gateway"]).is_err(),
-            "an unknown role is refused at parse time"
+            ApiCli::try_parse_from(["aenv-api", "--setup-host"]).is_err(),
+            "the api binary has no host-provisioning mode to offer"
         );
     }
 
@@ -2206,11 +1300,6 @@ mod tests {
             .expect("the defaults this function leans on must be a valid combination");
     }
 
-    // 🔴 `#[tokio::test]` rather than `#[test]`: the control probe at the end
-    // builds a real lazy channel, and `connect_lazy` installs a hyper executor
-    // that panics outside a runtime. Without the control the test would pass as
-    // a plain `#[test]` — and would pass equally against a function that
-    // refused every endpoint.
     #[tokio::test]
     async fn the_api_half_refuses_to_place_sandboxes_with_nothing_to_ask() {
         let mut config = AppConfig::default();
@@ -2470,165 +1559,6 @@ mod tests {
             err.contains("kubernetes_discovery"),
             "an empty namespace/service_name must be refused before the dual-report check \
              is ever reached: {err}"
-        );
-    }
-
-    /// 🔴 `--role all` opens one listener, and this is the assertion that says
-    /// so where somebody adding a second one will trip over it.
-    ///
-    /// The rollback target is defined as the process that ran before the split.
-    /// A second socket is not a behaviour that can be argued inert: it is a
-    /// port bound on every node in the fleet, and the startup-sequence gate
-    /// would have to grow an entry claiming otherwise.
-    #[test]
-    fn only_the_split_roles_bind_a_second_listener() {
-        let source = include_str!("server.rs");
-        let body = |name: &str| {
-            let start = source
-                .find(name)
-                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
-            let open = source[start..].find('{').expect("a body") + start;
-            let mut depth = 0usize;
-            for (offset, byte) in source[open..].bytes().enumerate() {
-                match byte {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return source[open..open + offset].to_string();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("{name} has no closing brace");
-        };
-
-        assert!(
-            !body("async fn assemble_all(").contains("spawn_grpc_surface"),
-            "--role all binds a second listener. It is the rollback target and is defined as \
-             today's behaviour verbatim; the node service belongs to --role node"
-        );
-        // 🔴 The control probe. Both halves of the split do bind one, so the
-        // assertion above is about `all` rather than about a helper that has
-        // been renamed out from under this test.
-        assert!(
-            body("async fn assemble_node(").contains("spawn_grpc_surface"),
-            "--role node no longer serves the node sandbox service, and nothing else does"
-        );
-        assert!(
-            body("async fn assemble_api(").contains("spawn_grpc_surface"),
-            "--role api no longer serves the wake-up surface, and the gateway's cold path has \
-             nowhere to ask"
-        );
-    }
-
-    /// 🔴 Guards the shutdown bounds `NodeRuntime::shutdown` and `main` are
-    /// each responsible for. Every one of the three calls this asserts on can
-    /// be deleted without a single one of this binary's other tests noticing
-    /// — nothing exercises the real graceful-shutdown path under test, the
-    /// same gap `only_the_split_roles_bind_a_second_listener` closes for the
-    /// `--role` split — so this scans the source text directly, the same way
-    /// that test does.
-    ///
-    /// See [`RUNTIME_SHUTDOWN_TIMEOUT`]'s doc for why `main`'s call matters —
-    /// without it a stuck `spawn_blocking` closure (RocksDB background
-    /// compaction/flush, observed on nodes that had actually run a VM) hangs
-    /// the process well past `terminationGracePeriodSeconds` — and
-    /// [`NodeRuntime::shutdown`]'s own doc for why the two store closes come
-    /// before that backstop rather than relying on it.
-    #[test]
-    fn the_shutdown_bounds_are_still_wired() {
-        let source = include_str!("server.rs");
-        let body = |name: &str| {
-            let start = source
-                .find(name)
-                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
-            let open = source[start..].find('{').expect("a body") + start;
-            let mut depth = 0usize;
-            for (offset, byte) in source[open..].bytes().enumerate() {
-                match byte {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return source[open..open + offset].to_string();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("{name} has no closing brace");
-        };
-
-        let shutdown = body("async fn shutdown(self)");
-        assert!(
-            shutdown.contains("close_image_cache_stores"),
-            "NodeRuntime::shutdown no longer closes the image cache metadata store's RocksDB \
-             handle before process exit"
-        );
-        assert!(
-            shutdown.contains("close_stores"),
-            "NodeRuntime::shutdown no longer closes the snapshot manager's RocksDB stores \
-             before process exit"
-        );
-
-        let main = body("fn main() -> anyhow::Result<()>");
-        assert!(
-            main.contains("shutdown_timeout"),
-            "main no longer bounds Runtime::shutdown_timeout after block_on returns — an \
-             un-bounded fallback here reintroduces the node-never-exits hang"
-        );
-    }
-
-    /// `ServerRole::check_pg_dsn`'s own tests (`src/role.rs`) only exercise
-    /// the pure function directly — none of them can notice if the one call
-    /// site that actually wires it into the running process disappears. That
-    /// call site is the entire enforcement of "a `[pg].dsn` must never reach
-    /// `--role node`": delete it and every test in `src/role.rs` stays green
-    /// while the invariant it guards is gone. Scans this file's own source
-    /// text for the call, the same way
-    /// `only_the_split_roles_bind_a_second_listener` does for
-    /// `spawn_grpc_surface`, so deleting the call site fails a test instead
-    /// of only a future security review.
-    #[test]
-    fn async_main_actually_calls_check_pg_dsn() {
-        let source = include_str!("server.rs");
-        let body = |name: &str| {
-            let start = source
-                .find(name)
-                .unwrap_or_else(|| panic!("{name} is no longer in this file"));
-            let open = source[start..].find('{').expect("a body") + start;
-            let mut depth = 0usize;
-            for (offset, byte) in source[open..].bytes().enumerate() {
-                match byte {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return source[open..open + offset].to_string();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("{name} has no closing brace");
-        };
-
-        assert!(
-            // 🔴 Matches the call *expression* (`role.check_pg_dsn(`), not the
-            // bare identifier `check_pg_dsn`. This file's own doc comment on
-            // the call site (`See \`agentenv::pg\` and \`ServerRole::check_pg_dsn\`.`)
-            // contains that bare identifier too — deleting the call while
-            // leaving the comment behind kept a bare-identifier assertion
-            // green, which is exactly backwards for a positive assertion:
-            // a false match here hides the invariant's enforcement going
-            // missing rather than merely giving a false alarm. No comment or
-            // string literal in this file spells the call expression itself.
-            body("async fn async_main() -> anyhow::Result<()>").contains("role.check_pg_dsn("),
-            "async_main no longer calls ServerRole::check_pg_dsn — a [pg].dsn could reach \
-             --role node with nothing left to refuse it, even though src/role.rs's own tests \
-             of the pure function would still report green"
         );
     }
 }

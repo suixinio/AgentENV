@@ -39,7 +39,7 @@
 //! scheduler scaled to zero left every create failing even though the
 //! exact logic needed to place it was already running, unreached, in the
 //! same process. See `cluster_placement`'s own doc comment in
-//! `src/bin/server.rs` for why `[cluster].scheduler_endpoint` is no longer
+//! `src/bin/aenv-api.rs` for why `[cluster].scheduler_endpoint` is no longer
 //! required at all once `[cluster].node_placement_source = "native"`.
 //!
 //! # Why `resolve_node` and `node_membership` share one registry call

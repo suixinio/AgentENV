@@ -217,6 +217,106 @@ fn node_from_endpoint(endpoint: &Endpoint, port: i32, scheme: &str) -> Option<(N
     ))
 }
 
+/// Task's own "D2": the same `EndpointSlice` -> `Node` conversion as
+/// [`nodes_from_endpoint_slices`], but selecting the complement --
+/// endpoints that are *not* `Serving` and *not* `Terminating`. These are
+/// nodes discovery already vouches for (a real, RBAC-watched `EndpointSlice`
+/// names them, with a routable address) that have not yet passed their
+/// readiness probe, most commonly a rolling update's freshly recreated pod
+/// in the seconds before it becomes `Serving`.
+///
+/// Deliberately a separate function rather than a third return value on
+/// [`nodes_from_endpoint_slices`]: that function's `Serving` gate, its
+/// tests, and every existing caller are left untouched (this task's own
+/// "port faithfully, do not rewrite a working, tested function" discipline)
+/// -- this is new, additive classification over the same input, not a
+/// change to what "active"/"lingering" mean. See
+/// [`super::registry::AtomicNodeRegistry::admit_pending`] for why the
+/// result is admitted as a third bucket rather than folded into `active` or
+/// `lingering`.
+///
+/// A `!Serving && Terminating` endpoint (never became ready, now going
+/// away) is excluded from every bucket, matching
+/// [`nodes_from_endpoint_slices`]'s pre-existing behavior for it -- there is
+/// no rolling-update-shaped race to close for a pod that never served
+/// anything.
+pub fn nodes_pending_from_endpoint_slices(
+    slices: &[EndpointSlice],
+    cfg: &KubernetesDiscoveryConfig,
+) -> Vec<Node> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+
+    let scheme = {
+        let trimmed = cfg.scheme.trim();
+        if trimmed.is_empty() {
+            "http"
+        } else {
+            trimmed
+        }
+    };
+
+    let mut pending_by_id: HashMap<String, Node> = HashMap::new();
+    for slice in slices {
+        if !has_matching_endpoint_port(slice.ports.as_deref(), cfg.port) {
+            continue;
+        }
+        for endpoint in &slice.endpoints {
+            let Some(node) = pending_node_from_endpoint(endpoint, cfg.port, scheme) else {
+                continue;
+            };
+            pending_by_id.insert(node.id.clone(), node);
+        }
+    }
+
+    pending_by_id.into_values().collect()
+}
+
+/// Converts one `EndpointSlice` endpoint into a `Node` when it is neither
+/// `Serving` nor `Terminating` -- the complement of [`node_from_endpoint`]'s
+/// `Serving` branch, restricted further by excluding `Terminating` (see
+/// [`nodes_pending_from_endpoint_slices`]'s own doc comment for why).
+fn pending_node_from_endpoint(endpoint: &Endpoint, port: i32, scheme: &str) -> Option<Node> {
+    let serving = endpoint
+        .conditions
+        .as_ref()
+        .and_then(|c| c.serving)
+        .unwrap_or(false);
+    if serving {
+        return None;
+    }
+    let terminating = endpoint
+        .conditions
+        .as_ref()
+        .and_then(|c| c.terminating)
+        .unwrap_or(false);
+    if terminating {
+        return None;
+    }
+
+    let target_ref_name = endpoint
+        .target_ref
+        .as_ref()
+        .and_then(|r| r.name.as_deref())
+        .filter(|name| !name.is_empty())?;
+
+    let id = node_id_for_endpoint(endpoint, target_ref_name);
+    let address = select_routable_endpoint_address(&endpoint.addresses)?;
+    let host_port = format_host_port(&address, port);
+    let pod_name = if id != target_ref_name {
+        target_ref_name.to_string()
+    } else {
+        String::new()
+    };
+
+    Some(Node {
+        id,
+        endpoint: format!("{scheme}://{host_port}"),
+        pod_name,
+    })
+}
+
 /// Names the node an endpoint belongs to: the cluster's name for the
 /// machine (`endpoint.node_name`) when present, falling back to the pod
 /// name. See `node_registry.go`'s `nodeIDForEndpoint` doc comment for why
@@ -717,13 +817,22 @@ fn sync_from_state(
     registry: &Arc<AtomicNodeRegistry>,
     config: &KubernetesDiscoveryConfig,
 ) {
-    let (active, lingering, ignore, no_schedule) = {
+    let (active, lingering, pending, ignore, no_schedule) = {
         let s = state.lock().expect("discovery state lock poisoned");
         let slices: Vec<EndpointSlice> = s.endpoint_slices.values().cloned().collect();
         let (active, lingering) = nodes_from_endpoint_slices(&slices, config);
+        // Task's own "D2": computed from the same slices, independent of
+        // the ignore/no-schedule pod-label filtering below -- a
+        // not-yet-Serving node cannot self-report anything a label
+        // selector would match against yet, and admitting it for
+        // heartbeat identity only (never for scheduling, see
+        // `AtomicNodeRegistry::admit_pending`) makes the label filters
+        // moot for it either way.
+        let pending = nodes_pending_from_endpoint_slices(&slices, config);
         (
             active,
             lingering,
+            pending,
             (!s.ignore_pod_names.is_empty()).then(|| s.ignore_pod_names.clone()),
             (!s.no_schedule_pod_names.is_empty()).then(|| s.no_schedule_pod_names.clone()),
         )
@@ -747,7 +856,11 @@ fn sync_from_state(
     };
     let (active, lingering) =
         filter_nodes_by_pod_labels(active, lingering, ignore.as_ref(), no_schedule.as_ref());
-    registry.set(active, lingering, std::time::SystemTime::now());
+    let now = std::time::SystemTime::now();
+    registry.set(active, lingering, now);
+    // Must run after `set()` -- see `AtomicNodeRegistry::admit_pending`'s
+    // own doc comment for why the order is load-bearing.
+    registry.admit_pending(pending);
 }
 
 #[cfg(test)]
@@ -893,6 +1006,81 @@ mod tests {
         let (active, lingering) =
             nodes_from_endpoint_slices(&[endpoint_slice(8000, vec![ep])], &default_cfg());
         assert!(active.is_empty() && lingering.is_empty());
+    }
+
+    // ---- nodes_pending_from_endpoint_slices: task's own "D2" ----
+
+    #[test]
+    fn not_yet_serving_and_not_terminating_is_pending() {
+        let pending = nodes_pending_from_endpoint_slices(
+            &[endpoint_slice(
+                8000,
+                vec![not_serving_endpoint("agentenv-node-a", "10.0.0.1")],
+            )],
+            &default_cfg(),
+        );
+        assert_eq!(ids(&pending), vec!["agentenv-node-a".to_string()]);
+        assert_eq!(pending[0].endpoint, "http://10.0.0.1:8000");
+    }
+
+    #[test]
+    fn a_serving_endpoint_is_not_pending() {
+        let pending = nodes_pending_from_endpoint_slices(
+            &[endpoint_slice(
+                8000,
+                vec![serving_endpoint("agentenv-node-a", "10.0.0.1")],
+            )],
+            &default_cfg(),
+        );
+        assert!(
+            pending.is_empty(),
+            "a Serving endpoint is active, not pending — the two sets must be disjoint"
+        );
+    }
+
+    #[test]
+    fn a_terminating_and_not_serving_endpoint_is_not_pending() {
+        // Never became ready, now going away — no rolling-update-shaped
+        // race to close for it, matches nodes_from_endpoint_slices's own
+        // not_serving_terminating_is_excluded.
+        let ep = endpoint_with_conditions("agentenv-node-a", "10.0.0.1", Some(false), Some(true));
+        let pending =
+            nodes_pending_from_endpoint_slices(&[endpoint_slice(8000, vec![ep])], &default_cfg());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_serving_and_terminating_lingering_endpoint_is_not_pending() {
+        let pending = nodes_pending_from_endpoint_slices(
+            &[endpoint_slice(
+                8000,
+                vec![terminating_endpoint("agentenv-node-a", "10.0.0.1")],
+            )],
+            &default_cfg(),
+        );
+        assert!(
+            pending.is_empty(),
+            "lingering (still Serving while terminating) must not also show up as pending"
+        );
+    }
+
+    #[test]
+    fn active_pending_and_lingering_partition_a_mixed_slice() {
+        let cfg = default_cfg();
+        let slice = endpoint_slice(
+            8000,
+            vec![
+                serving_endpoint("agentenv-node-active", "10.0.0.1"),
+                not_serving_endpoint("agentenv-node-pending", "10.0.0.2"),
+                terminating_endpoint("agentenv-node-lingering", "10.0.0.3"),
+            ],
+        );
+        let (active, lingering) = nodes_from_endpoint_slices(&[slice.clone()], &cfg);
+        let pending = nodes_pending_from_endpoint_slices(&[slice], &cfg);
+
+        assert_eq!(ids(&active), vec!["agentenv-node-active".to_string()]);
+        assert_eq!(ids(&lingering), vec!["agentenv-node-lingering".to_string()]);
+        assert_eq!(ids(&pending), vec!["agentenv-node-pending".to_string()]);
     }
 
     #[test]

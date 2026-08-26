@@ -270,6 +270,12 @@ struct Inner {
     /// see [`Node`]'s doc comment on `pod_name`.
     alias_to_id: HashMap<String, String>,
     lingering_ids: HashSet<String>,
+    /// Task's own "D2": node ids admitted to `nodes_by_id` by
+    /// [`AtomicNodeRegistry::admit_pending`] rather than by [`AtomicNodeRegistry::set`] —
+    /// discovered (an `EndpointSlice` entry names them), but not yet
+    /// `Serving`. See `admit_pending`'s own doc comment for why this is a
+    /// third bucket rather than folded into `lingering_ids`.
+    pending_ids: HashSet<String>,
     observed_ttl: Duration,
     observed: HashMap<String, ObservedNodeRecord>,
     cpu_intersection: HashMap<String, String>,
@@ -484,6 +490,7 @@ impl AtomicNodeRegistry {
                 nodes_by_id: HashMap::new(),
                 alias_to_id: HashMap::new(),
                 lingering_ids: HashSet::new(),
+                pending_ids: HashSet::new(),
                 observed_ttl: ttl,
                 observed: HashMap::new(),
                 cpu_intersection: HashMap::new(),
@@ -582,7 +589,9 @@ impl AtomicNodeRegistry {
         let stale: Vec<(String, String)> = inner
             .observed
             .iter()
-            .filter(|(node_id, _)| !inner.nodes_by_id.contains_key(*node_id))
+            .filter(|(node_id, _)| {
+                !inner.nodes_by_id.contains_key(*node_id) && !inner.pending_ids.contains(*node_id)
+            })
             .map(|(node_id, record)| (node_id.clone(), record.node.cluster_id.clone()))
             .collect();
 
@@ -599,6 +608,115 @@ impl AtomicNodeRegistry {
             inner.invalidate_intersection(&cluster_id);
         }
     }
+
+    /// Task's own "D2" (`docs/proposals/_sd-phase4-stageDE-remainder.md`'s
+    /// D2, the race this port intentionally preserved through Stage A --
+    /// see this module's own doc comment on why `heartbeat` never
+    /// auto-registers an unknown id, and `grpc_service.rs`'s module doc for
+    /// where the race was left as-is pending this fix).
+    ///
+    /// Admits nodes discovery has vouched for -- they name a real
+    /// `EndpointSlice` endpoint with a routable address -- but that are not
+    /// yet `Serving`, so [`AtomicNodeRegistry::heartbeat`] accepts them and
+    /// a rolling update's freshly recreated pod does not have to wait out a
+    /// readiness probe before its binding-store roster (task's own "D3")
+    /// refreshes.
+    ///
+    /// Deliberately **not** folded into [`AtomicNodeRegistry::set`]'s
+    /// `active`/`lingering` split:
+    ///
+    /// - `lingering` already carries an established, different meaning --
+    ///   `heartbeat`'s own status-derivation forces a lingering node's
+    ///   reported [`NodeStatus`] to [`NodeStatus::Lingering`] regardless of
+    ///   what it self-reports, and
+    ///   [`super::kubernetes_discovery::filter_nodes_by_pod_labels`]'s
+    ///   `no_schedule_pod_ids` arm deliberately *promotes* a node into
+    ///   `lingering` to pull it out of scheduling while keeping it
+    ///   otherwise indistinguishable from a genuinely draining one.
+    ///   Reusing that bucket for "just starting up" would make a brand new
+    ///   node's observed status read `Lingering` the moment its first
+    ///   heartbeat lands -- the opposite of what it is.
+    /// - `active` gates scheduling eligibility today only by the absence of
+    ///   a consumer (`filter.rs`'s own doc says as much), but this task
+    ///   also builds `Schedule`, and `filter_unschedulable`'s documented
+    ///   policy is "fail open on what we do not know" -- a node with no
+    ///   heartbeat snapshot yet is *kept*, not dropped. Admitting a
+    ///   not-yet-ready node into `active` would make it an immediately
+    ///   eligible `Schedule` candidate before it can actually run a
+    ///   sandbox, trading one race (a stale binding address) for a worse
+    ///   one (routing a brand new sandbox onto a node that cannot yet run
+    ///   it). `pending_ids` is checked by [`AtomicNodeRegistry::snapshot`]
+    ///   the same way `lingering_ids` is, so a pending node is excluded
+    ///   from `snapshot(false)` (the scheduling view) without touching its
+    ///   reported status at all.
+    ///
+    /// Must be called after [`AtomicNodeRegistry::set`] on every discovery
+    /// sync, never before it: `set` unconditionally replaces `nodes_by_id`
+    /// from `active`/`lingering` alone, so a call before `set` would have
+    /// its admission wiped out immediately by the very next `set` call in
+    /// the same sync. `set`'s own stale-cleanup filter already spares
+    /// `pending_ids` members' observed state for exactly this ordering
+    /// (see its own diff), so a node that stays pending across consecutive
+    /// syncs keeps its roster instead of having it wiped and re-seeded
+    /// every cycle.
+    ///
+    /// `pending` fully replaces the previous pending set, mirroring `set`'s
+    /// own replace-not-merge semantics: a node this call does not name this
+    /// cycle -- because it became `Serving` (and is now in
+    /// `active`/`lingering` from the `set` call just before this one) or
+    /// because it genuinely disappeared -- is dropped from `pending_ids`,
+    /// and if `set` did not already promote it to active/lingering, its
+    /// identity and observed state are cleared the same way `set`'s own
+    /// stale-cleanup pass clears a node discovery stopped reporting
+    /// entirely.
+    pub fn admit_pending(&self, pending: Vec<Node>) {
+        let mut inner = self.inner.write().expect("node registry lock poisoned");
+
+        let previous_pending = std::mem::take(&mut inner.pending_ids);
+        let mut new_pending_ids: HashSet<String> = HashSet::with_capacity(pending.len());
+
+        for node in &pending {
+            if node.id.is_empty() {
+                continue;
+            }
+            // `set()` already classified this id active/lingering this
+            // cycle -- it has become Serving, so it must not be
+            // re-admitted (and thereby re-excluded from scheduling) as
+            // merely pending.
+            if inner.nodes_by_id.contains_key(&node.id) {
+                continue;
+            }
+            inner.nodes_by_id.insert(node.id.clone(), node.clone());
+            if !node.pod_name.is_empty() && node.pod_name != node.id {
+                inner
+                    .alias_to_id
+                    .insert(node.pod_name.clone(), node.id.clone());
+            }
+            new_pending_ids.insert(node.id.clone());
+        }
+
+        let mut affected_clusters: HashSet<String> = HashSet::new();
+        for node_id in previous_pending {
+            if new_pending_ids.contains(&node_id) || inner.nodes_by_id.contains_key(&node_id) {
+                // Still pending, or `set()` promoted it to active/lingering
+                // this cycle -- either way it is not gone.
+                continue;
+            }
+            inner.nodes_by_id.remove(&node_id);
+            if let Some(record) = inner.observed.remove(&node_id) {
+                if !record.node.cluster_id.is_empty() {
+                    affected_clusters.insert(record.node.cluster_id.clone());
+                }
+            }
+            inner.clear_roster(&node_id);
+            inner.intersection_sent.remove(&node_id);
+        }
+        for cluster_id in affected_clusters {
+            inner.invalidate_intersection(&cluster_id);
+        }
+
+        inner.pending_ids = new_pending_ids;
+    }
 }
 
 impl NodeRegistry for AtomicNodeRegistry {
@@ -607,7 +725,10 @@ impl NodeRegistry for AtomicNodeRegistry {
         let mut result: Vec<Node> = inner
             .nodes_by_id
             .values()
-            .filter(|n| allow_lingering || !inner.lingering_ids.contains(&n.id))
+            .filter(|n| {
+                allow_lingering
+                    || (!inner.lingering_ids.contains(&n.id) && !inner.pending_ids.contains(&n.id))
+            })
             .cloned()
             .collect();
         result.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2170,5 +2291,214 @@ mod tests {
 
         registry.set(Vec::new(), Vec::new(), unix(100));
         assert!(registry.snapshot(true).is_empty());
+    }
+
+    // ---- admit_pending: task's own "D2" (this module's own doc comment on
+    //      `admit_pending`) ----
+
+    #[test]
+    fn a_pending_node_cannot_heartbeat_before_admit_pending_is_called() {
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(Vec::new(), Vec::new(), unix(100));
+
+        let err = registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), unix(100))
+            .expect_err("node-a was never admitted, pending or otherwise");
+        assert_eq!(err, NodeNotInRegistry);
+    }
+
+    #[test]
+    fn admit_pending_lets_a_not_yet_serving_node_heartbeat() {
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), unix(100))
+            .expect(
+                "a node discovery names but has not yet marked Serving must still be able to                  heartbeat — this is the exact race D2 closes",
+            );
+        assert!(
+            registry
+                .get_observed("node-a", "cluster-a", unix(100))
+                .is_some(),
+            "the heartbeat must have actually landed in observed state, not merely been accepted"
+        );
+    }
+
+    #[test]
+    fn a_pending_node_is_excluded_from_the_scheduling_snapshot_but_visible_in_the_full_one() {
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+
+        assert!(
+            !registry
+                .snapshot(false)
+                .iter()
+                .any(|n| n.id == "node-a"),
+            "a pending node must never be an eligible Schedule candidate —              filter_unschedulable's own fail-open policy would otherwise pick it up              immediately, before it can actually run a sandbox"
+        );
+        assert!(
+            registry.snapshot(true).iter().any(|n| n.id == "node-a"),
+            "the full inventory view (ListNodes) should still show a pending node as known"
+        );
+    }
+
+    #[test]
+    fn a_pending_nodes_reported_status_is_not_forced_to_lingering() {
+        // Contrast with `lingering`, which `derive_observed_node_view`
+        // forces to `NodeStatus::Lingering` regardless of what the node
+        // self-reports. A pending node is not draining — it is starting up
+        // — so its self-reported status must flow through unmodified.
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), unix(100))
+            .expect("node-a heartbeats while pending");
+
+        let observed = registry
+            .get_observed("node-a", "cluster-a", unix(100))
+            .expect("node-a is observed");
+        assert_eq!(
+            observed.snapshot.expect("a snapshot").status(),
+            NodeStatus::Ready,
+            "a pending node's self-reported status must not be overridden the way lingering's is"
+        );
+    }
+
+    #[test]
+    fn a_node_promoted_from_pending_to_active_is_no_longer_excluded_from_scheduling() {
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+        assert!(!registry.snapshot(false).iter().any(|n| n.id == "node-a"));
+
+        // Discovery's next sync now marks node-a Serving.
+        registry.set(vec![node("node-a", "http://node-a")], Vec::new(), unix(101));
+        registry.admit_pending(Vec::new());
+
+        assert!(
+            registry.snapshot(false).iter().any(|n| n.id == "node-a"),
+            "once set() promotes a node to active, admit_pending must not keep excluding it"
+        );
+    }
+
+    #[test]
+    fn a_stale_pending_report_for_an_already_active_node_does_not_downgrade_it() {
+        // A discovery watch loop calling admit_pending can lag set() by
+        // however long its own last pending computation took — if that
+        // stale computation still names a node set() has *this cycle*
+        // already promoted to active, admit_pending must not re-flag it
+        // pending and pull it back out of the scheduling snapshot.
+        let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+
+        registry.set(vec![node("node-a", "http://node-a")], Vec::new(), unix(101));
+        // Stale: still names node-a, as if the pending computation that fed
+        // this call ran before set()'s promotion was known.
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+
+        assert!(
+            registry.snapshot(false).iter().any(|n| n.id == "node-a"),
+            "a stale pending report must not downgrade a node set() already promoted to active"
+        );
+    }
+
+    #[test]
+    fn a_pending_nodes_roster_survives_consecutive_admit_pending_calls_while_still_pending() {
+        // Zero-confirmation, zero-window guard so the all-empty set() calls
+        // below actually run their stale-cleanup pass immediately, rather
+        // than being withheld by EmptySyncGuard (which would make this test
+        // pass without ever reaching the code it means to exercise — a
+        // pending-only registry counts as "populated" for the guard's own
+        // purposes, so the default guard intercepts an all-empty set() here
+        // before set()'s cleanup filter even runs).
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            Vec::new(),
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                confirmations: 0,
+                window: Duration::ZERO,
+            },
+        );
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+        registry
+            .heartbeat(
+                &HeartbeatRequest {
+                    node_id: "node-a".to_string(),
+                    cluster_id: "cluster-a".to_string(),
+                    service_instance_id: "svc-node-a".to_string(),
+                    roster: vec![crate::proto::scheduler::SandboxRosterEntry {
+                        sandbox_id: "sandbox-1".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                unix(100),
+            )
+            .expect("node-a heartbeats while pending");
+        assert_eq!(
+            registry.nodes_holding("sandbox-1"),
+            vec!["node-a".to_string()]
+        );
+
+        // The next discovery cycle: set() still does not know about node-a
+        // (still not Serving), then admit_pending re-confirms it pending
+        // again. set()'s own stale-cleanup must not have wiped node-a's
+        // roster out from under this — that is exactly the bug this
+        // module's own doc comment on `admit_pending` explains.
+        registry.set(Vec::new(), Vec::new(), unix(105));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+
+        assert_eq!(
+            registry.nodes_holding("sandbox-1"),
+            vec!["node-a".to_string()],
+            "a still-pending node's roster must survive the set() call in between two              admit_pending calls"
+        );
+    }
+
+    #[test]
+    fn a_pending_node_that_disappears_is_cleared_like_any_other_departed_node() {
+        // A zero-confirmation, zero-window guard so this test isolates
+        // admit_pending's own cleanup from EmptySyncGuard's separate,
+        // deliberate withholding of an all-empty set() once the registry is
+        // "populated" (which a pending-only admission also counts as) --
+        // that interaction is real and desirable, just not what this test
+        // is about.
+        let registry = AtomicNodeRegistry::with_empty_sync_guard(
+            Vec::new(),
+            DEFAULT_OBSERVED_REPORT_TTL,
+            EmptySyncGuard {
+                confirmations: 0,
+                window: Duration::ZERO,
+            },
+        );
+        registry.set(Vec::new(), Vec::new(), unix(100));
+        registry.admit_pending(vec![node("node-a", "http://node-a")]);
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), unix(100))
+            .expect("node-a heartbeats while pending");
+        assert!(registry
+            .get_observed("node-a", "cluster-a", unix(100))
+            .is_some());
+
+        // node-a's EndpointSlice entry is gone entirely on the next sync —
+        // never promoted, never renamed, just gone (pod deleted, not
+        // recreated).
+        registry.set(Vec::new(), Vec::new(), unix(110));
+        registry.admit_pending(Vec::new());
+
+        assert!(
+            registry.get_observed("node-a", "cluster-a", unix(110)).is_none(),
+            "a pending node that genuinely disappears must have its observed state cleared,              the same as a departed active/lingering node"
+        );
+        let err = registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-a"), unix(111))
+            .expect_err("node-a's identity must have been dropped along with its observed state");
+        assert_eq!(err, NodeNotInRegistry);
     }
 }

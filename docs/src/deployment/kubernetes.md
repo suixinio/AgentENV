@@ -1,15 +1,37 @@
 # Kubernetes (Multi-Node)
 
-Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runtime nodes on every worker.
+Deploy AgentENV across a Kubernetes cluster with a gateway, an api Deployment, and runtime nodes on every worker.
+
+🔴 **阶段四**: `deploy/k8s/base`'s default render no longer includes the
+`agentenv-scheduler` Deployment/Service/PodDisruptionBudget — they are
+commented out of `kustomization.yaml`'s `resources:`, not deleted, and
+`services/scheduler`'s Go source stays in the tree as the rollback target
+(one release image tag is still pinned in `kustomization.yaml`'s `images:`
+transformer). `--role api` (`agentenv-api-deployment.yaml`) runs with
+`[cluster].node_placement_source = "native"` and
+`[orchestrator.paused_registry].backend = "postgres"` by default, folding
+node discovery, heartbeat receipt, placement, and the paused-sandbox registry
+into itself over the shared `[pg]` pool instead of dialling a scheduler
+process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
+instead of `agentenv-scheduler:9090` for the same reason. The one RPC that
+gap does not close is `ListRegistrySandboxes`
+(`services/gateway/internal/registry_list.go`'s debug endpoint) — see
+`services/README.md` for the current status and how to bring the scheduler
+workload back if you need it. The rest of this page describes the
+architecture as it runs today; where it still names `agentenv-scheduler`
+directly (the paused-registry migration history below, in particular) that
+is describing what the *node* half still needs from that gRPC contract, now
+answered by `--role api` rather than a separate process.
 
 ## Architecture
 
 | Workload | Kind | Description |
 |----------|------|-------------|
 | `agentenv-gateway` | Deployment + ClusterIP Service | HTTP reverse proxy for client traffic |
-| `agentenv-scheduler` | Deployment (single replica) + ClusterIP Service | gRPC node selection and sandbox binding |
+| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四, `node_placement_source = "native"`) node discovery/placement/paused-registry — the scheduler's former job, folded in |
+| `agentenv-scheduler` | Deployment (single replica) + ClusterIP Service, **not deployed by default since 阶段四** | The original standalone gRPC node selection and sandbox binding service; manifests kept for rollback (see the 阶段四 note above) |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
-| `agentenv-nodes` | Headless Service | Used by the scheduler for EndpointSlice discovery |
+| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery — by `agentenv-scheduler` when it is deployed, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` under `node_placement_source = "native"` otherwise |
 
 ### Why a DaemonSet for Runtime Nodes
 
@@ -189,7 +211,7 @@ The setting reaches the DaemonSet through an optional reference, so a cluster wi
 Each node reports the backend it assembled, once, at startup:
 
 ```
-INFO paused sandbox registry ready backend=central cluster_id=… lease_ttl_secs=90 scheduler_endpoint=http://agentenv-scheduler:9090
+INFO paused sandbox registry ready backend=central cluster_id=… lease_ttl_secs=90 scheduler_endpoint=http://agentenv-api:8002
 ```
 
 That line is how a rollout is confirmed. A value `AENV_PAUSED_REGISTRY_BACKEND` does not recognise stops the node rather than falling back, but a value that never reached the Pod at all — a ConfigMap that was not created, a key spelled differently — leaves it on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
@@ -209,9 +231,19 @@ curl -s localhost:9101/healthz | jq .registry_write
 
 An empty `cluster_id` there means the write surface is registered and cold, answering every registry RPC `UNAVAILABLE` until one is supplied.
 
-### Migrating from the removed `postgres` backend
+### Migrating from the removed `postgres` backend (nodes only)
 
-Nodes used to connect to the registry database themselves, under `AENV_PAUSED_REGISTRY_BACKEND=postgres`. That backend has been **removed**, and a node still configured with it refuses to start rather than guessing:
+🔴 This subsection is about `--role node` specifically — `--role node` never
+holds a `[pg]` DSN and never will (`ServerRole::check_pg_dsn` refuses
+startup outright if one is configured). It does **not** describe `--role
+api`/`--role all`: 阶段四 gave those two roles a *different*, still-live
+`postgres` paused-registry backend that connects to the shared `[pg]` pool
+directly and folds the scheduler's own registry service into the process —
+`deploy/k8s/base/agentenv-api-deployment.yaml` runs it by default. See
+CLAUDE.md's paused-registry note and `[orchestrator.paused_registry]` in
+`config/default.toml` for that backend; nothing below applies to it.
+
+Nodes used to connect to the registry database themselves, under `AENV_PAUSED_REGISTRY_BACKEND=postgres`. That backend has been **removed for nodes**, and a node still configured with it refuses to start rather than guessing:
 
 ```
 paused_registry.backend = "postgres" has been removed: the node no longer connects to the

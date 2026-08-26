@@ -511,7 +511,13 @@ Notes:
 Shared PostgreSQL connection settings for the control plane (`--role api` /
 `--role all`), consumed by `src/pg/mod.rs`: a per-replica connection pool and
 a cluster-leadership primitive built on session-scoped advisory locks. Empty
-by default — nothing in this crate depends on PostgreSQL yet.
+by default — set it and the pool backs the committed-snapshot catalog
+(`[snapshot.catalog]` `write`/`read` = `both`/`postgres` or `postgres`) and,
+since 阶段四, the `postgres` cluster-wide paused-sandbox registry backend
+(`[orchestrator.paused_registry].backend = "postgres"`, `--role api` also
+needs `[cluster].node_placement_source = "native"`) — see
+`deploy/k8s/base/agentenv-api-deployment.yaml` for the deployed shape of
+both.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

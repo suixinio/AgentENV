@@ -2,6 +2,27 @@
 
 Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 
+🔴 **阶段四 status**: the Scheduler half of this module is **not deployed by
+default** on `deploy/k8s/base` any more — `docs/proposals/2026-08-20-service-decomposition.md`'s
+phase four has folded node discovery, heartbeat receipt (including the
+cluster CPU-config intersection), placement, P2P peer lookup, and the
+cluster-wide paused-sandbox registry into the Rust `--role api` binary
+(`src/node_registry/`, `src/orchestrator/paused_registry/postgres/`),
+reachable over the same `services/api/proto/scheduler.proto` contract this
+package still generates from. `agentenv-scheduler`'s Deployment/Service/PDB
+are commented out of `deploy/k8s/base/kustomization.yaml`'s `resources:`
+(not deleted — see "Deploy on Kubernetes" below for how to bring them back),
+and the Gateway's own `scheduler_addr` now points at `agentenv-api` instead
+of `agentenv-scheduler`.
+
+This Go source is **kept, not deleted**, as the rollback target: everything
+below still describes real, working, tested code, and `make -C services
+test` / `test-with-postgres` still exercise it. What has changed is only
+which process answers the RPCs on a deployed cluster. The one RPC group the
+Rust side has not ported is `ListRegistrySandboxes` (`internal/registry_list.go`'s
+gateway-facing debug endpoint) — that one still needs a real scheduler
+process reachable at `gateway.scheduler_addr` to answer.
+
 ## Features
 
 - Gateway routes control-plane requests by real-time scheduling.
@@ -246,6 +267,20 @@ The compose stack also wires each runtime node for scheduler heartbeat reporting
 - `SANDBOX_PROXY_DOMAINS`, when set, is passed through as both `GATEWAY_SANDBOX_PROXY_DOMAINS` and `AENV_SANDBOX_PROXY_DOMAINS`.
 
 ## Deploy on Kubernetes
+
+🔴 **The Scheduler workload is not part of this apply by default** (阶段四 —
+see the status note at the top of this file). `make k8s-render`/`k8s-apply`
+render `deploy/k8s/base/kustomization.yaml`, whose `resources:` list has
+`scheduler-service.yaml`/`scheduler-deployment.yaml`/`scheduler-pdb.yaml`
+commented out rather than removed. To roll back to a standalone scheduler,
+uncomment those three lines (and the matching `scheduler-k8s-config`
+`configMapGenerator` entry just above `gateway-k8s-config`), point
+`agentenv-api-deployment.yaml`'s `AENV_NODE_PLACEMENT_SOURCE` back to
+`"scheduler"` and `AENV_PAUSED_REGISTRY_BACKEND` back to `"central"`, and
+point `deploy/k8s/base/config/gateway.json`'s `scheduler_addr` back at
+`agentenv-scheduler:9090` — then re-render and apply. The Deployment's own
+image tag stays pinned in this file's `images:` transformer the whole time,
+so nothing needs rebuilding to bring it back.
 
 From the repository root:
 

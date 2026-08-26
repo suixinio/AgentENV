@@ -216,8 +216,8 @@ spec:
             # another env var, because kubelet refreshes non-`subPath`
             # ConfigMap volumes and never refreshes environment variables —
             # the same reason AENV_API_CONTROL_PLANE_TOKEN_FILE below is a
-            # file and not a `secretKeyRef`. `SchedulerChannelSource`
-            # (`src/observability/reporter.rs`) re-reads this file once per
+            # file and not a `secretKeyRef`. `SchedulerEndpointSource`
+            # (`src/scheduler_endpoint.rs`) re-reads this file once per
             # heartbeat tick and rebuilds the gRPC channel the moment its
             # content changes, so editing `node-heartbeat-config` and letting
             # kubelet sync the volume — no `kubectl set env`, no Pod restart —
@@ -226,39 +226,26 @@ spec:
             # value above, which is exactly today's behaviour.
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE
               value: /etc/agentenv/heartbeat/scheduler-endpoint
-            # Stage A of the scheduler fold
-            # (docs/proposals/_sd-phase4-stageA-node-inventory.md): the
-            # second, best-effort heartbeat target
-            # (`[observability.scheduler_report].dual_report_api_endpoint`)
-            # that feeds the api half's own node registry
-            # (`src/node_registry`) under `[cluster].node_placement_source =
-            # "native"`.
-            #
-            # 🔴 Not optional in the way the rest of this block is. It costs
-            # nothing while `node_placement_source` stays at its default
-            # (`scheduler`, unset on the api Deployment too) — nobody reads a
-            # registry nothing is warming up. But the moment that switch
-            # flips to `native`, this is the *only* way that registry ever
-            # receives a heartbeat: the primary heartbeat above always goes
-            # to `[cluster].scheduler_endpoint`, never to api. Leaving this
-            # unset when `native` is flipped is exactly the self-inflicted
-            # configuration `start_native_node_registry`
-            # (`src/bin/server.rs`) now refuses to start into — the registry
-            # would never leave warm-up and every `resolve_node`/
-            # `node_membership` call would refuse for the life of the
-            # process. Setting it here, ahead of that switch, is what makes
-            # flipping `node_placement_source` on the api Deployment a
-            # `kubectl set env` there alone rather than also a DaemonSet
-            # roll.
-            #
-            # The api half's own gRPC listener (`AENV_API_GRPC_ADDR` on
-            # agentenv-api-deployment.yaml, port 8002 — the same port
-            # `agentenv-api-service.yaml`'s `grpc` Service port names),
-            # fronted by the Service so any replica can receive it — the same
-            # reason the primary heartbeat above is a Service name and not a
-            # Pod IP.
-            - name: AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT
-              value: http://agentenv-api:8002
+            # 🔴 阶段四 E1: there used to be a second env var here,
+            # `AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT`
+            # (`[observability.scheduler_report].dual_report_api_endpoint`),
+            # a best-effort *second* heartbeat target that fed api's own node
+            # registry while `node-heartbeat-config` above still pointed the
+            # *primary* channel at the real scheduler — see
+            # `src/observability/reporter.rs`'s own doc comment on that field
+            # for why a serial fallback there would have been unsafe and a
+            # concurrent second send was the only safe shape. It is gone now
+            # because it is redundant, not because dual reporting stopped
+            # working: `node-heartbeat-config` above **is** `agentenv-api`,
+            # so the primary heartbeat already reaches api's registry
+            # directly — a second, concurrent send to the same target would
+            # only double the request rate for no new coverage. If a future
+            # migration needs a real second target again (an api replica set
+            # a heartbeat should warm up *before* the primary channel moves),
+            # reintroduce this var pointed at that target rather than
+            # assuming it is still wired: `assemble_api`
+            # (`src/bin/server.rs`) never starts a reporter, so nothing on
+            # this Deployment's own side needs a matching change.
             # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no
             # ConfigMap generating one. It was a seam for a design that was not
             # taken: letting `--role all` serve the node sandbox service too, so

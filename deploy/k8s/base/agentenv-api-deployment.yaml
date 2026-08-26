@@ -62,10 +62,10 @@ spec:
       # Stage A of the scheduler fold
       # (docs/proposals/_sd-phase4-stageA-node-inventory.md): grants
       # src/node_registry/kubernetes_discovery.rs the same
-      # endpointslices/pods get/list/watch access agentenv-scheduler already
-      # has, via serviceaccount.yaml/rolebinding.yaml's agentenv-api identity
-      # — a prerequisite for [cluster].node_placement_source = "native", not
-      # yet this deployment's default.
+      # endpointslices/pods get/list/watch access agentenv-scheduler used to
+      # need, via serviceaccount.yaml/rolebinding.yaml's agentenv-api
+      # identity — required now that [cluster].node_placement_source =
+      # "native" is this Deployment's own default (阶段四 E3).
       serviceAccountName: agentenv-api
       nodeSelector:
         kubernetes.io/os: linux
@@ -155,15 +155,36 @@ spec:
               value: redis://agentenv-redis:6379
             # The cluster-wide registry of paused sandboxes, which this half
             # arbitrates: it claims rows, renews their leases, reconciles them
-            # and discards them. `central` reaches it through the scheduler, so
-            # no database credential lands here either.
+            # and discards them.
+            #
+            # 🔴 阶段四 E3 (task's own label): `postgres`, not `central`. Stage
+            # C (`src/orchestrator/paused_registry/postgres/`) folds the
+            # scheduler's own registry service into this process — this
+            # replica now connects directly to the shared `[pg]` pool (the
+            # same one Stage B's snapshot catalog already uses, wired below
+            # via `AENV_CONFIG_OVERLAY_PATH`/`pg-overlay.toml`/`pg-dsn.toml`)
+            # rather than dialling the scheduler's `PausedRegistry` gRPC
+            # surface, so no database credential lands on `--role node`
+            # either way.
+            #
+            # 🔴 This precondition is load-bearing and enforced at startup,
+            # not just documented here: `build_paused_registry`
+            # (`src/orchestrator/paused_registry/mod.rs`) requires a
+            # heartbeat-roster `NodeRegistry` handle under `--role api`
+            # (`role.runs_sandbox_runtime() == false`), which only exists
+            # under `AENV_NODE_PLACEMENT_SOURCE = "native"` below — without
+            # it, `running` rows have no lease-renewal path and are wrongly
+            # reclaimed even while healthy (the exact failure Fix A, commit
+            # `151d00b`, closed for the `central` backend). The two switches
+            # must move together; flipping only this one CrashLoops the Pod
+            # with a bail naming exactly that.
             #
             # Not a configMapKeyRef, for the same reason as the store above: the
             # node's copy of this key may fall back to `local` and still be
             # correct, and this one may not. An api replica running a node-local
             # paused registry would arbitrate a registry only it can see.
             - name: AENV_PAUSED_REGISTRY_BACKEND
-              value: "central"
+              value: "postgres"
             # 阶段 2c, the same two keys and the same ConfigMap the DaemonSet
             # reads. See the note on snapshot-catalog-config in
             # kustomization.yaml.
@@ -314,53 +335,64 @@ spec:
             # `true`, without noticing what it means here.
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "false"
-            # Still needed, and not for heartbeats: the `central` paused
-            # registry above speaks to the scheduler over this endpoint.
+            # 🔴 阶段四 E1/E3 (task's own label): `agentenv-api` — itself, via
+            # its own Service — not `agentenv-scheduler`. Two independent
+            # consumers of this process's own `[cluster].scheduler_endpoint`
+            # still dial out over gRPC even under native placement, and both
+            # now resolve to this replica (or a sibling replica, load
+            # balanced by the Service, exactly like the DaemonSet's
+            # heartbeat) rather than the Go scheduler:
+            #
+            #   1. `ResumeWiring::cluster_from_config()`
+            #      (`src/api/impls/resume_surface.rs`) — the wake-site
+            #      placement source for `WakeSite::Remote`. It hard-refuses
+            #      to start with an empty endpoint ("--role api needs
+            #      [cluster].scheduler_endpoint") and is **not** gated by
+            #      `AENV_NODE_PLACEMENT_SOURCE` the way `placement`
+            #      (`cluster_placement`, driving create/build) is — it always
+            #      dials this endpoint's `LookupNode` RPC. Pointed at
+            #      `agentenv-api:8002`, that RPC is answered for real by this
+            #      same `NodeRegistryGrpcService.lookup_node`
+            #      (`src/node_registry/grpc_service.rs`, already exercised
+            #      by `lookup_node_answers_bound_from_the_binding_store` and
+            #      its siblings) instead of the scheduler's Go port of the
+            #      same query.
+            #   2. The `central` paused registry's gRPC fallback in
+            #      `build_central_catalog`
+            #      (`src/snapshot/repository/backends/mod.rs`) — moot here
+            #      since `[pg]` is always configured on this Deployment, so
+            #      that function picks `PostgresSnapshotCatalog` directly and
+            #      never reaches the branch that reads this value at all; it
+            #      is listed only so a reader auditing every consumer of this
+            #      key does not have to rediscover that for themselves.
+            #
+            # Rollback: change this back to `http://agentenv-scheduler:9090`
+            # and roll this Deployment — unlike the DaemonSet's copy of this
+            # key, this one has no mounted hot-reload file
+            # (`ResumeWiring::cluster_from_config` builds its
+            # `SchedulerEndpointSource` from `[cluster].scheduler_endpoint_file`
+            # too, but nothing here sets that file up), so this is a genuine
+            # restart, not a live reload.
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
-              value: http://agentenv-scheduler:9090
-            # Stage A of the scheduler fold
-            # (docs/proposals/_sd-phase4-stageA-node-inventory.md): the
-            # switch and the Kubernetes discovery it needs once flipped.
+              value: http://agentenv-api:8002
+            # 🔴 阶段四 E3 (task's own label): `native`, no longer the
+            # rollout's eventual step 2 — this Deployment's own permanent
+            # default now, alongside `AENV_PAUSED_REGISTRY_BACKEND=postgres`
+            # above, which *requires* it (see that key's own comment: the
+            # `postgres` paused-registry backend refuses to start under
+            # `--role api` without a heartbeat-roster `NodeRegistry`, which
+            # only `native` builds). The two switches move together in one
+            # apply, not two `kubectl set env` steps across a rollout window.
             #
-            # 🔴 Left at the code default (`cfg.rs`'s `scheduler`), on
-            # purpose, and stated rather than omitted — the same discipline
-            # `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` above follows.
-            #
-            # Cluster acceptance flips this half to `native` in two steps,
-            # in this order:
-            #   1. Confirm `AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT` is
-            #      live on the DaemonSet (see the note there) — i.e. the
-            #      rollout has actually reached every node Pod, not just
-            #      that the manifest was applied.
-            #   2. `kubectl set env deployment/agentenv-api
-            #      AENV_NODE_PLACEMENT_SOURCE=native`.
-            # Applying this file alone changes nothing about which placement
-            # source serves traffic; this manifest only carries the
-            # supporting discovery config so step 2 is one `kubectl set env`
-            # away rather than also a rollout.
-            #
-            # 🔴 Do NOT also set AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT
-            # on *this* Deployment to "match" the DaemonSet — it is a
-            # node-side setting (`cfg.rs`'s own doc: it lets *a node*
-            # dual-report to api's registry) and nothing on `--role api`
-            # ever reads it (`assemble_api` never starts a reporter). Setting
-            # it here would look tidy and do nothing.
-            #
-            # `start_native_node_registry` (`src/bin/server.rs`) used to hard
-            # -refuse to start when *this Deployment's own* copy of that
-            # setting was empty — which it always is, by the point above —
-            # so following steps 1-2 exactly as written used to
-            # CrashLoopBackOff every time. It now only warns (this process
-            # cannot confirm from its own config whether any node actually
-            # dual-reports to it); step 1 is still real and still matters,
-            # it is just verified operationally rather than enforced at
-            # startup — check `/debug/node-registry` or the
-            # `agentenv_api_node_registry_observed_nodes` metric after step 2
-            # to confirm heartbeats are actually landing, since a registry
-            # that started but never received one looks identical to a
-            # healthy one until queried.
+            # Rollback is a Pod restart on this Deployment with this value
+            # (and `AENV_PAUSED_REGISTRY_BACKEND`) set back to
+            # `"scheduler"`/`"central"` — `node_placement_source` is read
+            # once at startup (`start_native_node_registry`,
+            # `src/bin/server.rs`), unlike the DaemonSet's hot-reloadable
+            # heartbeat target, so there is no live-reload path for this one
+            # value alone.
             - name: AENV_NODE_PLACEMENT_SOURCE
-              value: "scheduler"
+              value: "native"
             # 🔴 P4 (task's own "phase4-close"): carried here now, ahead of
             # the `native` flip above, precisely so that flip is the single
             # `kubectl set env` step 2 already describes it as — not also a

@@ -9,9 +9,27 @@ resources:
   - role.yaml
   - rolebinding.yaml
   - redis.yaml
-  - scheduler-service.yaml
-  - scheduler-deployment.yaml
-  - scheduler-pdb.yaml
+  # 🔴 阶段四 E4 (task's own label): the scheduler workload is commented out
+  # of the render, not deleted. `scheduler-service.yaml`,
+  # `scheduler-deployment.yaml` and `scheduler-pdb.yaml` still exist on disk
+  # byte for byte, and `images:` below still carries a real, pinned tag for
+  # `agentenv-scheduler` — see its own note — so restoring the workload for a
+  # rollback is uncommenting these three lines, not reconstructing anything.
+  # `services/scheduler`'s Go source is untouched (task's own instruction:
+  # do not delete it).
+  #
+  # Nothing in this base layer still needs the scheduler process reachable:
+  # every node's primary heartbeat now targets `agentenv-api`
+  # (`node-heartbeat-config` above), `agentenv-api-deployment.yaml` runs
+  # `AENV_NODE_PLACEMENT_SOURCE=native` with
+  # `AENV_PAUSED_REGISTRY_BACKEND=postgres`, and `gateway-k8s-config`'s
+  # `config/gateway.json` now dials `agentenv-api:8002` instead of this
+  # Service. See CLAUDE.md's "Distributed Control Plane" section and
+  # `services/README.md` for the one gap that remains open
+  # (`ListRegistrySandboxes`, gateway-k8s-config's own comment above).
+  # - scheduler-service.yaml
+  # - scheduler-deployment.yaml
+  # - scheduler-pdb.yaml
   - gateway-service.yaml
   - gateway-deployment.yaml
   - agentenv-headless-service.yaml
@@ -80,19 +98,70 @@ configMapGenerator:
       # which must never hold `[pg].dsn` at all (`ServerRole::check_pg_dsn`
       # refuses `--role node` startup outright if it is configured).
       - config/pg-overlay.toml
-  - name: scheduler-k8s-config
-    files:
-      - config/scheduler.json
+  # 🔴 阶段四 E4: no longer generated from the Deployment — `scheduler-deployment.yaml`
+  # is out of `resources:` below (see the note there), so this ConfigMap has
+  # no reader left. Kept, not deleted, the same rollback discipline as the
+  # Deployment/Service/PDB files themselves: re-adding the Deployment to
+  # `resources:` needs this to already exist rather than also reconstructing
+  # it. `config/scheduler.json` itself is untouched.
+  # - name: scheduler-k8s-config
+  #   files:
+  #     - config/scheduler.json
   - name: gateway-k8s-config
     files:
+      # 🔴 阶段四 E4: `gateway.scheduler_addr` inside this file is
+      # `agentenv-api:8002`, not `agentenv-scheduler:9090` — the gateway's
+      # `schedulerv1.SchedulerClient` (`services/gateway/cmd/main.go`) is a
+      # plain generated gRPC client over `services/api/proto/scheduler.proto`,
+      # the same schema `src/node_registry/grpc_service.rs`'s
+      # `NodeRegistryGrpcService` implements, so pointing it at the api
+      # Deployment's own gRPC listener answers `ListNodes`/
+      # `ListObservedNodes`/`GetNode`/`Schedule`/`RecordAssignment`/
+      # `LookupNode` for real with no scheduler process running. The one
+      # exception is `ListRegistrySandboxes`
+      # (`services/gateway/internal/registry_list.go`): that RPC is still
+      # `Status::unimplemented` on the Rust side (Stage C's own, never
+      # ported — see `src/node_registry/grpc_service.rs`'s module doc and
+      # `list_registry_sandboxes`'s own body) and answers `Unimplemented`
+      # through this endpoint until someone ports it; every other
+      # gateway-to-scheduler RPC is covered.
+      # `gateway.query_only_scheduler_addr` stays unset — it already falls
+      # back to `scheduler_addr` when empty
+      # (`services/gateway/cmd/main.go`), so there is nothing separate to
+      # repoint.
       - config/gateway.json
   - name: sandbox-proxy-config
     literals:
       - SANDBOX_PROXY_DOMAINS=
-  # Where every node's heartbeat reporter dials the scheduler — one value,
-  # consumed two ways by `agentenv-daemonset.yaml`: as the env var read once
-  # at process start, and as a mounted file the reporter re-reads once per
-  # heartbeat while the process runs.
+  # Where every node's heartbeat reporter dials its primary heartbeat target
+  # — one value, consumed two ways by `agentenv-daemonset.yaml`: as the env
+  # var read once at process start, and as a mounted file the reporter
+  # re-reads once per heartbeat while the process runs.
+  #
+  # 🔴 阶段四 E1 (task's own label): this now points at `agentenv-api`, not
+  # `agentenv-scheduler`. `NodeRegistryGrpcService`
+  # (`src/node_registry/grpc_service.rs`) implements the same
+  # `scheduler.v1.Scheduler.Heartbeat` RPC the real scheduler does —
+  # including the cluster CPU-config bitwise-AND intersection
+  # (`src/node_registry/cpu_template.rs`, byte-for-byte golden-tested against
+  # the Go algorithm) — over the api Deployment's gRPC listener
+  # (`AENV_API_GRPC_ADDR`, port 8002, fronted by the `agentenv-api` Service
+  # the same way `agentenv-scheduler` fronted the real one). That RPC only
+  # answers once `AENV_NODE_PLACEMENT_SOURCE=native` on the api Deployment
+  # (`agentenv-api-deployment.yaml`) — the two switches must move together,
+  # and native placement is the api half's own permanent default now, not a
+  # follow-up step.
+  #
+  # 🔴 Rollback: change this key back to `http://agentenv-scheduler:9090` and
+  # nothing else — kubelet resyncs the mounted file and
+  # `SchedulerEndpointSource` (`src/scheduler_endpoint.rs`) redials the new
+  # target on the very next heartbeat tick, no Pod restart, no DaemonSet
+  # roll. That alone is enough to make heartbeats (and, since P2P peer
+  # discovery shares this same `[cluster].scheduler_endpoint`,
+  # `src/p2p/mod.rs::peer_discovery_from_config` — P2P discovery too) answer
+  # from the real scheduler again; rolling back `AENV_NODE_PLACEMENT_SOURCE`
+  # and `AENV_PAUSED_REGISTRY_BACKEND` on the api Deployment is a separate,
+  # heavier step (a Pod restart there) — see that file's own comments.
   #
   # 🔴 It used to be a bare literal in that file, with not even the
   # indirection every other cluster-specific value here already gets — so
@@ -100,21 +169,20 @@ configMapGenerator:
   # rolling it: exactly the "phase four rollback is a serial, hour-long
   # DaemonSet roll" trap
   # `docs/proposals/2026-08-20-service-decomposition.md`'s phase four section
-  # says a rollback must not depend on, since that section's rollback also
-  # requires moving this same target back in the same breath as the api
-  # half's own switch. 阶段四切片 0 closes that gap for the value itself: the
-  # DaemonSet mounts this ConfigMap **without** `subPath` (`subPath` mounts —
-  # `agentenv-config`'s two uses of it in that file — are never refreshed by
-  # kubelet; a whole-ConfigMap mount like this one is, on kubelet's ordinary
-  # sync period), so `SchedulerChannelSource`
-  # (`src/observability/reporter.rs`) notices an edit here within one
+  # says a rollback must not depend on. 阶段四切片 0 closes that gap for the
+  # value itself: the DaemonSet mounts this ConfigMap **without** `subPath`
+  # (`subPath` mounts — `agentenv-config`'s two uses of it in that file — are
+  # never refreshed by kubelet; a whole-ConfigMap mount like this one is, on
+  # kubelet's ordinary sync period), so `SchedulerEndpointSource`
+  # (`src/scheduler_endpoint.rs`, formerly a private type inside
+  # `src/observability/reporter.rs`) notices an edit here within one
   # heartbeat interval and dials the new address on the very next heartbeat —
   # no `kubectl set env`, no Pod restart, no DaemonSet roll.
   #
   # 🔴 One key, read two ways, deliberately — not an "env" ConfigMap and a
   # separate "file" ConfigMap. A process whose bootstrap value (env, read once
   # at startup) and hot-reloadable value (file, re-read forever) named two
-  # different schedulers would dial one of them by accident depending on
+  # different targets would dial one of them by accident depending on
   # timing, and keeping them as one key removes that possibility rather than
   # relying on an operator to edit both in step.
   #
@@ -125,18 +193,17 @@ configMapGenerator:
   # `ReporterConfig::resolve` (`src/observability/reporter.rs`) sees an empty
   # `[cluster].scheduler_endpoint`, logs a `warn!` naming exactly that, and
   # never starts the reporter rather than failing to start the process. That
-  # is a real degradation — the node stops appearing in the scheduler's
-  # observed-node list, and the paused-registry `central` backend, which reads
-  # the same `[cluster].scheduler_endpoint`, has nothing to dial either — but
-  # it is a *loud*, discoverable one rather than a crash, the same trade
-  # `cluster-identity-config` above makes for `AENV_CLUSTER_ID`.
+  # is a real degradation — the node stops appearing in api's observed-node
+  # list (and the cluster CPU-config intersection stops propagating to new
+  # VMs) — but it is a *loud*, discoverable one rather than a crash, the same
+  # trade `cluster-identity-config` above makes for `AENV_CLUSTER_ID`.
   #
-  # `http://agentenv-scheduler:9090` is this cluster's real, running value —
+  # `http://agentenv-api:8002` is this cluster's real, running value —
   # tracked here the same way `api-upstream-config`'s addresses are, not a
   # placeholder.
   - name: node-heartbeat-config
     literals:
-      - AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-scheduler:9090
+      - AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002
   # The three switches of the incarnation work, in one place because the
   # release sequence flips them one at a time and an operator has to be able to
   # see all three at once.
@@ -242,27 +309,33 @@ configMapGenerator:
       - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000
       - GATEWAY_RESUME_ADDR=agentenv-api:8002
   # 阶段 4 slice 1's lever, and it is declared here at the code default —
-  # fallback *on*, capped at 3s — not turned off. The scheduler is still this
-  # cluster's system of record for the cold LookupNode path a projection miss
-  # and an undecided wake-up both fall through to (agentenv-scheduler is a
-  # live Deployment, not scaled to zero), so disabling that fallback today
-  # would trade an api-half outage's graceful degradation (falls back to
-  # asking the scheduler directly) for a hard 503 — a regression, not a step
-  # towards phase 4.
+  # fallback *on*, capped at 3s — still not turned off, but for a different
+  # reason than when this was written. `gateway.scheduler_addr`
+  # (`gateway-k8s-config`'s own note above) now names `agentenv-api:8002`,
+  # not the scheduler — so the cold LookupNode path a projection miss and an
+  # undecided wake-up both fall through to no longer depends on
+  # `agentenv-scheduler` at all, decommissioned (阶段四 E4) or not. Disabling
+  # this fallback today would trade an api-half outage's graceful
+  # degradation (falls back to asking api's own `LookupNode` directly) for a
+  # hard 503, which was never what this lever was for.
   #
   # 🔴 What each key is for:
-  #   · GATEWAY_SCHEDULER_FALLBACK_DISABLED — the actual decommissioning
-  #     lever. Only meant to be flipped to `true` once nothing user-facing
-  #     still depends on a live `agentenv-scheduler` (the point phase 4 as a
-  #     whole is working towards), at which point it turns "the scheduler
-  #     Deployment is scaled to zero" from a slow, hanging failure on this
-  #     cold path into an immediate, classified one with zero network calls.
+  #   · GATEWAY_SCHEDULER_FALLBACK_DISABLED — skips this one call entirely.
+  #     Originally billed as "the decommissioning lever," which turned out to
+  #     be the wrong lever for that job: decommissioning the scheduler
+  #     process is `gateway.scheduler_addr` itself moving off it (done, see
+  #     `gateway-k8s-config` above), not skipping the call this flag guards.
+  #     What is still true is its own, narrower purpose — an operator wanting
+  #     zero network calls on this cold path, for its own sake, rather than
+  #     one more (now cheap, since it answers from api rather than hanging on
+  #     a dead scheduler) round trip on a resume.
   #   · GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — bounds that same call on its own
-  #     regardless of the switch above, so an *unreachable-but-not-yet-
-  #     decommissioned* scheduler (a bad rollout, a brief outage) cannot hold
-  #     this path open for gRPC's own connection backoff. Safe to lower once
-  #     this cluster's real LookupNode p99 is known; 3s is deliberately far
-  #     above it and far below GATEWAY_REQUEST_TIMEOUT's 30s.
+  #     regardless of the switch above, so a slow or unreachable target on
+  #     this path (a bad rollout, a brief outage on whichever api replica
+  #     answers) cannot hold it open for gRPC's own connection backoff. Safe
+  #     to lower once this cluster's real LookupNode p99 is known; 3s is
+  #     deliberately far above it and far below GATEWAY_REQUEST_TIMEOUT's
+  #     30s.
   #
   # Both values match `services/shared/config`'s own defaults, so losing this
   # ConfigMap is safe rather than a quiet change — the same reasoning

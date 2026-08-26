@@ -3,7 +3,7 @@
   "log_format": "json",
   "gateway": {
     "http_listen_addr": ":8080",
-    "scheduler_addr": "agentenv-scheduler:9090",
+    "scheduler_addr": "agentenv-api:8002",
     "resume_addr": "",
     "rest_upstream_addr": "",
     "request_timeout": "90s",

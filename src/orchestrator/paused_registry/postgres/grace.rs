@@ -100,6 +100,19 @@ use crate::pg::{AdvisoryLockKey, LeaderContext};
 
 use super::sql::EXTEND_LEASES_SQL;
 
+/// Task's own "D5": ports Go's `agentenv_scheduler_registry_write_phase`
+/// (`grace.go`), renamed per this codebase's own `scheduler` -> `api`
+/// convention. `0` = cold (no grace row for this cluster yet, the
+/// conservative default [`is_serving`] itself already treats a missing row
+/// as); `1` = grace (a row exists but `now() < grace_until`, set by
+/// [`enter`] the instant it (re-)computes a fresh `grace_until`); `2` =
+/// serving (`now() >= grace_until`, observed as a side effect of
+/// [`is_serving`]'s own read -- cheap, and it is the only place this
+/// process asks the question at all).
+const WRITE_PHASE_METRIC: &str = "agentenv_api_paused_registry_write_phase";
+/// Ports `agentenv_scheduler_registry_write_grace_downtime_seconds`.
+const GRACE_DOWNTIME_METRIC: &str = "agentenv_api_paused_registry_grace_downtime_seconds";
+
 /// `Grace.Enter`'s outcome (`GraceObservation`, `grace.go`), for logging and
 /// for the `pg::` test suite's own assertions on what one `enter` call
 /// actually computed -- not read by production code past the `info!` call
@@ -158,6 +171,10 @@ pub(super) async fn enter(
         "paused registry write surface entering its restart grace period"
     );
 
+    let cluster_label = cluster_id.to_string();
+    metrics::gauge!(WRITE_PHASE_METRIC, "cluster_id" => cluster_label.clone()).set(1.0);
+    metrics::gauge!(GRACE_DOWNTIME_METRIC, "cluster_id" => cluster_label).set(downtime_secs);
+
     Ok(GraceObservation {
         downtime_secs,
         extended,
@@ -178,6 +195,13 @@ pub(super) async fn is_serving(pool: &PgPool, cluster_id: Uuid) -> anyhow::Resul
     .fetch_optional(pool)
     .await
     .context("read the restart-grace phase")?;
+
+    let phase = match serving {
+        None => 0.0,        // cold: no grace row for this cluster yet
+        Some(false) => 1.0, // grace: row exists, still short of grace_until
+        Some(true) => 2.0,  // serving: past grace_until
+    };
+    metrics::gauge!(WRITE_PHASE_METRIC, "cluster_id" => cluster_id.to_string()).set(phase);
 
     Ok(serving.unwrap_or(false))
 }

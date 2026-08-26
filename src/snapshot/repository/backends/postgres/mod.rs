@@ -567,6 +567,93 @@ mod pg {
         assert_eq!(published.id, record.id);
     }
 
+    /// Regression for the v3 template build path failing with `AliasTaken`
+    /// against its *own* id every time: `POST /v3/templates` pre-binds the
+    /// alias to the new template's id via `create` (`begin_snapshot` ->
+    /// `bind_alias`), and the build's own `publish_commit` later binds the
+    /// same alias again onto the same id via `commit_snapshot` ->
+    /// `bind_alias`. That second bind must be a no-op, not a conflict --
+    /// `bind_alias`'s `INSERT ... ON CONFLICT DO NOTHING` was unconditionally
+    /// reporting `AliasTaken` on any conflict, including one where the
+    /// row already found by `SELECT snapshot_id` is this exact snapshot.
+    #[tokio::test]
+    async fn publish_commit_rebinding_its_own_alias_is_idempotent_not_alias_taken() {
+        let catalog =
+            catalog!("publish_commit_rebinding_its_own_alias_is_idempotent_not_alias_taken");
+        let record = template_record(Some("p4-acc-builder"));
+        catalog
+            .create(record.clone())
+            .await
+            .expect("create should succeed, binding the alias to the new template's own id");
+        catalog
+            .try_start_build(&record.id)
+            .await
+            .expect("starting the build should succeed");
+
+        let commit = commit_for(record.id.clone(), Some("p4-acc-builder"));
+        let published = catalog.publish_commit(commit).await.expect(
+            "rebinding the alias this exact snapshot already holds must succeed, not AliasTaken",
+        );
+        assert_eq!(published.id, record.id);
+        assert_eq!(
+            catalog.resolve_alias("p4-acc-builder").await.unwrap(),
+            Some(record.id)
+        );
+    }
+
+    /// The other side of the idempotence fix above: the branch must recognise
+    /// *this* snapshot, not accept anyone. A different snapshot reaching for a
+    /// name someone else still holds must still be refused, must still name
+    /// the real holder, and must leave both rows where they were.
+    ///
+    /// Deliberately staged so the steal is attempted by `commit_snapshot`'s
+    /// `bind_alias` rather than `begin_snapshot`'s: `publish_commit` over a
+    /// row that already exists never reaches the opening bind (the id insert
+    /// conflicts first and `AlreadyExists` is swallowed), so the commit-time
+    /// bind is the only one that runs -- and it is the one whose refusal has
+    /// to take the flip to `ready` back out with it.
+    #[tokio::test]
+    async fn publish_commit_refuses_to_steal_an_alias_held_by_a_different_snapshot() {
+        let catalog =
+            catalog!("publish_commit_refuses_to_steal_an_alias_held_by_a_different_snapshot");
+        let holder = commit_for(SnapshotId::generate(), Some("shared-build-alias"));
+        let holder_id = holder.id.clone();
+        catalog
+            .publish_commit(holder)
+            .await
+            .expect("the first publish should succeed and bind the alias");
+
+        let thief = template_record(None);
+        catalog
+            .create(thief.clone())
+            .await
+            .expect("opening the second row should succeed -- it claims no alias yet");
+        catalog
+            .try_start_build(&thief.id)
+            .await
+            .expect("starting the build should succeed");
+
+        let commit = commit_for(thief.id.clone(), Some("shared-build-alias"));
+        let error = catalog
+            .publish_commit(commit)
+            .await
+            .expect_err("a different snapshot must not be able to steal a live alias");
+        match error {
+            RepositoryError::AliasConflict { existing, .. } => assert_eq!(existing, holder_id),
+            other => panic!("expected AliasConflict naming the real holder, got {other:?}"),
+        }
+        assert_eq!(
+            catalog.resolve_alias("shared-build-alias").await.unwrap(),
+            Some(holder_id),
+            "the refused attempt must not have displaced the original holder"
+        );
+        assert!(
+            catalog.get(&thief.id.to_string()).await.unwrap().is_none(),
+            "a commit refused at alias binding must roll its whole transaction back, \
+             including the flip to 'ready' that ran before the bind"
+        );
+    }
+
     #[tokio::test]
     async fn a_disk_size_of_zero_is_allowed_while_waiting_but_refused_at_ready() {
         let catalog = catalog!("a_disk_size_of_zero_is_allowed_while_waiting_but_refused_at_ready");

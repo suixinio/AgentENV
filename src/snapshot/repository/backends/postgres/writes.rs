@@ -185,17 +185,43 @@ async fn bind_alias(
         return Ok(None);
     }
 
-    let holder: Option<String> = sqlx::query_scalar(
-        "SELECT snapshot_id::text FROM aliases WHERE cluster_id = $1 AND alias = $2",
-    )
-    .bind(cluster_id)
-    .bind(alias.to_string())
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(backend_error("bind_alias"))?;
+    let holder: Option<Uuid> =
+        sqlx::query_scalar("SELECT snapshot_id FROM aliases WHERE cluster_id = $1 AND alias = $2")
+            .bind(cluster_id)
+            .bind(alias.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(backend_error("bind_alias"))?;
+
+    // 🔴 The name is already this snapshot's own — a no-op success, not a
+    // conflict. This branch is the one thing the port of `bindAlias` left
+    // behind: Go's is `strings.EqualFold(holder, snapshot)` -> `return nil,
+    // nil`, under its own doc comment "Binding a name this snapshot already
+    // holds is a no-op success: the two callers that bind — opening a row and
+    // committing it — are both allowed to name the same alias, and a retry of
+    // either must not become a conflict with itself." The OSS backend states
+    // the same rule (`backends/oss/catalog.rs::bind_alias`: "If it already
+    // points to `id`, return success"), which left PostgreSQL as the only
+    // backend that refused itself.
+    //
+    // Both of this module's callers reach that state on every v3 template
+    // build: `POST /v3/templates` opens the row with the alias bound to the
+    // new template's own id (`begin_snapshot`), and the build's own
+    // `publish_commit` binds the same (alias, id) pair a second time
+    // (`commit_snapshot`). Without this branch that second bind falls through
+    // the `ON CONFLICT ... DO NOTHING` above and is reported as `AliasTaken`
+    // naming the caller itself — "alias 'x' already points to '<id>', cannot
+    // rebind to '<id>'", the same id printed twice, on every build.
+    //
+    // Compared as `Uuid` rather than as text: the holder is read as the
+    // `uuid` column itself, so this is the canonical value comparison Go can
+    // only approximate with a case-insensitive string match.
+    if holder == Some(snapshot_id.to_uuid()) {
+        return Ok(None);
+    }
 
     Ok(Some(CatalogRefusal::AliasTaken {
-        holder: holder.unwrap_or_default(),
+        holder: holder.map(|id| id.to_string()).unwrap_or_default(),
     }))
 }
 

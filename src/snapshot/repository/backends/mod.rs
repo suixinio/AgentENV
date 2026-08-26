@@ -27,7 +27,7 @@ use crate::snapshot::repository::mirror::{
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
 pub use oss::OssBackend;
-use posixfs::posixfs_repository;
+use posixfs::posixfs_catalog_only_repository;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 use postgres::migration_state::PgReadSideConfirmation;
 use postgres::PostgresSnapshotCatalog;
@@ -627,7 +627,7 @@ fn build_catalog_only_repository(config: &AppConfig) -> Result<Arc<SnapshotRepos
                 .context("backend.posix_fs config is required when repository_backend = posix_fs")?
                 .snapshot_store
                 .join("repository");
-            Ok(Arc::new(posixfs_repository(&root)))
+            Ok(Arc::new(posixfs_catalog_only_repository(&root)))
         }
         SnapshotRepositoryBackendKind::Oss => {
             let oss_config = config
@@ -713,6 +713,7 @@ mod tests {
     use crate::snapshot::repository::interfaces::SnapshotCatalog;
     use crate::snapshot::repository::mirror::test_doubles::{record_for, ScriptedCatalog};
     use crate::snapshot::types::SnapshotId;
+    use crate::snapshot::RepositoryError;
 
     use crate::snapshot::repository::interfaces::CatalogReadScope;
 
@@ -729,8 +730,15 @@ mod tests {
     ///    origin node can be gone, and a delete that had to be dispatched
     ///    there would leave the row removed and the bytes orphaned.
     ///
-    /// The publish is here to give the delete something real to remove; it is
-    /// not a claim that api publishes (staging happens where the sandbox is).
+    /// The bytes are staged through the *node*-assembled repository, because
+    /// that is where staging happens and because this half now refuses it —
+    /// see the third claim below.
+    ///
+    /// 3. `publish` through the api-assembled repository is refused rather
+    ///    than silently doing nothing. `--role api` never stages: every capture
+    ///    that reaches it arrived already staged by the node holding the bytes
+    ///    (`SnapshotManager::adopt_staged`). The importing half is what needs
+    ///    to read overlaybd layer files, so it is the half api does not build.
     #[tokio::test]
     async fn an_api_role_assembles_no_runtime_resolver_and_still_deletes() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -754,16 +762,43 @@ mod tests {
         let (_, _, manifest) = crate::snapshot::mock::write_mock_built_artifacts(workspace.path())
             .expect("mock built artifacts should write");
         let id = SnapshotId::generate();
-        repository
-            .publish(
-                crate::snapshot::SnapshotPublishMetadata {
-                    id: id.clone(),
-                    ..crate::snapshot::SnapshotPublishMetadata::mock()
-                },
-                manifest,
+        let metadata = crate::snapshot::SnapshotPublishMetadata {
+            id: id.clone(),
+            ..crate::snapshot::SnapshotPublishMetadata::mock()
+        };
+
+        // The half that holds the bytes writes them.
+        let root = dir.path().join("store").join("repository");
+        let node_repository = PosixFsBackend::from_parts(
+            PosixFsBackendConfig {
+                root: root.clone(),
+                cache_root: Some(dir.path().join("cache")),
+                runtime_cache_root: Some(dir.path().join("cache").join("runtime")),
+            },
+            crate::image::cache::local_image_services_from_app_config(&config).overlaybd_layers,
+            crate::snapshot::artifact_cache::LocalArtifactCache::new(
+                dir.path().join("cache"),
+                None,
             )
+            .expect("artifact cache"),
+        )
+        .into_parts()
+        .0;
+        node_repository
+            .publish(metadata.clone(), manifest.clone())
             .await
-            .expect("the api-assembled repository should own a real artifact store");
+            .expect("the node-assembled repository stages the bytes");
+
+        // And this half refuses to, rather than pretending it can.
+        let refusal = repository
+            .publish(metadata, manifest)
+            .await
+            .expect_err("--role api must refuse to import snapshot artifacts");
+        assert!(
+            matches!(refusal, RepositoryError::Unsupported { .. }),
+            "the refusal must say the feature is unavailable, not fail as a backend error: \
+             {refusal:?}"
+        );
 
         let committed_dir = dir
             .path()

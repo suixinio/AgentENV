@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::super::shared_runtime_cache_root;
-use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
+use super::import::PosixFsArtifactImporter;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::snapshot::artifact_cache::LocalArtifactCache;
@@ -94,7 +94,7 @@ impl PosixFsBackend {
 pub(crate) fn posixfs_repository(root: &std::path::Path) -> SnapshotRepository {
     SnapshotRepository::new(
         Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
-        Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
+        Arc::new(PosixFsArtifactImporter::new(root.to_path_buf())),
     )
 }
 

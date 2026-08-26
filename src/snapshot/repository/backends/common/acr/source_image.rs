@@ -1,110 +1,15 @@
 use std::path::{Path, PathBuf};
 
+use super::reference::SourceRegistryRepository;
 use crate::digest::FileDigest;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use overlaybd::dense_export;
-use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceRegistryImage {
     pub(crate) target: SourceRegistryRepository,
     pub(crate) layers: Vec<SourceRegistryLayer>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SourceRegistryRepository {
-    pub(crate) registry: String,
-    pub(crate) repository: String,
-    pub(crate) repo_blob_url: String,
-}
-
-impl SourceRegistryRepository {
-    pub(crate) fn parse(repo_blob_url: &str) -> RepositoryResult<Self> {
-        let url = Url::parse(repo_blob_url).map_err(|e| RepositoryError::Unsupported {
-            feature: format!("invalid ACR repoBlobUrl '{repo_blob_url}': {e}"),
-        })?;
-        let test_loopback_http = cfg!(test)
-            && url.scheme() == "http"
-            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
-        if url.scheme() != "https" && !test_loopback_http {
-            return Err(RepositoryError::Unsupported {
-                feature: format!("ACR repoBlobUrl must use https: {repo_blob_url}"),
-            });
-        }
-        let host = url.host_str().ok_or_else(|| RepositoryError::Unsupported {
-            feature: format!("ACR repoBlobUrl is missing registry host: {repo_blob_url}"),
-        })?;
-        // Strip the default HTTPS :443 so equivalent source URLs normalize to
-        // one registry; keep every other explicit port intact.
-        let registry = match url.port() {
-            Some(443) if url.scheme() == "https" => host.to_string(),
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
-
-        let segments: Vec<&str> = url
-            .path_segments()
-            .map(|segments| segments.collect())
-            .unwrap_or_default();
-        if segments.len() < 3
-            || segments.first() != Some(&"v2")
-            || segments.last() != Some(&"blobs")
-        {
-            return Err(RepositoryError::Unsupported {
-                feature: format!(
-                    "ACR repoBlobUrl must have shape https://<registry>/v2/<repo>/blobs: {repo_blob_url}"
-                ),
-            });
-        }
-        let repository = segments[1..segments.len() - 1].join("/");
-        if repository.is_empty() {
-            return Err(RepositoryError::Unsupported {
-                feature: format!("ACR repoBlobUrl repository is empty: {repo_blob_url}"),
-            });
-        }
-        let repo_blob_url = format!(
-            "{}://{}{}",
-            url.scheme(),
-            registry,
-            url.path().trim_end_matches('/')
-        );
-
-        Ok(Self {
-            registry,
-            repository,
-            repo_blob_url,
-        })
-    }
-
-    pub(crate) fn image_ref(&self, tag: &str) -> String {
-        format!("{}/{}:{tag}", self.registry, self.repository)
-    }
-
-    fn registry_api_url(&self) -> String {
-        let scheme = self
-            .repo_blob_url
-            .split_once("://")
-            .map(|(scheme, _)| scheme)
-            .unwrap_or("https");
-        format!("{scheme}://{}", self.registry)
-    }
-
-    pub(crate) fn upload_url(&self) -> String {
-        format!(
-            "{}/v2/{}/blobs/uploads/",
-            self.registry_api_url(),
-            self.repository
-        )
-    }
-
-    pub(crate) fn manifest_url(&self, tag: &str) -> String {
-        format!(
-            "{}/v2/{}/manifests/{tag}",
-            self.registry_api_url(),
-            self.repository
-        )
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

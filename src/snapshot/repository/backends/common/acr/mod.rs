@@ -1,6 +1,8 @@
 mod client;
 mod manifest;
 mod publisher;
+mod reference;
+mod rollback;
 mod source_image;
 
 pub(crate) use manifest::{
@@ -8,4 +10,5 @@ pub(crate) use manifest::{
     SnapshotOciConfigInput, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
 };
 pub(crate) use publisher::{AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject};
-pub(crate) use source_image::SourceRegistryRepository;
+pub(crate) use reference::SourceRegistryRepository;
+pub(crate) use rollback::AcrPublicationRollback;

@@ -1,10 +1,8 @@
-use std::collections::HashMap;
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use tempfile::NamedTempFile;
-use tracing::warn;
 
 use crate::digest;
 use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
@@ -19,9 +17,12 @@ use super::manifest::{
     build_oci_image_manifest, host_architecture_for_oci, minimal_oci_config_blob,
     snapshot_oci_config_blob, OciDescriptor, SnapshotOciConfigInput,
 };
+#[cfg(test)]
+use super::rollback::AcrClientBuilder;
+use super::rollback::AcrPublicationRollback;
 use super::source_image::{
     load_source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor,
-    SourceRegistryLayer, SourceRegistryRepository,
+    SourceRegistryLayer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,29 +46,33 @@ pub(crate) struct DiskImageExportOutcome {
     pub(crate) publication: Option<PersistedDiskImagePublication>,
 }
 
-type AcrClientBuilder = dyn Fn(&str) -> Result<AcrClient, AcrClientError> + Send + Sync + 'static;
-
+/// Publishes a snapshot's disk-image deltas to their source registry.
+///
+/// 🔴 Holds an [`AcrPublicationRollback`] rather than being one. Undoing a
+/// publication is a registry `DELETE` and nothing more, which is why it lives
+/// on the other side of this seam: the half that owns catalog rows removes
+/// publications when a snapshot goes away, and it has no overlaybd layers to
+/// read.
 pub(crate) struct AcrDiskImageExporter {
-    // This mutex only protects the in-memory client map. It is never held across
-    // an await point; client construction happens outside the lock as well.
-    clients: Mutex<HashMap<String, AcrClient>>,
-    client_builder: Arc<AcrClientBuilder>,
+    rollback: AcrPublicationRollback,
 }
 
 impl AcrDiskImageExporter {
     pub(crate) fn new() -> Self {
         Self {
-            clients: Mutex::new(HashMap::new()),
-            client_builder: Arc::new(AcrClient::from_docker_config),
+            rollback: AcrPublicationRollback::new(),
         }
     }
 
     #[cfg(test)]
     fn new_with_client_builder(client_builder: Arc<AcrClientBuilder>) -> Self {
         Self {
-            clients: Mutex::new(HashMap::new()),
-            client_builder,
+            rollback: AcrPublicationRollback::new_with_client_builder(client_builder),
         }
+    }
+
+    async fn client_for_registry(&self, registry: &str) -> Result<AcrClient, AcrClientError> {
+        self.rollback.client_for_registry(registry).await
     }
 
     pub(crate) async fn export(
@@ -154,63 +159,6 @@ impl AcrDiskImageExporter {
                 repo_blob_url: target.repo_blob_url.clone(),
             }),
         })
-    }
-
-    pub(crate) async fn rollback_publication(
-        &self,
-        publication: &PersistedDiskImagePublication,
-    ) -> RepositoryResult<()> {
-        let repository_ref = match SourceRegistryRepository::parse(&publication.repo_blob_url) {
-            Ok(repository_ref) => repository_ref,
-            Err(error) => {
-                warn!(
-                    repo_blob_url = %publication.repo_blob_url,
-                    error = %error,
-                    "cannot roll back ACR publication with invalid repoBlobUrl"
-                );
-                return Ok(());
-            }
-        };
-        let client = self.client_for_registry(&repository_ref.registry).await?;
-        client
-            .delete_manifest_by_digest(
-                &repository_ref.registry,
-                &repository_ref.repository,
-                &publication.manifest_digest,
-            )
-            .await
-            .map_err(RepositoryError::from)
-    }
-
-    async fn client_for_registry(&self, registry: &str) -> Result<AcrClient, AcrClientError> {
-        {
-            let clients = self.clients.lock().map_err(|_| AcrClientError::Registry {
-                message: "ACR client cache lock poisoned".to_string(),
-            })?;
-            if let Some(client) = clients.get(registry) {
-                return Ok(client.clone());
-            }
-        }
-
-        let registry = registry.to_string();
-        let registry_for_builder = registry.clone();
-        let client_builder = Arc::clone(&self.client_builder);
-        let client = tokio::task::spawn_blocking(move || (client_builder)(&registry_for_builder))
-            .await
-            .map_err(|e| AcrClientError::Registry {
-                message: format!("join ACR client builder task: {e}"),
-            })??;
-        let mut clients = self.clients.lock().map_err(|_| AcrClientError::Registry {
-            message: "ACR client cache lock poisoned".to_string(),
-        })?;
-        // Another task may have populated the cache while this task was loading
-        // Docker credentials in spawn_blocking. Prefer the cached client and
-        // discard the duplicate one.
-        if let Some(existing) = clients.get(&registry) {
-            return Ok(existing.clone());
-        }
-        clients.insert(registry, client.clone());
-        Ok(client)
     }
 
     async fn upload_local_delta(
@@ -324,6 +272,7 @@ fn is_tag_char(ch: char) -> bool {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::Mutex;
 
     use serde_json::json;
     use tempfile::TempDir;

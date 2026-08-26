@@ -2,6 +2,7 @@ mod artifacts;
 mod catalog;
 mod client;
 mod config;
+mod import;
 mod layout;
 mod resolver;
 #[cfg(test)]
@@ -63,10 +64,20 @@ impl OssBackend {
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Result<Self> {
         let OssDurableParts {
-            repository,
+            repository: _,
             client,
             managed_layers_repo_blob_url,
         } = Self::durable_parts(config, snapshot_image_storage)?;
+        // 🔴 Not `durable_parts`' repository. That one carries the delete-only
+        // artifact half; this process holds bytes and has to be able to import
+        // them, so it composes the same catalog with the importing half.
+        let repository = Arc::new(SnapshotRepository::new(
+            Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
+            Arc::new(import::OssSnapshotArtifactImporter::new(
+                Arc::clone(&client),
+                NormalizedOssConfig::new(config, snapshot_image_storage)?.snapshot_image_storage(),
+            )),
+        ));
 
         std::fs::create_dir_all(&runtime_root)
             .with_context(|| format!("create oss runtime root '{}'", runtime_root.display()))?;
@@ -120,10 +131,7 @@ impl OssBackend {
 
         let repository = Arc::new(SnapshotRepository::new(
             Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
-            Arc::new(OssSnapshotArtifactStore::new(
-                Arc::clone(&client),
-                config.snapshot_image_storage(),
-            )),
+            Arc::new(OssSnapshotArtifactStore::new(Arc::clone(&client))),
         ));
 
         Ok(OssDurableParts {

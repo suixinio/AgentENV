@@ -1143,7 +1143,7 @@ fn normalize_execution_id(raw: &str) -> String {
 
 /// The same rule as [`normalize_execution_id`] without the counter, and
 /// returns why it dropped a value instead of counting it.
-fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>) {
+pub(crate) fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>) {
     let normalized = raw.trim().to_lowercase();
     if normalized.is_empty() {
         return (String::new(), Some("no_execution"));

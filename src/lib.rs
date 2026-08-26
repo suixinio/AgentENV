@@ -1,4 +1,5 @@
 pub mod api;
+pub mod binding_store;
 pub mod cfg;
 mod digest;
 pub mod identity;

@@ -1075,7 +1075,7 @@ mod tests {
                 terminating_endpoint("agentenv-node-lingering", "10.0.0.3"),
             ],
         );
-        let (active, lingering) = nodes_from_endpoint_slices(&[slice.clone()], &cfg);
+        let (active, lingering) = nodes_from_endpoint_slices(std::slice::from_ref(&slice), &cfg);
         let pending = nodes_pending_from_endpoint_slices(&[slice], &cfg);
 
         assert_eq!(ids(&active), vec!["agentenv-node-active".to_string()]);

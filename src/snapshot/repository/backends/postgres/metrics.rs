@@ -16,26 +16,22 @@
 ///
 /// 🔴 `code`, not a coarser "ok/error": mirrors Go's gRPC status code label
 /// exactly enough to keep an existing dashboard's grouping meaningful. Since
-/// there is no gRPC status on this side of Stage B, `code` carries
-/// `"ok"`/`"error"`/the [`crate::snapshot::repository::RepositoryError`]
-/// variant name for a refusal — whichever this build actually has to report.
+/// there is no gRPC status on this side of Stage B, `code` carries `"ok"` or
+/// [`crate::snapshot::repository::RepositoryError::as_metric_label`] — the
+/// variant name for whichever error this build actually has to report.
 ///
-/// 🔴 Not wired to anything yet, for the same reason
-/// [`CATALOG_BUILD_CLOCK_SKEW_TOTAL`] below is not: matching Go's label
-/// semantics exactly (`code` carrying a `RepositoryError` variant name on
-/// refusal, not a flat `"error"`) needs a `RepositoryError -> &'static str`
-/// mapping this port does not have yet, and every one of
-/// `PostgresSnapshotCatalog`'s dozen write-path call sites would need to
-/// call this correctly and consistently. Left declared and unused rather
-/// than wired with a guessed label scheme a real dashboard would then have
-/// to unlearn.
-#[allow(dead_code)]
+/// Wired at [`super::PostgresSnapshotCatalog`]'s `SnapshotCatalog` and
+/// `CentralCatalogWrites` trait method bodies, each through
+/// [`record_catalog_outcome`] — one wrapper around every write-path and
+/// read-path call, rather than duplicating this match inside each of
+/// `postgres::writes`'s dozen functions.
 pub(crate) const CATALOG_RPC_TOTAL: &str = "agentenv_scheduler_catalog_rpc_total";
 
 /// Refusals answered as a decision the caller acts on rather than as a
-/// failure — matches Go's `catalogRejections`. Not wired yet; see
-/// [`CATALOG_RPC_TOTAL`]'s own note just above.
-#[allow(dead_code)]
+/// failure — matches Go's `catalogRejections`.
+/// [`crate::snapshot::repository::RepositoryError::is_rejection`] decides
+/// which of [`CATALOG_RPC_TOTAL`]'s errors also count here; see
+/// [`record_catalog_outcome`].
 pub(crate) const CATALOG_REJECTED_TOTAL: &str = "agentenv_scheduler_catalog_rejected_total";
 
 /// Builds the reaper ended because their heartbeat lapsed.
@@ -72,14 +68,35 @@ pub(crate) const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
 pub(crate) const CATALOG_BUILD_CLOCK_SKEW_TOTAL: &str =
     "agentenv_scheduler_catalog_build_clock_skew_total";
 
-#[allow(dead_code)]
 pub(crate) fn record_catalog_rpc(op: &'static str, code: &str) {
     metrics::counter!(CATALOG_RPC_TOTAL, "rpc" => op, "code" => code.to_string()).increment(1);
 }
 
-#[allow(dead_code)]
 pub(crate) fn record_catalog_rejected(op: &'static str, reason: &'static str) {
     metrics::counter!(CATALOG_REJECTED_TOTAL, "rpc" => op, "reason" => reason).increment(1);
+}
+
+/// Records one call's outcome on both series in one place — `op` on
+/// [`CATALOG_RPC_TOTAL`] always, and again on [`CATALOG_REJECTED_TOTAL`] when
+/// the error is a refusal rather than a failure
+/// ([`crate::snapshot::repository::RepositoryError::is_rejection`]). Returns
+/// `result` unchanged so a call site can wrap its own return expression with
+/// this rather than pre-binding a local.
+pub(crate) fn record_catalog_outcome<T>(
+    op: &'static str,
+    result: crate::snapshot::repository::RepositoryResult<T>,
+) -> crate::snapshot::repository::RepositoryResult<T> {
+    match &result {
+        Ok(_) => record_catalog_rpc(op, "ok"),
+        Err(err) => {
+            let label = err.as_metric_label();
+            record_catalog_rpc(op, label);
+            if err.is_rejection() {
+                record_catalog_rejected(op, label);
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn record_builds_reaped(count: u64) {

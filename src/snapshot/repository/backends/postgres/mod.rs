@@ -101,7 +101,10 @@ impl PostgresSnapshotCatalog {
         id_or_alias: &str,
         scope: CatalogReadScope,
     ) -> RepositoryResult<Option<SnapshotRecord>> {
-        reads::get_scoped(&self.pool, self.cluster_id, id_or_alias, scope).await
+        metrics::record_catalog_outcome(
+            "get_scoped",
+            reads::get_scoped(&self.pool, self.cluster_id, id_or_alias, scope).await,
+        )
     }
 
     pub(crate) async fn resolve_alias_scoped(
@@ -109,7 +112,10 @@ impl PostgresSnapshotCatalog {
         alias: &str,
         scope: CatalogReadScope,
     ) -> RepositoryResult<Option<SnapshotId>> {
-        reads::resolve_alias_scoped(&self.pool, self.cluster_id, alias, scope).await
+        metrics::record_catalog_outcome(
+            "resolve_alias_scoped",
+            reads::resolve_alias_scoped(&self.pool, self.cluster_id, alias, scope).await,
+        )
     }
 
     pub(crate) async fn list_scoped(
@@ -117,7 +123,10 @@ impl PostgresSnapshotCatalog {
         filter: SnapshotListFilter,
         scope: CatalogReadScope,
     ) -> RepositoryResult<Vec<SnapshotRecord>> {
-        reads::list_scoped(&self.pool, self.cluster_id, &filter, scope).await
+        metrics::record_catalog_outcome(
+            "list_scoped",
+            reads::list_scoped(&self.pool, self.cluster_id, &filter, scope).await,
+        )
     }
 
     pub(crate) async fn list_page_scoped(
@@ -125,20 +134,40 @@ impl PostgresSnapshotCatalog {
         filter: SnapshotListFilter,
         scope: CatalogReadScope,
     ) -> RepositoryResult<SnapshotListPage> {
-        let (items, next) =
-            reads::list_page_scoped(&self.pool, self.cluster_id, &filter, scope).await?;
+        let (items, next) = metrics::record_catalog_outcome(
+            "list_page_scoped",
+            reads::list_page_scoped(&self.pool, self.cluster_id, &filter, scope).await,
+        )?;
         Ok(SnapshotListPage { items, next })
     }
 }
 
+// 🔴 P6: `metrics::record_catalog_outcome` is wired here, on the
+// `SnapshotCatalog` trait surface only — this is the *sole* path a
+// `write = "postgres"` deployment ever calls (`assemble_postgres_only_backend`
+// wires `Arc<dyn SnapshotCatalog>` straight into the repository, with no
+// mirror in front of it) and the read half of every `write = "both"`
+// deployment too. `CentralCatalogWrites` below — the double write's own
+// surface, live during the `write = "both"` observation window — is left
+// unwired: its methods answer `RepositoryResult<CatalogWrite<T>>`, so a
+// refusal is `Ok(CatalogWrite::Refused(_))`, not `Err(_)`, and
+// `record_catalog_outcome`'s `Result`-shaped wrapper cannot see it as a
+// rejection without unwrapping that enum too — left for whoever wires that
+// surface next rather than guessed at here.
 #[async_trait]
 impl SnapshotCatalog for PostgresSnapshotCatalog {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        writes::create(&self.pool, self.cluster_id, &self.node_id, record).await
+        metrics::record_catalog_outcome(
+            "create",
+            writes::create(&self.pool, self.cluster_id, &self.node_id, record).await,
+        )
     }
 
     async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
-        writes::publish_commit(&self.pool, self.cluster_id, &self.node_id, commit).await
+        metrics::record_catalog_outcome(
+            "publish_commit",
+            writes::publish_commit(&self.pool, self.cluster_id, &self.node_id, commit).await,
+        )
     }
 
     /// Resolvable rows only — see [`Self::get_scoped`] for the surface that
@@ -172,7 +201,10 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-        writes::delete_record(&self.pool, self.cluster_id, record).await
+        metrics::record_catalog_outcome(
+            "delete_record",
+            writes::delete_record(&self.pool, self.cluster_id, record).await,
+        )
     }
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
@@ -189,18 +221,24 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
-        writes::try_start_build(
-            &self.pool,
-            self.cluster_id,
-            &self.node_id,
-            id,
-            self.max_concurrent_builds,
+        metrics::record_catalog_outcome(
+            "try_start_build",
+            writes::try_start_build(
+                &self.pool,
+                self.cluster_id,
+                &self.node_id,
+                id,
+                self.max_concurrent_builds,
+            )
+            .await,
         )
-        .await
     }
 
     async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
-        writes::renew_lease(&self.pool, self.cluster_id, &self.node_id, build_id).await
+        metrics::record_catalog_outcome(
+            "renew_build_lease",
+            writes::renew_lease(&self.pool, self.cluster_id, &self.node_id, build_id).await,
+        )
     }
 
     async fn mark_build_error(
@@ -208,7 +246,10 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
-        writes::mark_build_error(&self.pool, self.cluster_id, id, reason).await
+        metrics::record_catalog_outcome(
+            "mark_build_error",
+            writes::mark_build_error(&self.pool, self.cluster_id, id, reason).await,
+        )
     }
 }
 
@@ -949,5 +990,86 @@ mod pg {
             .await
             .expect_err("committing an already-ready row must be refused");
         let _ = error;
+    }
+
+    // ── metrics (P6) ─────────────────────────────────────────────────────
+
+    /// 🔴 `agentenv_scheduler_catalog_rpc_total` and
+    /// `agentenv_scheduler_catalog_rejected_total` were declared and
+    /// entirely unwired before this — see `metrics.rs`'s own former "not
+    /// wired to anything yet" note. This drives the `SnapshotCatalog` trait
+    /// surface (not `#[tokio::test]`: `metrics::with_local_recorder` is
+    /// thread-local, so the driven calls have to run on the very thread that
+    /// installed the recorder, which a `#[tokio::test]` runtime does not
+    /// guarantee — same reason `composite.rs`'s own metrics tests build
+    /// their runtime by hand) and checks both series actually moved: one
+    /// ordinary call, and one call admission refuses.
+    #[test]
+    fn a_call_and_a_rejection_are_both_recorded() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime should build");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        // 🔴 `::metrics::`, the crate root — bare `metrics::` in this scope
+        // resolves to `postgres::metrics` (this file's own submodule,
+        // brought in by `use super::*` above), which shadows the
+        // `with_local_recorder` free function the external `metrics` crate
+        // exports.
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let pool =
+                    isolated_schema_pool_or_skip!("a_call_and_a_rejection_are_both_recorded");
+                migrate(&pool).await.expect("migration should succeed");
+                let catalog =
+                    PostgresSnapshotCatalog::new(pool, Uuid::new_v4(), "node-a".to_string());
+
+                let record = template_record(None);
+                catalog
+                    .create(record.clone())
+                    .await
+                    .expect("create should succeed");
+                catalog
+                    .try_start_build(&record.id)
+                    .await
+                    .expect("the first build should be admitted");
+                catalog
+                    .try_start_build(&record.id)
+                    .await
+                    .expect_err("a second build of the same template must be refused");
+            });
+        });
+
+        // 🔴 One `snapshot()` call, not two through separate `counter_total`
+        // calls: `Snapshotter::snapshot()` drains what it reports —a second
+        // call sees zero even though the first genuinely observed the
+        // recorded counters — so both totals have to be read off the same
+        // snapshot.
+        let sample = snapshotter.snapshot().into_vec();
+        let total_of = |name: &str| -> u64 {
+            sample
+                .iter()
+                .filter(|(composite, _, _, _)| composite.key().name() == name)
+                .map(|(_, _, _, value)| match value {
+                    metrics_util::debugging::DebugValue::Counter(count) => *count,
+                    _ => 0,
+                })
+                .sum()
+        };
+
+        assert!(
+            total_of(metrics::CATALOG_RPC_TOTAL) >= 3,
+            "every SnapshotCatalog call this test made — one create, two try_start_build — must \
+             record agentenv_scheduler_catalog_rpc_total"
+        );
+        assert!(
+            total_of(metrics::CATALOG_REJECTED_TOTAL) >= 1,
+            "the second try_start_build was refused as an ordinary admission decision, not a \
+             backend failure, and must record agentenv_scheduler_catalog_rejected_total"
+        );
     }
 }

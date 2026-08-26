@@ -117,17 +117,39 @@ impl WarmupGate {
     }
 
     /// Reports whether a binding miss may be answered as "not found."
+    ///
+    /// 🔴 P1 (task's own "phase4-close" P3): `reported` is checked *before*
+    /// the deadline, not after. The deadline exists to stop waiting forever
+    /// on a straggler that is genuinely down while *other* nodes have
+    /// already reported (the loop below) — it must never, on its own,
+    /// latch `warm` on a registry that has received zero heartbeats at
+    /// all. A registry in that state is not "waited long enough and heard
+    /// nothing back from a dead node" — it is a process that has not
+    /// finished starting, and every replica of a rolling DaemonSet restart
+    /// is in exactly that state simultaneously for this gate's whole
+    /// `timeout`. Before this check existed here, a cold registry still
+    /// latched `warm = true` the moment its deadline passed, and
+    /// [`crate::node_client::NativeNodePlacement::node_membership`] turned
+    /// that straight into a confident [`crate::node_client::placement::NodeMembership::Gone`]
+    /// for every node it was asked about — which `src/node_client/stub.rs`
+    /// and `src/orchestrator/service.rs` treat as proof a sandbox's runtime
+    /// is gone for good, and delete its record. See this module's own
+    /// tests, and `native_placement.rs`'s
+    /// `node_membership_stays_cold_past_the_deadline_when_nothing_has_ever_reported`,
+    /// for the two-sided proof: the gate must stay shut with zero reports
+    /// even past the deadline, and must still open at the deadline once at
+    /// least one node (not necessarily every node) has reported in.
     pub fn warmed_up(&self, now: SystemTime) -> bool {
         if self.warm.load(Ordering::SeqCst) {
             return true;
+        }
+        if !self.reported.load(Ordering::SeqCst) {
+            return false;
         }
         let deadline = *self.deadline.read().expect("warmup deadline lock poisoned");
         if now >= deadline {
             self.warm.store(true, Ordering::SeqCst);
             return true;
-        }
-        if !self.reported.load(Ordering::SeqCst) {
-            return false;
         }
 
         // Lingering nodes are excluded deliberately: they are on their way
@@ -219,9 +241,52 @@ mod tests {
 
     // A node that is genuinely down never reports. Waiting for it forever
     // would turn every legitimate "not found" into "unavailable" for the
-    // life of the process.
+    // life of the process -- but only once *something else* has reported,
+    // so this registry is not merely a process that has not finished
+    // starting yet. See `warmed_up`'s own doc comment for the two-sided
+    // argument and the P1 bug this pair of tests replaced a single,
+    // now-wrong test for.
     #[test]
-    fn opens_at_the_deadline() {
+    fn opens_at_the_deadline_for_a_silent_straggler_once_something_has_reported() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a"), node("node-b")],
+            Duration::from_secs(30),
+        ));
+        let start = unix(100);
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            start,
+        );
+        // node-a reports; node-b never does for the rest of this test --
+        // deliberately not both, or the roster-complete path a few lines
+        // below `warmed_up`'s deadline check would open the gate on its
+        // own and this test would no longer be exercising the deadline at
+        // all.
+        heartbeat(&registry, &gate, "node-a", start);
+
+        assert!(
+            !gate.warmed_up(start + Duration::from_secs(14)),
+            "the gate must stay shut until the deadline, even with node-a already reported"
+        );
+        assert!(
+            gate.warmed_up(start + Duration::from_secs(15)),
+            "the gate must open at the deadline even with node-b still silent, now that \
+             node-a has reported at least once"
+        );
+    }
+
+    /// 🔴 P1: the fixed half of the bug `NativeNodePlacement::node_membership`
+    /// used to have -- a registry that has received *zero* heartbeats at
+    /// all (not "one straggler among several", but every known node still
+    /// silent) must not open past its deadline. Before the fix, this and
+    /// the test above were one test, asserting the gate opens at the
+    /// deadline "even with a silent node" with no heartbeat fed to it at
+    /// all -- which was proving the exact bug that let a freshly
+    /// (re)started replica read every node as `Gone` the moment its
+    /// deadline passed, heartbeats or not.
+    #[test]
+    fn stays_cold_past_the_deadline_when_nothing_has_ever_reported() {
         let registry: Arc<dyn NodeRegistry> = Arc::new(AtomicNodeRegistry::new(
             vec![node("node-a")],
             Duration::from_secs(30),
@@ -231,11 +296,17 @@ mod tests {
 
         assert!(
             !gate.warmed_up(start + Duration::from_secs(14)),
-            "the gate must stay shut until the deadline"
+            "the gate must stay shut before the deadline"
         );
         assert!(
-            gate.warmed_up(start + Duration::from_secs(15)),
-            "the gate must open at the deadline even with a silent node"
+            !gate.warmed_up(start + Duration::from_secs(15)),
+            "the gate must stay shut at and after the deadline too -- nothing has ever \
+             reported, so this is a registry that has not finished starting, not a \
+             genuinely-down node"
+        );
+        assert!(
+            !gate.warmed_up(start + Duration::from_secs(1_000_000)),
+            "and it must stay shut arbitrarily far past the deadline, for the same reason"
         );
     }
 
@@ -265,15 +336,28 @@ mod tests {
 
     #[test]
     fn rebase_deadline_moves_when_the_deadline_falls() {
-        let registry: Arc<dyn NodeRegistry> = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a")],
+        // Two known nodes, and only node-a ever heartbeats, for the same
+        // reason `opens_at_the_deadline_for_a_silent_straggler_once_something_has_reported`
+        // above uses two: since P1, the deadline can only open the gate
+        // once *something* has reported (`warmed_up`'s own doc comment), so
+        // this test needs at least one heartbeat to exercise the deadline
+        // boundary at all -- but heartbeating every known node would open
+        // the gate through the roster-complete path instead, before either
+        // `warmed_up` call below ever consulted a deadline, rebased or not.
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a"), node("node-b")],
             Duration::from_secs(30),
         ));
         // Constructed as if the assembly sequence before the gRPC listener
         // bound had already burned the whole timeout — exactly the bug
         // this exists to fix.
         let constructed_at = unix(0);
-        let gate = WarmupGate::new(registry, Duration::from_secs(15), constructed_at);
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            constructed_at,
+        );
+        heartbeat(&registry, &gate, "node-a", constructed_at);
         assert!(
             gate.warmed_up(constructed_at + Duration::from_secs(15)),
             "sanity: without a rebase the original deadline would already have passed"
@@ -281,13 +365,19 @@ mod tests {
 
         // The listener actually binds much later — rebase from there.
         let bound_at = unix(1_000);
-        let gate = {
-            let registry: Arc<dyn NodeRegistry> = Arc::new(AtomicNodeRegistry::new(
-                vec![node("node-a")],
+        let (registry, gate) = {
+            let registry = Arc::new(AtomicNodeRegistry::new(
+                vec![node("node-a"), node("node-b")],
                 Duration::from_secs(30),
             ));
-            WarmupGate::new(registry, Duration::from_secs(15), constructed_at)
+            let gate = WarmupGate::new(
+                registry.clone() as Arc<dyn NodeRegistry>,
+                Duration::from_secs(15),
+                constructed_at,
+            );
+            (registry, gate)
         };
+        heartbeat(&registry, &gate, "node-a", constructed_at);
         gate.rebase_deadline(bound_at, Duration::from_secs(15));
 
         assert!(

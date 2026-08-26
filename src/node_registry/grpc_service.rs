@@ -25,8 +25,10 @@
 //!
 //! # What is deliberately `unimplemented`
 //!
-//! `schedule`/`lookup_node`/`record_assignment` need the binding store
-//! (Stage D, still pending in this file — see below);
+//! `schedule`/`lookup_node` need the binding store's write and the
+//! three-stage lookup ladder respectively (still pending in this file —
+//! see below); `record_assignment` **is** implemented (task's own "D3"
+//! — see below), gated the same way `report_sandbox_event` is.
 //! `list_p2p_peers`/`record_p2p_artifact`/`forget_p2p_artifact`/
 //! `lookup_p2p_artifact` are the P2P discovery group
 //! (`_sd-phase4-stageA-node-inventory.md` §7 risk 3 — explicitly not to be
@@ -127,10 +129,8 @@ pub struct NodeRegistryGrpcService {
     /// a construction-time value the process wiring passes to both, not
     /// re-derived from one at call time.
     projection_authoritative: bool,
-    /// Mirrors Go's `Service.maxProjectionTTL`, used by a caller this Stage
-    /// has not wired yet (`RecordAssignment`'s `resolveProjectionTTL`) --
-    /// carried here now so that wiring is additive when it lands.
-    #[allow(dead_code)]
+    /// Mirrors Go's `Service.maxProjectionTTL`, consumed by
+    /// `resolve_projection_ttl` (`RecordAssignment`).
     max_projection_ttl: Duration,
 }
 
@@ -161,6 +161,27 @@ impl NodeRegistryGrpcService {
         self.projection_authoritative = projection_authoritative;
         self.max_projection_ttl = max_projection_ttl;
         self
+    }
+
+    /// Ports `resolveProjectionTTL` (`service.go:656-673`): `<= 0` raw or
+    /// the switch off both mean "use the receiver's own `binding_ttl`"
+    /// (`Duration::ZERO`, the same sentinel `BindingStore::record`'s
+    /// `projection_ttl` already treats that way); a positive raw value is
+    /// clamped to `max_projection_ttl` when configured (`> Duration::ZERO`)
+    /// and exceeded, otherwise passed through unchanged.
+    fn resolve_projection_ttl(&self, raw: Duration) -> (Duration, &'static str) {
+        if !self.projection_authoritative || raw.is_zero() {
+            return (Duration::ZERO, "default");
+        }
+        if !self.max_projection_ttl.is_zero() && raw > self.max_projection_ttl {
+            return (self.max_projection_ttl, "clamped");
+        }
+        (raw, "node")
+    }
+
+    fn record_projection_ttl_source(source: &str) {
+        metrics::counter!(PROJECTION_TTL_SOURCE_METRIC, "source" => source.to_string())
+            .increment(1);
     }
 
     /// Ports `sandboxEventTypeLabel` (`metrics.go`, used from
@@ -281,6 +302,21 @@ const SANDBOX_EVENT_METRIC: &str = "agentenv_api_sandbox_event_total";
 /// Ports `agentenv_scheduler_heartbeat_legacy_roster_total`, renamed per
 /// this module's own `scheduler` -> `api` convention.
 const HEARTBEAT_LEGACY_ROSTER_METRIC: &str = "agentenv_api_heartbeat_legacy_roster_total";
+/// Ports `agentenv_scheduler_projection_ttl_source_total`.
+const PROJECTION_TTL_SOURCE_METRIC: &str = "agentenv_api_projection_ttl_source_total";
+
+/// The one conversion from the wire's whole seconds. A zero value becomes
+/// `Duration::ZERO`, which every reader of this treats as "no budget
+/// offered" and never as "no expiry" -- mirrors `registry.rs`'s own private
+/// copy of this same conversion (`projection_ttl_from_secs`), duplicated
+/// here rather than exposed across the module boundary for one call site.
+fn projection_ttl_from_secs(secs: u32) -> Duration {
+    if secs == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(u64::from(secs))
+    }
+}
 
 fn node_status_label(status: scheduler::NodeStatus) -> &'static str {
     match status {
@@ -502,13 +538,73 @@ impl Scheduler for NodeRegistryGrpcService {
         )))
     }
 
+    /// Ports `RecordAssignment` (`service.go:463-512`, task's own "D3"):
+    /// validates the required fields, resolves the caller's node identity
+    /// through discovery (`AtomicNodeRegistry::resolve`, so an assignment
+    /// naming a pod's previous identity after a fleet-upgrade rename still
+    /// lands on the right binding), normalizes the execution id without the
+    /// roster-drop metric (same reasoning as `apply_projection_delete`:
+    /// this is not the roster path), resolves the projection TTL through
+    /// the same `projection_authoritative`/`max_projection_ttl` gate
+    /// `resolve_projection_ttl` implements, and records the binding through
+    /// the same arbitration a heartbeat's `ReconcileNode` uses.
     async fn record_assignment(
         &self,
-        _request: Request<RecordAssignmentRequest>,
+        request: Request<RecordAssignmentRequest>,
     ) -> Result<Response<RecordAssignmentResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "RecordAssignment needs the Stage D binding store: {NOT_STAGE_A}"
-        )))
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "RecordAssignment needs a binding store, and this deployment has not wired one \
+                 in yet: {NOT_STAGE_A}"
+            )));
+        };
+        let req = request.into_inner();
+        let sandbox_id = req.sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let Some(wire_node) = req.node else {
+            return Err(Status::invalid_argument("node is required"));
+        };
+        let requested_id = wire_node.node_id.trim();
+        if requested_id.is_empty() || wire_node.endpoint.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "node.node_id and node.endpoint are required",
+            ));
+        }
+        let Some(node) = self.registry.resolve(requested_id) else {
+            return Err(Status::invalid_argument(
+                "node is not in scheduler node list",
+            ));
+        };
+
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(&req.execution_id);
+        let (projection_ttl, ttl_source) =
+            self.resolve_projection_ttl(projection_ttl_from_secs(req.projection_ttl_secs));
+        Self::record_projection_ttl_source(ttl_source);
+
+        let now = SystemTime::now();
+        if let Err(err) = binding_store
+            .record(
+                sandbox_id,
+                crate::binding_store::Binding {
+                    node,
+                    execution_id: execution,
+                    projection_ttl,
+                },
+                now,
+            )
+            .await
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "scheduler record_assignment binding write failed"
+            );
+            return Err(Status::unavailable("binding store unavailable"));
+        }
+        Ok(Response::new(RecordAssignmentResponse {}))
     }
 
     /// Ports `service.go:576-598` (`ReportSandboxEvent`): PAUSE/DELETE
@@ -1381,5 +1477,144 @@ mod tests {
             })
             .await
             .expect("a binding-cleanup failure must not fail unregister_node itself");
+    }
+
+    // ---- record_assignment: task's own "D3" ----
+
+    #[tokio::test]
+    async fn record_assignment_writes_a_binding_resolved_through_discovery() {
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        let (mut client, _stop) = service_with_binding_store(
+            vec![node("node-a", "http://10.0.0.7:8000")],
+            Arc::clone(&store),
+            true,
+        )
+        .await;
+
+        client
+            .record_assignment(RecordAssignmentRequest {
+                sandbox_id: "sbx-1".to_string(),
+                node: Some(crate::proto::scheduler::Node {
+                    node_id: "node-a".to_string(),
+                    // Deliberately a stale endpoint the caller might have
+                    // cached -- resolving through discovery must use the
+                    // registry's own current endpoint, not this one.
+                    endpoint: "http://stale:9999".to_string(),
+                }),
+                execution_id: "00000000-0000-7000-8000-000000000001".to_string(),
+                projection_ttl_secs: 0,
+            })
+            .await
+            .expect("record_assignment succeeds");
+
+        let binding = store
+            .get("sbx-1", SystemTime::now())
+            .await
+            .unwrap()
+            .expect("bound");
+        assert_eq!(
+            binding.node.endpoint, "http://10.0.0.7:8000",
+            "the binding must carry discovery's current endpoint, not the caller's stale one"
+        );
+        assert_eq!(binding.execution_id, "00000000-0000-7000-8000-000000000001");
+    }
+
+    #[tokio::test]
+    async fn record_assignment_rejects_an_unknown_node() {
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        let (mut client, _stop) = service_with_binding_store(vec![], store, true).await;
+
+        let status = client
+            .record_assignment(RecordAssignmentRequest {
+                sandbox_id: "sbx-1".to_string(),
+                node: Some(crate::proto::scheduler::Node {
+                    node_id: "node-a".to_string(),
+                    endpoint: "http://10.0.0.7:8000".to_string(),
+                }),
+                execution_id: String::new(),
+                projection_ttl_secs: 0,
+            })
+            .await
+            .expect_err("node-a is not discovered");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn record_assignment_rejects_missing_required_fields() {
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        let (mut client, _stop) = service_with_binding_store(vec![], store, true).await;
+
+        let status = client
+            .record_assignment(RecordAssignmentRequest {
+                sandbox_id: String::new(),
+                node: Some(crate::proto::scheduler::Node {
+                    node_id: "node-a".to_string(),
+                    endpoint: "http://10.0.0.7:8000".to_string(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect_err("empty sandbox_id");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        let status = client
+            .record_assignment(RecordAssignmentRequest {
+                sandbox_id: "sbx-1".to_string(),
+                node: None,
+                ..Default::default()
+            })
+            .await
+            .expect_err("missing node");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn resolve_projection_ttl_matches_the_go_table() {
+        let off = NodeRegistryGrpcService::new(
+            Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30))),
+            Arc::new(WarmupGate::new(
+                Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)))
+                    as Arc<dyn NodeRegistry>,
+                Duration::from_secs(15),
+                SystemTime::now(),
+            )),
+        );
+        assert_eq!(
+            off.resolve_projection_ttl(Duration::from_secs(60)),
+            (Duration::ZERO, "default"),
+            "the switch off must always answer default, regardless of what the node offered"
+        );
+
+        let on = off.with_binding_store(
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            )),
+            true,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            on.resolve_projection_ttl(Duration::ZERO),
+            (Duration::ZERO, "default"),
+            "a non-positive raw value is always default, even with the switch on"
+        );
+        assert_eq!(
+            on.resolve_projection_ttl(Duration::from_secs(60)),
+            (Duration::from_secs(60), "node"),
+            "a raw value under the ceiling passes through unchanged"
+        );
+        assert_eq!(
+            on.resolve_projection_ttl(Duration::from_secs(7200)),
+            (Duration::from_secs(3600), "clamped"),
+            "a raw value over the ceiling is clamped to it"
+        );
     }
 }

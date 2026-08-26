@@ -39,7 +39,8 @@ use agentenv::node_registry::warmup::WarmupGate;
 use agentenv::observability::ObservabilityService;
 use agentenv::orchestrator::{
     build_paused_registry, spawn_paused_registry_background_tasks, DisabledSandboxPersister,
-    Orchestrator, RedisMetadataStore, SandboxOrchestration,
+    Orchestrator, PgPausedRegistryFactory, PostgresPausedRegistryFactory, RedisMetadataStore,
+    SandboxOrchestration,
 };
 use agentenv::pg::{self, PgPoolSettings};
 use agentenv::role::ServerRole;
@@ -414,13 +415,20 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> = native_registry_handle
         .clone()
         .map(|registry| registry as Arc<dyn NodeRegistry>);
+    // The `postgres` arm's own constructor, when this replica has a pool at
+    // all. `build_paused_registry` keeps the arm, its refusal message and its
+    // `--role api` roster guard; the pool, the schema bootstrap and the
+    // restart-grace entry live behind this.
+    let paused_registry_factory = pg_pool.clone().map(PgPausedRegistryFactory::new);
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
         &config.cluster,
         &config.observability.scheduler_report,
         &identity_for_registry,
         role,
-        pg_pool.clone(),
+        paused_registry_factory
+            .as_ref()
+            .map(|factory| factory as &dyn PostgresPausedRegistryFactory),
         node_registry_for_paused.clone(),
     )
     .await?;
@@ -479,7 +487,17 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
 
-    let snapshot_manager = Arc::new(SnapshotManager::new(None, None, pg_pool.clone(), role).await?);
+    // The central catalog's three faces and Stage B step 4's shared read-side
+    // confirmation record, both over the one pool this replica built — the
+    // only things `build_snapshot_backend` needs from PostgreSQL, and the
+    // reason it no longer takes the pool itself.
+    let pg_catalog = pg_pool
+        .as_ref()
+        .map(|pool| agentenv::snapshot::repository::backends::pg_catalog_parts(config, pool));
+    let snapshot_backend =
+        agentenv::snapshot::repository::backends::build_snapshot_backend(None, pg_catalog, role)
+            .await?;
+    let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));
 

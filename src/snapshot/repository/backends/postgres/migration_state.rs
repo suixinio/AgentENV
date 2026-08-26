@@ -63,30 +63,36 @@ fn now_ms() -> i64 {
 }
 
 /// [`ReadSideConfirmationStore`] backed by `catalog_migration_state`.
-pub(crate) struct PgReadSideConfirmation<'a> {
-    pool: &'a PgPool,
+/// 🔴 Owns its pool and node id rather than borrowing them: the one
+/// production constructor hands this out as an
+/// `Arc<dyn ReadSideConfirmationStore>` (see
+/// [`pg_catalog_parts`][super::pg_catalog_parts]), which a borrowing type
+/// cannot be. `PgPool` is an `Arc` internally, so the clone is a refcount
+/// bump.
+pub(crate) struct PgReadSideConfirmation {
+    pool: PgPool,
     cluster_id: Uuid,
-    node_id: &'a str,
+    node_id: String,
 }
 
-impl<'a> PgReadSideConfirmation<'a> {
-    pub(crate) fn new(pool: &'a PgPool, cluster_id: Uuid, node_id: &'a str) -> Self {
+impl PgReadSideConfirmation {
+    pub(crate) fn new(pool: &PgPool, cluster_id: Uuid, node_id: &str) -> Self {
         Self {
-            pool,
+            pool: pool.clone(),
             cluster_id,
-            node_id,
+            node_id: node_id.to_string(),
         }
     }
 }
 
 #[async_trait]
-impl ReadSideConfirmationStore for PgReadSideConfirmation<'_> {
+impl ReadSideConfirmationStore for PgReadSideConfirmation {
     async fn is_confirmed(&self) -> anyhow::Result<bool> {
-        read_side_confirmed(self.pool, self.cluster_id).await
+        read_side_confirmed(&self.pool, self.cluster_id).await
     }
 
     async fn confirm(&self) -> anyhow::Result<()> {
-        confirm_read_side(self.pool, self.cluster_id, self.node_id).await
+        confirm_read_side(&self.pool, self.cluster_id, &self.node_id).await
     }
 }
 

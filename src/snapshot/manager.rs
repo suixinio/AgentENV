@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use crate::snapshot::captured::{CapturedSandboxSnapshot, SnapshotArtifactAdvertiser};
-use crate::snapshot::repository::backends::build_snapshot_backend;
+use crate::snapshot::repository::backends::AssembledSnapshotBackend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
@@ -134,32 +134,28 @@ pub struct SnapshotManager {
 }
 
 impl SnapshotManager {
-    /// Builds a manager using the configured repository backend.
+    /// Builds a manager over an already-assembled backend.
     ///
-    /// Async because assembling the catalog may have to open the double
-    /// write's durable backlog and check it before anything is served.
+    /// # 🔴 Assembly happens in the process, not here
     ///
-    /// `pg_pool` is `Some` only for `--role api` / `--role all` replicas that
-    /// have `[pg]` configured — see `src/bin/aenv-api.rs::build_pg_pool`.
-    /// `--role node` always passes `None`: it must never hold PostgreSQL
-    /// credentials, see `src/pg/mod.rs`'s own module doc.
-    ///
-    /// `role` gates whether a central snapshot catalog (Postgres or the
-    /// scheduler's gRPC one) is built at all — see
-    /// `ServerRole::never_constructs_a_central_snapshot_catalog`'s own doc.
-    pub async fn new(
-        p2p_transport: Option<Arc<dyn crate::p2p::P2pTransport>>,
+    /// This used to be `SnapshotManager::new`, which called
+    /// [`build_snapshot_backend`] itself and so needed everything that
+    /// function needs — including an `Option<sqlx::PgPool>` threaded through
+    /// a type that has no business holding one. Each binary now assembles the
+    /// backend its own half is allowed to build and hands the result here:
+    /// `aenv-node` supplies the byte half and no central catalog, `aenv-api`
+    /// supplies the catalog-only repository and, when `[pg]` is configured,
+    /// the PostgreSQL parts.
+    pub fn from_assembled(
+        assembled: AssembledSnapshotBackend,
         advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
-        pg_pool: Option<sqlx::PgPool>,
-        role: crate::role::ServerRole,
-    ) -> anyhow::Result<Self> {
-        let assembled = build_snapshot_backend(p2p_transport, pg_pool, role).await?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             repository: assembled.repository,
             runtime_resolver: assembled.runtime_resolver,
             advertiser,
             _mirror_compensator: assembled.mirror_compensator,
-        })
+        }
     }
 
     /// Builds a manager from the given components.

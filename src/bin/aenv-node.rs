@@ -341,9 +341,20 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
         Arc::new(agentenv::snapshot::P2pSnapshotAdvertiser::new(transport))
             as Arc<dyn agentenv::snapshot::SnapshotArtifactAdvertiser>
     });
-    let snapshot_manager = Arc::new(
-        SnapshotManager::new(snapshot_p2p_transport, snapshot_advertiser, None, role).await?,
-    );
+    // 🔴 `None` for the PostgreSQL parts, unconditionally and by construction:
+    // this half never holds a `[pg]` pool (see `agentenv::pg`'s own module
+    // doc and `ServerRole::check_pg_dsn`), so there is nothing for it to build
+    // a central catalog out of.
+    let snapshot_backend = agentenv::snapshot::repository::backends::build_snapshot_backend(
+        snapshot_p2p_transport,
+        None,
+        role,
+    )
+    .await?;
+    let snapshot_manager = Arc::new(SnapshotManager::from_assembled(
+        snapshot_backend,
+        snapshot_advertiser,
+    ));
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     // The handle the cold-boot paths read the CPUID intersection from.
     //

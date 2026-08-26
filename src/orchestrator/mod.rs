@@ -20,9 +20,10 @@ pub use metrics::OrchestratorMetrics;
 pub use paused_registry::{
     build_paused_registry, spawn_paused_registry_background_tasks, BeganPause, ConflictReason,
     DeadlineRenewalOutcome, DisabledPausedSandboxRegistry, HeldSandbox, MarkRunningOutcome,
-    PausedRegistryError, PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState,
-    PausedSandboxEntry, PausedSandboxPublisher, PausedSandboxRegistry, ReclaimedHoldings,
-    RegistryResult, ReleasedHoldings, ResumeClaim,
+    PausedRegistryBackgroundTasks, PausedRegistryError, PausedRegistryListEntry,
+    PausedRegistryListing, PausedRegistryState, PausedSandboxEntry, PausedSandboxPublisher,
+    PausedSandboxRegistry, PgPausedRegistryFactory, PostgresPausedRegistryFactory,
+    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 pub use persistence::{
     ClusterRegistration, DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,

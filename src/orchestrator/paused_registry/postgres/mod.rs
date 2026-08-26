@@ -70,6 +70,8 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::cfg::{PausedRegistryBackendKind, PausedRegistryConfig};
+use crate::identity::NodeIdentity;
 use crate::node_registry::registry::NodeRegistry;
 use crate::pg::SingletonTaskHandle;
 use crate::snapshot::SnapshotId;
@@ -77,8 +79,61 @@ use crate::types::{ExecutionId, SandboxId};
 
 use super::{
     BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedSandboxEntry,
-    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    PausedSandboxRegistry, PostgresPausedRegistryFactory, ReclaimedHoldings, RegistryResult,
+    ReleasedHoldings, ResumeClaim,
 };
+
+/// [`PostgresPausedRegistryFactory`] over one shared `[pg]` pool.
+///
+/// 🔴 The only thing on this side of the boundary that a caller has to name
+/// to select the `postgres` backend. `build_paused_registry` keeps the arm,
+/// the refusal message and the `--role api` roster guard; this keeps the
+/// pool, the schema bootstrap and B2(1)'s synchronous restart-grace entry.
+pub struct PgPausedRegistryFactory {
+    pool: PgPool,
+}
+
+impl PgPausedRegistryFactory {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait(?Send)]
+impl PostgresPausedRegistryFactory for PgPausedRegistryFactory {
+    async fn build(
+        &self,
+        identity: &NodeIdentity,
+        lease_ttl: Duration,
+    ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
+        build_registry(self.pool.clone(), identity.cluster_id, lease_ttl).await
+    }
+}
+
+async fn build_registry(
+    pool: PgPool,
+    cluster_id: Uuid,
+    lease_ttl: Duration,
+) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
+    use anyhow::Context as _;
+
+    schema::migrate(&pool)
+        .await
+        .context("bootstrap the paused_sandboxes schema")?;
+
+    // 🔴 B2(1): a synchronous, best-effort attempt to enter restart grace
+    // *before* this returns and the caller opens for traffic -- see
+    // `grace::attempt_initial_entry`'s own doc for why this closes (most of)
+    // the window between this process serving its first request and the
+    // reconcile leader's own background loop landing its first `enter`. Never
+    // fails this call: a database that cannot be reached for this attempt will
+    // be retried by the background reconcile loop regardless.
+    attempt_initial_grace_entry(&pool, cluster_id, lease_ttl.as_secs_f64()).await;
+
+    Ok(Arc::new(PostgresPausedSandboxRegistry::new(
+        pool, cluster_id, lease_ttl,
+    )))
+}
 
 /// A direct PostgreSQL-backed [`PausedSandboxRegistry`]. One shared `[pg]`
 /// pool (built once per `--role api`/`--role all` process by
@@ -313,4 +368,64 @@ pub(super) fn spawn_background_tasks(
 /// parent module) can call it without reaching into [`grace`] directly.
 pub(super) async fn attempt_initial_grace_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
     grace::attempt_initial_entry(pool, cluster_id, ttl_secs).await
+}
+
+/// [`spawn_paused_registry_background_tasks`]'s result -- split by shutdown
+/// mechanism, mirroring `postgres::BackgroundTasks` (which this simply
+/// forwards): `singleton` needs `SingletonTaskHandle::shutdown()`'s async
+/// advisory-lock release and belongs in `Assembly::pg_singleton_tasks`
+/// (`src/bin/aenv-api.rs`); `plain` is safe to `.abort()` and belongs in
+/// `Assembly::upkeep` alongside `spawn_paused_record_upkeep`'s own tasks.
+#[derive(Default)]
+pub struct PausedRegistryBackgroundTasks {
+    pub singleton: Vec<SingletonTaskHandle>,
+    pub plain: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Starts the `postgres` backend's background tasks (reconcile leader loop,
+/// reclaim leader loop, and -- M1 -- B1's per-replica renewal loop when a
+/// roster source is available; see `postgres::spawn_background_tasks`'s own
+/// doc), if and only if `config.backend == Postgres`. Every other backend
+/// returns everything empty.
+///
+/// Kept separate from [`build_paused_registry`] deliberately, mirroring
+/// `src/bin/aenv-api.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
+/// split: the registry itself has to exist before `ApiImpl`/`Orchestrator`
+/// can be constructed, but the resulting task handles belong in the buckets
+/// every other PostgreSQL-backed background task in this process already
+/// shuts down through.
+///
+/// 🔴 Call this only after a preceding [`build_paused_registry`] call with
+/// the same `config`/`pg_pool` has already succeeded (it performed the
+/// "postgres requires a pool" validation this function relies on without
+/// repeating). `node_registry` may legitimately be `None` here even when
+/// `config.backend == Postgres` (M1: `--role all`) -- see
+/// `postgres::spawn_background_tasks`'s own doc for what that does and does
+/// not skip.
+pub fn spawn_paused_registry_background_tasks(
+    config: &PausedRegistryConfig,
+    identity: &NodeIdentity,
+    pg_pool: Option<sqlx::PgPool>,
+    node_registry: Option<Arc<dyn NodeRegistry>>,
+) -> PausedRegistryBackgroundTasks {
+    if config.backend != PausedRegistryBackendKind::Postgres {
+        return PausedRegistryBackgroundTasks::default();
+    }
+    let Some(pool) = pg_pool else {
+        return PausedRegistryBackgroundTasks::default();
+    };
+
+    let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
+    let tasks = spawn_background_tasks(
+        pool,
+        identity.cluster_id,
+        lease_ttl,
+        config.reconcile_interval(),
+        config.reclaim_interval(),
+        node_registry,
+    );
+    PausedRegistryBackgroundTasks {
+        singleton: tasks.singleton,
+        plain: tasks.plain,
+    }
 }

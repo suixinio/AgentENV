@@ -37,13 +37,14 @@ use crate::cfg::{
 use crate::identity::NodeIdentity;
 use crate::node_registry::registry::NodeRegistry;
 use crate::orchestrator::PauseOutcome;
-use crate::pg::SingletonTaskHandle;
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
 pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
-pub use postgres::PostgresPausedSandboxRegistry;
+pub use postgres::{
+    spawn_paused_registry_background_tasks, PausedRegistryBackgroundTasks, PgPausedRegistryFactory,
+};
 pub use types::{
     BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
     PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState, PausedSandboxEntry,
@@ -580,6 +581,41 @@ pub(super) fn log_claim_outcome(
     }
 }
 
+/// The `postgres` backend's own constructor, supplied by whichever half of
+/// the process holds the `[pg]` pool.
+///
+/// # 🔴 A trait, and not the `sqlx::PgPool` this used to take
+///
+/// [`build_paused_registry`] is the shared assembly: every role calls it, and
+/// two of its three arms (`local`, `central`) need no database at all. The
+/// third one does, and the pool, the schema bootstrap and the restart-grace
+/// entry that go with it belong to the deciding half alone — the half that is
+/// allowed to hold database credentials (`src/pg/mod.rs`'s own module doc:
+/// "`--role node` never reaches this module"). Taking the constructor as a
+/// trait object is what lets the arm stay here, with its refusal message and
+/// its `--role api` roster guard, while the thing it constructs lives behind
+/// the boundary that owns `sqlx`.
+///
+/// `None` means "this process has no `[pg]` pool", which is what the
+/// `postgres` arm refuses on — see its own `context` line for the message.
+///
+/// 🔴 `?Send`: the schema bootstrap behind this holds a pooled connection
+/// across `await` in a shape `sqlx`'s `Executor` impls make non-`Send`
+/// ("implementation of `sqlx::Executor` is not general enough"). Nothing
+/// spawns [`build_paused_registry`] — both callers await it directly from
+/// their process's entry point — so requiring a `Send` future here would buy
+/// nothing and cost the boxing this cannot express.
+#[async_trait(?Send)]
+pub trait PostgresPausedRegistryFactory: Send + Sync {
+    /// Brings the schema up to date, enters restart grace, and returns the
+    /// registry — in that order, all before returning.
+    async fn build(
+        &self,
+        identity: &NodeIdentity,
+        lease_ttl: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>>;
+}
+
 /// Builds the configured registry, and says which one it built.
 ///
 /// A cluster backend that is missing what it needs to reach the cluster is a
@@ -591,9 +627,12 @@ pub(super) fn log_claim_outcome(
 /// The backends that *are* reachable this way — `local` because the override
 /// never arrived — are told apart by the one info line at the end.
 ///
-/// `pg_pool`/`node_registry` are Stage C's own additions, both `None` for
+/// `postgres`/`node_registry` are Stage C's own additions, both `None` for
 /// every caller not selecting `postgres` (the `Local`/`Central` arms never
-/// touch either). `node_registry` is `Some` only when `--role api` built a
+/// touch either). `postgres` is the database half's own constructor --
+/// see [`PostgresPausedRegistryFactory`] for why this arrives as a trait
+/// object rather than as the `sqlx::PgPool` it used to be. `node_registry` is
+/// `Some` only when `--role api` built a
 /// real `crate::node_registry::registry::AtomicNodeRegistry`
 /// (`[cluster].node_placement_source = "native"`, `src/bin/aenv-api.rs`'s
 /// `assemble_api`) -- `--role all` never builds one at all.
@@ -606,14 +645,14 @@ pub async fn build_paused_registry(
     scheduler_report: &ObservabilitySchedulerReportConfig,
     identity: &NodeIdentity,
     role: crate::role::ServerRole,
-    pg_pool: Option<sqlx::PgPool>,
+    postgres: Option<&dyn PostgresPausedRegistryFactory>,
     node_registry: Option<Arc<dyn NodeRegistry>>,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
     let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
         match config.backend {
             PausedRegistryBackendKind::Local => (Arc::new(DisabledPausedSandboxRegistry), ""),
             PausedRegistryBackendKind::Postgres => {
-                let pool = pg_pool.context(
+                let factory = postgres.context(
                     "paused_registry.backend = \"postgres\" requires [pg].dsn to be configured \
                      (the shared PostgreSQL pool this process already builds for Stage B's \
                      catalog, if [pg] is set)",
@@ -662,34 +701,15 @@ pub async fn build_paused_registry(
                 // matter, not one avoided.
                 drop(node_registry);
 
-                postgres::schema::migrate(&pool)
-                    .await
-                    .context("bootstrap the paused_sandboxes schema")?;
-
                 let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
 
-                // 🔴 B2(1): a synchronous, best-effort attempt to enter
-                // restart grace *before* this function returns and its
-                // caller opens for traffic -- see
-                // `postgres::grace::attempt_initial_entry`'s own doc for why
-                // this closes (most of) the window between this process
-                // serving its first request and the reconcile leader's own
-                // background loop landing its first `enter`. Never fails
-                // this call: a database that cannot be reached for this
-                // attempt will be retried by the background reconcile loop
-                // regardless.
-                postgres::attempt_initial_grace_entry(
-                    &pool,
-                    identity.cluster_id,
-                    lease_ttl.as_secs_f64(),
-                )
-                .await;
-
-                let registry = Arc::new(PostgresPausedSandboxRegistry::new(
-                    pool,
-                    identity.cluster_id,
-                    lease_ttl,
-                ));
+                // 🔴 The schema bootstrap and B2(1)'s synchronous
+                // restart-grace entry both live behind this call, in the
+                // half that holds the pool -- see
+                // [`PgPausedRegistryFactory::build`]. They are not optional
+                // and not deferred: `build` performs both before it hands
+                // back a registry, exactly as this arm used to inline.
+                let registry = factory.build(identity, lease_ttl).await?;
 
                 (registry, "")
             }
@@ -743,66 +763,6 @@ pub async fn build_paused_registry(
     );
 
     Ok(registry)
-}
-
-/// [`spawn_paused_registry_background_tasks`]'s result -- split by shutdown
-/// mechanism, mirroring `postgres::BackgroundTasks` (which this simply
-/// forwards): `singleton` needs `SingletonTaskHandle::shutdown()`'s async
-/// advisory-lock release and belongs in `Assembly::pg_singleton_tasks`
-/// (`src/bin/aenv-api.rs`); `plain` is safe to `.abort()` and belongs in
-/// `Assembly::upkeep` alongside `spawn_paused_record_upkeep`'s own tasks.
-#[derive(Default)]
-pub struct PausedRegistryBackgroundTasks {
-    pub singleton: Vec<SingletonTaskHandle>,
-    pub plain: Vec<tokio::task::JoinHandle<()>>,
-}
-
-/// Starts the `postgres` backend's background tasks (reconcile leader loop,
-/// reclaim leader loop, and -- M1 -- B1's per-replica renewal loop when a
-/// roster source is available; see `postgres::spawn_background_tasks`'s own
-/// doc), if and only if `config.backend == Postgres`. Every other backend
-/// returns everything empty.
-///
-/// Kept separate from [`build_paused_registry`] deliberately, mirroring
-/// `src/bin/aenv-api.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
-/// split: the registry itself has to exist before `ApiImpl`/`Orchestrator`
-/// can be constructed, but the resulting task handles belong in the buckets
-/// every other PostgreSQL-backed background task in this process already
-/// shuts down through.
-///
-/// 🔴 Call this only after a preceding [`build_paused_registry`] call with
-/// the same `config`/`pg_pool` has already succeeded (it performed the
-/// "postgres requires a pool" validation this function relies on without
-/// repeating). `node_registry` may legitimately be `None` here even when
-/// `config.backend == Postgres` (M1: `--role all`) -- see
-/// `postgres::spawn_background_tasks`'s own doc for what that does and does
-/// not skip.
-pub fn spawn_paused_registry_background_tasks(
-    config: &PausedRegistryConfig,
-    identity: &NodeIdentity,
-    pg_pool: Option<sqlx::PgPool>,
-    node_registry: Option<Arc<dyn NodeRegistry>>,
-) -> PausedRegistryBackgroundTasks {
-    if config.backend != PausedRegistryBackendKind::Postgres {
-        return PausedRegistryBackgroundTasks::default();
-    }
-    let Some(pool) = pg_pool else {
-        return PausedRegistryBackgroundTasks::default();
-    };
-
-    let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
-    let tasks = postgres::spawn_background_tasks(
-        pool,
-        identity.cluster_id,
-        lease_ttl,
-        config.reconcile_interval(),
-        config.reclaim_interval(),
-        node_registry,
-    );
-    PausedRegistryBackgroundTasks {
-        singleton: tasks.singleton,
-        plain: tasks.plain,
-    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1152,11 @@ mod pg {
     use crate::cfg::PausedRegistryConfig;
     use crate::pg::harness::isolated_schema_pool_or_skip;
 
+    /// The `postgres` arm's factory, as `build_paused_registry` now takes it.
+    fn factory(pool: &sqlx::PgPool) -> PgPausedRegistryFactory {
+        PgPausedRegistryFactory::new(pool.clone())
+    }
+
     struct NoopNodeRegistry;
     impl NodeRegistry for NoopNodeRegistry {
         fn snapshot(&self, _allow_lingering: bool) -> Vec<crate::node_registry::types::Node> {
@@ -1306,7 +1271,7 @@ mod pg {
             &scheduler_report(),
             &identity(),
             crate::role::ServerRole::Api,
-            Some(pool),
+            Some(&factory(&pool)),
             None,
         )
         .await;
@@ -1344,7 +1309,7 @@ mod pg {
             &scheduler_report(),
             &identity(),
             crate::role::ServerRole::All,
-            Some(pool),
+            Some(&factory(&pool)),
             None,
         )
         .await
@@ -1368,7 +1333,7 @@ mod pg {
             &scheduler_report(),
             &identity(),
             crate::role::ServerRole::Api,
-            Some(pool.clone()),
+            Some(&factory(&pool)),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
         )
         .await
@@ -1408,7 +1373,7 @@ mod pg {
             &scheduler_report(),
             &node_identity,
             crate::role::ServerRole::Api,
-            Some(pool.clone()),
+            Some(&factory(&pool)),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
         )
         .await

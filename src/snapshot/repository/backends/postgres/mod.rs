@@ -21,18 +21,25 @@ pub(crate) mod reads;
 pub(crate) mod reaper;
 pub(crate) mod writes;
 
+use std::sync::Arc;
+
+use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::cfg::AppConfig;
 use crate::snapshot::repository::backends::central::CatalogWrite;
+use crate::snapshot::repository::backends::{CentralCatalogHandle, PgCatalogParts};
 use crate::snapshot::repository::interfaces::{
     CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
     StartedBuild,
 };
 use crate::snapshot::repository::mirror::{CatalogCensus, CentralCatalogWrites};
+
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
+use migration_state::PgReadSideConfirmation;
 
 /// Cluster-wide concurrent-build ceiling `PostgresSnapshotCatalog::new`
 /// starts at, and what an explicit `0` passed to
@@ -360,6 +367,101 @@ impl CentralCatalogWrites for PostgresSnapshotCatalog {
         self.get_scoped(id_or_alias, CatalogReadScope::Resolvable)
             .await
     }
+}
+
+/// The PostgreSQL half of what [`build_snapshot_backend`][super::build_snapshot_backend]
+/// needs: the central catalog's three faces plus the shared read-side
+/// confirmation record, both over the one `[pg]` pool this process built.
+///
+/// # 🔴 The `PostgresSnapshotCatalog` construction lives here, not in the
+/// shared assembly
+///
+/// [`build_central_catalog`][super::build_central_catalog] used to take an
+/// `Option<&sqlx::PgPool>` and build this itself, which put `sqlx` — and with
+/// it a database credential — inside code every role links. Everything that
+/// touches the pool is on this side of the seam now; the shared assembly
+/// takes the result.
+///
+/// `max_concurrent_builds` is read from `config` here, and it is the only
+/// place it is read on the production path — see
+/// `max_concurrent_builds_from_config_reaches_admission`.
+pub fn pg_catalog_parts(config: &AppConfig, pool: &PgPool) -> PgCatalogParts {
+    let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
+    let catalog = Arc::new(
+        PostgresSnapshotCatalog::new(pool.clone(), identity.cluster_id, identity.id.clone())
+            .with_max_concurrent_builds(config.snapshot.catalog.max_concurrent_builds),
+    );
+    if config.snapshot.catalog.max_concurrent_builds < 0 {
+        // 🔴 Legal, and deliberate (see `SnapshotCatalogConfig::max_concurrent_builds`'s
+        // own doc for why negative rather than zero means this) — still worth
+        // a line at startup, matching
+        // `services/scheduler/cmd/main.go::announceBuildQueue`'s own warning:
+        // with no ceiling the only thing bounding concurrent builds is how
+        // many VMs the fleet can boot, and the first symptom is nodes running
+        // out of memory rather than a refusal anybody can read.
+        tracing::warn!(
+            target: "agentenv",
+            max_concurrent_builds = config.snapshot.catalog.max_concurrent_builds,
+            "snapshot catalog build queue has no cluster-wide ceiling: nothing but the \
+             fleet's capacity limits how many builds run at once"
+        );
+    }
+
+    PgCatalogParts {
+        central: CentralCatalogHandle {
+            writes: Arc::clone(&catalog) as Arc<dyn CentralCatalogWrites>,
+            census: Arc::clone(&catalog) as Arc<dyn CatalogCensus>,
+            reads: catalog as Arc<dyn SnapshotCatalog>,
+        },
+        read_side_confirmation: Arc::new(PgReadSideConfirmation::new(
+            pool,
+            identity.cluster_id,
+            &identity.id,
+        )),
+    }
+}
+
+/// Starts the catalog build reaper for this process, when `pool` is `Some`
+/// (i.e. `[pg]` is configured) — a thin `pub` bridge so `src/bin/aenv-api.rs`
+/// (a separate crate from this library) can reach
+/// `reaper::spawn`, which stays `pub(crate)` like the rest of that
+/// module. `None` (no interval/ttl configured, or no pool at all) means
+/// nothing was started, matching [`reaper::spawn`]'s own `None`
+/// case.
+///
+/// 🔴 The returned handle must be shut down through
+/// `agentenv::pg::SingletonTaskHandle::shutdown()`, never pushed into a
+/// `Vec<tokio::task::JoinHandle<()>>` and `.abort()`-ed — see that type's
+/// own documentation on why: this replica's PostgreSQL advisory lock, if it
+/// is currently leader, would otherwise leak until the pool itself is torn
+/// down.
+pub fn spawn_catalog_build_reaper(
+    pool: Option<sqlx::PgPool>,
+    cluster_id: uuid::Uuid,
+    interval: std::time::Duration,
+    ttl: std::time::Duration,
+) -> Option<crate::pg::SingletonTaskHandle> {
+    reaper::spawn(pool?, cluster_id, interval, ttl)
+}
+
+/// Brings the catalog schema in `pool`'s database to the shape this build
+/// expects. A thin `pub` bridge to `migrate::migrate`, which stays
+/// `pub(crate)` like the rest of that module — see
+/// [`spawn_catalog_build_reaper`]'s own doc for why `src/bin/aenv-api.rs` (a
+/// separate crate from this library) needs one of these per function it
+/// calls into `postgres::`.
+///
+/// 🔴 Must run to completion before anything else touches the `snapshots` /
+/// `aliases` / `builds` tables through this pool — the catalog build reaper
+/// (`spawn_catalog_build_reaper`) and `build_snapshot_backend`'s
+/// `PostgresSnapshotCatalog` construction both assume the schema already
+/// exists and neither one migrates it itself (see `PostgresSnapshotCatalog`'s
+/// own module doc). Idempotent and safe to call on every start — the
+/// migration runner's own session-scoped advisory lock (`GO_SCHEMA_LOCK_KEY`)
+/// is what lets a fleet of `--role api` replicas call this concurrently
+/// without racing each other.
+pub async fn migrate_catalog_schema(pool: &sqlx::PgPool) -> Result<()> {
+    migrate::migrate(pool).await
 }
 
 #[cfg(test)]

@@ -669,9 +669,12 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     // never builds Stage A's native node registry (see `assemble_api`'s own
     // `native_node_registry` wiring, which this function has no equivalent
     // of), so `build_paused_registry`'s `node_registry` argument is always
-    // `None` here -- the `postgres` backend's own D1 guard therefore always
-    // refuses under this role, which is deliberate: see that function's own
-    // doc.
+    // `None` here. M1: unlike `--role api`, that no longer refuses the
+    // `postgres` backend -- `role` (`ServerRole::All`,
+    // `runs_sandbox_runtime() == true`) is what tells `build_paused_registry`
+    // this process's own identity already coincides with `origin_node_id`
+    // for everything it runs, so it does not need D2 Fix A's roster-driven
+    // renewal at all. See that function's own doc.
     let pg_pool_for_registry = pg_pool.clone();
     let core = assemble_node_core(config, role, pg_pool).await?;
 
@@ -685,16 +688,19 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
         &config.cluster,
         &config.observability.scheduler_report,
         &core.identity,
+        role,
         pg_pool_for_registry.clone(),
         None,
     )
     .await?;
-    pg_singleton_tasks.extend(spawn_paused_registry_background_tasks(
+    let paused_registry_tasks = spawn_paused_registry_background_tasks(
         &config.orchestrator.paused_registry,
         &core.identity,
         pg_pool_for_registry,
         None,
-    ));
+    );
+    pg_singleton_tasks.extend(paused_registry_tasks.singleton);
+    let mut paused_registry_upkeep = paused_registry_tasks.plain;
     let paused_wiring = PausedSandboxWiring::new(
         paused_registry,
         Arc::clone(&core.snapshot_manager),
@@ -752,6 +758,12 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
             retrier.retry_stale_node_holdings_release().await;
         }));
     }
+    // B1: the postgres backend's per-replica renewal loop (empty for every
+    // other backend, and for `--role all` with `node_placement_source` not
+    // set to native -- see `spawn_paused_registry_background_tasks`'s own
+    // doc). Stops the same way, at the same point, as the rest of this
+    // role's upkeep.
+    paused_upkeep.append(&mut paused_registry_upkeep);
 
     Ok(Assembly {
         app: server::new(api_impl, role),
@@ -1208,16 +1220,19 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         &config.cluster,
         &config.observability.scheduler_report,
         &identity_for_registry,
+        role,
         pg_pool.clone(),
         node_registry_for_paused.clone(),
     )
     .await?;
-    pg_singleton_tasks.extend(spawn_paused_registry_background_tasks(
+    let paused_registry_tasks = spawn_paused_registry_background_tasks(
         &config.orchestrator.paused_registry,
         &identity_for_registry,
         pg_pool,
         node_registry_for_paused,
-    ));
+    );
+    pg_singleton_tasks.extend(paused_registry_tasks.singleton);
+    let mut paused_registry_upkeep = paused_registry_tasks.plain;
     let paused_wiring = PausedSandboxWiring::new(
         paused_registry,
         Arc::clone(&snapshot_manager),
@@ -1274,6 +1289,10 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // this role's upkeep — see `spawn_paused_record_upkeep`'s callers for why
     // that point is "before the shutdown pauses start" and not later.
     paused_upkeep.append(&mut node_registry_upkeep);
+    // B1: the postgres backend's per-replica renewal loop, present only
+    // under `[cluster].node_placement_source = "native"` (empty otherwise --
+    // see `spawn_paused_registry_background_tasks`'s own doc).
+    paused_upkeep.append(&mut paused_registry_upkeep);
 
     // 🔴 Task 4's equivalence-dump debug endpoint: built and mounted
     // regardless of `node_placement_source`, per the task's own instruction

@@ -569,56 +569,69 @@ pub(super) fn log_claim_outcome(
 /// real `crate::node_registry::registry::AtomicNodeRegistry`
 /// (`[cluster].node_placement_source = "native"`, `src/bin/server.rs`'s
 /// `assemble_api`) -- `--role all` never builds one at all.
+///
+/// `role` (M1) decides whether a missing `node_registry` is refused: see the
+/// `postgres` arm's own comment.
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
     cluster: &ClusterConfig,
     scheduler_report: &ObservabilitySchedulerReportConfig,
     identity: &NodeIdentity,
+    role: crate::role::ServerRole,
     pg_pool: Option<sqlx::PgPool>,
     node_registry: Option<Arc<dyn NodeRegistry>>,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
     let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
         match config.backend {
             PausedRegistryBackendKind::Local => (Arc::new(DisabledPausedSandboxRegistry), ""),
-            // 🔴 D1 (Stage C report): refuses rather than degrading silently.
-            // Fix A's `running`-row lease renewal (`postgres::reconcile`,
-            // D2 Fix A / `151d00b`) only does anything with a real heartbeat
-            // roster -- without one, `running` rows have no path back to a
-            // renewed lease at all under the split node/api identity model
-            // (`renew_lease`'s own `Running` branch never matches an api
-            // replica's identity), which silently reintroduces the exact bug
-            // Fix A fixed. This repository has already paid for that failure
-            // mode once (see the "running 行租约冻结" memory note) -- it is
-            // refused here rather than risked twice.
             PausedRegistryBackendKind::Postgres => {
                 let pool = pg_pool.context(
                     "paused_registry.backend = \"postgres\" requires [pg].dsn to be configured \
                      (the shared PostgreSQL pool this process already builds for Stage B's \
                      catalog, if [pg] is set)",
                 )?;
-                let node_registry = node_registry.context(
-                    "paused_registry.backend = \"postgres\" requires a heartbeat roster source, \
-                     which only exists under [cluster].node_placement_source = \"native\" -- \
-                     without it, running sandboxes' registry leases have no renewal path and \
-                     will eventually be wrongly reclaimed even while healthy (this is the exact \
-                     failure Fix A, commit 151d00b, closed for the central/gRPC backend; --role \
-                     all never builds a native node registry at all and cannot select this \
-                     backend). Set AENV_CLUSTER_NODE_PLACEMENT_SOURCE=native, or keep this \
-                     backend on \"central\"",
-                )?;
+
+                // 🔴 M1: the roster requirement is `--role api`'s alone, not
+                // this backend's in general. `role.runs_sandbox_runtime()`
+                // is exactly the distinguishing fact: under `--role all`
+                // this process's own identity already coincides with
+                // `origin_node_id` for everything it runs, so the ordinary
+                // `renew_lease` trait method (this process's own periodic
+                // self-renewal, `spawn_paused_record_upkeep` in
+                // `src/bin/server.rs`) already covers what D2 Fix A exists
+                // to cover under the split node/api identity model -- see
+                // `postgres::replica_renewal`'s own module doc for the full
+                // argument. Under `--role api` (`runs_sandbox_runtime() ==
+                // false`), that identity never coincides, so a missing
+                // roster really would leave `running` rows with no renewal
+                // path at all -- the exact failure Fix A (commit `151d00b`)
+                // closed for the central/gRPC backend -- and is refused here
+                // exactly as before.
+                if !role.runs_sandbox_runtime() {
+                    node_registry.as_ref().context(
+                        "paused_registry.backend = \"postgres\" requires a heartbeat roster \
+                         source under --role api, which only exists under \
+                         [cluster].node_placement_source = \"native\" -- without it, running \
+                         sandboxes' registry leases have no renewal path and will eventually be \
+                         wrongly reclaimed even while healthy (this is the exact failure Fix A, \
+                         commit 151d00b, closed for the central/gRPC backend). Set \
+                         AENV_CLUSTER_NODE_PLACEMENT_SOURCE=native, or keep this backend on \
+                         \"central\"",
+                    )?;
+                }
 
                 // 🔴 `node_registry` is not consumed here -- it is only
-                // needed by the background reconcile/reclaim loops
+                // needed by the background reconcile/reclaim/renewal loops
                 // [`spawn_paused_registry_background_tasks`] starts, which
                 // this function's caller must invoke separately (mirroring
                 // `spawn_pg_singleton_tasks` alongside `build_pg_pool` in
-                // `src/bin/server.rs`) so their `SingletonTaskHandle`s land
-                // in the same `pg_singleton_tasks` bucket every other
-                // PostgreSQL-backed background task already shuts down
-                // through. Validated present here anyway (see the `context`
-                // above): a `postgres` backend that will fail to start its
-                // safety net a few lines later in the caller is a startup
-                // failure discovered too late to matter, not one avoided.
+                // `src/bin/server.rs`) so their task handles land in the
+                // same buckets every other PostgreSQL-backed background task
+                // already shuts down through. Validated present here
+                // anyway, under `--role api`, so a `postgres` backend that
+                // will fail to start its safety net a few lines later in the
+                // caller is a startup failure discovered too late to
+                // matter, not one avoided.
                 drop(node_registry);
 
                 postgres::schema::migrate(&pool)
@@ -626,6 +639,24 @@ pub async fn build_paused_registry(
                     .context("bootstrap the paused_sandboxes schema")?;
 
                 let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
+
+                // 🔴 B2(1): a synchronous, best-effort attempt to enter
+                // restart grace *before* this function returns and its
+                // caller opens for traffic -- see
+                // `postgres::grace::attempt_initial_entry`'s own doc for why
+                // this closes (most of) the window between this process
+                // serving its first request and the reconcile leader's own
+                // background loop landing its first `enter`. Never fails
+                // this call: a database that cannot be reached for this
+                // attempt will be retried by the background reconcile loop
+                // regardless.
+                postgres::attempt_initial_grace_entry(
+                    &pool,
+                    identity.cluster_id,
+                    lease_ttl.as_secs_f64(),
+                )
+                .await;
+
                 let registry = Arc::new(PostgresPausedSandboxRegistry::new(
                     pool,
                     identity.cluster_id,
@@ -686,47 +717,64 @@ pub async fn build_paused_registry(
     Ok(registry)
 }
 
-/// Starts the `postgres` backend's two leader-elected background loops
-/// (reconcile, reclaim -- see `postgres::reconcile`/`postgres::reclaim_task`),
-/// if and only if `config.backend == Postgres`. Every other backend returns
-/// an empty vec.
+/// [`spawn_paused_registry_background_tasks`]'s result -- split by shutdown
+/// mechanism, mirroring `postgres::BackgroundTasks` (which this simply
+/// forwards): `singleton` needs `SingletonTaskHandle::shutdown()`'s async
+/// advisory-lock release and belongs in `Assembly::pg_singleton_tasks`
+/// (`src/bin/server.rs`); `plain` is safe to `.abort()` and belongs in
+/// `Assembly::upkeep` alongside `spawn_paused_record_upkeep`'s own tasks.
+#[derive(Default)]
+pub struct PausedRegistryBackgroundTasks {
+    pub singleton: Vec<SingletonTaskHandle>,
+    pub plain: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Starts the `postgres` backend's background tasks (reconcile leader loop,
+/// reclaim leader loop, and -- M1 -- B1's per-replica renewal loop when a
+/// roster source is available; see `postgres::spawn_background_tasks`'s own
+/// doc), if and only if `config.backend == Postgres`. Every other backend
+/// returns everything empty.
 ///
 /// Kept separate from [`build_paused_registry`] deliberately, mirroring
 /// `src/bin/server.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
 /// split: the registry itself has to exist before `ApiImpl`/`Orchestrator`
-/// can be constructed, but the resulting `SingletonTaskHandle`s belong in
-/// the same `pg_singleton_tasks` bucket the catalog build reaper's handle
-/// already goes into, so graceful shutdown releases every advisory lock this
-/// process might be holding through one uniform path.
+/// can be constructed, but the resulting task handles belong in the buckets
+/// every other PostgreSQL-backed background task in this process already
+/// shuts down through.
 ///
 /// 🔴 Call this only after a preceding [`build_paused_registry`] call with
-/// the same `config`/`pg_pool`/`node_registry` has already succeeded (it
-/// performed the "postgres requires a pool and a roster" validation this
-/// function relies on without repeating). Called with `pg_pool`/
-/// `node_registry` both present but `config.backend != Postgres`, this
-/// simply returns an empty vec -- the same as when either is absent.
+/// the same `config`/`pg_pool` has already succeeded (it performed the
+/// "postgres requires a pool" validation this function relies on without
+/// repeating). `node_registry` may legitimately be `None` here even when
+/// `config.backend == Postgres` (M1: `--role all`) -- see
+/// `postgres::spawn_background_tasks`'s own doc for what that does and does
+/// not skip.
 pub fn spawn_paused_registry_background_tasks(
     config: &PausedRegistryConfig,
     identity: &NodeIdentity,
     pg_pool: Option<sqlx::PgPool>,
     node_registry: Option<Arc<dyn NodeRegistry>>,
-) -> Vec<SingletonTaskHandle> {
+) -> PausedRegistryBackgroundTasks {
     if config.backend != PausedRegistryBackendKind::Postgres {
-        return Vec::new();
+        return PausedRegistryBackgroundTasks::default();
     }
-    let (Some(pool), Some(node_registry)) = (pg_pool, node_registry) else {
-        return Vec::new();
+    let Some(pool) = pg_pool else {
+        return PausedRegistryBackgroundTasks::default();
     };
 
     let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
-    postgres::spawn_background_tasks(
+    let tasks = postgres::spawn_background_tasks(
         pool,
         identity.cluster_id,
         lease_ttl,
         config.reconcile_interval(),
         config.reclaim_interval(),
         node_registry,
-    )
+    );
+    PausedRegistryBackgroundTasks {
+        singleton: tasks.singleton,
+        plain: tasks.plain,
+    }
 }
 
 #[cfg(test)]
@@ -956,6 +1004,7 @@ mod build_tests {
             &cluster(None),
             &scheduler_report(),
             &identity(),
+            crate::role::ServerRole::Api,
             None,
             None,
         )
@@ -972,6 +1021,7 @@ mod build_tests {
             &cluster(Some("http://scheduler.invalid:9090")),
             &scheduler_report(),
             &identity(),
+            crate::role::ServerRole::Api,
             None,
             None,
         )
@@ -994,6 +1044,7 @@ mod build_tests {
                     &cluster(endpoint),
                     &scheduler_report(),
                     &identity(),
+                    crate::role::ServerRole::Api,
                     None,
                     None,
                 )
@@ -1014,6 +1065,7 @@ mod build_tests {
             &cluster(None),
             &scheduler_report(),
             &identity(),
+            crate::role::ServerRole::Api,
             None,
             Some(std::sync::Arc::new(NoopNodeRegistry) as std::sync::Arc<dyn NodeRegistry>),
         )
@@ -1060,6 +1112,7 @@ mod build_tests {
                 &cluster(endpoint),
                 &scheduler_report(),
                 &identity(),
+                crate::role::ServerRole::Api,
                 None,
                 None,
             )
@@ -1205,14 +1258,17 @@ mod pg {
     }
 
     /// 🔴 D1's central startup guard, proved with a real (reachable) pool
-    /// this time: a `postgres` backend still refuses to start without a
-    /// node registry, even once the *other* precondition
+    /// this time: under `--role api`, a `postgres` backend still refuses to
+    /// start without a node registry, even once the *other* precondition
     /// (`the_postgres_backend_without_a_pool_is_a_startup_failure`, in
-    /// `build_tests`) is satisfied.
+    /// `build_tests`) is satisfied. M1 narrowed this guard to `--role api`
+    /// specifically -- see
+    /// `the_postgres_backend_under_role_all_does_not_require_a_node_registry`
+    /// below for the role this guard must *not* fire for.
     #[tokio::test]
-    async fn the_postgres_backend_without_a_node_registry_is_a_startup_failure() {
+    async fn the_postgres_backend_without_a_node_registry_is_a_startup_failure_under_role_api() {
         let pool = isolated_schema_pool_or_skip!(
-            "the_postgres_backend_without_a_node_registry_is_a_startup_failure"
+            "the_postgres_backend_without_a_node_registry_is_a_startup_failure_under_role_api"
         );
 
         let failure = build_paused_registry(
@@ -1220,18 +1276,52 @@ mod pg {
             &cluster(None),
             &scheduler_report(),
             &identity(),
+            crate::role::ServerRole::Api,
             Some(pool),
             None,
         )
         .await;
 
         let Err(failure) = failure else {
-            panic!("a postgres backend with no node registry must not build a registry");
+            panic!("a postgres backend with no node registry must not build a registry under --role api");
         };
         assert!(
             failure.to_string().contains("node_placement_source"),
             "the refusal has to name the missing setting, got {failure}"
         );
+    }
+
+    /// 🔴 M1's own regression pin: `--role all` never builds a
+    /// `NodeRegistry` at all (it has no equivalent of `--role api`'s
+    /// `[cluster].node_placement_source = "native"` wiring), and unlike
+    /// `--role api` it does not need one -- this process's own identity
+    /// coincides with `origin_node_id` for everything it runs, so
+    /// `renew_lease` already covers what D2 Fix A exists to cover under the
+    /// split identity model (see `postgres::replica_renewal`'s own module
+    /// doc). Before M1, this configuration was an unconditional startup
+    /// failure -- the rollback target could not select this backend at
+    /// all. Without this test, a change that silently widened the `--role
+    /// api` guard back to every role would look identical to every other
+    /// green test in this file.
+    #[tokio::test]
+    async fn the_postgres_backend_under_role_all_does_not_require_a_node_registry() {
+        let pool = isolated_schema_pool_or_skip!(
+            "the_postgres_backend_under_role_all_does_not_require_a_node_registry"
+        );
+
+        let registry = build_paused_registry(
+            &config(),
+            &cluster(None),
+            &scheduler_report(),
+            &identity(),
+            crate::role::ServerRole::All,
+            Some(pool),
+            None,
+        )
+        .await
+        .expect("--role all must not require a node registry to select the postgres backend");
+
+        assert!(registry.is_cluster_backed());
     }
 
     /// The happy path: a real pool and a (fake, but present) node registry
@@ -1248,6 +1338,7 @@ mod pg {
             &cluster(None),
             &scheduler_report(),
             &identity(),
+            crate::role::ServerRole::Api,
             Some(pool.clone()),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
         )
@@ -1264,5 +1355,48 @@ mod pg {
             .await
             .expect("paused_sandboxes should exist after build_paused_registry");
         assert_eq!(count, 0);
+    }
+
+    /// 🔴 B2(1)'s own wiring pin: `build_paused_registry`'s `postgres` arm
+    /// must actually call `postgres::attempt_initial_grace_entry` before it
+    /// returns -- proving the connection, not just
+    /// `postgres::grace::attempt_initial_entry`'s own isolated pg-gated
+    /// tests (`postgres::grace::pg`), which exercise the function directly
+    /// but say nothing about whether `build_paused_registry` ever calls it.
+    /// A `paused_registry_grace` row for this cluster must exist the moment
+    /// this call returns, with no leader-elected background loop having run
+    /// yet.
+    #[tokio::test]
+    async fn building_the_postgres_backend_enters_grace_synchronously() {
+        let pool = isolated_schema_pool_or_skip!(
+            "building_the_postgres_backend_enters_grace_synchronously"
+        );
+
+        let node_identity = identity();
+        let registry = build_paused_registry(
+            &config(),
+            &cluster(None),
+            &scheduler_report(),
+            &node_identity,
+            crate::role::ServerRole::Api,
+            Some(pool.clone()),
+            Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
+        )
+        .await
+        .expect("a real pool and a real node registry should build successfully");
+        assert!(registry.is_cluster_backed());
+
+        let row_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM paused_registry_grace WHERE cluster_id = $1)",
+        )
+        .bind(node_identity.cluster_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query should succeed");
+        assert!(
+            row_exists,
+            "build_paused_registry must have entered grace synchronously before returning -- \
+             no background loop has run yet at this point in the test"
+        );
     }
 }

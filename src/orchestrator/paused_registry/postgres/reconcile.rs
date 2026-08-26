@@ -1,16 +1,49 @@
 //! The reconcile leader loop -- a Rust port of `computeRegistryReconcile` +
-//! `RunRegistryReconcile` (`services/scheduler/internal/reconcile.go`), the
-//! home of **D2 Fix A** (`151d00b`): proactively renewing `Running` row
-//! leases from a fresh heartbeat roster, the path that never existed before
-//! Fix A and that the split node/api identity model makes mandatory rather
-//! than optional (`renew_lease`'s own `Running` branch never matches an api
-//! replica's pod identity -- see `lease.rs`'s doc).
+//! `RunRegistryReconcile` (`services/scheduler/internal/reconcile.go`).
 //!
 //! Runs as a cluster-wide singleton
 //! ([`crate::pg::election::spawn_singleton_task`],
 //! `AdvisoryLockKey::PausedRegistryReconcile`) -- see [`super::grace`]'s
 //! module doc for why this loop, not the reclaim loop, is the one that owns
 //! entering the restart grace window.
+//!
+//! # B1: D2 Fix A no longer lives here
+//!
+//! An earlier version of this module also renewed `Running`/parked-state
+//! leases from a fresh heartbeat roster (D2 Fix A, `151d00b`) as part of
+//! this same leader-elected pass, using
+//! [`crate::node_registry::registry::NodeRegistry::rosters_in_cluster`].
+//! That was wrong under N `--role api` replicas for a structural reason, not
+//! a bug in the renewal logic itself: `AtomicNodeRegistry` is a per-process,
+//! in-memory roster with **no synchronisation between replicas** -- each
+//! node's gRPC heartbeat connection is a long-lived HTTP/2 stream pinned to
+//! whichever one `agentenv-api` Pod it happened to dial, so any single
+//! replica's own `rosters_in_cluster` answer only ever covers the subset of
+//! nodes whose heartbeats landed on *that* replica. Running Fix A only on
+//! the reconcile *leader* -- one specific replica -- meant every node whose
+//! heartbeat was not pinned to that one replica had no renewal path for its
+//! `running` rows at all, silently reintroducing the exact "running row
+//! lease freeze" failure Fix A was written to close (see this crate's own
+//! memory note by that name), just steady-state instead of after a failover.
+//!
+//! Fix A now runs on [`super::replica_renewal`] instead: every replica, on
+//! its own timer, unelected, renews from *its own* roster alone.
+//! `renew_parked_leases`/`renew_live_leases` are idempotent, caller-asserted
+//! `UPDATE`s (their own WHERE re-checks `origin_node_id` against the
+//! asserted identity -- see `lease.rs`'s doc), so nothing about them ever
+//! needed leadership; the leader-election here was serialising something
+//! that did not require serialising. Running the same renewal
+//! independently, unelected, on every replica means the *union* of what
+//! every replica's own roster covers is what ends up renewed -- which, since
+//! every node's heartbeat is pinned to exactly one replica, is the entire
+//! cluster. See `postgres::contract`'s pg-gated
+//! `two_replicas_each_holding_part_of_the_roster_together_renew_every_running_row`
+//! for the union claim proved directly against two independent rosters.
+//!
+//! What stays leader-elected here, and why: [`super::grace::enter`] (a
+//! per-cluster write that really must run exactly once per coverage-gap
+//! epoch, not once per replica) and D4's metrics below (a per-tick read that
+//! is cheap to run once and pointless to run N times over).
 //!
 //! # D4: the monitoring gap this port closes
 //!
@@ -22,35 +55,28 @@
 //! row's lease going unrenewed. [`ReconcileOutcome::at_risk_rows`] is the
 //! unified figure this port exposes from day one -- see its own doc.
 
-use std::collections::HashMap;
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::lease::{renew_live_leases, renew_parked_leases, LeaseHolder};
 use super::PostgresPausedSandboxRegistry;
-use crate::node_registry::types::Roster;
 use crate::orchestrator::paused_registry::PausedRegistryState;
 
 use super::row::RegistryRow;
-
-/// `defaultObservedReportTTL` (Stage A, `src/node_registry/registry.rs`) --
-/// reused rather than re-declared: a heartbeat roster older than this is
-/// exactly as stale for this loop's purposes as it is for Stage A's own
-/// `NodeStatus` derivation.
-const ROSTER_FRESH_TTL: Duration = crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL;
 
 /// `defaultRegistryLeaseWarnWindow` (`reconcile.go:16`), verbatim: how far
 /// ahead of a lease's own deadline this loop starts warning.
 const LEASE_WARN_WINDOW: Duration = Duration::from_secs(30);
 
 /// `computeRegistryReconcile`'s result (`registryReconcileResult`,
-/// `reconcile.go`), ported.
-#[derive(Debug, Default, Clone)]
+/// `reconcile.go`), ported -- minus the renewal-candidate lists B1 moved to
+/// [`super::replica_renewal`].
+#[derive(Debug, Default, Clone, Copy)]
 pub(super) struct ReconcileOutcome {
     /// `publishing`/`local_only` rows with no snapshot at all -- a pause that
     /// never finished publishing and never will unless its origin node comes
@@ -68,12 +94,6 @@ pub(super) struct ReconcileOutcome {
     /// rows with both conditions, or `resuming` rows with the lease alone
     /// (Fix B -- see `sql.rs::RECLAIM_RELEASED_RESUMING_SQL`'s doc).
     pub reclaimable_now: u64,
-    /// `publishing`/`local_only` rows whose origin node has a fresh
-    /// heartbeat roster that still lists them -- Fix A's parked-side sibling.
-    pub parked_lease_renewals: Vec<LeaseHolder>,
-    /// `running` rows whose origin node has a fresh heartbeat roster that
-    /// still lists them -- **Fix A itself**.
-    pub live_lease_renewals: Vec<LeaseHolder>,
 }
 
 impl ReconcileOutcome {
@@ -90,39 +110,13 @@ impl ReconcileOutcome {
 }
 
 /// `computeRegistryReconcile` (`reconcile.go`), ported: a pure function over
-/// the rows already read and the roster already fetched, so it is testable
-/// without a database (see the `#[cfg(test)] mod tests` below) the same way
-/// Go's own version is tested without one in `reconcile_test.go`.
-pub(super) fn compute_reconcile(
-    rows: &[RegistryRow],
-    rosters: &[Roster],
-    now: DateTime<Utc>,
-    roster_now: SystemTime,
-) -> ReconcileOutcome {
-    let roster_by_node: HashMap<&str, &Roster> =
-        rosters.iter().map(|r| (r.node_id.as_str(), r)).collect();
-    let is_fresh_and_listed = |node_id: &str, sandbox_id: &str| -> bool {
-        let Some(roster) = roster_by_node.get(node_id) else {
-            return false;
-        };
-        let Some(last_seen) = roster.last_seen else {
-            return false;
-        };
-        let fresh = roster_now
-            .duration_since(last_seen)
-            .map(|age| age <= ROSTER_FRESH_TTL)
-            .unwrap_or(true); // last_seen in the future (clock skew): treat as fresh.
-        fresh
-            && roster
-                .entries
-                .iter()
-                .any(|entry| entry.sandbox_id == sandbox_id)
-    };
-
+/// the rows already read, so it is testable without a database (see the
+/// `#[cfg(test)] mod tests` below) the same way Go's own version is tested
+/// without one in `reconcile_test.go`.
+pub(super) fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> ReconcileOutcome {
     let mut outcome = ReconcileOutcome::default();
 
     for row in rows {
-        let sandbox_id = row.sandbox_id.to_string();
         match row.state {
             PausedRegistryState::Publishing | PausedRegistryState::LocalOnly => {
                 if row.snapshot_id.is_none() {
@@ -132,12 +126,6 @@ pub(super) fn compute_reconcile(
                 let deadline = row.lease_expires_at.unwrap_or(row.updated_at);
                 if deadline < now + LEASE_WARN_WINDOW {
                     outcome.parked_lease_expiring += 1;
-                }
-                if is_fresh_and_listed(&row.origin_node_id, &sandbox_id) {
-                    outcome.parked_lease_renewals.push(LeaseHolder {
-                        sandbox_id: row.sandbox_id,
-                        node_id: row.origin_node_id.clone(),
-                    });
                 }
             }
             PausedRegistryState::Running | PausedRegistryState::Resuming => {
@@ -151,14 +139,6 @@ pub(super) fn compute_reconcile(
                 } else if row.state == PausedRegistryState::Running && deadline_passed {
                     outcome.live_deadline_passed += 1;
                 }
-                if row.state == PausedRegistryState::Running
-                    && is_fresh_and_listed(&row.origin_node_id, &sandbox_id)
-                {
-                    outcome.live_lease_renewals.push(LeaseHolder {
-                        sandbox_id: row.sandbox_id,
-                        node_id: row.origin_node_id.clone(),
-                    });
-                }
             }
             PausedRegistryState::Paused => {}
         }
@@ -167,31 +147,17 @@ pub(super) fn compute_reconcile(
     outcome
 }
 
-/// One reconcile pass against the live database: list rows, fetch the
-/// current roster, compute, then act on the two renewal candidate lists.
-/// Grace's own entry (`super::grace::enter`) happens in the caller, on the
-/// same connection, before this runs -- see [`spawn`]'s doc.
+/// One reconcile pass against the live database: list rows, compute D4's
+/// metrics, log. Grace's own entry (`super::grace::enter`) happens in the
+/// caller, on the same connection, before this runs -- see [`spawn`]'s doc.
 pub(super) async fn reconcile_once(
     registry: &PostgresPausedSandboxRegistry,
-    node_registry: &dyn crate::node_registry::registry::NodeRegistry,
 ) -> anyhow::Result<ReconcileOutcome> {
     let rows = super::reads::list_registry_rows(registry)
         .await
         .map_err(anyhow::Error::from)?;
-    let rosters = node_registry.rosters_in_cluster(&registry.cluster_id.to_string());
 
-    let outcome = compute_reconcile(&rows, &rosters, Utc::now(), SystemTime::now());
-
-    if !outcome.parked_lease_renewals.is_empty() {
-        renew_parked_leases(registry, &outcome.parked_lease_renewals)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
-    if !outcome.live_lease_renewals.is_empty() {
-        renew_live_leases(registry, &outcome.live_lease_renewals)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
+    let outcome = compute_reconcile(&rows, Utc::now());
 
     if outcome.at_risk_rows() > 0 {
         warn!(
@@ -203,16 +169,12 @@ pub(super) async fn reconcile_once(
             live_deadline_passed = outcome.live_deadline_passed,
             at_risk_rows = outcome.at_risk_rows(),
             reclaimable_now = outcome.reclaimable_now,
-            parked_leases_renewed = outcome.parked_lease_renewals.len(),
-            live_leases_renewed = outcome.live_lease_renewals.len(),
             "paused registry reconcile pass"
         );
     } else {
         info!(
             target: "agentenv",
             cluster_id = %registry.cluster_id,
-            parked_leases_renewed = outcome.parked_lease_renewals.len(),
-            live_leases_renewed = outcome.live_lease_renewals.len(),
             "paused registry reconcile pass"
         );
     }
@@ -257,9 +219,10 @@ async fn bound_statement_timeout(conn: &mut sqlx::PgConnection) {
 /// Starts the reconcile leader loop
 /// (`AdvisoryLockKey::PausedRegistryReconcile`). On every tick this
 /// replica holds leadership: detects a new epoch on its own connection
-/// (see [`super::grace::new_epoch_since`]) and, if so, runs
-/// [`super::grace::enter`] first -- then always runs one
-/// [`reconcile_once`] pass.
+/// (see [`super::grace::is_new_epoch`]) and, if so, runs
+/// [`super::grace::enter`] first -- recording the epoch as seen only once
+/// `enter` actually succeeds (B2(b) -- see [`super::grace::record_epoch_entered`]'s
+/// own doc for why) -- then always runs one [`reconcile_once`] pass.
 ///
 /// `interval <= Duration::ZERO` disables the loop, matching
 /// [`super::reclaim_task::spawn`]'s identical convention (and Go's own
@@ -273,9 +236,8 @@ pub(super) fn spawn(
     cluster_id: Uuid,
     lease_ttl: Duration,
     interval: Duration,
-    node_registry: Arc<dyn crate::node_registry::registry::NodeRegistry>,
 ) -> crate::pg::SingletonTaskHandle {
-    let last_pid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let last_pid = std::sync::Arc::new(AtomicI32::new(0));
 
     crate::pg::spawn_singleton_task(
         pool,
@@ -283,19 +245,25 @@ pub(super) fn spawn(
         interval,
         move |mut ctx: crate::pg::LeaderContext<'_>| {
             let registry = Arc::clone(&registry);
-            let node_registry = Arc::clone(&node_registry);
             let last_pid = Arc::clone(&last_pid);
             Box::pin(async move {
-                match super::grace::new_epoch_since(&mut ctx, &last_pid).await {
-                    Ok(true) => {
+                match super::grace::current_backend_pid(&mut ctx).await {
+                    Ok(pid) if super::grace::is_new_epoch(&last_pid, pid) => {
                         bound_statement_timeout(ctx.conn).await;
-                        if let Err(err) =
-                            super::grace::enter(ctx.conn, cluster_id, lease_ttl.as_secs_f64()).await
+                        match super::grace::enter(ctx.conn, cluster_id, lease_ttl.as_secs_f64())
+                            .await
                         {
-                            warn!(target: "agentenv", error = %err, "paused registry restart grace failed");
+                            Ok(_) => {
+                                // 🔴 B2(b): recorded only now, after success --
+                                // see `grace::record_epoch_entered`'s own doc.
+                                super::grace::record_epoch_entered(&last_pid, pid);
+                            }
+                            Err(err) => {
+                                warn!(target: "agentenv", error = %err, "paused registry restart grace failed; will retry next tick");
+                            }
                         }
                     }
-                    Ok(false) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         warn!(target: "agentenv", error = %err, "could not tell whether this is a new reconcile leadership epoch");
                     }
@@ -309,12 +277,7 @@ pub(super) fn spawn(
                 // reclaims cleanly. `ctx.conn` is the one connection this
                 // safety valve must never be used on (see [`TICK_BUDGET`]'s
                 // own doc).
-                match tokio::time::timeout(
-                    TICK_BUDGET,
-                    reconcile_once(&registry, node_registry.as_ref()),
-                )
-                .await
-                {
+                match tokio::time::timeout(TICK_BUDGET, reconcile_once(&registry)).await {
                     Ok(Ok(_outcome)) => {}
                     Ok(Err(err)) => {
                         warn!(target: "agentenv", error = %err, "paused registry reconcile pass failed");
@@ -338,7 +301,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::node_registry::types::RosterEntry;
     use crate::types::SandboxId;
 
     fn row(state: PausedRegistryState, origin: &str) -> RegistryRow {
@@ -360,21 +322,6 @@ mod tests {
         }
     }
 
-    fn fresh_roster(node_id: &str, sandbox_ids: &[SandboxId]) -> Roster {
-        Roster {
-            node_id: node_id.to_string(),
-            entries: sandbox_ids
-                .iter()
-                .map(|id| RosterEntry {
-                    sandbox_id: id.to_string(),
-                    execution_id: Uuid::new_v4().to_string(),
-                    projection_ttl: Duration::from_secs(30),
-                })
-                .collect(),
-            last_seen: Some(SystemTime::now()),
-        }
-    }
-
     /// D4's own regression pin: a `running` row with a lapsed lease counts
     /// in [`ReconcileOutcome::at_risk_rows`], the same as a stranded
     /// `publishing` row -- not just in a `running`-only counter nobody
@@ -387,12 +334,7 @@ mod tests {
         let mut lapsed_running = row(PausedRegistryState::Running, "node-b");
         lapsed_running.lease_expires_at = Some(Utc::now() - ChronoDuration::seconds(10));
 
-        let outcome = compute_reconcile(
-            &[stranded, lapsed_running],
-            &[],
-            Utc::now(),
-            SystemTime::now(),
-        );
+        let outcome = compute_reconcile(&[stranded, lapsed_running], Utc::now());
         assert_eq!(outcome.stranded_rows, 1);
         assert_eq!(outcome.live_lease_lapsed, 1);
         assert_eq!(
@@ -400,54 +342,6 @@ mod tests {
             2,
             "both a stranded parked row and a lapsed running row must count toward the same total"
         );
-    }
-
-    /// Fix A itself: a `running` row whose origin node has a fresh roster
-    /// still listing it is a renewal candidate.
-    #[test]
-    fn a_running_row_with_a_fresh_roster_entry_is_a_live_renewal_candidate() {
-        let r = row(PausedRegistryState::Running, "node-a");
-        let roster = fresh_roster("node-a", &[r.sandbox_id]);
-
-        let outcome = compute_reconcile(
-            std::slice::from_ref(&r),
-            &[roster],
-            Utc::now(),
-            SystemTime::now(),
-        );
-        assert_eq!(outcome.live_lease_renewals.len(), 1);
-        assert_eq!(outcome.live_lease_renewals[0].sandbox_id, r.sandbox_id);
-        assert_eq!(outcome.parked_lease_renewals.len(), 0);
-    }
-
-    /// The sibling for `publishing`/`local_only` -- Fix A's original half.
-    #[test]
-    fn a_parked_row_with_a_fresh_roster_entry_is_a_parked_renewal_candidate() {
-        let r = row(PausedRegistryState::LocalOnly, "node-a");
-        let mut r = r;
-        r.snapshot_id = Some(crate::snapshot::SnapshotId::generate());
-        let roster = fresh_roster("node-a", &[r.sandbox_id]);
-
-        let outcome = compute_reconcile(
-            std::slice::from_ref(&r),
-            &[roster],
-            Utc::now(),
-            SystemTime::now(),
-        );
-        assert_eq!(outcome.parked_lease_renewals.len(), 1);
-        assert_eq!(outcome.live_lease_renewals.len(), 0);
-    }
-
-    /// A `resuming` row is never a renewal candidate through this path --
-    /// only `running` rows are (`renew_live_leases`' own WHERE is
-    /// `state = 'running'` alone).
-    #[test]
-    fn a_resuming_row_is_never_a_live_renewal_candidate_even_with_a_fresh_roster() {
-        let r = row(PausedRegistryState::Resuming, "node-a");
-        let roster = fresh_roster("node-a", &[r.sandbox_id]);
-
-        let outcome = compute_reconcile(&[r], &[roster], Utc::now(), SystemTime::now());
-        assert_eq!(outcome.live_lease_renewals.len(), 0);
     }
 
     /// D2 Fix B's own metric split, mirrored: a `resuming` row is
@@ -463,28 +357,24 @@ mod tests {
         running_lapsed_only.lease_expires_at = Some(Utc::now() - ChronoDuration::seconds(1));
         running_lapsed_only.sandbox_expires_at = None;
 
-        let outcome = compute_reconcile(
-            &[resuming_lapsed_only, running_lapsed_only],
-            &[],
-            Utc::now(),
-            SystemTime::now(),
-        );
+        let outcome = compute_reconcile(&[resuming_lapsed_only, running_lapsed_only], Utc::now());
         assert_eq!(
             outcome.reclaimable_now, 1,
             "only the resuming row (lease alone) should be reclaimable; the running row still needs a passed deadline"
         );
     }
 
-    /// A roster entry older than [`ROSTER_FRESH_TTL`] does not count as a
-    /// renewal source -- a stale heartbeat is not evidence the node is
-    /// still alive.
+    /// A `publishing` row with a snapshot and a lease well inside the warn
+    /// window contributes to neither `stranded_rows` nor
+    /// `parked_lease_expiring` -- the healthy, uninteresting case, pinned so
+    /// a change that makes every row "at risk" is caught.
     #[test]
-    fn a_stale_roster_entry_is_not_a_renewal_source() {
-        let r = row(PausedRegistryState::Running, "node-a");
-        let mut roster = fresh_roster("node-a", &[r.sandbox_id]);
-        roster.last_seen = Some(SystemTime::now() - Duration::from_secs(120));
+    fn a_healthy_parked_row_is_not_at_risk() {
+        let r = row(PausedRegistryState::Publishing, "node-a");
+        let mut r = r;
+        r.snapshot_id = Some(crate::snapshot::SnapshotId::generate());
 
-        let outcome = compute_reconcile(&[r], &[roster], Utc::now(), SystemTime::now());
-        assert_eq!(outcome.live_lease_renewals.len(), 0);
+        let outcome = compute_reconcile(&[r], Utc::now());
+        assert_eq!(outcome.at_risk_rows(), 0);
     }
 }

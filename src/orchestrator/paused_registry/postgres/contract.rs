@@ -15,10 +15,11 @@
 mod pg {
     use std::time::{Duration, SystemTime};
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use uuid::Uuid;
 
     use super::super::PostgresPausedSandboxRegistry;
+    use crate::node_registry::registry::NodeRegistry;
     use crate::orchestrator::paused_registry::{
         ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
         PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
@@ -1109,5 +1110,219 @@ mod pg {
             wins, 1,
             "exactly one of two concurrent claims on the same paused row must win: a={claim_a:?} b={claim_b:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // B1: replica_renewal's per-replica coverage
+    // ---------------------------------------------------------------------
+
+    /// A [`NodeRegistry`] that answers `rosters_in_cluster` with exactly one
+    /// fixed, always-fresh [`Roster`] -- everything else is unreachable from
+    /// [`super::super::replica_renewal::renew_once`], the only method this
+    /// test exercises. Simulates one `--role api` replica whose heartbeat
+    /// connections happen to cover exactly one node.
+    struct SingleRosterRegistry(crate::node_registry::types::Roster);
+
+    impl NodeRegistry for SingleRosterRegistry {
+        fn snapshot(&self, _allow_lingering: bool) -> Vec<crate::node_registry::types::Node> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn contains(&self, _node: &crate::node_registry::types::Node) -> bool {
+            unreachable!("not exercised by renew_once")
+        }
+        fn resolve(&self, _node_id: &str) -> Option<crate::node_registry::types::Node> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn heartbeat(
+            &self,
+            _req: &crate::proto::scheduler::HeartbeatRequest,
+            _now: SystemTime,
+        ) -> Result<
+            (crate::node_registry::types::Node, String),
+            crate::node_registry::registry::NodeNotInRegistry,
+        > {
+            unreachable!("not exercised by renew_once")
+        }
+        fn list_observed(
+            &self,
+            _cluster_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::ObservedNode> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn list_p2p_peers(
+            &self,
+            _cluster_id: &str,
+            _backend: &str,
+            _exclude_node_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::P2pPeer> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn filter_p2p_peers(
+            &self,
+            _cluster_id: &str,
+            _backend: &str,
+            _node_ids: &[String],
+            _exclude_node_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::P2pPeer> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn get_observed(
+            &self,
+            _node_id: &str,
+            _cluster_id: &str,
+            _now: SystemTime,
+        ) -> Option<crate::proto::scheduler::ObservedNode> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn peek_observed(&self, _node_id: &str) -> Option<crate::proto::scheduler::NodeSnapshot> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn roster_of(
+            &self,
+            _node_id: &str,
+        ) -> Option<(Vec<crate::node_registry::types::RosterEntry>, SystemTime)> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn nodes_holding(&self, _sandbox_id: &str) -> Vec<String> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn rosters_in_cluster(
+            &self,
+            _cluster_id: &str,
+        ) -> Vec<crate::node_registry::types::Roster> {
+            vec![self.0.clone()]
+        }
+        fn unregister_observed(
+            &self,
+            _node_id: &str,
+            _service_instance_id: &str,
+        ) -> Result<(), crate::node_registry::registry::ServiceInstanceMismatch> {
+            unreachable!("not exercised by renew_once")
+        }
+        fn applied_cpu_intersection(&self, _cluster_id: &str) -> Option<String> {
+            unreachable!("not exercised by renew_once")
+        }
+    }
+
+    async fn raw_lease_expires_at(pool: &sqlx::PgPool, sandbox_id: SandboxId) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT lease_expires_at FROM paused_sandboxes WHERE sandbox_id = $1")
+            .bind(sandbox_id.into_inner())
+            .fetch_one(pool)
+            .await
+            .expect("the row should exist")
+    }
+
+    /// **B1's own regression pin**: two replicas, each holding only *part*
+    /// of the cluster's heartbeat roster (as `AtomicNodeRegistry` actually
+    /// is -- per-process, unsynchronised), each independently renew only the
+    /// `running` row their own roster names -- and the **union** of the two
+    /// covers every row. Neither replica's pass alone would have.
+    ///
+    /// Before B1, this exact renewal only ran on whichever replica held the
+    /// reconcile leader lock, using *that* replica's own roster alone -- a
+    /// `running` row whose node's heartbeat was pinned to any other replica
+    /// had no renewal path here at all. This test's own "before" half (the
+    /// mid-test assertion that node-b's lease is *still* expired after only
+    /// replica 1's pass) is the direct evidence that coverage really is
+    /// partial per replica, not an artifact of this test's own setup.
+    #[tokio::test]
+    async fn two_replicas_each_holding_part_of_the_roster_together_renew_every_running_row() {
+        let pool = isolated_schema_pool_or_skip!(
+            "two_replicas_each_holding_part_of_the_roster_together_renew_every_running_row"
+        );
+        let cluster_id = Uuid::new_v4();
+        let registry =
+            PostgresPausedSandboxRegistry::new(pool.clone(), cluster_id, Duration::from_millis(50));
+        super::super::schema::migrate(&pool).await.unwrap();
+
+        let sandbox_a = SandboxId::new();
+        let sandbox_b = SandboxId::new();
+        bring_to_running(
+            &registry,
+            sandbox_a,
+            cluster_id,
+            "node-a",
+            ExecutionId::new(),
+            None,
+        )
+        .await;
+        bring_to_running(
+            &registry,
+            sandbox_b,
+            cluster_id,
+            "node-b",
+            ExecutionId::new(),
+            None,
+        )
+        .await;
+
+        // Let both leases lapse -- the ordinary steady-state condition
+        // Fix A's renewal exists to prevent from mattering.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let expired_a = raw_lease_expires_at(&pool, sandbox_a).await;
+        let expired_b = raw_lease_expires_at(&pool, sandbox_b).await;
+        let now = Utc::now();
+        assert!(expired_a < now, "sandbox_a's lease should have lapsed");
+        assert!(expired_b < now, "sandbox_b's lease should have lapsed");
+
+        let roster_1 = crate::node_registry::types::Roster {
+            node_id: "node-a".to_string(),
+            entries: vec![crate::node_registry::types::RosterEntry {
+                sandbox_id: sandbox_a.to_string(),
+                execution_id: Uuid::new_v4().to_string(),
+                projection_ttl: Duration::from_secs(30),
+            }],
+            last_seen: Some(SystemTime::now()),
+        };
+        let roster_2 = crate::node_registry::types::Roster {
+            node_id: "node-b".to_string(),
+            entries: vec![crate::node_registry::types::RosterEntry {
+                sandbox_id: sandbox_b.to_string(),
+                execution_id: Uuid::new_v4().to_string(),
+                projection_ttl: Duration::from_secs(30),
+            }],
+            last_seen: Some(SystemTime::now()),
+        };
+        let replica_1 = SingleRosterRegistry(roster_1);
+        let replica_2 = SingleRosterRegistry(roster_2);
+
+        // Replica 1's pass, alone: only node-a's row is in its roster.
+        let (parked_1, live_1) = super::super::replica_renewal::renew_once(&registry, &replica_1)
+            .await
+            .expect("replica 1's renewal pass should succeed");
+        assert_eq!((parked_1, live_1), (0, 1));
+
+        let renewed_a = raw_lease_expires_at(&pool, sandbox_a).await;
+        assert!(
+            renewed_a > now,
+            "sandbox_a must have been renewed by replica 1's own pass"
+        );
+        // 🔴 The coverage-is-partial claim: replica 1's pass, which never
+        // saw node-b at all, must not have touched sandbox_b's row.
+        let still_expired_b = raw_lease_expires_at(&pool, sandbox_b).await;
+        assert!(
+            still_expired_b < now,
+            "sandbox_b must still be expired -- replica 1's roster never mentioned it"
+        );
+
+        // Replica 2's pass, independently: only node-b's row is in its roster.
+        let (parked_2, live_2) = super::super::replica_renewal::renew_once(&registry, &replica_2)
+            .await
+            .expect("replica 2's renewal pass should succeed");
+        assert_eq!((parked_2, live_2), (0, 1));
+
+        let renewed_b = raw_lease_expires_at(&pool, sandbox_b).await;
+        assert!(
+            renewed_b > now,
+            "sandbox_b must have been renewed by replica 2's own, independent pass"
+        );
+
+        // The union: both rows are now healthy, even though neither replica
+        // ever saw the other's node.
+        assert!(registry.get(&sandbox_a).await.unwrap().is_some());
+        assert!(registry.get(&sandbox_b).await.unwrap().is_some());
     }
 }

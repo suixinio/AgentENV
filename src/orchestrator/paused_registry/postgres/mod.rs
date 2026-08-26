@@ -19,8 +19,12 @@
 //!   + the `DiscardBreaker`.
 //! - [`grace`][]: the restart-grace redesign for N replicas -- **read this
 //!   module's doc before touching [`reconcile`] or [`reclaim_task`]**.
-//! - [`reconcile`][]: the reconcile leader loop (D2 Fix A's home) + D4's
-//!   monitoring fix.
+//! - [`reconcile`][]: the reconcile leader loop (D4's monitoring fix + grace
+//!   entry). D2 Fix A no longer lives here -- see [`replica_renewal`] and
+//!   [`reconcile`]'s own module doc's "B1" section for why.
+//! - [`replica_renewal`][]: **B1**'s per-replica, unelected Fix A -- read
+//!   this module's doc for why Fix A cannot be leader-elected under N
+//!   `--role api` replicas.
 //! - [`reclaim_task`][]: the reclaim leader loop.
 //!
 //! # D1: which parts of this backend need leader election, and why only
@@ -30,17 +34,19 @@
 //! [`PausedSandboxRegistry`] trait impl below) is safe to call from every
 //! `--role api` replica concurrently, unelected -- each is a single
 //! generation/execution_id-CAS'd statement, and PostgreSQL's own row locking
-//! serialises the rest. See the Stage C report's D1 section for the
-//! per-statement review this claim rests on.
+//! serialises the rest. So is [`replica_renewal`] (B1) -- see its own module
+//! doc. See the Stage C report's D1 section for the per-statement review
+//! this claim rests on.
 //!
-//! [`spawn_background_tasks`] is the only place this module starts anything
-//! that needs leadership: the reconcile loop
+//! [`spawn_background_tasks`] starts the two things that genuinely do need
+//! cluster-wide leadership: the reconcile loop
 //! (`AdvisoryLockKey::PausedRegistryReconcile`, [`reconcile`]) and the
 //! reclaim loop (`AdvisoryLockKey::PausedRegistryReclaim`,
-//! [`reclaim_task`]). Both require a heartbeat roster source
-//! ([`crate::node_registry::registry::NodeRegistry`]) to do anything useful
-//! with Fix A -- see [`spawn_background_tasks`]'s own doc on why this
-//! backend refuses to start without one.
+//! [`reclaim_task`]). Neither requires a heartbeat roster source any more
+//! (M1) -- [`replica_renewal`]'s per-replica loop is spawned alongside them
+//! only when [`crate::node_registry::registry::NodeRegistry`] is available,
+//! and is simply skipped (not required) when it is not, which is exactly
+//! `--role all`'s own shape: see [`spawn_background_tasks`]'s own doc.
 
 #[cfg(test)]
 mod contract;
@@ -50,6 +56,7 @@ mod reads;
 mod reclaim;
 mod reclaim_task;
 mod reconcile;
+mod replica_renewal;
 mod row;
 pub mod schema;
 mod sql;
@@ -205,54 +212,101 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
     }
 }
 
-/// Starts the reconcile and reclaim leader loops.
+/// This backend's background tasks, split by whether shutdown has to
+/// release an advisory lock ([`SingletonTaskHandle::shutdown`], `async`) or
+/// can simply be aborted (a plain [`tokio::task::JoinHandle`]) -- see
+/// [`spawn_background_tasks`]'s own doc for which is which and why.
+pub(super) struct BackgroundTasks {
+    /// The reconcile and reclaim leader loops. Belongs in the same
+    /// `pg_singleton_tasks` bucket every other PostgreSQL-elected background
+    /// task in this process shuts down through
+    /// (`src/bin/server.rs::Assembly::pg_singleton_tasks`).
+    pub(super) singleton: Vec<SingletonTaskHandle>,
+    /// B1's per-replica renewal loop, present only when a
+    /// [`NodeRegistry`] was supplied. Belongs in `Assembly::upkeep`
+    /// alongside `spawn_paused_record_upkeep`'s own tasks -- see
+    /// [`replica_renewal::spawn`]'s own doc for why a plain abort is safe
+    /// here.
+    pub(super) plain: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Starts this backend's background tasks: the reconcile leader loop, the
+/// reclaim leader loop, and (M1) B1's per-replica renewal loop when a
+/// heartbeat roster source is available.
 ///
-/// # 🔴 Requires a heartbeat roster source -- refuses to be called without one
+/// # M1: `node_registry` is optional
 ///
-/// D2 Fix A only does anything under a real
-/// [`NodeRegistry::rosters_in_cluster`] answer: without it, `running` rows
-/// have no path back to a renewed lease at all under the split node/api
-/// identity model (`renew_lease`'s own `Running` branch never matches an api
-/// replica's identity -- see `lease.rs`'s doc), and this backend would
-/// silently reintroduce the exact bug Fix A fixed
-/// (`151d00b`, and this repository's own memory note on the "running 行租约
-/// 冻结" failure mode). `--role api` only builds a real
-/// [`crate::node_registry::registry::AtomicNodeRegistry`] under
-/// `[cluster].node_placement_source = "native"`
-/// (`src/bin/server.rs::start_native_node_registry`); under the default
-/// `"scheduler"`, and always under `--role all` (which never builds one at
-/// all), `node_registry` here is `None`.
+/// D2 Fix A (now [`replica_renewal`]) only does anything under a real
+/// [`NodeRegistry::rosters_in_cluster`] answer -- without one, there is
+/// nothing for it to renew from, so [`replica_renewal::spawn`] is simply not
+/// started. This is **not** the same gap Fix A originally closed: under the
+/// split node/api identity model (`--role api`, `[cluster]
+/// .node_placement_source = "scheduler"`, the default), a missing roster
+/// really would leave `running` rows with no renewal path at all, and
+/// `crate::orchestrator::paused_registry::build_paused_registry` still
+/// refuses to select this backend in that configuration for exactly that
+/// reason (see that function's own doc). The case this function *does* have
+/// to accept a missing roster for is `--role all`, which never builds a
+/// [`crate::node_registry::registry::AtomicNodeRegistry`] at all: there,
+/// this process's own identity coincides with `origin_node_id` for
+/// everything it runs, so the ordinary `renew_lease` trait method (driven by
+/// `spawn_paused_record_upkeep` in `src/bin/server.rs`) already renews those
+/// rows under matching identity -- `--role all` never needed Fix A in the
+/// first place. See [`replica_renewal`]'s own module doc for the full
+/// argument.
 ///
-/// This is a **caller** contract, not enforced inside this function: the one
-/// call site (`crate::orchestrator::paused_registry::build_paused_registry`)
-/// refuses to select the `postgres` backend at all when it cannot supply a
-/// roster source, so `spawn_background_tasks` is simply never reached in
-/// that configuration. See that function's own doc for the refusal message.
+/// The reconcile and reclaim leader loops are started unconditionally
+/// either way: grace entry ([`grace::enter`]) and D4's metrics
+/// ([`reconcile::compute_reconcile`]) are both roster-independent, and a
+/// cluster running `--role all` still needs restart-grace protection against
+/// the same fleet-wide-coverage-gap scenario a `--role api` deployment does
+/// (see [`grace`]'s own module doc).
 pub(super) fn spawn_background_tasks(
     pool: PgPool,
     cluster_id: Uuid,
     lease_ttl: Duration,
     reconcile_interval: Duration,
     reclaim_interval: Duration,
-    node_registry: Arc<dyn NodeRegistry>,
-) -> Vec<SingletonTaskHandle> {
-    let mut handles = Vec::with_capacity(2);
+    node_registry: Option<Arc<dyn NodeRegistry>>,
+) -> BackgroundTasks {
+    let mut singleton = Vec::with_capacity(2);
 
     let registry_for_reconcile = Arc::new(PostgresPausedSandboxRegistry::new(
         pool.clone(),
         cluster_id,
         lease_ttl,
     ));
-    handles.push(reconcile::spawn(
+    singleton.push(reconcile::spawn(
         pool.clone(),
         registry_for_reconcile,
         cluster_id,
         lease_ttl,
         reconcile_interval,
-        node_registry,
     ));
 
-    handles.push(reclaim_task::spawn(pool, cluster_id, reclaim_interval));
+    singleton.push(reclaim_task::spawn(
+        pool.clone(),
+        cluster_id,
+        reclaim_interval,
+    ));
 
-    handles
+    let plain = match node_registry {
+        Some(node_registry) => {
+            let registry_for_renewal = Arc::new(PostgresPausedSandboxRegistry::new(
+                pool, cluster_id, lease_ttl,
+            ));
+            vec![replica_renewal::spawn(registry_for_renewal, node_registry)]
+        }
+        None => Vec::new(),
+    };
+
+    BackgroundTasks { singleton, plain }
+}
+
+/// B2(1): delegates to [`grace::attempt_initial_entry`] -- see that
+/// function's own doc. Exposed at this module's boundary so
+/// `crate::orchestrator::paused_registry::build_paused_registry` (the
+/// parent module) can call it without reaching into [`grace`] directly.
+pub(super) async fn attempt_initial_grace_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
+    grace::attempt_initial_entry(pool, cluster_id, ttl_secs).await
 }

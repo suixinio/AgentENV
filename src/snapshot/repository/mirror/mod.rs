@@ -69,6 +69,7 @@ pub use backlog::{
 };
 pub use central::CentralCatalogWrites;
 pub use compensator::{MirrorCompensator, DEFAULT_COMPENSATOR_INTERVAL};
+pub(crate) use population::require_read_side_confirmed;
 pub use population::{
     admit_read_side, admit_read_side_with_confirmation, CatalogCensus, CatalogPopulations,
     ObjectStoreCensus, ReadSideConfirmationStore,

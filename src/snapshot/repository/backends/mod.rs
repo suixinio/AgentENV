@@ -20,9 +20,9 @@ use crate::snapshot::repository::interfaces::SnapshotArtifactStore;
 use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::mirror::{
-    admit_read_side_with_confirmation, CatalogCensus, CatalogReadSide, CentralCatalogWrites,
-    DualWriteCatalog, MirrorBacklog, MirrorCompensator, MirrorDirection, MirrorTargets,
-    ObjectStoreCensus, ReadSideConfirmationStore,
+    admit_read_side_with_confirmation, require_read_side_confirmed, CatalogCensus,
+    CatalogReadSide, CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorCompensator,
+    MirrorDirection, MirrorTargets, ObjectStoreCensus, ReadSideConfirmationStore,
 };
 use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
@@ -119,15 +119,7 @@ pub async fn build_snapshot_backend(
         })?;
         let confirmation =
             PgReadSideConfirmation::new(pool, node_identity.cluster_id, &node_identity.id);
-        if !confirmation.is_confirmed().await? {
-            anyhow::bail!(
-                "snapshot.catalog.write = \"postgres\" requires this cluster's read side to have \
-                 already been confirmed onto PostgreSQL first — run write = \"both\", read = \
-                 \"postgres\" until admit_read_side_with_confirmation's population comparison has \
-                 passed, then switch write to \"postgres\". Nothing has confirmed that for this \
-                 cluster yet."
-            );
-        }
+        require_read_side_confirmed(&confirmation).await?;
 
         let node_id = crate::identity::local_node_id();
         tracing::info!(

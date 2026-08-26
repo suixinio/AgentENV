@@ -448,6 +448,34 @@ pub trait ReadSideConfirmationStore: Send + Sync {
     async fn confirm(&self) -> anyhow::Result<()>;
 }
 
+/// The sole thing standing between `snapshot.catalog.write = "postgres"` and
+/// silently orphaning every snapshot object storage still holds: refuses
+/// unless `store` already says this cluster's read side has been confirmed
+/// onto PostgreSQL.
+///
+/// 🔴 Extracted out of `backends/mod.rs::build_snapshot_backend`'s own
+/// `write = "postgres"` branch for the same reason
+/// `assemble_postgres_only_backend` was pulled out of that function: that
+/// caller reads `ConfigManager::global_config()` and a live `sqlx::PgPool`
+/// directly, so nothing in it can be driven by a unit test with an arbitrary
+/// confirmation state. This function depends on nothing but the trait, so a
+/// [`ReadSideConfirmationStore`] test double — this module's own
+/// `FakeSharedStore` among them — exercises the refusal without a database.
+pub(crate) async fn require_read_side_confirmed(
+    store: &dyn ReadSideConfirmationStore,
+) -> anyhow::Result<()> {
+    if !store.is_confirmed().await? {
+        anyhow::bail!(
+            "snapshot.catalog.write = \"postgres\" requires this cluster's read side to have \
+             already been confirmed onto PostgreSQL first — run write = \"both\", read = \
+             \"postgres\" until admit_read_side_with_confirmation's population comparison has \
+             passed, then switch write to \"postgres\". Nothing has confirmed that for this \
+             cluster yet."
+        );
+    }
+    Ok(())
+}
+
 /// [`admit_read_side`], but able to ask a cluster-shared store — rather than
 /// only this node's local [`MirrorBacklog`] — whether the switch has already
 /// been confirmed.
@@ -1485,5 +1513,43 @@ mod shared_confirmation_tests {
             1,
             "the second replica read the confirmation rather than re-confirming"
         );
+    }
+
+    // ── require_read_side_confirmed ─────────────────────────────────────
+    //
+    // 🔴 P2: the sole gate `snapshot.catalog.write = "postgres"` passes
+    // through before it will start (`backends/mod.rs::build_snapshot_backend`'s
+    // `write == Postgres` branch) — reusing `FakeSharedStore` rather than a
+    // new fixture, since it already implements `ReadSideConfirmationStore`
+    // and already lives in this test module.
+
+    #[tokio::test]
+    async fn an_unconfirmed_store_refuses_write_postgres() {
+        let shared = FakeSharedStore::default();
+        assert!(
+            !shared
+                .is_confirmed()
+                .await
+                .expect("is_confirmed should not error"),
+            "a fresh FakeSharedStore must start unconfirmed for this test's proof to hold"
+        );
+
+        let error = require_read_side_confirmed(&shared)
+            .await
+            .expect_err("an unconfirmed store must refuse write = \"postgres\"");
+        assert!(
+            error.to_string().contains("already been confirmed"),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_store_admits_write_postgres() {
+        let shared = FakeSharedStore::default();
+        shared.confirm().await.expect("confirm should not error");
+
+        require_read_side_confirmed(&shared)
+            .await
+            .expect("a confirmed store must admit write = \"postgres\"");
     }
 }

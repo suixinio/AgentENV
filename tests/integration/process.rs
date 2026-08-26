@@ -2,7 +2,7 @@ use crate::common;
 
 use std::collections::HashMap;
 
-use agentenv::sandbox::{FirecrackerSandbox, ProcessOpts, SandboxExecutor, Signal};
+use aenv_core::sandbox::{FirecrackerSandbox, ProcessOpts, SandboxExecutor, Signal};
 
 use anyhow::Result;
 use tokio::time::Duration;

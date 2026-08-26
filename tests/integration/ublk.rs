@@ -1,6 +1,6 @@
 use crate::common;
 
-use agentenv::sandbox::{
+use aenv_core::sandbox::{
     FirecrackerSandbox, FirecrackerSandboxConfig, SandboxExecutor, UblkBackend, UblkConfig,
 };
 use anyhow::{Context, Result};

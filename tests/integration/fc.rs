@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentenv::cfg::{ConfigManager, MemorySnapshotCompressionAlgorithm};
-use agentenv::sandbox::{
+use aenv_core::cfg::{ConfigManager, MemorySnapshotCompressionAlgorithm};
+use aenv_core::sandbox::{
     BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
     SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
 };
@@ -258,7 +258,7 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     drop(paused_state);
 
     let decoded =
-        agentenv::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
+        aenv_core::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
     let mut resumed =
         FirecrackerSandbox::resume_from_snapshot_config(decoded.snapshot_config()).await?;
     verify_disk_marker(&mut resumed).await?;

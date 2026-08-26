@@ -1,7 +1,7 @@
-use agentenv::orchestrator::{
+use aenv_core::orchestrator::{
     InMemoryMetadataStore, MetadataStore, SandboxListFilter, SandboxMetadata, SandboxState,
 };
-use agentenv::types::{SandboxId, SandboxResources};
+use aenv_core::types::{SandboxId, SandboxResources};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};

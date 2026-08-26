@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
-agentenv = { path = "../.." }
+aenv-core = { path = "../.." }
 anyhow = "1.0.100"
 criterion = { version = "0.8", features = ["async_tokio"] }
 libc = "0.2"

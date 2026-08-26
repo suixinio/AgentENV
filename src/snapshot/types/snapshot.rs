@@ -37,7 +37,7 @@ pub struct SnapshotPublishMetadata {
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 impl SnapshotPublishMetadata {
     pub fn mock() -> Self {
         Self {
@@ -305,7 +305,7 @@ pub struct CommittedSnapshot {
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 impl CommittedSnapshot {
     pub fn mock() -> Self {
         Self {
@@ -393,7 +393,7 @@ impl SnapshotRecord {
             .map(|publication| publication.image_ref.as_str())
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
             id: SnapshotId::generate(),

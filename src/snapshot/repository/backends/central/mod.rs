@@ -891,7 +891,7 @@ fn encode_filter(filter: &SnapshotListFilter) -> pb::SnapshotFilter {
     }
 }
 
-pub(crate) fn now_unix_ms() -> i64 {
+pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
@@ -1129,7 +1129,7 @@ pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
 /// record that deliberately carries no alias — the commit binds it — so passing
 /// that record here reported an empty name to a user whose publish was refused
 /// over a name they had asked for.
-pub(crate) fn alias_conflict(
+pub fn alias_conflict(
     alias: Option<&SnapshotAlias>,
     id: &SnapshotId,
     holder: String,

@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentenv::cfg::ConfigManager;
-use agentenv::image::ImageResolver;
-use agentenv::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
-use agentenv::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
-use agentenv::snapshot::repository::SnapshotRepository;
-use agentenv::snapshot::SnapshotManager;
-use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
+use aenv_core::cfg::ConfigManager;
+use aenv_core::image::ImageResolver;
+use aenv_core::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
+use aenv_core::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
+use aenv_core::snapshot::repository::SnapshotRepository;
+use aenv_core::snapshot::SnapshotManager;
+use aenv_core::template::{TemplateBuildSpec, TemplateBuilder};
 use anyhow::Result;
 use tokio::sync::OnceCell;
 
@@ -34,8 +34,8 @@ pub async fn setup() {
 
 /// Initialize logging, config, and the global ublk manager without resolving a
 /// registry image.
-pub async fn setup_runtime_only() -> &'static agentenv::cfg::AppConfig {
-    agentenv::logging::init_for_tests();
+pub async fn setup_runtime_only() -> &'static aenv_core::cfg::AppConfig {
+    aenv_core::logging::init_for_tests();
     std::env::set_var(
         "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
         "integration-test-seed",

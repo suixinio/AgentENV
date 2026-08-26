@@ -1,5 +1,5 @@
 [package]
-name = "agentenv"
+name = "aenv-core"
 version.workspace = true
 edition = "2021"
 license = "MIT"
@@ -9,6 +9,7 @@ members = [
     ".",
     "adev",
     "crates/aenv",
+    "crates/aenv-api",
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/linux-cap",
@@ -31,6 +32,7 @@ members = [
 version = "0.1.2"
 
 [lib]
+name = "aenv_core"
 path = "src/lib.rs"
 
 [features]
@@ -117,44 +119,14 @@ flate2 = "1"
 tar = "0.4"
 openssl-sys = { version = "0.9", optional = true }
 redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
-# Runtime-query API only (`sqlx::query`/`query_as`), never the `query!`
-# compile-time macros: those need either a live database or an offline cache
-# at build time, which would leak into CI and Docker builds. `tls-native-tls`
-# (bundled by `runtime-tokio-native-tls`) matches this crate's own TLS
-# backend -- `reqwest` above resolves to `native-tls`/openssl by default and
-# is never overridden to rustls the way `crates/aenv` deliberately is -- so
-# this does not add a second TLS stack next to the one `reqwest` already
-# pulls in. See `src/pg/mod.rs`.
-#
-# `chrono`: added for Stage C's paused-registry backend
-# (`src/orchestrator/paused_registry/postgres/`), which binds and decodes
-# `paused_sandboxes`' TIMESTAMPTZ columns (`paused_at`, `updated_at`,
-# `lease_expires_at`, `sandbox_expires_at`, `execution_started_at`) as
-# `chrono::DateTime<Utc>` -- the type `PausedSandboxEntry`/`HeldSandbox`
-# already use crate-wide (`chrono` is already a direct dependency above).
-# Stage B's catalog backend never needed this: its own timestamp columns are
-# `BIGINT` epoch-milliseconds (see `migration_state.rs`'s `now_ms`), sidestepping
-# the question entirely -- Stage C cannot do the same without diverging from
-# the schema `services/scheduler/internal/registry/migrate.go` already owns.
-#
-# `derive`: `#[derive(sqlx::FromRow)]` for Stage C's row types
-# (`postgres::row::EntryRow`/`ClaimRow`) -- 14 named columns is unworkable as
-# a positional tuple the way Stage B's `query_as::<_, (Uuid, Uuid, ...)>`
-# gets away with for two or three columns. Deliberately `derive`, not the
-# broader `macros` feature: `macros` also pulls in `sqlx::query!`/`query_as!`,
-# the compile-time-checked variants this crate's own comment two lines up
-# says never to use (they need a live database or an offline cache at build
-# time). `derive` alone needs neither -- it is a plain proc-macro expansion
-# over struct field names, nothing checked against a schema.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "uuid", "json", "chrono", "derive"] }
 # Stage A of the scheduler fold (docs/proposals/_sd-phase4-stageA-node-inventory.md):
 # `src/node_registry/kubernetes_discovery.rs` ports
 # `services/scheduler/internal/kubernetes_discovery.go`'s EndpointSlice/Pod
 # informers. `kube`'s default TLS backend is rustls; `openssl-tls` (backed by
-# `hyper-openssl`) is selected explicitly instead, for the same reason the
-# `sqlx` entry above picks `tls-native-tls`: `reqwest` already resolves to
-# native-tls/openssl by default, and a second TLS stack in the same binary is
-# exactly what that entry's comment argues against. `crates/aenv` is the
+# `hyper-openssl`) is selected explicitly instead, for the same reason
+# `crates/aenv-api`'s `sqlx` entry picks `tls-native-tls`: `reqwest` already
+# resolves to native-tls/openssl by default, and a second TLS stack in the same
+# binary is exactly what that comment argues against. `crates/aenv` is the
 # documented exception that uses rustls on purpose; this is not it. `v1_34`
 # pins a specific Kubernetes API generation rather than tracking `k8s-openapi`'s
 # `latest` feature, matching how Firecracker/kernel versions are pinned in

@@ -7,7 +7,7 @@ use crate::util;
 #[derive(Args)]
 pub struct MutantsArgs {
     /// Package to test (default: agentenv)
-    #[arg(long, default_value = "agentenv")]
+    #[arg(long, default_value = "aenv-core")]
     pub package: String,
 
     /// Timeout per mutant in seconds
@@ -31,8 +31,8 @@ pub fn run(args: MutantsArgs) -> Result<()> {
     ensure_tool::ensure_cargo_tool("mutants", "cargo-mutants")?;
 
     // Check platform
-    if args.package == "agentenv" && std::env::consts::OS != "linux" {
-        anyhow::bail!("agentenv mutation tests require Linux");
+    if args.package == "aenv-core" && std::env::consts::OS != "linux" {
+        anyhow::bail!("aenv-core mutation tests require Linux");
     }
 
     util::info(&format!(

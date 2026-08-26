@@ -1863,49 +1863,39 @@ async fn a_paused_state_without_a_node_is_refused() {
         .expect("a paused state that says where its bytes are");
 }
 
-/// 🔴 The blank ownership marker and the api role that cannot start are one
-/// fact, and must stop being true together.
+/// 🔴 The remote factory must not send a blank ownership marker.
 ///
-/// `RemoteSandboxBackendFactory` sends `control_plane_config: Vec::new()` on
-/// every create. A grep for who sets the marker therefore comes back with tests
-/// and nothing else, which reads exactly like a defect — and would be one, the
-/// moment anything drove this factory for real: every sandbox it created would
-/// be one the control plane does not recognise as its own, invisible to
-/// `ListSandboxes` and to the reconciliation that runs off it.
+/// `RemoteSandboxBackendFactory` used to send `control_plane_config:
+/// Vec::new()` on every create. A grep for who sets the marker therefore came
+/// back with tests and nothing else, which read exactly like a defect — and
+/// would have been one the moment anything drove this factory for real: every
+/// sandbox it created would be one the control plane does not recognise as its
+/// own, invisible to `ListSandboxes` and to the reconciliation that runs off
+/// it. It was not one at the time only because `--role api` refused to
+/// assemble, so nothing constructed this factory outside these tests.
 ///
-/// It is not one today for a reason that lives in a different file: `--role
-/// api` refuses to assemble, so nothing constructs this factory outside these
-/// tests. That reason is load-bearing and nothing else records it, so it is
-/// asserted here rather than left to a reader to reconstruct.
+/// Both halves of that have since been settled: `--role api` assembles (it is
+/// its own binary now, in `crates/aenv-api`), and the marker arrives from the
+/// caller. What is left is the assertion that mattered, kept on its own.
+///
+/// 🔴 This used to `include_str!` the api binary to decide which of two
+/// branches to assert. That branch is dead — the binary lives in another crate
+/// and assembles — and reaching across the crate boundary with a relative path
+/// to read it would be a coupling with nothing left to check.
 #[test]
-fn the_blank_ownership_marker_outlives_only_an_api_role_that_cannot_start() {
-    const UNASSEMBLABLE: &str = "--role api cannot be assembled yet";
+fn the_remote_factory_sends_no_blank_ownership_marker() {
     const BLANK_MARKER: &str = "control_plane_config: Vec::new()";
 
     let factory = include_str!("factory.rs");
-    let server = include_str!("../bin/aenv-api.rs");
-
-    if server.contains(UNASSEMBLABLE) {
-        // 🔴 Resolution. Without this half the test is a scan for a string that
-        // may no longer exist, and a scan that finds nothing passes forever —
-        // including on the tree where the marker had just been wired up and
-        // this note had gone stale.
-        assert!(
-            factory.contains(BLANK_MARKER),
-            "the remote factory no longer sends a blank ownership marker. That is the fix this \
-             test is waiting for; delete it, or update {BLANK_MARKER:?} to whatever replaced it"
-        );
-        return;
-    }
 
     assert!(
         !factory.contains(BLANK_MARKER),
-        "--role api can be assembled, and the remote factory still sends an empty ownership \
-         marker on every create. Every sandbox the api half started would be one the control \
-         plane does not recognise as its own: absent from ListSandboxes, and absent from the \
-         reconciliation that decides which bindings are still live. The marker is per sandbox — \
-         it is the control plane's record of that sandbox — so it has to arrive from the caller \
-         that decides what that record is, not from a constant here"
+        "the remote factory sends an empty ownership marker on every create. Every sandbox the \
+         api half started would be one the control plane does not recognise as its own: absent \
+         from ListSandboxes, and absent from the reconciliation that decides which bindings are \
+         still live. The marker is per sandbox — it is the control plane's record of that \
+         sandbox — so it has to arrive from the caller that decides what that record is, not \
+         from a constant here"
     );
 }
 

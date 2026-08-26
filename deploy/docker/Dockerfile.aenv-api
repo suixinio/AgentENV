@@ -65,7 +65,7 @@ FROM build-deps AS builder
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p agentenv --bin aenv-api \
+    cargo build --release -p aenv-api --bin aenv-api \
     && cp /build/target/release/aenv-api /out-aenv-api
 
 FROM ubuntu:24.04

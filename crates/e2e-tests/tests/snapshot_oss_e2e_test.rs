@@ -1,16 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use agentenv::cfg::{ConfigManager, OssBackendConfig};
-use agentenv::sandbox::FirecrackerSnapshotManifest;
-use agentenv::snapshot::mock::write_mock_built_artifacts;
-use agentenv::snapshot::repository::backends::storage::OssBackend;
-use agentenv::snapshot::{
+use aenv_core::cfg::{ConfigManager, OssBackendConfig};
+use aenv_core::sandbox::FirecrackerSnapshotManifest;
+use aenv_core::snapshot::mock::write_mock_built_artifacts;
+use aenv_core::snapshot::repository::backends::storage::OssBackend;
+use aenv_core::snapshot::{
     OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
-use agentenv::types::SandboxResources;
+use aenv_core::types::SandboxResources;
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -153,12 +153,12 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
                 id: snapshot_id.clone(),
                 alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
                 source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
+                context: aenv_core::snapshot::CommandContext::default(),
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
                 virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
+                image_configs: aenv_core::types::ImageConfigs::new(),
                 custom_extension_params: None,
             },
             manifest,
@@ -270,12 +270,12 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
                 id: snapshot_id.clone(),
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
+                context: aenv_core::snapshot::CommandContext::default(),
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
                 virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
+                image_configs: aenv_core::types::ImageConfigs::new(),
                 custom_extension_params: None,
             },
             manifest,
@@ -325,12 +325,12 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
                 id: snapshot_id,
                 alias: None,
                 source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
+                context: aenv_core::snapshot::CommandContext::default(),
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
                 virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
+                image_configs: aenv_core::types::ImageConfigs::new(),
                 custom_extension_params: None,
             },
             manifest,
@@ -384,12 +384,12 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
                 id: snapshot_id.clone(),
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
+                context: aenv_core::snapshot::CommandContext::default(),
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
                 virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
+                image_configs: aenv_core::types::ImageConfigs::new(),
                 custom_extension_params: None,
             },
             manifest,

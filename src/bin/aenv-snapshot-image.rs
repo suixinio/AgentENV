@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
-use agentenv::cfg::ConfigManager;
-use agentenv::snapshot::image_export::SnapshotImageService;
+use aenv_core::cfg::ConfigManager;
+use aenv_core::snapshot::image_export::SnapshotImageService;
 use anyhow::Context as _;
 use clap::Parser;
 

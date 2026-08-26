@@ -2347,6 +2347,26 @@ impl ConfigManager {
         }
     }
 
+    /// Loads the bundled `config/default.toml` into the global slot if nothing
+    /// has claimed it yet, for a test in a *sibling* crate.
+    ///
+    /// # 🔴 Why this is not just [`Self::global`]'s `#[cfg(test)]` branch
+    ///
+    /// That branch initializes on demand, and it is compiled only when *this*
+    /// crate is the one being tested. `aenv-api`/`aenv-node` tests run against
+    /// `aenv-core` built as a dependency, where `cfg(test)` is off and
+    /// [`Self::global`] panics instead. Anything those tests reach that reads
+    /// the global config — `CommittedSnapshot::mock`, for instance — needs the
+    /// slot filled first, and says so by calling this.
+    ///
+    /// Idempotent, and never fails: a slot already filled is left alone, and a
+    /// config file that cannot be read leaves it empty for [`Self::global`] to
+    /// complain about at the point of use, exactly as before.
+    #[doc(hidden)]
+    pub fn init_global_for_tests() {
+        let _ = Self::init_global();
+    }
+
     pub fn init_global() -> Result<&'static Self> {
         if let Some(manager) = GLOBAL_CONFIG_MANAGER.get() {
             return Ok(manager);

@@ -13,40 +13,40 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
-use agentenv::binding_store::{
+use aenv_api::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
+use aenv_api::binding_store::{
     ArbitrationMode, BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
-use agentenv::cfg::{
+use aenv_api::cfg::{
     AppConfig, BindingStoreBackendKind, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
     MetadataStoreBackendKind, NodePlacementSource, NodeRegistryObservedBackendKind,
 };
-use agentenv::identity::NodeIdentity;
-use agentenv::image::ImageResolver;
-use agentenv::node_client::{
+use aenv_api::identity::NodeIdentity;
+use aenv_api::image::ImageResolver;
+use aenv_api::node_client::{
     NativeNodePlacement, RemoteSandboxBackendFactory, SchedulerNodePlacement,
 };
-use agentenv::node_registry::dump::NodeRegistryDumpSource;
-use agentenv::node_registry::grpc_service::NodeRegistryGrpcService;
-use agentenv::node_registry::kubernetes_discovery::{
+use aenv_api::node_registry::dump::NodeRegistryDumpSource;
+use aenv_api::node_registry::grpc_service::NodeRegistryGrpcService;
+use aenv_api::node_registry::kubernetes_discovery::{
     validate_optional_pod_selector, KubernetesDiscovery, KubernetesDiscoveryConfig,
 };
-use agentenv::node_registry::redis::{
+use aenv_api::node_registry::redis::{
     run_shared_observed_sync, SharedObservedStore, SharedObservedStoreConfig, DEFAULT_PULL_INTERVAL,
 };
-use agentenv::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
-use agentenv::node_registry::warmup::WarmupGate;
-use agentenv::observability::ObservabilityService;
-use agentenv::orchestrator::{
+use aenv_api::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
+use aenv_api::node_registry::warmup::WarmupGate;
+use aenv_api::observability::ObservabilityService;
+use aenv_api::orchestrator::{
     build_paused_registry, spawn_paused_registry_background_tasks, DisabledSandboxPersister,
     Orchestrator, PgPausedRegistryFactory, PostgresPausedRegistryFactory, RedisMetadataStore,
     SandboxOrchestration,
 };
-use agentenv::pg::{self, PgPoolSettings};
-use agentenv::role::ServerRole;
-use agentenv::server_main::{self, spawn_grpc_surface, Assembly};
-use agentenv::snapshot::SnapshotManager;
-use agentenv::template::TemplateBuilder;
+use aenv_api::pg::{self, PgPoolSettings};
+use aenv_api::role::ServerRole;
+use aenv_api::server_main::{self, spawn_grpc_surface, Assembly};
+use aenv_api::snapshot::SnapshotManager;
+use aenv_api::template::TemplateBuilder;
 use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
@@ -81,15 +81,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    agentenv::logging::init();
+    aenv_api::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
     let cli = ApiCli::parse();
     let role = ServerRole::Api.confirm(cli.role)?;
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
-        agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
+        aenv_api::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
-        agentenv::cfg::ConfigManager::init_global()?
+        aenv_api::cfg::ConfigManager::init_global()?
     };
     let config = config_manager.config();
 
@@ -117,10 +117,10 @@ async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool
     // the build reaper (`spawn_pg_singleton_tasks`, started right after this
     // returns) and `build_snapshot_backend`'s `PostgresSnapshotCatalog`
     // construction both assume the schema already exists. See
-    // `agentenv::snapshot::repository::backends::migrate_catalog_schema`'s own
+    // `aenv_api::snapshot::repository::backends::migrate_catalog_schema`'s own
     // doc: idempotent, advisory-lock-guarded, safe on every start and across
     // a fleet of replicas racing to call it at once.
-    agentenv::snapshot::repository::backends::migrate_catalog_schema(&pool).await?;
+    aenv_api::snapshot::repository::backends::migrate_catalog_schema(&pool).await?;
     Ok(Some(pool))
 }
 
@@ -144,16 +144,16 @@ fn reaper_cadence(config: &AppConfig) -> (std::time::Duration, std::time::Durati
 }
 
 /// Starts the catalog build reaper for this process when `pg_pool` is
-/// `Some`. See `agentenv::snapshot::repository::backends::spawn_catalog_build_reaper`'s
+/// `Some`. See `aenv_api::snapshot::repository::backends::spawn_catalog_build_reaper`'s
 /// own doc on why the handle must be shut down through its own `shutdown()`
 /// path rather than folded into `paused_upkeep`.
 fn spawn_pg_singleton_tasks(
     config: &AppConfig,
     pg_pool: Option<sqlx::PgPool>,
-) -> Vec<agentenv::pg::SingletonTaskHandle> {
+) -> Vec<aenv_api::pg::SingletonTaskHandle> {
     let (interval, ttl) = reaper_cadence(config);
-    let identity = agentenv::identity::NodeIdentity::from_config(&config.node_identity);
-    agentenv::snapshot::repository::backends::spawn_catalog_build_reaper(
+    let identity = aenv_api::identity::NodeIdentity::from_config(&config.node_identity);
+    aenv_api::snapshot::repository::backends::spawn_catalog_build_reaper(
         pg_pool,
         identity.cluster_id,
         interval,
@@ -358,9 +358,9 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             binding_store_handle = Some(Arc::clone(&binding_store));
             let max_projection_ttl =
                 Duration::from_secs(config.binding_store.max_projection_ttl_secs);
-            let artifact_store: Arc<dyn agentenv::binding_store::artifact_index::ArtifactStore> =
+            let artifact_store: Arc<dyn aenv_api::binding_store::artifact_index::ArtifactStore> =
                 Arc::new(
-                    agentenv::binding_store::artifact_index::InMemoryArtifactStore::new(
+                    aenv_api::binding_store::artifact_index::InMemoryArtifactStore::new(
                         config.binding_store.artifact_index_capacity as usize,
                     ),
                 );
@@ -481,7 +481,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         // asked here for a build sandbox instead of a user one.
         RemoteSandboxBackendFactory::new(Arc::clone(&placement)),
         DisabledSandboxPersister,
-        agentenv::image::DisabledRuntimeImageRefs::shared(),
+        aenv_api::image::DisabledRuntimeImageRefs::shared(),
     )
     .await?;
     let orchestration: Arc<dyn SandboxOrchestration> =
@@ -493,9 +493,9 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // reason it no longer takes the pool itself.
     let pg_catalog = pg_pool
         .as_ref()
-        .map(|pool| agentenv::snapshot::repository::backends::pg_catalog_parts(config, pool));
-    let snapshot_backend = agentenv::snapshot::repository::backends::build_snapshot_backend(
-        agentenv::snapshot::repository::backends::build_catalog_only_storage(config)?,
+        .map(|pool| aenv_api::snapshot::repository::backends::pg_catalog_parts(config, pool));
+    let snapshot_backend = aenv_api::snapshot::repository::backends::build_snapshot_backend(
+        aenv_api::snapshot::repository::backends::build_catalog_only_storage(config)?,
         pg_catalog,
         role,
     )
@@ -599,7 +599,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             (native_registry_handle.clone(), binding_store_handle.clone())
         {
             let cluster_id = config.node_identity.cluster_id.clone().unwrap_or_default();
-            let sweeper = Arc::new(agentenv::binding_store::sweep::BindingSweeper::new(
+            let sweeper = Arc::new(aenv_api::binding_store::sweep::BindingSweeper::new(
                 cluster_id,
                 Duration::from_secs(config.binding_store.sweep_silence_secs),
             ));
@@ -637,7 +637,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
                 .filter(|endpoint| !endpoint.is_empty())
                 .expect("cluster_placement already required a non-empty scheduler_endpoint");
             let channel = tonic::transport::Endpoint::from_shared(
-                agentenv::scheduler_endpoint::qualified(endpoint),
+                aenv_api::scheduler_endpoint::qualified(endpoint),
             )
             .context("build the node-registry dump's scheduler-proxy channel")?
             .connect_lazy();
@@ -651,7 +651,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             &config.cluster.api_grpc_addr,
             "sandbox resume service",
             move |listener, shutdown| {
-                agentenv::api::grpc::serve_on(
+                aenv_api::api::grpc::serve_on(
                     listener,
                     served,
                     node_registry_grpc_service,
@@ -690,14 +690,14 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // address, its resource allocation and the cluster's CPU-config
     // intersection, and is reachable through the gateway's REST fan-out the
     // same as any other unrecognized path (`services/gateway/internal/server.go`).
-    // See `agentenv::api::server::new_with_control_plane_routes`'s own doc
+    // See `aenv_api::api::server::new_with_control_plane_routes`'s own doc
     // comment for the full argument, including why "zero impact by default"
     // is not an accurate description of adding this endpoint at all.
     let node_registry_debug_routes = axum::Router::new().route(
         "/debug/node-registry",
         axum::routing::get(move || {
             let source = node_registry_dump_source.clone();
-            async move { axum::Json(agentenv::node_registry::dump::dump(&source).await) }
+            async move { axum::Json(aenv_api::node_registry::dump::dump(&source).await) }
         }),
     );
 
@@ -722,8 +722,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
 /// would be warning about is two replicas each answering 404 for the other's
 /// sandboxes, which is indistinguishable from a sandbox that was deleted.
 fn cluster_store_config(
-    config: &agentenv::cfg::OrchestratorStoreConfig,
-) -> anyhow::Result<agentenv::orchestrator::RedisStoreConfig> {
+    config: &aenv_api::cfg::OrchestratorStoreConfig,
+) -> anyhow::Result<aenv_api::orchestrator::RedisStoreConfig> {
     if !matches!(config.backend, MetadataStoreBackendKind::Redis) {
         anyhow::bail!(
             "--role api needs [orchestrator.store].backend = \"redis\" \
@@ -742,7 +742,7 @@ fn cluster_store_config(
     // transition_key_ttl` — and `validate` refuses a combination that breaks
     // them. Exposing them individually would let a deployment set one and be
     // refused at startup for a reason about a different one.
-    Ok(agentenv::orchestrator::RedisStoreConfig {
+    Ok(aenv_api::orchestrator::RedisStoreConfig {
         url: config.redis_url.clone(),
         key_prefix: config.redis_key_prefix.clone(),
         distributed_lock_enabled: config.redis_distributed_lock_enabled,
@@ -772,12 +772,12 @@ fn cluster_store_config(
 /// to zero left every create failing. `Native` now needs no scheduler
 /// endpoint at all.
 fn cluster_placement(
-    config: &agentenv::cfg::ClusterConfig,
-    scheduler_report: &agentenv::cfg::ObservabilitySchedulerReportConfig,
+    config: &aenv_api::cfg::ClusterConfig,
+    scheduler_report: &aenv_api::cfg::ObservabilitySchedulerReportConfig,
     native_registry: Option<&Arc<AtomicNodeRegistry>>,
     native_warmup: Option<&Arc<WarmupGate>>,
     native_grpc_service: Option<&NodeRegistryGrpcService>,
-) -> anyhow::Result<Arc<dyn agentenv::node_client::NodePlacement>> {
+) -> anyhow::Result<Arc<dyn aenv_api::node_client::NodePlacement>> {
     match (
         config.node_placement_source,
         native_registry,
@@ -823,7 +823,7 @@ fn cluster_placement(
 /// feeds it (task's own "D5"), and the background tasks that keep both
 /// current (kube discovery, the observed-nodes metrics gauge). Callers merge
 /// `tasks` into the role's own `upkeep` and pass `grpc_service` to
-/// `agentenv::api::grpc::serve_on`.
+/// `aenv_api::api::grpc::serve_on`.
 ///
 /// 🔴 Under `[cluster].node_placement_source = "scheduler"` (the default),
 /// nothing in `assemble_api` calls this at all — no registry, no kube
@@ -851,7 +851,7 @@ const KUBE_DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const KUBE_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 async fn start_native_node_registry(
-    config: &agentenv::cfg::ClusterConfig,
+    config: &aenv_api::cfg::ClusterConfig,
     dual_report_api_endpoint: &str,
 ) -> anyhow::Result<NativeNodeRegistryBits> {
     let discovery = &config.kubernetes_discovery;
@@ -938,7 +938,7 @@ async fn start_native_node_registry(
     let registry = Arc::new(AtomicNodeRegistry::with_empty_sync_guard(
         Vec::new(),
         Duration::from_secs(30),
-        agentenv::node_registry::registry::EmptySyncGuard {
+        aenv_api::node_registry::registry::EmptySyncGuard {
             confirmations: discovery.empty_sync_confirmations,
             window: Duration::from_secs(discovery.empty_sync_window_secs),
         },
@@ -951,7 +951,7 @@ async fn start_native_node_registry(
     // and `AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS`'s doc comment (`cfg.rs`)
     // for why the two clocks must not be the same one.
     let warmup = Arc::new(WarmupGate::new(
-        Arc::clone(&registry) as Arc<dyn agentenv::node_registry::registry::NodeRegistry>,
+        Arc::clone(&registry) as Arc<dyn aenv_api::node_registry::registry::NodeRegistry>,
         Duration::from_secs(config.native_warmup_timeout_secs),
         std::time::SystemTime::now(),
     ));
@@ -1043,7 +1043,7 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
 /// The shared-roster fix: wires `--role api`'s Stage A node registry's
 /// heartbeat-derived (`observed`) state into Redis so every replica sees
 /// the whole cluster's roster, not just the nodes whose heartbeat happens
-/// to be pinned to it — see `agentenv::node_registry::redis`'s own module
+/// to be pinned to it — see `aenv_api::node_registry::redis`'s own module
 /// doc for the full design.
 ///
 /// Mirrors `build_binding_store`'s own multi-replica guardrail exactly, for
@@ -1058,7 +1058,7 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
 /// running.
 ///
 /// On success, spawns the background task
-/// (`agentenv::node_registry::redis::run_shared_observed_sync`) that keeps
+/// (`aenv_api::node_registry::redis::run_shared_observed_sync`) that keeps
 /// `registry` in sync going forward and returns its `JoinHandle` for the
 /// caller to fold into its own upkeep — the same pattern
 /// `start_native_node_registry` already uses for the kube-discovery and
@@ -1301,7 +1301,7 @@ mod tests {
         config.orchestrator.store.redis_key_prefix = "agentenv:probe".to_string();
         config.orchestrator.store.redis_distributed_lock_enabled = false;
 
-        let defaults = agentenv::orchestrator::RedisStoreConfig::default();
+        let defaults = aenv_api::orchestrator::RedisStoreConfig::default();
         assert_ne!(defaults.url, config.orchestrator.store.redis_url);
         assert_ne!(
             defaults.key_prefix,
@@ -1398,7 +1398,7 @@ mod tests {
 
         let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
         let warmup = Arc::new(WarmupGate::new(
-            Arc::clone(&registry) as Arc<dyn agentenv::node_registry::registry::NodeRegistry>,
+            Arc::clone(&registry) as Arc<dyn aenv_api::node_registry::registry::NodeRegistry>,
             Duration::from_secs(15),
             std::time::SystemTime::now(),
         ));
@@ -1530,7 +1530,7 @@ mod tests {
     /// end proves that one is untouched.
     #[tokio::test]
     async fn native_placement_without_a_dual_report_endpoint_warns_but_starts() {
-        let mut cluster = agentenv::cfg::ClusterConfig {
+        let mut cluster = aenv_api::cfg::ClusterConfig {
             node_placement_source: NodePlacementSource::Native,
             ..AppConfig::default().cluster
         };
@@ -1568,7 +1568,7 @@ mod tests {
         // Control: an empty namespace/service_name is still a hard refusal,
         // unaffected by this change — proves the check ahead of this one in
         // the function was not also weakened.
-        let unconfigured_discovery = agentenv::cfg::ClusterConfig {
+        let unconfigured_discovery = aenv_api::cfg::ClusterConfig {
             node_placement_source: NodePlacementSource::Native,
             ..AppConfig::default().cluster
         };

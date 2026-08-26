@@ -13,22 +13,22 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use agentenv::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring};
-use agentenv::cfg::{AppConfig, PausedRegistryBackendKind};
-use agentenv::identity::NodeIdentity;
-use agentenv::image::ImageResolver;
-use agentenv::observability::{ObservabilityReporter, ObservabilityService};
-use agentenv::orchestrator::{
+use aenv_core::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring};
+use aenv_core::cfg::{AppConfig, PausedRegistryBackendKind};
+use aenv_core::identity::NodeIdentity;
+use aenv_core::image::ImageResolver;
+use aenv_core::observability::{ObservabilityReporter, ObservabilityService};
+use aenv_core::orchestrator::{
     DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
     SandboxOrchestration,
 };
-use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::p2p::P2pTransport;
-use agentenv::role::ServerRole;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::server_main::{self, spawn_grpc_surface, Assembly, ProcessRuntime};
-use agentenv::snapshot::SnapshotManager;
-use agentenv::template::TemplateBuilder;
+use aenv_core::overlaybd::OverlaybdP2pRuntime;
+use aenv_core::p2p::P2pTransport;
+use aenv_core::role::ServerRole;
+use aenv_core::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use aenv_core::server_main::{self, spawn_grpc_surface, Assembly, ProcessRuntime};
+use aenv_core::snapshot::SnapshotManager;
+use aenv_core::template::TemplateBuilder;
 use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
@@ -174,7 +174,7 @@ impl ProcessRuntime for NodeRuntime {
         // shared-instance registry, in particular) are still live elsewhere in
         // the process.
         info!(target: "agentenv", "closing image cache metadata store");
-        agentenv::image::close_image_cache_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT).await;
+        aenv_core::image::close_image_cache_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT).await;
         info!(target: "agentenv", "closing snapshot catalog mirror backlog store");
         self.snapshot_manager
             .close_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT)
@@ -210,7 +210,7 @@ struct NodeCore {
 /// closure that has already started to return.
 ///
 /// Every RocksDB store this process opens (`LocalKvStore`, see
-/// `agentenv::local_store`) does its writes, and its own background
+/// `aenv_core::local_store`) does its writes, and its own background
 /// compaction/flush, through `spawn_blocking` — so one such closure still
 /// running when the async body below returns was enough to make the whole
 /// process hang past `terminationGracePeriodSeconds`, long after every log
@@ -240,15 +240,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    agentenv::logging::init();
+    aenv_core::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
     let cli = NodeCli::parse();
     let role = ServerRole::Node.confirm(cli.role)?;
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
-        agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
+        aenv_core::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
-        agentenv::cfg::ConfigManager::init_global()?
+        aenv_core::cfg::ConfigManager::init_global()?
     };
     let config = config_manager.config();
 
@@ -263,16 +263,16 @@ async fn async_main() -> anyhow::Result<()> {
     // still catches is *configuration*: an operator who leaves `[pg].dsn` in a
     // node's ConfigMap has put a database credential on a machine that runs
     // user code, whether or not anything in the process could use it.
-    role.check_pg_dsn(config.pg.as_ref().and_then(agentenv::cfg::PgConfig::dsn))?;
+    role.check_pg_dsn(config.pg.as_ref().and_then(aenv_core::cfg::PgConfig::dsn))?;
 
     if cli.setup_only {
-        agentenv::setup::ensure_provisioning(config).await?;
+        aenv_core::setup::ensure_provisioning(config).await?;
         info!(target: "agentenv", "dependency setup complete (setup-only mode)");
         return Ok(());
     }
 
     if cli.setup_host {
-        agentenv::setup::ensure_host(config, &cli.runtime_user, &cli.runtime_group)?;
+        aenv_core::setup::ensure_host(config, &cli.runtime_user, &cli.runtime_group)?;
         info!(target: "agentenv", "host setup complete");
         return Ok(());
     }
@@ -295,8 +295,8 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     debug_assert!(role.runs_sandbox_runtime());
     debug_assert!(role.sends_heartbeats());
 
-    agentenv::privileges::require_runtime_capabilities()?;
-    agentenv::privileges::clear_ambient_capabilities()?;
+    aenv_core::privileges::require_runtime_capabilities()?;
+    aenv_core::privileges::clear_ambient_capabilities()?;
 
     // 🔴 First, before anything else this process constructs, and in
     // particular before `setup::ensure_environment` — which unlinks every
@@ -304,18 +304,18 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // VMM is still running inside it. The sweep is sound only while this
     // process holds nothing on the machine, and that window is widest here.
     // See `src/node_reclaim/` for the whole argument.
-    agentenv::node_reclaim::run(role, config).await;
+    aenv_core::node_reclaim::run(role, config).await;
 
     let identity = NodeIdentity::from_config(&config.node_identity);
     // `identity` is moved into the observability service below; the registry
     // wiring needs the same node/cluster identity afterwards.
     let identity_for_registry = identity.clone();
-    let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
+    let p2p_transport = aenv_core::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
     let overlaybd_p2p =
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 
-    agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
+    aenv_core::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
 
     // Initialize the global ublk device manager (spawns daemon if configured).
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
@@ -338,15 +338,15 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // just wrote. Only the machine that holds bytes has anything to offer, so
     // only this assembly builds an advertiser — `assemble_api` passes `None`.
     let snapshot_advertiser = snapshot_p2p_transport.clone().map(|transport| {
-        Arc::new(agentenv::snapshot::P2pSnapshotAdvertiser::new(transport))
-            as Arc<dyn agentenv::snapshot::SnapshotArtifactAdvertiser>
+        Arc::new(aenv_core::snapshot::P2pSnapshotAdvertiser::new(transport))
+            as Arc<dyn aenv_core::snapshot::SnapshotArtifactAdvertiser>
     });
     // 🔴 `None` for the PostgreSQL parts, unconditionally and by construction:
-    // this half never holds a `[pg]` pool (see `agentenv::pg`'s own module
+    // this half never holds a `[pg]` pool (see `aenv_core::pg`'s own module
     // doc and `ServerRole::check_pg_dsn`), so there is nothing for it to build
     // a central catalog out of.
-    let snapshot_backend = agentenv::snapshot::repository::backends::build_snapshot_backend(
-        agentenv::snapshot::repository::backends::storage::build_node_storage(
+    let snapshot_backend = aenv_core::snapshot::repository::backends::build_snapshot_backend(
+        aenv_core::snapshot::repository::backends::storage::build_node_storage(
             config,
             snapshot_p2p_transport,
         )?,
@@ -401,7 +401,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // `src/orchestrator/tests.rs`.
     // 🔴 The node half's own layer cache, named here rather than defaulted
     // inside the orchestrator. This is the process that has one.
-    let image_refs = agentenv::image::local_runtime_image_refs();
+    let image_refs = aenv_core::image::local_runtime_image_refs();
     let orchestrator =
         Orchestrator::with_file_backed_store_and_factory(role, factory, image_refs).await?;
     let observability_config = &config.observability;
@@ -582,7 +582,7 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
             &config.cluster.node_service_addr,
             "node sandbox service",
             move |listener, shutdown| {
-                agentenv::node_server::serve_on(
+                aenv_core::node_server::serve_on(
                     listener,
                     orchestration,
                     snapshots,
@@ -768,7 +768,7 @@ mod tests {
         assert!(
             // 🔴 Matches the call *expression* (`role.check_pg_dsn(`), not the
             // bare identifier `check_pg_dsn`. This file's own doc comment on
-            // the call site (`See \`agentenv::pg\` and \`ServerRole::check_pg_dsn\`.`)
+            // the call site (`See \`aenv_core::pg\` and \`ServerRole::check_pg_dsn\`.`)
             // contains that bare identifier too — deleting the call while
             // leaving the comment behind kept a bare-identifier assertion
             // green, which is exactly backwards for a positive assertion:

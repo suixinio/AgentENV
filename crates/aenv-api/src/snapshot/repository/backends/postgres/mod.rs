@@ -430,7 +430,7 @@ pub fn pg_catalog_parts(config: &AppConfig, pool: &PgPool) -> PgCatalogParts {
 /// case.
 ///
 /// 🔴 The returned handle must be shut down through
-/// `agentenv::pg::SingletonTaskHandle::shutdown()`, never pushed into a
+/// `aenv_core::pg::SingletonTaskHandle::shutdown()`, never pushed into a
 /// `Vec<tokio::task::JoinHandle<()>>` and `.abort()`-ed — see that type's
 /// own documentation on why: this replica's PostgreSQL advisory lock, if it
 /// is currently leader, would otherwise leak until the pool itself is torn

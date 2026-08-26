@@ -1,14 +1,14 @@
 use crate::common;
 
-use agentenv::cfg::ConfigManager;
-use agentenv::orchestrator::{
+use aenv_core::cfg::ConfigManager;
+use aenv_core::orchestrator::{
     ClaimedExecution, CreateSandboxRequest, FileBackedSandboxPersister, ForkChildren,
     InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxExpiry,
     SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
-use agentenv::role::ServerRole;
-use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
-use agentenv::snapshot::{
+use aenv_core::role::ServerRole;
+use aenv_core::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
+use aenv_core::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotSource,
     StartupCommand,
 };
@@ -24,7 +24,7 @@ use uuid::Uuid;
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn envd_process_list_status(
-    target: &agentenv::orchestrator::ProxyTarget,
+    target: &aenv_core::orchestrator::ProxyTarget,
     access_token: Option<&str>,
 ) -> Result<envd::reqwest::StatusCode> {
     let port = ConfigManager::global_config().tools.control_plane_port;
@@ -37,7 +37,7 @@ async fn envd_process_list_status(
 }
 
 async fn assert_envd_process_list_succeeds(
-    target: &agentenv::orchestrator::ProxyTarget,
+    target: &aenv_core::orchestrator::ProxyTarget,
     access_token: &str,
 ) -> Result<()> {
     let port = ConfigManager::global_config().tools.control_plane_port;
@@ -78,7 +78,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             store,
             factory,
             persister,
-            agentenv::image::DisabledRuntimeImageRefs::shared(),
+            aenv_core::image::DisabledRuntimeImageRefs::shared(),
         )
         .await?;
         let case_id = Uuid::now_v7().to_string();
@@ -177,7 +177,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             host_file_persister(paused_store),
-            agentenv::image::DisabledRuntimeImageRefs::shared(),
+            aenv_core::image::DisabledRuntimeImageRefs::shared(),
         )
         .await?;
         let restored = restarted

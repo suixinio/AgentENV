@@ -605,7 +605,7 @@ pub trait SandboxExecutor: Send {
     ///
     /// # Example
     /// ```no_run
-    /// use agentenv::sandbox::SandboxExecutor;
+    /// use aenv_core::sandbox::SandboxExecutor;
     /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
     /// let output = sandbox.run_command("echo", &["hello", "world"]).await?;
     /// assert_eq!(output.exit_code, 0);
@@ -621,7 +621,7 @@ pub trait SandboxExecutor: Send {
     ///
     /// # Example
     /// ```no_run
-    /// use agentenv::sandbox::{ProcessOpts, SandboxExecutor};
+    /// use aenv_core::sandbox::{ProcessOpts, SandboxExecutor};
     /// use std::collections::HashMap;
     /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
     /// let opts = ProcessOpts::new().with_cwd("/tmp");
@@ -648,7 +648,7 @@ pub trait SandboxExecutor: Send {
     ///
     /// # Example
     /// ```no_run
-    /// use agentenv::sandbox::SandboxExecutor;
+    /// use aenv_core::sandbox::SandboxExecutor;
     /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
     /// sandbox.create_dir_all("/home/user/work").await?;
     /// # Ok(())
@@ -662,7 +662,7 @@ pub trait SandboxExecutor: Send {
     ///
     /// # Example
     /// ```no_run
-    /// use agentenv::sandbox::{ProcessOpts, SandboxExecutor};
+    /// use aenv_core::sandbox::{ProcessOpts, SandboxExecutor};
     /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
     /// let mut handle = sandbox.start_process("cat", &[], &ProcessOpts::default()).await?;
     /// handle.send_stdin(b"hello\n").await?;

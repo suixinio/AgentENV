@@ -2,11 +2,11 @@ mod facade;
 mod launch_plan;
 
 mod metrics;
-mod paused_registry;
+pub mod paused_registry;
 mod persistence;
 mod proxy;
 mod service;
-mod store;
+pub mod store;
 mod types;
 
 use std::time::SystemTime;
@@ -18,11 +18,10 @@ pub use facade::SandboxOrchestration;
 pub use launch_plan::ClaimedExecution;
 pub use metrics::OrchestratorMetrics;
 pub use paused_registry::{
-    build_paused_registry, spawn_paused_registry_background_tasks, BeganPause, ConflictReason,
-    DeadlineRenewalOutcome, DisabledPausedSandboxRegistry, HeldSandbox, MarkRunningOutcome,
-    PausedRegistryBackgroundTasks, PausedRegistryError, PausedRegistryListEntry,
-    PausedRegistryListing, PausedRegistryState, PausedSandboxEntry, PausedSandboxPublisher,
-    PausedSandboxRegistry, PgPausedRegistryFactory, PostgresPausedRegistryFactory,
+    build_paused_registry, BeganPause, ConflictReason, DeadlineRenewalOutcome,
+    DisabledPausedSandboxRegistry, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
+    PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState, PausedSandboxEntry,
+    PausedSandboxPublisher, PausedSandboxRegistry, PostgresPausedRegistryFactory,
     ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 pub use persistence::{

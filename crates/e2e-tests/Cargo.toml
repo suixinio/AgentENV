@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
-agentenv = { path = "../.." }
+aenv-core = { path = "../.." }
 agentenv-test-support = { path = "../test-support" }
 anyhow = "1.0"
 overlaybd = { path = "../../storage/overlaybd" }

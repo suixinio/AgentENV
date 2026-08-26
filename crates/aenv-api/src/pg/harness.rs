@@ -329,6 +329,14 @@ pub(crate) use pool_or_skip;
 /// survive for the whole test, across however many connections the pool
 /// borrows out over that time, not just one transaction.
 pub(crate) async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
+    // 🔴 Not this function's subject, and here anyway: every caller is a test
+    // in *this* crate, where `aenv-core` is a dependency and its `global()`
+    // panics rather than self-initializing (`ConfigManager::init_global_for_tests`
+    // says why). Several of these suites build records through
+    // `CommittedSnapshot::mock`, which reads the global config. Filling the
+    // slot once, here, is what every one of them would otherwise repeat.
+    crate::cfg::ConfigManager::init_global_for_tests();
+
     let dsn = dsn_for(test)?;
 
     static NEXT: AtomicI64 = AtomicI64::new(0);

@@ -7,7 +7,7 @@ pub mod mock;
 pub mod p2p;
 pub mod repository;
 pub(crate) mod runtime_support;
-mod types;
+pub mod types;
 
 pub use captured::{
     CallerOwnedArtifacts, CapturedSandboxSnapshot, LocalCapturedArtifacts,

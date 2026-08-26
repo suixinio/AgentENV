@@ -1,6 +1,6 @@
 use crate::common;
 
-use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor};
+use aenv_core::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor};
 use anyhow::Result;
 use tokio::time::Duration;
 

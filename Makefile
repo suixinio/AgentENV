@@ -76,13 +76,13 @@ release:
 	$(CARGO) build --release
 
 build-server:
-	$(CARGO) build -p agentenv --bin aenv-node --bin aenv-api
+	$(CARGO) build -p aenv-core -p aenv-api --bin aenv-node --bin aenv-api
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin aenv-node --bin aenv-api
+	$(CARGO) build --release -p aenv-core -p aenv-api --bin aenv-node --bin aenv-api
 
 build-snapshot-image:
-	$(CARGO) build -p agentenv --bin aenv-snapshot-image
+	$(CARGO) build -p aenv-core --bin aenv-snapshot-image
 
 build-aenv:
 	$(CARGO) build -p aenv
@@ -138,8 +138,8 @@ test: test-agent test-envd test-ublk
 # file without `--force`, and `aenv upload`'s directory walk refusing to
 # follow symlinks out of the tree.
 test-unit:
-	$(CARGO) test -p agentenv -p envd -p linux-cap -p aenv -p adev --lib --bins
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib --bins -- --ignored
+	$(CARGO) test -p aenv-core -p aenv-api -p envd -p linux-cap -p aenv -p adev --lib --bins
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api --lib --bins -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib --bins
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
@@ -169,7 +169,7 @@ test-with-redis:
 	  echo "Install redis-server, or point REDIS_SERVER_BIN at one."; \
 	  exit 1; }
 	@mkdir -p $(dir $(REDIS_TEST_LOG))
-	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p agentenv --lib -- --nocapture \
+	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p aenv-core --lib -- --nocapture \
 	  orchestrator::store:: binding_store::redis:: node_registry::redis:: \
 	  > $(REDIS_TEST_LOG) 2>&1; status=$$?; \
 	  cat $(REDIS_TEST_LOG); \
@@ -206,7 +206,7 @@ test-with-postgres:
 	  exit 1; \
 	fi
 	@mkdir -p $(dir $(PG_TEST_LOG))
-	@AENV_PG_TEST_REQUIRED=1 $(CARGO) test -p agentenv --lib pg:: -- --nocapture \
+	@AENV_PG_TEST_REQUIRED=1 $(CARGO) test -p aenv-core -p aenv-api --lib pg:: -- --nocapture \
 	  > $(PG_TEST_LOG) 2>&1; status=$$?; \
 	  cat $(PG_TEST_LOG); \
 	  if grep -q 'SKIPPED\[postgres\]' $(PG_TEST_LOG); then \
@@ -289,7 +289,7 @@ test-snapshot-catalog:
 	AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT="http://$(CATALOG_TEST_GRPC)" \
 	AENV_SNAPSHOT_CATALOG_TEST_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
 	AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1 \
-	$(CARGO) test -p agentenv --test snapshot_catalog; \
+	$(CARGO) test -p aenv-core --test snapshot_catalog; \
 	status=$$?; \
 	kill $$scheduler_pid 2>/dev/null; \
 	docker rm -f $(CATALOG_TEST_PG) >/dev/null 2>&1; \
@@ -302,14 +302,14 @@ test-agent: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
 	export PATH="$(DEBUG_PROFILE_DIR):$$PATH"; \
 	export AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon"; \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv; \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api; \
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api --lib -- --ignored
 
 test-agent-integration: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv \
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core \
 		--test integration \
 		--test orchestrator_integration
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \

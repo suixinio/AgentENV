@@ -1,0 +1,44 @@
+[package]
+name = "aenv-api"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "aenv_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aenv-api"
+path = "src/bin/aenv-api.rs"
+
+[dependencies]
+aenv-core = { path = "../.." }
+agentenv-observability = { path = "../observability" }
+anyhow = "1.0.100"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["multipart", "ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "openssl-tls"] }
+libc = "0.2"
+metrics = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+# Runtime-query API only (`sqlx::query`/`query_as`), never the `query!`
+# compile-time macros: those need either a live database or an offline cache at
+# build time, which would leak into CI and Docker builds. See `src/pg/mod.rs`
+# and the root manifest's own note, which this entry was moved from.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "uuid", "json", "chrono", "derive"] }
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tokio = { version = "1", features = ["full"] }
+tonic = "0.14.2"
+tracing = "0.1.41"
+url = "2.5"
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
+tempfile = "3.22.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

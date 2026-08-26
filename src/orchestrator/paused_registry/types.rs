@@ -36,7 +36,7 @@ impl PausedRegistryState {
     /// Decodes the textual form stored in the registry. The encoded values are
     /// written literally by the backend's SQL and pinned there by a CHECK
     /// constraint, so this is the only place that has to know them.
-    pub(super) fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "publishing" => Some(Self::Publishing),
             "paused" => Some(Self::Paused),

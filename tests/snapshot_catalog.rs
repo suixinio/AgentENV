@@ -43,21 +43,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agentenv::api::{snapshot_cursor_from_token, snapshot_next_token};
-use agentenv::sandbox::FirecrackerSnapshotManifest;
-use agentenv::snapshot::repository::backends::CentralSnapshotCatalog;
-use agentenv::snapshot::repository::interfaces::CatalogReadScope;
-use agentenv::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
-use agentenv::snapshot::repository::{
+use aenv_core::api::{snapshot_cursor_from_token, snapshot_next_token};
+use aenv_core::sandbox::FirecrackerSnapshotManifest;
+use aenv_core::snapshot::repository::backends::CentralSnapshotCatalog;
+use aenv_core::snapshot::repository::interfaces::CatalogReadScope;
+use aenv_core::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit};
+use aenv_core::snapshot::repository::{
     RepositoryError, SnapshotCursor, SnapshotListFilter, StartedBuild,
 };
-use agentenv::snapshot::{
+use aenv_core::snapshot::{
     CommandContext, CommittedSnapshot, ManagedLayer, SnapshotAlias, SnapshotId,
     SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
-use agentenv::types::{ImageConfigs, SandboxResources};
-use agentenv::virtualization::VirtualizationMode;
+use aenv_core::types::{ImageConfigs, SandboxResources};
+use aenv_core::virtualization::VirtualizationMode;
 use uuid::Uuid;
 
 /// The endpoint and cluster the tests run against, or a reason there are none.
@@ -259,7 +259,7 @@ async fn a_still_building_row_is_invisible_to_a_caller_that_did_not_ask_for_it()
     catalog
         .begin_snapshot(
             &opening,
-            agentenv::snapshot::repository::backends::central::STATUS_BUILDING,
+            aenv_core::snapshot::repository::backends::central::STATUS_BUILDING,
             false,
         )
         .await
@@ -490,7 +490,7 @@ async fn a_template_row_is_created_waiting_and_can_be_failed_with_a_reason() {
     assert!(matches!(
         waiting.source,
         SnapshotSource::Template { ref build }
-            if build.status == agentenv::snapshot::TemplateBuildStatus::Waiting
+            if build.status == aenv_core::snapshot::TemplateBuildStatus::Waiting
     ));
 
     catalog
@@ -508,7 +508,10 @@ async fn a_template_row_is_created_waiting_and_can_be_failed_with_a_reason() {
         .expect("the template row should still be there");
     match failed.source {
         SnapshotSource::Template { build } => {
-            assert_eq!(build.status, agentenv::snapshot::TemplateBuildStatus::Error);
+            assert_eq!(
+                build.status,
+                aenv_core::snapshot::TemplateBuildStatus::Error
+            );
             let reason = build.error_reason.expect("an error row must say why");
             assert_eq!(reason.message, "the build died");
             assert_eq!(reason.step.as_deref(), Some("RUN apt-get"));
@@ -749,7 +752,7 @@ async fn a_staged_snapshot_commits_into_the_central_catalog_after_a_round_trip()
     let catalog = catalog!();
     let workspace = tempfile::TempDir::new().expect("tempdir should exist");
     let (_, _, manifest): (_, _, FirecrackerSnapshotManifest) =
-        agentenv::snapshot::mock::write_mock_built_artifacts(workspace.path())
+        aenv_core::snapshot::mock::write_mock_built_artifacts(workspace.path())
             .expect("mock artifacts should write");
     let _ = manifest;
 
@@ -776,11 +779,13 @@ mod dual_write {
     use async_trait::async_trait;
 
     use super::*;
-    use agentenv::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
-    use agentenv::snapshot::repository::mirror::{
+    use aenv_core::snapshot::repository::backends::storage::{
+        PosixFsBackend, PosixFsBackendConfig,
+    };
+    use aenv_core::snapshot::repository::mirror::{
         CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorDirection, MirrorTargets,
     };
-    use agentenv::snapshot::repository::RepositoryResult;
+    use aenv_core::snapshot::repository::RepositoryResult;
 
     /// A real object-store catalog with a switch that takes it away.
     ///
@@ -894,7 +899,7 @@ mod dual_write {
     /// The POSIX backend builds its runtime resolver from the global config, so
     /// one has to exist. Idempotent — the first test through wins.
     async fn both(central: Arc<CentralSnapshotCatalog>) -> Both {
-        agentenv::cfg::ConfigManager::init_global().expect("a config should load");
+        aenv_core::cfg::ConfigManager::init_global().expect("a config should load");
         let workspace = tempfile::TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: workspace.path().join("repository"),
@@ -1210,7 +1215,7 @@ mod dual_write {
         assert!(matches!(
             central_row.source,
             SnapshotSource::Template { ref build }
-                if build.status == agentenv::snapshot::TemplateBuildStatus::Error
+                if build.status == aenv_core::snapshot::TemplateBuildStatus::Error
         ));
         let object_store_row = both
             .object_store
@@ -1221,7 +1226,7 @@ mod dual_write {
         assert!(matches!(
             object_store_row.source,
             SnapshotSource::Template { ref build }
-                if build.status == agentenv::snapshot::TemplateBuildStatus::Error
+                if build.status == aenv_core::snapshot::TemplateBuildStatus::Error
         ));
     }
 
@@ -1302,7 +1307,7 @@ mod dual_write {
                 matches!(
                     row.source,
                     SnapshotSource::Template { ref build }
-                        if build.status == agentenv::snapshot::TemplateBuildStatus::Building
+                        if build.status == aenv_core::snapshot::TemplateBuildStatus::Building
                 ),
                 "{which} should have moved the template to building"
             );
@@ -1903,7 +1908,7 @@ mod dual_write {
         let queued = both
             .backlog
             .queue_history_toward_central(both.object_store.as_ref()
-                as &dyn agentenv::snapshot::repository::interfaces::SnapshotCatalog)
+                as &dyn aenv_core::snapshot::repository::interfaces::SnapshotCatalog)
             .await
             .expect("the history should queue");
         assert_eq!(queued, 1, "one snapshot older than the double write");
@@ -1949,12 +1954,14 @@ mod dual_write {
 mod bytes_then_commit {
     use super::*;
 
-    use agentenv::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
-    use agentenv::snapshot::repository::mirror::{
+    use aenv_core::snapshot::repository::backends::storage::{
+        PosixFsBackend, PosixFsBackendConfig,
+    };
+    use aenv_core::snapshot::repository::mirror::{
         CentralCatalogWrites, DualWriteCatalog, MirrorBacklog,
     };
-    use agentenv::snapshot::repository::{SnapshotRepository, StagedSnapshot};
-    use agentenv::snapshot::{SnapshotManager, SnapshotPublishMetadata};
+    use aenv_core::snapshot::repository::{SnapshotRepository, StagedSnapshot};
+    use aenv_core::snapshot::{SnapshotManager, SnapshotPublishMetadata};
 
     /// 🔴 The whole point of the split, end to end and across a real process
     /// boundary.
@@ -1970,7 +1977,7 @@ mod bytes_then_commit {
     #[tokio::test]
     async fn bytes_land_here_and_the_commit_happens_in_another_process() {
         let central = catalog!();
-        agentenv::cfg::ConfigManager::init_global().expect("a config should load");
+        aenv_core::cfg::ConfigManager::init_global().expect("a config should load");
 
         let workspace = tempfile::TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
@@ -2000,7 +2007,7 @@ mod bytes_then_commit {
 
         let artifacts = tempfile::TempDir::new().expect("tempdir should exist");
         let (_, _, manifest) =
-            agentenv::snapshot::mock::write_mock_built_artifacts(artifacts.path())
+            aenv_core::snapshot::mock::write_mock_built_artifacts(artifacts.path())
                 .expect("mock artifacts should write");
 
         let id = SnapshotId::generate();
@@ -2316,7 +2323,7 @@ async fn a_still_building_row_is_absent_from_a_page_that_did_not_ask_for_it() {
     catalog
         .begin_snapshot(
             &opening,
-            agentenv::snapshot::repository::backends::central::STATUS_BUILDING,
+            aenv_core::snapshot::repository::backends::central::STATUS_BUILDING,
             false,
         )
         .await
@@ -2382,7 +2389,7 @@ async fn a_page_with_no_stated_limit_is_bounded_by_the_server() {
 /// having one.
 #[tokio::test]
 async fn the_read_side_gates_census_counts_rows_the_resolvable_reading_hides() {
-    use agentenv::snapshot::repository::mirror::CatalogCensus;
+    use aenv_core::snapshot::repository::mirror::CatalogCensus;
 
     let catalog = catalog!();
     let waiting = SnapshotId::generate();

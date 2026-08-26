@@ -4,17 +4,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common;
 
-use agentenv::cfg::ConfigManager;
-use agentenv::sandbox::{
+use aenv_core::cfg::ConfigManager;
+use aenv_core::sandbox::{
     ExtraDrive, FirecrackerSandbox, FirecrackerSandboxConfig, OverlaybdConfig, SandboxBackend,
     SandboxExecutor, SandboxLaunchConfig,
 };
-use agentenv::snapshot::{
+use aenv_core::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
 };
-use agentenv::template::{TemplateBuildDriver as _, TemplateBuildSpec, TemplateBuilder};
-use agentenv::types::{ExecutionId, SandboxResources};
+use aenv_core::template::{TemplateBuildDriver as _, TemplateBuildSpec, TemplateBuilder};
+use aenv_core::types::{ExecutionId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;
 
@@ -33,7 +33,7 @@ fn overlaybd_lower_count(image_config: &Path) -> Result<usize> {
 }
 
 fn assert_committed_attached_drive_metadata(
-    snapshot: &agentenv::snapshot::CommittedSnapshot,
+    snapshot: &aenv_core::snapshot::CommittedSnapshot,
     image_config: &Path,
     read_only: bool,
     expected_layer_count: usize,
@@ -165,10 +165,10 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
         alias: Some(SnapshotAlias::parse(alias)?),
-        source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
+        source: aenv_core::snapshot::SnapshotPublishSource::Sandbox {
             source_sandbox_id: "test-sandbox".to_string(),
         },
-        context: agentenv::snapshot::CommandContext::default(),
+        context: aenv_core::snapshot::CommandContext::default(),
         startup: None,
         resources: SandboxResources {
             cpu_count: 1,
@@ -183,8 +183,8 @@ async fn publish_sandbox_snapshot_with_attached_drive(
                 .resolved_tools_version()
                 .to_string(),
         },
-        virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
-        image_configs: agentenv::types::ImageConfigs::new(),
+        virtualization_mode: aenv_core::cfg::ConfigManager::global_config().virtualization_mode,
+        image_configs: aenv_core::types::ImageConfigs::new(),
         custom_extension_params: None,
     };
 

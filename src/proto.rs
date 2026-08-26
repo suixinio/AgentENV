@@ -1,4 +1,4 @@
-pub(crate) mod scheduler {
+pub mod scheduler {
     // Generated code. prost expands a `oneof` into an enum whose variants are
     // whatever the messages behind them weigh, so their size spread is decided
     // by the .proto and not by anything reachable from here: `AcquireSandbox`'s

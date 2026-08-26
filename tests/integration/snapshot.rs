@@ -1,18 +1,18 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentenv::cfg::ConfigManager;
-use agentenv::sandbox::{
+use aenv_core::cfg::ConfigManager;
+use aenv_core::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
     SandboxLaunchConfig,
 };
-use agentenv::snapshot::{
+use aenv_core::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
     SnapshotRuntimeVersions,
 };
-use agentenv::template::TemplateBuildDriver as _;
-use agentenv::template::TemplateBuildSpec;
-use agentenv::types::{ExecutionId, SandboxId, SandboxResources};
+use aenv_core::template::TemplateBuildDriver as _;
+use aenv_core::template::TemplateBuildSpec;
+use aenv_core::types::{ExecutionId, SandboxId, SandboxResources};
 use anyhow::{anyhow, bail, Context, Result};
 use tempfile::tempdir;
 
@@ -73,7 +73,7 @@ async fn assert_guest_path_absent(sandbox: &FirecrackerSandbox, path: &str) -> R
 }
 
 async fn publish_captured_snapshot_for_test(
-    snapshot_manager: &agentenv::snapshot::SnapshotManager,
+    snapshot_manager: &aenv_core::snapshot::SnapshotManager,
     alias: &str,
     source_sandbox_id: SandboxId,
     captured_snapshot: CapturedSandboxSnapshot,
@@ -86,7 +86,7 @@ async fn publish_captured_snapshot_for_test(
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: source_sandbox_id.to_string(),
                 },
-                context: agentenv::snapshot::CommandContext::default(),
+                context: aenv_core::snapshot::CommandContext::default(),
                 startup: None,
                 resources: SandboxResources {
                     cpu_count: 1,
@@ -94,9 +94,9 @@ async fn publish_captured_snapshot_for_test(
                     disk_size_mib: 0,
                 },
                 runtime_versions: sample_runtime_versions(),
-                virtualization_mode: agentenv::cfg::ConfigManager::global_config()
+                virtualization_mode: aenv_core::cfg::ConfigManager::global_config()
                     .virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
+                image_configs: aenv_core::types::ImageConfigs::new(),
                 custom_extension_params: None,
             },
             captured_snapshot,
@@ -128,7 +128,7 @@ impl DeterministicRng {
 
 enum ScenarioSandboxRuntime {
     Running(Box<FirecrackerSandbox>),
-    Paused(Box<agentenv::sandbox::FirecrackerSnapshotConfig>),
+    Paused(Box<aenv_core::sandbox::FirecrackerSnapshotConfig>),
 }
 
 struct ScenarioSandbox {

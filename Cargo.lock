@@ -68,32 +68,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "aes"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+name = "aenv-api"
+version = "0.1.2"
 dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures 0.2.17",
+ "aenv-core",
+ "agentenv-observability",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "kube",
+ "libc",
+ "metrics",
+ "metrics-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tikv-jemallocator",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
-name = "aes-gcm"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
-dependencies = [
- "aead",
- "aes",
- "cipher",
- "ctr",
- "ghash",
- "subtle",
-]
-
-[[package]]
-name = "agentenv"
+name = "aenv-core"
 version = "0.1.2"
 dependencies = [
  "agentenv-observability",
@@ -150,7 +154,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shell-util",
- "sqlx",
  "storage-util",
  "tar",
  "tempfile",
@@ -175,10 +178,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "agentenv-benchmarks"
 version = "0.1.0"
 dependencies = [
- "agentenv",
+ "aenv-core",
  "anyhow",
  "criterion",
  "libc",
@@ -198,7 +226,7 @@ dependencies = [
 name = "agentenv-e2e-tests"
 version = "0.1.0"
 dependencies = [
- "agentenv",
+ "aenv-core",
  "agentenv-test-support",
  "anyhow",
  "overlaybd",

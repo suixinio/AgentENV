@@ -64,7 +64,7 @@ jobs:
       - name: Configure ublk test host
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
       # 🔴 `src/orchestrator/store/`'s suite runs inside `make test-unit` —
-      # it is part of `cargo test -p agentenv --lib` — and 67 of its tests ask
+      # it is part of `cargo test -p aenv-core --lib` — and 67 of its tests ask
       # `redis::harness::store_for` for a real server. Without one they print
       # `SKIPPED[redis]` to stderr, return, and are counted as passes. Nothing
       # in this job provided a server, so on every PR the store filter reported

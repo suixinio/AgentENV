@@ -153,9 +153,14 @@ pub(super) fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> Rec
 pub(super) async fn reconcile_once(
     registry: &PostgresPausedSandboxRegistry,
 ) -> anyhow::Result<ReconcileOutcome> {
-    let rows = super::reads::list_registry_rows(registry)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let start = std::time::Instant::now();
+    let rows = match super::reads::list_registry_rows(registry).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            record_reconcile_read_failure(registry.cluster_id);
+            return Err(anyhow::Error::from(err));
+        }
+    };
 
     let outcome = compute_reconcile(&rows, Utc::now());
 
@@ -179,8 +184,118 @@ pub(super) async fn reconcile_once(
         );
     }
 
+    record_reconcile_metrics(registry.cluster_id, &rows, outcome, start.elapsed());
+
     Ok(outcome)
 }
+
+/// D4-adjacent (task's own "Stage D remainder"): ports the subset of Go's
+/// `recordRegistryReconcile` (`metrics.go`) that this port can compute
+/// honestly from rows alone. **Deliberately excludes** `registry_ghost`,
+/// `registry_untracked`, `registry_stale_copy`, `registry_holder_conflict`,
+/// `registry_rows_without_roster`, `registry_roster_stale`, and the
+/// heartbeat-lease-renewal candidate/renewed/failure gauges: every one of
+/// those cross-references registry rows against a node's *heartbeat
+/// roster*, and this module's own B1 doc (above) explains why that
+/// cross-reference cannot run here -- `AtomicNodeRegistry` is a per-replica,
+/// in-memory view covering only the nodes whose heartbeat happens to be
+/// pinned to *this* `--role api` Pod, not the cluster's. Computing those six
+/// metrics from a partial roster would not degrade gracefully, it would
+/// actively lie: a node whose heartbeat landed on a different replica reads
+/// as `ghost`/`untracked` here even though it is perfectly healthy. Go's
+/// single-process scheduler has no such gap, which is exactly why this
+/// reconcile port is the leader-elected, roster-free half (see the module
+/// doc's "B1" section) and [`super::replica_renewal`] is the per-replica,
+/// roster-scoped half -- the split this metrics function respects too.
+/// `registry_enabled` also has no counterpart: this whole module is only
+/// ever spawned under the Postgres backend (see [`spawn`]), so the series'
+/// own presence in a scrape already says what the gauge would have.
+fn record_reconcile_metrics(
+    cluster_id: Uuid,
+    rows: &[RegistryRow],
+    outcome: ReconcileOutcome,
+    elapsed: Duration,
+) {
+    let cluster_label = cluster_id.to_string();
+
+    let mut by_state: std::collections::HashMap<&'static str, u64> = [
+        ("publishing", 0),
+        ("paused", 0),
+        ("resuming", 0),
+        ("local_only", 0),
+        ("running", 0),
+    ]
+    .into_iter()
+    .collect();
+    for row in rows {
+        *by_state.entry(row_state_label(row.state)).or_insert(0) += 1;
+    }
+    for (state, count) in by_state {
+        metrics::gauge!(
+            REGISTRY_ROWS_METRIC,
+            "cluster_id" => cluster_label.clone(),
+            "state" => state,
+        )
+        .set(count as f64);
+    }
+
+    metrics::gauge!(STRANDED_ROWS_METRIC, "cluster_id" => cluster_label.clone())
+        .set(outcome.stranded_rows as f64);
+    metrics::gauge!(PARKED_LEASE_EXPIRING_METRIC, "cluster_id" => cluster_label.clone())
+        .set(outcome.parked_lease_expiring as f64);
+    metrics::gauge!(LIVE_LEASE_LAPSED_METRIC, "cluster_id" => cluster_label.clone())
+        .set(outcome.live_lease_lapsed as f64);
+    metrics::gauge!(LIVE_DEADLINE_PASSED_METRIC, "cluster_id" => cluster_label.clone())
+        .set(outcome.live_deadline_passed as f64);
+    metrics::gauge!(RECLAIMABLE_NOW_METRIC, "cluster_id" => cluster_label.clone())
+        .set(outcome.reclaimable_now as f64);
+    metrics::gauge!(AT_RISK_ROWS_METRIC, "cluster_id" => cluster_label.clone())
+        .set(outcome.at_risk_rows() as f64);
+    metrics::histogram!(RECONCILE_DURATION_METRIC, "cluster_id" => cluster_label.clone())
+        .record(elapsed.as_secs_f64());
+    metrics::gauge!(LAST_SUCCESS_METRIC, "cluster_id" => cluster_label).set(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    );
+}
+
+fn record_reconcile_read_failure(cluster_id: Uuid) {
+    metrics::counter!(READ_FAILURES_METRIC, "cluster_id" => cluster_id.to_string()).increment(1);
+}
+
+fn row_state_label(state: PausedRegistryState) -> &'static str {
+    match state {
+        PausedRegistryState::Publishing => "publishing",
+        PausedRegistryState::Paused => "paused",
+        PausedRegistryState::Resuming => "resuming",
+        PausedRegistryState::LocalOnly => "local_only",
+        PausedRegistryState::Running => "running",
+    }
+}
+
+/// Ports `agentenv_scheduler_registry_rows{state}`.
+const REGISTRY_ROWS_METRIC: &str = "agentenv_api_paused_registry_rows";
+/// Ports `agentenv_scheduler_registry_stranded_rows`.
+const STRANDED_ROWS_METRIC: &str = "agentenv_api_paused_registry_stranded_rows";
+/// Ports `agentenv_scheduler_registry_parked_lease_expiring`.
+const PARKED_LEASE_EXPIRING_METRIC: &str = "agentenv_api_paused_registry_parked_lease_expiring";
+/// Ports `agentenv_scheduler_registry_live_lease_lapsed`.
+const LIVE_LEASE_LAPSED_METRIC: &str = "agentenv_api_paused_registry_live_lease_lapsed";
+/// Ports `agentenv_scheduler_registry_live_deadline_passed`.
+const LIVE_DEADLINE_PASSED_METRIC: &str = "agentenv_api_paused_registry_live_deadline_passed";
+/// Ports `agentenv_scheduler_registry_reclaimable_now`.
+const RECLAIMABLE_NOW_METRIC: &str = "agentenv_api_paused_registry_reclaimable_now";
+/// No Go counterpart -- this port's own D4 unified figure (see
+/// [`ReconcileOutcome::at_risk_rows`]'s own doc).
+const AT_RISK_ROWS_METRIC: &str = "agentenv_api_paused_registry_at_risk_rows";
+/// Ports `agentenv_scheduler_registry_reconcile_duration_seconds`.
+const RECONCILE_DURATION_METRIC: &str = "agentenv_api_paused_registry_reconcile_duration_seconds";
+/// Ports `agentenv_scheduler_registry_last_success_timestamp_seconds`.
+const LAST_SUCCESS_METRIC: &str = "agentenv_api_paused_registry_last_success_timestamp_seconds";
+/// Ports `agentenv_scheduler_registry_read_failures_total`.
+const READ_FAILURES_METRIC: &str = "agentenv_api_paused_registry_read_failures_total";
 
 /// A single reconcile-task tick's own time budget, independent of `interval`.
 ///
@@ -376,5 +491,126 @@ mod tests {
 
         let outcome = compute_reconcile(&[r], Utc::now());
         assert_eq!(outcome.at_risk_rows(), 0);
+    }
+}
+
+/// Task's own "Stage D remainder": proves `reconcile_once` actually reports
+/// [`record_reconcile_metrics`] against a real database end to end -- the
+/// pure-function tests above cover `compute_reconcile`'s arithmetic, but
+/// nothing until this exercised the metric emission wired onto its result
+/// (the same "was the Ok(_outcome) actually read from" gap
+/// `record_assignment`/`heartbeat`'s binding-execution metric test closes
+/// for the RPC layer).
+#[cfg(test)]
+mod pg {
+    use uuid::Uuid;
+
+    use super::super::schema::migrate;
+    use super::*;
+    use crate::pg::harness::isolated_schema_pool_or_skip;
+
+    async fn seed_row(
+        pool: &PgPool,
+        cluster_id: Uuid,
+        state: &str,
+        origin_node_id: &str,
+        has_snapshot: bool,
+    ) {
+        let sandbox_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO paused_sandboxes (
+                sandbox_id, cluster_id, state, generation, origin_node_id, snapshot_id,
+                metadata, paused_at, updated_at, lease_expires_at, execution_id, execution_started_at
+             ) VALUES ($1, $2, $3, 1, $4, $5, '{}'::jsonb, now(), now(),
+                       now() + interval '1 hour', $6, now())",
+        )
+        .bind(sandbox_id)
+        .bind(cluster_id)
+        .bind(state)
+        .bind(origin_node_id)
+        .bind(if has_snapshot {
+            Some(Uuid::new_v4())
+        } else {
+            None::<Uuid>
+        })
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await
+        .expect("seeding a row should succeed");
+    }
+
+    #[tokio::test]
+    async fn reconcile_once_reports_row_and_at_risk_gauges() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let pool = isolated_schema_pool_or_skip!("reconcile_once_reports_row_and_at_risk_gauges");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let cluster_id = Uuid::new_v4();
+        // One healthy `running` row (fresh lease, has a snapshot) and one
+        // `publishing` row with no snapshot at all -- stranded, per
+        // `compute_reconcile`.
+        seed_row(&pool, cluster_id, "running", "node-a", true).await;
+        seed_row(&pool, cluster_id, "publishing", "node-b", false).await;
+
+        let registry =
+            PostgresPausedSandboxRegistry::new(pool, cluster_id, Duration::from_secs(90));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let outcome = reconcile_once(&registry)
+            .await
+            .expect("reconcile pass should succeed");
+        drop(guard);
+
+        assert_eq!(outcome.stranded_rows, 1, "the snapshot-less publishing row");
+
+        let cluster_label = cluster_id.to_string();
+        let mut rows_by_state: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        let mut stranded = None;
+        for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
+            let key = composite.key();
+            let Some(cid) = key.labels().find(|l| l.key() == "cluster_id") else {
+                continue;
+            };
+            if cid.value() != cluster_label {
+                continue;
+            }
+            match key.name() {
+                "agentenv_api_paused_registry_rows" => {
+                    if let DebugValue::Gauge(v) = value {
+                        if let Some(state) = key.labels().find(|l| l.key() == "state") {
+                            rows_by_state.insert(state.value().to_string(), v.into_inner());
+                        }
+                    }
+                }
+                "agentenv_api_paused_registry_stranded_rows" => {
+                    if let DebugValue::Gauge(v) = value {
+                        stranded = Some(v.into_inner());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            rows_by_state.get("running").copied(),
+            Some(1.0),
+            "{rows_by_state:?}"
+        );
+        assert_eq!(
+            rows_by_state.get("publishing").copied(),
+            Some(1.0),
+            "{rows_by_state:?}"
+        );
+        assert_eq!(
+            rows_by_state.get("paused").copied(),
+            Some(0.0),
+            "every known state must be published, zeroed if absent -- not just the states this \
+             cluster happens to have a row in: {rows_by_state:?}"
+        );
+        assert_eq!(stranded, Some(1.0));
     }
 }

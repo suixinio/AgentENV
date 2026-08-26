@@ -1261,6 +1261,14 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         node_registry_for_paused.clone(),
     )
     .await?;
+    // Task's own "Stage D remainder": `lookup_node`'s stage 3. Built here,
+    // strictly between `node_registry_grpc_service`'s own construction
+    // (`with_binding_store`, above) and its only consumer
+    // (`spawn_grpc_surface`, below) -- a no-op under
+    // `[cluster].node_placement_source = "scheduler"`
+    // (`node_registry_grpc_service` is `None` there).
+    let node_registry_grpc_service = node_registry_grpc_service
+        .map(|service| service.with_paused_registry(Arc::clone(&paused_registry)));
     let paused_registry_tasks = spawn_paused_registry_background_tasks(
         &config.orchestrator.paused_registry,
         &identity_for_registry,

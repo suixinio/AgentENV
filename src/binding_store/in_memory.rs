@@ -342,7 +342,18 @@ mod tests {
             Some(InMemoryBindingStore::new(BindingStoreSettings::default()))
         }
 
+        async fn new_contract_store_with_mode(
+            _test: &str,
+            mode: crate::binding_store::ArbitrationMode,
+        ) -> Option<InMemoryBindingStore> {
+            Some(InMemoryBindingStore::new(BindingStoreSettings {
+                arbitration: mode,
+                ..BindingStoreSettings::default()
+            }))
+        }
+
         crate::binding_store::contract::binding_store_contract!();
+        crate::binding_store::contract::binding_store_arbitration_contract!();
     }
 
     fn unix(secs: u64) -> SystemTime {

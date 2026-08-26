@@ -259,7 +259,22 @@ mod contract {
         super::store_or_skip_option(test, BindingStoreSettings::default()).await
     }
 
+    async fn new_contract_store_with_mode(
+        test: &str,
+        mode: crate::binding_store::ArbitrationMode,
+    ) -> Option<RedisBindingStore> {
+        super::store_or_skip_option(
+            test,
+            BindingStoreSettings {
+                arbitration: mode,
+                ..BindingStoreSettings::default()
+            },
+        )
+        .await
+    }
+
     crate::binding_store::contract::binding_store_contract!();
+    crate::binding_store::contract::binding_store_arbitration_contract!();
 }
 
 /// A non-macro variant of `store_or_skip!` for `mod contract`, which needs

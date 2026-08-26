@@ -34,6 +34,7 @@
 pub mod arbitration;
 pub mod artifact_index;
 pub mod in_memory;
+pub mod lookup;
 pub mod record;
 pub mod redis;
 pub mod sweep;

@@ -32,10 +32,32 @@ pub(super) async fn get(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
 ) -> RegistryResult<Option<PausedSandboxEntry>> {
+    get_via_conn(&registry.pool, registry.cluster_id, sandbox_id).await
+}
+
+/// [`get`]'s own query, over an arbitrary executor rather than
+/// `registry.pool` specifically -- **B5**'s own reason to exist: a caller
+/// that just wrote a conditional `UPDATE` and needs to classify why it
+/// matched zero rows must read the row it is classifying on the *same*
+/// connection/transaction as the write, or the read can land on a
+/// different physical connection and see a version of the row the write
+/// never observed (see `writes.rs`'s `mark_running`/`renew_sandbox_deadline`
+/// for the two internal callers this exists for). Takes anything
+/// implementing [`sqlx::Executor`] for `Postgres` -- `&PgPool` (this
+/// function's own use above), `&mut PgConnection`, or `&mut Transaction<'_,
+/// Postgres>` via `&mut *tx` all satisfy it.
+pub(super) async fn get_via_conn<'e, E>(
+    executor: E,
+    cluster_id: Uuid,
+    sandbox_id: &SandboxId,
+) -> RegistryResult<Option<PausedSandboxEntry>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let row: Option<EntryRow> = sqlx::query_as(&sql::get_sql())
         .bind(sandbox_id.into_inner())
-        .bind(registry.cluster_id)
-        .fetch_optional(&registry.pool)
+        .bind(cluster_id)
+        .fetch_optional(executor)
         .await
         .map_err(|e| backend_err("get", e))?;
 

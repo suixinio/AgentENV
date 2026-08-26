@@ -60,7 +60,7 @@ pub(super) async fn begin_pause(
     // quote a different one through.
     let execution_id = metadata.execution_id;
 
-    let row: Option<(i64, Option<String>)> = sqlx::query_as(&sql::begin_pause_sql())
+    let row: Option<(i64, Option<String>)> = sqlx::query_as(sql::BEGIN_PAUSE_SQL)
         .bind(entry.sandbox_id.into_inner())
         .bind(registry.cluster_id)
         .bind(&entry.origin_node_id)

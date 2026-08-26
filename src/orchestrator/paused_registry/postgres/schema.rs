@@ -6,9 +6,9 @@
 //! has **no** migrations-applied ledger table on the Go side, and this port
 //! does not invent one. `services/scheduler/internal/registry/migrate.go`
 //! never tracked "which migrations have run" — it just re-applies one
-//! idempotent DDL string (`CREATE TABLE IF NOT EXISTS` /
-//! `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` / `DROP CONSTRAINT IF EXISTS`
-//! + `ADD CONSTRAINT`) on every call, guarded by the same session-scoped
+//! idempotent DDL string (`CREATE TABLE IF NOT EXISTS`,
+//! `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, `DROP CONSTRAINT IF EXISTS`
+//! and `ADD CONSTRAINT`) on every call, guarded by the same session-scoped
 //! advisory lock catalog's own migrator uses
 //! (`crate::pg::GO_SCHEMA_LOCK_KEY`, `services/scheduler/internal/registry/
 //! migrate.go:183` and `services/scheduler/internal/catalog/migrate.go:113`
@@ -363,9 +363,21 @@ mod pg {
         // or a later successful migration attempt would find a table it
         // cannot add that constraint to without the operator's manual
         // intervention this refusal exists to force in the first place.
+        //
+        // Scoped to `current_schema()` explicitly: `pg_constraint` is a
+        // system catalog, not schema-scoped by `search_path` the way a plain
+        // `SELECT` from a user table is -- an unscoped query here would find
+        // the *other* isolated-schema tests' own
+        // `paused_sandboxes_execution_check` constraints too, which was a
+        // real false failure this test hit once (the harness's per-test
+        // schemas share one physical database).
         let has_constraint: bool = sqlx::query_scalar(
             "SELECT EXISTS (
-                SELECT 1 FROM pg_constraint WHERE conname = 'paused_sandboxes_execution_check'
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE c.conname = 'paused_sandboxes_execution_check'
+                  AND n.nspname = current_schema()
              )",
         )
         .fetch_one(&pool)

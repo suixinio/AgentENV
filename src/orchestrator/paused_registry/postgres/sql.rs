@@ -74,9 +74,7 @@ pub(super) fn get_many_sql() -> String {
 /// `publishing`->`publishing` (a retried upload) are both legitimate and
 /// both carry the same incarnation, so the identity axis judges this more
 /// precisely than the state would.
-pub(super) fn begin_pause_sql() -> String {
-    format!(
-        "
+pub(super) const BEGIN_PAUSE_SQL: &str = "
 WITH previous AS (
     SELECT snapshot_id FROM paused_sandboxes
      WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid
@@ -105,9 +103,7 @@ upserted AS (
 SELECT upserted.generation          AS generation,
        previous.snapshot_id::text   AS previous_snapshot_id
   FROM upserted
-  LEFT JOIN previous ON TRUE"
-    )
-}
+  LEFT JOIN previous ON TRUE";
 
 /// A `begin_pause` whose upsert matched zero rows: re-read to classify why
 /// -- `classifyRefusedPause`'s query (`store_postgres.go:615-617`), verbatim.

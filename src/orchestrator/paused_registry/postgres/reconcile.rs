@@ -409,7 +409,12 @@ mod tests {
         let r = row(PausedRegistryState::Running, "node-a");
         let roster = fresh_roster("node-a", &[r.sandbox_id]);
 
-        let outcome = compute_reconcile(&[r.clone()], &[roster], Utc::now(), SystemTime::now());
+        let outcome = compute_reconcile(
+            std::slice::from_ref(&r),
+            &[roster],
+            Utc::now(),
+            SystemTime::now(),
+        );
         assert_eq!(outcome.live_lease_renewals.len(), 1);
         assert_eq!(outcome.live_lease_renewals[0].sandbox_id, r.sandbox_id);
         assert_eq!(outcome.parked_lease_renewals.len(), 0);
@@ -423,7 +428,12 @@ mod tests {
         r.snapshot_id = Some(crate::snapshot::SnapshotId::generate());
         let roster = fresh_roster("node-a", &[r.sandbox_id]);
 
-        let outcome = compute_reconcile(&[r.clone()], &[roster], Utc::now(), SystemTime::now());
+        let outcome = compute_reconcile(
+            std::slice::from_ref(&r),
+            &[roster],
+            Utc::now(),
+            SystemTime::now(),
+        );
         assert_eq!(outcome.parked_lease_renewals.len(), 1);
         assert_eq!(outcome.live_lease_renewals.len(), 0);
     }

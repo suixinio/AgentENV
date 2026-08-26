@@ -7,21 +7,21 @@
 //!
 //! # Module map
 //!
-//! - [`schema`]: `paused_sandboxes` DDL bootstrap (`migrate.go`).
-//! - [`sql`]: every SQL statement, ported verbatim from `store_postgres.go`.
-//! - [`row`]: row decoding shared by every reader.
-//! - [`reads`]: `get`/`get_many` (trait) + the internal full-column reads
+//! - [`schema`][]: `paused_sandboxes` DDL bootstrap (`migrate.go`).
+//! - [`sql`][]: every SQL statement, ported verbatim from `store_postgres.go`.
+//! - [`row`][]: row decoding shared by every reader.
+//! - [`reads`][]: `get`/`get_many` (trait) + the internal full-column reads
 //!   [`reconcile`]/[`reclaim`] use.
-//! - [`writes`]: the fencing write path (`begin_pause` through `remove`).
-//! - [`lease`]: `renew_lease` (trait) + the two heartbeat-driven,
+//! - [`writes`][]: the fencing write path (`begin_pause` through `remove`).
+//! - [`lease`][]: `renew_lease` (trait) + the two heartbeat-driven,
 //!   internal-only siblings Fix A/Fix B need.
-//! - [`reclaim`]: `reclaim_expired_holdings`/`release_node_holdings` (trait)
+//! - [`reclaim`][]: `reclaim_expired_holdings`/`release_node_holdings` (trait)
 //!   + the `DiscardBreaker`.
-//! - [`grace`]: the restart-grace redesign for N replicas -- **read this
+//! - [`grace`][]: the restart-grace redesign for N replicas -- **read this
 //!   module's doc before touching [`reconcile`] or [`reclaim_task`]**.
-//! - [`reconcile`]: the reconcile leader loop (D2 Fix A's home) + D4's
+//! - [`reconcile`][]: the reconcile leader loop (D2 Fix A's home) + D4's
 //!   monitoring fix.
-//! - [`reclaim_task`]: the reclaim leader loop.
+//! - [`reclaim_task`][]: the reclaim leader loop.
 //!
 //! # D1: which parts of this backend need leader election, and why only
 //! these two
@@ -42,6 +42,8 @@
 //! with Fix A -- see [`spawn_background_tasks`]'s own doc on why this
 //! backend refuses to start without one.
 
+#[cfg(test)]
+mod contract;
 mod grace;
 mod lease;
 mod reads;

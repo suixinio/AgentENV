@@ -6,8 +6,9 @@ use agentenv::binding_store::{
     ArbitrationMode, BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
 use agentenv::cfg::{
-    AppConfig, BindingStoreBackendKind, BindingStoreConfig, MetadataStoreBackendKind,
-    NodePlacementSource, PausedRegistryBackendKind,
+    AppConfig, BindingStoreBackendKind, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
+    MetadataStoreBackendKind, NodePlacementSource, NodeRegistryObservedBackendKind,
+    PausedRegistryBackendKind,
 };
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
@@ -18,6 +19,9 @@ use agentenv::node_registry::dump::NodeRegistryDumpSource;
 use agentenv::node_registry::grpc_service::NodeRegistryGrpcService;
 use agentenv::node_registry::kubernetes_discovery::{
     validate_optional_pod_selector, KubernetesDiscovery, KubernetesDiscoveryConfig,
+};
+use agentenv::node_registry::redis::{
+    run_shared_observed_sync, SharedObservedStore, SharedObservedStoreConfig, DEFAULT_PULL_INTERVAL,
 };
 use agentenv::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use agentenv::node_registry::warmup::WarmupGate;
@@ -1189,6 +1193,18 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         }
         None => None,
     };
+    // The shared-roster fix: only under `[cluster].node_placement_source =
+    // "native"` (`native_registry_handle` is `Some`), the same gate
+    // `binding_store` above is wired under. Its background task is folded
+    // into this role's own upkeep the same way the kube-discovery/metrics
+    // tasks already are, via `node_registry_upkeep`.
+    if let Some(registry) = native_registry_handle.as_ref() {
+        if let Some(task) =
+            wire_shared_node_observed_store(&config.cluster.node_registry_store, registry).await?
+        {
+            node_registry_upkeep.push(task);
+        }
+    }
     // 🔴 P1 (task's own "phase4-close"): moved up from after
     // `Orchestrator::new` (see the historical comments still attached to
     // `pg_pool`/`node_registry_for_paused`/`build_paused_registry` below).
@@ -1820,6 +1836,85 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
     }
 }
 
+/// The shared-roster fix: wires `--role api`'s Stage A node registry's
+/// heartbeat-derived (`observed`) state into Redis so every replica sees
+/// the whole cluster's roster, not just the nodes whose heartbeat happens
+/// to be pinned to it — see `agentenv::node_registry::redis`'s own module
+/// doc for the full design.
+///
+/// Mirrors `build_binding_store`'s own multi-replica guardrail exactly, for
+/// the same reason: nothing at this layer can distinguish "one replica,
+/// alone, safe" from "one of several, silently split," and this is only
+/// ever called from `assemble_api`, only when `native_registry_handle` is
+/// `Some` — i.e. only under `[cluster].node_placement_source = "native"`,
+/// the same trigger `build_binding_store` refuses
+/// `BindingStoreBackendKind::InMemory` under. So
+/// `NodeRegistryObservedBackendKind::InMemory` is refused here
+/// unconditionally too, regardless of how many replicas are actually
+/// running.
+///
+/// On success, spawns the background task
+/// (`agentenv::node_registry::redis::run_shared_observed_sync`) that keeps
+/// `registry` in sync going forward and returns its `JoinHandle` for the
+/// caller to fold into its own upkeep — the same pattern
+/// `start_native_node_registry` already uses for the kube-discovery and
+/// metrics tasks.
+async fn wire_shared_node_observed_store(
+    config: &ClusterNodeRegistryStoreConfig,
+    registry: &Arc<AtomicNodeRegistry>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    match config.backend {
+        NodeRegistryObservedBackendKind::InMemory => {
+            anyhow::bail!(
+                "[cluster].node_placement_source = \"native\" needs \
+                 [cluster.node_registry_store].backend = \"redis\" \
+                 (AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND): the in-memory node registry only \
+                 sees the nodes whose heartbeat happens to be pinned to this replica, and \
+                 --role api runs as more than one replica. Set \
+                 AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND=redis, or keep \
+                 [cluster].node_placement_source = \"scheduler\""
+            );
+        }
+        NodeRegistryObservedBackendKind::Redis => {
+            let store = SharedObservedStore::connect(SharedObservedStoreConfig {
+                url: config.redis_url.clone(),
+                key_prefix: config.redis_key_prefix.clone(),
+            })
+            .await?;
+            let rx = registry.enable_shared_observed_publishing();
+            // 🔴 Best-effort, not a startup refusal: the connection above
+            // already proved Redis is reachable, so a failure here is a
+            // transient blip on an otherwise-good connection —
+            // `run_shared_observed_sync`'s own periodic pull will retry
+            // within `DEFAULT_PULL_INTERVAL` regardless. Doing this pull
+            // now rather than waiting for the loop's first tick matters
+            // for correctness, not just latency: without it, a freshly
+            // (re)started replica's `Inner.all_configs_ready` gate would
+            // see only the nodes it has personally heartbeated with so far
+            // for up to a whole `DEFAULT_PULL_INTERVAL` — exactly the
+            // partial-cluster view this fix exists to close.
+            match store.pull_all().await {
+                Ok(remote) => registry.merge_remote_snapshot(remote),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "agentenv",
+                        error = %err,
+                        "node registry redis: initial pull failed; continuing, the periodic \
+                         pull will retry"
+                    );
+                }
+            }
+            let task_registry = Arc::clone(registry);
+            Ok(Some(tokio::spawn(run_shared_observed_sync(
+                task_registry,
+                rx,
+                store,
+                DEFAULT_PULL_INTERVAL,
+            ))))
+        }
+    }
+}
+
 /// Mirrors `services/scheduler/cmd/main.go`'s `runKubernetesDiscoveryWithRetry`:
 /// (re)connects and runs discovery, and on any failure — connecting or the
 /// watch loop itself ending — waits an exponentially growing backoff and
@@ -2233,6 +2328,55 @@ mod tests {
         redis_config.backend = BindingStoreBackendKind::Redis;
         redis_config.redis_url = "redis://127.0.0.1:1/0".to_string();
         let connect_err = match build_binding_store(&redis_config).await {
+            Ok(_) => panic!("nothing is listening on this port"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !connect_err.contains("more than one replica"),
+            "a redis backend must fail on the connection, not on the multi-replica refusal: \
+             {connect_err}"
+        );
+    }
+
+    /// The shared-roster fix's own copy of
+    /// `the_api_half_refuses_a_binding_ledger_no_other_replica_can_see` above
+    /// — same shape, same reasoning, a third multi-replica ledger
+    /// (`Inner.observed`, `src/node_registry/registry.rs`). Before this
+    /// guard existed, `AtomicNodeRegistry`'s heartbeat-derived state had no
+    /// cross-replica sharing at all and nothing refused starting that way.
+    #[tokio::test]
+    async fn the_api_half_refuses_a_node_registry_no_other_replica_can_see() {
+        let config = AppConfig::default().cluster.node_registry_store;
+        assert_eq!(
+            config.backend,
+            NodeRegistryObservedBackendKind::InMemory,
+            "the default is the per-replica heartbeat shard, which is what makes this refusal \
+             necessary"
+        );
+
+        let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
+        let err = match wire_shared_node_observed_store(&config, &registry).await {
+            Ok(_) => panic!(
+                "the in-memory node registry only sees the nodes whose heartbeat is pinned to \
+                 this replica"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("node_registry_store"), "{err}");
+        assert!(
+            err.contains("AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND"),
+            "{err}"
+        );
+        assert!(err.contains("redis"), "{err}");
+
+        // The control, again: the redis backend at least attempts to
+        // connect rather than being refused outright — a *different* error
+        // (a connection failure, not the multi-replica refusal) against a
+        // URL nothing is listening on.
+        let mut redis_config = AppConfig::default().cluster.node_registry_store;
+        redis_config.backend = NodeRegistryObservedBackendKind::Redis;
+        redis_config.redis_url = "redis://127.0.0.1:1/0".to_string();
+        let connect_err = match wire_shared_node_observed_store(&redis_config, &registry).await {
             Ok(_) => panic!("nothing is listening on this port"),
             Err(err) => err.to_string(),
         };

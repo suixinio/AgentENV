@@ -290,7 +290,6 @@ async fn async_main() -> anyhow::Result<()> {
 /// trusted to pass `None` for.
 async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     let role = ServerRole::Node;
-    let pg_pool: Option<sqlx::PgPool> = None;
     // Both roles that reach here run the machine and report it as one; the API
     // half never does, and never calls this.
     debug_assert!(role.runs_sandbox_runtime());
@@ -343,7 +342,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
             as Arc<dyn agentenv::snapshot::SnapshotArtifactAdvertiser>
     });
     let snapshot_manager = Arc::new(
-        SnapshotManager::new(snapshot_p2p_transport, snapshot_advertiser, pg_pool, role).await?,
+        SnapshotManager::new(snapshot_p2p_transport, snapshot_advertiser, None, role).await?,
     );
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     // The handle the cold-boot paths read the CPUID intersection from.
@@ -474,8 +473,8 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
 /// half rather than of this one — see the list on [`assemble_api`].
 async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::Node;
-    // 🔴 Always `None`, never `build_pg_pool(config)`. `--role node` must
-    // never hold PostgreSQL credentials — see `build_pg_pool`'s own doc
+    // 🔴 This binary has no `build_pg_pool` to call and no pool type to name.
+    // `--role node` must never hold PostgreSQL credentials — see `src/pg/mod.rs`'s own doc
     // comment — and this is that invariant enforced by construction here,
     // not only by `ServerRole::check_pg_dsn` at startup.
     let core = assemble_node_core(config).await?;

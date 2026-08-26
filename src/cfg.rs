@@ -1509,6 +1509,21 @@ pub struct BindingStoreConfig {
         env = "AENV_BINDING_STORE_MAX_PROJECTION_TTL_SECS"
     )]
     pub max_projection_ttl_secs: u64,
+    /// Task's own "D4": whether the heartbeat-timeout binding sweep
+    /// (`src/binding_store/sweep.rs`) runs at all. On by default — a
+    /// binding's own TTL is the backstop either way, this only shortens
+    /// the window.
+    #[config(default = true, env = "AENV_BINDING_STORE_SWEEP_ENABLED")]
+    pub sweep_enabled: bool,
+    /// How often a sweep round runs. Go's own default
+    /// (`defaultBindingSweepInterval`) is 30 seconds.
+    #[config(default = 30u64, env = "AENV_BINDING_STORE_SWEEP_INTERVAL_SECS")]
+    pub sweep_interval_secs: u64,
+    /// How long a node may go without a heartbeat before its bindings
+    /// become sweep candidates. Go's own default
+    /// (`defaultBindingSweepSilence`) is 5 minutes.
+    #[config(default = 300u64, env = "AENV_BINDING_STORE_SWEEP_SILENCE_SECS")]
+    pub sweep_silence_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]

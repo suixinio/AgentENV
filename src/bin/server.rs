@@ -1146,9 +1146,11 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // `[cluster].node_placement_source = "native"` — because without that
     // surface there is nowhere for `report_sandbox_event`/`heartbeat`/
     // `record_assignment` to run at all.
+    let mut binding_store_handle: Option<Arc<dyn BindingStore>> = None;
     let node_registry_grpc_service = match node_registry_grpc_service {
         Some(service) => {
             let binding_store = build_binding_store(&config.binding_store).await?;
+            binding_store_handle = Some(Arc::clone(&binding_store));
             let max_projection_ttl =
                 Duration::from_secs(config.binding_store.max_projection_ttl_secs);
             Some(service.with_binding_store(
@@ -1313,6 +1315,25 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // this role's upkeep — see `spawn_paused_record_upkeep`'s callers for why
     // that point is "before the shutdown pauses start" and not later.
     paused_upkeep.append(&mut node_registry_upkeep);
+    // Task's own "D4": the heartbeat-timeout binding sweep. Only meaningful
+    // alongside a wired binding store, which only exists alongside the
+    // native node registry -- both `Option`s are `Some` or `None` together.
+    if config.binding_store.sweep_enabled {
+        if let (Some(registry), Some(store)) =
+            (native_registry_handle.clone(), binding_store_handle.clone())
+        {
+            let cluster_id = config.node_identity.cluster_id.clone().unwrap_or_default();
+            let sweeper = Arc::new(agentenv::binding_store::sweep::BindingSweeper::new(
+                cluster_id,
+                Duration::from_secs(config.binding_store.sweep_silence_secs),
+            ));
+            let registry: Arc<dyn NodeRegistry> = registry;
+            let interval = Duration::from_secs(config.binding_store.sweep_interval_secs);
+            paused_upkeep.push(tokio::spawn(async move {
+                sweeper.run(registry, store, interval).await;
+            }));
+        }
+    }
     // B1: the postgres backend's per-replica renewal loop, present only
     // under `[cluster].node_placement_source = "native"` (empty otherwise --
     // see `spawn_paused_registry_background_tasks`'s own doc).

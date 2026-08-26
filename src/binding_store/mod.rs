@@ -35,6 +35,7 @@ pub mod arbitration;
 pub mod in_memory;
 pub mod record;
 pub mod redis;
+pub mod sweep;
 
 #[cfg(test)]
 pub(crate) mod contract;

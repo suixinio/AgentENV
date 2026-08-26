@@ -1103,7 +1103,7 @@ async fn run_the_build_on_a_node(
     };
 
     let metadata = adopted_build_metadata(&build_id, alias);
-    let captured = CapturedSandboxSnapshot::new(staged);
+    let captured = CapturedSandboxSnapshot::staged(staged);
     match api
         .snapshot_manager
         .publish_captured(metadata, captured)

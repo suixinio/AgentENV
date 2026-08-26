@@ -2339,10 +2339,10 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
     assert_eq!(result.metadata.id, sandbox_id);
     assert_eq!(result.metadata.state, SandboxState::Running);
     assert!(
-        result
-            .captured_snapshot
-            .downcast_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
-            .is_some(),
+        matches!(
+            result.captured_snapshot,
+            crate::snapshot::CapturedSandboxSnapshot::Local(_)
+        ),
         "capture_snapshot should return the backend-provided snapshot payload"
     );
 
@@ -2409,10 +2409,10 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
     let retry = orchestrator.capture_snapshot(sandbox_id).await?;
     assert_eq!(retry.metadata.state, SandboxState::Running);
     assert!(
-        retry
-            .captured_snapshot
-            .downcast_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
-            .is_some(),
+        matches!(
+            retry.captured_snapshot,
+            crate::snapshot::CapturedSandboxSnapshot::Local(_)
+        ),
         "retry should produce a captured snapshot"
     );
 

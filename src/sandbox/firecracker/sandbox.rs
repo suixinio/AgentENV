@@ -278,6 +278,12 @@ impl FirecrackerCapturedSnapshot {
     }
 }
 
+impl crate::snapshot::LocalCapturedArtifacts for FirecrackerCapturedSnapshot {
+    fn publishable_manifest(&self) -> Option<&FirecrackerSnapshotManifest> {
+        Some(&self.manifest)
+    }
+}
+
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
     fn execution_id(&self) -> ExecutionId {
@@ -345,7 +351,7 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(PausedSandboxCapture {
             state: Arc::new(FirecrackerPausedState::new(snapshot_config)),
             publishable: manifest.map(|manifest| {
-                CapturedSandboxSnapshot::new(FirecrackerCapturedSnapshot::in_caller_owned_dir(
+                CapturedSandboxSnapshot::local(FirecrackerCapturedSnapshot::in_caller_owned_dir(
                     manifest,
                 ))
             }),
@@ -380,7 +386,7 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        Ok(CapturedSandboxSnapshot::new(
+        Ok(CapturedSandboxSnapshot::local(
             FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
         ))
     }

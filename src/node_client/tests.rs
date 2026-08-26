@@ -33,6 +33,7 @@ use crate::snapshot::repository::{
     RepositoryResult, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotRepository,
     SnapshotRuntimeResolver, StagedSnapshot, StartedBuild,
 };
+use crate::snapshot::CapturedSandboxSnapshot;
 use crate::snapshot::{
     CommittedSnapshot, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotRecord,
 };
@@ -1615,9 +1616,10 @@ async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
     backend.start().await.expect("start");
 
     let captured = backend.snapshot().await.expect("checkpoint");
-    let decoded: StagedSnapshot = captured
-        .downcast()
-        .expect("the capture carries a staged snapshot and not something else");
+    let CapturedSandboxSnapshot::Staged(decoded) = captured else {
+        panic!("the capture carries a staged snapshot and not something else");
+    };
+    let decoded: StagedSnapshot = *decoded;
     assert_eq!(decoded.origin_node_id, "node-under-test");
     assert_eq!(decoded.execution_id, Some(execution_id));
     assert_eq!(decoded.id(), staged.id());
@@ -2692,11 +2694,13 @@ async fn a_pause_asks_for_a_row_only_when_its_caller_will_commit_one() {
         sent[0].publish,
         "a caller that promised to commit asked the node for nothing"
     );
-    let decoded: crate::snapshot::repository::StagedSnapshot = capture
+    let publishable = capture
         .publishable
-        .expect("a pause that asked to publish came back with nothing to publish")
-        .downcast()
-        .expect("the capture carries a staged snapshot and not something else");
+        .expect("a pause that asked to publish came back with nothing to publish");
+    let CapturedSandboxSnapshot::Staged(decoded) = publishable else {
+        panic!("the capture carries a staged snapshot and not something else");
+    };
+    let decoded: crate::snapshot::repository::StagedSnapshot = *decoded;
     assert_eq!(decoded.id(), staged.id());
     assert_eq!(decoded.origin_node_id, "node-under-test");
 

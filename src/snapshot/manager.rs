@@ -8,7 +8,7 @@ use tracing::warn;
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
-use crate::sandbox::{CapturedSandboxSnapshot, FirecrackerCapturedSnapshot};
+use crate::snapshot::captured::CapturedSandboxSnapshot;
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
@@ -289,14 +289,14 @@ impl SnapshotManager {
         captured_snapshot: CapturedSandboxSnapshot,
         execution_id: Option<ExecutionId>,
     ) -> crate::snapshot::RepositoryResult<StagedSnapshotHandle> {
-        let captured_snapshot = match captured_snapshot.downcast::<StagedSnapshot>() {
-            Ok(staged) => return self.adopt_staged(metadata, staged),
-            Err(captured_snapshot) => captured_snapshot,
+        let local_capture = match captured_snapshot {
+            CapturedSandboxSnapshot::Staged(staged) => return self.adopt_staged(metadata, *staged),
+            CapturedSandboxSnapshot::Local(local) => local,
         };
 
-        let manifest = captured_snapshot
-            .downcast_ref::<FirecrackerCapturedSnapshot>()
-            .map(|snapshot| snapshot.manifest().clone())
+        let manifest = local_capture
+            .publishable_manifest()
+            .cloned()
             .ok_or_else(|| RepositoryError::Unsupported {
                 feature: "publishing captured snapshots for this sandbox backend".to_string(),
             })?;
@@ -310,7 +310,7 @@ impl SnapshotManager {
             staged,
             local: LocalSnapshotStaging {
                 manifest: Some(manifest),
-                _capture: Some(captured_snapshot),
+                _capture: Some(CapturedSandboxSnapshot::Local(local_capture)),
             },
         })
     }
@@ -689,6 +689,7 @@ impl SnapshotManager {
 
 #[cfg(test)]
 mod tests {
+    use super::super::captured::CallerOwnedArtifacts;
     use super::*;
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
@@ -1074,9 +1075,7 @@ mod tests {
         let local = manager
             .publish_captured(
                 capture_of(sandbox, local_id.clone()),
-                CapturedSandboxSnapshot::new(FirecrackerCapturedSnapshot::in_caller_owned_dir(
-                    manifest,
-                )),
+                CapturedSandboxSnapshot::local(CallerOwnedArtifacts::new(manifest)),
             )
             .await
             .expect("a local capture should publish");
@@ -1091,7 +1090,7 @@ mod tests {
         let adopted = manager
             .publish_captured(
                 proposal,
-                CapturedSandboxSnapshot::new(staged_elsewhere(staged_id.clone(), sandbox)),
+                CapturedSandboxSnapshot::staged(staged_elsewhere(staged_id.clone(), sandbox)),
             )
             .await
             .expect("an adopted staging should commit");
@@ -1165,7 +1164,7 @@ mod tests {
         let err = manager
             .publish_captured(
                 capture_of("the-sandbox-this-half-asked-about", SnapshotId::generate()),
-                CapturedSandboxSnapshot::new(staged_elsewhere(
+                CapturedSandboxSnapshot::staged(staged_elsewhere(
                     mismatched_id.clone(),
                     "some-other-sandbox-entirely",
                 )),
@@ -1190,7 +1189,7 @@ mod tests {
         let record = manager
             .publish_captured(
                 capture_of("the-sandbox-this-half-asked-about", SnapshotId::generate()),
-                CapturedSandboxSnapshot::new(staged_elsewhere(
+                CapturedSandboxSnapshot::staged(staged_elsewhere(
                     matching_id.clone(),
                     "the-sandbox-this-half-asked-about",
                 )),
@@ -1237,7 +1236,7 @@ mod tests {
         let adopted = manager
             .stage_captured(
                 capture_of(sandbox, SnapshotId::generate()),
-                CapturedSandboxSnapshot::new(staged_elsewhere(staged_id.clone(), sandbox)),
+                CapturedSandboxSnapshot::staged(staged_elsewhere(staged_id.clone(), sandbox)),
                 None,
             )
             .await
@@ -1258,9 +1257,7 @@ mod tests {
         let local = manager
             .stage_captured(
                 capture_of(sandbox, local_id.clone()),
-                CapturedSandboxSnapshot::new(FirecrackerCapturedSnapshot::in_caller_owned_dir(
-                    manifest,
-                )),
+                CapturedSandboxSnapshot::local(CallerOwnedArtifacts::new(manifest)),
                 None,
             )
             .await

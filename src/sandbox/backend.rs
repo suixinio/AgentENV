@@ -19,6 +19,7 @@ use super::{
 };
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::CustomExtensionParams;
+pub use crate::snapshot::CapturedSandboxSnapshot;
 use crate::types::{ExecutionId, SandboxId};
 
 /// A concrete sandbox backend's paused state.
@@ -204,15 +205,6 @@ pub struct ResolvedImageFacts {
     pub image_configs: crate::types::ImageConfigs,
 }
 
-/// Opaque captured snapshot artifacts produced from a running sandbox.
-///
-/// Unlike [`PausedSandboxState`], this value is intended for one-shot
-/// consumption by snapshot publication code. Concrete backends may use it to
-/// keep temporary artifact directories alive until publication finishes.
-pub struct CapturedSandboxSnapshot {
-    inner: Box<dyn Any + Send>,
-}
-
 /// Everything a single pause produced.
 ///
 /// A pause captures the sandbox once and can express that capture two ways: the
@@ -237,42 +229,6 @@ impl PausedSandboxCapture {
             state,
             publishable: None,
         }
-    }
-}
-
-impl CapturedSandboxSnapshot {
-    pub fn new<T>(snapshot: T) -> Self
-    where
-        T: Send + 'static,
-    {
-        Self {
-            inner: Box::new(snapshot),
-        }
-    }
-
-    pub fn downcast_ref<T>(&self) -> Option<&T>
-    where
-        T: Send + 'static,
-    {
-        self.inner.downcast_ref::<T>()
-    }
-
-    pub fn downcast<T>(self) -> std::result::Result<T, Self>
-    where
-        T: Send + 'static,
-    {
-        match self.inner.downcast::<T>() {
-            Ok(inner) => Ok(*inner),
-            Err(inner) => Err(Self { inner }),
-        }
-    }
-}
-
-impl fmt::Debug for CapturedSandboxSnapshot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CapturedSandboxSnapshot")
-            .field("opaque", &true)
-            .finish()
     }
 }
 

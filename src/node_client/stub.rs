@@ -1271,7 +1271,7 @@ impl SandboxBackend for RemoteSandboxStub {
                                 "node {node_id} returned an empty staged snapshot for {sandbox_id}"
                             ))
                         })?;
-                Some(CapturedSandboxSnapshot::new(staged))
+                Some(CapturedSandboxSnapshot::staged(staged))
             }
             // 🔴 Not an error even when `publish` was asked for. The node
             // answers with nothing when its pause found the sandbox already
@@ -1373,7 +1373,7 @@ impl SandboxBackend for RemoteSandboxStub {
                     ))
                 })?;
 
-        Ok(CapturedSandboxSnapshot::new(staged))
+        Ok(CapturedSandboxSnapshot::staged(staged))
     }
 
     async fn fork(

@@ -1103,9 +1103,7 @@ mod tests {
         BeganPause, HeldSandbox, PausedRegistryError, ReclaimedHoldings, RegistryResult,
         ReleasedHoldings, ResumeClaim,
     };
-    use crate::sandbox::{
-        CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
-    };
+    use crate::sandbox::{CapturedSandboxSnapshot, FirecrackerSnapshotManifest};
     use crate::snapshot::repository::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
         SnapshotListFilter, SnapshotRepository, StartedBuild,
@@ -1910,7 +1908,7 @@ mod tests {
             // mock snapshot manager refuses to stage anything it did not
             // produce, which lands on the `mark_local_only` arm and leaves the
             // row where these tests can see it.
-            publishable: committable.then(|| crate::sandbox::CapturedSandboxSnapshot::new(())),
+            publishable: committable.then(crate::sandbox::CapturedSandboxSnapshot::unpublishable),
         }
     }
 
@@ -2040,8 +2038,8 @@ mod tests {
 
     /// A pause carrying a capture the repository can really commit.
     ///
-    /// 🔴 Not [`pause_outcome`]'s placeholder. `stage_captured` downcasts to
-    /// `FirecrackerCapturedSnapshot` and refuses anything else, so a
+    /// 🔴 Not [`pause_outcome`]'s placeholder. That one answers
+    /// `publishable_manifest` with `None` and `stage_captured` refuses it, so a
     /// placeholder capture can only ever prove that the upload failed — never
     /// that it was not attempted.
     fn publishable_pause_outcome(sandbox_id: SandboxId) -> PauseOutcome {
@@ -2053,10 +2051,11 @@ mod tests {
 
         PauseOutcome {
             metadata,
-            publishable: Some(CapturedSandboxSnapshot::new(
-                FirecrackerCapturedSnapshot::in_caller_owned_dir(
-                    FirecrackerSnapshotManifest::for_test(32768, &[]),
-                ),
+            publishable: Some(CapturedSandboxSnapshot::local(
+                crate::snapshot::CallerOwnedArtifacts::new(FirecrackerSnapshotManifest::for_test(
+                    32768,
+                    &[],
+                )),
             )),
         }
     }

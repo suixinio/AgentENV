@@ -1,4 +1,5 @@
 mod artifact_cache;
+mod captured;
 pub mod image_export;
 mod manager;
 #[doc(hidden)]
@@ -8,6 +9,9 @@ pub mod repository;
 pub(crate) mod runtime_support;
 mod types;
 
+pub use captured::{
+    CallerOwnedArtifacts, CapturedSandboxSnapshot, LocalCapturedArtifacts, UnpublishableCapture,
+};
 pub use manager::SnapshotManager;
 pub use repository::{
     CatalogReadScope, RepositoryError, RepositoryResult, SnapshotAbsence, SnapshotCursor,

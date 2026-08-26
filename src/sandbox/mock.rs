@@ -42,6 +42,12 @@ impl PausedSandboxState for MockSnapshot {
 #[derive(Debug)]
 pub struct MockCapturedSnapshot;
 
+impl crate::snapshot::LocalCapturedArtifacts for MockCapturedSnapshot {
+    fn publishable_manifest(&self) -> Option<&crate::types::FirecrackerSnapshotManifest> {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MockOperation {
     Build,
@@ -142,13 +148,13 @@ impl MockBehavior {
 
     fn capture(&self) -> CapturedSandboxSnapshot {
         if self.captures_are_stageable.load(Ordering::SeqCst) {
-            CapturedSandboxSnapshot::new(
+            CapturedSandboxSnapshot::local(
                 crate::sandbox::FirecrackerCapturedSnapshot::in_caller_owned_dir(
                     crate::sandbox::FirecrackerSnapshotManifest::for_test(32768, &[]),
                 ),
             )
         } else {
-            CapturedSandboxSnapshot::new(MockCapturedSnapshot)
+            CapturedSandboxSnapshot::local(MockCapturedSnapshot)
         }
     }
 

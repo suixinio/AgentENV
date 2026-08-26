@@ -115,14 +115,20 @@
 //! sync is not something an operator has to cause.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
+
+use tokio::sync::mpsc;
 
 use crate::proto::scheduler::{
     HeartbeatRequest, NodeSnapshot, NodeStatus, ObservedNode, P2pEndpoint, P2pPeer,
 };
 
 use super::cpu_template::intersect_cpu_configs;
+use super::redis::{
+    PublishOp, StoredDiskMetric, StoredMachineInfo, StoredNodeSnapshot, StoredObservedRecord,
+    StoredP2pEndpoint, StoredRosterEntry,
+};
 use super::types::{Node, Roster, RosterEntry};
 
 /// Mirrors Go's `defaultObservedReportTTL`.
@@ -251,7 +257,7 @@ pub trait NodeRegistry: Send + Sync {
     fn applied_cpu_intersection(&self, cluster_id: &str) -> Option<String>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ObservedNodeRecord {
     /// Always carries `Some` snapshot once constructed by
     /// [`AtomicNodeRegistry::heartbeat`] — mirrors Go's `cloneSnapshot`,
@@ -262,6 +268,153 @@ struct ObservedNodeRecord {
     /// The roster from this node's last heartbeat, normalized.
     entries: Vec<RosterEntry>,
     last_seen: SystemTime,
+}
+
+/// The wire-format conversions for `super::redis`'s shared observed store.
+/// Live here, not in `super::redis`, because `ObservedNodeRecord` is
+/// private to this module — see `super::redis`'s own module doc for why
+/// that boundary is deliberate. `SystemTime`/`Duration` become
+/// millisecond/second integers; everything else is a straight field copy.
+impl From<&ObservedNodeRecord> for StoredObservedRecord {
+    fn from(record: &ObservedNodeRecord) -> Self {
+        Self {
+            node_id: record.node.node_id.clone(),
+            endpoint: record.node.endpoint.clone(),
+            cluster_id: record.node.cluster_id.clone(),
+            service_instance_id: record.node.service_instance_id.clone(),
+            version: record.node.version.clone(),
+            commit: record.node.commit.clone(),
+            machine_info: record
+                .node
+                .machine_info
+                .as_ref()
+                .map(|m| StoredMachineInfo {
+                    cpu_family: m.cpu_family.clone(),
+                    cpu_model: m.cpu_model.clone(),
+                    cpu_model_name: m.cpu_model_name.clone(),
+                    cpu_architecture: m.cpu_architecture.clone(),
+                    cpu_config_json: m.cpu_config_json.clone(),
+                }),
+            snapshot: record.node.snapshot.as_ref().map(|s| StoredNodeSnapshot {
+                status: s.status,
+                allocated_cpu: s.allocated_cpu,
+                allocated_memory_bytes: s.allocated_memory_bytes,
+                cpu_percent: s.cpu_percent,
+                cpu_count: s.cpu_count,
+                memory_used_bytes: s.memory_used_bytes,
+                memory_total_bytes: s.memory_total_bytes,
+                disks: s
+                    .disks
+                    .iter()
+                    .map(|d| StoredDiskMetric {
+                        mount_point: d.mount_point.clone(),
+                        device: d.device.clone(),
+                        filesystem_type: d.filesystem_type.clone(),
+                        used_bytes: d.used_bytes,
+                        total_bytes: d.total_bytes,
+                    })
+                    .collect(),
+                sandbox_count: s.sandbox_count,
+                sandbox_starting_count: s.sandbox_starting_count,
+                create_successes: s.create_successes,
+                create_fails: s.create_fails,
+                reported_at_unix_ms: s.reported_at_unix_ms,
+                paused_sandbox_count: s.paused_sandbox_count,
+                paused_allocated_cpu: s.paused_allocated_cpu,
+                paused_allocated_memory_bytes: s.paused_allocated_memory_bytes,
+            }),
+            last_seen_unix_ms: record.node.last_seen_unix_ms,
+            p2p_endpoint: record.p2p_endpoint.as_ref().map(|p| StoredP2pEndpoint {
+                backend: p.backend.clone(),
+                address: p.address.clone(),
+            }),
+            report_ttl_secs: record.report_ttl.as_secs(),
+            entries: record
+                .entries
+                .iter()
+                .map(|e| StoredRosterEntry {
+                    sandbox_id: e.sandbox_id.clone(),
+                    execution_id: e.execution_id.clone(),
+                    projection_ttl_secs: e.projection_ttl.as_secs(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<StoredObservedRecord> for ObservedNodeRecord {
+    fn from(stored: StoredObservedRecord) -> Self {
+        let last_seen_unix_ms = stored.last_seen_unix_ms;
+        Self {
+            node: ObservedNode {
+                node_id: stored.node_id,
+                endpoint: stored.endpoint,
+                cluster_id: stored.cluster_id,
+                service_instance_id: stored.service_instance_id,
+                version: stored.version,
+                commit: stored.commit,
+                machine_info: stored
+                    .machine_info
+                    .map(|m| crate::proto::scheduler::MachineInfo {
+                        cpu_family: m.cpu_family,
+                        cpu_model: m.cpu_model,
+                        cpu_model_name: m.cpu_model_name,
+                        cpu_architecture: m.cpu_architecture,
+                        cpu_config_json: m.cpu_config_json,
+                    }),
+                snapshot: stored.snapshot.map(|s| NodeSnapshot {
+                    status: s.status,
+                    allocated_cpu: s.allocated_cpu,
+                    allocated_memory_bytes: s.allocated_memory_bytes,
+                    cpu_percent: s.cpu_percent,
+                    cpu_count: s.cpu_count,
+                    memory_used_bytes: s.memory_used_bytes,
+                    memory_total_bytes: s.memory_total_bytes,
+                    disks: s
+                        .disks
+                        .into_iter()
+                        .map(|d| crate::proto::scheduler::DiskMetric {
+                            mount_point: d.mount_point,
+                            device: d.device,
+                            filesystem_type: d.filesystem_type,
+                            used_bytes: d.used_bytes,
+                            total_bytes: d.total_bytes,
+                        })
+                        .collect(),
+                    sandbox_count: s.sandbox_count,
+                    sandbox_starting_count: s.sandbox_starting_count,
+                    create_successes: s.create_successes,
+                    create_fails: s.create_fails,
+                    reported_at_unix_ms: s.reported_at_unix_ms,
+                    paused_sandbox_count: s.paused_sandbox_count,
+                    paused_allocated_cpu: s.paused_allocated_cpu,
+                    paused_allocated_memory_bytes: s.paused_allocated_memory_bytes,
+                }),
+                last_seen_unix_ms,
+            },
+            p2p_endpoint: stored.p2p_endpoint.map(|p| P2pEndpoint {
+                backend: p.backend,
+                address: p.address,
+            }),
+            report_ttl: Duration::from_secs(stored.report_ttl_secs),
+            entries: stored
+                .entries
+                .into_iter()
+                .map(|e| RosterEntry {
+                    sandbox_id: e.sandbox_id,
+                    execution_id: e.execution_id,
+                    projection_ttl: Duration::from_secs(e.projection_ttl_secs),
+                })
+                .collect(),
+            // `unix_millis`'s inverse: a stored record's own `last_seen_unix_ms`
+            // is always a value `unix_millis(SystemTime::now())` produced on
+            // some replica, so this reconstructs the same instant rather than
+            // reusing whatever `SystemTime::now()` happens to be at merge
+            // time.
+            last_seen: SystemTime::UNIX_EPOCH
+                + Duration::from_millis(last_seen_unix_ms.max(0) as u64),
+        }
+    }
 }
 
 struct Inner {
@@ -411,6 +564,82 @@ impl Inner {
         }
     }
 
+    /// Records a fresh observed record for `node_id` — keeps the roster
+    /// reverse index (`apply_roster`) and the CPU-intersection cache
+    /// (`invalidate_intersection`) in step exactly the same way regardless
+    /// of whether the record came from this replica's own heartbeat
+    /// (`AtomicNodeRegistry::heartbeat`) or was adopted from another
+    /// replica via `merge_remote` (`super::redis`'s shared observed
+    /// store). Shared so the two ingestion paths cannot drift apart.
+    fn ingest_observed(&mut self, node_id: &str, record: ObservedNodeRecord) {
+        let prev_cpu = self
+            .observed
+            .get(node_id)
+            .and_then(|r| r.node.machine_info.as_ref())
+            .map(|m| m.cpu_config_json.clone())
+            .unwrap_or_default();
+        let existed = self.observed.contains_key(node_id);
+        let cluster_id = record.node.cluster_id.clone();
+        // 🔴 `is_some_and`, not "treat a missing `machine_info` as an empty
+        // `cpu_config_json` and compare that": an omitted `machine_info`
+        // (as opposed to one explicitly sent with a blank
+        // `cpu_config_json`) must never itself count as a CPU change, or a
+        // heartbeat/merge that carries no machine info at all would wrongly
+        // invalidate a cluster's already-computed intersection every time
+        // one lands. Mirrors `AtomicNodeRegistry::heartbeat`'s pre-refactor
+        // inline check exactly — `heartbeat_delivers_intersection_exactly_once_per_node`
+        // and `multi_cluster_cpu_intersections_are_independent` pin this.
+        let cpu_changed = record
+            .node
+            .machine_info
+            .as_ref()
+            .is_some_and(|m| m.cpu_config_json != prev_cpu);
+
+        self.apply_roster(node_id, &record.entries);
+        self.observed.insert(node_id.to_string(), record);
+
+        if !existed || cpu_changed {
+            self.invalidate_intersection(&cluster_id);
+        }
+    }
+
+    /// Adopts a record pulled from the shared observed store, but only if
+    /// it is actually newer than what this replica already has — see
+    /// `super::redis`'s own module doc ("last write wins by `last_seen`")
+    /// for why: a node's heartbeat is pinned to one replica at a time, so a
+    /// stale pull of this replica's *own* not-yet-superseded write must
+    /// never regress `last_seen` backward, and a node that has since
+    /// reconnected to a different replica must win once that fact reaches
+    /// Redis.
+    fn merge_remote(&mut self, node_id: &str, record: ObservedNodeRecord) {
+        let should_adopt = self
+            .observed
+            .get(node_id)
+            .is_none_or(|current| record.last_seen > current.last_seen);
+        if should_adopt {
+            self.ingest_observed(node_id, record);
+        }
+    }
+
+    /// Recomputes and caches a cluster's CPU intersection if it is not
+    /// already cached and every node that has ever reported for the
+    /// cluster now has a config. Factored out of `AtomicNodeRegistry::heartbeat`
+    /// so `AtomicNodeRegistry::merge_remote_snapshot` can apply the exact
+    /// same gate: a node whose heartbeat only ever reached a *different*
+    /// replica must complete `all_configs_ready` the same way a locally
+    /// received one does, promptly on the merge that adopts it — not only
+    /// on whatever this replica's own next local heartbeat happens to be.
+    /// This is the correctness property the shared observed store exists
+    /// for; see `super::redis`'s own module doc.
+    fn refresh_intersection_if_ready(&mut self, cluster_id: &str) {
+        if !self.cpu_intersection.contains_key(cluster_id) && self.all_configs_ready(cluster_id) {
+            let result = self.compute_intersection(cluster_id);
+            if !result.is_empty() {
+                self.cpu_intersection.insert(cluster_id.to_string(), result);
+            }
+        }
+    }
+
     /// Builds the external `ObservedNode` view for a heartbeat record,
     /// overriding the endpoint and status based on the current discovery
     /// state. See `NodeStatus` in `scheduler.proto` for the full derivation
@@ -463,6 +692,18 @@ impl Inner {
 pub struct AtomicNodeRegistry {
     inner: RwLock<Inner>,
     empty_sync_guard: EmptySyncGuard,
+    /// Set at most once, by [`Self::enable_shared_observed_publishing`] —
+    /// `Some` for exactly as long as `super::redis`'s shared observed store
+    /// is wired up (`[cluster].node_placement_source = "native"` with
+    /// `[cluster.node_registry_store].backend = "redis"`; see
+    /// `src/bin/server.rs`'s `wire_shared_node_observed_store`). `None`
+    /// (the default for every other caller, including every test in this
+    /// module) makes [`Self::publish_upsert`]/[`Self::publish_remove`]
+    /// no-ops, so nothing about local behavior changes when no shared store
+    /// is configured — the same "absent means untouched" discipline
+    /// `--role all` and `--role node` already get for free by never
+    /// constructing this type's native-placement wiring at all.
+    publish_tx: OnceLock<mpsc::UnboundedSender<PublishOp>>,
 }
 
 impl AtomicNodeRegistry {
@@ -499,6 +740,7 @@ impl AtomicNodeRegistry {
                 pending_empty_sync: None,
             }),
             empty_sync_guard,
+            publish_tx: OnceLock::new(),
         };
         // `inner.nodes_by_id` starts empty regardless of `nodes`, so this
         // first call is never an empty-to-empty transition and the guard
@@ -511,6 +753,68 @@ impl AtomicNodeRegistry {
         // own clock instead.
         registry.set(nodes, Vec::new(), SystemTime::now());
         registry
+    }
+
+    /// Turns on publishing of local `observed` writes to `super::redis`'s
+    /// shared store. Returns the receiving half of the channel — the caller
+    /// (`src/bin/server.rs`'s `wire_shared_node_observed_store`) drives
+    /// `super::redis::run_shared_observed_sync` with it as a background
+    /// task.
+    ///
+    /// Call exactly once, before this registry starts receiving heartbeats
+    /// — mirrored by the `expect` below, which turns a second call into an
+    /// immediate panic rather than a silently dropped first channel.
+    pub fn enable_shared_observed_publishing(&self) -> mpsc::UnboundedReceiver<PublishOp> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.publish_tx
+            .set(tx)
+            .unwrap_or_else(|_| panic!("enable_shared_observed_publishing called twice"));
+        rx
+    }
+
+    fn publish_upsert(&self, node_id: &str, record: &StoredObservedRecord) {
+        let Some(tx) = self.publish_tx.get() else {
+            return;
+        };
+        let _ = tx.send(PublishOp::Upsert {
+            node_id: node_id.to_string(),
+            record: Box::new(record.clone()),
+        });
+    }
+
+    fn publish_remove(&self, node_id: &str) {
+        let Some(tx) = self.publish_tx.get() else {
+            return;
+        };
+        let _ = tx.send(PublishOp::Remove {
+            node_id: node_id.to_string(),
+        });
+    }
+
+    /// Merges a snapshot pulled from the shared observed store
+    /// (`super::redis::SharedObservedStore::pull_all`) into this replica's
+    /// local view. See `Inner::merge_remote` for the per-node adoption
+    /// rule, and `super::redis`'s own module doc for why a pull never
+    /// deletes an entry absent from the snapshot.
+    pub fn merge_remote_snapshot(&self, remote: HashMap<String, StoredObservedRecord>) {
+        let mut inner = self.inner.write().expect("node registry lock poisoned");
+        let mut touched_clusters: HashSet<String> = HashSet::new();
+        for (node_id, stored) in remote {
+            let record = ObservedNodeRecord::from(stored);
+            if !record.node.cluster_id.is_empty() {
+                touched_clusters.insert(record.node.cluster_id.clone());
+            }
+            inner.merge_remote(&node_id, record);
+        }
+        // Same gate `heartbeat` applies inline, applied here too — a node
+        // whose heartbeat only ever reached a different replica must
+        // complete `all_configs_ready` promptly on the merge that adopts
+        // it, not only whenever this replica's own next local heartbeat
+        // happens to land. See `Inner::refresh_intersection_if_ready`'s own
+        // doc.
+        for cluster_id in touched_clusters {
+            inner.refresh_intersection_if_ready(&cluster_id);
+        }
     }
 
     /// Replaces the discovered node list. `active` nodes are serving and not
@@ -596,6 +900,7 @@ impl AtomicNodeRegistry {
             .collect();
 
         let mut affected_clusters: HashSet<String> = HashSet::new();
+        let mut departed: Vec<String> = Vec::new();
         for (node_id, cluster_id) in stale {
             if !cluster_id.is_empty() {
                 affected_clusters.insert(cluster_id);
@@ -603,9 +908,19 @@ impl AtomicNodeRegistry {
             inner.clear_roster(&node_id);
             inner.observed.remove(&node_id);
             inner.intersection_sent.remove(&node_id);
+            departed.push(node_id);
         }
         for cluster_id in affected_clusters {
             inner.invalidate_intersection(&cluster_id);
+        }
+        drop(inner);
+        // Same discovery-driven cleanup on every replica (the Kubernetes
+        // watch feeding `set` is identical everywhere), so this is a
+        // harmless, idempotent `HDEL` no matter which replica gets here
+        // first — see `super::redis`'s own module doc ("absence never
+        // deletes... removal instead rides discovery-driven cleanup").
+        for node_id in &departed {
+            self.publish_remove(node_id);
         }
     }
 
@@ -696,6 +1011,7 @@ impl AtomicNodeRegistry {
         }
 
         let mut affected_clusters: HashSet<String> = HashSet::new();
+        let mut departed: Vec<String> = Vec::new();
         for node_id in previous_pending {
             if new_pending_ids.contains(&node_id) || inner.nodes_by_id.contains_key(&node_id) {
                 // Still pending, or `set()` promoted it to active/lingering
@@ -710,12 +1026,17 @@ impl AtomicNodeRegistry {
             }
             inner.clear_roster(&node_id);
             inner.intersection_sent.remove(&node_id);
+            departed.push(node_id);
         }
         for cluster_id in affected_clusters {
             inner.invalidate_intersection(&cluster_id);
         }
 
         inner.pending_ids = new_pending_ids;
+        drop(inner);
+        for node_id in &departed {
+            self.publish_remove(node_id);
+        }
     }
 }
 
@@ -771,11 +1092,8 @@ impl NodeRegistry for AtomicNodeRegistry {
             .cloned()
             .ok_or(NodeNotInRegistry)?;
 
-        let mut prev_cpu = String::new();
-        let mut existed = false;
         if let Some(previous) = inner.observed.get(&node_id) {
-            existed = true;
-            prev_cpu = previous
+            let prev_cpu = previous
                 .node
                 .machine_info
                 .as_ref()
@@ -783,7 +1101,7 @@ impl NodeRegistry for AtomicNodeRegistry {
                 .unwrap_or_default();
             if let Some(mi) = machine_info.as_mut() {
                 if mi.cpu_config_json.is_empty() {
-                    mi.cpu_config_json = prev_cpu.clone();
+                    mi.cpu_config_json = prev_cpu;
                 }
             }
         }
@@ -816,31 +1134,38 @@ impl NodeRegistry for AtomicNodeRegistry {
             last_seen: now,
         };
 
-        inner.apply_roster(&node_id, &record.entries);
-        inner.observed.insert(node_id.clone(), record);
-
         let cluster_id = req.cluster_id.clone();
-        let cpu_changed = machine_info
-            .as_ref()
-            .is_some_and(|m| m.cpu_config_json != prev_cpu);
-        if !existed || cpu_changed {
-            inner.invalidate_intersection(&cluster_id);
-        }
-        if !inner.cpu_intersection.contains_key(&cluster_id) && inner.all_configs_ready(&cluster_id)
-        {
-            let result = inner.compute_intersection(&cluster_id);
-            if !result.is_empty() {
-                inner.cpu_intersection.insert(cluster_id.clone(), result);
-            }
-        }
+        // Published to the shared observed store (when one is configured)
+        // below, after the local write — see `Self::publish_upsert`'s own
+        // doc. Cloned because `ingest_observed` takes ownership of `record`
+        // to insert it locally.
+        let published = StoredObservedRecord::from(&record);
+        inner.ingest_observed(&node_id, record);
+        inner.refresh_intersection_if_ready(&cluster_id);
 
-        if let Some(intersection) = inner.cpu_intersection.get(&cluster_id).cloned() {
-            if !inner.intersection_sent.contains(&node_id) {
-                inner.intersection_sent.insert(node_id);
-                return Ok((node, intersection));
+        let cached_intersection = inner.cpu_intersection.get(&cluster_id).cloned();
+        let intersection_to_report = match cached_intersection {
+            Some(intersection) if !inner.intersection_sent.contains(&node_id) => {
+                inner.intersection_sent.insert(node_id.clone());
+                Some(intersection)
             }
+            _ => None,
+        };
+        drop(inner);
+
+        // 🔴 Outside the write lock, and unconditional on whether a shared
+        // store is even configured (`Self::publish_upsert` is a no-op then)
+        // — a heartbeat is published every time it is locally received, not
+        // only when something changed, because `last_seen`/resource usage
+        // legitimately changes on every call and every reader of the shared
+        // view (`list_observed`, `applied_cpu_intersection`'s own
+        // `all_configs_ready` gate on another replica) needs that freshness.
+        self.publish_upsert(&node_id, &published);
+
+        match intersection_to_report {
+            Some(intersection) => Ok((node, intersection)),
+            None => Ok((node, String::new())),
         }
-        Ok((node, String::new()))
     }
 
     fn list_observed(&self, cluster_id: &str, now: SystemTime) -> Vec<ObservedNode> {
@@ -977,6 +1302,8 @@ impl NodeRegistry for AtomicNodeRegistry {
         inner.clear_roster(node_id);
         inner.observed.remove(node_id);
         inner.invalidate_intersection(&cluster_id);
+        drop(inner);
+        self.publish_remove(node_id);
         Ok(())
     }
 
@@ -1184,7 +1511,7 @@ fn record_roster_dropped(reason: &'static str) {
     metrics::counter!(ROSTER_ENTRY_DROPPED_METRIC, "reason" => reason).increment(1);
 }
 
-fn unix_millis(t: SystemTime) -> i64 {
+pub(crate) fn unix_millis(t: SystemTime) -> i64 {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
         Err(e) => -(e.duration().as_millis() as i64),
@@ -1289,6 +1616,38 @@ mod tests {
 
     fn roster_ids(entries: &[RosterEntry]) -> Vec<String> {
         entries.iter().map(|e| e.sandbox_id.clone()).collect()
+    }
+
+    /// A minimal `StoredObservedRecord` for `merge_remote_snapshot` tests —
+    /// simulates what `super::redis::SharedObservedStore::pull_all` would
+    /// hand back for a node whose heartbeat landed on a *different*
+    /// replica than the one running the test.
+    fn stored_record(
+        node_id: &str,
+        cluster_id: &str,
+        cpu_config_json: Option<String>,
+        last_seen: SystemTime,
+    ) -> StoredObservedRecord {
+        StoredObservedRecord {
+            node_id: node_id.to_string(),
+            endpoint: format!("http://{node_id}"),
+            cluster_id: cluster_id.to_string(),
+            service_instance_id: format!("svc-{node_id}"),
+            version: String::new(),
+            commit: String::new(),
+            machine_info: cpu_config_json.map(|cpu_config_json| StoredMachineInfo {
+                cpu_family: String::new(),
+                cpu_model: String::new(),
+                cpu_model_name: String::new(),
+                cpu_architecture: String::new(),
+                cpu_config_json,
+            }),
+            snapshot: None,
+            last_seen_unix_ms: unix_millis(last_seen),
+            p2p_endpoint: None,
+            report_ttl_secs: 30,
+            entries: Vec::new(),
+        }
     }
 
     // ---- node_registry_test.go ----
@@ -2500,5 +2859,313 @@ mod tests {
             .heartbeat(&ready_heartbeat("node-a", "cluster-a"), unix(111))
             .expect_err("node-a's identity must have been dropped along with its observed state");
         assert_eq!(err, NodeNotInRegistry);
+    }
+
+    // ---- the shared-roster fix (`super::redis`): merge semantics, the
+    //      publish channel, and the one correctness-bearing property (CPU
+    //      intersection over the *merged*, cluster-wide view) ----
+
+    #[test]
+    fn stored_observed_record_round_trips_every_field() {
+        let record = ObservedNodeRecord {
+            node: ObservedNode {
+                node_id: "node-a".to_string(),
+                endpoint: "http://node-a".to_string(),
+                cluster_id: "cluster-1".to_string(),
+                service_instance_id: "svc-node-a".to_string(),
+                version: "v1.2.3".to_string(),
+                commit: "deadbeef".to_string(),
+                machine_info: Some(MachineInfo {
+                    cpu_family: "6".to_string(),
+                    cpu_model: "42".to_string(),
+                    cpu_model_name: "Test CPU".to_string(),
+                    cpu_architecture: "x86_64".to_string(),
+                    cpu_config_json: cpu_config_json(0xFF),
+                }),
+                snapshot: Some(NodeSnapshot {
+                    status: NodeStatus::Ready as i32,
+                    allocated_cpu: 4,
+                    allocated_memory_bytes: 1024,
+                    cpu_percent: 50,
+                    cpu_count: 8,
+                    memory_used_bytes: 2048,
+                    memory_total_bytes: 4096,
+                    disks: vec![crate::proto::scheduler::DiskMetric {
+                        mount_point: "/".to_string(),
+                        device: "/dev/sda1".to_string(),
+                        filesystem_type: "ext4".to_string(),
+                        used_bytes: 100,
+                        total_bytes: 200,
+                    }],
+                    sandbox_count: 3,
+                    sandbox_starting_count: 1,
+                    create_successes: 10,
+                    create_fails: 2,
+                    reported_at_unix_ms: 12345,
+                    paused_sandbox_count: 1,
+                    paused_allocated_cpu: 1,
+                    paused_allocated_memory_bytes: 512,
+                }),
+                last_seen_unix_ms: 999_000,
+            },
+            p2p_endpoint: Some(P2pEndpointProto {
+                backend: "iroh".to_string(),
+                address: "node-a-p2p".to_string(),
+            }),
+            report_ttl: Duration::from_secs(45),
+            entries: vec![RosterEntry {
+                sandbox_id: "sbx-1".to_string(),
+                execution_id: "018f0000-0000-7000-8000-000000000000".to_string(),
+                projection_ttl: Duration::from_secs(60),
+            }],
+            last_seen: SystemTime::UNIX_EPOCH + Duration::from_millis(999_000),
+        };
+
+        let stored = StoredObservedRecord::from(&record);
+        let round_tripped = ObservedNodeRecord::from(stored);
+        assert_eq!(
+            round_tripped, record,
+            "every field must survive a StoredObservedRecord round trip byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn merge_remote_adopts_a_node_never_seen_locally() {
+        let registry = AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-b", "http://node-b"),
+            ],
+            Duration::from_secs(30),
+        );
+        assert!(registry
+            .get_observed("node-b", "cluster-1", unix(100))
+            .is_none());
+
+        let stored = stored_record("node-b", "cluster-1", None, unix(100));
+        registry.merge_remote_snapshot(HashMap::from([("node-b".to_string(), stored)]));
+
+        let observed = registry
+            .get_observed("node-b", "cluster-1", unix(100))
+            .expect(
+                "node-b must be visible after a merge, even though it never heartbeated \
+                 through this replica",
+            );
+        assert_eq!(observed.endpoint, "http://node-b");
+    }
+
+    #[test]
+    fn merge_remote_ignores_a_stale_pull_of_a_fresher_local_heartbeat() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        );
+        // A fresh local heartbeat at t=200.
+        heartbeat_with_roster(&registry, "node-a", "cluster-1", unix(200), &["sbx-fresh"]);
+
+        // A stale pull of this replica's own earlier write (t=100), as if
+        // the async publish round-tripped through redis late and the
+        // periodic pull picked up an older snapshot than what is already
+        // local.
+        let mut stale = stored_record("node-a", "cluster-1", None, unix(100));
+        stale.entries = vec![StoredRosterEntry {
+            sandbox_id: "sbx-stale".to_string(),
+            execution_id: String::new(),
+            projection_ttl_secs: 0,
+        }];
+        registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), stale)]));
+
+        let (entries, _) = registry.roster_of("node-a").expect("node-a has a roster");
+        assert_eq!(
+            roster_ids(&entries),
+            vec!["sbx-fresh".to_string()],
+            "a stale pull must never regress a fresher local heartbeat's roster"
+        );
+    }
+
+    #[test]
+    fn merge_remote_adopts_a_newer_record_when_a_node_reconnects_elsewhere() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        );
+        heartbeat_with_roster(&registry, "node-a", "cluster-1", unix(100), &["sbx-old"]);
+
+        // node-a reconnected to a different replica and heartbeated there
+        // at t=200 with a different roster; this replica only learns of it
+        // through the next merge.
+        let mut newer = stored_record("node-a", "cluster-1", None, unix(200));
+        newer.entries = vec![StoredRosterEntry {
+            sandbox_id: "sbx-new".to_string(),
+            execution_id: String::new(),
+            projection_ttl_secs: 0,
+        }];
+        registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), newer)]));
+
+        let (entries, last_seen) = registry.roster_of("node-a").expect("node-a has a roster");
+        assert_eq!(roster_ids(&entries), vec!["sbx-new".to_string()]);
+        assert_eq!(last_seen, unix(200));
+    }
+
+    #[test]
+    fn merge_remote_never_deletes_an_entry_absent_from_the_pull() {
+        let registry = AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-b", "http://node-b"),
+            ],
+            Duration::from_secs(30),
+        );
+        heartbeat_with_roster(&registry, "node-a", "cluster-1", unix(100), &["sbx-a"]);
+
+        // A pull that only names node-b -- as if node-a's own
+        // not-yet-flushed first publish simply has not landed in redis
+        // yet.
+        registry.merge_remote_snapshot(HashMap::from([(
+            "node-b".to_string(),
+            stored_record("node-b", "cluster-1", None, unix(100)),
+        )]));
+
+        assert!(
+            registry
+                .get_observed("node-a", "cluster-1", unix(100))
+                .is_some(),
+            "a merge must never delete a node solely because it was absent from the pull"
+        );
+    }
+
+    /// The one correctness-bearing property of the whole fix: the CPU
+    /// intersection gate (`Inner::all_configs_ready`/`compute_intersection`)
+    /// must evaluate the merged, cluster-wide view — not just whatever
+    /// heartbeats happened to land on this particular replica.
+    #[test]
+    fn applied_cpu_intersection_incorporates_a_node_only_known_through_a_redis_merge() {
+        let registry = AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-b", "http://node-b"),
+            ],
+            Duration::from_secs(30),
+        );
+        let cfg_a = cpu_config_json(0xFF);
+        heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg_a);
+
+        assert_eq!(
+            registry.applied_cpu_intersection("cluster-1"),
+            Some(cfg_a.clone()),
+            "with only node-a ever observed, the trivial 'intersection' is its own config -- \
+             see Inner::all_configs_ready's own doc on counting observed reporters, not \
+             discovered nodes"
+        );
+
+        // node-b's heartbeat landed on a *different* replica in this
+        // simulation: this replica only learns of it through a
+        // shared-store merge, never a local `heartbeat` call.
+        let cfg_b = cpu_config_json(0x0F);
+        let stored_b = stored_record("node-b", "cluster-1", Some(cfg_b), unix(100));
+        registry.merge_remote_snapshot(HashMap::from([("node-b".to_string(), stored_b)]));
+
+        assert_eq!(
+            registry.applied_cpu_intersection("cluster-1"),
+            Some(cpu_config_json(0xFF & 0x0F)),
+            "the cluster-wide intersection must be recomputed over both nodes once node-b is \
+             merged in, even though its heartbeat was never received by this replica directly \
+             -- proves all_configs_ready/compute_intersection evaluate the merged view, not \
+             just this replica's own locally-received heartbeats"
+        );
+    }
+
+    #[test]
+    fn heartbeat_publishes_an_upsert_once_a_shared_store_is_enabled() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        );
+        let mut rx = registry.enable_shared_observed_publishing();
+
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-1"), unix(100))
+            .expect("heartbeat");
+
+        match rx
+            .try_recv()
+            .expect("a heartbeat must publish an upsert once a shared store is enabled")
+        {
+            PublishOp::Upsert { node_id, record } => {
+                assert_eq!(node_id, "node-a");
+                assert_eq!(record.cluster_id, "cluster-1");
+            }
+            PublishOp::Remove { .. } => panic!("expected an upsert, got a remove"),
+        }
+    }
+
+    /// The default, in-memory-only configuration every existing test in
+    /// this module (and every `--role all` / `--role node` process) runs
+    /// under — `enable_shared_observed_publishing` is never called, so
+    /// `heartbeat` must not panic or otherwise misbehave with `publish_tx`
+    /// unset. Compiling and returning normally is the assertion.
+    #[test]
+    fn heartbeat_does_not_require_a_shared_store_to_be_enabled() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        );
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-1"), unix(100))
+            .expect("heartbeat");
+    }
+
+    #[test]
+    fn a_departed_node_publishes_a_remove() {
+        let registry = AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-b", "http://node-b"),
+            ],
+            Duration::from_secs(30),
+        );
+        let mut rx = registry.enable_shared_observed_publishing();
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-1"), unix(100))
+            .expect("heartbeat");
+        let _ = rx.try_recv().expect("the heartbeat's own upsert");
+
+        // node-a's EndpointSlice entry is gone on the next discovery sync;
+        // node-b's is not, so this is an ordinary partial-departure sync,
+        // not an all-empty one -- `EmptySyncGuard` never engages.
+        registry.set(vec![node("node-b", "http://node-b")], Vec::new(), unix(110));
+
+        match rx
+            .try_recv()
+            .expect("a departed node must publish a remove")
+        {
+            PublishOp::Remove { node_id } => assert_eq!(node_id, "node-a"),
+            PublishOp::Upsert { .. } => panic!("expected a remove, got an upsert"),
+        }
+    }
+
+    #[test]
+    fn unregister_observed_publishes_a_remove() {
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        );
+        let mut rx = registry.enable_shared_observed_publishing();
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-1"), unix(100))
+            .expect("heartbeat");
+        let _ = rx.try_recv().expect("the heartbeat's own upsert");
+
+        registry
+            .unregister_observed("node-a", "svc-node-a")
+            .expect("unregister");
+
+        match rx
+            .try_recv()
+            .expect("unregister_observed must publish a remove")
+        {
+            PublishOp::Remove { node_id } => assert_eq!(node_id, "node-a"),
+            PublishOp::Upsert { .. } => panic!("expected a remove, got an upsert"),
+        }
     }
 }

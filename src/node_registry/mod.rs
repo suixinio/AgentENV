@@ -59,6 +59,7 @@ pub mod dump;
 pub mod filter;
 pub mod grpc_service;
 pub mod kubernetes_discovery;
+pub mod redis;
 pub mod registry;
 pub mod strategy;
 pub mod types;

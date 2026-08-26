@@ -2371,12 +2371,23 @@ mod tests {
     /// called: its deadline is anchored at the Unix epoch, which every
     /// `SystemTime::now()` a test observes is already past -- mirrors
     /// `src/node_client/native_placement.rs`'s own `warm_gate` helper.
+    ///
+    /// 🔴 P1: `reported_in` is called explicitly, once, right here. Since
+    /// `WarmupGate::warmed_up`'s fix (a wall-clock deadline alone can no
+    /// longer latch `warm` on a registry that has received zero
+    /// heartbeats — see that method's own doc), a gate this helper hands
+    /// out has to actually report in at least once to go warm at all; the
+    /// already-past deadline above is what makes that one report latch
+    /// `warm` for good immediately, rather than requiring every node
+    /// discovery knows about to also be observed.
     fn warm_gate(registry: &Arc<AtomicNodeRegistry>) -> Arc<WarmupGate> {
-        Arc::new(WarmupGate::new(
+        let gate = Arc::new(WarmupGate::new(
             Arc::clone(registry) as Arc<dyn NodeRegistry>,
             Duration::from_secs(1),
             SystemTime::UNIX_EPOCH,
-        ))
+        ));
+        gate.reported_in(SystemTime::now());
+        gate
     }
 
     /// A gate that stays cold for the lifetime of a test: an hour-long

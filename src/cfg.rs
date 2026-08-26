@@ -1123,12 +1123,14 @@ pub struct ObservabilitySchedulerReportConfig {
 /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): `Scheduler` (the
 /// default) asks `[cluster].scheduler_endpoint` over gRPC, byte-for-byte
 /// today's behavior — `cluster_placement` in `src/bin/server.rs` builds no
-/// registry, no kube client, nothing. `Native` answers `resolve_node`/
-/// `node_membership` from api's own `src/node_registry` node registry
-/// instead (`crate::node_client::NativeNodePlacement`); the other three
-/// `NodePlacement` methods (`place_new`/`place_existing`/`record_placement`)
-/// still delegate to an inner `SchedulerNodePlacement` even under `Native` —
-/// those need the binding store, which is Stage D's, not Stage A's. `Native`
+/// registry, no kube client, nothing. `Native` answers every
+/// `NodePlacement` method from api's own process instead
+/// (`crate::node_client::NativeNodePlacement`): `resolve_node`/
+/// `node_membership` from `src/node_registry`'s node registry, and
+/// `place_new`/`place_existing`/`record_placement` (task's own "phase4-close"
+/// P1) from the same in-process `Schedule`/`LookupNode`/`RecordAssignment`
+/// surface Stage D built (`crate::node_registry::grpc_service`) — no
+/// `[cluster].scheduler_endpoint` is required under `Native` at all. `Native`
 /// also gates whether `assemble_api` starts Kubernetes discovery
 /// (`[cluster.kubernetes_discovery]`) and the heartbeat-receiving gRPC
 /// service at all: under `Scheduler`, nothing in this module runs, no kube

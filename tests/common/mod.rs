@@ -4,7 +4,7 @@ use std::sync::Arc;
 use agentenv::cfg::ConfigManager;
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
-use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+use agentenv::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
 use agentenv::snapshot::repository::SnapshotRepository;
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};

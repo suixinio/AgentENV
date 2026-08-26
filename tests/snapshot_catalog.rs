@@ -776,7 +776,7 @@ mod dual_write {
     use async_trait::async_trait;
 
     use super::*;
-    use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use agentenv::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use agentenv::snapshot::repository::mirror::{
         CentralCatalogWrites, DualWriteCatalog, MirrorBacklog, MirrorDirection, MirrorTargets,
     };
@@ -1949,7 +1949,7 @@ mod dual_write {
 mod bytes_then_commit {
     use super::*;
 
-    use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use agentenv::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use agentenv::snapshot::repository::mirror::{
         CentralCatalogWrites, DualWriteCatalog, MirrorBacklog,
     };

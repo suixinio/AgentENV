@@ -346,7 +346,10 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // doc and `ServerRole::check_pg_dsn`), so there is nothing for it to build
     // a central catalog out of.
     let snapshot_backend = agentenv::snapshot::repository::backends::build_snapshot_backend(
-        snapshot_p2p_transport,
+        agentenv::snapshot::repository::backends::storage::build_node_storage(
+            config,
+            snapshot_p2p_transport,
+        )?,
         None,
         role,
     )

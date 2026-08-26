@@ -3083,7 +3083,7 @@ async fn a_sandbox_paused_through_the_rpc_is_reopened_through_the_rpc() {
 async fn a_built_templates_metadata_survives_stage_encode_decode_and_commit() {
     use crate::sandbox::FirecrackerSnapshotManifest;
     use crate::snapshot::mock::write_mock_built_artifacts;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::repository::StagedSnapshot;
     use crate::snapshot::{CommandContext, SnapshotId, SnapshotRuntimeVersions};
     use crate::template::TemplateBuildExecution;

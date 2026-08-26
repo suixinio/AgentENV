@@ -592,7 +592,7 @@ pub(crate) mod tests {
     use super::super::captured::CallerOwnedArtifacts;
     use super::*;
     use crate::snapshot::mock::write_mock_built_artifacts;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::repository::StagedSnapshot;
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
     use std::path::Path;

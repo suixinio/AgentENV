@@ -25,7 +25,7 @@ pub(crate) enum CachedImageConfig {
 }
 
 #[derive(Debug)]
-pub(crate) enum OverlaybdLayerLocation {
+pub enum OverlaybdLayerLocation {
     LocalFile(PathBuf),
     CacheDir(PathBuf),
 }
@@ -55,7 +55,7 @@ pub(crate) trait SourceImageEntry: Send {
     async fn write_metadata(&self, metadata: ImageResolutionMetadata) -> Result<PathBuf>;
 }
 
-pub(crate) trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
+pub trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
     fn layer_location(&self, digest: &str, size: u64, has_remote: bool) -> OverlaybdLayerLocation;
 
     fn publishable_roots(&self) -> Vec<PathBuf>;

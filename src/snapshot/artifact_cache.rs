@@ -86,7 +86,7 @@ struct SharedFetchError {
 /// - Fetches are deduplicated: only one fetch per key at a time.
 /// - Entries are node-local derived state that can be regenerated or
 ///   re-fetched if the cache is missing or partially evicted.
-pub(crate) struct LocalArtifactCache {
+pub struct LocalArtifactCache {
     cache_root: PathBuf,
     max_size_bytes: u64,
     index: Mutex<CacheIndex>,

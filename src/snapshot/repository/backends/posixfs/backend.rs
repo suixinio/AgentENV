@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::super::shared_runtime_cache_root;
+use super::super::storage::shared_runtime_cache_root;
 use super::catalog::PosixFsCatalogStore;
 use super::import::PosixFsArtifactImporter;
 use super::runtime::PosixFsRuntimeResolver;

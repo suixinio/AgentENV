@@ -1,4 +1,4 @@
-mod artifact_cache;
+pub mod artifact_cache;
 mod captured;
 pub mod image_export;
 pub(crate) mod manager;

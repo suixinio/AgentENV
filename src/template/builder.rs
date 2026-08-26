@@ -366,7 +366,7 @@ impl TemplateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotManager, SnapshotRecord};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;

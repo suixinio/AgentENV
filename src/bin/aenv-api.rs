@@ -494,9 +494,12 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let pg_catalog = pg_pool
         .as_ref()
         .map(|pool| agentenv::snapshot::repository::backends::pg_catalog_parts(config, pool));
-    let snapshot_backend =
-        agentenv::snapshot::repository::backends::build_snapshot_backend(None, pg_catalog, role)
-            .await?;
+    let snapshot_backend = agentenv::snapshot::repository::backends::build_snapshot_backend(
+        agentenv::snapshot::repository::backends::build_catalog_only_storage(config)?,
+        pg_catalog,
+        role,
+    )
+    .await?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));

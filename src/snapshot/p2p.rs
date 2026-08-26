@@ -472,7 +472,7 @@ mod advertisement_tests {
     use crate::snapshot::manager::tests::{capture_of, staged_elsewhere};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::p2p::fixed_artifact_key;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{
         CallerOwnedArtifacts, CapturedSandboxSnapshot, SnapshotId, SnapshotManager,
         SnapshotPublishMetadata, SNAPSHOT_ARTIFACT_LAYOUT,

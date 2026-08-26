@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use agentenv::cfg::{ConfigManager, OssBackendConfig};
 use agentenv::sandbox::FirecrackerSnapshotManifest;
 use agentenv::snapshot::mock::write_mock_built_artifacts;
-use agentenv::snapshot::repository::backends::OssBackend;
+use agentenv::snapshot::repository::backends::storage::OssBackend;
 use agentenv::snapshot::{
     OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,

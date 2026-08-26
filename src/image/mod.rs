@@ -1,4 +1,4 @@
-pub(crate) mod cache;
+pub mod cache;
 pub(crate) mod commit_index;
 mod contract;
 pub(crate) mod local_layer;

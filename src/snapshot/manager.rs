@@ -1,36 +1,16 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
-use futures::{stream, StreamExt};
-use tracing::warn;
 
-use super::p2p::SnapshotP2pArtifact;
-use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
-use crate::p2p::P2pTransport;
-use crate::snapshot::captured::CapturedSandboxSnapshot;
+use crate::snapshot::captured::{CapturedSandboxSnapshot, SnapshotArtifactAdvertiser};
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRecord,
+    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
 };
 use crate::types::{ExecutionId, FirecrackerSnapshotManifest};
-
-/// Concurrency limit for publishing snapshot artifacts to P2P after commit.
-const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;
-
-fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
-    layers
-        .iter()
-        .filter_map(|layer| match layer {
-            OverlaybdLayerRef::Managed(managed) => managed.uuid.clone(),
-            OverlaybdLayerRef::External(_) => None,
-        })
-        .collect()
-}
 
 /// The sandbox a publication says it came from, or `None` for a template
 /// build.
@@ -52,13 +32,6 @@ fn describe_source(source_sandbox_id: Option<&str>) -> String {
         Some(id) => format!("sandbox {id}"),
         None => "a template build".to_string(),
     }
-}
-
-fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> {
-    layers
-        .iter()
-        .filter_map(|layer| layer.uuid.clone())
-        .collect()
 }
 
 /// What a `stage` on this node produced: the value that travels, and the part
@@ -154,7 +127,7 @@ pub struct SnapshotManager {
     /// [`Self::resolve_runnable`] is the only reader, and it refuses rather
     /// than unwrapping.
     runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
-    p2p_transport: Option<Arc<dyn P2pTransport>>,
+    advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
     /// Held, not used. The replay of owed object-store writes stops when the
     /// last handle is dropped, so it lives as long as the manager does.
     _mirror_compensator: Option<Arc<crate::snapshot::repository::mirror::MirrorCompensator>>,
@@ -175,15 +148,16 @@ impl SnapshotManager {
     /// scheduler's gRPC one) is built at all — see
     /// `ServerRole::never_constructs_a_central_snapshot_catalog`'s own doc.
     pub async fn new(
-        p2p_transport: Option<Arc<dyn P2pTransport>>,
+        p2p_transport: Option<Arc<dyn crate::p2p::P2pTransport>>,
+        advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
         pg_pool: Option<sqlx::PgPool>,
         role: crate::role::ServerRole,
     ) -> anyhow::Result<Self> {
-        let assembled = build_snapshot_backend(p2p_transport.clone(), pg_pool, role).await?;
+        let assembled = build_snapshot_backend(p2p_transport, pg_pool, role).await?;
         Ok(Self {
             repository: assembled.repository,
             runtime_resolver: assembled.runtime_resolver,
-            p2p_transport,
+            advertiser,
             _mirror_compensator: assembled.mirror_compensator,
         })
     }
@@ -198,12 +172,12 @@ impl SnapshotManager {
     pub fn from_parts(
         repository: Arc<SnapshotRepository>,
         runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
-        p2p_transport: Option<Arc<dyn P2pTransport>>,
+        advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
     ) -> Self {
         Self {
             repository,
             runtime_resolver,
-            p2p_transport,
+            advertiser,
             _mirror_compensator: None,
         }
     }
@@ -414,11 +388,14 @@ impl SnapshotManager {
             // reachable from.
             return;
         };
-        self.publish_p2p_artifacts(record, manifest).await;
+        let Some(advertiser) = self.advertiser.as_ref() else {
+            return;
+        };
+        advertiser.advertise(record, manifest).await;
     }
 
     /// stage -> commit -> advertise, in the one process that can do all three.
-    async fn commit_and_advertise(
+    pub(crate) async fn commit_and_advertise(
         &self,
         handle: StagedSnapshotHandle,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
@@ -426,79 +403,6 @@ impl SnapshotManager {
         let record = self.commit_staged(staged).await?;
         self.advertise_committed(&record, local).await;
         Ok(record)
-    }
-
-    /// Best effort attempt to publish snapshot artifacts to P2P.
-    #[tracing::instrument(skip(self, record, manifest), fields(snapshot_id = %record.id))]
-    async fn publish_p2p_artifacts(
-        &self,
-        record: &SnapshotRecord,
-        manifest: &FirecrackerSnapshotManifest,
-    ) {
-        let Some(transport) = self.p2p_transport.as_ref() else {
-            return;
-        };
-        let snapshot_id = &record.id;
-        let Some(committed) = record.committed.as_ref() else {
-            return;
-        };
-
-        // Prepare the manifest and VM state.
-        let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
-        let mut artifacts = vec![
-            SnapshotP2pArtifact::fixed(
-                snapshot_id,
-                SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
-                manifest.vm_state.path.clone(),
-            ),
-            SnapshotP2pArtifact::bytes(
-                snapshot_id,
-                SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-                manifest_bytes,
-            ),
-        ];
-
-        // Collect any overlaybd layers referenced by this snapshot's runtime images.
-        let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
-        artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.rootfs.image_config_path,
-            &rootfs_uuids,
-        ));
-        let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
-        artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.memory.image_config_path,
-            &memory_uuids,
-        ));
-        for drive in &manifest.attached_drives {
-            let drive_uuids = committed
-                .attached_drives
-                .iter()
-                .find_map(|committed_drive| match committed_drive {
-                    crate::snapshot::CommittedAttachedDrive::Overlaybd {
-                        drive_id, layers, ..
-                    } if drive_id == &drive.drive_id => Some(managed_layer_uuids(layers)),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-                &drive.image_config_path,
-                &drive_uuids,
-            ));
-        }
-
-        // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
-        stream::iter(artifacts)
-            .for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, |artifact| async move {
-                if let Err(error) = artifact.publish(transport).await {
-                    warn!(
-                        key = %artifact.key,
-                        source = %artifact.source,
-                        error = %error,
-                        "failed to publish snapshot artifact to P2P"
-                    );
-                }
-            })
-            .await;
     }
 
     /// Loads a snapshot record by id or alias.
@@ -688,13 +592,10 @@ impl SnapshotManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::captured::CallerOwnedArtifacts;
     use super::*;
-    use crate::overlaybd::layer_key_from_digest;
-    use crate::p2p::mock::MockTransport;
     use crate::snapshot::mock::write_mock_built_artifacts;
-    use crate::snapshot::p2p::fixed_artifact_key;
     use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::repository::StagedSnapshot;
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
@@ -963,61 +864,8 @@ mod tests {
             .is_some());
     }
 
-    #[tokio::test]
-    async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
-        let p2p = Arc::new(MockTransport::default());
-        let manager =
-            SnapshotManager::from_parts(repository, Some(runtime_resolver), Some(p2p.clone()));
-
-        let workspace = TempDir::new().expect("tempdir should exist");
-        let (rootfs_lower, _, manifest) =
-            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
-        let snapshot_id = SnapshotId::generate();
-        let metadata = SnapshotPublishMetadata {
-            id: snapshot_id.clone(),
-            ..SnapshotPublishMetadata::mock()
-        };
-
-        manager
-            .publish(metadata, manifest)
-            .await
-            .expect("publish should commit");
-
-        let vm_state_key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let manifest_key =
-            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        let rootfs_layer_digest = crate::digest::FileDigest::describe(&rootfs_lower)
-            .await
-            .expect("describe rootfs lower");
-        let rootfs_layer_key = layer_key_from_digest(&rootfs_layer_digest.sha256);
-
-        assert!(p2p
-            .lookup(&vm_state_key)
-            .await
-            .expect("lookup vm state")
-            .is_some());
-        assert!(p2p
-            .lookup(&manifest_key)
-            .await
-            .expect("lookup manifest")
-            .is_some());
-        assert!(p2p
-            .lookup(&rootfs_layer_key)
-            .await
-            .expect("lookup rootfs layer")
-            .is_some());
-    }
-
     /// Builds a row staged somewhere this process cannot read.
-    fn staged_elsewhere(id: SnapshotId, source_sandbox_id: &str) -> StagedSnapshot {
+    pub(crate) fn staged_elsewhere(id: SnapshotId, source_sandbox_id: &str) -> StagedSnapshot {
         StagedSnapshot {
             commit: crate::snapshot::repository::SnapshotCommit {
                 id,
@@ -1039,7 +887,7 @@ mod tests {
         }
     }
 
-    fn capture_of(source_sandbox_id: &str, id: SnapshotId) -> SnapshotPublishMetadata {
+    pub(crate) fn capture_of(source_sandbox_id: &str, id: SnapshotId) -> SnapshotPublishMetadata {
         SnapshotPublishMetadata {
             id,
             source: SnapshotPublishSource::Sandbox {
@@ -1202,95 +1050,5 @@ mod tests {
             .await
             .expect("get should work")
             .is_some());
-    }
-
-    /// An adopted staging holds no local bytes and offers nothing to P2P; a local
-    /// one holds them and does.
-    ///
-    /// 🔴 Two assertions per half, and the pair is deliberate. The P2P lookups
-    /// alone are not enough: "nothing was advertised" is the same observation
-    /// whether the staging had nothing to offer or had a manifest and failed to
-    /// read the files it names, so a build that handed an adopted staging some
-    /// other snapshot's manifest would still look right from there. The handle
-    /// is asked directly for the fact itself.
-    ///
-    /// 🔴 And the local publish in the same round is what stops the negative
-    /// halves passing on a build where staging or advertising stopped working
-    /// altogether — a different and much worse bug than the one this pins.
-    #[tokio::test]
-    async fn only_bytes_this_process_holds_are_advertised() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
-        let p2p = Arc::new(MockTransport::default());
-        let manager =
-            SnapshotManager::from_parts(repository, Some(runtime_resolver), Some(p2p.clone()));
-        let sandbox = "one-sandbox";
-
-        let staged_id = SnapshotId::generate();
-        let adopted = manager
-            .stage_captured(
-                capture_of(sandbox, SnapshotId::generate()),
-                CapturedSandboxSnapshot::staged(staged_elsewhere(staged_id.clone(), sandbox)),
-                None,
-            )
-            .await
-            .expect("an adopted staging");
-        assert!(
-            !adopted.holds_local_bytes(),
-            "a staging performed on another machine claimed bytes this process holds"
-        );
-        manager
-            .commit_and_advertise(adopted)
-            .await
-            .expect("an adopted staging should commit");
-
-        let workspace = TempDir::new().expect("tempdir should exist");
-        let (_, _, manifest) =
-            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
-        let local_id = SnapshotId::generate();
-        let local = manager
-            .stage_captured(
-                capture_of(sandbox, local_id.clone()),
-                CapturedSandboxSnapshot::local(CallerOwnedArtifacts::new(manifest)),
-                None,
-            )
-            .await
-            .expect("a local staging");
-        assert!(
-            local.holds_local_bytes(),
-            "a staging this process performed disclaimed its own bytes, so the assertion above \
-             proves nothing"
-        );
-        manager
-            .commit_and_advertise(local)
-            .await
-            .expect("a local capture should publish");
-
-        assert!(
-            p2p.lookup(&fixed_artifact_key(
-                &staged_id,
-                SNAPSHOT_ARTIFACT_LAYOUT.vm_state
-            ))
-            .await
-            .expect("lookup")
-            .is_none(),
-            "this process advertised bytes it has never held"
-        );
-        assert!(
-            p2p.lookup(&fixed_artifact_key(
-                &local_id,
-                SNAPSHOT_ARTIFACT_LAYOUT.vm_state
-            ))
-            .await
-            .expect("lookup")
-            .is_some(),
-            "the local publish advertised nothing, so the assertion above proves nothing"
-        );
     }
 }

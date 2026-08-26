@@ -570,8 +570,18 @@ async fn assemble_node_core(
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager =
-        Arc::new(SnapshotManager::new(snapshot_p2p_transport, pg_pool, role).await?);
+    // 🔴 Two handles on the same transport, and they answer different
+    // questions. The first is how the *resolver* fetches a snapshot's fixed
+    // artifacts from a peer; the second is how this node offers the ones it
+    // just wrote. Only the machine that holds bytes has anything to offer, so
+    // only this assembly builds an advertiser — `assemble_api` passes `None`.
+    let snapshot_advertiser = snapshot_p2p_transport.clone().map(|transport| {
+        Arc::new(agentenv::snapshot::P2pSnapshotAdvertiser::new(transport))
+            as Arc<dyn agentenv::snapshot::SnapshotArtifactAdvertiser>
+    });
+    let snapshot_manager = Arc::new(
+        SnapshotManager::new(snapshot_p2p_transport, snapshot_advertiser, pg_pool, role).await?,
+    );
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     // The handle the cold-boot paths read the CPUID intersection from.
     //
@@ -613,7 +623,11 @@ async fn assemble_node_core(
     // few seconds of 404s indistinguishable from a cold cache. Pinned by
     // `the_roster_is_complete_the_moment_new_returns` in
     // `src/orchestrator/tests.rs`.
-    let orchestrator = Orchestrator::with_file_backed_store_and_factory(role, factory).await?;
+    // 🔴 The node half's own layer cache, named here rather than defaulted
+    // inside the orchestrator. This is the process that has one.
+    let image_refs = agentenv::image::local_runtime_image_refs();
+    let orchestrator =
+        Orchestrator::with_file_backed_store_and_factory(role, factory, image_refs).await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -1291,12 +1305,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         // asked here for a build sandbox instead of a user one.
         RemoteSandboxBackendFactory::new(Arc::clone(&placement)),
         DisabledSandboxPersister,
+        agentenv::image::DisabledRuntimeImageRefs::shared(),
     )
     .await?;
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
 
-    let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool.clone(), role).await?);
+    let snapshot_manager = Arc::new(SnapshotManager::new(None, None, pg_pool.clone(), role).await?);
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));
 

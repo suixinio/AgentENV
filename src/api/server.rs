@@ -480,18 +480,17 @@ mod tests {
         let orchestrator = crate::orchestrator::Orchestrator::new(
             ServerRole::All,
             crate::orchestrator::InMemoryMetadataStore::new(),
-            crate::sandbox::FirecrackerSandboxFactory::new(),
+            crate::sandbox::mock::MockBackendFactory::new(),
             crate::orchestrator::FileBackedSandboxPersister::new_for_test(
                 root.path().to_path_buf(),
             ),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .unwrap();
         let snapshot_manager = Arc::new(crate::snapshot::mock::mock_snapshot_manager());
-        let template_builder = Arc::new(crate::template::TemplateBuilder::new());
-        let image_resolver = Arc::new(crate::image::ImageResolver::new(
-            &crate::cfg::AppConfig::default(),
-        ));
+        let template_builder = Arc::new(crate::template::RefusingTemplateBuildDriver);
+        let image_resolver = Arc::new(crate::image::RefusingImageResolver::new(""));
         let identity = crate::identity::NodeIdentity::from_config(&Default::default());
         Arc::new(ApiImpl::new(
             orchestrator,

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::{RuntimeImageOwner, RuntimeImageRefs};
+use crate::image::{RuntimeImageOwner, RuntimeImageRefs};
 use crate::sandbox::RuntimeArtifactSet;
 use crate::types::SandboxId;
 

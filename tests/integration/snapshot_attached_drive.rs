@@ -13,7 +13,7 @@ use agentenv::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
 };
-use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
+use agentenv::template::{TemplateBuildDriver as _, TemplateBuildSpec, TemplateBuilder};
 use agentenv::types::{ExecutionId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;

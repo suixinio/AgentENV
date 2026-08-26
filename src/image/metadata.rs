@@ -2,52 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageBaseContext {
-    #[serde(default)]
-    pub env_vars: HashMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
-    // OCI image config `User` field forwarded as-is to envd's InitPostRequest.
-    // Accepted formats: "username", "uid", "user:group", "uid:gid", "" (root).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exposed_ports: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entrypoint: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cmd: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub volumes: Vec<String>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub labels: HashMap<String, String>,
-}
-
-impl ImageBaseContext {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        env_vars: HashMap<String, String>,
-        workdir: Option<String>,
-        user: Option<String>,
-        exposed_ports: Vec<String>,
-        entrypoint: Option<Vec<String>>,
-        cmd: Option<Vec<String>>,
-        volumes: Vec<String>,
-        labels: HashMap<String, String>,
-    ) -> Self {
-        Self {
-            env_vars,
-            workdir: normalize_optional_string(workdir),
-            user: normalize_optional_string(user),
-            exposed_ports,
-            entrypoint,
-            cmd,
-            volumes,
-            labels,
-        }
-    }
-}
+use super::ImageBaseContext;
 
 pub(crate) fn env_vars_from_entries(entries: &[String]) -> HashMap<String, String> {
     // Docker-compatible last-wins behavior for duplicate ENV keys.
@@ -68,10 +23,4 @@ pub(crate) struct ImageResolutionMetadata {
     /// to consumers (e.g. MMDS metadata) without field-level interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_config: Option<serde_json::Value>,
-}
-
-fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }

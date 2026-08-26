@@ -43,6 +43,7 @@ async fn service_with(
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -72,6 +73,7 @@ async fn service_with_catalog() -> (
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -477,6 +479,7 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
         HalfAnswering(InMemoryMetadataStore::new()),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -642,6 +645,7 @@ async fn the_listing_reports_the_incarnation_the_handle_is_running() {
             drifted: Arc::clone(&drifted),
         },
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -690,6 +694,7 @@ async fn a_sandbox_whose_handle_is_busy_is_still_reported() {
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -2136,6 +2141,7 @@ async fn a_resume_whose_records_could_not_be_read_is_not_an_absence() {
         store,
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -2304,6 +2310,7 @@ async fn service_with_persister() -> (
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -2347,6 +2354,7 @@ async fn staging_service() -> StagingHarness {
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         persister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -2867,6 +2875,7 @@ async fn a_failed_pause_says_whether_the_sandbox_survived_it() {
             InMemoryMetadataStore::new(),
             MockBackendFactory::with_behavior(Arc::clone(&behavior)),
             DisabledSandboxPersister,
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an in-memory orchestrator");

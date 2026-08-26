@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::image::ImageResolver;
+use crate::image::RootfsImageResolver;
 use crate::sandbox::{validate_drive_id, validate_mount_path, validate_sub_path, ExtraDrive};
 use agentenv_http_server::models;
 
@@ -109,7 +109,7 @@ fn validate_attached_drives(
 /// Resolves attached drive declarations into `ResolvedAttachedDrive` values ready for sandbox launch.
 pub(super) async fn resolve_attached_drives(
     drives: &[models::AttachedDrive],
-    image_resolver: &ImageResolver,
+    image_resolver: &dyn RootfsImageResolver,
 ) -> Result<Vec<ResolvedAttachedDrive>, models::Error> {
     let pending = validate_attached_drives(drives)?;
 
@@ -206,12 +206,12 @@ mod tests {
     use crate::cfg::AppConfig;
     use tempfile::TempDir;
 
-    fn test_resolver(temp: &TempDir) -> ImageResolver {
+    fn test_resolver(temp: &TempDir) -> crate::image::ImageResolver {
         let config = AppConfig {
             deps_path: temp.path().join("deps"),
             ..AppConfig::default()
         };
-        ImageResolver::new(&config)
+        crate::image::ImageResolver::new(&config)
     }
 
     fn drive(

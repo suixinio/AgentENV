@@ -1,5 +1,6 @@
 pub(crate) mod cache;
 pub(crate) mod commit_index;
+mod contract;
 pub(crate) mod local_layer;
 mod metadata;
 pub(crate) mod oci_image;
@@ -8,9 +9,12 @@ mod resolver;
 
 use thiserror::Error;
 
-pub use metadata::ImageBaseContext;
+pub use contract::{
+    DisabledRuntimeImageRefs, ImageBaseContext, RefusingImageResolver, ResolvedBlockImage,
+    RootfsImageResolver, RuntimeImageOwner, RuntimeImageRefs,
+};
 pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
-pub use resolver::{ImageResolver, ResolvedBlockImage};
+pub use resolver::ImageResolver;
 
 /// Boundedly closes every local image-cache RocksDB metadata store this
 /// process opened, so the shutdown path can wait on it with a bound instead of
@@ -22,6 +26,15 @@ pub use resolver::{ImageResolver, ResolvedBlockImage};
 /// resolver's handle is not this store's owner in any sense that would make
 /// "close the resolver" the right shape. See
 /// `crate::local_store::LocalKvStore::close` for the mechanism.
+/// This machine's own layer-cache handle, for the orchestrator that runs on it.
+///
+/// 🔴 Constructing this is what opens the node-local cache, which is why it is
+/// the caller's call and not a default inside `Orchestrator::new` — see that
+/// function's own doc.
+pub fn local_runtime_image_refs() -> std::sync::Arc<dyn RuntimeImageRefs> {
+    cache::local_image_services_from_global_config().runtime_refs
+}
+
 pub async fn close_image_cache_stores(timeout: std::time::Duration) {
     cache::close_shared_metadata_stores(timeout).await;
 }

@@ -75,6 +75,23 @@ fn is_allowed_extra_boot_arg(arg: &str, allowed_prefixes: &[String]) -> bool {
 }
 
 impl SandboxBackendFactory for FirecrackerSandboxFactory {
+    /// Tears down the host network plumbing this factory's sandboxes were
+    /// given slots out of.
+    ///
+    /// 🔴 Moved here from `Orchestrator::shutdown`, which used to name
+    /// `NetworkManager::global_if_initialized` directly. Nothing about the
+    /// behaviour changed — including that it is best effort and only logs.
+    fn release_process_wide_resources(&self) {
+        if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {
+            if let Err(err) = manager.shutdown() {
+                tracing::warn!(
+                    error = ?err,
+                    "failed to clean up network resources during orchestrator shutdown"
+                );
+            }
+        }
+    }
+
     fn build(
         &self,
         build_spec: FreshSandboxBuildSpec,

@@ -73,7 +73,14 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let factory = FirecrackerSandboxFactory::new();
         let paused_store = root.path().join("paused-sandboxes");
         let persister = host_file_persister(paused_store.clone());
-        let orchestrator = Orchestrator::new(ServerRole::All, store, factory, persister).await?;
+        let orchestrator = Orchestrator::new(
+            ServerRole::All,
+            store,
+            factory,
+            persister,
+            agentenv::image::DisabledRuntimeImageRefs::shared(),
+        )
+        .await?;
         let case_id = Uuid::now_v7().to_string();
 
         let request = CreateSandboxRequest {
@@ -170,6 +177,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             host_file_persister(paused_store),
+            agentenv::image::DisabledRuntimeImageRefs::shared(),
         )
         .await?;
         let restored = restarted
@@ -247,7 +255,8 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             .await?;
         let runnable = snapshot_manager.resolve_runnable(stored).await?;
 
-        let orchestrator = Orchestrator::with_in_memory_store().await;
+        let orchestrator =
+            Orchestrator::with_in_memory_store(FirecrackerSandboxFactory::new()).await;
         let created = orchestrator
             .create_sandbox(CreateSandboxRequest {
                 source: SandboxLaunchSource::Snapshot(Box::new(runnable)),

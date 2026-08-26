@@ -18,14 +18,14 @@ use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
 use crate::identity::NodeIdentity;
-use crate::image::ImageResolver;
+use crate::image::RootfsImageResolver;
 use crate::node_client::NodePlacement;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
 use crate::role::ServerRole;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
-use crate::template::TemplateBuilder;
+use crate::template::TemplateBuildDriver;
 use agentenv_http_server::{apis, models};
 pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
 // The data-plane auto-resume takes the same decision the REST resume does; both
@@ -89,8 +89,8 @@ pub struct ApiImpl {
     /// Cluster-wide bookkeeping for paused sandboxes. With the default `local`
     /// registry backend every call is a no-op and pause/resume stay node-local.
     paused: Arc<PausedSandboxCoordinator>,
-    template_builder: Arc<TemplateBuilder>,
-    image_resolver: Arc<ImageResolver>,
+    template_builder: Arc<dyn TemplateBuildDriver>,
+    image_resolver: Arc<dyn RootfsImageResolver>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -127,8 +127,8 @@ impl ApiImpl {
     pub fn new(
         orchestrator: Arc<dyn SandboxOrchestration>,
         snapshot_manager: Arc<SnapshotManager>,
-        template_builder: Arc<TemplateBuilder>,
-        image_resolver: Arc<ImageResolver>,
+        template_builder: Arc<dyn TemplateBuildDriver>,
+        image_resolver: Arc<dyn RootfsImageResolver>,
         observability: Option<Arc<ObservabilityService>>,
         paused: PausedSandboxWiring,
         sandbox_proxy_domains: Vec<String>,
@@ -191,7 +191,7 @@ impl ApiImpl {
         &self.sandbox_proxy_domains
     }
 
-    pub(crate) fn image_resolver(&self) -> Arc<ImageResolver> {
+    pub(crate) fn image_resolver(&self) -> Arc<dyn RootfsImageResolver> {
         Arc::clone(&self.image_resolver)
     }
 

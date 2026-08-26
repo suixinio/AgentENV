@@ -340,15 +340,14 @@ mod operator_snapshot_delete_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
+    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
     };
     use crate::role::ServerRole;
-    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
         StartedBuild,
@@ -361,7 +360,7 @@ mod operator_snapshot_delete_tests {
         SnapshotManager, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason, TemplateBuildInfo,
     };
-    use crate::template::TemplateBuilder;
+    use crate::template::RefusingTemplateBuildDriver;
 
     /// One row, and a note of what was asked to be deleted.
     struct OneRowCatalog {
@@ -514,8 +513,9 @@ mod operator_snapshot_delete_tests {
         let orchestrator = Orchestrator::new(
             ServerRole::All,
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an orchestrator");
@@ -535,8 +535,8 @@ mod operator_snapshot_delete_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),

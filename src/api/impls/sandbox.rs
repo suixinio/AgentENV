@@ -639,7 +639,7 @@ impl Sandboxes<()> for ApiImpl {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
                         source.chain().find_map(|cause| {
                             cause
-                                .downcast_ref::<uvm_ublk_daemon::InvalidRequestError>()
+                                .downcast_ref::<crate::sandbox::InvalidSandboxRequest>()
                                 .map(ToString::to_string)
                         })
                     }
@@ -2279,14 +2279,13 @@ mod cold_start_role_tests {
     use super::ApiImpl;
     use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
     };
     use crate::role::ServerRole;
-    use crate::sandbox::FirecrackerSandboxFactory;
-    use crate::template::TemplateBuilder;
+    use crate::sandbox::mock::MockBackendFactory;
+    use crate::template::RefusingTemplateBuildDriver;
 
     /// The image every fixture here asks for.
     ///
@@ -2359,8 +2358,9 @@ mod cold_start_role_tests {
         let orchestrator = Orchestrator::new(
             ServerRole::All,
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an orchestrator");
@@ -2370,8 +2370,8 @@ mod cold_start_role_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&config)),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(crate::image::ImageResolver::new(&config)),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),
@@ -2550,9 +2550,8 @@ mod warm_start_role_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
+    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
@@ -2561,7 +2560,7 @@ mod warm_start_role_tests {
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
-    use crate::template::TemplateBuilder;
+    use crate::template::RefusingTemplateBuildDriver;
 
     /// One API surface whose catalog holds a ready snapshot and whose runtime
     /// resolver refuses every call.
@@ -2585,6 +2584,7 @@ mod warm_start_role_tests {
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an orchestrator");
@@ -2594,8 +2594,8 @@ mod warm_start_role_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),

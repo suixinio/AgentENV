@@ -362,6 +362,7 @@ impl UblkDeviceManager {
         let created = client
             .create_overlaybd_runtime_device(request)
             .await
+            .map_err(mark_invalid_request)
             .context("create overlaybd runtime device via daemon");
         metric.finish(&created);
         let created = created?;
@@ -733,6 +734,23 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
             )
             .set(stat.valid_data_size.saturating_sub(used) as f64);
         }
+    }
+}
+
+/// Re-states a daemon "your request is wrong" refusal as the marker the API
+/// surface classifies on.
+///
+/// 🔴 A `context`, not a replacement: the daemon's own message and every frame
+/// under it stay in the chain, and only the *classification* is added. See
+/// [`InvalidSandboxRequest`].
+fn mark_invalid_request(err: anyhow::Error) -> anyhow::Error {
+    match err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<uvm_ublk_daemon::InvalidRequestError>())
+        .map(ToString::to_string)
+    {
+        Some(message) => err.context(crate::sandbox::InvalidSandboxRequest(message)),
+        None => err,
     }
 }
 

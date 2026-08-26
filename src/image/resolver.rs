@@ -9,7 +9,7 @@ use tracing::{info, trace, warn};
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
 use super::oci_image::{self, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
-use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult};
+use super::{ImageError, ImageResolutionMetadata, ImageResult, ResolvedBlockImage};
 use crate::cfg::AppConfig;
 use crate::image::oci_image::ImageFormat;
 use crate::observability::prometheus::MetricGuard;
@@ -40,16 +40,6 @@ const OVERLAYBD_REFERRER_ARTIFACT_TYPES: &[&str] = &[
     OVERLAYBD_NATIVE_ARTIFACT_TYPE,
     ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE,
 ];
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedBlockImage {
-    pub image_ref: String,
-    pub overlaybd_config_path: PathBuf,
-    pub base_context: ImageBaseContext,
-    /// Raw source image config JSON, `None` when the image source has no config
-    /// (e.g. bare overlaybd config path) or when loaded from a legacy cache entry.
-    pub raw_config: Option<serde_json::Value>,
-}
 
 #[derive(Debug)]
 pub struct ImageResolver {
@@ -492,6 +482,17 @@ fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
         "upper": {},
         "resultFile": ""
     })
+}
+
+#[async_trait::async_trait]
+impl crate::image::RootfsImageResolver for ImageResolver {
+    fn default_image(&self) -> &str {
+        ImageResolver::default_image(self)
+    }
+
+    async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        ImageResolver::resolve(self, image_ref).await
+    }
 }
 
 #[cfg(test)]

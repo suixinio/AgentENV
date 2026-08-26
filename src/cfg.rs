@@ -1674,12 +1674,26 @@ pub struct CustomExtensionConfig {
     pub timeout_ms: u64,
 }
 
+/// Which artifact transport `[p2p].transport` selects.
+///
+/// 🔴 A config value, and so it lives here rather than in `crate::p2p`. The
+/// half of the system that reads config is not always the half that links a
+/// transport implementation: a process that never moves artifact bytes still
+/// has to parse a config file that names one. `crate::p2p` re-exports this and
+/// owns the mapping from a name to a linked backend.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum P2pTransportKind {
+    Disabled,
+    Iroh,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct P2pConfig {
     #[config(default = false)]
     pub enabled: bool,
     #[config(default = "iroh")]
-    pub transport: crate::p2p::P2pTransportKind,
+    pub transport: P2pTransportKind,
     #[config(default = "$AENV_HOME/p2p/store")]
     pub store_dir: PathBuf,
     #[config(default = "0.0.0.0:0")]

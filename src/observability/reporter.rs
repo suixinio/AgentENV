@@ -1172,7 +1172,9 @@ mod against_a_scheduler {
     /// as real as one holding sandboxes; this test is about where the
     /// heartbeat goes, not what is in it.
     async fn test_service() -> Arc<ObservabilityService> {
-        let orchestrator = Orchestrator::with_in_memory_store().await;
+        let orchestrator =
+            Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
+                .await;
         let orchestration: Arc<dyn SandboxOrchestration> = orchestrator as _;
         Arc::new(
             ObservabilityService::new(

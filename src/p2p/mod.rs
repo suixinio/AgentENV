@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::identity::NodeIdentity;
 
-pub use config::P2pTransportKind;
+pub use crate::cfg::P2pTransportKind;
 pub use discovery::{
     NoopP2pPeerDiscovery, P2pPeerDiscovery, SchedulerPeerDiscovery, StaticP2pPeerDiscovery,
 };
@@ -56,6 +56,6 @@ fn peer_discovery_from_config(
         node_identity.id.clone(),
         node_identity.cluster_id.to_string(),
         p2p.peer_discovery_refresh_interval,
-        p2p.transport.backend_id().map(ToString::to_string),
+        config::backend_id(p2p.transport).map(ToString::to_string),
     )
 }

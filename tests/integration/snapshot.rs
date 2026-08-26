@@ -10,6 +10,7 @@ use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
     SnapshotRuntimeVersions,
 };
+use agentenv::template::TemplateBuildDriver as _;
 use agentenv::template::TemplateBuildSpec;
 use agentenv::types::{ExecutionId, SandboxId, SandboxResources};
 use anyhow::{anyhow, bail, Context, Result};

@@ -1605,12 +1605,10 @@ mod tests {
 
     use crate::{
         api::server,
-        cfg::AppConfig,
-        image::ImageResolver,
+        image::RefusingImageResolver,
         orchestrator::{FileBackedSandboxPersister, Orchestrator},
         role::ServerRole,
         snapshot::mock::mock_snapshot_manager,
-        template::TemplateBuilder,
     };
 
     #[test]
@@ -2010,14 +2008,15 @@ mod tests {
         let orchestrator = Orchestrator::new(
             ServerRole::All,
             crate::orchestrator::InMemoryMetadataStore::new(),
-            crate::sandbox::FirecrackerSandboxFactory::new(),
+            crate::sandbox::mock::MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
-        let template_builder = Arc::new(TemplateBuilder::new());
-        let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let template_builder = Arc::new(crate::template::RefusingTemplateBuildDriver);
+        let image_resolver = Arc::new(RefusingImageResolver::new(""));
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),

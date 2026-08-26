@@ -10,8 +10,7 @@ mod mock;
 pub(crate) use service::close_shared_metadata_stores;
 pub(crate) use store::{
     local_image_services_from_app_config, local_image_services_from_global_config,
-    CachedImageConfig, OverlaybdLayerLocation, OverlaybdLayerStore, RuntimeImageOwner,
-    RuntimeImageRefs, SourceImageStore,
+    CachedImageConfig, OverlaybdLayerLocation, OverlaybdLayerStore, SourceImageStore,
 };
 
 #[cfg(test)]

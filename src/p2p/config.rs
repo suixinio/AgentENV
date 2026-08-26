@@ -1,23 +1,21 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Deserialize;
-
 use crate::cfg::P2pConfig;
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum P2pTransportKind {
-    Disabled,
-    Iroh,
-}
+pub use crate::cfg::P2pTransportKind;
 
-impl P2pTransportKind {
-    pub(crate) fn backend_id(self) -> Option<&'static str> {
-        match self {
-            Self::Disabled => None,
-            Self::Iroh => Some(super::iroh::IROH_BACKEND_ID),
-        }
+/// The backend id a transport kind advertises to peers.
+///
+/// 🔴 Not an inherent method on [`P2pTransportKind`]: that type is a *config*
+/// value — `[p2p].transport` — and lives with the rest of the config, which
+/// knows nothing about which transport implementations are linked into this
+/// process. The mapping from the configured name to a linked backend belongs
+/// to the half that links them.
+pub(crate) fn backend_id(kind: P2pTransportKind) -> Option<&'static str> {
+    match kind {
+        P2pTransportKind::Disabled => None,
+        P2pTransportKind::Iroh => Some(super::iroh::IROH_BACKEND_ID),
     }
 }
 

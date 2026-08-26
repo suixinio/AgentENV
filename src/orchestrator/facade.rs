@@ -335,7 +335,9 @@ mod tests {
     /// stack ran out.
     #[tokio::test]
     async fn the_facade_answers_from_the_orchestrator_behind_it() {
-        let concrete = Orchestrator::with_in_memory_store().await;
+        let concrete =
+            Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
+                .await;
         let orchestration: Arc<dyn SandboxOrchestration> = Arc::clone(&concrete) as _;
 
         assert!(!orchestration.scheduling_disabled());
@@ -408,7 +410,8 @@ mod tests {
     #[tokio::test]
     async fn every_by_arc_method_reaches_the_orchestrator_through_dyn() {
         let orchestration: Arc<dyn SandboxOrchestration> =
-            Orchestrator::with_in_memory_store().await;
+            Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
+                .await;
         let unknown = SandboxId::new();
 
         fn refuses<T: std::fmt::Debug>(what: &str, unknown: SandboxId, result: Result<T>) {

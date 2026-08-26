@@ -123,6 +123,21 @@ impl From<anyhow::Error> for SandboxCaptureError {
 #[error("{0}")]
 pub struct RuntimeConfirmedGone(#[source] pub anyhow::Error);
 
+/// Downcast marker on an error out of a sandbox build: the *request* was
+/// invalid, not the machine that refused it.
+///
+/// # 🔴 A marker in the chain, put there by whoever knows
+///
+/// The API surface turns this into a 400. It used to reach that conclusion by
+/// downcasting to the ublk daemon client's own `InvalidRequestError`, which
+/// meant the half that serves HTTP had to link the block-device daemon's crate
+/// to classify a status code. The judgement belongs to the layer that made it:
+/// the backend attaches this marker with `anyhow::Context` and the classifier
+/// looks for the marker.
+#[derive(thiserror::Error, Debug)]
+#[error("{0}")]
+pub struct InvalidSandboxRequest(pub String);
+
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 
@@ -463,6 +478,23 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
              snapshot actually takes"
         )
     }
+
+    /// Releases whatever this factory set up process-wide for the sandboxes it
+    /// builds, at orchestrator shutdown.
+    ///
+    /// # 🔴 The factory's, not the orchestrator's
+    ///
+    /// The orchestrator's shutdown used to reach for the host network manager
+    /// by name — a global belonging to the Firecracker backend — which put a
+    /// piece of one specific runtime into the one type both halves of this
+    /// system run. Whatever a factory sets up for its sandboxes is the same
+    /// factory's to take down, and a factory whose sandboxes run on another
+    /// machine has nothing here to do.
+    ///
+    /// Best effort: shutdown has already preserved every sandbox by the time
+    /// this runs, and a failure to reclaim host plumbing must not turn a
+    /// completed shutdown into a failed one.
+    fn release_process_wide_resources(&self) {}
 
     /// Whether the sandboxes this factory builds need the control plane's
     /// ownership marker sent with them.

@@ -34,9 +34,9 @@ use crate::api::impls::{
     PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource, WakeSite,
 };
 use crate::api::{ApiImpl, PausedSandboxWiring, ResumeWiring};
-use crate::cfg::{AppConfig, ConfigManager};
+use crate::cfg::ConfigManager;
 use crate::identity::NodeIdentity;
-use crate::image::ImageResolver;
+use crate::image::RefusingImageResolver;
 use crate::orchestrator::{
     DisabledPausedSandboxRegistry, DisabledSandboxPersister, InMemoryMetadataStore, Orchestrator,
     ProxyTarget, SandboxState,
@@ -47,7 +47,7 @@ use crate::proto::apiproxy::{
 use crate::role::ServerRole;
 use crate::sandbox::mock::MockBackendFactory;
 use crate::snapshot::mock::mock_snapshot_manager;
-use crate::template::TemplateBuilder;
+use crate::template::RefusingTemplateBuildDriver;
 use crate::types::SandboxId;
 
 /// The node the process under test wakes sandboxes on.
@@ -97,6 +97,7 @@ async fn build_api(resume_wiring: ResumeWiring) -> Arc<ApiImpl> {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -105,8 +106,8 @@ async fn build_api(resume_wiring: ResumeWiring) -> Arc<ApiImpl> {
     Arc::new(ApiImpl::new(
         orchestrator,
         Arc::clone(&snapshot_manager),
-        Arc::new(TemplateBuilder::new()),
-        Arc::new(ImageResolver::new(&AppConfig::default())),
+        Arc::new(RefusingTemplateBuildDriver),
+        Arc::new(RefusingImageResolver::new("")),
         None,
         PausedSandboxWiring::new(
             Arc::new(DisabledPausedSandboxRegistry),

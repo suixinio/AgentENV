@@ -1,18 +1,20 @@
 mod artifact_cache;
 mod captured;
 pub mod image_export;
-mod manager;
+pub(crate) mod manager;
 #[doc(hidden)]
 pub mod mock;
-mod p2p;
+pub mod p2p;
 pub mod repository;
 pub(crate) mod runtime_support;
 mod types;
 
 pub use captured::{
-    CallerOwnedArtifacts, CapturedSandboxSnapshot, LocalCapturedArtifacts, UnpublishableCapture,
+    CallerOwnedArtifacts, CapturedSandboxSnapshot, LocalCapturedArtifacts,
+    SnapshotArtifactAdvertiser, UnpublishableCapture,
 };
 pub use manager::SnapshotManager;
+pub use p2p::P2pSnapshotAdvertiser;
 pub use repository::{
     CatalogReadScope, RepositoryError, RepositoryResult, SnapshotAbsence, SnapshotCursor,
     SnapshotListFilter, SnapshotListPage,

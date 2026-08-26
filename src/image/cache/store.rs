@@ -12,7 +12,7 @@ use tracing::info;
 use super::service::{HoldNamespace, ImageCacheService};
 use crate::cfg::{AppConfig, ConfigManager};
 use crate::image::oci_image::ImageConversion;
-use crate::image::ImageResolutionMetadata;
+use crate::image::{ImageResolutionMetadata, RuntimeImageOwner, RuntimeImageRefs};
 use crate::sandbox::RuntimeArtifactSet;
 use crate::types::SandboxId;
 
@@ -28,12 +28,6 @@ pub(crate) enum CachedImageConfig {
 pub(crate) enum OverlaybdLayerLocation {
     LocalFile(PathBuf),
     CacheDir(PathBuf),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeImageOwner {
-    StartingSandbox(SandboxId),
-    PausedSandbox(SandboxId),
 }
 
 #[async_trait]
@@ -65,17 +59,6 @@ pub(crate) trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
     fn layer_location(&self, digest: &str, size: u64, has_remote: bool) -> OverlaybdLayerLocation;
 
     fn publishable_roots(&self) -> Vec<PathBuf>;
-}
-
-#[async_trait]
-pub(crate) trait RuntimeImageRefs: Send + Sync + std::fmt::Debug {
-    async fn pin(&self, owner: RuntimeImageOwner, artifacts: RuntimeArtifactSet) -> Result<()>;
-
-    async fn unpin_best_effort(&self, owner: RuntimeImageOwner);
-
-    async fn reconcile_paused(&self, live_paused: &[SandboxId]) -> Result<()>;
-
-    async fn maintain_running(&self, running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()>;
 }
 
 #[derive(Clone)]

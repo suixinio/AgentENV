@@ -1400,18 +1400,17 @@ mod tests {
 
     use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
-    use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
+    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, DisabledSandboxPersister, FileBackedSandboxPersister,
         InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
     use crate::role::ServerRole;
-    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::mock_snapshot_manager;
     use crate::snapshot::SnapshotId;
-    use crate::template::TemplateBuilder;
+    use crate::template::RefusingTemplateBuildDriver;
 
     const SELF: &str = "node-a";
     const OTHER: &str = "node-b";
@@ -1444,8 +1443,9 @@ mod tests {
         let orchestrator = Orchestrator::new(
             ServerRole::All,
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .unwrap();
@@ -1454,8 +1454,8 @@ mod tests {
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry,
@@ -1693,8 +1693,9 @@ mod tests {
         let orchestrator = Orchestrator::new(
             ServerRole::Api,
             store,
-            FirecrackerSandboxFactory::new(),
+            MockBackendFactory::new(),
             DisabledSandboxPersister,
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .unwrap();
@@ -1703,8 +1704,8 @@ mod tests {
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry,
@@ -2606,14 +2607,13 @@ mod cross_node_resume_scope_tests {
 
     use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
-    use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
+    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
     use crate::role::ServerRole;
-    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit, StartedBuild};
     use crate::snapshot::repository::{
         RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
@@ -2622,7 +2622,7 @@ mod cross_node_resume_scope_tests {
         SnapshotAbsence, SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason,
     };
-    use crate::template::TemplateBuilder;
+    use crate::template::RefusingTemplateBuildDriver;
 
     /// A catalog holding one row that has not been committed: present to a
     /// scoped read, absent to the resolvable one. That is a pause mid-publish,
@@ -2745,8 +2745,9 @@ mod cross_node_resume_scope_tests {
         let orchestrator = Orchestrator::new(
             ServerRole::All,
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an orchestrator");
@@ -2764,8 +2765,8 @@ mod cross_node_resume_scope_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry as Arc<dyn PausedSandboxRegistry>,
@@ -2954,9 +2955,8 @@ mod cross_node_resume_role_tests {
 
     use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
-    use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
+    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
@@ -2964,7 +2964,7 @@ mod cross_node_resume_role_tests {
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
-    use crate::template::TemplateBuilder;
+    use crate::template::RefusingTemplateBuildDriver;
 
     /// One API surface whose catalog holds a ready snapshot and whose runtime
     /// resolver refuses every call.
@@ -2980,6 +2980,7 @@ mod cross_node_resume_role_tests {
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an orchestrator");
@@ -2991,8 +2992,8 @@ mod cross_node_resume_role_tests {
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry,

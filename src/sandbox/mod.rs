@@ -21,10 +21,10 @@ use crate::types::{ImageConfigs, SandboxId};
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, ResolvedImageFacts,
-    RuntimeArtifactSet, RuntimeConfirmedGone, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, InvalidSandboxRequest, PausedSandboxCapture, PausedSandboxState,
+    ResolvedImageFacts, RuntimeArtifactSet, RuntimeConfirmedGone, SandboxBackend,
+    SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
+    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use extra_drive::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,

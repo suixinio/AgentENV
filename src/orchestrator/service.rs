@@ -11,16 +11,13 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
 use crate::cfg::ConfigManager;
-use crate::image::cache::{
-    local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
-};
+use crate::image::{RuntimeImageOwner, RuntimeImageRefs};
 use crate::role::ServerRole;
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
-    FreshSandboxBuildSpec, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
-    RuntimeConfirmedGone, SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory,
-    SandboxForkSpec, SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
-    UnresolvedImageBuildSpec,
+    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FreshSandboxBuildSpec,
+    PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet, RuntimeConfirmedGone,
+    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
+    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo, UnresolvedImageBuildSpec,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
@@ -93,11 +90,7 @@ impl FailedLaunchStage {
     }
 }
 
-pub struct Orchestrator<
-    S: MetadataStore = InMemoryMetadataStore,
-    F: SandboxBackendFactory = FirecrackerSandboxFactory,
-    P: SandboxPersister = FileBackedSandboxPersister,
-> {
+pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory, P: SandboxPersister> {
     store: S,
     factory: F,
     persister: P,
@@ -182,31 +175,41 @@ enum ClusterDisposition {
     KeepClusterRecord,
 }
 
-impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
+impl<F> Orchestrator<InMemoryMetadataStore, F, DisabledSandboxPersister>
+where
+    F: SandboxBackendFactory,
+{
     /// A throwaway orchestrator for tests and examples.
     ///
     /// Fixed at [`ServerRole::All`] rather than taking a role, because that is
     /// what it is for: the single-process shape, with no configured envd
     /// access-token seed required of whoever calls it.
-    pub async fn with_in_memory_store() -> Arc<Self> {
+    ///
+    /// 🔴 The factory is an argument. It used to be fixed at
+    /// `FirecrackerSandboxFactory`, which made the one convenience constructor
+    /// in this module the reason the orchestrator named a sandbox runtime at
+    /// all.
+    pub async fn with_in_memory_store(factory: F) -> Arc<Self> {
         Self::new(
             ServerRole::All,
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            factory,
             DisabledSandboxPersister,
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("in-memory orchestrator should never fail to initialize")
     }
 }
 
-impl<F> Orchestrator<InMemoryMetadataStore, F>
+impl<F> Orchestrator<InMemoryMetadataStore, F, FileBackedSandboxPersister>
 where
     F: SandboxBackendFactory,
 {
     pub async fn with_file_backed_store_and_factory(
         role: ServerRole,
         factory: F,
+        image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
         let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
@@ -214,7 +217,7 @@ where
             config.orchestrator.persisted_sandbox_store_path.clone(),
             config.virtualization_mode,
         );
-        Self::new(role, store, factory, persister).await
+        Self::new(role, store, factory, persister, image_refs).await
     }
 }
 
@@ -230,12 +233,17 @@ where
     /// decides is whether this process may invent its own envd access-token
     /// seed when none is configured. A replicated half may not — see
     /// [`ServerRole::needs_a_configured_access_token_seed`].
-    pub async fn new(role: ServerRole, store: S, factory: F, persister: P) -> Result<Arc<Self>> {
-        let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner(role, store, factory, persister, image_refs).await
-    }
-
-    async fn new_inner(
+    ///
+    /// # 🔴 `image_refs` is an argument and not a default
+    ///
+    /// It used to be read here from the node-local layer cache
+    /// (`local_image_services_from_global_config`), which meant every process
+    /// holding an orchestrator opened that cache — including one with no layers
+    /// on its disk to protect. Whether this machine has a layer cache is a fact
+    /// about the machine, not about the orchestrator, so the caller states it:
+    /// a node passes its cache's own handle, and a process that runs no
+    /// sandboxes passes [`DisabledRuntimeImageRefs`][crate::image::DisabledRuntimeImageRefs].
+    pub async fn new(
         role: ServerRole,
         store: S,
         factory: F,
@@ -3890,12 +3898,11 @@ where
             )));
         }
 
-        // Clean up remaining network resources.
-        if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {
-            if let Err(err) = manager.shutdown() {
-                warn!(error = ?err, "failed to clean up network resources during orchestrator shutdown");
-            }
-        }
+        // Whatever the factory set up process-wide for the sandboxes it
+        // builds — on the Firecracker backend, the host network slots — is the
+        // factory's to take down. See
+        // [`SandboxBackendFactory::release_process_wide_resources`].
+        self.factory.release_process_wide_resources();
 
         info!("orchestrator shutdown completed");
         Ok(())

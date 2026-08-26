@@ -1446,16 +1446,15 @@ mod template_read_scope_tests {
     use agentenv_http_server::models;
 
     use super::{run_the_build_on_a_node, ApiImpl, TemplateBuildStartBaseSource};
-    use crate::cfg::AppConfig;
     use crate::identity::NodeIdentity;
-    use crate::image::ImageResolver;
+    use crate::image::RefusingImageResolver;
     use crate::node_client::{FixedNodePlacement, NodeEndpoint, NodePlacement};
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
     };
     use crate::role::ServerRole;
-    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         SnapshotCatalog, SnapshotCommit, SnapshotListPage, StartedBuild,
     };
@@ -1466,7 +1465,7 @@ mod template_read_scope_tests {
         CatalogReadScope, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotRecord,
         SnapshotSource, TemplateBuildErrorReason, TemplateBuildInfo,
     };
-    use crate::template::{TemplateBuildSpec, TemplateBuilder};
+    use crate::template::TemplateBuildSpec;
 
     /// A catalog that hides a `waiting` row from a resolvable read, and shows
     /// it to a scoped one. The central catalog, in the one respect these tests
@@ -1632,8 +1631,9 @@ mod template_read_scope_tests {
         let orchestrator = Orchestrator::new(
             ServerRole::All,
             InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
+            MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
         )
         .await
         .expect("an orchestrator");
@@ -1652,8 +1652,8 @@ mod template_read_scope_tests {
         let api = ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(TemplateBuilder::new()),
-            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(crate::template::RefusingTemplateBuildDriver),
+            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),

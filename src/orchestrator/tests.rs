@@ -19,12 +19,11 @@ use super::super::persistence::{
 use super::super::types::SandboxLaunchSource;
 use super::*;
 use crate::cfg::ResolvedImageCacheConfig;
+use crate::image::cache::local_image_services_from_global_config;
 use crate::image::cache::test_support::{
     test_local_image_services_from_service, ImageCacheService, RecordingRuntimeImageRefs,
 };
-use crate::image::cache::{
-    local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
-};
+use crate::image::{RuntimeImageOwner, RuntimeImageRefs};
 use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
@@ -52,7 +51,7 @@ fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
 }
 
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
-    Orchestrator::new_inner(
+    Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
@@ -64,7 +63,7 @@ async fn make_orchestrator() -> Arc<TestOrchestrator> {
 }
 
 async fn make_orchestrator_with_factory(factory: MockBackendFactory) -> Arc<TestOrchestrator> {
-    Orchestrator::new_inner(
+    Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
         factory,
@@ -743,7 +742,7 @@ impl MetadataStore for ScriptedWaitStore {
 #[tokio::test]
 async fn with_in_memory_store_constructs_without_panic() {
     setup();
-    let orchestrator = Orchestrator::with_in_memory_store().await;
+    let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
     drop(orchestrator);
 }
 
@@ -760,6 +759,7 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
+        test_runtime_image_refs(),
     )
     .await?;
 
@@ -803,6 +803,7 @@ async fn the_roster_is_complete_the_moment_new_returns() -> Result<()> {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister,
+        test_runtime_image_refs(),
     )
     .await?;
 
@@ -831,6 +832,7 @@ async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
+        test_runtime_image_refs(),
     )
     .await;
 
@@ -4803,7 +4805,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
         paused_state: None,
         ..Default::default()
     }]);
-    let orchestrator = Orchestrator::new_inner(
+    let orchestrator = Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
@@ -7178,7 +7180,7 @@ async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
     setup();
     let factory = StampingFactory::new(true);
     let seen = factory.seen();
-    let orchestrator = Orchestrator::new_inner(
+    let orchestrator = Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
         factory,
@@ -7237,7 +7239,7 @@ async fn a_machine_local_orchestrator_stamps_nothing() {
     setup();
     let factory = StampingFactory::new(false);
     let seen = factory.seen();
-    let orchestrator = Orchestrator::new_inner(
+    let orchestrator = Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
         factory,
@@ -7283,7 +7285,7 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
     setup();
     let factory = StampingFactory::new(true);
     let seen = factory.seen();
-    let orchestrator = Orchestrator::new_inner(
+    let orchestrator = Orchestrator::new(
         ServerRole::All,
         InMemoryMetadataStore::new(),
         factory,

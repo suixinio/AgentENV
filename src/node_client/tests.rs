@@ -122,6 +122,7 @@ async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -185,6 +186,7 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -2029,6 +2031,7 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -3057,6 +3060,7 @@ async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
         ledger.clone(),
         RemoteSandboxBackendFactory::new(node.placement()),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("a replica of the deciding half")
@@ -3070,6 +3074,7 @@ async fn local_half(
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("a machine-local orchestrator")
@@ -4215,6 +4220,7 @@ async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger)
         ledger.clone(),
         RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>),
         DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("a replica of the deciding half")

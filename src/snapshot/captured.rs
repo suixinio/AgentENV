@@ -22,6 +22,7 @@
 use std::fmt;
 
 use super::repository::interfaces::StagedSnapshot;
+use super::SnapshotRecord;
 use crate::types::FirecrackerSnapshotManifest;
 
 /// Artifacts a capture wrote on the machine this process is running on.
@@ -124,4 +125,22 @@ impl fmt::Debug for CapturedSandboxSnapshot {
                 .finish(),
         }
     }
+}
+
+/// Announces a freshly committed snapshot's artifacts to whoever fetches them.
+///
+/// # 🔴 A trait, because only one half of the system holds any bytes
+///
+/// The advertisement reads the manifest's *local* paths and offers the files
+/// they name — overlaybd layers included — to peers. That is something only the
+/// machine that wrote them can do, and doing it needs the overlaybd layer
+/// format. A process that commits snapshots staged elsewhere has nothing to
+/// offer and holds `None` here, which is the same answer
+/// [`SnapshotManager::advertise_committed`][crate::snapshot::SnapshotManager]
+/// already gives for a staging that ran on another machine.
+#[async_trait::async_trait]
+pub trait SnapshotArtifactAdvertiser: Send + Sync {
+    /// Best effort: a snapshot is committed and reachable whether or not this
+    /// succeeds, so failures are logged rather than returned.
+    async fn advertise(&self, record: &SnapshotRecord, manifest: &FirecrackerSnapshotManifest);
 }

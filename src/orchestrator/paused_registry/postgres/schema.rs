@@ -97,9 +97,19 @@ CREATE TABLE IF NOT EXISTS paused_registry_grace (
 
 /// `executionAxisViolationsSQL` (`migrate.go:106-109`), verbatim: a row whose
 /// identity axis disagrees with the CHECK constraint this DDL is about to add
-/// — a live state with no `execution_id`, or a parked one carrying one.
+/// — a live state with no `execution_id`, or a parked one carrying one, OR
+/// (the second disjunct, previously missing from this port -- B4) an
+/// `execution_id`/`execution_started_at` pair that disagree with each other.
+///
+/// 🔴 Must stay the exact negation of `paused_sandboxes_execution_check`'s
+/// own `CHECK` (`SCHEMA_DDL` above) -- both conjuncts, `IS DISTINCT FROM`
+/// rather than `!=` for the same reason Go's own query uses it: a row this
+/// check misses is a row that surfaces as a raw constraint-violation error
+/// from the `ALTER TABLE` a few statements later instead of this refusal's
+/// own message, which is the whole reason `preflight` exists.
 const EXECUTION_AXIS_VIOLATIONS_SQL: &str = "SELECT count(*) FROM paused_sandboxes \
-     WHERE (state IN ('running', 'publishing', 'resuming')) != (execution_id IS NOT NULL)";
+     WHERE (state IN ('running', 'publishing', 'resuming')) IS DISTINCT FROM (execution_id IS NOT NULL) \
+        OR (execution_id IS NULL) IS DISTINCT FROM (execution_started_at IS NULL)";
 
 /// `anyRowSQL` (`migrate.go:114`).
 const ANY_ROW_SQL: &str = "SELECT count(*) FROM paused_sandboxes";
@@ -386,6 +396,87 @@ mod pg {
         assert!(
             !has_constraint,
             "a refused migration must not have applied the constraint it refused over"
+        );
+
+        // Go's `TestMigrateRefusesAPrePhase3Table` also asserts the refusal
+        // never leaks the raw constraint-violation error `ALTER TABLE ...
+        // ADD CONSTRAINT` would have produced had `preflight` let this row
+        // through -- `preflight`'s whole job is to intercept that and
+        // report something an operator can act on instead.
+        assert!(
+            !message.contains("paused_sandboxes_execution_check"),
+            "the refusal must be preflight's own message, not the raw constraint's: {message}"
+        );
+    }
+
+    /// 🔴 B4: `EXECUTION_AXIS_VIOLATIONS_SQL` is two disjuncts, not one --
+    /// this table has every axis column (so the query above runs, not the
+    /// `42703`/undefined_column fallback `preflight_refuses_a_table_with_
+    /// pre_axis_violations` exercises) and satisfies the *first* disjunct
+    /// perfectly (a `paused` row with `execution_id IS NULL`, exactly what a
+    /// parked state should carry) while violating only the *second*:
+    /// `execution_started_at` is set even though `execution_id` is not. A
+    /// build missing this disjunct would see zero violations, let `preflight`
+    /// pass, and then fail on the `ALTER TABLE ... ADD CONSTRAINT` itself
+    /// with Postgres's own raw constraint-violation error -- the exact
+    /// message this refusal exists to replace (`EXECUTION_AXIS_VIOLATIONS_SQL`'s
+    /// own doc comment).
+    #[tokio::test]
+    async fn preflight_refuses_a_table_that_only_violates_the_second_conjunct() {
+        let pool = isolated_schema_pool_or_skip!(
+            "preflight_refuses_a_table_that_only_violates_the_second_conjunct"
+        );
+
+        // Every axis column present, but no constraint yet -- simulating a
+        // database whose columns were added out of band (a partial or
+        // hand-rolled migration) before this build's `ADD CONSTRAINT` ever
+        // ran against it.
+        sqlx::raw_sql(
+            "CREATE TABLE paused_sandboxes (
+                sandbox_id           UUID        PRIMARY KEY,
+                cluster_id           UUID        NOT NULL,
+                state                TEXT        NOT NULL,
+                generation           BIGINT      NOT NULL,
+                origin_node_id       TEXT        NOT NULL,
+                snapshot_id          UUID,
+                metadata             JSONB       NOT NULL,
+                paused_at            TIMESTAMPTZ NOT NULL,
+                updated_at           TIMESTAMPTZ NOT NULL,
+                claimed_by_node_id   TEXT,
+                lease_expires_at     TIMESTAMPTZ,
+                sandbox_expires_at   TIMESTAMPTZ,
+                execution_id         UUID,
+                execution_started_at TIMESTAMPTZ
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seeding the axis-columns-present table should succeed");
+
+        sqlx::query(
+            "INSERT INTO paused_sandboxes (
+                sandbox_id, cluster_id, state, generation, origin_node_id, metadata,
+                paused_at, updated_at, execution_id, execution_started_at
+             ) VALUES ($1, $2, 'paused', 1, 'node-a', '{}'::jsonb, now(), now(), NULL, now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("seeding a second-conjunct-only violation should succeed");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("a second-conjunct-only violation must refuse the migration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("predate the identity axis"),
+            "the refusal must be preflight's own message, naming the reason, not a raw \
+             constraint-violation error from the ALTER TABLE that follows it: {message}"
+        );
+        assert!(
+            !message.contains("paused_sandboxes_execution_check"),
+            "preflight must have caught this before the ALTER ran at all: {message}"
         );
     }
 }

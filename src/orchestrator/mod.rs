@@ -18,10 +18,10 @@ pub use facade::SandboxOrchestration;
 pub use launch_plan::ClaimedExecution;
 pub use metrics::OrchestratorMetrics;
 pub use paused_registry::{
-    build_paused_registry, BeganPause, ConflictReason, DeadlineRenewalOutcome,
-    DisabledPausedSandboxRegistry, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
-    PausedRegistryState, PausedSandboxEntry, PausedSandboxPublisher, PausedSandboxRegistry,
-    ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+    build_paused_registry, spawn_paused_registry_background_tasks, BeganPause, ConflictReason,
+    DeadlineRenewalOutcome, DisabledPausedSandboxRegistry, HeldSandbox, MarkRunningOutcome,
+    PausedRegistryError, PausedRegistryState, PausedSandboxEntry, PausedSandboxPublisher,
+    PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 pub use persistence::{
     ClusterRegistration, DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,

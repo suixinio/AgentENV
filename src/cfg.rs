@@ -700,15 +700,28 @@ pub enum PausedRegistryBackendKind {
     /// Node-local only. A paused sandbox is resumable on the node that paused
     /// it and invisible to the rest of the cluster.
     Local,
-    /// Removed. Kept as a name so a deployment still carrying it is told what
-    /// to do instead of being told the word is unknown.
+    /// The registry's PG schema, reached by connecting directly rather than
+    /// through the scheduler's gRPC surface.
     ///
-    /// 🔴 It fails startup rather than being treated as `central`. The two are
-    /// not interchangeable at the moment of the switch: `central` needs a
-    /// scheduler endpoint this node may not have been given, and a node that
-    /// silently reinterpreted the value would either start with no registry at
-    /// all or start against an endpoint nobody meant it to use. Neither
-    /// reports anything until a node is lost.
+    /// Stage C (`docs/proposals/_sd-phase4-stageC-paused-registry.md`)'s own
+    /// backend: `--role api`/`--role all` hold the `paused_sandboxes` table's
+    /// connection pool, schema and credentials themselves instead of the
+    /// scheduler owning them. Requires `[pg].dsn` and, for the background
+    /// reconcile/reclaim loops' D2 Fix A safety net, a heartbeat roster —
+    /// `[cluster].node_placement_source = "native"` — or startup refuses; see
+    /// `orchestrator::paused_registry::build_paused_registry`'s own doc.
+    ///
+    /// 🔴 This name was briefly retired between D11 (which removed
+    /// `--role node`'s own direct connection to this database — an unsafe
+    /// shape for a process that also runs user code) and Stage C (which
+    /// reintroduces the same word for the *`--role api`/`--role all`*
+    /// connection, a safe shape because neither role runs user code). A
+    /// build from that window refuses this value at startup rather than
+    /// silently reinterpreting it either as `local` (losing cluster-wide
+    /// recovery with no error) or as `central` (pointing at a scheduler
+    /// endpoint nobody configured) — see that build's own history for the
+    /// refusal message. Today the value is live again and means what it
+    /// says.
     Postgres,
     /// Same registry, reached over gRPC through whoever owns the database
     /// instead of by connecting to it. Identical semantics to `postgres` — the
@@ -779,6 +792,21 @@ pub struct PausedRegistryConfig {
     /// dead node's sandboxes back sooner than their own timeouts allow.
     #[config(default = 90u64)]
     pub lease_ttl_secs: u64,
+    /// How often the `postgres` backend's cluster-wide reclaim pass runs
+    /// (`PostgresPausedSandboxRegistry`'s reclaim leader loop,
+    /// `AdvisoryLockKey::PausedRegistryReclaim`). Ignored by every other
+    /// backend.
+    ///
+    /// A separate knob from `reconcile_interval_secs` on purpose, mirroring
+    /// Go's own split (`services/shared/config/config.go`'s
+    /// `ReconcileInterval`/`ReclaimInterval`, independently configurable
+    /// there too even though both default to the same 30s): the two loops
+    /// answer different questions on different urgency — reconcile keeps
+    /// healthy leases alive, reclaim is a backstop for rows nothing has
+    /// renewed in a lease's worth of time already, per `RunReclaim`'s own
+    /// comment ("nothing about it is urgent").
+    #[config(default = 30u64)]
+    pub reclaim_interval_secs: u64,
 }
 
 impl PausedRegistryConfig {
@@ -789,6 +817,12 @@ impl PausedRegistryConfig {
     /// at startup with a config value.
     pub fn reconcile_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.reconcile_interval_secs.max(1))
+    }
+
+    /// Reclamation cadence, floored at one second -- same reasoning as
+    /// [`Self::reconcile_interval`].
+    pub fn reclaim_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.reclaim_interval_secs.max(1))
     }
 
     /// Lease length, held to at least three renewal intervals.
@@ -813,6 +847,7 @@ mod paused_registry_config_tests {
             backend: PausedRegistryBackendKind::Central,
             reconcile_interval_secs,
             lease_ttl_secs,
+            reclaim_interval_secs: 30,
         }
     }
 

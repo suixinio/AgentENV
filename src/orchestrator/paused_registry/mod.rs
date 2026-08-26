@@ -19,13 +19,14 @@
 
 mod central;
 mod disabled;
+mod postgres;
 mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
@@ -34,12 +35,15 @@ use crate::cfg::{
     PausedRegistryConfig,
 };
 use crate::identity::NodeIdentity;
+use crate::node_registry::registry::NodeRegistry;
 use crate::orchestrator::PauseOutcome;
+use crate::pg::SingletonTaskHandle;
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
 pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
+pub use postgres::PostgresPausedSandboxRegistry;
 pub use types::{
     BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
     PausedRegistryState, PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
@@ -558,31 +562,77 @@ pub(super) fn log_claim_outcome(
 ///
 /// The backends that *are* reachable this way — `local` because the override
 /// never arrived — are told apart by the one info line at the end.
+///
+/// `pg_pool`/`node_registry` are Stage C's own additions, both `None` for
+/// every caller not selecting `postgres` (the `Local`/`Central` arms never
+/// touch either). `node_registry` is `Some` only when `--role api` built a
+/// real `crate::node_registry::registry::AtomicNodeRegistry`
+/// (`[cluster].node_placement_source = "native"`, `src/bin/server.rs`'s
+/// `assemble_api`) -- `--role all` never builds one at all.
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
     cluster: &ClusterConfig,
     scheduler_report: &ObservabilitySchedulerReportConfig,
     identity: &NodeIdentity,
+    pg_pool: Option<sqlx::PgPool>,
+    node_registry: Option<Arc<dyn NodeRegistry>>,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
     let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
         match config.backend {
             PausedRegistryBackendKind::Local => (Arc::new(DisabledPausedSandboxRegistry), ""),
-            // 🔴 Refused, not reinterpreted. A node reaching the registry
-            // database itself is the shape this whole change removed: the
-            // credentials, the connection budget and the schema stopped being
-            // every node's business, and putting them back on a machine that
-            // runs user code is not something a stale config value gets to do
-            // quietly.
-            //
-            // Nor is it silently upgraded to `central`, which needs a scheduler
-            // endpoint this node may not have been given.
+            // 🔴 D1 (Stage C report): refuses rather than degrading silently.
+            // Fix A's `running`-row lease renewal (`postgres::reconcile`,
+            // D2 Fix A / `151d00b`) only does anything with a real heartbeat
+            // roster -- without one, `running` rows have no path back to a
+            // renewed lease at all under the split node/api identity model
+            // (`renew_lease`'s own `Running` branch never matches an api
+            // replica's identity), which silently reintroduces the exact bug
+            // Fix A fixed. This repository has already paid for that failure
+            // mode once (see the "running 行租约冻结" memory note) -- it is
+            // refused here rather than risked twice.
             PausedRegistryBackendKind::Postgres => {
-                bail!(
-                    "paused_registry.backend = \"postgres\" has been removed: the node no longer \
-                     connects to the registry database. Set AENV_PAUSED_REGISTRY_BACKEND=central \
-                     and point AENV_OBSERVABILITY_SCHEDULER_ENDPOINT at the scheduler, which owns \
-                     the database now; the node's own DSN secret can then be dropped"
-                )
+                let pool = pg_pool.context(
+                    "paused_registry.backend = \"postgres\" requires [pg].dsn to be configured \
+                     (the shared PostgreSQL pool this process already builds for Stage B's \
+                     catalog, if [pg] is set)",
+                )?;
+                let node_registry = node_registry.context(
+                    "paused_registry.backend = \"postgres\" requires a heartbeat roster source, \
+                     which only exists under [cluster].node_placement_source = \"native\" -- \
+                     without it, running sandboxes' registry leases have no renewal path and \
+                     will eventually be wrongly reclaimed even while healthy (this is the exact \
+                     failure Fix A, commit 151d00b, closed for the central/gRPC backend; --role \
+                     all never builds a native node registry at all and cannot select this \
+                     backend). Set AENV_CLUSTER_NODE_PLACEMENT_SOURCE=native, or keep this \
+                     backend on \"central\"",
+                )?;
+
+                // 🔴 `node_registry` is not consumed here -- it is only
+                // needed by the background reconcile/reclaim loops
+                // [`spawn_paused_registry_background_tasks`] starts, which
+                // this function's caller must invoke separately (mirroring
+                // `spawn_pg_singleton_tasks` alongside `build_pg_pool` in
+                // `src/bin/server.rs`) so their `SingletonTaskHandle`s land
+                // in the same `pg_singleton_tasks` bucket every other
+                // PostgreSQL-backed background task already shuts down
+                // through. Validated present here anyway (see the `context`
+                // above): a `postgres` backend that will fail to start its
+                // safety net a few lines later in the caller is a startup
+                // failure discovered too late to matter, not one avoided.
+                drop(node_registry);
+
+                postgres::schema::migrate(&pool)
+                    .await
+                    .context("bootstrap the paused_sandboxes schema")?;
+
+                let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
+                let registry = Arc::new(PostgresPausedSandboxRegistry::new(
+                    pool,
+                    identity.cluster_id,
+                    lease_ttl,
+                ));
+
+                (registry, "")
             }
             PausedRegistryBackendKind::Central => {
                 let endpoint = cluster
@@ -634,6 +684,49 @@ pub async fn build_paused_registry(
     );
 
     Ok(registry)
+}
+
+/// Starts the `postgres` backend's two leader-elected background loops
+/// (reconcile, reclaim -- see `postgres::reconcile`/`postgres::reclaim_task`),
+/// if and only if `config.backend == Postgres`. Every other backend returns
+/// an empty vec.
+///
+/// Kept separate from [`build_paused_registry`] deliberately, mirroring
+/// `src/bin/server.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
+/// split: the registry itself has to exist before `ApiImpl`/`Orchestrator`
+/// can be constructed, but the resulting `SingletonTaskHandle`s belong in
+/// the same `pg_singleton_tasks` bucket the catalog build reaper's handle
+/// already goes into, so graceful shutdown releases every advisory lock this
+/// process might be holding through one uniform path.
+///
+/// 🔴 Call this only after a preceding [`build_paused_registry`] call with
+/// the same `config`/`pg_pool`/`node_registry` has already succeeded (it
+/// performed the "postgres requires a pool and a roster" validation this
+/// function relies on without repeating). Called with `pg_pool`/
+/// `node_registry` both present but `config.backend != Postgres`, this
+/// simply returns an empty vec -- the same as when either is absent.
+pub fn spawn_paused_registry_background_tasks(
+    config: &PausedRegistryConfig,
+    identity: &NodeIdentity,
+    pg_pool: Option<sqlx::PgPool>,
+    node_registry: Option<Arc<dyn NodeRegistry>>,
+) -> Vec<SingletonTaskHandle> {
+    if config.backend != PausedRegistryBackendKind::Postgres {
+        return Vec::new();
+    }
+    let (Some(pool), Some(node_registry)) = (pg_pool, node_registry) else {
+        return Vec::new();
+    };
+
+    let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
+    postgres::spawn_background_tasks(
+        pool,
+        identity.cluster_id,
+        lease_ttl,
+        config.reconcile_interval(),
+        config.reclaim_interval(),
+        node_registry,
+    )
 }
 
 #[cfg(test)]
@@ -730,15 +823,107 @@ mod build_tests {
     use crate::cfg::{ObservabilitySchedulerReportConfig, PausedRegistryConfig};
     use crate::logging::capture::Recorder;
 
+    /// A `NodeRegistry` that answers every question with "nothing" -- only
+    /// used to satisfy `build_paused_registry`'s type signature in tests
+    /// that never reach a code path calling any of these methods (the
+    /// `postgres` backend's own construction fails, in every test that uses
+    /// this fixture, before its background tasks -- the only consumer of a
+    /// real `NodeRegistry` -- are ever spawned).
+    struct NoopNodeRegistry;
+    impl NodeRegistry for NoopNodeRegistry {
+        fn snapshot(&self, _allow_lingering: bool) -> Vec<crate::node_registry::types::Node> {
+            Vec::new()
+        }
+        fn contains(&self, _node: &crate::node_registry::types::Node) -> bool {
+            false
+        }
+        fn resolve(&self, _node_id: &str) -> Option<crate::node_registry::types::Node> {
+            None
+        }
+        fn heartbeat(
+            &self,
+            _req: &crate::proto::scheduler::HeartbeatRequest,
+            _now: SystemTime,
+        ) -> Result<
+            (crate::node_registry::types::Node, String),
+            crate::node_registry::registry::NodeNotInRegistry,
+        > {
+            Err(crate::node_registry::registry::NodeNotInRegistry)
+        }
+        fn list_observed(
+            &self,
+            _cluster_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::ObservedNode> {
+            Vec::new()
+        }
+        fn list_p2p_peers(
+            &self,
+            _cluster_id: &str,
+            _backend: &str,
+            _exclude_node_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::P2pPeer> {
+            Vec::new()
+        }
+        fn filter_p2p_peers(
+            &self,
+            _cluster_id: &str,
+            _backend: &str,
+            _node_ids: &[String],
+            _exclude_node_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::P2pPeer> {
+            Vec::new()
+        }
+        fn get_observed(
+            &self,
+            _node_id: &str,
+            _cluster_id: &str,
+            _now: SystemTime,
+        ) -> Option<crate::proto::scheduler::ObservedNode> {
+            None
+        }
+        fn peek_observed(&self, _node_id: &str) -> Option<crate::proto::scheduler::NodeSnapshot> {
+            None
+        }
+        fn roster_of(
+            &self,
+            _node_id: &str,
+        ) -> Option<(Vec<crate::node_registry::types::RosterEntry>, SystemTime)> {
+            None
+        }
+        fn nodes_holding(&self, _sandbox_id: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn rosters_in_cluster(
+            &self,
+            _cluster_id: &str,
+        ) -> Vec<crate::node_registry::types::Roster> {
+            Vec::new()
+        }
+        fn unregister_observed(
+            &self,
+            _node_id: &str,
+            _service_instance_id: &str,
+        ) -> Result<(), crate::node_registry::registry::ServiceInstanceMismatch> {
+            Ok(())
+        }
+        fn applied_cpu_intersection(&self, _cluster_id: &str) -> Option<String> {
+            None
+        }
+    }
+
     fn config(backend: PausedRegistryBackendKind) -> PausedRegistryConfig {
         PausedRegistryConfig {
             backend,
             reconcile_interval_secs: 30,
             lease_ttl_secs: 90,
+            reclaim_interval_secs: 30,
         }
     }
 
-    fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
+    pub(super) fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
             node_placement_source: crate::cfg::NodePlacementSource::Scheduler,
             scheduler_endpoint: scheduler_endpoint.map(str::to_string),
@@ -751,7 +936,7 @@ mod build_tests {
         }
     }
 
-    fn scheduler_report() -> ObservabilitySchedulerReportConfig {
+    pub(super) fn scheduler_report() -> ObservabilitySchedulerReportConfig {
         ObservabilitySchedulerReportConfig {
             enabled: false,
             interval_secs: 5,
@@ -760,7 +945,7 @@ mod build_tests {
         }
     }
 
-    fn identity() -> NodeIdentity {
+    pub(super) fn identity() -> NodeIdentity {
         NodeIdentity::from_config(&Default::default())
     }
 
@@ -771,6 +956,8 @@ mod build_tests {
             &cluster(None),
             &scheduler_report(),
             &identity(),
+            None,
+            None,
         )
         .await
         .expect("the local backend needs nothing");
@@ -785,6 +972,8 @@ mod build_tests {
             &cluster(Some("http://scheduler.invalid:9090")),
             &scheduler_report(),
             &identity(),
+            None,
+            None,
         )
         .await
         .expect("the endpoint is dialled on first use, not here");
@@ -805,6 +994,8 @@ mod build_tests {
                     &cluster(endpoint),
                     &scheduler_report(),
                     &identity(),
+                    None,
+                    None,
                 )
                 .await
                 .is_err(),
@@ -813,36 +1004,36 @@ mod build_tests {
         }
     }
 
-    /// 🔴 A deployment still asking for the removed backend is stopped, not
-    /// reinterpreted.
-    ///
-    /// Both of the plausible reinterpretations are wrong. Treating it as
-    /// `local` puts the node back to node-local pauses, which is the silent
-    /// failure `AENV_PAUSED_REGISTRY_BACKEND` exists to prevent. Treating it as
-    /// `central` points the node at whatever endpoint happens to be configured
-    /// — including none. Refusing to start is the only answer an operator
-    /// cannot miss.
+    /// 🔴 D1 (Stage C report): the `postgres` backend refuses to start
+    /// without a PostgreSQL pool -- never silently falls back to `local`,
+    /// which would drop cluster-wide recovery with no error at all.
     #[tokio::test]
-    async fn the_removed_postgres_backend_refuses_to_start() {
+    async fn the_postgres_backend_without_a_pool_is_a_startup_failure() {
         let failure = build_paused_registry(
             &config(PausedRegistryBackendKind::Postgres),
-            // A perfectly usable endpoint, so nothing about *this* is what
-            // makes it fail.
-            &cluster(Some("http://scheduler.invalid:9090")),
+            &cluster(None),
             &scheduler_report(),
             &identity(),
+            None,
+            Some(std::sync::Arc::new(NoopNodeRegistry) as std::sync::Arc<dyn NodeRegistry>),
         )
         .await;
 
         let Err(failure) = failure else {
-            panic!("the removed backend must not build a registry");
+            panic!("a postgres backend with no pool must not build a registry");
         };
-        let message = failure.to_string();
         assert!(
-            message.contains("central"),
-            "the refusal has to say what to set instead, got {message:?}"
+            failure.to_string().contains("[pg].dsn"),
+            "the refusal has to name the missing setting, got {failure}"
         );
     }
+
+    // 🔴 The node-registry-only refusal (a real `Some(pool)`, `None`
+    // `node_registry`) needs an actual reachable PostgreSQL pool to
+    // construct — `sqlx::PgPool::connect` dials on construction, so there is
+    // no fake to substitute here. That case is covered by the `pg::`-gated
+    // suite's `the_postgres_backend_without_a_node_registry_is_a_startup_failure`
+    // below, alongside the rest of this backend's real-database coverage.
 
     /// 🔴 Every backend says which one it is, out loud, at assembly.
     ///
@@ -869,6 +1060,8 @@ mod build_tests {
                 &cluster(endpoint),
                 &scheduler_report(),
                 &identity(),
+                None,
+                None,
             )
             .await
             .expect("neither backend dials anything here");
@@ -904,5 +1097,172 @@ mod build_tests {
                 recorder.events()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pg {
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use super::build_tests::*;
+    use super::*;
+    use crate::cfg::PausedRegistryConfig;
+    use crate::pg::harness::isolated_schema_pool_or_skip;
+
+    struct NoopNodeRegistry;
+    impl NodeRegistry for NoopNodeRegistry {
+        fn snapshot(&self, _allow_lingering: bool) -> Vec<crate::node_registry::types::Node> {
+            Vec::new()
+        }
+        fn contains(&self, _node: &crate::node_registry::types::Node) -> bool {
+            false
+        }
+        fn resolve(&self, _node_id: &str) -> Option<crate::node_registry::types::Node> {
+            None
+        }
+        fn heartbeat(
+            &self,
+            _req: &crate::proto::scheduler::HeartbeatRequest,
+            _now: SystemTime,
+        ) -> Result<
+            (crate::node_registry::types::Node, String),
+            crate::node_registry::registry::NodeNotInRegistry,
+        > {
+            Err(crate::node_registry::registry::NodeNotInRegistry)
+        }
+        fn list_observed(
+            &self,
+            _cluster_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::ObservedNode> {
+            Vec::new()
+        }
+        fn list_p2p_peers(
+            &self,
+            _cluster_id: &str,
+            _backend: &str,
+            _exclude_node_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::P2pPeer> {
+            Vec::new()
+        }
+        fn filter_p2p_peers(
+            &self,
+            _cluster_id: &str,
+            _backend: &str,
+            _node_ids: &[String],
+            _exclude_node_id: &str,
+            _now: SystemTime,
+        ) -> Vec<crate::proto::scheduler::P2pPeer> {
+            Vec::new()
+        }
+        fn get_observed(
+            &self,
+            _node_id: &str,
+            _cluster_id: &str,
+            _now: SystemTime,
+        ) -> Option<crate::proto::scheduler::ObservedNode> {
+            None
+        }
+        fn peek_observed(&self, _node_id: &str) -> Option<crate::proto::scheduler::NodeSnapshot> {
+            None
+        }
+        fn roster_of(
+            &self,
+            _node_id: &str,
+        ) -> Option<(Vec<crate::node_registry::types::RosterEntry>, SystemTime)> {
+            None
+        }
+        fn nodes_holding(&self, _sandbox_id: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn rosters_in_cluster(
+            &self,
+            _cluster_id: &str,
+        ) -> Vec<crate::node_registry::types::Roster> {
+            Vec::new()
+        }
+        fn unregister_observed(
+            &self,
+            _node_id: &str,
+            _service_instance_id: &str,
+        ) -> Result<(), crate::node_registry::registry::ServiceInstanceMismatch> {
+            Ok(())
+        }
+        fn applied_cpu_intersection(&self, _cluster_id: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn config() -> PausedRegistryConfig {
+        PausedRegistryConfig {
+            backend: PausedRegistryBackendKind::Postgres,
+            reconcile_interval_secs: 30,
+            lease_ttl_secs: 90,
+            reclaim_interval_secs: 30,
+        }
+    }
+
+    /// 🔴 D1's central startup guard, proved with a real (reachable) pool
+    /// this time: a `postgres` backend still refuses to start without a
+    /// node registry, even once the *other* precondition
+    /// (`the_postgres_backend_without_a_pool_is_a_startup_failure`, in
+    /// `build_tests`) is satisfied.
+    #[tokio::test]
+    async fn the_postgres_backend_without_a_node_registry_is_a_startup_failure() {
+        let pool = isolated_schema_pool_or_skip!(
+            "the_postgres_backend_without_a_node_registry_is_a_startup_failure"
+        );
+
+        let failure = build_paused_registry(
+            &config(),
+            &cluster(None),
+            &scheduler_report(),
+            &identity(),
+            Some(pool),
+            None,
+        )
+        .await;
+
+        let Err(failure) = failure else {
+            panic!("a postgres backend with no node registry must not build a registry");
+        };
+        assert!(
+            failure.to_string().contains("node_placement_source"),
+            "the refusal has to name the missing setting, got {failure}"
+        );
+    }
+
+    /// The happy path: a real pool and a (fake, but present) node registry
+    /// build a working, cluster-backed registry, and the schema bootstrap
+    /// this function is documented to run actually leaves the table usable.
+    #[tokio::test]
+    async fn the_postgres_backend_builds_a_working_cluster_backed_registry() {
+        let pool = isolated_schema_pool_or_skip!(
+            "the_postgres_backend_builds_a_working_cluster_backed_registry"
+        );
+
+        let registry = build_paused_registry(
+            &config(),
+            &cluster(None),
+            &scheduler_report(),
+            &identity(),
+            Some(pool.clone()),
+            Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
+        )
+        .await
+        .expect("a real pool and a real node registry should build successfully");
+
+        assert!(registry.is_cluster_backed());
+
+        // The migration this call is documented to run actually happened:
+        // the table is queryable without the caller having to migrate it
+        // separately first.
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM paused_sandboxes")
+            .fetch_one(&pool)
+            .await
+            .expect("paused_sandboxes should exist after build_paused_registry");
+        assert_eq!(count, 0);
     }
 }

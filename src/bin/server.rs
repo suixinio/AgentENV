@@ -15,13 +15,13 @@ use agentenv::node_registry::grpc_service::NodeRegistryGrpcService;
 use agentenv::node_registry::kubernetes_discovery::{
     validate_optional_pod_selector, KubernetesDiscovery, KubernetesDiscoveryConfig,
 };
-use agentenv::node_registry::registry::AtomicNodeRegistry;
+use agentenv::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use agentenv::node_registry::warmup::WarmupGate;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::{
-    build_paused_registry, DisabledPausedSandboxRegistry, DisabledSandboxPersister,
-    FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, RedisMetadataStore,
-    SandboxOrchestration,
+    build_paused_registry, spawn_paused_registry_background_tasks, DisabledPausedSandboxRegistry,
+    DisabledSandboxPersister, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
+    RedisMetadataStore, SandboxOrchestration,
 };
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::p2p::P2pTransport;
@@ -664,7 +664,15 @@ async fn assemble_node_core(
 async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
     let role = ServerRole::All;
     let pg_pool = build_pg_pool(config).await?;
-    let pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
+    let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
+    // 🔴 Cloned before the move into `assemble_node_core` below: `--role all`
+    // never builds Stage A's native node registry (see `assemble_api`'s own
+    // `native_node_registry` wiring, which this function has no equivalent
+    // of), so `build_paused_registry`'s `node_registry` argument is always
+    // `None` here -- the `postgres` backend's own D1 guard therefore always
+    // refuses under this role, which is deliberate: see that function's own
+    // doc.
+    let pg_pool_for_registry = pg_pool.clone();
     let core = assemble_node_core(config, role, pg_pool).await?;
 
     debug_assert!(role.arbitrates_paused_sandbox_ownership());
@@ -677,8 +685,16 @@ async fn assemble_all(config: &AppConfig) -> anyhow::Result<Assembly> {
         &config.cluster,
         &config.observability.scheduler_report,
         &core.identity,
+        pg_pool_for_registry.clone(),
+        None,
     )
     .await?;
+    pg_singleton_tasks.extend(spawn_paused_registry_background_tasks(
+        &config.orchestrator.paused_registry,
+        &core.identity,
+        pg_pool_for_registry,
+        None,
+    ));
     let paused_wiring = PausedSandboxWiring::new(
         paused_registry,
         Arc::clone(&core.snapshot_manager),
@@ -1152,8 +1168,15 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // consulted: P2P moves bytes between machines that hold them, and this
     // process holds none.
     let pg_pool = build_pg_pool(config).await?;
-    let pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
-    let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool).await?);
+    let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
+    // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
+    // coerced to `Arc<dyn NodeRegistry>`, cloned rather than moved --
+    // `native_registry_handle` itself is still needed below by
+    // `cluster_placement` and `node_registry_dump_source`.
+    let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> = native_registry_handle
+        .clone()
+        .map(|registry| registry as Arc<dyn NodeRegistry>);
+    let snapshot_manager = Arc::new(SnapshotManager::new(None, pg_pool.clone()).await?);
     let template_builder = Arc::new(TemplateBuilder::new());
     let image_resolver = Arc::new(ImageResolver::new(config));
 
@@ -1185,8 +1208,16 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         &config.cluster,
         &config.observability.scheduler_report,
         &identity_for_registry,
+        pg_pool.clone(),
+        node_registry_for_paused.clone(),
     )
     .await?;
+    pg_singleton_tasks.extend(spawn_paused_registry_background_tasks(
+        &config.orchestrator.paused_registry,
+        &identity_for_registry,
+        pg_pool,
+        node_registry_for_paused,
+    ));
     let paused_wiring = PausedSandboxWiring::new(
         paused_registry,
         Arc::clone(&snapshot_manager),

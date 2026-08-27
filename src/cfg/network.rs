@@ -30,6 +30,13 @@ pub struct NetworkEgressConfig {
         "192.168.0.0/16",
     ])]
     pub always_denied_cidrs: Vec<String>,
+
+    /// Tier0 patch: node-level destinations reachable by every sandbox,
+    /// evaluated before `always_denied_cidrs`. Used to punch the DAB proxy VIP
+    /// (a private-range ClusterIP) through the private-range deny so sandboxes
+    /// can reach tenant PG via the proxy. Default empty (opt-in per node config).
+    #[config(default = [])]
+    pub always_allowed_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -54,6 +61,12 @@ impl NetworkConfig {
         for cidr in &config.egress.always_denied_cidrs {
             cidr.parse::<Ipv4Network>().with_context(|| {
                 format!("invalid network.egress.always_denied_cidrs entry {cidr:?}")
+            })?;
+        }
+
+        for cidr in &config.egress.always_allowed_cidrs {
+            cidr.parse::<Ipv4Network>().with_context(|| {
+                format!("invalid network.egress.always_allowed_cidrs entry {cidr:?}")
             })?;
         }
 

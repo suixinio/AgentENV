@@ -126,6 +126,15 @@ fn configured_always_denied_cidrs() -> &'static [String] {
         .always_denied_cidrs
 }
 
+// Tier0 patch: node-level allowlist (DAB proxy VIP), accepted before the
+// private-range deny so the proxy is reachable despite being a ClusterIP.
+fn configured_always_allowed_cidrs() -> &'static [String] {
+    &crate::cfg::ConfigManager::global_config()
+        .network
+        .egress
+        .always_allowed_cidrs
+}
+
 pub fn initialize_namespace_egress_chain(
     veth_host_ip: Ipv4Addr,
     guest_dns_ip: Ipv4Addr,
@@ -156,6 +165,7 @@ pub fn initialize_namespace_egress_chain(
         guest_dns_ip,
         internal_egress_denied_cidrs,
         configured_always_denied_cidrs(),
+        configured_always_allowed_cidrs(),
     ));
 
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
@@ -167,10 +177,19 @@ fn build_static_egress_commands(
     guest_dns_ip: Ipv4Addr,
     internal_egress_denied_cidrs: &[String],
     node_always_denied_cidrs: &[String],
+    node_always_allowed_cidrs: &[String],
 ) -> Vec<IptablesRestoreCommand> {
     let mut commands = Vec::new();
 
     for cidr in [format!("{veth_host_ip}/32"), format!("{guest_dns_ip}/32")] {
+        commands.push(append_egress_command(format!(
+            "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
+        )));
+    }
+
+    // Tier0 patch: node-level allowlist (DAB proxy VIP) is accepted before the
+    // deny rules below, so a private-range ClusterIP stays reachable.
+    for cidr in node_always_allowed_cidrs {
         commands.push(append_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
         )));
@@ -420,6 +439,7 @@ mod tests {
             Ipv4Addr::new(10, 1, 2, 1),
             &internal_egress_denied_cidrs,
             &denied_cidrs,
+            &[],
         );
 
         let host_allow_pos = commands
@@ -457,6 +477,39 @@ mod tests {
     }
 
     #[test]
+    fn always_allowed_cidr_accepted_before_private_range_deny() {
+        // Tier0 patch: the DAB proxy VIP (a 10.0.0.0/8 ClusterIP) must be
+        // ACCEPTed before the private-range REJECT, otherwise the sandbox can
+        // never reach the proxy and per-sandbox allowOut is irrelevant.
+        let denied_cidrs = NetworkConfig::default().egress.always_denied_cidrs;
+        let allowed_cidrs = vec!["10.100.4.32/32".to_string()];
+        let commands = build_static_egress_commands(
+            Ipv4Addr::new(10, 12, 0, 2),
+            Ipv4Addr::new(10, 1, 2, 1),
+            &[],
+            &denied_cidrs,
+            &allowed_cidrs,
+        );
+
+        let allow_pos = commands
+            .iter()
+            .position(|command| {
+                append_rule(command) == Some("-i tap0 -o vpeer -d 10.100.4.32/32 -j ACCEPT")
+            })
+            .expect("proxy VIP must be accepted");
+        let private_deny_pos = commands
+            .iter()
+            .position(|command| {
+                append_rule(command) == Some("-i tap0 -o vpeer -d 10.0.0.0/8 -j REJECT")
+            })
+            .expect("private range still denied");
+        assert!(
+            allow_pos < private_deny_pos,
+            "proxy VIP ACCEPT must precede the 10.0.0.0/8 REJECT"
+        );
+    }
+
+    #[test]
     fn build_static_rules_use_configured_denied_cidrs() {
         let denied_cidrs = vec!["203.0.113.0/24".to_string()];
         let internal_egress_denied_cidrs = Vec::new();
@@ -465,6 +518,7 @@ mod tests {
             Ipv4Addr::new(10, 1, 2, 1),
             &internal_egress_denied_cidrs,
             &denied_cidrs,
+            &[],
         );
 
         assert!(commands.iter().any(|command| {

@@ -1061,7 +1061,6 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
                 node_index_ttl: Duration::from_secs(config.redis_node_index_ttl_secs),
                 response_timeout: Duration::from_millis(config.redis_response_timeout_ms),
                 connect_timeout: Duration::from_millis(config.redis_connect_timeout_ms),
-                ..Default::default()
             };
             let store = RedisBindingStore::connect(redis_config, settings)
                 .await

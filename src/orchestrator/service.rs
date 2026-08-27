@@ -46,6 +46,49 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// How many expired sandboxes [`Orchestrator::evict_expired_sandboxes`] asks
+/// its store for per round.
+///
+/// 🔴 Before this existed, `evict_expired_sandboxes` called
+/// `MetadataStore::list_expired`, which on the Redis backend
+/// (`RedisMetadataStore::list_expired`) requests `expired_batch(now,
+/// usize::MAX)` — and `expiry::expired_batch`'s own `count = -1` special
+/// case for `usize::MAX` means that was an *unbounded* `ZRANGEBYSCORE
+/// -inf <now> LIMIT 0 -1` against the whole expiry index, once per
+/// `auto_evict_interval_ms` (1s default) tick, per replica. This is the
+/// `expired_batch`-with-a-real-limit call the trait's own doc comment
+/// already says an evictor needs ("a fixed amount of work per round
+/// instead of pulling the whole table") — `evict_expired_sandboxes` just
+/// was not the caller using it.
+///
+/// The value matches `RedisStoreConfig::expired_batch_limit`'s own default
+/// (256): on the Redis backend, `expired_batch` already clamps any
+/// non-`usize::MAX` limit to `min(limit, config.expired_batch_limit)`, so
+/// passing a larger number here would silently be capped there anyway;
+/// matching it makes this the effective bound on every backend, including
+/// `InMemoryMetadataStore`, which has no such clamp of its own.
+///
+/// # Why a round that does not finish the backlog is still safe
+///
+/// `ZRANGEBYSCORE ... LIMIT 0 N` returns the `N` *lowest-scoring* (i.e.
+/// oldest-overdue) members of the range, not an arbitrary `N`. Every
+/// successful write that changes a record's expiry-relevant state
+/// (`scripts::UPDATE`'s `rescore_flag` arm, driven by `crud.rs`) issues a
+/// paired `ZREM`/`ZADD` against the same index in the same script — so a
+/// sandbox this round evicts is not returned by the *next* round's query,
+/// and the next-oldest `N` take its place. A round capped at
+/// `AUTO_EVICT_BATCH_LIMIT` is therefore not "the rest gets dropped": it is
+/// "the rest is still the oldest-first queue this exact query will ask
+/// about again one second from now" (`auto_evict_interval_ms`). The one
+/// case that does *not* advance is a sandbox whose eviction attempt itself
+/// fails (`evict_expired_sandboxes`'s own `warn!` + `continue`) — its score
+/// is untouched, so it keeps sorting first and keeps being retried every
+/// round, exactly like the healer/reaper backstops elsewhere in this store
+/// retry a stuck record — but it can only ever occupy its own one slot in
+/// a batch, never the other `AUTO_EVICT_BATCH_LIMIT - 1`, so a
+/// persistently-failing sandbox cannot starve the rest of the backlog.
+const AUTO_EVICT_BATCH_LIMIT: usize = 256;
+
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
     Success,
@@ -3169,7 +3212,13 @@ where
             return Ok(Vec::new());
         }
 
-        let expired = self.store.list_expired(SystemTime::now()).await?;
+        // Bounded, not `list_expired` (unbounded) — see
+        // `AUTO_EVICT_BATCH_LIMIT`'s own doc for why a capped round is
+        // still guaranteed to make progress on the whole backlog.
+        let expired = self
+            .store
+            .expired_batch(SystemTime::now(), AUTO_EVICT_BATCH_LIMIT)
+            .await?;
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {

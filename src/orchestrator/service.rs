@@ -930,24 +930,14 @@ where
 
         info!("forking sandboxes");
 
-        let source_handle = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&source_sandbox_id).cloned()
-        };
-        // 🔴 A replica that did not start the source sandbox is not a replica
-        // the source sandbox is missing from. Answering `SandboxNotFound` here
-        // made a fork fail on whichever of the api replicas the request
-        // happened to reach.
-        let source_handle = match source_handle {
-            Some(handle) => handle,
-            None => match self.absent_handle(source_sandbox_id).await? {
-                AbsentHandle::Adopted(handle) => handle,
-                AbsentHandle::RuntimeGone | AbsentHandle::NoRecord => {
-                    return Err(OrchestratorError::SandboxNotFound(source_sandbox_id))
-                }
-            },
-        };
-
+        // The CAS runs before the handle is resolved, not after: it is what
+        // makes `source_metadata.execution_id` below authoritative rather
+        // than a snapshot that a concurrent pause+resume could invalidate out
+        // from under this call. Nothing can move the execution id while
+        // `Forking` holds — the only op that does is a resume, and a resume
+        // requires `Paused`, not `Forking` — so any handle checked against it
+        // from here on is checked against the truth for the whole rest of
+        // this operation.
         let source_metadata = self
             .store
             .update_if_state(&source_sandbox_id, &[SandboxState::Running], |metadata| {
@@ -965,6 +955,46 @@ where
                 err => OrchestratorError::from(err),
             })?
             .previous;
+
+        // 🔴 A replica that did not start the source sandbox is not a replica
+        // the source sandbox is missing from. Answering `SandboxNotFound` here
+        // made a fork fail on whichever of the api replicas the request
+        // happened to reach. Nor is a replica whose cached handle a
+        // pause+resume elsewhere has since superseded: `cached_handle_for_execution`
+        // discards that one exactly as if it had never been here, so it also
+        // falls through to `absent_handle` below.
+        let source_handle = self
+            .cached_handle_for_execution(source_sandbox_id, source_metadata.execution_id)
+            .await;
+        let source_handle = match source_handle {
+            Some(handle) => handle,
+            None => match self.absent_handle(source_sandbox_id).await {
+                Ok(AbsentHandle::Adopted(handle)) => handle,
+                Ok(AbsentHandle::RuntimeGone) | Ok(AbsentHandle::NoRecord) => {
+                    let _ = self
+                        .store
+                        .update_state_if_state(
+                            &source_sandbox_id,
+                            SandboxState::Running,
+                            &[SandboxState::Forking],
+                        )
+                        .await;
+                    return Err(OrchestratorError::SandboxNotFound(source_sandbox_id));
+                }
+                Err(error) => {
+                    warn!(error = %error, "could not reach the sandbox while forking; leaving its record alone");
+                    let _ = self
+                        .store
+                        .update_state_if_state(
+                            &source_sandbox_id,
+                            SandboxState::Running,
+                            &[SandboxState::Forking],
+                        )
+                        .await;
+                    return Err(error);
+                }
+            },
+        };
 
         // 🔴 One entry per child, and the ownership marker is carried alongside
         // the identity rather than derived from the source: the clone of the
@@ -1611,7 +1641,34 @@ where
             }
         };
 
-        let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        // The authoritative execution for this sandbox, read now that this
+        // call exclusively holds it in `Killing`. Nothing else can move the
+        // execution id while that holds — the only op that does is a resume,
+        // and a resume requires `Paused`, not `Killing` — so the detached
+        // handle below is checked against the truth, not a stale local copy.
+        // Nothing has mutated the backend yet at this point, so a failure
+        // here rolls back to `previous_state` exactly like the "could not
+        // reach the sandbox" branch below it does.
+        let expected_execution_id = match self.store.get(&sandbox_id).await {
+            Ok(Some(metadata)) => metadata.execution_id,
+            Ok(None) => {
+                // We just won the Killing transition; the record vanishing
+                // immediately after reads the same as "already deleted".
+                warn!("sandbox record disappeared while deleting");
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(error = ?err, "could not read sandbox record while deleting; leaving its record alone");
+                self.store
+                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                    .await?;
+                return Err(OrchestratorError::from(err));
+            }
+        };
+
+        let (handle, removed_route) = self
+            .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
+            .await;
         // See the matching note in `pause_sandbox_inner`: an adopted backend is
         // never filed in the running set.
         let handle_was_held_here = handle.is_some();
@@ -2106,7 +2163,44 @@ where
             }
         };
 
-        let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        // The authoritative execution for this sandbox, read now that this
+        // call exclusively holds it in `Pausing`. Nothing else can move the
+        // execution id while that holds — the only op that does is a resume,
+        // and a resume requires `Paused`, not `Pausing` — so the detached
+        // handle below is checked against the truth, not a stale local copy.
+        //
+        // Nothing has touched the backend yet at this point (the pinned
+        // image refs and allocated artifact root above are the only side
+        // effects so far), so a failure here gets exactly the same rollback
+        // as the two branches immediately above it: release the refs, put
+        // the record back to `Running`, return.
+        let expected_execution_id = match self.store.get(&sandbox_id).await {
+            Ok(Some(metadata)) => metadata.execution_id,
+            Ok(None) => {
+                warn!("sandbox record disappeared while pausing");
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            }
+            Err(err) => {
+                warn!(error = ?err, "failed to read sandbox record while pausing");
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Pausing],
+                    )
+                    .await;
+                return Err(OrchestratorError::from(err));
+            }
+        };
+
+        let (handle, removed_proxy_route) = self
+            .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
+            .await;
 
         // 🔴 Whether the backend below is this process's own. A handle rebuilt
         // from the record is built for one operation and is never put into the
@@ -2650,11 +2744,38 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        // Get the sandbox handle.
-        let handle = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
+        // The authoritative execution for this sandbox, read now that this
+        // call exclusively holds it in `Snapshotting`. Nothing else can move
+        // the execution id while that holds, so a cached handle is checked
+        // against the truth, not a stale local copy of it. Nothing has
+        // touched the backend yet at this point, so a failure here rolls
+        // back to `Running` exactly like the "could not reach the sandbox"
+        // branch below it does.
+        let expected_execution_id = match self.store.get(&sandbox_id).await {
+            Ok(Some(metadata)) => metadata.execution_id,
+            Ok(None) => {
+                warn!("sandbox record disappeared while snapshotting");
+                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+            }
+            Err(err) => {
+                warn!(error = ?err, "could not read sandbox record while snapshotting; leaving its record alone");
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Snapshotting],
+                    )
+                    .await;
+                return Err(OrchestratorError::from(err));
+            }
         };
+
+        // Get the sandbox handle, discarding it first if a pause+resume this
+        // replica never observed has already superseded it.
+        let handle = self
+            .cached_handle_for_execution(sandbox_id, expected_execution_id)
+            .await;
         let handle = match handle {
             Some(handle) => handle,
             None => match self.absent_handle(sandbox_id).await {
@@ -2784,12 +2905,15 @@ where
             });
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        };
         // As in `fork_sandbox_inner`: on a replicated deciding half the handle
-        // usually lives on another replica, and that is not a conflict.
+        // usually lives on another replica, and that is not a conflict — nor
+        // is a handle this replica does hold but whose execution
+        // `metadata.execution_id` above has already superseded;
+        // `cached_handle_for_execution` discards that one exactly as if it
+        // had never been here.
+        let sandbox = self
+            .cached_handle_for_execution(sandbox_id, metadata.execution_id)
+            .await;
         let sandbox = match sandbox {
             Some(handle) => handle,
             None => match self.absent_handle(sandbox_id).await? {
@@ -2869,10 +2993,12 @@ where
             });
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        };
+        // A handle this replica holds but whose execution `metadata.execution_id`
+        // above has already superseded is discarded exactly as if it had
+        // never been cached — see `cached_handle_for_execution`.
+        let sandbox = self
+            .cached_handle_for_execution(sandbox_id, metadata.execution_id)
+            .await;
         let sandbox = match sandbox {
             Some(handle) => handle,
             None => match self.absent_handle(sandbox_id).await? {
@@ -2962,10 +3088,12 @@ where
             });
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        };
+        // A handle this replica holds but whose execution `metadata.execution_id`
+        // above has already superseded is discarded exactly as if it had
+        // never been cached — see `cached_handle_for_execution`.
+        let sandbox = self
+            .cached_handle_for_execution(sandbox_id, metadata.execution_id)
+            .await;
         let sandbox = match sandbox {
             Some(handle) => handle,
             None => match self.absent_handle(sandbox_id).await? {
@@ -3054,6 +3182,16 @@ where
         metrics.create_successes = self.counters.create_successes();
         metrics.create_fails = self.counters.create_fails();
         Ok(metrics)
+    }
+
+    /// How many times this orchestrator has thrown away a process-local
+    /// sandbox handle because its execution no longer matched the
+    /// authoritative metadata record — see
+    /// [`OrchestratorCounters::record_stale_handle_discarded`] for what that
+    /// means and why every store read used to investigate one shows nothing
+    /// wrong.
+    pub fn stale_handle_discards(&self) -> u64 {
+        self.counters.stale_handles_discarded()
     }
 
     pub fn subscribe_sandbox_events(&self) -> broadcast::Receiver<SandboxLifecycleEvent> {
@@ -3912,6 +4050,147 @@ where
 
         drop(sandboxes);
         (handle, removed_route)
+    }
+
+    /// Logs and counts the one event this half of the fix exists to make
+    /// visible: a handle this process cached is being thrown away because it
+    /// no longer names the run the metadata store says is authoritative.
+    ///
+    /// # 🔴 Why this can happen with every stored record agreeing
+    ///
+    /// A replicated deciding half's handle table is not part of the record
+    /// it caches a stub for. Pause a sandbox on replica B, resume it (also on
+    /// B, or on any replica) — PG, Redis and the node all move to the new
+    /// execution together — and replica A, which never fielded either call,
+    /// still holds the [`RemoteSandboxStub`](crate::node_client::stub) it
+    /// built when *it* created the sandbox, fenced to the run that no longer
+    /// exists. Every store read anyone runs to investigate this will show
+    /// three consistent records and nothing wrong at all; the only place the
+    /// stale value lives is this table, in this process's memory, which is
+    /// exactly why this warning (and the counter behind it) has to exist —
+    /// nothing else will ever say so.
+    fn note_stale_handle_discarded(
+        &self,
+        sandbox_id: SandboxId,
+        stale_execution_id: ExecutionId,
+        current_execution_id: ExecutionId,
+    ) {
+        warn!(
+            %sandbox_id,
+            %stale_execution_id,
+            %current_execution_id,
+            "discarding a cached sandbox handle whose execution has been superseded; a \
+             pause+resume this replica never observed must have moved the sandbox on. \
+             Rebuilding the handle from the authoritative record instead of fencing \
+             against the stale execution."
+        );
+        self.counters.record_stale_handle_discarded();
+    }
+
+    /// Looks up the process-local handle for `sandbox_id` without removing
+    /// it, discarding it first if it is stale.
+    ///
+    /// A handle is trusted only when [`SandboxBackend::execution_id`] equals
+    /// `expected_execution_id` — a value the caller must already have read
+    /// from (or established atomically via) the metadata store, since that
+    /// store, not this table, is what "authoritative" means here. A match
+    /// returns the handle untouched, still filed in the table, for callers
+    /// that go on serving the sandbox from it afterwards (a fork's source, an
+    /// in-place network-policy or custom-extension-params update, a running
+    /// snapshot capture).
+    ///
+    /// A mismatch means this table is holding a fencing token for a run the
+    /// authoritative record has already moved past — seconds or days out of
+    /// date, there is no way to tell from here — and handing it to the node
+    /// would only earn a `superseded` refusal no retry on this replica could
+    /// ever clear. The stale entry is removed (only if it is still exactly
+    /// the entry just read — a concurrent operation may have already
+    /// replaced it with something newer, which must not be clobbered) along
+    /// with its paired proxy route when that route was published under the
+    /// same stale execution, logged and counted via
+    /// [`note_stale_handle_discarded`](Self::note_stale_handle_discarded),
+    /// and `None` is returned — exactly what a caller sees when nothing was
+    /// ever cached, so every call site already knows how to fall through to
+    /// [`absent_handle`](Self::absent_handle) from here.
+    async fn cached_handle_for_execution(
+        &self,
+        sandbox_id: SandboxId,
+        expected_execution_id: ExecutionId,
+    ) -> Option<SandboxHandle> {
+        let cached = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&sandbox_id).cloned()
+        };
+        let handle = cached?;
+        let actual_execution_id = handle.lock().await.execution_id();
+        if actual_execution_id == expected_execution_id {
+            return Some(handle);
+        }
+
+        self.note_stale_handle_discarded(sandbox_id, actual_execution_id, expected_execution_id);
+
+        {
+            let mut sandboxes = self.sandboxes.write().await;
+            if sandboxes
+                .get(&sandbox_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                sandboxes.remove(&sandbox_id);
+            }
+        }
+        {
+            let mut routes = self.proxy_routes.write().await;
+            if routes
+                .route(&sandbox_id)
+                .is_some_and(|route| route.execution_id() == actual_execution_id)
+            {
+                routes.remove(&sandbox_id);
+            }
+        }
+
+        None
+    }
+
+    /// [`detach_sandbox_handle_and_route`](Self::detach_sandbox_handle_and_route),
+    /// with the same staleness check as
+    /// [`cached_handle_for_execution`](Self::cached_handle_for_execution)
+    /// applied to whatever it detached.
+    ///
+    /// For callers — pause, delete — that always take the handle out of the
+    /// table up front and decide afterwards whether they end up driving it or
+    /// an adopted replacement. A detached handle that turns out to be stale
+    /// is reported exactly like [`cached_handle_for_execution`] and then
+    /// dropped from the return value entirely: the caller sees `(None, _)`,
+    /// identical to what it would have seen had the table never held an
+    /// entry for this sandbox, and its existing "fall through to
+    /// `absent_handle`" branch takes care of the rest. The paired route comes
+    /// back untouched unless it was published under the same stale
+    /// execution — routes and handles are always written together, so this
+    /// should be the only case in practice, but a route under some other
+    /// execution is left for the caller to decide about rather than guessed
+    /// away here.
+    async fn detach_sandbox_handle_and_route_checked(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: ExecutionId,
+    ) -> (Option<SandboxHandle>, Option<ProxyRoute>) {
+        let (handle, removed_route) = self.detach_sandbox_handle_and_route(sandbox_id).await;
+        let Some(handle) = handle else {
+            return (None, removed_route);
+        };
+
+        let actual_execution_id = handle.lock().await.execution_id();
+        if actual_execution_id == expected_execution_id {
+            return (Some(handle), removed_route);
+        }
+
+        self.note_stale_handle_discarded(*sandbox_id, actual_execution_id, expected_execution_id);
+
+        let removed_route = match removed_route {
+            Some(route) if route.execution_id() == actual_execution_id => None,
+            other => other,
+        };
+        (None, removed_route)
     }
 
     async fn run_shutdown_cleanup(self: &Arc<Self>) -> Result<()> {

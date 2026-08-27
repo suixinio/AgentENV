@@ -7838,3 +7838,354 @@ async fn the_artifact_root_a_capture_went_into_is_readable_through_the_facade() 
     );
     Ok(())
 }
+
+// ── Stale process-local handle vs. the authoritative record ────────────────
+//
+// A replicated deciding half (aenv-api, two-plus replicas, no session
+// affinity) caches a `SandboxHandle` per sandbox the moment it starts or
+// adopts one. That cache can go stale without this process ever finding out:
+// replica A creates a sandbox under execution E1 and files a handle for it;
+// replica B — not A — pauses and resumes it; PG, Redis and the node all move
+// to a new execution E2 together; A's own copy of the record updates too,
+// because it shares the same store. Only A's handle table does not, because
+// nothing in a pause or a resume A never received touches it. The next
+// control-plane call that lands on A used to trust whatever was in that
+// table unconditionally, fence a real node call against E1, and get refused
+// — every store anyone reads to investigate shows E2, consistently, which is
+// exactly what makes this bug invisible from the outside.
+//
+// `MockSandboxBackend` never enforces fencing itself, so a bare
+// success/failure assertion here cannot tell "used the stale handle anyway
+// and the mock did not mind" apart from "discarded it and rebuilt". The
+// tests below use `AdoptingFactory`'s call counter for that instead: it is
+// the only production-shaped way to get a fresh handle for an already
+// -running sandbox (`RemoteSandboxBackendFactory::adopt_running`), so
+// counting calls to it says, unambiguously, whether a rebuild happened. That
+// also closes the other half of the polarity the fix has to get right: an
+// implementation that always discards and rebuilds — the handle table
+// reduced to dead weight — would leave every one of these operations
+// succeeding too, but it would call `adopt_running` even when the cached
+// handle already named the right execution, which the "reuses a matching
+// handle" tests below catch directly.
+
+/// A [`MockBackendFactory`] wrapper that answers `adopt_running` instead of
+/// inheriting the trait's `Ok(None)` default `MockBackendFactory` itself
+/// relies on. `Ok(None)` is correct for a factory whose sandboxes live in the
+/// process that started them, which is what plain `MockBackendFactory`
+/// stands in for — but it makes the "another replica adopts this sandbox"
+/// branch this fix is about untestable. `AdoptingFactory` stands in for the
+/// one production implementation that does answer `Some`,
+/// `RemoteSandboxBackendFactory` (`src/node_client/factory.rs`), by handing
+/// back a fresh `MockSandboxBackend` bound to whatever execution id the
+/// caller names — exactly the value `absent_handle` reads fresh off the
+/// metadata store right before calling this.
+struct AdoptingFactory {
+    inner: MockBackendFactory,
+    behavior: Arc<MockBehavior>,
+    adopt_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AdoptingFactory {
+    fn new(behavior: Arc<MockBehavior>) -> Self {
+        Self {
+            inner: MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+            behavior,
+            adopt_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// A cloned handle to the call counter, taken before the factory is moved
+    /// into `Orchestrator::new`.
+    fn adopt_calls_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.adopt_calls)
+    }
+}
+
+impl SandboxBackendFactory for AdoptingFactory {
+    fn build(
+        &self,
+        build_spec: crate::sandbox::FreshSandboxBuildSpec,
+        launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        self.inner.build(build_spec, launch_config, execution_id)
+    }
+
+    fn build_from_snapshot(
+        &self,
+        snapshot: &RunnableSnapshot,
+        launch_config: SandboxLaunchConfig,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        self.inner
+            .build_from_snapshot(snapshot, launch_config, execution_id)
+    }
+
+    fn build_from_paused_state(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        state: &dyn PausedSandboxState,
+        envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        self.inner
+            .build_from_paused_state(sandbox_id, execution_id, state, envd_access_token)
+    }
+
+    fn decode_paused_state(
+        &self,
+        artifact_root: PathBuf,
+        state: serde_json::Value,
+    ) -> anyhow::Result<Arc<dyn PausedSandboxState>> {
+        self.inner.decode_paused_state(artifact_root, state)
+    }
+
+    fn adopt_running(
+        &self,
+        _sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        _resources: SandboxResources,
+    ) -> anyhow::Result<Option<Box<dyn SandboxBackend>>> {
+        self.adopt_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(Box::new(MockSandboxBackend::new(
+            Arc::clone(&self.behavior),
+            execution_id,
+        ))))
+    }
+}
+
+async fn make_adopting_orchestrator() -> (
+    Arc<TestOrchestrator<InMemoryMetadataStore, AdoptingFactory>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let behavior = Arc::new(MockBehavior::new());
+    let factory = AdoptingFactory::new(behavior);
+    let adopt_calls = factory.adopt_calls_handle();
+    let orchestrator = Orchestrator::new(
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        InMemoryMetadataStore::new(),
+        factory,
+        DisabledSandboxPersister,
+        test_runtime_image_refs(),
+    )
+    .await
+    .expect("in-memory orchestrator should not fail to construct");
+    (orchestrator, adopt_calls)
+}
+
+/// Moves the authoritative record to a freshly minted execution without
+/// touching the process-local handle table — precisely the shape a
+/// pause+resume performed by a different replica leaves behind. Returns the
+/// new execution id so callers can assert against it.
+async fn supersede_execution_without_touching_the_handle(
+    orchestrator: &Arc<TestOrchestrator<InMemoryMetadataStore, AdoptingFactory>>,
+    sandbox_id: SandboxId,
+) -> ExecutionId {
+    let current_execution_id = ExecutionId::new();
+    orchestrator
+        .set_live_execution_for_test(
+            sandbox_id,
+            ProxyTarget::new(Ipv4Addr::LOCALHOST),
+            current_execution_id,
+        )
+        .await;
+    current_execution_id
+}
+
+#[tokio::test]
+async fn delete_discards_a_stale_handle_and_rebuilds_from_the_record() -> anyhow::Result<()> {
+    setup();
+    let (orchestrator, adopt_calls) = make_adopting_orchestrator().await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    let stale_execution_id = created.execution_id;
+    let current_execution_id =
+        supersede_execution_without_touching_the_handle(&orchestrator, sandbox_id).await;
+    assert_ne!(stale_execution_id, current_execution_id);
+
+    let discards_before = orchestrator.stale_handle_discards();
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+
+    assert_eq!(
+        orchestrator.stale_handle_discards(),
+        discards_before + 1,
+        "the stale handle should have been logged and counted as discarded"
+    );
+    assert_eq!(
+        adopt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "delete should have rebuilt the handle from the record rather than \
+         driving the stale one straight at the node"
+    );
+    assert!(
+        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
+        "the sandbox should be gone after a successful delete"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_reuses_a_matching_handle_without_rebuilding_it() -> anyhow::Result<()> {
+    setup();
+    let (orchestrator, adopt_calls) = make_adopting_orchestrator().await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let discards_before = orchestrator.stale_handle_discards();
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+
+    assert_eq!(
+        orchestrator.stale_handle_discards(),
+        discards_before,
+        "a handle whose execution still matches the record must not be \
+         reported as discarded"
+    );
+    assert_eq!(
+        adopt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "delete must drive the cached handle directly rather than rebuild one \
+         that would carry the same execution id anyway — an \"always \
+         rebuild\" implementation also leaves the sandbox deleted, but it \
+         would call adopt_running here, which this asserts it did not"
+    );
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_discards_a_stale_handle_and_rebuilds_from_the_record() -> anyhow::Result<()> {
+    setup();
+    let (orchestrator, adopt_calls) = make_adopting_orchestrator().await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    let stale_execution_id = created.execution_id;
+    let current_execution_id =
+        supersede_execution_without_touching_the_handle(&orchestrator, sandbox_id).await;
+    assert_ne!(stale_execution_id, current_execution_id);
+
+    let discards_before = orchestrator.stale_handle_discards();
+
+    let paused = orchestrator.pause_sandbox(sandbox_id).await?;
+
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert_eq!(
+        orchestrator.stale_handle_discards(),
+        discards_before + 1,
+        "the stale handle should have been logged and counted as discarded"
+    );
+    assert_eq!(
+        adopt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "pause should have rebuilt the handle from the record rather than \
+         driving the stale one straight at the node"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_reuses_a_matching_handle_without_rebuilding_it() -> anyhow::Result<()> {
+    setup();
+    let (orchestrator, adopt_calls) = make_adopting_orchestrator().await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let discards_before = orchestrator.stale_handle_discards();
+
+    let paused = orchestrator.pause_sandbox(sandbox_id).await?;
+
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert_eq!(
+        orchestrator.stale_handle_discards(),
+        discards_before,
+        "a handle whose execution still matches the record must not be \
+         reported as discarded"
+    );
+    assert_eq!(
+        adopt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "pause must drive the cached handle directly rather than rebuild one \
+         that would carry the same execution id anyway"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn capture_snapshot_discards_a_stale_handle_and_rebuilds_from_the_record(
+) -> anyhow::Result<()> {
+    setup();
+    let (orchestrator, adopt_calls) = make_adopting_orchestrator().await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    let stale_execution_id = created.execution_id;
+    let current_execution_id =
+        supersede_execution_without_touching_the_handle(&orchestrator, sandbox_id).await;
+    assert_ne!(stale_execution_id, current_execution_id);
+
+    let discards_before = orchestrator.stale_handle_discards();
+
+    // Unlike delete/pause, a successful capture leaves the sandbox `Running`
+    // and does not detach the handle it drove — this exercises
+    // `cached_handle_for_execution`'s peek shape rather than
+    // `detach_sandbox_handle_and_route_checked`'s detach-then-check one.
+    orchestrator.capture_snapshot(sandbox_id).await?;
+
+    assert_eq!(
+        orchestrator.stale_handle_discards(),
+        discards_before + 1,
+        "the stale handle should have been logged and counted as discarded"
+    );
+    assert_eq!(
+        adopt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "capture_snapshot should have rebuilt the handle from the record \
+         rather than driving the stale one straight at the node"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn capture_snapshot_reuses_a_matching_handle_without_rebuilding_it() -> anyhow::Result<()> {
+    setup();
+    let (orchestrator, adopt_calls) = make_adopting_orchestrator().await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let discards_before = orchestrator.stale_handle_discards();
+
+    orchestrator.capture_snapshot(sandbox_id).await?;
+
+    assert_eq!(
+        orchestrator.stale_handle_discards(),
+        discards_before,
+        "a handle whose execution still matches the record must not be \
+         reported as discarded"
+    );
+    assert_eq!(
+        adopt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "capture_snapshot must drive the cached handle directly rather than \
+         rebuild one that would carry the same execution id anyway"
+    );
+    Ok(())
+}

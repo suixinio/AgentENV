@@ -33,6 +33,7 @@ pub struct OrchestratorMetrics {
 pub struct OrchestratorCounters {
     create_successes: AtomicU64,
     create_fails: AtomicU64,
+    stale_handles_discarded: AtomicU64,
 }
 
 impl OrchestratorCounters {
@@ -50,6 +51,26 @@ impl OrchestratorCounters {
 
     pub fn create_fails(&self) -> u64 {
         self.create_fails.load(Ordering::Relaxed)
+    }
+
+    /// Bumped whenever the process-local sandbox handle table held a handle
+    /// whose execution no longer matched the authoritative metadata record —
+    /// a pause+resume elsewhere superseded it without this replica ever
+    /// detaching it — and the handle was discarded and rebuilt rather than
+    /// driven straight at the node with a stale fencing token.
+    ///
+    /// This should stay at zero on a non-replicated orchestrator (a single
+    /// `aenv-node`, which is always the process that mutates its own handle
+    /// table). A nonzero, climbing count on a replicated deciding half is the
+    /// signal that replicas are routinely caching handles across a pause and
+    /// resume they never observed — expected to happen sometimes given no
+    /// session affinity, but a symptom worth watching if it climbs sharply.
+    pub fn record_stale_handle_discarded(&self) {
+        self.stale_handles_discarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn stale_handles_discarded(&self) -> u64 {
+        self.stale_handles_discarded.load(Ordering::Relaxed)
     }
 }
 

@@ -1,0 +1,50 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The pve-mf cluster (PVE host `pve-mf`, k3s on 10.1.0.200/10.1.0.201).
+#
+# It differs from `overlays/default` in exactly one respect: the registry this
+# cluster's images and user images come from. `base` hardcodes the pve-sg
+# cluster's `10.10.10.204:5000` in two places that `deploy/k8s/run.sh`'s
+# IMAGE_REGISTRY rewrite deliberately does not touch — that rewrite only
+# retags the three `agentenv-*` images built from this tree:
+#
+#   * base/redis.yaml's `image:`, an upstream image mirrored into the builder's
+#     registry rather than built here, so it carries a full registry-qualified
+#     name that the `images:` transformer below re-points instead.
+#   * base/config/regctl.json, which is what tells `regctl` that this one
+#     registry speaks plain HTTP. It is a configMapGenerator *file*, so an
+#     overlay replaces the whole generator rather than patching a field.
+#
+# Everything else, including the /var/lib/aenv hostPath, matches
+# `overlays/default`. The `agentenv-runtime-secrets` Secret is likewise NOT
+# generated here for the reason that overlay spells out at length: one
+# committed seed would be the same seed on every cluster that applied it.
+# Create it once, before the first apply.
+
+namespace: agentenv-system
+
+resources:
+  - ../../base
+
+configMapGenerator:
+  - name: regctl-config
+    behavior: replace
+    files:
+      - config.json=regctl.json
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+images:
+  - name: 10.10.10.204:5000/redis
+    newName: 10.1.0.201:5000/redis
+
+patches:
+  - target:
+      kind: DaemonSet
+      name: agentenv-node
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/hostPath/path
+        value: /var/lib/aenv

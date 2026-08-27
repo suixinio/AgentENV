@@ -1,10 +1,10 @@
 openapi: 3.0.0
 info:
   version: 0.1.0
-  title: E2B API
+  title: AgentENV E2B-compatible API
 
 servers:
-  - url: https://api.e2b.app
+  - url: /
 
 components:
   securitySchemes:

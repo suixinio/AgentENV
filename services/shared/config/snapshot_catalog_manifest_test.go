@@ -127,11 +127,20 @@ func TestTheSnapshotCatalogShipsTheStateTheClusterRuns(t *testing.T) {
 		want string
 		enum string
 	}{
-		// 2c's accepted end state: both catalogs written, the central one
-		// answering reads. `write` stays at `both` and not `postgres` — that is
-		// what keeps object storage a complete copy, and the rollback a config
-		// change rather than a backfill.
-		{env: catalogWriteEnv, want: "both", enum: "SnapshotCatalogWrite"},
+		// Stage B's completed end state: PostgreSQL is the only catalog.
+		//
+		// 🔴 This pin used to read `both`, on the reasoning that keeping object
+		// storage a complete copy made the rollback a config change rather than
+		// a backfill. That reasoning was correct and it has been deliberately
+		// spent: `write = "postgres"` was taken only after
+		// `catalog_migration_state.read_side_confirmed` was true for this
+		// cluster (`require_read_side_confirmed` refuses to start otherwise),
+		// and the price is that object storage is now frozen at the cutover.
+		// Moving `read` back to `object_store` is therefore no longer a
+		// rollback — no code replays PostgreSQL rows into object storage — while
+		// moving `write` back to `both` still is. See the note on
+		// snapshot-catalog-config in deploy/k8s/base/kustomization.yaml.
+		{env: catalogWriteEnv, want: "postgres", enum: "SnapshotCatalogWrite"},
 		{env: catalogReadEnv, want: "postgres", enum: "SnapshotCatalogRead"},
 	} {
 		t.Run(tc.env, func(t *testing.T) {

@@ -201,9 +201,22 @@ spec:
             # paused registry would arbitrate a registry only it can see.
             - name: AENV_PAUSED_REGISTRY_BACKEND
               value: "postgres"
-            # 阶段 2c, the same two keys and the same ConfigMap the DaemonSet
-            # reads. See the note on snapshot-catalog-config in
-            # kustomization.yaml.
+            # 阶段 2c / Stage B, the same two keys and the same ConfigMap the
+            # DaemonSet reads. Now `postgres`/`postgres` — see the note on
+            # snapshot-catalog-config in kustomization.yaml for the values, the
+            # three-step route that reached them, and why the way back is not
+            # symmetric.
+            #
+            # 🔴 This half is now the *only* writer of the snapshot catalog.
+            # A node stages the bytes and tells the catalog nothing
+            # (`SnapshotRepository::stage`); the row is written here, by
+            # `commit_staged` → `catalog.publish_commit`, straight into the
+            # shared `[pg]` pool. `build_snapshot_backend`'s
+            # `write = "postgres"` branch refuses to start this replica unless
+            # `catalog_migration_state.read_side_confirmed` is already true for
+            # this cluster, and logs `catalog_write=postgres
+            # catalog_read=postgres` when it is — that log line, not Pod
+            # readiness, is what says the assembly actually took this path.
             #
             # 🔴 A configMapKeyRef here rather than the literals this half uses
             # for AENV_ORCHESTRATOR_STORE_BACKEND and

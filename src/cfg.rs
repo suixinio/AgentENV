@@ -1211,6 +1211,28 @@ pub struct ClusterNodeRegistryStoreConfig {
         parse_env = parse_trimmed_string
     )]
     pub redis_key_prefix: String,
+    /// How long a single Redis command (`HGETALL`/`HSET`/`HGET`) may run
+    /// before `redis::aio::ConnectionManager` times it out and reconnects.
+    /// redis-rs's own default is 500ms; raised because a 292ms
+    /// `ZRANGEBYSCORE` has been observed against this same production
+    /// Redis (`[orchestrator.store]`'s expiry index, a neighbor on the
+    /// same instance) and cross-node RTT stacks on top of that on every
+    /// command. See `crate::node_registry::redis::DEFAULT_RESPONSE_TIMEOUT`'s
+    /// own doc for the full trade-off (a dead Redis now takes longer to be
+    /// detected; audited as safe because nothing on this path depends on a
+    /// fast failure).
+    #[config(
+        default = 2000u64,
+        env = "AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_RESPONSE_TIMEOUT_MS"
+    )]
+    pub redis_response_timeout_ms: u64,
+    /// How long a fresh TCP connection attempt (initial connect, or a
+    /// reconnect after a `redis_response_timeout_ms`) may take.
+    #[config(
+        default = 3000u64,
+        env = "AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_CONNECT_TIMEOUT_MS"
+    )]
+    pub redis_connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1608,6 +1630,23 @@ pub struct BindingStoreConfig {
         env = "AENV_BINDING_STORE_ARTIFACT_INDEX_CAPACITY"
     )]
     pub artifact_index_capacity: u64,
+    /// How long a single Redis command (a script `EVAL`, a `GET`) may run
+    /// before `redis::aio::ConnectionManager` times it out and reconnects.
+    /// redis-rs's own default is 500ms, which this store's own
+    /// `operation_timeout` field (now `response_timeout`) had already
+    /// picked a 2s replacement for without it ever actually being wired
+    /// into the connection — see
+    /// `crate::binding_store::redis::RedisBindingStoreConfig::response_timeout`'s
+    /// own doc for the full history and trade-off audit.
+    #[config(
+        default = 2000u64,
+        env = "AENV_BINDING_STORE_REDIS_RESPONSE_TIMEOUT_MS"
+    )]
+    pub redis_response_timeout_ms: u64,
+    /// How long a fresh TCP connection attempt (initial connect, or a
+    /// reconnect after a `redis_response_timeout_ms`) may take.
+    #[config(default = 3000u64, env = "AENV_BINDING_STORE_REDIS_CONNECT_TIMEOUT_MS")]
+    pub redis_connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1656,6 +1695,28 @@ pub struct OrchestratorStoreConfig {
         env = "AENV_ORCHESTRATOR_STORE_DISTRIBUTED_LOCK_ENABLED"
     )]
     pub redis_distributed_lock_enabled: bool,
+    /// How long a single Redis command may run before
+    /// `redis::aio::ConnectionManager` times it out and reconnects.
+    /// redis-rs's own default is 500ms; raised because a `ZRANGEBYSCORE` on
+    /// this exact store's own expiry index was observed taking 292ms in
+    /// production, plus cross-node RTT on every command. The default here
+    /// is kept below `RedisStoreConfig::write_budget`'s own default (2s,
+    /// not independently configurable — see the module doc above this
+    /// section); see `RedisStoreConfig::response_timeout`'s own doc for
+    /// the full trade-off audit and for why that is a default-vs-default
+    /// relationship rather than a `validate`-enforced one.
+    #[config(
+        default = 1500u64,
+        env = "AENV_ORCHESTRATOR_STORE_REDIS_RESPONSE_TIMEOUT_MS"
+    )]
+    pub redis_response_timeout_ms: u64,
+    /// How long a fresh TCP connection attempt (initial connect, or a
+    /// reconnect after a `redis_response_timeout_ms`) may take.
+    #[config(
+        default = 2500u64,
+        env = "AENV_ORCHESTRATOR_STORE_REDIS_CONNECT_TIMEOUT_MS"
+    )]
+    pub redis_connect_timeout_ms: u64,
 }
 
 /// Custom extension service integration.

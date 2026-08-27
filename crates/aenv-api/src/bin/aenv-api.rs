@@ -754,18 +754,27 @@ fn cluster_store_config(
             config.backend.as_str()
         );
     }
-    // 🔴 Four settings from configuration and the rest from the store's own
+    // 🔴 Six settings from configuration and the rest from the store's own
     // defaults, which is a decision and not laziness. `RedisStoreConfig` has
     // around twenty timing parameters whose *relationships* carry correctness
     // — `transition_key_ttl > wait_transition_timeout > lock_ttl`,
     // `stale_cutoff > transition_key_ttl`, `record_ttl_grace >
     // transition_key_ttl` — and `validate` refuses a combination that breaks
     // them. Exposing them individually would let a deployment set one and be
-    // refused at startup for a reason about a different one.
+    // refused at startup for a reason about a different one. The two Redis
+    // client timeouts added here are the exception: they bound the
+    // connection layer, not this store's own business-logic durations, and
+    // do not participate in any of `validate`'s ordering invariants — their
+    // *defaults* are chosen so `response_timeout < write_budget`, but that
+    // is not itself `validate`-enforced (see `RedisStoreConfig::response_timeout`'s
+    // own doc for why: some tests deliberately shrink `write_budget` far
+    // below any sane connection timeout).
     Ok(aenv_api::orchestrator::RedisStoreConfig {
         url: config.redis_url.clone(),
         key_prefix: config.redis_key_prefix.clone(),
         distributed_lock_enabled: config.redis_distributed_lock_enabled,
+        response_timeout: Duration::from_millis(config.redis_response_timeout_ms),
+        connect_timeout: Duration::from_millis(config.redis_connect_timeout_ms),
         ..Default::default()
     })
 }
@@ -1050,6 +1059,8 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
                 url: config.redis_url.clone(),
                 key_prefix: config.redis_key_prefix.clone(),
                 node_index_ttl: Duration::from_secs(config.redis_node_index_ttl_secs),
+                response_timeout: Duration::from_millis(config.redis_response_timeout_ms),
+                connect_timeout: Duration::from_millis(config.redis_connect_timeout_ms),
                 ..Default::default()
             };
             let store = RedisBindingStore::connect(redis_config, settings)
@@ -1103,6 +1114,8 @@ async fn wire_shared_node_observed_store(
             let store = SharedObservedStore::connect(SharedObservedStoreConfig {
                 url: config.redis_url.clone(),
                 key_prefix: config.redis_key_prefix.clone(),
+                response_timeout: Duration::from_millis(config.redis_response_timeout_ms),
+                connect_timeout: Duration::from_millis(config.redis_connect_timeout_ms),
             })
             .await?;
             let rx = registry.enable_shared_observed_publishing();
@@ -1320,7 +1333,7 @@ mod tests {
         // function that refuses every configuration, including the right one.
         //
         // 🔴 Every value set here differs from what `RedisStoreConfig::default()`
-        // would supply, and that is the point rather than arbitrary. Only three
+        // would supply, and that is the point rather than arbitrary. Only five
         // of that struct's ~twenty fields come from configuration; the rest
         // arrive through `..Default::default()`, so a field this function
         // forgot to carry would silently take the default — and if the test
@@ -1329,6 +1342,8 @@ mod tests {
         config.orchestrator.store.redis_url = "redis://cluster-redis:6379".to_string();
         config.orchestrator.store.redis_key_prefix = "agentenv:probe".to_string();
         config.orchestrator.store.redis_distributed_lock_enabled = false;
+        config.orchestrator.store.redis_response_timeout_ms = 1234;
+        config.orchestrator.store.redis_connect_timeout_ms = 2345;
 
         let defaults = aenv_api::orchestrator::RedisStoreConfig::default();
         assert_ne!(defaults.url, config.orchestrator.store.redis_url);
@@ -1337,12 +1352,22 @@ mod tests {
             config.orchestrator.store.redis_key_prefix
         );
         assert!(defaults.distributed_lock_enabled);
+        assert_ne!(
+            defaults.response_timeout.as_millis() as u64,
+            config.orchestrator.store.redis_response_timeout_ms
+        );
+        assert_ne!(
+            defaults.connect_timeout.as_millis() as u64,
+            config.orchestrator.store.redis_connect_timeout_ms
+        );
 
         let store = cluster_store_config(&config.orchestrator.store)
             .expect("the cluster store is what this role is for");
         assert_eq!(store.url, "redis://cluster-redis:6379");
         assert_eq!(store.key_prefix, "agentenv:probe");
         assert!(!store.distributed_lock_enabled);
+        assert_eq!(store.response_timeout, Duration::from_millis(1234));
+        assert_eq!(store.connect_timeout, Duration::from_millis(2345));
         // The settings that are deliberately *not* configurable still arrive,
         // and arrive at the values whose ordering `validate` checks.
         store

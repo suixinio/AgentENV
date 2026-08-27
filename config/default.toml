@@ -209,6 +209,22 @@ api_grpc_addr = "0.0.0.0:8002"
 # given a second endpoint list to keep in step with the first.
 node_service_port = 8001
 
+[cluster.node_registry_store]
+# The shared-roster fix's own Redis tuning (backend/redis_url/redis_key_prefix
+# are set via AENV_CLUSTER_NODE_REGISTRY_STORE_* environment variables in
+# deploy/k8s/base rather than templated here — see that ConfigMap-vs-Secret
+# split's own note under [orchestrator.store] below).
+#
+# How long a single Redis command (HGETALL/HSET/HGET) may run before the
+# client times it out and reconnects. redis-rs's own default is 500ms;
+# raised for the same reason as [orchestrator.store]'s own
+# redis_response_timeout_ms below — a 292ms ZRANGEBYSCORE has been observed
+# against the same production Redis, and this store's own HGETALL/HSET
+# travel the same cross-node RTT on top of that. Milliseconds.
+redis_response_timeout_ms = 2000
+# How long a fresh TCP connection attempt may take. Milliseconds.
+redis_connect_timeout_ms = 3000
+
 [pg]
 # Shared PostgreSQL connection settings for the control plane (`aenv-api`
 # only), consumed by crates/aenv-api/src/pg/mod.rs. `aenv-node` cannot link a
@@ -264,6 +280,14 @@ node_service_port = 8001
 # (GATEWAY_ROUTING_PROJECTION_READ=on) speaks to this exact keyspace. Do not
 # rename it; nothing else knows to follow.
 # redis_key_prefix = "agentenv:scheduler:bindings"
+#
+# How long a single Redis command may run before the client times it out and
+# reconnects (redis-rs's own default is 500ms, measured too tight against
+# this cluster's own Redis — see [orchestrator.store]'s comment below for the
+# 292ms ZRANGEBYSCORE this was measured against). Milliseconds.
+# redis_response_timeout_ms = 2000
+# How long a fresh TCP connection attempt may take. Milliseconds.
+# redis_connect_timeout_ms = 3000
 
 [api]
 # Credentials that prove a control-plane call arrived through the gateway.
@@ -373,11 +397,14 @@ projection_ttl_grace_secs = 60
 # 🔴 Selected through AENV_ORCHESTRATOR_STORE_BACKEND, not by editing the copy
 # of this file that lands in the cluster ConfigMap; see the note below.
 #
-# Only the four settings here are configurable. The Redis store has around
+# Only the six settings here are configurable. The Redis store has around
 # twenty further timing parameters, and they are left at the values
 # `RedisStoreConfig::default()` states a reason for — a knob whose right value
 # is derived from the others is a knob that can be set to an invalid
 # combination, and `RedisStoreConfig::validate` would then refuse to start.
+# The two Redis client timeouts below are the exception: they bound the
+# connection layer, not this store's business-logic durations, and only
+# participate in one such ordering check (`response_timeout < write_budget`).
 [orchestrator.store]
 backend = "in_memory"
 redis_url = "redis://127.0.0.1:6379"
@@ -388,6 +415,18 @@ redis_key_prefix = "agentenv:api"
 # fail fast with a conflict (false). A throughput switch, not a correctness
 # one: nothing is corrupted either way.
 redis_distributed_lock_enabled = true
+# How long a single Redis command may run before the client times it out and
+# reconnects. redis-rs's own default is 500ms; raised because a
+# ZRANGEBYSCORE on this store's own expiry index was observed taking 292ms
+# in production against the pve-sg cluster's Redis, and cross-node RTT
+# stacks on top of that on every command. This default is kept below
+# write_budget's own default (2000ms, not independently configurable) —
+# see `RedisStoreConfig::response_timeout`'s own doc for why that is a
+# default-vs-default choice rather than a validated invariant.
+# Milliseconds.
+redis_response_timeout_ms = 1500
+# How long a fresh TCP connection attempt may take. Milliseconds.
+redis_connect_timeout_ms = 2500
 
 #
 # 🔴 This section must stay in this file even when every value is a default.

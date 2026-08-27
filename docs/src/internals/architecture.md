@@ -188,34 +188,38 @@ See [P2P Artifact Transport](./p2p-design.md) for the detailed design.
 
 ## Distributed Control Plane
 
-The multi-node control plane in `services/` routes client traffic across multiple AgentENV backend nodes.
+The control plane routes client traffic across multiple AgentENV backend nodes over one shared gRPC contract (`services/api/proto/scheduler.proto`): node discovery, heartbeat receipt, sandbox-to-node placement/binding, P2P peer/artifact lookup, and the cluster-wide paused-sandbox registry. Which process answers that contract is a deploy-time choice (`[cluster].node_placement_source`), not something a client branches on.
 
 ```mermaid
 flowchart LR
     client["Client"] -->|HTTP| gateway["Gateway<br/>(:8080)"]
-    gateway -->|gRPC| scheduler["Scheduler<br/>(:9090)"]
+    gateway -->|gRPC<br/>scheduler.proto| api["aenv-api<br/>native registry<br/>(:8002)"]
     gateway -->|proxy HTTP| nodeA["Node A<br/>(:8000)"]
     gateway -->|proxy HTTP| nodeB["Node B<br/>(:8000)"]
-    scheduler -.->|node selection /<br/> lookup result| gateway
+    api -.->|node selection /<br/> lookup result| gateway
 ```
 
-**Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via scheduler before proxying to the resolved node.
+This is `deploy/k8s/base`'s default as of 阶段四 E1-E3: `agentenv-scheduler`'s Deployment/Service/PDB are commented out of `kustomization.yaml`'s `resources:` (not deleted), and node heartbeats plus the gateway's `scheduler_addr` target `agentenv-api:8002` instead of a standalone scheduler. The code-level default is still `node_placement_source = "scheduler"` (`config/default.toml`), which is what `make deploy-up`'s docker-compose stack and local-dev `make -C services run-scheduler` still run: a standalone Go `scheduler` process on `:9090` answering the same contract, the shape this diagram used to show.
 
-**Scheduler** (`services/scheduler/`): gRPC service with pluggable node discovery and in-memory sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.
+**Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via `gateway.scheduler_addr` before proxying to the resolved node — whichever process that address currently names.
 
-Binding lifecycle:
+**aenv-api native registry** (`src/node_registry/`, the Kubernetes default): the same RPC surface answered in-process inside the Rust `aenv-api` binary instead of a separate service. `NodeRegistryGrpcService` (`src/node_registry/grpc_service.rs`) is a port of the Go scheduler's handlers — `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat` (including the cluster-wide CPU-template intersection, `src/node_registry/cpu_template.rs`), `ListObservedNodes`, `ListP2pPeers` plus the P2P artifact record/forget/lookup RPCs, `GetNode`, `UnregisterNode`, and `ListRegistrySandboxes` (against `PausedSandboxRegistry::list_all`, backed on Kubernetes by the Postgres paused-registry under `crates/aenv-api/src/orchestrator/paused_registry/postgres/` — the same `[pg]` pool the snapshot catalog uses). Node discovery (static or Kubernetes EndpointSlice, `src/node_registry/kubernetes_discovery.rs`) and sandbox-to-node bindings (`src/binding_store/`, in-memory or Redis) are its own Rust implementations of the same contract, switched on via `[cluster].node_placement_source = "native"`.
+
+**Scheduler** (`services/scheduler/`, the non-Kubernetes default and the Kubernetes rollback target): gRPC service with pluggable node discovery and sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node. This Go source stays on tree and is still exercised by `make -C services test` / `test-with-postgres`; see `services/README.md` for how a Kubernetes deployment rolls back onto it.
+
+Binding lifecycle (the same on both implementations — `NodeRegistryGrpcService` is a port of the Go handlers, not a reinterpretation of them):
 
 - `RecordAssignment` creates the initial binding immediately after sandbox creation succeeds.
-- Runtime heartbeats include the node's full sandbox ID roster. Scheduler treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.
-- `binding_ttl` is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, scheduler drops it on the next lookup or roster reconcile.
+- Runtime heartbeats include the node's full sandbox ID roster. The binding store treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.
+- `binding_ttl` is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, the next lookup or roster reconcile drops it.
 - `UnregisterNode` removes the observed node record and proactively clears bindings owned by that node.
 
-Discovery modes:
+Discovery modes (both implementations):
 
 - `static`: explicit `scheduler.nodes` list from config
 - `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
 
-**Limitations**: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.
+**Limitations**: bindings default to in-memory on both implementations and are lost when the process holding them restarts; either can be backed by Redis instead (`scheduler.redis_addr` for the standalone scheduler, `[binding_store].backend = "redis"` for the native registry). The standalone scheduler additionally supports read-only `--query-only` replicas that serve data-plane `LookupNode` off that Redis during a primary restart (`gateway.query_only_scheduler_addr` — see `services/README.md`), but that HA path is data-plane only: scheduling, sandbox creation, assignment writes, node APIs, and P2P scheduler APIs still need the primary. Kubernetes discovery updates the schedulable node set dynamically, but the P2P key-to-node artifact index stays in-memory-only on both implementations regardless of binding persistence.
 
 **Deployment**:
 
@@ -223,11 +227,14 @@ Discovery modes:
 # local dev (single node)
 make start-server && make -C services run-scheduler && make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node) -- standalone scheduler, unchanged by 阶段四
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 
-# kubernetes (gateway + scheduler + daemonset runtime nodes)
+# kubernetes (gateway + daemonset runtime nodes; aenv-api's native registry
+# answers placement/heartbeat/registry by default -- see above, and
+# services/README.md's "Deploy on Kubernetes" section to bring the
+# standalone scheduler back)
 make k8s-render
 make k8s-apply
 ```

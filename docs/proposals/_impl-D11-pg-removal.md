@@ -4,8 +4,7 @@
 > [`2026-08-19-agentenv-control-plane-refactor.md`](2026-08-19-agentenv-control-plane-refactor.md)
 > · 收口记录：[`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md)
 >
-> **裁决依据**：本轮所有取舍一律对照 e2b（`/home/debian/e2b-infra`）与
-> CubeSandbox（`/home/debian/CubeSandbox-latest`）的实际实现，不凭直觉。
+> **裁决依据**：本轮取舍对照 e2b（`/home/debian/e2b-infra`）的实际实现，不凭直觉。
 
 ---
 
@@ -20,14 +19,14 @@
 
 ---
 
-## 1. 终局形状：两家参考都指向同一处
+## 1. 终局形状：参考实现指向同一处
 
-| | e2b | CubeSandbox | AgentENV（本轮之后）|
-|---|---|---|---|
-| 节点侧进程 | `orchestrator` | `Cubelet` | `agentenv` (node) |
-| 节点连 DB？ | **否**（`packages/orchestrator/` 全仓 grep `sql.Open`/`pgx`/`database/sql` **零命中**）| **否**（`Cubelet/` 同样零命中）| **否**（本轮达成）|
-| 控制面 | `api` + `edge`，状态在 Redis `sandbox-catalog` | `CubeMaster` + `CubeDB` | `scheduler` (controller) + PG |
-| 破坏性写怎么防串扰 | `DeleteSandbox(ctx, sandboxID, executionID)`：**executionID 不匹配就不删**，且**静默成功不报错**（`catalog_redis.go:78-105`）| `CubeMaster` 独占 DB，Cubelet 只上报 | 本轮给 `REMOVE` 加 `expect_generation`（见 D11-2）|
+| | e2b | AgentENV（本轮之后）|
+|---|---|---|
+| 节点侧进程 | `orchestrator` | `agentenv` (node) |
+| 节点连 DB？ | **否**（`packages/orchestrator/` 全仓 grep `sql.Open`/`pgx`/`database/sql` **零命中**）| **否**（本轮达成）|
+| 控制面 | `api` + `edge`，状态在 Redis `sandbox-catalog` | `scheduler` (controller) + PG |
+| 破坏性写怎么防串扰 | `DeleteSandbox(ctx, sandboxID, executionID)`：**executionID 不匹配就不删**，且**静默成功不报错**（`catalog_redis.go:78-105`）| 本轮给 `REMOVE` 加 `expect_generation`（见 D11-2）|
 
 > e2b 的 node 侧 RPC（`SandboxDeleteRequest`）**本身不带 execution 身份** ——
 > 身份校验发生在**控制面持有的那份状态**上。方向与我们一致：
@@ -48,10 +47,10 @@
 | **J5** | `ReleaseClaim` 0 行静默成功不可观测（S2）| 响应加 `bool matched`；服务端对 `matched=false` 计数 `..._release_claim_unmatched_total` | 中央化之后这是"节点报的 generation 已过期"的唯一信号 |
 | **J6** | `conflict` 一个变体两种事实、`origin_node_id` 一个字段三种含义（S8）| `AcquireOriginRef` 加 `ConflictReason reason`（`LIVE_ELSEWHERE` / `CLAIM_LOST`），并把字段语义在注释里按 reason 分列 | 阶段 3 的中央决策要做同样判断，压平的字段传不过去 |
 | **J7** | 租约下限校验归属丢失（S3）| `RenewNodeLeaseRequest` 加 `int64 reconcile_interval_millis`，controller 校验 `ttl ≥ 3×interval`，不满足只**告警不拒绝** | 拒绝会让一次配置漂移变成集群停摆；告警足以让它可见。e2b 的 lease 也只在 api 侧校验不阻断 |
-| **J8** | scheduler 单点（A4）| `replicas: 2` + PDB `minAvailable: 1` + `maxSurge: 1 / maxUnavailable: 0`。**registry 写面本身已是单写者安全的**（全部单条条件写），多副本不需要选主 | e2b 的 api 层就是多副本无选主，靠 Redis 的条件写做互斥。CubeMaster 同样多副本 |
+| **J8** | scheduler 单点（A4）| `replicas: 2` + PDB `minAvailable: 1` + `maxSurge: 1 / maxUnavailable: 0`。**registry 写面本身已是单写者安全的**（全部单条条件写），多副本不需要选主 | e2b 的 api 层就是多副本无选主，靠 Redis 的条件写做互斥 |
 | **J9** | 熔断阈值对小表不合理（A6）| 改成"**绝对下限 + 比例**"：`candidates > max(min_floor, ratio × total)`，`min_floor` 默认 8。小表（total ≤ 8）永不因比例跳闸 | dev 上 2/8 就跳闸会把任何一次正常回收拦掉；e2b 的孤儿清理没有比例闸，只有并发闸 |
 | **J10** | `sandbox_expires_at` NULL ⇒ 永久孤儿行（F6）| `begin_pause` / `mark_running` / `claim_for_resume` **都写** `sandbox_expires_at`，与 `renew_lease` 一致 | e2b 的 catalog 每次 `StoreSandbox` 都带 `expiration`，没有"先建行后补过期"的窗口 |
-| **J11** | 鉴权只查 header 存在不查值（A2/A3）| `auth.rs` 改成常量时间比对配置值；未配置凭据时**拒绝启动**而不是放行 | 两家都不存在"有 header 就放行"的形态。这是既有缺陷，但摘除后 registry 面是唯一路径，暴露面变大 |
+| **J11** | 鉴权只查 header 存在不查值（A2/A3）| `auth.rs` 改成常量时间比对配置值；未配置凭据时**拒绝启动**而不是放行 | e2b 不存在"有 header 就放行"的形态。这是既有缺陷，但摘除后 registry 面是唯一路径，暴露面变大 |
 | **J12** | 删 `postgres` 后端后 `local` 怎么办 | **保留**。单机 / 开发形态需要它，且它是 `DisabledPausedSandboxRegistry`（不连任何东西），不构成"node 连 DB" | e2b 有 `catalog_memory` 对应形态 |
 
 ---
@@ -64,7 +63,7 @@
 |---|---|---|---|
 | **J3** | `GetSandboxesResponse` **与** `AcquireSandboxResponse` 都带 `now_unix_micros` | **只做前者** | Acquire 的租约判断整个发生在服务端，node 拿到的是「我已经拿到了 claim」这一结论，没有任何地方对它做租约算术。给它加一个永不被读的字段比不加更糟——一个字段的存在本身就是一句「这里需要它」的断言。 |
 | **J8** | scheduler `replicas: 2` + PDB，registry 写面单写者安全 | **保持 1 副本**，改为 `maxSurge: 1 / maxUnavailable: 0` + PDB | 「registry 写面安全」是对的，**但 scheduler 不只有这个写面**：bindings、observed-node 状态、P2P 索引全在进程内存里，第二个副本会用空副本服务半个集群（`CLAUDE.md` 明确 HA 模式是 data-plane only，且需要 `redis_addr` + `--query-only`）。真正要修的不是副本数是**窗口**——阶段 2 之后它是每个节点续租/暂停/恢复的硬依赖，而滚动升级默认先停唯一那个 Pod。 |
-| **J11** | 鉴权改成常量时间比对配置值；未配置则拒绝启动 | **不改代码**，改为把边界模型写进代码注释与部署文档 | 三条：① 超出「PG 摘除」的范围，且 A2/A3 都不是本轮引入的暴露面；② 爆炸半径是跨仓的——所有调用方（含 agent-platform）都要带上正确凭据，是一次凭据签发/分发/轮换工程；③ **两家参考都不在端点上做这件事**：e2b 的 orchestrator gRPC 服务端没有任何鉴权拦截器（`packages/shared/pkg/grpc/server.go` 只链了 recovery 和 logging），保护来自「只有控制面够得到它」。所以真正要收口的是 NetworkPolicy / NodePort，不是字符串比较。**遗留登记见 §5。** |
+| **J11** | 鉴权改成常量时间比对配置值；未配置则拒绝启动 | **不改代码**，改为把边界模型写进代码注释与部署文档 | 三条：① 超出「PG 摘除」的范围，且 A2/A3 都不是本轮引入的暴露面；② 爆炸半径是跨仓的——所有调用方（含 agent-platform）都要带上正确凭据，是一次凭据签发/分发/轮换工程；③ **e2b 参考实现不在端点上做这件事**：orchestrator gRPC 服务端没有任何鉴权拦截器（`packages/shared/pkg/grpc/server.go` 只链 recovery 与 logging），保护来自「只有控制面够得到它」。所以真正要收口的是 NetworkPolicy / NodePort，不是字符串比较。**遗留登记见 §5。** |
 | **J10** | `begin_pause` / `mark_running` / `claim_for_resume` **都**写 `sandbox_expires_at` | **只有 `mark_running`** | reclaim 的谓词是 `state IN ('running','resuming')`。`begin_pause` 产生的是 `publishing`，之后转 `paused`——两个状态 reclaim 都不碰，给它们写 deadline 不解决任何问题。`claim_for_resume` 产生的 `resuming` 确实在谓词里，但它是个极短的中间态，且 `begin_pause` 时行上已有的值会留着，后继进程的 `release_node_holdings` 也覆盖这条路。F6 描述的窗口——「首个续租 tick 之前失联」——精确落在 `mark_running` 之后。 |
 
 **另外一条自己消失了**：A7（D10 §5.1，共享测试库残留导致

@@ -1,26 +1,26 @@
-# AgentENV 中央控制面改造：与 e2b / CubeSandbox 的架构对照分析
+# AgentENV 中央控制面改造：与 e2b 的架构对照分析
 
 > 2026-08-19 · 分析文档（非实施方案）
 > 结论先行：**AgentENV 让 node 直连 PG 不是取舍，是"系统里没有第二个能持有状态的进程"的必然结果。**
 > 根因比"PG 放哪"更深一层 —— AgentENV 的用户级 API 是 **per-node** 的，
-> 而 e2b / CubeSandbox 的用户级 API 只有中央一份，node 永远只暴露内部 gRPC。
+> 而 e2b 的用户级 API 只有中央一份，node 永远只暴露内部 gRPC。
 
 ---
 
-## 1. 三家服务映射矩阵
+## 1. 两家服务映射矩阵
 
 ### 1.1 服务对照
 
-| AgentENV | e2b | CubeSandbox | 职责本质 |
-|---|---|---|---|
-| **gateway**（Go，:8080）| `client-proxy` **+ `api` 的 HTTP 入口** | `CubeProxy` **+ `CubeAPI`** | AgentENV 把"数据面路由"和"控制面入口"合成了一个纯转发器 |
-| **scheduler**（Go gRPC，:9090）| `api/internal/orchestrator/placement` + `nodemanager`（**api 内部包，不是服务**）| `CubeMaster` 的调度部分 | 只有"选节点"这一半；缺"持有状态 + 状态机 + 裁决"那一半 |
-| **node**（Rust，:8000）| `orchestrator` **+ `api` 的全部状态职责** | `Cubelet` + `CubeShim` + `CubeHypervisor` **+ `CubeMaster` 的部分职责** | 一台机器 = 一个完整的 AgentENV |
-| — | **`api`（中央，PG+Redis+ClickHouse）** | **`CubeAPI` + `CubeMaster`** | 🔴 **AgentENV 没有这一层** |
-| —（node 内 `/proxy` + sandbox_proxy_domains）| `client-proxy` | `CubeProxy` + `cube-lifecycle-manager` | 数据面路由，e2b/Cube 独立部署可扩，AgentENV 混在 gateway + node 里 |
-| —（node 内 `image/` + template 构建）| `orchestrator` 里的 `template-manager` | `CubeMaster/templatecenter` + Cubelet | |
-| `envd`（thirdparty，VM 内）| `envd` | `agent`（VM 内）| 一致 |
-| — | `dashboard-api` | `CubeOps` + `WebUI` | 我们用 Agent-Console 顶了 |
+| AgentENV | e2b | 职责本质 |
+|---|---|---|
+| **gateway**（Go，:8080）| `client-proxy` **+ `api` 的 HTTP 入口** | AgentENV 把"数据面路由"和"控制面入口"合成了一个纯转发器 |
+| **scheduler**（Go gRPC，:9090）| `api/internal/orchestrator/placement` + `nodemanager`（**api 内部包，不是服务**）| 只有"选节点"这一半；缺"持有状态 + 状态机 + 裁决"那一半 |
+| **node**（Rust，:8000）| `orchestrator` **+ `api` 的全部状态职责** | 一台机器 = 一个完整的 AgentENV |
+| — | **`api`（中央，PG+Redis+ClickHouse）** | 🔴 **AgentENV 没有这一层** |
+| —（node 内 `/proxy` + sandbox_proxy_domains）| `client-proxy` | 数据面路由在 AgentENV 混进 gateway + node |
+| —（node 内 `image/` + template 构建）| `orchestrator` 里的 `template-manager` | |
+| `envd`（thirdparty，VM 内）| `envd` | 一致 |
+| — | `dashboard-api` | 我们用 Agent-Console 顶了 |
 
 ### 1.2 最本质的差异：API 在哪一层
 
@@ -47,7 +47,6 @@ service SandboxService {
 
 **没有 Resume。** 因为在 e2b 里 resume 根本不是节点操作，而是"中央拿着快照重新走一遍 Create，顺便决定放在哪台机器"。用户永远碰不到 orchestrator，它只有一个客户端：中央 api。
 
-CubeSandbox 同理：Cubelet 只有 gRPC，用户走 CubeAPI（Rust/Axum，E2B 兼容 REST）→ CubeMaster（Go，调度）→ Cubelet。
 
 🔴 **这才是 PG 下沉到 node 的真正原因**：当"谁能决定一个沙箱的命运"这件事分散在 N 台机器上时，它们只能找一个共享的地方打架 —— 那个地方就是 PG。
 
@@ -187,70 +186,11 @@ var AllowedTransitions = map[State]map[State]bool{
 
 ---
 
-## 3. CubeSandbox 的设计理念
+## 3. 对照结论
 
-架构文档的设计原则表里直接写死了：
-
-> **无状态控制面** | CubeAPI 与 CubeMaster 不保存本地状态，所有协调通过 Redis 完成，可轻松横向扩容。
->
-> 控制面是**无状态**的 —— **Redis 是沙箱元数据与生命周期事件的唯一可信源**，任意 CubeAPI 或 CubeMaster 实例都可处理任意请求。
-> 数据面是**节点本地**的。
-
-两家独立设计，收敛到同一个结论。分层：
-
-| 层 | Cube 的实现 |
-|---|---|
-| 关系库（MySQL/PG，`CubeDB` GORM）| 只被 **CubeMaster** 和 **CubeOps** require。表：`sandbox_spec` / `snapshot_runtime_ref` / `snapshot_runtime_active` / `node_registration` / `node_status` / `template_definition` / `template_replica` / `volume_record` / `rootfs_artifact` / `artifact_node_placement` |
-| Redis | 沙箱元数据 + 生命周期事件流；CubeProxy 读它路由；cube-lifecycle-manager 靠它发现所有 CubeProxy 副本 |
-| Cubelet（node）| **go.mod 里连 CubeDB 都没有**。本地状态在 **bbolt**（卷/挂载/引用计数/元数据）；Redis 只**订阅** cubevs 事件流更新本地网关配置 |
-
-### 3.1 一个刺眼的对照
-
-Cube 的 `snapshot_runtime_ref` 表：
-
-```go
-SnapshotID / SandboxID / NodeID / NodeIP / BindingType
-MemoryVol / RootfsVol / SandboxGen / Status
-AttachedAt / ReleasedAt / LastSeenAt / LastError
-```
-
-和 AgentENV 的 `paused_sandboxes`：
-
-```sql
-sandbox_id / cluster_id / state / generation / origin_node_id
-snapshot_id / metadata / paused_at / updated_at
-claimed_by_node_id / lease_expires_at / sandbox_expires_at
-```
-
-**字段几乎一一对应**（`generation` ↔ `SandboxGen`，`lease_expires_at` ↔ `LastSeenAt`）。同样的状态模型，**唯一的差别是谁写**：Cube 是 CubeMaster 一个进程写，AgentENV 是 N 台 KVM 节点抢着写。
-
-> 🔧 **深挖订正（2026-08-19 考古 @ `CubeSandbox-latest` `50d9a3e7`）：上面这个类比形似而神不似，要打折。**
->
-> **最重要的一条：Cube 根本没有跨节点 resume。** pause/resume 严格同节点（VM 快照落**本地**
-> cubecow reflink 卷），沙箱一生 HostIP 不变。跨机暂停恢复在 roadmap「即将上线」里
-> （`docs/zh/guide/lifecycle.md:259` 逐字：「后续版本将支持跨节点恢复」）。
-> 全仓 grep `fencing|fence|epoch` **零命中** —— 不是没找到，是真的没有。
->
-> 由此，上面几处对应关系全部要重新理解：
->
-> | 原表述 | 考古事实 |
-> |---|---|
-> | `generation` ↔ `SandboxGen` | **不对等**。`SandboxGen` 只在 **rollback** 时递增（`snapshot_ops.go:469`），编进卷名 `sb-{id}-rootfs-gen{N}`，cubelet 拒 `new_gen <= current`（`rollback.go:104-107`）。它防的是**同节点内迟到的 rollback 重放**，不是跨节点化身 fencing。create 时固定 gen=0，pause / resume **根本不碰它** |
-> | `lease_expires_at` ↔ `LastSeenAt` | **不对等**。`LastSeenAt` **只被写、从没有任何代码读它做过期判定**（全部读取点只是 DTO 透传到视图）。Cube 没有租约判死这回事 |
-> | `snapshot_runtime_ref` ≈ 我们的登记表 | 它其实是**快照删除保护的引用计数账本**（谁的内存卷还被哪个运行中沙箱当 backing），不是化身注册表。`BindingType` 全仓只有一个取值 `memory_backing` |
->
-> **Cube 真正的互斥在哪**：cubelet **进程内** per-sandbox 锁（`services/cubebox/update.go:77`）——
-> 因为一个沙箱的全部生命周期操作都汇聚到唯一节点，**这把进程锁就是全局锁**。
-> 控制侧的 Redis SETNX 只是防重复 RPC 的礼貌锁，注释自认
-> `This is intentionally racy... CubeMaster handles idempotently`（`resumer.go:266-271`）。
->
-> **节点失联后 Cube 什么都不做**：判死只影响调度准入与快照操作，其上运行中 / paused 沙箱 =
-> **等节点回来**，无接管、无 orphan kill、无回归对账。代价写在文档里：节点死 ⇒ 其上 paused 沙箱不可恢复。
->
-> 🔴 **一条要抄进我们任务书的反面教材**：`sandbox_remove.go:180-204` —— 删除沙箱时若节点不在内存缓存里，
-> **直接跳过 Destroy RPC、抹掉 Redis 元数据**。结果是"中央认为已删、分区节点上 VM 还在跑还在写盘"，
-> 且 cubelet 无本地 TTL 自杀逻辑，孤儿会一直跑到人工干预。
-> **这正是我们护栏哲学（"我不知道"≠"不存在"）要防的那类事。**
+e2b 证明了中央控制面持有状态、节点只暴露内部执行接口的形状能够横向扩展。
+AgentENV 当前把用户级 API 与状态职责下沉到每个节点，才需要所有节点通过共享 PG
+竞争同一份生命周期状态。重构目标不是照抄组件，而是把发布权与仲裁权收回中央。
 
 ---
 
@@ -264,12 +204,12 @@ claimed_by_node_id / lease_expires_at / sandbox_expires_at
 | **G2** | **孤儿沙箱无人回收**：节点上跑着、登记表里没有的沙箱会一直占内存和盘 | `Reconcile` → `KillOrphanSandbox`，中央每 20s 对账一次 | e2b `store.go:140` |
 | **G3** | **404 有三来源且不可区分**，平台侧只能靠状态码猜，猜错就重建工作区（我们真出过事故）| 中央持有 catalog + ExecutionID，"这个沙箱存不存在/是不是同一次化身"是**查询**不是猜 | e2b `sandbox-catalog` |
 | **G4** | **并发 resume 互相不知情**（节点各自 claim，靠 DB CAS 兜底，失败方拿到含义模糊的错误）| resume 变成"中央选节点 + Create with snapshot"，天然串行化 | e2b 的 orchestrator **根本没有 Resume RPC** |
-| **G5** | **scheduler 单副本 + 绑定在内存，重启丢绑定**（EKS 方案 §5.3 明写"变更窗口要避开有活沙箱的时候"）| catalog 进 Redis，控制面变无状态多副本，随便重启 | e2b + Cube 都是这么做的 |
-| **G6** | **schema 由节点自建**（`ensure_schema` + advisory lock，注释记着首次两节点滚动就撞 `pg_type` 唯一索引挂了一台）| schema 有 owner，走正常 migration | e2b `packages/db/migrations`，Cube `CubeDB/migrate` |
-| **G7** | **PG DSN 下发到每台跑用户代码的 KVM 机器** | node 只拿 Redis 凭据；PG 凭据只在控制面 Deployment。爆炸半径 N 台 → 1 处 | 你提的约束，与两家实践一致 |
+| **G5** | **scheduler 单副本 + 绑定在内存，重启丢绑定**（EKS 方案 §5.3 明写"变更窗口要避开有活沙箱的时候"）| catalog 进 Redis，控制面变无状态多副本，随便重启 | e2b |
+| **G6** | **schema 由节点自建**（`ensure_schema` + advisory lock，注释记着首次两节点滚动就撞 `pg_type` 唯一索引挂了一台）| schema 有 owner，走正常 migration | e2b `packages/db/migrations` |
+| **G7** | **PG DSN 下发到每台跑用户代码的 KVM 机器** | node 只拿 Redis 凭据；PG 凭据只在控制面 Deployment。爆炸半径 N 台 → 1 处 | 你提的约束，与 e2b 实践一致 |
 | **G8** | **PG 连接数随节点数线性增长**（每 node 默认 8 条，20 台 = 160 条常驻）| 恒定（控制面副本数 × pool） | — |
 | **G9** | **平台 PG 与 aenv PG 两套真相，无人对账**：`sessions.sandbox_id/sandbox_engine` 在我们库，`sandbox → node + state + lease` 在 aenv 库，中间只有 HTTP 状态码 | 中央控制面可以对账，也可以直接被 agent-platform 查询 | 见 §5 选项 |
-| **G10** | **登记表只能直连 PG 看**（Agent-Console 只能开 PG 直连）| 控制面有 API，运维面走 API | Cube 的 CubeOps / e2b 的 dashboard-api |
+| **G10** | **登记表只能直连 PG 看**（Agent-Console 只能开 PG 直连）| 控制面有 API，运维面走 API | e2b 的 dashboard-api |
 
 ### 4.2 改造**不能**解决的（别抱幻想）
 
@@ -310,15 +250,6 @@ e2b 把 `indexHealed` 这类指标当**首要告警信号**（"healthy steady st
 ## 附：本文结论的源码依据
 
 - e2b：`packages/api/internal/sandbox/{store.go,sandboxtypes/states.go,storage/redis/,reservations/redis/}`、`packages/api/internal/orchestrator/{cache.go,pause_instance.go,create_instance.go,placement/,nodemanager/sync.go}`、`packages/shared/pkg/sandbox-catalog/`、`packages/orchestrator/{orchestrator.proto,go.mod,pkg/factories/run.go}`、`packages/client-proxy/internal/proxy/proxy.go`
-- CubeSandbox：`docs/zh/architecture/overview.md`、`CubeDB/go.mod`、`CubeMaster/pkg/base/db/models/{snapshot_runtime_ref.go,nodemeta.go}`、`Cubelet/{go.mod,pkg/utils/localstorage.go,network/event/doc.go}`
 - AgentENV：`src/orchestrator/paused_registry/postgres.rs`、`src/cfg.rs`、`src/api/generated/src/server/mod.rs`、`services/{go.mod,shared/config/config.go,api/proto/scheduler.proto}`、`docs/src/internals/architecture.md`
 
-> 🔧 **2026-08-19 补充**：本文 §2 / §3 的两处深挖订正来自一次**专门针对闸门 B**（分区双活 fencing）
-> 的逐调用点考古，检出版本：e2b `/home/debian/e2b-infra` @ `6938cbb`、
-> CubeSandbox `/home/debian/CubeSandbox-latest` @ `50d9a3e7`（比 `/home/debian/CubeSandbox` 新 660 commits，
-> **以 latest 为准**）。
-> **考古的总结论**：两家都没有"解决"闸门 B，而是各自靠一条我们不具备的业务前提把它**消解**掉了 ——
-> e2b 靠「沙箱可弃 + 运行态在节点本地盘 + 节点无自主快照权」，Cube 靠「没有跨节点 resume」。
-> 三家里**只有我们同时具备"持久用户工作区 + 快照在共享存储 + 跨节点 resume 既有能力"**，
-> ⇒ **闸门 B 对我们是真问题，没有作业可抄；最硬的可抄项是 e2b 的「发布权集中」写路径 fencing。**
 > 决策落点见 [`2026-08-19-control-plane-refactor-outcome.md`](2026-08-19-control-plane-refactor-outcome.md) §3。

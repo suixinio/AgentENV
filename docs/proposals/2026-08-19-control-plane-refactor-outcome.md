@@ -2,7 +2,7 @@
 
 > 2026-08-19 · **写给三个月后回来接着做的人**。
 > 权威方案（含实施订正）：[`2026-08-19-agentenv-control-plane-refactor.md`](2026-08-19-agentenv-control-plane-refactor.md)
-> 背景与三家架构对照：[`2026-08-19-aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
+> 背景与架构对照：[`2026-08-19-aenv-central-control-plane.md`](2026-08-19-aenv-central-control-plane.md)
 >
 > 本文能独立读懂：需要细节时再按文末索引去翻过程文档，不必先读它们。
 
@@ -197,15 +197,14 @@ T3 交付时那 4 项"未复原的未合并代码"随合并一起消失了——
 
 ## 3. 🚦 闸门 B 的决策材料
 
-> 🔧 **2026-08-19 更新**：本节原文写于源码考古之前。考古（e2b `/home/debian/e2b-infra` @ `6938cbb`；
-> CubeSandbox `/home/debian/CubeSandbox-latest` @ `50d9a3e7`）**改写了三处**：
+> 🔧 **2026-08-19 更新**：本节原文写于源码考古之前。对 e2b
+>（`/home/debian/e2b-infra` @ `6938cbb`）的考古改写了三处：
 > ① 三个候选的判断（§3.1 订正）；② 前置二不再是阻塞项（§3.2 订正）；
 > ③ 多出一件必须同批做的事（§3.3）。**推荐答案见 §3.4。**
 >
-> **一句话总结考古**：两家都没有"解决"闸门 B —— 各自靠一条我们不具备的业务前提把问题**消解**掉了。
-> e2b 靠「沙箱可弃 + 运行态在节点本地盘 + 节点无自主快照权」，Cube 靠「**根本没有跨节点 resume**」。
-> 三家里**只有我们同时具备"持久用户工作区 + 快照在共享存储 + 跨节点 resume 既有能力"** ——
-> 闸门 B 对我们是真问题，**没有作业可抄**。
+> e2b 靠「沙箱可弃 + 运行态在节点本地盘 + 节点无自主快照权」消解了闸门 B；
+> 我们同时具备持久用户工作区、共享快照与跨节点 resume，不能照抄该前提，
+> 因此仍需独立的写路径 fencing。
 
 ~~阶段 3 有两件前置，缺一件都不能开工。~~ 🔧 **现在只剩一件（§3.1）。**
 
@@ -281,7 +280,7 @@ seed 来自 `[sandbox].access_token_hash_seed`，没配就用节点本地
 >
 > | 候选 | 考古发现 | 修订判断 |
 > |---|---|---|
-> | 1 存储层写锁 | e2b 的 GCS / S3 / Azure 后端 grep `IfGenerationMatch` / `precondition` / `IfNoneMatch` **零命中**，全是无条件 Put；唯一的"锁"是**节点本地** `O_EXCL` + 10s TTL 的 NFS 读缓存去重锁，注释自认 `The worst that can happen is more than one node will acquire the lock`（`shared/pkg/storage/lock/file_lock.go:47-49`）—— 它保护的是**不可变、内容逐字相同**的缓存 chunk，坏了只是重复下载 | **两家零先例**。维持长期项 |
+> | 1 存储层写锁 | e2b 的 GCS / S3 / Azure 后端 grep `IfGenerationMatch` / `precondition` / `IfNoneMatch` **零命中**，全是无条件 Put；唯一的"锁"是**节点本地** `O_EXCL` + 10s TTL 的 NFS 读缓存去重锁，注释自认 `The worst that can happen is more than one node will acquire the lock`（`shared/pkg/storage/lock/file_lock.go:47-49`）—— 它保护的是**不可变、内容逐字相同**的缓存 chunk，坏了只是重复下载 | **e2b 零先例**。维持长期项 |
 > | 2 envd token 绑 execution | e2b 的 token = `HMAC(sandboxID)`（`sandbox_envd_secret.go:27-35`），新旧化身**完全相同** | **e2b 也没做**。维持加强项 |
 > | 3 路由层拒旧 execution | e2b 把路由缓存**刻意删成**每请求实时查 catalog（PR #2636 / #2315），买的就是收敛速度 | 方向被**半**验证：它只做**收敛**，不做**拒绝** |
 >
@@ -383,7 +382,7 @@ fencing 从"检查"降级成"拓扑"，是同一件事的更强形态。
 
 **写路径 fencing 为主 + node API 收窄同批 + 路由层拒旧 execution 为辅。**
 
-> **裁决依据（三家对照后的取舍）**：候选 1（存储层写锁）两家零先例、且踩在已知最不稳的 rustfs 上；
+> **裁决依据（对照 e2b 后的取舍）**：候选 1（存储层写锁）在 e2b 中零先例、且踩在已知最不稳的 rustfs 上；
 > 候选 2（envd token 绑 execution）e2b 同样没做、且只覆盖 `secure` 沙箱是"有一半没锁"；
 > 候选 3 方向被 e2b 半验证但它只做收敛不做拒绝。**真正被实证有效的是 e2b 的「发布权集中」**——
 > 它保护的恰是我们唯一不可逆的东西：用户工作区的快照链。
@@ -414,7 +413,7 @@ sandboxID 存在性判** —— e2b 的现成缺口（`storage/redis/main.go:205
 |---|---|
 | **A0** dev 集群上未合并代码持有 DELETE 权 | **消失**：分支已合并进 `origin/dev`，集群跑的就是它 |
 | **A1** `224b70d` 从未在集群上跑过 | **已跑**：D11 的集群验证用的是含它的完整分支 |
-| **A2/A3** 鉴权只查 header 存在不查值 | **不改代码**，改为写清边界模型 + 给出该查的部署项。理由：两家参考都把节点面的保护放在网络边界（e2b 的 orchestrator gRPC 服务端零鉴权拦截器），改成真凭据是一次跨仓的签发/分发/轮换工程。**遗留登记见 D11 §5 的 L1** |
+| **A2/A3** 鉴权只查 header 存在不查值 | **不改代码**，改为写清边界模型 + 给出该查的部署项。理由：e2b 把节点面的保护放在网络边界（orchestrator gRPC 服务端零鉴权拦截器），改成真凭据是一次跨仓的签发/分发/轮换工程。**遗留登记见 D11 §5 的 L1** |
 | **A4** scheduler 单点 | **更正后处置**：不加副本（bindings / observed-node / P2P 索引都在进程内存里），改为 `maxSurge:1 / maxUnavailable:0` + PDB，把"缺席窗口"从滚动升级的默认行为里拿掉 |
 | **A5** 生产 Secret 有没有 `cluster_id` | `224b70d` 已把值搬进 base 层 `configMapGenerator`；**生产集群的实际状态仍需单独确认** |
 | **A6** 熔断阈值对小表不合理 | **已修**：比例臂加了绝对下限，小表不再因百分比跳闸 |

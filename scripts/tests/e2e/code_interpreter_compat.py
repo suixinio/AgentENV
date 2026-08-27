@@ -23,7 +23,9 @@ from e2b_code_interpreter.models import OutputMessage
 
 T = TypeVar("T")
 
-CI_IMAGE = "cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest"
+CI_IMAGE = os.environ.get(
+    "CODE_INTERPRETER_IMAGE", "docker.io/e2bdev/code-interpreter:latest"
+)
 TEMPLATE_NAME_PREFIX = "e2b-code-interpreter-compat"
 
 def _percentile(data: list[float], p: float) -> float:

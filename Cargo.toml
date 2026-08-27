@@ -52,6 +52,13 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 test-support = []
 
 [dev-dependencies]
+# 🔴 A dev-dependency on this crate itself, and the only way to say "turn
+# `test-support` on when *this* crate is the one under test". Without it,
+# `cargo test -p aenv-core` resolves a different feature set than
+# `cargo test -p aenv-core -p aenv-node` does (the siblings' dev-dependencies
+# ask for the feature), and cargo rebuilds the entire dependency graph a
+# second time whenever a developer alternates between the two.
+aenv-core = { path = ".", features = ["test-support"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

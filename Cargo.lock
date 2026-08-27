@@ -100,6 +100,7 @@ dependencies = [
 name = "aenv-core"
 version = "0.1.2"
 dependencies = [
+ "aenv-core",
  "agentenv-observability",
  "agentenv_http_server",
  "anyhow",

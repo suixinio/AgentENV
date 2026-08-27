@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# Install AgentENV: the aenv CLI and the server binaries.
-# The server is configured as a systemd service (or prints a manual start
+# Install AgentENV: the aenv CLI and the node server binary.
+# The node server is configured as a systemd service (or prints a manual start
 # command if systemd is unavailable).
+#
+# 🔴 The node half only. The split has two binaries; `aenv-api` is the cluster
+# control plane and belongs on an ordinary Deployment with no /dev/kvm, not on
+# a machine being provisioned to boot microVMs. Deploy it from
+# deploy/k8s/base/agentenv-api-deployment.yaml.
 # Downloads: aenv (cli)   -> /usr/local/bin/aenv
-#            server -> /usr/local/bin/server
+#            aenv-node -> /usr/local/bin/aenv-node
 #            dependencies -> /var/lib/aenv/deps
 #            ublk daemon -> /var/lib/aenv/ublk/uvm-ublk-daemon
 #            config  -> /var/lib/aenv/config/config.toml
 #            overlaybd default config -> /etc/overlaybd/overlaybd.json
 #            service -> /etc/systemd/system/aenv.service
 #            env     -> /etc/default/aenv
-# Runs:      sudo server --setup-only  (provisions runtime dependencies)
-#            sudo server --setup-host  (provisions virtualization access, ublk, and networking)
+# Runs:      sudo aenv-node --setup-only  (provisions runtime dependencies)
+#            sudo aenv-node --setup-host  (provisions virtualization access, ublk, and networking)
 #
 # Usage:
 #   curl -fsSL https://github.com/kvcache-ai/AgentENV/releases/latest/download/install.sh | sudo bash
@@ -67,7 +72,7 @@ fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 if [[ "$OS" != "linux" ]]; then
-    echo "error: AgentENV server only supports Linux" >&2
+    echo "error: the AgentENV node server only supports Linux" >&2
     exit 1
 fi
 
@@ -190,7 +195,7 @@ download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
 sudo install -m 0755 "$tmp_cli" "${INSTALL_DIR}/aenv"
 
 # ---------------------------------------------------------------------------
-# 2. Install the server
+# 2. Install the node server
 # ---------------------------------------------------------------------------
 if [[ -d /run/systemd/system ]] && systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
     echo "Stopping existing ${SERVICE_NAME} service ..."
@@ -203,7 +208,11 @@ download_release_asset "$TARBALL" "$tmp_tarball"
 tar -xzf "$tmp_tarball" -C "$tmp_dir"
 
 sudo mkdir -p "$(dirname "$UBLK_DAEMON_PATH")"
-sudo install -m 0755 "$tmp_dir/server" "${INSTALL_DIR}/server"
+# 🔴 `aenv-node`, which is the name the release tarball has carried since the
+# crate split (.github/workflows/release.yml copies `target/release/aenv-node`
+# into the bundle). This line said `server` for one release after that, which
+# made every fresh install fail on a missing file.
+sudo install -m 0755 "$tmp_dir/aenv-node" "${INSTALL_DIR}/aenv-node"
 sudo install -m 0755 "$tmp_dir/ublk/uvm-ublk-daemon" "$UBLK_DAEMON_PATH"
 
 if [[ -d "$tmp_dir/deps" ]]; then
@@ -233,12 +242,12 @@ else
     echo "Running dependency setup ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
         AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
-        "${INSTALL_DIR}/server" --setup-only
+        "${INSTALL_DIR}/aenv-node" --setup-only
 
     echo "Provisioning virtualization device access, ublk, and host networking for ${SERVICE_USER} ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
         AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
-        "${INSTALL_DIR}/server" --setup-host \
+        "${INSTALL_DIR}/aenv-node" --setup-host \
         --runtime-user "$SERVICE_USER" --runtime-group "$SERVICE_GROUP"
 fi
 
@@ -335,7 +344,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 SupplementaryGroups=kvm
 EnvironmentFile=${ENV_FILE}
-ExecStart=${INSTALL_DIR}/server
+ExecStart=${INSTALL_DIR}/aenv-node
 RuntimeDirectory=aenv
 RuntimeDirectoryMode=0750
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
@@ -346,7 +355,7 @@ LimitNOFILE=1048576
 LimitMEMLOCK=infinity
 Restart=on-failure
 RestartSec=5
-# KillMode=process lets the server pause and persist running sandboxes before
+# KillMode=process lets the node pause and persist running sandboxes before
 # exiting. The default control-group mode would SIGKILL all Firecracker child
 # processes immediately, losing in-memory sandbox state.
 KillMode=process
@@ -367,7 +376,7 @@ echo ""
 echo "Installation complete."
 echo ""
 echo "  CLI    : ${INSTALL_DIR}/aenv"
-echo "  Server : ${INSTALL_DIR}/server"
+echo "  Node   : ${INSTALL_DIR}/aenv-node"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
 echo "  Mode   : ${VIRTUALIZATION_MODE}"
@@ -381,7 +390,7 @@ if [[ -d /run/systemd/system ]]; then
 fi
 echo ""
 if [[ -d /run/systemd/system ]]; then
-    echo "Start the server:"
+    echo "Start the node server:"
     echo "  sudo systemctl start ${SERVICE_NAME}"
     echo ""
     echo "To change the listen port, edit API_ADDR in ${ENV_FILE} then run:"
@@ -391,13 +400,13 @@ if [[ -d /run/systemd/system ]]; then
     echo "  sudo systemctl status ${SERVICE_NAME}"
     echo "  sudo journalctl -u ${SERVICE_NAME} -f"
 else
-    echo "systemd not detected. Start the server manually:"
+    echo "systemd not detected. Start the node server manually:"
     echo "  sudo setpriv --reuid=${SERVICE_USER} --regid=${SERVICE_GROUP} --init-groups \\"
     echo "    --inh-caps=+net_admin,+sys_admin --ambient-caps=+net_admin,+sys_admin \\"
     echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp \\"
     echo "    env AENV_CONFIG_PATH=${CONFIG_PATH} AENV_HOME_PATH=${DATA_DIR} AENV_RUNTIME_PATH=${RUNTIME_DIR} \\"
     echo "    AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE} \\"
-    echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/server"
+    echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/aenv-node"
 fi
 echo ""
 echo "For aenv CLI:"

@@ -22,7 +22,7 @@ awk '
     -e "s|\${SERVICE_USER}|aenv|g" \
     -e "s|\${SERVICE_GROUP}|aenv|g" \
     -e "s|\${ENV_FILE}|${env_file}|g" \
-    -e "s|\${INSTALL_DIR}/server|/bin/true|g" > "$unit_file"
+    -e "s|\${INSTALL_DIR}/aenv-node|/bin/true|g" > "$unit_file"
 
 for directive in \
   'User=aenv' \

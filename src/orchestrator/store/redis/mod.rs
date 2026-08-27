@@ -162,9 +162,13 @@ impl RedisMetadataStore {
         })?;
 
         let client = redis::Client::open(config.url.as_str()).map_err(backend)?;
-        let connection = redis::aio::ConnectionManager::new(client.clone())
-            .await
-            .map_err(backend)?;
+        let manager_config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(config.response_timeout))
+            .set_connection_timeout(Some(config.connect_timeout));
+        let connection =
+            redis::aio::ConnectionManager::new_with_config(client.clone(), manager_config)
+                .await
+                .map_err(backend)?;
 
         let keys = KeySpace::new(config.key_prefix.clone());
         let notifier = Notifier::start(client, connection.clone(), keys.notify_channel());

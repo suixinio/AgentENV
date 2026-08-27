@@ -121,6 +121,53 @@ pub struct RedisStoreConfig {
     /// and the CAS predicates apart.
     pub distributed_lock_enabled: bool,
 
+    // -- connection timeouts -------------------------------------------------
+    /// How long a single Redis command may run before
+    /// `redis::aio::ConnectionManager` times it out and reconnects.
+    /// redis-rs 1.6.0's own built-in default (applied by a bare
+    /// `ConnectionManager::new(client)`, which is what `RedisMetadataStore::connect`
+    /// constructed until this field existed) is 500ms — measured too tight
+    /// against this exact store's own production traffic on the pve-sg
+    /// cluster: a `ZRANGEBYSCORE` on `super::expiry`'s expiry index was
+    /// observed taking 292ms, and cross-node RTT stacks on top of that
+    /// server-side latency, on every command, not only this one. 3x the
+    /// crate default: bounded and short, but with real headroom over an
+    /// already-observed worst case.
+    ///
+    /// 🔴 The *default* (1.5s) is deliberately kept below `write_budget`'s
+    /// own default (2s), not equal to it: `write_budget` is "headroom the
+    /// write itself is assumed to need," checked against the lock's
+    /// remaining lifetime before a write is attempted (see that field's
+    /// own doc and `crud.rs`'s `lock.remaining() <= config.write_budget`
+    /// check) — a `response_timeout` at or above `write_budget` would let a
+    /// single slow command alone eat the entire budget that check exists
+    /// to reserve. This is a default-vs-default relationship only, not a
+    /// `validate`-enforced invariant: several tests in this module
+    /// deliberately shrink `write_budget` far below any sane connection
+    /// timeout (down to 100ms) to exercise the lock-lapse path in
+    /// `crud.rs` in well under a second, and a real deployment has no
+    /// comparable reason to shrink `write_budget` — see this field's own
+    /// production-latency justification above, which does not shrink with
+    /// it.
+    ///
+    /// Trade-off: a genuinely unreachable Redis now takes up to this long
+    /// (per call, not cumulative) to be detected, instead of 500ms. Audited
+    /// as acceptable: nothing in `src/orchestrator/` races this store's
+    /// calls against a shorter deadline in a `select!` (the only `select!`
+    /// in `src/orchestrator/service.rs`'s eviction/shutdown loops is
+    /// against `shutdown_rx`/a ticker, never against a store call), and no
+    /// health/readiness probe touches this store synchronously
+    /// (`src/api/server.rs`'s `/health` is a bare `"ok"`). Every caller of
+    /// this store already treats a backend error as retryable — the write
+    /// path returns `StoreError::Backend` up to the orchestrator, which
+    /// logs and the caller (an HTTP request, or the auto-evict/healer/reaper
+    /// background loops) retries on its own next round either way.
+    pub response_timeout: Duration,
+    /// How long a fresh TCP connection attempt (initial connect, or a
+    /// reconnect after a `response_timeout`) may take. Bounds only
+    /// connection setup, not command execution.
+    pub connect_timeout: Duration,
+
     /// 🔴 Test-only, and there is no field for it in a non-test build.
     ///
     /// It removes the `rev`/`execution_id` predicates from the write scripts,
@@ -162,6 +209,8 @@ impl Default for RedisStoreConfig {
             batch_chunk: 256,
             metrics_memo_ttl: Duration::from_secs(1),
             distributed_lock_enabled: true,
+            response_timeout: Duration::from_millis(1500),
+            connect_timeout: Duration::from_millis(2500),
             #[cfg(test)]
             cas_predicates_enabled: true,
         }

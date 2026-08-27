@@ -102,7 +102,7 @@ The resulting snapshot appears in `aenv snapshot list` and can be started with `
 
 ### Fork
 
-Forking clones a **running** sandbox into up to 16 child sandboxes on the same node. The source sandbox is briefly paused while the clone is captured, then resumes. All children inherit the source's filesystem, memory, and resource configuration.
+Forking clones a **running** sandbox into up to 100 child sandboxes on the same node (`count`, 1-100). The source sandbox is briefly paused while the clone is captured, then resumes. All children inherit the source's filesystem, memory, and resource configuration.
 
 ```bash
 curl -X POST \

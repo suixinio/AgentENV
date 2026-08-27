@@ -287,7 +287,7 @@ fn overlaybd_root() -> Result<PathBuf> {
         .unwrap_or_else(|_| PathBuf::from("env/overlaybd"));
     fs::canonicalize(&root).with_context(|| {
         format!(
-            "canonicalize overlaybd root {}; run `cargo run --bin server -- --setup-only` first or set AGENTENV_BENCH_OVERLAYBD_ROOT",
+            "canonicalize overlaybd root {}; run `cargo run -p aenv-node --bin aenv-node -- --setup-only` first or set AGENTENV_BENCH_OVERLAYBD_ROOT",
             root.display()
         )
     })

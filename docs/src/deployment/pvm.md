@@ -214,7 +214,7 @@ Select PVM for both dependency provisioning and server startup:
 ```bash
 export AENV_VIRTUALIZATION_MODE=pvm
 
-cargo run --bin aenv-node -- --setup-only
+cargo run -p aenv-node --bin aenv-node -- --setup-only
 make start-server
 ```
 

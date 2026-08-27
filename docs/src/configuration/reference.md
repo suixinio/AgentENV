@@ -5,7 +5,7 @@ AgentENV reads configuration from a TOML file. The default path is `config/defau
 ```bash
 export AENV_CONFIG_PATH=/path/to/config.toml
 # or
-cargo run --bin aenv-node -- --config /path/to/config.toml
+cargo run -p aenv-node --bin aenv-node -- --config /path/to/config.toml
 ```
 
 ## Layered configuration files

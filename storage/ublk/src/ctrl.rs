@@ -74,7 +74,7 @@ pub fn load_ublk_module() -> Result<()> {
 
     anyhow::bail!(
         "ublk kernel module is not loaded and automatic loading failed. \
-         Try `sudo modprobe ublk_drv` or rerun `cargo run --bin server -- --setup-only`.",
+         Try `sudo modprobe ublk_drv` or rerun `cargo run -p aenv-node --bin aenv-node -- --setup-only`.",
     )
 }
 
@@ -82,15 +82,15 @@ fn ctrl_open_error(err: std::io::Error) -> Error {
     let message = match err.kind() {
         std::io::ErrorKind::NotFound if !ublk_module_loaded() => format!(
             "failed to open {CTRL_PATH}: ublk kernel module may not be loaded. \
-               Try `sudo modprobe ublk_drv` or rerun `cargo run --bin server -- --setup-only`"
+               Try `sudo modprobe ublk_drv` or rerun `cargo run -p aenv-node --bin aenv-node -- --setup-only`"
         ),
         std::io::ErrorKind::NotFound => format!(
             "failed to open {CTRL_PATH}: the ublk control device is missing. \
-               Ensure the ublk device node is present and rerun `cargo run --bin server -- --setup-only` if needed"
+               Ensure the ublk device node is present and rerun `cargo run -p aenv-node --bin aenv-node -- --setup-only` if needed"
         ),
         std::io::ErrorKind::PermissionDenied => format!(
             "failed to open {CTRL_PATH}: permission denied. Ensure the current user has access \
-               to the ublk control device, or rerun `cargo run --bin server -- --setup-only` to refresh permissions"
+               to the ublk control device, or rerun `cargo run -p aenv-node --bin aenv-node -- --setup-only` to refresh permissions"
         ),
         _ => format!("failed to open {CTRL_PATH}"),
     };

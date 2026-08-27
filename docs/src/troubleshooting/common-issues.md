@@ -84,7 +84,7 @@ API_ADDR=0.0.0.0:8001 make start-server
 
 **Symptom**: `POST /sandboxes` returns a timeout error.
 
-**Solution**: Check that runtime assets (Firecracker binary, kernel, rootfs) have been downloaded. The server auto-provisions them on first start, but network issues can cause failures. Run `cargo run --bin aenv-node -- --setup-only` to provision manually and see detailed errors.
+**Solution**: Check that runtime assets (Firecracker binary, kernel, rootfs) have been downloaded. The server auto-provisions them on first start, but network issues can cause failures. Run `cargo run -p aenv-node --bin aenv-node -- --setup-only` to provision manually and see detailed errors.
 
 Also check `[envd].init_timeout_secs` in your config. The default is 60 seconds. If the rootfs image is large, the in-guest envd daemon may need more time to initialize.
 

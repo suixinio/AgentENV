@@ -325,7 +325,7 @@ test-snapshot-catalog:
 	exit $$status
 
 prepare-agent-test-state:
-	$(CAPABILITY_TEST_ENV) $(CARGO) run --bin aenv-node -- --setup-only
+	$(CAPABILITY_TEST_ENV) $(CARGO) run -p aenv-node --bin aenv-node -- --setup-only
 
 test-agent: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
@@ -414,11 +414,11 @@ test-e2e-all: test-e2e test-e2e-compose test-e2e-k8s
 # Run `aenv-api` beside it when the cluster half is wanted too.
 start-server:
 	$(MAKE) install-ublk PROFILE=debug
-	$(CAPABILITY_RUNNER) $(CARGO) run --bin aenv-node
+	$(CAPABILITY_RUNNER) $(CARGO) run -p aenv-node --bin aenv-node
 
 start-server-release:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin aenv-node
+	$(CAPABILITY_RUNNER) $(CARGO) run --release -p aenv-node --bin aenv-node
 
 deploy-up:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d

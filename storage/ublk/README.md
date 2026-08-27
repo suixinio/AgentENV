@@ -22,7 +22,7 @@ cargo build
 
 ## Running
 
-`uvm-ublk` attempts to load the `ublk` kernel module automatically when it starts. If automatic loading fails, please load it manually following the below instructions, or rerun `cargo run --bin server -- --setup-only` to refresh both module state and device permissions.
+`uvm-ublk` attempts to load the `ublk` kernel module automatically when it starts. If automatic loading fails, please load it manually following the below instructions, or rerun `cargo run -p aenv-node --bin aenv-node -- --setup-only` to refresh both module state and device permissions.
 
 ```
 # First insert kernel module

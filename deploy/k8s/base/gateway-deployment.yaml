@@ -157,9 +157,12 @@ spec:
             # `agentenv-api:8002` asks the api half over gRPC.
             #
             # 🔴 The two are independent and may be flipped in either order.
-            # REST first is the ordinary one — it is the half with a rollback
-            # nobody has to think about, since the nodes are still `--role all`
-            # and still serving REST the whole time.
+            # They are no longer *optional*, though: the nodes run `aenv-node`,
+            # which never serves user-facing REST under any configuration, so
+            # emptying REST_UPSTREAM_ADDR 404s every REST call in the cluster
+            # rather than putting it back on the nodes. Through 阶段 3a it did
+            # put it back, because the nodes were still the pre-split single
+            # process and served REST the whole time.
             - name: GATEWAY_REST_UPSTREAM_ADDR
               valueFrom:
                 configMapKeyRef:

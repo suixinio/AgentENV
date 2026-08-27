@@ -7,7 +7,7 @@
 // caught up with — and the gateway cannot tell which from anything it holds.
 // Before this package, the only thing it could do was ask the scheduler for a
 // node and forward the request there, where the node woke the sandbox itself.
-// That is the arrangement `--role node` exists to end (`_sd-impl-phase3-role.md`
+// That is the arrangement `aenv-node` exists to end (`_sd-impl-phase3-role.md`
 // §6.1): a node that decides when a sandbox should be alive is not an executor.
 //
 // So the question goes to the half that owns sandboxes, over one RPC, and this

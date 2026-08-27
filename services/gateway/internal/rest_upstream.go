@@ -16,7 +16,11 @@ import (
 // forwarded to whichever node it named; a REST call about one sandbox
 // (`POST /sandboxes/{id}/pause`) is resolved to the node holding it and
 // forwarded there. Every node in the fleet answers those routes because every
-// node is `--role all`.
+// node was the pre-split single process.
+//
+// 🔴 That premise is retired. Nodes run `aenv-node` now and never serve
+// user-facing REST under any configuration, so this upstream is not optional —
+// see `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
 //
 // On, the same calls go to one address instead: the api half, which owns
 // sandboxes and drives the machines itself over the node service. The gateway
@@ -26,11 +30,11 @@ import (
 //
 // # 🔴 Why this is a value and not a manifest
 //
-// 3a's whole value is the shape of its rollback. The nodes stay `--role all`
-// for the whole of it, so they never stop being able to serve REST, so putting
-// the traffic back is emptying this one value and rolling the gateway —
+// 3a's whole value was the shape of its rollback. The nodes stayed pre-split
+// for the whole of it, so they never stopped being able to serve REST, so
+// putting the traffic back was emptying this one value and rolling the gateway —
 // seconds, and nothing touches the DaemonSet. 3b, where the DaemonSet moves to
-// `--role node`, is the step whose rollback is a serial roll with an hour of
+// `aenv-node`, is the step whose rollback is a serial roll with an hour of
 // grace per machine. Anything that makes enabling or disabling 3a a manifest
 // change spends 3b's cost to buy 3a's, which is the one trade this staging
 // exists to refuse (`_sd-impl-phase3-role.md` §11.1, §11.2).
@@ -76,7 +80,7 @@ const (
 
 // isUserFacingRestRequest reports whether this exchange is one of the routes the
 // api half exists to answer: the `sandboxes`, `snapshots` and `templates`
-// groups, which are exactly the routes `--role node` answers 404 on.
+// groups, which are exactly the routes `aenv-node` answers 404 on.
 //
 // Decided from the route source rather than from the path, because the route
 // source is what already distinguishes "this request is about a sandbox" from

@@ -143,8 +143,8 @@ func TestTheNodeMountsRegctlConfigWhereRegctlLooksForIt(t *testing.T) {
 	}
 }
 
-// 🔴 The control. `--role api` never calls `regctl`
-// (`src/bin/server.rs::assemble_api`'s own doc comment: "installs no regctl —
+// 🔴 The control. `aenv-api` never calls `regctl`
+// (`crates/aenv-node/src/bin/aenv-node.rs::assemble_api`'s own doc comment: "installs no regctl —
 // by design, that is a node's tooling"; both `POST /sandboxes-cold` and a
 // template build refuse on `!role.runs_sandbox_runtime()` before reaching one),
 // so giving this half the same volume and env var as the node would cost
@@ -155,11 +155,11 @@ func TestTheApiHalfCarriesNoRegctlConfig(t *testing.T) {
 	container := onlyContainer(t, "the api Deployment", api.Spec.Template.Spec.Containers)
 
 	if _, ok := volumeNamed(api.Spec.Template.Spec.Volumes, regctlConfigMap); ok {
-		t.Fatalf("the api Deployment declares a %q volume; --role api never calls regctl, so this "+
+		t.Fatalf("the api Deployment declares a %q volume; aenv-api never calls regctl, so this "+
 			"volume unblocks nothing", regctlConfigMap)
 	}
 	if _, ok := volumeMountAt(container, regctlMountPath); ok {
-		t.Fatalf("the api Deployment mounts something at %s; --role api never calls regctl", regctlMountPath)
+		t.Fatalf("the api Deployment mounts something at %s; aenv-api never calls regctl", regctlMountPath)
 	}
 	if _, ok := envValue(container, regctlHomeEnv); ok {
 		t.Fatalf("the api Deployment sets %s; it exists only to steer regctl, which this half never calls", regctlHomeEnv)

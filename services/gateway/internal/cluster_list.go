@@ -85,12 +85,12 @@ func isClusterListRequest(r *http.Request) bool {
 // `forwardToRestUpstream` with the rest of the REST surface.
 //
 // 🔴 Why the listing moves with that value rather than getting a switch of its
-// own. 阶段 3b flips the DaemonSet to `--role node`, and the role gate answers
+// own. 阶段 3b flips the DaemonSet to `aenv-node`, and the role gate answers
 // `GET /sandboxes` and `GET /v2/sandboxes` with 404 there — those are exactly
 // the two routes this fan-out calls. The fan-out is all-or-nothing
 // (`fetchClusterList` cancels the rest on the first failure) and
 // `handleClusterList` passes a 4xx through verbatim, so a node fleet on
-// `--role node` turns the user's `GET /sandboxes` into a bare 404 rather than
+// `aenv-node` turns the user's `GET /sandboxes` into a bare 404 rather than
 // into a degraded list. A separate switch would mean 3b's correctness depended
 // on two values being flipped in the right order; with one, the position that
 // takes REST off the nodes is the position that stops asking nodes for this

@@ -1,18 +1,19 @@
 # The deciding half of the split control plane: user-facing REST, sandbox
-# ownership, placement. Same image as the node DaemonSet, told which half it is
-# by `--role api` (`src/role.rs`).
+# ownership, placement. Its own image, `agentenv-api`, built from the
+# `aenv-api` crate — a different binary from the node DaemonSet's, not the same
+# one under a flag. There is no `--role` any more; see this file's `args:` note
+# below and `services/README.md`'s rollback section.
 #
-# 🔴 This is the workload 阶段 3a brings up while the DaemonSet stays on
-# `--role all`. Bringing it up is not what turns 3a on — the gateway's
-# `rest_upstream_addr` is (see gateway-deployment.yaml). That separation is the
-# whole of 3a's rollback story: an api Deployment that is running but that
-# nothing is pointed at costs two idle pods, and pointing the gateway back at
-# the nodes is one value change and a gateway roll, seconds, without touching
-# the DaemonSet. 3b — the DaemonSet moving to `--role node` — is the expensive
-# one to reverse, and nothing here may borrow from it
-# (`_sd-impl-phase3-role.md` §11.1, §11.2).
+# 🔴 History, kept because the rollback story is what it explains. 阶段 3a
+# brought this workload up while the DaemonSet still ran the pre-split single
+# process; bringing it up was not what turned 3a on — the gateway's
+# `rest_upstream_addr` was (see gateway-deployment.yaml). That separation was
+# the whole of 3a's rollback story. 3b — the DaemonSet moving to the node half
+# — was the expensive one to reverse, and it has happened
+# (`_sd-impl-phase3-role.md` §11.1, §11.2). Reversing it now means deploying
+# the pre-split image tag on the DaemonSet, not changing a value here.
 #
-# 🔴 `--role api` assembles now (`src/bin/aenv-api.rs::assemble_api`): the cluster
+# 🔴 `aenv-api` assembles now (`src/bin/aenv-api.rs::assemble_api`): the cluster
 # metadata store, the remote backend factory and both gRPC listeners are wired.
 # What it still refuses, and refuses loudly rather than half-doing, is a cold
 # create (`POST /sandboxes-cold`) and resuming a paused sandbox whose capture
@@ -24,10 +25,10 @@
 # on that list in code — `run_the_build_on_a_node` dispatches it to a node
 # instead of refusing at the door — but it still cannot succeed in 3a as
 # deployed here: dispatching needs a node serving `NodeSandboxService`, which
-# is `--role node`, and 3a deliberately keeps the DaemonSet on `--role all`
-# (see the 3b note above). This Deployment answering the build route is
-# necessary and not sufficient; it starts working the moment 3b flips the
-# DaemonSet, with no change to this file.
+# is `aenv-node` — which is what the DaemonSet runs, so it works as deployed.
+# The paragraph above described 3a, when the DaemonSet still ran the pre-split
+# single process and this Deployment answering the build route was necessary
+# but not sufficient.
 #
 # 🔴 It also has one precondition no other workload in this tree has: the
 # `agentenv-runtime-secrets` Secret must carry `sandbox-access-token-hash-seed`,
@@ -106,16 +107,14 @@ spec:
           # two tags disagree. Roll them together.
           image: agentenv-api:latest
           imagePullPolicy: IfNotPresent
-          # 🔴 Kept, and it no longer selects anything. `aenv-api` *is* the api
-          # half — it links no sandbox runtime, so no flag could make it the
-          # other one — and `ServerRole::confirm` checks this argument against
-          # the binary rather than obeying it. Left in place because it still
-          # says what this Pod is where an operator reads it, and because a
-          # manifest that kept `--role node` here would now fail to start with a
-          # message naming `aenv-node`, which is the outcome worth having.
-          args:
-            - --role
-            - api
+          # 🔴 No `args:`, and that is deliberate rather than an omission.
+          # `aenv-api` *is* the api half — it links no sandbox runtime, so no
+          # flag could make it the other one — and the binary no longer declares
+          # `--role` at all. A manifest that still passed it would be refused by
+          # clap before the process started, which is the outcome worth having:
+          # an un-migrated manifest fails loudly instead of being ignored.
+          # `TestNeitherHalfPassesARoleFlag` in
+          # `services/shared/config/api_manifest_test.go` is what keeps it gone.
           env:
             - name: AENV_CONFIG_PATH
               value: /workspace/config/agentenv.toml
@@ -148,7 +147,7 @@ spec:
             # are not alike. A node may legitimately be `local`/`in_memory` —
             # its records describe the machine it is on. An api replica may not:
             # `in_memory` would give each replica a private opinion about
-            # sandboxes the others also answer for. `--role api` refuses to
+            # sandboxes the others also answer for. `aenv-api` refuses to
             # start on `in_memory` rather than starting like that, and these two
             # lines are what it wants instead.
             - name: AENV_ORCHESTRATOR_STORE_BACKEND
@@ -179,13 +178,13 @@ spec:
             # same one Stage B's snapshot catalog already uses, wired below
             # via `AENV_CONFIG_OVERLAY_PATH`/`pg-overlay.toml`/`pg-dsn.toml`)
             # rather than dialling the scheduler's `PausedRegistry` gRPC
-            # surface, so no database credential lands on `--role node`
+            # surface, so no database credential lands on `aenv-node`
             # either way.
             #
             # 🔴 This precondition is load-bearing and enforced at startup,
             # not just documented here: `build_paused_registry`
             # (`src/orchestrator/paused_registry/mod.rs`) requires a
-            # heartbeat-roster `NodeRegistry` handle under `--role api`
+            # heartbeat-roster `NodeRegistry` handle under `aenv-api`
             # (`role.runs_sandbox_runtime() == false`), which only exists
             # under `AENV_NODE_PLACEMENT_SOURCE = "native"` below — without
             # it, `running` rows have no lease-renewal path and are wrongly
@@ -361,7 +360,7 @@ spec:
             #   1. `ResumeWiring::cluster_from_config()`
             #      (`src/api/impls/resume_surface.rs`) — the wake-site
             #      placement source for `WakeSite::Remote`. It hard-refuses
-            #      to start with an empty endpoint ("--role api needs
+            #      to start with an empty endpoint ("aenv-api needs
             #      [cluster].scheduler_endpoint") and is **not** gated by
             #      `AENV_NODE_PLACEMENT_SOURCE` the way `placement`
             #      (`cluster_placement`, driving create/build) is — it always
@@ -395,7 +394,7 @@ spec:
             # default now, alongside `AENV_PAUSED_REGISTRY_BACKEND=postgres`
             # above, which *requires* it (see that key's own comment: the
             # `postgres` paused-registry backend refuses to start under
-            # `--role api` without a heartbeat-roster `NodeRegistry`, which
+            # `aenv-api` without a heartbeat-roster `NodeRegistry`, which
             # only `native` builds). The two switches move together in one
             # apply, not two `kubectl set env` steps across a rollout window.
             #
@@ -403,7 +402,7 @@ spec:
             # (and `AENV_PAUSED_REGISTRY_BACKEND`) set back to
             # `"scheduler"`/`"central"` — `node_placement_source` is read
             # once at startup (`start_native_node_registry`,
-            # `src/bin/server.rs`), unlike the DaemonSet's hot-reloadable
+            # `crates/aenv-node/src/bin/aenv-node.rs`), unlike the DaemonSet's hot-reloadable
             # heartbeat target, so there is no live-reload path for this one
             # value alone.
             - name: AENV_NODE_PLACEMENT_SOURCE
@@ -417,7 +416,7 @@ spec:
             # `src/node_client/native_placement.rs`), and this Deployment
             # runs `replicas: 2`: the code default (`in_memory`) is one
             # replica's private routing table, and `build_binding_store`
-            # (`src/bin/server.rs`) now refuses to start on it under
+            # (`crates/aenv-node/src/bin/aenv-node.rs`) now refuses to start on it under
             # `node_placement_source = "native"` — the same refusal
             # `AENV_ORCHESTRATOR_STORE_BACKEND`'s own comment above
             # describes for the sandbox ledger. The same Redis, the same
@@ -451,9 +450,9 @@ spec:
             # `deploy/k8s/base/config/scheduler.json`'s
             # `scheduler.discovery.kubernetes` already discovers nodes from
             # (mounted there as a file, not env — confirmed against that file
-            # rather than assumed). `--role api` refuses to start under
+            # rather than assumed). `aenv-api` refuses to start under
             # `node_placement_source = "native"` with the namespace/service
-            # name unset (`src/bin/server.rs`), so these three have no
+            # name unset (`crates/aenv-node/src/bin/aenv-node.rs`), so these three have no
             # default of their own; port/scheme are written out explicitly
             # even though they already match `cfg.rs`'s defaults, so a reader
             # comparing this file against scheduler.json does not have to
@@ -500,9 +499,9 @@ spec:
                   optional: true
             # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and
             # everywhere else in this tree. It makes a process sweep the host
-            # for another process's leftover VMs, which is sound for `--role
-            # node` — where it defaults to on — and destructive anywhere two
-            # servers can share a machine. This half has no host to sweep.
+            # for another process's leftover VMs, which is sound for
+            # `aenv-node` — where it defaults to on — and destructive anywhere
+            # two servers can share a machine. This half has no host to sweep.
           ports:
             - name: http
               containerPort: 8000
@@ -531,9 +530,10 @@ spec:
           securityContext:
             # 🔴 The inverse of the DaemonSet's `privileged: true`, and stated
             # rather than left out. This half touches no /dev/kvm, creates no
-            # network namespace and opens no ublk device; `ServerRole` is what
-            # keeps it from constructing any of that, and this is the deployment
-            # saying the same thing in the place a reader of the manifest looks.
+            # network namespace and opens no ublk device; the `aenv-api` crate
+            # does not link the code that would (`make check-crate-boundaries`),
+            # and this is the deployment saying the same thing in the place a
+            # reader of the manifest looks.
             # If either statement is ever wrong, the Pod fails loudly here
             # instead of quietly acquiring a privilege it was never meant to
             # hold.
@@ -608,7 +608,7 @@ spec:
         # DaemonSet (see the note on `regctl-config` in kustomization.yaml).
         # Both exist only to make `regctl` find this cluster's plain-HTTP
         # registry, and this half never calls `regctl`: the doc comment on
-        # `assemble_api` in `src/bin/aenv-api.rs` is explicit that `--role api`
+        # `assemble_api` in `src/bin/aenv-api.rs` is explicit that `aenv-api`
         # "installs no regctl — by design, that is a node's tooling", and the
         # two routes that would otherwise resolve an image
         # (`POST /sandboxes-cold`, a template build) refuse at the door on

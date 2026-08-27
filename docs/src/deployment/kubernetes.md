@@ -7,7 +7,7 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, an api Deployment, a
 commented out of `kustomization.yaml`'s `resources:`, not deleted, and
 `services/scheduler`'s Go source stays in the tree as the rollback target
 (one release image tag is still pinned in `kustomization.yaml`'s `images:`
-transformer). `--role api` (`agentenv-api-deployment.yaml`) runs with
+transformer). `aenv-api` (`agentenv-api-deployment.yaml`) runs with
 `[cluster].node_placement_source = "native"` and
 `[orchestrator.paused_registry].backend = "postgres"` by default, folding
 node discovery, heartbeat receipt, placement, and the paused-sandbox registry
@@ -15,13 +15,13 @@ into itself over the shared `[pg]` pool instead of dialling a scheduler
 process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
 instead of `agentenv-scheduler:9090` for the same reason, including for
 `ListRegistrySandboxes` (`services/gateway/internal/registry_list.go`'s
-debug endpoint), which `--role api` now answers too — see
+debug endpoint), which `aenv-api` now answers too — see
 `services/README.md` for the current status and how to bring the scheduler
 workload back if you need it. The rest of this page describes the
 architecture as it runs today; where it still names `agentenv-scheduler`
 directly (the paused-registry migration history below, in particular) that
 is describing what the *node* half still needs from that gRPC contract, now
-answered by `--role api` rather than a separate process.
+answered by `aenv-api` rather than a separate process.
 
 ## Architecture
 
@@ -128,9 +128,11 @@ The P2P listen address must be reachable Pod-to-Pod; use a concrete container po
 ## The API Half
 
 `agentenv-api` is the deciding half of the split control plane: user-facing REST,
-sandbox ownership, placement. It runs the same `agentenv-runtime` image as the
-node DaemonSet with `--role api`, on an ordinary Deployment with no `/dev/kvm`,
-no host paths and no privileges. It needs
+sandbox ownership, placement. It runs its **own** image, `agentenv-api`, built
+from the `aenv-api` crate — a different binary from the node DaemonSet's, not
+the same one under a flag. `aenv-api` links no sandbox runtime at all
+(`make check-crate-boundaries`), so it runs on an ordinary Deployment with no
+`/dev/kvm`, no host paths and no privileges. It needs
 `agentenv-runtime-secrets/sandbox-access-token-hash-seed` to exist — the
 reference is not optional, because an API replica that invents its own seed
 mints envd tokens the other replica cannot derive, and that failure is silent.
@@ -144,7 +146,7 @@ kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
 
 Whether the value actually reached every process is a separate question from
 whether it was set, and `agentenv_access_token_seed_fingerprint{fingerprint=...}`
-is where it is answered: every role publishes it at startup, the label is the
+is where it is answered: both halves publish it at startup, the label is the
 first eight bytes of `SHA-256(seed)`, and two processes that hold the same seed
 report the same label. Two replicas each configured with a *different* non-empty
 seed pass every startup check there is, so comparing this label across the
@@ -169,15 +171,19 @@ No AgentENV code has ever read that variable, so setting it changed nothing; the
 ConfigMap and the DaemonSet reference are both gone, and
 `no_manifest_sets_a_node_service_gate_nothing_reads` (`src/cfg.rs`) fails if
 either comes back. What the switch was supposed to buy — a node serving the gRPC
-surface the API half drives it through — comes from running the DaemonSet with
-`--role node`. `--role all` deliberately does not bind that listener: it is the
-rollback target and is defined as the pre-split process verbatim, which
-`only_the_split_roles_bind_a_second_listener` (`src/bin/server.rs`) asserts.
+surface the API half drives it through — is simply what `aenv-node` does: it
+binds that listener unconditionally.
 
-🔴 **Rolling back is the two gateway switches.** Emptying them puts every REST
-call back on the nodes, which never stopped being able to serve them, and the API
-half stops driving machines the moment it stops receiving REST — so the rollback
-is one ConfigMap and one gateway roll, seconds, with the DaemonSet untouched.
+🔴 **Rolling back is now an image tag, not a flag.** There was a `--role` flag
+(and an `AENV_ROLE` environment variable) while one binary could be any of three
+things, and `--role all` was the rollback target. Neither binary declares it any
+more — a manifest that still passes it is refused by argument parsing before the
+process starts, which is deliberate: an un-migrated manifest fails loudly instead
+of being ignored. Going back to a single process that serves REST on every node
+means deploying the pre-split image tag on the DaemonSet, a serial roll with a
+drain per machine; see `services/README.md`. Emptying the two gateway switches
+below alone does **not** do it any more, because an `aenv-node` fleet has no
+configuration in which it answers user-facing REST.
 
 🔴 **Do not turn a gateway switch on by editing `config/gateway.json`.** An
 environment variable set to the empty string is ignored by the loader, so a
@@ -233,12 +239,13 @@ An empty `cluster_id` there means the write surface is registered and cold, answ
 
 ### Migrating from the removed `postgres` backend (nodes only)
 
-🔴 This subsection is about `--role node` specifically — `--role node` never
-holds a `[pg]` DSN and never will (`ServerRole::check_pg_dsn` refuses
-startup outright if one is configured). It does **not** describe `--role
-api`/`--role all`: 阶段四 gave those two roles a *different*, still-live
-`postgres` paused-registry backend that connects to the shared `[pg]` pool
-directly and folds the scheduler's own registry service into the process —
+🔴 This subsection is about `aenv-node` specifically — a node never holds a
+`[pg]` DSN and never will: it does not link a PostgreSQL client at all, and it
+refuses to start outright if one is configured (`refuse_configured_pg_dsn`, in
+`crates/aenv-node/src/bin/aenv-node.rs`). It does **not** describe `aenv-api`:
+阶段四 gave that half a *different*, still-live `postgres` paused-registry
+backend that connects to the shared `[pg]` pool directly and folds the
+scheduler's own registry service into the process —
 `deploy/k8s/base/agentenv-api-deployment.yaml` runs it by default. See
 CLAUDE.md's paused-registry note and `[orchestrator.paused_registry]` in
 `config/default.toml` for that backend; nothing below applies to it.

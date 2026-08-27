@@ -161,7 +161,7 @@ func TestTheRestUpstreamSwitchDecidesWhoAnswersTheClusterSandboxList(t *testing.
 // The listing is the only user-facing REST route this process can serve out of
 // the nodes without forwarding anything, so it is the one route that could
 // quietly go on being served by nodes while the counter said no node served
-// REST any more. 阶段 3b's rollback — the DaemonSet on `--role node` with this
+// REST any more. 阶段 3b's rollback — the DaemonSet on `aenv-node` with this
 // value emptied — is exactly that state, and it 404s.
 func TestBothArmsOfTheUpstreamCounterMoveForTheClusterSandboxList(t *testing.T) {
 	apiBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamAPI))

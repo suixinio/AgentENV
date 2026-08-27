@@ -107,7 +107,7 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 
 ## Per-Node Subsystems
 
-Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host
+Each node is an `aenv-node` binary (`crates/aenv-node/src/bin/aenv-node.rs`) on a Linux host
 with `/dev/kvm` and one configured virtualization mode. KVM is the default;
 PVM currently requires x86_64 and the `kvm_pvm` host module.
 
@@ -281,7 +281,7 @@ storage/
     └── scm.rs                  # SCM_RIGHTS fd passing
 
 src/
-├── bin/server.rs               # node binary entrypoint
+├── bin/aenv-node.rs            # node binary entrypoint (crates/aenv-node/src/)
 ├── api/                        # HTTP API layer
 ├── orchestrator/               # sandbox lifecycle
 ├── observability/              # node identity + host/runtime metrics projection

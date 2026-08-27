@@ -150,7 +150,7 @@ func TestResumingRowReportsRegistryUnderPreallocation(t *testing.T) {
 	}
 	// Holder() is always origin_node_id, never the claimant
 	// (claimed_by_node_id): the claimant is an api-replica process under
-	// --role api|node and structurally never reports a heartbeat, so routing
+	// aenv-api|node and structurally never reports a heartbeat, so routing
 	// on it would always fail. See lookup_test.go's
 	// TestLookupRoutesAResumingSandboxToItsOrigin for why.
 	if got := resp.GetNode().GetNodeId(); got != "node-a" {

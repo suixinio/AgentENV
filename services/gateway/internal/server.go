@@ -375,7 +375,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// The cluster listing is counted the same way from its own branch above,
 	// which is the one user-facing REST route this process can serve out of the
 	// nodes without forwarding anything. Counted there rather than left out, so
-	// that a fleet on `--role node` with this switch rolled back — where the
+	// that a fleet on `aenv-node` with this switch rolled back — where the
 	// listing is fanned out to nodes and 404s — cannot read as "no node serves
 	// REST any more".
 	if isUserFacingRestRequest(r, hostRoute, routeSource) {

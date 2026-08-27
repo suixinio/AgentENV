@@ -245,7 +245,7 @@ func TestPostgresReaderListReadsEveryStateWithLeases(t *testing.T) {
 	}
 	// Holder() is always origin_node_id, including here: the claimant
 	// (claimed_by_node_id, "node-b" in this seed) is a mutual-exclusion
-	// identity, not a routing target, and under --role api|node it is an
+	// identity, not a routing target, and under aenv-api|node it is an
 	// api-replica process that never reports a heartbeat.
 	if resuming.Holder() != "node-a" {
 		t.Fatalf("expected the origin to hold a resuming row, got %q", resuming.Holder())

@@ -10,7 +10,7 @@ kind: Kustomization
 # HMAC(seed, sandbox_id), so a seed generated per replica makes the two replicas
 # disagree about every sandbox's token, and the user only finds out when a token
 # they were handed stops working. A Pod that will not start is the only form of
-# that fault anybody sees (`_sd-impl-phase3-role.md` §9). `--role api` refuses
+# that fault anybody sees (`_sd-impl-phase3-role.md` §9). `aenv-api` refuses
 # the same way from inside the process (`src/sandbox/access.rs`).
 #
 # There is no literal here because the value must not live in the repository:

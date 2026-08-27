@@ -214,7 +214,7 @@ Select PVM for both dependency provisioning and server startup:
 ```bash
 export AENV_VIRTUALIZATION_MODE=pvm
 
-cargo run --bin server -- --setup-only
+cargo run --bin aenv-node -- --setup-only
 make start-server
 ```
 
@@ -342,7 +342,7 @@ Then rerun provisioning:
 sudo AENV_VIRTUALIZATION_MODE=pvm \
   AENV_CONFIG_PATH=/var/lib/aenv/config/config.toml \
   AENV_HOME_PATH=/var/lib/aenv \
-  /usr/local/bin/server --setup-only
+  /usr/local/bin/aenv-node --setup-only
 ```
 
 ### Snapshot or paused-sandbox mode mismatch

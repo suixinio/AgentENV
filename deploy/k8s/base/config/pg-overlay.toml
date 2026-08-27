@@ -18,7 +18,7 @@
 # `config/default.toml`'s own `[pg]` section for what each one means.
 #
 # `max_connections` (P4/P6, task's own "phase4-close") is set explicitly at
-# its own default, 8 per replica: `--role api` runs `replicas: 2`
+# its own default, 8 per replica: `aenv-api` runs `replicas: 2`
 # (`agentenv-api-deployment.yaml`), each with its own pool against the same
 # database, so this cluster's real ceiling is `max_connections * replicas`
 # against whatever PostgreSQL itself allows — a value worth reading off this

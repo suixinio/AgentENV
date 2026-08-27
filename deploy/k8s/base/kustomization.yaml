@@ -97,8 +97,10 @@ configMapGenerator:
       # the second, Secret-projected half and why this one key cannot simply
       # be appended to AENV_CONFIG_OVERLAY_PATH itself. Read only by
       # agentenv-api-deployment.yaml — never mounted onto the DaemonSet,
-      # which must never hold `[pg].dsn` at all (`ServerRole::check_pg_dsn`
-      # refuses `--role node` startup outright if it is configured).
+      # which must never hold `[pg].dsn` at all (`refuse_configured_pg_dsn`,
+      # in `crates/aenv-node/src/bin/aenv-node.rs`, refuses startup outright if
+      # it is configured — and that binary cannot link a PostgreSQL client
+      # anyway).
       - config/pg-overlay.toml
   # 🔴 阶段四 E4: no longer generated from the Deployment — `scheduler-deployment.yaml`
   # is out of `resources:` below (see the note there), so this ConfigMap has
@@ -289,7 +291,7 @@ configMapGenerator:
   #
   # 🔴 That last sentence stopped being true of this cluster, and it is why
   # these two values must not be left `off` here. The DaemonSet has since moved
-  # to `--role node` (3b, see agentenv-daemonset.yaml), so the nodes answer 404
+  # to `aenv-node` (3b, see agentenv-daemonset.yaml), so the nodes answer 404
   # on the sandboxes routes. An `apply -k` that emptied these two keys would
   # point the gateway back at nodes that no longer serve REST — not a rollback
   # to the old behaviour but a REST outage, and one that only shows up as 404s
@@ -349,15 +351,16 @@ configMapGenerator:
       - GATEWAY_SCHEDULER_FALLBACK_TIMEOUT=3s
   # 🔴 There was a third switch here — node-service-config, carrying
   # AENV_NODE_SERVICE_ENABLED — and it is gone rather than set to `false`. It
-  # was meant to let `--role all` serve the node sandbox service, but nothing in
-  # the Rust tree ever read the variable, and HEAD decides against that design
-  # outright (`only_the_split_roles_bind_a_second_listener` in
-  # `src/bin/server.rs`). Because it was read by every node in the fleet, the
+  # was meant to let the pre-split single process serve the node sandbox
+  # service, but nothing in the Rust tree ever read the variable, and the design
+  # went the other way: the node sandbox service is bound unconditionally by
+  # `aenv-node`, which is the only binary that could bind it. Because it was
+  # read by every node in the fleet, the
   # runbooks costed flipping it at a serial DaemonSet roll with a drain per
   # machine — paid for a behaviour change that could not happen. Its absence is
   # scanned for by `no_manifest_sets_a_node_service_gate_nothing_reads`
   # (`src/cfg.rs`); `deploy/k8s/base/agentenv-daemonset.yaml` carries the long
-  # form of why. Giving the api half a machine to drive is a `--role node`
+  # form of why. Giving the api half a machine to drive is a `aenv-node`
   # DaemonSet, not a ConfigMap key.
 
   # Which paused-sandbox registry the node keeps: node-local, or the shared one
@@ -505,12 +508,12 @@ configMapGenerator:
       - AENV_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml
       # 🔴 Not AENV_CONFIG_OVERLAY_PATH itself, deliberately, even though it is
       # read into that exact environment variable by
-      # agentenv-api-deployment.yaml alone. `--role api`/`--role all` is the
-      # only role that may ever hold `[pg]` — `--role node`
+      # agentenv-api-deployment.yaml alone. `aenv-api` is the
+      # only half that may ever hold `[pg]` — `aenv-node`
       # (agentenv-daemonset.yaml) reads AENV_CONFIG_OVERLAY_PATH from the key
       # right above this one, unchanged, and must keep reading exactly that
-      # two-file list forever: `ServerRole::check_pg_dsn` refuses `--role
-      # node` startup outright if `[pg].dsn` is configured at all, and a node
+      # two-file list forever: `refuse_configured_pg_dsn` refuses `aenv-node`
+      # startup outright if `[pg].dsn` is configured at all, and a node
       # Pod named a pg overlay file it never has mounted would simply fail to
       # start on a missing file. A plain ConfigMap value cannot be
       # concatenated declaratively, so api gets its own key with the full
@@ -552,7 +555,7 @@ configMapGenerator:
       # Turning it off is one command and does not touch a manifest:
       #   kubectl -n agentenv-system set env deploy/agentenv-api \
       #     AENV_CONFIG_OVERLAY_PATH=
-      # which lands `--role api` back on `config/agentenv.toml` alone —
+      # which lands `aenv-api` back on `config/agentenv.toml` alone —
       # `[pg]` absent, `[backend.oss]` absent too (the same rollback the
       # unmodified key above documents), so pair this with re-adding
       # AENV_SNAPSHOT_REPOSITORY_BACKEND/AENV_CONFIG_OVERLAY_PATH by hand if
@@ -640,7 +643,7 @@ configMapGenerator:
   # registry should replace this file's contents with.
   #
   # 🔴 Only the node reads it. `assemble_api` in `src/bin/aenv-api.rs` states
-  # outright that `--role api` "installs no regctl — by design, that is a
+  # outright that `aenv-api` "installs no regctl — by design, that is a
   # node's tooling", and both call sites that would otherwise reach for one —
   # `POST /sandboxes-cold` and a template build — refuse at the door on
   # `!role.runs_sandbox_runtime()` before any image is resolved

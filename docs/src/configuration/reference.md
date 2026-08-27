@@ -5,7 +5,7 @@ AgentENV reads configuration from a TOML file. The default path is `config/defau
 ```bash
 export AENV_CONFIG_PATH=/path/to/config.toml
 # or
-cargo run --bin server -- --config /path/to/config.toml
+cargo run --bin aenv-node -- --config /path/to/config.toml
 ```
 
 ## Layered configuration files
@@ -325,7 +325,7 @@ The managed seed is node-local persistent state and must be included in backups 
 
 Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every node when cross-node recovery of the same sandbox is required. Nodes use their own managed seed when it is unset.
 
-`--role api` does not have that choice: it refuses to start when no seed is configured, rather than generating one. An API replica that invented its own would mint envd tokens its siblings cannot derive, and nothing about that is visible — the user is handed a token by whichever replica answered and it stops working when another one does. `--role node` and `--role all` are unchanged and still generate a managed seed.
+`aenv-api` does not have that choice: it refuses to start when no seed is configured, rather than generating one. An API replica that invented its own would mint envd tokens its siblings cannot derive, and nothing about that is visible — the user is handed a token by whichever replica answered and it stops working when another one does. `aenv-node` still generates a managed seed.
 
 Every role publishes `agentenv_access_token_seed_fingerprint{fingerprint="..."} 1` at startup, where the label is the first eight bytes of `SHA-256(seed)` in hex. It is what makes "every process in this cluster holds the same seed" answerable from a scrape: the required-seed check above catches a *missing* seed, but two replicas each configured with a different non-empty value pass every check and still disagree. Compare the label across processes; the seed itself never appears in a log or a metric.
 
@@ -508,13 +508,13 @@ Notes:
 
 ## `[pg]`
 
-Shared PostgreSQL connection settings for the control plane (`--role api` /
-`--role all`), consumed by `src/pg/mod.rs`: a per-replica connection pool and
+Shared PostgreSQL connection settings for the control plane (`aenv-api`),
+consumed by `crates/aenv-api/src/pg/mod.rs`: a per-replica connection pool and
 a cluster-leadership primitive built on session-scoped advisory locks. Empty
 by default — set it and the pool backs the committed-snapshot catalog
 (`[snapshot.catalog]` `write`/`read` = `both`/`postgres` or `postgres`) and,
 since 阶段四, the `postgres` cluster-wide paused-sandbox registry backend
-(`[orchestrator.paused_registry].backend = "postgres"`, `--role api` also
+(`[orchestrator.paused_registry].backend = "postgres"`, `aenv-api` also
 needs `[cluster].node_placement_source = "native"`) — see
 `deploy/k8s/base/agentenv-api-deployment.yaml` for the deployed shape of
 both.
@@ -522,7 +522,7 @@ both.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `dsn` | string | unset | A libpq-style connection URL (`postgres://user:password@host:port/dbname`). Absent or blank means PostgreSQL is not configured for this process. |
-| `max_connections` | integer | `8` | Per-replica pool cap. `--role api` runs more than one replica and each builds its own pool independently, so the cluster-wide connection count this deployment produces is `replica_count * max_connections`, not this number alone — keep it comfortably under PostgreSQL's own `max_connections`. |
+| `max_connections` | integer | `8` | Per-replica pool cap. `aenv-api` runs more than one replica and each builds its own pool independently, so the cluster-wide connection count this deployment produces is `replica_count * max_connections`, not this number alone — keep it comfortably under PostgreSQL's own `max_connections`. |
 | `connect_timeout_secs` | integer | `5` | Bounds the pool's initial connection attempt and every later acquire. |
 
 No environment variable reaches this section, for the same reason as
@@ -533,14 +533,17 @@ credential and must never be written into a tracked file such as
 `config/default.toml`, the same rule `[backend.oss]`'s `access_key_id` and
 `access_key_secret` follow.
 
-### 🔴 `dsn` must never reach `--role node`
+### 🔴 `dsn` must never reach `aenv-node`
 
-`--role node` runs user-submitted code; database credentials, the connection
-budget and the schema belong to the deciding half only. A `--role node`
-process refuses to start if `[pg].dsn` resolves to a non-blank value —
-`ServerRole::check_pg_dsn`, checked in `src/bin/server.rs` before any
-role-specific assembly runs. `--role api` and `--role all` may configure
-`[pg]` freely.
+`aenv-node` runs user-submitted code; database credentials, the connection
+budget and the schema belong to the deciding half only. Two things enforce
+that, and they are not redundant: `aenv-node` does not link a PostgreSQL
+client at all (`make check-crate-boundaries`), so it *cannot* use a DSN; and
+it refuses to start if `[pg].dsn` resolves to a non-blank value
+(`refuse_configured_pg_dsn`, checked in
+`crates/aenv-node/src/bin/aenv-node.rs` before anything is assembled), so a
+DSN cannot be left sitting unused on a machine that runs user code. `aenv-api`
+may configure `[pg]` freely.
 
 Other path override:
 

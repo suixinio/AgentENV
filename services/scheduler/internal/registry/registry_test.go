@@ -16,9 +16,10 @@ func timePtr(t time.Time) *time.Time { return &t }
 // 🔴 This used to branch: resuming with a non-empty claimed_by_node_id
 // answered the claimant, on the theory that a claim's origin_node_id "still
 // names whoever holds the local artifacts" and so is "the wrong answer for
-// exactly the rows that are moving" — true under --role all, where the
+// exactly the rows that are moving" — true under the pre-split single process,
+// where the
 // process that calls claim_for_resume is the same machine that will run the
-// VM, so the claimant is a legitimate routing target. Under --role api|node
+// VM, so the claimant is a legitimate routing target. Under aenv-api|node
 // the claimant is an api-replica process (a Pod name, e.g.
 // "agentenv-api-57f67787-dj9th") that structurally never reports a heartbeat,
 // so routing to it always fails; origin_node_id, meanwhile, is the honest

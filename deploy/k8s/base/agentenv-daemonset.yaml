@@ -39,21 +39,25 @@ spec:
           # half instead, which is what `api-upstream-config` in
           # kustomization.yaml points at.
           #
-          # 🔴 The order of those two is load-bearing. `api-upstream-config`
-          # must carry real addresses *before* this argument is applied, and
-          # must not be emptied while it stands: a gateway still fanning REST
-          # out to nodes that have taken `--role node` gets 404 from every one
-          # of them. The two live in different files, so an apply that reverted
-          # one and not the other is exactly that outage — which is why both are
-          # pinned together by `execution_switches_manifest_test.go`.
+          # 🔴 `api-upstream-config` must carry real addresses, and must not
+          # be emptied: this image never serves user-facing REST, so a gateway
+          # still fanning REST out to these nodes gets 404 from every one of
+          # them. That used to be conditional on the `aenv-node` argument this
+          # container passed; it is unconditional now, because the binary this
+          # image runs is `aenv-node` and there is no argument that could make
+          # it answer those routes. Pinned by
+          # `execution_switches_manifest_test.go`.
           #
-          # 🔴 Rolling back is `--role all`, and it is a serial DaemonSet roll
-          # with an hour of grace per machine, not a value change. `all` is
-          # defined as the pre-split process verbatim
-          # (`only_the_split_roles_bind_a_second_listener` in
-          # `src/bin/server.rs`), so it re-serves REST on every node — point the
-          # gateway back at the nodes in the same step, or the 404s simply move.
-          args: ["--role", "node"]
+          # 🔴 Rolling back is an **image tag**, not an argument. The pre-split
+          # single-process image is the thing that re-serves REST on every node;
+          # `services/README.md` has the procedure. It is a serial DaemonSet
+          # roll with an hour of grace per machine, and the gateway has to be
+          # pointed back at the nodes in the same step, or the 404s simply move.
+          #
+          # 🔴 No `args:`. `aenv-node` no longer declares `--role`, so a manifest
+          # that still passed it would be refused by clap before the process
+          # started — an un-migrated manifest fails loudly instead of being
+          # ignored. `TestNeitherHalfPassesARoleFlag` keeps it gone.
           env:
             - name: AENV_CONFIG_PATH
               value: /workspace/config/agentenv.toml
@@ -244,19 +248,18 @@ spec:
             # a heartbeat should warm up *before* the primary channel moves),
             # reintroduce this var pointed at that target rather than
             # assuming it is still wired: `assemble_api`
-            # (`src/bin/server.rs`) never starts a reporter, so nothing on
-            # this Deployment's own side needs a matching change.
+            # (`crates/aenv-api/src/bin/aenv-api.rs`) never starts a reporter,
+            # so nothing on that Deployment's own side needs a matching change.
             # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no
             # ConfigMap generating one. It was a seam for a design that was not
-            # taken: letting `--role all` serve the node sandbox service too, so
-            # the api half had a machine to drive while the DaemonSet stayed on
-            # `--role all`. HEAD decides the other way and asserts it —
-            # `only_the_split_roles_bind_a_second_listener` in `src/bin/server.rs`
-            # fails if `assemble_all` ever grows `spawn_grpc_surface`, and
-            # `config/default.toml` says the same over `node_service_addr`. The
-            # node sandbox service belongs to `--role node`, which is what
-            # this DaemonSet now passes above; `--role all` is the rollback
-            # target and is the pre-split process verbatim.
+            # taken: letting the pre-split single process serve the node
+            # sandbox service too, so the api half had a machine to drive without the
+            # DaemonSet moving at all. HEAD decided the other way, and the
+            # decision is now structural rather than asserted: the node sandbox
+            # service belongs to `aenv-node`, which is the binary this
+            # DaemonSet's image runs, and there is no other binary that could
+            # bind it. `config/default.toml` says the same over
+            # `node_service_addr`.
             #
             # 🔴 So the switch was never read by anything: no Rust code has ever
             # looked the variable up. Setting it changed nothing while costing a
@@ -266,16 +269,15 @@ spec:
             # `no_manifest_sets_a_node_service_gate_nothing_reads`
             # (`src/cfg.rs`) skips comment lines so this explanation can live in
             # the file it is about. Giving the api half a machine to drive was
-            # done the way it had to be — moving the DaemonSet to `--role node`,
+            # done the way it had to be — moving the DaemonSet to `aenv-node`,
             # a roll that buys something — and not by reviving this key.
             #
-            # Where that listener sits on a `--role node` machine. Set
+            # Where that listener sits on an `aenv-node` machine. Set
             # explicitly at its own default so the container port declared below
             # has a visible source, and so the api half's
             # AENV_NODE_SERVICE_PORT has something in this file to be compared
             # against — a mismatch there is the api half dialling a closed port
-            # on every machine, and the symptom arrives at the moment the
-            # DaemonSet moves to `--role node`.
+            # on every machine.
             - name: AENV_NODE_SERVICE_ADDR
               value: "0.0.0.0:8001"
             # Where the control-plane credential is read from, re-read while
@@ -306,7 +308,7 @@ spec:
             - name: http
               containerPort: 8000
             # The node sandbox service. Declared before this DaemonSet took
-            # `--role node`, which is what made that move an argument change
+            # `aenv-node`, which is what made that move an argument change
             # rather than that plus a YAML edit on a live cluster; now that the
             # argument is set, the process actually binds it.
             #
@@ -375,7 +377,7 @@ spec:
                     # single pod deletion: set image, rollout restart, delete
                     # pod, drain, node reboot.
                     #
-                    # 🔴 Reads /nodes, not /sandboxes. Under `--role node` the
+                    # 🔴 Reads /nodes, not /sandboxes. Under `aenv-node` the
                     # sandboxes routes answer 404 (src/api/role_gate.rs), so the
                     # old `curl -sf … /sandboxes` would fail every time,
                     # `continue` forever, and hang the pod in Terminating for

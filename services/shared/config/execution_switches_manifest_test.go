@@ -263,38 +263,33 @@ func TestTheMountedFilesDoNotUndoTheSwitches(t *testing.T) {
 	}
 }
 
-// 🔴 3a's REST upstream and 3b's `--role node` are one setting spread across two
-// files, and the apply that reverts one and not the other is an outage.
+// 🔴 The gateway's REST upstream is not optional, because the nodes never serve
+// user-facing REST.
 //
-// A node holding `--role node` answers 404 on every user-facing REST route
-// (`src/api/role_gate.rs`). The gateway only stops sending REST to nodes when
-// `GATEWAY_REST_UPSTREAM_ADDR` names the api half. Empty that key while the
-// DaemonSet keeps the argument and every REST call in the cluster 404s — and
-// because both halves look individually like a rollback to a known-good state,
-// nothing in either file says the pair must move together. This test is where
-// that is said.
-func TestTheRestUpstreamIsOnForAsLongAsTheDaemonSetTakesRoleNode(t *testing.T) {
-	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
-	roleNode := strings.Contains(strings.Join(nodeContainer.Args, " "), "--role node")
-
+// `aenv-node` answers 404 on every user-facing REST route
+// (`src/api/role_gate.rs`), and there is no argument, environment variable or
+// ConfigMap key that changes that — it is which binary the DaemonSet's image
+// runs. The gateway only sends REST somewhere that answers when
+// `GATEWAY_REST_UPSTREAM_ADDR` names the api half. Empty that key and every
+// REST call in the cluster 404s.
+//
+// 🔴 This used to be a *conditional*: the DaemonSet passed `aenv-node`, and
+// the assertion fired only while it did, because emptying the key was a
+// legitimate rollback of 阶段 3a as long as the DaemonSet went back to
+// `--role all` in the same apply. That pair no longer exists — rolling the
+// nodes back is an image-tag change, which this manifest cannot express as an
+// argument, and an apply against the current image with these keys empty is an
+// outage with no matching half. So the requirement is unconditional now.
+func TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest(t *testing.T) {
 	upstream := generatedLiteral(t, upstreamConfigMap, restUpstreamEnv)
 	resume := generatedLiteral(t, upstreamConfigMap, resumeAddrEnv)
 
-	if roleNode && (upstream == "" || resume == "") {
-		t.Fatalf("the node DaemonSet passes `--role node` but %s ships REST upstream %q and resume "+
-			"%q. Under `--role node` the nodes answer 404 on the sandboxes routes, so a gateway "+
-			"with no api upstream has nowhere to send user-facing REST — this pair is not two "+
-			"independent switches, and emptying these two is not a rollback of 3a, it is an outage",
+	if upstream == "" || resume == "" {
+		t.Fatalf("%s ships REST upstream %q and resume %q. The node DaemonSet runs aenv-node, "+
+			"which answers 404 on the sandboxes routes whatever it is passed, so a gateway with "+
+			"no api upstream has nowhere to send user-facing REST — emptying these two is not a "+
+			"rollback of anything, it is an outage",
 			upstreamConfigMap, upstream, resume)
-	}
-	if !roleNode && upstream != "" {
-		t.Fatalf("the node DaemonSet no longer passes `--role node` (args %q) while %s still points "+
-			"REST at %q. Rolling the DaemonSet back to `--role all` re-serves REST on every node; "+
-			"leaving the gateway aimed at the api half is then a live half-migration nobody chose",
-			strings.Join(nodeContainer.Args, " "), upstreamConfigMap, upstream)
-	}
-	if !roleNode {
-		return
 	}
 
 	// Both addresses have to be ones the loader can use, and they have to name

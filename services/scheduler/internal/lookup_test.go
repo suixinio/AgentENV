@@ -370,7 +370,7 @@ func TestLookupPinResolvesAnOriginRecordedUnderItsPodName(t *testing.T) {
 //
 // 🔴 The claimant fixture below is deliberately Pod-name-shaped
 // ("agentenv-api-57f67787-dj9th"), the way claimed_by_node_id is actually
-// written under --role api|node: the process that calls claim_for_resume is an
+// written under aenv-api|node: the process that calls claim_for_resume is an
 // api replica, never a machine that reports a heartbeat. This test used to use
 // "node-b" here — a string indistinguishable from a real, live node name, and
 // in fact one of the two nodes this file's fixtures register and heartbeat.
@@ -405,7 +405,7 @@ func TestLookupRoutesAResumingSandboxToItsOrigin(t *testing.T) {
 
 // The complementary case to the test above: the claimant here happens to also
 // be a live, discoverable node — the shape every claimant had before the
-// --role api|node split, when the process calling claim_for_resume was always
+// aenv-api|node split, when the process calling claim_for_resume was always
 // the machine that would run the VM. Even then, a resuming row must route to
 // its origin, not its claimant: Holder() must not branch on state at all, not
 // merely "usually" dodge the claimant because it is usually unreachable.

@@ -970,7 +970,7 @@ type GatewayConfig struct {
 	// (`_sd-impl-phase3-role.md` §11.1, §11.2).
 	ResumeAddr string `json:"resume_addr"`
 	// RestUpstreamAddr is where user-facing REST goes: sandbox, snapshot and
-	// template calls, the routes `--role node` answers 404 on.
+	// template calls, the routes `aenv-node` answers 404 on.
 	//
 	// 🔴 Empty is the switch off, and off is today's behaviour exactly: the
 	// gateway asks the scheduler which node should serve the call and forwards
@@ -980,7 +980,7 @@ type GatewayConfig struct {
 	//
 	// 🔴 This is the half of 阶段 3a whose rollback has to stay cheap. Emptying
 	// this value puts every REST call back on the nodes, which are still
-	// `--role all` for the whole of 3a and have never stopped being able to
+	// the pre-split single process for the whole of 3a and never stopped being able to
 	// serve it. Nothing about that rollback touches the DaemonSet, and that is
 	// the entire reason 3a is a separate step from 3b, where the same rollback
 	// is a serial roll with an hour of grace per machine

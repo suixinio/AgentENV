@@ -3064,10 +3064,11 @@ type RegistrySandbox struct {
 	//
 	// This used to branch on state and answer claimed_by_node_id while
 	// resuming. That read as "the claimant is who owns this now", which holds
-	// only when the claimant and the holder are the same process — true under
-	// --role all, false under --role api|node, where claimed_by_node_id is an
-	// api-replica Pod name that never appears in a heartbeat roster. See the
-	// registry.go Holder() doc comment and the design-doc revision note at
+	// only when the claimant and the holder are the same process — true in the
+	// pre-split single process, false across aenv-api/aenv-node, where
+	// claimed_by_node_id is an api-replica Pod name that never appears in a
+	// heartbeat roster. See the registry.go Holder() doc comment and the
+	// design-doc revision note at
 	// docs/proposals/_design-phase3-gateway.md §5-S5.
 	HolderNodeId string `protobuf:"bytes,12,opt,name=holder_node_id,json=holderNodeId,proto3" json:"holder_node_id,omitempty"`
 	// The incarnation this row is fenced against. Empty when the row's state

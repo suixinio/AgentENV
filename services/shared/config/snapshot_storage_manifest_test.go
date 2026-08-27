@@ -314,8 +314,7 @@ func TestTheRuntimeConfigShipsThePosixFallback(t *testing.T) {
 // agentenv-api-deployment.yaml is set from.
 //
 // 🔴 Not the literal string `agentenv-api-deployment.yaml` itself reads,
-// because that one is the one place the overlay chain diverges: `--role
-// api`/`--role all` is the only role that may ever hold `[pg]`, so it needs
+// because that one is the one place the overlay chain diverges: `aenv-api` is the only role that may ever hold `[pg]`, so it needs
 // two extra segments (`pg-overlay.toml`, `pg-dsn.toml`) that
 // agentenv-daemonset.yaml must never mount — see the note on
 // AENV_API_CONFIG_OVERLAY_PATH under snapshot-storage-config in
@@ -876,7 +875,7 @@ func TestConfigOverlayEnvNameMatchesWhatTheProcessReads(t *testing.T) {
 	}
 }
 
-// 🔴 `--role node` must never hold `[pg]` — `ServerRole::check_pg_dsn`
+// 🔴 `aenv-node` must never hold `[pg]` — `ServerRole::check_pg_dsn`
 // refuses startup outright the moment `[pg].dsn` is configured at all, which
 // on a DaemonSet means every node Pod in the fleet CrashLoops at once, not
 // just the one workload that made the mistake.
@@ -902,7 +901,7 @@ func TestDaemonSetNeverReadsPg(t *testing.T) {
 		"AENV_API_CONFIG_OVERLAY_PATH",
 	} {
 		if strings.Contains(manifest, forbidden) {
-			t.Errorf("agentenv-daemonset.yaml mentions %q. --role node must never hold [pg]: "+
+			t.Errorf("agentenv-daemonset.yaml mentions %q. aenv-node must never hold [pg]: "+
 				"ServerRole::check_pg_dsn refuses startup outright the moment [pg].dsn is "+
 				"configured, which on a DaemonSet CrashLoops every node Pod in the fleet at once.",
 				forbidden)
@@ -916,7 +915,7 @@ func TestDaemonSetNeverReadsPg(t *testing.T) {
 	// either — this is what would actually reach the process at runtime.
 	for _, seg := range overlayPathsFromManifests(t) {
 		if strings.Contains(strings.ToLower(seg), "pg") {
-			t.Errorf("the shared AENV_CONFIG_OVERLAY_PATH chain %v names %q, which --role node "+
+			t.Errorf("the shared AENV_CONFIG_OVERLAY_PATH chain %v names %q, which aenv-node "+
 				"(agentenv-daemonset.yaml) also reads — that chain must never carry a pg segment",
 				overlayPathsFromManifests(t), seg)
 		}

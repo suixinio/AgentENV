@@ -119,10 +119,10 @@ service NodeSandboxService {
   // 🔴 **Not a sandbox, and not on the `ListSandboxes` roster.** The build VM
   // this spins up never goes through `Create`, carries no
   // `control_plane_config`, and is torn down before this call returns either
-  // way. It exists so `--role api`, which has no `/dev/kvm`, no `regctl` and
+  // way. It exists so `aenv-api`, which has no `/dev/kvm`, no `regctl` and
   // no Firecracker binary of its own, can still build templates — see
   // `TemplateBuildRunner` (`src/template/runner.rs`), which is what actually
-  // runs on this node and is otherwise reached only from `--role all`.
+  // runs on this node and is otherwise reached only from the pre-split single process.
   //
   // 🔴 **Stages, and does not commit.** The same split as `Pause`'s `staged`
   // arm and `Checkpoint`: the bytes are durable on this node's repository
@@ -282,7 +282,7 @@ message SnapshotSource {
   // `SerializedValue.schema_version`'s two-way enforcement plus the
   // deploy-on-one-tag rule — see `SerializedValue`'s own doc for both.
   //
-  // 🔴 Why this exists at all: `--role node` has no catalog access of its own
+  // 🔴 Why this exists at all: `aenv-node` has no catalog access of its own
   // once the central catalog moves behind `[pg]` (see
   // `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3) — every write
   // it could make already goes through bytes-only paths, and node must never

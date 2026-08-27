@@ -34,8 +34,9 @@ x-control-plane-config-volume: &control-plane-config-volume
 
 services:
   # 🔴 New in the crate split, and the stack does not serve the user-facing
-  # REST API without it. `agentenv-a`/`agentenv-b` used to run `--role all` and
-  # answer `/sandboxes`, `/snapshots` and `/templates` themselves; they are
+  # REST API without it. `agentenv-a`/`agentenv-b` used to run the pre-split
+  # single process and answer `/sandboxes`, `/snapshots` and `/templates`
+  # themselves; they are
   # `aenv-node` now, which 404s all three. Everything a user calls goes to
   # `agentenv-api`, which holds no `/dev/kvm` and boots nothing.
   #

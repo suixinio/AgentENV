@@ -131,7 +131,7 @@ func TestOnlyTheApiHalfIsToldWhereTheClusterStoreIs(t *testing.T) {
 
 	backend, ok := envValue(apiContainer, "AENV_ORCHESTRATOR_STORE_BACKEND")
 	if !ok || backend.Value != "redis" {
-		t.Fatalf("the api Deployment does not select the cluster store (%q); `--role api` refuses to "+
+		t.Fatalf("the api Deployment does not select the cluster store (%q); `aenv-api` refuses to "+
 			"start on the in-memory one rather than run a replica whose ledger no other replica "+
 			"can see", backend.Value)
 	}
@@ -160,10 +160,10 @@ func TestOnlyTheApiHalfIsToldWhereTheClusterStoreIs(t *testing.T) {
 }
 
 // 🔴 AENV_STARTUP_RECLAIM_ENABLED=true turns a process into one that sweeps the
-// host for another process's leftover VMs. That is right for `--role node`,
+// host for another process's leftover VMs. That is right for `aenv-node`,
 // where it is the default, and destructive anywhere two servers can share a
-// machine — which is exactly what 3a is: a DaemonSet still on `--role all`
-// alongside whatever else lands on that host.
+// machine — which is exactly what 3a was: a DaemonSet still running the
+// pre-split single process alongside whatever else landed on that host.
 //
 // The scan's own control is at the bottom: the same walk over the same files
 // finds an environment variable that *is* there, so "found nothing" is a fact
@@ -198,7 +198,7 @@ func TestNoManifestSwitchesOnTheStartupHostSweep(t *testing.T) {
 			}
 			if strings.Contains(trimmed, forbidden) {
 				t.Fatalf("%s sets %s (%q); it makes a process tear down VMs it did not start, and "+
-					"during 阶段 3a every machine still runs a `--role all` node that did",
+					"during 阶段 3a every machine still ran a pre-split node that did",
 					entry.Name(), forbidden, trimmed)
 			}
 		}
@@ -290,35 +290,71 @@ func TestTheApiServiceCarriesTheTwoAddressesTheGatewayIsPointedAt(t *testing.T) 
 	}
 }
 
-// 🔴 Both halves name the role they are. 3b has happened: the DaemonSet holds
-// `--role node` and the api Deployment holds `--role api`, and neither is
-// allowed to fall back to `--role all` by omission.
+// 🔴 Neither half passes a role flag, because neither binary has one.
 //
-// This test used to assert the opposite of half of that — that the DaemonSet
-// named no role — because during 阶段 3a it stayed on `--role all` and kept
-// serving REST, which is what made rolling 3a back a gateway value change.
-// That is no longer the deployed shape, and the assertion was inverted
-// deliberately rather than deleted: `--role node` is a fleet-wide roll with an
-// hour of grace per machine in either direction, so it must not be arrived at
-// or departed from by accident. The pairing with the gateway's REST upstream —
-// the half that turns a role change into an outage — is pinned separately by
-// `TestTheRestUpstreamIsOnForAsLongAsTheDaemonSetTakesRoleNode`.
-func TestBothHalvesNameTheRoleTheyAre(t *testing.T) {
+// `--role` (and `AENV_ROLE`) existed while one binary could be any of three
+// things. There are two binaries now, `aenv-api` and `aenv-node`, and neither
+// declares the argument — clap refuses an unknown `--long`, so a manifest that
+// still passed it would not start at all. That is the outcome worth having: an
+// un-migrated manifest fails loudly rather than being ignored.
+//
+// This test used to assert the opposite — that each manifest *did* name its
+// role — and it is inverted rather than deleted, because the failure it now
+// guards is the same class in the other direction: somebody re-adding
+// `- --role` to a manifest, or a merge bringing an old one back, would take
+// down every Pod it touched.
+//
+// Which half a Pod is, is the image it runs; that is pinned by
+// TestEachHalfRunsItsOwnImage below.
+func TestNeitherHalfPassesARoleFlag(t *testing.T) {
 	apiContainer := onlyContainer(t, "the api Deployment", apiDeployment(t).Spec.Template.Spec.Containers)
-
-	if got := strings.Join(apiContainer.Args, " "); !strings.Contains(got, "--role api") {
-		t.Fatalf("the api Deployment's args are %q; without `--role api` this Pod assembles "+
-			"`--role all`, which reaches for /dev/kvm on a container that has none", got)
-	}
-
 	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
-	if got := strings.Join(nodeContainer.Args, " "); !strings.Contains(got, "--role node") {
-		t.Fatalf("the node DaemonSet's args are %q; without `--role node` it assembles `--role "+
-			"all`, which re-serves user-facing REST on every machine and does not bind the node "+
-			"sandbox service the api half drives it through", got)
+
+	for _, half := range []struct {
+		what      string
+		container corev1.Container
+	}{
+		{"the api Deployment", apiContainer},
+		{"the node DaemonSet", nodeContainer},
+	} {
+		if got := strings.Join(half.container.Args, " "); strings.Contains(got, "--role") {
+			t.Fatalf("%s passes %q. Neither binary declares --role any more, so clap refuses it "+
+				"and the Pod never starts", half.what, got)
+		}
+		if role, ok := envValue(half.container, "AENV_ROLE"); ok {
+			t.Fatalf("%s sets AENV_ROLE=%q. Nothing reads it; it is a leftover from the "+
+				"three-role binary and reads as configuration that does something", half.what, role.Value)
+		}
 	}
-	if role, ok := envValue(nodeContainer, "AENV_ROLE"); ok && strings.TrimSpace(role.Value) != "node" {
-		t.Fatalf("the node DaemonSet sets AENV_ROLE=%q while its args say `--role node`", role.Value)
+}
+
+// 🔴 Which half a Pod is, is the image it runs — and the two are different
+// images built from different crates.
+//
+// This is what replaced `--role`: `agentenv-api` runs `aenv-api`, which links
+// no sandbox runtime, and `agentenv-runtime` runs `aenv-node`, which links no
+// PostgreSQL driver (`make check-crate-boundaries`). Pointing one workload at
+// the other's image is the mistake `--role` used to make impossible by being
+// wrong in the args; it is now a mistake in the image reference, and this is
+// where it is caught.
+func TestEachHalfRunsItsOwnImage(t *testing.T) {
+	apiContainer := onlyContainer(t, "the api Deployment", apiDeployment(t).Spec.Template.Spec.Containers)
+	nodeContainer := onlyContainer(t, "the node DaemonSet", nodeDaemonSet(t).Spec.Template.Spec.Containers)
+
+	if !strings.HasPrefix(apiContainer.Image, "agentenv-api:") {
+		t.Fatalf("the api Deployment runs image %q; the api half is its own image, built from "+
+			"crates/aenv-api", apiContainer.Image)
+	}
+	if !strings.HasPrefix(nodeContainer.Image, "agentenv-runtime:") {
+		t.Fatalf("the node DaemonSet runs image %q; the node half is its own image, built from "+
+			"crates/aenv-node", nodeContainer.Image)
+	}
+	// 🔴 The control: the two must not be the same image. A single image
+	// serving both workloads is exactly the shape `--role` existed for, and it
+	// is the shape this deployment no longer has.
+	if apiContainer.Image == nodeContainer.Image {
+		t.Fatalf("both halves run %q. One image for two workloads is what --role was for, and "+
+			"neither binary has that flag any more", apiContainer.Image)
 	}
 }
 
@@ -355,11 +391,11 @@ func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T)
 			// them. They shipped empty through 阶段 3a because turning them on
 			// was meant to be a deliberate act rather than something that
 			// arrives with an image — and then it was deliberately done. The
-			// DaemonSet has since taken `--role node`, so the nodes answer 404
+			// DaemonSet has since taken `aenv-node`, so the nodes answer 404
 			// on the sandboxes routes and an empty upstream here is no longer
 			// "3a off", it is a gateway with nowhere to send REST.
 			if value := generatedLiteral(t, ref.Name, ref.Key); value == "" {
-				t.Fatalf("%s/%s is generated empty. The node DaemonSet holds `--role node`, so REST "+
+				t.Fatalf("%s/%s is generated empty. The node DaemonSet holds `aenv-node`, so REST "+
 					"has to reach the api half — an empty upstream sends it to nodes that 404",
 					ref.Name, ref.Key)
 			}
@@ -476,7 +512,7 @@ func TestTheApiHalfDialsThePortTheNodeListensOn(t *testing.T) {
 // node-local one, and the two api replicas then disagree about what every
 // sandbox's token is: the user is handed one by whichever replica the load
 // balancer picked, and it stops working the moment the other answers — no error,
-// no log, no metric (`_sd-impl-phase3-role.md` §9.2). `--role api` refuses to
+// no log, no metric (`_sd-impl-phase3-role.md` §9.2). `aenv-api` refuses to
 // start without it (`src/sandbox/access.rs`), and `optional: false` is what
 // makes the Pod stop before the process even gets to say so.
 //

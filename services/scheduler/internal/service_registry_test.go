@@ -137,7 +137,7 @@ func TestListRegistrySandboxesReturnsRowsSortedWithDerivedHolder(t *testing.T) {
 	resuming := resp.GetSandboxes()[0]
 	// Holder() is always origin_node_id, never claimed_by_node_id: the
 	// claimant (node-b here) is a mutual-exclusion identity, not a routing
-	// target, and under --role api|node is an api-replica process that never
+	// target, and under aenv-api|node is an api-replica process that never
 	// reports a heartbeat.
 	if resuming.GetHolderNodeId() != "node-a" {
 		t.Fatalf("expected a resuming row to be held by its origin, got %q", resuming.GetHolderNodeId())

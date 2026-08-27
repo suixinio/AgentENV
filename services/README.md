@@ -6,8 +6,8 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 default** on `deploy/k8s/base` any more — `docs/proposals/2026-08-20-service-decomposition.md`'s
 phase four has folded node discovery, heartbeat receipt (including the
 cluster CPU-config intersection), placement, P2P peer lookup, and the
-cluster-wide paused-sandbox registry into the Rust `--role api` binary
-(`src/node_registry/`, `src/orchestrator/paused_registry/postgres/`),
+cluster-wide paused-sandbox registry into the Rust `aenv-api` binary
+(`src/node_registry/`, `crates/aenv-api/src/orchestrator/paused_registry/postgres/`),
 reachable over the same `services/api/proto/scheduler.proto` contract this
 package still generates from. `agentenv-scheduler`'s Deployment/Service/PDB
 are commented out of `deploy/k8s/base/kustomization.yaml`'s `resources:`
@@ -284,6 +284,36 @@ point `deploy/k8s/base/config/gateway.json`'s `scheduler_addr` back at
 `agentenv-scheduler:9090` — then re-render and apply. The Deployment's own
 image tag stays pinned in this file's `images:` transformer the whole time,
 so nothing needs rebuilding to bring it back.
+
+### 🔴 Rolling the *node* half back is an image tag, not a flag
+
+This is a different rollback from the one above, and the mechanism changed.
+Through 阶段三 the AgentENV server was one binary that could be `--role api`,
+`--role node` or `--role all`, and putting the DaemonSet back on `--role all`
+was how you got one process serving user-facing REST on every machine again.
+
+There is no `--role` any more, and no `AENV_ROLE`. `aenv-api` and `aenv-node`
+are two crates, two dependency graphs (`make check-crate-boundaries`) and two
+images — `agentenv-api` and `agentenv-runtime` — and neither binary declares
+the argument, so a manifest that still passes it is refused by argument parsing
+before the process starts. That is deliberate: an un-migrated manifest fails
+loudly rather than being ignored.
+
+To go back to the single-process shape, deploy the **pre-split image tag** on
+`agentenv-daemonset.yaml` (the last tag built before the crate split; that
+binary still accepts `--role all`) and point the gateway's
+`GATEWAY_REST_UPSTREAM_ADDR` and
+`GATEWAY_RESUME_ADDR` back at the nodes in the same apply. Two things to know
+before starting:
+
+- it is a **serial DaemonSet roll with a drain per machine**, not a value
+  change — budget the grace period times the node count;
+- leaving the gateway aimed at `agentenv-api` while the nodes go back to
+  serving REST is a live half-migration nobody chose, and emptying those two
+  keys while the nodes still run `aenv-node` 404s every REST call in the
+  cluster. `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`
+  (`shared/config/execution_switches_manifest_test.go`) is what refuses the
+  second of those in the tree.
 
 From the repository root:
 

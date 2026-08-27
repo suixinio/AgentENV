@@ -445,6 +445,33 @@ spec:
               value: "redis"
             - name: AENV_BINDING_STORE_REDIS_URL
               value: redis://agentenv-redis:6379
+            # 🔴 The scheduler's SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE,
+            # under this half's own name, and 阶段四 shipped without it. It
+            # gates `apply_projection_delete`
+            # (`src/node_registry/grpc_service.rs`), which is what removes a
+            # sandbox's routing binding the moment its PAUSE/DELETE event
+            # arrives. Off, every such event is dropped as
+            # `ignored_switch_off` and the only teardown left is heartbeat
+            # reconciliation — so for up to one heartbeat interval a paused
+            # sandbox still holds a projection, the gateway reads that as "a
+            # VM is at the other end", forwards the data plane to the node
+            # instead of waking it, and the node answers 410 for a sandbox
+            # that never wakes. Measured on the dev cluster before this
+            # landed: 12 of 18 immediate post-pause requests, and
+            # `agentenv_api_sandbox_event_total{event_type="pause",
+            # outcome="ignored_switch_off"}` climbing on every one.
+            #
+            # 🔴 `"true"`, not the `on` the two Go keys beside it in this
+            # ConfigMap use. confique's env deserializer takes
+            # `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitively) and
+            # returns an error for anything else — so `on` here is a startup
+            # failure, not a quiet `false`.
+            - name: AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE
+              valueFrom:
+                configMapKeyRef:
+                  name: routing-projection-config
+                  key: AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE
+                  optional: true
             # The shared-roster fix: this Deployment's `replicas: 2` means a
             # node's gRPC heartbeat (a long-lived HTTP/2 stream through the
             # agentenv-api Service) is pinned to exactly one replica for its

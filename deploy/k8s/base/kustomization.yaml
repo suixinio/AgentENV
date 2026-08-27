@@ -279,6 +279,20 @@ configMapGenerator:
       - SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=on
       - GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE=on
       - GATEWAY_ROUTING_PROJECTION_READ=on
+      # 🔴 The write-side switch again, for the half that now owns the
+      # registry. `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE` above only
+      # reaches the scheduler process, and 阶段四 commented that workload out
+      # of `resources:` — so from the moment the api half took over
+      # `ReportSandboxEvent`, the eager projection delete was off cluster-wide
+      # and nothing said so. See the long note on this key in
+      # `agentenv-api-deployment.yaml` for what that costs.
+      #
+      # 🔴 `true`, not `on`. confique's env deserializer accepts
+      # `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitively) and errors
+      # on anything else, so `on` here would fail api startup rather than
+      # read as a quiet `false` — loud, but only if you spell it right in the
+      # first place.
+      - AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE=true
   # 阶段 3a, in two keys: which upstream the gateway sends user-facing REST to,
   # and who wakes a paused sandbox the routing projection has no answer for.
   #

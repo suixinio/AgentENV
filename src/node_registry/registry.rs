@@ -295,6 +295,12 @@ impl From<&ObservedNodeRecord> for StoredObservedRecord {
                     cpu_architecture: m.cpu_architecture.clone(),
                     cpu_config_json: m.cpu_config_json.clone(),
                 }),
+            // Always `None` here: this is the semantically-complete record
+            // `registry.rs` hands to `super::redis`, which computes and
+            // populates this field itself only for the copy it actually
+            // writes to the hot hash — see that module's own "splitting the
+            // near-static machine payload off the hot path" doc section.
+            machine_digest: None,
             snapshot: record.node.snapshot.as_ref().map(|s| StoredNodeSnapshot {
                 status: s.status,
                 allocated_cpu: s.allocated_cpu,
@@ -1655,6 +1661,10 @@ mod tests {
                 cpu_architecture: String::new(),
                 cpu_config_json,
             }),
+            // Simulating what `pull_all` hands back, which is always a
+            // fully-resolved `machine_info` — see `stored_record`'s own doc
+            // comment above.
+            machine_digest: None,
             snapshot: None,
             last_seen_unix_ms: unix_millis(last_seen),
             p2p_endpoint: None,

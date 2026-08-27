@@ -200,6 +200,7 @@ pub async fn store_for(test: &str) -> Option<SharedObservedStore> {
     let config = SharedObservedStoreConfig {
         url: server.url(next_db()),
         key_prefix: DEFAULT_KEY_PREFIX.to_string(),
+        ..Default::default()
     };
     let store = SharedObservedStore::connect(config)
         .await
@@ -212,6 +213,12 @@ pub async fn store_for(test: &str) -> Option<SharedObservedStore> {
 /// (`HLEN`, a direct `HGET`, "this field is truly gone").
 pub fn raw(store: &SharedObservedStore) -> (redis::aio::ConnectionManager, String) {
     (store.connection.clone(), store.hash_key.clone())
+}
+
+/// Same as [`raw`], but for the machine-info side hash — see
+/// `super::machine_hash_key`'s own doc.
+pub fn raw_machine(store: &SharedObservedStore) -> (redis::aio::ConnectionManager, String) {
+    (store.connection.clone(), store.machine_hash_key.clone())
 }
 
 /// Binds a store, or returns from the test having said so out loud.

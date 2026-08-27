@@ -348,3 +348,44 @@ func TestTheTargetPortReachesTheApiHalf(t *testing.T) {
 		t.Fatalf("target port metadata = %v, want exactly one value", service.gotTargetPort)
 	}
 }
+
+// 🔴 `autoResume: {enabled: false}` is a 410, not the 503 its code would earn.
+//
+// It arrives as a FailedPrecondition like the two refusals above, and the three
+// are told apart only by the trailer — so this is asserted beside them rather
+// than alone: a build that mapped the whole FailedPrecondition arm to 410 would
+// pass this test and break both of those.
+//
+// The distinction is not cosmetic. A 503 says "try again", and every client
+// that believes it will retry forever against a sandbox whose owner asked that
+// traffic never wake it. 410 is also what a node answers for a paused sandbox
+// it will not wake (`src/api/proxy.rs`'s SandboxUnavailable), so the flag reads
+// the same whichever half fields the request.
+func TestAutoResumeDisabledIs410AndNotRetryable(t *testing.T) {
+	service := &stubResumeService{
+		err: status.Error(codes.FailedPrecondition,
+			"this sandbox was created with auto-resume off and does not wake on data-plane traffic"),
+		trailer: metadata.Pairs(
+			"x-agentenv-resume-refusal", "auto_resume_disabled",
+			"x-agentenv-resume-origin-node", "",
+		),
+	}
+
+	server := newTestServer(t,
+		refusingScheduler(t, "a sandbox that declines to wake must not be routed anywhere"),
+		5*time.Second, 1<<20,
+		withProjectionReader(missingProjection()),
+		withResumeClient(service),
+	)
+	resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("status = %d, want 410", resp.StatusCode)
+	}
+	// 🔴 And no Retry-After. The flag does not clear on its own; the sandbox
+	// comes back when somebody calls resume, not when a client waits.
+	if retry := resp.Header.Get("Retry-After"); retry != "" {
+		t.Fatalf("Retry-After = %q on auto-resume-disabled, want none", retry)
+	}
+}

@@ -760,6 +760,7 @@ fn every_outcome_of_the_wake_up_surface_is_published_before_the_first_request() 
         "permission_denied",
         "not_found",
         "transition_in_progress",
+        "auto_resume_disabled",
         "resource_exhausted",
         "unavailable",
         "internal",
@@ -872,5 +873,407 @@ async fn the_metric_label_is_the_same_string_the_refusal_trailer_carries() {
         "and a wake-up that worked must record exactly one success: without this \
          the assertion above would also hold for a build that recorded a refusal \
          for everything"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 🔴 `autoResume: {enabled: false}`
+// ---------------------------------------------------------------------------
+
+/// 🔴 A paused sandbox created with auto-resume off does not wake on traffic,
+/// and the refusal is spelled so the gateway can turn it into a 410.
+///
+/// The split moved the wake decision off the node's local reverse proxy — which
+/// read this flag (`src/api/proxy.rs`'s `Paused { auto_resume: true }` arm) —
+/// and onto this surface, which did not. `enabled: false` therefore became a
+/// no-op in every clustered deployment: measured on the dev cluster as 9 out of
+/// 9 paused sandboxes woken and served 204 where the contract says 410.
+///
+/// # The three cases are one test on purpose
+///
+/// A refusal on its own proves nothing: a build that refused every wake-up
+/// would pass it. So the sandbox that *does* wake is asserted beside it, and so
+/// is the already-running one — the case the first draft of this fix broke,
+/// because it read the flag without asking whether there was anything to start.
+#[tokio::test]
+async fn a_paused_sandbox_with_auto_resume_off_is_refused_and_the_other_two_are_not() {
+    let api = serve_api(wiring(Ok(ResumePlacement::Unconstrained))).await;
+
+    // ---- refused: paused, flag off ----
+    let refused_id = SandboxId::new();
+    api.api
+        .orchestrator()
+        .set_metadata_state_for_test(refused_id, SandboxState::Paused)
+        .await
+        .expect("seed a paused sandbox");
+    api.api
+        .orchestrator()
+        .set_auto_resume_for_test(&refused_id, false)
+        .await
+        .expect("turn auto-resume off");
+
+    let status = api
+        .resume(&refused_id.to_string(), None, None)
+        .await
+        .expect_err("a paused sandbox with auto-resume off must not wake on traffic");
+    assert_eq!(
+        status.code(),
+        Code::FailedPrecondition,
+        "🔴 not NotFound: the sandbox exists and still resumes through the REST \
+         route. The gateway turns NotFound into a 404, which the platform reads \
+         as 'rebuild it from its template' — that resets the user's workspace"
+    );
+    assert_eq!(
+        status
+            .metadata()
+            .get(pb::REFUSAL_REASON_TRAILER)
+            .map(|value| value.to_str().expect("an ASCII trailer")),
+        Some("auto_resume_disabled"),
+        "🔴 the reason is what the gateway keys its 410 off — a FailedPrecondition \
+         with any other reason is a 503, which advertises 'try again' for a \
+         sandbox that is never going to answer"
+    );
+
+    // ---- not refused: paused, flag on ----
+    let woken_id = SandboxId::new();
+    api.api
+        .orchestrator()
+        .set_metadata_state_for_test(woken_id, SandboxState::Paused)
+        .await
+        .expect("seed a paused sandbox");
+    api.api
+        .orchestrator()
+        .set_auto_resume_for_test(&woken_id, true)
+        .await
+        .expect("turn auto-resume on");
+
+    let status = api
+        .resume(&woken_id.to_string(), None, None)
+        .await
+        .expect_err("the mock backend cannot actually bring a sandbox up");
+    assert_ne!(
+        status.code(),
+        Code::FailedPrecondition,
+        "🔴 a sandbox with the flag on must get past this check and fail — if at \
+         all — on the wake-up itself. Sharing an outcome with the refused case \
+         would make the assertion above hold for a build that refuses everything"
+    );
+
+    // ---- not refused: already running, flag off ----
+    //
+    // 🔴 The flag governs whether traffic may *start* a sandbox. One that is
+    // already up has nothing to start, and the proto calls this out: "a sandbox
+    // that is already running is a success carrying that sandbox's node and
+    // incarnation, not a conflict."
+    let running_id = SandboxId::new();
+    api.api
+        .orchestrator()
+        .set_proxy_target_for_test(
+            running_id,
+            ProxyTarget::new(Ipv4Addr::LOCALHOST),
+            SandboxState::Running,
+        )
+        .await;
+    api.api
+        .orchestrator()
+        .set_auto_resume_for_test(&running_id, false)
+        .await
+        .expect("turn auto-resume off");
+
+    let woken = api
+        .resume(&running_id.to_string(), None, None)
+        .await
+        .expect("an already-running sandbox is a success regardless of the flag");
+    assert_eq!(
+        woken.node_id, THIS_NODE,
+        "and it names the machine it is on, as the idempotent case always did"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 🔴 The cold path: the flag read off the cluster row
+// ---------------------------------------------------------------------------
+
+/// A cluster-backed registry that grants one claim, carrying the record the
+/// caller asked for.
+///
+/// 🔴 The reason this stub exists rather than reusing
+/// `DisabledPausedSandboxRegistry`: that one is not cluster-backed, so
+/// `arbitrate_resume` short-circuits to `Proceed` with **no entry at all** and
+/// the post-claim pass reads `None` on every request. A test built on it
+/// therefore exercises the pre-claim pass only — which is exactly what the
+/// first version of this file did, and the whole 1397-test suite stayed green
+/// with the post-claim check deleted.
+struct GrantingRegistry {
+    inner: DisabledPausedSandboxRegistry,
+    auto_resume: bool,
+    /// Set when the claim was handed back, which a refusal after a granted
+    /// claim must do — a claim left behind sits in `resuming` until its lease
+    /// lapses and blocks every later attempt to wake the sandbox anywhere.
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl crate::orchestrator::PausedSandboxRegistry for GrantingRegistry {
+    fn is_cluster_backed(&self) -> bool {
+        true
+    }
+
+    async fn claim_for_resume(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+        execution_id: crate::types::ExecutionId,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ResumeClaim> {
+        let metadata = crate::orchestrator::SandboxMetadata {
+            auto_resume: self.auto_resume,
+            ..Default::default()
+        };
+        Ok(crate::orchestrator::ResumeClaim::Claimed {
+            entry: Box::new(crate::orchestrator::PausedSandboxEntry {
+                sandbox_id: *sandbox_id,
+                cluster_id: uuid::Uuid::nil(),
+                state: crate::orchestrator::PausedRegistryState::Resuming,
+                generation: 7,
+                origin_node_id: THIS_NODE.to_string(),
+                claimed_by_node_id: Some(node_id.to_string()),
+                snapshot_id: Some(crate::snapshot::SnapshotId::generate()),
+                metadata: Some(metadata),
+                execution_id: Some(execution_id),
+                paused_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }),
+            previous_state: crate::orchestrator::PausedRegistryState::Paused,
+        })
+    }
+
+    async fn release_claim(
+        &self,
+        _sandbox_id: &SandboxId,
+        _generation: i64,
+    ) -> crate::orchestrator::RegistryResult<bool> {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
+    }
+
+    // ---- everything the path does not touch, delegated ----
+    async fn begin_pause(
+        &self,
+        entry: &crate::orchestrator::PausedSandboxEntry,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::BeganPause> {
+        self.inner.begin_pause(entry).await
+    }
+    async fn complete_pause(
+        &self,
+        sandbox_id: &SandboxId,
+        generation: i64,
+        snapshot_id: &crate::snapshot::SnapshotId,
+    ) -> crate::orchestrator::RegistryResult<()> {
+        self.inner
+            .complete_pause(sandbox_id, generation, snapshot_id)
+            .await
+    }
+    async fn mark_local_only(
+        &self,
+        sandbox_id: &SandboxId,
+        generation: i64,
+    ) -> crate::orchestrator::RegistryResult<()> {
+        self.inner.mark_local_only(sandbox_id, generation).await
+    }
+    async fn get(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> crate::orchestrator::RegistryResult<Option<crate::orchestrator::PausedSandboxEntry>> {
+        self.inner.get(sandbox_id).await
+    }
+    async fn get_many(
+        &self,
+        sandbox_ids: &[SandboxId],
+    ) -> crate::orchestrator::RegistryResult<
+        std::collections::HashMap<SandboxId, crate::orchestrator::PausedSandboxEntry>,
+    > {
+        self.inner.get_many(sandbox_ids).await
+    }
+    async fn renew_lease(
+        &self,
+        node_id: &str,
+        held: &[crate::orchestrator::HeldSandbox],
+    ) -> crate::orchestrator::RegistryResult<u64> {
+        self.inner.renew_lease(node_id, held).await
+    }
+    async fn reclaim_expired_holdings(
+        &self,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ReclaimedHoldings> {
+        self.inner.reclaim_expired_holdings().await
+    }
+    async fn mark_running(
+        &self,
+        sandbox_id: &SandboxId,
+        node_id: &str,
+        holder_node_id: &str,
+        execution_id: crate::types::ExecutionId,
+        expires_at: Option<std::time::SystemTime>,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::MarkRunningOutcome> {
+        self.inner
+            .mark_running(
+                sandbox_id,
+                node_id,
+                holder_node_id,
+                execution_id,
+                expires_at,
+            )
+            .await
+    }
+    async fn renew_sandbox_deadline(
+        &self,
+        sandbox_id: &SandboxId,
+        execution_id: crate::types::ExecutionId,
+        expires_at: Option<std::time::SystemTime>,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::DeadlineRenewalOutcome> {
+        self.inner
+            .renew_sandbox_deadline(sandbox_id, execution_id, expires_at)
+            .await
+    }
+    async fn release_node_holdings(
+        &self,
+        node_id: &str,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ReleasedHoldings> {
+        self.inner.release_node_holdings(node_id).await
+    }
+    async fn remove(
+        &self,
+        sandbox_id: &SandboxId,
+        generation: i64,
+    ) -> crate::orchestrator::RegistryResult<bool> {
+        self.inner.remove(sandbox_id, generation).await
+    }
+    async fn list_all(
+        &self,
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::PausedRegistryListing> {
+        self.inner.list_all().await
+    }
+}
+
+async fn serve_api_with_registry(
+    auto_resume: bool,
+    released: Arc<std::sync::atomic::AtomicBool>,
+) -> RunningApi {
+    crate::logging::init_for_tests();
+    let orchestrator = Orchestrator::new(
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        crate::image::DisabledRuntimeImageRefs::shared(),
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let snapshot_manager = Arc::new(mock_snapshot_manager());
+
+    let api = Arc::new(ApiImpl::new(
+        orchestrator,
+        Arc::clone(&snapshot_manager),
+        Arc::new(RefusingTemplateBuildDriver),
+        Arc::new(RefusingImageResolver::new("")),
+        None,
+        PausedSandboxWiring::new(
+            Arc::new(GrantingRegistry {
+                inner: DisabledPausedSandboxRegistry,
+                auto_resume,
+                released,
+            }),
+            snapshot_manager,
+            &NodeIdentity::from_config(&Default::default()),
+        ),
+        Vec::new(),
+        wiring(Ok(ResumePlacement::Unconstrained)),
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let addr: SocketAddr = listener.local_addr().expect("the bound address");
+    let (tx, rx) = oneshot::channel();
+    let served = Arc::clone(&api);
+    tokio::spawn(async move {
+        let _ = super::serve_on(listener, served, None, async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    RunningApi {
+        addr,
+        api,
+        _shutdown: tx,
+    }
+}
+
+/// 🔴 The flag is honoured when it arrives on the **cluster row**, which is the
+/// only copy of it on the cold path.
+///
+/// This surface exists to be asked about sandboxes the asking process has never
+/// run: `get_sandbox` returns `None`, the pre-claim pass reads nothing, and the
+/// record only shows up with the claim that arbitration grants. A build that
+/// checked only the pre-claim pass would honour `enabled: false` on whichever
+/// process happens to hold the sandbox and nowhere else — indistinguishable
+/// from working, on a single-node test, and wrong on every cluster.
+///
+/// The granted claim is also asserted to be handed back: a refusal that keeps
+/// it leaves the row in `resuming` until its lease lapses, which blocks every
+/// later attempt to wake that sandbox from anywhere.
+#[tokio::test]
+async fn the_flag_is_read_off_the_cluster_row_when_this_process_has_no_record() {
+    // ---- refused, and the claim handed back ----
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let api = serve_api_with_registry(false, Arc::clone(&released)).await;
+    let sandbox_id = SandboxId::new();
+    assert!(
+        api.api
+            .orchestrator()
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("the store answers")
+            .is_none(),
+        "🔴 the premise: this process holds no record, so only the cluster row \
+         can carry the flag"
+    );
+
+    let status = api
+        .resume(&sandbox_id.to_string(), None, None)
+        .await
+        .expect_err("the cluster row says auto-resume is off");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status
+            .metadata()
+            .get(pb::REFUSAL_REASON_TRAILER)
+            .map(|value| value.to_str().expect("an ASCII trailer")),
+        Some("auto_resume_disabled"),
+    );
+    assert!(
+        released.load(std::sync::atomic::Ordering::SeqCst),
+        "🔴 a refusal after a granted claim must release it, or the row sits in \
+         `resuming` until its lease lapses and nothing can wake the sandbox"
+    );
+
+    // ---- the same path, flag on: not refused ----
+    let released_on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let api_on = serve_api_with_registry(true, released_on).await;
+    let status = api_on
+        .resume(&SandboxId::new().to_string(), None, None)
+        .await
+        .expect_err("the mock backend cannot actually restore a sandbox");
+    assert_ne!(
+        status.code(),
+        Code::FailedPrecondition,
+        "🔴 with the flag on the same path must get past this check — otherwise \
+         the refusal above is just this stub refusing everything"
     );
 }

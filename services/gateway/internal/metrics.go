@@ -314,6 +314,11 @@ const (
 	resumeReasonOriginNotAccepting   = "origin_not_accepting_work"
 	resumeReasonOriginNotReachable   = "origin_not_reachable_from_here"
 	resumeReasonOriginUnclassified   = "origin_unclassified"
+	// The sandbox was created with autoResume off. Unlike every other reason
+	// here this one is not a failure: it is the sandbox behaving as asked, and
+	// writeResumeError turns it into a 410 rather than the 503 its
+	// FailedPrecondition code would otherwise earn.
+	resumeReasonAutoResumeDisabled = "auto_resume_disabled"
 )
 
 var knownResumeReasons = map[string]struct{}{
@@ -322,6 +327,7 @@ var knownResumeReasons = map[string]struct{}{
 	resumeReasonOriginNotAccepting:   {},
 	resumeReasonOriginNotReachable:   {},
 	resumeReasonOriginUnclassified:   {},
+	resumeReasonAutoResumeDisabled:   {},
 }
 
 // The gRPC codes this build maps to a label, spelled as the api half spells

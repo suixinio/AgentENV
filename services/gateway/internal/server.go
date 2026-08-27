@@ -1640,6 +1640,18 @@ func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, resul
 	case codes.PermissionDenied:
 		http.Error(w, reason, http.StatusForbidden)
 	case codes.FailedPrecondition, codes.ResourceExhausted:
+		// 🔴 410 and not 503, and this is the one refusal in this switch that
+		// is not a failure. `autoResume: {enabled: false}` is the sandbox's
+		// owner saying traffic must not bring it back; a 503 would advertise
+		// that as temporary and have every client retry forever against a
+		// sandbox that is never going to answer. 410 is also byte-for-byte
+		// what a node answers for a paused sandbox it will not wake
+		// (`src/api/proxy.rs`'s `SandboxUnavailable`), so the flag reads the
+		// same to a client whichever half fields the request.
+		if result.Reason == resumeReasonAutoResumeDisabled {
+			http.Error(w, reason, http.StatusGone)
+			return
+		}
 		// Retry-After on the transient one only. `transition_in_progress`
 		// clears in a moment; a pin refusal clears when a machine comes back,
 		// which may be never, and a small Retry-After on that would have the

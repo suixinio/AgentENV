@@ -49,6 +49,7 @@ use super::{ApiImpl, ResumeArbitration};
 use crate::cfg::ConfigManager;
 use crate::orchestrator::{
     ClaimedExecution, NewTimeout, OrchestratorError, PausedSandboxEntry, SandboxMetadata,
+    SandboxState,
 };
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 use crate::scheduler_endpoint::SchedulerEndpointSource;
@@ -529,6 +530,15 @@ pub(in crate::api) enum DataPlaneResume {
     },
     /// The caller did not present the sandbox's envd access token.
     Unauthorized,
+    /// The sandbox is paused and was created with `autoResume` off, so
+    /// data-plane traffic must not bring it back.
+    ///
+    /// 🔴 Not a form of [`Self::NotFound`]. The sandbox exists and can still be
+    /// resumed through the REST route; what it will not do is wake because
+    /// something sent it a request. Answering "no such sandbox" would tell the
+    /// platform to rebuild it from its template, which resets the user's
+    /// workspace — the same reason `NotFound`'s own comment gives.
+    AutoResumeDisabled,
     /// Nothing anywhere knows this sandbox.
     NotFound,
     /// Another resume is in flight. Retryable in a moment.
@@ -569,6 +579,34 @@ enum EnvdAuthorization {
     Authorized,
     Rejected,
     Unknown,
+}
+
+/// Whether a sandbox wakes because something sent it traffic.
+///
+/// 🔴 Three answers, and `Unknown` is not `Refused`. On the cold path the
+/// asking process routinely holds no record — that is what the path is for —
+/// and collapsing "no record to read the flag from" into "refuse" would refuse
+/// every cross-node wake-up in the cluster. The caller reads this twice, once
+/// per record it can get its hands on, exactly as it does the credential check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoResume {
+    Allowed,
+    Refused,
+    Unknown,
+}
+
+/// Reads [`SandboxMetadata::auto_resume`] out of whichever record is in hand.
+///
+/// 🔴 A free function taking the record, rather than a method that looks the
+/// record up: the two call sites read two *different* records — this process's
+/// own, and the cluster row — and the second is the one that matters, because
+/// on the cold path the first is usually absent.
+fn wakes_on_traffic(metadata: Option<&SandboxMetadata>) -> AutoResume {
+    match metadata {
+        None => AutoResume::Unknown,
+        Some(metadata) if metadata.auto_resume => AutoResume::Allowed,
+        Some(_) => AutoResume::Refused,
+    }
 }
 
 impl EnvdAuthorization {
@@ -635,6 +673,27 @@ impl ApiImpl {
             return DataPlaneResume::Unauthorized;
         }
 
+        // The same two-pass shape as the credential check, for the same
+        // reason: this process usually holds no record on the cold path, and
+        // the flag only arrives with the cluster row the arbitration below
+        // returns. See the second pass after it.
+        //
+        // 🔴 `Paused` exactly, and the state gate is the point. The flag says
+        // whether traffic may *start* a sandbox that is not running; a sandbox
+        // that is already running has nothing to start, and the proto calls
+        // that case out as "a success carrying that sandbox's node and
+        // incarnation, not a conflict". Without the gate this refuses the
+        // idempotent case and turns every already-running sandbox reached
+        // through the cold path into a 410 — which is what the three tests
+        // seeding `SandboxState::Running` caught.
+        if let Some(metadata) = local.as_ref() {
+            if metadata.state == SandboxState::Paused
+                && wakes_on_traffic(Some(metadata)) == AutoResume::Refused
+            {
+                return DataPlaneResume::AutoResumeDisabled;
+            }
+        }
+
         // 🔴 The same call the REST resume route makes, and deliberately not a
         // second way of asking. Both paths end with a live sandbox, so a resume
         // that arbitrated separately would be a second place two nodes could be
@@ -676,6 +735,35 @@ impl ApiImpl {
                 }
                 return DataPlaneResume::Unauthorized;
             }
+        }
+
+        // 🔴 The pass that actually does the work. The row this reads is the
+        // only copy of the flag anywhere on the cold path — the whole point of
+        // this surface is being asked about sandboxes this process has never
+        // run — so a build that checked only the pre-claim pass above would
+        // honour `autoResume: {enabled: false}` exactly on the process that
+        // happens to hold the sandbox and nowhere else, which is the shape the
+        // split left behind.
+        //
+        // 🔴 After the credential check, never before: a caller presenting no
+        // token must be told it is unauthorized rather than be told, for free,
+        // how this sandbox is configured.
+        //
+        // 🔴 No state gate on this one, unlike the pre-claim pass. That record
+        // is "the sandbox's identity and configuration, as it looked when it
+        // was paused" (`PausedSandboxEntry::metadata`), so its `state` is a
+        // snapshot of a transition, not a current fact — gating on it would
+        // read `Pausing` and silently never fire. What makes the gate
+        // unnecessary here is that arbitration granted a claim: reaching this
+        // line means this call is about to start the sandbox, which is exactly
+        // when the flag has something to refuse.
+        if wakes_on_traffic(entry.as_ref().and_then(|entry| entry.metadata.as_ref()))
+            == AutoResume::Refused
+        {
+            if let Some(generation) = held {
+                self.abandon_claim(sandbox_id, generation).await;
+            }
+            return DataPlaneResume::AutoResumeDisabled;
         }
 
         self.wake(sandbox_id, entry, claimed, held, &placement)

@@ -39,6 +39,16 @@ use crate::types::SandboxId;
 /// trailer, so the gateway has one key to read rather than two.
 const REASON_TRANSITION_IN_PROGRESS: &str = "transition_in_progress";
 
+/// The sandbox was created with `autoResume` off.
+///
+/// 🔴 Travels as a reason on a `FailedPrecondition` rather than as a status
+/// code of its own, because the gateway already reads this trailer to separate
+/// refusals that share a code, and because there is no gRPC code that means
+/// "gone" — the 410 this becomes is decided on the gateway side, from this
+/// string. Keep it in step with `resumeReasonAutoResumeDisabled` in
+/// `services/gateway/internal/metrics.go`, which is a closed set.
+const REASON_AUTO_RESUME_DISABLED: &str = "auto_resume_disabled";
+
 /// Serves [`pb::sandbox_resume_service_server::SandboxResumeService`] out of one
 /// `ApiImpl`.
 pub struct SandboxResumeService<I> {
@@ -120,6 +130,23 @@ where
             DataPlaneResume::NotFound => {
                 record("not_found");
                 Err(Status::not_found(format!("sandbox {sandbox_id} not found")))
+            }
+            DataPlaneResume::AutoResumeDisabled => {
+                // `debug`, not `warn`. A sandbox that declines to wake on
+                // traffic is doing what it was asked to do, and every request
+                // that reaches it while it is paused lands here — so this is
+                // as high-volume as the traffic itself.
+                debug!(
+                    %sandbox_id,
+                    "refusing to wake a sandbox created with auto-resume off"
+                );
+                record("auto_resume_disabled");
+                Err(refusal(
+                    "this sandbox was created with auto-resume off and does not wake on \
+                     data-plane traffic",
+                    REASON_AUTO_RESUME_DISABLED,
+                    "",
+                ))
             }
             DataPlaneResume::TransitionInProgress { holder } => {
                 record("transition_in_progress");
@@ -222,6 +249,7 @@ pub fn describe_metrics() {
         "permission_denied",
         "not_found",
         "transition_in_progress",
+        REASON_AUTO_RESUME_DISABLED,
         "resource_exhausted",
         "unavailable",
         "internal",

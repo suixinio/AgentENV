@@ -552,7 +552,53 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
       fi
     done < <(candidate_node_urls)
 
-    [[ -n "$found" ]] && printf '%s\n' "$found"
+    # 🔴 `printf`, not `[[ -n ]] && printf`. The guarded form makes the whole
+    # function exit non-zero when it finds nothing, and every caller runs it in
+    # a `$(...)` under `set -e` — so "no node claimed this sandbox" killed the
+    # suite on the spot, before the `assert_not_empty` written to report it
+    # could run. That is how 04/07/10 came to die with `command: [[ -n
+    # "$found" ]]` in the log, which reads like a shell bug rather than like
+    # the answer it actually is.
+    printf '%s' "$found"
+    [[ -n "$found" ]] || printf '\n'
+  }
+
+  # Whether a runtime node still answers the user-facing REST API.
+  #
+  # 🔴 It does not, in a split deployment, and that is by design rather than by
+  # accident: `aenv-node` refuses every user-facing route with a 404 that is
+  # byte-for-byte what an unrouted path produces (`src/api/role_gate.rs`), so
+  # `/sandboxes`, `/templates/...` and `/nodes` are all gone from a node's own
+  # port. The suites that reach for a node endpoint predate that split.
+  #
+  # Probed once and cached, against `/sandboxes` — a route the node half
+  # refuses and the api half serves, so the probe separates the two halves
+  # rather than merely proving something is listening (`/health` answers on
+  # both, which is why it cannot be the probe).
+  _E2E_NODE_REST_SERVED=""
+  node_rest_is_served() {
+    if [[ -z "${_E2E_NODE_REST_SERVED}" ]]; then
+      local probe_url
+      probe_url="$(candidate_node_urls | head -n 1)"
+      if [[ -z "${probe_url}" ]]; then
+        _E2E_NODE_REST_SERVED="no"
+      else
+        api_get_at "${probe_url}" "/sandboxes" || true
+        if [[ "${HTTP_STATUS}" == "200" ]]; then
+          _E2E_NODE_REST_SERVED="yes"
+        else
+          _E2E_NODE_REST_SERVED="no"
+        fi
+      fi
+    fi
+    [[ "${_E2E_NODE_REST_SERVED}" == "yes" ]]
+  }
+
+  # The one message every suite uses when it steps around the split, so a
+  # reader greps one string rather than five paraphrases.
+  node_rest_skip_reason() {
+    printf '%s' "skipped because the node half does not serve user-facing REST \
+(aenv-node refuses these routes by design — src/api/role_gate.rs)"
   }
 
   # ---- suite init --------------------------------------------------------------

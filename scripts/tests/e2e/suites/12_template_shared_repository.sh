@@ -22,6 +22,18 @@ if [[ -z "${AENV_NODE_A_URL:-}" || -z "${AENV_NODE_B_URL:-}" ]]; then
   exit 0
 fi
 
+# 🔴 This suite's whole premise is two independent REST surfaces: build a
+# template through node A, read it back through node B, and thereby prove the
+# repository underneath is shared. The split leaves one REST surface — the api
+# half — in front of both nodes, so there is no longer a second endpoint to
+# read back from, and the property is no longer observable from outside.
+if ! node_rest_is_served; then
+  warn "Skipping shared repository checks: nodes no longer serve user-facing REST."
+  _pass "cross-node template flow $(node_rest_skip_reason)"
+  suite_summary "12_template_shared_repository"
+  exit 0
+fi
+
 assert_cross_node_template_flow() {
   local builder_url="$1"
   local builder_label="$2"

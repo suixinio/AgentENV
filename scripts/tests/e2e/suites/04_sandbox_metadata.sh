@@ -30,7 +30,13 @@ assert_contains "$HTTP_BODY" "$id_a" "filter returns sandbox A"
 count=$(echo "$HTTP_BODY" | jq '[.[] | select(.sandboxID == "'"$id_b"'")] | length')
 assert_eq "$count" "0" "filter excludes sandbox B"
 
-if e2e_mode_is_clustered; then
+if e2e_mode_is_clustered && ! node_rest_is_served; then
+  # 🔴 Lost coverage, stated as such. The contrast below — a node lists its own
+  # sandboxes and not the other node's — cannot be expressed against the split:
+  # nodes serve no `/sandboxes`, and no user-facing API says which node owns a
+  # sandbox. Restoring it needs an API affordance, not a test change.
+  _pass "cross-node local metadata contrast $(node_rest_skip_reason)"
+elif e2e_mode_is_clustered; then
   owner_a=$(find_sandbox_node_url "$id_a")
   owner_b=$(find_sandbox_node_url "$id_b")
   assert_not_empty "$owner_a" "sandbox A resolves to a runtime node"

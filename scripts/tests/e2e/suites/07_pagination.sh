@@ -23,7 +23,11 @@ for sid in "${_TRACKED_SANDBOX_IDS[@]}"; do
   wait_for_sandbox_state "$sid" "running" 30
 done
 
-if e2e_mode_is_clustered; then
+if e2e_mode_is_clustered && ! node_rest_is_served; then
+  # Informational either way — the pagination assertions below are what this
+  # suite is for, and they run against the gateway regardless.
+  _pass "pagination fixture node spread $(node_rest_skip_reason)"
+elif e2e_mode_is_clustered; then
   owner_count=$(for sid in "${_TRACKED_SANDBOX_IDS[@]}"; do find_sandbox_node_url "$sid"; done | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
   if [[ "${owner_count}" -ge 2 ]]; then
     _pass "pagination fixture spans multiple runtime nodes"

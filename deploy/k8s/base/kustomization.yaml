@@ -644,10 +644,16 @@ configMapGenerator:
   #
   # 🔴 Only the node reads it. `assemble_api` in `src/bin/aenv-api.rs` states
   # outright that `aenv-api` "installs no regctl — by design, that is a
-  # node's tooling", and both call sites that would otherwise reach for one —
-  # `POST /sandboxes-cold` and a template build — refuse at the door on
-  # `!role.runs_sandbox_runtime()` before any image is resolved
-  # (`src/api/impls/sandbox.rs`, `src/api/impls/template.rs`). So
+  # node's tooling", and neither call site that would otherwise reach for one
+  # resolves an image in this process. `POST /sandboxes-cold` does not refuse:
+  # it validates the request and ships the *unresolved* reference to a node,
+  # which resolves it inside the same `Create`
+  # (`SandboxLaunchSource::UnresolvedImage`, `src/api/impls/sandbox.rs`). A
+  # template build dispatches to a node as well (`run_the_build_on_a_node`);
+  # its refusal is narrower than it reads. It is two conjuncts, not one:
+  # `!self.runs_sandbox_runtime() && self.node_placement().is_none()`
+  # (`src/api/impls/template.rs`), so it fires only for an `aenv-api` with no
+  # node to forward to at all. So
   # `agentenv-api-deployment.yaml` carries neither this ConfigMap nor the env
   # var; see the note on its `volumes:` block for the paired absence.
   # `regctl_config_manifest_test.go` pins the generator, the DaemonSet's mount

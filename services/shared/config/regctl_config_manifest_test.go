@@ -145,8 +145,9 @@ func TestTheNodeMountsRegctlConfigWhereRegctlLooksForIt(t *testing.T) {
 
 // 🔴 The control. `aenv-api` never calls `regctl`
 // (`crates/aenv-node/src/bin/aenv-node.rs::assemble_api`'s own doc comment: "installs no regctl —
-// by design, that is a node's tooling"; both `POST /sandboxes-cold` and a
-// template build refuse on `!role.runs_sandbox_runtime()` before reaching one),
+// by design, that is a node's tooling"; `POST /sandboxes-cold` ships the
+// unresolved image reference to a node instead of resolving one, and a template
+// build dispatches to a node too — neither resolves an image in this process),
 // so giving this half the same volume and env var as the node would cost
 // nothing and fix nothing. Checked here so that "the node" and "not the api
 // half" stay two different, both-verified claims rather than one assumption.

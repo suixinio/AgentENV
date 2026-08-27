@@ -652,8 +652,9 @@ pub async fn build_paused_registry(
                 )?;
 
                 // 🔴 M1: the roster requirement, and it is unconditional now.
-                // It used to be guarded by `!role.runs_sandbox_runtime()`,
-                // because a the pre-split single process process's own identity already
+                // It used to be guarded by the now-deleted `ServerRole`'s
+                // `runs_sandbox_runtime`, because a the pre-split single
+                // process process's own identity already
                 // coincided with `origin_node_id` for everything it ran, so
                 // the ordinary `renew_lease` trait method (its own periodic
                 // self-renewal) already covered what D2 Fix A exists to cover

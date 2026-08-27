@@ -184,8 +184,10 @@ spec:
             # 🔴 This precondition is load-bearing and enforced at startup,
             # not just documented here: `build_paused_registry`
             # (`src/orchestrator/paused_registry/mod.rs`) requires a
-            # heartbeat-roster `NodeRegistry` handle under `aenv-api`
-            # (`role.runs_sandbox_runtime() == false`), which only exists
+            # heartbeat-roster `NodeRegistry` handle for this backend —
+            # unconditionally, not behind any role test: `aenv-api` is the only
+            # caller that function has ever had, and no process links both
+            # halves. That handle exists only
             # under `AENV_NODE_PLACEMENT_SOURCE = "native"` below — without
             # it, `running` rows have no lease-renewal path and are wrongly
             # reclaimed even while healthy (the exact failure Fix A, commit
@@ -293,11 +295,27 @@ spec:
             # answer. Set explicitly at its own default so the containerPort
             # below has a visible source and the two cannot drift.
             #
-            # 🔴 Nothing binds this listener yet — `api::grpc::serve` is written
-            # and uncalled in every role — so until that lands the gateway's
-            # `resume_addr` pointed here gets a connection refused, which the
-            # resume client reads as VerdictUndecided and falls back to the
-            # scheduler. That is the safe direction: latency, not availability.
+            # 🔴 Bound for real by `assemble_api`
+            # (`crates/aenv-api/src/bin/aenv-api.rs`), which hands this address
+            # to `spawn_grpc_surface` and serves the bound listener with
+            # `aenv_api::api::grpc::serve_on`. Two gRPC services share that one
+            # listener, multiplexed by HTTP/2 path: `SandboxResumeService`
+            # always, plus `NodeRegistryGrpcService`'s `Scheduler` service under
+            # `AENV_NODE_PLACEMENT_SOURCE = "native"` below. So both of this
+            # port's callers land here — the gateway's cold path, pointed at it
+            # by `GATEWAY_RESUME_ADDR=agentenv-api:8002`, and every node's
+            # heartbeat, pointed at it by
+            # `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002`
+            # (both literals in kustomization.yaml).
+            #
+            # 🔴 A replica that came up without this listener refuses both.
+            # The resume client reads its connection refused as
+            # VerdictUndecided and falls through to the cold `LookupNode` path
+            # — which, since `gateway.scheduler_addr` also names
+            # `agentenv-api:8002` now, dials this same address rather than a
+            # separate scheduler. This is no longer the latency-not-availability
+            # trade it was when that fallback led somewhere else; see the
+            # `GATEWAY_SCHEDULER_FALLBACK_DISABLED` note in kustomization.yaml.
             - name: AENV_API_GRPC_ADDR
               value: "0.0.0.0:8002"
             # The port this half dials a machine's node sandbox service on.
@@ -610,11 +628,19 @@ spec:
         # registry, and this half never calls `regctl`: the doc comment on
         # `assemble_api` in `src/bin/aenv-api.rs` is explicit that `aenv-api`
         # "installs no regctl — by design, that is a node's tooling", and the
-        # two routes that would otherwise resolve an image
-        # (`POST /sandboxes-cold`, a template build) refuse at the door on
-        # `!role.runs_sandbox_runtime()` before reaching it. Mounting the
-        # volume here would cost nothing and fix nothing — there is no call
-        # site left for it to unblock.
+        # two routes that would otherwise resolve an image never resolve one
+        # in this process. `POST /sandboxes-cold` does not refuse: it validates
+        # the request and ships the *unresolved* reference to a node, which
+        # resolves it inside the same `Create`
+        # (`SandboxLaunchSource::UnresolvedImage`, `src/api/impls/sandbox.rs`).
+        # A template build dispatches to a node as well
+        # (`run_the_build_on_a_node`); its refusal is narrower than it reads.
+        # It is two conjuncts, not one:
+        # `!self.runs_sandbox_runtime() && self.node_placement().is_none()`
+        # (`src/api/impls/template.rs`), so it fires only for an `aenv-api`
+        # with no node to forward to at all.
+        # Mounting the volume here would cost nothing and fix nothing — there
+        # is no call site left for it to unblock.
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config

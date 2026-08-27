@@ -158,9 +158,9 @@ pub async fn resolve_attached_drives(
 /// same way, but leaves every drive's image reference unresolved for the node
 /// that will build the sandbox to resolve instead.
 ///
-/// 🔴 Used only when `!role.runs_sandbox_runtime()` — see
-/// `sandboxes_cold_post`'s role branch. A role that can resolve images itself
-/// always takes `resolve_attached_drives`, unchanged.
+/// 🔴 Used only when `ApiImpl::runs_sandbox_runtime` is false — see the branch
+/// it guards in `sandboxes_cold_post`. `aenv-node`, which can resolve images
+/// itself, always takes `resolve_attached_drives`, unchanged.
 pub fn unresolved_attached_drives(
     drives: &[models::AttachedDrive],
 ) -> Result<Vec<crate::sandbox::UnresolvedAttachedDrive>, models::Error> {

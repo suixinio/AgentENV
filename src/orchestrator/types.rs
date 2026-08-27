@@ -31,11 +31,11 @@ pub enum SandboxLaunchSource {
     /// machine-local cold create (`aenv-node`) already has by
     /// the time it builds a launch source. `aenv-api` has no `regctl`, so
     /// `sandboxes_cold_post` cannot produce that variant at all when
-    /// `!role.runs_sandbox_runtime()`; this is what it builds instead. It
-    /// carries only what is known without an image resolver: the reference
-    /// itself, the already-computed resources (no image needed to size a
-    /// sandbox), and attached drives named by reference rather than by local
-    /// path. `create_sandbox_inner` routes it to
+    /// `ApiImpl::runs_sandbox_runtime` is false; this is what it builds
+    /// instead. It carries only what is known without an image resolver: the
+    /// reference itself, the already-computed resources (no image needed to
+    /// size a sandbox), and attached drives named by reference rather than by
+    /// local path. `create_sandbox_inner` routes it to
     /// `SandboxBackendFactory::build_from_image_ref`, whose only real
     /// implementation (`RemoteSandboxBackendFactory`) ships it to a node that
     /// *can* resolve it.

@@ -9,9 +9,10 @@
 //! importing halves, overlaybd itself. A process that boots no microVMs must
 //! not link any of it.
 //!
-//! That used to be a runtime gate — `build_storage_for_role` returned early on
-//! `!role.runs_sandbox_runtime()`, and a source-scanning test asserted it was
-//! the only call site. The gate is now the crate boundary: this module lives
+//! That used to be a runtime gate — `build_storage_for_role` took the
+//! now-deleted `ServerRole` and returned early when it said this process runs
+//! no sandbox runtime, and a source-scanning test asserted it was the only
+//! call site. The gate is now the crate boundary: this module lives
 //! in `aenv-node`, `aenv-api` does not depend on it, and
 //! `make check-crate-boundaries` is what fails when that stops being true.
 //! See `build_catalog_only_storage` for the half `aenv-api` builds instead.

@@ -83,7 +83,7 @@ pub struct NodeSandboxService {
 /// `template_build`.
 struct TemplateBuildWiring {
     /// Resolves an image reference into local overlaybd, node-side — the
-    /// piece `--role api` cannot do for itself: see the note on
+    /// piece `aenv-api` cannot do for itself: see the note on
     /// `TemplateBuildImageBase` and `ImageSource` in `node.proto`.
     image_resolver: Arc<ImageResolver>,
     /// Drives `TemplateBuildRunner` and validates the build's `TemplateBuildContext`.
@@ -251,9 +251,9 @@ impl NodeSandboxService {
     /// The "resolve the base, execute, stage" shape is exactly
     /// `run_the_build` -> `TemplateBuilder::execute_and_publish`'s local path
     /// in `src/api/impls/template.rs`, moved here because resolving an image
-    /// needs `regctl` and `--role api` has none. It stops one step short of
+    /// needs `regctl` and `aenv-api` has none. It stops one step short of
     /// that path, at `SnapshotManager::stage` rather than `publish`: a build
-    /// run for `--role api` has no catalog row of its own to write into —
+    /// run for `aenv-api` has no catalog row of its own to write into —
     /// only the caller's `try_start_build` row does, and only the caller can
     /// write it. What crosses back is therefore a `StagedSnapshot` for the
     /// caller to commit, exactly like `stage_for_caller` above.
@@ -1043,10 +1043,10 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
     /// both the capture belongs to the pause that produced it and is gone. Any
     /// other reason fails the call.
     ///
-    /// 🔴 This node's own publisher is not consulted on this arm. On `--role
-    /// node` it is `DisabledPausedSandboxRegistry` and would drop the capture;
-    /// on any role it would be a second process writing a row for a pause the
-    /// caller already owns.
+    /// 🔴 This node's own publisher is not consulted on this arm. In
+    /// `aenv-node` it is `DisabledPausedSandboxRegistry` and would drop the
+    /// capture; either way it would be a second process writing a row for a
+    /// pause the caller already owns.
     async fn pause(
         &self,
         request: Request<pb::SandboxPauseRequest>,

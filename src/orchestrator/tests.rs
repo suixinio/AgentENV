@@ -55,7 +55,7 @@ fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
 
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
     Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -67,7 +67,7 @@ async fn make_orchestrator() -> Arc<TestOrchestrator> {
 
 async fn make_orchestrator_with_factory(factory: MockBackendFactory) -> Arc<TestOrchestrator> {
     Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
@@ -745,7 +745,7 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
 
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
@@ -789,7 +789,7 @@ async fn the_roster_is_complete_the_moment_new_returns() -> Result<()> {
     let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
 
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister,
@@ -818,7 +818,7 @@ async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
     persister.fail_next(RecordingCall::LoadAll);
 
     let result = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
@@ -4699,7 +4699,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
         ..Default::default()
     }]);
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
@@ -7074,7 +7074,7 @@ async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
     let factory = StampingFactory::new(true);
     let seen = factory.seen();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
@@ -7122,7 +7122,7 @@ async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
     );
 }
 
-/// 🔴 The control probe for the test above, and the one that keeps `--role all`
+/// 🔴 The control probe for the test above, and the one that keeps the pre-split single process
 /// honest. Everything is identical except the factory's answer to one question;
 /// if the stamping were unconditional, the test above would still pass and the
 /// user-facing REST surface would start producing sandboxes that claim to
@@ -7133,7 +7133,7 @@ async fn a_machine_local_orchestrator_stamps_nothing() {
     let factory = StampingFactory::new(false);
     let seen = factory.seen();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
@@ -7179,7 +7179,7 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
     let factory = StampingFactory::new(true);
     let seen = factory.seen();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,

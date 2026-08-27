@@ -31,8 +31,8 @@
 //! placement-deciding ones now that Stage D exists to answer them.
 //!
 //! 🔴 Before this, `place_new`/`place_existing`/`record_placement` forwarded
-//! unconditionally to an inner `SchedulerNodePlacement` — meaning `--role
-//! api` under `Native` was simultaneously the gRPC *server* for
+//! unconditionally to an inner `SchedulerNodePlacement` — meaning `aenv-api`
+//! under `Native` was simultaneously the gRPC *server* for
 //! `Schedule`/`LookupNode`/`RecordAssignment` (Stage D) and, for placement
 //! decisions, still a *client* of the Go scheduler for those same three
 //! calls, with nothing in the process ever answering its own server. A Go

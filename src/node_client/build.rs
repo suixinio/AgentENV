@@ -1,4 +1,4 @@
-//! Dispatching a template build to a node, for `--role api`.
+//! Dispatching a template build to a node, for `aenv-api`.
 //!
 //! # 🔴 The one place in this module that reaches a staged row
 //!
@@ -6,8 +6,8 @@
 //! create refuses, and a pause's `publish` arm refuses because "nothing here
 //! commits a staged snapshot row". A template build cannot refuse the same
 //! way and still leave the caller anything to do — there is no local
-//! execution to fall back to once `ServerRole::runs_sandbox_runtime()` is
-//! false, so `--role api` either drives this or template builds stop working
+//! execution to fall back to once `ApiImpl::runs_sandbox_runtime()` is
+//! false, so `aenv-api` either drives this or template builds stop working
 //! for the whole cluster. This file is the first thing in `node_client` that
 //! actually reaches a staged row, and it does so by reusing the mechanism a
 //! checkpoint already relies on rather than inventing a second one — see

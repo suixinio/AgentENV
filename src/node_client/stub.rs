@@ -198,7 +198,7 @@ impl RemoteSandboxStub {
     /// # 🔴 This is what a replicated deciding half has instead of a handle
     ///
     /// `Orchestrator` keeps its backends in a process-local map, which is the
-    /// whole truth when there is one process. `--role api` runs several behind
+    /// whole truth when there is one process. `aenv-api` runs several behind
     /// a load balancer with no session affinity, so the replica a call lands on
     /// is *not* the replica that started the sandbox — and the one that did not
     /// start it has an empty map and a perfectly good record. Without this it

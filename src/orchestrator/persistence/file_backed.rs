@@ -521,8 +521,8 @@ impl SandboxPersister for FileBackedSandboxPersister {
     ///
     /// 🔴 Nothing here calls `Drop` on the store, and nothing needs to: this
     /// only front-loads the wait `LocalKvStore::close` documents — see it for
-    /// why an unbounded version of that wait is what leaves `server --role
-    /// node` running past `terminationGracePeriodSeconds` after every log line
+    /// why an unbounded version of that wait is what leaves `aenv-node`
+    /// running past `terminationGracePeriodSeconds` after every log line
     /// the graceful shutdown was ever going to print has already printed. A
     /// node that never paused anything this run has an uninitialized `db`
     /// cell and nothing to close, which is also why such nodes were always

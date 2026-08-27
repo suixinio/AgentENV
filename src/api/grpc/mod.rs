@@ -9,12 +9,12 @@
 //! multiplexed by HTTP/2 path — the same way any two tonic services share a
 //! `Server::builder()`.
 //!
-//! # 🔴 Served by `--role api`, and by nothing else
+//! # 🔴 Served by `aenv-api`, and by nothing else
 //!
 //! `assemble_api` binds [`serve_on`] on `[cluster].api_grpc_addr`.
-//! `--role all` deliberately does not open a second listener: it is the
+//! the pre-split single process deliberately does not open a second listener: it is the
 //! rollback target and is defined as the process that ran before the split.
-//! Under `--role all` the wake-up decision is still taken where it always was —
+//! Under the pre-split single process the wake-up decision is still taken where it always was —
 //! `try_auto_resume` on the local reverse proxy's request path — which is what
 //! makes rolling back to it a ConfigMap change rather than a code change.
 

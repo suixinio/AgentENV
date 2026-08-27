@@ -6,18 +6,19 @@ use super::control_plane_gate::{require_control_plane, ControlPlaneGate};
 use super::role_gate;
 use super::{isolation, proxy, ApiImpl};
 use crate::observability::prometheus;
-use crate::role::ServerRole;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
 
 /// Builds the router this process serves.
 ///
-/// 🔴 `role` is a parameter rather than something read from a global because
-/// the failure mode of getting it wrong is a layer that is silently absent —
-/// a node serving the full user-facing REST surface, which is exactly the
-/// state `--role node` exists to end. Every caller has to say which half it is
-/// assembling.
-pub fn new<I, A, E, C>(api_impl: I, role: ServerRole) -> Router
+/// 🔴 Which half this is comes off the `ApiImpl` itself
+/// ([`ApiImpl::owns_sandboxes`]) rather than from a parameter beside it. It was
+/// a parameter while `--role` existed, kept in step with the `ApiImpl` by a
+/// `debug_assert` in [`assemble`] below — a router gated as a node whose
+/// `ApiImpl` believed otherwise would have refused user REST while going on
+/// waking sandboxes on its own initiative, and nothing else would have noticed.
+/// One carrier cannot disagree with itself.
+pub fn new<I, A, E, C>(api_impl: I) -> Router
 where
     I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
     A: apis::admin::Admin<E, Claims = C>
@@ -33,7 +34,7 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
-    new_with_control_plane_routes::<I, A, E, C>(api_impl, role, Router::new())
+    new_with_control_plane_routes::<I, A, E, C>(api_impl, Router::new())
 }
 
 /// Same as [`new`], plus `extra_control_plane_routes` merged into the
@@ -70,7 +71,6 @@ where
 /// not merely this one route.
 pub fn new_with_control_plane_routes<I, A, E, C>(
     api_impl: I,
-    role: ServerRole,
     extra_control_plane_routes: Router,
 ) -> Router
 where
@@ -90,7 +90,6 @@ where
 {
     new_with_control_plane_routes_and_gate::<I, A, E, C>(
         api_impl,
-        role,
         extra_control_plane_routes,
         Arc::new(ControlPlaneGate::from_global_config()),
     )
@@ -120,7 +119,6 @@ where
 /// default gate.
 fn new_with_control_plane_routes_and_gate<I, A, E, C>(
     api_impl: I,
-    role: ServerRole,
     extra_control_plane_routes: Router,
     gate: Arc<ControlPlaneGate>,
 ) -> Router
@@ -139,19 +137,11 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
-    // 🔴 The role now has two carriers: this parameter, which the role gate
-    // reads, and the `ApiImpl`, which the data plane's auto-resume arm reads
-    // (`crate::api::proxy::resolve_proxy_request`). Every assembly in
-    // `src/bin/aenv-api.rs` passes one variable to both, and this catches the day
-    // one of them stops doing so — a router gated as `node` whose `ApiImpl`
-    // still believes it is `all` would refuse user REST while going on waking
-    // sandboxes on its own initiative, which is the precise half-landed state
-    // `--role node` exists to end, and nothing else would notice.
-    debug_assert_eq!(
-        role,
-        AsRef::<ApiImpl>::as_ref(&api_impl).role(),
-        "the role this router is gated on and the role its ApiImpl holds must agree"
-    );
+    // 🔴 One carrier. The gate below and the data plane's auto-resume arm
+    // (`crate::api::proxy::resolve_proxy_request`) now read the same `ApiImpl`,
+    // so there is no longer a pair that has to be kept in step by a
+    // `debug_assert` here.
+    let serves_user_facing_rest = AsRef::<ApiImpl>::as_ref(&api_impl).owns_sandboxes();
 
     // Keep the generated control-plane API as the primary router, merge the
     // caller's extra gated routes into it *before* `assemble` attaches the
@@ -163,7 +153,7 @@ where
             .merge(extra_control_plane_routes),
         proxy::router(api_impl.clone()),
         gate,
-        role,
+        serves_user_facing_rest,
     )
     .route("/metrics", get(metrics_handler))
     // Runs ahead of the generated resume handler: an isolated node answers
@@ -193,7 +183,7 @@ where
 /// node stops answering. `the_gate_covers_the_control_plane_router_and_nothing_merged_after_it`
 /// is the only thing standing between that and a very confusing outage.
 ///
-/// 🔴 The role gate is attached *after* the control-plane gate and therefore
+/// 🔴 The user-REST gate is attached *after* the control-plane gate and therefore
 /// runs *before* it. Both are on the same router and both refuse; the order
 /// decides which refusal a caller sees. A node asked for `POST /sandboxes`
 /// without a credential must answer 404 — "no such route here" — and not 403,
@@ -205,11 +195,11 @@ fn assemble(
     generated: Router,
     data_plane: Router,
     gate: Arc<ControlPlaneGate>,
-    role: ServerRole,
+    serves_user_facing_rest: bool,
 ) -> Router {
     role_gate::attach(
         generated.layer(middleware::from_fn_with_state(gate, require_control_plane)),
-        role,
+        serves_user_facing_rest,
     )
     .merge(data_plane)
 }
@@ -251,15 +241,20 @@ mod tests {
     }
 
     fn gated(tokens: Vec<String>, token_file: &str) -> Router {
-        assemble_as(ServerRole::All, tokens, token_file)
+        assemble_as(SERVES_USER_REST, tokens, token_file)
     }
 
-    fn assemble_as(role: ServerRole, tokens: Vec<String>, token_file: &str) -> Router {
+    /// The two halves, spelled where an assertion reads them: `aenv-api`
+    /// serves the user-facing REST surface and `aenv-node` does not.
+    const SERVES_USER_REST: bool = true;
+    const REFUSES_USER_REST: bool = false;
+
+    fn assemble_as(serves_user_facing_rest: bool, tokens: Vec<String>, token_file: &str) -> Router {
         assemble(
             stand_in_control_plane(),
             stand_in_data_plane(),
             Arc::new(ControlPlaneGate::new(tokens, token_file)),
-            role,
+            serves_user_facing_rest,
         )
     }
 
@@ -352,7 +347,7 @@ mod tests {
             stand_in_control_plane().merge(debug_route()),
             stand_in_data_plane(),
             Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], "")),
-            ServerRole::All,
+            SERVES_USER_REST,
         );
         assert_eq!(
             status(merged_before_assemble, Method::GET, "/debug/example", None).await,
@@ -369,7 +364,7 @@ mod tests {
             stand_in_control_plane(),
             stand_in_data_plane(),
             Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], "")),
-            ServerRole::All,
+            SERVES_USER_REST,
         )
         .route("/debug/example", get(|| async { "debug" }));
         assert_ne!(
@@ -478,7 +473,7 @@ mod tests {
     async fn build_api_impl_for_gate_test() -> Arc<ApiImpl> {
         let root = tempfile::tempdir().unwrap();
         let orchestrator = crate::orchestrator::Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             crate::orchestrator::InMemoryMetadataStore::new(),
             crate::sandbox::mock::MockBackendFactory::new(),
             crate::orchestrator::FileBackedSandboxPersister::new_for_test(
@@ -504,8 +499,11 @@ mod tests {
                 &identity,
             ),
             Vec::new(),
-            ServerRole::All,
-            crate::api::ResumeWiring::node_local(identity.id),
+            // 🔴 The half that serves the user-facing REST surface, because
+            // that is what this module's gate tests are about: on the other
+            // half every assertion below would read 404 from the user-REST
+            // gate rather than 403 from the control-plane gate.
+            crate::api::ResumeWiring::api_half_for_test(),
         ))
     }
 
@@ -542,7 +540,6 @@ mod tests {
         let router = || {
             new_with_control_plane_routes_and_gate(
                 Arc::clone(&api_impl),
-                ServerRole::All,
                 stand_in_debug_route(),
                 Arc::clone(&gate),
             )
@@ -585,7 +582,7 @@ mod tests {
     /// 🔴 T-A4-10. The role gate answers before the control-plane gate does.
     ///
     /// Both layers sit on the generated router and both refuse. Under
-    /// `--role node` a user-facing route must come back 404 whether or not the
+    /// `aenv-node` a user-facing route must come back 404 whether or not the
     /// caller has a credential — the route is not part of a node's surface, and
     /// a 403 would say it is, only locked. Getting the two `.layer` calls in the
     /// wrong order does not fail to compile and does not fail any other test
@@ -595,7 +592,7 @@ mod tests {
     /// three assertions on its own.
     #[tokio::test]
     async fn the_role_gate_answers_before_the_control_plane_gate_does() {
-        let node = || assemble_as(ServerRole::Node, vec![TOKEN.to_string()], "");
+        let node = || assemble_as(REFUSES_USER_REST, vec![TOKEN.to_string()], "");
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
 
         for presented in [None, Some(TOKEN), Some("wrong")] {
@@ -617,26 +614,26 @@ mod tests {
         );
         assert_eq!(
             status(
-                assemble_as(ServerRole::All, vec![TOKEN.to_string()], ""),
+                assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
                 Method::POST,
                 sandbox_path,
                 None
             )
             .await,
             StatusCode::FORBIDDEN,
-            "under --role all the same route is still gated on the credential, \
+            "under the pre-split single process the same route is still gated on the credential, \
              which is what makes the 404s above a statement about the role"
         );
     }
 
-    /// 🔴 T-A4-11. What `--role node` costs the gateway's cluster listing, said
+    /// 🔴 T-A4-11. What `aenv-node` costs the gateway's cluster listing, said
     /// out loud in the one place that can say it.
     ///
     /// `control_plane_gate::is_exempt` lets `GET /sandboxes` and
     /// `GET /v2/sandboxes` through without a credential because the gateway
     /// fans out to every node with its own HTTP client to build the cluster
     /// -wide list. The role gate runs *first* and refuses both on a node, so on
-    /// a `--role node` fleet that fan-out gets the 404s below — and since the
+    /// a `aenv-node` fleet that fan-out gets the 404s below — and since the
     /// listing is all-or-nothing and the gateway passes a 4xx through verbatim,
     /// the user's `GET /sandboxes` is that same 404.
     ///
@@ -645,37 +642,37 @@ mod tests {
     /// place until the fan-out is deleted, in that order — deleting the
     /// exemption first would 403 a fan-out that is still running. The gateway
     /// now skips the fan-out whenever `rest_upstream_addr` is set, which is what
-    /// keeps a `--role node` fleet answering this route at all; the empty value
+    /// keeps a `aenv-node` fleet answering this route at all; the empty value
     /// still fans out, so these 404s are what that rollback position costs. This
     /// test is not a preference about either; it is here so that whoever flips a
-    /// DaemonSet to `--role node` learns this from a test name rather than from
+    /// DaemonSet to `aenv-node` learns this from a test name rather than from
     /// a 404 on the first listing.
     #[tokio::test]
     async fn a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts() {
         for path in ["/sandboxes", "/v2/sandboxes"] {
             assert_eq!(
                 status(
-                    assemble_as(ServerRole::All, vec![TOKEN.to_string()], ""),
+                    assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
                     Method::GET,
                     path,
                     None
                 )
                 .await,
                 StatusCode::OK,
-                "under --role all the fan-out is exempt and reaches the handler: {path}"
+                "under the pre-split single process the fan-out is exempt and reaches the handler: {path}"
             );
             assert_eq!(
                 status(
-                    assemble_as(ServerRole::Node, vec![TOKEN.to_string()], ""),
+                    assemble_as(REFUSES_USER_REST, vec![TOKEN.to_string()], ""),
                     Method::GET,
                     path,
                     None
                 )
                 .await,
                 StatusCode::NOT_FOUND,
-                "under --role node the same fan-out is refused before the exemption \
+                "under aenv-node the same fan-out is refused before the exemption \
                  is ever consulted: {path}. Stop the gateway fan-out before rolling \
-                 a node to --role node."
+                 a node to aenv-node."
             );
         }
     }
@@ -800,7 +797,7 @@ mod tests {
                 stand_in_control_plane(),
                 stand_in_data_plane(),
                 Arc::clone(&gate),
-                ServerRole::All,
+                SERVES_USER_REST,
             )
         };
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
@@ -853,7 +850,7 @@ mod tests {
                 stand_in_control_plane(),
                 stand_in_data_plane(),
                 Arc::clone(&gate),
-                ServerRole::All,
+                SERVES_USER_REST,
             )
         };
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";

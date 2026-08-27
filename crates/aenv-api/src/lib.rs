@@ -4,10 +4,12 @@
 //!
 //! Database credentials, the connection budget and the schema are the deciding
 //! half's business, never the machines that run user code — `pg`'s own module
-//! doc has stated that invariant since Stage B, and `ServerRole::check_pg_dsn`
-//! enforced it at startup. This crate is the compile-time form of the same
-//! statement: `aenv-node` does not depend on it, so `sqlx` is not in that
-//! binary's dependency graph at all.
+//! doc has stated that invariant since Stage B, and `aenv-node`'s own
+//! `refuse_configured_pg_dsn` enforces it at startup. This crate is the
+//! compile-time form of the same statement: `aenv-node` does not depend on it,
+//! so `sqlx` is not in that binary's dependency graph at all. The two are not
+//! redundant — the graph says a node cannot *use* a DSN, the startup check says
+//! it must not be *handed* one.
 //!
 //! `cargo tree -p aenv-node -e normal | grep sqlx` is the executable version of
 //! that sentence; `make check-crate-boundaries` runs it.
@@ -27,8 +29,8 @@
 // they do there.
 pub use aenv_core::{
     api, binding_store, cfg, digest, identity, image, leader_task, local_store, logging,
-    node_client, node_registry, observability, p2p, privileges, proto, role, runtime_snapshot,
-    sandbox, scheduler_endpoint, server_main, template, types, virtualization,
+    node_client, node_registry, observability, p2p, privileges, proto, runtime_snapshot, sandbox,
+    scheduler_endpoint, server_main, template, types, virtualization,
 };
 
 pub mod orchestrator;

@@ -1,5 +1,5 @@
 //! Shares [`super::registry::AtomicNodeRegistry`]'s heartbeat-derived
-//! ("observed") state across `--role api` replicas.
+//! ("observed") state across `aenv-api` replicas.
 //!
 //! # The split this closes
 //!

@@ -203,7 +203,7 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
     /// [`build`](Self::build) above refuses because the [`FreshSandboxBuildSpec`]
     /// it is handed has already lost the user's image reference to local
     /// resolution. [`UnresolvedImageBuildSpec`] is the type that exists so
-    /// that does not happen here: `--role api`'s `sandboxes_cold_post`
+    /// that does not happen here: `aenv-api`'s `sandboxes_cold_post`
     /// constructs one instead of resolving anything, and everything in it —
     /// the reference, the attached drives' references, the already-computed
     /// resources — travels to the node as-is. The node resolves it, the same
@@ -299,7 +299,7 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
     ///
     /// `Orchestrator` keeps live backends in a process-local map and, for a
     /// single process, "not in the map" and "not running" are the same fact.
-    /// `--role api` is deployed as replicas behind a Service with no session
+    /// `aenv-api` is deployed as replicas behind a Service with no session
     /// affinity, so the two come apart on the first request: the replica a
     /// pause lands on is not usually the replica that created the sandbox, and
     /// the one that did not create it has an empty map and the cluster's own

@@ -3,9 +3,10 @@
 //! [`super::central::CentralSnapshotCatalog`]'s gRPC hop to
 //! `services/scheduler`.
 //!
-//! 🔴 `--role node` must never hold one of these — see `src/pg/mod.rs`'s own
-//! module doc and `crate::role::ServerRole::check_pg_dsn`, which refuses
-//! `--role node` startup outright if `[pg].dsn` is configured at all.
+//! 🔴 `aenv-node` must never hold one of these, and cannot: it does not link
+//! this crate. See `crate::pg`'s own module doc, and that binary's
+//! `refuse_configured_pg_dsn`, which refuses startup outright if `[pg].dsn` is
+//! configured at all.
 //!
 //! Wired into `build_snapshot_backend` (`backends/mod.rs::build_central_catalog`):
 //! whenever a `[pg]` pool is available, this type stands in for
@@ -458,7 +459,7 @@ pub fn spawn_catalog_build_reaper(
 /// exists and neither one migrates it itself (see `PostgresSnapshotCatalog`'s
 /// own module doc). Idempotent and safe to call on every start — the
 /// migration runner's own session-scoped advisory lock (`GO_SCHEMA_LOCK_KEY`)
-/// is what lets a fleet of `--role api` replicas call this concurrently
+/// is what lets a fleet of `aenv-api` replicas call this concurrently
 /// without racing each other.
 pub async fn migrate_catalog_schema(pool: &sqlx::PgPool) -> Result<()> {
     migrate::migrate(pool).await
@@ -945,7 +946,7 @@ mod pg {
     /// exercises `builds_one_active_per_template` rather than the
     /// `pg_advisory_xact_lock` serializing two sequential calls that would
     /// have been refused anyway. Two `try_start_build` calls launched at the
-    /// same instant simulate two `--role api` replicas racing to admit the
+    /// same instant simulate two `aenv-api` replicas racing to admit the
     /// same template's build — under READ COMMITTED, a read-modify-write
     /// implementation (SELECT the active-build count, then INSERT) would let
     /// both through, which is exactly the defect `queries_admin.go`'s

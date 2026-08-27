@@ -497,11 +497,11 @@ impl ApiImpl {
         // downloads `vm_state.bin` onto this machine's disk, materializes the
         // memory and rootfs overlaybd `image.json` files, and leases all of it
         // in this process's local artifact cache. A restore driven from
-        // `--role api` boots nothing here — `RemoteSandboxBackendFactory` reads
+        // `aenv-api` boots nothing here — `RemoteSandboxBackendFactory` reads
         // only the catalog row back out and sends it on, and the node resolves
         // it against the cache its own VM mmaps. `record` is already in hand
         // from the read above, so the unresolved half costs nothing at all.
-        let source = if self.role().runs_sandbox_runtime() {
+        let source = if self.runs_sandbox_runtime() {
             match self.snapshot_manager.resolve_runnable(record).await {
                 Ok(snapshot) => SandboxLaunchSource::Snapshot(Box::new(snapshot)),
                 Err(err) => {
@@ -1298,7 +1298,7 @@ fn record_supersession(kind: &'static str, outcome: &'static str) {
 /// this reap) *before* `mark_running` confirms and flips the row past
 /// `Resuming`, so every reap tick that lands in that window would have read
 /// its own in-flight resume as "claimed by someone else" and deleted the
-/// sandbox it had just brought up. On `--role all` this was never observable
+/// sandbox it had just brought up. On the pre-split single process this was never observable
 /// — one process is both claimant and holder, so the two arguments were
 /// always the same string — which is exactly why a test built on a single
 /// shared constant for both axes cannot catch it; see
@@ -1403,7 +1403,6 @@ mod tests {
         DisabledPausedSandboxRegistry, DisabledSandboxPersister, FileBackedSandboxPersister,
         InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
-    use crate::role::ServerRole;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::mock_snapshot_manager;
     use crate::snapshot::SnapshotId;
@@ -1438,7 +1437,7 @@ mod tests {
         registry: Arc<dyn PausedSandboxRegistry>,
     ) -> Arc<ApiImpl> {
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.to_path_buf()),
@@ -1460,9 +1459,9 @@ mod tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `All` and not a default: these fixtures predate the split and
-            // assert today's behaviour, which is what `all` is defined as.
-            crate::role::ServerRole::All,
+            // 🔴 `node_local`, i.e. the `aenv-node` half: these fixtures
+            // predate the split and assert the behaviour of a process that
+            // runs the sandboxes it answers for.
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ))
     }
@@ -1688,7 +1687,7 @@ mod tests {
         registry: Arc<CountingRegistry>,
     ) -> Arc<ApiImpl> {
         let orchestrator = Orchestrator::new(
-            ServerRole::Api,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             store,
             MockBackendFactory::new(),
             DisabledSandboxPersister,
@@ -1710,8 +1709,11 @@ mod tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            ServerRole::Api,
-            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+            // 🔴 The half this test is about: `aenv-api`, which owns paused
+            // sandboxes it does not run. It used to say so with a `role`
+            // argument beside a `node_local` wiring that said the opposite;
+            // `ApiImpl` reads the one fact off the wiring now.
+            crate::api::ResumeWiring::api_half_for_test(),
         ))
     }
 
@@ -2307,7 +2309,7 @@ mod tests {
     /// resuming.
     ///
     /// `registered_as` (the holder) happens to equal the claimant here, which
-    /// is the `--role all` shape — one process is both. That coincidence is
+    /// is the the pre-split single process shape — one process is both. That coincidence is
     /// exactly what let this comparison ship broken: see the next test for
     /// the shape that actually catches it.
     #[test]
@@ -2333,7 +2335,7 @@ mod tests {
     /// it just resumed, in the confirmation window before `mark_running` has
     /// flipped the row past `Resuming`. `our_own_claim_is_not_superseded`
     /// above cannot catch that: it uses `SELF` for both axes, which is only
-    /// ever true on `--role all`.
+    /// ever true on the pre-split single process.
     #[test]
     fn our_own_claim_is_not_superseded_even_when_holder_and_claimant_differ() {
         assert!(running_supersession(
@@ -2609,7 +2611,6 @@ mod cross_node_resume_scope_tests {
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
-    use crate::role::ServerRole;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit, StartedBuild};
     use crate::snapshot::repository::{
@@ -2740,7 +2741,7 @@ mod cross_node_resume_scope_tests {
         });
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
@@ -2771,9 +2772,9 @@ mod cross_node_resume_scope_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `All` and not a default: these fixtures predate the split and
-            // assert today's behaviour, which is what `all` is defined as.
-            crate::role::ServerRole::All,
+            // 🔴 `node_local`, i.e. the `aenv-node` half: these fixtures
+            // predate the split and assert the behaviour of a process that
+            // runs the sandboxes it answers for.
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
         (api, scoped_reads)
@@ -2923,7 +2924,7 @@ mod cross_node_resume_scope_tests {
     }
 }
 
-/// 🔴 Whether `--role api` turns a paused sandbox's snapshot into bytes on its
+/// 🔴 Whether `aenv-api` turns a paused sandbox's snapshot into bytes on its
 /// own disk before asking a node to bring the sandbox back.
 ///
 /// A cross-node resume already has the catalog row in hand — it just read it,
@@ -2940,8 +2941,8 @@ mod cross_node_resume_scope_tests {
 ///
 /// Same construction as `sandbox::warm_start_role_tests`: the resolver is
 /// `MockSnapshotRuntimeResolver`, which fails every call, so a restore that
-/// resolved could not have completed. `--role api` answering `Restored` over a
-/// resolver that refuses is the proof; the `--role all` arm, which still
+/// resolved could not have completed. `aenv-api` answering `Restored` over a
+/// resolver that refuses is the proof; the `aenv-node` arm, which still
 /// resolves and therefore still fails, is what keeps that proof from being
 /// vacuous.
 #[cfg(test)]
@@ -2957,7 +2958,6 @@ mod cross_node_resume_role_tests {
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
-    use crate::role::ServerRole;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
@@ -2966,14 +2966,15 @@ mod cross_node_resume_role_tests {
     /// One API surface whose catalog holds a ready snapshot and whose runtime
     /// resolver refuses every call.
     ///
-    /// 🔴 The orchestrator is `All` in both cases and only `ApiImpl`'s role
-    /// varies, for the reason `sandbox::cold_start_role_tests::surface_as`
-    /// gives; and the factory is `MockBackendFactory` because the question is
-    /// what the api half *sends*, not whether this machine can run a VM.
-    async fn api_as(role: ServerRole, row: SnapshotRecord) -> Arc<ApiImpl> {
+    /// 🔴 The orchestrator's seed policy is the permissive one in both cases
+    /// and only `ApiImpl`'s half varies, for the reason
+    /// `sandbox::warm_start_role_tests::surface_as` gives; and the factory is
+    /// `MockBackendFactory` because the question is what the api half *sends*,
+    /// not whether this machine can run a VM.
+    async fn api_as(wiring: crate::api::ResumeWiring, row: SnapshotRecord) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
@@ -2999,8 +3000,7 @@ mod cross_node_resume_role_tests {
             ),
             Vec::new(),
             // 🔴 The one value this fixture varies.
-            role,
-            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+            wiring,
         ))
     }
 
@@ -3027,23 +3027,29 @@ mod cross_node_resume_role_tests {
     }
 
     #[tokio::test]
-    async fn a_cross_node_resume_resolves_locally_or_ships_the_catalog_row_depending_on_role() {
+    async fn a_cross_node_resume_resolves_locally_or_ships_the_catalog_row_depending_on_half() {
         let row = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
         let snapshot_id = row.id.clone();
 
-        let api = api_as(ServerRole::Api, row.clone()).await;
+        let api = api_as(crate::api::ResumeWiring::api_half_for_test(), row.clone()).await;
         let outcome = api
             .restore_claimed_sandbox(claimed_entry(snapshot_id.clone()), NewTimeout::None)
             .await;
         assert!(
             matches!(outcome, CrossNodeResume::Restored(_)),
             "🔴 the assertion. This manager's runtime resolver fails every call, so a restore \
-             that touched it could not have got here — --role api restoring over it is the proof \
+             that touched it could not have got here — aenv-api restoring over it is the proof \
              that it never turned the catalog row into local bytes, got {outcome:?}"
         );
 
-        for role in [ServerRole::All, ServerRole::Node] {
-            let api = api_as(role, row.clone()).await;
+        {
+            let api = api_as(
+                crate::api::ResumeWiring::node_local(
+                    NodeIdentity::from_config(&Default::default()).id,
+                ),
+                row.clone(),
+            )
+            .await;
             let outcome = api
                 .restore_claimed_sandbox(claimed_entry(snapshot_id.clone()), NewTimeout::None)
                 .await;
@@ -3058,16 +3064,14 @@ mod cross_node_resume_role_tests {
                 // same function.
                 CrossNodeResume::Failed(reason) => assert!(
                     reason.contains("resolve committed snapshot into runnable runtime paths"),
-                    "--role {} must still resolve the snapshot itself, so it must fail exactly \
+                    "aenv-node must still resolve the snapshot itself, so it must fail exactly \
                      where this fixture's resolver refuses; failing anywhere else would mean the \
-                     fixture, not the fork, decided this test: got {reason:?}",
-                    role.as_str()
+                     fixture, not the fork, decided this test: got {reason:?}"
                 ),
                 other => panic!(
-                    "--role {} still resolves, and this fixture's resolver refuses every call, \
+                    "aenv-node still resolves, and this fixture's resolver refuses every call, \
                      so this restore cannot succeed — if it did, nothing here would be resolving \
-                     anywhere and the api-role assertion above would be vacuous: got {other:?}",
-                    role.as_str()
+                     anywhere and the api-half assertion above would be vacuous: got {other:?}"
                 ),
             }
         }

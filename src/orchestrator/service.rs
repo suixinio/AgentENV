@@ -12,12 +12,12 @@ use tracing::{debug, info, trace, warn};
 
 use crate::cfg::ConfigManager;
 use crate::image::{RuntimeImageOwner, RuntimeImageRefs};
-use crate::role::ServerRole;
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FreshSandboxBuildSpec,
-    PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet, RuntimeConfirmedGone,
-    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo, UnresolvedImageBuildSpec,
+    AccessTokenSeedPolicy, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken,
+    FreshSandboxBuildSpec, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
+    RuntimeConfirmedGone, SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory,
+    SandboxForkSpec, SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    UnresolvedImageBuildSpec,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
@@ -132,7 +132,7 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory, P: SandboxPe
 /// [`Orchestrator::sandboxes`] is a *process-local* map of live backends. For a
 /// single process, an id missing from it means the sandbox's runtime is gone,
 /// and the pause and snapshot paths acted on exactly that reading: they deleted
-/// the record. `--role api` is deployed as several replicas behind a Service
+/// the record. `aenv-api` is deployed as several replicas behind a Service
 /// with no session affinity, and there the same absence usually means something
 /// else entirely — *another replica started it* — because a sandbox's record is
 /// shared and its handle is not.
@@ -181,9 +181,9 @@ where
 {
     /// A throwaway orchestrator for tests and examples.
     ///
-    /// Fixed at [`ServerRole::All`] rather than taking a role, because that is
-    /// what it is for: the single-process shape, with no configured envd
-    /// access-token seed required of whoever calls it.
+    /// Fixed at [`AccessTokenSeedPolicy::MayGenerate`] rather than taking one,
+    /// because that is what it is for: no configured envd access-token seed
+    /// required of whoever calls it.
     ///
     /// 🔴 The factory is an argument. It used to be fixed at
     /// `FirecrackerSandboxFactory`, which made the one convenience constructor
@@ -191,7 +191,7 @@ where
     /// all.
     pub async fn with_in_memory_store(factory: F) -> Arc<Self> {
         Self::new(
-            ServerRole::All,
+            AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             factory,
             DisabledSandboxPersister,
@@ -206,8 +206,11 @@ impl<F> Orchestrator<InMemoryMetadataStore, F, FileBackedSandboxPersister>
 where
     F: SandboxBackendFactory,
 {
+    /// 🔴 No seed policy argument: `aenv-node` is the only caller and a node
+    /// generates its own seed under `$AENV_HOME/secrets/`. A replicated
+    /// process, which may not, does not build a file-backed persister at all —
+    /// see `assemble_api`'s own note on `DisabledSandboxPersister`.
     pub async fn with_file_backed_store_and_factory(
-        role: ServerRole,
         factory: F,
         image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
@@ -217,7 +220,14 @@ where
             config.orchestrator.persisted_sandbox_store_path.clone(),
             config.virtualization_mode,
         );
-        Self::new(role, store, factory, persister, image_refs).await
+        Self::new(
+            AccessTokenSeedPolicy::MayGenerate,
+            store,
+            factory,
+            persister,
+            image_refs,
+        )
+        .await
     }
 }
 
@@ -268,10 +278,10 @@ where
 
     /// Builds the orchestrator this process will run.
     ///
-    /// `role` is carried no further than construction: the only thing it
+    /// `seed_policy` is carried no further than construction: the only thing it
     /// decides is whether this process may invent its own envd access-token
     /// seed when none is configured. A replicated half may not — see
-    /// [`ServerRole::needs_a_configured_access_token_seed`].
+    /// [`AccessTokenSeedPolicy`].
     ///
     /// # 🔴 `image_refs` is an argument and not a default
     ///
@@ -283,7 +293,7 @@ where
     /// a node passes its cache's own handle, and a process that runs no
     /// sandboxes passes [`DisabledRuntimeImageRefs`][crate::image::DisabledRuntimeImageRefs].
     pub async fn new(
-        role: ServerRole,
+        seed_policy: AccessTokenSeedPolicy,
         store: S,
         factory: F,
         persister: P,
@@ -300,7 +310,11 @@ where
         let persisted = persister.load_all(&factory).await?;
         let managed_seed_must_exist = persisted.iter().any(|metadata| metadata.secure);
         let access_tokens = tokio::task::spawn_blocking(move || {
-            SandboxAccessTokenGenerator::load_or_create(app_config, role, managed_seed_must_exist)
+            SandboxAccessTokenGenerator::load_or_create(
+                app_config,
+                seed_policy,
+                managed_seed_must_exist,
+            )
         })
         .await
         .context("join envd access-token seed loader")??;
@@ -1912,7 +1926,7 @@ where
     ///
     /// The node service serves a `Pause` for a process that decided the pause,
     /// holds the cluster's record of the sandbox, and will commit the row. This
-    /// machine's own publisher is not that process — on `--role node` it is
+    /// machine's own publisher is not that process — on `aenv-node` it is
     /// `DisabledPausedSandboxRegistry`, which records nothing — so letting the
     /// ordinary path run would offer the capture to a publisher that drops it,
     /// and the caller would be told the pause produced nothing publishable.
@@ -3276,7 +3290,7 @@ where
     ///
     /// Only a factory whose sandboxes run on other machines asks for one
     /// ([`SandboxBackendFactory::stamps_control_plane_ownership`]), so on
-    /// `--role all` and `--role node` this returns on its first line. That is
+    /// `aenv-node` this returns on its first line. That is
     /// the property that keeps `None` meaning what it has always meant on the
     /// user-facing REST surface: not that a marker went missing, but that no
     /// control plane owns this sandbox.

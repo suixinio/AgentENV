@@ -1,7 +1,7 @@
 //! A cluster-wide singleton background task, built on PostgreSQL's
 //! session-scoped advisory locks.
 //!
-//! Every `--role api` replica runs the same loop with the same
+//! Every `aenv-api` replica runs the same loop with the same
 //! [`AdvisoryLockKey`]; PostgreSQL decides which one is "it" purely by which
 //! replica's session first calls `pg_try_advisory_lock` successfully. There
 //! is no lease, no TTL and nothing to renew: the lock lives exactly as long
@@ -13,7 +13,7 @@
 //!
 //! Stage B and Stage C consumers: see [`AdvisoryLockKey`] for the reserved
 //! key each of you owns. Nothing in this module runs anything on its own —
-//! call [`spawn_singleton_task`] from wherever `--role api` assembly already
+//! call [`spawn_singleton_task`] from wherever `aenv-api` assembly already
 //! starts its other background loops.
 
 use std::panic::AssertUnwindSafe;
@@ -85,7 +85,7 @@ impl<F> SingletonTaskBody for F where
 /// can cut it off.
 pub use crate::leader_task::LeaderTaskHandle as SingletonTaskHandle;
 
-/// Runs `body` on a fixed `interval`, but only on whichever `--role api`
+/// Runs `body` on a fixed `interval`, but only on whichever `aenv-api`
 /// replica currently holds `key`'s session-scoped advisory lock.
 ///
 /// Every replica is expected to call this with the same `key` and the same
@@ -288,7 +288,7 @@ mod tests {
     const TICK: Duration = Duration::from_millis(50);
 
     /// Two loops competing for the same key on two independent pools — the
-    /// same shape two `--role api` replicas would be, each with its own
+    /// same shape two `aenv-api` replicas would be, each with its own
     /// connections to one database. Only one may ever see itself run `body`
     /// while the other is still up.
     #[tokio::test]

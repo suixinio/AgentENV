@@ -135,7 +135,7 @@ const PROXY_AUTO_RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shared with `crate::api::impls`'s data-plane wake-up rather than duplicated,
 /// for the same reason the timeout floor below is: a wake-up that arrived over
 /// the gateway's cold path and one that arrived through a node's own proxy must
-/// be bounded identically, or `--role all` stops being today's behaviour and
+/// be bounded identically, or the pre-split single process stops being today's behaviour and
 /// the rollback story goes with it.
 pub(in crate::api) fn auto_resume_deadline() -> Duration {
     PROXY_AUTO_RESUME_TIMEOUT
@@ -173,11 +173,11 @@ where
 {
     // 🔴 Published at zero before any request arrives, for every role and every
     // outcome. The acceptance test for moving the wake-up decision off the node
-    // is "this counter stays at zero on a `--role node` fleet"
+    // is "this counter stays at zero on a `aenv-node` fleet"
     // (`_sd-impl-phase3-role.md` §12, P3 control A), and a counter that is
     // absent until its first increment makes "zero" and "the probe is looking
     // at a series that does not exist" the same scrape. Lifting it is then a
-    // real check: point traffic at a `--role all` node's own port and it moves.
+    // real check: point traffic at a the pre-split single process node's own port and it moves.
     for result in AUTO_RESUME_RESULTS {
         metrics::counter!("agentenv_proxy_auto_resume_total", "result" => *result).increment(0);
     }
@@ -906,17 +906,14 @@ async fn resolve_proxy_request(
                     sandbox_id,
                 )))
             }
-            // 🔴 A role branch and not a deletion. `--role node` must not
-            // start a sandbox on its own initiative — the wake-up decision
-            // belongs to the API half and reaches it over
-            // `crate::api::grpc::resume` — but `--role all` is the rollback
-            // target and is defined as today's behaviour verbatim, so the four
-            // decision arms below stay compiled and stay reached
-            // (`_sd-impl-phase3-role.md` §11.3). The delete belongs to a
-            // release after the switch.
-            Ok(ProxyLookupResult::Paused { auto_resume: true })
-                if api_impl.role().serves_wake_decisions() =>
-            {
+            // 🔴 A branch on which half this is, and not a deletion.
+            // `aenv-node` must not start a sandbox on its own initiative — the
+            // wake-up decision belongs to the API half and reaches it over
+            // `crate::api::grpc::resume` — while `aenv-api` takes the four
+            // decision arms below. Both binaries link this function, so this is
+            // a runtime question here even though it is settled at build time
+            // for each of them; see [`ApiImpl::owns_sandboxes`].
+            Ok(ProxyLookupResult::Paused { auto_resume: true }) if api_impl.owns_sandboxes() => {
                 if auto_resume_attempted {
                     return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
                         sandbox_id,
@@ -1607,7 +1604,6 @@ mod tests {
         api::server,
         image::RefusingImageResolver,
         orchestrator::{FileBackedSandboxPersister, Orchestrator},
-        role::ServerRole,
         snapshot::mock::mock_snapshot_manager,
     };
 
@@ -1984,29 +1980,51 @@ mod tests {
         .await
     }
 
-    pub async fn build_api() -> Arc<ApiImpl> {
-        build_api_with(Vec::new(), ServerRole::All).await
+    /// The wiring that makes an `ApiImpl` the half that owns sandboxes and
+    /// runs none — `aenv-api`.
+    ///
+    /// 🔴 The default for this module, and not because the data plane runs
+    /// there: it is the half whose router attaches no user-REST gate and whose
+    /// proxy path may take the auto-resume arm, which is every behaviour the
+    /// tests below observe. The node half is asked for by name, twice, where
+    /// the difference is the point.
+    fn api_half() -> crate::api::ResumeWiring {
+        crate::api::ResumeWiring::api_half_for_test()
     }
 
-    /// 🔴 An `ApiImpl` that genuinely *is* the role under test.
+    /// The wiring that makes an `ApiImpl` the half that runs sandboxes and
+    /// decides nothing about who owns them — `aenv-node`.
+    fn node_half() -> crate::api::ResumeWiring {
+        crate::api::ResumeWiring::node_local(
+            crate::identity::NodeIdentity::from_config(&Default::default()).id,
+        )
+    }
+
+    pub async fn build_api() -> Arc<ApiImpl> {
+        build_api_with(Vec::new(), api_half()).await
+    }
+
+    /// 🔴 An `ApiImpl` that genuinely *is* the half under test.
     ///
-    /// Before the wake-up decision moved, `role` reached the router only through
-    /// `server::new`'s parameter, so a test could hand a `--role node` router an
-    /// `ApiImpl` that believed it was `all`. The auto-resume arm reads the role
-    /// off the `ApiImpl`, so that divergence would have made a node-role test
-    /// silently exercise `all`'s branch.
-    pub async fn build_api_with_role(role: ServerRole) -> Arc<ApiImpl> {
-        build_api_with(Vec::new(), role).await
+    /// Before the wake-up decision moved, which half a router was gated as
+    /// reached it only through `server::new`'s own parameter, so a test could
+    /// hand a node router an `ApiImpl` that believed otherwise. Both now read
+    /// the one fact off the `ApiImpl`, so that divergence cannot be built.
+    pub async fn build_api_as(wiring: crate::api::ResumeWiring) -> Arc<ApiImpl> {
+        build_api_with(Vec::new(), wiring).await
     }
 
     async fn build_api_with_sandbox_proxy_domains(domains: Vec<String>) -> Arc<ApiImpl> {
-        build_api_with(domains, ServerRole::All).await
+        build_api_with(domains, api_half()).await
     }
 
-    async fn build_api_with(domains: Vec<String>, role: ServerRole) -> Arc<ApiImpl> {
+    async fn build_api_with(
+        domains: Vec<String>,
+        resume_wiring: crate::api::ResumeWiring,
+    ) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().unwrap();
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             crate::orchestrator::InMemoryMetadataStore::new(),
             crate::sandbox::mock::MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
@@ -2029,10 +2047,7 @@ mod tests {
                 &crate::identity::NodeIdentity::from_config(&Default::default()),
             ),
             domains,
-            role,
-            crate::api::ResumeWiring::node_local(
-                crate::identity::NodeIdentity::from_config(&Default::default()).id,
-            ),
+            resume_wiring,
         ))
     }
 
@@ -2041,16 +2056,16 @@ mod tests {
         state: crate::orchestrator::SandboxState,
         auto_resume: bool,
     ) -> axum::Router {
-        proxy_app_for_sandbox_as_role(sandbox_id, state, auto_resume, ServerRole::All).await
+        proxy_app_for_sandbox_as_half(sandbox_id, state, auto_resume, api_half()).await
     }
 
-    async fn proxy_app_for_sandbox_as_role(
+    async fn proxy_app_for_sandbox_as_half(
         sandbox_id: &SandboxId,
         state: crate::orchestrator::SandboxState,
         auto_resume: bool,
-        role: ServerRole,
+        wiring: crate::api::ResumeWiring,
     ) -> axum::Router {
-        let api = build_api_with_role(role).await;
+        let api = build_api_as(wiring).await;
         api.orchestrator()
             .set_proxy_target_for_test(*sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), state)
             .await;
@@ -2058,7 +2073,7 @@ mod tests {
             .set_auto_resume_for_test(sandbox_id, auto_resume)
             .await
             .unwrap();
-        server::new(api, role)
+        server::new(api)
     }
 
     async fn proxy_app_for_sandbox(sandbox_id: &SandboxId) -> axum::Router {
@@ -2082,7 +2097,7 @@ mod tests {
                 crate::orchestrator::SandboxState::Running,
             )
             .await;
-        server::new(api, ServerRole::All)
+        server::new(api)
     }
 
     async fn proxy_app_for_running_sandbox_without_route(sandbox_id: &SandboxId) -> axum::Router {
@@ -2094,7 +2109,7 @@ mod tests {
         api.orchestrator()
             .remove_proxy_route_for_test(sandbox_id)
             .await;
-        server::new(api, ServerRole::All)
+        server::new(api)
     }
 
     async fn start_proxy_server(sandbox_id: &SandboxId) -> SocketAddr {
@@ -2216,7 +2231,7 @@ mod tests {
     /// instead of taking three route groups away.
     ///
     /// Four faces, and the middle two are the ones that matter. Without the
-    /// `--role all` comparison, a `POST /sandboxes` that 404s because the route
+    /// the pre-split single process comparison, a `POST /sandboxes` that 404s because the route
     /// is broken passes. Without the data-plane call, a gate that refused
     /// everything on the port passes.
     #[tokio::test]
@@ -2231,23 +2246,20 @@ mod tests {
                 .unwrap()
         };
 
-        let node = server::new(
-            build_api_with_role(ServerRole::Node).await,
-            ServerRole::Node,
-        );
+        let node = server::new(build_api_as(node_half()).await);
         assert_eq!(
             node.clone().oneshot(create()).await.unwrap().status(),
             StatusCode::NOT_FOUND,
             "a node must answer the user-facing create as if the route were not there"
         );
 
-        // ...and the same request on the rollback role reaches the handler, so
-        // the 404 above is the role and not a broken route.
-        let all = server::new(build_api().await, ServerRole::All);
+        // ...and the same request on the other half reaches the handler, so
+        // the 404 above is which half this is and not a broken route.
+        let api = server::new(build_api().await);
         assert_ne!(
-            all.oneshot(create()).await.unwrap().status(),
+            api.oneshot(create()).await.unwrap().status(),
             StatusCode::NOT_FOUND,
-            "under --role all the create route still exists"
+            "on aenv-api the create route still exists"
         );
 
         // 🔴 The port is not what was taken away: the sandbox data plane on the
@@ -2300,10 +2312,7 @@ mod tests {
     /// Status, content type and body, with only the path differing.
     #[tokio::test]
     async fn a_refused_route_is_indistinguishable_from_one_that_never_existed() {
-        let node = server::new(
-            build_api_with_role(ServerRole::Node).await,
-            ServerRole::Node,
-        );
+        let node = server::new(build_api_as(node_half()).await);
         let answer = |path: &'static str| {
             let node = node.clone();
             async move {
@@ -2348,7 +2357,7 @@ mod tests {
 
         // The probe has resolution: the same route on the rollback role is not
         // a 404 at all, so the equality above is about the role.
-        let all = server::new(build_api().await, ServerRole::All);
+        let all = server::new(build_api().await);
         assert_ne!(
             all.oneshot(
                 Request::builder()
@@ -2367,7 +2376,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_requires_routing_headers() {
-        let app = server::new(build_api().await, ServerRole::All);
+        let app = server::new(build_api().await);
 
         let response = app
             .clone()
@@ -2451,36 +2460,39 @@ mod tests {
         assert_eq!(body, Bytes::from_static(b"sandbox auto-resume failed"));
     }
 
-    /// 🔴 The role branch that is the whole of §6 on the node side, and §11.3's
-    /// exception in the same test.
+    /// 🔴 The branch that is the whole of §6 on the node side, and the API
+    /// half's counterpart in the same test.
     ///
     /// Identical input — a paused sandbox with `autoResume: true`, the same
-    /// request — put to the two roles, and they must answer differently:
+    /// request — put to the two halves, and they must answer differently:
     ///
-    /// - `--role all` still runs today's four decision arms, so the wake is
-    ///   attempted and fails on the missing VM: **502**. That is §11.3's
-    ///   requirement that `try_auto_resume` stay *reached*, not merely compiled;
-    ///   a `#[cfg]`-ed-out or dead-code version of it would fail here.
-    /// - `--role node` never takes the arm, so the sandbox is simply reported
+    /// - `aenv-api` runs the four decision arms, so the wake is attempted and
+    ///   fails on the missing VM: **502**. That is the requirement that
+    ///   `try_auto_resume` stay *reached*, not merely compiled; a
+    ///   `#[cfg]`-ed-out or dead-code version of it would fail here.
+    /// - `aenv-node` never takes the arm, so the sandbox is simply reported
     ///   paused: **410**. That is §6.1's requirement that a node stop starting
     ///   sandboxes on its own initiative.
     ///
     /// 🔴 Neither half is an assertion that nothing happened. "A node did not
     /// wake the sandbox" is true of a build where the wake path is broken for
     /// everyone, so it is worth nothing on its own — it is only evidence
-    /// standing next to the 502, which proves the path still fires when the
-    /// role says it may.
+    /// standing next to the 502, which proves the path still fires on the half
+    /// that may take it.
     #[tokio::test]
-    async fn only_a_role_that_serves_wake_decisions_auto_resumes_a_paused_sandbox() {
+    async fn only_the_half_that_owns_sandboxes_auto_resumes_a_paused_one() {
         let upstream_addr = start_upstream_server().await;
 
-        async fn ask(role: ServerRole, upstream_addr: SocketAddr) -> (StatusCode, Bytes) {
+        async fn ask(
+            wiring: crate::api::ResumeWiring,
+            upstream_addr: SocketAddr,
+        ) -> (StatusCode, Bytes) {
             let sandbox_id = SandboxId::new();
-            let app = proxy_app_for_sandbox_as_role(
+            let app = proxy_app_for_sandbox_as_half(
                 &sandbox_id,
                 crate::orchestrator::SandboxState::Paused,
                 true,
-                role,
+                wiring,
             )
             .await;
 
@@ -2502,20 +2514,19 @@ mod tests {
             (status, body)
         }
 
-        let (all_status, all_body) = ask(ServerRole::All, upstream_addr).await;
+        let (api_status, api_body) = ask(api_half(), upstream_addr).await;
         assert_eq!(
-            all_status,
+            api_status,
             StatusCode::BAD_GATEWAY,
-            "🔴 --role all is the rollback target and is defined as today's \
-             behaviour verbatim: it must still take the auto-resume arm"
+            "🔴 aenv-api owns sandboxes: it must take the auto-resume arm"
         );
         assert_eq!(
-            all_body,
+            api_body,
             Bytes::from_static(b"sandbox auto-resume failed"),
-            "and it must reach try_auto_resume itself, not merely a role check"
+            "and it must reach try_auto_resume itself, not merely a half check"
         );
 
-        let (node_status, node_body) = ask(ServerRole::Node, upstream_addr).await;
+        let (node_status, node_body) = ask(node_half(), upstream_addr).await;
         assert_eq!(
             node_status,
             StatusCode::GONE,
@@ -2531,8 +2542,8 @@ mod tests {
         );
 
         assert_ne!(
-            all_status, node_status,
-            "if these ever agree the role branch has stopped doing anything, \
+            api_status, node_status,
+            "if these ever agree the branch on which half this is has stopped doing anything, \
              and the topology change is a no-op that looks like it landed"
         );
     }
@@ -2566,7 +2577,7 @@ mod tests {
             .orchestrator()
             .get_envd_access_token(&metadata)
             .expect("secure paused sandbox token");
-        let app = server::new(api, ServerRole::All);
+        let app = server::new(api);
 
         for token in [None, Some("incorrect")] {
             let mut request = Request::builder()
@@ -3086,7 +3097,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_fallback_returns_not_found_without_routing_header() {
-        let app = server::new(build_api().await, ServerRole::All);
+        let app = server::new(build_api().await);
 
         let response = app
             .oneshot(
@@ -3565,7 +3576,6 @@ mod execution_fencing_tests {
 
     use crate::api::server;
     use crate::orchestrator::{ProxyTarget, SandboxState};
-    use crate::role::ServerRole;
 
     use super::tests::{build_api, spawn_upstream};
 
@@ -3591,7 +3601,7 @@ mod execution_fencing_tests {
         api.orchestrator()
             .set_live_execution_for_test(sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), live)
             .await;
-        server::new(api, ServerRole::All)
+        server::new(api)
     }
 
     fn proxy_request(sandbox_id: SandboxId, port: u16, expect: Option<ExecutionId>) -> Request {
@@ -3704,7 +3714,7 @@ mod execution_fencing_tests {
         let sandbox_id = SandboxId::new();
         let app = {
             let api = build_api().await;
-            server::new(api, ServerRole::All)
+            server::new(api)
         };
 
         let response = app
@@ -3739,7 +3749,7 @@ mod execution_fencing_tests {
                 .set_auto_resume_for_test(&sandbox_id, true)
                 .await
                 .unwrap();
-            server::new(api, ServerRole::All)
+            server::new(api)
         };
 
         let response = app

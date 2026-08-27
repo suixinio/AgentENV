@@ -1,12 +1,12 @@
-//! What `--role api` answers when it is asked to cold-start a sandbox.
+//! What `aenv-api` answers when it is asked to cold-start a sandbox.
 //!
 //! 🔴 In `aenv-node` even though the surface under test is `aenv-core`'s
 //! `api::impls::sandbox`. These fixtures install a fake `regctl` and drive the
 //! real `ImageResolver` — the resolving half, which lives in this crate — so
-//! that "the api role never reaches the resolver" is proved against the thing
+//! that "the api half never reaches the resolver" is proved against the thing
 //! that would have been reached. A test in `aenv-core` could not link it.
 //!
-//! 🔴 What `--role api` answers when it is asked to cold-start a sandbox.
+//! 🔴 What `aenv-api` answers when it is asked to cold-start a sandbox.
 //!
 //! A cold start is the one create path whose first act is to resolve an OCI
 //! image *here*: `regctl` fetches the manifest and converts the layers into a
@@ -32,7 +32,6 @@ use crate::identity::NodeIdentity;
 use crate::orchestrator::{
     DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
 };
-use crate::role::ServerRole;
 use crate::sandbox::mock::MockBackendFactory;
 use crate::template::RefusingTemplateBuildDriver;
 use aenv_core::api::impls::ApiImpl;
@@ -57,14 +56,20 @@ struct Surface {
 }
 
 /// A surface differing from every other one here in exactly one value:
-/// which half of the split the process serving it runs as.
+/// which half of the split the process serving it is.
 ///
-/// 🔴 The orchestrator stays `All` in every case, for the reason
-/// `template_read_scope_tests::surface_as` gives: the cold-start route asks
-/// `ApiImpl::role()`, not the orchestrator's, and an `Orchestrator` built
-/// as `Api` has construction-time demands of its own that would make the
-/// refusing half of this test fail on the fixture instead of on the gate.
-async fn surface_as(role: ServerRole) -> Surface {
+/// 🔴 The orchestrator takes `AccessTokenSeedPolicy::MayGenerate` in every
+/// case: the cold-start route asks the `ApiImpl`, not the orchestrator, and an
+/// orchestrator built with `MustBeConfigured` has construction-time demands of
+/// its own that would make the refusing half of this test fail on the fixture
+/// instead of on the gate.
+///
+/// 🔴 `ResumeWiring` is the whole of the difference. `node_local` gives an
+/// `ApiImpl` that runs its sandboxes here; `api_half_for_test` gives one that
+/// does not — see `ApiImpl::runs_sandbox_runtime`, which is the branch under
+/// test. This crate can reach the second only because `aenv-core`'s
+/// `test-support` feature is on for its dev build.
+async fn surface_as(wiring: crate::api::ResumeWiring) -> Surface {
     let root = tempfile::tempdir().expect("a temp dir");
 
     // A fake `regctl` that answers every lookup with a registry 404. The
@@ -106,7 +111,7 @@ async fn surface_as(role: ServerRole) -> Surface {
     };
 
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
@@ -130,8 +135,7 @@ async fn surface_as(role: ServerRole) -> Surface {
         ),
         Vec::new(),
         // 🔴 The one value this fixture varies.
-        role,
-        crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+        wiring,
     ));
 
     // Held for the process's lifetime: the persister above goes on reading
@@ -175,17 +179,17 @@ fn regctl_argv(s: &Surface) -> Option<Vec<String>> {
         .map(|raw| raw.lines().map(ToString::to_string).collect())
 }
 
-/// `--role api` used to refuse a cold start outright — see the retired
+/// `aenv-api` used to refuse a cold start outright — see the retired
 /// history on `SandboxLaunchSource::UnresolvedImage`. This pins the
-/// replacement: `--role api` no longer touches `regctl` (it cannot — no
+/// replacement: `aenv-api` no longer touches `regctl` (it cannot — no
 /// `/dev/kvm`, no `ublk` either) but *does* now build a launch source and
-/// hand it to the orchestrator, same as `--role all`/`--role node` always
-/// have — just carrying a reference instead of an already-resolved path.
+/// hand it to the orchestrator, same as a node always has — just carrying a
+/// reference instead of an already-resolved path.
 ///
-/// # 🔴 Why the api-role assertion is a refusal from `build_from_image_ref`
+/// # 🔴 Why the api-half assertion is a refusal from `build_from_image_ref`
 ///
 /// `surface_as`'s fixture orchestrator is deliberately the same
-/// `FirecrackerSandboxFactory` `All`/`Node` use (see its own note) rather
+/// `MockBackendFactory` the node arm uses (see its own note) rather
 /// than a `RemoteSandboxBackendFactory` dialling a real node, so an
 /// unresolved-image create on this fixture runs out of road at
 /// `SandboxBackendFactory::build_from_image_ref`'s *default* refusal.
@@ -193,33 +197,33 @@ fn regctl_argv(s: &Surface) -> Option<Vec<String>> {
 /// reaching it means `sandboxes_cold_post` built
 /// `SandboxLaunchSource::UnresolvedImage` from `body.image` verbatim and
 /// handed it to the orchestrator without ever calling `regctl`, which is
-/// the whole of what this route owes `--role api` now. A real remote
+/// the whole of what this route owes `aenv-api` now. A real remote
 /// dispatch — the node actually resolving the reference itself — is
 /// exercised end-to-end in `node_client::tests` and `node_server::tests`,
 /// which run a real node service over a real socket; this test's job is
 /// only the fork inside this one function.
 ///
-/// `Node` is asserted alongside `All` even though a node never reaches
-/// this handler in production — `RoleGate` answers `POST /sandboxes-cold`
-/// with 404 there (`crate::api::role_gate`) — because the branch under
-/// test is `runs_sandbox_runtime`, and a node answers `true` to it.
+/// The node arm is asserted even though a node never reaches this handler in
+/// production — the user-REST gate answers `POST /sandboxes-cold` with 404
+/// there (`crate::api::role_gate`) — because the branch under test is
+/// `ApiImpl::runs_sandbox_runtime`, and a node answers `true` to it.
 #[tokio::test]
-async fn a_cold_start_resolves_locally_or_ships_the_reference_unresolved_depending_on_role() {
-    let s = surface_as(ServerRole::Api).await;
+async fn a_cold_start_resolves_locally_or_ships_the_reference_unresolved_depending_on_half() {
+    let s = surface_as(crate::api::ResumeWiring::api_half_for_test()).await;
     let response = cold_start(&s).await;
     assert_eq!(
         regctl_argv(&s),
         None,
-        "🔴 --role api must never resolve the image itself — that capability gap is what \
+        "🔴 aenv-api must never resolve the image itself — that capability gap is what \
          this route now closes by dispatching instead of resolving — so regctl must not \
          have run, got {response:?}"
     );
     match &response {
         SandboxesColdPostResponse::Status500_ServerError(error) => {
             assert!(
-                !error.message.contains("--role api"),
+                !error.message.contains("no sandbox runtime"),
                 "this must not be the old door refusal — the whole point of the fix is that \
-                 --role api no longer refuses this route outright — got {:?}",
+                 aenv-api no longer refuses this route outright — got {:?}",
                 error.message
             );
             assert!(
@@ -240,15 +244,17 @@ async fn a_cold_start_resolves_locally_or_ships_the_reference_unresolved_dependi
         ),
     }
 
-    for role in [ServerRole::All, ServerRole::Node] {
-        let s = surface_as(role).await;
+    {
+        let s = surface_as(crate::api::ResumeWiring::node_local(
+            NodeIdentity::from_config(&Default::default()).id,
+        ))
+        .await;
         let response = cold_start(&s).await;
         let argv = regctl_argv(&s).unwrap_or_else(|| {
             panic!(
-                "--role {} must still resolve the image itself, and the resolver's first act \
+                "aenv-node must still resolve the image itself, and the resolver's first act \
                  is to run regctl; it never ran, so this create was cut short somewhere it \
-                 never used to be, got {response:?}",
-                role.as_str()
+                 never used to be, got {response:?}"
             )
         });
         assert!(

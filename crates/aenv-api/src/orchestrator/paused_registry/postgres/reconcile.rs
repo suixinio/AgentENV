@@ -13,7 +13,7 @@
 //! leases from a fresh heartbeat roster (D2 Fix A, `151d00b`) as part of
 //! this same leader-elected pass, using
 //! [`crate::node_registry::registry::NodeRegistry::rosters_in_cluster`].
-//! That was wrong under N `--role api` replicas for a structural reason, not
+//! That was wrong under N `aenv-api` replicas for a structural reason, not
 //! a bug in the renewal logic itself: `AtomicNodeRegistry` is a per-process,
 //! in-memory roster with **no synchronisation between replicas** -- each
 //! node's gRPC heartbeat connection is a long-lived HTTP/2 stream pinned to
@@ -199,7 +199,7 @@ pub async fn reconcile_once(
 /// roster*, and this module's own B1 doc (above) explains why that
 /// cross-reference cannot run here -- `AtomicNodeRegistry` is a per-replica,
 /// in-memory view covering only the nodes whose heartbeat happens to be
-/// pinned to *this* `--role api` Pod, not the cluster's. Computing those six
+/// pinned to *this* `aenv-api` Pod, not the cluster's. Computing those six
 /// metrics from a partial roster would not degrade gracefully, it would
 /// actively lie: a node whose heartbeat landed on a different replica reads
 /// as `ghost`/`untracked` here even though it is perfectly healthy. Go's

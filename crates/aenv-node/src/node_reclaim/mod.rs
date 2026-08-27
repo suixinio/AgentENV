@@ -87,7 +87,7 @@
 //!
 //! 🔴 And the mistake it would be is not a marginal one. An absent marker means
 //! *the control plane does not own this record* — never *leftover*, never *safe
-//! to kill*. Through the shadow phase the DaemonSet stays on `--role all`, and
+//! to kill*. Through the shadow phase the DaemonSet stays on the pre-split single process, and
 //! in that role every sandbox created through the node's own REST leaves the
 //! marker absent. Absence is therefore the **majority** case on a node, and
 //! every one of those is a live user sandbox. A reclaim that read absence as a
@@ -184,7 +184,6 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
-use crate::role::ServerRole;
 
 /// How long the sweep waits for a VMM it signalled to actually be gone before
 /// it starts deleting the directory that VMM was running in.
@@ -306,39 +305,21 @@ pub struct ReclaimReport {
 
 /// Whether this process sweeps the host at startup.
 ///
-/// 🔴 Three states, because two would be wrong. `Some(_)` is an operator who
-/// said so; `None` is nobody having said anything, which is not the same as
-/// having said "no" — it means the role decides, and the roles disagree. A
-/// `node` is a machine dedicated to one server process and sweeps; an `all` is
-/// what runs on a laptop next to a second copy of itself and does not.
-pub fn enabled_for(role: ServerRole, configured: Option<bool>) -> bool {
-    let enabled = configured.unwrap_or_else(|| role.reclaims_host_leftovers_at_startup());
-
-    // 🔴 The one setting that can take the rollback away.
-    //
-    // `--role all` is defined as the pre-split process, and §11.3 needs it to
-    // stay a working rollback target. It does not sweep, so on `all` this whole
-    // module is one gauge and one log line — unless somebody sets
-    // `AENV_STARTUP_RECLAIM_ENABLED=true`, at which point the rollback target
-    // starts killing processes and deleting directories, which the thing being
-    // rolled back to never did.
-    //
-    // Said loudly rather than refused: the premise checks in `sweep` already
-    // catch the failure this would cause (another server on the host), and
-    // taking a documented override away is its own kind of surprise. But an
-    // operator who set this on a `--role all` node has almost certainly set it
-    // on the wrong workload, and nothing else would tell them.
-    if enabled && !role.reclaims_host_leftovers_at_startup() {
-        warn!(
-            target: "agentenv",
-            role = role.as_str(),
-            "startup reclaim has been turned on for a role that does not sweep by default. \
-             --role all is the rollback target and is meant to behave exactly as the process \
-             before the split did; sweeping the host is not something it ever did. This is \
-             only safe while nothing else on this machine owns a sandbox — unset \
-             AENV_STARTUP_RECLAIM_ENABLED unless that is deliberate"
-        );
-    }
+/// 🔴 Two states in the configuration and three in meaning. `Some(_)` is an
+/// operator who said so; `None` is nobody having said anything, which is not
+/// the same as having said "no" — it means this binary decides, and this
+/// binary sweeps. `aenv-node` is a machine dedicated to one server process,
+/// and its startup is the one moment at which "nothing on this host is mine
+/// yet" is true.
+///
+/// 🔴 There is no longer an arm for a process that does not sweep by default.
+/// There was one while the pre-split single process existed — the shape that runs on a laptop
+/// next to a second copy of itself, where the premise above is simply false —
+/// and it carried a warning for an operator who had turned the sweep on for
+/// it. `aenv-api` does not link this crate at all, so the only process that
+/// can reach this function is one that sweeps.
+pub fn enabled_for(configured: Option<bool>) -> bool {
+    let enabled = configured.unwrap_or(true);
 
     // A gauge, so "is this node sweeping" is answerable from a scrape with no
     // traffic and no restart to observe. A node that never sweeps and a node
@@ -347,7 +328,7 @@ pub fn enabled_for(role: ServerRole, configured: Option<bool>) -> bool {
     enabled
 }
 
-/// Sweeps the host for what a previous process left, if this role sweeps.
+/// Sweeps the host for what a previous process left, unless it is switched off.
 ///
 /// 🔴 **Call this before `setup::ensure_environment`.** That function unlinks
 /// every stale network namespace, and a namespace must not be unlinked while a
@@ -359,12 +340,11 @@ pub fn enabled_for(role: ServerRole, configured: Option<bool>) -> bool {
 /// Best-effort throughout, and never fatal — the e2b property, kept for the
 /// same reason: a node that cannot clean up a leftover is a degraded node, and
 /// a node that refuses to start is an absent one.
-pub async fn run(role: ServerRole, config: &AppConfig) -> ReclaimReport {
-    if !enabled_for(role, config.orchestrator.startup_reclaim_enabled) {
+pub async fn run(config: &AppConfig) -> ReclaimReport {
+    if !enabled_for(config.orchestrator.startup_reclaim_enabled) {
         info!(
             target: "agentenv",
-            role = role.as_str(),
-            "startup reclaim is off for this role; leaving host leftovers alone"
+            "startup reclaim is switched off; leaving host leftovers alone"
         );
         return ReclaimReport::default();
     }
@@ -577,17 +557,15 @@ mod tests {
 
     use crate::logging::capture::Recorder;
 
+    /// 🔴 The three states, each distinct. The middle one is the one a
+    /// two-state reading would lose: an operator who has set nothing is not an
+    /// operator who has said no, and this binary sweeps when nobody has said
+    /// anything.
     #[test]
-    fn the_role_decides_only_when_configuration_has_not() {
-        // 🔴 The three states, each distinct. The middle one is the one a
-        // two-state reading would lose: an operator who has set nothing is not
-        // an operator who has said no.
-        assert!(enabled_for(ServerRole::Node, None));
-        assert!(!enabled_for(ServerRole::All, None));
-        assert!(!enabled_for(ServerRole::Api, None));
-
-        assert!(enabled_for(ServerRole::All, Some(true)));
-        assert!(!enabled_for(ServerRole::Node, Some(false)));
+    fn configuration_decides_in_both_directions_and_absence_means_sweep() {
+        assert!(enabled_for(None));
+        assert!(enabled_for(Some(true)));
+        assert!(!enabled_for(Some(false)));
     }
 
     #[test]
@@ -1004,75 +982,6 @@ mod tests {
         assert_eq!(another_server_instance(&proc_dir, &own_exe, 1), None);
     }
 
-    /// 🔴 T-NR-34. The role that runs during the shadow phase does not sweep.
-    ///
-    /// This is the protection for the case above, and it is one line of policy
-    /// rather than any cleverness in the sweep. Pushed up in both directions,
-    /// so the `false` is a decision and not a constant.
-    #[test]
-    fn the_role_that_runs_during_the_shadow_phase_does_not_sweep() {
-        // The shadow phase keeps the DaemonSet on `--role all`, so the sweep
-        // never runs there, whatever is on the node.
-        assert!(!enabled_for(ServerRole::All, None));
-        // ...and it is a decision: an operator can turn it on, which is what
-        // makes the line above worth asserting.
-        assert!(enabled_for(ServerRole::All, Some(true)));
-        // The role that does sweep, whose startup is the one moment at which
-        // the premise holds.
-        assert!(enabled_for(ServerRole::Node, None));
-    }
-
-    /// 🔴 T-NR-53. An operator who turned the sweep on for a role that does not
-    /// sweep is told so, and one who turned it on for a role that does is not.
-    ///
-    /// The warning is the whole of that decision — `enabled_for` returns the
-    /// same `true` either way, and the gauge it sets is the same `1`. So the
-    /// only thing that distinguishes "this is the ordinary configuration" from
-    /// "somebody has taken §11.3's rollback target and pointed it at the host"
-    /// is the line, and a test that does not read the line cannot tell a
-    /// predicate over two operands from one that is always true.
-    #[test]
-    fn enabling_the_sweep_for_a_role_that_does_not_sweep_says_so() {
-        const ANNOUNCEMENT: &str = "AENV_STARTUP_RECLAIM_ENABLED";
-
-        // Enabled, by a role that would not have swept: the two operands
-        // disagree, which is the case this line exists for.
-        let overridden = Recorder::default();
-        let guard = overridden.install();
-        assert!(enabled_for(ServerRole::All, Some(true)));
-        drop(guard);
-        assert!(
-            overridden.saw(Level::WARN, ANNOUNCEMENT),
-            "the rollback target was pointed at the host and nothing said so: {:?}",
-            overridden.events()
-        );
-
-        // 🔴 The same `enabled`, a role that sweeps by default. Nothing unusual
-        // has happened and there is nothing to say — and this is the half a
-        // predicate reading `||` where it says `&&` gets wrong.
-        let ordinary = Recorder::default();
-        let guard = ordinary.install();
-        assert!(enabled_for(ServerRole::Node, Some(true)));
-        drop(guard);
-        assert!(
-            !ordinary.saw(Level::WARN, ANNOUNCEMENT),
-            "an ordinary node was warned about its own default: {:?}",
-            ordinary.events()
-        );
-
-        // ...and the other operand alone: the role that does not sweep, left
-        // alone. Not enabled, so again nothing to say.
-        let untouched = Recorder::default();
-        let guard = untouched.install();
-        assert!(!enabled_for(ServerRole::All, None));
-        drop(guard);
-        assert!(
-            !untouched.saw(Level::WARN, ANNOUNCEMENT),
-            "a role that is simply not sweeping was warned about an override nobody set: {:?}",
-            untouched.events()
-        );
-    }
-
     /// 🔴 T-NR-54. Each refusal is recorded under the reason it actually is.
     ///
     /// The label goes on `agentenv_node_reclaim_refused_total`, and the three
@@ -1186,7 +1095,7 @@ mod tests {
             // A path with nothing listening on it, which is a leftover socket
             // rather than a server that still owns this host.
             config.ublk.daemon_socket_path = root.path().join("ublk.sock");
-            // Nobody has said anything, so the role decides.
+            // Nobody has said anything, which is what every deployment does.
             config.orchestrator.startup_reclaim_enabled = None;
 
             Self {
@@ -1240,28 +1149,32 @@ mod tests {
     ///
     /// Everything else in this file drives `sweep`, one level below the
     /// enablement check — so a `run` that returned an empty report and did
-    /// nothing, for every role, on every host, would leave all of it green.
-    /// Both directions are asserted against the same host: the role that does
-    /// not sweep leaves the leftover where it is, and the role that does
-    /// retires it.
+    /// nothing, on every host, would leave all of it green. Both directions
+    /// are asserted against the same host: switched off it leaves the leftover
+    /// where it is, and left alone it retires it.
+    ///
+    /// 🔴 The negative half used to be the pre-split single process, the shape that did not
+    /// sweep by default. There is no such shape now — `aenv-api` does not link
+    /// this crate — so the operator's own `startup_reclaim_enabled = false` is
+    /// what stands in for it. It is the same branch of the same `if` in `run`.
     #[tokio::test]
-    async fn run_turns_the_decision_into_a_sweep_for_the_role_that_sweeps() {
-        let host = ConfiguredHost::new();
+    async fn run_turns_the_decision_into_a_sweep_unless_it_is_switched_off() {
+        let mut host = ConfiguredHost::new();
         let leftover = host.leftover("agentenv-fc-A1");
 
-        // §11.3's rollback target. "Does not sweep" has to mean the host is
-        // untouched, not merely that the report came back empty.
-        assert_eq!(
-            run(ServerRole::All, &host.config).await,
-            ReclaimReport::default()
-        );
+        // Switched off. "Does not sweep" has to mean the host is untouched,
+        // not merely that the report came back empty.
+        host.config.orchestrator.startup_reclaim_enabled = Some(false);
+        assert_eq!(run(&host.config).await, ReclaimReport::default());
         assert!(
             leftover.exists(),
-            "--role all reclaimed a host it is defined not to touch"
+            "a sweep that was switched off reclaimed the host anyway"
         );
 
-        // The same host, the same configuration, the role that does sweep.
-        let report = run(ServerRole::Node, &host.config).await;
+        // The same host, the same leftover, with the setting back where every
+        // deployment leaves it.
+        host.config.orchestrator.startup_reclaim_enabled = None;
+        let report = run(&host.config).await;
         assert_eq!(
             report.firecracker.failed, 0,
             "a Firecracker on this machine could not be classified, which vetoes the file \
@@ -1269,7 +1182,7 @@ mod tests {
         );
         assert_eq!(
             report.work_dirs.reclaimed, 1,
-            "--role node swept nothing; if the premise was refused, something else on this \
+            "aenv-node swept nothing; if the premise was refused, something else on this \
              machine is running this same test binary"
         );
         assert!(!leftover.exists());
@@ -1296,7 +1209,7 @@ mod tests {
 
         let unaccounted = Recorder::default();
         let guard = unaccounted.install();
-        let report = run(ServerRole::Node, &host.config).await;
+        let report = run(&host.config).await;
         drop(guard);
 
         assert_eq!(
@@ -1320,7 +1233,7 @@ mod tests {
         let settled = clean.leftover("agentenv-fc-B2");
         let accounted = Recorder::default();
         let guard = accounted.install();
-        let report = run(ServerRole::Node, &clean.config).await;
+        let report = run(&clean.config).await;
         drop(guard);
 
         assert_eq!(
@@ -1364,14 +1277,14 @@ mod tests {
 
     /// 🔴 T-NR-37. No deployment manifest turns the sweep on.
     ///
-    /// `AENV_STARTUP_RECLAIM_ENABLED=true` on a `--role all` node makes the
-    /// rollback target sweep the host, which the process before the split never
-    /// did — the sharpest available way to lose §11.3's rollback. It is a
-    /// deliberate operator override and stays one; what it must never be is
-    /// something that arrives in a manifest and is noticed later.
+    /// `AENV_STARTUP_RECLAIM_ENABLED` is the one setting that can make a node
+    /// kill processes and delete directories it did not put there, and the
+    /// sweep is sound only because of *when* it runs — before the listener
+    /// opens, on the premise that the previous process on this machine is
+    /// gone. A manifest that sets it makes that a fleet-wide default rather
+    /// than a deliberate, local operator decision.
     ///
-    /// The startup warning in [`enabled_for`] covers the operator who types it.
-    /// This covers the one who commits it, which nothing at runtime can.
+    /// This covers the operator who commits it, which nothing at runtime can.
     ///
     /// 🔴 The scan's whole result is an absence, so the proof that it *would*
     /// find a setting lives in this same test rather than in a sibling one. A
@@ -1407,7 +1320,11 @@ mod tests {
             &format!("            # {VAR} is deliberately absent, here and everywhere"),
             VAR
         ));
-        assert!(!manifest_sets("            - name: AENV_ROLE", VAR));
+        // A near miss: a prefix of the real name is not the real name.
+        assert!(!manifest_sets(
+            "            - name: AENV_STARTUP_RECLAIM",
+            VAR
+        ));
 
         // 🔴 Resolution: the name below has to be the name the config actually
         // reads, or this scan looks for a string nothing would ever contain and
@@ -1449,9 +1366,9 @@ mod tests {
                 checked += 1;
                 assert!(
                     !manifest_sets(&contents, VAR),
-                    "{} sets {VAR}. On --role all that makes the rollback target sweep the \
-                     host, which the pre-split process never did. If this is deliberate, it \
-                     belongs on a --role node workload and this test needs to say so",
+                    "{} sets {VAR}, which makes every node in the fleet sweep the host at \
+                     startup by deployment rather than by a deliberate local decision. If this \
+                     is intended, this test needs to say so",
                     path.display()
                 );
                 if sample.is_none() && contents.contains('\n') {

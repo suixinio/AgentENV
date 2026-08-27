@@ -5,7 +5,7 @@
 //! It used to be a function in the local reverse proxy. `try_auto_resume` sat
 //! on `src/api/proxy.rs`'s request path and took three decisions — arbitrate,
 //! start, hand the claim back — on the node the traffic happened to arrive at.
-//! That is the arrangement `--role node` exists to end: a node that decides
+//! That is the arrangement `aenv-node` exists to end: a node that decides
 //! when a sandbox should be alive is not an executor, and it needs a
 //! decision-making orchestrator to be one.
 //!
@@ -17,7 +17,7 @@
 //! # 🔴 What did *not* move
 //!
 //! `try_auto_resume` is still in `src/api/proxy.rs`, still compiled, still
-//! reached — under `--role all`, which is the rollback target and is defined as
+//! reached — under the pre-split single process, which is the rollback target and is defined as
 //! today's behaviour verbatim. The call site became a role branch rather than a
 //! deletion (`_sd-impl-phase3-role.md` §11.3). Deleting it belongs to a release
 //! after the switch, not to the switch.
@@ -109,7 +109,7 @@ pub(in crate::api) enum PinRefusalReason {
     /// sandbox on another machine.
     ///
     /// 🔴 Reachable only in the shape where the API half runs inside a process
-    /// that also runs sandboxes, i.e. `--role all`. Once the remote backend
+    /// that also runs sandboxes, i.e. the pre-split single process. Once the remote backend
     /// factory lands, the API half drives any node and this stops being
     /// possible. It is a refusal and not a fallback on purpose — the fallback
     /// is the rewind.
@@ -180,7 +180,7 @@ pub(in crate::api) enum WakeSite {
     /// The orchestration surface places the wake-up on whichever machine it
     /// decides, so the pin is that surface's to honour.
     ///
-    /// 🔴 Nothing in `src/bin/` constructs this yet. It is what `--role api`
+    /// 🔴 Nothing in `src/bin/` constructs this yet. It is what `aenv-api`
     /// will pass once the remote backend factory exists, and the factory has to
     /// take the placement with it — resume places through `LookupNode`, create
     /// places through `Schedule` (`_sd-impl-phase3-role.md` §6.6). Leaving the
@@ -195,7 +195,7 @@ pub(in crate::api) enum WakeSite {
     /// the factory is wired.
     ///
     /// 🔧 That day has come: `ResumeWiring::cluster_from_config` constructs it,
-    /// and `--role api` is the caller.
+    /// and `aenv-api` is the caller.
     Remote,
 }
 
@@ -225,12 +225,44 @@ impl ResumeWiring {
         }
     }
 
+    /// Whether the orchestration surface behind this wiring runs its sandboxes
+    /// in this process.
+    ///
+    /// 🔴 The one fact that tells `aenv-node` from `aenv-api` inside the crate
+    /// they share. It is read off the wake site rather than carried beside it
+    /// because the wake site already had to know, and had to be right: a
+    /// process that names the machine it wakes sandboxes on
+    /// ([`WakeSite::Local`]) is the process that runs them, and one that
+    /// delegates every wake-up to a placement ([`WakeSite::Remote`]) has no
+    /// machine to run them on. `ApiImpl` used to hold a role *as well*, kept in
+    /// step with this by a `debug_assert` in `super::super::server::assemble`;
+    /// one carrier cannot disagree with itself.
+    pub(in crate::api) fn runs_sandboxes_here(&self) -> bool {
+        matches!(self.wake_site, WakeSite::Local(_))
+    }
+
     /// The wiring for a process with no cluster to ask: every placement is
     /// unconstrained and the wake happens here.
     pub fn node_local(node_id: impl Into<String>) -> Self {
         Self {
             placement: None,
             wake_site: WakeSite::Local(node_id.into()),
+        }
+    }
+
+    /// The wiring an `aenv-api` process has, without the scheduler endpoint
+    /// [`cluster_from_config`](Self::cluster_from_config) insists on.
+    ///
+    /// 🔴 Test-only, and behind `test-support` rather than plain `cfg(test)` so
+    /// `aenv-node`'s own suite can build the half it is asserting *about*:
+    /// `crates/aenv-node/src/tests/api_cold_start.rs` puts both halves' cold
+    /// -start arms side by side over one real `ImageResolver`, and only the
+    /// node crate has one. Nothing in a shipped binary can reach it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn api_half_for_test() -> Self {
+        Self {
+            placement: None,
+            wake_site: WakeSite::Remote,
         }
     }
 
@@ -290,7 +322,7 @@ impl ResumeWiring {
         let endpoint = configured_placement_endpoint(config.cluster.scheduler_endpoint.as_deref())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--role api needs [cluster].scheduler_endpoint \
+                    "aenv-api needs [cluster].scheduler_endpoint \
                      (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not run, \
                      so every wake-up and every create has to be placed by the scheduler, and \
                      there is no machine here to fall back to"

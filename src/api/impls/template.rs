@@ -621,7 +621,7 @@ impl Templates<()> for ApiImpl {
         // this one *can* be forwarded: `TemplateBuildRunner` is ordinary Rust
         // that runs wherever it is called, and a node has `/dev/kvm`, `regctl`
         // and a Firecracker binary even when this process does not. So
-        // `--role api` does not refuse here — it dispatches to a node instead
+        // `aenv-api` does not refuse here — it dispatches to a node instead
         // (`run_the_build_on_a_node`, below). What is refused is the one
         // configuration that can do neither: no local sandbox runtime *and* no
         // node placement to send the build to, which today only happens if
@@ -631,11 +631,10 @@ impl Templates<()> for ApiImpl {
         // the whole difference between an answer the caller gets and an answer
         // only a log has. Nothing has been mutated at this point, so the
         // template row is left exactly as it was found, in `waiting`.
-        if !self.role().runs_sandbox_runtime() && self.node_placement().is_none() {
+        if !self.runs_sandbox_runtime() && self.node_placement().is_none() {
             warn!(
                 template_id = %path_params.template_id,
-                role = self.role().as_str(),
-                "refused a template build: this role runs no sandbox runtime and has no node \
+                "refused a template build: this process runs no sandbox runtime and has no node \
                  placement source to forward the build to"
             );
             return Ok(v2_start_build_error(Self::error(
@@ -852,9 +851,9 @@ async fn hold_a_lease<Renew, Answer>(
     }
 }
 
-/// Runs a template build wherever this process can run one — locally, when
-/// `--role all` gave it a sandbox runtime, or on a node it dials, when
-/// `--role api` gave it a placement source instead. Every failure either arm
+/// Runs a template build wherever this process can run one — locally, in
+/// `aenv-node`, which has a sandbox runtime, or on a node it dials, in
+/// `aenv-api`, which has a placement source instead. Every failure either arm
 /// can raise ends the same way: `mark_v2_build_error` on `build_id`, and the
 /// template row stays `waiting` for the reaper to hand to another build if
 /// nothing else claims it first.
@@ -864,7 +863,7 @@ async fn run_the_build(
     base_source: TemplateBuildStartBaseSource,
     spec: crate::template::TemplateBuildSpec,
 ) {
-    if api.role().runs_sandbox_runtime() {
+    if api.runs_sandbox_runtime() {
         run_the_build_locally(api, build_id, base_source, spec).await
     } else {
         run_the_build_on_a_node(api, build_id, base_source, spec).await
@@ -872,7 +871,7 @@ async fn run_the_build(
 }
 
 /// `run_the_build`'s local arm: drives `TemplateBuildRunner` in this process,
-/// exactly as it did before `--role api` existed.
+/// exactly as it did before the split.
 async fn run_the_build_locally(
     api: ApiImpl,
     build_id: SnapshotId,
@@ -1002,7 +1001,7 @@ async fn run_the_build_locally(
     }
 }
 
-/// `run_the_build`'s remote arm, for `--role api`: picks a node through
+/// `run_the_build`'s remote arm, for `aenv-api`: picks a node through
 /// `api.node_placement()`, asks it to run the build
 /// (`crate::node_client::build_template_on_a_node`), and commits what comes
 /// back.
@@ -1453,7 +1452,6 @@ mod template_read_scope_tests {
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
     };
-    use crate::role::ServerRole;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         SnapshotCatalog, SnapshotCommit, SnapshotListPage, StartedBuild,
@@ -1586,20 +1584,31 @@ mod template_read_scope_tests {
 
     /// The surface as the role every fixture here predates the split with.
     async fn surface() -> Surface {
-        surface_as(ServerRole::All, None).await
+        surface_as(node_half(), None).await
     }
 
     /// The same surface, differing in two values: which half of the split the
-    /// process serving it runs as, and — for the halves that need one to
-    /// build a template remotely — where that half sends the build.
+    /// process serving it is, and — for a half that needs one to build a
+    /// template remotely — where that half sends the build.
     ///
-    /// 🔴 The orchestrator stays `All` in every case. It is not what the build
-    /// route reads — the handler asks `ApiImpl::role()` — and an `Orchestrator`
-    /// built as `Api` refuses to construct without a configured envd access
-    /// -token seed, which would make the refusing half of these tests fail on
-    /// the fixture rather than on the thing under test.
+    /// 🔴 The orchestrator takes [`AccessTokenSeedPolicy::MayGenerate`] in
+    /// every case. It is not what the build route reads — the handler asks
+    /// `ApiImpl` — and an `Orchestrator` built with `MustBeConfigured` refuses
+    /// to construct without a configured envd access-token seed, which would
+    /// make the refusing half of these tests fail on the fixture rather than
+    /// on the thing under test.
+    /// The wiring that makes a `Surface`'s `ApiImpl` the `aenv-node` half.
+    fn node_half() -> crate::api::ResumeWiring {
+        crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id)
+    }
+
+    /// The wiring that makes a `Surface`'s `ApiImpl` the `aenv-api` half.
+    fn api_half() -> crate::api::ResumeWiring {
+        crate::api::ResumeWiring::api_half_for_test()
+    }
+
     async fn surface_as(
-        role: ServerRole,
+        wiring: crate::api::ResumeWiring,
         node_placement: Option<Arc<dyn NodePlacement>>,
     ) -> Surface {
         let id = SnapshotId::generate();
@@ -1629,7 +1638,7 @@ mod template_read_scope_tests {
 
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
@@ -1661,11 +1670,10 @@ mod template_read_scope_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 The one value these fixtures vary. `surface()` passes `All`,
-            // because they predate the split and assert today's behaviour,
-            // which is what `all` is defined as.
-            role,
-            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+            // 🔴 The one value these fixtures vary. `surface()` passes the
+            // node half, because they predate the split and assert the
+            // behaviour of a process that runs the sandboxes it answers for.
+            wiring,
         );
         // 🔴 A builder step, matching `assemble_api`'s own use of it — see
         // `ApiImpl::with_node_placement`.
@@ -1924,29 +1932,29 @@ mod template_read_scope_tests {
         )))
     }
 
-    /// 🔴 Only a role with **neither** a local sandbox runtime **nor** a node
-    /// to send the build to is refused at the door — and the point of this
-    /// test is that `--role api` is only in that set when it was not given a
-    /// placement source, which `assemble_api` always gives it in production.
+    /// 🔴 Only a process with **neither** a local sandbox runtime **nor** a
+    /// node to send the build to is refused at the door — and the point of
+    /// this test is that `aenv-api` is only in that set when it was not given
+    /// a placement source, which `assemble_api` always gives it in production.
     ///
-    /// Before `run_the_build_on_a_node` existed, `--role api` refused
+    /// Before `run_the_build_on_a_node` existed, `aenv-api` refused
     /// unconditionally: the 202 would otherwise have gone out, the build would
     /// have died in a background task with no machine to run it on, and the
     /// status endpoint would have reported the same generic reason a user's
     /// broken `RUN` step reports. This is the regression that refusal existed
     /// to prevent, restated as "still true when there is truly nowhere to
-    /// send the build" rather than "true for `--role api` unconditionally".
+    /// send the build" rather than "true for `aenv-api` unconditionally".
     ///
     /// The discriminator is the admission counter rather than the status
     /// code, because a refusal and a failed admission are both 500 — only one
     /// of them got as far as asking the catalog to start a build.
     #[tokio::test]
     async fn a_build_is_refused_only_when_it_can_run_nowhere_at_all() {
-        let s = surface_as(ServerRole::Api, None).await;
+        let s = surface_as(api_half(), None).await;
         let response = start_a_build(&s).await;
         let refusal = role_refusal(&response).unwrap_or_else(|| {
             panic!(
-                "--role api with no node placement source has no /dev/kvm and nowhere to send \
+                "aenv-api with no node placement source has no /dev/kvm and nowhere to send \
                  the build, and answering anything but a refusal here is what made the failure \
                  arrive minutes later as a log line, got {response:?}"
             )
@@ -1963,14 +1971,13 @@ mod template_read_scope_tests {
              template moved out of `waiting` into a `building` state nothing will ever finish"
         );
 
-        for role in [ServerRole::All, ServerRole::Node] {
-            let s = surface_as(role, None).await;
+        {
+            let s = surface_as(node_half(), None).await;
             let response = start_a_build(&s).await;
             assert!(
                 role_refusal(&response).is_none(),
-                "--role {} runs sandboxes, so this build takes the road it always took, got \
-                 {response:?}",
-                role.as_str()
+                "aenv-node runs sandboxes, so this build takes the road it always took, got \
+                 {response:?}"
             );
             assert_eq!(
                 s.build_starts.load(Ordering::SeqCst),
@@ -1982,17 +1989,17 @@ mod template_read_scope_tests {
     }
 
     /// 🔴 The regression guard for the gap this whole feature closes:
-    /// `--role api` given a node to send the build to is admitted exactly
-    /// like `--role all`, not refused the way it always was before
-    /// `run_the_build_on_a_node` existed. Deleting the `node_placement`
-    /// half of the door's refusal condition (leaving only
-    /// `!role.runs_sandbox_runtime()`, which is what this repository shipped
-    /// before this change) turns this assertion red — `--role api` would go
-    /// back to refusing every build regardless of whether it has somewhere to
-    /// send one.
+    /// `aenv-api` given a node to send the build to is admitted exactly like
+    /// `aenv-node`, not refused the way it always was before
+    /// `run_the_build_on_a_node` existed. Deleting the `node_placement` half
+    /// of the door's refusal condition (leaving only
+    /// `!self.runs_sandbox_runtime()`, which is what this repository shipped
+    /// before this change) turns this assertion red — `aenv-api` would go back
+    /// to refusing every build regardless of whether it has somewhere to send
+    /// one.
     #[tokio::test]
     async fn an_api_replica_with_a_node_to_send_the_build_to_is_admitted() {
-        let s = surface_as(ServerRole::Api, Some(unreachable_placement())).await;
+        let s = surface_as(api_half(), Some(unreachable_placement())).await;
         let response = start_a_build(&s).await;
         assert!(
             role_refusal(&response).is_none(),
@@ -2002,7 +2009,7 @@ mod template_read_scope_tests {
         assert_eq!(
             s.build_starts.load(Ordering::SeqCst),
             1,
-            "it must reach the admission exactly like --role all does"
+            "it must reach the admission exactly like aenv-node does"
         );
     }
 
@@ -2028,7 +2035,7 @@ mod template_read_scope_tests {
     /// quietly.
     #[tokio::test]
     async fn a_node_nobody_answers_does_not_hang_the_remote_build() {
-        let s = surface_as(ServerRole::Api, Some(unreachable_placement())).await;
+        let s = surface_as(api_half(), Some(unreachable_placement())).await;
         let spec = TemplateBuildSpec::new().resources(1, 128);
 
         let outcome = tokio::time::timeout(

@@ -87,7 +87,7 @@ impl AdvisoryLockKey {
 /// Stage B's Rust migration runner (`crate::snapshot::repository::backends::
 /// postgres::migrate`) takes this same key, session-scoped
 /// (`pg_advisory_lock`/`pg_advisory_unlock`), for the same reason: a schema
-/// two Go processes and a fleet of `--role api` replicas might ever migrate
+/// two Go processes and a fleet of `aenv-api` replicas might ever migrate
 /// concurrently must serialize against all of them through one number, not a
 /// second one that happens not to collide today.
 ///

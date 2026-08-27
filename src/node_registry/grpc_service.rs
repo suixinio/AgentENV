@@ -134,7 +134,7 @@ use super::warmup::WarmupGate;
 const NOT_STAGE_A: &str = "not served by api's Stage A node-registry service — see \
      src/node_registry/grpc_service.rs's module doc for which half owns this RPC";
 
-/// The `Scheduler` service `--role api` serves for the node-registry subset
+/// The `Scheduler` service `aenv-api` serves for the node-registry subset
 /// of its RPCs. See the module doc for the split.
 ///
 /// `Clone` is cheap and intentional: both fields are `Arc`s, so a second

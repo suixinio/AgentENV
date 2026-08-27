@@ -77,7 +77,7 @@ CREATE INDEX IF NOT EXISTS paused_sandboxes_resuming_reclaim_idx
 /// Stage C's own addition, absent from the Go schema: the write surface's
 /// persisted restart-grace phase. Go never needed this — `Grace` lived in the
 /// one scheduler process's memory, and `RunReclaim`'s
-/// `s.grace.RequireServing()` check was a plain in-process read. `--role api`
+/// `s.grace.RequireServing()` check was a plain in-process read. `aenv-api`
 /// is N replicas: `Grace.Enter`'s equivalent runs on whichever replica newly
 /// wins the reconcile leader lock, but the *reclaim* leader lock is a
 /// **separate** election (`AdvisoryLockKey::PausedRegistryReclaim` vs
@@ -177,7 +177,7 @@ async fn preflight(conn: &mut sqlx::PgConnection) -> Result<()> {
 /// the unlock itself fails (never returning a connection to the pool with an
 /// uncertain lock state).
 ///
-/// Idempotent and safe to call from every `--role api` replica on every
+/// Idempotent and safe to call from every `aenv-api` replica on every
 /// startup, concurrently -- matching the Go doc's own claim ("two controllers
 /// rolling over each other are the pair that has to serialise now").
 pub async fn migrate(pool: &PgPool) -> Result<()> {
@@ -275,7 +275,7 @@ mod pg {
         assert_eq!(grace_count, 0);
     }
 
-    /// Every `--role api` replica runs this at startup: it has to be safe to
+    /// Every `aenv-api` replica runs this at startup: it has to be safe to
     /// call twice against the same schema, whether from the same pool or two
     /// independent ones racing each other (see below).
     #[tokio::test]
@@ -306,7 +306,7 @@ mod pg {
         // same schema): each `migrate()` call still does its own independent
         // `pool.acquire()`, so this is two distinct PostgreSQL sessions
         // racing the same advisory lock and the same DDL -- exactly two
-        // `--role api` replicas starting at once against one database.
+        // `aenv-api` replicas starting at once against one database.
         let pool_b = pool_a.clone();
 
         let (a, b) = tokio::join!(migrate(&pool_a), migrate(&pool_b));

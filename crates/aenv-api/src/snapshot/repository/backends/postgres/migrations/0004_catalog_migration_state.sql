@@ -6,7 +6,7 @@
 -- used to cause. The comparison itself
 -- (`crate::snapshot::repository::mirror::CatalogPopulations::compare`) still
 -- runs — this table only changes where its *answer* is remembered. Before
--- this table, the answer lived in each `--role api` replica's own
+-- this table, the answer lived in each `aenv-api` replica's own
 -- `MirrorBacklog` (RocksDB under `$AENV_HOME/snapshot-catalog-mirror`), and
 -- `$AENV_HOME` is an `emptyDir` on that role: every fresh replica read an
 -- empty local store, concluded "nobody has confirmed this yet", and re-ran

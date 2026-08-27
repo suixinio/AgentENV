@@ -557,7 +557,7 @@ mod pg {
 
     /// Branch ①: a cross-node resume claimed on `node-b`, running physically on
     /// `node-b` too (the ordinary shape when the api replica's own identity and
-    /// the real machine coincide, e.g. `--role all`).
+    /// the real machine coincide, e.g. the pre-split single process).
     #[tokio::test]
     async fn mark_running_adopts_a_freshly_claimed_sandbox() {
         let pool = isolated_schema_pool_or_skip!("mark_running_adopts_a_freshly_claimed_sandbox");
@@ -1511,7 +1511,7 @@ mod pg {
     /// A [`NodeRegistry`] that answers `rosters_in_cluster` with exactly one
     /// fixed, always-fresh [`Roster`] -- everything else is unreachable from
     /// [`super::super::replica_renewal::renew_once`], the only method this
-    /// test exercises. Simulates one `--role api` replica whose heartbeat
+    /// test exercises. Simulates one `aenv-api` replica whose heartbeat
     /// connections happen to cover exactly one node.
     struct SingleRosterRegistry(crate::node_registry::types::Roster);
 

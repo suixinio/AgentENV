@@ -22,8 +22,8 @@ use crate::types::FirecrackerSnapshotManifest;
 /// on this catalog's and [`MockSnapshotRuntimeResolver`]'s differently-worded
 /// refusals: a string match cannot tell "the catalog was consulted and
 /// refused" from "the catalog was never asked" once the wording changes (for
-/// instance, when `--role node` stops holding a catalog at all and the
-/// refusal becomes something like "no catalog access on `--role node`" —
+/// instance, when `aenv-node` stops holding a catalog at all and the
+/// refusal becomes something like "no catalog access on `aenv-node`" —
 /// still containing the substring "catalog"), while a call count goes to
 /// zero the moment nothing calls [`Self::get`] any more, whatever the
 /// message says.
@@ -357,12 +357,12 @@ impl SnapshotCatalog for OneRowSnapshotCatalog {
 /// A snapshot manager whose catalog holds `row` and whose runtime resolver
 /// refuses every call.
 ///
-/// This is the shape of `--role api`'s world once it stops resolving: it can
+/// This is the shape of `aenv-api`'s world once it stops resolving: it can
 /// read the catalog, and it has no business turning a row into local bytes.
 ///
 /// 🔴 A resolver that refuses, deliberately, rather than the `None` a real
-/// `--role api` is now assembled with (see `build_storage_for_role`). This
-/// fixture is handed to `--role all` and `--role node` in the same tests, and
+/// `aenv-api` is now assembled with (see `build_storage_for_role`). This
+/// fixture is handed to `aenv-node` in the same tests, and
 /// for those two the refusal is the *positive* control: they must fail exactly
 /// here, which is what proves they resolved rather than shipped the row. A
 /// `None` would make both roles fail with the same message and the fork would

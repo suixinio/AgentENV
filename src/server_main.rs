@@ -25,7 +25,6 @@ use tracing::{info, warn};
 use crate::cfg::AppConfig;
 use crate::observability::ObservabilityReporter;
 use crate::orchestrator::SandboxOrchestration;
-use crate::role::ServerRole;
 
 /// Whatever a process brought up on the machine it runs on, and has to take
 /// back down before exit.
@@ -38,12 +37,12 @@ pub trait ProcessRuntime: Send {
     async fn shutdown(self: Box<Self>);
 }
 
-/// What an assembled role hands back to `main`: the router it serves and the
+/// What an assembled binary hands back to `main`: the router it serves and the
 /// four things the shutdown path has to stand down, in that order.
 pub struct Assembly {
     pub app: axum::Router,
     /// The orchestration surface this process drives. Which concrete
-    /// `Orchestrator` is behind it is the role's decision.
+    /// `Orchestrator` is behind it is the assembling binary's decision.
     pub orchestration: Arc<dyn SandboxOrchestration>,
     /// Background tasks to stop before the shutdown pauses start.
     pub upkeep: Vec<tokio::task::JoinHandle<()>>,
@@ -54,13 +53,23 @@ pub struct Assembly {
     /// currently leader) before returning; pushing one into `upkeep` and
     /// letting the shutdown loop `.abort()` it would skip that release
     /// entirely and strand the lock until the pool itself is torn down.
-    /// Empty for `--role node`, which never holds a `[pg]` pool at all.
+    /// Empty in `aenv-node`, which never holds a `[pg]` pool at all.
     pub pg_singleton_tasks: Vec<crate::leader_task::LeaderTaskHandle>,
-    /// The heartbeat sender, for roles that report themselves as a machine.
+    /// The heartbeat sender, for a process that reports itself as a machine.
     pub reporter: Option<ObservabilityReporter>,
-    /// The machine-local runtime, for roles that brought one up.
+    /// The machine-local runtime, for a process that brought one up.
     pub runtime: Option<Box<dyn ProcessRuntime>>,
-    /// The gRPC surface this role serves alongside the HTTP one, already
+    /// Whether this process takes itself out of scheduling rotation on
+    /// shutdown and waits for the cluster to notice.
+    ///
+    /// 🔴 `true` in `aenv-node` and `false` in `aenv-api`: only a process that
+    /// can be scheduled *onto* has anything to withdraw. Stated by the
+    /// assembling binary rather than derived from `reporter.is_some()` next to
+    /// it — a node with `observability.enabled = false` has no reporter and
+    /// must still drain, and deriving it would turn that setting into a silent
+    /// "stop draining on shutdown".
+    pub drains_on_shutdown: bool,
+    /// The gRPC surface this process serves alongside the HTTP one, already
     /// accepting: the task serving it, and the channel that stops it.
     ///
     /// 🔴 Already bound by the time this is built. A listener that binds inside
@@ -84,7 +93,7 @@ pub const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serves `assembly` until a shutdown signal, then takes the process down in
 /// the order the comments below spell out.
-pub async fn serve(role: ServerRole, config: &AppConfig, assembly: Assembly) -> anyhow::Result<()> {
+pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()> {
     let Assembly {
         app,
         orchestration,
@@ -92,6 +101,7 @@ pub async fn serve(role: ServerRole, config: &AppConfig, assembly: Assembly) -> 
         pg_singleton_tasks,
         mut reporter,
         runtime,
+        drains_on_shutdown,
         grpc,
     } = assembly;
 
@@ -105,7 +115,6 @@ pub async fn serve(role: ServerRole, config: &AppConfig, assembly: Assembly) -> 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let shutdown_orchestration = Arc::clone(&orchestration);
     let drain_orchestration = Arc::clone(&orchestration);
-    let drains_on_shutdown = role.drains_on_shutdown();
     let drain_propagation =
         Duration::from_secs(config.orchestrator.shutdown_drain_propagation_secs);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -164,7 +173,7 @@ pub async fn serve(role: ServerRole, config: &AppConfig, assembly: Assembly) -> 
             // the state we want, and re-announcing it would reset the timestamp
             // an operator is watching.
             //
-            // 🔴 Only a role that can be scheduled onto has anything to
+            // 🔴 Only a process that can be scheduled onto has anything to
             // withdraw; an API replica is not a placement target.
             if drains_on_shutdown && drain_orchestration.set_scheduling_disabled(true) {
                 info!(

@@ -344,7 +344,7 @@ impl SnapshotManager {
     /// Announces a staged snapshot. The flip, and nothing else.
     ///
     /// 🔴 Takes the pure value, not the handle. A caller that has one of these
-    /// and nothing else — which is every caller once `--role api` exists — can
+    /// and nothing else — which is every caller once `aenv-api` exists — can
     /// still commit, and that is the property the seam is for. Serialising a
     /// [`StagedSnapshot`], sending it, and committing it on the far side has to
     /// work, so nothing here may consult the local half.
@@ -366,7 +366,7 @@ impl SnapshotManager {
     /// 🔴 Node-local, and that is the piece the next phase has to move. It
     /// reads files, so it can only run where the bytes are — while the commit
     /// that must precede it will be running somewhere else. A commit performed
-    /// by `--role api` therefore needs a way to tell this node it happened;
+    /// by `aenv-api` therefore needs a way to tell this node it happened;
     /// until that exists, the two are in the same process and this ordering is
     /// simply a statement order.
     /// 🔴 Takes the residue by value, and the capture inside it goes out of
@@ -516,10 +516,10 @@ impl SnapshotManager {
     ///
     /// 🔴 Refuses, rather than panicking, when this process was assembled
     /// without a runtime resolver. That is not a defensive `unwrap` dressed up:
-    /// `--role api` is assembled that way on purpose (see
-    /// [`build_storage_for_role`][crate::snapshot::repository::backends]) and
-    /// every one of its callers already forks on
-    /// `ServerRole::runs_sandbox_runtime` and ships the catalog row to a node
+    /// `aenv-api` is assembled that way on purpose (see
+    /// [`CentralCatalogUse`][crate::snapshot::repository::backends::CentralCatalogUse])
+    /// and every one of its callers already forks on
+    /// `ApiImpl::runs_sandbox_runtime` and ships the catalog row to a node
     /// instead. A typed [`RepositoryError::Unsupported`] is what a future
     /// caller that forgets the fork gets back — a 5xx with a legible reason,
     /// on one request, rather than the whole api process aborting.

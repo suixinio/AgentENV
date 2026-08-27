@@ -340,7 +340,7 @@ UPDATE paused_sandboxes
 /// 🔴 **Do not re-merge this with `RECLAIM_RELEASED_RUNNING_SQL`** into one
 /// `state IN ('running', 'resuming')` statement. That is the exact
 /// pre-Fix-B shape, and folding them back together reopens the stuck-forever
-/// deadlock -- worse under N `--role api` replicas than under Go's single
+/// deadlock -- worse under N `aenv-api` replicas than under Go's single
 /// instance, because a Kubernetes Deployment pod name is never reused after
 /// a reschedule, so `release_node_holdings`'s identity-based fallback can
 /// never reach a row a dead replica orphaned mid-claim either.

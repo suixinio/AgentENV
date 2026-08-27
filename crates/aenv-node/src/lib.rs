@@ -22,7 +22,7 @@
 
 pub use aenv_core::{
     api, binding_store, cfg, digest, identity, leader_task, local_store, logging, node_client,
-    node_registry, observability, orchestrator, p2p, privileges, proto, role, runtime_snapshot,
+    node_registry, observability, orchestrator, p2p, privileges, proto, runtime_snapshot,
     scheduler_endpoint, server_main, types, virtualization,
 };
 

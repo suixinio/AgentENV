@@ -338,7 +338,7 @@ mod tests {
     /// in the production case this guards against, RocksDB-background-work-is-
     /// still-running) blocking closure would make the caller wait for however
     /// long the closure takes — which, unbounded, is the exact failure mode
-    /// that left `server --role node` running past `terminationGracePeriodSeconds`
+    /// that left `server aenv-node` running past `terminationGracePeriodSeconds`
     /// on every node that had actually run a VM.
     ///
     /// The closure sleeps well past the timeout rather than blocking forever:

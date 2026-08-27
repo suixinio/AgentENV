@@ -44,7 +44,6 @@ use crate::orchestrator::{
 use crate::proto::apiproxy::{
     self as pb, sandbox_resume_service_client::SandboxResumeServiceClient,
 };
-use crate::role::ServerRole;
 use crate::sandbox::mock::MockBackendFactory;
 use crate::snapshot::mock::mock_snapshot_manager;
 use crate::template::RefusingTemplateBuildDriver;
@@ -93,7 +92,7 @@ fn wiring_at(
 
 async fn build_api(resume_wiring: ResumeWiring) -> Arc<ApiImpl> {
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -115,10 +114,9 @@ async fn build_api(resume_wiring: ResumeWiring) -> Arc<ApiImpl> {
             &NodeIdentity::from_config(&Default::default()),
         ),
         Vec::new(),
-        // 🔴 `Api` and not `All`. This surface is the API half's, and building
-        // it as `all` would let a test pass that a `--role api` process could
-        // not reproduce.
-        ServerRole::Api,
+        // 🔴 The half comes from `resume_wiring` alone now: this surface is
+        // the API half's, and `ResumeWiring::api_half_for_test` is what makes
+        // it one. See `ApiImpl::runs_sandbox_runtime`.
         resume_wiring,
     ))
 }
@@ -358,7 +356,7 @@ async fn a_pin_the_placement_source_refused_carries_its_reason_through() {
 /// sandboxes on one named machine, so a pin naming any other machine cannot be
 /// honoured here and must be refused. `WakeSite::Remote` means the surface
 /// places the wake-up itself, so the pin is *its* to honour and refusing here
-/// would strand every unpublished sandbox the moment `--role api` lands.
+/// would strand every unpublished sandbox the moment `aenv-api` lands.
 ///
 /// 🔴 Nothing in `src/bin/` constructs `Remote` yet — it arrives with the
 /// remote backend factory, and `WakeSite::Remote`'s own doc says the two must

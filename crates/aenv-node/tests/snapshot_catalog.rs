@@ -1969,7 +1969,7 @@ mod bytes_then_commit {
     /// `stage` writes bytes to this machine's disk and announces nothing. The
     /// value it hands back is written down, read back, and committed — and the
     /// commit travels over gRPC to a different process, which is the property
-    /// `--role api` will depend on and the reason the value may not carry a
+    /// `aenv-api` will depend on and the reason the value may not carry a
     /// path, a handle, or a manifest.
     ///
     /// The controls are the two reads between the two calls: with the bytes on

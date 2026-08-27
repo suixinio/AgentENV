@@ -701,7 +701,7 @@ pub struct AtomicNodeRegistry {
     /// module) makes [`Self::publish_upsert`]/[`Self::publish_remove`]
     /// no-ops, so nothing about local behavior changes when no shared store
     /// is configured — the same "absent means untouched" discipline
-    /// `--role all` and `--role node` already get for free by never
+    /// `aenv-node` already get for free by never
     /// constructing this type's native-placement wiring at all.
     publish_tx: OnceLock<mpsc::UnboundedSender<PublishOp>>,
 }
@@ -3100,7 +3100,7 @@ mod tests {
     }
 
     /// The default, in-memory-only configuration every existing test in
-    /// this module (and every `--role all` / `--role node` process) runs
+    /// this module (and every `aenv-node` process) runs
     /// under — `enable_shared_observed_publishing` is never called, so
     /// `heartbeat` must not panic or otherwise misbehave with `publish_tx`
     /// unset. Compiling and returning normally is the assertion.

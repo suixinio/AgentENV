@@ -1,5 +1,5 @@
 //! The restart-grace lease extension -- a Rust port of `Grace`/`ExtendLeases`
-//! (`grace.go`), redesigned for N `--role api` replicas instead of Go's
+//! (`grace.go`), redesigned for N `aenv-api` replicas instead of Go's
 //! single scheduler process. Read this module's doc in full before touching
 //! [`super::reconcile`] or [`super::reclaim_task`]: it is the piece the plan
 //! doc (`docs/proposals/_sd-phase4-stageC-paused-registry.md` §6.3-6.4)
@@ -15,7 +15,7 @@
 //! in-memory read, correct because there is exactly one process holding both
 //! ends of it.
 //!
-//! `--role api` is N replicas, and this port gives the reconcile loop and
+//! `aenv-api` is N replicas, and this port gives the reconcile loop and
 //! the reclaim loop **independent** elections
 //! (`AdvisoryLockKey::PausedRegistryReconcile` /
 //! `AdvisoryLockKey::PausedRegistryReclaim`) -- deliberately, because they

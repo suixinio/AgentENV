@@ -8,7 +8,7 @@
 //! required — because a DaemonSet roll to change one config value costs an
 //! hour-long, serial `terminationGracePeriodSeconds` wait
 //! (`docs/proposals/2026-08-20-service-decomposition.md`'s phase four
-//! section), and rolling back a phase-4 stage means switching `--role api`'s
+//! section), and rolling back a phase-4 stage means switching `aenv-api`'s
 //! implementation back to talking to the Go scheduler — an action that must
 //! not itself require a fleet-wide roll.
 //!

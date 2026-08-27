@@ -44,7 +44,7 @@ pub trait TemplateBuildDriver: Send + Sync {
 /// The driver for a process that runs no builds itself.
 ///
 /// 🔴 Refuses rather than panicking. The route reaches the local arm only when
-/// [`ServerRole::runs_sandbox_runtime`][crate::role::ServerRole::runs_sandbox_runtime]
+/// [`ApiImpl::runs_sandbox_runtime`][crate::api::ApiImpl::runs_sandbox_runtime]
 /// says so, and this half answers `false` — so a call landing here is a routing
 /// mistake, and a build that fails with a message beats a replica that dies.
 #[derive(Debug, Default)]

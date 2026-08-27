@@ -346,7 +346,6 @@ mod operator_snapshot_delete_tests {
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
     };
-    use crate::role::ServerRole;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
@@ -511,7 +510,7 @@ mod operator_snapshot_delete_tests {
 
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
@@ -544,9 +543,9 @@ mod operator_snapshot_delete_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `All` and not a default: these fixtures predate the split and
-            // assert today's behaviour, which is what `all` is defined as.
-            crate::role::ServerRole::All,
+            // 🔴 `node_local`, i.e. the `aenv-node` half: these fixtures
+            // predate the split and assert the behaviour of a process that
+            // runs the sandboxes it answers for.
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
 

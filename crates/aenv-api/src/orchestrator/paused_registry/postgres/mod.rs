@@ -1,5 +1,5 @@
 //! `PostgresPausedSandboxRegistry`: the paused registry backend that
-//! connects directly to PostgreSQL from `--role api`, folding
+//! connects directly to PostgreSQL from `aenv-api`, folding
 //! `services/scheduler/internal/registry/` (4,191 lines) plus the
 //! heartbeat-lease-renewal half of `internal/reconcile.go` into this
 //! process. Stage C of the phase-4 scheduler fold
@@ -24,7 +24,7 @@
 //!   [`reconcile`]'s own module doc's "B1" section for why.
 //! - [`replica_renewal`][]: **B1**'s per-replica, unelected Fix A -- read
 //!   this module's doc for why Fix A cannot be leader-elected under N
-//!   `--role api` replicas.
+//!   `aenv-api` replicas.
 //! - [`reclaim_task`][]: the reclaim leader loop.
 //!
 //! # D1: which parts of this backend need leader election, and why only
@@ -32,7 +32,7 @@
 //!
 //! Every method in [`writes`]/[`reads`]/[`lease`] (the whole
 //! [`PausedSandboxRegistry`] trait impl below) is safe to call from every
-//! `--role api` replica concurrently, unelected -- each is a single
+//! `aenv-api` replica concurrently, unelected -- each is a single
 //! generation/execution_id-CAS'd statement, and PostgreSQL's own row locking
 //! serialises the rest. So is [`replica_renewal`] (B1) -- see its own module
 //! doc. See the Stage C report's D1 section for the per-statement review
@@ -46,7 +46,7 @@
 //! (M1) -- [`replica_renewal`]'s per-replica loop is spawned alongside them
 //! only when [`crate::node_registry::registry::NodeRegistry`] is available,
 //! and is simply skipped (not required) when it is not, which is exactly
-//! `--role all`'s own shape: see [`spawn_background_tasks`]'s own doc.
+//! the pre-split single process's own shape: see [`spawn_background_tasks`]'s own doc.
 
 #[cfg(test)]
 mod contract;
@@ -87,7 +87,7 @@ use super::{
 ///
 /// 🔴 The only thing on this side of the boundary that a caller has to name
 /// to select the `postgres` backend. `build_paused_registry` keeps the arm,
-/// the refusal message and the `--role api` roster guard; this keeps the
+/// the refusal message and the `aenv-api` roster guard; this keeps the
 /// pool, the schema bootstrap and B2(1)'s synchronous restart-grace entry.
 pub struct PgPausedRegistryFactory {
     pool: PgPool,
@@ -136,7 +136,7 @@ async fn build_registry(
 }
 
 /// A direct PostgreSQL-backed [`PausedSandboxRegistry`]. One shared `[pg]`
-/// pool (built once per `--role api`/`--role all` process by
+/// pool (built once per `aenv-api` process by
 /// `src/bin/aenv-api.rs::build_pg_pool`, the same pool Stage B's catalog
 /// backend uses) covers both the per-request CRUD paths in this struct's
 /// trait impl and the two background leader tasks
@@ -299,26 +299,26 @@ pub struct BackgroundTasks {
 /// [`NodeRegistry::rosters_in_cluster`] answer -- without one, there is
 /// nothing for it to renew from, so [`replica_renewal::spawn`] is simply not
 /// started. This is **not** the same gap Fix A originally closed: under the
-/// split node/api identity model (`--role api`, `[cluster]
+/// split node/api identity model (`aenv-api`, `[cluster]
 /// .node_placement_source = "scheduler"`, the default), a missing roster
 /// really would leave `running` rows with no renewal path at all, and
 /// `crate::orchestrator::paused_registry::build_paused_registry` still
 /// refuses to select this backend in that configuration for exactly that
 /// reason (see that function's own doc). The case this function *does* have
-/// to accept a missing roster for is `--role all`, which never builds a
+/// to accept a missing roster for is the pre-split single process, which never builds a
 /// [`crate::node_registry::registry::AtomicNodeRegistry`] at all: there,
 /// this process's own identity coincides with `origin_node_id` for
 /// everything it runs, so the ordinary `renew_lease` trait method (driven by
 /// `spawn_paused_record_upkeep` in `src/bin/aenv-api.rs`) already renews those
-/// rows under matching identity -- `--role all` never needed Fix A in the
+/// rows under matching identity -- the pre-split single process never needed Fix A in the
 /// first place. See [`replica_renewal`]'s own module doc for the full
 /// argument.
 ///
 /// The reconcile and reclaim leader loops are started unconditionally
 /// either way: grace entry ([`grace::enter`]) and D4's metrics
 /// ([`reconcile::compute_reconcile`]) are both roster-independent, and a
-/// cluster running `--role all` still needs restart-grace protection against
-/// the same fleet-wide-coverage-gap scenario a `--role api` deployment does
+/// cluster running the pre-split single process still needs restart-grace protection against
+/// the same fleet-wide-coverage-gap scenario a `aenv-api` deployment does
 /// (see [`grace`]'s own module doc).
 pub fn spawn_background_tasks(
     pool: PgPool,
@@ -399,7 +399,7 @@ pub struct PausedRegistryBackgroundTasks {
 /// the same `config`/`pg_pool` has already succeeded (it performed the
 /// "postgres requires a pool" validation this function relies on without
 /// repeating). `node_registry` may legitimately be `None` here even when
-/// `config.backend == Postgres` (M1: `--role all`) -- see
+/// `config.backend == Postgres` (M1: the pre-split single process) -- see
 /// `postgres::spawn_background_tasks`'s own doc for what that does and does
 /// not skip.
 pub fn spawn_paused_registry_background_tasks(

@@ -15,9 +15,9 @@ use super::{
 ///
 /// # 🔴 A node's own ledger, not the cluster's authority
 ///
-/// Under `--role all` and `--role node` this is the sandbox record for the
+/// Under `aenv-node` this is the sandbox record for the
 /// machine it runs on. It is **not** a second backend for cluster state, and
-/// `--role api` never constructs it. Nothing should ever write to both this and
+/// `aenv-api` never constructs it. Nothing should ever write to both this and
 /// the Redis store: two authorities for one fact is the arrangement this whole
 /// stage exists to remove.
 ///

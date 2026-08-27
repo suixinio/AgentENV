@@ -7,7 +7,7 @@
 //! `sql.rs` for the SQL text itself. **D1's concurrency claim for every
 //! statement in this file**: each is a single CAS'd `UPDATE`/`INSERT ...
 //! RETURNING`, so PostgreSQL's own row-level locking serialises two
-//! `--role api` replicas racing the same sandbox -- neither statement here
+//! `aenv-api` replicas racing the same sandbox -- neither statement here
 //! needs the caller to hold any lock of its own. See the Stage C report's
 //! "D1" section for the exhaustive per-statement review.
 

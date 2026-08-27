@@ -22,7 +22,6 @@ use crate::image::RootfsImageResolver;
 use crate::node_client::NodePlacement;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
-use crate::role::ServerRole;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuildDriver;
@@ -81,9 +80,9 @@ impl PausedSandboxWiring {
 #[derive(Clone)]
 pub struct ApiImpl {
     /// 🔴 The orchestration surface, not an `Orchestrator`. Which concrete
-    /// orchestrator is behind it is the role's decision, taken once at startup;
-    /// see `crate::orchestrator::facade` for why it cannot be taken one type
-    /// parameter at a time.
+    /// orchestrator is behind it is the calling binary's decision, taken once
+    /// at startup; see `crate::orchestrator::facade` for why it cannot be taken
+    /// one type parameter at a time.
     orchestrator: Arc<dyn SandboxOrchestration>,
     snapshot_manager: Arc<SnapshotManager>,
     /// Cluster-wide bookkeeping for paused sandboxes. With the default `local`
@@ -94,35 +93,31 @@ pub struct ApiImpl {
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
-    /// Which half of the split this process runs.
-    ///
-    /// 🔴 Held rather than read from a global for the same reason
-    /// `crate::api::server::new` takes it as a parameter: the failure mode of
-    /// getting it wrong is a node that quietly goes on deciding when sandboxes
-    /// should be alive, which is the one thing `--role node` exists to end.
-    role: ServerRole,
     /// What the data-plane wake-up path needs beyond the above: where the
     /// cluster says a sandbox may be woken, and whether this process wakes them
     /// itself.
     resume_wiring: ResumeWiring,
     /// Where a template build this process cannot run itself should be sent.
     ///
-    /// 🔴 `Some` only for `--role api`: `runs_sandbox_runtime()` is true for
-    /// every other role, and a process that can build a template locally has
-    /// no business picking a node to send one to instead. `None` there is not
-    /// "not configured yet" — it is the role showing through, matching the
-    /// `resume_wiring` field's own `WakeSite::Local`/`Remote` split just above.
+    /// 🔴 `Some` only in `aenv-api`: [`Self::runs_sandbox_runtime`] is true in
+    /// `aenv-node`, and a process that can build a template locally has no
+    /// business picking a node to send one to instead. `None` there is not
+    /// "not configured yet" — it is which binary this is showing through,
+    /// matching the `resume_wiring` field's own `WakeSite::Local`/`Remote`
+    /// split just above.
     node_placement: Option<Arc<dyn NodePlacement>>,
 }
 
 impl ApiImpl {
-    // Nine, and each one is a distinct subsystem this surface needs rather than
-    // a parameter that could be folded into another. The two newest — the role
-    // and the wake-up wiring — are deliberately separate: the role is read on
-    // the data plane's proxy path, the wiring only on the cold path.
+    // Eight, and each one is a distinct subsystem this surface needs rather
+    // than a parameter that could be folded into another.
     //
-    // 🔴 Not ten: `node_placement` is deliberately not a constructor parameter
-    // — see `with_node_placement` below for why.
+    // 🔴 It was nine while a `role` sat beside `resume_wiring`. The two said
+    // the same thing — see [`ResumeWiring::runs_sandboxes_here`] — and a pair
+    // that must agree is a pair that can disagree.
+    //
+    // 🔴 Not nine now either: `node_placement` is deliberately not a
+    // constructor parameter — see `with_node_placement` below for why.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<dyn SandboxOrchestration>,
@@ -132,7 +127,6 @@ impl ApiImpl {
         observability: Option<Arc<ObservabilityService>>,
         paused: PausedSandboxWiring,
         sandbox_proxy_domains: Vec<String>,
-        role: ServerRole,
         resume_wiring: ResumeWiring,
     ) -> Self {
         Self {
@@ -144,7 +138,6 @@ impl ApiImpl {
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
-            role,
             resume_wiring,
             node_placement: None,
         }
@@ -153,28 +146,51 @@ impl ApiImpl {
     /// Wires this process to send a template build somewhere else when it
     /// cannot run one itself.
     ///
-    /// 🔴 A builder step and not an eleventh constructor argument, on
-    /// purpose: every call site of `new` but `assemble_api`'s predates this
-    /// field and has no placement to give it, `--role all`'s among them —
-    /// and that one is the rollback target, whose assembly function is
-    /// asserted byte-for-byte unchanged in behavior by
-    /// `only_the_split_roles_bind_a_second_listener`. A required tenth
-    /// argument would have meant editing it (and seven other call sites that
-    /// have nothing to do with this feature) to pass `None`, for a value
-    /// that only ever varies for one of them.
+    /// 🔴 A builder step and not a ninth constructor argument, on purpose:
+    /// every call site of `new` but `assemble_api`'s has no placement to give
+    /// it. A required argument would have meant editing all of them (and they
+    /// have nothing to do with this feature) to pass `None`, for a value that
+    /// only ever varies for one of them.
     pub fn with_node_placement(mut self, node_placement: Arc<dyn NodePlacement>) -> Self {
         self.node_placement = Some(node_placement);
         self
     }
 
-    /// Which half of the split this process runs.
-    pub fn role(&self) -> ServerRole {
-        self.role
+    /// Whether the sandboxes this surface answers for run in *this* process.
+    ///
+    /// 🔴 `aenv-node` answers `true`, `aenv-api` answers `false`, and there is
+    /// no third answer: they are two binaries with two dependency graphs, and
+    /// `aenv-api` does not link a sandbox runtime at all
+    /// (`make check-crate-boundaries`). This is a method rather than a
+    /// compile-time constant only because `ApiImpl` lives in the crate *both*
+    /// of them link; a constant here would be a lie for one of them.
+    ///
+    /// Read off [`ResumeWiring::runs_sandboxes_here`] — see there for why this
+    /// surface no longer carries a second copy of the same fact.
+    pub fn runs_sandbox_runtime(&self) -> bool {
+        self.resume_wiring.runs_sandboxes_here()
+    }
+
+    /// Whether this process answers the user-facing REST surface — the
+    /// `sandboxes`, `snapshots` and `templates` route groups — and decides, on
+    /// its own initiative, that a paused sandbox should be woken.
+    ///
+    /// 🔴 The exact complement of [`Self::runs_sandbox_runtime`], and that is
+    /// a property of there being exactly two halves rather than a coincidence
+    /// worth hiding: a node runs VMs, and deciding that a sandbox should exist,
+    /// be woken or be thrown away is the other half's job. A node that kept
+    /// answering those routes while the API half believed it owned the same
+    /// sandboxes would be a second ledger for one set of machines.
+    ///
+    /// These were two separate predicates while a third, `all`, answered `true`
+    /// to both this and `runs_sandbox_runtime`. No process is both any more.
+    pub fn owns_sandboxes(&self) -> bool {
+        !self.runs_sandbox_runtime()
     }
 
     /// Where to send a template build this process cannot run itself, or
-    /// `None` when it can (or, on a misconfigured `--role api`, when nobody
-    /// gave it one — see the field's own doc).
+    /// `None` when it can (or, on a misconfigured `aenv-api`, when nobody gave
+    /// it one — see the field's own doc).
     pub fn node_placement(&self) -> Option<Arc<dyn NodePlacement>> {
         self.node_placement.as_ref().map(Arc::clone)
     }

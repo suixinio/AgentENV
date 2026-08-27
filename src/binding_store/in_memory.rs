@@ -1,6 +1,6 @@
 //! Task's own "D3": ports `services/scheduler/internal/store.go`'s
 //! `InMemoryBindingStore` (lines 195-501) — a single-replica, in-process
-//! binding store. Used directly by `--role all`/a single-node deployment,
+//! binding store. Used directly by a single-node deployment,
 //! and as the cheap half of [`super::contract`]'s dual-backend suite.
 
 use std::collections::{HashMap, HashSet};

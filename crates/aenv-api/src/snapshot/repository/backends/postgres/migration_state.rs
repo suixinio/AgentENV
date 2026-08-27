@@ -2,7 +2,7 @@
 //! `docs/proposals/_sd-phase4-stageB-catalog.md` §5.1's structural fix for
 //! the read-side admission CrashLoopBackOff: whether this cluster's
 //! PostgreSQL catalog has ever been confirmed to hold what object storage
-//! does, recorded once for every `--role api`/`--role all` replica to read
+//! does, recorded once for every `aenv-api` replica to read
 //! instead of each one re-deriving the answer from node-local storage.
 
 use anyhow::{Context, Result};

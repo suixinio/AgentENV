@@ -20,7 +20,7 @@ pub use crate::types::{
     ExtraDrive,
 };
 pub use ::envd::process::Signal;
-pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
+pub use access::{AccessTokenSeedPolicy, EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
     CapturedSandboxSnapshot, InvalidSandboxRequest, PausedSandboxCapture, PausedSandboxState,
     ResolvedImageFacts, RuntimeArtifactSet, RuntimeConfirmedGone, SandboxBackend,
@@ -47,7 +47,7 @@ pub struct FreshSandboxBuildSpec {
 /// `ExtraDrive` carries an `image_config_path` — a path on the local disk an
 /// `ImageResolver` already wrote. This carries the reference that path would
 /// have come from, because the machine building the request
-/// (`--role api`, which has no `regctl`) is not the machine that gets to
+/// (`aenv-api`, which has no `regctl`) is not the machine that gets to
 /// resolve it. See [`UnresolvedImageBuildSpec`] and
 /// `SandboxLaunchSource::UnresolvedImage`.
 #[derive(Clone, Debug)]
@@ -72,7 +72,7 @@ pub struct UnresolvedAttachedDrive {
 /// `FreshSandboxBuildSpec` is handed to a factory that resolves images
 /// locally and can turn a reference into a local overlaybd path itself. A
 /// factory whose sandboxes run on another machine (`RemoteSandboxBackendFactory`)
-/// cannot do that — resolving an image needs `regctl`, and `--role api` has
+/// cannot do that — resolving an image needs `regctl`, and `aenv-api` has
 /// none — so it needs the reference, not a path, to hand to the machine that
 /// will. `resources` is unaffected: computing the sandbox's CPU/memory/disk
 /// request needs no image, so it is resolved locally either way and travels

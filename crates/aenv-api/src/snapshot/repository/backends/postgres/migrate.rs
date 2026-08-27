@@ -6,7 +6,7 @@
 //! (Go's own file header explains why: four files that change roughly once a
 //! month do not earn a build-time tool), and a session-scoped PostgreSQL
 //! advisory lock so that two processes racing to migrate the same database —
-//! two `--role api` replicas starting at once, or this build racing a Go
+//! two `aenv-api` replicas starting at once, or this build racing a Go
 //! `scheduler` process during a rollout — serialize rather than corrupt the
 //! ledger.
 //!
@@ -34,7 +34,7 @@
 //! tables — `snapshots`/`templates`/`builds`/`aliases`, plus the
 //! `catalog_schema_migrations` ledger itself — created by *Go's* migrate.go,
 //! against the *same* PostgreSQL database this build's `[pg]` now points at.
-//! `migrate()` runs unconditionally at `--role api`/`--role all` startup
+//! `migrate()` runs unconditionally at `aenv-api` startup
 //! whenever `[pg]` is configured (`build_pg_pool` in `src/bin/aenv-api.rs`), so
 //! this is not a hypothetical shared-database scenario to defend against —
 //! it is the ordinary shape of a cluster mid-migration off `services/scheduler`.
@@ -469,7 +469,7 @@ mod pg {
     /// share one isolated-schema pool (rather than one pool each) precisely
     /// so they race over the *same* tables: `pool.acquire()` still hands each
     /// concurrent `migrate()` call its own physical connection, which is
-    /// exactly what two `--role api` replicas each holding their own pool
+    /// exactly what two `aenv-api` replicas each holding their own pool
     /// would look like, without racing every *other* concurrently-running
     /// test over the shared `public` schema's table names.
     #[tokio::test]

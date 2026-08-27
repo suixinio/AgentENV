@@ -1,6 +1,6 @@
-//! Which of the generated routes a process serves, given the role it runs as.
+//! Which of the generated routes a process serves, given which half it is.
 //!
-//! `--role node` runs the half that owns VMs, not the half that owns sandboxes.
+//! `aenv-node` runs the half that owns VMs, not the half that owns sandboxes.
 //! The user-facing REST surface — the `sandboxes`, `snapshots` and `templates`
 //! groups — belongs to the API half, and a node that keeps answering it while
 //! the API half believes it owns those sandboxes is two ledgers for one set of
@@ -20,10 +20,10 @@
 //!    was never attached does not 404 — it lands in the data-plane fallback and
 //!    is answered as if it were sandbox traffic. "The node refuses user REST"
 //!    would then fail in the single hardest way to diagnose.
-//! 3. The rollback to `--role all` requires every generated route to still be
-//!    there (`_sd-impl-phase3-role.md` §11.3). A layer satisfies that by
-//!    construction: nothing is removed, and `--role all` does not attach the
-//!    layer at all.
+//! 3. The two halves share one crate and one generated router, so "the node
+//!    serves less" has to be expressible without taking anything away from what
+//!    `aenv-api` serves. A layer satisfies that by construction: nothing is
+//!    removed, and `aenv-api` does not attach the layer at all.
 //!
 //! # Where it is attached, and in which order
 //!
@@ -48,12 +48,12 @@
 //! does on its own initiative. It is a gate on inbound HTTP and nothing else.
 //!
 //! 🔴 It also does not consume the `control_plane_config` ownership marker, and
-//! must not be changed to. This layer answers "does this role serve this
+//! must not be changed to. This layer answers "does this process serve this
 //! route", which is a question about the process, not about any sandbox.
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::{Method, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -61,39 +61,46 @@ use axum::{
 };
 use tracing::debug;
 
-use crate::role::ServerRole;
+/// The `role` label this gate's metrics carry.
+///
+/// 🔴 A constant, and the metric names around it are unchanged, on purpose.
+/// The gate is only ever attached in `aenv-node` — [`attach`] returns
+/// `generated` untouched otherwise — so the label has exactly one value now
+/// that `--role` is gone. Renaming `agentenv_api_role_gate_*` or dropping the
+/// label would break every dashboard and alert already reading them, which is a
+/// worse outcome than the word "role" outliving the flag.
+const GATE_ROLE_LABEL: &str = "node";
 
-/// Attaches the role gate to `generated` when the role serves less than the
-/// full generated surface, and returns it untouched when the role serves all of
+/// Attaches the gate to `generated` for the half that serves less than the full
+/// generated surface, and returns it untouched for the half that serves all of
 /// it.
 ///
-/// 🔴 Untouched, not "attached with an allow-everything policy". `--role all`
-/// is defined as today's behaviour verbatim and is the rollback target; an
-/// extra layer in its request path is a difference, however small, between the
-/// thing being rolled back to and the thing that was running before.
-pub fn attach(generated: Router, role: ServerRole) -> Router {
-    // Published before any request arrives, and for every role. "Is this
-    // process refusing user REST" has to be answerable from a scrape of a node
-    // that has had no traffic — otherwise a node whose gate never got attached
-    // and a node nobody has called look identical.
-    metrics::gauge!("agentenv_api_role_gate_enabled").set(if role.serves_user_facing_rest() {
+/// 🔴 Untouched, not "attached with an allow-everything policy". `aenv-api`
+/// serves every generated route, and an extra layer in its request path buys
+/// nothing but a per-request branch that can only answer one way.
+pub fn attach(generated: Router, serves_user_facing_rest: bool) -> Router {
+    // Published before any request arrives, by both halves. "Is this process
+    // refusing user REST" has to be answerable from a scrape of a node that has
+    // had no traffic — otherwise a node whose gate never got attached and a
+    // node nobody has called look identical.
+    metrics::gauge!("agentenv_api_role_gate_enabled").set(if serves_user_facing_rest {
         0.0
     } else {
         1.0
     });
 
-    if role.serves_user_facing_rest() {
+    if serves_user_facing_rest {
         return generated;
     }
 
-    generated.layer(middleware::from_fn_with_state(role, refuse_outside_role))
+    generated.layer(middleware::from_fn(refuse_outside_role))
 }
 
 /// What the gate did with one request. A closed set: the label goes on a metric
 /// and a metric label with unbounded values is a memory leak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoleDecision {
-    /// A route this role serves. Handed on untouched.
+    /// A route this half serves. Handed on untouched.
     Served,
     /// A route that belongs to the other half of the split.
     Refused,
@@ -108,24 +115,7 @@ impl RoleDecision {
     }
 }
 
-/// Whether `role` serves the generated route this request landed on.
-///
-/// 🔴 Takes the request's own path rather than a matched route pattern. This
-/// layer only ever runs on requests that already matched one of the generated
-/// routes — anything else went to the data-plane fallback before reaching here
-/// — so the path is a path that a generated route accepted, and matching it
-/// against a hand-written list is comparing like with like.
-/// `every_generated_route_is_either_named_by_the_allowlist_or_refused` walks the
-/// generator's own output to keep the two lists from drifting apart.
-fn serves(role: ServerRole, method: &Method, path: &str) -> bool {
-    if role.serves_user_facing_rest() {
-        return true;
-    }
-
-    node_serves(method, path)
-}
-
-/// The generated routes a `--role node` process still answers.
+/// The generated routes an `aenv-node` process still answers.
 ///
 /// 🔴 Keep this list this short, and keep the reason for each entry attached to
 /// it. Every addition is a piece of the user-facing surface coming back to a
@@ -146,7 +136,7 @@ fn node_serves(method: &Method, path: &str) -> bool {
     match path {
         // Method-blind on purpose: kubelet's probes are GETs, and a
         // hypothetical other method on `/health` is the generated router's 405
-        // to give, exactly as it would be under `--role all`.
+        // to give, exactly as it is on the half that attaches no gate.
         "/health" => true,
         "/nodes" => method == Method::GET,
         _ => node_detail_id(path).is_some() && (method == Method::GET || method == Method::POST),
@@ -169,12 +159,15 @@ fn node_detail_id(path: &str) -> Option<&str> {
 }
 
 /// Refuses generated routes that belong to the other half of the split.
-async fn refuse_outside_role(
-    State(role): State<ServerRole>,
-    request: Request,
-    next: Next,
-) -> Response<Body> {
-    let decision = if serves(role, request.method(), request.uri().path()) {
+///
+/// 🔴 No state. This function is only ever reached through the layer [`attach`]
+/// installs, and `attach` installs it only on the half that serves less than
+/// the full surface — so "does this half serve user REST" is already answered
+/// `no` by the time a request gets here. It used to be re-asked from a
+/// `State` on every request, which meant one arm of that branch was
+/// unreachable in every process that had the layer at all.
+async fn refuse_outside_role(request: Request, next: Next) -> Response<Body> {
+    let decision = if node_serves(request.method(), request.uri().path()) {
         RoleDecision::Served
     } else {
         RoleDecision::Refused
@@ -182,7 +175,7 @@ async fn refuse_outside_role(
 
     metrics::counter!(
         "agentenv_api_role_gate_total",
-        "role" => role.as_str(),
+        "role" => GATE_ROLE_LABEL,
         "decision" => decision.label(),
     )
     .increment(1);
@@ -197,10 +190,10 @@ async fn refuse_outside_role(
     // and one the counter above already surfaces without a log line per
     // request.
     debug!(
-        role = role.as_str(),
+        role = GATE_ROLE_LABEL,
         method = %request.method(),
         path = %request.uri().path(),
-        "refusing a route this role does not serve"
+        "refusing a route this half does not serve"
     );
 
     not_found(request.method(), request.uri().path())
@@ -277,55 +270,26 @@ mod tests {
     /// asserted together, in one test, against the same gate.
     #[test]
     fn a_node_serves_its_own_routes_and_refuses_the_users() {
-        let node = ServerRole::Node;
-
         // Must still be reachable.
-        assert!(serves(node, &Method::GET, "/health"));
-        assert!(serves(node, &Method::GET, "/nodes"));
-        assert!(serves(node, &Method::GET, "/nodes/ip-10-0-1-7"));
+        assert!(node_serves(&Method::GET, "/health"));
+        assert!(node_serves(&Method::GET, "/nodes"));
+        assert!(node_serves(&Method::GET, "/nodes/ip-10-0-1-7"));
         assert!(
-            serves(node, &Method::POST, "/nodes/ip-10-0-1-7"),
+            node_serves(&Method::POST, "/nodes/ip-10-0-1-7"),
             "the preStop hook posts to this to drain the node"
         );
 
         // Must not be.
-        assert!(!serves(node, &Method::POST, "/sandboxes"));
-        assert!(!serves(node, &Method::GET, "/sandboxes"));
-        assert!(!serves(node, &Method::GET, "/v2/sandboxes"));
-        assert!(!serves(node, &Method::POST, "/sandboxes-cold"));
-        assert!(!serves(node, &Method::POST, "/sandboxes/sbx-1/pause"));
-        assert!(!serves(node, &Method::DELETE, "/sandboxes/sbx-1"));
-        assert!(!serves(node, &Method::GET, "/snapshots"));
-        assert!(!serves(node, &Method::DELETE, "/snapshots/snap-1"));
-        assert!(!serves(node, &Method::GET, "/templates"));
-        assert!(!serves(node, &Method::POST, "/v3/templates"));
-    }
-
-    /// 🔴 T-RG-2. The two roles that serve everything, serve everything.
-    ///
-    /// Without this the allowlist could be applied to `--role all` by mistake
-    /// and the rollback would take the user-facing API away with it — which is
-    /// the one thing the rollback exists to restore.
-    #[test]
-    fn the_roles_that_serve_the_whole_surface_serve_all_of_it() {
-        for role in [ServerRole::All, ServerRole::Api] {
-            assert!(role.serves_user_facing_rest(), "{role:?}");
-            for path in generated_route_paths() {
-                let path = concrete(&path);
-                for method in [Method::GET, Method::POST, Method::DELETE, Method::PUT] {
-                    assert!(
-                        serves(role, &method, &path),
-                        "{role:?} must serve {method} {path}"
-                    );
-                }
-            }
-        }
-
-        // 🔴 The contrast, in the same test. Every assertion above is an
-        // "allowed", and a `serves` that answered `true` for everything would
-        // satisfy all of them while letting a node keep the whole user-facing
-        // surface — the one thing this file exists to prevent.
-        assert!(!serves(ServerRole::Node, &Method::POST, "/sandboxes"));
+        assert!(!node_serves(&Method::POST, "/sandboxes"));
+        assert!(!node_serves(&Method::GET, "/sandboxes"));
+        assert!(!node_serves(&Method::GET, "/v2/sandboxes"));
+        assert!(!node_serves(&Method::POST, "/sandboxes-cold"));
+        assert!(!node_serves(&Method::POST, "/sandboxes/sbx-1/pause"));
+        assert!(!node_serves(&Method::DELETE, "/sandboxes/sbx-1"));
+        assert!(!node_serves(&Method::GET, "/snapshots"));
+        assert!(!node_serves(&Method::DELETE, "/snapshots/snap-1"));
+        assert!(!node_serves(&Method::GET, "/templates"));
+        assert!(!node_serves(&Method::POST, "/v3/templates"));
     }
 
     /// 🔴 T-RG-3. The allowlist and the generator cannot drift apart in
@@ -354,7 +318,7 @@ mod tests {
             // method the generated table could carry.
             let any = [Method::GET, Method::POST, Method::DELETE, Method::PUT]
                 .iter()
-                .any(|method| serves(ServerRole::Node, method, &concrete));
+                .any(|method| node_serves(method, &concrete));
             if any {
                 served.push(path.as_str());
             } else {
@@ -365,7 +329,7 @@ mod tests {
         assert_eq!(
             served,
             vec!["/health", "/nodes", "/nodes/{node_id}"],
-            "a --role node process serves exactly the three routes §7.2 names"
+            "a aenv-node process serves exactly the three routes §7.2 names"
         );
         // ...and the rest is the user-facing surface, all of it.
         assert_eq!(refused.len(), 22);
@@ -391,26 +355,21 @@ mod tests {
         assert_eq!(node_detail_id("/nodes"), None);
         assert_eq!(node_detail_id("/sandboxes/a"), None);
 
-        assert!(!serves(
-            ServerRole::Node,
-            &Method::GET,
-            "/nodes/a/sandboxes"
-        ));
+        assert!(!node_serves(&Method::GET, "/nodes/a/sandboxes"));
     }
 
     /// T-RG-5. The methods `/nodes` and `/nodes/{id}` are served under are the
     /// ones §7.2 names, and not a wider set.
     #[test]
     fn the_node_routes_are_served_under_the_methods_they_were_granted() {
-        let node = ServerRole::Node;
-        assert!(serves(node, &Method::GET, "/nodes"));
-        assert!(!serves(node, &Method::POST, "/nodes"));
-        assert!(!serves(node, &Method::DELETE, "/nodes"));
+        assert!(node_serves(&Method::GET, "/nodes"));
+        assert!(!node_serves(&Method::POST, "/nodes"));
+        assert!(!node_serves(&Method::DELETE, "/nodes"));
 
-        assert!(serves(node, &Method::GET, "/nodes/n1"));
-        assert!(serves(node, &Method::POST, "/nodes/n1"));
-        assert!(!serves(node, &Method::DELETE, "/nodes/n1"));
-        assert!(!serves(node, &Method::PUT, "/nodes/n1"));
+        assert!(node_serves(&Method::GET, "/nodes/n1"));
+        assert!(node_serves(&Method::POST, "/nodes/n1"));
+        assert!(!node_serves(&Method::DELETE, "/nodes/n1"));
+        assert!(!node_serves(&Method::PUT, "/nodes/n1"));
     }
 
     // ── The layer, as it is actually assembled ──────────────────────────────
@@ -460,7 +419,7 @@ mod tests {
     /// below mean "this route", not "this router is broken".
     #[tokio::test]
     async fn the_attached_layer_refuses_user_rest_and_serves_the_nodes_own_routes() {
-        let node = || attach(stand_in_generated(), ServerRole::Node);
+        let node = || attach(stand_in_generated(), false);
 
         assert_eq!(status(node(), Method::GET, "/health").await, StatusCode::OK);
         assert_eq!(status(node(), Method::GET, "/nodes").await, StatusCode::OK);
@@ -494,7 +453,7 @@ mod tests {
     /// the comparison against the real router; this pins the shape.
     #[tokio::test]
     async fn a_refusal_says_only_what_an_absent_route_says() {
-        let response = attach(stand_in_generated(), ServerRole::Node)
+        let response = attach(stand_in_generated(), false)
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::POST)
@@ -522,39 +481,39 @@ mod tests {
         assert_eq!(body["message"], "route not found: POST /sandboxes");
     }
 
-    /// 🔴 T-RG-8. `--role all` gets no layer at all.
+    /// 🔴 T-RG-8. The half that serves everything gets no layer at all.
     ///
-    /// Not "a layer that allows everything": the rollback target is defined as
-    /// today's behaviour verbatim, and this is the cheapest place to keep that
-    /// claim true.
+    /// Not "a layer that allows everything": `aenv-api` serves the whole
+    /// generated surface, and this is the cheapest place to keep that claim
+    /// true. It also covers what a deleted T-RG-2 used to assert directly —
+    /// that the user-facing surface is reachable on that half — now that
+    /// `attach`'s early return is the only thing standing between the two.
     #[tokio::test]
-    async fn the_rollback_role_is_left_exactly_as_it_was() {
-        for role in [ServerRole::All, ServerRole::Api] {
-            let router = || attach(stand_in_generated(), role);
-            assert_eq!(
-                status(router(), Method::POST, "/sandboxes").await,
-                StatusCode::OK,
-                "{role:?} must serve the user-facing surface"
-            );
-            assert_eq!(
-                status(router(), Method::GET, "/health").await,
-                StatusCode::OK
-            );
-        }
+    async fn the_half_that_serves_everything_gets_no_layer_at_all() {
+        let router = || attach(stand_in_generated(), true);
+        assert_eq!(
+            status(router(), Method::POST, "/sandboxes").await,
+            StatusCode::OK,
+            "aenv-api must serve the user-facing surface"
+        );
+        assert_eq!(
+            status(router(), Method::GET, "/health").await,
+            StatusCode::OK
+        );
 
         // 🔴 The contrast, against the same stand-in router. Without it an
         // `attach` that never attached anything would pass — and that is not a
-        // hypothetical mistake, it is what this function does for two of the
-        // three roles.
+        // hypothetical mistake, it is what this function does for one of the
+        // two halves.
         assert_eq!(
             status(
-                attach(stand_in_generated(), ServerRole::Node),
+                attach(stand_in_generated(), false),
                 Method::POST,
                 "/sandboxes"
             )
             .await,
             StatusCode::NOT_FOUND,
-            "the same call on the role that does get a layer is refused"
+            "the same call on the half that does get a layer is refused"
         );
     }
 
@@ -602,7 +561,7 @@ mod tests {
     /// 🔴 T-RG-10. **The hook only calls routes this gate still serves.**
     ///
     /// This is the test that would have caught the outage this batch exists to
-    /// prevent. The hook used to poll `GET /sandboxes`; under `--role node`
+    /// prevent. The hook used to poll `GET /sandboxes`; under `aenv-node`
     /// that answers 404, `curl -sf` fails, and the loop it fed had no exit for
     /// a failed read — so every node pod deletion, of any kind, hung in
     /// Terminating for the full 3600-second grace period, and the server never
@@ -622,8 +581,8 @@ mod tests {
 
         for (method, path) in &calls {
             assert!(
-                serves(ServerRole::Node, method, path),
-                "the preStop hook calls {method} {path}, which a --role node process answers \
+                node_serves(method, path),
+                "the preStop hook calls {method} {path}, which an aenv-node process answers \
                  with 404. The hook swallows its own failures, so this does not show up as an \
                  error — it shows up as a pod stuck in Terminating for the whole grace period."
             );
@@ -631,7 +590,7 @@ mod tests {
 
         // The control face: the route it used to call is one this gate refuses,
         // so the assertion above is about the allowlist and not vacuous.
-        assert!(!serves(ServerRole::Node, &Method::GET, "/sandboxes"));
+        assert!(!node_serves(&Method::GET, "/sandboxes"));
     }
 
     /// 🔴 T-RG-11. The drain wait is bounded, twice over.
@@ -725,7 +684,7 @@ mod tests {
     /// resolution.
     #[tokio::test]
     async fn the_gate_does_not_reach_what_is_merged_after_it() {
-        let router = || attach(stand_in_generated(), ServerRole::Node).merge(stand_in_data_plane());
+        let router = || attach(stand_in_generated(), false).merge(stand_in_data_plane());
 
         assert_eq!(
             status(router(), Method::POST, "/sandboxes").await,

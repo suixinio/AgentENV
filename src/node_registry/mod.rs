@@ -3,7 +3,7 @@
 //! inventory (`node_registry.go`, `kubernetes_discovery.go`, `filter.go`,
 //! `strategy.go`, `warmup.go`, `cpu_template.go`).
 //!
-//! `[cluster].node_placement_source = "native"` is what flips `--role api`
+//! `[cluster].node_placement_source = "native"` is what flips `aenv-api`
 //! onto this module's answers instead of the scheduler's — see
 //! [`crate::node_client::NativeNodePlacement`] (the placement-side consumer)
 //! and [`grpc_service`] (the heartbeat-receiving plane that feeds it). Under

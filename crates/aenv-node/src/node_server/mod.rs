@@ -17,17 +17,17 @@
 //! this wire is identifiers and facts, and where the local trait hands back
 //! something holding bytes, this one hands back where the bytes already are.
 //!
-//! # 🔴 Served by `--role node`, and by nothing else
+//! # 🔴 Served by `aenv-node`, and by nothing else
 //!
 //! `assemble_node` binds [`serve_on`] on `[cluster].node_service_addr`.
-//! `--role all` deliberately does not: it is the rollback target and is defined
+//! the pre-split single process deliberately does not: it is the rollback target and is defined
 //! as the process that ran before the split, which listened on one port.
 //!
 //! 🔴 That has a consequence for the shadow phase, and it is not a small one.
-//! §11.2's 3a keeps the DaemonSet on `--role all` while the API half drives it
-//! through this service — and a `--role all` node does not serve this service.
+//! §11.2's 3a keeps the DaemonSet on the pre-split single process while the API half drives it
+//! through this service — and a the pre-split single process node does not serve this service.
 //! So the API half can decide, and can serve the wake-up surface, but has no
-//! machine it can drive until the DaemonSet moves to `--role node`.
+//! machine it can drive until the DaemonSet moves to `aenv-node`.
 
 mod convert;
 mod ownership;
@@ -75,10 +75,10 @@ pub use ownership::owned_by_control_plane;
 
 /// Builds the tonic server for one node's orchestrator.
 ///
-/// 🔴 Always wired for `BuildTemplate`: every `--role node` process has its
+/// 🔴 Always wired for `BuildTemplate`: every `aenv-node` process has its
 /// own `ImageResolver` and `TemplateBuilder` regardless of whether a template
 /// build ever reaches it (`assemble_node_core` builds both unconditionally,
-/// the same as `--role all` always has), so there is no configuration under
+/// the same as the pre-split single process always has), so there is no configuration under
 /// which this server should answer `Unimplemented` for it. See
 /// `NodeSandboxService::with_template_build`'s doc for why the *type* still
 /// allows a service with neither wired — that is for this function's own

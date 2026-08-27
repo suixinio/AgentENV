@@ -185,8 +185,8 @@ pub struct CentralSnapshotCatalog {
     /// node is staging — the `origin_node_id` the row records.
     ///
     /// 🔴 For `builds.node_id` specifically, "this process" is not always
-    /// "the machine that runs the build". A local build (`--role all`) has
-    /// them coincide. A build `--role api` dispatches to a node
+    /// "the machine that runs the build". A local build (the pre-split single process) has
+    /// them coincide. A build `aenv-api` dispatches to a node
     /// (`crate::node_client::build_template_on_a_node`) does not: `start_build`
     /// is called by the API replica *before* a node is even chosen — nothing
     /// this struct does learns the executor's identity, ever — and

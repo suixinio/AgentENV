@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
-use crate::role::ServerRole;
 use crate::types::SandboxId;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -39,12 +38,51 @@ const SEED_FINGERPRINT_BYTES: usize = 8;
 /// scrape.
 ///
 /// 🔴 Always `1`, and the value is not the point: the *label* is. A missing
-/// seed is caught at startup by [`ServerRole::needs_a_configured_access_token_seed`],
+/// seed is caught at startup by [`AccessTokenSeedPolicy::MustBeConfigured`],
 /// but two replicas each configured with a different non-empty seed pass every
 /// check there is and still hand users tokens the other one rejects. Comparing
 /// this label across replicas is the only place that divergence is visible
 /// (`_sd-impl-phase3-role.md` §9.3 item 4).
 const SEED_FINGERPRINT_METRIC: &str = "agentenv_access_token_seed_fingerprint";
+
+/// Whether this process may invent its own envd access-token seed when none is
+/// configured.
+///
+/// envd access tokens are `HMAC(seed, sandbox_id)`, so the seed is not a private
+/// detail of the process that holds it: it is the only thing that makes two
+/// processes agree on what a sandbox's token is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessTokenSeedPolicy {
+    /// A single machine, which generates a seed and keeps it under
+    /// `$AENV_HOME/secrets/`. What `aenv-node` passes, and today's behaviour
+    /// verbatim: a developer running one should not need a secret to boot.
+    ///
+    /// Cross-*node* agreement still matters for cross-node recovery, but that
+    /// is a warning's job, not a refusal's — the deployment that needs it is
+    /// not the deployment that is broken without it. What tells the two apart
+    /// on a live cluster is the fingerprint gauge, not this;
+    /// see [`SandboxAccessTokenGenerator`].
+    MayGenerate,
+    /// A replicated process, which must be *handed* the seed. What `aenv-api`
+    /// passes.
+    ///
+    /// 🔴 About replication rather than about being the deciding half. An
+    /// `aenv-api` Deployment runs more than one replica, and every one of them
+    /// mints tokens (`create`, `fork`), re-derives them (`resume`) and hands
+    /// them back (`GET /sandboxes/{id}`). Two replicas with two invented seeds
+    /// do not disagree loudly — the user is handed a token by whichever replica
+    /// the load balancer picked, and it stops working the moment another one
+    /// answers, with no error, no log and no metric
+    /// (`_sd-impl-phase3-role.md` §9.2). Refusing to start is the only form of
+    /// that fault anybody sees.
+    MustBeConfigured,
+}
+
+impl AccessTokenSeedPolicy {
+    fn refuses_an_invented_seed(self) -> bool {
+        matches!(self, Self::MustBeConfigured)
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct EnvdAccessToken(String);
@@ -77,24 +115,22 @@ impl SandboxAccessTokenGenerator {
     /// Resolves the seed this process signs envd access tokens with, and
     /// publishes its fingerprint.
     ///
-    /// The fingerprint is published for *every* role, including `all`. That is
-    /// deliberate and it is what makes the gauge worth having before the split
-    /// ships: on today's fleet, where every machine runs `--role all`, scraping
-    /// it from two nodes answers "do these two agree?" — which is the same
-    /// question two `api` replicas will need answered, asked a release early.
+    /// The fingerprint is published by *both* halves. Scraping it from two
+    /// nodes answers "do these two agree?", which is the same question two
+    /// `aenv-api` replicas need answered.
     pub fn load_or_create(
         config: &AppConfig,
-        role: ServerRole,
+        seed_policy: AccessTokenSeedPolicy,
         managed_seed_must_exist: bool,
     ) -> Result<Self> {
-        let generator = Self::resolve(config, role, managed_seed_must_exist)?;
-        generator.publish_seed_fingerprint(role);
+        let generator = Self::resolve(config, seed_policy, managed_seed_must_exist)?;
+        generator.publish_seed_fingerprint(seed_policy);
         Ok(generator)
     }
 
     fn resolve(
         config: &AppConfig,
-        role: ServerRole,
+        seed_policy: AccessTokenSeedPolicy,
         managed_seed_must_exist: bool,
     ) -> Result<Self> {
         if let Some(seed) = config.sandbox.access_token_hash_seed.as_deref() {
@@ -105,18 +141,17 @@ impl SandboxAccessTokenGenerator {
         // node-local seed is the failure, not a step on the way to it: the
         // process would come up, serve requests, and mint tokens no sibling
         // replica can verify.
-        if role.needs_a_configured_access_token_seed() {
+        if seed_policy.refuses_an_invented_seed() {
             bail!(
-                "--role {role} has no envd access-token seed configured. Set {SEED_ENV_VAR} (or \
-                 [sandbox].access_token_hash_seed) to the same value on every {role} replica, and \
-                 do not let this process generate one: envd access tokens are \
+                "aenv-api has no envd access-token seed configured. Set {SEED_ENV_VAR} (or \
+                 [sandbox].access_token_hash_seed) to the same value on every replica, and do \
+                 not let this process generate one: envd access tokens are \
                  HMAC(seed, sandbox_id), so a seed invented here would make this replica hand out \
                  tokens its siblings reject and reject the ones they handed out — silently, on \
                  whichever request the load balancer sent where. In Kubernetes the value is the \
                  `sandbox-access-token-hash-seed` key of the `agentenv-runtime-secrets` Secret, \
                  which deploy/k8s/base/agentenv-api-deployment.yaml already reads with \
-                 `optional: false`; create the Secret before rolling out the Deployment.",
-                role = role.as_str()
+                 `optional: false`; create the Secret before rolling out the Deployment."
             );
         }
 
@@ -143,12 +178,12 @@ impl SandboxAccessTokenGenerator {
         hex::encode(&digest[..SEED_FINGERPRINT_BYTES])
     }
 
-    fn publish_seed_fingerprint(&self, role: ServerRole) {
+    fn publish_seed_fingerprint(&self, seed_policy: AccessTokenSeedPolicy) {
         let fingerprint = self.seed_fingerprint();
         // The seed itself never reaches either sink; the fingerprint is what
         // both carry.
         info!(
-            role = role.as_str(),
+            seed_policy = ?seed_policy,
             fingerprint = %fingerprint,
             "resolved the envd access-token seed"
         );
@@ -555,8 +590,11 @@ mod tests {
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
         let config = config_with_seed(temp.path(), Some("configured-seed"));
 
-        let generator =
-            SandboxAccessTokenGenerator::load_or_create(&config, ServerRole::All, false)?;
+        let generator = SandboxAccessTokenGenerator::load_or_create(
+            &config,
+            AccessTokenSeedPolicy::MayGenerate,
+            false,
+        )?;
 
         assert_eq!(generator.seed, "configured-seed".as_bytes());
         assert!(!managed_path.exists());
@@ -565,11 +603,12 @@ mod tests {
 
     /// 🔴 The refusal and the thing it refuses, one config apart.
     ///
-    /// Asserting only that `--role api` fails would pass on a `load_or_create`
-    /// that had simply stopped working; asserting only that `--role node`
-    /// succeeds would pass on the code as it was before this gate existed. The
-    /// evidence is that the same directory, the same absent seed and the same
-    /// call give opposite answers for two roles — and that the api arm leaves
+    /// Asserting only that [`AccessTokenSeedPolicy::MustBeConfigured`] fails
+    /// would pass on a `load_or_create` that had simply stopped working;
+    /// asserting only that [`AccessTokenSeedPolicy::MayGenerate`] succeeds
+    /// would pass on the code as it was before this gate existed. The evidence
+    /// is that the same directory, the same absent seed and the same call give
+    /// opposite answers for the two policies — and that the refusing arm leaves
     /// no managed file behind, which is what says it refused *instead of*
     /// falling back rather than after having done so.
     ///
@@ -577,26 +616,27 @@ mod tests {
     /// reason is worth knowing before somebody goes looking for the same test
     /// one layer up: `ConfigManager::set_global` injects
     /// `TEST_ACCESS_TOKEN_HASH_SEED` into every `#[cfg(test)]` build
-    /// (`src/cfg.rs`), so an `Orchestrator::new(ServerRole::Api, ..)` in any
+    /// (`src/cfg.rs`), so an `Orchestrator::new(MustBeConfigured, ..)` in any
     /// unit test always finds a configured seed and always succeeds. A test
     /// there would look like it covered this and would not.
     #[test]
-    fn the_api_half_refuses_to_invent_a_seed_and_the_other_two_still_may() -> Result<()> {
-        for role in [ServerRole::Node, ServerRole::All] {
+    fn the_api_half_refuses_to_invent_a_seed_and_the_node_half_still_may() -> Result<()> {
+        {
             let temp = TempDir::new()?;
             let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
             let config = config_with_seed(temp.path(), None);
 
-            let generator = SandboxAccessTokenGenerator::load_or_create(&config, role, false)
-                .unwrap_or_else(|error| {
-                    panic!("--role {} should still generate: {error:#}", role.as_str())
-                });
+            let generator = SandboxAccessTokenGenerator::load_or_create(
+                &config,
+                AccessTokenSeedPolicy::MayGenerate,
+                false,
+            )
+            .unwrap_or_else(|error| panic!("aenv-node should still generate: {error:#}"));
 
             assert_eq!(generator.seed.len(), SEED_HEX_LEN);
             assert!(
                 managed_path.exists(),
-                "--role {} did not write the managed seed it generated",
-                role.as_str()
+                "aenv-node did not write the managed seed it generated"
             );
         }
 
@@ -604,21 +644,22 @@ mod tests {
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
         let config = config_with_seed(temp.path(), None);
 
-        let error = SandboxAccessTokenGenerator::load_or_create(&config, ServerRole::Api, false)
-            .expect_err("--role api must not invent a seed its siblings cannot derive");
+        let error = SandboxAccessTokenGenerator::load_or_create(
+            &config,
+            AccessTokenSeedPolicy::MustBeConfigured,
+            false,
+        )
+        .expect_err("aenv-api must not invent a seed its siblings cannot derive");
 
         let message = format!("{error:#}");
         // Actionable, in the words an operator would go looking for.
         assert!(message.contains(SEED_ENV_VAR), "{message}");
-        assert!(
-            message.contains("same value on every api replica"),
-            "{message}"
-        );
+        assert!(message.contains("same value on every replica"), "{message}");
         assert!(message.contains("agentenv-runtime-secrets"), "{message}");
         // Refused before the fallback, not after it.
         assert!(
             !managed_path.exists(),
-            "--role api generated a seed on its way to refusing"
+            "aenv-api generated a seed on its way to refusing"
         );
         Ok(())
     }
@@ -632,13 +673,20 @@ mod tests {
         let temp = TempDir::new()?;
 
         let configured = config_with_seed(temp.path(), Some("cluster-wide-seed"));
-        let generator =
-            SandboxAccessTokenGenerator::load_or_create(&configured, ServerRole::Api, false)?;
+        let generator = SandboxAccessTokenGenerator::load_or_create(
+            &configured,
+            AccessTokenSeedPolicy::MustBeConfigured,
+            false,
+        )?;
         assert_eq!(generator.seed, "cluster-wide-seed".as_bytes());
 
         let blank = config_with_seed(temp.path(), Some("   "));
-        let error = SandboxAccessTokenGenerator::load_or_create(&blank, ServerRole::Api, false)
-            .expect_err("a whitespace-only seed is not a seed");
+        let error = SandboxAccessTokenGenerator::load_or_create(
+            &blank,
+            AccessTokenSeedPolicy::MustBeConfigured,
+            false,
+        )
+        .expect_err("a whitespace-only seed is not a seed");
         assert!(
             format!("{error:#}").contains("must be non-empty"),
             "{error:#}"
@@ -719,7 +767,11 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let guard = metrics::set_default_local_recorder(&recorder);
-        let loaded = SandboxAccessTokenGenerator::load_or_create(config, ServerRole::Api, false);
+        let loaded = SandboxAccessTokenGenerator::load_or_create(
+            config,
+            AccessTokenSeedPolicy::MustBeConfigured,
+            false,
+        );
         drop(guard);
         loaded?;
 

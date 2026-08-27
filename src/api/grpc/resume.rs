@@ -173,7 +173,7 @@ where
             // 🔴 The same status as `Failed` and a different label. §6.3's table
             // sends everything unclassified to `Internal`, and the local reverse
             // proxy answered a timed-out auto-resume with the same 502 it gave a
-            // failed one — so answering differently here would make `--role all`
+            // failed one — so answering differently here would make the pre-split single process
             // and the cold path disagree, which is the one thing the rollback
             // story cannot afford. The counter is where the two separate.
             DataPlaneResume::TimedOut => {

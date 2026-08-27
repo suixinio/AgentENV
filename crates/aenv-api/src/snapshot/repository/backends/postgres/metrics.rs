@@ -1,5 +1,5 @@
 //! The five Prometheus series `catalog_service.go` published, rebuilt here so
-//! folding the catalog into `--role api` does not also make the build queue
+//! folding the catalog into `aenv-api` does not also make the build queue
 //! and the RPC surface silently unobservable.
 //!
 //! Names are kept identical to the Go originals — `agentenv_scheduler_*` — on
@@ -49,7 +49,7 @@ pub const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
 /// purely for this comparison) against the controller's — a signal that only
 /// exists because two separate machines and a wire hop sit between "the
 /// builder says it is alive" and "the process judging that claim". Stage B's
-/// direct-PG catalog removes that hop for the admitting `--role api`
+/// direct-PG catalog removes that hop for the admitting `aenv-api`
 /// replica: `renew_build_lease` never carries a caller-asserted timestamp in
 /// the `SnapshotCatalog` trait today (see
 /// `src/snapshot/repository/interfaces.rs`), and the heartbeat this schema

@@ -126,7 +126,7 @@ mod tests {
     /// see the third claim below.
     ///
     /// 3. `publish` through the api-assembled repository is refused rather
-    ///    than silently doing nothing. `--role api` never stages: every capture
+    ///    than silently doing nothing. `aenv-api` never stages: every capture
     ///    that reaches it arrived already staged by the node holding the bytes
     ///    (`SnapshotManager::adopt_staged`). The importing half is what needs
     ///    to read overlaybd layer files, so it is the half api does not build.
@@ -183,7 +183,7 @@ mod tests {
         let refusal = repository
             .publish(metadata, manifest)
             .await
-            .expect_err("--role api must refuse to import snapshot artifacts");
+            .expect_err("aenv-api must refuse to import snapshot artifacts");
         assert!(
             matches!(refusal, RepositoryError::Unsupported { .. }),
             "the refusal must say the feature is unavailable, not fail as a backend error: \
@@ -212,11 +212,11 @@ mod tests {
                 .await
                 .expect("the catalog should answer")
                 .is_none(),
-            "the row survived a delete on --role api"
+            "the row survived a delete on aenv-api"
         );
         assert!(
             !committed_dir.exists(),
-            "the bytes survived a delete on --role api — this is the orphan the whole \
+            "the bytes survived a delete on aenv-api — this is the orphan the whole \
              api-side delete exists to prevent"
         );
     }

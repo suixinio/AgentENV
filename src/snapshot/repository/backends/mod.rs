@@ -23,11 +23,43 @@ use crate::snapshot::repository::SnapshotRepository;
 pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
 use posixfs::posixfs_catalog_only_repository;
 
+/// Whether this process builds a central snapshot catalog at all.
+///
+/// 🔴 A parameter and not a compile-time constant because
+/// [`build_snapshot_backend`] is in the crate both binaries link. Each of them
+/// passes one literal: `aenv-api` [`AsConfigured`](CentralCatalogUse::AsConfigured),
+/// `aenv-node` [`Never`](CentralCatalogUse::Never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CentralCatalogUse {
+    /// `aenv-api`: whatever `[snapshot.catalog]` configures — a
+    /// `PostgresSnapshotCatalog` over the shared `[pg]` pool, a
+    /// `CentralSnapshotCatalog` gRPC client, or neither.
+    AsConfigured,
+    /// `aenv-node`: none, ever.
+    ///
+    /// 🔴 A node never queries this catalog at all -- both of its request-time
+    /// reads (`create`'s `Source::Snapshot` arm, `build_template`'s
+    /// `Base::BaseSnapshotRef` arm) are pre-resolved by api and sent down with
+    /// the request, and only ever fall back to `repository.get_scoped` (served
+    /// by whatever `build_storage_backend` already built, object-storage
+    /// -backed) during a mixed-version rolling upgrade window -- never to a
+    /// central Postgres/gRPC catalog.
+    ///
+    /// That is why this skips *both* the `write = "postgres"` bail (no `[pg]`,
+    /// ever, in that binary -- it cannot even link `sqlx`) and the
+    /// `write = "both"` gRPC client (a live dependency on a scheduler a node
+    /// has no reason to reach), and why it also skips the `read == "postgres"`
+    /// refusal: that refusal exists to catch reads this backend actually
+    /// serves silently diverging from the configured read side, and a node
+    /// serves none through this catalog at all.
+    Never,
+}
+
 /// Everything the snapshot layer needs from storage, assembled.
 pub struct AssembledSnapshotBackend {
     pub repository: Arc<SnapshotRepository>,
-    /// 🔴 `None` on every role that runs no sandbox runtime — today that is
-    /// `--role api`. Resolving a snapshot is not a lookup: it downloads
+    /// 🔴 `None` in the half that runs no sandbox runtime — `aenv-api`.
+    /// Resolving a snapshot is not a lookup: it downloads
     /// `vm_state.bin` onto this machine's disk, materializes the memory and
     /// rootfs overlaybd `image.json` files, and leases all of it in this
     /// process's local artifact cache. An api replica boots nothing, so it
@@ -51,8 +83,8 @@ pub async fn build_snapshot_backend(
     // the byte half is untouched by it; which byte half exists at all is the
     // calling binary's decision, and now its crate's.
     storage: RoleStorage,
-    // 🔴 `None` for `--role node` always — see
-    // `src/bin/aenv-api.rs::build_pg_pool`. Consumed by the read-side
+    // 🔴 `None` in `aenv-node` always — see
+    // `crates/aenv-api/src/bin/aenv-api.rs::build_pg_pool`. Consumed by the read-side
     // admission's shared confirmation (Stage B step 4,
     // `docs/proposals/_sd-phase4-stageB-catalog.md` §7/§5.1) and, when
     // present, by `build_central_catalog`, which then uses the
@@ -64,28 +96,14 @@ pub async fn build_snapshot_backend(
     // constructing them is the deciding half's business, and this function is
     // shared. See [`PgCatalogParts`].
     pg: Option<PgCatalogParts>,
-    role: crate::role::ServerRole,
+    central: CentralCatalogUse,
 ) -> Result<AssembledSnapshotBackend> {
     let config = ConfigManager::global_config();
     let (repository, runtime_resolver) = storage;
 
-    // 🔴 P2 (task's own "phase4-close"): `--role node` never queries this
-    // catalog at all -- both of its request-time reads
-    // (`create`'s `Source::Snapshot` arm, `build_template`'s
-    // `Base::BaseSnapshotRef` arm) are pre-resolved by api and sent down
-    // with the request, and only ever fall back to `repository.get_scoped`
-    // (served by whatever `build_storage_backend` above already built,
-    // object-storage-backed) during a mixed-version rolling upgrade
-    // window -- never to a central Postgres/gRPC catalog. See
-    // `ServerRole::never_constructs_a_central_snapshot_catalog`'s own doc
-    // for why this skips *both* the `write = "postgres"` bail below (no
-    // `[pg]`, ever, on this role) and the `write = "both"` gRPC client (a
-    // live dependency on a scheduler this role has no reason to reach),
-    // and why it also skips the `read == "postgres"` refusal a few lines
-    // down: that refusal exists to catch reads this backend actually
-    // serves silently diverging from the configured read side, and a node
-    // role serves none through this catalog at all.
-    if role.never_constructs_a_central_snapshot_catalog() {
+    // 🔴 P2 (task's own "phase4-close"): see [`CentralCatalogUse::Never`]'s
+    // own doc for why `aenv-node` skips *all three* of the arms below.
+    if central == CentralCatalogUse::Never {
         let compensator = drain_a_rolled_back_mirror(
             &config.snapshot.catalog.mirror_backlog_path,
             std::time::Duration::from_secs(
@@ -435,8 +453,8 @@ pub struct PgCatalogParts {
 /// 🔴 Whenever a `[pg]` pool is available, this picks `PostgresSnapshotCatalog`
 /// over the gRPC hop to `services/scheduler` — a direct, in-process connection
 /// to the same database `services/scheduler` itself would have written,
-/// without a network hop or a second process. This is what lets a `--role api`
-/// (or `--role all`) replica with `[pg]` configured serve `write = "both"`
+/// without a network hop or a second process. This is what lets an `aenv-api`
+/// replica with `[pg]` configured serve `write = "both"`
 /// without ever dialing a scheduler, and it is the *only* way `write =
 /// "postgres"` is servable at all — that mode has no gRPC form, because there
 /// is nothing left to fall back to once the central catalog is the only copy.

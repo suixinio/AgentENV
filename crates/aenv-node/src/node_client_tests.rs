@@ -28,7 +28,6 @@ use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
     NodeSandboxService, NodeSandboxServiceServer,
 };
-use crate::role::ServerRole;
 use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
 use crate::sandbox::{
     CustomExtensionParams, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
@@ -126,7 +125,7 @@ async fn real_node() -> RunningNode {
 async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
@@ -191,7 +190,7 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
     let template_builder = Arc::new(crate::template::TemplateBuilder::new());
 
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -536,7 +535,7 @@ async fn a_sandbox_built_here_starts_on_the_node() {
 /// `custom_extension_params_update_is_a_real_round_trip` proves the stub
 /// sends a real RPC and surfaces a real failure. This proves the other half
 /// of the old lie: with a real `NodeSandboxService` behind the wire — the
-/// same one `--role node` runs — the value the stub sent is the value the
+/// same one `aenv-node` runs — the value the stub sent is the value the
 /// node's own orchestrator now has on file for this sandbox, read back
 /// through the node's own `get_sandbox`, which is the node-local analogue of
 /// what a `GET` on the API half would answer. `None` and `Some(..)` in
@@ -653,7 +652,7 @@ async fn a_node_that_started_another_run_fails_the_start_and_is_told_to_stop() {
 /// 🔴 The api half sends the same bytes whether or not it resolved the
 /// snapshot first.
 ///
-/// `--role api` used to reach `SnapshotRuntimeResolver::resolve` before every
+/// `aenv-api` used to reach `SnapshotRuntimeResolver::resolve` before every
 /// warm create — downloading `vm_state.bin` onto its own disk, materializing
 /// two overlaybd `image.json` files and leasing them — and then throw all of
 /// it away here, because a `SnapshotSource` carries the catalog row and
@@ -1899,10 +1898,10 @@ async fn a_paused_state_without_a_node_is_refused() {
 /// would have been one the moment anything drove this factory for real: every
 /// sandbox it created would be one the control plane does not recognise as its
 /// own, invisible to `ListSandboxes` and to the reconciliation that runs off
-/// it. It was not one at the time only because `--role api` refused to
+/// it. It was not one at the time only because `aenv-api` refused to
 /// assemble, so nothing constructed this factory outside these tests.
 ///
-/// Both halves of that have since been settled: `--role api` assembles (it is
+/// Both halves of that have since been settled: `aenv-api` assembles (it is
 /// its own binary now, in `crates/aenv-api`), and the marker arrives from the
 /// caller. What is left is the assertion that mattered, kept on its own.
 ///
@@ -2047,7 +2046,7 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
 async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -2899,7 +2898,7 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
 // 🔴 What this section is for, stated once.
 //
 // `Orchestrator` keeps its live backends in a process-local map. That map is
-// the whole truth when there is one process, and `--role api` is deployed as
+// the whole truth when there is one process, and `aenv-api` is deployed as
 // two replicas behind a Service with **no session affinity** — so the replica a
 // request lands on is not usually the replica that started the sandbox.
 //
@@ -3071,12 +3070,12 @@ type ApiReplica =
 /// sandboxes are on `node`.
 async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
     Orchestrator::new(
-        // 🔴 `All` rather than `Api`, and it changes nothing this file is
-        // about: the role is read once, to decide whether the process may
-        // invent its own envd access-token seed, and a test config has none to
-        // find. Everything that makes this a replica of the deciding half is
-        // the store and the factory below.
-        ServerRole::All,
+        // 🔴 `MayGenerate` rather than `MustBeConfigured`, and it changes
+        // nothing this file is about: the policy is read once, to decide
+        // whether the process may invent its own envd access-token seed, and a
+        // test config has none to find. Everything that makes this a replica of
+        // the deciding half is the store and the factory below.
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         ledger.clone(),
         RemoteSandboxBackendFactory::new(node.placement()),
         DisabledSandboxPersister,
@@ -3090,7 +3089,7 @@ async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
 async fn local_half(
 ) -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory, DisabledSandboxPersister>> {
     Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -3584,7 +3583,7 @@ async fn routed_to(
 ///
 /// # 🔴 This is the shape the bug had in production
 ///
-/// `--role api` forks by asking a node, and the node's answer is the only thing
+/// `aenv-api` forks by asking a node, and the node's answer is the only thing
 /// this half ever learns about where a child is. The node used to answer with
 /// an empty address, so `proxy_target_from_sandbox` refused every child with
 /// *missing host interaction IP after start* — deterministically, on children
@@ -3785,7 +3784,7 @@ async fn adopted(
 ///
 /// # 🔴 The gap this closes
 ///
-/// `--role api` runs several replicas behind a Service with no session
+/// `aenv-api` runs several replicas behind a Service with no session
 /// affinity, so a call about a sandbox usually lands on a replica that did not
 /// start it. That replica adopts the sandbox — and the adopted stub used to be
 /// placed with its address and rootfs size left as `None`, on the reasoning
@@ -4236,7 +4235,7 @@ impl NodePlacement for ClusterPlacement {
 /// One replica of the deciding half, over a placement source a test controls.
 async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {
     Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         ledger.clone(),
         RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>),
         DisabledSandboxPersister,

@@ -30,16 +30,16 @@
 //! `origin_node_id` before writing anything (see their own doc comments), so
 //! nothing about them ever required the caller to hold any lock, let alone
 //! cluster-wide leadership. [`spawn`] below runs this on **every**
-//! `--role api` replica that has a [`NodeRegistry`], on its own timer,
+//! `aenv-api` replica that has a [`NodeRegistry`], on its own timer,
 //! contending for nothing. Since every node's heartbeat is pinned to exactly
 //! one replica, the *union* of what every replica's own roster covers is the
 //! entire cluster -- see `postgres::contract`'s pg-gated
 //! `two_replicas_each_holding_part_of_the_roster_together_renew_every_running_row`
 //! for this claim proved directly.
 //!
-//! `--role all` never reaches this module at all: [`spawn`] is only called
+//! the pre-split single process never reaches this module at all: [`spawn`] is only called
 //! when a [`NodeRegistry`] is available (M1's `spawn_background_tasks`
-//! taking `Option<Arc<dyn NodeRegistry>>`), and under `--role all` the
+//! taking `Option<Arc<dyn NodeRegistry>>`), and under the pre-split single process the
 //! process's own identity coincides with `origin_node_id` for everything it
 //! runs -- `renew_lease` (the ordinary trait method, driven by
 //! `spawn_paused_record_upkeep` in `src/bin/aenv-api.rs`) already renews those

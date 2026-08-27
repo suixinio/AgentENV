@@ -1,5 +1,5 @@
-//! Shared PostgreSQL infrastructure for the control plane (`--role api` /
-//! `--role all`): one connection pool convention and one cluster-leadership
+//! Shared PostgreSQL infrastructure for the control plane (`aenv-api` /
+//! the pre-split single process): one connection pool convention and one cluster-leadership
 //! primitive, so Stage B's catalog fold and Stage C's paused-registry fold
 //! build on the same foundation instead of inventing their own.
 //!
@@ -10,7 +10,7 @@
 //! ([`election`]), built on PostgreSQL session-scoped advisory locks rather
 //! than a Redis-style TTL lock.
 //!
-//! # 🔴 `--role node` never reaches this module
+//! # 🔴 `aenv-node` never reaches this module
 //!
 //! Database credentials, the connection budget and the schema are the
 //! deciding half's business, not the machines that run user code —
@@ -18,10 +18,9 @@
 //! invariant for the snapshot catalog's own central backend, and
 //! `PausedRegistryBackendKind::Postgres` (`src/cfg.rs`) already refuses a
 //! node that tries to connect to the registry database directly. This module
-//! is the same invariant generalized to *any* `[pg]` DSN: `--role node`
-//! refuses to start with one configured at all, checked by
-//! [`crate::role::ServerRole::check_pg_dsn`] before any role-specific
-//! assembly runs in `src/bin/aenv-api.rs`.
+//! is the same invariant generalized to *any* `[pg]` DSN: `aenv-node` refuses
+//! to start with one configured at all, checked by `refuse_configured_pg_dsn`
+//! in `crates/aenv-node/src/bin/aenv-node.rs` before anything is assembled.
 
 pub mod election;
 pub mod lock_keys;

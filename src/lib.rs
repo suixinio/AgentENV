@@ -14,7 +14,6 @@ pub mod orchestrator;
 pub mod p2p;
 pub mod privileges;
 pub mod proto;
-pub mod role;
 pub mod runtime_snapshot;
 pub mod sandbox;
 pub mod scheduler_endpoint;

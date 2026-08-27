@@ -31,10 +31,10 @@ fn test_manager(root: &Path) -> SnapshotManager {
 }
 
 /// 🔴 A manager assembled without a runtime resolver — which is what
-/// `--role api` gets — must *refuse* a resolve, not abort the process.
+/// `aenv-api` gets — must *refuse* a resolve, not abort the process.
 ///
 /// The refusal is typed: `RepositoryError::Unsupported`, downcastable, so
-/// a caller that forgot to fork on `ServerRole::runs_sandbox_runtime` gets
+/// a caller that forgot to fork on `ApiImpl::runs_sandbox_runtime` gets
 /// a legible 5xx on one request instead of taking every in-flight request
 /// down with it.
 ///
@@ -263,7 +263,7 @@ async fn a_manager_staged_snapshot_commits_after_a_serde_round_trip() {
         .expect("staging should work");
     let encoded = serde_json::to_vec(handle.staged()).expect("staged value should serialize");
     // 🔴 Dropped before the commit: the local half is gone, and the commit
-    // still has to work. That is the property `--role api` depends on.
+    // still has to work. That is the property `aenv-api` depends on.
     drop(handle);
 
     let decoded: StagedSnapshot =

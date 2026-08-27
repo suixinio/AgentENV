@@ -43,7 +43,6 @@ use aenv_api::orchestrator::{
     SandboxOrchestration,
 };
 use aenv_api::pg::{self, PgPoolSettings};
-use aenv_api::role::ServerRole;
 use aenv_api::server_main::{self, spawn_grpc_surface, Assembly};
 use aenv_api::snapshot::SnapshotManager;
 use aenv_api::template::RefusingTemplateBuildDriver;
@@ -51,17 +50,23 @@ use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
 
-/// 🔴 `--role` is accepted and checked, not obeyed. See
-/// [`ServerRole::confirm`]: this binary *is* the api half, and it is that
-/// because of what it does not link — no overlaybd, no ublk, no Firecracker.
+/// 🔴 No `--role`. This binary *is* the api half, and it is that because of
+/// what it does not link — no overlaybd, no ublk, no Firecracker
+/// (`make check-crate-boundaries`). There was a `--role` flag (and an
+/// `AENV_ROLE` environment variable) through the transition, accepted and
+/// checked rather than obeyed, so that manifests written for the
+/// single-process image kept starting. Nothing passes it any more — see
+/// `deploy/k8s/base/` — and a flag that can only be confirmed is a flag that
+/// cannot select anything.
+///
+/// 🔴 And no `--setup-only`/`--setup-host` either, which `aenv-node` does
+/// have. This half has no `/dev/kvm`, no ublk and no downloaded runtime
+/// assets, so there is nothing here to provision; the flags used to exist and
+/// be refused by a `ServerRole::check_setup_flags` that no longer exists, and
+/// not declaring them is the same refusal one layer earlier.
 #[derive(Debug, Parser)]
 #[command(name = "aenv-api")]
 struct ApiCli {
-    /// Which half of the split this process runs. Only `api` is accepted
-    /// here; also read from AENV_ROLE.
-    #[arg(long, value_enum)]
-    role: Option<ServerRole>,
-
     /// Path to config file (same as AENV_CONFIG_PATH).
     #[arg(long)]
     config: Option<std::path::PathBuf>,
@@ -85,7 +90,6 @@ async fn async_main() -> anyhow::Result<()> {
     agentenv_observability::init_prometheus_recorder()?;
 
     let cli = ApiCli::parse();
-    let role = ServerRole::Api.confirm(cli.role)?;
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         aenv_api::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
@@ -93,21 +97,20 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
-    info!(target: "agentenv", role = role.as_str(), "assembling server");
+    info!(target: "agentenv", "assembling the api half");
     let assembly = assemble_api(config).await?;
-    server_main::serve(role, config, assembly).await
+    server_main::serve(config, assembly).await
 }
 
 /// This replica's `[pg]` connection pool, or `None` when PostgreSQL is not
 /// configured for this process.
 ///
-/// 🔴 Never call this from `assemble_node`. `--role node` is refused at
-/// startup if `[pg].dsn` is configured at all (`ServerRole::check_pg_dsn`,
-/// enforced in `async_main` before any role-specific assembly runs), but that
-/// guard is defense against a *configured* DSN reaching a node — it does not
-/// stop this function itself from being called there. The two callers that
-/// may hold PostgreSQL credentials, the connection budget and the schema are
-/// `assemble_api` and `assemble_all`; see `src/pg/mod.rs`'s own module doc.
+/// 🔴 There is no node-side counterpart, and there cannot be: `aenv-node` does
+/// not link `sqlx` (`make check-crate-boundaries`), and it refuses to start at
+/// all if `[pg].dsn` is configured (`refuse_configured_pg_dsn`, in that
+/// binary's own `async_main`). This is the one process that may hold
+/// PostgreSQL credentials, the connection budget and the schema; see
+/// `src/pg/mod.rs`'s own module doc.
 async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool>> {
     let Some(settings) = PgPoolSettings::from_config(config.pg.as_ref())? else {
         return Ok(None);
@@ -163,13 +166,13 @@ fn spawn_pg_singleton_tasks(
     .collect()
 }
 
-/// `--role api`: the deciding half.
+/// `aenv-api`: the deciding half.
 ///
 /// It owns sandboxes and runs none of them. Everything it constructs is either
 /// a decision (the cluster store, the paused registry, placement) or a surface
 /// (the full REST route set, the wake-up gRPC); everything a machine needs is
-/// absent, and absent because this role answers `false` to
-/// [`ServerRole::runs_sandbox_runtime`].
+/// absent, and absent because this binary does not link the crate that would
+/// build it.
 ///
 /// # 🔴 What it refuses to start without, and why each refusal is loud
 ///
@@ -191,7 +194,7 @@ fn spawn_pg_singleton_tasks(
 ///   serving HTTP with no gRPC surface refuses every wake-up with a connection
 ///   error the gateway reads as "try again later".
 ///
-/// # 🔴 What it constructs that a machine-local role does not
+/// # 🔴 What it constructs that `aenv-node` does not
 ///
 /// [`RemoteSandboxBackendFactory`], which is what makes an `Orchestrator`
 /// written entirely in terms of local backends drive sandboxes on other
@@ -205,12 +208,12 @@ fn spawn_pg_singleton_tasks(
 ///   `RemoteSandboxBackendFactory::build` refuses outright — the build spec it
 ///   is handed has already been resolved into paths on a local disk and the
 ///   user's image reference is gone by then — so `POST /sandboxes-cold` was
-///   refused at the door (`ServerRole::runs_sandbox_runtime`, read before
+///   refused at the door (`ApiImpl::runs_sandbox_runtime`, read before
 ///   anything is resolved, in `crate::api::impls`) rather than failing on the
 ///   way there with a missing-`regctl` error. Kept here rather than deleted so
 ///   it is not re-derived from the same reasoning. It no longer holds:
 ///   `sandboxes_cold_post` now builds `SandboxLaunchSource::UnresolvedImage`
-///   instead of resolving anything when `!role.runs_sandbox_runtime()`, and
+///   instead of resolving anything when `!self.runs_sandbox_runtime()`, and
 ///   `SandboxBackendFactory::build_from_image_ref`
 ///   (`RemoteSandboxBackendFactory`'s implementation, the method `build`
 ///   still refuses for) ships the reference — and each attached drive's own
@@ -288,18 +291,15 @@ fn spawn_pg_singleton_tasks(
 ///   nowhere to send the build — see `ApiImpl::node_placement` and the
 ///   refusal's own condition in `v2_templates_template_id_builds_build_id_post`.
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
-    let role = ServerRole::Api;
-    // The four this role answers `false` to, stated where somebody adding a
-    // line to this function will read them.
-    debug_assert!(!role.runs_sandbox_runtime());
-    debug_assert!(!role.sends_heartbeats());
-    debug_assert!(!role.reclaims_host_leftovers_at_startup());
-    debug_assert!(!role.drains_on_shutdown());
-    // And the three it answers `true` to.
-    debug_assert!(role.arbitrates_paused_sandbox_ownership());
-    debug_assert!(role.serves_user_facing_rest());
-    debug_assert!(role.serves_wake_decisions());
-
+    // 🔴 What this half does and does not do used to be seven `debug_assert`s
+    // over a now-deleted role enum, stated here so somebody adding a line to this
+    // function would read them. They are all constants of this binary now and
+    // each one has moved to where it is actually spent: no sandbox runtime and
+    // no host sweep (nothing here constructs either, and this crate does not
+    // link the code that would), no heartbeat (`reporter: None`, below), no
+    // drain (`drains_on_shutdown: false`, below), sandbox ownership and the
+    // user-facing REST surface and the wake-up decision (all three off
+    // `ResumeWiring::cluster_from_config`, below).
     let identity = NodeIdentity::from_config(&config.node_identity);
     let identity_for_registry = identity.clone();
 
@@ -417,15 +417,14 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .map(|registry| registry as Arc<dyn NodeRegistry>);
     // The `postgres` arm's own constructor, when this replica has a pool at
     // all. `build_paused_registry` keeps the arm, its refusal message and its
-    // `--role api` roster guard; the pool, the schema bootstrap and the
-    // restart-grace entry live behind this.
+    // roster guard; the pool, the schema bootstrap and the restart-grace entry
+    // live behind this.
     let paused_registry_factory = pg_pool.clone().map(PgPausedRegistryFactory::new);
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
         &config.cluster,
         &config.observability.scheduler_report,
         &identity_for_registry,
-        role,
         paused_registry_factory
             .as_ref()
             .map(|factory| factory as &dyn PostgresPausedRegistryFactory),
@@ -465,13 +464,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // paused sandbox is the cluster store's row and the registry's, not a file
     // here.
     //
-    // 🔴 And the role is what makes the envd access-token seed mandatory. Two
-    // replicas that each invented one would hand users tokens the other cannot
-    // verify, and nothing about that is visible until a user's token stops
-    // working (`_sd-impl-phase3-role.md` §9.2). Refused here, at construction,
-    // before the listener opens.
+    // 🔴 And `MustBeConfigured` is what makes the envd access-token seed
+    // mandatory. Two replicas that each invented one would hand users tokens
+    // the other cannot verify, and nothing about that is visible until a user's
+    // token stops working (`_sd-impl-phase3-role.md` §9.2). Refused here, at
+    // construction, before the listener opens.
     let orchestrator = Orchestrator::new(
-        role,
+        aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
         store,
         // 🔴 A clone, not the original: `ApiImpl` needs its own handle on the
         // same placement source to pick a node for a template build it
@@ -497,7 +496,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let snapshot_backend = aenv_api::snapshot::repository::backends::build_snapshot_backend(
         aenv_api::snapshot::repository::backends::build_catalog_only_storage(config)?,
         pg_catalog,
-        role,
+        aenv_api::snapshot::repository::backends::CentralCatalogUse::AsConfigured,
     )
     .await?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
@@ -506,10 +505,9 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // drives a Firecracker sandbox are `aenv-node`'s, and this binary does not
     // link that crate at all. Nothing here reaches either — `ApiImpl` takes
     // both arms behind traits and only calls them when
-    // `role.runs_sandbox_runtime()` says so, which this role answers `false`
-    // to (`debug_assert`ed at the top of this function). What used to be
-    // constructed here was the concrete pair, unused; what is constructed now
-    // says so in the type.
+    // `ApiImpl::runs_sandbox_runtime()` says so, which is `false` for the
+    // `WakeSite::Remote` wiring below. What used to be constructed here was the
+    // concrete pair, unused; what is constructed now says so in the type.
     //
     // `default_image` still comes from config: the request shapes that only
     // need the *name* — a template build that named no image, about to be
@@ -566,14 +564,16 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             observability,
             paused_wiring,
             config.sandbox_proxy.domains.clone(),
-            role,
-            // 🔴 `WakeSite::Remote`: the pin is honoured by the orchestration
-            // surface below, which places the wake-up on the machine the paused
-            // state names, rather than by a same-machine check this process cannot
-            // make. Requires a scheduler endpoint and says so if it has none.
+            // 🔴 `WakeSite::Remote`, and it carries two facts rather than one.
+            // The pin is honoured by the orchestration surface below, which
+            // places the wake-up on the machine the paused state names, rather
+            // than by a same-machine check this process cannot make (it
+            // requires a scheduler endpoint and says so if it has none). And it
+            // is what `ApiImpl::runs_sandbox_runtime` reads to know it is in
+            // this binary and not `aenv-node` — see its own doc.
             ResumeWiring::cluster_from_config()?,
         )
-        // 🔴 The role `!runs_sandbox_runtime()` names, and the one
+        // 🔴 What `!runs_sandbox_runtime()` names, and the one
         // `v2_templates_...`'s remote branch exists for: a template build has
         // to go somewhere, and the earlier clone into the factory is what
         // makes handing this process the same placement source free. See
@@ -581,13 +581,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .with_node_placement(placement),
     );
 
-    // The same three passes, in the same order, and for the same reasons as
-    // `assemble_all` — with one difference worth naming. There, "this process
-    // holds nothing yet" is a statement about a machine; here it is a statement
-    // about a replica, and it holds because a replica's identity is its own
-    // (`AENV_NODE_ID` is the Pod's name). Two replicas sharing one identity
-    // would make the release below hand back the *other* replica's live
-    // holdings.
+    // The same three passes, in the same order, and for the same reasons the
+    // pre-split single process ran them — with one difference worth naming.
+    // There, "this process holds nothing yet" was a statement about a machine;
+    // here it is a statement about a replica, and it holds because a replica's
+    // identity is its own (`AENV_NODE_ID` is the Pod's name). Two replicas
+    // sharing one identity would make the release below hand back the *other*
+    // replica's live holdings.
     let stale_release = api_impl.release_stale_node_holdings().await;
     api_impl.renew_paused_leases().await;
     api_impl.reconcile_local_records().await;
@@ -717,14 +717,19 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     );
 
     Ok(Assembly {
-        // 🔴 No RoleGate: this half serves the whole user-facing surface. The
-        // gate exists to stop a *node* answering it.
-        app: server::new_with_control_plane_routes(api_impl, role, node_registry_debug_routes),
+        // 🔴 No user-REST gate: this half serves the whole user-facing
+        // surface, and `server::new_with_control_plane_routes` reads that off
+        // the `ApiImpl` itself. The gate exists to stop a *node* answering it.
+        app: server::new_with_control_plane_routes(api_impl, node_registry_debug_routes),
         orchestration,
         upkeep: paused_upkeep,
         pg_singleton_tasks,
         reporter: None,
         runtime: None,
+        // 🔴 An API replica is not a placement target, so it has nothing to
+        // withdraw from scheduling on the way down. `aenv-node` passes `true`;
+        // see `Assembly`'s own field doc.
+        drains_on_shutdown: false,
         grpc: Some(grpc),
     })
 }
@@ -741,7 +746,7 @@ fn cluster_store_config(
 ) -> anyhow::Result<aenv_api::orchestrator::RedisStoreConfig> {
     if !matches!(config.backend, MetadataStoreBackendKind::Redis) {
         anyhow::bail!(
-            "--role api needs [orchestrator.store].backend = \"redis\" \
+            "aenv-api needs [orchestrator.store].backend = \"redis\" \
              (AENV_ORCHESTRATOR_STORE_BACKEND), and this process is configured for {:?}. The \
              in-memory store is one process's private ledger: an API replica using it would hold \
              an opinion about sandboxes no other replica shares, and the two would not disagree \
@@ -778,9 +783,9 @@ fn cluster_store_config(
 ///
 /// 🔴 P1 (task's own "phase4-close"): `[cluster].scheduler_endpoint` is now
 /// required *only* under `Scheduler` — the doc comment this replaced said
-/// "`Native` is not a way to run `--role api` without a scheduler," and
+/// "`Native` is not a way to run `aenv-api` without a scheduler," and
 /// that was the bug: three of `NativeNodePlacement`'s five methods used to
-/// forward to a `SchedulerNodePlacement` regardless, so `--role api` under
+/// forward to a `SchedulerNodePlacement` regardless, so `aenv-api` under
 /// `Native` was simultaneously the gRPC server for `Schedule`/`LookupNode`/
 /// `RecordAssignment` (Stage D) and a client of the Go scheduler for those
 /// same three calls, never reaching its own answers. Scaling that scheduler
@@ -815,7 +820,7 @@ fn cluster_placement(
                 .filter(|endpoint| !endpoint.is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "--role api needs [cluster].scheduler_endpoint \
+                        "aenv-api needs [cluster].scheduler_endpoint \
                          (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not \
                          run, so every create has to be placed by the scheduler and there is no \
                          machine here to fall back to"
@@ -879,7 +884,7 @@ async fn start_native_node_registry(
     // for a reason a startup log line would have caught immediately.
     if namespace.is_empty() || service_name.is_empty() {
         anyhow::bail!(
-            "--role api needs [cluster.kubernetes_discovery].namespace and .service_name \
+            "aenv-api needs [cluster.kubernetes_discovery].namespace and .service_name \
              (AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE / \
              AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when \
              [cluster].node_placement_source = \"native\": Stage A's node registry has nothing \
@@ -891,9 +896,9 @@ async fn start_native_node_registry(
     // `dual_report_api_endpoint` (`cfg.rs`'s own doc: "lets *a node* report
     // to both scheduler ... and api's registry") is a *sender*-side setting
     // — it belongs to whatever process calls `ObservabilityReporter::
-    // send_heartbeat`, i.e. `--role node`/`--role all`, and is read there
+    // send_heartbeat`, i.e. `aenv-node`/the pre-split single process, and is read there
     // from *that* process's own `[observability.scheduler_report]` section.
-    // This function runs on `--role api`, where the same config struct
+    // This function runs on `aenv-api`, where the same config struct
     // exists but nothing ever consumes this particular field — `assemble_api`
     // deliberately never starts a reporter (`reporter: None` in its
     // `Assembly`; this half receives heartbeats, it does not send them). So
@@ -1006,7 +1011,7 @@ async fn start_native_node_registry(
 /// 🔴 P4 (task's own "phase4-close"): also mirrors `cluster_store_config`'s
 /// own refusal of the in-memory metadata store — `BindingStoreBackendKind::InMemory`
 /// is refused here the same way, for the same reason (one replica's private
-/// state, `--role api` runs as more than one replica), and unconditionally
+/// state, `aenv-api` runs as more than one replica), and unconditionally
 /// for the same reason: nothing at this layer can distinguish "one replica,
 /// alone, safe" from "one of several, silently wrong."
 async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<dyn BindingStore>> {
@@ -1018,7 +1023,7 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
     match config.backend {
         // 🔴 P4 (task's own "phase4-close"): refused unconditionally, the
         // same discipline `cluster_store_config` already applies to
-        // `[orchestrator.store].backend` above -- `--role api` is a
+        // `[orchestrator.store].backend` above -- `aenv-api` is a
         // multi-replica Deployment (`deploy/k8s/base/agentenv-api-deployment.yaml`'s
         // `replicas: 2`), and an in-memory binding store is one replica's
         // private routing table: `Schedule`/`LookupNode`/`RecordAssignment`
@@ -1035,7 +1040,7 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
             anyhow::bail!(
                 "[cluster].node_placement_source = \"native\" needs [binding_store].backend = \
                  \"redis\" (AENV_BINDING_STORE_BACKEND): the in-memory binding store is one \
-                 replica's private routing table, and --role api runs as more than one \
+                 replica's private routing table, and aenv-api runs as more than one \
                  replica. Set AENV_BINDING_STORE_BACKEND=redis, or keep \
                  [cluster].node_placement_source = \"scheduler\""
             );
@@ -1055,7 +1060,7 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
     }
 }
 
-/// The shared-roster fix: wires `--role api`'s Stage A node registry's
+/// The shared-roster fix: wires `aenv-api`'s Stage A node registry's
 /// heartbeat-derived (`observed`) state into Redis so every replica sees
 /// the whole cluster's roster, not just the nodes whose heartbeat happens
 /// to be pinned to it — see `aenv_api::node_registry::redis`'s own module
@@ -1089,7 +1094,7 @@ async fn wire_shared_node_observed_store(
                  [cluster.node_registry_store].backend = \"redis\" \
                  (AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND): the in-memory node registry only \
                  sees the nodes whose heartbeat happens to be pinned to this replica, and \
-                 --role api runs as more than one replica. Set \
+                 aenv-api runs as more than one replica. Set \
                  AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND=redis, or keep \
                  [cluster].node_placement_source = \"scheduler\""
             );
@@ -1229,35 +1234,44 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// 🔴 `--role` no longer selects anything; it confirms. See
-    /// [`ServerRole::confirm`] and `role::confirm_tests` for the arms.
+    /// 🔴 What this binary's command line does *not* accept.
+    ///
+    /// Both groups are absences, and an absence comes back by accident: a flag
+    /// re-added "for compatibility" restores exactly what was removed here.
+    ///
+    /// - `--role` (and `AENV_ROLE`, which no argument reads any more). A
+    ///   manifest still passing it has not been migrated, and starting anyway
+    ///   would hide that.
+    /// - `--setup-only`/`--setup-host`, which are gone from this binary rather
+    ///   than refused by it. `--setup-host` provisions KVM, ublk and host
+    ///   networking; there is nothing here that could use any of it.
     #[test]
-    fn the_api_binary_is_the_api_half() {
+    fn the_api_binary_accepts_neither_a_role_nor_a_provisioning_mode() {
         ApiCli::command().debug_assert();
 
-        let bare = ApiCli::parse_from(["aenv-api"]);
-        assert_eq!(bare.role, None, "no --role means this binary's own half");
-        assert_eq!(
-            ServerRole::Api.confirm_with(bare.role, None).unwrap(),
-            ServerRole::Api
-        );
-        assert!(
-            ServerRole::Api
-                .confirm_with(Some(ServerRole::Node), None)
-                .is_err(),
-            "this binary links no sandbox runtime; it cannot be the node half"
-        );
-
-        // 🔴 The provisioning flags are gone from this binary rather than
-        // refused by it. `--setup-host` provisions KVM, ublk and host
-        // networking; there is nothing here that could use any of it.
+        ApiCli::parse_from(["aenv-api"]);
+        for spelling in ["api", "node", "all"] {
+            assert!(
+                ApiCli::try_parse_from(["aenv-api", "--role", spelling]).is_err(),
+                "--role {spelling} must be refused outright"
+            );
+        }
         assert!(
             ApiCli::try_parse_from(["aenv-api", "--setup-host"]).is_err(),
             "the api binary has no host-provisioning mode to offer"
         );
+        assert!(
+            ApiCli::try_parse_from(["aenv-api", "--setup-only"]).is_err(),
+            "nor a dependency-provisioning one"
+        );
+        assert!(
+            ApiCli::try_parse_from(["aenv-api", "--config", "/dev/null"]).is_ok(),
+            "the control: an argument this binary does declare still parses, so the refusals \
+             above are about the flags and not about parse_from being broken"
+        );
     }
 
-    /// 🔴 The two refusals `--role api` takes on its own configuration, each
+    /// 🔴 The two refusals `aenv-api` takes on its own configuration, each
     /// pushed up rather than assumed.
     ///
     /// Both are read before anything is connected, which is what makes them
@@ -1441,7 +1455,7 @@ mod tests {
     /// exact risk ("every replica answers LookupNode ... out of its own,
     /// mutually invisible table") with nothing enforcing it; before this
     /// guard existed, `build_binding_store` happily built an
-    /// `InMemoryBindingStore` for `--role api` regardless of how many
+    /// `InMemoryBindingStore` for `aenv-api` regardless of how many
     /// replicas were actually running.
     #[tokio::test]
     async fn the_api_half_refuses_a_binding_ledger_no_other_replica_can_see() {
@@ -1529,7 +1543,7 @@ mod tests {
 
     /// 🔴 F2: `[observability.scheduler_report].dual_report_api_endpoint` is
     /// a node-side setting (`cfg.rs`'s own doc: it lets *a node* dual-report
-    /// to api's registry) with no runtime consumer on `--role api` at all
+    /// to api's registry) with no runtime consumer on `aenv-api` at all
     /// (`assemble_api` never starts a reporter). Gating api's own startup on
     /// its own copy of this value — as this function used to, with a hard
     /// `anyhow::bail!` — meant that following the deployment manifest's own
@@ -1558,7 +1572,7 @@ mod tests {
         // rather than using `.unwrap()`/`expect_err`.
         assert!(
             start_native_node_registry(&cluster, "").await.is_ok(),
-            "an empty dual_report_api_endpoint must not stop --role api from starting — this \
+            "an empty dual_report_api_endpoint must not stop aenv-api from starting — this \
              process never consumes it"
         );
 

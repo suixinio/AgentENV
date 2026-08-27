@@ -105,7 +105,7 @@ pub fn regctl_path(deps_path: &Path) -> PathBuf {
 #[derive(Debug, Clone, Config)]
 pub struct AppConfig {
     /// Shared PostgreSQL connection settings for the control plane
-    /// (`--role api` / `--role all`). See `src/pg/mod.rs`.
+    /// (`aenv-api`). See `src/pg/mod.rs`.
     ///
     /// `Option<PgConfig>`, not `#[config(nested)]`, on purpose and for the
     /// same reason as `[backend.oss]`: confique only descends into a struct
@@ -648,7 +648,7 @@ pub struct PgConfig {
     pub dsn: Option<String>,
     /// Per-replica pool cap. Defaults to 8 when unset — see
     /// `src/pg::pool::DEFAULT_MAX_CONNECTIONS` for why that number, and for
-    /// the reminder that `--role api` runs more than one replica: the
+    /// the reminder that `aenv-api` runs more than one replica: the
     /// cluster-wide connection count this deployment produces is
     /// `replica_count * max_connections`, not this number alone, and has to
     /// stay under PostgreSQL's own `max_connections`.
@@ -711,7 +711,7 @@ pub enum PausedRegistryBackendKind {
     /// through the scheduler's gRPC surface.
     ///
     /// Stage C (`docs/proposals/_sd-phase4-stageC-paused-registry.md`)'s own
-    /// backend: `--role api`/`--role all` hold the `paused_sandboxes` table's
+    /// backend: `aenv-api` hold the `paused_sandboxes` table's
     /// connection pool, schema and credentials themselves instead of the
     /// scheduler owning them. Requires `[pg].dsn` and, for the background
     /// reconcile/reclaim loops' D2 Fix A safety net, a heartbeat roster —
@@ -719,9 +719,9 @@ pub enum PausedRegistryBackendKind {
     /// `orchestrator::paused_registry::build_paused_registry`'s own doc.
     ///
     /// 🔴 This name was briefly retired between D11 (which removed
-    /// `--role node`'s own direct connection to this database — an unsafe
+    /// `aenv-node`'s own direct connection to this database — an unsafe
     /// shape for a process that also runs user code) and Stage C (which
-    /// reintroduces the same word for the *`--role api`/`--role all`*
+    /// reintroduces the same word for the *`aenv-api`*
     /// connection, a safe shape because neither role runs user code). A
     /// build from that window refuses this value at startup rather than
     /// silently reinterpreting it either as `local` (losing cluster-wide
@@ -1080,7 +1080,7 @@ pub struct ObservabilitySchedulerReportConfig {
     /// dump endpoint with once heartbeats actually reach it — discovery
     /// alone tells api *that* a node exists, not what it last reported.
     /// Pointing this at `[cluster].api_grpc_addr` (or a Service in front of
-    /// several `--role api` replicas) lets a node report to both scheduler
+    /// several `aenv-api` replicas) lets a node report to both scheduler
     /// (still authoritative — this is additive, not a replacement) and api's
     /// registry, without a second copy of the reporter's retry/backoff/
     /// hot-reload machinery: this target is dialled once, lazily, and is
@@ -1111,7 +1111,7 @@ pub struct ObservabilitySchedulerReportConfig {
     pub dual_report_api_endpoint: String,
 }
 
-/// Where `--role api` resolves a known node's current address for
+/// Where `aenv-api` resolves a known node's current address for
 /// [`crate::node_client::placement::NodePlacement::resolve_node`] and
 /// [`crate::node_client::placement::NodePlacement::node_membership`].
 ///
@@ -1142,7 +1142,7 @@ pub enum NodePlacementSource {
 /// The shared-roster fix: which backend
 /// [`crate::node_registry::registry::AtomicNodeRegistry`]'s
 /// heartbeat-derived ("observed") state — machine info, CPU config,
-/// sandbox roster, `last_seen` — is mirrored into so every `--role api`
+/// sandbox roster, `last_seen` — is mirrored into so every `aenv-api`
 /// replica sees the whole cluster's roster, not just the nodes whose
 /// heartbeat happens to be pinned to it (a node's gRPC heartbeat is a
 /// long-lived HTTP/2 stream through the `agentenv-api` Service, so it
@@ -1157,10 +1157,10 @@ pub enum NodePlacementSource {
 #[serde(rename_all = "snake_case")]
 pub enum NodeRegistryObservedBackendKind {
     /// One replica's own heartbeat shard, lost when it exits and invisible
-    /// to every other replica. Correct only for `--role all`/a single-node
-    /// deployment — `--role all` never even constructs
+    /// to every other replica. Correct only for a single-node
+    /// deployment — the pre-split single process never even constructs
     /// `AtomicNodeRegistry`'s native-placement wiring, so this default
-    /// never matters there; under `--role api` with
+    /// never matters there; under `aenv-api` with
     /// `[cluster].node_placement_source = "native"`, it is the exact split
     /// roster this fix exists to close, and `wire_shared_node_observed_store`
     /// (`src/bin/aenv-api.rs`) refuses to start on it unconditionally — the
@@ -1262,17 +1262,17 @@ pub struct ClusterConfig {
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint_file: String,
-    /// Where `--role node` serves the node sandbox service — the gRPC surface
+    /// Where `aenv-node` serves the node sandbox service — the gRPC surface
     /// the API half drives a machine through (`crate::node_server`).
     ///
     /// 🔴 A second listener rather than a route on the HTTP port, because the
     /// two have different audiences: this one is spoken to only by the API
     /// half, and a deployment has to be able to expose them differently.
-    /// `--role api` and `--role all` never bind it — see `ServerRole` for why
-    /// `all` in particular must not.
+    /// `aenv-api` never binds it: it is the caller of this surface, not a
+    /// server of it.
     #[config(default = "0.0.0.0:8001", env = "AENV_NODE_SERVICE_ADDR")]
     pub node_service_addr: String,
-    /// Where `--role api` serves the data plane's wake-up surface
+    /// Where `aenv-api` serves the data plane's wake-up surface
     /// (`crate::api::grpc`).
     ///
     /// Separate from the HTTP port for the same reason as above: the gateway's
@@ -1450,7 +1450,7 @@ pub struct OrchestratorConfig {
     /// work directories they were running in. See `crate::node_reclaim`.
     ///
     /// 🔴 Three states, and the unset one is not "off". Unset means the role
-    /// decides — `--role node` sweeps, `--role all` does not — because the
+    /// decides — `aenv-node` sweeps, the pre-split single process does not — because the
     /// sweep is only sound while "the previous process on this machine is
     /// gone" holds, and that is a property of the deployment rather than of
     /// the code. A DaemonSet with `maxSurge: 0` guarantees it; a developer's
@@ -1502,14 +1502,14 @@ impl MetadataStoreBackendKind {
 }
 
 /// Task's own "D3": which [`crate::binding_store::BindingStore`]
-/// implementation `--role api` constructs. Mirrors
+/// implementation `aenv-api` constructs. Mirrors
 /// [`MetadataStoreBackendKind`]'s two-value shape, but the two are not
 /// interchangeable — see [`BindingStoreConfig`]'s own doc comment.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingStoreBackendKind {
     /// A single replica's own routing table, lost when it exits. Correct
-    /// only for `--role all`/a single-node deployment — the whole point of
+    /// only for a single-node deployment — the whole point of
     /// the Redis backend is letting gateway read bindings without asking
     /// any particular api replica, which an in-memory table cannot do.
     InMemory,
@@ -1525,8 +1525,8 @@ pub enum BindingStoreBackendKind {
 /// [`AppConfig::binding_store`]'s own doc comment.
 #[derive(Debug, Config, Clone)]
 pub struct BindingStoreConfig {
-    /// The default matches `--role all`/a single-node deployment; a
-    /// multi-replica `--role api` deployment must set this to `"redis"` or
+    /// The default matches a single-node deployment; a
+    /// multi-replica `aenv-api` deployment must set this to `"redis"` or
     /// every replica answers `LookupNode`/reconciles heartbeats out of its
     /// own, mutually invisible table.
     #[config(default = "in_memory", env = "AENV_BINDING_STORE_BACKEND")]
@@ -1619,7 +1619,7 @@ pub struct OrchestratorStoreConfig {
     /// per-process ledger, which reports nothing and simply forgets other
     /// replicas' sandboxes.
     ///
-    /// The default is what `--role all` and `--role node` want. `--role api`
+    /// The default is what `aenv-node` want. `aenv-api`
     /// refuses to start with it rather than starting a replica whose ledger
     /// nobody else can see.
     #[config(default = "in_memory", env = "AENV_ORCHESTRATOR_STORE_BACKEND")]
@@ -2911,7 +2911,7 @@ mod tests {
                 .binding_store
                 .backend,
             BindingStoreBackendKind::InMemory,
-            "the safe, --role all-compatible default must stand when nothing overrides it"
+            "the safe, single-process-compatible default must stand when nothing overrides it"
         );
 
         std::env::set_var("AENV_BINDING_STORE_BACKEND", "redis");
@@ -4915,7 +4915,7 @@ endpoint = "http://second:9000"
     /// 🔴 No deployment manifest declares a node-service gate nothing reads.
     ///
     /// `AENV_NODE_SERVICE_ENABLED` was a seam for a design this tree decided
-    /// against: letting `--role all` serve the node sandbox service. Nothing in
+    /// against: letting the pre-split single process serve the node sandbox service. Nothing in
     /// the Rust tree ever read it, and there is no longer a role that could:
     /// `aenv-node` always serves the node sandbox service and `aenv-api` never
     /// does, so setting the variable could not change behaviour even in
@@ -5012,7 +5012,7 @@ endpoint = "http://second:9000"
                     !manifest_sets(&contents, VAR),
                     "{} sets {VAR}. No AgentENV process reads it, so this buys a serial \
                      DaemonSet roll across the fleet and changes nothing. Serving the node \
-                     sandbox service is what `--role node` is for",
+                     sandbox service is what `aenv-node` is for",
                     path.display()
                 );
                 if sample.is_none() && contents.contains('\n') {

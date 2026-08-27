@@ -28,8 +28,8 @@ pub enum SandboxLaunchSource {
     /// # 🔴 The unresolved counterpart to [`Self::Image`]
     ///
     /// `Image` above carries a `regctl`-resolved local path — what a
-    /// machine-local cold create (`--role all` / `--role node`) already has by
-    /// the time it builds a launch source. `--role api` has no `regctl`, so
+    /// machine-local cold create (`aenv-node`) already has by
+    /// the time it builds a launch source. `aenv-api` has no `regctl`, so
     /// `sandboxes_cold_post` cannot produce that variant at all when
     /// `!role.runs_sandbox_runtime()`; this is what it builds instead. It
     /// carries only what is known without an image resolver: the reference
@@ -56,7 +56,7 @@ pub enum SandboxLaunchSource {
     /// rootfs overlaybd `image.json` files, and returns a lease pinning all of
     /// it in this process's local artifact cache. That is exactly right for a
     /// process that is about to boot a Firecracker VM from those bytes, and
-    /// pure waste for one that is not: `--role api` hands the create to a node
+    /// pure waste for one that is not: `aenv-api` hands the create to a node
     /// over gRPC, and `RemoteSandboxBackendFactory::build_from_snapshot` reads
     /// only `record.id`, the serialized catalog row and `record.resources`
     /// back out of the `RunnableSnapshot` — the manifest, the lease and every
@@ -92,7 +92,7 @@ pub enum SandboxLaunchSource {
 ///   whose expiry index and whose eviction loop all live in the API half.
 ///
 /// One process answered both the same way and nothing noticed, because in a
-/// `--role all` server the second sender does not exist. Split the halves apart
+/// the pre-split single process server the second sender does not exist. Split the halves apart
 /// and it does: the API half sent "you do not own this deadline", the node read
 /// "use your own default", and `[orchestrator].default_sandbox_timeout_secs`
 /// then paused a running VM out from under an owner that went on reporting it

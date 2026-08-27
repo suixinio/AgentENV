@@ -7,7 +7,7 @@
 //! `building`/`waiting` holds its template shut until something ends it, and
 //! this is that something.
 //!
-//! 🔴 A cluster-wide singleton, not "every `--role api` replica runs its own
+//! 🔴 A cluster-wide singleton, not "every `aenv-api` replica runs its own
 //! copy". Go had exactly one `scheduler` process ever running this loop;
 //! Rust is N replicas. `src/pg::election::spawn_singleton_task` — PostgreSQL
 //! session-scoped advisory locks, `AdvisoryLockKey::CatalogBuildReaper`,

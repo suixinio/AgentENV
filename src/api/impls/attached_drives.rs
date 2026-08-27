@@ -31,7 +31,7 @@ struct PendingAttachedDrive {
 ///
 /// Everything here is pure input validation — drive id shape, mount path
 /// shape, sub-path shape, uniqueness, `diskSizeMB`'s bounds — and needs no
-/// registry access. `sandboxes_cold_post` on `--role api` cannot resolve an
+/// registry access. `sandboxes_cold_post` on `aenv-api` cannot resolve an
 /// image (no `regctl`), but it can and must still run these same checks
 /// before it ever asks a node to: a caller sending a malformed drive should
 /// get a 400 from the machine it talked to, not a registry round trip on
@@ -154,7 +154,7 @@ pub async fn resolve_attached_drives(
     Ok(resolved)
 }
 
-/// The `--role api` counterpart of [`resolve_attached_drives`]: validates the
+/// The `aenv-api` counterpart of [`resolve_attached_drives`]: validates the
 /// same way, but leaves every drive's image reference unresolved for the node
 /// that will build the sandbox to resolve instead.
 ///

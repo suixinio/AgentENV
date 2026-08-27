@@ -1,9 +1,8 @@
-//! A per-process PostgreSQL connection pool for the control plane
-//! (`--role api` / `--role all`).
+//! A per-process PostgreSQL connection pool for the control plane (`aenv-api`).
 //!
-//! `--role node` must never build one of these — see
-//! [`crate::role::ServerRole::check_pg_dsn`], enforced in `src/bin/aenv-node.rs`
-//! before any role-specific assembly runs.
+//! `aenv-node` must never build one of these, and cannot: it does not link this
+//! crate. It also refuses to start with `[pg].dsn` configured at all — see
+//! `refuse_configured_pg_dsn` in `crates/aenv-node/src/bin/aenv-node.rs`.
 
 use std::time::Duration;
 
@@ -15,7 +14,7 @@ use crate::cfg::PgConfig;
 
 /// Per-replica pool cap used when `[pg].max_connections` is unset.
 ///
-/// 🔴 `--role api` runs more than one replica, and every replica builds its
+/// 🔴 `aenv-api` runs more than one replica, and every replica builds its
 /// own pool independently — there is no cluster-wide coordination over how
 /// many connections exist, only over how many *this process* opens. The
 /// cluster-wide total this deployment produces is therefore

@@ -18,7 +18,6 @@ use crate::orchestrator::{
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
-use crate::role::ServerRole;
 use crate::sandbox::mock::{MockAction, MockBackendFactory, MockBehavior, MockOperation};
 use crate::sandbox::{
     PausedSandboxState, RuntimeArtifactSet, SandboxNetworkPolicy, SandboxRuntimeInfo,
@@ -39,7 +38,7 @@ async fn service_with(
 ) -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         DisabledSandboxPersister,
@@ -69,7 +68,7 @@ async fn service_with_catalog() -> (
 ) {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -475,7 +474,7 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
 
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         HalfAnswering(InMemoryMetadataStore::new()),
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -638,7 +637,7 @@ async fn the_listing_reports_the_incarnation_the_handle_is_running() {
     crate::logging::init_for_tests();
     let drifted = Arc::new(std::sync::Mutex::new(Vec::new()));
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         Drifting {
             inner: MockBackendFactory::new(),
@@ -690,7 +689,7 @@ async fn a_sandbox_whose_handle_is_busy_is_still_reported() {
     crate::logging::init_for_tests();
     let behavior = Arc::new(MockBehavior::new());
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         DisabledSandboxPersister,
@@ -923,9 +922,9 @@ async fn a_create_uses_the_id_the_caller_chose() {
 /// which of the two refusal messages came back. A string match cannot tell
 /// "the catalog was consulted and refused" from "the catalog was never asked
 /// in the first place" once the wording changes — and it will: Phase 4's own
-/// direction is `--role node` ending up with no catalog access at all, at
+/// direction is `aenv-node` ending up with no catalog access at all, at
 /// which point this fallback is deleted outright and the refusal becomes
-/// something like "no catalog access on `--role node`", which still contains
+/// something like "no catalog access on `aenv-node`", which still contains
 /// the substring "catalog" and would keep a string-matching assertion green
 /// over behaviour that no longer exists. A call count does not have that
 /// blind spot: it reads zero the moment nothing calls `get` any more,
@@ -977,7 +976,7 @@ async fn a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup() {
 ///
 /// 🔴 Proven with `MockSnapshotCatalog::get_calls()` — see the skip test
 /// above's doc for why a message match on "catalog" cannot be trusted to
-/// keep detecting this once `--role node` stops holding a catalog at all.
+/// keep detecting this once `aenv-node` stops holding a catalog at all.
 #[tokio::test]
 async fn a_snapshot_source_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
     let (_orchestration, service, catalog) = service_with_catalog().await;
@@ -1209,7 +1208,7 @@ async fn a_base_snapshot_ref_matching_the_records_alias_is_accepted() {
 /// 🔴 Proven with `MockSnapshotCatalog::get_calls()` — see
 /// `a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup`'s doc for
 /// why a message match on "catalog" cannot be trusted to keep detecting this
-/// once `--role node` stops holding a catalog at all.
+/// once `aenv-node` stops holding a catalog at all.
 #[tokio::test]
 async fn a_base_snapshot_ref_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
     let (orchestration, mut service, catalog) = service_with_catalog().await;
@@ -2137,7 +2136,7 @@ async fn a_resume_whose_records_could_not_be_read_is_not_an_absence() {
     let store = FlakyRecords::new();
     let breaker = store.reads_fail.clone();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         store,
         MockBackendFactory::new(),
         DisabledSandboxPersister,
@@ -2306,7 +2305,7 @@ async fn service_with_persister() -> (
     crate::logging::init_for_tests();
     let persister = RecordingPersister::default();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         persister.clone(),
@@ -2350,7 +2349,7 @@ async fn staging_service() -> StagingHarness {
     let behavior = Arc::new(MockBehavior::new());
     behavior.make_captures_stageable();
     let orchestrator = Orchestrator::new(
-        ServerRole::All,
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         persister,
@@ -2871,7 +2870,7 @@ async fn a_failed_pause_says_whether_the_sandbox_survived_it() {
         crate::logging::init_for_tests();
         let behavior = Arc::new(crate::sandbox::mock::MockBehavior::new());
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             MockBackendFactory::with_behavior(Arc::clone(&behavior)),
             DisabledSandboxPersister,
@@ -2993,7 +2992,7 @@ async fn a_pause_for_a_superseded_run_is_refused_without_condemning_the_sandbox(
 /// RPC is reopened through the `Resume` RPC, under a run the caller claimed.
 ///
 /// 🔴 Both halves driven through the wire types rather than through the
-/// orchestrator, because that is the pair `--role api` uses and each was
+/// orchestrator, because that is the pair `aenv-api` uses and each was
 /// served in a different change. Nothing else in this file pauses through the
 /// RPC, so nothing else would notice a `Pause` that answered plausibly and left
 /// no record for a `Resume` to find.

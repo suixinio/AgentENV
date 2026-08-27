@@ -25,7 +25,7 @@
 //! the same decode path that reads a persisted one.
 //!
 //! The handle itself stays a handle: `paused_state` remains `#[serde(skip)]`
-//! and remains node-local. Under `--role api` there is no backend factory to
+//! and remains node-local. Under `aenv-api` there is no backend factory to
 //! turn the reference back into one, and there should not be: the reference
 //! travels to the node that owns the bytes and is decoded there.
 
@@ -57,7 +57,7 @@ pub struct PausedStateRef {
     /// never sees an artifact root — `pause_sandbox_inner` allocates it from
     /// the persister and hands it straight to the backend — and both in-tree
     /// factories read the location out of the encoded state itself and ignore
-    /// the argument when decoding. Under `--role api` the directory the node
+    /// the argument when decoding. Under `aenv-api` the directory the node
     /// named travels *inside* `state`, because `RemotePausedState` puts it
     /// there along with the machine it is on. Whoever needs it at this level
     /// has to supply it; until then it decodes as `None`, which
@@ -238,8 +238,8 @@ impl StoredSandboxRecord {
 
     /// The metadata, with the paused-state handle left empty.
     ///
-    /// Callers under `--role all` restore the handle from their own factory;
-    /// callers under `--role api` pass [`StoredSandboxRecord::paused_state_ref`]
+    /// Callers under the pre-split single process restore the handle from their own factory;
+    /// callers under `aenv-api` pass [`StoredSandboxRecord::paused_state_ref`]
     /// to the node that owns the bytes and let it decode there.
     pub fn into_metadata(self) -> SandboxMetadata {
         self.metadata

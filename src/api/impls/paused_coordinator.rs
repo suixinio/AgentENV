@@ -161,7 +161,7 @@ pub enum StaleReleaseOutcome {
 ///
 /// A pause that could not reach the registry and a pause that had nothing to
 /// register both end with no row, and for months they also ended with the same
-/// silent `None` out of the same `?`. That is how `--role api` came to record
+/// silent `None` out of the same `?`. That is how `aenv-api` came to record
 /// nothing at all without anybody noticing: every pause it performs takes the
 /// second branch, which said nothing, and the empty table was indistinguishable
 /// from a cluster where nobody had paused anything.
@@ -223,7 +223,7 @@ enum Unrecorded {
     /// There is no cluster registry, so there is nothing a published snapshot
     /// could be referenced by — and nothing was published.
     ///
-    /// 🔴 The `--role node` case, and `--role all` with
+    /// 🔴 The `aenv-node` case, and the pre-split single process with
     /// `paused_registry.backend = "local"`. Both wire in
     /// [`DisabledPausedSandboxRegistry`](crate::orchestrator::DisabledPausedSandboxRegistry),
     /// whose `begin_pause` and `complete_pause` are no-ops — but the
@@ -442,7 +442,7 @@ impl PausedSandboxCoordinator {
         // pause. The two are the same on every role that runs its own
         // sandboxes, and `holding_node` is `None` there precisely because a
         // local capture has nothing to say about a machine other than this one
-        // (`PausedSandboxState::holding_node_id`). They part on `--role api`,
+        // (`PausedSandboxState::holding_node_id`). They part on `aenv-api`,
         // and the wrong one of them costs the sandbox:
         //
         // - `publishing` and `local_only` have no copy in shared storage, so
@@ -2061,7 +2061,7 @@ mod tests {
         }
     }
 
-    /// 🔴 The leak `--role node` ran into, stated as the one question that
+    /// 🔴 The leak `aenv-node` ran into, stated as the one question that
     /// separates the two halves: is there anything that could reference what
     /// this pause is about to upload?
     ///
@@ -2071,7 +2071,7 @@ mod tests {
     /// all: the journal below is not empty, it holds the cluster-backed half's
     /// upload and commit, so a fake that was never wired up would fail the
     /// assertion before it could pass the negative one. And it is what pins the
-    /// rollback target: the cluster-backed half here *is* `--role all` with the
+    /// rollback target: the cluster-backed half here *is* the pre-split single process with the
     /// central registry, and it uploads, commits, and leaves a row pointing at
     /// what it committed, exactly as before.
     #[tokio::test]
@@ -2132,7 +2132,7 @@ mod tests {
 
     /// The fake's flag is only worth anything if the backend it stands in for
     /// answers the same way. `DisabledPausedSandboxRegistry` is what both
-    /// `--role node` and `--role all` with `paused_registry.backend = "local"`
+    /// `aenv-node` and the pre-split single process with `paused_registry.backend = "local"`
     /// actually wire in, so it is asked here directly, against the same
     /// repository that has just been shown to accept an upload.
     #[tokio::test]
@@ -2368,7 +2368,7 @@ mod tests {
     ///
     /// Both halves run in one round through one coordinator, and differ in
     /// exactly one value — whether the paused state names a machine other than
-    /// this process. The second half is the `--role all` rollback face: a
+    /// this process. The second half is the the pre-split single process rollback face: a
     /// local capture answers `None`, so the row it writes is the same row that
     /// build wrote, byte for byte.
     #[tokio::test]
@@ -2379,13 +2379,13 @@ mod tests {
         let staged_on_a_node = SandboxId::new();
         let captured_here = SandboxId::new();
 
-        // `--role api`: the node staged the bytes and handed back a capture to
+        // `aenv-api`: the node staged the bytes and handed back a capture to
         // commit, so both the holding machine and something to commit are
         // present. That pair is what the early return above no longer catches.
         let remote = coordinator
             .publish(pause_outcome(staged_on_a_node, true, Some("node-203")))
             .await;
-        // `--role all`: captured in this process, so the paused state names no
+        // the pre-split single process: captured in this process, so the paused state names no
         // other machine.
         let local = coordinator
             .publish(pause_outcome(captured_here, true, None))
@@ -2468,7 +2468,7 @@ mod tests {
             .expect("publish left a row behind")
             .generation;
 
-        // `--role api`: the resume claim landed on a machine, and the backend
+        // `aenv-api`: the resume claim landed on a machine, and the backend
         // that drove it knows which one.
         coordinator
             .mark_sandbox_running(
@@ -2478,7 +2478,7 @@ mod tests {
                 Some("node-203".to_string()),
             )
             .await;
-        // `--role all`: the backend ran in this process, so it has nothing to
+        // the pre-split single process: the backend ran in this process, so it has nothing to
         // report but `None` — which this process's own identity answers for.
         coordinator
             .mark_sandbox_running(resumed_here, ExecutionId::new(), None, None)

@@ -420,7 +420,7 @@ pub async fn admit_read_side(
 /// store.
 ///
 /// 🔴 This is the structural fix for the CrashLoopBackOff
-/// [`admit_read_side`] used to cause on `--role api`. That role's replicas
+/// [`admit_read_side`] used to cause on `aenv-api`. That role's replicas
 /// each hold their own `MirrorBacklog` on `$AENV_HOME`, which is an
 /// `emptyDir` there — so every fresh replica's [`MirrorBacklog::recorded_read_side`]
 /// answers `None`, [`admit_read_side_with_confirmation`] reads that as "this
@@ -482,7 +482,7 @@ pub async fn require_read_side_confirmed(
 ///
 /// `shared_confirmation` is `None` for every caller that predates Stage B
 /// (including every test in this module, which keeps calling
-/// [`admit_read_side`] unchanged) and for `--role api`/`--role all` replicas
+/// [`admit_read_side`] unchanged) and for `aenv-api` replicas
 /// with no `[pg]` pool configured: behaviour is then byte-for-byte identical
 /// to before this function existed. When `Some`, the "is this process moving
 /// reads onto PostgreSQL for the first time" question this function's own doc
@@ -1321,7 +1321,7 @@ mod shared_confirmation_tests {
     /// `catalog_migration_state` row, shared (via `Arc`) across as many
     /// "replicas" as a test constructs — each replica in these tests gets its
     /// own, independent, empty `MirrorBacklog` (the node-local half), the same
-    /// way `--role api` replicas each get their own empty `$AENV_HOME`.
+    /// way `aenv-api` replicas each get their own empty `$AENV_HOME`.
     #[derive(Default)]
     struct FakeSharedStore {
         confirmed: AtomicBool,

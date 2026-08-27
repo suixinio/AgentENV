@@ -136,7 +136,7 @@ async fn a_paused_handle_survives_the_store_as_a_reference() {
     assert_eq!(reference.state, serde_json::json!({"vm": "state", "n": 7}));
 
     // The control: the handle itself does not come back, and must not — under
-    // `--role api` there is no factory to rebuild it, and the reference is what
+    // `aenv-api` there is no factory to rebuild it, and the reference is what
     // travels to the node that owns the bytes.
     let read_back = store.get(&id).await.unwrap().unwrap();
     assert!(read_back.paused_state.is_none());
@@ -145,8 +145,8 @@ async fn a_paused_handle_survives_the_store_as_a_reference() {
 /// 🔴 On a shared store the answer is `Remote`, carrying the reference and the
 /// node whose disk the bytes are on — never `NotPaused`.
 ///
-/// A `--role api` replica has no backend factory and should not have one; it
-/// forwards this. A `--role all` process decodes it with its own. Both need to
+/// A `aenv-api` replica has no backend factory and should not have one; it
+/// forwards this. A the pre-split single process process decodes it with its own. Both need to
 /// be told which of those they are looking at, and `Option<Arc<dyn ..>>` read
 /// through `get` cannot tell them.
 #[tokio::test]

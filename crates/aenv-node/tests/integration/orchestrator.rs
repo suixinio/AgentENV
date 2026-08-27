@@ -6,7 +6,6 @@ use aenv_node::orchestrator::{
     InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxExpiry,
     SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
-use aenv_node::role::ServerRole;
 use aenv_node::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use aenv_node::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotSource,
@@ -74,7 +73,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let paused_store = root.path().join("paused-sandboxes");
         let persister = host_file_persister(paused_store.clone());
         let orchestrator = Orchestrator::new(
-            ServerRole::All,
+            aenv_node::sandbox::AccessTokenSeedPolicy::MayGenerate,
             store,
             factory,
             persister,
@@ -173,7 +172,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         drop(orchestrator);
 
         let restarted = Orchestrator::new(
-            ServerRole::All,
+            aenv_node::sandbox::AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             host_file_persister(paused_store),

@@ -73,7 +73,7 @@ pub const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 /// ⚠️ Only the reads are exempt. `POST /sandboxes` creates a sandbox and stays
 /// behind the gate.
 ///
-/// 🔴 **The `/sandboxes` half is dead code on a `--role node` process, and
+/// 🔴 **The `/sandboxes` half is dead code on a `aenv-node` process, and
 /// deleting it is still not this batch's job.** [`super::role_gate`] runs ahead
 /// of this gate and answers both listing routes with 404 there, so the fan-out
 /// this exemption exists for gets 404s from such a node — and because the
@@ -85,7 +85,7 @@ pub const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 /// exemption second**. Deleting it while
 /// `services/gateway/internal/cluster_list.go` can still call
 /// `fetchNodeClusterList` turns every one of those calls into a 403 on nodes
-/// that are still `--role all`, which is the same outage a release earlier.
+/// that are still the pre-split single process, which is the same outage a release earlier.
 /// `a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts`
 /// holds both halves of that in one place.
 ///
@@ -94,7 +94,7 @@ pub const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 /// (`Server.fansOutClusterList`). That is not the same thing as the fan-out
 /// being gone, and it is not yet licence to delete this: the empty value is the
 /// documented rollback position, and in it the fan-out runs exactly as before
-/// and needs this exemption on every `--role all` node. What retires this
+/// and needs this exemption on every the pre-split single process node. What retires this
 /// exemption is deleting `fetchNodeClusterList` — the off position ceasing to
 /// exist — not any deployment happening to have the switch on.
 fn is_exempt(method: &Method, path: &str) -> bool {

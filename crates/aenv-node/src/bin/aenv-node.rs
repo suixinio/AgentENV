@@ -24,7 +24,6 @@ use aenv_node::orchestrator::{
 };
 use aenv_node::overlaybd::OverlaybdP2pRuntime;
 use aenv_node::p2p::P2pTransport;
-use aenv_node::role::ServerRole;
 use aenv_node::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use aenv_node::server_main::{self, spawn_grpc_surface, Assembly, ProcessRuntime};
 use aenv_node::snapshot::SnapshotManager;
@@ -33,23 +32,21 @@ use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
 
-/// The orchestrator a machine-local role assembles: this node's own ledger,
-/// this node's Firecracker, this node's files.
+/// The orchestrator this binary assembles: this node's own ledger, this node's
+/// Firecracker, this node's files.
 type LocalOrchestrator =
     Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, FileBackedSandboxPersister>;
 
-/// 🔴 `--role` is accepted and checked, not obeyed. See
-/// [`ServerRole::confirm`]: this binary *is* the node half, because it is the
-/// one that links a sandbox runtime, and a `--role api` here names the other
-/// binary rather than changing what this one does.
+/// 🔴 No `--role`. This binary *is* the node half, because it is the one that
+/// links a sandbox runtime; `aenv-api` is the other. There was a `--role` flag
+/// (and an `AENV_ROLE` environment variable) through the transition, accepted
+/// and checked rather than obeyed, so that manifests written for the
+/// single-process image kept starting. Nothing passes it any more — see
+/// `deploy/k8s/base/` — and a flag that can only be confirmed is a flag that
+/// cannot select anything.
 #[derive(Debug, Parser)]
 #[command(name = "aenv-node")]
 struct NodeCli {
-    /// Which half of the split this process runs. Only `node` is accepted
-    /// here; also read from AENV_ROLE.
-    #[arg(long, value_enum)]
-    role: Option<ServerRole>,
-
     /// Run setup/provisioning only, then exit.
     #[arg(long)]
     setup_only: bool,
@@ -88,7 +85,7 @@ struct NodeCli {
 /// nothing about `local_store`.
 const NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The machine-local runtime a sandbox-running role owns: the two P2P pieces it
+/// The machine-local runtime this binary owns: the two P2P pieces it
 /// holds by value, the process-wide Firecracker pool and ublk daemon it
 /// reaches through their globals, and a handle onto the snapshot manager kept
 /// only so shutdown can close its durable mirror-backlog store.
@@ -182,13 +179,8 @@ impl ProcessRuntime for NodeRuntime {
     }
 }
 
-/// Everything a machine-local role builds before the question of who owns a
-/// paused sandbox comes up.
-///
-/// 🔴 `--role node` and `--role all` share this, deliberately: it is the part
-/// where the two are *supposed* to be identical, and a second copy of it would
-/// be a second thing to keep in step with the first. What the two roles differ
-/// on comes after, in `assemble_node` and `assemble_all`.
+/// Everything this binary builds before the question of who owns a paused
+/// sandbox comes up.
 struct NodeCore {
     orchestrator: Arc<LocalOrchestrator>,
     snapshot_manager: Arc<SnapshotManager>,
@@ -244,7 +236,6 @@ async fn async_main() -> anyhow::Result<()> {
     agentenv_observability::init_prometheus_recorder()?;
 
     let cli = NodeCli::parse();
-    let role = ServerRole::Node.confirm(cli.role)?;
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         aenv_node::cfg::ConfigManager::init_global_from_path(config_path)?
     } else {
@@ -252,18 +243,13 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
-    // Before either provisioning path runs, not after: the point of the check
-    // is that the process was pointed at the wrong workload, and provisioning a
-    // host on the way to finding that out helps nobody.
-    role.check_setup_flags(cli.setup_only, cli.setup_host)?;
-
-    // 🔴 Security invariant, and now a belt over a brace. This binary cannot
-    // link `sqlx` at all — `cargo tree -p aenv-node -e normal | grep sqlx` is
-    // empty, which is a stronger statement than any check could make. What this
-    // still catches is *configuration*: an operator who leaves `[pg].dsn` in a
-    // node's ConfigMap has put a database credential on a machine that runs
-    // user code, whether or not anything in the process could use it.
-    role.check_pg_dsn(config.pg.as_ref().and_then(aenv_node::cfg::PgConfig::dsn))?;
+    // 🔴 Security invariant, and a belt over a brace. This binary cannot link
+    // `sqlx` at all — `cargo tree -p aenv-node -e normal | grep sqlx` is empty,
+    // which is a stronger statement than any check could make. What this still
+    // catches is *configuration*: an operator who leaves `[pg].dsn` in a node's
+    // ConfigMap has put a database credential on a machine that runs user code,
+    // whether or not anything in the process could use it.
+    refuse_configured_pg_dsn(config.pg.as_ref().and_then(aenv_node::cfg::PgConfig::dsn))?;
 
     if cli.setup_only {
         aenv_node::setup::ensure_provisioning(config).await?;
@@ -277,24 +263,51 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!(target: "agentenv", role = role.as_str(), "assembling server");
+    info!(target: "agentenv", "assembling the node half");
     let assembly = assemble_node(config).await?;
-    server_main::serve(role, config, assembly).await
+    server_main::serve(config, assembly).await
+}
+
+/// Refuses a node that has been handed a PostgreSQL DSN.
+///
+/// `dsn` is [`aenv_node::cfg::PgConfig::dsn`]'s output — already trimmed,
+/// already `None` for blank — so this only ever sees a value here when one is
+/// genuinely configured.
+///
+/// A hard startup failure rather than a warning, for the same reason
+/// `crates/aenv-api/src/snapshot/repository/backends/central/mod.rs` gives for
+/// the snapshot catalog and `PausedRegistryBackendKind::Postgres`
+/// (`src/cfg.rs`) already enforces for the paused registry: database
+/// credentials, the connection budget and the schema are the deciding half's
+/// business, never the machines that run user code.
+///
+/// 🔴 Not made redundant by the crate split, which is why it outlived the role
+/// enum's `check_pg_dsn` it was lifted from. The dependency graph proves this
+/// binary *cannot use* a DSN; it says nothing about one being *present* on the
+/// machine. A
+/// `[pg].dsn` left in a node's ConfigMap would otherwise sit there being
+/// ignored — a database credential on a host that runs user code, and an
+/// operator who believes the node is configured.
+fn refuse_configured_pg_dsn(dsn: Option<&str>) -> anyhow::Result<()> {
+    if dsn.is_none() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "aenv-node must not be configured with [pg].dsn: database credentials, the connection \
+         budget and the schema belong to the deciding half (aenv-api), never to a machine that \
+         runs user code. This binary cannot even link a PostgreSQL client, so the setting does \
+         nothing here but leave a credential on a host that runs user code. Remove [pg] from \
+         this node's configuration, or from whatever file AENV_CONFIG_OVERLAY_PATH names for it"
+    )
 }
 
 /// Brings up everything this machine needs to run sandboxes.
 ///
-/// 🔴 Took a `role` and a `pg_pool` while `--role all` shared it. Both are
-/// gone: this binary is one role, and it holds no PostgreSQL pool — which is
+/// 🔴 Took a `role` and a `pg_pool` while one binary was three roles. Both are
+/// gone: this binary is one half, and it holds no PostgreSQL pool — which is
 /// now a fact about which crates it links rather than an argument it is
 /// trusted to pass `None` for.
 async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
-    let role = ServerRole::Node;
-    // Both roles that reach here run the machine and report it as one; the API
-    // half never does, and never calls this.
-    debug_assert!(role.runs_sandbox_runtime());
-    debug_assert!(role.sends_heartbeats());
-
     aenv_node::privileges::require_runtime_capabilities()?;
     aenv_node::privileges::clear_ambient_capabilities()?;
 
@@ -304,7 +317,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // VMM is still running inside it. The sweep is sound only while this
     // process holds nothing on the machine, and that window is widest here.
     // See `src/node_reclaim/` for the whole argument.
-    aenv_node::node_reclaim::run(role, config).await;
+    aenv_node::node_reclaim::run(config).await;
 
     let identity = NodeIdentity::from_config(&config.node_identity);
     // `identity` is moved into the observability service below; the registry
@@ -342,16 +355,16 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
             as Arc<dyn aenv_node::snapshot::SnapshotArtifactAdvertiser>
     });
     // 🔴 `None` for the PostgreSQL parts, unconditionally and by construction:
-    // this half never holds a `[pg]` pool (see `aenv_node::pg`'s own module
-    // doc and `ServerRole::check_pg_dsn`), so there is nothing for it to build
-    // a central catalog out of.
+    // this half never holds a `[pg]` pool (see `refuse_configured_pg_dsn`
+    // above, and the dependency graph it is a belt over), so there is nothing
+    // for it to build a central catalog out of.
     let snapshot_backend = aenv_node::snapshot::repository::backends::build_snapshot_backend(
         aenv_node::snapshot::repository::backends::storage::build_node_storage(
             config,
             snapshot_p2p_transport,
         )?,
         None,
-        role,
+        aenv_node::snapshot::repository::backends::CentralCatalogUse::Never,
     )
     .await?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(
@@ -403,7 +416,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // inside the orchestrator. This is the process that has one.
     let image_refs = aenv_node::image::local_runtime_image_refs();
     let orchestrator =
-        Orchestrator::with_file_backed_store_and_factory(role, factory, image_refs).await?;
+        Orchestrator::with_file_backed_store_and_factory(factory, image_refs).await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -436,7 +449,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     // Cloned before `snapshot_manager` moves into `NodeCore` below: the
     // shutdown path needs its own handle to close the manager's stores, kept
     // separately from whatever the caller does with the `NodeCore` field (move
-    // it into `ApiImpl`, in every role that reaches this function today).
+    // it into `ApiImpl`, which is what its one caller does).
     let runtime = NodeRuntime {
         overlaybd_p2p,
         p2p_transport,
@@ -455,13 +468,14 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     })
 }
 
-/// `--role node`: the half that runs sandboxes, and decides nothing about who
+/// `aenv-node`: the half that runs sandboxes, and decides nothing about who
 /// owns them.
 ///
-/// What it drops relative to `all` is one thing, arrived at from one rule: a
-/// node executes, the API decides. So the cluster paused registry, the three
-/// startup passes over it and the four upkeep tasks that keep this node's claim
-/// on a paused sandbox alive are all gone; the API half holds those records now.
+/// What it drops relative to the pre-split single process is one thing, arrived
+/// at from one rule: a node executes, the API decides. So the cluster paused
+/// registry, the three startup passes over it and the four upkeep tasks that
+/// keep this node's claim on a paused sandbox alive are all gone; the API half
+/// holds those records now.
 ///
 /// 🔴 What that leaves is a node that never takes a lease it will not renew.
 /// The registry it wires in is the disabled one regardless of configuration,
@@ -476,30 +490,25 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
 /// - the **node gRPC service** the API half drives it through is bound by
 ///   `spawn_grpc_surface` before `ApiImpl` takes the snapshot manager, and
 ///   returned as `grpc: Some(..)`;
-/// - the **RoleGate** that stops user-facing REST being served from this port
-///   is attached by `server::new(api_impl, role)` (`src/api/role_gate.rs`),
-///   which is what `debug_assert!(!role.serves_user_facing_rest())` is naming;
+/// - the **user-REST gate** that stops the `sandboxes`/`snapshots`/`templates`
+///   route groups being served from this port is attached by
+///   `server::new(api_impl)` (`src/api/role_gate.rs`), off
+///   `ApiImpl::owns_sandboxes`, which the `ResumeWiring::node_local` below
+///   makes `false`;
 /// - the **startup reclaim of host leftovers** already ran, inside
-///   `assemble_node_core`, which is what
-///   `debug_assert!(role.reclaims_host_leftovers_at_startup())` is naming.
+///   `assemble_node_core`.
 ///
-/// So this role is driven, and what it cannot do is now a property of the API
-/// half rather than of this one — see the list on [`assemble_api`].
+/// So this half is driven, and what it cannot do is now a property of the API
+/// half rather than of this one — see the list on `assemble_api`
+/// (`crates/aenv-api/src/bin/aenv-api.rs`).
 async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
-    let role = ServerRole::Node;
     // 🔴 This binary has no `build_pg_pool` to call and no pool type to name.
-    // `--role node` must never hold PostgreSQL credentials — see `src/pg/mod.rs`'s own doc
-    // comment — and this is that invariant enforced by construction here,
-    // not only by `ServerRole::check_pg_dsn` at startup.
+    // A node must never hold PostgreSQL credentials — see
+    // `crates/aenv-api/src/pg/mod.rs`'s own doc comment — and this is that
+    // invariant enforced by construction here, not only by
+    // `refuse_configured_pg_dsn` at startup.
     let core = assemble_node_core(config).await?;
 
-    debug_assert!(!role.arbitrates_paused_sandbox_ownership());
-    // Both are `role`'s to decide and both are read from it below rather than
-    // spelled out again: the user-facing REST surface is refused by the layer
-    // `server::new` attaches, and the host sweep already ran inside
-    // `assemble_node_core`.
-    debug_assert!(!role.serves_user_facing_rest());
-    debug_assert!(role.reclaims_host_leftovers_at_startup());
     let configured_backend = config.orchestrator.paused_registry.backend;
     let cluster_registry_configured =
         !matches!(configured_backend, PausedRegistryBackendKind::Local);
@@ -521,13 +530,12 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         // disabled registry is wired in regardless of configuration.
         //
         // Backward: whatever *the previous process on this machine* claimed
-        // while it ran as `--role all` stays claimed. `--role all` calls
-        // `release_stale_node_holdings` at startup to hand those back; this
-        // role does not, and deliberately — releasing rows by node identity is
-        // a statement about who owns a paused sandbox, which is the one thing
-        // `ServerRole::Node` answers `false` to
-        // (`arbitrates_paused_sandbox_ownership`). Putting it back here would
-        // reintroduce exactly the split this role exists to end.
+        // while it ran the pre-split single-process image stays claimed. That
+        // process called `release_stale_node_holdings` at startup to hand those
+        // back; this binary does not, and deliberately — releasing rows by node
+        // identity is a statement about who owns a paused sandbox, which is the
+        // one thing this half does not make. Putting it back here would
+        // reintroduce exactly the split this half exists to end.
         //
         // The successor for it is the API half's reconciliation, which has a
         // proof this process does not: it can see from the scheduler that this
@@ -536,10 +544,11 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         warn!(
             target: "agentenv",
             configured = ?configured_backend,
-            "--role node ignores the configured paused-sandbox registry: cluster-wide records \
+            "aenv-node ignores the configured paused-sandbox registry: cluster-wide records \
              belong to the API half. Paused sandboxes stay resumable on this node, and this \
              process claims nothing new — but anything this machine was holding from a previous \
-             --role all process is not released by this one and stays held until its lease lapses."
+             single-process AgentENV is not released by this one and stays held until its lease \
+             lapses."
         );
     }
     // `ApiImpl` needs a coordinator either way; this one is wired to a registry
@@ -604,26 +613,32 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         core.observability,
         paused_wiring,
         config.sandbox_proxy.domains.clone(),
-        role,
-        // 🔴 No placement source, and that is the role showing through rather
-        // than an omission: `serves_wake_decisions()` is false here, so nothing
-        // on this process may consult a placement. Handing it one would be
-        // handing it the means to decide something it must not decide.
+        // 🔴 `node_local`, and it carries two facts rather than one. No
+        // placement source, which is this half showing through rather than an
+        // omission: nothing on this process may consult a placement, because
+        // handing it one would be handing it the means to decide something it
+        // must not decide. And `WakeSite::Local`, which is what
+        // `ApiImpl::runs_sandbox_runtime` reads to know it is in this binary
+        // and not the other — see its own doc.
         ResumeWiring::node_local(&core.identity.id),
     ));
 
     Ok(Assembly {
-        // 🔴 The role is what attaches the RoleGate: the user-facing REST
-        // surface is still compiled in and still routed, and is answered with
-        // 404 on this half. See `src/api/role_gate.rs`.
-        app: server::new(api_impl, role),
+        // 🔴 `server::new` attaches the user-REST gate off the `ApiImpl` above:
+        // the user-facing REST surface is still compiled in and still routed,
+        // and is answered with 404 on this half. See `src/api/role_gate.rs`.
+        app: server::new(api_impl),
         orchestration,
         // 🔴 No upkeep: renewing a lease and reconciling local records against
-        // the cluster are both decisions, and this role takes none.
+        // the cluster are both decisions, and this half takes none.
         upkeep: Vec::new(),
         pg_singleton_tasks: Vec::new(),
         reporter: core.reporter,
         runtime: Some(Box::new(core.runtime)),
+        // 🔴 A node is a placement target, so it withdraws itself from
+        // scheduling before the shutdown pauses start and waits for the cluster
+        // to notice. `aenv-api` passes `false`; see `Assembly`'s own field doc.
+        drains_on_shutdown: true,
         grpc: Some(grpc),
     })
 }
@@ -633,38 +648,55 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// 🔴 `--role` no longer selects anything; it confirms. See
-    /// [`ServerRole::confirm`] and `role::confirm_tests` for the arms.
+    /// 🔴 `--role` is gone, and a manifest that still passes it is stopped at
+    /// the door rather than silently ignored.
+    ///
+    /// clap refuses an unknown `--long` by default, so this is a property of
+    /// *not* having declared the argument — which is exactly the kind of thing
+    /// that comes back by accident when somebody re-adds a flag "for
+    /// compatibility". `AENV_ROLE` gets the same treatment for free: no
+    /// argument reads it, so a leftover environment variable does nothing at
+    /// all. The two are asserted together because the pair is the contract.
     #[test]
-    fn the_node_binary_is_the_node_half() {
+    fn the_node_binary_has_no_role_flag_left() {
         NodeCli::command().debug_assert();
 
-        let bare = NodeCli::parse_from(["aenv-node"]);
-        assert_eq!(bare.role, None, "no --role means this binary's own half");
-
+        NodeCli::parse_from(["aenv-node"]);
         for spelling in ["api", "node", "all"] {
-            let parsed = NodeCli::parse_from(["aenv-node", "--role", spelling]);
-            assert_eq!(
-                parsed.role.unwrap().as_str(),
-                spelling,
-                "every role still parses — it is confirmed, not selected, one layer up"
+            assert!(
+                NodeCli::try_parse_from(["aenv-node", "--role", spelling]).is_err(),
+                "--role {spelling} must be refused outright: a manifest still passing it is a \
+                 manifest that has not been migrated, and starting anyway hides that"
             );
         }
         assert!(
-            NodeCli::try_parse_from(["aenv-node", "--role", "gateway"]).is_err(),
-            "an unknown role is refused at parse time"
+            NodeCli::try_parse_from(["aenv-node", "--config", "/dev/null"]).is_ok(),
+            "the control: an argument this binary does declare still parses, so the refusals \
+             above are about --role and not about parse_from being broken"
         );
+    }
 
-        assert_eq!(
-            ServerRole::Node.confirm_with(bare.role, None).unwrap(),
-            ServerRole::Node
-        );
-        assert!(
-            ServerRole::Node
-                .confirm_with(Some(ServerRole::Api), None)
-                .is_err(),
-            "this binary links a sandbox runtime; it cannot be the api half"
-        );
+    /// 🔴 Both arms of the refusal `async_main` runs before anything is
+    /// assembled, and the reason the check survived the role enum it came from.
+    ///
+    /// The dependency graph already proves this binary cannot *use* a DSN
+    /// (`make check-crate-boundaries`). What it cannot prove is that one is
+    /// not *present*, and a present-but-ignored `[pg].dsn` is a database
+    /// credential sitting on a machine that runs user code.
+    #[test]
+    fn a_configured_pg_dsn_is_refused_and_an_absent_one_is_not() {
+        let error = refuse_configured_pg_dsn(Some("postgres://user:pw@db.internal:5432/agentenv"))
+            .expect_err("a node handed a DSN must not start");
+        let message = format!("{error:#}");
+        assert!(message.contains("[pg].dsn"), "{message}");
+        assert!(message.contains("aenv-node"), "{message}");
+        // 🔴 The credential itself must not be echoed into the process's first
+        // log line by the refusal that exists to keep it off this machine.
+        assert!(!message.contains("pw@"), "{message}");
+
+        // The other arm: no DSN configured at all is the ordinary case, and a
+        // refusal that fired here would stop every node in the fleet.
+        assert!(refuse_configured_pg_dsn(None).is_ok());
     }
 
     /// 🔴 Guards the shutdown bounds `NodeRuntime::shutdown` and `main` are
@@ -673,13 +705,14 @@ mod tests {
     /// — nothing exercises the real graceful-shutdown path under test — so
     /// this scans the source text directly.
     ///
-    /// 🔴 Kept, and kept *here*, through the crate split. What it guards is a
-    /// RocksDB `spawn_blocking` closure outliving the async body and hanging
-    /// the process past `terminationGracePeriodSeconds` — the real defect
-    /// behind "every DaemonSet rollout waits the full hour". That has nothing
-    /// to do with which half this process is, so no dependency graph can prove
-    /// it; and it was only ever observed on a node that had actually run a VM,
-    /// which is this binary.
+    /// 🔴 Kept, and kept *here*, through the crate split and through the
+    /// deletion of the role enum. What it guards is a RocksDB `spawn_blocking`
+    /// closure outliving the async body and hanging the process past
+    /// `terminationGracePeriodSeconds` — the real defect behind "every
+    /// DaemonSet rollout waits the full hour". That has nothing to do with
+    /// which half this process is, so no dependency graph can prove it; and it
+    /// was only ever observed on a node that had actually run a VM, which is
+    /// this binary.
     ///
     /// See [`server_main::RUNTIME_SHUTDOWN_TIMEOUT`]'s doc for why `main`'s call matters —
     /// without it a stuck `spawn_blocking` closure (RocksDB background
@@ -731,18 +764,25 @@ mod tests {
         );
     }
 
-    /// `ServerRole::check_pg_dsn`'s own tests (`src/role.rs`) only exercise
-    /// the pure function directly — none of them can notice if the one call
-    /// site that actually wires it into the running process disappears. That
-    /// call site is the entire enforcement of "a `[pg].dsn` must never reach
-    /// `--role node`": delete it and every test in `src/role.rs` stays green
-    /// while the invariant it guards is gone. Scans this file's own source
-    /// text for the call, the same way
-    /// `only_the_split_roles_bind_a_second_listener` does for
-    /// `spawn_grpc_surface`, so deleting the call site fails a test instead
-    /// of only a future security review.
+    /// 🔴 Kept through the deletion of the role enum, rewritten to match the
+    /// call it now guards.
+    ///
+    /// `refuse_configured_pg_dsn`'s own test just above exercises the pure
+    /// function directly — it cannot notice if the one call site that wires it
+    /// into the running process disappears. That call site is the entire
+    /// enforcement of "a `[pg].dsn` must never reach a node": delete it and
+    /// both arms above stay green while the invariant they describe is gone.
+    ///
+    /// 🔴 And no dependency graph replaces it. `make check-crate-boundaries`
+    /// proves `aenv-node` cannot link `sqlx`; it says nothing about whether a
+    /// DSN in a node's ConfigMap is *refused*. Without this call the setting
+    /// would simply be ignored — a database credential left on a machine that
+    /// runs user code, and an operator who believes the node is configured.
+    ///
+    /// Scans this file's own source text for the call, so deleting the call
+    /// site fails a test instead of only a future security review.
     #[test]
-    fn async_main_actually_calls_check_pg_dsn() {
+    fn async_main_actually_refuses_a_configured_pg_dsn() {
         let source = include_str!("aenv-node.rs");
         let body = |name: &str| {
             let start = source
@@ -765,20 +805,29 @@ mod tests {
             panic!("{name} has no closing brace");
         };
 
+        let async_main = body("async fn async_main() -> anyhow::Result<()>");
         assert!(
-            // 🔴 Matches the call *expression* (`role.check_pg_dsn(`), not the
-            // bare identifier `check_pg_dsn`. This file's own doc comment on
-            // the call site (`See \`aenv_node::pg\` and \`ServerRole::check_pg_dsn\`.`)
-            // contains that bare identifier too — deleting the call while
-            // leaving the comment behind kept a bare-identifier assertion
-            // green, which is exactly backwards for a positive assertion:
-            // a false match here hides the invariant's enforcement going
-            // missing rather than merely giving a false alarm. No comment or
-            // string literal in this file spells the call expression itself.
-            body("async fn async_main() -> anyhow::Result<()>").contains("role.check_pg_dsn("),
-            "async_main no longer calls ServerRole::check_pg_dsn — a [pg].dsn could reach \
-             --role node with nothing left to refuse it, even though src/role.rs's own tests \
-             of the pure function would still report green"
+            // 🔴 Matches the call *expression*, not the bare identifier. The
+            // function's own name appears in comments and in this file's other
+            // test; matching the bare identifier would let somebody delete the
+            // call and keep a mention, and a false match on a *positive*
+            // assertion hides the invariant's enforcement going missing rather
+            // than merely giving a false alarm. `async_main`'s body is the only
+            // place `refuse_configured_pg_dsn(config.` is spelled.
+            async_main.contains("refuse_configured_pg_dsn(config."),
+            "async_main no longer calls refuse_configured_pg_dsn — a [pg].dsn could reach a \
+             node with nothing left to refuse it, even though the pure function's own two arms \
+             would still report green"
+        );
+        // 🔴 The mutation control, in the same test: the scan has to be able to
+        // fail. A `body()` that returned the whole file, or an empty string
+        // that `contains` happened to satisfy, would pass the assertion above
+        // for the wrong reason.
+        assert!(
+            !async_main.contains("refuse_configured_pg_dsn(dsn"),
+            "the scan is reading something other than async_main's body — \
+             `refuse_configured_pg_dsn(dsn` is the definition's own parameter list, which is \
+             outside it"
         );
     }
 }

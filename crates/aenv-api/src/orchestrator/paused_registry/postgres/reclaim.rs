@@ -8,7 +8,7 @@
 //! statements, run as two independent `UPDATE`s in the same transaction --
 //! never folded into one `state IN ('running', 'resuming')` statement. See
 //! their own doc comments in `sql.rs` for why re-merging them reopens the
-//! stuck-forever `resuming` deadlock, worse under N `--role api` replicas
+//! stuck-forever `resuming` deadlock, worse under N `aenv-api` replicas
 //! than under Go's single instance.
 
 use anyhow::anyhow;
@@ -182,7 +182,7 @@ pub async fn reclaim_expired_holdings(
 ///
 /// 🔴 For a `Running` row this only ever matches when `node_id` equals the
 /// row's `origin_node_id` -- which, under the split node/api identity model,
-/// `--role api`'s own identity never is (`origin_node_id` names the real
+/// `aenv-api`'s own identity never is (`origin_node_id` names the real
 /// machine; an api replica's identity is a Pod name). It remains fully
 /// effective for `Resuming` rows this same api replica claimed and never
 /// finished resuming -- see the Stage C report's D1 section for why this is

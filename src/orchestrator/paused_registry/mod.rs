@@ -587,9 +587,9 @@ pub fn log_claim_outcome(
 /// third one does, and the pool, the schema bootstrap and the restart-grace
 /// entry that go with it belong to the deciding half alone — the half that is
 /// allowed to hold database credentials (`src/pg/mod.rs`'s own module doc:
-/// "`--role node` never reaches this module"). Taking the constructor as a
+/// "`aenv-node` never reaches this module"). Taking the constructor as a
 /// trait object is what lets the arm stay here, with its refusal message and
-/// its `--role api` roster guard, while the thing it constructs lives behind
+/// its `aenv-api` roster guard, while the thing it constructs lives behind
 /// the boundary that owns `sqlx`.
 ///
 /// `None` means "this process has no `[pg]` pool", which is what the
@@ -628,19 +628,16 @@ pub trait PostgresPausedRegistryFactory: Send + Sync {
 /// touch either). `postgres` is the database half's own constructor --
 /// see [`PostgresPausedRegistryFactory`] for why this arrives as a trait
 /// object rather than as the `sqlx::PgPool` it used to be. `node_registry` is
-/// `Some` only when `--role api` built a
+/// `Some` only when `aenv-api` built a
 /// real `crate::node_registry::registry::AtomicNodeRegistry`
 /// (`[cluster].node_placement_source = "native"`, `src/bin/aenv-api.rs`'s
-/// `assemble_api`) -- `--role all` never builds one at all.
+/// `assemble_api`) -- the pre-split single process never builds one at all.
 ///
-/// `role` (M1) decides whether a missing `node_registry` is refused: see the
-/// `postgres` arm's own comment.
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
     cluster: &ClusterConfig,
     scheduler_report: &ObservabilitySchedulerReportConfig,
     identity: &NodeIdentity,
-    role: crate::role::ServerRole,
     postgres: Option<&dyn PostgresPausedRegistryFactory>,
     node_registry: Option<Arc<dyn NodeRegistry>>,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
@@ -654,34 +651,29 @@ pub async fn build_paused_registry(
                      catalog, if [pg] is set)",
                 )?;
 
-                // 🔴 M1: the roster requirement is `--role api`'s alone, not
-                // this backend's in general. `role.runs_sandbox_runtime()`
-                // is exactly the distinguishing fact: under `--role all`
-                // this process's own identity already coincides with
-                // `origin_node_id` for everything it runs, so the ordinary
-                // `renew_lease` trait method (this process's own periodic
-                // self-renewal, `spawn_paused_record_upkeep` in
-                // `src/bin/aenv-api.rs`) already covers what D2 Fix A exists
-                // to cover under the split node/api identity model -- see
-                // `postgres::replica_renewal`'s own module doc for the full
-                // argument. Under `--role api` (`runs_sandbox_runtime() ==
-                // false`), that identity never coincides, so a missing
-                // roster really would leave `running` rows with no renewal
-                // path at all -- the exact failure Fix A (commit `151d00b`)
-                // closed for the central/gRPC backend -- and is refused here
-                // exactly as before.
-                if !role.runs_sandbox_runtime() {
-                    node_registry.as_ref().context(
-                        "paused_registry.backend = \"postgres\" requires a heartbeat roster \
-                         source under --role api, which only exists under \
-                         [cluster].node_placement_source = \"native\" -- without it, running \
-                         sandboxes' registry leases have no renewal path and will eventually be \
-                         wrongly reclaimed even while healthy (this is the exact failure Fix A, \
-                         commit 151d00b, closed for the central/gRPC backend). Set \
-                         AENV_NODE_PLACEMENT_SOURCE=native, or keep this backend on \
-                         \"central\"",
-                    )?;
-                }
+                // 🔴 M1: the roster requirement, and it is unconditional now.
+                // It used to be guarded by `!role.runs_sandbox_runtime()`,
+                // because a the pre-split single process process's own identity already
+                // coincided with `origin_node_id` for everything it ran, so
+                // the ordinary `renew_lease` trait method (its own periodic
+                // self-renewal) already covered what D2 Fix A exists to cover
+                // -- see `postgres::replica_renewal`'s own module doc for the
+                // full argument. `aenv-api` is the only caller of this
+                // function that has ever existed, no process links both
+                // halves, and that identity never coincides here: a missing
+                // roster leaves `running` rows with no renewal path at all --
+                // the exact failure Fix A (commit `151d00b`) closed for the
+                // central/gRPC backend.
+                node_registry.as_ref().context(
+                    "paused_registry.backend = \"postgres\" requires a heartbeat roster \
+                     source, which only exists under \
+                     [cluster].node_placement_source = \"native\" -- without it, running \
+                     sandboxes' registry leases have no renewal path and will eventually be \
+                     wrongly reclaimed even while healthy (this is the exact failure Fix A, \
+                     commit 151d00b, closed for the central/gRPC backend). Set \
+                     AENV_NODE_PLACEMENT_SOURCE=native, or keep this backend on \
+                     \"central\"",
+                )?;
 
                 // 🔴 `node_registry` is not consumed here -- it is only
                 // needed by the background reconcile/reclaim/renewal loops
@@ -690,11 +682,10 @@ pub async fn build_paused_registry(
                 // `spawn_pg_singleton_tasks` alongside `build_pg_pool` in
                 // `src/bin/aenv-api.rs`) so their task handles land in the
                 // same buckets every other PostgreSQL-backed background task
-                // already shuts down through. Validated present here
-                // anyway, under `--role api`, so a `postgres` backend that
-                // will fail to start its safety net a few lines later in the
-                // caller is a startup failure discovered too late to
-                // matter, not one avoided.
+                // already shuts down through. Validated present here anyway,
+                // so a `postgres` backend that will fail to start its safety
+                // net a few lines later in the caller is a startup failure
+                // discovered too late to matter, not one avoided.
                 drop(node_registry);
 
                 let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
@@ -989,7 +980,6 @@ mod build_tests {
             &cluster(None),
             &scheduler_report(),
             &identity(),
-            crate::role::ServerRole::Api,
             None,
             None,
         )
@@ -1006,7 +996,6 @@ mod build_tests {
             &cluster(Some("http://scheduler.invalid:9090")),
             &scheduler_report(),
             &identity(),
-            crate::role::ServerRole::Api,
             None,
             None,
         )
@@ -1029,7 +1018,6 @@ mod build_tests {
                     &cluster(endpoint),
                     &scheduler_report(),
                     &identity(),
-                    crate::role::ServerRole::Api,
                     None,
                     None,
                 )
@@ -1050,7 +1038,6 @@ mod build_tests {
             &cluster(None),
             &scheduler_report(),
             &identity(),
-            crate::role::ServerRole::Api,
             None,
             Some(std::sync::Arc::new(NoopNodeRegistry) as std::sync::Arc<dyn NodeRegistry>),
         )
@@ -1097,7 +1084,6 @@ mod build_tests {
                 &cluster(endpoint),
                 &scheduler_report(),
                 &identity(),
-                crate::role::ServerRole::Api,
                 None,
                 None,
             )

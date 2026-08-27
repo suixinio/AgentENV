@@ -160,17 +160,22 @@ mod pg {
     }
 
     /// 🔴 D1's central startup guard, proved with a real (reachable) pool
-    /// this time: under `--role api`, a `postgres` backend still refuses to
-    /// start without a node registry, even once the *other* precondition
+    /// this time: a `postgres` backend still refuses to start without a node
+    /// registry, even once the *other* precondition
     /// (`the_postgres_backend_without_a_pool_is_a_startup_failure`, in
-    /// `build_tests`) is satisfied. M1 narrowed this guard to `--role api`
-    /// specifically -- see
-    /// `the_postgres_backend_under_role_all_does_not_require_a_node_registry`
-    /// below for the role this guard must *not* fire for.
+    /// `build_tests`) is satisfied.
+    ///
+    /// 🔴 Unconditional now. M1 narrowed this guard to `aenv-api`
+    /// specifically, because the pre-split single process's own identity
+    /// coincided with `origin_node_id` for everything it ran and `renew_lease`
+    /// already covered what D2 Fix A exists to cover; a sibling test pinned
+    /// that exemption. No process is both halves any more, `aenv-api` is
+    /// `build_paused_registry`'s only caller, and the exemption's test went
+    /// with the shape it was about.
     #[tokio::test]
-    async fn the_postgres_backend_without_a_node_registry_is_a_startup_failure_under_role_api() {
+    async fn the_postgres_backend_without_a_node_registry_is_a_startup_failure() {
         let pool = isolated_schema_pool_or_skip!(
-            "the_postgres_backend_without_a_node_registry_is_a_startup_failure_under_role_api"
+            "the_postgres_backend_without_a_node_registry_is_a_startup_failure"
         );
 
         let failure = build_paused_registry(
@@ -178,52 +183,20 @@ mod pg {
             &cluster(None),
             &scheduler_report(),
             &identity(),
-            crate::role::ServerRole::Api,
             Some(&factory(&pool)),
             None,
         )
         .await;
 
         let Err(failure) = failure else {
-            panic!("a postgres backend with no node registry must not build a registry under --role api");
+            panic!(
+                "a postgres backend with no node registry must not build a registry under aenv-api"
+            );
         };
         assert!(
             failure.to_string().contains("node_placement_source"),
             "the refusal has to name the missing setting, got {failure}"
         );
-    }
-
-    /// 🔴 M1's own regression pin: `--role all` never builds a
-    /// `NodeRegistry` at all (it has no equivalent of `--role api`'s
-    /// `[cluster].node_placement_source = "native"` wiring), and unlike
-    /// `--role api` it does not need one -- this process's own identity
-    /// coincides with `origin_node_id` for everything it runs, so
-    /// `renew_lease` already covers what D2 Fix A exists to cover under the
-    /// split identity model (see `postgres::replica_renewal`'s own module
-    /// doc). Before M1, this configuration was an unconditional startup
-    /// failure -- the rollback target could not select this backend at
-    /// all. Without this test, a change that silently widened the `--role
-    /// api` guard back to every role would look identical to every other
-    /// green test in this file.
-    #[tokio::test]
-    async fn the_postgres_backend_under_role_all_does_not_require_a_node_registry() {
-        let pool = isolated_schema_pool_or_skip!(
-            "the_postgres_backend_under_role_all_does_not_require_a_node_registry"
-        );
-
-        let registry = build_paused_registry(
-            &config(),
-            &cluster(None),
-            &scheduler_report(),
-            &identity(),
-            crate::role::ServerRole::All,
-            Some(&factory(&pool)),
-            None,
-        )
-        .await
-        .expect("--role all must not require a node registry to select the postgres backend");
-
-        assert!(registry.is_cluster_backed());
     }
 
     /// The happy path: a real pool and a (fake, but present) node registry
@@ -240,7 +213,6 @@ mod pg {
             &cluster(None),
             &scheduler_report(),
             &identity(),
-            crate::role::ServerRole::Api,
             Some(&factory(&pool)),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
         )
@@ -280,7 +252,6 @@ mod pg {
             &cluster(None),
             &scheduler_report(),
             &node_identity,
-            crate::role::ServerRole::Api,
             Some(&factory(&pool)),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
         )

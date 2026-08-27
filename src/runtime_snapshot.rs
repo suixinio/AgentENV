@@ -6,7 +6,7 @@
 //! metadata — data every role reads, including the one that runs no sandbox.
 //! The types here are the other half: what a snapshot looks like *after* a node
 //! has downloaded its bytes, materialized overlaybd image configs and taken a
-//! lease over them. They are node-only by construction — since `--role api`
+//! lease over them. They are node-only by construction — since `aenv-api`
 //! stopped resolving snapshots into local bytes, the api half never builds one.
 //!
 //! They lived in `crate::snapshot::types` next to the catalog model, which is

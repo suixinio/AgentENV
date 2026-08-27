@@ -45,7 +45,39 @@ pub struct RedisBindingStoreConfig {
     /// it is reconciliation bookkeeping, not a route (Go's
     /// `defaultRedisNodeIndexTTL`, 1 hour).
     pub node_index_ttl: Duration,
-    pub operation_timeout: Duration,
+    /// How long a single Redis command (a script `EVAL`, a `GET`) may run
+    /// before `redis::aio::ConnectionManager` times it out and reconnects.
+    ///
+    /// 🔴 Renamed from `operation_timeout`: the field existed under that
+    /// name before this change with the same 2s default, but nothing ever
+    /// read it — `RedisBindingStore::connect` built its `ConnectionManager`
+    /// with `ConnectionManager::new(client)`, which ignores this struct
+    /// entirely and applies redis-rs's own built-in 500ms default instead.
+    /// Renaming rather than merely wiring it up in place because
+    /// "`operation_timeout`, silently unused" and "`response_timeout`,
+    /// actually applied" are different enough claims that reusing the old
+    /// name over the exact same bug site invites the next reader to assume
+    /// the old name was already live. 500ms was measured too tight against
+    /// this exact production Redis: a `ZRANGEBYSCORE` on
+    /// `crate::orchestrator::store::redis::expiry` (a neighbor on the same
+    /// instance) was observed taking 292ms, plus cross-node RTT on every
+    /// command. This field's pre-existing 2s default already had the right
+    /// order of magnitude in mind; it simply never took effect until now.
+    ///
+    /// Trade-off: a genuinely unreachable Redis now takes up to this long
+    /// (per call, not cumulative) to be detected, instead of the crate's
+    /// 500ms default this connection was actually running under. Audited
+    /// as acceptable: `src/binding_store/` has no `select!` racing a store
+    /// call against a shorter deadline, and no health/readiness probe
+    /// touches this store synchronously (`src/api/server.rs`'s `/health`
+    /// is a bare `"ok"`) — every caller already treats a
+    /// `BindingStoreError` as retryable (`Schedule`/`LookupNode`/
+    /// `RecordAssignment` return it up to the gRPC caller, and the sweep
+    /// task in `src/binding_store/sweep.rs` retries on its own next round).
+    pub response_timeout: Duration,
+    /// How long a fresh TCP connection attempt (initial connect, or a
+    /// reconnect after a `response_timeout`) may take.
+    pub connect_timeout: Duration,
 }
 
 impl Default for RedisBindingStoreConfig {
@@ -54,7 +86,8 @@ impl Default for RedisBindingStoreConfig {
             url: "redis://127.0.0.1:6379".to_string(),
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
             node_index_ttl: Duration::from_secs(3600),
-            operation_timeout: Duration::from_secs(2),
+            response_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(3000),
         }
     }
 }
@@ -79,7 +112,10 @@ impl RedisBindingStore {
         settings: BindingStoreSettings,
     ) -> Result<Self, BindingStoreError> {
         let client = redis::Client::open(redis_config.url.as_str()).map_err(backend)?;
-        let connection = redis::aio::ConnectionManager::new(client)
+        let manager_config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(redis_config.response_timeout))
+            .set_connection_timeout(Some(redis_config.connect_timeout));
+        let connection = redis::aio::ConnectionManager::new_with_config(client, manager_config)
             .await
             .map_err(backend)?;
         Ok(Self {

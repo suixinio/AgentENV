@@ -11,7 +11,11 @@ x-agentenv-base: &agentenv-base
     AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
     AENV_SNAPSHOT_LOCAL_CACHE_PATH: /var/cache/agentenv/snapshot-local-cache
     AENV_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
-    RUST_LOG: ${RUST_LOG:-agentenv=info,envd=info,uvm_ublk=info}
+    # Keep in step with `aenv_core::logging::DEFAULT_FILTER`: these are target
+    # prefixes, and a target is `module_path!()`, so the crate names have to be
+    # the post-split ones. `agentenv` stays for the explicit
+    # `target: "agentenv"` call sites and the generated `agentenv_http_server`.
+    RUST_LOG: ${RUST_LOG:-aenv_core=info,aenv_node=info,aenv_api=info,agentenv=info,envd=info,uvm_ublk=info}
   volumes:
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
@@ -87,7 +91,9 @@ services:
       AENV_NODE_PLACEMENT_SOURCE: scheduler
       AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
       AENV_NODE_ID: api-0
-      RUST_LOG: ${RUST_LOG:-agentenv=info}
+      # This half runs no sandboxes, so no `envd`/`uvm_ublk`; the rest matches
+      # `aenv_core::logging::DEFAULT_FILTER`.
+      RUST_LOG: ${RUST_LOG:-aenv_core=info,aenv_api=info,agentenv=info}
     volumes:
       - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
     # 🔴 Published directly, and the gateway is not yet in front of it. The

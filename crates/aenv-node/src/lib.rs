@@ -39,3 +39,44 @@ pub mod sandbox;
 pub mod setup;
 pub mod snapshot;
 pub mod template;
+
+/// Proves `aenv-core`'s default log filter still lets **this** crate's logs out.
+///
+/// `aenv_core::logging::DEFAULT_FILTER` names target prefixes, and a target is
+/// `module_path!()` unless a call site says otherwise — so the filter has to
+/// name `aenv_node`, and nothing in `aenv-core` can check that from over there.
+/// This is the copy of the guard that lives where the target is decided: rename
+/// `aenv-node` and `module_path!()` follows, the filter does not, and this goes red.
+#[cfg(test)]
+mod default_filter_guard {
+    use aenv_core::logging::capture::targets_passing_filter;
+    use aenv_core::logging::{DEFAULT_FILTER, PRE_RENAME_FILTER};
+
+    /// One callsite, reused by both directions, with no explicit `target:`.
+    fn emit_untargeted() {
+        tracing::info!("default-filter probe");
+    }
+
+    #[test]
+    fn default_filter_covers_this_crate() {
+        assert_eq!(
+            targets_passing_filter(DEFAULT_FILTER, emit_untargeted),
+            vec![module_path!().to_string()],
+            "{DEFAULT_FILTER} drops this crate's own logs; a crate rename \
+             (or a typo) has put it out of step with module_path!()"
+        );
+    }
+
+    #[test]
+    fn the_pre_rename_filter_no_longer_covers_this_crate() {
+        // Same callsite as above, so an empty result is the filter's doing and
+        // not a callsite that was never interesting.
+        assert_eq!(
+            targets_passing_filter(PRE_RENAME_FILTER, emit_untargeted),
+            Vec::<String>::new(),
+            "the pre-split filter matched {}, so this guard cannot tell a \
+             stale filter from a current one and is worth nothing",
+            module_path!()
+        );
+    }
+}

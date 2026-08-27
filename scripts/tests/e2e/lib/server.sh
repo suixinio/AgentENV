@@ -17,7 +17,9 @@ if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
 
     local env_vars=(
       "API_ADDR=127.0.0.1:${AENV_PORT}"
-      "RUST_LOG=agentenv=info,envd=info"
+      # Target prefixes, so post-split crate names; see
+      # `aenv_core::logging::DEFAULT_FILTER`.
+      "RUST_LOG=aenv_core=info,aenv_node=info,aenv_api=info,agentenv=info,envd=info"
     )
     [[ -n "$config" ]] && env_vars+=("AENV_CONFIG_PATH=${config}")
 

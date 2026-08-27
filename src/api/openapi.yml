@@ -738,12 +738,10 @@ components:
         - public
         - createdAt
         - updatedAt
-        - createdBy
         - lastSpawnedAt
         - spawnCount
         - buildCount
         - envdVersion
-        - aliases
         - names
         - buildStatus
       properties:
@@ -868,7 +866,6 @@ components:
       required:
         - templateID
         - public
-        - aliases
         - names
         - createdAt
         - updatedAt

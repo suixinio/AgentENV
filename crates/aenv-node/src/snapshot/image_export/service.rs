@@ -12,7 +12,9 @@ use super::regctl::Regctl;
 use super::target::{
     resolve_snapshot_image_target, snapshot_managed_publication_for_target, SnapshotImageTarget,
 };
-use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
+use crate::cfg::{
+    ConfigManager, SnapshotCatalogWrite, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind,
+};
 use crate::digest;
 use crate::snapshot::repository::backends::common::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
@@ -36,6 +38,31 @@ pub struct SnapshotImageResult {
 enum ManagedLayerLocator {
     PosixFs { root: PathBuf },
     Oss { client: Arc<oss::OssClient> },
+}
+
+/// Refuses to export from an object-storage catalog that is no longer written.
+///
+/// [`SnapshotImageService::from_global_config`] builds its catalog straight
+/// out of `snapshot.repository_backend` and never consults
+/// `[snapshot.catalog]`'s write/read modes. That is correct exactly while
+/// object storage is still *one of* the catalogs (`write = "object_store"` or
+/// `"both"`), and silently wrong the moment it stops being one:
+/// `write = "postgres"` freezes the object-storage catalog at the cutover, so
+/// every snapshot committed afterwards reads back here as "not found" from a
+/// tool that otherwise looks entirely healthy -- an answer an operator cannot
+/// tell apart from a wrong snapshot id. Refusing is the whole point.
+fn ensure_object_store_catalog_is_current(write: SnapshotCatalogWrite) -> anyhow::Result<()> {
+    match write {
+        SnapshotCatalogWrite::ObjectStore | SnapshotCatalogWrite::Both => Ok(()),
+        SnapshotCatalogWrite::Postgres => anyhow::bail!(
+            "snapshot.catalog.write = \"postgres\": object storage is no longer a catalog, and \
+             aenv-snapshot-image reads the object-storage catalog directly -- this binary has no \
+             PostgreSQL edge (aenv-node links no sqlx, by design). Every snapshot committed since \
+             that cutover would read back here as not found, which is indistinguishable from a \
+             wrong snapshot id, so this refuses rather than export from a frozen catalog. \
+             Exporting under this mode needs a catalog read path this binary does not have."
+        ),
+    }
 }
 
 fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
@@ -62,6 +89,7 @@ impl SnapshotImageService {
     /// node-runtime resolver, artifact cache, layer store, and P2P machinery.
     pub fn from_global_config(regctl_binary: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
+        ensure_object_store_catalog_is_current(config.snapshot.catalog.write)?;
         let (catalog, layers): (Arc<dyn SnapshotCatalog>, ManagedLayerLocator) =
             match config.snapshot.repository_backend {
                 SnapshotRepositoryBackendKind::PosixFs => {
@@ -727,5 +755,31 @@ mod tests {
                 Err(SnapshotImageTargetError::CannotInfer { .. })
             ));
         }
+    }
+
+    /// The cutover this guards is a config change on a running cluster, not a
+    /// code change here, so the polarity is what matters: `both` must stay
+    /// allowed (object storage is still written) and `postgres` must be
+    /// refused (it is not). Asserting only the refusal would still pass if the
+    /// guard rejected every mode.
+    #[test]
+    fn export_is_refused_once_object_storage_stops_being_a_catalog() {
+        for still_written in [
+            SnapshotCatalogWrite::ObjectStore,
+            SnapshotCatalogWrite::Both,
+        ] {
+            assert!(
+                ensure_object_store_catalog_is_current(still_written).is_ok(),
+                "{still_written:?} still writes the object-storage catalog this tool reads"
+            );
+        }
+
+        let refused = ensure_object_store_catalog_is_current(SnapshotCatalogWrite::Postgres)
+            .expect_err("a frozen object-storage catalog must not be exported from silently");
+        let message = refused.to_string();
+        assert!(
+            message.contains("no longer a catalog"),
+            "the refusal has to say why, not just that: {message}"
+        );
     }
 }

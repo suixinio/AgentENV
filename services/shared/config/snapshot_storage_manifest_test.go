@@ -875,10 +875,11 @@ func TestConfigOverlayEnvNameMatchesWhatTheProcessReads(t *testing.T) {
 	}
 }
 
-// 🔴 `aenv-node` must never hold `[pg]` — `ServerRole::check_pg_dsn`
-// refuses startup outright the moment `[pg].dsn` is configured at all, which
-// on a DaemonSet means every node Pod in the fleet CrashLoops at once, not
-// just the one workload that made the mistake.
+// 🔴 `aenv-node` must never hold `[pg]` — `refuse_configured_pg_dsn`
+// (`crates/aenv-node/src/bin/aenv-node.rs`) refuses startup outright the
+// moment `[pg].dsn` is configured at all, which on a DaemonSet means every
+// node Pod in the fleet CrashLoops at once, not just the one workload that
+// made the mistake.
 //
 // Nothing in this file asserted that before: the generic overlay/mount tests
 // above are satisfied as long as whatever AENV_CONFIG_OVERLAY_PATH names is
@@ -902,7 +903,7 @@ func TestDaemonSetNeverReadsPg(t *testing.T) {
 	} {
 		if strings.Contains(manifest, forbidden) {
 			t.Errorf("agentenv-daemonset.yaml mentions %q. aenv-node must never hold [pg]: "+
-				"ServerRole::check_pg_dsn refuses startup outright the moment [pg].dsn is "+
+				"refuse_configured_pg_dsn refuses startup outright the moment [pg].dsn is "+
 				"configured, which on a DaemonSet CrashLoops every node Pod in the fleet at once.",
 				forbidden)
 		}

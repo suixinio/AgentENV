@@ -62,8 +62,8 @@ use tracing::{info, warn};
 /// 🔴 And no `--setup-only`/`--setup-host` either, which `aenv-node` does
 /// have. This half has no `/dev/kvm`, no ublk and no downloaded runtime
 /// assets, so there is nothing here to provision; the flags used to exist and
-/// be refused by a `ServerRole::check_setup_flags` that no longer exists, and
-/// not declaring them is the same refusal one layer earlier.
+/// be refused at startup by a role predicate that no longer exists, and not
+/// declaring them at all is the same refusal one layer earlier.
 #[derive(Debug, Parser)]
 #[command(name = "aenv-api")]
 struct ApiCli {

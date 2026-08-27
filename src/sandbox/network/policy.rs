@@ -187,20 +187,25 @@ fn build_static_egress_commands(
         )));
     }
 
+    // Internal AgentENV networks are denied before user rules so a sandbox
+    // cannot reach another sandbox's namespace or VM link addresses. These come
+    // before the Tier0 allowlist so a misconfigured always_allowed entry cannot
+    // punch through inter-sandbox isolation (I-8).
+    for cidr in internal_egress_denied_cidrs {
+        commands.push(append_egress_command(format!(
+            "-i tap0 -o vpeer -d {cidr} -j REJECT"
+        )));
+    }
+
     // Tier0 patch: node-level allowlist (DAB proxy VIP) is accepted before the
-    // deny rules below, so a private-range ClusterIP stays reachable.
+    // private-range deny below, so a private-range ClusterIP stays reachable.
     for cidr in node_always_allowed_cidrs {
         commands.push(append_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
         )));
     }
 
-    // Internal AgentENV networks are denied before user rules so a sandbox
-    // cannot reach another sandbox's namespace or VM link addresses.
-    for cidr in internal_egress_denied_cidrs
-        .iter()
-        .chain(node_always_denied_cidrs.iter())
-    {
+    for cidr in node_always_denied_cidrs {
         commands.push(append_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j REJECT"
         )));
@@ -482,30 +487,36 @@ mod tests {
         // ACCEPTed before the private-range REJECT, otherwise the sandbox can
         // never reach the proxy and per-sandbox allowOut is irrelevant.
         let denied_cidrs = NetworkConfig::default().egress.always_denied_cidrs;
+        let internal_denied = vec!["10.12.0.0/16".to_string()];
         let allowed_cidrs = vec!["10.100.4.32/32".to_string()];
         let commands = build_static_egress_commands(
             Ipv4Addr::new(10, 12, 0, 2),
             Ipv4Addr::new(10, 1, 2, 1),
-            &[],
+            &internal_denied,
             &denied_cidrs,
             &allowed_cidrs,
         );
 
-        let allow_pos = commands
-            .iter()
-            .position(|command| {
-                append_rule(command) == Some("-i tap0 -o vpeer -d 10.100.4.32/32 -j ACCEPT")
-            })
-            .expect("proxy VIP must be accepted");
-        let private_deny_pos = commands
-            .iter()
-            .position(|command| {
-                append_rule(command) == Some("-i tap0 -o vpeer -d 10.0.0.0/8 -j REJECT")
-            })
-            .expect("private range still denied");
+        let pos = |rule: &str| {
+            commands
+                .iter()
+                .position(|command| append_rule(command) == Some(rule))
+                .unwrap_or_else(|| panic!("missing rule: {rule}"))
+        };
+        let internal_deny_pos = pos("-i tap0 -o vpeer -d 10.12.0.0/16 -j REJECT");
+        let allow_pos = pos("-i tap0 -o vpeer -d 10.100.4.32/32 -j ACCEPT");
+        let private_deny_pos = pos("-i tap0 -o vpeer -d 10.0.0.0/8 -j REJECT");
+
+        // proxy VIP overrides the node private-range deny ...
         assert!(
             allow_pos < private_deny_pos,
             "proxy VIP ACCEPT must precede the 10.0.0.0/8 REJECT"
+        );
+        // ... but must NOT override inter-sandbox isolation (I-8): the internal
+        // cross-talk REJECT stays ahead of the allowlist.
+        assert!(
+            internal_deny_pos < allow_pos,
+            "inter-sandbox REJECT must precede the allowlist ACCEPT"
         );
     }
 

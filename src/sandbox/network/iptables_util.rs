@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, Context, Result};
 use tracing::warn;
 
-pub(super) enum IptablesRestoreCommand {
+pub enum IptablesRestoreCommand {
     NewChain {
         table: &'static str,
         chain: &'static str,
@@ -45,7 +45,7 @@ impl IptablesRestoreCommand {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum OpenFailurePolicy {
+pub enum OpenFailurePolicy {
     ReturnErr,
     WarnAndIgnore(&'static str),
 }
@@ -151,7 +151,7 @@ fn handle_restore_failure(err: anyhow::Error, policy: OpenFailurePolicy) -> Resu
 /// Normal rule sets are applied in one atomic batch. Cleanup consists only of
 /// delete commands, which are applied individually so rules that are already
 /// absent remain idempotent without parsing rule strings back into argv.
-pub(super) fn apply_iptables_commands(
+pub fn apply_iptables_commands(
     commands: &[IptablesRestoreCommand],
     open_failure_policy: OpenFailurePolicy,
 ) -> Result<()> {

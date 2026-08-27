@@ -955,7 +955,7 @@ mod build_tests {
         }
     }
 
-    pub(super) fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
+    pub fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
             node_placement_source: crate::cfg::NodePlacementSource::Scheduler,
             scheduler_endpoint: scheduler_endpoint.map(str::to_string),
@@ -969,7 +969,7 @@ mod build_tests {
         }
     }
 
-    pub(super) fn scheduler_report() -> ObservabilitySchedulerReportConfig {
+    pub fn scheduler_report() -> ObservabilitySchedulerReportConfig {
         ObservabilitySchedulerReportConfig {
             enabled: false,
             interval_secs: 5,
@@ -978,7 +978,7 @@ mod build_tests {
         }
     }
 
-    pub(super) fn identity() -> NodeIdentity {
+    pub fn identity() -> NodeIdentity {
         NodeIdentity::from_config(&Default::default())
     }
 

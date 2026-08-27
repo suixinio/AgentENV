@@ -30,13 +30,13 @@ use super::population::CatalogCensus;
 /// compare the two catalogs' rows against each other, and two fixtures built a
 /// millisecond apart would disagree about a snapshot's creation time for a
 /// reason that has nothing to do with what the test is holding still.
-pub(crate) const CREATED_AT: i64 = 1_700_000_000_000;
+pub const CREATED_AT: i64 = 1_700_000_000_000;
 
-pub(crate) fn committed() -> CommittedSnapshot {
+pub fn committed() -> CommittedSnapshot {
     CommittedSnapshot::mock()
 }
 
-pub(crate) fn record_for(id: &SnapshotId) -> SnapshotRecord {
+pub fn record_for(id: &SnapshotId) -> SnapshotRecord {
     let mut record =
         SnapshotRecord::template_waiting(id.clone(), None, SandboxResources::default());
     record.created_at_unix_ms = CREATED_AT;
@@ -44,7 +44,7 @@ pub(crate) fn record_for(id: &SnapshotId) -> SnapshotRecord {
     record
 }
 
-pub(crate) fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit {
+pub fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit {
     SnapshotCommit {
         id: id.clone(),
         alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias parses")),
@@ -56,7 +56,7 @@ pub(crate) fn commit_for(id: &SnapshotId, alias: Option<&str>) -> SnapshotCommit
 }
 
 /// A committed row for `id`, as a store that took the commit would hold it.
-pub(crate) fn committed_record(id: &SnapshotId) -> SnapshotRecord {
+pub fn committed_record(id: &SnapshotId) -> SnapshotRecord {
     let mut record = record_for(id);
     record.mark_committed(
         None,
@@ -80,7 +80,7 @@ pub(crate) fn committed_record(id: &SnapshotId) -> SnapshotRecord {
 /// make every one of those comparisons a test of the fixture rather than of the
 /// code — agreeing or disagreeing for reasons no production store has.
 #[derive(Default)]
-pub(crate) struct ScriptedCatalog {
+pub struct ScriptedCatalog {
     calls: Mutex<Vec<String>>,
     /// Ids whose writes fail, and how.
     failing: Mutex<Vec<(SnapshotId, bool)>>,
@@ -105,7 +105,7 @@ pub(crate) struct ScriptedCatalog {
 }
 
 impl ScriptedCatalog {
-    pub(crate) fn calls(&self) -> Vec<String> {
+    pub fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls").clone()
     }
 
@@ -114,7 +114,7 @@ impl ScriptedCatalog {
     }
 
     /// `retryable` picks which error kind the write fails with.
-    pub(crate) fn fail(&self, id: &SnapshotId, retryable: bool) {
+    pub fn fail(&self, id: &SnapshotId, retryable: bool) {
         self.failing
             .lock()
             .expect("failing")
@@ -122,16 +122,16 @@ impl ScriptedCatalog {
     }
 
     /// Puts a committed row in without going through a write.
-    pub(crate) fn hold(&self, id: &SnapshotId) {
+    pub fn hold(&self, id: &SnapshotId) {
         self.keep(committed_record(id));
     }
 
     /// Puts any row in without going through a write.
-    pub(crate) fn seed(&self, record: SnapshotRecord) {
+    pub fn seed(&self, record: SnapshotRecord) {
         self.keep(record);
     }
 
-    pub(crate) fn holds(&self, id: &SnapshotId) -> Option<SnapshotRecord> {
+    pub fn holds(&self, id: &SnapshotId) -> Option<SnapshotRecord> {
         self.rows
             .lock()
             .expect("rows")
@@ -146,21 +146,21 @@ impl ScriptedCatalog {
             .insert(record.id.to_string(), record);
     }
 
-    pub(crate) fn break_it(&self) {
+    pub fn break_it(&self) {
         self.broken.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) fn fix_it(&self) {
+    pub fn fix_it(&self) {
         self.broken.store(false, Ordering::SeqCst);
     }
 
-    pub(crate) fn break_reads(&self) {
+    pub fn break_reads(&self) {
         self.get_fails.store(true, Ordering::SeqCst);
     }
 
     /// Makes the store behave like PostgreSQL: nothing is resolvable, and only
     /// a read that says `AnyStatus` sees anything.
-    pub(crate) fn hide_from_unscoped_reads(&self) {
+    pub fn hide_from_unscoped_reads(&self) {
         self.only_ready.store(true, Ordering::SeqCst);
     }
 
@@ -168,7 +168,7 @@ impl ScriptedCatalog {
         self.only_ready.load(Ordering::SeqCst) && scope == CatalogReadScope::Resolvable
     }
 
-    pub(crate) fn refuse_alias_to(&self, holder: SnapshotId) {
+    pub fn refuse_alias_to(&self, holder: SnapshotId) {
         *self.alias_conflict.lock().expect("alias") = Some(holder);
     }
 
@@ -177,7 +177,7 @@ impl ScriptedCatalog {
     /// They go into the rows as well as into what `list` answers, because a
     /// store that lists a snapshot it cannot then be asked about is not a state
     /// any real one reaches.
-    pub(crate) fn with_history(self, records: Vec<SnapshotRecord>) -> Self {
+    pub fn with_history(self, records: Vec<SnapshotRecord>) -> Self {
         for record in &records {
             self.keep(record.clone());
         }
@@ -435,7 +435,7 @@ impl ScriptedCatalog {
 
 /// Which central call a test wants to break.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CentralCall {
+pub enum CentralCall {
     Begin,
     Commit,
     Fail,
@@ -463,7 +463,7 @@ impl CentralCall {
 /// inducible is "the whole catalog is down", which breaks both at once and
 /// leaves either guard removable without a test noticing.
 #[derive(Default)]
-pub(crate) struct ScriptedCentral {
+pub struct ScriptedCentral {
     calls: Mutex<Vec<String>>,
     rows: Mutex<HashMap<String, SnapshotRecord>>,
     unreachable: Mutex<Vec<CentralCall>>,
@@ -479,7 +479,7 @@ pub(crate) struct ScriptedCentral {
 }
 
 impl ScriptedCentral {
-    pub(crate) fn calls(&self) -> Vec<String> {
+    pub fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls").clone()
     }
 
@@ -488,7 +488,7 @@ impl ScriptedCentral {
     }
 
     /// Takes a build away, as the reaper does when a heartbeat lapses.
-    pub(crate) fn reap_build(&self, id: &SnapshotId) {
+    pub fn reap_build(&self, id: &SnapshotId) {
         self.live_builds
             .lock()
             .expect("live builds")
@@ -496,23 +496,23 @@ impl ScriptedCentral {
     }
 
     /// Makes one call fail as if nothing answered.
-    pub(crate) fn unreachable_on(&self, call: CentralCall) {
+    pub fn unreachable_on(&self, call: CentralCall) {
         self.unreachable.lock().expect("unreachable").push(call);
     }
 
-    pub(crate) fn reachable_again(&self) {
+    pub fn reachable_again(&self) {
         self.unreachable.lock().expect("unreachable").clear();
     }
 
     /// Makes one call fail the way a controller that will never accept this
     /// request fails: an answer, arriving as a status code rather than as a
     /// [`CatalogRefusal`], that asking again cannot change.
-    pub(crate) fn reject_permanently_on(&self, call: CentralCall) {
+    pub fn reject_permanently_on(&self, call: CentralCall) {
         self.rejected.lock().expect("rejected").push(call);
     }
 
     /// Makes one call answer with a refusal.
-    pub(crate) fn refuse(&self, call: CentralCall, refusal: CatalogRefusal) {
+    pub fn refuse(&self, call: CentralCall, refusal: CatalogRefusal) {
         self.refusals
             .lock()
             .expect("refusals")
@@ -521,7 +521,7 @@ impl ScriptedCentral {
 
     /// Stops one call refusing, so a test can arrange a disagreement and then
     /// go on using the double for something else.
-    pub(crate) fn stop_refusing(&self, call: CentralCall) {
+    pub fn stop_refusing(&self, call: CentralCall) {
         self.refusals
             .lock()
             .expect("refusals")
@@ -530,14 +530,14 @@ impl ScriptedCentral {
 
     /// Puts a row in without going through a write, so a test can arrange a
     /// catalog that already holds something.
-    pub(crate) fn seed(&self, record: SnapshotRecord) {
+    pub fn seed(&self, record: SnapshotRecord) {
         self.rows
             .lock()
             .expect("rows")
             .insert(record.id.to_string(), record);
     }
 
-    pub(crate) fn holds(&self, id: &SnapshotId) -> Option<SnapshotRecord> {
+    pub fn holds(&self, id: &SnapshotId) -> Option<SnapshotRecord> {
         self.rows
             .lock()
             .expect("rows")

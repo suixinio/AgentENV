@@ -256,7 +256,7 @@ fn pg_required() -> bool {
 /// [`super::AdvisoryLockKey`] variant and every digit of the Go
 /// `schemaLockKey`'s magnitude, so a test can never collide with a real key
 /// or with another test racing it on the same shared server.
-pub(crate) fn next_test_lock_key() -> i64 {
+pub fn next_test_lock_key() -> i64 {
     static NEXT: AtomicI64 = AtomicI64::new(1_000_000);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -264,7 +264,7 @@ pub(crate) fn next_test_lock_key() -> i64 {
 /// The shared ephemeral test server's connection URL, or `None` when this
 /// machine has no usable `initdb`/`postgres` and the run has not demanded
 /// one.
-pub(crate) fn dsn_for(test: &str) -> Option<String> {
+pub fn dsn_for(test: &str) -> Option<String> {
     let Some(server) = server() else {
         if pg_required() {
             panic!(
@@ -283,7 +283,7 @@ pub(crate) fn dsn_for(test: &str) -> Option<String> {
 /// same conditions as [`dsn_for`]. Always a brand-new `PgPool`, never a
 /// shared/cloned one — two calls simulate two independent replicas each
 /// dialing the same database, which is what election tests need.
-pub(crate) async fn pool_for(test: &str) -> Option<sqlx::PgPool> {
+pub async fn pool_for(test: &str) -> Option<sqlx::PgPool> {
     let dsn = dsn_for(test)?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -328,15 +328,7 @@ pub(crate) use pool_or_skip;
 /// `after_connect`, not a per-transaction `SET LOCAL` — the schema has to
 /// survive for the whole test, across however many connections the pool
 /// borrows out over that time, not just one transaction.
-pub(crate) async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
-    // 🔴 Not this function's subject, and here anyway: every caller is a test
-    // in *this* crate, where `aenv-core` is a dependency and its `global()`
-    // panics rather than self-initializing (`ConfigManager::init_global_for_tests`
-    // says why). Several of these suites build records through
-    // `CommittedSnapshot::mock`, which reads the global config. Filling the
-    // slot once, here, is what every one of them would otherwise repeat.
-    crate::cfg::ConfigManager::init_global_for_tests();
-
+pub async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
     let dsn = dsn_for(test)?;
 
     static NEXT: AtomicI64 = AtomicI64::new(0);

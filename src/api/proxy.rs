@@ -43,7 +43,7 @@ use crate::{
 };
 
 /// Shared outbound HTTP client for the client-facing reverse proxy.
-pub(crate) type ProxyClient = Client<HttpConnector, Body>;
+pub type ProxyClient = Client<HttpConnector, Body>;
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct ResolvedProxyRequest {
@@ -154,7 +154,7 @@ pub(in crate::api) fn auto_resume_min_sandbox_timeout() -> Duration {
     })
 }
 
-pub(crate) fn build_proxy_client() -> ProxyClient {
+pub fn build_proxy_client() -> ProxyClient {
     let mut connector = HttpConnector::new();
     // Proxied requests and responses are small, so Nagle only ever adds a
     // delayed-ACK wait to them.
@@ -167,7 +167,7 @@ pub(crate) fn build_proxy_client() -> ProxyClient {
         .build(connector)
 }
 
-pub(crate) fn router<I>(api_impl: I) -> Router
+pub fn router<I>(api_impl: I) -> Router
 where
     I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
 {
@@ -196,7 +196,7 @@ where
         .with_state(api_impl)
 }
 
-pub(crate) async fn sandbox_proxy_classifier<I>(
+pub async fn sandbox_proxy_classifier<I>(
     State(api_impl): State<I>,
     request: Request,
     next: Next,
@@ -1756,7 +1756,7 @@ mod tests {
         second_response.into_body().collect().await.unwrap();
     }
 
-    pub(super) async fn spawn_upstream(router: axum::Router) -> SocketAddr {
+    pub async fn spawn_upstream(router: axum::Router) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1984,7 +1984,7 @@ mod tests {
         .await
     }
 
-    pub(super) async fn build_api() -> Arc<ApiImpl> {
+    pub async fn build_api() -> Arc<ApiImpl> {
         build_api_with(Vec::new(), ServerRole::All).await
     }
 
@@ -1995,7 +1995,7 @@ mod tests {
     /// `ApiImpl` that believed it was `all`. The auto-resume arm reads the role
     /// off the `ApiImpl`, so that divergence would have made a node-role test
     /// silently exercise `all`'s branch.
-    pub(super) async fn build_api_with_role(role: ServerRole) -> Arc<ApiImpl> {
+    pub async fn build_api_with_role(role: ServerRole) -> Arc<ApiImpl> {
         build_api_with(Vec::new(), role).await
     }
 

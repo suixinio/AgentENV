@@ -9,25 +9,25 @@ pub type TemplatePipelineResult<T> = Result<T, TemplatePipelineError>;
 
 #[derive(Debug, Error)]
 #[error("{reason}")]
-pub(crate) struct TemplateBuildFailure {
+pub struct TemplateBuildFailure {
     pub reason: TemplateBuildErrorReason,
 }
 
 impl TemplateBuildFailure {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             reason: TemplateBuildErrorReason::new(message),
         }
     }
 
-    pub(crate) fn with_step(message: impl Into<String>, step: impl Into<String>) -> Self {
+    pub fn with_step(message: impl Into<String>, step: impl Into<String>) -> Self {
         Self {
             reason: TemplateBuildErrorReason::with_step(message, step),
         }
     }
 }
 
-pub(crate) fn command_output_suffix(stdout: &str, stderr: &str) -> String {
+pub fn command_output_suffix(stdout: &str, stderr: &str) -> String {
     let stderr = stderr.trim();
     if !stderr.is_empty() {
         return format!("; stderr: {stderr}");
@@ -75,7 +75,7 @@ impl TemplateBuildError {
         }
     }
 
-    pub(crate) fn with_reason_source(
+    pub fn with_reason_source(
         reason: TemplateBuildErrorReason,
         source: impl Into<AnyhowError>,
     ) -> Self {

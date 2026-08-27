@@ -1,11 +1,11 @@
-pub(crate) mod custom_extension;
-pub(crate) mod drive;
+pub mod custom_extension;
+pub mod drive;
 mod firecracker_manifest;
 mod id;
 mod image_configs;
 mod resources;
 
-pub(crate) use custom_extension::CustomExtensionParams;
+pub use custom_extension::CustomExtensionParams;
 pub use drive::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
     ExtraDrive,

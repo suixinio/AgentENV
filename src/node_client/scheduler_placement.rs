@@ -323,7 +323,7 @@ const RECORD_PLACEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// 🔴 Parsed rather than string-spliced, because an IPv6 literal is written
 /// `http://[::1]:8000` and the last colon in it is not the one before the
 /// port on any naive reading that also has to cope with `http://[::1]`.
-pub(super) fn rewrite_port(endpoint: &str, port: u16) -> Result<String> {
+pub fn rewrite_port(endpoint: &str, port: u16) -> Result<String> {
     let mut url = url::Url::parse(&qualified(endpoint))
         .with_context(|| format!("node address {endpoint:?} is not a valid URI"))?;
     url.set_port(Some(port))

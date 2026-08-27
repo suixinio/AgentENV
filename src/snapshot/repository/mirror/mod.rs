@@ -46,7 +46,7 @@ mod compensator;
 mod metrics;
 mod population;
 #[cfg(test)]
-pub(crate) mod test_doubles;
+pub mod test_doubles;
 
 use std::sync::Arc;
 
@@ -69,7 +69,7 @@ pub use backlog::{
 };
 pub use central::CentralCatalogWrites;
 pub use compensator::{MirrorCompensator, DEFAULT_COMPENSATOR_INTERVAL};
-pub(crate) use population::require_read_side_confirmed;
+pub use population::require_read_side_confirmed;
 pub use population::{
     admit_read_side, admit_read_side_with_confirmation, CatalogCensus, CatalogPopulations,
     ObjectStoreCensus, ReadSideConfirmationStore,
@@ -1079,11 +1079,11 @@ fn now_unix_ms() -> i64 {
 /// contract nothing else has. What a caller's test legitimately needs is a
 /// backlog with something owed in it, so that is what is offered.
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     use super::{MirrorBacklog, MirrorDirection, MirrorOp};
     use crate::snapshot::types::SnapshotRecord;
 
-    pub(crate) async fn owe_a_create(
+    pub async fn owe_a_create(
         backlog: &MirrorBacklog,
         direction: MirrorDirection,
         record: SnapshotRecord,

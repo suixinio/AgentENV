@@ -110,7 +110,7 @@ pub const DEFAULT_PULL_INTERVAL: Duration = Duration::from_secs(2);
 /// not a second staleness judgment competing with
 /// `Inner::derive_observed_node_view`'s own (see this module's own doc
 /// comment).
-pub(crate) const GC_GRACE_MULTIPLIER: u64 = 4;
+pub const GC_GRACE_MULTIPLIER: u64 = 4;
 
 /// Redis-specific configuration, analogous to
 /// `crate::binding_store::redis::RedisBindingStoreConfig`.

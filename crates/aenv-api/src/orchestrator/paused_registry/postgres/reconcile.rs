@@ -77,7 +77,7 @@ const LEASE_WARN_WINDOW: Duration = Duration::from_secs(30);
 /// `reconcile.go`), ported -- minus the renewal-candidate lists B1 moved to
 /// [`super::replica_renewal`].
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct ReconcileOutcome {
+pub struct ReconcileOutcome {
     /// `publishing`/`local_only` rows with no snapshot at all -- a pause that
     /// never finished publishing and never will unless its origin node comes
     /// back.
@@ -113,7 +113,7 @@ impl ReconcileOutcome {
 /// the rows already read, so it is testable without a database (see the
 /// `#[cfg(test)] mod tests` below) the same way Go's own version is tested
 /// without one in `reconcile_test.go`.
-pub(super) fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> ReconcileOutcome {
+pub fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> ReconcileOutcome {
     let mut outcome = ReconcileOutcome::default();
 
     for row in rows {
@@ -150,7 +150,7 @@ pub(super) fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> Rec
 /// One reconcile pass against the live database: list rows, compute D4's
 /// metrics, log. Grace's own entry (`super::grace::enter`) happens in the
 /// caller, on the same connection, before this runs -- see [`spawn`]'s doc.
-pub(super) async fn reconcile_once(
+pub async fn reconcile_once(
     registry: &PostgresPausedSandboxRegistry,
 ) -> anyhow::Result<ReconcileOutcome> {
     let start = std::time::Instant::now();
@@ -345,7 +345,7 @@ async fn bound_statement_timeout(conn: &mut sqlx::PgConnection) {
 /// this port refuses instead, since `PausedRegistryConfig::reconcile_interval`
 /// already floors at one second and a zero here can only mean a caller
 /// bypassed that floor).
-pub(super) fn spawn(
+pub fn spawn(
     pool: PgPool,
     registry: Arc<PostgresPausedSandboxRegistry>,
     cluster_id: Uuid,

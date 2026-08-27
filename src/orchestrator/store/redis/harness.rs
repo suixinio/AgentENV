@@ -31,7 +31,7 @@ use super::{RedisMetadataStore, RedisStoreConfig};
 /// How many logical databases the spawned server offers, one per test.
 const DATABASES: u32 = 512;
 
-pub(crate) struct RedisServer {
+pub struct RedisServer {
     port: u16,
 }
 
@@ -201,7 +201,7 @@ fn next_db() -> u32 {
 
 /// A store on its own database, or `None` when this machine has no Redis and
 /// the run has not demanded one.
-pub(crate) async fn store_for(
+pub async fn store_for(
     test: &str,
     tweak: impl FnOnce(&mut RedisStoreConfig),
 ) -> Option<RedisMetadataStore> {
@@ -257,7 +257,7 @@ pub(crate) use store_or_skip;
 
 /// A raw connection to the same database, for assertions the store's own API
 /// deliberately cannot make — `PTTL`, `ZSCORE`, key existence.
-pub(crate) fn raw(store: &RedisMetadataStore) -> redis::aio::ConnectionManager {
+pub fn raw(store: &RedisMetadataStore) -> redis::aio::ConnectionManager {
     store.inner().connection()
 }
 
@@ -266,7 +266,7 @@ pub(crate) fn raw(store: &RedisMetadataStore) -> redis::aio::ConnectionManager {
 /// 🔴 This is the only way to demonstrate anything about several replicas. A
 /// single store instance cannot show that two of them stay out of each other's
 /// way, however many tasks are run against it.
-pub(crate) async fn sibling(store: &RedisMetadataStore) -> RedisMetadataStore {
+pub async fn sibling(store: &RedisMetadataStore) -> RedisMetadataStore {
     let sibling = RedisMetadataStore::connect(store.inner().config().clone())
         .await
         .expect("a second store should connect to the same redis");

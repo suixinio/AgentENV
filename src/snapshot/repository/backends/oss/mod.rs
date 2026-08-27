@@ -1,19 +1,22 @@
-mod artifacts;
-mod backend;
-mod catalog;
-mod client;
-mod config;
-mod durable;
-mod import;
-mod layout;
-mod resolver;
-#[cfg(test)]
-mod test_support;
+//! The OSS snapshot backend's durable halves: the catalog, the delete-only
+//! artifact store, and the client both use.
+//!
+//! 🔴 The importing half and the runtime resolver are `aenv-node`'s `oss`
+//! module — see [`durable`]'s own doc for the seam.
 
-pub use backend::OssBackend;
-pub(crate) use durable::oss_durable_parts;
+pub mod artifacts;
+pub mod catalog;
+pub mod client;
+pub mod config;
+pub mod durable;
+pub mod layout;
+#[doc(hidden)]
+pub mod test_support;
 
-pub(crate) use self::catalog::OssSnapshotCatalog;
-pub(crate) use self::client::OssClient;
-pub(crate) use self::config::NormalizedOssConfig;
-pub(crate) use self::layout::OssSnapshotArtifactLayout;
+pub use durable::{oss_durable_parts, OssDurableParts};
+
+pub use self::artifacts::OssSnapshotArtifactStore;
+pub use self::catalog::OssSnapshotCatalog;
+pub use self::client::OssClient;
+pub use self::config::NormalizedOssConfig;
+pub use self::layout::OssSnapshotArtifactLayout;

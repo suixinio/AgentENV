@@ -37,7 +37,7 @@ pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum HttpRouteSource {
+pub enum HttpRouteSource {
     ControlPlane,
     ProxyHost,
     ProxyHeader,

@@ -82,7 +82,7 @@ impl SandboxAccessTokenGenerator {
     /// ships: on today's fleet, where every machine runs `--role all`, scraping
     /// it from two nodes answers "do these two agree?" — which is the same
     /// question two `api` replicas will need answered, asked a release early.
-    pub(crate) fn load_or_create(
+    pub fn load_or_create(
         config: &AppConfig,
         role: ServerRole,
         managed_seed_must_exist: bool,
@@ -138,7 +138,7 @@ impl SandboxAccessTokenGenerator {
     ///
     /// Two processes holding the same seed produce the same string; two holding
     /// different seeds do not. That is the whole contract.
-    pub(crate) fn seed_fingerprint(&self) -> String {
+    pub fn seed_fingerprint(&self) -> String {
         let digest = Sha256::digest(&self.seed);
         hex::encode(&digest[..SEED_FINGERPRINT_BYTES])
     }

@@ -1,0 +1,571 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+
+use super::super::storage::shared_runtime_cache_root;
+use super::catalog::PosixFsCatalogStore;
+use super::import::PosixFsArtifactImporter;
+use super::runtime::PosixFsRuntimeResolver;
+use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
+use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::SnapshotRepository;
+
+#[derive(Clone, Debug)]
+pub struct PosixFsBackendConfig {
+    /// Durable repository root. This may live on a shared POSIX or distributed filesystem.
+    pub root: std::path::PathBuf,
+    /// Optional shared node-local cache root for downloaded/materialized runtime artifacts.
+    ///
+    /// When `None`, a stable node-local default under the process temp directory is used.
+    pub cache_root: Option<std::path::PathBuf>,
+    /// Optional node-local cache root for runtime-materialized files such as runnable image configs.
+    ///
+    /// When `None`, defaults to `<cache_root>/runtime`.
+    pub runtime_cache_root: Option<std::path::PathBuf>,
+}
+
+pub struct PosixFsBackend {
+    repository: Arc<SnapshotRepository>,
+    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+}
+
+impl PosixFsBackend {
+    /// Builds the POSIX backend bundle: durable repository state plus node-local runtime resolver.
+    pub fn new(config: PosixFsBackendConfig) -> Result<Self> {
+        let cache_root = config
+            .cache_root
+            .clone()
+            .unwrap_or_else(shared_runtime_cache_root);
+        let cache = LocalArtifactCache::new(cache_root, None)?;
+        Ok(Self::from_parts(
+            config,
+            local_image_services_from_global_config().overlaybd_layers,
+            cache,
+        ))
+    }
+
+    /// Builds the POSIX backend bundle using a shared node-local artifact cache.
+    ///
+    /// `runtime_image_hints` is a node-local runtime-acceleration hint (e.g. the
+    /// overlaybd commit-store path) consumed only by the runtime resolver. It is
+    /// passed here rather than carried in [`PosixFsBackendConfig`] so the durable
+    /// backend config stays free of runtime-only concerns.
+    pub fn from_parts(
+        config: PosixFsBackendConfig,
+        store: Arc<dyn OverlaybdLayerStore>,
+        cache: Arc<LocalArtifactCache>,
+    ) -> Self {
+        let PosixFsBackendConfig {
+            root,
+            cache_root,
+            runtime_cache_root,
+        } = config;
+        let cache_root = cache_root.unwrap_or_else(shared_runtime_cache_root);
+        let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
+        let repository = Arc::new(posixfs_repository(&root));
+        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
+            PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
+        );
+
+        Self {
+            repository,
+            runtime_resolver,
+        }
+    }
+
+    /// Returns the committed-state repository for publish/get/list/delete operations.
+    pub fn repository(&self) -> Arc<SnapshotRepository> {
+        Arc::clone(&self.repository)
+    }
+
+    /// Returns the node-local runtime resolver used to materialize runnable paths.
+    pub fn runtime_resolver(&self) -> Arc<dyn SnapshotRuntimeResolver> {
+        Arc::clone(&self.runtime_resolver)
+    }
+
+    /// Splits the backend into its repository and runtime-resolution components.
+    pub fn into_parts(self) -> (Arc<SnapshotRepository>, Arc<dyn SnapshotRuntimeResolver>) {
+        (self.repository, self.runtime_resolver)
+    }
+}
+
+/// Composes a POSIX repository out of its two halves, both rooted at `root`.
+pub fn posixfs_repository(root: &std::path::Path) -> SnapshotRepository {
+    SnapshotRepository::new(
+        Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
+        Arc::new(PosixFsArtifactImporter::new(root.to_path_buf())),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use overlaybd::config::ImageConfig as OverlaybdImageConfig;
+    use tempfile::TempDir;
+
+    use super::super::runtime::PosixFsRuntimeResolver;
+    use super::{posixfs_repository, PosixFsBackend, PosixFsBackendConfig};
+    use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
+    use crate::snapshot::artifact_cache::LocalArtifactCache;
+    use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::repository::{
+        RepositoryError, SnapshotRepository, SnapshotRuntimeResolver,
+    };
+    use crate::snapshot::{
+        CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId,
+        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+        TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
+    };
+    use crate::types::{ExtraDrive, FirecrackerSnapshotManifest};
+
+    #[derive(Debug)]
+    struct TestOverlaybdLayerStore;
+
+    impl OverlaybdLayerStore for TestOverlaybdLayerStore {
+        fn layer_location(&self, _: &str, _: u64, _: bool) -> OverlaybdLayerLocation {
+            OverlaybdLayerLocation::CacheDir("test-image-cache/commits".into())
+        }
+
+        fn publishable_roots(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+    }
+
+    fn test_overlaybd_layer_store() -> Arc<dyn OverlaybdLayerStore> {
+        Arc::new(TestOverlaybdLayerStore)
+    }
+
+    fn sample_metadata(id: SnapshotId, alias: Option<&str>) -> SnapshotPublishMetadata {
+        SnapshotPublishMetadata {
+            id,
+            alias: alias.map(|value| SnapshotAlias::parse(value).expect("alias should parse")),
+            ..SnapshotPublishMetadata::mock()
+        }
+    }
+
+    fn ready_record(
+        metadata: SnapshotPublishMetadata,
+        committed: CommittedSnapshot,
+    ) -> SnapshotRecord {
+        let mut record = SnapshotRecord::mock_ready(committed);
+        record.id = metadata.id;
+        record.alias = metadata.alias;
+        record.resources = metadata.resources;
+        let source = match metadata.source {
+            SnapshotPublishSource::Template => record.source,
+            SnapshotPublishSource::Sandbox { source_sandbox_id } => {
+                SnapshotSource::Sandbox { source_sandbox_id }
+            }
+        };
+        record.source = source;
+        record
+    }
+
+    fn test_backend(root: &Path) -> PosixFsBackend {
+        let config = PosixFsBackendConfig {
+            root: root.to_path_buf(),
+            cache_root: Some(root.join("runtime-cache")),
+            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+        };
+        let cache = LocalArtifactCache::new(root.join("runtime-cache"), None)
+            .expect("local artifact cache");
+        PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
+    }
+
+    fn test_repository(root: &Path) -> SnapshotRepository {
+        posixfs_repository(root)
+    }
+
+    fn seed_built_snapshot(root: &Path) -> FirecrackerSnapshotManifest {
+        let local_root = root.join("local").join(uuid::Uuid::now_v7().to_string());
+        let (_, _, manifest) =
+            write_mock_built_artifacts(&local_root).expect("mock built artifacts should write");
+        manifest
+    }
+
+    fn seed_committed_firecracker_manifest(
+        repository_root: &Path,
+        snapshot_id: &SnapshotId,
+        memory_virtual_size: u64,
+        rootfs_virtual_size: u64,
+    ) {
+        let snapshot_dir = repository_root
+            .join("snapshots")
+            .join(snapshot_id.to_string());
+        fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
+        let manifest = FirecrackerSnapshotManifest::new(
+            snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+            snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
+            memory_virtual_size,
+            snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config),
+            rootfs_virtual_size,
+            &[],
+        )
+        .expect("seed manifest should be valid");
+        fs::write(
+            snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
+            serde_json::to_vec_pretty(&manifest).expect("serialize firecracker manifest"),
+        )
+        .expect("write firecracker manifest");
+    }
+
+    #[tokio::test]
+    async fn publishes_gets_and_resolves_snapshot() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let backend = test_backend(tempdir.path());
+        let repository = backend.repository();
+        let resolver = backend.runtime_resolver();
+        let snapshot_id = SnapshotId::generate();
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        let metadata = sample_metadata(snapshot_id, Some("mvp"));
+        let stored = repository
+            .publish(metadata, local_artifacts)
+            .await
+            .expect("publish should work");
+
+        let fetched = repository
+            .get("mvp")
+            .await
+            .expect("get should work")
+            .expect("snapshot should exist");
+        assert_eq!(stored.id, fetched.id);
+
+        let runnable = resolver
+            .resolve(Arc::new(fetched))
+            .await
+            .expect("resolve should work");
+        assert!(runnable.manifest().rootfs.image_config_path.exists());
+        assert!(runnable.manifest().vm_state.path.exists());
+        assert!(runnable.manifest().memory.image_config_path.exists());
+
+        let image_config: OverlaybdImageConfig = serde_json::from_slice(
+            &std::fs::read(runnable.manifest().rootfs.image_config_path.as_path())
+                .expect("read image config"),
+        )
+        .expect("parse overlaybd image config");
+        assert_eq!(image_config.repo_blob_url, "");
+        assert_eq!(image_config.lowers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_commit_cleans_uncommitted_snapshot_directory() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository_root = tempdir.path().to_path_buf();
+        let repository = test_backend(tempdir.path()).repository();
+
+        let first_id = SnapshotId::generate();
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        let first_metadata = sample_metadata(first_id.clone(), Some("conflict"));
+        repository
+            .publish(first_metadata, local_artifacts)
+            .await
+            .expect("first publish should work");
+
+        let second_id = SnapshotId::generate();
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        let err = repository
+            .publish(
+                sample_metadata(second_id.clone(), Some("conflict")),
+                local_artifacts,
+            )
+            .await
+            .expect_err("second publish should fail");
+
+        assert!(matches!(err, RepositoryError::AliasConflict { .. }));
+        assert!(
+            !repository_root
+                .join("snapshots")
+                .join(second_id.to_string())
+                .exists(),
+            "failed publish should not leave a committed revision directory"
+        );
+    }
+
+    /// The pre-split `abort_publish` refused to delete a snapshot directory a
+    /// committed record still owned; after the split that decision is the
+    /// catalog's `retains_artifacts_on_publish_failure`, and the artifact store
+    /// only obeys. Re-publishing over a committed id and failing must still
+    /// leave that id's bytes alone — otherwise a rejected rebuild destroys a
+    /// live snapshot.
+    #[tokio::test]
+    async fn failed_republish_keeps_the_committed_snapshot_it_was_overwriting() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+
+        let committed_id = SnapshotId::generate();
+        repository
+            .publish(
+                sample_metadata(committed_id.clone(), Some("keeper")),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect("first publish should work");
+        repository
+            .publish(
+                sample_metadata(SnapshotId::generate(), Some("taken")),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect("second publish should work");
+
+        // Re-publish the already-committed id onto an alias someone else
+        // holds. It fails during the import, because committed artifacts are
+        // read-only — which is the same rollback path a failed commit takes.
+        repository
+            .publish(
+                sample_metadata(committed_id.clone(), Some("taken")),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect_err("re-publish over a committed snapshot should fail");
+
+        assert!(
+            tempdir
+                .path()
+                .join("snapshots")
+                .join(committed_id.to_string())
+                .join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state)
+                .exists(),
+            "a failed re-publish must not delete the artifacts of the snapshot it \
+             was overwriting"
+        );
+        assert!(
+            repository
+                .get(&committed_id.to_string())
+                .await
+                .expect("get should work")
+                .expect("the committed snapshot should still exist")
+                .committed
+                .is_some(),
+            "the original commit must survive the failed re-publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_committed_snapshot_directory() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+        let snapshot_id = SnapshotId::generate();
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        let metadata = sample_metadata(snapshot_id.clone(), Some("cleanup"));
+
+        repository
+            .publish(metadata, local_artifacts)
+            .await
+            .expect("publish should work");
+
+        let committed_dir = tempdir
+            .path()
+            .join("snapshots")
+            .join(snapshot_id.to_string());
+        assert!(
+            committed_dir.exists(),
+            "committed snapshot dir should exist"
+        );
+
+        repository
+            .delete("cleanup")
+            .await
+            .expect("delete should work");
+
+        assert!(
+            !committed_dir.exists(),
+            "delete should remove the whole committed snapshot directory"
+        );
+        assert!(
+            repository
+                .get(&snapshot_id.to_string())
+                .await
+                .expect("get after delete should work")
+                .is_none(),
+            "deleted snapshot should no longer be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_failed_template_build_record() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+        let snapshot_id = SnapshotId::generate();
+        let record =
+            SnapshotRecord::template_waiting(snapshot_id.clone(), None, Default::default());
+
+        repository.create(record).await.expect("create should work");
+        repository
+            .mark_build_error(&snapshot_id, TemplateBuildErrorReason::new("boom"))
+            .await
+            .expect("mark error should work");
+
+        let record_path = tempdir
+            .path()
+            .join("catalog")
+            .join("records")
+            .join(format!("{snapshot_id}.json"));
+        assert!(record_path.exists(), "failed build record should exist");
+
+        repository
+            .delete(&snapshot_id.to_string())
+            .await
+            .expect("delete should work");
+
+        assert!(
+            !record_path.exists(),
+            "delete should remove failed build record"
+        );
+        assert!(
+            repository
+                .get(&snapshot_id.to_string())
+                .await
+                .expect("get after delete should work")
+                .is_none(),
+            "deleted failed build should no longer be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let repository = test_repository(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let manifest = FirecrackerSnapshotManifest::for_test(
+            32768,
+            &[
+                ExtraDrive::Overlaybd {
+                    drive_id: "data".to_string(),
+                    image_config_path: "drives/data/image.json".into(),
+                    read_only: true,
+                    mount_path: ExtraDrive::default_mount_path("data"),
+                    virtual_size: Some(32768),
+                    sub_path: None,
+                },
+                ExtraDrive::Overlaybd {
+                    drive_id: "data".to_string(),
+                    image_config_path: "drives/data/image.json".into(),
+                    read_only: true,
+                    mount_path: ExtraDrive::default_mount_path("data"),
+                    virtual_size: Some(32768),
+                    sub_path: None,
+                },
+            ],
+        );
+        let err = repository
+            .publish(sample_metadata(snapshot_id, Some("dup-drive")), manifest)
+            .await
+            .expect_err("duplicate attached drive ids should be rejected");
+
+        assert!(matches!(err, RepositoryError::InvalidRequest { .. }));
+        assert!(!tempdir.path().join("catalog").exists());
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_missing_artifact_paths() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let cache =
+            LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
+        let resolver = PosixFsRuntimeResolver::new(
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("runtime-cache"),
+            test_overlaybd_layer_store(),
+            cache,
+        );
+        let metadata = sample_metadata(SnapshotId::generate(), None);
+        let committed = CommittedSnapshot {
+            context: metadata.context.clone(),
+            startup: metadata.startup.clone(),
+            runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
+            image_configs: metadata.image_configs.clone(),
+            rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: "sharedfs:missing".to_string(),
+                size: 1,
+                uuid: None,
+            })],
+            attached_drives: Vec::new(),
+            memory_layers: Vec::new(),
+            disk_publications: Vec::new(),
+            custom_extension_params: None,
+        };
+        let snapshot = Arc::new(ready_record(metadata, committed));
+
+        let err = resolver
+            .resolve(snapshot)
+            .await
+            .expect_err("resolve should fail");
+        assert!(matches!(err, RepositoryError::ArtifactNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let cache =
+            LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
+        let resolver = PosixFsRuntimeResolver::new(
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("runtime-cache"),
+            test_overlaybd_layer_store(),
+            cache,
+        );
+        let layer_path = tempdir.path().join("managed-layers").join(
+            super::super::layout::managed_layer_file_name("sharedfs:test"),
+        );
+        std::fs::create_dir_all(layer_path.parent().expect("managed-layers dir"))
+            .expect("managed-layers dir");
+        std::fs::write(&layer_path, b"layer").expect("layer");
+        let snapshot_id = SnapshotId::generate();
+        let snapshot_dir = tempdir
+            .path()
+            .join("snapshots")
+            .join(snapshot_id.to_string());
+        std::fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
+        std::fs::write(snapshot_dir.join("vm_state.bin"), b"vm state").expect("vm state");
+        seed_committed_firecracker_manifest(tempdir.path(), &snapshot_id, 0, 32 * 1024);
+        std::fs::write(
+            snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_dump),
+            b"memory",
+        )
+        .expect("memory");
+
+        let metadata = sample_metadata(snapshot_id, None);
+        let committed = CommittedSnapshot {
+            context: metadata.context.clone(),
+            startup: metadata.startup.clone(),
+            runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
+            image_configs: metadata.image_configs.clone(),
+            rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: "sharedfs:test".to_string(),
+                size: 5,
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            })],
+            attached_drives: Vec::new(),
+            memory_layers: Vec::new(),
+            disk_publications: Vec::new(),
+            custom_extension_params: None,
+        };
+        let snapshot = Arc::new(ready_record(metadata, committed));
+
+        let runnable = resolver
+            .resolve(snapshot)
+            .await
+            .expect("resolve should work from rootfs layers");
+
+        let image_config: OverlaybdImageConfig = serde_json::from_slice(
+            &std::fs::read(runnable.manifest().rootfs.image_config_path.as_path())
+                .expect("read image config"),
+        )
+        .expect("parse runtime image config");
+        assert_eq!(image_config.lowers.len(), 1);
+        assert_eq!(
+            image_config.lowers[0].file,
+            layer_path.display().to_string()
+        );
+        assert_eq!(
+            image_config.lowers[0].uuid,
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+}

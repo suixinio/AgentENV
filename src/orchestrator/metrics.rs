@@ -30,7 +30,7 @@ pub struct OrchestratorMetrics {
 /// outcomes of historical attempts (including failures whose metadata was
 /// removed). They are stored as atomics so updates do not require a lock.
 #[derive(Debug, Default)]
-pub(crate) struct OrchestratorCounters {
+pub struct OrchestratorCounters {
     create_successes: AtomicU64,
     create_fails: AtomicU64,
 }
@@ -73,7 +73,7 @@ impl OrchestratorCounters {
 ///   running set so that schedulers can apply an "including paused" ceiling
 ///   without conflating the two.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SandboxContribution {
+pub struct SandboxContribution {
     running_sandbox_count: u32,
     starting_sandbox_count: u32,
     allocated_cpu: u32,
@@ -84,7 +84,7 @@ pub(crate) struct SandboxContribution {
 }
 
 impl SandboxContribution {
-    pub(crate) fn new(state: SandboxState, resources: SandboxResources) -> Self {
+    pub fn new(state: SandboxState, resources: SandboxResources) -> Self {
         let is_paused = matches!(state, SandboxState::Paused);
         let counts_as_running = matches!(
             state,
@@ -113,7 +113,7 @@ impl SandboxContribution {
 ///
 /// The counter fields (`create_successes` / `create_fails`) are intentionally
 /// untouched and must be filled in by the caller from [`OrchestratorCounters`].
-pub(crate) fn aggregate_resource_metrics(
+pub fn aggregate_resource_metrics(
     metrics: &mut OrchestratorMetrics,
     contribution: SandboxContribution,
 ) {

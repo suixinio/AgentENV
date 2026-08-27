@@ -1,13 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
@@ -18,12 +17,7 @@ use super::super::persistence::{
 };
 use super::super::types::SandboxLaunchSource;
 use super::*;
-use crate::cfg::ResolvedImageCacheConfig;
-use crate::image::cache::local_image_services_from_global_config;
-use crate::image::cache::test_support::{
-    test_local_image_services_from_service, ImageCacheService, RecordingRuntimeImageRefs,
-};
-use crate::image::{RuntimeImageOwner, RuntimeImageRefs};
+use crate::image::{RecordingRuntimeImageRefs, RuntimeImageOwner, RuntimeImageRefs};
 use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
@@ -46,8 +40,17 @@ fn setup() {
     crate::logging::init_for_tests();
 }
 
+/// 🔴 A recording double, not this machine's real layer cache.
+///
+/// It used to be `local_image_services_from_global_config().runtime_refs`,
+/// which opens the process-wide image-cache RocksDB under `$AENV_HOME` — code
+/// that lives in `aenv-node` now and that the orchestrator, being shared, does
+/// not link. The double answers the same trait the orchestrator drives, and
+/// the one test that needed the *real* cache (GC keeping a paused sandbox's
+/// runtime config alive) moved to `aenv-node` with it — see
+/// `aenv_node::image::cache`'s `pause_uses_runtime_config_when_source_config_was_evicted`.
 fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
-    local_image_services_from_global_config().runtime_refs
+    Arc::new(RecordingRuntimeImageRefs::default())
 }
 
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
@@ -144,27 +147,14 @@ fn make_orchestrator_without_background_parts<
     persister: P,
     default_sandbox_timeout: Duration,
 ) -> Arc<TestOrchestrator<S, F, P>> {
-    let (sandbox_event_tx, _sandbox_event_rx) =
-        tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
-    Arc::new(Orchestrator {
+    Arc::new(Orchestrator::from_test_parts(
         store,
         factory,
         persister,
-        sandboxes: RwLock::new(HashMap::new()),
-        proxy_routes: RwLock::new(ProxyRouteTable::default()),
-        next_proxy_route_version: AtomicU64::new(1),
-        counters: Default::default(),
-        sandbox_event_tx,
         default_sandbox_timeout,
-        is_shutting_down: std::sync::atomic::AtomicBool::new(false),
-        scheduling_disabled: std::sync::atomic::AtomicBool::new(false),
-        scheduling_disabled_changed_at_ms: std::sync::atomic::AtomicI64::new(0),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        shutdown_outcome: tokio::sync::OnceCell::new(),
-        image_refs: test_runtime_image_refs(),
-        access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
-        paused_publisher: tokio::sync::OnceCell::new(),
-    })
+        test_runtime_image_refs(),
+        "orchestrator-test-seed",
+    ))
 }
 
 enum StoreAction {
@@ -1457,26 +1447,6 @@ fn create_request(
     }
 }
 
-fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size: u64) {
-    std::fs::create_dir_all(path.parent().expect("image config parent"))
-        .expect("create image config dir");
-    std::fs::write(
-        path,
-        serde_json::to_vec_pretty(&json!({
-            "repoBlobUrl": "",
-            "lowers": [{
-                "file": file.display().to_string(),
-                "digest": digest,
-                "size": size
-            }],
-            "upper": {},
-            "resultFile": ""
-        }))
-        .expect("serialize image config"),
-    )
-    .expect("write image config");
-}
-
 #[tokio::test]
 async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     setup();
@@ -1526,83 +1496,6 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     assert_eq!(created.snapshot_alias, None);
     assert_eq!(created.resources, expected_resources);
     assert_proxy_ready(&orchestrator, &created.id).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()> {
-    setup();
-    let temp = TempDir::new().expect("tempdir");
-    let root_dir = temp.path().join("image-cache");
-    let image_cache = Arc::new(ImageCacheService::from_resolved_config(
-        ResolvedImageCacheConfig {
-            commit_store: root_dir.join("commits"),
-            remote_blocks_dir: root_dir.join("remote-blocks"),
-            root_dir: root_dir.clone(),
-            remote_blocks_size_gb: 10,
-            capacity_bytes: None,
-        },
-    ));
-
-    let source = temp.path().join("source.commit");
-    std::fs::write(&source, b"paused").expect("write source commit");
-    let commit_file = image_cache
-        .import_hard_commit_trusted_descriptor(&source, "sha256:paused", 6)
-        .await
-        .expect("import paused commit");
-
-    let source_config = root_dir.join("configs/source-image.json");
-    let runtime_config = temp.path().join("runtime/image.json");
-    write_local_commit_image_config(&source_config, &commit_file, "sha256:paused", 6);
-    write_local_commit_image_config(&runtime_config, &commit_file, "sha256:paused", 6);
-
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.set_source_config_paths(vec![source_config.clone()]);
-    behavior.set_runtime_info(SandboxRuntimeInfo {
-        runtime_artifacts: RuntimeArtifactSet::from_overlaybd_image_configs(vec![runtime_config]),
-        ..Default::default()
-    });
-    let mut orchestrator = make_orchestrator_without_background_with_factory(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::with_behavior(behavior),
-    );
-    Arc::get_mut(&mut orchestrator)
-        .expect("orchestrator should be uniquely owned")
-        .image_refs = test_local_image_services_from_service(
-        Arc::clone(&image_cache),
-        None,
-        Duration::from_secs(0),
-    )
-    .runtime_refs;
-
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[]))
-        .await?;
-    std::fs::remove_file(&source_config).expect("evict source config");
-
-    orchestrator.pause_sandbox(created.id).await?;
-    let running: Vec<(String, Vec<PathBuf>)> = orchestrator
-        .collect_running_artifacts()
-        .await
-        .into_iter()
-        .map(|(id, artifacts)| {
-            (
-                id.to_string(),
-                artifacts.into_overlaybd_image_config_paths(),
-            )
-        })
-        .collect();
-    let summary = image_cache
-        .run_maintenance(running, None, Duration::from_secs(0))
-        .await
-        .expect("run gc");
-
-    assert_eq!(summary.collected, 0);
-    assert!(commit_file.exists());
-    assert!(
-        summary.retained >= 1,
-        "paused commit must be retained by its durable pin"
-    );
     Ok(())
 }
 

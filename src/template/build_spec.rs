@@ -7,7 +7,7 @@ use crate::snapshot::{CommandContext, SnapshotAlias};
 use crate::types::{ImageConfigs, SandboxResources};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum TemplateBuildRootfsBase {
+pub enum TemplateBuildRootfsBase {
     Ext4 {
         image_path: PathBuf,
     },
@@ -19,12 +19,12 @@ pub(crate) enum TemplateBuildRootfsBase {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TemplateBuildStep {
-    pub(crate) kind: TemplateBuildStepKind,
+pub struct TemplateBuildStep {
+    pub kind: TemplateBuildStepKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum TemplateBuildStepKind {
+pub enum TemplateBuildStepKind {
     Run { cmd: String },
     Env { key: String, value: String },
     Workdir { path: PathBuf },
@@ -35,13 +35,13 @@ pub(crate) enum TemplateBuildStepKind {
 }
 
 impl TemplateBuildStep {
-    pub(crate) fn run(cmd: impl Into<String>) -> Self {
+    pub fn run(cmd: impl Into<String>) -> Self {
         Self {
             kind: TemplateBuildStepKind::Run { cmd: cmd.into() },
         }
     }
 
-    pub(crate) fn env(key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn env(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             kind: TemplateBuildStepKind::Env {
                 key: key.into(),
@@ -50,13 +50,13 @@ impl TemplateBuildStep {
         }
     }
 
-    pub(crate) fn workdir(path: impl Into<PathBuf>) -> Self {
+    pub fn workdir(path: impl Into<PathBuf>) -> Self {
         Self {
             kind: TemplateBuildStepKind::Workdir { path: path.into() },
         }
     }
 
-    pub(crate) fn user(value: impl Into<String>) -> Self {
+    pub fn user(value: impl Into<String>) -> Self {
         Self {
             kind: TemplateBuildStepKind::User {
                 value: value.into(),
@@ -64,19 +64,19 @@ impl TemplateBuildStep {
         }
     }
 
-    pub(crate) fn exposed_port(port: impl Into<String>) -> Self {
+    pub fn exposed_port(port: impl Into<String>) -> Self {
         Self {
             kind: TemplateBuildStepKind::ExposedPort { port: port.into() },
         }
     }
 
-    pub(crate) fn volume(path: impl Into<String>) -> Self {
+    pub fn volume(path: impl Into<String>) -> Self {
         Self {
             kind: TemplateBuildStepKind::Volume { path: path.into() },
         }
     }
 
-    pub(crate) fn label(key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn label(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             kind: TemplateBuildStepKind::Label {
                 key: key.into(),
@@ -117,7 +117,7 @@ impl TemplateBuildSpec {
         self.with_resolved_overlaybd_image(image_config_path, ImageConfigs::new())
     }
 
-    pub(crate) fn with_resolved_overlaybd_image(
+    pub fn with_resolved_overlaybd_image(
         mut self,
         image_config_path: impl Into<PathBuf>,
         image_configs: ImageConfigs,
@@ -220,7 +220,7 @@ impl TemplateBuildSpec {
         self
     }
 
-    pub(crate) fn parsed_alias(&self) -> TemplateBuildResult<Option<SnapshotAlias>> {
+    pub fn parsed_alias(&self) -> TemplateBuildResult<Option<SnapshotAlias>> {
         self.alias
             .as_deref()
             .map(|value| {
@@ -230,11 +230,11 @@ impl TemplateBuildSpec {
             .transpose()
     }
 
-    pub(crate) fn rootfs_base_ref(&self) -> Option<&TemplateBuildRootfsBase> {
+    pub fn rootfs_base_ref(&self) -> Option<&TemplateBuildRootfsBase> {
         self.rootfs_base.as_ref()
     }
 
-    pub(crate) fn steps(&self) -> &[TemplateBuildStep] {
+    pub fn steps(&self) -> &[TemplateBuildStep] {
         &self.steps
     }
 
@@ -246,33 +246,33 @@ impl TemplateBuildSpec {
     /// `RUN`/`ENV`/... calls that build one up locally. Re-deriving those
     /// calls from the decoded kinds would just reconstruct the vector this
     /// method sets directly, one match arm at a time, for no benefit.
-    pub(crate) fn with_steps(mut self, steps: Vec<TemplateBuildStep>) -> Self {
+    pub fn with_steps(mut self, steps: Vec<TemplateBuildStep>) -> Self {
         self.steps = steps;
         self
     }
 
-    pub(crate) fn resources_ref(&self) -> Option<&SandboxResources> {
+    pub fn resources_ref(&self) -> Option<&SandboxResources> {
         self.resources.as_ref()
     }
 
-    pub(crate) fn start_cmd_ref(&self) -> Option<&str> {
+    pub fn start_cmd_ref(&self) -> Option<&str> {
         self.start_cmd.as_deref()
     }
 
-    pub(crate) fn ready_cmd_ref(&self) -> Option<&str> {
+    pub fn ready_cmd_ref(&self) -> Option<&str> {
         self.ready_cmd.as_deref()
     }
 
-    pub(crate) fn with_base_context(mut self, context: CommandContext) -> Self {
+    pub fn with_base_context(mut self, context: CommandContext) -> Self {
         self.base_context = Some(context);
         self
     }
 
-    pub(crate) fn base_context_ref(&self) -> Option<&CommandContext> {
+    pub fn base_context_ref(&self) -> Option<&CommandContext> {
         self.base_context.as_ref()
     }
 
-    pub(crate) fn overrides_startup(&self) -> bool {
+    pub fn overrides_startup(&self) -> bool {
         self.start_cmd.is_some() || self.ready_cmd.is_some()
     }
 }

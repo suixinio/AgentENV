@@ -18,7 +18,7 @@ pub enum ProxyLookupResult {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProxyRoute {
+pub struct ProxyRoute {
     target: ProxyTarget,
     version: u64,
     updated_at: SystemTime,
@@ -32,7 +32,7 @@ pub(crate) struct ProxyRoute {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ProxyRouteTable {
+pub struct ProxyRouteTable {
     routes: HashMap<SandboxId, ProxyRoute>,
 }
 

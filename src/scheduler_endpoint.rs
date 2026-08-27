@@ -179,7 +179,7 @@ impl SchedulerEndpointSource {
     /// in-process test server, a broken dial target) without going through
     /// [`spawn`](Self::spawn)'s endpoint-string parsing.
     #[cfg(test)]
-    pub(crate) fn fixed(channel: Channel, endpoint: impl Into<String>) -> Self {
+    pub fn fixed(channel: Channel, endpoint: impl Into<String>) -> Self {
         let (_tx, rx) = watch::channel((channel, endpoint.into()));
         Self { rx }
     }

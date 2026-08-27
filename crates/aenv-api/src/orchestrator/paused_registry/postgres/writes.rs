@@ -49,7 +49,7 @@ fn invalid(sandbox_id: &str, reason: impl Into<String>) -> PausedRegistryError {
 /// a row that was actually fenced, or the reverse -- and the two answers this
 /// backend gives a caller for those are opposite (`InvalidRecord`, which is a
 /// bug report, versus `ExecutionFenced`, which means stop retrying for good).
-pub(super) async fn begin_pause(
+pub async fn begin_pause(
     registry: &PostgresPausedSandboxRegistry,
     entry: &PausedSandboxEntry,
 ) -> RegistryResult<BeganPause> {
@@ -193,7 +193,7 @@ where
 }
 
 /// `CompletePause` (`completePauseSQL`, `store_postgres.go:648-664`).
-pub(super) async fn complete_pause(
+pub async fn complete_pause(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
     generation: i64,
@@ -219,7 +219,7 @@ pub(super) async fn complete_pause(
 }
 
 /// `MarkLocalOnly` (`markLocalOnlySQL`, `store_postgres.go:694-703`).
-pub(super) async fn mark_local_only(
+pub async fn mark_local_only(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
     generation: i64,
@@ -246,7 +246,7 @@ pub(super) async fn mark_local_only(
 /// selects `claim_for_resume_durable_only_sql` in place of the full
 /// three-way test -- the Rust equivalent of Go's
 /// `!s.grace.allowsLeaseTakeover()` gate (see [`super::grace`]).
-pub(super) async fn claim_for_resume(
+pub async fn claim_for_resume(
     registry: &PostgresPausedSandboxRegistry,
     durable_only: bool,
     sandbox_id: &SandboxId,
@@ -313,7 +313,7 @@ async fn claim_for_resume_not_claimed(
 /// `ReleaseClaim` (`releaseClaimSQL`, `store_postgres.go:971-986`): a
 /// seizure, so zero rows affected is a plain, non-error `false` -- somebody
 /// else already moved the row on, which is what this call wanted.
-pub(super) async fn release_claim(
+pub async fn release_claim(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
     generation: i64,
@@ -343,7 +343,7 @@ pub(super) async fn release_claim(
 /// re-read "now decides whether the caller retries or stops for good, and a
 /// classification made against a version of the row this statement never saw
 /// can send a node either way for no reason".
-pub(super) async fn mark_running(
+pub async fn mark_running(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
     node_id: &str,
@@ -430,7 +430,7 @@ pub(super) async fn mark_running(
 /// `Superseded` versus `NotTracked` decides whether a caller retries or
 /// gives up for good, and a classification made off a different connection's
 /// view of the row can send it either way for no reason.
-pub(super) async fn renew_sandbox_deadline(
+pub async fn renew_sandbox_deadline(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
     execution_id: ExecutionId,
@@ -472,7 +472,7 @@ pub(super) async fn renew_sandbox_deadline(
 /// `Remove` (`removeSQL`, `store_postgres.go:1872-1909`): a non-match is a
 /// plain, non-error `false` -- the row this caller meant to delete is
 /// already gone, which is what it wanted.
-pub(super) async fn remove(
+pub async fn remove(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
     generation: i64,

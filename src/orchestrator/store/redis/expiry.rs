@@ -32,7 +32,7 @@ fn desired_score(metadata: &SandboxMetadata, now: SystemTime) -> Option<i64> {
         .map(to_unix_millis)
 }
 
-pub(super) async fn expired_batch(
+pub async fn expired_batch(
     inner: &Arc<StoreInner>,
     now: SystemTime,
     limit: usize,
@@ -166,7 +166,7 @@ pub(super) async fn expired_batch(
 /// deleted since by a concurrent `remove`, and a bare `ZADD` would put it back
 /// — an index entry for a sandbox that no longer exists, planted by the very
 /// sweep whose job is to remove such things.
-pub(super) async fn rescore_existing_members(
+pub async fn rescore_existing_members(
     connection: &mut redis::aio::ConnectionManager,
     key: &str,
     members: &[(i64, String)],
@@ -199,7 +199,7 @@ pub(super) async fn rescore_existing_members(
 /// 🔴 That argument depends on the eviction re-check already existing. Order
 /// matters: the re-check first, the healer second. The other order plants
 /// entries with no safety net under them.
-pub(super) async fn heal_expiry_index(inner: &Arc<StoreInner>) -> Result<usize> {
+pub async fn heal_expiry_index(inner: &Arc<StoreInner>) -> Result<usize> {
     // 🔴 Re-read every round, so it is a kill switch that works without a
     // redeploy, and reported in three states so that "this round healed
     // nothing" cannot be read as "there was nothing to heal".

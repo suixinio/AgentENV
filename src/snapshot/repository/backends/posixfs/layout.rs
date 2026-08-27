@@ -2,72 +2,72 @@ use std::path::{Path, PathBuf};
 
 use crate::snapshot::{SnapshotAlias, SnapshotId};
 
-pub(super) const POSIXFS_SNAPSHOT_COMMIT_MARKER: &str = "commit";
+pub const POSIXFS_SNAPSHOT_COMMIT_MARKER: &str = "commit";
 const LOCK_SUFFIX: &str = ".lock";
 
-pub(super) fn managed_layer_file_name(digest: &str) -> String {
+pub fn managed_layer_file_name(digest: &str) -> String {
     format!("{}.overlaybd.commit", digest.replace([':', '/'], "_"))
 }
 
 /// Committed artifact layout for the POSIX-backed snapshot repository.
-pub(crate) struct PosixFsSnapshotArtifactLayout {
+pub struct PosixFsSnapshotArtifactLayout {
     root: PathBuf,
     snapshot_id: SnapshotId,
 }
 
 impl PosixFsSnapshotArtifactLayout {
-    pub(super) fn new(root: impl Into<PathBuf>, snapshot_id: &SnapshotId) -> Self {
+    pub fn new(root: impl Into<PathBuf>, snapshot_id: &SnapshotId) -> Self {
         Self {
             root: root.into(),
             snapshot_id: snapshot_id.clone(),
         }
     }
 
-    pub(super) fn catalog_dir(root: &Path) -> PathBuf {
+    pub fn catalog_dir(root: &Path) -> PathBuf {
         root.join("catalog")
     }
 
-    pub(super) fn aliases_dir(root: &Path) -> PathBuf {
+    pub fn aliases_dir(root: &Path) -> PathBuf {
         Self::catalog_dir(root).join("aliases")
     }
 
-    pub(super) fn records_dir(root: &Path) -> PathBuf {
+    pub fn records_dir(root: &Path) -> PathBuf {
         Self::catalog_dir(root).join("records")
     }
 
-    pub(super) fn alias_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
+    pub fn alias_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
         Self::aliases_dir(root).join(alias.to_string())
     }
 
-    pub(super) fn alias_lock_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
+    pub fn alias_lock_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
         Self::aliases_dir(root).join(format!("{alias}{LOCK_SUFFIX}"))
     }
 
-    pub(super) fn record_path(root: &Path, id: &SnapshotId) -> PathBuf {
+    pub fn record_path(root: &Path, id: &SnapshotId) -> PathBuf {
         Self::records_dir(root).join(format!("{id}.json"))
     }
 
-    pub(super) fn record_lock_path(root: &Path, id: &SnapshotId) -> PathBuf {
+    pub fn record_lock_path(root: &Path, id: &SnapshotId) -> PathBuf {
         Self::records_dir(root).join(format!("{id}{LOCK_SUFFIX}"))
     }
 
-    pub(super) fn snapshots_dir(root: &Path) -> PathBuf {
+    pub fn snapshots_dir(root: &Path) -> PathBuf {
         root.join("snapshots")
     }
 
-    pub(super) fn managed_layers_dir(root: &Path) -> PathBuf {
+    pub fn managed_layers_dir(root: &Path) -> PathBuf {
         root.join("managed-layers")
     }
 
-    pub(crate) fn managed_layer_path(root: &Path, digest: &str) -> PathBuf {
+    pub fn managed_layer_path(root: &Path, digest: &str) -> PathBuf {
         Self::managed_layers_dir(root).join(managed_layer_file_name(digest))
     }
 
-    pub(super) fn snapshot_dir(&self) -> PathBuf {
+    pub fn snapshot_dir(&self) -> PathBuf {
         Self::snapshots_dir(&self.root).join(self.snapshot_id.to_string())
     }
 
-    pub(super) fn path(&self, relative_path: &str) -> PathBuf {
+    pub fn path(&self, relative_path: &str) -> PathBuf {
         self.snapshot_dir().join(relative_path)
     }
 }

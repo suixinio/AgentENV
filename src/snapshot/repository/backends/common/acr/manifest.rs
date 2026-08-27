@@ -7,25 +7,25 @@ use crate::digest;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::CommandContext;
 
-pub(crate) const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-pub(crate) const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
-pub(crate) const OCI_TAR_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+pub const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
+pub const OCI_TAR_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 const OVERLAYBD_BLOB_DIGEST_ANNOTATION: &str = "containerd.io/snapshot/overlaybd/blob-digest";
 const OVERLAYBD_BLOB_SIZE_ANNOTATION: &str = "containerd.io/snapshot/overlaybd/blob-size";
 const SNAPSHOT_TAG_ANNOTATION: &str = "io.agentenv.snapshot.tag";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OciDescriptor {
-    pub(crate) media_type: String,
-    pub(crate) digest: String,
-    pub(crate) size: u64,
+pub struct OciDescriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
-    pub(crate) annotations: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
 }
 
 impl OciDescriptor {
-    pub(crate) fn overlaybd_layer(digest: String, size: u64) -> Self {
+    pub fn overlaybd_layer(digest: String, size: u64) -> Self {
         let mut annotations = BTreeMap::new();
         annotations.insert(OVERLAYBD_BLOB_DIGEST_ANNOTATION.to_string(), digest.clone());
         annotations.insert(OVERLAYBD_BLOB_SIZE_ANNOTATION.to_string(), size.to_string());
@@ -37,7 +37,7 @@ impl OciDescriptor {
         }
     }
 
-    pub(crate) fn config(digest: String, size: u64) -> Self {
+    pub fn config(digest: String, size: u64) -> Self {
         Self {
             media_type: OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
             digest,
@@ -59,13 +59,13 @@ struct OciManifest {
 
 /// Effective runtime metadata plus the optional source rootfs OCI config.
 #[derive(Clone, Copy)]
-pub(crate) struct SnapshotOciConfigInput<'a> {
+pub struct SnapshotOciConfigInput<'a> {
     context: &'a CommandContext,
     raw_config: Option<&'a Value>,
 }
 
 impl<'a> SnapshotOciConfigInput<'a> {
-    pub(crate) fn new(context: &'a CommandContext, raw_config: Option<&'a Value>) -> Self {
+    pub fn new(context: &'a CommandContext, raw_config: Option<&'a Value>) -> Self {
         Self {
             context,
             raw_config,
@@ -201,7 +201,7 @@ fn merged_runtime_config(input: SnapshotOciConfigInput<'_>) -> Value {
     canonicalize_json(Value::Object(config))
 }
 
-pub(crate) fn snapshot_oci_config_blob(
+pub fn snapshot_oci_config_blob(
     architecture: &str,
     input: SnapshotOciConfigInput<'_>,
 ) -> RepositoryResult<(Vec<u8>, String, u64)> {
@@ -212,9 +212,7 @@ pub(crate) fn snapshot_oci_config_blob(
     )
 }
 
-pub(crate) fn minimal_oci_config_blob(
-    architecture: &str,
-) -> RepositoryResult<(Vec<u8>, String, u64)> {
+pub fn minimal_oci_config_blob(architecture: &str) -> RepositoryResult<(Vec<u8>, String, u64)> {
     oci_config_blob(
         architecture,
         serde_json::json!({"Env": [], "WorkingDir": ""}),
@@ -223,7 +221,7 @@ pub(crate) fn minimal_oci_config_blob(
 }
 
 /// OCI architecture string of the host running this binary.
-pub(crate) fn host_architecture_for_oci() -> &'static str {
+pub fn host_architecture_for_oci() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
@@ -233,7 +231,7 @@ pub(crate) fn host_architecture_for_oci() -> &'static str {
     }
 }
 
-pub(crate) fn build_oci_image_manifest(
+pub fn build_oci_image_manifest(
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,
     publication_tag: &str,

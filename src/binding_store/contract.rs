@@ -30,11 +30,11 @@ fn node(id: &str) -> Node {
     }
 }
 
-pub(crate) async fn get_is_none_for_an_absent_sandbox<S: BindingStore>(store: &S) {
+pub async fn get_is_none_for_an_absent_sandbox<S: BindingStore>(store: &S) {
     assert!(store.get("never-bound", unix(0)).await.unwrap().is_none());
 }
 
-pub(crate) async fn record_then_get_round_trips<S: BindingStore>(store: &S) {
+pub async fn record_then_get_round_trips<S: BindingStore>(store: &S) {
     let decision = store
         .record(
             "sbx-1",
@@ -54,7 +54,7 @@ pub(crate) async fn record_then_get_round_trips<S: BindingStore>(store: &S) {
     assert_eq!(binding.execution_id, "0198f5c0-1234-7abc-8def-000000000001");
 }
 
-pub(crate) async fn record_with_no_execution_id_installs_unknown<S: BindingStore>(store: &S) {
+pub async fn record_with_no_execution_id_installs_unknown<S: BindingStore>(store: &S) {
     let decision = store
         .record(
             "sbx-1",
@@ -71,7 +71,7 @@ pub(crate) async fn record_with_no_execution_id_installs_unknown<S: BindingStore
 
 /// Fenced arbitration (both backends default to it): a lexicographically
 /// older challenger is refused and the existing record is left untouched.
-pub(crate) async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
+pub async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
     store
         .record(
             "sbx-1",
@@ -111,7 +111,7 @@ pub(crate) async fn record_rejects_an_older_incarnation<S: BindingStore>(store: 
 }
 
 /// A newer incarnation is accepted and takes over.
-pub(crate) async fn record_accepts_a_newer_incarnation<S: BindingStore>(store: &S) {
+pub async fn record_accepts_a_newer_incarnation<S: BindingStore>(store: &S) {
     store
         .record(
             "sbx-1",
@@ -141,7 +141,7 @@ pub(crate) async fn record_accepts_a_newer_incarnation<S: BindingStore>(store: &
     assert_eq!(binding.node.id, "node-b");
 }
 
-pub(crate) async fn reconcile_node_installs_every_roster_entry<S: BindingStore>(store: &S) {
+pub async fn reconcile_node_installs_every_roster_entry<S: BindingStore>(store: &S) {
     let decisions = store
         .reconcile_node(
             node("node-a"),
@@ -166,9 +166,7 @@ pub(crate) async fn reconcile_node_installs_every_roster_entry<S: BindingStore>(
     assert!(store.get("sbx-2", unix(0)).await.unwrap().is_some());
 }
 
-pub(crate) async fn reconcile_node_with_an_empty_roster_removes_everything_it_owns<
-    S: BindingStore,
->(
+pub async fn reconcile_node_with_an_empty_roster_removes_everything_it_owns<S: BindingStore>(
     store: &S,
 ) {
     store
@@ -193,9 +191,7 @@ pub(crate) async fn reconcile_node_with_an_empty_roster_removes_everything_it_ow
     assert!(store.get("sbx-1", unix(1)).await.unwrap().is_none());
 }
 
-pub(crate) async fn reconcile_node_drops_entries_the_node_no_longer_reports<S: BindingStore>(
-    store: &S,
-) {
+pub async fn reconcile_node_drops_entries_the_node_no_longer_reports<S: BindingStore>(store: &S) {
     store
         .reconcile_node(
             node("node-a"),
@@ -236,9 +232,7 @@ pub(crate) async fn reconcile_node_drops_entries_the_node_no_longer_reports<S: B
     );
 }
 
-pub(crate) async fn reconcile_node_does_not_touch_another_nodes_binding<S: BindingStore>(
-    store: &S,
-) {
+pub async fn reconcile_node_does_not_touch_another_nodes_binding<S: BindingStore>(store: &S) {
     store
         .record(
             "sbx-1",
@@ -268,7 +262,7 @@ pub(crate) async fn reconcile_node_does_not_touch_another_nodes_binding<S: Bindi
 
 // ---- delete: "the guard is the whole point" ----
 
-pub(crate) async fn delete_of_an_absent_sandbox_is_a_noop<S: BindingStore>(store: &S) {
+pub async fn delete_of_an_absent_sandbox_is_a_noop<S: BindingStore>(store: &S) {
     let outcome = store
         .delete("never-bound", "exec-1", unix(0))
         .await
@@ -276,7 +270,7 @@ pub(crate) async fn delete_of_an_absent_sandbox_is_a_noop<S: BindingStore>(store
     assert_eq!(outcome, BindingDeleteOutcome::Absent);
 }
 
-pub(crate) async fn delete_with_the_matching_incarnation_deletes<S: BindingStore>(store: &S) {
+pub async fn delete_with_the_matching_incarnation_deletes<S: BindingStore>(store: &S) {
     store
         .record(
             "sbx-1",
@@ -294,9 +288,7 @@ pub(crate) async fn delete_with_the_matching_incarnation_deletes<S: BindingStore
     assert!(store.get("sbx-1", unix(0)).await.unwrap().is_none());
 }
 
-pub(crate) async fn delete_with_a_stale_incarnation_is_refused_and_the_record_survives<
-    S: BindingStore,
->(
+pub async fn delete_with_a_stale_incarnation_is_refused_and_the_record_survives<S: BindingStore>(
     store: &S,
 ) {
     store
@@ -329,7 +321,7 @@ pub(crate) async fn delete_with_a_stale_incarnation_is_refused_and_the_record_su
     );
 }
 
-pub(crate) async fn delete_of_a_record_with_no_known_incarnation_deletes_anyway<S: BindingStore>(
+pub async fn delete_of_a_record_with_no_known_incarnation_deletes_anyway<S: BindingStore>(
     store: &S,
 ) {
     // A record that never named an incarnation (arbitration-off, or an old
@@ -352,7 +344,7 @@ pub(crate) async fn delete_of_a_record_with_no_known_incarnation_deletes_anyway<
     assert!(store.get("sbx-1", unix(0)).await.unwrap().is_none());
 }
 
-pub(crate) async fn delete_with_an_empty_execution_id_is_a_noop_never_an_unguarded_delete<
+pub async fn delete_with_an_empty_execution_id_is_a_noop_never_an_unguarded_delete<
     S: BindingStore,
 >(
     store: &S,
@@ -399,9 +391,7 @@ pub(crate) async fn delete_with_an_empty_execution_id_is_a_noop_never_an_unguard
 /// Observing: the decision label still reads what `Fenced` would have
 /// decided (so the metric a caller watches to judge "would enforcing this
 /// break anything" is honest), but the write always lands regardless.
-pub(crate) async fn record_observing_mode_accepts_but_still_labels_the_fenced_decision<
-    S: BindingStore,
->(
+pub async fn record_observing_mode_accepts_but_still_labels_the_fenced_decision<S: BindingStore>(
     store: &S,
 ) {
     store
@@ -447,9 +437,7 @@ pub(crate) async fn record_observing_mode_accepts_but_still_labels_the_fenced_de
 
 /// Off: always accepts, and reports no decision at all -- nothing for
 /// `agentenv_api_binding_execution_total` to count.
-pub(crate) async fn record_off_mode_accepts_anything_and_reports_no_decision<S: BindingStore>(
-    store: &S,
-) {
+pub async fn record_off_mode_accepts_anything_and_reports_no_decision<S: BindingStore>(store: &S) {
     store
         .record(
             "sbx-1",

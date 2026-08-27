@@ -10,6 +10,7 @@ members = [
     "adev",
     "crates/aenv",
     "crates/aenv-api",
+    "crates/aenv-node",
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/linux-cap",
@@ -37,6 +38,18 @@ path = "src/lib.rs"
 
 [features]
 vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
+# 🔴 Test scaffolding this crate's *siblings* need, and that nothing ships.
+#
+# `aenv-node` and `aenv-api` are separate crates now, so their tests are not
+# `cfg(test)` in here: anything of this crate's that only a test uses —
+# `p2p::mock`, `logging::capture`, `RunnableSnapshot::mock`, the ACR fake
+# registry — is invisible to them unless it is compiled unconditionally.
+# Compiling it unconditionally would put a fake registry server in the
+# shipped binary, so it goes behind this instead, enabled from those crates'
+# `[dev-dependencies]` only. Cargo's v2 resolver does not unify a
+# dev-dependency's features into a normal build, so `cargo build` is
+# unaffected.
+test-support = []
 
 [dev-dependencies]
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
@@ -44,7 +57,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
-firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }
 tokio = { version = "1", features = ["full"] }
@@ -62,8 +74,6 @@ anyhow = "1.0.100"
 tempfile = "3.22.0"
 nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio"] }
 libc = "0.2"
-rtnetlink = "0.20"
-netlink-packet-route = "0.28"
 ipnetwork = "0.21"
 futures = "0.3"
 tonic = "0.14.2"
@@ -71,11 +81,9 @@ tonic-prost = "0.14.2"
 prost = "0.14.3"
 prost-types = "0.14.3"
 thiserror = "2.0.18"
-index-set = "0.2"
 uuid = { version = "1", features = ["serde", "v7"] }
 toml = "0.9.11"
 confique = { version = "0.4.0", features = ["toml"] }
-which = "8.0.0"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 metrics = "0.24"
@@ -96,17 +104,10 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 url = "2.5"
 clap = { version = "4", features = ["derive"] }
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-uvm-ublk = { path = "storage/ublk" }
-uvm-ublk-daemon = { path = "storage/ublk-daemon" }
 shell-util = { path = "crates/shell-util" }
 linux-cap = { path = "crates/linux-cap" }
 warm-pool = { path = "crates/warm-pool" }
-ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
-overlaybd = { path = "storage/overlaybd" }
-storage-util = { path = "storage/util" }
 dashmap = "6.1.0"
-io-uring = "0.7.9"
 tokio-tungstenite = "0.28"
 sha2 = "0.10"
 hmac = "0.12"
@@ -115,8 +116,6 @@ semver = "1"
 iroh = { version = "=1.0.0-rc.0" }
 iroh-blobs = { version = "=0.101.0" }
 rand = "0.10"
-flate2 = "1"
-tar = "0.4"
 openssl-sys = { version = "0.9", optional = true }
 redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
 # Stage A of the scheduler fold (docs/proposals/_sd-phase4-stageA-node-inventory.md):

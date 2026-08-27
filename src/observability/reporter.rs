@@ -697,11 +697,11 @@ mod tests {
     use crate::orchestrator::SandboxRosterEntry;
     use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-    pub(super) fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
+    pub fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         make_cluster_config_with_file(endpoint, None)
     }
 
-    pub(super) fn make_cluster_config_with_file(
+    pub fn make_cluster_config_with_file(
         endpoint: Option<&str>,
         scheduler_endpoint_file: Option<&str>,
     ) -> ClusterConfig {
@@ -725,7 +725,7 @@ mod tests {
         make_report_config_with_file(enabled, interval_secs, None)
     }
 
-    pub(super) fn make_report_config_with_file(
+    pub fn make_report_config_with_file(
         enabled: Option<bool>,
         interval_secs: Option<u64>,
         scheduler_endpoint_file: Option<&str>,

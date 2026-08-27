@@ -1,5 +1,5 @@
 mod file_backed;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod mock;
 
 use async_trait::async_trait;
@@ -10,8 +10,8 @@ use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 
 pub use file_backed::FileBackedSandboxPersister;
-#[cfg(test)]
-pub(crate) use mock::{RecordingCall, RecordingPersister};
+#[cfg(any(test, feature = "test-support"))]
+pub use mock::{RecordingCall, RecordingPersister};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
 
@@ -41,11 +41,7 @@ pub enum SandboxPersistenceError {
 }
 
 impl SandboxPersistenceError {
-    pub(super) fn io(
-        operation: &'static str,
-        path: impl Into<PathBuf>,
-        source: std::io::Error,
-    ) -> Self {
+    pub fn io(operation: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
             operation,
             path: path.into(),
@@ -53,7 +49,7 @@ impl SandboxPersistenceError {
         }
     }
 
-    pub(super) fn store(operation: &'static str, source: anyhow::Error) -> Self {
+    pub fn store(operation: &'static str, source: anyhow::Error) -> Self {
         Self::Store { operation, source }
     }
 }

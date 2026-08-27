@@ -36,7 +36,7 @@ const OSS_OPERATION_DURATION: &str = "agentenv_snapshot_oss_operation_duration_s
 /// metrics and in upload completion logs so memory layers can be told apart
 /// from rootfs/attached-drive layers.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum OssUploadArtifact {
+pub enum OssUploadArtifact {
     RootfsLayer,
     AttachedDriveLayer,
     MemoryLayer,
@@ -47,7 +47,7 @@ pub(crate) enum OssUploadArtifact {
 }
 
 impl OssUploadArtifact {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::RootfsLayer => "rootfs_layer",
             Self::AttachedDriveLayer => "attached_drive_layer",
@@ -62,7 +62,7 @@ impl OssUploadArtifact {
 
 /// Thin wrapper around the OSS client used by the repository and resolver.
 #[derive(Clone, Debug)]
-pub(crate) struct OssClient {
+pub struct OssClient {
     operator_config: ObjectStoreOperatorConfig,
     prefix: String,
     credentials: Arc<CachedCredentialSource>,
@@ -70,7 +70,7 @@ pub(crate) struct OssClient {
 }
 
 impl OssClient {
-    pub(crate) fn new(
+    pub fn new(
         bucket: String,
         endpoint: String,
         region: String,
@@ -100,7 +100,7 @@ impl OssClient {
         }
     }
 
-    pub(crate) fn managed_layers_repo_blob_url(&self) -> String {
+    pub fn managed_layers_repo_blob_url(&self) -> String {
         // overlaybd expects an S3-compatible repo blob URL here, including for
         // Alibaba OSS, so the scheme remains `s3://` rather than `oss://`.
         if self.prefix.is_empty() {
@@ -114,7 +114,7 @@ impl OssClient {
     }
 
     /// Read a small object entirely into memory.
-    pub(crate) async fn get_bytes(&self, key: &str) -> Result<Bytes> {
+    pub async fn get_bytes(&self, key: &str) -> Result<Bytes> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "get_bytes");
         let result = self
             .run_with_key(key, |operator, key| async move {
@@ -132,7 +132,7 @@ impl OssClient {
     }
 
     /// Download an object directly to a local file (atomic: temp + rename).
-    pub(crate) async fn get_to_file(&self, key: &str, dest: &Path) -> Result<u64> {
+    pub async fn get_to_file(&self, key: &str, dest: &Path) -> Result<u64> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "get_to_file");
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent)
@@ -160,7 +160,7 @@ impl OssClient {
     }
 
     /// Check whether an object exists.
-    pub(crate) async fn exists(&self, key: &str) -> Result<bool> {
+    pub async fn exists(&self, key: &str) -> Result<bool> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "exists");
         let result = self
             .run_with_key(
@@ -185,7 +185,7 @@ impl OssClient {
     }
 
     /// List all files recursively under a prefix.
-    pub(crate) async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
+    pub async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
         let listed = self
             .run_with_key(prefix, |operator, prefix| async move {
                 let entries = operator.list_with(&prefix).recursive(true).await?;
@@ -218,7 +218,7 @@ impl OssClient {
     }
 
     /// Write small data (catalog JSON, alias JSON, etc.).
-    pub(crate) async fn put_bytes(
+    pub async fn put_bytes(
         &self,
         key: &str,
         data: impl Into<Bytes>,
@@ -256,7 +256,7 @@ impl OssClient {
     }
 
     /// Upload a local file to OSS.
-    pub(crate) async fn put_file(
+    pub async fn put_file(
         &self,
         key: &str,
         path: &Path,
@@ -310,7 +310,7 @@ impl OssClient {
     }
 
     /// Delete a single object. Idempotent – missing objects are not errors.
-    pub(crate) async fn delete(&self, key: &str) -> Result<()> {
+    pub async fn delete(&self, key: &str) -> Result<()> {
         // `Deleted::Absent` records the idempotent case the public signature
         // erases: the store answered "no such object" and the caller was told
         // the delete succeeded.
@@ -336,7 +336,7 @@ impl OssClient {
     }
 
     /// Delete all objects under a prefix.
-    pub(crate) async fn delete_prefix(&self, prefix: &str) -> Result<()> {
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<()> {
         // `list_keys_recursive()` returns repository-relative keys with the
         // configured backend prefix stripped, while `delete()` expects that
         // same repository-relative form and re-applies the backend prefix.
@@ -358,7 +358,7 @@ impl OssClient {
         result
     }
 
-    pub(crate) fn is_not_found_error(error: &anyhow::Error) -> bool {
+    pub fn is_not_found_error(error: &anyhow::Error) -> bool {
         error.chain().any(|cause| {
             if let Some(opendal_error) = cause.downcast_ref::<OpenDalError>() {
                 return opendal_error.kind() == OpenDalErrorKind::NotFound;

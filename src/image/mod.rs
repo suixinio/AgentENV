@@ -1,11 +1,13 @@
-pub mod cache;
-pub(crate) mod commit_index;
+//! What the rest of the system asks of the image layer.
+//!
+//! 🔴 The resolving half — `regctl`, the layer cache and overlaybd — is
+//! `aenv-node`'s `image` module. What is here is the contract every caller
+//! spells, and the error type they classify by. See [`contract`]'s own module
+//! doc for the argument.
+
 mod contract;
-pub(crate) mod local_layer;
-mod metadata;
-pub(crate) mod oci_image;
-mod reference;
-mod resolver;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mock;
 
 use thiserror::Error;
 
@@ -13,31 +15,8 @@ pub use contract::{
     DisabledRuntimeImageRefs, ImageBaseContext, RefusingImageResolver, ResolvedBlockImage,
     RootfsImageResolver, RuntimeImageOwner, RuntimeImageRefs,
 };
-pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
-pub use resolver::ImageResolver;
-
-/// Boundedly closes every local image-cache RocksDB metadata store this
-/// process opened, so the shutdown path can wait on it with a bound instead of
-/// trusting an implicit `Drop` deep inside the tokio runtime's blocking pool.
-///
-/// 🔴 Not a method on [`ImageResolver`]: the store this closes is shared
-/// process-wide (`ImageCacheService`'s own instance registry deduplicates by
-/// cache root directory and never forgets an entry), so an individual
-/// resolver's handle is not this store's owner in any sense that would make
-/// "close the resolver" the right shape. See
-/// `crate::local_store::LocalKvStore::close` for the mechanism.
-/// This machine's own layer-cache handle, for the orchestrator that runs on it.
-///
-/// 🔴 Constructing this is what opens the node-local cache, which is why it is
-/// the caller's call and not a default inside `Orchestrator::new` — see that
-/// function's own doc.
-pub fn local_runtime_image_refs() -> std::sync::Arc<dyn RuntimeImageRefs> {
-    cache::local_image_services_from_global_config().runtime_refs
-}
-
-pub async fn close_image_cache_stores(timeout: std::time::Duration) {
-    cache::close_shared_metadata_stores(timeout).await;
-}
+#[cfg(any(test, feature = "test-support"))]
+pub use mock::RecordingRuntimeImageRefs;
 
 /// The image module's single error type.
 ///
@@ -81,7 +60,7 @@ impl ImageError {
     /// variant-safe counterpart to [`anyhow::Context`], which would collapse
     /// every variant into [`ImageError::Other`] and so lose the 4xx/5xx
     /// classification when context is added mid-flight.
-    pub(crate) fn context(self, context: impl std::fmt::Display) -> Self {
+    pub fn context(self, context: impl std::fmt::Display) -> Self {
         match self {
             Self::InvalidReference { reason } => Self::InvalidReference {
                 reason: format!("{context}: {reason}"),

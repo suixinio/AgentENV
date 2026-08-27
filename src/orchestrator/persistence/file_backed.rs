@@ -138,8 +138,8 @@ impl FileBackedSandboxPersister {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test(root: PathBuf) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test(root: PathBuf) -> Self {
         Self::new(root, VirtualizationMode::Kvm)
     }
 

@@ -129,7 +129,7 @@ pub struct RedisStoreConfig {
     /// instance of exactly the class of thing this work exists to remove.
     #[cfg(test)]
     #[serde(skip)]
-    pub(crate) cas_predicates_enabled: bool,
+    pub cas_predicates_enabled: bool,
 }
 
 impl Default for RedisStoreConfig {
@@ -179,7 +179,7 @@ impl RedisStoreConfig {
     /// test build there is no field, no accessor and no branch — the predicates
     /// cannot be turned off by anything.
     #[cfg(test)]
-    pub(crate) fn cas_predicates_enabled(&self) -> bool {
+    pub fn cas_predicates_enabled(&self) -> bool {
         self.cas_predicates_enabled
     }
 

@@ -383,7 +383,7 @@ impl SnapshotRecord {
 
     /// Returns the published rootfs OCI image reference, if source-registry
     /// image publication produced one for this snapshot.
-    pub(crate) fn published_rootfs_image_ref(&self) -> Option<&str> {
+    pub fn published_rootfs_image_ref(&self) -> Option<&str> {
         let committed = self.committed.as_ref()?;
         let expected_tag = rootfs_snapshot_image_tag(&self.id);
         committed
@@ -453,7 +453,7 @@ pub struct PersistedDiskImagePublication {
 const SNAPSHOT_IMAGE_TAG_PREFIX: &str = "agentenv-snapshot-";
 
 /// OCI tag used when publishing a snapshot rootfs image to its source registry.
-pub(crate) fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
+pub fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
     format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
 }
 

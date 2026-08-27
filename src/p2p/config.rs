@@ -12,7 +12,7 @@ pub use crate::cfg::P2pTransportKind;
 /// knows nothing about which transport implementations are linked into this
 /// process. The mapping from the configured name to a linked backend belongs
 /// to the half that links them.
-pub(crate) fn backend_id(kind: P2pTransportKind) -> Option<&'static str> {
+pub fn backend_id(kind: P2pTransportKind) -> Option<&'static str> {
     match kind {
         P2pTransportKind::Disabled => None,
         P2pTransportKind::Iroh => Some(super::iroh::IROH_BACKEND_ID),
@@ -20,7 +20,7 @@ pub(crate) fn backend_id(kind: P2pTransportKind) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedP2pConfig {
+pub struct ResolvedP2pConfig {
     pub transport: P2pTransportKind,
     pub store_dir: PathBuf,
     pub listen_addr: Option<String>,
@@ -30,7 +30,7 @@ pub(crate) struct ResolvedP2pConfig {
 }
 
 impl ResolvedP2pConfig {
-    pub(crate) fn from_config(p2p: &P2pConfig) -> Self {
+    pub fn from_config(p2p: &P2pConfig) -> Self {
         let transport = if p2p.enabled {
             p2p.transport
         } else {

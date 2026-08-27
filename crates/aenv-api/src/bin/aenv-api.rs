@@ -22,7 +22,7 @@ use aenv_api::cfg::{
     MetadataStoreBackendKind, NodePlacementSource, NodeRegistryObservedBackendKind,
 };
 use aenv_api::identity::NodeIdentity;
-use aenv_api::image::ImageResolver;
+use aenv_api::image::RefusingImageResolver;
 use aenv_api::node_client::{
     NativeNodePlacement, RemoteSandboxBackendFactory, SchedulerNodePlacement,
 };
@@ -46,7 +46,7 @@ use aenv_api::pg::{self, PgPoolSettings};
 use aenv_api::role::ServerRole;
 use aenv_api::server_main::{self, spawn_grpc_surface, Assembly};
 use aenv_api::snapshot::SnapshotManager;
-use aenv_api::template::TemplateBuilder;
+use aenv_api::template::RefusingTemplateBuildDriver;
 use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
@@ -501,8 +501,23 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     )
     .await?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
-    let template_builder = Arc::new(TemplateBuilder::new());
-    let image_resolver = Arc::new(ImageResolver::new(config));
+    // 🔴 Both halves refuse rather than resolve, and that is what this
+    // process is: the resolving `ImageResolver` and the `TemplateBuilder` that
+    // drives a Firecracker sandbox are `aenv-node`'s, and this binary does not
+    // link that crate at all. Nothing here reaches either — `ApiImpl` takes
+    // both arms behind traits and only calls them when
+    // `role.runs_sandbox_runtime()` says so, which this role answers `false`
+    // to (`debug_assert`ed at the top of this function). What used to be
+    // constructed here was the concrete pair, unused; what is constructed now
+    // says so in the type.
+    //
+    // `default_image` still comes from config: the request shapes that only
+    // need the *name* — a template build that named no image, about to be
+    // dispatched to a machine that will resolve it — go on working.
+    let template_builder = Arc::new(RefusingTemplateBuildDriver);
+    let image_resolver = Arc::new(RefusingImageResolver::new(
+        config.image.resolver.default_image.clone(),
+    ));
 
     // 🔴 The receiving side only. `ObservabilityReporter` is not started: a
     // heartbeat reports a machine, and this replica is not one — reporting

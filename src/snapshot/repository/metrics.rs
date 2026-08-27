@@ -19,8 +19,7 @@ const CATALOG_PREFIX: &str = "catalog/";
 /// layer and multipart uploads can turn one increment into several requests on
 /// the wire. Catalog objects are small single-shot JSON blobs, so on the
 /// catalog surface the two coincide unless a request is retried.
-pub(crate) const OBJECT_STORE_REQUESTS_TOTAL: &str =
-    "agentenv_snapshot_object_store_requests_total";
+pub const OBJECT_STORE_REQUESTS_TOTAL: &str = "agentenv_snapshot_object_store_requests_total";
 
 /// Publish rollbacks that deliberately left a snapshot's artifacts in place.
 ///
@@ -34,15 +33,15 @@ pub(crate) const OBJECT_STORE_REQUESTS_TOTAL: &str =
 ///
 /// Nothing collects these. Every increment is bytes that will sit in the store
 /// until somebody looks, so a rising number is the signal to go and look.
-pub(crate) const ARTIFACTS_RETAINED_TOTAL: &str = "agentenv_snapshot_artifacts_retained_total";
+pub const ARTIFACTS_RETAINED_TOTAL: &str = "agentenv_snapshot_artifacts_retained_total";
 
-pub(crate) fn record_artifacts_retained() {
+pub fn record_artifacts_retained() {
     metrics::counter!(ARTIFACTS_RETAINED_TOTAL).increment(1);
 }
 
 /// Which body of data a request touched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ObjectStoreSurface {
+pub enum ObjectStoreSurface {
     /// Snapshot records and alias bindings — the rows.
     Catalog,
     /// Snapshot artifacts and managed layers — the bytes.
@@ -50,7 +49,7 @@ pub(crate) enum ObjectStoreSurface {
 }
 
 impl ObjectStoreSurface {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Catalog => "catalog",
             Self::Artifact => "artifact",
@@ -65,7 +64,7 @@ impl ObjectStoreSurface {
     /// them having to remember to say so: `list()`'s LIST plus one GET per
     /// record, and `bind_alias()`'s read / write / read-back / delete, all land
     /// on `catalog/` keys and are counted as catalog traffic for free.
-    pub(crate) fn for_key(key: &str) -> Self {
+    pub fn for_key(key: &str) -> Self {
         let key = key.trim_start_matches('/');
         if key.starts_with(CATALOG_PREFIX) || key == CATALOG_PREFIX.trim_end_matches('/') {
             Self::Catalog
@@ -77,7 +76,7 @@ impl ObjectStoreSurface {
 
 /// The object-storage verb a backend operation maps to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ObjectStoreOp {
+pub enum ObjectStoreOp {
     Get,
     Put,
     Head,
@@ -91,7 +90,7 @@ pub(crate) enum ObjectStoreOp {
 }
 
 impl ObjectStoreOp {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Get => "get",
             Self::Put => "put",
@@ -115,7 +114,7 @@ impl ObjectStoreOp {
 /// healthy traffic. `Error` now means only what it says: the request did not
 /// produce a usable answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ObjectStoreOutcome {
+pub enum ObjectStoreOutcome {
     /// The store returned the object, the listing, or the write acknowledgement.
     Ok,
     /// The request completed and the store answered "no such object". Callers
@@ -127,7 +126,7 @@ pub(crate) enum ObjectStoreOutcome {
 }
 
 impl ObjectStoreOutcome {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::NotFound => "not_found",
@@ -137,7 +136,7 @@ impl ObjectStoreOutcome {
 
     /// Classifies an operation that cannot miss: a write, a listing, or any
     /// composite whose constituent requests are counted in their own right.
-    pub(crate) fn from_success(ok: bool) -> Self {
+    pub fn from_success(ok: bool) -> Self {
         if ok {
             Self::Ok
         } else {
@@ -147,7 +146,7 @@ impl ObjectStoreOutcome {
 
     /// Classifies a lookup: `true` means the object was there, `false` means
     /// the store said it was not.
-    pub(crate) fn from_present(present: bool) -> Self {
+    pub fn from_present(present: bool) -> Self {
         if present {
             Self::Ok
         } else {
@@ -157,7 +156,7 @@ impl ObjectStoreOutcome {
 }
 
 /// Records one object-storage request against the repository backend store.
-pub(crate) fn record_object_store_request(
+pub fn record_object_store_request(
     op: ObjectStoreOp,
     surface: ObjectStoreSurface,
     outcome: ObjectStoreOutcome,
@@ -174,13 +173,13 @@ pub(crate) fn record_object_store_request(
 /// Test-only readout of [`OBJECT_STORE_REQUESTS_TOTAL`], shared by the backend
 /// test modules so they all assert against the same series naming.
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     use std::collections::BTreeMap;
 
     use metrics_util::debugging::{DebugValue, Snapshotter};
 
     /// The total of every sample of one unlabelled counter.
-    pub(crate) fn counter_total(snapshotter: &Snapshotter, name: &str) -> u64 {
+    pub fn counter_total(snapshotter: &Snapshotter, name: &str) -> u64 {
         let mut total = 0u64;
         for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
             if composite.key().name() != name {
@@ -197,7 +196,7 @@ pub(crate) mod test_support {
     /// `snapshotter`, keyed by `"{op}/{surface}/{outcome}"`. Series that were
     /// never touched are absent rather than zero, so a missing key and a zero
     /// count are distinguishable.
-    pub(crate) fn object_store_requests(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
+    pub fn object_store_requests(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
         let mut counters: BTreeMap<String, u64> = BTreeMap::new();
         for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
             let key = composite.key();

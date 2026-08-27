@@ -20,7 +20,7 @@ use crate::types::{ExecutionId, SandboxId};
 
 /// How a write decides what happens to the record key's TTL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TtlMode {
+pub enum TtlMode {
     /// Leave whatever TTL the key already has.
     ///
     /// Used where a write deliberately must not touch the lifetime budget —
@@ -46,7 +46,7 @@ pub(super) enum TtlMode {
 impl TtlMode {
     /// The literal the scripts take. 🔴 Every write names one; there is no
     /// default, because both wrong answers are silent.
-    pub(super) fn resolve(self, record: &StoredSandboxRecord, grace: Duration) -> String {
+    pub fn resolve(self, record: &StoredSandboxRecord, grace: Duration) -> String {
         match self {
             TtlMode::Keep => "keep".to_string(),
             TtlMode::Recompute => match record.record_ttl(SystemTime::now(), grace) {
@@ -96,7 +96,7 @@ impl StoreInner {
     ///
     /// Returns `Err(ConcurrentUpdate)` when the revision moved and
     /// `Err(ExecutionSuperseded)` when the incarnation did.
-    pub(super) async fn write_record(
+    pub async fn write_record(
         &self,
         previous: &SandboxMetadata,
         record: &StoredSandboxRecord,
@@ -177,7 +177,7 @@ impl StoreInner {
     /// An optimistic retry is safe here — unlike in `update_if_state` there is
     /// no caller-supplied callback, so re-running costs nothing and observes
     /// nothing.
-    pub(super) async fn compare_and_set_state(
+    pub async fn compare_and_set_state(
         &self,
         sandbox_id: &SandboxId,
         new_state: SandboxState,
@@ -223,10 +223,7 @@ impl StoreInner {
     }
 
     /// Deletes a record and everything that indexes it.
-    pub(super) async fn remove_record(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<Option<SandboxMetadata>> {
+    pub async fn remove_record(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>> {
         let mut connection = self.connection();
         let removed: Option<Vec<u8>> = scripts::remove()
             .key(self.keys().record(sandbox_id))
@@ -313,7 +310,7 @@ impl StoreInner {
     /// 🔴 The existence check is inside the script. Checking here and removing
     /// afterwards would let a lockless `add` land in between and have its
     /// brand-new sandbox removed from the membership set.
-    pub(super) async fn sweep_index_member(&self, sandbox_id: &SandboxId) -> Result<()> {
+    pub async fn sweep_index_member(&self, sandbox_id: &SandboxId) -> Result<()> {
         let mut connection = self.connection();
         let removed: i64 = scripts::sweep_index_member()
             .key(self.keys().index())
@@ -334,7 +331,7 @@ impl StoreInner {
 /// 🔴 A closed channel must fall back to sleeping. `recv` on a closed broadcast
 /// returns immediately and for ever, so selecting on it without this would turn
 /// every wait in the module into a busy loop the moment the notifier stopped.
-pub(super) async fn wake_or_poll(wake: &mut broadcast::Receiver<()>, poll: Duration) {
+pub async fn wake_or_poll(wake: &mut broadcast::Receiver<()>, poll: Duration) {
     tokio::select! {
         received = wake.recv() => {
             if matches!(received, Err(broadcast::error::RecvError::Closed)) {

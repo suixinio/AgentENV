@@ -14,8 +14,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_EXTRA_DRIVE_MOUNT_ROOT: &str = "/mnt";
-pub(crate) const ROOTFS_DRIVE_ID: &str = "rootfs";
-pub(crate) const USER_ROOTFS_DRIVE_ID: &str = "user_rootfs";
+pub const ROOTFS_DRIVE_ID: &str = "rootfs";
+pub const USER_ROOTFS_DRIVE_ID: &str = "user_rootfs";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExtraDrive {
@@ -96,7 +96,7 @@ impl ExtraDrive {
         }
     }
 
-    pub(crate) fn image_config_path(&self) -> &Path {
+    pub fn image_config_path(&self) -> &Path {
         match self {
             Self::Overlaybd {
                 image_config_path, ..
@@ -116,21 +116,21 @@ impl ExtraDrive {
         }
     }
 
-    pub(crate) fn virtual_size(&self) -> Option<u64> {
+    pub fn virtual_size(&self) -> Option<u64> {
         match self {
             Self::Overlaybd { virtual_size, .. } => *virtual_size,
         }
     }
 
-    pub(crate) fn runtime_dir(&self, sandbox_work_dir: &Path) -> PathBuf {
+    pub fn runtime_dir(&self, sandbox_work_dir: &Path) -> PathBuf {
         sandbox_work_dir.join(format!("extra-drive-runtime-{}", self.drive_id()))
     }
 
-    pub(crate) fn attachment_symlink_name(&self) -> String {
+    pub fn attachment_symlink_name(&self) -> String {
         format!("extra-drive-{}", self.drive_id())
     }
 
-    pub(crate) fn with_image_config_path(&self, image_config_path: PathBuf) -> Self {
+    pub fn with_image_config_path(&self, image_config_path: PathBuf) -> Self {
         match self {
             Self::Overlaybd {
                 drive_id,
@@ -150,7 +150,7 @@ impl ExtraDrive {
         }
     }
 
-    pub(crate) fn try_with_virtual_size(&self, virtual_size: u64) -> Result<Self> {
+    pub fn try_with_virtual_size(&self, virtual_size: u64) -> Result<Self> {
         anyhow::ensure!(
             virtual_size > 0,
             "extra drive virtual size must be non-zero"

@@ -2,8 +2,8 @@ mod config;
 mod discovery;
 mod error;
 mod iroh;
-#[cfg(test)]
-pub(crate) mod mock;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mock;
 mod transport;
 mod types;
 

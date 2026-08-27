@@ -31,9 +31,9 @@ use crate::snapshot::repository::SnapshotRepository;
 /// [`OssBackend::from_parts`][super::backend::OssBackend::from_parts] consumes
 /// the latter two — every other caller wants [`Self::into_repository`].
 pub struct OssDurableParts {
-    pub(super) repository: Arc<SnapshotRepository>,
-    pub(super) client: Arc<OssClient>,
-    pub(super) managed_layers_repo_blob_url: String,
+    pub repository: Arc<SnapshotRepository>,
+    pub client: Arc<OssClient>,
+    pub managed_layers_repo_blob_url: String,
 }
 
 impl OssDurableParts {

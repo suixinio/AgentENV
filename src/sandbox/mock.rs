@@ -148,11 +148,12 @@ impl MockBehavior {
 
     fn capture(&self) -> CapturedSandboxSnapshot {
         if self.captures_are_stageable.load(Ordering::SeqCst) {
-            CapturedSandboxSnapshot::local(
-                crate::sandbox::FirecrackerCapturedSnapshot::in_caller_owned_dir(
-                    crate::sandbox::FirecrackerSnapshotManifest::for_test(32768, &[]),
-                ),
-            )
+            // 🔴 `CallerOwnedArtifacts`, not `FirecrackerCapturedSnapshot`:
+            // the two are the same value — a manifest and no temporary
+            // directory — and this one is on the shared side of the split.
+            CapturedSandboxSnapshot::local(crate::snapshot::CallerOwnedArtifacts::new(
+                crate::types::FirecrackerSnapshotManifest::for_test(32768, &[]),
+            ))
         } else {
             CapturedSandboxSnapshot::local(MockCapturedSnapshot)
         }

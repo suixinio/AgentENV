@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ pub enum ResolvedAttachedDrive {
 }
 
 impl ResolvedAttachedDrive {
-    pub(crate) fn to_extra_drive(&self) -> ExtraDrive {
+    pub fn to_extra_drive(&self) -> ExtraDrive {
         match self {
             Self::Overlaybd {
                 drive_id,
@@ -104,16 +104,16 @@ impl ResolvedAttachedDrive {
     }
 }
 
-pub(crate) trait RuntimeArtifactLease: Send + Sync {}
+pub trait RuntimeArtifactLease: Send + Sync {}
 
 #[derive(Clone, Default)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct EmptyRuntimeArtifactLease;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RuntimeArtifactLease for EmptyRuntimeArtifactLease {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
     static INSTANCE: OnceLock<Arc<dyn RuntimeArtifactLease>> = OnceLock::new();
     INSTANCE
@@ -130,7 +130,7 @@ pub struct RunnableSnapshot {
 }
 
 impl RunnableSnapshot {
-    pub(crate) fn new(
+    pub fn new(
         record: SnapshotRecord,
         manifest: FirecrackerSnapshotManifest,
         lease: Arc<dyn RuntimeArtifactLease>,
@@ -184,7 +184,7 @@ impl RunnableSnapshot {
         &self.record.resources
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn mock() -> Self {
         Self::from_test_manifest(
             SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
@@ -192,8 +192,8 @@ impl RunnableSnapshot {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_test_manifest(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_test_manifest(
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,
     ) -> Self {

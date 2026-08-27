@@ -11,7 +11,7 @@ use crate::sandbox::PausedSandboxState;
 use crate::types::SandboxId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum RecordingCall {
+pub enum RecordingCall {
     LoadAll,
     AllocateArtifactRoot,
     PersistPaused,
@@ -46,8 +46,8 @@ impl fmt::Display for RecordingCall {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct RecordingPersister {
-    pub(crate) calls: Arc<Mutex<Vec<RecordingCall>>>,
+pub struct RecordingPersister {
+    pub calls: Arc<Mutex<Vec<RecordingCall>>>,
     loaded: Arc<Mutex<Vec<SandboxMetadata>>>,
     persisted: Arc<Mutex<Vec<SandboxMetadata>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
@@ -56,7 +56,7 @@ pub(crate) struct RecordingPersister {
 }
 
 impl RecordingPersister {
-    pub(crate) fn with_loaded(loaded: Vec<SandboxMetadata>) -> Self {
+    pub fn with_loaded(loaded: Vec<SandboxMetadata>) -> Self {
         Self {
             loaded: Arc::new(Mutex::new(loaded)),
             ..Default::default()
@@ -67,7 +67,7 @@ impl RecordingPersister {
     ///
     /// 🔴 Off by default, so a test that wants the "there is a path" half has
     /// to say so and a test that wants the other half gets it without asking.
-    pub(crate) fn holds_capture_at(&self, artifact_root: impl Into<PathBuf>) {
+    pub fn holds_capture_at(&self, artifact_root: impl Into<PathBuf>) {
         *self.artifact_root.lock().unwrap() = Some(artifact_root.into());
     }
 
@@ -82,11 +82,11 @@ impl RecordingPersister {
     /// happened put its bytes. A test that wants the second is not asking for
     /// the first, and folding them together would give every existing caller of
     /// `holds_capture_at` a publishable capture it never asked for.
-    pub(crate) fn allocates_artifact_root_at(&self, root: impl Into<PathBuf>) {
+    pub fn allocates_artifact_root_at(&self, root: impl Into<PathBuf>) {
         *self.allocated_root.lock().unwrap() = Some(root.into());
     }
 
-    pub(crate) fn calls(&self) -> Vec<RecordingCall> {
+    pub fn calls(&self) -> Vec<RecordingCall> {
         self.calls.lock().unwrap().clone()
     }
 
@@ -96,19 +96,19 @@ impl RecordingPersister {
     /// holding — the store reconciles a record on the way in, and the persister
     /// does not — so a caller that has to get the record right *before* it is
     /// written can only be checked here.
-    pub(crate) fn persisted(&self) -> Vec<SandboxMetadata> {
+    pub fn persisted(&self) -> Vec<SandboxMetadata> {
         self.persisted.lock().unwrap().clone()
     }
 
-    pub(crate) fn clear_calls(&self) {
+    pub fn clear_calls(&self) {
         self.calls.lock().unwrap().clear();
     }
 
-    pub(crate) fn record(&self, call: RecordingCall) {
+    pub fn record(&self, call: RecordingCall) {
         self.calls.lock().unwrap().push(call);
     }
 
-    pub(crate) fn fail_next(&self, call: RecordingCall) {
+    pub fn fail_next(&self, call: RecordingCall) {
         let mut failures = self.failures.lock().unwrap();
         *failures.entry(call).or_default() += 1;
     }

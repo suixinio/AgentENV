@@ -39,6 +39,7 @@ url = "2.5"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
+aenv-core = { path = "../..", features = ["test-support"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 tempfile = "3.22.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -41,10 +41,7 @@ impl PosixFsArtifactStore {
         Self { root }
     }
 
-    pub(crate) fn committed_layout(
-        &self,
-        snapshot_id: &SnapshotId,
-    ) -> PosixFsSnapshotArtifactLayout {
+    pub fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
     }
 
@@ -97,10 +94,7 @@ impl SnapshotArtifactStore for PosixFsArtifactStore {
     }
 }
 
-pub(crate) async fn run_artifact_blocking<T, F>(
-    operation: &'static str,
-    work: F,
-) -> RepositoryResult<T>
+pub async fn run_artifact_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> RepositoryResult<T> + Send + 'static,

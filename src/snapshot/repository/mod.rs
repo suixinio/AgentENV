@@ -2,7 +2,7 @@ pub mod backends;
 pub mod composite;
 pub mod errors;
 pub mod interfaces;
-pub(crate) mod metrics;
+pub mod metrics;
 pub mod mirror;
 
 pub use composite::SnapshotRepository;

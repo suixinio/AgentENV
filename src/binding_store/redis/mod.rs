@@ -10,7 +10,7 @@
 pub mod scripts;
 
 #[cfg(test)]
-pub(crate) mod harness;
+pub mod harness;
 #[cfg(test)]
 mod tests;
 
@@ -112,12 +112,12 @@ impl RedisBindingStore {
     /// Test-only: a raw connection to the same Redis, for assertions the
     /// store's own API deliberately cannot make (`PTTL`, key existence).
     #[cfg(test)]
-    pub(crate) fn raw_connection(&self) -> redis::aio::ConnectionManager {
+    pub fn raw_connection(&self) -> redis::aio::ConnectionManager {
         self.connection.clone()
     }
 
     #[cfg(test)]
-    pub(crate) fn config(&self) -> &RedisBindingStoreConfig {
+    pub fn config(&self) -> &RedisBindingStoreConfig {
         &self.redis_config
     }
 }

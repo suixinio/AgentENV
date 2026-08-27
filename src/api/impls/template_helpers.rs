@@ -6,7 +6,7 @@ use crate::template::TemplateBuildSpec;
 use crate::types::SandboxResources;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TemplateBuildStartBaseSource {
+pub enum TemplateBuildStartBaseSource {
     DefaultImage,
     Image(String),
     Template(SnapshotAlias),
@@ -46,7 +46,7 @@ fn resolve_resources(
     })
 }
 
-pub(super) fn template_build_record_from_v3_request(
+pub fn template_build_record_from_v3_request(
     body: &models::TemplateBuildRequestV3,
     id: SnapshotId,
     alias: &str,
@@ -71,7 +71,7 @@ pub(super) fn template_build_record_from_v3_request(
     Ok(SnapshotRecord::template_waiting(id, Some(alias), resources))
 }
 
-pub(super) fn template_build_spec_from_start_request(
+pub fn template_build_spec_from_start_request(
     body: &models::TemplateBuildStartV2,
     alias: Option<&SnapshotAlias>,
     resources: SandboxResources,
@@ -94,7 +94,7 @@ pub(super) fn template_build_spec_from_start_request(
     Ok(spec)
 }
 
-pub(super) fn template_build_start_base_source(
+pub fn template_build_start_base_source(
     body: &models::TemplateBuildStartV2,
 ) -> Result<TemplateBuildStartBaseSource, models::Error> {
     let from_image = body

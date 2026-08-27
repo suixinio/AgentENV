@@ -1,5 +1,5 @@
-use aenv_core::image::ImageResolver;
-use aenv_core::sandbox::{
+use aenv_node::image::ImageResolver;
+use aenv_node::sandbox::{
     FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig, OverlaybdConfig,
     SandboxExecutor, UblkDeviceManager,
 };
@@ -126,7 +126,7 @@ async fn setup_sandbox() -> Result<FirecrackerSandbox> {
 }
 
 async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
-    let app_config = aenv_core::cfg::ConfigManager::init_global()?.config();
+    let app_config = aenv_node::cfg::ConfigManager::init_global()?.config();
     let image_config_path = DEFAULT_ROOTFS_IMAGE_CONFIG
         .get_or_try_init(|| async {
             let image_resolver = ImageResolver::new(app_config);
@@ -264,7 +264,7 @@ fn bench_snapshot_creation_1gmem(c: &mut Criterion) {
     );
 }
 
-async fn prepare_snapshot() -> Result<aenv_core::sandbox::FirecrackerSnapshotConfig> {
+async fn prepare_snapshot() -> Result<aenv_node::sandbox::FirecrackerSnapshotConfig> {
     let mut sandbox = setup_sandbox().await?;
     let snapshot = sandbox.pause().await?;
     sandbox.stop().await?;

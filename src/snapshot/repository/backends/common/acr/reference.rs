@@ -11,18 +11,22 @@ use url::Url;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SourceRegistryRepository {
-    pub(crate) registry: String,
-    pub(crate) repository: String,
-    pub(crate) repo_blob_url: String,
+pub struct SourceRegistryRepository {
+    pub registry: String,
+    pub repository: String,
+    pub repo_blob_url: String,
 }
 
 impl SourceRegistryRepository {
-    pub(crate) fn parse(repo_blob_url: &str) -> RepositoryResult<Self> {
+    pub fn parse(repo_blob_url: &str) -> RepositoryResult<Self> {
         let url = Url::parse(repo_blob_url).map_err(|e| RepositoryError::Unsupported {
             feature: format!("invalid ACR repoBlobUrl '{repo_blob_url}': {e}"),
         })?;
-        let test_loopback_http = cfg!(test)
+        // 🔴 `feature = "test-support"` as well as `cfg(test)`: the fake
+        // registry these fixtures publish to is a loopback HTTP server, and
+        // the suite that drives it lives in `aenv-node` now, where this
+        // crate's `cfg(test)` is off.
+        let test_loopback_http = cfg!(any(test, feature = "test-support"))
             && url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
         if url.scheme() != "https" && !test_loopback_http {
@@ -75,7 +79,7 @@ impl SourceRegistryRepository {
         })
     }
 
-    pub(crate) fn image_ref(&self, tag: &str) -> String {
+    pub fn image_ref(&self, tag: &str) -> String {
         format!("{}/{}:{tag}", self.registry, self.repository)
     }
 
@@ -88,7 +92,7 @@ impl SourceRegistryRepository {
         format!("{scheme}://{}", self.registry)
     }
 
-    pub(crate) fn upload_url(&self) -> String {
+    pub fn upload_url(&self) -> String {
         format!(
             "{}/v2/{}/blobs/uploads/",
             self.registry_api_url(),
@@ -96,7 +100,7 @@ impl SourceRegistryRepository {
         )
     }
 
-    pub(crate) fn manifest_url(&self, tag: &str) -> String {
+    pub fn manifest_url(&self, tag: &str) -> String {
         format!(
             "{}/v2/{}/manifests/{tag}",
             self.registry_api_url(),

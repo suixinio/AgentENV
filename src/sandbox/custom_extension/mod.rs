@@ -2,9 +2,9 @@
 //! (`[custom_extension].url`) extending sandbox behavior. Its only current
 //! capability is sandbox lifecycle hooks; see [`client`].
 
-pub(crate) mod client;
+pub mod client;
 
-pub(crate) use crate::types::CustomExtensionParams;
-pub(crate) use client::{
+pub use crate::types::CustomExtensionParams;
+pub use client::{
     custom_extension_params_is_empty, CustomExtensionClient, CustomExtensionHookGuard,
 };

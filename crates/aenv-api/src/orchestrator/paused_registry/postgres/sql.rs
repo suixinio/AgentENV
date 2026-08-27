@@ -17,17 +17,17 @@
 //! point 1 on why `SET default_transaction_read_only` does not port).
 
 /// `leaseExpired` (`store_postgres.go:45-51`), verbatim.
-pub(super) const LEASE_EXPIRED: &str = "COALESCE(lease_expires_at, updated_at) < now()";
+pub const LEASE_EXPIRED: &str = "COALESCE(lease_expires_at, updated_at) < now()";
 
 /// `liveHoldingsOfNode` (`store_postgres.go:53-59`), verbatim. `$2` is the
 /// node id in every statement that embeds this.
-pub(super) const LIVE_HOLDINGS_OF_NODE: &str = "((state = 'running'  AND origin_node_id     = $2)
+pub const LIVE_HOLDINGS_OF_NODE: &str = "((state = 'running'  AND origin_node_id     = $2)
               OR (state = 'resuming' AND claimed_by_node_id = $2))";
 
 /// The 14 columns the write path's row type (`PausedSandboxEntry` +
 /// the reconcile-only lease/execution-start fields) is built from --
 /// `entryColumns` (`store_postgres.go:17-43`), verbatim.
-pub(super) const ENTRY_COLUMNS: &str = "sandbox_id::text         AS sandbox_id,
+pub const ENTRY_COLUMNS: &str = "sandbox_id::text         AS sandbox_id,
        cluster_id::text         AS cluster_id,
        state                    AS state,
        generation               AS generation,
@@ -42,7 +42,7 @@ pub(super) const ENTRY_COLUMNS: &str = "sandbox_id::text         AS sandbox_id,
        execution_id::text       AS execution_id,
        execution_started_at     AS execution_started_at";
 
-pub(super) fn get_sql() -> String {
+pub fn get_sql() -> String {
     format!(
         "SELECT {ENTRY_COLUMNS}
   FROM paused_sandboxes
@@ -50,7 +50,7 @@ pub(super) fn get_sql() -> String {
     )
 }
 
-pub(super) fn get_many_sql() -> String {
+pub fn get_many_sql() -> String {
     format!(
         "SELECT {ENTRY_COLUMNS}
   FROM paused_sandboxes
@@ -67,7 +67,7 @@ pub(super) fn get_many_sql() -> String {
 /// (`src/node_registry/grpc_service.rs::list_registry_sandboxes`) sorts
 /// after filtering, the same layering Go's own `listRegistrySandboxes`
 /// uses (`service.go:915-918`) rather than this query's.
-pub(super) fn list_all_sql() -> String {
+pub fn list_all_sql() -> String {
     format!(
         "SELECT {ENTRY_COLUMNS}
   FROM paused_sandboxes
@@ -91,7 +91,7 @@ pub(super) fn list_all_sql() -> String {
 /// `publishing`->`publishing` (a retried upload) are both legitimate and
 /// both carry the same incarnation, so the identity axis judges this more
 /// precisely than the state would.
-pub(super) const BEGIN_PAUSE_SQL: &str = "
+pub const BEGIN_PAUSE_SQL: &str = "
 WITH previous AS (
     SELECT snapshot_id FROM paused_sandboxes
      WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid
@@ -124,13 +124,13 @@ SELECT upserted.generation          AS generation,
 
 /// A `begin_pause` whose upsert matched zero rows: re-read to classify why
 /// -- `classifyRefusedPause`'s query (`store_postgres.go:615-617`), verbatim.
-pub(super) const CLASSIFY_REFUSED_PAUSE_SQL: &str =
+pub const CLASSIFY_REFUSED_PAUSE_SQL: &str =
     "SELECT cluster_id::text, execution_id::text FROM paused_sandboxes WHERE sandbox_id = $1::uuid";
 
 /// `completePauseSQL` (`store_postgres.go:648-664`), verbatim. The two
 /// execution columns are cleared: the target state is `paused`, which the
 /// table's CHECK pins to carrying no incarnation.
-pub(super) const COMPLETE_PAUSE_SQL: &str = "
+pub const COMPLETE_PAUSE_SQL: &str = "
 UPDATE paused_sandboxes
    SET state = 'paused', snapshot_id = $3::uuid, updated_at = now(),
        lease_expires_at = now() + make_interval(secs => $4::double precision),
@@ -139,7 +139,7 @@ UPDATE paused_sandboxes
    AND generation = $2 AND state = 'publishing'";
 
 /// `markLocalOnlySQL` (`store_postgres.go:694-703`), verbatim.
-pub(super) const MARK_LOCAL_ONLY_SQL: &str = "
+pub const MARK_LOCAL_ONLY_SQL: &str = "
 UPDATE paused_sandboxes
    SET state = 'local_only', updated_at = now(),
        lease_expires_at = now() + make_interval(secs => $3::double precision),
@@ -155,7 +155,7 @@ UPDATE paused_sandboxes
 /// lapsed: a lapsed lease says only that the holder cannot reach this
 /// database, which a partitioned-but-still-serving node satisfies exactly as
 /// well as a dead one.
-pub(super) fn claim_for_resume_sql() -> String {
+pub fn claim_for_resume_sql() -> String {
     format!(
         "
 WITH previous AS (
@@ -184,7 +184,7 @@ SELECT claimed.*, previous.previous_state
 /// `claimForResumeDurableOnlySQL` (`store_postgres.go:791-813`), verbatim:
 /// `claim_for_resume_sql` without its lapsed-lease arm -- used while the
 /// cluster's restart grace window is still open (see [`super::grace`]).
-pub(super) fn claim_for_resume_durable_only_sql() -> String {
+pub fn claim_for_resume_durable_only_sql() -> String {
     format!(
         "
 WITH previous AS (
@@ -211,7 +211,7 @@ SELECT claimed.*, previous.previous_state
 
 /// `releaseClaimSQL` (`store_postgres.go:971-986`), verbatim: a seizure, so
 /// no execution predicate -- this is not asking the incumbent's consent.
-pub(super) const RELEASE_CLAIM_SQL: &str = "
+pub const RELEASE_CLAIM_SQL: &str = "
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL, updated_at = now(),
        lease_expires_at = now() + make_interval(secs => $3::double precision),
@@ -226,7 +226,7 @@ UPDATE paused_sandboxes
 /// asymmetry is deliberate (a retried write from the process that already
 /// repointed `origin_node_id` at the holder must still recognise its own
 /// row).
-pub(super) const MARK_RUNNING_SQL: &str = "
+pub const MARK_RUNNING_SQL: &str = "
 UPDATE paused_sandboxes
    SET state = 'running', origin_node_id = $7, claimed_by_node_id = NULL,
        execution_id = $6::uuid,
@@ -254,7 +254,7 @@ UPDATE paused_sandboxes
 /// node identity anywhere -- fenced on `execution_id` alone, see the trait
 /// doc on `renew_sandbox_deadline` for why no rival actor needs guarding
 /// against here.
-pub(super) const RENEW_SANDBOX_DEADLINE_SQL: &str = "
+pub const RENEW_SANDBOX_DEADLINE_SQL: &str = "
 UPDATE paused_sandboxes
    SET sandbox_expires_at = $3,
        updated_at         = now()
@@ -269,7 +269,7 @@ UPDATE paused_sandboxes
 /// A's own doc (`super::lease`) for why this never renews a `running` row
 /// under the split node/api identity model, and why that is by design rather
 /// than a residual bug -- [`RENEW_LIVE_LEASE_SQL`] covers that state instead.
-pub(super) const RENEW_LEASE_SQL: &str = "
+pub const RENEW_LEASE_SQL: &str = "
 UPDATE paused_sandboxes AS p
    SET lease_expires_at   = now() + make_interval(secs => $1::double precision),
        sandbox_expires_at = v.expires_at,
@@ -285,7 +285,7 @@ UPDATE paused_sandboxes AS p
 /// heartbeat-driven, caller-asserted `(sandbox, node)` pairs re-checked
 /// against the row's own `origin_node_id` -- never touches
 /// `sandbox_expires_at`, which is the API half's authority alone.
-pub(super) const RENEW_PARKED_LEASE_SQL: &str = "
+pub const RENEW_PARKED_LEASE_SQL: &str = "
 UPDATE paused_sandboxes AS p
    SET lease_expires_at = now() + make_interval(secs => $1::double precision),
        updated_at       = now()
@@ -300,7 +300,7 @@ UPDATE paused_sandboxes AS p
 /// (`151d00b`): `renewParkedLeaseSQL`'s sibling for `running` rows, added
 /// because `renewLeaseSQL`'s own `running` branch never matches an api
 /// replica's pod identity.
-pub(super) const RENEW_LIVE_LEASE_SQL: &str = "
+pub const RENEW_LIVE_LEASE_SQL: &str = "
 UPDATE paused_sandboxes AS p
    SET lease_expires_at = now() + make_interval(secs => $1::double precision),
        updated_at       = now()
@@ -314,7 +314,7 @@ UPDATE paused_sandboxes AS p
 /// `reclaimReleasedRunningSQL` (`store_postgres.go:1602-1698`), verbatim.
 /// Both conditions required: a lapsed lease alone cannot distinguish a dead
 /// node from a partitioned-but-alive one.
-pub(super) const RECLAIM_RELEASED_RUNNING_SQL: &str = "
+pub const RECLAIM_RELEASED_RUNNING_SQL: &str = "
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL,
        execution_id = NULL, execution_started_at = NULL,
@@ -344,7 +344,7 @@ UPDATE paused_sandboxes
 /// instance, because a Kubernetes Deployment pod name is never reused after
 /// a reschedule, so `release_node_holdings`'s identity-based fallback can
 /// never reach a row a dead replica orphaned mid-claim either.
-pub(super) const RECLAIM_RELEASED_RESUMING_SQL: &str = "
+pub const RECLAIM_RELEASED_RESUMING_SQL: &str = "
 UPDATE paused_sandboxes
    SET state = 'paused', claimed_by_node_id = NULL,
        execution_id = NULL, execution_started_at = NULL,
@@ -358,7 +358,7 @@ UPDATE paused_sandboxes
 /// `reclaimDiscardedSQL` (`store_postgres.go:1602-1698`), verbatim: a live
 /// row with no durable snapshot behind it and no reachable holder is gone
 /// for good, not merely parked.
-pub(super) const RECLAIM_DISCARDED_SQL: &str = "
+pub const RECLAIM_DISCARDED_SQL: &str = "
 DELETE FROM paused_sandboxes
  WHERE cluster_id = $1::uuid
    AND snapshot_id IS NULL
@@ -369,7 +369,7 @@ DELETE FROM paused_sandboxes
 /// `countReclaimDiscardableSQL` (`store_postgres.go:1700-1711`), verbatim --
 /// the DiscardBreaker's numerator, read inside the same transaction as
 /// [`RECLAIM_DISCARDED_SQL`] so it sees the same snapshot.
-pub(super) const COUNT_RECLAIM_DISCARDABLE_SQL: &str = "
+pub const COUNT_RECLAIM_DISCARDABLE_SQL: &str = "
 SELECT count(*) FROM paused_sandboxes
  WHERE cluster_id = $1::uuid
    AND snapshot_id IS NULL
@@ -379,11 +379,11 @@ SELECT count(*) FROM paused_sandboxes
 
 /// `countClusterRowsSQL` (`store_postgres.go:1713-1714`), verbatim -- the
 /// DiscardBreaker's denominator.
-pub(super) const COUNT_CLUSTER_ROWS_SQL: &str =
+pub const COUNT_CLUSTER_ROWS_SQL: &str =
     "SELECT count(*) FROM paused_sandboxes WHERE cluster_id = $1::uuid";
 
 /// `releaseHoldingsReleasedSQL` (`store_postgres.go:1798-1814`), verbatim.
-pub(super) fn release_holdings_released_sql() -> String {
+pub fn release_holdings_released_sql() -> String {
     format!(
         "
 UPDATE paused_sandboxes
@@ -398,7 +398,7 @@ UPDATE paused_sandboxes
 }
 
 /// `releaseHoldingsDiscardedSQL` (`store_postgres.go:1798-1814`), verbatim.
-pub(super) fn release_holdings_discarded_sql() -> String {
+pub fn release_holdings_discarded_sql() -> String {
     format!(
         "
 DELETE FROM paused_sandboxes
@@ -409,13 +409,13 @@ DELETE FROM paused_sandboxes
 }
 
 /// `removeSQL` (`store_postgres.go:1872-1873`), verbatim.
-pub(super) const REMOVE_SQL: &str = "DELETE FROM paused_sandboxes
+pub const REMOVE_SQL: &str = "DELETE FROM paused_sandboxes
  WHERE sandbox_id = $1::uuid AND cluster_id = $2::uuid AND generation = $3";
 
 /// `extendLeasesSQL` (`grace.go:356-374`), verbatim: `Grace.ExtendLeases`.
 /// See [`super::grace`] for the N-replica leadership redesign around this
 /// statement -- the statement itself is unchanged from Go.
-pub(super) const EXTEND_LEASES_SQL: &str = "
+pub const EXTEND_LEASES_SQL: &str = "
 WITH observed AS (
     SELECT GREATEST(
                COALESCE(now() - max(updated_at), make_interval(secs => $2::double precision)),

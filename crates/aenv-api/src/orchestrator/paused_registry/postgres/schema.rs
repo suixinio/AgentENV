@@ -35,7 +35,7 @@ use crate::pg::GO_SCHEMA_LOCK_KEY;
 /// `SchemaDDL` in `services/scheduler/internal/registry/migrate.go:30-96`,
 /// verbatim (including the two partial indexes Fix B added:
 /// `paused_sandboxes_reclaim_idx` and `paused_sandboxes_resuming_reclaim_idx`).
-pub(crate) const SCHEMA_DDL: &str = r#"
+pub const SCHEMA_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS paused_sandboxes (
     sandbox_id           UUID        PRIMARY KEY,
     cluster_id           UUID        NOT NULL,
@@ -85,7 +85,7 @@ CREATE INDEX IF NOT EXISTS paused_sandboxes_resuming_reclaim_idx
 /// "is this cluster still inside its restart grace window" has to be a fact
 /// both leaders can observe, not a flag one of them holds in memory the other
 /// cannot see. See `super::grace`'s own module doc for the full design.
-pub(crate) const GRACE_STATE_DDL: &str = r#"
+pub const GRACE_STATE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS paused_registry_grace (
     cluster_id      UUID PRIMARY KEY,
     grace_until     TIMESTAMPTZ NOT NULL,

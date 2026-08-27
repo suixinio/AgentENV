@@ -1162,7 +1162,7 @@ pub fn alias_conflict(
 ///
 /// Scoped to errors that came *out of this module*. A caller applying it to an
 /// error from somewhere else is asking a question it does not answer.
-pub(crate) fn is_permanent_failure(error: &RepositoryError) -> bool {
+pub fn is_permanent_failure(error: &RepositoryError) -> bool {
     matches!(error, RepositoryError::InvalidRequest { .. })
 }
 

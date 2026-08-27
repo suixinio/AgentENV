@@ -62,7 +62,7 @@ fn now_ms() -> i64 {
 /// Opens a row before any bytes exist, and binds its alias in the same
 /// transaction if it has one — matches `insertSnapshotSQL` +
 /// `releaseOtherAliasesSQL` + `bindAliasSQL`.
-pub(crate) async fn begin_snapshot(
+pub async fn begin_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -517,7 +517,7 @@ async fn delete_snapshot(
 /// `store_postgres.go:809`'s `if s.maxConcurrentBuilds > 0`, including
 /// skipping the lock and the cluster-wide `count(*)` entirely once the
 /// ceiling is off — `store_postgres.go`'s own version of the same skip.
-pub(crate) async fn start_build(
+pub async fn start_build(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -657,7 +657,7 @@ async fn renew_build_lease(
 // Trait-facing composition — matches `impl SnapshotCatalog for CentralSnapshotCatalog`
 // ─────────────────────────────────────────────────────────────────────────
 
-pub(crate) async fn create(
+pub async fn create(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -681,7 +681,7 @@ pub(crate) async fn create(
     }
 }
 
-pub(crate) async fn publish_commit(
+pub async fn publish_commit(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -723,7 +723,7 @@ pub(crate) async fn publish_commit(
     }
 }
 
-pub(crate) async fn delete_record(
+pub async fn delete_record(
     pool: &PgPool,
     cluster_id: Uuid,
     record: &SnapshotRecord,
@@ -735,7 +735,7 @@ pub(crate) async fn delete_record(
     Ok(())
 }
 
-pub(crate) async fn try_start_build(
+pub async fn try_start_build(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -758,7 +758,7 @@ pub(crate) async fn try_start_build(
     }
 }
 
-pub(crate) async fn renew_lease(
+pub async fn renew_lease(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -767,7 +767,7 @@ pub(crate) async fn renew_lease(
     renew_build_lease(pool, cluster_id, node_id, build_id).await
 }
 
-pub(crate) async fn mark_build_error(
+pub async fn mark_build_error(
     pool: &PgPool,
     cluster_id: Uuid,
     id: &SnapshotId,
@@ -792,7 +792,7 @@ pub(crate) async fn mark_build_error(
 /// exactly (the two-step "begin, then commit" sequence a caller like
 /// `publish_commit` above or the mirror's own `publish_commit` wants is
 /// composed by the caller, not by this function).
-pub(crate) async fn commit(
+pub async fn commit(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,
@@ -832,7 +832,7 @@ pub(crate) async fn commit(
 /// every read helper in `reads.rs` over `sqlx::Executor` so this could read
 /// inside the same `Transaction` — is more machinery than the one caller
 /// that needs it justifies today.
-pub(crate) async fn fail(
+pub async fn fail(
     pool: &PgPool,
     cluster_id: Uuid,
     id: &SnapshotId,
@@ -865,7 +865,7 @@ pub(crate) async fn fail(
 /// alias is allowed to look exactly like a uuid, so the shape of the string
 /// is a hint rather than an answer. Idempotent: nothing to delete is
 /// `Ok(false)`, not an error.
-pub(crate) async fn delete(
+pub async fn delete(
     pool: &PgPool,
     cluster_id: Uuid,
     id_or_alias: &str,

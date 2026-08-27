@@ -7,7 +7,7 @@ use super::MachineInfo;
 ///
 /// This is evaluated once during observability service construction rather than
 /// on every API request.
-pub(crate) fn detect_machine_info() -> MachineInfo {
+pub fn detect_machine_info() -> MachineInfo {
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
 
     MachineInfo {
@@ -24,7 +24,7 @@ pub(crate) fn detect_machine_info() -> MachineInfo {
 
 /// Runs `cpu-template-helper template dump` and returns the JSON output.
 /// Returns `None` if the binary is missing, not executable, or fails.
-pub(super) async fn dump_cpu_config(path: PathBuf) -> Option<String> {
+pub async fn dump_cpu_config(path: PathBuf) -> Option<String> {
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new(&path)
             .args(["template", "dump", "-o", "/dev/stdout"])
@@ -42,7 +42,7 @@ pub(super) async fn dump_cpu_config(path: PathBuf) -> Option<String> {
     .flatten()
 }
 
-pub(crate) fn first_cpuinfo_value(cpuinfo: &str, keys: &[&str]) -> Option<String> {
+pub fn first_cpuinfo_value(cpuinfo: &str, keys: &[&str]) -> Option<String> {
     cpuinfo.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         keys.iter()

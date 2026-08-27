@@ -116,7 +116,7 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory, P: SandboxPe
     scheduling_disabled_changed_at_ms: AtomicI64,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
-    image_refs: Arc<dyn RuntimeImageRefs>,
+    pub image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     /// Cluster-wide bookkeeping for paused sandboxes, wired in after
     /// construction because it is built from the snapshot repository, which the
@@ -227,6 +227,45 @@ where
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
+    /// An orchestrator with no background tasks, for a test.
+    ///
+    /// 🔴 Not [`Orchestrator::new`]: that starts the eviction and maintenance
+    /// loops and restores persisted sandboxes. Tests drive the transitions
+    /// themselves. Behind `feature = "test-support"` so `aenv-node`'s own
+    /// suite can build one too — the struct's fields are this module's
+    /// business, not something a sibling crate should be spelling out.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_test_parts(
+        store: S,
+        factory: F,
+        persister: P,
+        default_sandbox_timeout: std::time::Duration,
+        image_refs: std::sync::Arc<dyn crate::image::RuntimeImageRefs>,
+        access_token_seed: &str,
+    ) -> Self {
+        let (sandbox_event_tx, _sandbox_event_rx) =
+            tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
+        Self {
+            store,
+            factory,
+            persister,
+            sandboxes: RwLock::new(HashMap::new()),
+            proxy_routes: RwLock::new(ProxyRouteTable::default()),
+            next_proxy_route_version: AtomicU64::new(1),
+            counters: Default::default(),
+            sandbox_event_tx,
+            default_sandbox_timeout,
+            is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            scheduling_disabled: std::sync::atomic::AtomicBool::new(false),
+            scheduling_disabled_changed_at_ms: std::sync::atomic::AtomicI64::new(0),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            shutdown_outcome: tokio::sync::OnceCell::new(),
+            image_refs,
+            access_tokens: SandboxAccessTokenGenerator::new(access_token_seed).unwrap(),
+            paused_publisher: tokio::sync::OnceCell::new(),
+        }
+    }
+
     /// Builds the orchestrator this process will run.
     ///
     /// `role` is carried no further than construction: the only thing it
@@ -432,7 +471,7 @@ where
     }
 
     /// Snapshot the running set's local runtime artifacts for maintenance.
-    async fn collect_running_artifacts(&self) -> Vec<(SandboxId, RuntimeArtifactSet)> {
+    pub async fn collect_running_artifacts(&self) -> Vec<(SandboxId, RuntimeArtifactSet)> {
         let handles = {
             self.sandboxes
                 .read()
@@ -3978,14 +4017,14 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<S, F, P> Orchestrator<S, F, P>
 where
     S: MetadataStore + 'static,
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
-    pub(crate) async fn set_proxy_target_for_test(
+    pub async fn set_proxy_target_for_test(
         &self,
         sandbox_id: SandboxId,
         target: ProxyTarget,
@@ -4011,7 +4050,7 @@ where
         }
     }
 
-    pub(crate) async fn set_metadata_state_for_test(
+    pub async fn set_metadata_state_for_test(
         &self,
         sandbox_id: SandboxId,
         state: SandboxState,
@@ -4035,7 +4074,7 @@ where
         Ok(())
     }
 
-    pub(crate) async fn set_auto_resume_for_test(
+    pub async fn set_auto_resume_for_test(
         &self,
         sandbox_id: &SandboxId,
         auto_resume_enabled: bool,
@@ -4050,11 +4089,7 @@ where
         Ok(())
     }
 
-    pub(crate) async fn set_secure_for_test(
-        &self,
-        sandbox_id: &SandboxId,
-        secure: bool,
-    ) -> Result<()> {
+    pub async fn set_secure_for_test(&self, sandbox_id: &SandboxId, secure: bool) -> Result<()> {
         let Some(mut metadata) = self.store.get(sandbox_id).await? else {
             return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
         };
@@ -4068,11 +4103,11 @@ where
     /// What a replica that never started the sandbox looks like from the
     /// inside, and the only way to produce that shape without standing up a
     /// second replica.
-    pub(crate) async fn forget_sandbox_handle_for_test(&self, sandbox_id: &SandboxId) -> bool {
+    pub async fn forget_sandbox_handle_for_test(&self, sandbox_id: &SandboxId) -> bool {
         self.sandboxes.write().await.remove(sandbox_id).is_some()
     }
 
-    pub(crate) async fn remove_proxy_route_for_test(&self, sandbox_id: &SandboxId) {
+    pub async fn remove_proxy_route_for_test(&self, sandbox_id: &SandboxId) {
         let _ = self.proxy_routes.write().await.remove(sandbox_id);
     }
 
@@ -4081,7 +4116,7 @@ where
     /// 🔴 Read off the backend, not the store. Asserting against the store
     /// would only prove that the value written there is the value written
     /// there; this proves the VM was actually started under it.
-    pub(crate) async fn backend_execution_id_for_test(
+    pub async fn backend_execution_id_for_test(
         &self,
         sandbox_id: &SandboxId,
     ) -> Option<ExecutionId> {
@@ -4092,7 +4127,7 @@ where
 
     /// Seeds a running sandbox whose live incarnation is a chosen value, so the
     /// data plane's ordered comparison can be driven from both sides.
-    pub(crate) async fn set_live_execution_for_test(
+    pub async fn set_live_execution_for_test(
         &self,
         sandbox_id: SandboxId,
         target: ProxyTarget,

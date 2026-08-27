@@ -57,7 +57,7 @@ FROM build-deps AS builder
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p aenv-core --bin aenv-node -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+    cargo build --release -p aenv-node --bin aenv-node -p uvm-ublk-daemon --bin uvm-ublk-daemon \
     && cp /build/target/release/aenv-node /out-aenv-node \
     && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon
 

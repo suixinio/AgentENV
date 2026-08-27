@@ -141,7 +141,7 @@ pub fn init_for_tests() {
         // event. That is a test failing at random depending on the order the
         // harness happened to run in — which is what it did.
         let registry = tracing_subscriber::registry();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let registry = registry.with(capture::layer());
 
         let _ = registry.with(fmt_layer.with_filter(filter)).try_init();
@@ -156,8 +156,8 @@ pub fn init_for_tests() {
 /// still valid, are both cases where the code does the right thing silently and
 /// the only way to know it happened is the log. Those lines can be deleted by a
 /// refactor without any test noticing, which is what this is for.
-#[cfg(test)]
-pub(crate) mod capture {
+#[cfg(any(test, feature = "test-support"))]
+pub mod capture {
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
 
@@ -179,21 +179,21 @@ pub(crate) mod capture {
 
     /// One recorded event: its level and its message.
     #[derive(Clone, Debug)]
-    pub(crate) struct Recorded {
-        pub(crate) level: Level,
-        pub(crate) message: String,
+    pub struct Recorded {
+        pub level: Level,
+        pub message: String,
     }
 
     #[derive(Clone, Default)]
-    pub(crate) struct Recorder(Arc<Mutex<Vec<Recorded>>>);
+    pub struct Recorder(Arc<Mutex<Vec<Recorded>>>);
 
     impl Recorder {
-        pub(crate) fn events(&self) -> Vec<Recorded> {
+        pub fn events(&self) -> Vec<Recorded> {
             self.0.lock().unwrap().clone()
         }
 
         /// Whether any event at `level` contains `needle`.
-        pub(crate) fn saw(&self, level: Level, needle: &str) -> bool {
+        pub fn saw(&self, level: Level, needle: &str) -> bool {
             self.events()
                 .iter()
                 .any(|event| event.level == level && event.message.contains(needle))
@@ -208,7 +208,7 @@ pub(crate) mod capture {
         /// whole process, the first time it is reached, so a test that got
         /// there first without a subscriber would silence the callsite for
         /// everyone afterwards.
-        pub(crate) fn install(&self) -> Guard {
+        pub fn install(&self) -> Guard {
             super::init_for_tests();
             ACTIVE.with(|active| *active.borrow_mut() = Some(self.clone()));
 
@@ -217,7 +217,7 @@ pub(crate) mod capture {
     }
 
     /// Stops routing this thread's events to whatever installed it.
-    pub(crate) struct Guard;
+    pub struct Guard;
 
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -225,7 +225,7 @@ pub(crate) mod capture {
         }
     }
 
-    pub(crate) fn layer<S: tracing::Subscriber>() -> impl Layer<S> {
+    pub fn layer<S: tracing::Subscriber>() -> impl Layer<S> {
         RecordingLayer
     }
 

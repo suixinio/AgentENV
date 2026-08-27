@@ -137,7 +137,7 @@ jobs:
           OPENSSL_STATIC: "1"
         run: |
           cargo build --release --locked \
-            -p aenv-core -p aenv-api --bin aenv-node --bin aenv-api \
+            -p aenv-node -p aenv-api --bin aenv-node --bin aenv-api \
             -p uvm-ublk-daemon --bin uvm-ublk-daemon \
             --features vendored-openssl
 

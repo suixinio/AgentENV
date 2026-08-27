@@ -63,14 +63,14 @@ use crate::types::{CustomExtensionParams, ExecutionId, SandboxId};
 /// `[custom_extension].url` is unset.
 static GLOBAL_CLIENT: OnceLock<Option<Arc<CustomExtensionClient>>> = OnceLock::new();
 
-pub(crate) struct CustomExtensionClient {
+pub struct CustomExtensionClient {
     configuration: Configuration,
 }
 
 impl CustomExtensionClient {
     /// Return the process-wide custom extension client, or `None` when the
     /// custom extension service URL is not configured.
-    pub(crate) fn global() -> Option<Arc<CustomExtensionClient>> {
+    pub fn global() -> Option<Arc<CustomExtensionClient>> {
         GLOBAL_CLIENT
             .get_or_init(|| Self::build_from_config().map(Arc::new))
             .clone()
@@ -167,7 +167,7 @@ impl CustomExtensionClient {
     /// The patch document is passed through verbatim; the hook returns the
     /// updated full params (normalized: an absent or empty-object value means
     /// empty params). A failure rejects the patch.
-    pub(crate) async fn hook_patch_params(
+    pub async fn hook_patch_params(
         &self,
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
@@ -232,7 +232,7 @@ impl CustomExtensionClient {
 /// (never blocking the drop). The stop hook always carries the incarnation the
 /// start hook carried, so the extension can ignore stop notifications for
 /// superseded incarnations.
-pub(crate) struct CustomExtensionHookGuard {
+pub struct CustomExtensionHookGuard {
     client: Arc<CustomExtensionClient>,
     sandbox_id: SandboxId,
     /// The incarnation this guard belongs to. Handed in at construction and
@@ -244,7 +244,7 @@ pub(crate) struct CustomExtensionHookGuard {
 }
 
 impl CustomExtensionHookGuard {
-    pub(crate) fn new(
+    pub fn new(
         client: Arc<CustomExtensionClient>,
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
@@ -260,7 +260,7 @@ impl CustomExtensionHookGuard {
     /// Invoke the start-fresh hook (a fresh sandbox is about to boot).
     ///
     /// Returns the extra kernel boot args returned by the hook, if any.
-    pub(crate) async fn start_fresh(
+    pub async fn start_fresh(
         &mut self,
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
@@ -290,7 +290,7 @@ impl CustomExtensionHookGuard {
 
     /// Invoke the start-resume hook (a sandbox is about to resume from a
     /// snapshot).
-    pub(crate) async fn start_resume(
+    pub async fn start_resume(
         &mut self,
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
@@ -316,7 +316,7 @@ impl CustomExtensionHookGuard {
     }
 
     /// Deliver the stop hook now and leave the guard inert.
-    pub(crate) async fn stop(mut self) {
+    pub async fn stop(mut self) {
         if std::mem::take(&mut self.started) {
             self.client
                 .hook_stop(self.sandbox_id, self.execution_id)
@@ -354,7 +354,7 @@ fn empty_params() -> serde_json::Value {
 }
 
 /// Whether the given params count as empty (absent or an empty map).
-pub(crate) fn custom_extension_params_is_empty(params: Option<&CustomExtensionParams>) -> bool {
+pub fn custom_extension_params_is_empty(params: Option<&CustomExtensionParams>) -> bool {
     match params {
         None => true,
         Some(map) => map.is_empty(),
@@ -362,7 +362,7 @@ pub(crate) fn custom_extension_params_is_empty(params: Option<&CustomExtensionPa
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
     use std::sync::mpsc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -376,7 +376,7 @@ pub(crate) mod tests {
             .clone()
     }
 
-    pub(crate) fn test_client(base: &str) -> CustomExtensionClient {
+    pub fn test_client(base: &str) -> CustomExtensionClient {
         CustomExtensionClient {
             configuration: Configuration {
                 base_path: base.to_string(),
@@ -448,7 +448,7 @@ pub(crate) mod tests {
     /// Spawn an HTTP server that captures `request_count` sequential requests
     /// and replies to each with the given status code and JSON body. Returns
     /// the base URL and a receiver for `(request_line, body)`.
-    pub(crate) async fn spawn_test_server(
+    pub async fn spawn_test_server(
         status: u16,
         body: String,
         request_count: usize,
@@ -468,7 +468,7 @@ pub(crate) mod tests {
     /// Spawn a one-shot HTTP server that captures a single request and replies
     /// with the given status code and JSON body. Returns the base URL and a
     /// receiver for `(request_line, body)`.
-    pub(crate) async fn spawn_one_shot_server(
+    pub async fn spawn_one_shot_server(
         status: u16,
         body: String,
     ) -> (String, mpsc::Receiver<(String, String)>) {

@@ -25,7 +25,7 @@ fn backend_err(operation: &'static str, err: sqlx::Error) -> PausedRegistryError
 /// why this never renews a `Running` row's lease under the split node/api
 /// identity model -- that state has [`renew_live_leases`] instead, driven by
 /// the reconcile loop rather than by this per-replica call.
-pub(super) async fn renew_lease(
+pub async fn renew_lease(
     registry: &PostgresPausedSandboxRegistry,
     node_id: &str,
     held: &[HeldSandbox],
@@ -57,7 +57,7 @@ pub(super) async fn renew_lease(
 /// a row -- see [`super::sql::RENEW_PARKED_LEASE_SQL`]/
 /// [`super::sql::RENEW_LIVE_LEASE_SQL`]'s own doc.
 #[derive(Debug, Clone)]
-pub(super) struct LeaseHolder {
+pub struct LeaseHolder {
     pub sandbox_id: SandboxId,
     pub node_id: String,
 }
@@ -65,7 +65,7 @@ pub(super) struct LeaseHolder {
 /// `RenewParkedLeases` (`renewParkedLeaseSQL`, `store_postgres.go:
 /// 1454-1486`): `publishing`/`local_only` rows only, `sandbox_expires_at`
 /// untouched.
-pub(super) async fn renew_parked_leases(
+pub async fn renew_parked_leases(
     registry: &PostgresPausedSandboxRegistry,
     holders: &[LeaseHolder],
 ) -> RegistryResult<u64> {
@@ -82,7 +82,7 @@ pub(super) async fn renew_parked_leases(
 /// Fix A (`151d00b`): `running` rows only, `sandbox_expires_at` untouched.
 /// This is the statement that makes a healthy node's lease survive under
 /// the split node/api identity model; see the Stage C report's D2 section.
-pub(super) async fn renew_live_leases(
+pub async fn renew_live_leases(
     registry: &PostgresPausedSandboxRegistry,
     holders: &[LeaseHolder],
 ) -> RegistryResult<u64> {

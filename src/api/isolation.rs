@@ -29,8 +29,8 @@ use crate::types::SandboxId;
 
 /// Asks the gateway to hand this request to a different node. Only ever sent
 /// with 503, and only for work another node can pick up.
-pub(crate) const REROUTE_HEADER: &str = "x-agentenv-reroute";
-pub(crate) const REROUTE_SCHEDULE: &str = "schedule";
+pub const REROUTE_HEADER: &str = "x-agentenv-reroute";
+pub const REROUTE_SCHEDULE: &str = "schedule";
 
 /// Declines a resume that another node could serve, while this node is
 /// isolated.
@@ -38,7 +38,7 @@ pub(crate) const REROUTE_SCHEDULE: &str = "schedule";
 /// Sits in front of the generated handler rather than inside the orchestrator
 /// because the decision is about *routing*, not about the sandbox: the answer
 /// is "somebody else should do this", and the gateway is who can act on it.
-pub(crate) async fn resume_isolation_gate<I>(
+pub async fn resume_isolation_gate<I>(
     State(api_impl): State<I>,
     request: Request,
     next: Next,

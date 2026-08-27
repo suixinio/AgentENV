@@ -18,19 +18,19 @@ use super::{
 };
 
 #[derive(Clone, Default)]
-pub(crate) struct MockTransport {
-    pub(crate) descriptors: Arc<RwLock<HashMap<P2pArtifactKey, P2pArtifactDescriptor>>>,
-    pub(crate) blobs: Arc<RwLock<HashMap<P2pArtifactKey, Bytes>>>,
-    pub(crate) lookup_count: Arc<AtomicUsize>,
-    pub(crate) fetch_count: Arc<AtomicUsize>,
-    pub(crate) fetch_bytes_count: Arc<AtomicUsize>,
-    pub(crate) fetch_range_count: Arc<AtomicUsize>,
-    pub(crate) publish_count: Arc<AtomicUsize>,
-    pub(crate) lookup_delay: Option<Duration>,
-    pub(crate) fetch_range_delay: Option<Duration>,
-    pub(crate) fail_lookup: Arc<AtomicBool>,
-    pub(crate) fail_publish: Arc<AtomicBool>,
-    pub(crate) fail_fetch_range_stream_after_first_chunk: Arc<AtomicBool>,
+pub struct MockTransport {
+    pub descriptors: Arc<RwLock<HashMap<P2pArtifactKey, P2pArtifactDescriptor>>>,
+    pub blobs: Arc<RwLock<HashMap<P2pArtifactKey, Bytes>>>,
+    pub lookup_count: Arc<AtomicUsize>,
+    pub fetch_count: Arc<AtomicUsize>,
+    pub fetch_bytes_count: Arc<AtomicUsize>,
+    pub fetch_range_count: Arc<AtomicUsize>,
+    pub publish_count: Arc<AtomicUsize>,
+    pub lookup_delay: Option<Duration>,
+    pub fetch_range_delay: Option<Duration>,
+    pub fail_lookup: Arc<AtomicBool>,
+    pub fail_publish: Arc<AtomicBool>,
+    pub fail_fetch_range_stream_after_first_chunk: Arc<AtomicBool>,
 }
 
 #[async_trait]

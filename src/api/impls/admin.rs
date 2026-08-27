@@ -453,7 +453,7 @@ mod operator_snapshot_delete_tests {
         async fn import_built_artifacts(
             &self,
             _metadata: &SnapshotPublishMetadata,
-            _manifest: &crate::sandbox::FirecrackerSnapshotManifest,
+            _manifest: &crate::types::FirecrackerSnapshotManifest,
             _publications: &mut Vec<PersistedDiskImagePublication>,
         ) -> RepositoryResult<ImportedSnapshotArtifacts> {
             unreachable!("these tests never import")

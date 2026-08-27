@@ -121,7 +121,7 @@ where
 /// case, without touching [`AdvisoryLockKey`]'s closed, centrally-managed set
 /// of real production variants. External callers only ever reach this
 /// through [`spawn_singleton_task`], so a real key can never be bypassed.
-pub(crate) fn spawn_singleton_task_raw<B>(
+pub fn spawn_singleton_task_raw<B>(
     pool: PgPool,
     key: i64,
     interval: Duration,

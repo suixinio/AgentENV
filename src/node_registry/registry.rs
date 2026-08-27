@@ -1395,7 +1395,7 @@ fn normalize_heartbeat_roster(req: &HeartbeatRequest) -> Vec<RosterEntry> {
 /// `//nolint:staticcheck` on the same line: the deprecated field is the
 /// rollout fallback, not dead code to warn about.
 #[allow(deprecated)]
-pub(crate) fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool) {
+pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool) {
     if !req.roster.is_empty() {
         let mut out = Vec::with_capacity(req.roster.len());
         let mut seen: HashSet<String> = HashSet::with_capacity(req.roster.len());
@@ -1470,7 +1470,7 @@ fn normalize_execution_id(raw: &str) -> String {
 
 /// The same rule as [`normalize_execution_id`] without the counter, and
 /// returns why it dropped a value instead of counting it.
-pub(crate) fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>) {
+pub fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>) {
     let normalized = raw.trim().to_lowercase();
     if normalized.is_empty() {
         return (String::new(), Some("no_execution"));
@@ -1511,7 +1511,7 @@ fn record_roster_dropped(reason: &'static str) {
     metrics::counter!(ROSTER_ENTRY_DROPPED_METRIC, "reason" => reason).increment(1);
 }
 
-pub(crate) fn unix_millis(t: SystemTime) -> i64 {
+pub fn unix_millis(t: SystemTime) -> i64 {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
         Err(e) => -(e.duration().as_millis() as i64),

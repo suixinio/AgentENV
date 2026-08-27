@@ -1,12 +1,12 @@
-mod admin;
-mod attached_drives;
-mod auth;
+pub mod admin;
+pub mod attached_drives;
+pub mod auth;
 mod pagination;
 pub use pagination::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
 mod paused_coordinator;
 mod paused_recovery;
 mod resume_surface;
-mod sandbox;
+pub mod sandbox;
 mod snapshots;
 mod template;
 mod template_helpers;
@@ -168,37 +168,37 @@ impl ApiImpl {
     }
 
     /// Which half of the split this process runs.
-    pub(crate) fn role(&self) -> ServerRole {
+    pub fn role(&self) -> ServerRole {
         self.role
     }
 
     /// Where to send a template build this process cannot run itself, or
     /// `None` when it can (or, on a misconfigured `--role api`, when nobody
     /// gave it one — see the field's own doc).
-    pub(crate) fn node_placement(&self) -> Option<Arc<dyn NodePlacement>> {
+    pub fn node_placement(&self) -> Option<Arc<dyn NodePlacement>> {
         self.node_placement.as_ref().map(Arc::clone)
     }
 
-    pub(crate) fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {
+    pub fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {
         Arc::clone(&self.orchestrator)
     }
 
-    pub(crate) fn proxy_client(&self) -> &ProxyClient {
+    pub fn proxy_client(&self) -> &ProxyClient {
         &self.proxy_client
     }
 
-    pub(crate) fn sandbox_proxy_domains(&self) -> &[String] {
+    pub fn sandbox_proxy_domains(&self) -> &[String] {
         &self.sandbox_proxy_domains
     }
 
-    pub(crate) fn image_resolver(&self) -> Arc<dyn RootfsImageResolver> {
+    pub fn image_resolver(&self) -> Arc<dyn RootfsImageResolver> {
         Arc::clone(&self.image_resolver)
     }
 
     /// Returns the optional observability service backing node/admin
     /// observability endpoints. This is `None` when the server is configured
     /// with `observability.enabled = false`.
-    pub(crate) fn observability(&self) -> Option<Arc<ObservabilityService>> {
+    pub fn observability(&self) -> Option<Arc<ObservabilityService>> {
         self.observability.as_ref().map(Arc::clone)
     }
 

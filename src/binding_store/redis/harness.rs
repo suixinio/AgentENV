@@ -21,7 +21,7 @@ use crate::binding_store::BindingStoreSettings;
 
 const DATABASES: u32 = 512;
 
-pub(crate) struct RedisServer {
+pub struct RedisServer {
     port: u16,
 }
 
@@ -171,7 +171,7 @@ fn next_db() -> u32 {
 
 /// A store on its own database, or `None` when this machine has no Redis
 /// and the run has not demanded one.
-pub(crate) async fn store_for(
+pub async fn store_for(
     test: &str,
     settings: BindingStoreSettings,
     tweak: impl FnOnce(&mut RedisBindingStoreConfig),

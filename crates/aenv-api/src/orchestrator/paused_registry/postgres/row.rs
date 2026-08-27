@@ -24,7 +24,7 @@ use crate::types::{ExecutionId, SandboxId};
 /// `::text` casts and its comment on why: independence from whichever uuid
 /// codec the driver happens to register).
 #[derive(Debug, sqlx::FromRow)]
-pub(super) struct EntryRow {
+pub struct EntryRow {
     pub sandbox_id: String,
     pub cluster_id: String,
     pub state: String,
@@ -46,7 +46,7 @@ pub(super) struct EntryRow {
 /// `previous_state` column those two statements alone add (`claimed.*,
 /// previous.previous_state` -- `scanClaim`, `store_postgres.go:1980-2033`).
 #[derive(Debug, sqlx::FromRow)]
-pub(super) struct ClaimRow {
+pub struct ClaimRow {
     pub sandbox_id: String,
     pub cluster_id: String,
     pub state: String,
@@ -90,9 +90,7 @@ impl ClaimRow {
 /// never be read off the post-UPDATE row (always `Resuming`), which is
 /// exactly the bug [`super::super::types`]'s own doc warns silently
 /// mis-reported every ordinary resume as a takeover for months.
-pub(super) fn decode_claim(
-    row: ClaimRow,
-) -> RegistryResult<(PausedSandboxEntry, PausedRegistryState)> {
+pub fn decode_claim(row: ClaimRow) -> RegistryResult<(PausedSandboxEntry, PausedRegistryState)> {
     let previous_state = PausedRegistryState::parse(&row.previous_state).ok_or_else(|| {
         invalid(
             &row.sandbox_id,
@@ -118,7 +116,7 @@ pub(super) fn decode_claim(
 /// widen a narrowed struct or add a second query.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(super) struct RegistryRow {
+pub struct RegistryRow {
     pub sandbox_id: SandboxId,
     pub cluster_id: Uuid,
     pub state: PausedRegistryState,
@@ -205,7 +203,7 @@ fn parse_identity(row: &EntryRow) -> RegistryResult<ParsedIdentity> {
 
 /// The trait-facing decode: [`PausedSandboxEntry`]'s 11 fields, metadata
 /// decoded into [`SandboxMetadata`] (mirrors `central.rs::decode_entry`).
-pub(super) fn decode_entry(row: EntryRow) -> RegistryResult<PausedSandboxEntry> {
+pub fn decode_entry(row: EntryRow) -> RegistryResult<PausedSandboxEntry> {
     let identity = parse_identity(&row)?;
     let metadata: SandboxMetadata =
         serde_json::from_value(row.metadata).map_err(|e| PausedRegistryError::InvalidRecord {
@@ -234,7 +232,7 @@ pub(super) fn decode_entry(row: EntryRow) -> RegistryResult<PausedSandboxEntry> 
 /// (see that struct's own doc), metadata left undecoded like
 /// [`decode_registry_row`] (the wire response has no field for it and
 /// nothing downstream reads it).
-pub(super) fn decode_list_entry(row: EntryRow) -> RegistryResult<PausedRegistryListEntry> {
+pub fn decode_list_entry(row: EntryRow) -> RegistryResult<PausedRegistryListEntry> {
     let identity = parse_identity(&row)?;
     Ok(PausedRegistryListEntry {
         sandbox_id: identity.sandbox_id,
@@ -254,7 +252,7 @@ pub(super) fn decode_list_entry(row: EntryRow) -> RegistryResult<PausedRegistryL
 
 /// The internal decode: every column, metadata left undecoded (nothing
 /// internal to this backend needs it -- reconcile/reclaim never read it).
-pub(super) fn decode_registry_row(row: EntryRow) -> RegistryResult<RegistryRow> {
+pub fn decode_registry_row(row: EntryRow) -> RegistryResult<RegistryRow> {
     let identity = parse_identity(&row)?;
     Ok(RegistryRow {
         sandbox_id: identity.sandbox_id,

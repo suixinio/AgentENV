@@ -26,7 +26,7 @@ use super::{SharedObservedStore, SharedObservedStoreConfig, DEFAULT_KEY_PREFIX};
 /// How many logical databases the spawned server offers, one per test.
 const DATABASES: u32 = 512;
 
-pub(crate) struct RedisServer {
+pub struct RedisServer {
     port: u16,
 }
 
@@ -185,7 +185,7 @@ fn next_db() -> u32 {
 
 /// A store on its own database, or `None` when this machine has no Redis and
 /// the run has not demanded one.
-pub(crate) async fn store_for(test: &str) -> Option<SharedObservedStore> {
+pub async fn store_for(test: &str) -> Option<SharedObservedStore> {
     let Some(server) = server() else {
         if redis_required() {
             panic!(
@@ -210,7 +210,7 @@ pub(crate) async fn store_for(test: &str) -> Option<SharedObservedStore> {
 /// A raw connection to the same database, plus the hash key it uses, for
 /// assertions `SharedObservedStore`'s own API deliberately cannot make
 /// (`HLEN`, a direct `HGET`, "this field is truly gone").
-pub(crate) fn raw(store: &SharedObservedStore) -> (redis::aio::ConnectionManager, String) {
+pub fn raw(store: &SharedObservedStore) -> (redis::aio::ConnectionManager, String) {
     (store.connection.clone(), store.hash_key.clone())
 }
 

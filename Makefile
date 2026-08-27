@@ -53,7 +53,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
 	build-ublk install-ublk \
-	fmt clippy \
+	fmt clippy check-crate-boundaries \
 	mutants coverage \
 	test test-unit test-integration test-with-redis test-with-postgres test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
@@ -76,13 +76,13 @@ release:
 	$(CARGO) build --release
 
 build-server:
-	$(CARGO) build -p aenv-core -p aenv-api --bin aenv-node --bin aenv-api
+	$(CARGO) build -p aenv-node -p aenv-api --bin aenv-node --bin aenv-api
 
 build-server-release:
-	$(CARGO) build --release -p aenv-core -p aenv-api --bin aenv-node --bin aenv-api
+	$(CARGO) build --release -p aenv-node -p aenv-api --bin aenv-node --bin aenv-api
 
 build-snapshot-image:
-	$(CARGO) build -p aenv-core --bin aenv-snapshot-image
+	$(CARGO) build -p aenv-node --bin aenv-snapshot-image
 
 build-aenv:
 	$(CARGO) build -p aenv
@@ -104,6 +104,33 @@ fmt:
 
 clippy:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+
+# The crate split, as a fact about the dependency graph rather than a comment.
+#
+# 🔴 This is what replaced `only_a_role_that_runs_sandboxes_builds_the_byte_half`,
+# a source scan that asserted the byte half had exactly one call site inside a
+# runtime role gate. The gate is gone: the byte half (overlaybd, ublk) lives in
+# `aenv-node` and the deciding half (`sqlx`) in `aenv-api`, and neither crate
+# depends on the other. A regression is now a `Cargo.toml` edit, and this is
+# what fails on it.
+#
+# `-e normal` on purpose: `aenv-core` dev-depends on nothing, but `aenv-node`
+# and `aenv-api` both dev-depend on `aenv-core`'s `test-support` feature, and a
+# dev edge is not something a shipped binary links.
+check-crate-boundaries:
+	@fail=0; \
+	api_tree=$$($(CARGO) tree -p aenv-api -e normal) || { echo "cargo tree -p aenv-api failed"; exit 1; }; \
+	node_tree=$$($(CARGO) tree -p aenv-node -e normal) || { echo "cargo tree -p aenv-node failed"; exit 1; }; \
+	if printf '%s\n' "$$api_tree" | grep -E 'overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util'; then \
+	  echo "aenv-api links the byte half; --role api runs no sandboxes and must not."; \
+	  fail=1; \
+	fi; \
+	if printf '%s\n' "$$node_tree" | grep -E 'sqlx|deadpool-postgres'; then \
+	  echo "aenv-node links a PostgreSQL driver; --role node must never hold database credentials."; \
+	  fail=1; \
+	fi; \
+	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database"; fi; \
+	exit $$fail
 
 mutants:
 	$(CARGO) adev mutants
@@ -138,8 +165,8 @@ test: test-agent test-envd test-ublk
 # file without `--force`, and `aenv upload`'s directory walk refusing to
 # follow symlinks out of the tree.
 test-unit:
-	$(CARGO) test -p aenv-core -p aenv-api -p envd -p linux-cap -p aenv -p adev --lib --bins
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api --lib --bins -- --ignored
+	$(CARGO) test -p aenv-core -p aenv-api -p aenv-node -p envd -p linux-cap -p aenv -p adev --lib --bins
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node --lib --bins -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib --bins
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
@@ -289,7 +316,7 @@ test-snapshot-catalog:
 	AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT="http://$(CATALOG_TEST_GRPC)" \
 	AENV_SNAPSHOT_CATALOG_TEST_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
 	AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1 \
-	$(CARGO) test -p aenv-core --test snapshot_catalog; \
+	$(CARGO) test -p aenv-node --test snapshot_catalog; \
 	status=$$?; \
 	kill $$scheduler_pid 2>/dev/null; \
 	docker rm -f $(CATALOG_TEST_PG) >/dev/null 2>&1; \
@@ -302,14 +329,14 @@ test-agent: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
 	export PATH="$(DEBUG_PROFILE_DIR):$$PATH"; \
 	export AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon"; \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api; \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api --lib -- --ignored
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node; \
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node --lib -- --ignored
 
 test-agent-integration: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core \
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-node \
 		--test integration \
 		--test orchestrator_integration
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \

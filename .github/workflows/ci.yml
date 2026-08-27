@@ -55,6 +55,14 @@ jobs:
       - name: Clippy
         run: make clippy
 
+      # 🔴 The crate split, checked as a dependency-graph fact. This replaced a
+      # source scan (`only_a_role_that_runs_sandboxes_builds_the_byte_half`)
+      # that could only see one file; a `Cargo.toml` edit that put overlaybd
+      # back in front of `aenv-api`, or sqlx in front of `aenv-node`, is what
+      # this catches and nothing else does.
+      - name: Crate boundaries
+        run: make check-crate-boundaries
+
   unit-tests:
     # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
     runs-on: ubuntu-22.04

@@ -50,7 +50,7 @@ pub struct ImageBaseContext {
 
 impl ImageBaseContext {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         env_vars: HashMap<String, String>,
         workdir: Option<String>,
         user: Option<String>,

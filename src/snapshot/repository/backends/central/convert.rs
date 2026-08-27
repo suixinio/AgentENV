@@ -34,24 +34,24 @@ use crate::types::SandboxResources;
 /// drop fields it does not know and hand back a snapshot missing its memory
 /// layers. Bump it when the encoding stops being backward compatible, never for
 /// an added optional field.
-pub(super) const COMMITTED_PAYLOAD_SCHEMA: u32 = 1;
+pub const COMMITTED_PAYLOAD_SCHEMA: u32 = 1;
 
 pub const STATUS_WAITING: &str = "waiting";
 pub const STATUS_BUILDING: &str = "building";
-pub(super) const STATUS_READY: &str = "ready";
-pub(super) const STATUS_ERROR: &str = "error";
+pub const STATUS_READY: &str = "ready";
+pub const STATUS_ERROR: &str = "error";
 
-pub(super) const SOURCE_KIND_TEMPLATE: &str = "template";
-pub(super) const SOURCE_KIND_SANDBOX: &str = "sandbox";
+pub const SOURCE_KIND_TEMPLATE: &str = "template";
+pub const SOURCE_KIND_SANDBOX: &str = "sandbox";
 
-pub(super) fn source_kind_str(kind: SnapshotSourceKind) -> &'static str {
+pub fn source_kind_str(kind: SnapshotSourceKind) -> &'static str {
     match kind {
         SnapshotSourceKind::Template => SOURCE_KIND_TEMPLATE,
         SnapshotSourceKind::Sandbox => SOURCE_KIND_SANDBOX,
     }
 }
 
-pub(super) fn build_status_str(status: TemplateBuildStatus) -> &'static str {
+pub fn build_status_str(status: TemplateBuildStatus) -> &'static str {
     match status {
         TemplateBuildStatus::Waiting => STATUS_WAITING,
         TemplateBuildStatus::Building => STATUS_BUILDING,
@@ -79,14 +79,14 @@ pub fn opening_status(record: &SnapshotRecord) -> &'static str {
     }
 }
 
-pub(super) fn source_sandbox_id(record: &SnapshotRecord) -> String {
+pub fn source_sandbox_id(record: &SnapshotRecord) -> String {
     match &record.source {
         SnapshotSource::Sandbox { source_sandbox_id } => source_sandbox_id.clone(),
         SnapshotSource::Template { .. } => String::new(),
     }
 }
 
-pub(super) fn record_source_kind(record: &SnapshotRecord) -> &'static str {
+pub fn record_source_kind(record: &SnapshotRecord) -> &'static str {
     match &record.source {
         SnapshotSource::Sandbox { .. } => SOURCE_KIND_SANDBOX,
         SnapshotSource::Template { .. } => SOURCE_KIND_TEMPLATE,
@@ -104,7 +104,7 @@ fn malformed(row_id: &str, reason: impl Into<String>) -> RepositoryError {
 }
 
 /// Encodes a committed payload for the `bytea` column.
-pub(super) fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u8>> {
+pub fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u8>> {
     serde_json::to_vec(committed).map_err(|error| RepositoryError::Backend {
         message: "serialize committed snapshot payload for the catalog".to_string(),
         source: Some(error.into()),
@@ -118,7 +118,7 @@ pub(super) fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResul
 /// JSON document the column would take and the server's own guard would then
 /// refuse — so the encoder is pinned to the struct form rather than left to
 /// whatever the type happens to serialise as.
-pub(super) fn encode_build_error(reason: &TemplateBuildErrorReason) -> RepositoryResult<Vec<u8>> {
+pub fn encode_build_error(reason: &TemplateBuildErrorReason) -> RepositoryResult<Vec<u8>> {
     serde_json::to_vec(reason).map_err(|error| RepositoryError::Backend {
         message: "serialize template build error for the catalog".to_string(),
         source: Some(error.into()),
@@ -130,7 +130,7 @@ pub(super) fn encode_build_error(reason: &TemplateBuildErrorReason) -> Repositor
 /// 🔴 Never returns a plausible-looking record for a row it did not understand.
 /// Downstream a `SnapshotRecord` is launched from, deleted on the strength of,
 /// and counted in a page; a row decoded on a guess is worse than no row at all.
-pub(super) fn decode_row(
+pub fn decode_row(
     row: pb::SnapshotRow,
     expected_cluster: Uuid,
 ) -> RepositoryResult<SnapshotRecord> {

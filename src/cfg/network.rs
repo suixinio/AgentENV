@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use confique::Config;
 use ipnetwork::Ipv4Network;
 
-pub(crate) const NETWORK_MAX_SLOTS: usize = 32768;
+pub const NETWORK_MAX_SLOTS: usize = 32768;
 
 // Part of the snapshot ABI: fresh boots pass this VM/tap link through the
 // kernel `ip=` argument, and snapshot resume does not re-run boot args. Do not
@@ -43,14 +43,14 @@ pub struct NetworkInternalConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ResolvedNetworkInternalConfig {
-    pub(crate) host_interaction_cidr: Ipv4Network,
-    pub(crate) veth_cidr: Ipv4Network,
-    pub(crate) vm_link_cidr: Ipv4Network,
+pub struct ResolvedNetworkInternalConfig {
+    pub host_interaction_cidr: Ipv4Network,
+    pub veth_cidr: Ipv4Network,
+    pub vm_link_cidr: Ipv4Network,
 }
 
 impl NetworkConfig {
-    pub(crate) fn validate(config: &Self) -> Result<()> {
+    pub fn validate(config: &Self) -> Result<()> {
         for cidr in &config.egress.always_denied_cidrs {
             cidr.parse::<Ipv4Network>().with_context(|| {
                 format!("invalid network.egress.always_denied_cidrs entry {cidr:?}")
@@ -61,7 +61,7 @@ impl NetworkConfig {
         Ok(())
     }
 
-    pub(crate) fn resolved_internal(config: &Self) -> Result<ResolvedNetworkInternalConfig> {
+    pub fn resolved_internal(config: &Self) -> Result<ResolvedNetworkInternalConfig> {
         let host_interaction_cidr = config
             .internal
             .host_interaction_cidr
@@ -130,7 +130,7 @@ impl NetworkConfig {
 
 super::impl_config_default!(NetworkConfig, NetworkEgressConfig, NetworkInternalConfig);
 
-pub(crate) fn normalize_dns_name(domain: &str) -> Option<String> {
+pub fn normalize_dns_name(domain: &str) -> Option<String> {
     let domain = domain.to_ascii_lowercase();
     is_valid_dns_name(&domain).then_some(domain)
 }

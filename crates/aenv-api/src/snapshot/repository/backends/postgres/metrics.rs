@@ -25,21 +25,20 @@
 /// [`record_catalog_outcome`] — one wrapper around every write-path and
 /// read-path call, rather than duplicating this match inside each of
 /// `postgres::writes`'s dozen functions.
-pub(crate) const CATALOG_RPC_TOTAL: &str = "agentenv_scheduler_catalog_rpc_total";
+pub const CATALOG_RPC_TOTAL: &str = "agentenv_scheduler_catalog_rpc_total";
 
 /// Refusals answered as a decision the caller acts on rather than as a
 /// failure — matches Go's `catalogRejections`.
 /// [`crate::snapshot::repository::RepositoryError::is_rejection`] decides
 /// which of [`CATALOG_RPC_TOTAL`]'s errors also count here; see
 /// [`record_catalog_outcome`].
-pub(crate) const CATALOG_REJECTED_TOTAL: &str = "agentenv_scheduler_catalog_rejected_total";
+pub const CATALOG_REJECTED_TOTAL: &str = "agentenv_scheduler_catalog_rejected_total";
 
 /// Builds the reaper ended because their heartbeat lapsed.
-pub(crate) const CATALOG_BUILDS_REAPED_TOTAL: &str =
-    "agentenv_scheduler_catalog_builds_reaped_total";
+pub const CATALOG_BUILDS_REAPED_TOTAL: &str = "agentenv_scheduler_catalog_builds_reaped_total";
 
 /// Reaping passes held back by the reaper's own warm-up window.
-pub(crate) const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
+pub const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
     "agentenv_scheduler_catalog_build_reaper_warmup_passes_total";
 
 /// Build heartbeats carrying a caller-asserted clock far from this replica's
@@ -65,14 +64,14 @@ pub(crate) const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
 /// dispatch's clock reporting next, instead of being rediscovered from a
 /// blank dashboard panel.
 #[allow(dead_code)]
-pub(crate) const CATALOG_BUILD_CLOCK_SKEW_TOTAL: &str =
+pub const CATALOG_BUILD_CLOCK_SKEW_TOTAL: &str =
     "agentenv_scheduler_catalog_build_clock_skew_total";
 
-pub(crate) fn record_catalog_rpc(op: &'static str, code: &str) {
+pub fn record_catalog_rpc(op: &'static str, code: &str) {
     metrics::counter!(CATALOG_RPC_TOTAL, "rpc" => op, "code" => code.to_string()).increment(1);
 }
 
-pub(crate) fn record_catalog_rejected(op: &'static str, reason: &'static str) {
+pub fn record_catalog_rejected(op: &'static str, reason: &'static str) {
     metrics::counter!(CATALOG_REJECTED_TOTAL, "rpc" => op, "reason" => reason).increment(1);
 }
 
@@ -82,7 +81,7 @@ pub(crate) fn record_catalog_rejected(op: &'static str, reason: &'static str) {
 /// ([`crate::snapshot::repository::RepositoryError::is_rejection`]). Returns
 /// `result` unchanged so a call site can wrap its own return expression with
 /// this rather than pre-binding a local.
-pub(crate) fn record_catalog_outcome<T>(
+pub fn record_catalog_outcome<T>(
     op: &'static str,
     result: crate::snapshot::repository::RepositoryResult<T>,
 ) -> crate::snapshot::repository::RepositoryResult<T> {
@@ -99,10 +98,10 @@ pub(crate) fn record_catalog_outcome<T>(
     result
 }
 
-pub(crate) fn record_builds_reaped(count: u64) {
+pub fn record_builds_reaped(count: u64) {
     metrics::counter!(CATALOG_BUILDS_REAPED_TOTAL).increment(count);
 }
 
-pub(crate) fn record_build_reaper_warmup_pass() {
+pub fn record_build_reaper_warmup_pass() {
     metrics::counter!(CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL).increment(1);
 }

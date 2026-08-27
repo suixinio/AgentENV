@@ -41,10 +41,7 @@ use super::keys::routing;
 use super::{backend, backend_msg, duration_to_secs_ceil, scripts, StoreInner};
 use crate::types::SandboxId;
 
-pub(super) async fn reserve(
-    inner: &Arc<StoreInner>,
-    sandbox_id: &SandboxId,
-) -> Result<Reservation> {
+pub async fn reserve(inner: &Arc<StoreInner>, sandbox_id: &SandboxId) -> Result<Reservation> {
     let config = inner.config();
     let now = std::time::SystemTime::now();
     let now_secs = now

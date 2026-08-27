@@ -29,7 +29,7 @@ fn backend_err(operation: &'static str, err: sqlx::Error) -> PausedRegistryError
     PausedRegistryError::backend(operation, err)
 }
 
-pub(super) async fn get(
+pub async fn get(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
 ) -> RegistryResult<Option<PausedSandboxEntry>> {
@@ -47,7 +47,7 @@ pub(super) async fn get(
 /// implementing [`sqlx::Executor`] for `Postgres` -- `&PgPool` (this
 /// function's own use above), `&mut PgConnection`, or `&mut Transaction<'_,
 /// Postgres>` via `&mut *tx` all satisfy it.
-pub(super) async fn get_via_conn<'e, E>(
+pub async fn get_via_conn<'e, E>(
     executor: E,
     cluster_id: Uuid,
     sandbox_id: &SandboxId,
@@ -65,7 +65,7 @@ where
     row.map(decode_entry).transpose()
 }
 
-pub(super) async fn get_many(
+pub async fn get_many(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_ids: &[SandboxId],
 ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
@@ -147,7 +147,7 @@ fn skip_bad_entries(rows: Vec<EntryRow>) -> (HashMap<SandboxId, PausedSandboxEnt
 /// cluster -- precisely the "running row lease freeze" failure mode this
 /// backend already exists to avoid (see B1's own doc). A skipped row is
 /// counted and named at `warn` instead.
-pub(super) async fn list_registry_rows(
+pub async fn list_registry_rows(
     registry: &PostgresPausedSandboxRegistry,
 ) -> RegistryResult<Vec<RegistryRow>> {
     let query = format!(
@@ -213,7 +213,7 @@ fn skip_bad_registry_rows(rows: Vec<EntryRow>) -> (Vec<RegistryRow>, u32) {
 /// Go's `PostgresReader.List` having none either): filtering and paging are
 /// `list_registry_sandboxes`'s job (`src/node_registry/grpc_service.rs`),
 /// not this read's.
-pub(super) async fn list_all(
+pub async fn list_all(
     registry: &PostgresPausedSandboxRegistry,
 ) -> RegistryResult<PausedRegistryListing> {
     let mut tx = registry

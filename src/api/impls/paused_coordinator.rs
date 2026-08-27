@@ -326,7 +326,7 @@ impl PausedSandboxCoordinator {
     }
 
     #[cfg(test)]
-    pub(crate) fn consecutive_renew_failures(&self) -> u64 {
+    pub fn consecutive_renew_failures(&self) -> u64 {
         self.consecutive_renew_failures.load(Ordering::SeqCst)
     }
 
@@ -618,7 +618,7 @@ impl PausedSandboxCoordinator {
     /// Idempotent by construction: the first success closes the takeover
     /// window, and so does the first sandbox this process takes live, so this
     /// can be called repeatedly and will act at most once.
-    pub(super) async fn release_stale_holdings(&self) -> StaleReleaseOutcome {
+    pub async fn release_stale_holdings(&self) -> StaleReleaseOutcome {
         let Some(attempt) = self.enter_takeover_window().await else {
             return StaleReleaseOutcome::Fenced;
         };
@@ -1103,7 +1103,7 @@ mod tests {
         BeganPause, HeldSandbox, PausedRegistryError, ReclaimedHoldings, RegistryResult,
         ReleasedHoldings, ResumeClaim,
     };
-    use crate::sandbox::{CapturedSandboxSnapshot, FirecrackerSnapshotManifest};
+    use crate::sandbox::CapturedSandboxSnapshot;
     use crate::snapshot::repository::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
         SnapshotListFilter, SnapshotRepository, StartedBuild,
@@ -1111,6 +1111,7 @@ mod tests {
     use crate::snapshot::{
         PersistedDiskImagePublication, RepositoryResult, SnapshotRecord, TemplateBuildErrorReason,
     };
+    use crate::types::FirecrackerSnapshotManifest;
 
     /// T-A1-9. 🔴 A committed snapshot must not carry the incarnation that
     /// produced it.
@@ -2652,7 +2653,7 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
+pub mod test_support {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2671,7 +2672,7 @@ pub(super) mod test_support {
     ///
     /// Only the two calls the takeover window turns on are interesting here;
     /// everything else answers the way the disabled registry does.
-    pub(crate) struct CountingRegistry {
+    pub struct CountingRegistry {
         release_calls: AtomicUsize,
         releases_to_fail: usize,
         mark_running_fails: bool,
@@ -2700,7 +2701,7 @@ pub(super) mod test_support {
     }
 
     /// What a programmed `get` should answer.
-    pub(crate) enum GetAnswer {
+    pub enum GetAnswer {
         /// No row at all.
         Missing,
         /// A row naming this snapshot.
@@ -2710,7 +2711,7 @@ pub(super) mod test_support {
     }
 
     impl CountingRegistry {
-        pub(crate) fn new(releases_to_fail: usize, mark_running_fails: bool) -> Self {
+        pub fn new(releases_to_fail: usize, mark_running_fails: bool) -> Self {
             Self {
                 release_calls: AtomicUsize::new(0),
                 releases_to_fail,
@@ -2730,7 +2731,7 @@ pub(super) mod test_support {
 
         /// Answers every `claim_for_resume` with a `Conflict` naming
         /// `origin_node_id`, instead of `NotFound`.
-        pub(crate) fn answering_conflict(origin_node_id: &str) -> Self {
+        pub fn answering_conflict(origin_node_id: &str) -> Self {
             Self {
                 conflict_origin: Some(origin_node_id.to_string()),
                 ..Self::new(0, false)
@@ -2738,12 +2739,12 @@ pub(super) mod test_support {
         }
 
         /// A registry nobody can reach: the shape of a controller mid-rollout.
-        pub(crate) fn unreachable() -> Self {
+        pub fn unreachable() -> Self {
             Self::unreachable_for(usize::MAX)
         }
 
         /// Unreachable for the first `renewals_to_fail` renewals, then back.
-        pub(crate) fn unreachable_for(renewals_to_fail: usize) -> Self {
+        pub fn unreachable_for(renewals_to_fail: usize) -> Self {
             Self {
                 claim_fails: true,
                 renewals_to_fail,
@@ -2753,11 +2754,11 @@ pub(super) mod test_support {
         }
 
         /// Fails every release, forever.
-        pub(crate) fn always_failing() -> Self {
+        pub fn always_failing() -> Self {
             Self::new(usize::MAX, false)
         }
 
-        pub(crate) fn answering(get_answer: GetAnswer) -> Self {
+        pub fn answering(get_answer: GetAnswer) -> Self {
             Self {
                 get_answer,
                 ..Self::new(0, false)
@@ -2766,14 +2767,14 @@ pub(super) mod test_support {
 
         /// Every `renew_sandbox_deadline` call fails with a backend error —
         /// the shape of a controller mid-rollout for this one write.
-        pub(crate) fn failing_renew_deadline() -> Self {
+        pub fn failing_renew_deadline() -> Self {
             Self {
                 renew_deadline_fails: true,
                 ..Self::new(0, false)
             }
         }
 
-        pub(crate) fn release_calls(&self) -> usize {
+        pub fn release_calls(&self) -> usize {
             self.release_calls.load(Ordering::SeqCst)
         }
 
@@ -2782,20 +2783,20 @@ pub(super) mod test_support {
         /// 🔴 The destructive one. A row dropped here is the cluster's only
         /// record that a paused sandbox exists, so a test about "was the row
         /// thrown away" has to be able to see it.
-        pub(crate) fn remove_calls(&self) -> usize {
+        pub fn remove_calls(&self) -> usize {
             self.remove_calls.load(Ordering::SeqCst)
         }
 
-        pub(crate) fn get_calls(&self) -> usize {
+        pub fn get_calls(&self) -> usize {
             self.get_calls.load(Ordering::SeqCst)
         }
 
         /// Every `node_id` a `claim_for_resume` call was made under, in order.
-        pub(crate) fn claimed_as(&self) -> Vec<String> {
+        pub fn claimed_as(&self) -> Vec<String> {
             self.claimed_as.lock().unwrap().clone()
         }
 
-        pub(crate) fn renewed_deadlines(
+        pub fn renewed_deadlines(
             &self,
         ) -> Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)> {
             self.renewed_deadlines.lock().unwrap().clone()

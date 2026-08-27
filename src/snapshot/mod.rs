@@ -1,12 +1,8 @@
-pub mod artifact_cache;
 mod captured;
-pub mod image_export;
-pub(crate) mod manager;
+pub mod manager;
 #[doc(hidden)]
 pub mod mock;
-pub mod p2p;
 pub mod repository;
-pub(crate) mod runtime_support;
 pub mod types;
 
 pub use captured::{
@@ -14,12 +10,11 @@ pub use captured::{
     SnapshotArtifactAdvertiser, UnpublishableCapture,
 };
 pub use manager::SnapshotManager;
-pub use p2p::P2pSnapshotAdvertiser;
 pub use repository::{
     CatalogReadScope, RepositoryError, RepositoryResult, SnapshotAbsence, SnapshotCursor,
     SnapshotListFilter, SnapshotListPage,
 };
-pub(crate) use types::rootfs_snapshot_image_tag;
+pub use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
     OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,

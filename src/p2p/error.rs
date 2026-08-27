@@ -19,10 +19,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn internal_message(
-        operation: &'static str,
-        source: impl std::fmt::Display,
-    ) -> Self {
+    pub fn internal_message(operation: &'static str, source: impl std::fmt::Display) -> Self {
         Self::Internal(anyhow::anyhow!("{operation}: {source}"))
     }
 }

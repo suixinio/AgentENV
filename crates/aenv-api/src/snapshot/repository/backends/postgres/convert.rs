@@ -26,15 +26,15 @@ use crate::types::SandboxResources;
 /// so there is no reason for the version numbers to diverge, and every
 /// reason for them not to: a payload this build wrote through one backend
 /// must decode through the other unchanged.
-pub(super) const COMMITTED_PAYLOAD_SCHEMA: i32 = 1;
+pub const COMMITTED_PAYLOAD_SCHEMA: i32 = 1;
 
-pub(super) const STATUS_WAITING: &str = "waiting";
-pub(super) const STATUS_BUILDING: &str = "building";
-pub(super) const STATUS_READY: &str = "ready";
-pub(super) const STATUS_ERROR: &str = "error";
+pub const STATUS_WAITING: &str = "waiting";
+pub const STATUS_BUILDING: &str = "building";
+pub const STATUS_READY: &str = "ready";
+pub const STATUS_ERROR: &str = "error";
 
-pub(super) const SOURCE_KIND_TEMPLATE: &str = "template";
-pub(super) const SOURCE_KIND_SANDBOX: &str = "sandbox";
+pub const SOURCE_KIND_TEMPLATE: &str = "template";
+pub const SOURCE_KIND_SANDBOX: &str = "sandbox";
 
 /// One row as `reads.rs`'s queries scan it — column order matches
 /// `SNAPSHOT_COLUMNS` in that file exactly; [`sqlx::FromRow`] below binds by
@@ -46,7 +46,7 @@ pub(super) const SOURCE_KIND_SANDBOX: &str = "sandbox";
 /// crate does not enable (`Cargo.toml`'s own comment: runtime-query API
 /// only, `sqlx::query`/`query_as`, never the compile-time macros). This impl
 /// costs the same handful of `try_get` calls the derive would generate.
-pub(super) struct CatalogRow {
+pub struct CatalogRow {
     pub id: String,
     pub cluster_id: String,
     pub source_kind: String,
@@ -105,10 +105,7 @@ fn malformed(row_id: &str, reason: impl Into<String>) -> RepositoryError {
 
 /// Turns one row into a record, refusing anything it cannot read — never a
 /// plausible-looking record for a row it did not understand.
-pub(super) fn decode_row(
-    row: CatalogRow,
-    expected_cluster: Uuid,
-) -> RepositoryResult<SnapshotRecord> {
+pub fn decode_row(row: CatalogRow, expected_cluster: Uuid) -> RepositoryResult<SnapshotRecord> {
     let id = SnapshotId::parse(&row.id).map_err(|_| malformed(&row.id, "id is not a uuid"))?;
 
     let cluster_id = Uuid::parse_str(&row.cluster_id)
@@ -247,7 +244,7 @@ fn decode_committed(
 /// Encodes a committed payload for the `bytea` column — matches
 /// `central/convert.rs::encode_committed` (same type, same `serde_json`
 /// encoding, same schema version).
-pub(super) fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u8>> {
+pub fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u8>> {
     serde_json::to_vec(committed).map_err(|error| RepositoryError::Backend {
         message: "serialize committed snapshot payload for the catalog".to_string(),
         source: Some(error.into()),
@@ -258,11 +255,11 @@ pub(super) fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResul
 /// `central/convert.rs::encode_build_error`'s comment on why a bare-string
 /// encoding (which `TemplateBuildErrorReason`'s `Deserialize` also accepts,
 /// for legacy rows) is never written here.
-pub(super) fn encode_build_error(reason: &TemplateBuildErrorReason) -> serde_json::Value {
+pub fn encode_build_error(reason: &TemplateBuildErrorReason) -> serde_json::Value {
     serde_json::json!({"message": reason.message, "step": reason.step})
 }
 
-pub(super) fn opening_status(record: &SnapshotRecord) -> &'static str {
+pub fn opening_status(record: &SnapshotRecord) -> &'static str {
     match &record.source {
         SnapshotSource::Template { build } => match build.status {
             TemplateBuildStatus::Building => STATUS_BUILDING,
@@ -272,14 +269,14 @@ pub(super) fn opening_status(record: &SnapshotRecord) -> &'static str {
     }
 }
 
-pub(super) fn source_kind_str(record: &SnapshotRecord) -> &'static str {
+pub fn source_kind_str(record: &SnapshotRecord) -> &'static str {
     match &record.source {
         SnapshotSource::Sandbox { .. } => SOURCE_KIND_SANDBOX,
         SnapshotSource::Template { .. } => SOURCE_KIND_TEMPLATE,
     }
 }
 
-pub(super) fn source_sandbox_id(record: &SnapshotRecord) -> Option<String> {
+pub fn source_sandbox_id(record: &SnapshotRecord) -> Option<String> {
     match &record.source {
         SnapshotSource::Sandbox { source_sandbox_id } => Some(source_sandbox_id.clone()),
         SnapshotSource::Template { .. } => None,

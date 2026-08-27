@@ -28,8 +28,8 @@ pub use persistence::{
     ClusterRegistration, DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,
 };
-#[cfg(test)]
-pub(crate) use persistence::{RecordingCall, RecordingPersister};
+#[cfg(any(test, feature = "test-support"))]
+pub use persistence::{RecordingCall, RecordingPersister};
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{

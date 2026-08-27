@@ -63,7 +63,7 @@ fn scope_predicate(scope: CatalogReadScope) -> &'static str {
 /// first and falls back to `alias`, matching `queries_resolved.go`'s own
 /// comment on why: an alias is allowed to look exactly like a uuid, so the
 /// shape of the string is a hint rather than an answer.
-pub(crate) async fn get_scoped(
+pub async fn get_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
     id_or_alias: &str,
@@ -108,7 +108,7 @@ pub(crate) async fn get_scoped(
 /// trait this backs has no pin-aware resolution surface; see
 /// `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3 and the Stage B
 /// report's "not done" list for what pin-aware resolution would need.
-pub(crate) async fn resolve_alias_scoped(
+pub async fn resolve_alias_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
     alias: &str,
@@ -136,7 +136,7 @@ pub(crate) async fn resolve_alias_scoped(
 /// The unbounded read: every row matching `filter`, at `scope`, ignoring
 /// pagination — for the mirror's history backfill and the population
 /// comparison, both of which are counting *everything*.
-pub(crate) async fn list_scoped(
+pub async fn list_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
     filter: &SnapshotListFilter,
@@ -157,7 +157,7 @@ pub(crate) async fn list_scoped(
 /// One keyset page, pushed all the way into the `WHERE`/`ORDER BY`/`LIMIT` —
 /// the pushdown that is the whole point of this backend existing, unlike the
 /// object-store backends' "list everything and slice".
-pub(crate) async fn list_page_scoped(
+pub async fn list_page_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
     filter: &SnapshotListFilter,
@@ -376,7 +376,7 @@ fn build_status_str(status: crate::snapshot::types::TemplateBuildStatus) -> &'st
     }
 }
 
-pub(super) fn backend_error(operation: &'static str) -> impl Fn(sqlx::Error) -> RepositoryError {
+pub fn backend_error(operation: &'static str) -> impl Fn(sqlx::Error) -> RepositoryError {
     move |error| RepositoryError::backend(format!("snapshot catalog '{operation}' failed"), error)
 }
 

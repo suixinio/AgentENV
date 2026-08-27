@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::drive::{normalize_mount_path_for_drive, ExtraDrive};
 
-pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
+pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 
 /// Manifest describing the on-disk layout of a Firecracker snapshot.
 ///
@@ -146,10 +146,12 @@ impl FirecrackerSnapshotManifest {
     }
 }
 
-#[cfg(test)]
+/// 🔴 `#[doc(hidden)]` rather than `#[cfg(test)]`: `sandbox::mock` is compiled
+/// unconditionally now that `aenv-node`'s and `aenv-api`'s own test suites are
+/// in other crates, and this is what its stageable capture is built from.
 #[doc(hidden)]
 impl FirecrackerSnapshotManifest {
-    pub(crate) fn for_test(
+    pub fn for_test(
         rootfs_virtual_size: u64,
         attached_drives: &[ExtraDrive],
     ) -> FirecrackerSnapshotManifest {

@@ -36,7 +36,7 @@ fn running(id: SandboxId) -> SandboxMetadata {
     }
 }
 
-pub(crate) async fn add_get_remove_round_trip<S: MetadataStore>(store: &S) {
+pub async fn add_get_remove_round_trip<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     let mut metadata = running(id);
     metadata.snapshot_id = "snap-1".to_string();
@@ -71,7 +71,7 @@ pub(crate) async fn add_get_remove_round_trip<S: MetadataStore>(store: &S) {
 /// that matters is "this one went and that one stayed". A suite in which
 /// everything is expected to vanish cannot tell a working predicate from a
 /// backend that simply deletes whatever it is handed.
-pub(crate) async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(store: &S) {
+pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(store: &S) {
     let mine = ExecutionId::new();
     let theirs = ExecutionId::new();
 
@@ -164,7 +164,7 @@ pub(crate) async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataS
     );
 }
 
-pub(crate) async fn add_refuses_a_duplicate<S: MetadataStore>(store: &S) {
+pub async fn add_refuses_a_duplicate<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
     let error = store.add(running(id)).await.unwrap_err();
@@ -174,7 +174,7 @@ pub(crate) async fn add_refuses_a_duplicate<S: MetadataStore>(store: &S) {
     );
 }
 
-pub(crate) async fn missing_records_are_reported_as_missing<S: MetadataStore>(store: &S) {
+pub async fn missing_records_are_reported_as_missing<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     assert!(store.get(&id).await.unwrap().is_none());
     let error = store
@@ -196,7 +196,7 @@ pub(crate) async fn missing_records_are_reported_as_missing<S: MetadataStore>(st
     );
 }
 
-pub(crate) async fn state_cas_moves_only_from_an_expected_state<S: MetadataStore>(store: &S) {
+pub async fn state_cas_moves_only_from_an_expected_state<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
 
@@ -222,7 +222,7 @@ pub(crate) async fn state_cas_moves_only_from_an_expected_state<S: MetadataStore
     }
 }
 
-pub(crate) async fn update_if_state_runs_the_callback_exactly_once<S: MetadataStore>(store: &S) {
+pub async fn update_if_state_runs_the_callback_exactly_once<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
 
@@ -246,7 +246,7 @@ pub(crate) async fn update_if_state_runs_the_callback_exactly_once<S: MetadataSt
     assert_eq!(store.get(&id).await.unwrap().unwrap().snapshot_id, "after");
 }
 
-pub(crate) async fn update_if_state_refuses_the_wrong_state<S: MetadataStore>(store: &S) {
+pub async fn update_if_state_refuses_the_wrong_state<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
 
@@ -265,7 +265,7 @@ pub(crate) async fn update_if_state_refuses_the_wrong_state<S: MetadataStore>(st
     );
 }
 
-pub(crate) async fn update_writes_the_whole_record<S: MetadataStore>(store: &S) {
+pub async fn update_writes_the_whole_record<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     let metadata = running(id);
     store.add(metadata.clone()).await.unwrap();
@@ -283,7 +283,7 @@ pub(crate) async fn update_writes_the_whole_record<S: MetadataStore>(store: &S) 
     );
 }
 
-pub(crate) async fn filters_match_states_and_metadata<S: MetadataStore>(store: &S) {
+pub async fn filters_match_states_and_metadata<S: MetadataStore>(store: &S) {
     let running_id = SandboxId::new();
     let paused_id = SandboxId::new();
 
@@ -339,7 +339,7 @@ pub(crate) async fn filters_match_states_and_metadata<S: MetadataStore>(store: &
     assert_eq!(dev.len(), 1);
 }
 
-pub(crate) async fn list_with_callback_visits_every_record<S: MetadataStore>(store: &S) {
+pub async fn list_with_callback_visits_every_record<S: MetadataStore>(store: &S) {
     let ids: Vec<_> = (0..3).map(|_| SandboxId::new()).collect();
     for id in &ids {
         store.add(running(*id)).await.unwrap();
@@ -355,7 +355,7 @@ pub(crate) async fn list_with_callback_visits_every_record<S: MetadataStore>(sto
     assert_eq!(seen, expected);
 }
 
-pub(crate) async fn expiry_listing_is_bounded_and_ordered<S: MetadataStore>(store: &S) {
+pub async fn expiry_listing_is_bounded_and_ordered<S: MetadataStore>(store: &S) {
     let now = SystemTime::now();
     let mut ids = Vec::new();
     for offset in 1..=3u64 {
@@ -382,7 +382,7 @@ pub(crate) async fn expiry_listing_is_bounded_and_ordered<S: MetadataStore>(stor
     assert_eq!(batch.len(), 2);
 }
 
-pub(crate) async fn get_many_reports_what_it_covered<S: MetadataStore>(store: &S) {
+pub async fn get_many_reports_what_it_covered<S: MetadataStore>(store: &S) {
     let present = SandboxId::new();
     let absent = SandboxId::new();
     store.add(running(present)).await.unwrap();
@@ -403,7 +403,7 @@ pub(crate) async fn get_many_reports_what_it_covered<S: MetadataStore>(store: &S
     assert!(rows.covers(&[]));
 }
 
-pub(crate) async fn waiting_returns_immediately_when_not_transitional<S: MetadataStore>(store: &S) {
+pub async fn waiting_returns_immediately_when_not_transitional<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
 
@@ -418,7 +418,7 @@ pub(crate) async fn waiting_returns_immediately_when_not_transitional<S: Metadat
     assert_eq!(settled.state, SandboxState::Running);
 }
 
-pub(crate) async fn waiting_on_a_missing_record_is_none<S: MetadataStore>(store: &S) {
+pub async fn waiting_on_a_missing_record_is_none<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     let settled = tokio::time::timeout(
         Duration::from_secs(2),
@@ -430,7 +430,7 @@ pub(crate) async fn waiting_on_a_missing_record_is_none<S: MetadataStore>(store:
     assert!(settled.is_none());
 }
 
-pub(crate) async fn waiting_wakes_when_the_state_settles<S: MetadataStore + 'static>(store: &S) {
+pub async fn waiting_wakes_when_the_state_settles<S: MetadataStore + 'static>(store: &S) {
     let id = SandboxId::new();
     let mut metadata = running(id);
     metadata.state = SandboxState::Pausing;
@@ -452,7 +452,7 @@ pub(crate) async fn waiting_wakes_when_the_state_settles<S: MetadataStore + 'sta
     assert_eq!(settled.unwrap().unwrap().state, SandboxState::Paused);
 }
 
-pub(crate) async fn waiting_returns_none_when_the_record_is_removed<S: MetadataStore>(store: &S) {
+pub async fn waiting_returns_none_when_the_record_is_removed<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     let mut metadata = running(id);
     metadata.state = SandboxState::Pausing;
@@ -475,9 +475,7 @@ pub(crate) async fn waiting_returns_none_when_the_record_is_removed<S: MetadataS
 /// it is a shared contract rather than an in-memory implementation detail.
 /// Getting it wrong on one backend means sandboxes that gain or lose budget
 /// depending on which role wrote them.
-pub(crate) async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore>(
-    store: &S,
-) {
+pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     let mut metadata = running(id);
     metadata.max_lifetime = Some(Duration::from_secs(3600));
@@ -529,7 +527,7 @@ pub(crate) async fn the_lifetime_clock_is_reconciled_after_every_write<S: Metada
 /// anywhere. Two sandboxes paused with captures differing in one value are what
 /// gives the assertion its resolution: without them, "the answer is not
 /// `NotPaused`" is satisfied by a store that returns a constant.
-pub(crate) async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: &S) {
+pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: &S) {
     #[derive(Debug)]
     struct FakePausedState(&'static str);
 

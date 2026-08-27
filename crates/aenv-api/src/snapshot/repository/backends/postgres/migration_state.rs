@@ -16,7 +16,7 @@ use crate::snapshot::repository::mirror::ReadSideConfirmationStore;
 ///
 /// `false` for a cluster with no row at all — the same reading as a fresh
 /// [`crate::snapshot::repository::mirror::MirrorBacklog`] answering `None`.
-pub(crate) async fn read_side_confirmed(pool: &PgPool, cluster_id: Uuid) -> Result<bool> {
+pub async fn read_side_confirmed(pool: &PgPool, cluster_id: Uuid) -> Result<bool> {
     let confirmed: Option<bool> = sqlx::query_scalar(
         "SELECT read_side_confirmed FROM catalog_migration_state WHERE cluster_id = $1",
     )
@@ -33,11 +33,7 @@ pub(crate) async fn read_side_confirmed(pool: &PgPool, cluster_id: Uuid) -> Resu
 /// Idempotent and monotonic: a second confirmation from a second replica
 /// (or the same one, restarted) just rewrites the same `true` and a newer
 /// timestamp, never turns a confirmed cluster back to unconfirmed.
-pub(crate) async fn confirm_read_side(
-    pool: &PgPool,
-    cluster_id: Uuid,
-    node_id: &str,
-) -> Result<()> {
+pub async fn confirm_read_side(pool: &PgPool, cluster_id: Uuid, node_id: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO catalog_migration_state (cluster_id, read_side_confirmed, confirmed_at_ms, confirmed_by_node_id)
          VALUES ($1, true, $2, $3)
@@ -69,14 +65,14 @@ fn now_ms() -> i64 {
 /// [`pg_catalog_parts`][super::pg_catalog_parts]), which a borrowing type
 /// cannot be. `PgPool` is an `Arc` internally, so the clone is a refcount
 /// bump.
-pub(crate) struct PgReadSideConfirmation {
+pub struct PgReadSideConfirmation {
     pool: PgPool,
     cluster_id: Uuid,
     node_id: String,
 }
 
 impl PgReadSideConfirmation {
-    pub(crate) fn new(pool: &PgPool, cluster_id: Uuid, node_id: &str) -> Self {
+    pub fn new(pool: &PgPool, cluster_id: Uuid, node_id: &str) -> Self {
         Self {
             pool: pool.clone(),
             cluster_id,

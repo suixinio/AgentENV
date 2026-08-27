@@ -26,14 +26,14 @@ static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .expect("build envd bootstrap HTTP client")
 });
 
-pub(crate) struct EnvdInstance {
+pub struct EnvdInstance {
     config: Configuration,
     grpc_address: String,
     access_token: Option<EnvdAccessToken>,
 }
 
 impl EnvdInstance {
-    pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
+    pub fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
         let grpc_address = base_path.clone();
         Self {
             // Share client configuration without retaining bootstrap TCP
@@ -57,7 +57,7 @@ impl EnvdInstance {
 
     /// Create a new gRPC `ProcessClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
-    pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
+    pub async fn process_client(&self) -> Result<ProcessClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
         let client = ProcessClient::connect(
             &self.grpc_address,
@@ -71,7 +71,7 @@ impl EnvdInstance {
 
     /// Create a new gRPC `FilesystemClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
-    pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
+    pub async fn filesystem_client(&self) -> Result<FilesystemClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
         let client = FilesystemClient::connect(
             &self.grpc_address,
@@ -84,11 +84,7 @@ impl EnvdInstance {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn wait_for_ready(
-        &self,
-        timeout: Duration,
-        retry_interval: Duration,
-    ) -> Result<()> {
+    pub async fn wait_for_ready(&self, timeout: Duration, retry_interval: Duration) -> Result<()> {
         debug!(
             base_path = %self.config.base_path,
             timeout_ms = timeout.as_millis(),
@@ -130,7 +126,7 @@ impl EnvdInstance {
     }
 
     #[tracing::instrument(skip(self, env_vars))]
-    pub(crate) async fn init(
+    pub async fn init(
         &self,
         env_vars: Option<HashMap<String, String>>,
         default_workdir: Option<String>,

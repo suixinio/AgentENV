@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Inner type is `Uuid`: Display/serde output is always lowercase-hyphenated.
 /// Snapshot directory names on disk must match; uppercase IDs from external
 /// tools or manual edits will cause lookup misses in the PosixFs backend.
-pub struct SnapshotId(pub(crate) Uuid);
+pub struct SnapshotId(pub Uuid);
 
 impl SnapshotId {
     pub fn generate() -> Self {
@@ -51,7 +51,7 @@ impl TryFrom<&str> for SnapshotId {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Human-readable alias that can point to a committed snapshot.
-pub struct SnapshotAlias(pub(crate) String);
+pub struct SnapshotAlias(pub String);
 
 impl SnapshotAlias {
     /// Parses and validates a user-provided snapshot alias.

@@ -12,10 +12,10 @@
 use super::backlog::MirrorDirection;
 
 /// One increment per catalog RPC this node issues.
-pub(crate) const CENTRAL_REQUESTS_TOTAL: &str = "agentenv_snapshot_catalog_central_requests_total";
+pub const CENTRAL_REQUESTS_TOTAL: &str = "agentenv_snapshot_catalog_central_requests_total";
 
 /// Writes the central catalog refused with a reason the caller acts on.
-pub(crate) const CENTRAL_REFUSED_TOTAL: &str = "agentenv_snapshot_catalog_central_refused_total";
+pub const CENTRAL_REFUSED_TOTAL: &str = "agentenv_snapshot_catalog_central_refused_total";
 
 /// 🔴 Writes the central catalog would not take because its row is behind what
 /// the object store's already is — the batch's one known, named gap. Separate
@@ -25,11 +25,11 @@ pub(crate) const CENTRAL_REFUSED_TOTAL: &str = "agentenv_snapshot_catalog_centra
 ///
 /// This counts the *events*. [`MIRROR_DIVERGED`] is the standing number of
 /// snapshots still in that state, which is the one a switch can be judged on.
-pub(crate) const CENTRAL_DIVERGED_TOTAL: &str = "agentenv_snapshot_catalog_central_diverged_total";
+pub const CENTRAL_DIVERGED_TOTAL: &str = "agentenv_snapshot_catalog_central_diverged_total";
 
 /// I3: a mirror write that failed after the other store took it. The operation
 /// still succeeded; this is what says so.
-pub(crate) const MIRROR_FAILED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_failed_total";
+pub const MIRROR_FAILED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_failed_total";
 
 /// I4/I5: how many writes the store on `direction` still owes.
 ///
@@ -44,7 +44,7 @@ pub(crate) const MIRROR_FAILED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_f
 /// nothing. A single unlabelled series would answer neither question. Summing
 /// the label back up is safe — it is the more conservative reading, never the
 /// less.
-pub(crate) const MIRROR_LAG: &str = "agentenv_snapshot_catalog_mirror_lag";
+pub const MIRROR_LAG: &str = "agentenv_snapshot_catalog_mirror_lag";
 
 /// 🔴 Snapshots the two catalogs disagree about that no replay can settle.
 ///
@@ -56,22 +56,20 @@ pub(crate) const MIRROR_LAG: &str = "agentenv_snapshot_catalog_mirror_lag";
 /// lag alone would move reads onto a store missing exactly those rows. This is
 /// the number that makes "they agree" answerable, and the read-side guard reads
 /// it alongside the lag.
-pub(crate) const MIRROR_DIVERGED: &str = "agentenv_snapshot_catalog_mirror_diverged";
+pub const MIRROR_DIVERGED: &str = "agentenv_snapshot_catalog_mirror_diverged";
 
 /// Owed writes this process could not write down.
 ///
 /// Counted into [`MIRROR_LAG`] as well, because the write is owed either way.
 /// Separate because these are the only entries a restart forgets, so a non-zero
 /// value here is the one case where the lag can come back smaller than it was.
-pub(crate) const MIRROR_UNRECORDED_TOTAL: &str =
-    "agentenv_snapshot_catalog_mirror_unrecorded_total";
+pub const MIRROR_UNRECORDED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_unrecorded_total";
 
 /// Backlog entries the compensator replayed successfully.
-pub(crate) const MIRROR_REPAIRED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_repaired_total";
+pub const MIRROR_REPAIRED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_repaired_total";
 
 /// Backlog entries a pass could not clear, by why.
-pub(crate) const MIRROR_REPAIR_FAILED_TOTAL: &str =
-    "agentenv_snapshot_catalog_mirror_repair_failed_total";
+pub const MIRROR_REPAIR_FAILED_TOTAL: &str = "agentenv_snapshot_catalog_mirror_repair_failed_total";
 
 /// 🔴 Entries the target *took* and the two catalogs still disagreed about.
 ///
@@ -84,7 +82,7 @@ pub(crate) const MIRROR_REPAIR_FAILED_TOTAL: &str =
 ///
 /// A non-zero value here with a non-zero lag is the honest state: the write
 /// landed, the rows do not match, and the entry is still counted as debt.
-pub(crate) const MIRROR_CONTENT_MISMATCH_TOTAL: &str =
+pub const MIRROR_CONTENT_MISMATCH_TOTAL: &str =
     "agentenv_snapshot_catalog_mirror_content_mismatch_total";
 
 /// 🔴 Divergences retired because the snapshot they were about is gone from
@@ -96,12 +94,12 @@ pub(crate) const MIRROR_CONTENT_MISMATCH_TOTAL: &str =
 /// this existed a divergence recorded on one node and deleted through another
 /// pinned that node's gauge at one over a snapshot that no longer existed, with
 /// no API call able to clear it and the read-side switch blocked for good.
-pub(crate) const MIRROR_DIVERGENCES_RETIRED_TOTAL: &str =
+pub const MIRROR_DIVERGENCES_RETIRED_TOTAL: &str =
     "agentenv_snapshot_catalog_mirror_divergences_retired_total";
 
 /// What one central call did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CentralOutcome {
+pub enum CentralOutcome {
     /// The catalog took the write, or answered the read.
     Ok,
     /// The catalog answered, and the answer was a refusal.
@@ -120,7 +118,7 @@ impl CentralOutcome {
     }
 }
 
-pub(crate) fn record_central_request(op: &'static str, outcome: CentralOutcome) {
+pub fn record_central_request(op: &'static str, outcome: CentralOutcome) {
     metrics::counter!(
         CENTRAL_REQUESTS_TOTAL,
         "op" => op,
@@ -129,15 +127,15 @@ pub(crate) fn record_central_request(op: &'static str, outcome: CentralOutcome) 
     .increment(1);
 }
 
-pub(crate) fn record_central_refused(op: &'static str, reason: &'static str) {
+pub fn record_central_refused(op: &'static str, reason: &'static str) {
     metrics::counter!(CENTRAL_REFUSED_TOTAL, "op" => op, "reason" => reason).increment(1);
 }
 
-pub(crate) fn record_central_diverged(op: &'static str, reason: &'static str) {
+pub fn record_central_diverged(op: &'static str, reason: &'static str) {
     metrics::counter!(CENTRAL_DIVERGED_TOTAL, "op" => op, "reason" => reason).increment(1);
 }
 
-pub(crate) fn record_mirror_failed(direction: MirrorDirection, op: &'static str) {
+pub fn record_mirror_failed(direction: MirrorDirection, op: &'static str) {
     metrics::counter!(
         MIRROR_FAILED_TOTAL,
         "direction" => direction.as_str(),
@@ -146,7 +144,7 @@ pub(crate) fn record_mirror_failed(direction: MirrorDirection, op: &'static str)
     .increment(1);
 }
 
-pub(crate) fn record_mirror_repaired(direction: MirrorDirection, op: &'static str) {
+pub fn record_mirror_repaired(direction: MirrorDirection, op: &'static str) {
     metrics::counter!(
         MIRROR_REPAIRED_TOTAL,
         "direction" => direction.as_str(),
@@ -155,7 +153,7 @@ pub(crate) fn record_mirror_repaired(direction: MirrorDirection, op: &'static st
     .increment(1);
 }
 
-pub(crate) fn record_mirror_repair_failed(
+pub fn record_mirror_repair_failed(
     direction: MirrorDirection,
     op: &'static str,
     verdict: &'static str,
@@ -169,7 +167,7 @@ pub(crate) fn record_mirror_repair_failed(
     .increment(1);
 }
 
-pub(crate) fn record_mirror_content_mismatch(direction: MirrorDirection, field: &'static str) {
+pub fn record_mirror_content_mismatch(direction: MirrorDirection, field: &'static str) {
     metrics::counter!(
         MIRROR_CONTENT_MISMATCH_TOTAL,
         "direction" => direction.as_str(),
@@ -178,7 +176,7 @@ pub(crate) fn record_mirror_content_mismatch(direction: MirrorDirection, field: 
     .increment(1);
 }
 
-pub(crate) fn record_mirror_divergence_retired(direction: MirrorDirection) {
+pub fn record_mirror_divergence_retired(direction: MirrorDirection) {
     metrics::counter!(
         MIRROR_DIVERGENCES_RETIRED_TOTAL,
         "direction" => direction.as_str(),
@@ -186,7 +184,7 @@ pub(crate) fn record_mirror_divergence_retired(direction: MirrorDirection) {
     .increment(1);
 }
 
-pub(crate) fn record_mirror_unrecorded(direction: MirrorDirection, op: &'static str) {
+pub fn record_mirror_unrecorded(direction: MirrorDirection, op: &'static str) {
     metrics::counter!(
         MIRROR_UNRECORDED_TOTAL,
         "direction" => direction.as_str(),
@@ -195,10 +193,10 @@ pub(crate) fn record_mirror_unrecorded(direction: MirrorDirection, op: &'static 
     .increment(1);
 }
 
-pub(crate) fn set_mirror_lag(direction: MirrorDirection, lag: u64) {
+pub fn set_mirror_lag(direction: MirrorDirection, lag: u64) {
     metrics::gauge!(MIRROR_LAG, "direction" => direction.as_str()).set(lag as f64);
 }
 
-pub(crate) fn set_mirror_diverged(direction: MirrorDirection, diverged: u64) {
+pub fn set_mirror_diverged(direction: MirrorDirection, diverged: u64) {
     metrics::gauge!(MIRROR_DIVERGED, "direction" => direction.as_str()).set(diverged as f64);
 }

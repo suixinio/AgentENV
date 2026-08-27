@@ -85,9 +85,9 @@ pub enum MirrorDirection {
 }
 
 impl MirrorDirection {
-    pub(super) const ALL: [Self; 2] = [Self::ObjectStore, Self::Central];
+    pub const ALL: [Self; 2] = [Self::ObjectStore, Self::Central];
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ObjectStore => "object_store",
             Self::Central => "central",
@@ -120,7 +120,7 @@ impl MirrorDirection {
 /// whichever store missed it, while a row diff would only be replayable against
 /// the store whose columns are a subset of the other's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) enum MirrorOp {
+pub enum MirrorOp {
     Create {
         record: SnapshotRecord,
     },
@@ -149,7 +149,7 @@ pub(super) enum MirrorOp {
 }
 
 impl MirrorOp {
-    pub(super) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             Self::Create { .. } => "create",
             Self::PublishCommit { .. } => "publish_commit",
@@ -164,7 +164,7 @@ impl MirrorOp {
     /// The replay's ordering key: two writes to one snapshot must be replayed
     /// in the order they were made, and writes to different snapshots are
     /// independent of each other.
-    pub(super) fn snapshot_id(&self) -> &SnapshotId {
+    pub fn snapshot_id(&self) -> &SnapshotId {
         match self {
             Self::Create { record } | Self::DeleteRecord { record } => &record.id,
             Self::PublishCommit { commit } => &commit.id,
@@ -211,7 +211,7 @@ struct OwedWrite {
 /// central catalog really is missing the write — and it keeps the read-side
 /// switch shut, which is the behaviour that matters. Clearing it takes deleting
 /// the snapshot, or an operator.
-pub(super) const MAX_REPLAY_ATTEMPTS: u32 = 120;
+pub const MAX_REPLAY_ATTEMPTS: u32 = 120;
 
 impl OwedWrite {
     /// Decodes an entry, including one written before the queue had directions.
@@ -446,7 +446,7 @@ impl MirrorTargets {
 
 /// What comparing the two catalogs' rows for one snapshot found.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CatalogComparison {
+pub enum CatalogComparison {
     /// Both stores answered and their rows say the same thing.
     Agree,
     /// There is only one store, so there is nothing to compare against.
@@ -619,7 +619,7 @@ async fn compare_catalogs(targets: &MirrorTargets, id: &SnapshotId) -> CatalogCo
 
 /// What one replay attempt settled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RepairVerdict {
+pub enum RepairVerdict {
     /// The target now reflects the write. Drop the entry.
     Repaired,
     /// Nothing was learned; the same attempt may work later. Keep the entry and
@@ -650,10 +650,7 @@ impl RepairVerdict {
 ///
 /// Split out from the pass so it can be exercised against every outcome
 /// without a store on either side.
-pub(super) fn verdict_for(
-    replay: &RepositoryResult<()>,
-    already_applied: Option<bool>,
-) -> RepairVerdict {
+pub fn verdict_for(replay: &RepositoryResult<()>, already_applied: Option<bool>) -> RepairVerdict {
     if replay.is_ok() {
         return RepairVerdict::Repaired;
     }
@@ -713,7 +710,7 @@ pub struct DivergenceSweep {
 /// otherwise turn a background tidy-up into a steady load nobody asked for.
 /// Sweeps resume where the last one stopped, so a large set is worked through
 /// over several rather than truncated at the same place forever.
-pub(super) const MAX_DIVERGENCES_PER_SWEEP: usize = 64;
+pub const MAX_DIVERGENCES_PER_SWEEP: usize = 64;
 
 /// Which store answers catalog reads.
 ///
@@ -921,7 +918,7 @@ impl MirrorBacklog {
     /// Boundedly stops background compaction/flush on the backlog's RocksDB
     /// store, ahead of process shutdown. See `LocalKvStore::close` for the
     /// mechanism and why it needs to be explicit and bounded at all.
-    pub(crate) async fn close(
+    pub async fn close(
         &self,
         timeout: std::time::Duration,
     ) -> crate::local_store::LocalKvCloseOutcome {
@@ -1052,7 +1049,7 @@ impl MirrorBacklog {
     ///
     /// Returns what is still owed afterwards. Like its caller it decides
     /// nothing: whatever it could not settle is left for the check that asked.
-    pub(super) async fn drain_debt_toward(
+    pub async fn drain_debt_toward(
         &self,
         direction: MirrorDirection,
         targets: &MirrorTargets,
@@ -1317,7 +1314,7 @@ impl MirrorBacklog {
     ///
     /// Returns whether the note is on disk. Only the history backfill reads the
     /// answer: it must not mark itself done over a write nothing wrote down.
-    pub(super) async fn record(&self, direction: MirrorDirection, op: MirrorOp) -> bool {
+    pub async fn record(&self, direction: MirrorDirection, op: MirrorOp) -> bool {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let owed = OwedWrite {
             direction,
@@ -1388,10 +1385,7 @@ impl MirrorBacklog {
     /// a genuinely dangling registry row is left alone rather than dropped —
     /// and it is the recoverable direction of a choice whose other direction
     /// destroys a workspace.
-    pub(super) async fn owes_a_write_about(
-        &self,
-        id: &SnapshotId,
-    ) -> anyhow::Result<Option<String>> {
+    pub async fn owes_a_write_about(&self, id: &SnapshotId) -> anyhow::Result<Option<String>> {
         if let Some(direction) = MirrorDirection::ALL
             .into_iter()
             .find(|direction| self.counters(*direction).unrecorded.load(Ordering::Acquire) > 0)
@@ -1436,7 +1430,7 @@ impl MirrorBacklog {
     /// Keyed by snapshot and direction, so the same disagreement discovered
     /// twice — a template's build start and then its commit — is one
     /// divergence, not two. Returns whether it was written down durably.
-    pub(super) async fn note_divergence(
+    pub async fn note_divergence(
         &self,
         direction: MirrorDirection,
         id: &SnapshotId,
@@ -1483,7 +1477,7 @@ impl MirrorBacklog {
     /// whatever they used to disagree about is superseded by both of them not
     /// having it at all. Clearing it anywhere else would be forgetting a
     /// disagreement rather than resolving one.
-    pub(super) async fn clear_divergences(&self, id: &SnapshotId) {
+    pub async fn clear_divergences(&self, id: &SnapshotId) {
         for direction in MirrorDirection::ALL {
             let key = encode_diverged(direction, id);
             if !matches!(self.store.get(key.clone()).await, Ok(Some(_))) {

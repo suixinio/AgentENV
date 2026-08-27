@@ -34,4 +34,4 @@ pub use pool::{
 };
 
 #[cfg(test)]
-pub(crate) mod harness;
+pub mod harness;

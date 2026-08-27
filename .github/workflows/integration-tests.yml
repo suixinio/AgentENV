@@ -119,7 +119,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/docker/Dockerfile.agentenv
+          file: deploy/docker/Dockerfile.aenv-node
           load: true
           tags: agentenv-runtime:latest
           cache-from: type=gha,scope=agentenv-runtime

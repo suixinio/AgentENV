@@ -7,7 +7,7 @@ use object_store_operator::{
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
 
 #[derive(Debug, Clone)]
-pub(crate) struct NormalizedOssConfig {
+pub struct NormalizedOssConfig {
     bucket: String,
     endpoint: String,
     region: String,
@@ -17,7 +17,7 @@ pub(crate) struct NormalizedOssConfig {
 }
 
 impl NormalizedOssConfig {
-    pub(crate) fn new(
+    pub fn new(
         config: &OssBackendConfig,
         snapshot_image_storage: SnapshotImageStoragePolicy,
     ) -> Result<Self> {
@@ -64,31 +64,31 @@ impl NormalizedOssConfig {
         })
     }
 
-    pub(crate) fn bucket(&self) -> &str {
+    pub fn bucket(&self) -> &str {
         &self.bucket
     }
 
-    pub(crate) fn endpoint(&self) -> &str {
+    pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    pub(crate) fn prefix(&self) -> &str {
+    pub fn prefix(&self) -> &str {
         &self.prefix
     }
 
-    pub(crate) fn region(&self) -> &str {
+    pub fn region(&self) -> &str {
         &self.region
     }
 
-    pub(crate) fn credential_source(&self) -> CredentialSource {
+    pub fn credential_source(&self) -> CredentialSource {
         self.credential_source.clone()
     }
 
-    pub(crate) fn snapshot_image_storage(&self) -> SnapshotImageStoragePolicy {
+    pub fn snapshot_image_storage(&self) -> SnapshotImageStoragePolicy {
         self.snapshot_image_storage
     }
 
-    pub(crate) fn managed_layers_repo_blob_url(&self) -> String {
+    pub fn managed_layers_repo_blob_url(&self) -> String {
         // overlaybd expects an S3-compatible repo blob URL here, including for
         // Alibaba OSS, so the scheme remains `s3://` rather than `oss://`.
         if self.prefix.is_empty() {

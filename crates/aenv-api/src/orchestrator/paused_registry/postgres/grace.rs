@@ -120,7 +120,7 @@ const GRACE_DOWNTIME_METRIC: &str = "agentenv_api_paused_registry_grace_downtime
 /// opposed to a build that also compiles tests) flags these fields.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
-pub(super) struct GraceObservation {
+pub struct GraceObservation {
     pub downtime_secs: f64,
     pub extended: i64,
 }
@@ -133,7 +133,7 @@ pub(super) struct GraceObservation {
 /// same tick are already serialised against every other contender for that
 /// lock -- see the module doc's own B3 section for why no additional lock is
 /// taken here.
-pub(super) async fn enter(
+pub async fn enter(
     conn: &mut PgConnection,
     cluster_id: Uuid,
     ttl_secs: f64,
@@ -187,7 +187,7 @@ pub(super) async fn enter(
 /// yet" (this cluster's reconcile leader has never entered grace under this
 /// backend, i.e. `PhaseCold`), which is the conservative answer: nothing may
 /// reclaim or take over a lapsed lease before the first grace pass has run.
-pub(super) async fn is_serving(pool: &PgPool, cluster_id: Uuid) -> anyhow::Result<bool> {
+pub async fn is_serving(pool: &PgPool, cluster_id: Uuid) -> anyhow::Result<bool> {
     let serving: Option<bool> = sqlx::query_scalar(
         "SELECT (now() >= grace_until) FROM paused_registry_grace WHERE cluster_id = $1",
     )
@@ -211,7 +211,7 @@ pub(super) async fn is_serving(pool: &PgPool, cluster_id: Uuid) -> anyhow::Resul
 /// against. Split out from what used to be one `new_epoch_since` call
 /// (B2(b) below) so the caller can decide whether to record this pid as
 /// "seen" only *after* [`enter`] for it has actually succeeded.
-pub(super) async fn current_backend_pid(ctx: &mut LeaderContext<'_>) -> anyhow::Result<i32> {
+pub async fn current_backend_pid(ctx: &mut LeaderContext<'_>) -> anyhow::Result<i32> {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *ctx.conn)
         .await
@@ -227,7 +227,7 @@ pub(super) async fn current_backend_pid(ctx: &mut LeaderContext<'_>) -> anyhow::
 ///
 /// A pure comparison, never a write -- see [`record_epoch_entered`] for the
 /// other half.
-pub(super) fn is_new_epoch(last_pid: &AtomicI32, pid: i32) -> bool {
+pub fn is_new_epoch(last_pid: &AtomicI32, pid: i32) -> bool {
     // 0 is not a real backend pid (PostgreSQL's lowest is 1), so it is safe
     // as the "never observed" sentinel -- `AtomicI32` has no native
     // `Option`, and this avoids a `Mutex<Option<i32>>` for a value this
@@ -247,7 +247,7 @@ pub(super) fn is_new_epoch(last_pid: &AtomicI32, pid: i32) -> bool {
 /// even though it never actually ran. Recording only on success means a
 /// failed attempt is retried on the very next tick, since the pid was never
 /// marked seen.
-pub(super) fn record_epoch_entered(last_pid: &AtomicI32, pid: i32) {
+pub fn record_epoch_entered(last_pid: &AtomicI32, pid: i32) {
     last_pid.store(pid, Ordering::SeqCst);
 }
 
@@ -313,7 +313,7 @@ const INITIAL_ENTRY_BUDGET: Duration = Duration::from_secs(5);
 /// would require every replica to block on a cluster-wide startup barrier,
 /// which is a materially larger amount of complexity and startup latency for
 /// a residual risk this narrow.
-pub(super) async fn attempt_initial_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
+pub async fn attempt_initial_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
     let attempt = async {
         let mut conn = pool
             .acquire()

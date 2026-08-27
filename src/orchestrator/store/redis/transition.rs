@@ -42,7 +42,7 @@ use crate::types::{ExecutionId, SandboxId};
 /// How many index members one reaper round looks at.
 const REAP_BATCH: usize = 128;
 
-pub(super) async fn start_transition(
+pub async fn start_transition(
     inner: &Arc<StoreInner>,
     sandbox_id: &SandboxId,
     request: TransitionRequest,
@@ -377,7 +377,7 @@ enum Settle {
 /// guessing. Instead the record is made eligible for eviction and handed to the
 /// evictor, which goes down the full pause/delete path, which asks the node.
 /// Hand the question to whoever can answer it.
-pub(super) async fn reap_stuck_transitions(
+pub async fn reap_stuck_transitions(
     inner: &Arc<StoreInner>,
     now: SystemTime,
 ) -> Result<Vec<SandboxId>> {
@@ -517,7 +517,7 @@ async fn make_evictable(
     }
 }
 
-pub(super) async fn read_transition_result(
+pub async fn read_transition_result(
     inner: &Arc<StoreInner>,
     sandbox_id: &SandboxId,
     transition_id: &Uuid,

@@ -49,7 +49,7 @@ struct ReapedBuild {
 /// start under the same condition — a reaper with no TTL would either never
 /// fire or fire on every row immediately, and neither is "disabled" spelled
 /// correctly.
-pub(crate) fn spawn(
+pub fn spawn(
     pool: PgPool,
     cluster_id: Uuid,
     interval: Duration,

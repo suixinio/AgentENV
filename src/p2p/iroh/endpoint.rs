@@ -6,14 +6,14 @@ use crate::p2p::error::{Error, Result};
 use crate::p2p::types::P2pEndpoint;
 
 impl P2pEndpoint {
-    pub(crate) fn from_iroh_addr(addr: &EndpointAddr) -> Result<Self> {
+    pub fn from_iroh_addr(addr: &EndpointAddr) -> Result<Self> {
         Ok(Self {
             backend: IROH_BACKEND_ID.to_string(),
             address: serde_json::to_string(addr).context("serialize iroh endpoint address")?,
         })
     }
 
-    pub(crate) fn to_iroh_addr(&self) -> Result<EndpointAddr> {
+    pub fn to_iroh_addr(&self) -> Result<EndpointAddr> {
         if self.backend != IROH_BACKEND_ID {
             return Err(Error::InvalidDescriptor {
                 reason: format!("unsupported P2P endpoint backend {}", self.backend),

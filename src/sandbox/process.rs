@@ -188,7 +188,7 @@ pub struct Executor<'a> {
 }
 
 impl<'a> Executor<'a> {
-    pub(super) fn new(envd_instance: &'a EnvdInstance) -> Self {
+    pub fn new(envd_instance: &'a EnvdInstance) -> Self {
         Self { envd_instance }
     }
 

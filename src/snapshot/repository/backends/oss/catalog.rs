@@ -34,12 +34,12 @@ use crate::snapshot::{
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
 
 /// Snapshot rows stored as one JSON object per record in OSS.
-pub(crate) struct OssSnapshotCatalog {
+pub struct OssSnapshotCatalog {
     client: Arc<OssClient>,
 }
 
 impl OssSnapshotCatalog {
-    pub(crate) fn new(client: Arc<OssClient>) -> Self {
+    pub fn new(client: Arc<OssClient>) -> Self {
         Self { client }
     }
 }

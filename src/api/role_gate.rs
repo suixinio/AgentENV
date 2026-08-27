@@ -71,7 +71,7 @@ use crate::role::ServerRole;
 /// is defined as today's behaviour verbatim and is the rollback target; an
 /// extra layer in its request path is a difference, however small, between the
 /// thing being rolled back to and the thing that was running before.
-pub(crate) fn attach(generated: Router, role: ServerRole) -> Router {
+pub fn attach(generated: Router, role: ServerRole) -> Router {
     // Published before any request arrives, and for every role. "Is this
     // process refusing user REST" has to be answerable from a scrape of a node
     // that has had no traffic — otherwise a node whose gate never got attached

@@ -1,6 +1,6 @@
 mod control_plane_gate;
 pub mod grpc;
-mod impls;
+pub mod impls;
 /// The public pagination token's codec.
 ///
 /// 🔴 Exported because the format is public API and the thing that proves it

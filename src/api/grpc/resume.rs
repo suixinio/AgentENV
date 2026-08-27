@@ -215,7 +215,7 @@ fn record(result: &'static str) {
 /// acceptance probe for this whole move compares the gateway's attempt counter
 /// against this one "逐条相等" — and two counters cannot be compared when one
 /// of them does not exist until something goes right.
-pub(crate) fn describe_metrics() {
+pub fn describe_metrics() {
     for result in [
         "ok",
         "invalid_argument",

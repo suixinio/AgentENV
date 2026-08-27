@@ -40,7 +40,7 @@ pub mod redis;
 pub mod sweep;
 
 #[cfg(test)]
-pub(crate) mod contract;
+pub mod contract;
 
 use std::time::{Duration, SystemTime};
 

@@ -70,7 +70,7 @@ const ROSTER_FRESH_TTL: Duration = crate::node_registry::registry::DEFAULT_OBSER
 /// Short on purpose -- a `running` row's lease should reflect a healthy
 /// node's heartbeat promptly, not lag behind it by up to a full reconcile
 /// interval.
-pub(super) const RENEWAL_INTERVAL: Duration = Duration::from_secs(10);
+pub const RENEWAL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Every `(sandbox, node)` pair worth attempting a renewal for, built from
 /// `rosters` alone -- no database read required. A pure function, testable
@@ -84,7 +84,7 @@ pub(super) const RENEWAL_INTERVAL: Duration = Duration::from_secs(10);
 /// rows rather than doing anything unsafe -- there is no need to know a
 /// row's current state at this layer to decide which statement it belongs
 /// to.
-pub(super) fn candidates_from_rosters(rosters: &[Roster], now: SystemTime) -> Vec<LeaseHolder> {
+pub fn candidates_from_rosters(rosters: &[Roster], now: SystemTime) -> Vec<LeaseHolder> {
     let mut out = Vec::new();
     for roster in rosters {
         let Some(last_seen) = roster.last_seen else {
@@ -118,7 +118,7 @@ pub(super) fn candidates_from_rosters(rosters: &[Roster], now: SystemTime) -> Ve
 
 /// One renewal pass using this replica's own roster: `(parked_renewed,
 /// live_renewed)`.
-pub(super) async fn renew_once(
+pub async fn renew_once(
     registry: &PostgresPausedSandboxRegistry,
     node_registry: &dyn NodeRegistry,
 ) -> anyhow::Result<(u64, u64)> {
@@ -146,7 +146,7 @@ pub(super) async fn renew_once(
 /// statement this loop issues is a single idempotent `UPDATE`, and aborting
 /// mid-tick loses at most one renewal cycle's worth of freshness, not
 /// correctness.
-pub(super) fn spawn(
+pub fn spawn(
     registry: Arc<PostgresPausedSandboxRegistry>,
     node_registry: Arc<dyn NodeRegistry>,
 ) -> tokio::task::JoinHandle<()> {

@@ -17,8 +17,8 @@ use object_store_operator::{CredentialSource, ResolvedCredential};
 
 use super::client::OssClient;
 
-pub(super) const TEST_BUCKET: &str = "bucket";
-pub(super) const TEST_PREFIX: &str = "snapshots";
+pub const TEST_BUCKET: &str = "bucket";
+pub const TEST_PREFIX: &str = "snapshots";
 
 type FakeObjects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
 
@@ -100,7 +100,7 @@ fn percent_decode(value: &str) -> String {
 }
 
 /// Starts a fake S3 seeded with `objects`, keyed by full bucket-relative key.
-pub(super) async fn spawn_fake_s3(objects: BTreeMap<String, Vec<u8>>) -> SocketAddr {
+pub async fn spawn_fake_s3(objects: BTreeMap<String, Vec<u8>>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake s3");
@@ -115,7 +115,7 @@ pub(super) async fn spawn_fake_s3(objects: BTreeMap<String, Vec<u8>>) -> SocketA
 }
 
 /// An `OssClient` pointed at a fake S3.
-pub(super) fn fake_s3_client(addr: SocketAddr) -> Arc<OssClient> {
+pub fn fake_s3_client(addr: SocketAddr) -> Arc<OssClient> {
     Arc::new(
         OssClient::new(
             TEST_BUCKET.to_string(),

@@ -1,8 +1,7 @@
 pub mod central;
-pub(crate) mod common;
-pub(crate) mod oss;
-pub(crate) mod posixfs;
-pub mod storage;
+pub mod common;
+pub mod oss;
+pub mod posixfs;
 
 use std::sync::Arc;
 
@@ -578,7 +577,7 @@ fn build_catalog_only_repository(config: &AppConfig) -> Result<Arc<SnapshotRepos
 
 /// Which storage the source-registry publication policy names, for both
 /// halves. Read in one place so the two constructors cannot drift.
-pub(crate) fn snapshot_image_storage_policy(config: &AppConfig) -> SnapshotImageStoragePolicy {
+pub fn snapshot_image_storage_policy(config: &AppConfig) -> SnapshotImageStoragePolicy {
     if config.snapshot.image_publish.enabled {
         SnapshotImageStoragePolicy::SourceRegistry
     } else {

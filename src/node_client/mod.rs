@@ -33,18 +33,15 @@
 //! `RemoteSandboxStub::pause`.
 
 mod build;
-mod factory;
+pub mod factory;
 mod native_placement;
-mod paused_state;
-mod placement;
+pub mod paused_state;
+pub mod placement;
 mod scheduler_placement;
-mod stub;
-mod wire;
+pub mod stub;
+pub mod wire;
 
-#[cfg(test)]
-mod tests;
-
-pub(crate) use build::build_template_on_a_node;
+pub use build::build_template_on_a_node;
 pub use factory::RemoteSandboxBackendFactory;
 pub use native_placement::NativeNodePlacement;
 pub use paused_state::RemotePausedState;

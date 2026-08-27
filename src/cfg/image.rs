@@ -129,7 +129,7 @@ pub struct ResolvedImageCacheGcConfig {
 impl ResolvedImageCacheGcConfig {
     /// Watermark byte budgets derived from the cache `capacity_bytes`. `None`
     /// when capacity is unset (capacity-driven eviction is then disabled).
-    pub(crate) fn watermark_bytes(&self, capacity_bytes: Option<u64>) -> Option<(u64, u64)> {
+    pub fn watermark_bytes(&self, capacity_bytes: Option<u64>) -> Option<(u64, u64)> {
         let capacity = capacity_bytes? as f64;
         let high = (capacity * self.high_watermark_ratio) as u64;
         let low = (capacity * self.low_watermark_ratio) as u64;
@@ -138,7 +138,7 @@ impl ResolvedImageCacheGcConfig {
 }
 
 impl ImageConfig {
-    pub(crate) fn normalize(config: &mut Self, config_dir: &Path, home_path: &Path) {
+    pub fn normalize(config: &mut Self, config_dir: &Path, home_path: &Path) {
         config.resolver.normalize();
         config.cache.gc.normalize();
         let raw = super::resolve_path(home_path, config_dir, &config.cache.root_dir);
@@ -147,7 +147,7 @@ impl ImageConfig {
 }
 
 impl ImageCacheConfig {
-    pub(crate) fn layout(&self) -> ResolvedImageCacheConfig {
+    pub fn layout(&self) -> ResolvedImageCacheConfig {
         let root_dir = lexically_normalize_path(&self.root_dir);
         let remote_blocks_size_gb = self.remote_blocks.max_size_gb;
         let capacity_bytes = self.capacity_gb.map(|gb| gb.saturating_mul(BYTES_PER_GIB));
@@ -160,7 +160,7 @@ impl ImageCacheConfig {
         }
     }
 
-    pub(crate) fn gc_schedule(&self) -> ResolvedImageCacheGcConfig {
+    pub fn gc_schedule(&self) -> ResolvedImageCacheGcConfig {
         ResolvedImageCacheGcConfig {
             enabled: self.gc.enabled,
             interval: Duration::from_secs(self.gc.interval_secs),
@@ -178,7 +178,7 @@ impl ImageCacheGcConfig {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         validate_ratio(
             "image.cache.gc.high_watermark_ratio",
             self.high_watermark_ratio,

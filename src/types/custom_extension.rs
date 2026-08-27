@@ -6,4 +6,4 @@
 /// 🔴 Defined here rather than beside the hook client so that
 /// `crate::snapshot` can persist the value without depending on
 /// `crate::sandbox`. `crate::sandbox` re-exports it.
-pub(crate) type CustomExtensionParams = serde_json::Map<String, serde_json::Value>;
+pub type CustomExtensionParams = serde_json::Map<String, serde_json::Value>;

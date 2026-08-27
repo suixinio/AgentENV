@@ -13,13 +13,13 @@
 //! `write = "both"` and `write = "postgres"`, via the [`CentralCatalogWrites`]
 //! impl below.
 
-pub(crate) mod convert;
-pub(crate) mod metrics;
-pub(crate) mod migrate;
-pub(crate) mod migration_state;
-pub(crate) mod reads;
-pub(crate) mod reaper;
-pub(crate) mod writes;
+pub mod convert;
+pub mod metrics;
+pub mod migrate;
+pub mod migration_state;
+pub mod reads;
+pub mod reaper;
+pub mod writes;
 
 use std::sync::Arc;
 
@@ -49,12 +49,12 @@ use migration_state::PgReadSideConfirmation;
 /// `build_central_catalog`'s call site). A *negative* value removes the
 /// ceiling entirely (see `with_max_concurrent_builds`'s own doc); `0` is
 /// never unlimited on either side.
-pub(crate) const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 20;
+pub const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 20;
 
 /// A `SnapshotCatalog` backed by a direct, in-process connection pool to the
 /// shared control-plane PostgreSQL database, rather than an RPC hop to
 /// `services/scheduler`.
-pub(crate) struct PostgresSnapshotCatalog {
+pub struct PostgresSnapshotCatalog {
     pool: PgPool,
     cluster_id: Uuid,
     node_id: String,
@@ -68,7 +68,7 @@ impl PostgresSnapshotCatalog {
     /// this type never dials PostgreSQL or applies schema changes on its
     /// own, the same division `CentralSnapshotCatalog` draws between "how to
     /// reach the database" and "what to do once connected".
-    pub(crate) fn new(pool: PgPool, cluster_id: Uuid, node_id: String) -> Self {
+    pub fn new(pool: PgPool, cluster_id: Uuid, node_id: String) -> Self {
         Self {
             pool,
             cluster_id,
@@ -94,7 +94,7 @@ impl PostgresSnapshotCatalog {
     /// `if s.maxConcurrentBuilds > 0`), so 0 and a positive number are both
     /// enforced and only a negative number skips the check (and its cost)
     /// entirely.
-    pub(crate) fn with_max_concurrent_builds(mut self, max: i32) -> Self {
+    pub fn with_max_concurrent_builds(mut self, max: i32) -> Self {
         self.max_concurrent_builds = if max == 0 {
             DEFAULT_MAX_CONCURRENT_BUILDS
         } else {
@@ -103,7 +103,7 @@ impl PostgresSnapshotCatalog {
         self
     }
 
-    pub(crate) async fn get_scoped(
+    pub async fn get_scoped(
         &self,
         id_or_alias: &str,
         scope: CatalogReadScope,
@@ -114,7 +114,7 @@ impl PostgresSnapshotCatalog {
         )
     }
 
-    pub(crate) async fn resolve_alias_scoped(
+    pub async fn resolve_alias_scoped(
         &self,
         alias: &str,
         scope: CatalogReadScope,
@@ -125,7 +125,7 @@ impl PostgresSnapshotCatalog {
         )
     }
 
-    pub(crate) async fn list_scoped(
+    pub async fn list_scoped(
         &self,
         filter: SnapshotListFilter,
         scope: CatalogReadScope,
@@ -136,7 +136,7 @@ impl PostgresSnapshotCatalog {
         )
     }
 
-    pub(crate) async fn list_page_scoped(
+    pub async fn list_page_scoped(
         &self,
         filter: SnapshotListFilter,
         scope: CatalogReadScope,

@@ -26,7 +26,7 @@ fn backend_err(operation: &'static str, err: sqlx::Error) -> PausedRegistryError
 /// `DiscardBreaker` (`grace.go:411-513`), ported. Both arms are ORed --
 /// the stricter wins.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct DiscardBreaker {
+pub struct DiscardBreaker {
     pub max_rows: i64,
     pub max_ratio: f64,
     pub min_ratio_rows: i64,
@@ -50,7 +50,7 @@ impl Default for DiscardBreaker {
 impl DiscardBreaker {
     /// `DiscardBreaker.Allow` (`grace.go:465-513`), ported verbatim.
     /// `candidates == 0` always allows -- nothing to trip a breaker over.
-    pub(super) fn allow(&self, candidates: i64, total: i64) -> Result<(), String> {
+    pub fn allow(&self, candidates: i64, total: i64) -> Result<(), String> {
         if candidates == 0 {
             return Ok(());
         }
@@ -94,7 +94,7 @@ impl DiscardBreaker {
 /// discard DELETE on the breaker -- **the whole transaction, releases
 /// included, is abandoned if the breaker trips**, exactly mirroring Go's own
 /// comment on that point.
-pub(super) async fn reclaim_expired_holdings(
+pub async fn reclaim_expired_holdings(
     pool: &PgPool,
     cluster_id: Uuid,
     breaker: DiscardBreaker,
@@ -189,7 +189,7 @@ pub(super) async fn reclaim_expired_holdings(
 /// not a gap this port needs to close: Fix B's lease-based reclaim is the
 /// primary safety net for that state, this is a faster, identity-based
 /// shortcut on top of it.
-pub(super) async fn release_node_holdings(
+pub async fn release_node_holdings(
     pool: &PgPool,
     cluster_id: Uuid,
     node_id: &str,

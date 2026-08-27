@@ -136,7 +136,7 @@ impl WarmUp {
     }
 }
 
-pub(super) struct StoreInner {
+pub struct StoreInner {
     connection: redis::aio::ConnectionManager,
     keys: KeySpace,
     config: RedisStoreConfig,
@@ -203,13 +203,13 @@ impl RedisMetadataStore {
             .map(|sample| sample.sampled_at)
     }
 
-    pub(super) fn inner(&self) -> &Arc<StoreInner> {
+    pub fn inner(&self) -> &Arc<StoreInner> {
         &self.inner
     }
 
     /// Deletes every key this store owns. Test support only.
     #[cfg(test)]
-    pub(crate) async fn flush_namespace(&self) -> Result<()> {
+    pub async fn flush_namespace(&self) -> Result<()> {
         let mut connection = self.inner.connection.clone();
         let pattern = format!("{}:*", self.inner.config.key_prefix);
         let keys: Vec<String> = redis::cmd("KEYS")
@@ -229,21 +229,21 @@ impl RedisMetadataStore {
 }
 
 impl StoreInner {
-    pub(super) fn connection(&self) -> redis::aio::ConnectionManager {
+    pub fn connection(&self) -> redis::aio::ConnectionManager {
         self.connection.clone()
     }
 
-    pub(super) fn keys(&self) -> &KeySpace {
+    pub fn keys(&self) -> &KeySpace {
         &self.keys
     }
 
-    pub(super) fn config(&self) -> &RedisStoreConfig {
+    pub fn config(&self) -> &RedisStoreConfig {
         &self.config
     }
 
     /// The write script, or its predicate-free control in test builds that have
     /// asked for it.
-    pub(super) fn update_script(&self) -> &'static redis::Script {
+    pub fn update_script(&self) -> &'static redis::Script {
         #[cfg(test)]
         if !self.config.cas_predicates_enabled() {
             return scripts::update_without_predicates();
@@ -251,10 +251,7 @@ impl StoreInner {
         scripts::update()
     }
 
-    pub(super) async fn read_record(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<Option<StoredSandboxRecord>> {
+    pub async fn read_record(&self, sandbox_id: &SandboxId) -> Result<Option<StoredSandboxRecord>> {
         let mut connection = self.connection();
         let raw: Option<Vec<u8>> = redis::cmd("GET")
             .arg(self.keys.record(sandbox_id))
@@ -264,10 +261,7 @@ impl StoreInner {
         raw.as_deref().map(StoredSandboxRecord::decode).transpose()
     }
 
-    pub(super) async fn require_record(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<StoredSandboxRecord> {
+    pub async fn require_record(&self, sandbox_id: &SandboxId) -> Result<StoredSandboxRecord> {
         self.read_record(sandbox_id)
             .await?
             .ok_or(StoreError::SandboxNotFound {
@@ -275,41 +269,41 @@ impl StoreInner {
             })
     }
 
-    pub(super) async fn notify(&self, routing_key: &str) {
+    pub async fn notify(&self, routing_key: &str) {
         self.notifier.publish(routing_key).await;
     }
 
-    pub(super) fn subscribe(&self, routing_key: &str) -> tokio::sync::broadcast::Receiver<()> {
+    pub fn subscribe(&self, routing_key: &str) -> tokio::sync::broadcast::Receiver<()> {
         self.notifier.subscribe(routing_key)
     }
 
-    pub(super) fn locks(&self) -> &LockManager {
+    pub fn locks(&self) -> &LockManager {
         &self.locks
     }
 
-    pub(super) async fn invalidate_listing_memo(&self) {
+    pub async fn invalidate_listing_memo(&self) {
         *self.listing_memo.write().await = None;
     }
 
-    pub(super) async fn memoised_listing(&self) -> Option<Arc<Vec<SandboxMetadata>>> {
+    pub async fn memoised_listing(&self) -> Option<Arc<Vec<SandboxMetadata>>> {
         let memo = self.listing_memo.read().await;
         let sample = memo.as_ref()?;
         (sample.sampled_at.elapsed() < self.config.metrics_memo_ttl)
             .then(|| Arc::clone(&sample.records))
     }
 
-    pub(super) fn healer_readiness(&self) -> RoundReadiness {
+    pub fn healer_readiness(&self) -> RoundReadiness {
         self.healer_warmup
             .readiness(self.config.expiry_healer_enabled)
     }
 
-    pub(super) fn reaper_readiness(&self) -> RoundReadiness {
+    pub fn reaper_readiness(&self) -> RoundReadiness {
         self.reaper_warmup
             .readiness(self.config.transition_reaper_enabled)
     }
 
     #[cfg(test)]
-    pub(crate) fn skip_background_warmup(&self) {
+    pub fn skip_background_warmup(&self) {
         for warmup in [&self.healer_warmup, &self.reaper_warmup] {
             *warmup
                 .armed_at
@@ -319,7 +313,7 @@ impl StoreInner {
         }
     }
 
-    pub(super) async fn store_listing_memo(
+    pub async fn store_listing_memo(
         &self,
         records: Vec<SandboxMetadata>,
     ) -> Arc<Vec<SandboxMetadata>> {
@@ -337,23 +331,23 @@ impl StoreInner {
 /// 🔴 Always an error, never an absence. A store this call could not reach has
 /// not told us that a sandbox does not exist; it has told us nothing. Callers
 /// answer absence by deleting local artifacts and tearing down running VMs.
-pub(super) fn backend(source: redis::RedisError) -> StoreError {
+pub fn backend(source: redis::RedisError) -> StoreError {
     StoreError::Backend {
         source: anyhow::Error::from(source),
     }
 }
 
-pub(super) fn backend_msg(message: impl Into<String>) -> StoreError {
+pub fn backend_msg(message: impl Into<String>) -> StoreError {
     StoreError::Backend {
         source: anyhow::anyhow!(message.into()),
     }
 }
 
-pub(super) fn now_millis(now: SystemTime) -> i64 {
+pub fn now_millis(now: SystemTime) -> i64 {
     record::to_unix_millis(now)
 }
 
-pub(super) fn duration_to_secs_ceil(duration: Duration) -> u64 {
+pub fn duration_to_secs_ceil(duration: Duration) -> u64 {
     duration
         .as_secs()
         .saturating_add(u64::from(duration.subsec_nanos() > 0))

@@ -175,7 +175,7 @@ impl RuntimeArtifactSet {
 
     /// Build from overlaybd image configs whose local-only layers must stay
     /// available while the sandbox may reopen them.
-    pub(crate) fn from_overlaybd_image_configs(overlaybd_image_config_paths: Vec<PathBuf>) -> Self {
+    pub fn from_overlaybd_image_configs(overlaybd_image_config_paths: Vec<PathBuf>) -> Self {
         Self {
             overlaybd_image_config_paths,
         }
@@ -185,7 +185,7 @@ impl RuntimeArtifactSet {
         self.overlaybd_image_config_paths.is_empty()
     }
 
-    pub(crate) fn into_overlaybd_image_config_paths(self) -> Vec<PathBuf> {
+    pub fn into_overlaybd_image_config_paths(self) -> Vec<PathBuf> {
         self.overlaybd_image_config_paths
     }
 }

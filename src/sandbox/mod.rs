@@ -1,23 +1,24 @@
-mod access;
-mod backend;
-pub(crate) mod custom_extension;
-mod envd;
-mod extra_drive;
-mod firecracker;
-#[cfg(test)]
-pub(crate) mod mock;
-mod network;
-mod process;
-mod ublk;
+pub mod access;
+pub mod backend;
+pub mod custom_extension;
+pub mod envd;
+#[doc(hidden)]
+pub mod mock;
+pub mod network;
+pub mod process;
 
 use std::{collections::HashMap, path::PathBuf};
 
-pub(crate) use custom_extension::{
+pub use custom_extension::{
     custom_extension_params_is_empty, CustomExtensionClient, CustomExtensionParams,
 };
 
 use crate::types::{ImageConfigs, SandboxId};
 
+pub use crate::types::{
+    normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
+    ExtraDrive,
+};
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
@@ -26,19 +27,8 @@ pub use backend::{
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
-pub use extra_drive::{
-    normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
-    ExtraDrive,
-};
-pub use firecracker::{
-    FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
-    FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
-};
-pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
-pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {
@@ -139,7 +129,7 @@ pub struct SandboxLaunchConfig {
 }
 
 impl SandboxLaunchConfig {
-    pub(crate) fn new(sandbox_id: SandboxId, snapshot_id: impl Into<String>) -> Self {
+    pub fn new(sandbox_id: SandboxId, snapshot_id: impl Into<String>) -> Self {
         Self {
             sandbox_id,
             snapshot_id: snapshot_id.into(),
@@ -152,7 +142,7 @@ impl SandboxLaunchConfig {
         }
     }
 
-    pub(crate) fn with_image_configs(mut self, image_configs: &ImageConfigs) -> Self {
+    pub fn with_image_configs(mut self, image_configs: &ImageConfigs) -> Self {
         if !image_configs.is_empty() {
             self.extra_mmds
                 .insert("imageConfigs".to_string(), image_configs.to_value());

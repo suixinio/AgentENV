@@ -14,7 +14,7 @@ use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
 use crate::snapshot::repository::SnapshotRepository;
 
-pub(crate) fn posixfs_catalog_only_repository(root: &Path) -> SnapshotRepository {
+pub fn posixfs_catalog_only_repository(root: &Path) -> SnapshotRepository {
     SnapshotRepository::new(
         Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
         Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),

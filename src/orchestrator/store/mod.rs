@@ -4,7 +4,7 @@ pub mod redis;
 mod transitions;
 
 #[cfg(test)]
-pub(crate) mod contract;
+pub mod contract;
 
 use std::collections::HashMap;
 use std::sync::Arc;

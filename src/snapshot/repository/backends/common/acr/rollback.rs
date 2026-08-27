@@ -15,18 +15,24 @@ use super::reference::SourceRegistryRepository;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::PersistedDiskImagePublication;
 
-pub(crate) type AcrClientBuilder =
+pub type AcrClientBuilder =
     dyn Fn(&str) -> Result<AcrClient, AcrClientError> + Send + Sync + 'static;
 
-pub(crate) struct AcrPublicationRollback {
+pub struct AcrPublicationRollback {
     // This mutex only protects the in-memory client map. It is never held across
     // an await point; client construction happens outside the lock as well.
     clients: Mutex<HashMap<String, AcrClient>>,
     client_builder: Arc<AcrClientBuilder>,
 }
 
+impl Default for AcrPublicationRollback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AcrPublicationRollback {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
             client_builder: Arc::new(AcrClient::from_docker_config),
@@ -34,14 +40,14 @@ impl AcrPublicationRollback {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn new_with_client_builder(client_builder: Arc<AcrClientBuilder>) -> Self {
+    pub fn new_with_client_builder(client_builder: Arc<AcrClientBuilder>) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
             client_builder,
         }
     }
 
-    pub(crate) async fn rollback_publication(
+    pub async fn rollback_publication(
         &self,
         publication: &PersistedDiskImagePublication,
     ) -> RepositoryResult<()> {
@@ -67,10 +73,7 @@ impl AcrPublicationRollback {
             .map_err(RepositoryError::from)
     }
 
-    pub(crate) async fn client_for_registry(
-        &self,
-        registry: &str,
-    ) -> Result<AcrClient, AcrClientError> {
+    pub async fn client_for_registry(&self, registry: &str) -> Result<AcrClient, AcrClientError> {
         {
             let clients = self.clients.lock().map_err(|_| AcrClientError::Registry {
                 message: "ACR client cache lock poisoned".to_string(),

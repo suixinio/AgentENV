@@ -78,7 +78,7 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `anyhow::Error` string first, the way `wire::into_error` does for calls
 /// that do not carry per-step detail, would lose it before this function's
 /// one caller ever saw it.
-pub(crate) async fn build_template_on_a_node(
+pub async fn build_template_on_a_node(
     placement: &dyn NodePlacement,
     resources: SandboxResources,
     request: pb::TemplateBuildRequest,

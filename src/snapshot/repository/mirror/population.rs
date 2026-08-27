@@ -461,7 +461,7 @@ pub trait ReadSideConfirmationStore: Send + Sync {
 /// confirmation state. This function depends on nothing but the trait, so a
 /// [`ReadSideConfirmationStore`] test double — this module's own
 /// `FakeSharedStore` among them — exercises the refusal without a database.
-pub(crate) async fn require_read_side_confirmed(
+pub async fn require_read_side_confirmed(
     store: &dyn ReadSideConfirmationStore,
 ) -> anyhow::Result<()> {
     if !store.is_confirmed().await? {
@@ -607,7 +607,7 @@ mod admission_tests {
     /// a target that *could* have repaired proves less than it looks: the
     /// replay landing nothing has to be a property of the fixture rather than
     /// a hope about the queue being empty.
-    pub(super) fn no_repair_possible() -> MirrorTargets {
+    pub fn no_repair_possible() -> MirrorTargets {
         MirrorTargets::object_store(std::sync::Arc::new(ScriptedCatalog::default())
             as std::sync::Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>)
     }
@@ -993,16 +993,16 @@ mod admission_tests {
     /// is. `central_also_holds` are rows the central catalog has and object
     /// storage does not: the direction of difference that no replay toward the
     /// central catalog can close.
-    pub(super) struct FreshStart {
-        pub(super) backlog: Arc<MirrorBacklog>,
-        pub(super) object_store: Arc<ScriptedCatalog>,
-        pub(super) central: Arc<ScriptedCentral>,
-        pub(super) targets: MirrorTargets,
+    pub struct FreshStart {
+        pub backlog: Arc<MirrorBacklog>,
+        pub object_store: Arc<ScriptedCatalog>,
+        pub central: Arc<ScriptedCentral>,
+        pub targets: MirrorTargets,
         /// What `settle_before_reading_from` left the central catalog owing.
         left_by_the_pre_guard_drain: u64,
     }
 
-    pub(super) async fn start_with(
+    pub async fn start_with(
         dir: &std::path::Path,
         recorded: Option<CatalogReadSide>,
         history: &[SnapshotId],

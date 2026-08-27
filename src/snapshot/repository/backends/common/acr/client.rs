@@ -31,13 +31,15 @@ const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(300);
 const TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
-pub(crate) struct AcrClientOptions {
-    pub(crate) timeout: Duration,
-    pub(crate) retry_count: usize,
-    pub(crate) upload_chunk_size: usize,
-    pub(crate) retry_initial_backoff: Duration,
-    #[cfg(test)]
-    pub(crate) allow_insecure_http: bool,
+pub struct AcrClientOptions {
+    pub timeout: Duration,
+    pub retry_count: usize,
+    pub upload_chunk_size: usize,
+    pub retry_initial_backoff: Duration,
+    /// 🔴 Test-only, and gated on the feature rather than `cfg(test)` because
+    /// the fake registry that needs it is driven from `aenv-node`'s suite too.
+    #[cfg(any(test, feature = "test-support"))]
+    pub allow_insecure_http: bool,
 }
 
 impl Default for AcrClientOptions {
@@ -47,7 +49,7 @@ impl Default for AcrClientOptions {
             retry_count: DEFAULT_RETRY_COUNT,
             upload_chunk_size: DEFAULT_UPLOAD_CHUNK_SIZE,
             retry_initial_backoff: DEFAULT_RETRY_INITIAL_BACKOFF,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             allow_insecure_http: false,
         }
     }
@@ -87,7 +89,7 @@ impl RequestBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AcrClient {
+pub struct AcrClient {
     http: reqwest::Client,
     credentials: Option<DockerRegistryCredentials>,
     options: AcrClientOptions,
@@ -96,9 +98,9 @@ pub(crate) struct AcrClient {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DockerRegistryCredentials {
-    username: String,
-    password: String,
+pub struct DockerRegistryCredentials {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,7 +118,7 @@ struct CachedToken {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum AcrClientError {
+pub enum AcrClientError {
     #[error("ACR credentials are missing for registry '{registry}'")]
     MissingCredentials { registry: String },
 
@@ -134,7 +136,7 @@ pub(crate) enum AcrClientError {
 }
 
 impl AcrClient {
-    pub(crate) fn from_docker_config(registry: &str) -> Result<Self, AcrClientError> {
+    pub fn from_docker_config(registry: &str) -> Result<Self, AcrClientError> {
         let credentials = load_docker_credentials(registry)?.ok_or_else(|| {
             AcrClientError::MissingCredentials {
                 registry: registry.to_string(),
@@ -143,7 +145,7 @@ impl AcrClient {
         Self::new(Some(credentials), AcrClientOptions::default())
     }
 
-    fn new(
+    pub fn new(
         credentials: Option<DockerRegistryCredentials>,
         options: AcrClientOptions,
     ) -> Result<Self, AcrClientError> {
@@ -163,7 +165,7 @@ impl AcrClient {
         })
     }
 
-    pub(crate) async fn ensure_manifest_absent(
+    pub async fn ensure_manifest_absent(
         &self,
         manifest_url: &str,
         repository: &str,
@@ -184,7 +186,7 @@ impl AcrClient {
         }
     }
 
-    pub(crate) async fn blob_exists(
+    pub async fn blob_exists(
         &self,
         repo_blob_url: &str,
         repository: &str,
@@ -202,7 +204,7 @@ impl AcrClient {
         }
     }
 
-    pub(crate) async fn upload_blob(
+    pub async fn upload_blob(
         &self,
         upload_url: &str,
         repository: &str,
@@ -264,7 +266,7 @@ impl AcrClient {
             .await
     }
 
-    pub(crate) async fn upload_blob_with_descriptor(
+    pub async fn upload_blob_with_descriptor(
         &self,
         upload_url: &str,
         repo_blob_url: &str,
@@ -307,7 +309,7 @@ impl AcrClient {
         Ok((digest.to_string(), size))
     }
 
-    pub(crate) async fn upload_blob_bytes(
+    pub async fn upload_blob_bytes(
         &self,
         upload_url: &str,
         repository: &str,
@@ -363,7 +365,7 @@ impl AcrClient {
         }
     }
 
-    pub(crate) async fn put_manifest(
+    pub async fn put_manifest(
         &self,
         manifest_url: &str,
         repository: &str,
@@ -389,7 +391,7 @@ impl AcrClient {
             .unwrap_or(fallback_digest))
     }
 
-    pub(crate) async fn delete_manifest_by_digest(
+    pub async fn delete_manifest_by_digest(
         &self,
         registry: &str,
         repository: &str,
@@ -405,7 +407,7 @@ impl AcrClient {
         self.delete_manifest_url(&url, repository).await
     }
 
-    pub(crate) async fn delete_manifest_url(
+    pub async fn delete_manifest_url(
         &self,
         manifest_digest_url: &str,
         repository: &str,
@@ -742,12 +744,12 @@ fn redirect_target_allowed(url: &Url, options: &AcrClientOptions) -> bool {
 }
 
 fn insecure_http_allowed(options: &AcrClientOptions) -> bool {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = options;
         false
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         options.allow_insecure_http
     }
@@ -1069,101 +1071,21 @@ fn challenge_cache_key(url: &str) -> String {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use std::error::Error as _;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use axum::body::Bytes;
     use axum::extract::State;
-    use axum::http::{HeaderMap as AxumHeaderMap, HeaderValue, StatusCode as AxumStatusCode};
-    use axum::response::{IntoResponse, Redirect};
-    use axum::routing::{delete, get, head, patch, post, put};
+    use axum::http::{HeaderMap as AxumHeaderMap, StatusCode as AxumStatusCode};
+    use axum::response::Redirect;
+    use axum::routing::{get, put};
     use axum::Router;
     use tempfile::TempDir;
-    use tokio::net::TcpListener;
 
+    use super::super::fake_registry::*;
     use super::*;
-
-    #[derive(Default)]
-    pub(crate) struct FakeState {
-        token_scopes: Vec<String>,
-        uploads: Vec<Vec<u8>>,
-        upload_completes: usize,
-        pub(crate) manifest_puts: Vec<Vec<u8>>,
-        deletes: Vec<String>,
-        blob_exists: bool,
-        blob_head_429s_remaining: usize,
-        manifest_exists: bool,
-        omit_manifest_digest: bool,
-    }
-
-    impl FakeState {
-        pub(crate) fn with_existing_blobs() -> Self {
-            Self {
-                blob_exists: true,
-                ..Default::default()
-            }
-        }
-    }
-
-    async fn serve(app: Router) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
-    }
-
-    pub(crate) async fn fake_server(state: Arc<Mutex<FakeState>>) -> String {
-        let app = Router::new()
-            .route("/token", get(token))
-            .route("/v2/ns/repo/blobs/{digest}", head(blob_head))
-            .route("/v2/ns/repo/blobs/uploads/", post(upload_start))
-            .route("/upload/session", patch(upload_chunk))
-            .route("/upload/session", put(upload_complete))
-            .route("/v2/ns/repo/manifests/{reference}", head(manifest_head))
-            .route("/v2/ns/repo/manifests/{reference}", put(manifest_put))
-            .route("/v2/ns/repo/manifests/{reference}", delete(manifest_delete))
-            .with_state(state);
-        serve(app).await
-    }
-
-    fn bearer_challenge(base: &str) -> String {
-        format!(r#"Bearer realm="{base}/token",service="registry.test""#)
-    }
-
-    fn upload_url(base: &str) -> String {
-        format!("{base}/v2/ns/repo/blobs/uploads/")
-    }
-
-    fn manifest_url(base: &str, tag: &str) -> String {
-        format!("{base}/v2/ns/repo/manifests/{tag}")
-    }
-
-    fn repo_blob_url(base: &str) -> String {
-        format!("{base}/v2/ns/repo/blobs")
-    }
-
-    pub(crate) fn client() -> AcrClient {
-        client_with_retry_count(0)
-    }
-
-    fn client_with_retry_count(retry_count: usize) -> AcrClient {
-        AcrClient::new(
-            Some(DockerRegistryCredentials {
-                username: "user".to_string(),
-                password: "pass".to_string(),
-            }),
-            AcrClientOptions {
-                timeout: Duration::from_secs(5),
-                retry_count,
-                upload_chunk_size: 4,
-                retry_initial_backoff: Duration::from_millis(1),
-                allow_insecure_http: true,
-            },
-        )
-        .unwrap()
-    }
 
     #[test]
     fn selects_docker_credential_helper_for_registry() {
@@ -1218,136 +1140,6 @@ pub(super) mod tests {
                 password: "helper-secret".to_string(),
             }
         );
-    }
-
-    async fn token(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        axum::extract::Query(query): axum::extract::Query<
-            std::collections::HashMap<String, String>,
-        >,
-        headers: AxumHeaderMap,
-    ) -> impl IntoResponse {
-        assert_eq!(headers.get("authorization").unwrap(), "Basic dXNlcjpwYXNz");
-        state
-            .lock()
-            .unwrap()
-            .token_scopes
-            .push(query.get("scope").cloned().unwrap_or_default());
-        (AxumStatusCode::OK, r#"{"token":"push-token"}"#)
-    }
-
-    async fn blob_head(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        headers: AxumHeaderMap,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |state| {
-            if state.blob_head_429s_remaining > 0 {
-                state.blob_head_429s_remaining -= 1;
-                return (AxumStatusCode::TOO_MANY_REQUESTS, [("Retry-After", "0")]).into_response();
-            }
-            if state.blob_exists {
-                AxumStatusCode::OK.into_response()
-            } else {
-                AxumStatusCode::NOT_FOUND.into_response()
-            }
-        })
-    }
-
-    async fn upload_start(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        headers: AxumHeaderMap,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |_state| {
-            (AxumStatusCode::ACCEPTED, [("Location", "/upload/session")]).into_response()
-        })
-    }
-
-    async fn upload_complete(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        headers: AxumHeaderMap,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |state| {
-            state.upload_completes += 1;
-            AxumStatusCode::CREATED.into_response()
-        })
-    }
-
-    async fn upload_chunk(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        headers: AxumHeaderMap,
-        body: Bytes,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |state| {
-            state.uploads.push(body.to_vec());
-            (AxumStatusCode::ACCEPTED, [("Location", "/upload/session")]).into_response()
-        })
-    }
-
-    async fn manifest_head(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        headers: AxumHeaderMap,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |state| {
-            if state.manifest_exists {
-                AxumStatusCode::OK.into_response()
-            } else {
-                AxumStatusCode::NOT_FOUND.into_response()
-            }
-        })
-    }
-
-    async fn manifest_put(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        headers: AxumHeaderMap,
-        body: Bytes,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |state| {
-            state.manifest_puts.push(body.to_vec());
-            let mut headers = AxumHeaderMap::new();
-            if !state.omit_manifest_digest {
-                headers.insert(
-                    "Docker-Content-Digest",
-                    HeaderValue::from_static("sha256:manifest"),
-                );
-            }
-            (AxumStatusCode::CREATED, headers).into_response()
-        })
-    }
-
-    async fn manifest_delete(
-        State(state): State<Arc<Mutex<FakeState>>>,
-        axum::extract::Path(reference): axum::extract::Path<String>,
-        headers: AxumHeaderMap,
-    ) -> impl IntoResponse {
-        authorized_or_challenge(&headers, &state, |state| {
-            state.deletes.push(reference);
-            AxumStatusCode::ACCEPTED.into_response()
-        })
-    }
-
-    fn authorized_or_challenge(
-        headers: &AxumHeaderMap,
-        state: &Arc<Mutex<FakeState>>,
-        f: impl FnOnce(&mut FakeState) -> axum::response::Response,
-    ) -> axum::response::Response {
-        if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer push-token") {
-            let base = state_base_url(headers);
-            let mut headers = AxumHeaderMap::new();
-            headers.insert(
-                "WWW-Authenticate",
-                HeaderValue::from_str(&bearer_challenge(&base)).unwrap(),
-            );
-            return (AxumStatusCode::UNAUTHORIZED, headers).into_response();
-        }
-        f(&mut state.lock().unwrap())
-    }
-
-    fn state_base_url(headers: &AxumHeaderMap) -> String {
-        let host = headers
-            .get("host")
-            .and_then(|value| value.to_str().ok())
-            .unwrap();
-        format!("http://{host}")
     }
 
     #[tokio::test]

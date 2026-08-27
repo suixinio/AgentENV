@@ -12,8 +12,8 @@ use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::p2p::error::Result;
 use crate::p2p::types::{P2pArtifactDescriptor, P2pArtifactKey, P2pEndpoint, P2pPeer};
 
-pub(super) const CATALOG_ALPN: &[u8] = b"/agentenv/artifact-catalog/v1";
-pub(super) const MAX_CATALOG_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const CATALOG_ALPN: &[u8] = b"/agentenv/artifact-catalog/v1";
+pub const MAX_CATALOG_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CATALOG_REQUEST_BYTES: usize = 1024 * 1024;
 /// Time to wait for the client to close the connection after we finish
 /// sending. Prevents a slow or misbehaving peer from holding a handler task open.
@@ -25,28 +25,24 @@ const DB_DURABILITY: LocalStoreDurability = LocalStoreDurability::Wal;
 const DB_DURABILITY: LocalStoreDurability = LocalStoreDurability::Memory;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CatalogRequest {
-    pub(crate) key: P2pArtifactKey,
+pub struct CatalogRequest {
+    pub key: P2pArtifactKey,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CatalogResponse {
-    pub(crate) descriptor: Option<P2pArtifactDescriptor>,
+pub struct CatalogResponse {
+    pub descriptor: Option<P2pArtifactDescriptor>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PublishedArtifactCatalog {
+pub struct PublishedArtifactCatalog {
     inner: Arc<RwLock<HashMap<P2pArtifactKey, P2pArtifactDescriptor>>>,
     store: LocalKvStore,
     local_provider: P2pPeer,
 }
 
 impl PublishedArtifactCatalog {
-    pub(super) async fn load(
-        db_path: &Path,
-        node_id: &str,
-        local_endpoint: &P2pEndpoint,
-    ) -> Result<Self> {
+    pub async fn load(db_path: &Path, node_id: &str, local_endpoint: &P2pEndpoint) -> Result<Self> {
         let store = LocalKvStore::open(db_path.to_path_buf(), DB_DURABILITY)
             .await
             .with_context(|| format!("open P2P catalog {}", db_path.display()))?;
@@ -78,14 +74,11 @@ impl PublishedArtifactCatalog {
         })
     }
 
-    pub(crate) async fn descriptor_for(
-        &self,
-        key: &P2pArtifactKey,
-    ) -> Option<P2pArtifactDescriptor> {
+    pub async fn descriptor_for(&self, key: &P2pArtifactKey) -> Option<P2pArtifactDescriptor> {
         self.inner.read().await.get(key).cloned()
     }
 
-    pub(crate) async fn upsert(&self, descriptor: P2pArtifactDescriptor) -> Result<()> {
+    pub async fn upsert(&self, descriptor: P2pArtifactDescriptor) -> Result<()> {
         let bytes = serde_json::to_vec(&descriptor).context("serialize P2P catalog entry")?;
         self.store
             .put(descriptor.key.as_bytes(), bytes)
@@ -96,10 +89,7 @@ impl PublishedArtifactCatalog {
         Ok(())
     }
 
-    pub(crate) async fn remove(
-        &self,
-        key: &P2pArtifactKey,
-    ) -> Result<Option<P2pArtifactDescriptor>> {
+    pub async fn remove(&self, key: &P2pArtifactKey) -> Result<Option<P2pArtifactDescriptor>> {
         self.store
             .delete(key.as_bytes())
             .await
@@ -119,7 +109,7 @@ impl PublishedArtifactCatalog {
     /// doc for why leaving a store's background work unbounded here is not
     /// merely a slow shutdown: it is a wait nothing else in the process
     /// bounds either.
-    pub(super) async fn close(
+    pub async fn close(
         &self,
         timeout: std::time::Duration,
     ) -> crate::local_store::LocalKvCloseOutcome {
@@ -141,12 +131,12 @@ impl PublishedArtifactCatalog {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CatalogProtocol {
+pub struct CatalogProtocol {
     published_catalog: PublishedArtifactCatalog,
 }
 
 impl CatalogProtocol {
-    pub(crate) fn new(published_catalog: PublishedArtifactCatalog) -> Self {
+    pub fn new(published_catalog: PublishedArtifactCatalog) -> Self {
         Self { published_catalog }
     }
 

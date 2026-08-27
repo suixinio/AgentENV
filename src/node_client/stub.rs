@@ -50,7 +50,7 @@ use std::sync::Arc;
 /// nothing may be done here that touches a network. Choosing a node and asking
 /// it to create the sandbox both happen in `start`, and that is the property
 /// that lets a remote factory satisfy a trait written for a local one.
-pub(super) enum PendingLaunch {
+pub enum PendingLaunch {
     /// A `Create` request built and ready to send — from a `Source::Snapshot`
     /// or a `Source::Image`, whichever `SandboxBackendFactory::build_from_snapshot`
     /// or `build_from_image_ref` built it as. `start` treats the two exactly
@@ -143,7 +143,7 @@ struct LiveFacts {
 }
 
 impl RemoteSandboxStub {
-    pub(super) fn pending(
+    pub fn pending(
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         resources: SandboxResources,
@@ -162,7 +162,7 @@ impl RemoteSandboxStub {
     }
 
     /// A stub for a sandbox that is already running on a known node.
-    pub(super) fn already_running(
+    pub fn already_running(
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         resources: SandboxResources,
@@ -209,7 +209,7 @@ impl RemoteSandboxStub {
     /// reason: the factory method that produces it is synchronous and may not
     /// touch a network. `start` on this variant starts nothing — it finds the
     /// machine the sandbox is already on and opens a channel to it.
-    pub(super) fn attaching(
+    pub fn attaching(
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         resources: SandboxResources,
@@ -724,7 +724,7 @@ impl RemoteSandboxStub {
     /// re-resolve-and-retry path this function's caller wraps in
     /// [`STALE_PLACEMENT_RETRY_BUDGET`] ever got a turn. See that constant's
     /// doc for how the two are sized together.
-    pub(super) async fn connect(endpoint: &str) -> Result<NodeSandboxServiceClient<Channel>> {
+    pub async fn connect(endpoint: &str) -> Result<NodeSandboxServiceClient<Channel>> {
         let channel = Endpoint::from_shared(endpoint.to_string())
             .with_context(|| format!("node endpoint {endpoint:?} is not a URI"))?
             .connect_timeout(STUB_CONNECT_TIMEOUT)
@@ -1007,7 +1007,7 @@ impl RemoteSandboxStub {
 /// for the `resolve_node` RPC and the retried call that follow the reconnect
 /// in the same window. A `STUB_CONNECT_TIMEOUT` at or above the budget would
 /// leave that reconnect free to consume the entire budget by itself.
-pub(super) const STUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const STUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a re-resolve-and-reconnect retry after a stale node address may
 /// take before the original failure is surfaced instead.
@@ -1030,7 +1030,7 @@ pub(super) const STUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// "however long the reconnect alone takes," with nothing left over for
 /// either of those. See `STUB_CONNECT_TIMEOUT`'s doc for the sum the two
 /// constants together bound.
-pub(super) const STALE_PLACEMENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+pub const STALE_PLACEMENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Decodes a `Create` reply's resolved context and image configs, when the
 /// node sent both.

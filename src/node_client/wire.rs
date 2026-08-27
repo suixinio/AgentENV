@@ -18,7 +18,7 @@ use crate::types::SandboxId;
 /// node means "not on that node", which is not the same as "not anywhere", and
 /// the only caller allowed to read it as an answer is the one that knows what
 /// it asked — see `RemoteSandboxStub::stop`.
-pub(super) fn into_error(status: Status) -> anyhow::Error {
+pub fn into_error(status: Status) -> anyhow::Error {
     anyhow!("{}: {}", status.code(), status.message())
 }
 
@@ -51,7 +51,7 @@ pub(super) fn into_error(status: Status) -> anyhow::Error {
 /// A caller that finds this true has learned nothing about the node's
 /// opinion of the request — only that the request never reached it — and may
 /// safely retry the same request once a fresh address has been resolved.
-pub(super) fn is_unreachable(status: &Status) -> bool {
+pub fn is_unreachable(status: &Status) -> bool {
     status.code() == tonic::Code::Unavailable && status.source().is_some()
 }
 
@@ -71,7 +71,7 @@ pub(super) fn is_unreachable(status: &Status) -> bool {
 /// The classification travels in the status details and never in the code:
 /// `Internal` is produced by both kinds and by the transport itself, so a
 /// caller reading the code alone would be guessing.
-pub(super) fn into_capture_error(status: Status) -> SandboxCaptureError {
+pub fn into_capture_error(status: Status) -> SandboxCaptureError {
     let message = format!("{}: {}", status.code(), status.message());
     let unclassified = || {
         SandboxCaptureError::terminal(anyhow!(
@@ -123,7 +123,7 @@ pub(super) fn into_capture_error(status: Status) -> SandboxCaptureError {
 /// surface that will is still being assembled; what it must never do is arrive
 /// to find the difference already thrown away in a string.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum RemoteResumeFailure {
+pub enum RemoteResumeFailure {
     #[error("node {node_id} is not holding a paused capture for sandbox {sandbox_id}: {detail}")]
     CaptureAbsent {
         node_id: String,
@@ -151,7 +151,7 @@ impl RemoteResumeFailure {
     /// and a node that delivered it and said it is not taking work, and they
     /// are one class on purpose: both mean *the capture is still there, ask
     /// again*, which is the only thing the caller does differently.
-    pub(super) fn from_status(node_id: &str, sandbox_id: SandboxId, status: Status) -> Self {
+    pub fn from_status(node_id: &str, sandbox_id: SandboxId, status: Status) -> Self {
         let node_id = node_id.to_string();
         let detail = format!("{}: {}", status.code(), status.message());
         match status.code() {
@@ -177,7 +177,7 @@ impl RemoteResumeFailure {
     ///
     /// 🔴 Never [`CaptureAbsent`][Self::CaptureAbsent]. A refused connection is
     /// the one failure with no answer in it at all.
-    pub(super) fn unreachable(node_id: &str, sandbox_id: SandboxId, detail: String) -> Self {
+    pub fn unreachable(node_id: &str, sandbox_id: SandboxId, detail: String) -> Self {
         Self::NodeUnreachable {
             node_id: node_id.to_string(),
             sandbox_id,
@@ -186,11 +186,11 @@ impl RemoteResumeFailure {
     }
 }
 
-pub(super) fn serialize<T: serde::Serialize>(value: &T, what: &str) -> Result<pb::SerializedValue> {
+pub fn serialize<T: serde::Serialize>(value: &T, what: &str) -> Result<pb::SerializedValue> {
     crate::proto::node::encode_value(value).with_context(|| format!("encode {what}"))
 }
 
-pub(super) fn serialized<T: serde::de::DeserializeOwned>(
+pub fn serialized<T: serde::de::DeserializeOwned>(
     value: Option<&pb::SerializedValue>,
     what: &str,
 ) -> Result<Option<T>> {
@@ -202,7 +202,7 @@ pub(super) fn serialized<T: serde::de::DeserializeOwned>(
         .with_context(|| format!("decode {what}"))
 }
 
-pub(super) fn serialized_value(
+pub fn serialized_value(
     value: Option<&pb::SerializedValue>,
     what: &str,
 ) -> Result<Option<serde_json::Value>> {
@@ -229,7 +229,7 @@ pub(super) fn serialized_value(
 /// 🔴 An unparseable address is `None` rather than an error: the field is
 /// informational — it is what the proxy would dial — and failing a whole create
 /// over it would trade a degraded sandbox for no sandbox.
-pub(super) fn host_ip(raw: &str) -> Option<Ipv4Addr> {
+pub fn host_ip(raw: &str) -> Option<Ipv4Addr> {
     (!raw.is_empty()).then(|| raw.parse().ok()).flatten()
 }
 

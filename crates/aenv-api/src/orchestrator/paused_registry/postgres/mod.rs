@@ -275,18 +275,18 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
 /// release an advisory lock ([`SingletonTaskHandle::shutdown`], `async`) or
 /// can simply be aborted (a plain [`tokio::task::JoinHandle`]) -- see
 /// [`spawn_background_tasks`]'s own doc for which is which and why.
-pub(super) struct BackgroundTasks {
+pub struct BackgroundTasks {
     /// The reconcile and reclaim leader loops. Belongs in the same
     /// `pg_singleton_tasks` bucket every other PostgreSQL-elected background
     /// task in this process shuts down through
     /// (`src/bin/aenv-api.rs::Assembly::pg_singleton_tasks`).
-    pub(super) singleton: Vec<SingletonTaskHandle>,
+    pub singleton: Vec<SingletonTaskHandle>,
     /// B1's per-replica renewal loop, present only when a
     /// [`NodeRegistry`] was supplied. Belongs in `Assembly::upkeep`
     /// alongside `spawn_paused_record_upkeep`'s own tasks -- see
     /// [`replica_renewal::spawn`]'s own doc for why a plain abort is safe
     /// here.
-    pub(super) plain: Vec<tokio::task::JoinHandle<()>>,
+    pub plain: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Starts this backend's background tasks: the reconcile leader loop, the
@@ -320,7 +320,7 @@ pub(super) struct BackgroundTasks {
 /// cluster running `--role all` still needs restart-grace protection against
 /// the same fleet-wide-coverage-gap scenario a `--role api` deployment does
 /// (see [`grace`]'s own module doc).
-pub(super) fn spawn_background_tasks(
+pub fn spawn_background_tasks(
     pool: PgPool,
     cluster_id: Uuid,
     lease_ttl: Duration,
@@ -366,7 +366,7 @@ pub(super) fn spawn_background_tasks(
 /// function's own doc. Exposed at this module's boundary so
 /// `crate::orchestrator::paused_registry::build_paused_registry` (the
 /// parent module) can call it without reaching into [`grace`] directly.
-pub(super) async fn attempt_initial_grace_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
+pub async fn attempt_initial_grace_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
     grace::attempt_initial_entry(pool, cluster_id, ttl_secs).await
 }
 

@@ -32,7 +32,7 @@ impl ClaimedExecution {
     /// paths — the cluster claim, and the local decision taken when no registry
     /// has a say — go through that one point on purpose: a second mint site is
     /// a second way for a resume to start without anybody deciding it may.
-    pub(crate) fn from_claim(execution_id: ExecutionId) -> Self {
+    pub fn from_claim(execution_id: ExecutionId) -> Self {
         Self(execution_id)
     }
 
@@ -58,7 +58,7 @@ impl ClaimedExecution {
     /// 🔴 One call site, guarded by
     /// `the_adopted_claim_token_is_only_taken_where_a_remote_claim_arrives`
     /// below.
-    pub(crate) fn adopted_from_remote_claim(execution_id: ExecutionId) -> Self {
+    pub fn adopted_from_remote_claim(execution_id: ExecutionId) -> Self {
         Self(execution_id)
     }
 
@@ -85,7 +85,7 @@ impl ClaimedExecution {
     }
 }
 
-pub(super) struct CreateLaunchPlan {
+pub struct CreateLaunchPlan {
     pub sandbox_id: SandboxId,
     /// 🔴 Private: a struct literal with a private field cannot be written
     /// outside this module, so the `for_*` constructors below are the only way
@@ -98,7 +98,7 @@ pub(super) struct CreateLaunchPlan {
     pub timeout: NewTimeout,
 }
 
-pub(super) enum CreateLaunchSource {
+pub enum CreateLaunchSource {
     Snapshot {
         snapshot: Box<RunnableSnapshot>,
     },
@@ -124,7 +124,7 @@ pub(super) enum CreateLaunchSource {
     },
 }
 
-pub(super) struct ResumeLaunchPlan {
+pub struct ResumeLaunchPlan {
     pub sandbox_id: SandboxId,
     /// Private for the same reason as on [`CreateLaunchPlan`]; the value comes
     /// from the [`ClaimedExecution`] this plan consumed.
@@ -135,7 +135,7 @@ pub(super) struct ResumeLaunchPlan {
     pub envd_access_token: Option<EnvdAccessToken>,
 }
 
-pub(super) enum LaunchPlan {
+pub enum LaunchPlan {
     Create(Box<CreateLaunchPlan>),
     Resume(Box<ResumeLaunchPlan>),
 }
@@ -157,7 +157,7 @@ impl LaunchPlan {
     /// two records of one sandbox would name two different runs, and fencing —
     /// which compares exactly that value — would refuse writes from the sandbox
     /// that is actually running.
-    pub(super) fn for_create_from_snapshot(
+    pub fn for_create_from_snapshot(
         sandbox_id: SandboxId,
         snapshot: Box<RunnableSnapshot>,
         launch_config: SandboxLaunchConfig,
@@ -185,7 +185,7 @@ impl LaunchPlan {
 
     /// The unresolved counterpart of [`Self::for_create_from_snapshot`]; see
     /// [`CreateLaunchSource::SnapshotRecord`].
-    pub(super) fn for_create_from_snapshot_record(
+    pub fn for_create_from_snapshot_record(
         sandbox_id: SandboxId,
         record: Box<SnapshotRecord>,
         launch_config: SandboxLaunchConfig,
@@ -205,7 +205,7 @@ impl LaunchPlan {
         }))
     }
 
-    pub(super) fn for_create_fresh(
+    pub fn for_create_fresh(
         sandbox_id: SandboxId,
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
@@ -229,7 +229,7 @@ impl LaunchPlan {
 
     /// The unresolved-image counterpart of [`Self::for_create_fresh`]; see
     /// [`CreateLaunchSource::UnresolvedImage`].
-    pub(super) fn for_create_unresolved_image(
+    pub fn for_create_unresolved_image(
         sandbox_id: SandboxId,
         build_spec: UnresolvedImageBuildSpec,
         launch_config: SandboxLaunchConfig,
@@ -258,7 +258,7 @@ impl LaunchPlan {
     /// that named this node as the claimant, and the resume has to run under
     /// that one — minting a second one here would leave `mark_running` quoting
     /// a value the row never had.
-    pub(super) fn for_resume(
+    pub fn for_resume(
         sandbox_id: SandboxId,
         claimed: ClaimedExecution,
         paused_state: Arc<dyn PausedSandboxState>,
@@ -276,7 +276,7 @@ impl LaunchPlan {
         }))
     }
 
-    pub(super) fn sandbox_id(&self) -> SandboxId {
+    pub fn sandbox_id(&self) -> SandboxId {
         match self {
             Self::Create(plan) => plan.sandbox_id,
             Self::Resume(plan) => plan.sandbox_id,
@@ -284,35 +284,35 @@ impl LaunchPlan {
     }
 
     /// The incarnation this launch runs under.
-    pub(super) fn execution_id(&self) -> ExecutionId {
+    pub fn execution_id(&self) -> ExecutionId {
         match self {
             Self::Create(plan) => plan.execution_id,
             Self::Resume(plan) => plan.execution_id,
         }
     }
 
-    pub(super) fn transitional_state(&self) -> SandboxState {
+    pub fn transitional_state(&self) -> SandboxState {
         match self {
             Self::Create(_) => SandboxState::Creating,
             Self::Resume(_) => SandboxState::Resuming,
         }
     }
 
-    pub(super) fn transitional_metadata(&self) -> Option<&SandboxMetadata> {
+    pub fn transitional_metadata(&self) -> Option<&SandboxMetadata> {
         match self {
             Self::Create(plan) => Some(&plan.metadata),
             Self::Resume(_) => None,
         }
     }
 
-    pub(super) fn timeout(&self) -> NewTimeout {
+    pub fn timeout(&self) -> NewTimeout {
         match self {
             Self::Create(plan) => plan.timeout,
             Self::Resume(plan) => plan.timeout,
         }
     }
 
-    pub(super) fn resources(&self) -> SandboxResources {
+    pub fn resources(&self) -> SandboxResources {
         match self {
             Self::Create(plan) => plan.metadata.resources,
             Self::Resume(plan) => plan.resources,
@@ -336,6 +336,14 @@ mod tests {
             for entry in std::fs::read_dir(dir).expect("src is readable") {
                 let path = entry.expect("readable dir entry").path();
                 if path.is_dir() {
+                    // 🔴 A directory called `tests` is test code wherever it
+                    // sits — a crate's integration-test tree, or the module
+                    // `aenv-node` keeps its moved `aenv-core` tests in. Minting
+                    // the token there is what it is for. This is what the scan
+                    // used to get for free by starting at `src/`.
+                    if path.file_name().and_then(|name| name.to_str()) == Some("tests") {
+                        continue;
+                    }
                     visit(&path, offenders);
                     continue;
                 }
@@ -352,9 +360,13 @@ mod tests {
             }
         }
 
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // 🔴 Both trees. `aenv-node` and `aenv-api` are separate crates now,
+        // and a scan that stopped at this one would pass on a tree where the
+        // offending call had simply moved across the boundary.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
-        visit(&src, &mut offenders);
+        visit(&root.join("src"), &mut offenders);
+        visit(&root.join("crates"), &mut offenders);
 
         assert!(
             offenders.is_empty(),
@@ -380,6 +392,12 @@ mod tests {
             for entry in std::fs::read_dir(dir).expect("src is readable") {
                 let path = entry.expect("readable dir entry").path();
                 if path.is_dir() {
+                    // 🔴 See the sibling scan: a directory called `tests` is
+                    // test code, and the scan used to exclude it by starting
+                    // at `src/`.
+                    if path.file_name().and_then(|name| name.to_str()) == Some("tests") {
+                        continue;
+                    }
                     visit(&path, token, found);
                     continue;
                 }
@@ -396,9 +414,13 @@ mod tests {
             }
         }
 
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // 🔴 Both trees — see the sibling scan above. The one legitimate call
+        // site lives in `aenv-node` now, so a scan of this crate alone would
+        // find nothing and read as "nobody takes an adopted claim".
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut found = Vec::new();
-        visit(&src, TOKEN, &mut found);
+        visit(&root.join("src"), TOKEN, &mut found);
+        visit(&root.join("crates"), TOKEN, &mut found);
 
         // 🔴 The half that gives the scan its resolution. Without it this test
         // passes on a tree where the constructor was renamed and nothing calls

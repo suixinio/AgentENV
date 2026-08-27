@@ -52,7 +52,7 @@ use crate::cfg::ConfigManager;
 /// what they mean stays exactly what it meant. This is a separate question —
 /// "did this come through the control plane" — asked outside the generated auth
 /// layer rather than instead of it.
-pub(crate) const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
+pub const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 
 /// Paths this gate never applies to.
 ///
@@ -109,7 +109,7 @@ fn is_exempt(method: &Method, path: &str) -> bool {
 ///
 /// Two sources, unioned: a static list read once at startup, and a file re-read
 /// while the process runs. Both empty means the gate is off.
-pub(crate) struct ControlPlaneGate {
+pub struct ControlPlaneGate {
     /// From configuration/environment. Fixed for the life of the process.
     static_tokens: Vec<String>,
     /// The file to re-read, or `None` when none was configured.
@@ -140,7 +140,7 @@ struct TokenFileState {
 /// What the gate did with one request. A closed set: the label goes on a metric
 /// and a metric label with unbounded values is a memory leak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GateDecision {
+pub enum GateDecision {
     /// No credentials configured, so the gate is off and this request went
     /// through the way it would have before the gate existed.
     Disabled,
@@ -167,7 +167,7 @@ impl GateDecision {
 }
 
 impl ControlPlaneGate {
-    pub(crate) fn from_global_config() -> Self {
+    pub fn from_global_config() -> Self {
         let config = &ConfigManager::global_config().api;
         Self::new(
             config.control_plane_tokens.clone(),
@@ -175,7 +175,7 @@ impl ControlPlaneGate {
         )
     }
 
-    pub(crate) fn new(static_tokens: Vec<String>, token_file: impl Into<String>) -> Self {
+    pub fn new(static_tokens: Vec<String>, token_file: impl Into<String>) -> Self {
         let token_file = token_file.into();
         let token_file = token_file.trim();
 
@@ -334,7 +334,7 @@ fn normalize(tokens: Vec<String>) -> Vec<String> {
 }
 
 /// Refuses control-plane calls that did not come through the gateway.
-pub(crate) async fn require_control_plane(
+pub async fn require_control_plane(
     State(gate): State<Arc<ControlPlaneGate>>,
     request: Request,
     next: Next,

@@ -40,7 +40,7 @@ use crate::types::{ExecutionId, SandboxId};
 /// 就订阅赢家的完成通知（`e2b/packages/api/internal/sandbox/reservations/redis/reservation.go`），
 /// 命中 storage index 就直接读回既有沙箱（`.../sandbox/store.go`）。它从不把
 /// 输家答成「不存在」。这里对齐的是那个保证，不是它的 Redis 形状。
-pub(super) enum MissingLocalResume {
+pub enum MissingLocalResume {
     /// 集群也不认识它。**唯一**允许回 404 的情形。
     Unknown,
     /// 另一发 resume 已经把它拉起来了，而且赢家就在本节点 —— 直接返回成品。
@@ -97,7 +97,7 @@ fn missing_local_verdict(
 
 /// Outcome of rebuilding a sandbox from a claim this node already holds.
 #[derive(Debug)]
-pub(super) enum CrossNodeResume {
+pub enum CrossNodeResume {
     /// The sandbox is running here again, under its original ID.
     Restored(Box<SandboxMetadata>),
     /// The registry named a snapshot the repository no longer has, so there is
@@ -274,10 +274,7 @@ impl ApiImpl {
     /// failure.
     const STALE_RELEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-    pub(super) async fn resolve_missing_local_resume(
-        &self,
-        sandbox_id: SandboxId,
-    ) -> MissingLocalResume {
+    pub async fn resolve_missing_local_resume(&self, sandbox_id: SandboxId) -> MissingLocalResume {
         // 单机形态：登记表没有话语权，本地没有就是真没有 —— 保持原语义。
         if !self.paused.registry().is_cluster_backed() {
             return MissingLocalResume::Unknown;
@@ -343,7 +340,7 @@ impl ApiImpl {
     /// Reached when the local resume reported the sandbox unknown — this node
     /// has never run it, or has already discarded its copy — while the cluster
     /// still has a snapshot to rebuild it from.
-    pub(super) async fn restore_claimed_sandbox(
+    pub async fn restore_claimed_sandbox(
         &self,
         entry: PausedSandboxEntry,
         timeout: NewTimeout,
@@ -747,7 +744,7 @@ impl ApiImpl {
     /// Only used where the orchestrator cannot do it itself: a delete for a
     /// sandbox this node does not hold, which exists in the cluster purely as a
     /// published snapshot.
-    pub(super) async fn forget_paused_sandbox(&self, sandbox_id: SandboxId) {
+    pub async fn forget_paused_sandbox(&self, sandbox_id: SandboxId) {
         // No handle: this call stopped nothing, so it has no real machine to
         // report. `forget_sandbox`'s fallback (this process's own identity)
         // is the correct answer here, not a stopgap — a `Running` row this
@@ -992,7 +989,7 @@ impl ApiImpl {
     /// registry unreachable, row still ours — leaves the local record alone:
     /// refusing a resume that would have worked is worse than the narrow race
     /// this closes.
-    pub(super) async fn discard_if_superseded(&self, sandbox_id: SandboxId) -> bool {
+    pub async fn discard_if_superseded(&self, sandbox_id: SandboxId) -> bool {
         if !self.paused.registry().is_cluster_backed() {
             return false;
         }

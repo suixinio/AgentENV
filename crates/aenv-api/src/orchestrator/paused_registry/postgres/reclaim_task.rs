@@ -37,11 +37,7 @@ const TICK_BUDGET: Duration = Duration::from_secs(25);
 /// a different question from when a newly-elected leader's body first runs
 /// -- both loops share that leader-acquisition timing; only the
 /// reconcile/reclaim distinction above is Go's own.
-pub(super) fn spawn(
-    pool: PgPool,
-    cluster_id: Uuid,
-    interval: Duration,
-) -> crate::pg::SingletonTaskHandle {
+pub fn spawn(pool: PgPool, cluster_id: Uuid, interval: Duration) -> crate::pg::SingletonTaskHandle {
     crate::pg::spawn_singleton_task(
         pool.clone(),
         crate::pg::AdvisoryLockKey::PausedRegistryReclaim,

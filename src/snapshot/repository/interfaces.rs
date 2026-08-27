@@ -451,7 +451,7 @@ impl StartedBuild {
 /// there until the reaper's TTL expired. The second attempt at a failed build
 /// is the case the whole retry path is for, and it was the one case neither
 /// store could complete.
-pub(crate) fn build_may_start_from(status: TemplateBuildStatus) -> bool {
+pub fn build_may_start_from(status: TemplateBuildStatus) -> bool {
     matches!(
         status,
         TemplateBuildStatus::Waiting | TemplateBuildStatus::Error
@@ -492,7 +492,7 @@ pub enum CatalogReadScope {
 }
 
 impl CatalogReadScope {
-    pub(crate) fn allow_any_status(self) -> bool {
+    pub fn allow_any_status(self) -> bool {
         matches!(self, Self::AnyStatus)
     }
 }

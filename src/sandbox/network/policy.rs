@@ -62,13 +62,13 @@ impl SandboxNetworkEgressPolicy {
         Ok(policy)
     }
 
-    pub(crate) fn has_explicit_rules(&self) -> bool {
+    pub fn has_explicit_rules(&self) -> bool {
         !self.allowed_cidrs.is_empty()
             || !self.allowed_domains.is_empty()
             || !self.denied_cidrs.is_empty()
     }
 
-    pub(crate) fn has_domain_allow_rules(&self) -> bool {
+    pub fn has_domain_allow_rules(&self) -> bool {
         !self.allowed_domains.is_empty()
     }
 }
@@ -87,24 +87,24 @@ impl SandboxNetworkPolicy {
         }
     }
 
-    pub(crate) fn runtime_policy(&self) -> Option<Self> {
+    pub fn runtime_policy(&self) -> Option<Self> {
         self.has_runtime_egress_rules().then(|| self.clone())
     }
 
-    pub(crate) fn has_explicit_egress_rules(&self) -> bool {
+    pub fn has_explicit_egress_rules(&self) -> bool {
         self.egress.has_explicit_rules()
     }
 
-    pub(crate) fn has_runtime_egress_rules(&self) -> bool {
+    pub fn has_runtime_egress_rules(&self) -> bool {
         self.base_policy == BaseSandboxNetworkPolicy::Deny || self.has_explicit_egress_rules()
     }
 
-    pub(crate) fn has_domain_allow_rules(&self) -> bool {
+    pub fn has_domain_allow_rules(&self) -> bool {
         self.egress.has_domain_allow_rules()
     }
 }
 
-pub(super) fn set_namespace_egress_policy(policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+pub fn set_namespace_egress_policy(policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
     let default_policy = SandboxNetworkPolicy::default();
     let policy = policy.unwrap_or(&default_policy);
 
@@ -126,7 +126,7 @@ fn configured_always_denied_cidrs() -> &'static [String] {
         .always_denied_cidrs
 }
 
-pub(super) fn initialize_namespace_egress_chain(
+pub fn initialize_namespace_egress_chain(
     veth_host_ip: Ipv4Addr,
     guest_dns_ip: Ipv4Addr,
     internal_egress_denied_cidrs: &[String],

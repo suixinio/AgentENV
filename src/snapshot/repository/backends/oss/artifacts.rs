@@ -26,13 +26,13 @@ use crate::snapshot::{PersistedDiskImagePublication, SnapshotId, SnapshotPublish
 use crate::types::FirecrackerSnapshotManifest;
 
 /// Snapshot bytes stored in OSS: what removing them takes.
-pub(crate) struct OssSnapshotArtifactStore {
+pub struct OssSnapshotArtifactStore {
     client: Arc<OssClient>,
     rollback: AcrPublicationRollback,
 }
 
 impl OssSnapshotArtifactStore {
-    pub(crate) fn new(client: Arc<OssClient>) -> Self {
+    pub fn new(client: Arc<OssClient>) -> Self {
         Self {
             client,
             rollback: AcrPublicationRollback::new(),

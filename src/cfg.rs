@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub(crate) mod image;
-pub(crate) mod network;
+pub mod image;
+pub mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
 pub use image::{
@@ -95,7 +95,7 @@ impl SetupDependencyManifest {
     }
 }
 
-pub(crate) fn regctl_path(deps_path: &Path) -> PathBuf {
+pub fn regctl_path(deps_path: &Path) -> PathBuf {
     deps_path
         .join("regctl")
         .join(&SetupDependencyManifest::get().regclient.version)
@@ -1820,7 +1820,7 @@ impl AppConfig {
         self.resolved_tools_drive_path_for_version(self.resolved_tools_version())
     }
 
-    pub(crate) fn resolved_overlaybd_oci_converter_id(&self) -> String {
+    pub fn resolved_overlaybd_oci_converter_id(&self) -> String {
         let version = self
             .overlaybd
             .as_ref()
@@ -1835,7 +1835,7 @@ impl AppConfig {
     /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
     /// which would destroy the Rust runtime cache's per-entry directories if
     /// both shared `remote-blocks`.
-    pub(crate) fn resolved_overlaybd_convert_global_config_path(&self) -> PathBuf {
+    pub fn resolved_overlaybd_convert_global_config_path(&self) -> PathBuf {
         self.ublk
             .overlaybd
             .global_config_path
@@ -1850,7 +1850,7 @@ impl AppConfig {
     /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
     /// which would destroy the Rust runtime cache's per-entry directories if
     /// both shared `remote-blocks`.
-    pub(crate) fn resolved_overlaybd_resize_global_config_path(&self) -> PathBuf {
+    pub fn resolved_overlaybd_resize_global_config_path(&self) -> PathBuf {
         self.ublk
             .overlaybd
             .global_config_path
@@ -1879,7 +1879,7 @@ impl AppConfig {
         regctl_path(&self.deps_path)
     }
 
-    pub(crate) fn image_cache_layout(&self) -> ResolvedImageCacheConfig {
+    pub fn image_cache_layout(&self) -> ResolvedImageCacheConfig {
         self.image.cache.layout()
     }
 
@@ -2258,7 +2258,7 @@ impl AppConfig {
         Ok(())
     }
 
-    pub(crate) fn validate_overlaybd_global_config_paths(&self) -> Result<()> {
+    pub fn validate_overlaybd_global_config_paths(&self) -> Result<()> {
         let paths = [
             (
                 "ublk.overlaybd.global_config_path",
@@ -2334,37 +2334,25 @@ impl ConfigManager {
             return manager;
         }
 
-        #[cfg(test)]
+        // 🔴 `feature = "test-support"` as well as `cfg(test)`. `aenv-node`
+        // and `aenv-api` are separate crates now, so their tests run against
+        // this one built as a *dependency*, where `cfg(test)` is off — and
+        // anything they reach that reads the global config (a mock snapshot,
+        // a paused-registry fixture) would panic here instead of loading the
+        // bundled `config/default.toml`. The feature is enabled only from
+        // those crates' `[dev-dependencies]`, so a real binary still gets the
+        // refusal below.
+        #[cfg(any(test, feature = "test-support"))]
         {
             Self::init_global().expect("test ConfigManager initialization failed")
         }
 
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         {
             GLOBAL_CONFIG_MANAGER
                 .get()
                 .expect("ConfigManager must be initialized before use")
         }
-    }
-
-    /// Loads the bundled `config/default.toml` into the global slot if nothing
-    /// has claimed it yet, for a test in a *sibling* crate.
-    ///
-    /// # 🔴 Why this is not just [`Self::global`]'s `#[cfg(test)]` branch
-    ///
-    /// That branch initializes on demand, and it is compiled only when *this*
-    /// crate is the one being tested. `aenv-api`/`aenv-node` tests run against
-    /// `aenv-core` built as a dependency, where `cfg(test)` is off and
-    /// [`Self::global`] panics instead. Anything those tests reach that reads
-    /// the global config — `CommittedSnapshot::mock`, for instance — needs the
-    /// slot filled first, and says so by calling this.
-    ///
-    /// Idempotent, and never fails: a slot already filled is left alone, and a
-    /// config file that cannot be read leaves it empty for [`Self::global`] to
-    /// complain about at the point of use, exactly as before.
-    #[doc(hidden)]
-    pub fn init_global_for_tests() {
-        let _ = Self::init_global();
     }
 
     pub fn init_global() -> Result<&'static Self> {

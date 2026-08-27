@@ -27,9 +27,8 @@
 // they do there.
 pub use aenv_core::{
     api, binding_store, cfg, digest, identity, image, leader_task, local_store, logging,
-    node_client, node_reclaim, node_registry, node_server, observability, overlaybd, p2p,
-    privileges, proto, role, runtime_snapshot, sandbox, scheduler_endpoint, server_main, setup,
-    template, types, virtualization,
+    node_client, node_registry, observability, p2p, privileges, proto, role, runtime_snapshot,
+    sandbox, scheduler_endpoint, server_main, template, types, virtualization,
 };
 
 pub mod orchestrator;

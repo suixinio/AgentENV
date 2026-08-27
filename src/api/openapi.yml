@@ -2112,7 +2112,6 @@ paths:
       tags: [snapshots]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2172,7 +2171,6 @@ paths:
       tags: [templates]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2222,7 +2220,6 @@ paths:
       tags: [templates]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2291,7 +2288,6 @@ paths:
       tags: [templates]
       security:
         - ApiKeyAuth: []
-        - AccessTokenAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
@@ -2344,7 +2340,6 @@ paths:
       description: Get template build info
       tags: [templates]
       security:
-        - AccessTokenAuth: []
         - ApiKeyAuth: []
         - AuthProviderBearerAuth: []
           AuthProviderTeamAuth: []

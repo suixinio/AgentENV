@@ -240,4 +240,3 @@ For Firecracker runtime upgrades, update `thirdparty/firecracker-client/firecrac
 - Rust 2021 edition. Keep touched code `rustfmt`-clean and clippy-clean.
 - Use `info` for lifecycle events, `debug` for internal transitions, `warn` for recoverable issues, `error` for unrecoverable failures. Initialize tracing only in binary entrypoints.
 - Conventional Commit prefixes: `feat:`, `fix:`, `refactor:`, `ci:`, `chore:`.
-- Push to a fork repository and open PRs against `https://github.com/kvcache-ai/AgentENV/`. Never push branches to `https://github.com/kvcache-ai/AgentENV/` directly.

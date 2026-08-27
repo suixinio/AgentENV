@@ -7,7 +7,7 @@ body = """
 {% for commit in commits %}\
 - {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
 {{ commit.message | upper_first }}\
-{% if commit.remote.pr_number %} ([#{{ commit.remote.pr_number }}](https://github.com/kvcache-ai/AgentENV/pull/{{ commit.remote.pr_number }})){% endif %}\
+{% if commit.remote.pr_number %} (#{{ commit.remote.pr_number }}){% endif %}\
 {% if commit.remote.username %} — **@{{ commit.remote.username }}**{% endif %}
 {% endfor %}
 {% endfor %}\

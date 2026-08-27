@@ -178,7 +178,7 @@ func TestTheSnapshotCatalogShipsTheStateTheClusterRuns(t *testing.T) {
 	}
 }
 
-// The claim as a scan: every workload in the base layer that runs the AgentENV
+// The claim as a scan: every workload in the base layer that runs an AgentENV
 // binary declares both switches. Two do today, and the number matters — this is
 // an "all of them" assertion, and "all of them" over an empty set is true. A
 // walk that decoded nothing, or that decoded workloads with no containers in
@@ -194,6 +194,10 @@ func TestTheSnapshotCatalogShipsTheStateTheClusterRuns(t *testing.T) {
 // that reads as a bug — the counts still look plausible — and it is exactly the
 // error that would let a future AgentENV workload sharing a file with something
 // else slip past this test.
+// The image prefixes that mean "this workload runs an AgentENV server binary".
+// One per half, since the two halves are two crates and two images.
+var agentenvImagePrefixes = []string{"agentenv-runtime:", "agentenv-api:"}
+
 func TestEveryAgentenvWorkloadDeclaresTheSnapshotCatalogSwitches(t *testing.T) {
 	entries, err := os.ReadDir(manifestDir)
 	if err != nil {
@@ -214,10 +218,18 @@ func TestEveryAgentenvWorkloadDeclaresTheSnapshotCatalogSwitches(t *testing.T) {
 			if workload.documentIndex > 0 {
 				behindOtherDocuments++
 			}
+			// 🔴 Two prefixes, not one. The crate split gave the api half its
+			// own binary and its own image (`agentenv-api`, built from
+			// `crates/aenv-api`) while the node half kept `agentenv-runtime`;
+			// a scan that still named only the runtime image found one
+			// workload where the assertion below needs two, and said so —
+			// which is the whole reason the count is asserted.
 			runsAgentenv := false
 			for _, container := range workload.containers {
-				if strings.HasPrefix(container.Image, "agentenv-runtime:") {
-					runsAgentenv = true
+				for _, prefix := range agentenvImagePrefixes {
+					if strings.HasPrefix(container.Image, prefix) {
+						runsAgentenv = true
+					}
 				}
 			}
 			if !runsAgentenv {
@@ -251,9 +263,9 @@ func TestEveryAgentenvWorkloadDeclaresTheSnapshotCatalogSwitches(t *testing.T) {
 			workloads)
 	}
 	if len(agentenv) < 2 {
-		t.Fatalf("the walk found %d workloads running agentenv-runtime (%v); it must find at least "+
+		t.Fatalf("the walk found %d workloads running one of %v (%v); it must find at least "+
 			"the node DaemonSet and the api Deployment, or \"all of them declare it\" is a claim "+
-			"about nothing", len(agentenv), agentenv)
+			"about nothing", len(agentenv), agentenvImagePrefixes, agentenv)
 	}
 	if behindOtherDocuments == 0 {
 		t.Fatal("every workload the walk decoded was the first document in its file, so nothing " +

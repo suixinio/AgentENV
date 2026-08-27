@@ -1138,6 +1138,16 @@ where
                 // write silently downgrades that sandbox's routing record for
                 // good.
                 projection_ttl_secs: metadata.projection_ttl_secs(now),
+                // 🔴 `Paused` exactly, not "anything that is not running".
+                // The flag's only job is to keep a *routing projection* off a
+                // sandbox that has no VM behind it, and the transitional
+                // states each already own their routing: `Resuming` is on its
+                // way to having a VM and its resume path writes the binding
+                // it will need, `Pausing` still has one attached. Widening
+                // this to the transitional states would drop and reinstall a
+                // projection on every pause/resume round trip for no gain,
+                // and would race the resume path's own write.
+                paused: metadata.state == SandboxState::Paused,
             })
             .collect())
     }

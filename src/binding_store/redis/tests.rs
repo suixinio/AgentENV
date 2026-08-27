@@ -64,6 +64,7 @@ async fn authoritative_mode_keeps_the_deadline_on_a_same_incarnation_refresh() {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             unix(0),
         )
@@ -93,6 +94,7 @@ async fn authoritative_mode_keeps_the_deadline_on_a_same_incarnation_refresh() {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             unix(1),
         )
@@ -126,6 +128,7 @@ async fn ephemeral_mode_always_rearms_the_deadline() {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             unix(0),
         )
@@ -144,6 +147,7 @@ async fn ephemeral_mode_always_rearms_the_deadline() {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             unix(1),
         )
@@ -178,6 +182,7 @@ async fn a_ttl_less_key_gets_a_deadline_rather_than_staying_ttl_less() {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             unix(0),
         )
@@ -201,6 +206,7 @@ async fn a_ttl_less_key_gets_a_deadline_rather_than_staying_ttl_less() {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             unix(1),
         )

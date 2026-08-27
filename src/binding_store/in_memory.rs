@@ -407,6 +407,7 @@ mod tests {
                     sandbox_id: "sbx-1".to_string(),
                     execution_id: "exec-1".to_string(),
                     projection_ttl: Duration::ZERO,
+                    paused: false,
                 }],
                 unix(12),
             )

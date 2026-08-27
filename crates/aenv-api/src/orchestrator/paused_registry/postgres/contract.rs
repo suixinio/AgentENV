@@ -1666,6 +1666,7 @@ mod pg {
                 sandbox_id: sandbox_a.to_string(),
                 execution_id: Uuid::new_v4().to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             last_seen: Some(SystemTime::now()),
         };
@@ -1675,6 +1676,7 @@ mod pg {
                 sandbox_id: sandbox_b.to_string(),
                 execution_id: Uuid::new_v4().to_string(),
                 projection_ttl: Duration::from_secs(30),
+                paused: false,
             }],
             last_seen: Some(SystemTime::now()),
         };

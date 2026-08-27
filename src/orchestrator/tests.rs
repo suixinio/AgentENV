@@ -2035,6 +2035,56 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
     Ok(())
 }
 
+/// 🔴 The producer end of the transparent-wake fix, and the reason the guards
+/// in `node_registry/grpc_service.rs` are not testing themselves.
+///
+/// Those guards feed the receiver a synthetic `paused: true` entry. Nothing in
+/// them would notice if this side never set the flag — the receiver would keep
+/// filtering nothing, every paused sandbox would keep its routing projection,
+/// and the gateway would keep answering 410 instead of waking it, with the
+/// whole receiver-side suite still green. This is the test that fails in that
+/// case.
+#[tokio::test]
+async fn the_roster_flags_a_sandbox_as_paused_only_once_it_is_paused() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        RecordingPersister::default(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "roster-paused")]))
+        .await?;
+
+    let running = orchestrator.list_sandbox_roster().await?;
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].sandbox_id, created.id);
+    assert!(
+        !running[0].paused,
+        "a Running sandbox must not be flagged: withholding its binding would take away the \
+         routing projection of a sandbox that does have a VM behind it"
+    );
+
+    orchestrator.pause_sandbox(created.id).await?;
+
+    let parked = orchestrator.list_sandbox_roster().await?;
+    assert_eq!(
+        parked.len(),
+        1,
+        "🔴 pausing must not remove the sandbox from the roster. The roster is the sole \
+         renewal source for its lease in the cluster paused registry; dropping it here would \
+         let another node claim a row whose snapshot is on this node's disk alone"
+    );
+    assert_eq!(parked[0].sandbox_id, created.id);
+    assert!(
+        parked[0].paused,
+        "and it must now be flagged, or the receiver has nothing to filter on and a paused \
+         sandbox keeps a routing projection that makes the gateway answer 410 instead of \
+         waking it"
+    );
+    Ok(())
+}
+
 /// 🔴 The run has to be charged *before* the record is written, not merely
 /// before the store sees it.
 ///

@@ -195,6 +195,7 @@ mod tests {
                     sandbox_id: id.to_string(),
                     execution_id: Uuid::new_v4().to_string(),
                     projection_ttl: Duration::from_secs(30),
+                    paused: false,
                 })
                 .collect(),
             last_seen,
@@ -278,11 +279,13 @@ mod tests {
                     sandbox_id: "not-a-uuid".to_string(),
                     execution_id: Uuid::new_v4().to_string(),
                     projection_ttl: Duration::from_secs(30),
+                    paused: false,
                 },
                 RosterEntry {
                     sandbox_id: good.to_string(),
                     execution_id: Uuid::new_v4().to_string(),
                     projection_ttl: Duration::from_secs(30),
+                    paused: false,
                 },
             ],
             last_seen: Some(now),

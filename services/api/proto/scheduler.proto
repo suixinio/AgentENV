@@ -326,6 +326,21 @@ message SandboxRosterEntry {
   // Absent (an older node) lands on the same fallback, which is exactly the
   // behaviour that shipped before this field existed.
   uint32 projection_ttl_secs = 3;
+  // Whether this sandbox is parked: on this node's disk, with no VM behind it.
+  //
+  // The entry is still reported — the roster is the only thing that renews a
+  // paused sandbox's registry lease, and a node that stopped naming its paused
+  // sandboxes would let another node claim rows whose snapshot only exists
+  // here. What the flag changes is routing: a parked sandbox must NOT hold a
+  // routing projection, because the gateway reads a projection hit as "there
+  // is a VM at the other end" and answers the data plane straight from it
+  // instead of waking the sandbox. So the receiver keeps this entry in the
+  // registry and withholds it from binding reconciliation.
+  //
+  // 🔴 Absent (an older node, or the `sandbox_ids` fallback) is false, which
+  // is byte-for-byte the behaviour that shipped before this field existed:
+  // every entry reconciled, paused ones included.
+  bool paused = 4;
 }
 
 message HeartbeatResponse {

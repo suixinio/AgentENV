@@ -219,6 +219,11 @@ pub struct StoredRosterEntry {
     pub sandbox_id: String,
     pub execution_id: String,
     pub projection_ttl_secs: u64,
+    /// 🔴 `#[serde(default)]` on purpose: a record written by a replica that
+    /// predates the field has to keep deserializing, and `false` is the same
+    /// answer that replica would have given.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// A single update to publish to the shared hash. Constructed by

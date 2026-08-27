@@ -75,6 +75,22 @@ pub struct RosterEntry {
     /// on the repair path rather than the create path. `Duration::ZERO`
     /// means "use the store's binding_ttl", never "never expires".
     pub projection_ttl: Duration,
+    /// Whether the node reported this sandbox as parked: on its disk, with no
+    /// VM behind it.
+    ///
+    /// 🔴 This entry still belongs in the registry. The heartbeat roster is
+    /// the sole renewal source for a paused sandbox's lease in the cluster
+    /// registry (`paused_registry`'s `candidates_from_rosters` reads exactly
+    /// these entries), and dropping it here would let its lease lapse and
+    /// another node claim a row whose snapshot only exists on the reporting
+    /// node. The one consumer that must skip it is *binding* reconciliation:
+    /// a routing projection means "there is a VM at the other end", which is
+    /// precisely what a parked sandbox does not have.
+    ///
+    /// False where the node did not say — an older build, or the deprecated
+    /// `sandbox_ids` fallback — which is byte-for-byte the behaviour that
+    /// shipped before the flag existed.
+    pub paused: bool,
 }
 
 /// One node's heartbeat-reported sandbox list, ported from

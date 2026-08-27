@@ -279,6 +279,19 @@ pub struct SandboxRosterEntry {
     pub execution_id: ExecutionId,
     /// 🔴 `0` means "use the receiver's default", never "never expires".
     pub projection_ttl_secs: u32,
+    /// Whether this sandbox is parked: on this node's disk, with no VM behind
+    /// it.
+    ///
+    /// Reported rather than filtered out here, and the distinction is the
+    /// whole point of the flag. The heartbeat roster is the *only* thing that
+    /// renews a paused sandbox's row in the cluster registry, so a node that
+    /// stopped naming its paused sandboxes would let their leases lapse and
+    /// another node claim rows whose snapshot lives on this node's disk alone.
+    /// What the receiver does with the flag is withhold the entry from
+    /// *binding* reconciliation, so a parked sandbox holds no routing
+    /// projection and the gateway takes its wake path instead of answering the
+    /// data plane out of a projection that points at a VM that is not running.
+    pub paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

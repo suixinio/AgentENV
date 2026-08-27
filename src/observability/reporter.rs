@@ -583,6 +583,7 @@ impl ObservabilityReporter {
                     sandbox_id: entry.sandbox_id.to_string(),
                     execution_id: entry.execution_id.to_string(),
                     projection_ttl_secs: entry.projection_ttl_secs,
+                    paused: entry.paused,
                 })
                 .collect(),
         }
@@ -825,6 +826,7 @@ mod tests {
             sandbox_id: SandboxId::new(),
             execution_id: ExecutionId::new(),
             projection_ttl_secs: 86_460,
+            paused: false,
         };
 
         let request =
@@ -849,6 +851,7 @@ mod tests {
             sandbox_id: SandboxId::new(),
             execution_id: ExecutionId::new(),
             projection_ttl_secs: 0,
+            paused: false,
         };
 
         let request =

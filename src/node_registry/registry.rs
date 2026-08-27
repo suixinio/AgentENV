@@ -336,6 +336,7 @@ impl From<&ObservedNodeRecord> for StoredObservedRecord {
                     sandbox_id: e.sandbox_id.clone(),
                     execution_id: e.execution_id.clone(),
                     projection_ttl_secs: e.projection_ttl.as_secs(),
+                    paused: e.paused,
                 })
                 .collect(),
         }
@@ -404,6 +405,7 @@ impl From<StoredObservedRecord> for ObservedNodeRecord {
                     sandbox_id: e.sandbox_id,
                     execution_id: e.execution_id,
                     projection_ttl: Duration::from_secs(e.projection_ttl_secs),
+                    paused: e.paused,
                 })
                 .collect(),
             // `unix_millis`'s inverse: a stored record's own `last_seen_unix_ms`
@@ -1411,6 +1413,7 @@ pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool)
                 sandbox_id,
                 execution_id: normalize_execution_id(&item.execution_id),
                 projection_ttl: projection_ttl_from_secs(item.projection_ttl_secs),
+                paused: item.paused,
             });
         }
         if out.is_empty() {
@@ -1436,6 +1439,14 @@ pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool)
             sandbox_id,
             execution_id: String::new(),
             projection_ttl: Duration::ZERO,
+            // 🔴 False, and only false. `sandbox_ids` is a flat list of ids
+            // with no room to say anything about state, so a node old enough
+            // to be on this path has told us nothing about which of its
+            // sandboxes are parked. False is the answer that reproduces that
+            // node's pre-flag behaviour exactly — every entry reconciled —
+            // rather than guessing, which on this path could only ever guess
+            // wrong in the direction of dropping a live sandbox's route.
+            paused: false,
         });
     }
     if out.is_empty() {
@@ -1521,7 +1532,9 @@ pub fn unix_millis(t: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::scheduler::{MachineInfo, P2pEndpoint as P2pEndpointProto};
+    use crate::proto::scheduler::{
+        MachineInfo, P2pEndpoint as P2pEndpointProto, SandboxRosterEntry,
+    };
 
     fn unix(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -2153,6 +2166,71 @@ mod tests {
     }
 
     // ---- node_registry_roster_test.go ----
+
+    /// The `paused` flag's two wire generations, in one place.
+    ///
+    /// The fallback half is the one that matters for a rolling upgrade: a node
+    /// old enough to be on the deprecated `sandbox_ids` path has said nothing
+    /// about which of its sandboxes are parked, and `false` is the only answer
+    /// that reproduces that node's pre-flag behaviour — every entry reconciled,
+    /// which is what it got before the field existed. Anything else would let a
+    /// silent field decide whether a live sandbox keeps its route.
+    #[test]
+    #[allow(deprecated)]
+    fn roster_from_heartbeat_defaults_paused_to_false_on_the_legacy_sandbox_ids_path() {
+        let (entries, legacy) = roster_from_heartbeat(&HeartbeatRequest {
+            node_id: "node-a".to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: "svc-node-a".to_string(),
+            sandbox_ids: vec!["s1".to_string(), "s2".to_string()],
+            ..Default::default()
+        });
+
+        assert!(
+            legacy,
+            "precondition: this is the sandbox_ids fallback path"
+        );
+        assert_eq!(roster_ids(&entries), vec!["s1", "s2"]);
+        assert!(
+            entries.iter().all(|entry| !entry.paused),
+            "a node too old to send the flag must land on false, which is exactly the \
+             behaviour it had before the flag existed: every entry reconciled"
+        );
+    }
+
+    #[test]
+    fn roster_from_heartbeat_carries_the_paused_flag_both_ways() {
+        let (entries, legacy) = roster_from_heartbeat(&HeartbeatRequest {
+            node_id: "node-a".to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: "svc-node-a".to_string(),
+            roster: vec![
+                SandboxRosterEntry {
+                    sandbox_id: "s-running".to_string(),
+                    paused: false,
+                    ..Default::default()
+                },
+                SandboxRosterEntry {
+                    sandbox_id: "s-parked".to_string(),
+                    paused: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert!(!legacy);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.sandbox_id.as_str(), entry.paused))
+                .collect::<Vec<_>>(),
+            vec![("s-running", false), ("s-parked", true)],
+            "the flag must survive the wire-to-registry conversion unchanged in both \
+             directions -- a conversion that hardcoded either value would make one of the \
+             two guards in grpc_service.rs vacuous"
+        );
+    }
 
     #[test]
     fn roster_of_keeps_the_heartbeat_roster() {
@@ -2917,6 +2995,7 @@ mod tests {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "018f0000-0000-7000-8000-000000000000".to_string(),
                 projection_ttl: Duration::from_secs(60),
+                paused: false,
             }],
             last_seen: SystemTime::UNIX_EPOCH + Duration::from_millis(999_000),
         };
@@ -2972,6 +3051,7 @@ mod tests {
             sandbox_id: "sbx-stale".to_string(),
             execution_id: String::new(),
             projection_ttl_secs: 0,
+            paused: false,
         }];
         registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), stale)]));
 
@@ -2999,6 +3079,7 @@ mod tests {
             sandbox_id: "sbx-new".to_string(),
             execution_id: String::new(),
             projection_ttl_secs: 0,
+            paused: false,
         }];
         registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), newer)]));
 

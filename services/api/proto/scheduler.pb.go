@@ -1983,8 +1983,23 @@ type SandboxRosterEntry struct {
 	// Absent (an older node) lands on the same fallback, which is exactly the
 	// behaviour that shipped before this field existed.
 	ProjectionTtlSecs uint32 `protobuf:"varint,3,opt,name=projection_ttl_secs,json=projectionTtlSecs,proto3" json:"projection_ttl_secs,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Whether this sandbox is parked: on this node's disk, with no VM behind it.
+	//
+	// The entry is still reported — the roster is the only thing that renews a
+	// paused sandbox's registry lease, and a node that stopped naming its paused
+	// sandboxes would let another node claim rows whose snapshot only exists
+	// here. What the flag changes is routing: a parked sandbox must NOT hold a
+	// routing projection, because the gateway reads a projection hit as "there
+	// is a VM at the other end" and answers the data plane straight from it
+	// instead of waking the sandbox. So the receiver keeps this entry in the
+	// registry and withholds it from binding reconciliation.
+	//
+	// 🔴 Absent (an older node, or the `sandbox_ids` fallback) is false, which
+	// is byte-for-byte the behaviour that shipped before this field existed:
+	// every entry reconciled, paused ones included.
+	Paused        bool `protobuf:"varint,4,opt,name=paused,proto3" json:"paused,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SandboxRosterEntry) Reset() {
@@ -2036,6 +2051,13 @@ func (x *SandboxRosterEntry) GetProjectionTtlSecs() uint32 {
 		return x.ProjectionTtlSecs
 	}
 	return 0
+}
+
+func (x *SandboxRosterEntry) GetPaused() bool {
+	if x != nil {
+		return x.Paused
+	}
+	return false
 }
 
 type HeartbeatResponse struct {
@@ -7133,12 +7155,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"sandboxIds\x12<\n" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x128\n" +
 	"\x06roster\x18\n" +
-	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06roster\"\x86\x01\n" +
+	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06roster\"\x9e\x01\n" +
 	"\x12SandboxRosterEntry\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
 	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12.\n" +
-	"\x13projection_ttl_secs\x18\x03 \x01(\rR\x11projectionTtlSecs\";\n" +
+	"\x13projection_ttl_secs\x18\x03 \x01(\rR\x11projectionTtlSecs\x12\x16\n" +
+	"\x06paused\x18\x04 \x01(\bR\x06paused\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\x9c\x02\n" +
 	"\fSandboxEvent\x12\x1d\n" +

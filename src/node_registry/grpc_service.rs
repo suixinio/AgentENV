@@ -584,6 +584,44 @@ impl Scheduler for NodeRegistryGrpcService {
         // means "the registry accepted a heartbeat," nothing more.
         if let Some(binding_store) = &self.binding_store {
             let (roster, legacy) = super::registry::roster_from_heartbeat(&req);
+            // 🔴 The routing half of the roster, and only the routing half.
+            //
+            // The full roster already went into `self.registry.heartbeat`
+            // above, paused entries included, and it has to: that call is what
+            // feeds `rosters_in_cluster`, which is the *sole* renewal source
+            // for a paused sandbox's lease in the cluster registry
+            // (`paused_registry`'s `candidates_from_rosters`). A paused
+            // sandbox dropped from that path loses its lease, and a lapsed
+            // lease on a `publishing`/`local_only` row lets another node claim
+            // a snapshot that exists only on this node's disk.
+            //
+            // What a paused sandbox must not have is a *binding*. The gateway
+            // reads a projection hit as "there is a VM at the other end" and
+            // answers the data plane straight out of it; a hit on a parked
+            // sandbox is how a request that should have woken it gets a 410
+            // instead. Deleting the projection at pause time is not enough on
+            // its own either, because reconciliation reinstalls every entry it
+            // is given and the node keeps naming its paused sandboxes every
+            // five seconds — so the filter belongs here, on the way in, not on
+            // the delete.
+            //
+            // Withholding the entry is also what deletes an already-installed
+            // projection: `reconcile_node` removes the bindings this node owns
+            // that its roster no longer claims. That is the same branch that
+            // makes a resume race benign rather than dangerous — an in-flight
+            // heartbeat built while the sandbox was still `Paused` can delete
+            // a binding the resume has just written, which costs one
+            // projection miss and resolves as a wake that finds the sandbox
+            // already running.
+            let routable: Vec<_> = roster.iter().filter(|e| !e.paused).cloned().collect();
+            let withheld = roster.len() - routable.len();
+            if withheld > 0 {
+                tracing::debug!(
+                    node_id = %node_id,
+                    withheld,
+                    "withholding paused sandboxes from binding reconciliation"
+                );
+            }
             if legacy {
                 // 🔴 Counted per node, not merely logged — mirrors Go's own
                 // comment on `recordLegacyRoster`: this is the number that
@@ -593,7 +631,7 @@ impl Scheduler for NodeRegistryGrpcService {
                 metrics::counter!(HEARTBEAT_LEGACY_ROSTER_METRIC, "node" => node.id.clone())
                     .increment(1);
             }
-            match binding_store.reconcile_node(node, roster, now).await {
+            match binding_store.reconcile_node(node, routable, now).await {
                 Err(err) => {
                     tracing::warn!(
                         node_id = %node_id,
@@ -2027,6 +2065,260 @@ mod tests {
         assert_eq!(binding.node.id, "node-a");
     }
 
+    // ---- paused sandboxes: registered, but never reconciled into a binding ----
+    //
+    // The two tests below are one guard split in half on purpose, because the
+    // two halves fail to two *different* mistakes and a single test would let
+    // either one hide behind the other:
+    //
+    //   * withhold too little -> a parked sandbox keeps a routing projection,
+    //     the gateway reads the hit as "there is a VM there", answers the data
+    //     plane from it and returns 410 instead of waking the sandbox.
+    //   * withhold too much  -> the entry never reaches the *registry*, whose
+    //     roster is the sole renewal source for that sandbox's lease in the
+    //     cluster paused registry. The lease lapses, another node claims a row
+    //     whose snapshot exists only on this node's disk, and the snapshot is
+    //     silently lost.
+    //
+    // The second is the worse failure and the easier one to introduce, since
+    // "filter the paused entries out of the heartbeat" reads like the obvious
+    // implementation right up until you notice which of the two independently
+    // derived rosters you filtered.
+
+    /// A `BindingStore` that records the roster `reconcile_node` was actually
+    /// handed. The filter is asserted on directly rather than inferred from a
+    /// downstream binding, so the test says which roster reached the store
+    /// even when the store would have made the same end state either way.
+    #[derive(Default)]
+    struct RecordingBindingStore {
+        reconciled: std::sync::Mutex<Vec<Vec<crate::node_registry::types::RosterEntry>>>,
+    }
+
+    impl RecordingBindingStore {
+        fn last_roster(&self) -> Vec<crate::node_registry::types::RosterEntry> {
+            self.reconciled
+                .lock()
+                .expect("not poisoned")
+                .last()
+                .cloned()
+                .expect("reconcile_node must have been called at least once")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BindingStore for RecordingBindingStore {
+        async fn get(
+            &self,
+            _sandbox_id: &str,
+            _now: SystemTime,
+        ) -> Result<Option<Binding>, crate::binding_store::BindingStoreError> {
+            Ok(None)
+        }
+        async fn record(
+            &self,
+            _sandbox_id: &str,
+            _binding: Binding,
+            _now: SystemTime,
+        ) -> Result<BindingDecision, crate::binding_store::BindingStoreError> {
+            Ok(BindingDecision::Installed)
+        }
+        async fn reconcile_node(
+            &self,
+            _node: crate::node_registry::types::Node,
+            roster: Vec<crate::node_registry::types::RosterEntry>,
+            _now: SystemTime,
+        ) -> Result<Vec<(String, BindingDecision)>, crate::binding_store::BindingStoreError>
+        {
+            self.reconciled.lock().expect("not poisoned").push(roster);
+            Ok(Vec::new())
+        }
+        async fn delete(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            Ok(BindingDeleteOutcome::Absent)
+        }
+    }
+
+    /// Builds the service in-process, handing back the registry so both sides
+    /// of the split can be observed from one heartbeat.
+    fn service_with_registry(
+        nodes: Vec<Node>,
+        binding_store: Arc<dyn BindingStore>,
+    ) -> (Arc<AtomicNodeRegistry>, NodeRegistryGrpcService) {
+        let registry = Arc::new(AtomicNodeRegistry::new(nodes, Duration::from_secs(30)));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            SystemTime::now(),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warmup)
+            .with_binding_store(binding_store, true, Duration::ZERO);
+        (registry, service)
+    }
+
+    /// One node reporting one running sandbox and one paused one.
+    fn heartbeat_with_a_paused_sandbox() -> HeartbeatRequest {
+        HeartbeatRequest {
+            node_id: "node-a".to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: "node-a-instance".to_string(),
+            roster: vec![
+                scheduler::SandboxRosterEntry {
+                    sandbox_id: "sbx-running".to_string(),
+                    execution_id: "0199a000-0000-7000-8000-000000000001".to_string(),
+                    paused: false,
+                    ..Default::default()
+                },
+                scheduler::SandboxRosterEntry {
+                    sandbox_id: "sbx-parked".to_string(),
+                    execution_id: "0199a000-0000-7000-8000-000000000002".to_string(),
+                    paused: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_withholds_paused_sandboxes_from_binding_reconciliation() {
+        let store = Arc::new(RecordingBindingStore::default());
+        let (_registry, service) = service_with_registry(
+            vec![node("node-a", "http://node-a")],
+            Arc::clone(&store) as Arc<dyn BindingStore>,
+        );
+
+        service
+            .heartbeat(Request::new(heartbeat_with_a_paused_sandbox()))
+            .await
+            .expect("node-a heartbeats");
+
+        let reconciled: Vec<String> = store
+            .last_roster()
+            .into_iter()
+            .map(|entry| entry.sandbox_id)
+            .collect();
+
+        // 🔴 Asserted as an exact set, not with `contains`. A `!contains`
+        // assertion would also pass if the roster arrived empty, which is the
+        // over-withholding mistake the sibling test exists to catch -- and a
+        // guard that passes under the failure next door is not a guard.
+        assert_eq!(
+            reconciled,
+            vec!["sbx-running".to_string()],
+            "binding reconciliation must receive the running sandbox and only the running \
+             sandbox: a projection for a parked sandbox is what makes the gateway answer the \
+             data plane with 410 instead of waking it"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_still_registers_paused_sandboxes_so_their_leases_keep_renewing() {
+        let store = Arc::new(RecordingBindingStore::default());
+        let (registry, service) = service_with_registry(
+            vec![node("node-a", "http://node-a")],
+            Arc::clone(&store) as Arc<dyn BindingStore>,
+        );
+
+        service
+            .heartbeat(Request::new(heartbeat_with_a_paused_sandbox()))
+            .await
+            .expect("node-a heartbeats");
+
+        let (roster, _last_seen) = registry
+            .roster_of("node-a")
+            .expect("the node reported, so it has a roster");
+        let held: Vec<&str> = roster
+            .iter()
+            .map(|entry| entry.sandbox_id.as_str())
+            .collect();
+        assert_eq!(
+            held,
+            vec!["sbx-running", "sbx-parked"],
+            "🔴 the registry roster must keep the paused sandbox. It is the only thing that \
+             renews that sandbox's lease in the cluster paused registry \
+             (`candidates_from_rosters` reads exactly these entries); dropping it here lets the \
+             lease lapse and another node claim a row whose snapshot lives on this node's disk \
+             alone"
+        );
+        assert!(
+            roster
+                .iter()
+                .any(|entry| entry.sandbox_id == "sbx-parked" && entry.paused),
+            "and it must keep it flagged as paused, not launder it into a running entry"
+        );
+
+        assert_eq!(
+            registry.nodes_holding("sbx-parked"),
+            vec!["node-a".to_string()],
+            "🔴 the reverse index must still name the node holding the paused sandbox: this is \
+             what answers 'who has this snapshot' after the projection is gone"
+        );
+        assert_eq!(
+            registry.nodes_holding("sbx-running"),
+            vec!["node-a".to_string()],
+            "and the running sandbox is unaffected"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_removes_the_projection_of_a_sandbox_that_has_since_paused() {
+        // The end-to-end shape of the cluster failure, against a real store:
+        // a sandbox that was running (and so had a projection) pauses, and the
+        // next heartbeat must take its projection away rather than reinstall
+        // it. Reinstalling is exactly what shipped -- the roster named the
+        // paused sandbox, reconciliation installs every entry it is given, and
+        // the five-second heartbeat meant the record never got the chance to
+        // expire.
+        let store: Arc<dyn BindingStore> =
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings::default(),
+            ));
+        let (_registry, service) =
+            service_with_registry(vec![node("node-a", "http://node-a")], Arc::clone(&store));
+
+        let mut running = heartbeat_with_a_paused_sandbox();
+        running.roster[1].paused = false;
+        service
+            .heartbeat(Request::new(running))
+            .await
+            .expect("node-a heartbeats while both sandboxes run");
+        assert!(
+            store
+                .get("sbx-parked", SystemTime::now())
+                .await
+                .unwrap()
+                .is_some(),
+            "precondition: while it is running the sandbox does hold a projection"
+        );
+
+        service
+            .heartbeat(Request::new(heartbeat_with_a_paused_sandbox()))
+            .await
+            .expect("node-a heartbeats again, now with the sandbox paused");
+
+        assert!(
+            store
+                .get("sbx-parked", SystemTime::now())
+                .await
+                .unwrap()
+                .is_none(),
+            "the projection must be gone once the node reports the sandbox as paused, so the \
+             gateway takes its wake path instead of routing to a VM that is not running"
+        );
+        assert!(
+            store
+                .get("sbx-running", SystemTime::now())
+                .await
+                .unwrap()
+                .is_some(),
+            "and the running sandbox must keep its projection through the same reconcile"
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_fails_with_unavailable_when_the_binding_store_reconcile_fails() {
         let store: Arc<dyn BindingStore> = Arc::new(FailingBindingStore);
@@ -2854,6 +3146,7 @@ mod tests {
                     sandbox_id: sandbox_id.to_string(),
                     execution_id: execution_id.to_string(),
                     projection_ttl_secs: 0,
+                    paused: false,
                 })
                 .collect(),
             ..Default::default()

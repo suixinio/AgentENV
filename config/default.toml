@@ -152,7 +152,7 @@ peer_discovery_refresh_interval_secs = 5
 # timeout_ms = 5000
 
 [cluster]
-# Where `--role api` resolves node placement (`Schedule`/`LookupNode`/
+# Where `aenv-api` resolves node placement (`Schedule`/`LookupNode`/
 # `RecordAssignment`, and a known node's own address) from.
 #
 #   node_placement_source = "scheduler"  (the default) dials
@@ -183,18 +183,21 @@ peer_discovery_refresh_interval_secs = 5
 # deprecated [observability.scheduler_report].scheduler_endpoint_file if unset.
 # scheduler_endpoint_file = "/etc/agentenv/heartbeat/scheduler-endpoint"
 
-# Where `--role node` serves the node sandbox service: the gRPC surface the API
+# Where `aenv-node` serves the node sandbox service: the gRPC surface the API
 # half drives a machine through. A second listener rather than a route on the
 # HTTP port below, because the two have different audiences — this one is
 # spoken to only by the API half.
 #
-# 🔴 Bound by `--role node` only. `--role all` deliberately does not open it:
-# `all` is the rollback target and is defined as the process that ran before
-# the split, so anything it gains stops it from being that.
+# 🔴 Bound by `aenv-node` only (`assemble_node`,
+# `crates/aenv-node/src/bin/aenv-node.rs`). `aenv-api` never opens it: it is
+# this port's client, reaching a node at `node_service_port` below.
 node_service_addr = "0.0.0.0:8001"
 
-# Where `--role api` serves the data plane's wake-up surface. Bound by
-# `--role api` only; the gateway's cold path is its only caller.
+# Where `aenv-api` serves the data plane's wake-up surface. Bound by
+# `aenv-api` only (`assemble_api`, `crates/aenv-api/src/bin/aenv-api.rs`).
+# The gateway's cold path calls it, and under `node_placement_source =
+# "native"` nodes' heartbeats land on the same listener — one port, two
+# gRPC services multiplexed by HTTP/2 path (`src/api/grpc/mod.rs`).
 api_grpc_addr = "0.0.0.0:8002"
 
 # The port the API half reaches a node's `node_service_addr` on.
@@ -207,10 +210,13 @@ api_grpc_addr = "0.0.0.0:8002"
 node_service_port = 8001
 
 [pg]
-# Shared PostgreSQL connection settings for the control plane (--role api /
-# --role all), consumed by src/pg/mod.rs. Empty on purpose: `dsn` is a
-# credential and this file is copied verbatim over the cluster ConfigMap on
-# every `make k8s-apply` (deploy/k8s/run.sh), so it can never carry one.
+# Shared PostgreSQL connection settings for the control plane (`aenv-api`
+# only), consumed by crates/aenv-api/src/pg/mod.rs. `aenv-node` cannot link a
+# PostgreSQL client and refuses to start when this section carries a `dsn` at
+# all (`refuse_configured_pg_dsn`, crates/aenv-node/src/bin/aenv-node.rs).
+# Empty on purpose: `dsn` is a credential and this file is copied verbatim
+# over the cluster ConfigMap on every `make k8s-apply` (deploy/k8s/run.sh), so
+# it can never carry one.
 # `the_bundled_default_config_never_carries_a_pg_dsn` fails the build if it
 # ever does.
 #
@@ -221,7 +227,7 @@ node_service_port = 8001
 #
 # dsn = "postgres://user:password@host:5432/dbname"
 #
-# Per-replica pool cap. `--role api` runs more than one replica, so the
+# Per-replica pool cap. `aenv-api` runs more than one replica, so the
 # cluster-wide connection count is `replica_count * max_connections`, not
 # this number alone. Defaults to 8 when unset.
 # max_connections = 8
@@ -239,14 +245,14 @@ node_service_port = 8001
 #   backend = "in_memory"  (the code default) one replica's own table, lost
 #                           when it exits. Correct only for a single-replica
 #                           deployment.
-#   backend = "redis"      the shared table every `--role api` replica reads
-#                           and writes. `--role api` runs more than one
+#   backend = "redis"      the shared table every `aenv-api` replica reads
+#                           and writes. `aenv-api` runs more than one
 #                           replica (`agentenv-api-deployment.yaml`'s
 #                           `replicas: 2`), so this is the only backend that
 #                           deployment may run under `node_placement_source =
 #                           "native"` — `build_binding_store`
-#                           (`src/bin/server.rs`) refuses to start on
-#                           "in_memory" in that mode, the same guard
+#                           (`crates/aenv-api/src/bin/aenv-api.rs`) refuses to
+#                           start on "in_memory" in that mode, the same guard
 #                           [orchestrator.store] already has for the sandbox
 #                           ledger.
 # backend = "redis"
@@ -352,15 +358,17 @@ projection_ttl_grace_secs = 60
 # Where this process's orchestrator keeps its active-state records.
 #
 #   backend = "in_memory"  this process's own ledger, lost when it exits. What
-#                          `--role all` and `--role node` want: their records
-#                          describe the sandboxes on this machine, and a
-#                          machine that is gone has no sandboxes.
+#                          a machine-local ledger wants: its records describe
+#                          the sandboxes on this machine, and a machine that
+#                          is gone has no sandboxes.
 #   backend = "redis"      the cluster's shared store, so every API replica
 #                          reads and writes one ledger.
 #
-# 🔴 `--role api` refuses to start on "in_memory" rather than starting a
-# replica whose ledger no other replica can see. `--role all` never reads this
-# section at all — it is the rollback target and keeps the store it always had.
+# 🔴 Read by `aenv-api` only, and `aenv-api` refuses to start on "in_memory"
+# rather than starting a replica whose ledger no other replica can see
+# (`cluster_store_config`, crates/aenv-api/src/bin/aenv-api.rs). `aenv-node`
+# never reads this section at all: it always builds an `InMemoryMetadataStore`
+# for the sandboxes on its own machine, whatever is set here.
 #
 # 🔴 Selected through AENV_ORCHESTRATOR_STORE_BACKEND, not by editing the copy
 # of this file that lands in the cluster ConfigMap; see the note below.
@@ -396,11 +404,14 @@ redis_distributed_lock_enabled = true
 #   original ID. The registry is reached over gRPC through the scheduler, which
 #   owns the database. Requires [cluster].scheduler_endpoint; a "central"
 #   backend with no endpoint fails startup rather than falling back.
-# - "postgres": --role api (and --role all) connect directly to the registry
-#   database over the shared [pg] pool, folding the scheduler's registry
-#   service into this process. --role api requires a heartbeat roster source
-#   ([cluster].node_placement_source = "native") to select this backend;
-#   --role all does not.
+# - "postgres": aenv-api connects directly to the registry database over the
+#   shared [pg] pool, folding the scheduler's registry service into that
+#   process. It requires a heartbeat roster source
+#   ([cluster].node_placement_source = "native") to select this backend, and
+#   requires it unconditionally — aenv-api is the only process that builds
+#   this registry at all. aenv-node ignores whatever is set here: it warns and
+#   wires a registry that records nothing, because cluster-wide records belong
+#   to the API half.
 #
 # 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
 # editing the copy of this file that lands in the cluster ConfigMap — see
@@ -463,7 +474,7 @@ p2p_enabled = true
 #                           and no scheduler dependency — [pg] alone. Refused
 #                           at startup unless the read side was already
 #                           confirmed onto PostgreSQL first (see below).
-#                           --role node never builds a catalog of any kind
+#                           aenv-node never builds a catalog of any kind
 #                           under this backend or any other: its two
 #                           request-time catalog reads are pre-resolved by
 #                           api and sent down with the request (task's own

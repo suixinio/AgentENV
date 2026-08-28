@@ -126,15 +126,19 @@ services:
       # verify. Fixed here because this is a local dev stack; never reuse it.
       AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED: agentenv-compose-dev-access-token-hash-seed
       # 🔴 Native topology (阶段四 E4 in compose): this replica answers its own
-      # Schedule/LookupNode/RecordAssignment and node heartbeats in-process
-      # instead of dialling `services/scheduler` — same switch
-      # `deploy/k8s/base/agentenv-api-deployment.yaml` runs, with the same
-      # paired requirements (see the keys below).
-      AENV_NODE_PLACEMENT_SOURCE: native
-      # Mandatory even under native: `ResumeWiring::cluster_from_config`
-      # (the `WakeSite::Remote` placement source) always dials
-      # `[cluster].scheduler_endpoint` for LookupNode and refuses to start on
-      # an empty one, regardless of AENV_NODE_PLACEMENT_SOURCE. Self-pointing,
+      # Schedule/LookupNode/RecordAssignment and node heartbeats in-process,
+      # unconditionally, instead of dialling `services/scheduler` — same
+      # paired requirements `deploy/k8s/base/agentenv-api-deployment.yaml`
+      # runs (see the keys below). There used to be an
+      # `AENV_NODE_PLACEMENT_SOURCE: native` key here selecting this instead
+      # of a `"scheduler"` alternative that dialled a Go scheduler process;
+      # that process and the switch are both gone (see CLAUDE.md's
+      # "Distributed Control Plane" section) — this is simply how it works
+      # now, with no key to set.
+      #
+      # `ResumeWiring::cluster_from_config` (the `WakeSite::Remote` placement
+      # source) separately, and always, dials `[cluster].scheduler_endpoint`
+      # for LookupNode and refuses to start on an empty one. Self-pointing,
       # same as `agentenv-api-deployment.yaml`'s own copy of this key:
       # `agentenv-api:8002` answers both LookupNode (in-process,
       # NodeRegistryGrpcService) and ResumeSandbox on the same listener.
@@ -251,8 +255,8 @@ services:
       GATEWAY_HTTP_LISTEN_ADDR: :8080
       # 🔴 阶段四 E4: `agentenv-api:8002`, not the (now removed) `scheduler`
       # service — Schedule/LookupNode/RecordAssignment and node heartbeats are
-      # all answered in-process by `aenv-api`'s own `NodeRegistryGrpcService`
-      # now that it runs `AENV_NODE_PLACEMENT_SOURCE=native`. Same value
+      # all answered in-process by `aenv-api`'s own `NodeRegistryGrpcService`,
+      # unconditionally. Same value
       # `deploy/k8s/base/config/gateway.json`'s `gateway.scheduler_addr` uses.
       GATEWAY_SCHEDULER_ADDR: agentenv-api:8002
       # 🔴 No longer optional (R9, `services/shared/config`'s `Config.Validate`):

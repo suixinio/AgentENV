@@ -23,10 +23,12 @@ topology is no longer blocked on a Kubernetes API to discover nodes against.
 The pieces confirmed to exist and to be exercised by a real deployment today
 (`deploy/docker-compose.yml`) are:
 
-- `[cluster].node_placement_source = "native"` (env
-  `AENV_NODE_PLACEMENT_SOURCE=native`) makes `aenv-api` answer node
-  placement/heartbeat/paused-registry itself instead of dialing a Scheduler
-  process — there is none to dial any more.
+- `aenv-api` answers node placement/heartbeat/paused-registry itself,
+  unconditionally, instead of dialing a Scheduler process — there is none to
+  dial any more, and no switch left to choose otherwise (the
+  `[cluster].node_placement_source` field this used to require setting to
+  `"native"` is deleted along with the `"scheduler"` alternative it selected
+  against).
 - `[cluster].node_discovery_mode = "static"` (env
   `AENV_CLUSTER_NODE_DISCOVERY_MODE=static`) makes that native registry seed
   itself from a configured node list instead of Kubernetes EndpointSlice

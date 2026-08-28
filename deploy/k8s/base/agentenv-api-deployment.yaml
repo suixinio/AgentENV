@@ -65,8 +65,8 @@ spec:
       # src/node_registry/kubernetes_discovery.rs the same
       # endpointslices/pods get/list/watch access agentenv-scheduler used to
       # need, via serviceaccount.yaml/rolebinding.yaml's agentenv-api
-      # identity — required now that [cluster].node_placement_source =
-      # "native" is this Deployment's own default (阶段四 E3).
+      # identity — required now that this process always builds its own node
+      # registry, unconditionally (阶段四 E3).
       serviceAccountName: agentenv-api
       nodeSelector:
         kubernetes.io/os: linux
@@ -187,13 +187,11 @@ spec:
             # heartbeat-roster `NodeRegistry` handle for this backend —
             # unconditionally, not behind any role test: `aenv-api` is the only
             # caller that function has ever had, and no process links both
-            # halves. That handle exists only
-            # under `AENV_NODE_PLACEMENT_SOURCE = "native"` below — without
-            # it, `running` rows have no lease-renewal path and are wrongly
-            # reclaimed even while healthy (the exact failure Fix A, commit
-            # `151d00b`, closed for the `central` backend). The two switches
-            # must move together; flipping only this one CrashLoops the Pod
-            # with a bail naming exactly that.
+            # halves. That handle always exists — `aenv-api` builds its own
+            # node registry unconditionally now — without it, `running` rows
+            # would have no lease-renewal path and would be wrongly reclaimed
+            # even while healthy (the exact failure Fix A, commit `151d00b`,
+            # closed for the `central` backend).
             #
             # Not a configMapKeyRef, for the same reason as the store above: the
             # node's copy of this key may fall back to `local` and still be
@@ -288,9 +286,8 @@ spec:
             # (`crates/aenv-api/src/bin/aenv-api.rs`), which hands this address
             # to `spawn_grpc_surface` and serves the bound listener with
             # `aenv_api::api::grpc::serve_on`. Two gRPC services share that one
-            # listener, multiplexed by HTTP/2 path: `SandboxResumeService`
-            # always, plus `NodeRegistryGrpcService`'s `Scheduler` service under
-            # `AENV_NODE_PLACEMENT_SOURCE = "native"` below. So both of this
+            # listener, always, multiplexed by HTTP/2 path: `SandboxResumeService`
+            # and `NodeRegistryGrpcService`'s `Scheduler` service. So both of this
             # port's callers land here — the gateway's cold path, pointed at it
             # by `GATEWAY_RESUME_ADDR=agentenv-api:8002`, and every node's
             # heartbeat, pointed at it by
@@ -371,10 +368,11 @@ spec:
             #      (`src/api/impls/resume_surface.rs`) — the wake-site
             #      placement source for `WakeSite::Remote`. It hard-refuses
             #      to start with an empty endpoint ("aenv-api needs
-            #      [cluster].scheduler_endpoint") and is **not** gated by
-            #      `AENV_NODE_PLACEMENT_SOURCE` the way `placement`
-            #      (`cluster_placement`, driving create/build) is — it always
-            #      dials this endpoint's `LookupNode` RPC. Pointed at
+            #      [cluster].scheduler_endpoint") and always dials this
+            #      endpoint's `LookupNode` RPC — unlike `placement`
+            #      (`cluster_placement`, driving create/build), which answers
+            #      from `aenv-api`'s own in-process node registry instead and
+            #      never dials this endpoint at all. Pointed at
             #      `agentenv-api:8002`, that RPC is answered for real by this
             #      same `NodeRegistryGrpcService.lookup_node`
             #      (`src/node_registry/grpc_service.rs`, already exercised
@@ -398,35 +396,29 @@ spec:
             # (or restoring the scheduler manifests and a compatible
             # scheduler image from git history) alongside
             # kustomization.yaml's heartbeat key and this Deployment's
-            # `AENV_NODE_PLACEMENT_SOURCE` / `AENV_PAUSED_REGISTRY_BACKEND`
-            # — a genuine restart either way, since this key has no mounted
-            # hot-reload file the way the DaemonSet's copy does
-            # (`ResumeWiring::cluster_from_config` builds its
-            # `SchedulerEndpointSource` from
+            # `AENV_PAUSED_REGISTRY_BACKEND` — a genuine restart either way,
+            # since this key has no mounted hot-reload file the way the
+            # DaemonSet's copy does (`ResumeWiring::cluster_from_config`
+            # builds its `SchedulerEndpointSource` from
             # `[cluster].scheduler_endpoint_file` too, but nothing here sets
             # that file up).
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
               value: http://agentenv-api:8002
-            # 🔴 阶段四 E3 (task's own label): `native`, no longer the
-            # rollout's eventual step 2 — this Deployment's own permanent
-            # default now, alongside `AENV_PAUSED_REGISTRY_BACKEND=postgres`
-            # above, which *requires* it (see that key's own comment: the
-            # `postgres` paused-registry backend refuses to start under
-            # `aenv-api` without a heartbeat-roster `NodeRegistry`, which
-            # only `native` builds). The two switches move together in one
-            # apply, not two `kubectl set env` steps across a rollout window.
+            # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` requires a heartbeat-roster
+            # `NodeRegistry` (see that key's own comment above) — `aenv-api`
+            # always builds one, unconditionally, so there is no companion
+            # switch left to keep in step with this one; there used to be an
+            # `AENV_NODE_PLACEMENT_SOURCE` env var doing exactly that, but the
+            # `"scheduler"` alternative it selected between (dialling a Go
+            # scheduler process for placement instead of answering from this
+            # process's own registry) is gone along with that process, and
+            # the switch was deleted with it — `aenv-api` refuses to start if
+            # this env var is still set (`cfg::refuse_removed_node_placement_source_env_var`).
             #
-            # Rollback is a Pod restart on this Deployment with this value set
-            # back to `"scheduler"` — `node_placement_source` is read once at
-            # startup (`start_native_node_registry`,
-            # `crates/aenv-node/src/bin/aenv-node.rs`), unlike the DaemonSet's
-            # hot-reloadable heartbeat target, so there is no live-reload path
-            # for this value alone.
-            #
-            # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` does not roll back alongside
-            # it any more. `"central"` — the backend that used to pair with
-            # `"scheduler"` here — is gone, not merely unused:
-            # `PausedRegistryBackendKind::Central` and
+            # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` does not roll back on its own
+            # any more. `"central"` — the backend that used to pair with the
+            # now-deleted `"scheduler"` placement source — is gone, not
+            # merely unused: `PausedRegistryBackendKind::Central` and
             # `CentralPausedSandboxRegistry` were deleted along with the Go
             # scheduler they dialled, so setting `AENV_PAUSED_REGISTRY_BACKEND
             # =central` now refuses to start rather than rolling back. A
@@ -434,19 +426,14 @@ spec:
             # "restore the scheduler manifests from git history" step named
             # above for `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, not a value
             # this Deployment can still express.
-            - name: AENV_NODE_PLACEMENT_SOURCE
-              value: "native"
-            # 🔴 P4 (task's own "phase4-close"): carried here now, ahead of
-            # the `native` flip above, precisely so that flip is the single
-            # `kubectl set env` step 2 already describes it as — not also a
-            # second one to remember for this. `[binding_store]` backs
-            # `Schedule`/`LookupNode`/`RecordAssignment` once native
-            # placement answers them locally (`NativeNodePlacement`,
+            # 🔴 P4 (task's own "phase4-close"): `[binding_store]` backs
+            # `Schedule`/`LookupNode`/`RecordAssignment`, which native
+            # placement always answers locally (`NativeNodePlacement`,
             # `src/node_client/native_placement.rs`), and this Deployment
             # runs `replicas: 2`: the code default (`in_memory`) is one
             # replica's private routing table, and `build_binding_store`
-            # (`crates/aenv-node/src/bin/aenv-node.rs`) now refuses to start on it under
-            # `node_placement_source = "native"` — the same refusal
+            # (`crates/aenv-node/src/bin/aenv-node.rs`) refuses to start on it
+            # unconditionally — the same refusal
             # `AENV_ORCHESTRATOR_STORE_BACKEND`'s own comment above
             # describes for the sandbox ledger. The same Redis, the same
             # key prefix the store defaults to (`agentenv:scheduler:bindings`)
@@ -491,8 +478,8 @@ spec:
             # nodes whose heartbeat happens to land on it — this is what
             # `gateway`'s own `/nodes` split in half under two replicas.
             # `wire_shared_node_observed_store` (`src/bin/aenv-api.rs`) now
-            # refuses to start under `node_placement_source = "native"` on
-            # the in-memory default, the same discipline
+            # refuses to start unconditionally on the in-memory default, the
+            # same discipline
             # `AENV_BINDING_STORE_BACKEND`'s own comment above describes.
             # The same Redis, a namespace of its own
             # (`agentenv:node-registry`, not `agentenv:scheduler:bindings`
@@ -507,9 +494,9 @@ spec:
             # (mounted there as a file, not env — `deploy/k8s/base/config/
             # scheduler.json`, deleted along with `services/scheduler`; this
             # port carries forward the values it used to name rather than a
-            # fresh guess). `aenv-api` refuses to start under
-            # `node_placement_source = "native"` with the namespace/service
-            # name unset (`crates/aenv-node/src/bin/aenv-node.rs`), so these three have no
+            # fresh guess). `aenv-api` refuses to start unconditionally with
+            # the namespace/service name unset
+            # (`crates/aenv-node/src/bin/aenv-node.rs`), so these three have no
             # default of their own; port/scheme are written out explicitly
             # even though they already match `cfg.rs`'s defaults, so a reader
             # does not have to know that to see what this Deployment

@@ -578,7 +578,6 @@ mod tests {
         scheduler_endpoint_file: Option<&str>,
     ) -> ClusterConfig {
         ClusterConfig {
-            node_placement_source: crate::cfg::NodePlacementSource::Scheduler,
             scheduler_endpoint: endpoint.map(|s| s.to_string()),
             scheduler_endpoint_file: scheduler_endpoint_file.unwrap_or_default().to_string(),
             node_service_addr: "0.0.0.0:8001".to_string(),

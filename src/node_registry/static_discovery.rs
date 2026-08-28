@@ -106,8 +106,7 @@ mod tests {
     /// Go process left reading that file's `scheduler` block at all.
     ///
     /// What is still real and worth pinning: `deploy/docker-compose.yml` runs
-    /// `aenv-api` with `AENV_CLUSTER_NODE_DISCOVERY_MODE=static`
-    /// (`[cluster].node_placement_source = "native"`) and
+    /// `aenv-api` with `AENV_CLUSTER_NODE_DISCOVERY_MODE=static` and
     /// `AENV_CONFIG_OVERLAY_PATH` naming
     /// `deploy/docker/config/cluster-static-discovery-overlay.toml` — the
     /// tracked, credential-free overlay that is the *only* way

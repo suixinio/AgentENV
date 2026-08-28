@@ -4,15 +4,16 @@
 //! `strategy.go`, `warmup.go`, `cpu_template.go`).
 //!
 //! `aenv-api`'s `assemble_api` builds this module's registry unconditionally
-//! now and answers every placement question from it — see
+//! and answers every placement question from it — see
 //! [`crate::node_client::NativeNodePlacement`] (the placement-side consumer)
 //! and [`grpc_service`] (the heartbeat-receiving plane that feeds it). It
-//! used to be conditional on `[cluster].node_placement_source = "native"`,
-//! with a `"scheduler"` alternative under which `assemble_api` built none of
-//! this at all — no registry, no kube client, no gRPC service — but that
-//! alternative dialled a Go scheduler process that is deleted from the tree
-//! (see "Distributed Control Plane" in the repo's top-level `CLAUDE.md`), so
-//! this tree is what every `aenv-api` replica runs now, always.
+//! used to be conditional on a now-deleted `[cluster].node_placement_source`
+//! switch, with a `"scheduler"` alternative under which `assemble_api` built
+//! none of this at all — no registry, no kube client, no gRPC service — but
+//! that alternative dialled a Go scheduler process that is deleted from the
+//! tree (see "Distributed Control Plane" in the repo's top-level
+//! `CLAUDE.md`), so this tree is what every `aenv-api` replica runs now,
+//! always, with no switch left to turn it off.
 //!
 //! # 🔴 P6-e: the Go test-parity count, precisely
 //!

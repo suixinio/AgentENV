@@ -976,29 +976,6 @@ pub struct ObservabilitySchedulerReportConfig {
     pub interval_secs: u64,
 }
 
-/// 🔴 Vestigial: nothing reads this any more. It used to choose where
-/// `aenv-api` resolved a known node's current address for
-/// [`crate::node_client::placement::NodePlacement::resolve_node`] and
-/// [`crate::node_client::placement::NodePlacement::node_membership`] —
-/// `Scheduler` (the code default) asked `[cluster].scheduler_endpoint` over
-/// gRPC, through the now-deleted `SchedulerNodePlacement`; `Native` answered
-/// every `NodePlacement` method from api's own process instead
-/// (`crate::node_client::NativeNodePlacement`). That Go scheduler process is
-/// deleted from the tree (see "Distributed Control Plane" in the repo's
-/// top-level `CLAUDE.md`), so `Native` is what `src/bin/aenv-api.rs`'s
-/// `cluster_placement`/`start_native_node_registry` always build now,
-/// unconditionally — Kubernetes discovery (`[cluster.kubernetes_discovery]`)
-/// and the heartbeat-receiving gRPC service both start regardless of what
-/// this field is set to. The field and this enum are kept only for one more
-/// commit's worth of config-surface stability; see
-/// [`ClusterConfig::node_placement_source`]'s own doc comment.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NodePlacementSource {
-    Scheduler,
-    Native,
-}
-
 /// The shared-roster fix: which backend
 /// [`crate::node_registry::registry::AtomicNodeRegistry`]'s
 /// heartbeat-derived ("observed") state — machine info, CPU config,
@@ -1037,10 +1014,10 @@ pub enum NodeRegistryObservedBackendKind {
 }
 
 /// The shared-roster fix's own tuning, nested under [`ClusterConfig`]
-/// because it only ever matters alongside
-/// [`NodePlacementSource::Native`] (`[cluster.kubernetes_discovery]`'s own
-/// sibling). Never read under [`NodePlacementSource::Scheduler`] (the
-/// default) — see [`NodePlacementSource`]'s own doc comment.
+/// alongside [`ClusterConfig::kubernetes_discovery`] — both are read
+/// unconditionally: `aenv-api` always builds its own node registry, kube
+/// discovery, and the heartbeat-receiving gRPC service, with nothing left to
+/// gate any of it on.
 #[derive(Debug, Config, Clone)]
 pub struct ClusterNodeRegistryStoreConfig {
     /// See [`NodeRegistryObservedBackendKind`].
@@ -1095,8 +1072,10 @@ pub struct ClusterNodeRegistryStoreConfig {
     pub redis_connect_timeout_ms: u64,
 }
 
-/// Which discovery strategy seeds [`NodePlacementSource::Native`]'s node
-/// registry. Mirrors `services/shared/config.SchedulerDiscoveryConfig.Mode`
+/// Which discovery strategy seeds `aenv-api`'s node registry — built
+/// unconditionally, with nothing left to make that registry conditional on.
+/// Mirrors
+/// `services/shared/config.SchedulerDiscoveryConfig.Mode`
 /// (`"static"` or `"kubernetes"`, validated in `services/shared/config/config.go`'s
 /// `Config.validate` and dispatched in `services/scheduler/cmd/main.go`'s
 /// `switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))`).
@@ -1108,8 +1087,7 @@ pub struct ClusterNodeRegistryStoreConfig {
 /// `Nodes: []Node{{ID: "local-node", Endpoint: "http://127.0.0.1:8000"}}`).
 /// This process ships no such fallback list — [`ClusterConfig::static_discovery_nodes`]
 /// defaults to empty — so defaulting the *mode* to `Static` here would make
-/// every already-deployed `[cluster].node_placement_source = "native"`
-/// cluster (`deploy/k8s/base`, configured only with
+/// every already-deployed cluster (`deploy/k8s/base`, configured only with
 /// `[cluster.kubernetes_discovery]`, never with a static node list) refuse
 /// to start the moment this switch shipped. Defaulting to `Kubernetes`
 /// keeps that fleet's dependency footprint and behavior byte-for-byte
@@ -1140,12 +1118,6 @@ pub struct ClusterStaticDiscoveryNode {
 
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
-    /// 🔴 Vestigial — see [`NodePlacementSource`]'s own doc comment. Setting
-    /// this to anything no longer changes `aenv-api`'s behavior; kept for one
-    /// more commit's worth of config-surface stability before the field, the
-    /// enum, and `AENV_NODE_PLACEMENT_SOURCE` are all deleted.
-    #[config(default = "scheduler", env = "AENV_NODE_PLACEMENT_SOURCE")]
-    pub node_placement_source: NodePlacementSource,
     /// Shared gRPC scheduler endpoint for cluster-level services.
     #[config(
         env = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
@@ -1219,16 +1191,14 @@ pub struct ClusterConfig {
     /// [`node_service_addr`]: ClusterConfig::node_service_addr
     #[config(default = 8001u16, env = "AENV_NODE_SERVICE_PORT")]
     pub node_service_port: u16,
-    /// Which discovery strategy [`NodePlacementSource::Native`]'s node
-    /// registry is seeded from. See [`ClusterNodeDiscoveryMode`]. Only read
-    /// under `Native` — see [`NodePlacementSource`]'s doc comment.
+    /// Which discovery strategy `aenv-api`'s node registry is seeded from —
+    /// read unconditionally, see [`ClusterNodeDiscoveryMode`].
     #[config(default = "kubernetes", env = "AENV_CLUSTER_NODE_DISCOVERY_MODE")]
     pub node_discovery_mode: ClusterNodeDiscoveryMode,
-    /// Kubernetes EndpointSlice/Pod discovery for
-    /// [`NodePlacementSource::Native`]'s node registry. Read, and a kube
-    /// client built, only when `node_placement_source = "native"` and
+    /// Kubernetes EndpointSlice/Pod discovery for `aenv-api`'s node
+    /// registry. Read, and a kube client built, whenever
     /// [`Self::node_discovery_mode`] is [`ClusterNodeDiscoveryMode::Kubernetes`]
-    /// (the default) — see [`NodePlacementSource`]'s doc comment.
+    /// (the default) — unconditionally.
     #[config(nested)]
     pub kubernetes_discovery: ClusterKubernetesDiscoveryConfig,
     /// Statically-configured node list, read only when
@@ -1291,10 +1261,10 @@ pub struct ClusterConfig {
 /// no single namespace/Service name every deployment of this process shares
 /// the way `agentenv-system`/`agentenv-nodes` happens to be what
 /// `deploy/k8s/base/config/scheduler.json` (deleted along with
-/// `services/scheduler`) used to pick for the Go scheduler.
-/// `Scheduler` mode (the default) never reads this struct at all, so an
-/// unconfigured cluster with the default placement source is unaffected by
-/// the missing defaults.
+/// `services/scheduler`) used to pick for the Go scheduler. This struct is
+/// read whenever [`ClusterConfig::node_discovery_mode`] is `"kubernetes"`
+/// (the default) — unconditionally, not gated on anything else — so every
+/// deployment that has not opted into static discovery has to set both.
 #[derive(Debug, Config, Clone)]
 pub struct ClusterKubernetesDiscoveryConfig {
     /// The namespace the watched `EndpointSlice`/`Pod` objects live in.
@@ -2713,6 +2683,64 @@ pub fn refuse_removed_scheduler_endpoint_file_env_var_from(
     )
 }
 
+/// The environment variable that used to choose where `aenv-api` resolved
+/// node placement/heartbeat/paused-registry from — `[cluster]
+/// .node_placement_source`'s `env =` binding — and is now removed along with
+/// that field, its `NodePlacementSource` enum, and the `"scheduler"`
+/// alternative it selected (`SchedulerNodePlacement`, which dialled a Go
+/// scheduler process that is itself deleted from the tree; see "Distributed
+/// Control Plane" in this repo's top-level `CLAUDE.md`).
+///
+/// 🔴 Named here and refused — rather than simply deleted from
+/// [`ClusterConfig`]. confique **silently ignores** an environment variable
+/// no field declares, so a manifest that still sets
+/// `AENV_NODE_PLACEMENT_SOURCE` (to either value — `"native"` is exactly as
+/// stale as `"scheduler"`, since `aenv-api` now always answers in-process
+/// unconditionally, with nothing left to switch) would start a perfectly
+/// healthy-looking process while its operator believes the setting still
+/// means something.
+///
+/// Same decision `--role`/`AENV_ROLE`, [`REMOVED_CATALOG_ENV_VARS`], and
+/// [`REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR`] got: an un-migrated manifest
+/// fails loudly instead of being ignored.
+pub const REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR: &str = "AENV_NODE_PLACEMENT_SOURCE";
+
+/// Refuses to start when [`REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR`] is set.
+///
+/// Called from both binaries' entrypoints, before the configuration is
+/// loaded — same placement and reasoning as
+/// [`refuse_removed_scheduler_endpoint_file_env_var`]: the point is to stop a
+/// process whose *manifest* still describes an arrangement this build does
+/// not have, knowable before anything is read.
+pub fn refuse_removed_node_placement_source_env_var() -> Result<()> {
+    refuse_removed_node_placement_source_env_var_from(|name| std::env::var(name).ok())
+}
+
+/// [`refuse_removed_node_placement_source_env_var`] with the environment
+/// injected, so the decision is testable without mutating a process-global
+/// the rest of the test binary is reading concurrently.
+///
+/// 🔴 An empty value counts as set, same reasoning as
+/// [`refuse_removed_catalog_env_vars_from`]: a manifest that sets
+/// `AENV_NODE_PLACEMENT_SOURCE=` has still not been migrated.
+pub fn refuse_removed_node_placement_source_env_var_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    if lookup(REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR).is_none() {
+        return Ok(());
+    }
+
+    bail!(
+        "{name} is set, and this build no longer has the setting it names. `aenv-api` always \
+         resolves node placement/heartbeat/paused-registry from its own in-process node \
+         registry now, unconditionally — the Go scheduler process the \"scheduler\" value used \
+         to dial is deleted from the tree, and the switch that chose between the two is deleted \
+         with it. Remove {name} from this workload's manifest; leaving it set would otherwise be \
+         ignored in silence, and an operator would go on believing it still selects something",
+        name = REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR
+    )
+}
+
 fn resolve_path(home_path: &Path, config_dir: &Path, raw: &Path) -> PathBuf {
     let expanded = match raw.to_str() {
         Some(s) if s.contains(HOME_PATH_PLACEHOLDER) => {
@@ -3152,65 +3180,6 @@ mod tests {
                  environment has to win or `kubectl set env` stops being a rollback"
             );
         }
-    }
-
-    /// Stage A of the scheduler fold
-    /// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): the switch
-    /// that moves `resolve_node`/`node_membership` off the scheduler onto
-    /// api's own node registry (`NativeNodePlacement`, `src/bin/aenv-api.rs`'s
-    /// `cluster_placement`) once set to `Native`. 🔴 P6-d correction: this
-    /// used to say "nothing reads this field's `Native` value yet" — that
-    /// stopped being true once `cluster_placement` and
-    /// `start_native_node_registry` started branching on it. What is still
-    /// true, and the reason this test exists on its own regardless of that
-    /// wiring: the config surface (default, env override, and rejection of
-    /// an unrecognized value) has to hold up by itself, independent of
-    /// whatever reads it.
-    #[test]
-    fn node_placement_source_defaults_to_scheduler_and_is_settable_from_the_environment() {
-        let _env = env_guard();
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let bundled = workspace.join("config/default.toml");
-
-        assert_eq!(
-            ConfigManager::new_from_path(&bundled)
-                .expect("load without the override")
-                .config()
-                .cluster
-                .node_placement_source,
-            NodePlacementSource::Scheduler,
-            "the default must leave every existing deployment on the scheduler-backed path"
-        );
-
-        for (value, expected) in [
-            ("native", NodePlacementSource::Native),
-            ("scheduler", NodePlacementSource::Scheduler),
-        ] {
-            std::env::set_var("AENV_NODE_PLACEMENT_SOURCE", value);
-            let overridden = ConfigManager::new_from_path(&bundled);
-            std::env::remove_var("AENV_NODE_PLACEMENT_SOURCE");
-
-            assert_eq!(
-                overridden
-                    .unwrap_or_else(|err| panic!("load with node_placement_source={value}: {err}"))
-                    .config()
-                    .cluster
-                    .node_placement_source,
-                expected,
-                "AENV_NODE_PLACEMENT_SOURCE={value} did not reach the config"
-            );
-        }
-
-        // A typo must stop the process rather than silently falling back to
-        // `scheduler` — the same "fail loud, not quiet" rule the snapshot
-        // repository backend's own env override follows.
-        std::env::set_var("AENV_NODE_PLACEMENT_SOURCE", "natve");
-        let loaded = ConfigManager::new_from_path(&bundled);
-        std::env::remove_var("AENV_NODE_PLACEMENT_SOURCE");
-        assert!(
-            loaded.is_err(),
-            "node_placement_source=natve was accepted instead of refused"
-        );
     }
 
     /// The three local-disk budgets are per-machine numbers, and the file they
@@ -4289,6 +4258,70 @@ endpoint = "http://second:9000"
         );
     }
 
+    /// 🔴 The direction that matters: a manifest still carrying the removed
+    /// `AENV_NODE_PLACEMENT_SOURCE` stops the process rather than starting it
+    /// with a setting that no longer means anything.
+    #[test]
+    fn a_manifest_still_setting_the_removed_node_placement_source_env_var_is_refused() {
+        let error = refuse_removed_node_placement_source_env_var_from(|probed| {
+            (probed == REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR).then(|| "native".to_string())
+        })
+        .expect_err("the removed env var must stop the process, not be ignored");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR),
+            "the refusal must name the variable an operator has to delete: {rendered}"
+        );
+        assert!(
+            rendered.contains("in-process"),
+            "the refusal must explain that this build always answers in-process now: {rendered}"
+        );
+    }
+
+    /// The refusal must fire for *either* stale value — `"native"` is exactly
+    /// as stale as `"scheduler"` once nothing reads the field either way.
+    #[test]
+    fn a_manifest_still_setting_the_removed_node_placement_source_env_var_to_scheduler_is_refused()
+    {
+        refuse_removed_node_placement_source_env_var_from(|probed| {
+            (probed == REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR).then(|| "scheduler".to_string())
+        })
+        .expect_err("both stale values must be refused, not just one");
+    }
+
+    /// An empty value is still a manifest that has not been migrated.
+    #[test]
+    fn the_removed_node_placement_source_env_var_set_to_nothing_is_still_refused() {
+        refuse_removed_node_placement_source_env_var_from(|probed| {
+            (probed == REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR).then(String::new)
+        })
+        .expect_err("an empty value is set");
+    }
+
+    /// The control, and the half that makes the tests above mean something:
+    /// with the variable unset the check passes, so a green run is "the
+    /// environment is clean" rather than "this function never fires".
+    #[test]
+    fn an_environment_without_the_removed_node_placement_source_env_var_starts() {
+        refuse_removed_node_placement_source_env_var_from(|_| None)
+            .expect("a migrated manifest does not set it and must start");
+    }
+
+    /// The refused name must not still be a declared binding — a name that is
+    /// both refused here and read by confique would be refused before it
+    /// could be read, which is a contradiction somebody should hear about.
+    #[test]
+    fn the_removed_node_placement_source_env_var_is_not_still_a_declared_binding() {
+        let source = include_str!("cfg.rs");
+        assert!(
+            !source.contains(&format!(
+                "env = \"{REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR}\""
+            )),
+            "{REMOVED_NODE_PLACEMENT_SOURCE_ENV_VAR} is refused at startup and still bound to a \
+             config field"
+        );
+    }
+
     #[test]
     fn validate_rejects_zero_memory_snapshot_download_concurrency() {
         let mut config = AppConfig::default();
@@ -4827,7 +4860,6 @@ endpoint = "http://second:9000"
     #[test]
     fn cluster_normalize_trims_and_drops_blank_scheduler_endpoint() {
         let mut config = ClusterConfig {
-            node_placement_source: NodePlacementSource::Scheduler,
             scheduler_endpoint: Some("  ".to_string()),
             scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),
@@ -4843,7 +4875,6 @@ endpoint = "http://second:9000"
         assert_eq!(config.scheduler_endpoint, None);
 
         let mut config = ClusterConfig {
-            node_placement_source: NodePlacementSource::Scheduler,
             scheduler_endpoint: Some("  http://scheduler:9090  ".to_string()),
             scheduler_endpoint_file: String::new(),
             node_service_addr: "0.0.0.0:8001".to_string(),

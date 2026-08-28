@@ -296,7 +296,7 @@ Deployment model:
 
 - `gateway`: Deployment + ClusterIP Service
 - `agentenv-node`: privileged DaemonSet with `/dev/kvm` and hostPath `/var/lib/agentenv`
-- `agentenv-api`: Deployment answering the `Scheduler`/`PausedRegistry` RPCs — see CLAUDE.md's "Distributed Control Plane" section for `[cluster].node_placement_source = "native"` and the rest of that fold
+- `agentenv-api`: Deployment answering the `Scheduler`/`PausedRegistry` RPCs unconditionally, in-process — see CLAUDE.md's "Distributed Control Plane" section for the rest of that fold
 - `agentenv-nodes`: headless Service used by Kubernetes-mode node discovery
 
 Operational notes:

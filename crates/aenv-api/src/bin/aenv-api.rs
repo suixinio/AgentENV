@@ -95,6 +95,13 @@ async fn async_main() -> anyhow::Result<()> {
     // manifest would otherwise start with the heartbeat's hot-reload silently
     // dead rather than refuse to start.
     aenv_api::cfg::refuse_removed_scheduler_endpoint_file_env_var()?;
+    // 🔴 Same reasoning again, for the deleted `[cluster].node_placement_source`
+    // switch: `aenv-api` now always answers placement/heartbeat/paused-registry
+    // from its own in-process node registry, unconditionally, so a manifest
+    // still setting AENV_NODE_PLACEMENT_SOURCE (to either value) would
+    // otherwise start looking healthy while an operator believes the setting
+    // still selects something.
+    aenv_api::cfg::refuse_removed_node_placement_source_env_var()?;
 
     let cli = ApiCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
@@ -1559,6 +1566,35 @@ mod tests {
             "async_main no longer refuses AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE; an \
              un-migrated manifest would then start in silence, and src/cfg.rs's own test of the \
              pure function would still report green"
+        );
+        // 🔴 The mutation control, same reasoning as the catalog scan above.
+        assert!(
+            !async_main.contains("async fn async_main"),
+            "the scan is reading more than async_main's body, so the assertion above proves \
+             nothing about where the call actually is"
+        );
+    }
+
+    /// 🔴 This binary actually refuses a manifest that still sets the removed
+    /// `AENV_NODE_PLACEMENT_SOURCE` switch — the one that used to choose
+    /// between this in-process node registry and dialling a Go scheduler
+    /// process for the same placement/heartbeat/paused-registry answers.
+    ///
+    /// `refuse_removed_node_placement_source_env_var` has its own
+    /// two-direction test in `src/cfg.rs`, and that test stays green with the
+    /// call site deleted — which is the whole failure mode: confique ignores
+    /// an undeclared environment variable, so a manifest that kept setting it
+    /// would start a process that looks entirely healthy while an operator
+    /// believes the setting still selects something.
+    #[test]
+    fn async_main_actually_refuses_the_removed_node_placement_source_env_var() {
+        let source = include_str!("aenv-api.rs");
+        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
+        assert!(
+            async_main.contains("cfg::refuse_removed_node_placement_source_env_var()"),
+            "async_main no longer refuses AENV_NODE_PLACEMENT_SOURCE; an un-migrated manifest \
+             would then start in silence, and src/cfg.rs's own test of the pure function would \
+             still report green"
         );
         // 🔴 The mutation control, same reasoning as the catalog scan above.
         assert!(

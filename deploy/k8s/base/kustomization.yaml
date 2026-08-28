@@ -117,10 +117,9 @@ configMapGenerator:
   # the Go algorithm) — over the api Deployment's gRPC listener
   # (`AENV_API_GRPC_ADDR`, port 8002, fronted by the `agentenv-api` Service
   # the same way `agentenv-scheduler` fronted the real one). That RPC only
-  # answers once `AENV_NODE_PLACEMENT_SOURCE=native` on the api Deployment
-  # (`agentenv-api-deployment.yaml`) — the two switches must move together,
-  # and native placement is the api half's own permanent default now, not a
-  # follow-up step.
+  # answers unconditionally now — the api Deployment
+  # (`agentenv-api-deployment.yaml`) always builds its own node registry,
+  # with no switch left to gate it on.
   #
   # 🔴 Rollback: `http://agentenv-scheduler:9090` no longer resolves to
   # anything — the Go scheduler's Deployment/Service/PDB and the
@@ -133,8 +132,8 @@ configMapGenerator:
   # before `e2734fd` (or restoring the scheduler Deployment/Service/PDB
   # manifests and a compatible scheduler image from git history) and
   # rolling both this key and the api Deployment's
-  # `AENV_NODE_PLACEMENT_SOURCE` / `AENV_PAUSED_REGISTRY_BACKEND` back
-  # together — see that file's own comments.
+  # `AENV_PAUSED_REGISTRY_BACKEND` back together — see that file's own
+  # comments.
   #
   # 🔴 It used to be a bare literal in that file, with not even the
   # indirection every other cluster-specific value here already gets — so

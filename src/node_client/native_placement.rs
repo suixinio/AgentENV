@@ -1,10 +1,11 @@
 //! [`NativeNodePlacement`]: `aenv-api`'s only [`NodePlacement`] implementation.
-//! It used to be one of two — the `Native` half of
-//! `[cluster].node_placement_source`, alongside a `Scheduler` half
-//! (`SchedulerNodePlacement`) that dialled a Go scheduler process over gRPC —
-//! but that process is deleted from the tree (see "Distributed Control
-//! Plane" in the repo's top-level `CLAUDE.md`) and `SchedulerNodePlacement`
-//! went with it, so this is what every `aenv-api` replica runs now, always.
+//! It used to be one of two — selected by a now-deleted
+//! `[cluster].node_placement_source` switch, alongside a `Scheduler`
+//! alternative (`SchedulerNodePlacement`) that dialled a Go scheduler process
+//! over gRPC — but that process is deleted from the tree (see "Distributed
+//! Control Plane" in the repo's top-level `CLAUDE.md`) and
+//! `SchedulerNodePlacement` went with it, so this is what every `aenv-api`
+//! replica runs now, always, with no switch left to choose otherwise.
 //! (`docs/proposals/_sd-phase4-stageA-node-inventory.md` §5 — task's own "D7").
 //!
 //! # 🔴 P1 (task's own "phase4-close"): all five methods now go local

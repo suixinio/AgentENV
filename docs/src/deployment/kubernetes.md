@@ -4,8 +4,10 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, an api Deployment, a
 
 🔴 **阶段四**: the Go Scheduler — `services/scheduler`, and the
 `agentenv-scheduler` Deployment/Service/PodDisruptionBudget that ran it — has
-been deleted. `aenv-api` (`agentenv-api-deployment.yaml`) runs with
-`[cluster].node_placement_source = "native"` and
+been deleted. `aenv-api` (`agentenv-api-deployment.yaml`) always answers node
+discovery/placement/heartbeat from its own in-process node registry now (the
+`[cluster].node_placement_source` switch that used to select this is deleted
+too — there is no alternative left to choose), and runs with
 `[orchestrator.paused_registry].backend = "postgres"` by default, folding
 node discovery, heartbeat receipt, placement, and the paused-sandbox registry
 into itself over the shared `[pg]` pool instead of dialling a scheduler
@@ -24,9 +26,9 @@ separate Go process.
 | Workload | Kind | Description |
 |----------|------|-------------|
 | `agentenv-gateway` | Deployment + ClusterIP Service | HTTP reverse proxy for client traffic |
-| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四, `node_placement_source = "native"`) node discovery/placement/paused-registry — the Go scheduler's former job, folded in |
+| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四) node discovery/placement/paused-registry — the Go scheduler's former job, folded in, unconditionally |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
-| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` under `node_placement_source = "native"` |
+| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` |
 
 ### Why a DaemonSet for Runtime Nodes
 
@@ -207,7 +209,7 @@ By default a paused sandbox is resumable only on the node that paused it — the
 
 - The `paused-registry-config` ConfigMap and the `AENV_PAUSED_REGISTRY_BACKEND` key on the DaemonSet are gone from `deploy/k8s/base` (`02117b9`).
 - `aenv-node`'s `assemble_node` (`crates/aenv-node/src/bin/aenv-node.rs`) ignores `[orchestrator.paused_registry].backend` whenever it is anything other than `"local"`: it logs one `warn!` naming the configured value and wires in a registry that claims and records nothing, because cluster-wide paused-sandbox state belongs to the API half alone now. A node never refuses to start over this setting — only over a configured `[pg].dsn` (`refuse_configured_pg_dsn`), which a node must never hold regardless of this backend.
-- Cluster-wide resume is controlled entirely by `aenv-api`'s own `[orchestrator.paused_registry].backend = "postgres"`. `deploy/k8s/base/agentenv-api-deployment.yaml` sets `AENV_PAUSED_REGISTRY_BACKEND=postgres` unconditionally, alongside `AENV_NODE_PLACEMENT_SOURCE=native`, which that backend requires (`build_paused_registry` needs a heartbeat-roster `NodeRegistry` handle, which only `native` builds — the two env vars move together in one apply, never independently).
+- Cluster-wide resume is controlled entirely by `aenv-api`'s own `[orchestrator.paused_registry].backend = "postgres"`. `deploy/k8s/base/agentenv-api-deployment.yaml` sets `AENV_PAUSED_REGISTRY_BACKEND=postgres` unconditionally; that backend requires a heartbeat-roster `NodeRegistry` handle (`build_paused_registry`), which `aenv-api` always builds now, with no separate switch to keep in step.
 - `aenv-api` reaches PostgreSQL directly over the shared `[pg]` pool — the same pool the snapshot catalog uses — instead of dialling a separate scheduler process. No node ever holds a `[pg]` DSN, a database connection, or any say over the schema.
 
 In short: on the `deploy/k8s/base` overlay, cluster-wide paused-sandbox resume is on by default and there is no ConfigMap toggle or kubectl step left to run to enable it. See `config/default.toml`'s `[orchestrator.paused_registry]` comment block (the authoritative description of `"local"`/`"postgres"`) and CLAUDE.md's "Distributed Control Plane" section.
@@ -267,7 +269,7 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 
 ## Service Discovery
 
-Under `node_placement_source = "native"`, `agentenv-api`'s own
+`agentenv-api`'s own
 `src/node_registry/kubernetes_discovery.rs` watches EndpointSlices for the
 headless `agentenv-nodes` Service and watches Pods for optional label-based
 discovery policy — a port of the same mechanism the deleted Go scheduler

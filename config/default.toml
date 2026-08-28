@@ -152,26 +152,17 @@ peer_discovery_refresh_interval_secs = 5
 # timeout_ms = 5000
 
 [cluster]
-# Where `aenv-api` resolves node placement (`Schedule`/`LookupNode`/
-# `RecordAssignment`, and a known node's own address) from.
-#
-#   node_placement_source = "scheduler"  (the default) dials
-#                           [cluster].scheduler_endpoint below for all of it,
-#                           byte-for-byte the pre-fold behaviour.
-#   node_placement_source = "native"     answers every one of those from
-#                           api's own process instead (task's own
-#                           "phase4-close" P1): a local node registry fed by
-#                           Kubernetes discovery and node heartbeats
-#                           (requires [cluster.kubernetes_discovery] below),
-#                           and [binding_store] for the routing table
-#                           `Schedule`/`LookupNode`/`RecordAssignment`
-#                           answer from. No [cluster].scheduler_endpoint is
-#                           required in this mode. See
-#                           `src/node_client/native_placement.rs`'s module
-#                           doc for the full argument, and
-#                           `deploy/k8s/base/agentenv-api-deployment.yaml`
-#                           for the two-step rollout this flips with.
-# node_placement_source = "scheduler"
+# `aenv-api` resolves node placement (`Schedule`/`LookupNode`/
+# `RecordAssignment`, and a known node's own address) entirely from its own
+# process: a local node registry fed by Kubernetes discovery and node
+# heartbeats (requires [cluster.kubernetes_discovery] below), and
+# [binding_store] for the routing table those three RPCs answer from. No
+# [cluster].scheduler_endpoint is required for any of it. There used to be a
+# `node_placement_source` switch choosing between this and dialling out to a
+# Go scheduler process for the same answers; that process is deleted from the
+# tree (see CLAUDE.md's "Distributed Control Plane" section) and the switch
+# went with it — see `src/node_client/native_placement.rs`'s module doc for
+# the full argument.
 
 # Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
@@ -194,9 +185,9 @@ node_service_addr = "0.0.0.0:8001"
 
 # Where `aenv-api` serves the data plane's wake-up surface. Bound by
 # `aenv-api` only (`assemble_api`, `crates/aenv-api/src/bin/aenv-api.rs`).
-# The gateway's cold path calls it, and under `node_placement_source =
-# "native"` nodes' heartbeats land on the same listener — one port, two
-# gRPC services multiplexed by HTTP/2 path (`src/api/grpc/mod.rs`).
+# The gateway's cold path calls it, and nodes' heartbeats land on the same
+# listener — one port, two gRPC services multiplexed by HTTP/2 path
+# (`src/api/grpc/mod.rs`).
 api_grpc_addr = "0.0.0.0:8002"
 
 # The port the API half reaches a node's `node_service_addr` on.
@@ -252,10 +243,10 @@ redis_connect_timeout_ms = 3000
 # connect_timeout_secs = 5
 
 [binding_store]
-# The sandbox-to-node routing table `[cluster].node_placement_source =
-# "native"` answers `Schedule`/`LookupNode`/`RecordAssignment` from (task's
-# own "phase4-close" P1/D), and the same key space gateway's routing-
-# projection read path already speaks to.
+# The sandbox-to-node routing table `aenv-api` answers `Schedule`/
+# `LookupNode`/`RecordAssignment` from (task's own "phase4-close" P1/D), and
+# the same key space gateway's routing-projection read path already speaks
+# to.
 #
 #   backend = "in_memory"  (the code default) one replica's own table, lost
 #                           when it exits. Correct only for a single-replica
@@ -264,12 +255,11 @@ redis_connect_timeout_ms = 3000
 #                           and writes. `aenv-api` runs more than one
 #                           replica (`agentenv-api-deployment.yaml`'s
 #                           `replicas: 2`), so this is the only backend that
-#                           deployment may run under `node_placement_source =
-#                           "native"` — `build_binding_store`
+#                           deployment may run — `build_binding_store`
 #                           (`crates/aenv-api/src/bin/aenv-api.rs`) refuses to
-#                           start on "in_memory" in that mode, the same guard
-#                           [orchestrator.store] already has for the sandbox
-#                           ledger.
+#                           start on "in_memory" unconditionally, the same
+#                           guard [orchestrator.store] already has for the
+#                           sandbox ledger.
 # backend = "redis"
 #
 # redis_url = "redis://127.0.0.1:6379"
@@ -439,12 +429,12 @@ redis_connect_timeout_ms = 2500
 # - "local": a paused sandbox is resumable only on the node that paused it.
 # - "postgres": aenv-api connects directly to the registry database over the
 #   shared [pg] pool, folding the scheduler's registry service into that
-#   process. It requires a heartbeat roster source
-#   ([cluster].node_placement_source = "native") to select this backend, and
-#   requires it unconditionally — aenv-api is the only process that builds
-#   this registry at all. aenv-node ignores whatever is set here: it warns and
-#   wires a registry that records nothing, because cluster-wide records belong
-#   to the API half.
+#   process. It requires a heartbeat roster source (aenv-api's own node
+#   registry, which it always builds) to select this backend, and requires it
+#   unconditionally — aenv-api is the only process that builds this registry
+#   at all. aenv-node ignores whatever is set here: it warns and wires a
+#   registry that records nothing, because cluster-wide records belong to the
+#   API half.
 #
 # 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
 # editing the copy of this file that lands in the cluster ConfigMap — see

@@ -3,10 +3,11 @@
 //!
 //! # 🔴 One source now, not two
 //!
-//! This used to run under either of `[cluster].node_placement_source`'s two
-//! values — reading api's own [`AtomicNodeRegistry`] directly under `Native`,
-//! or making a live `ListNodes` + `ListObservedNodes` RPC pair against a
-//! real Go scheduler process under `Scheduler` (the former default) — and
+//! This used to run under either of a now-deleted `[cluster].node_placement_source`
+//! switch's two values — reading api's own [`AtomicNodeRegistry`] directly
+//! under `Native`, or making a live `ListNodes` + `ListObservedNodes` RPC
+//! pair against a real Go scheduler process under `Scheduler` (the former
+//! default) — and
 //! reshaping both into the identical [`NodeRegistryDump`] JSON shape so a
 //! caller could diff this endpoint's output against the scheduler's own
 //! `ListNodes`/`ListObservedNodes` and see the two agree. That scheduler

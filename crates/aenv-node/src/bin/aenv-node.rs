@@ -245,6 +245,11 @@ async fn async_main() -> anyhow::Result<()> {
     // and an un-migrated manifest would otherwise start with the heartbeat's
     // hot-reload silently dead rather than refuse to start.
     aenv_node::cfg::refuse_removed_scheduler_endpoint_file_env_var()?;
+    // 🔴 Same reasoning again, for the deleted `[cluster].node_placement_source`
+    // switch: `aenv-node` never read this field meaningfully to begin with
+    // (placement is answered by `aenv-api` alone), but the same manifest
+    // could carry it, and confique would silently ignore it here too.
+    aenv_node::cfg::refuse_removed_node_placement_source_env_var()?;
 
     let cli = NodeCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
@@ -918,6 +923,36 @@ mod tests {
              pure function would still report green"
         );
         // 🔴 The mutation control, same reasoning as the catalog scan above.
+        assert!(
+            !async_main.contains("async fn async_main"),
+            "the scan is reading more than async_main's body, so the assertion above proves \
+             nothing about where the call actually is"
+        );
+    }
+
+    /// 🔴 This binary actually refuses a manifest that still sets the removed
+    /// `AENV_NODE_PLACEMENT_SOURCE` switch. `aenv-node` never read this field
+    /// meaningfully — placement is answered by `aenv-api` alone — but the
+    /// same reasoning as the two scans above still applies: confique ignores
+    /// an undeclared environment variable, so a manifest that kept setting it
+    /// would start a process that looks entirely healthy while an operator
+    /// believes the setting still selects something.
+    ///
+    /// `refuse_removed_node_placement_source_env_var` has its own
+    /// two-direction test in `src/cfg.rs`, and that test stays green with the
+    /// call site deleted — this is the guard that a mutant deleting the call
+    /// site here would otherwise slip past.
+    #[test]
+    fn async_main_actually_refuses_the_removed_node_placement_source_env_var() {
+        let source = include_str!("aenv-node.rs");
+        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
+        assert!(
+            async_main.contains("cfg::refuse_removed_node_placement_source_env_var()"),
+            "async_main no longer refuses AENV_NODE_PLACEMENT_SOURCE; an un-migrated manifest \
+             would then start in silence, and src/cfg.rs's own test of the pure function would \
+             still report green"
+        );
+        // 🔴 The mutation control, same reasoning as the scans above.
         assert!(
             !async_main.contains("async fn async_main"),
             "the scan is reading more than async_main's body, so the assertion above proves \

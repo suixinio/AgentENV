@@ -303,8 +303,11 @@ spec:
             # — which, since `gateway.scheduler_addr` also names
             # `agentenv-api:8002` now, dials this same address rather than a
             # separate scheduler. This is no longer the latency-not-availability
-            # trade it was when that fallback led somewhere else; see the
-            # `GATEWAY_SCHEDULER_FALLBACK_DISABLED` note in kustomization.yaml.
+            # trade it was when that path could lead somewhere else; the switch
+            # that used to be able to skip it entirely
+            # (GATEWAY_SCHEDULER_FALLBACK_DISABLED) is deleted, so the call is
+            # unconditional now — see the `cold-lookup-config` note in
+            # kustomization.yaml for the timeout that still bounds it.
             - name: AENV_API_GRPC_ADDR
               value: "0.0.0.0:8002"
             # The port this half dials a machine's node sandbox service on.

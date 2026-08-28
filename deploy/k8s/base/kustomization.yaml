@@ -94,10 +94,11 @@ configMapGenerator:
       # `src/node_registry/grpc_service.rs`'s `list_registry_sandboxes` now
       # answers it against `PausedSandboxRegistry::list_all`, so every
       # gateway-to-scheduler RPC this endpoint sends is covered.
-      # `gateway.query_only_scheduler_addr` stays unset — it already falls
-      # back to `scheduler_addr` when empty
-      # (`services/gateway/cmd/main.go`), so there is nothing separate to
-      # repoint.
+      # `gateway.query_only_scheduler_addr`, which used to name a second,
+      # separately dialled address for the cold-path LookupNode call below, is
+      # deleted from `services/shared/config` outright along with the client
+      # selection it configured — there is no longer a second address to
+      # leave unset here.
       - config/gateway.json
   - name: sandbox-proxy-config
     literals:
@@ -251,16 +252,19 @@ configMapGenerator:
   # above.
   - name: routing-projection-config
     literals:
-      - SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=on
       - GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE=on
       - GATEWAY_ROUTING_PROJECTION_READ=on
       # 🔴 The write-side switch again, for the half that now owns the
-      # registry. `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE` above only
-      # reaches the scheduler process, and 阶段四 commented that workload out
-      # of `resources:` — so from the moment the api half took over
-      # `ReportSandboxEvent`, the eager projection delete was off cluster-wide
-      # and nothing said so. See the long note on this key in
-      # `agentenv-api-deployment.yaml` for what that costs.
+      # registry. This ConfigMap used to also declare
+      # SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE, the scheduler process's own
+      # half of this same logical switch — but that key never reached anything
+      # once `services/scheduler` (the workload it was scoped to) was deleted
+      # outright, not merely removed from `resources:`, and it was never
+      # consumed by any Deployment even before that (`55b8411` confirmed it
+      # parsed into a field the gateway never read). It is deleted here rather
+      # than kept as a documented no-op. See the long note on this key in
+      # `agentenv-api-deployment.yaml` for what the api half's own half of the
+      # write-side switch costs when off.
       #
       # 🔴 `true`, not `on`. confique's env deserializer accepts
       # `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitively) and errors
@@ -301,45 +305,40 @@ configMapGenerator:
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000
       - GATEWAY_RESUME_ADDR=agentenv-api:8002
-  # 阶段 4 slice 1's lever, and it is declared here at the code default —
-  # fallback *on*, capped at 3s — still not turned off, but for a different
-  # reason than when this was written. `gateway.scheduler_addr`
-  # (`gateway-k8s-config`'s own note above) now names `agentenv-api:8002`,
-  # not the scheduler — so the cold LookupNode path a projection miss and an
-  # undecided wake-up both fall through to no longer depends on
-  # `agentenv-scheduler` at all, decommissioned (阶段四 E4) or not. Disabling
-  # this fallback today would trade an api-half outage's graceful
-  # degradation (falls back to asking api's own `LookupNode` directly) for a
-  # hard 503, which was never what this lever was for.
-  #
-  # 🔴 What each key is for:
-  #   · GATEWAY_SCHEDULER_FALLBACK_DISABLED — skips this one call entirely.
-  #     Originally billed as "the decommissioning lever," which turned out to
-  #     be the wrong lever for that job: decommissioning the scheduler
-  #     process is `gateway.scheduler_addr` itself moving off it (done, see
-  #     `gateway-k8s-config` above), not skipping the call this flag guards.
-  #     What is still true is its own, narrower purpose — an operator wanting
-  #     zero network calls on this cold path, for its own sake, rather than
-  #     one more (now cheap, since it answers from api rather than hanging on
-  #     a dead scheduler) round trip on a resume.
-  #   · GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — bounds that same call on its own
-  #     regardless of the switch above, so a slow or unreachable target on
-  #     this path (a bad rollout, a brief outage on whichever api replica
-  #     answers) cannot hold it open for gRPC's own connection backoff. Safe
-  #     to lower once this cluster's real LookupNode p99 is known; 3s is
-  #     deliberately far above it and far below GATEWAY_REQUEST_TIMEOUT's
-  #     30s.
-  #
-  # Both values match `services/shared/config`'s own defaults, so losing this
-  # ConfigMap is safe rather than a quiet change — the same reasoning
+  # The cold LookupNode path a projection miss and an undecided wake-up both
+  # fall through to — declared here at the code default (3s) so losing this
+  # ConfigMap is safe rather than a quiet change, the same reasoning
   # `execution-fencing-config` above gives for doing this instead of leaving
-  # the keys undeclared. `gateway-deployment.yaml` references both with
-  # `optional: true`, so flipping the lever later is one literal added here
-  # and a restart, never a Deployment edit.
-  - name: scheduler-fallback-config
+  # the key undeclared.
+  #
+  # 🔴 This ConfigMap used to be named `scheduler-fallback-config` and to also
+  # carry GATEWAY_SCHEDULER_FALLBACK_DISABLED, a switch that could skip this
+  # call entirely — billed at the time as "阶段四 slice 1's decommissioning
+  # lever," which turned out to be the wrong lever for that job:
+  # decommissioning the scheduler process was `gateway.scheduler_addr` itself
+  # moving off it (`gateway-k8s-config` above), not skipping this call. That
+  # switch (and the client-selection field it worked alongside,
+  # `QueryOnlySchedulerClient`) is deleted from `services/shared/config`
+  # outright, not merely defaulted off — the call is unconditional again,
+  # exactly as it was before either existed.
+  #
+  # GATEWAY_COLD_LOOKUP_TIMEOUT — this ConfigMap's one remaining key — is not
+  # decommissioning scaffolding: it bounds this one RPC on its own, separately
+  # from GATEWAY_REQUEST_TIMEOUT, so a slow or unreachable target on this path
+  # (a bad rollout, a brief outage on whichever api replica answers) cannot
+  # hold it open for gRPC's own connection backoff. It is the same setting
+  # that used to be named GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — renamed, not
+  # removed, once the call it bounds stopped being a fallback to a process
+  # that might not exist. Safe to lower once this cluster's real LookupNode
+  # p99 is known; 3s is deliberately far above it and far below
+  # GATEWAY_REQUEST_TIMEOUT's 30s.
+  #
+  # `gateway-deployment.yaml` references this key with `optional: true`, so
+  # retuning it later is one literal edited here and a restart, never a
+  # Deployment edit.
+  - name: cold-lookup-config
     literals:
-      - GATEWAY_SCHEDULER_FALLBACK_DISABLED=false
-      - GATEWAY_SCHEDULER_FALLBACK_TIMEOUT=3s
+      - GATEWAY_COLD_LOOKUP_TIMEOUT=3s
   # 🔴 There was a third switch here — node-service-config, carrying
   # AENV_NODE_SERVICE_ENABLED — and it is gone rather than set to `false`. It
   # was meant to let the pre-split single process serve the node sandbox

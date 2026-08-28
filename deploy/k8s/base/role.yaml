@@ -1,3 +1,9 @@
+# The name is history, not a mistake: the workload it was written for
+# (`agentenv-scheduler`) no longer exists, but renaming a Role that
+# rolebinding.yaml's RoleBinding still points at by name is not free on a live
+# cluster (RoleBinding.roleRef is immutable, so a rename means delete-then-
+# recreate and a real, if brief, permission gap). See rolebinding.yaml's own
+# comment for the full reasoning.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

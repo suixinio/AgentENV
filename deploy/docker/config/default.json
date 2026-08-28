@@ -1,22 +1,6 @@
 {
   "log_level": "info",
   "log_format": "auto",
-  "scheduler": {
-    "grpc_listen_addr": ":9090",
-    "strategy": "round_robin",
-    "report_ttl": "30s",
-    "binding_ttl": "30s",
-    "nodes": [
-      {
-        "id": "node-a",
-        "endpoint": "http://agentenv-a:8000"
-      },
-      {
-        "id": "node-b",
-        "endpoint": "http://agentenv-b:8000"
-      }
-    ]
-  },
   "gateway": {
     "http_listen_addr": ":8080",
     "scheduler_addr": "agentenv-api:8002",

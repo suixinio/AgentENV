@@ -19,7 +19,6 @@ K8S_NAMESPACE ?= agentenv-system
 K8S_RUNTIME_IMAGE ?= agentenv-runtime:latest
 K8S_API_IMAGE ?= agentenv-api:latest
 K8S_GATEWAY_IMAGE ?= agentenv-gateway:latest
-K8S_SCHEDULER_IMAGE ?= agentenv-scheduler:latest
 K3S_CTR ?= sudo k3s ctr
 
 # aenv home path.
@@ -66,7 +65,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
-	services gateway scheduler \
+	services gateway \
 	deploy-build deploy-up deploy-up-no-build deploy-down deploy-logs deploy-ps \
 	k8s-build k8s-redeploy k8s-load-dev k8s-refresh-dev \
 	k8s-render k8s-apply k8s-delete \
@@ -372,15 +371,12 @@ k8s-build:
 	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-node -t $(K8S_RUNTIME_IMAGE) .
 	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-api -t $(K8S_API_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
-	$(DOCKER) build -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
 
 k8s-redeploy:
 	$(KUBECTL) rollout restart deploy/agentenv-gateway -n $(K8S_NAMESPACE)
-	$(KUBECTL) rollout restart deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart ds/agentenv-node -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart deploy/agentenv-api -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-gateway -n $(K8S_NAMESPACE)
-	$(KUBECTL) rollout status deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status ds/agentenv-node -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-api -n $(K8S_NAMESPACE)
 
@@ -388,7 +384,6 @@ k8s-load-dev:
 	$(DOCKER) save $(K8S_RUNTIME_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_API_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_GATEWAY_IMAGE) | $(K3S_CTR) images import -
-	$(DOCKER) save $(K8S_SCHEDULER_IMAGE) | $(K3S_CTR) images import -
 
 k8s-refresh-dev: k8s-build k8s-load-dev k8s-redeploy
 
@@ -415,9 +410,6 @@ services-%:
 
 gateway-%:
 	$(MAKE) -C services/gateway $*
-
-scheduler-%:
-	$(MAKE) -C services/scheduler $*
 
 docs/src/openapi.yml:
 	ln -sf ../../src/api/openapi.yml docs/src/openapi.yml

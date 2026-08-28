@@ -2,12 +2,9 @@
 
 Deploy AgentENV across a Kubernetes cluster with a gateway, an api Deployment, and runtime nodes on every worker.
 
-🔴 **阶段四**: `deploy/k8s/base`'s default render no longer includes the
-`agentenv-scheduler` Deployment/Service/PodDisruptionBudget — they are
-commented out of `kustomization.yaml`'s `resources:`, not deleted, and
-`services/scheduler`'s Go source stays in the tree as the rollback target
-(one release image tag is still pinned in `kustomization.yaml`'s `images:`
-transformer). `aenv-api` (`agentenv-api-deployment.yaml`) runs with
+🔴 **阶段四**: the Go Scheduler — `services/scheduler`, and the
+`agentenv-scheduler` Deployment/Service/PodDisruptionBudget that ran it — has
+been deleted. `aenv-api` (`agentenv-api-deployment.yaml`) runs with
 `[cluster].node_placement_source = "native"` and
 `[orchestrator.paused_registry].backend = "postgres"` by default, folding
 node discovery, heartbeat receipt, placement, and the paused-sandbox registry
@@ -15,23 +12,21 @@ into itself over the shared `[pg]` pool instead of dialling a scheduler
 process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
 instead of `agentenv-scheduler:9090` for the same reason, including for
 `ListRegistrySandboxes` (`services/gateway/internal/registry_list.go`'s
-debug endpoint), which `aenv-api` now answers too — see
-`services/README.md` for the current status and how to bring the scheduler
-workload back if you need it. The rest of this page describes the
-architecture as it runs today; where it still names `agentenv-scheduler`
-directly (the paused-registry migration history below, in particular) that
-is describing what the *node* half still needs from that gRPC contract, now
-answered by `aenv-api` rather than a separate process.
+debug endpoint), which `aenv-api` now answers too — see `services/README.md`
+for the current status. The rest of this page describes the architecture as
+it runs today; where it still names "the scheduler" generically (the
+paused-registry migration history below, in particular) that is describing
+what the *node* half still needs from the `services/api/proto/scheduler.proto`
+gRPC contract, answered by `aenv-api` and not by a separate process.
 
 ## Architecture
 
 | Workload | Kind | Description |
 |----------|------|-------------|
 | `agentenv-gateway` | Deployment + ClusterIP Service | HTTP reverse proxy for client traffic |
-| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四, `node_placement_source = "native"`) node discovery/placement/paused-registry — the scheduler's former job, folded in |
-| `agentenv-scheduler` | Deployment (single replica) + ClusterIP Service, **not deployed by default since 阶段四** | The original standalone gRPC node selection and sandbox binding service; manifests kept for rollback (see the 阶段四 note above) |
+| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四, `node_placement_source = "native"`) node discovery/placement/paused-registry — the Go scheduler's former job, folded in |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
-| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery — by `agentenv-scheduler` when it is deployed, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` under `node_placement_source = "native"` otherwise |
+| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` under `node_placement_source = "native"` |
 
 ### Why a DaemonSet for Runtime Nodes
 
@@ -64,7 +59,7 @@ cd AgentENV
 make k8s-build
 ```
 
-This builds three images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, and `agentenv-scheduler:latest`.
+This builds three images: `agentenv-runtime:latest`, `agentenv-api:latest`, and `agentenv-gateway:latest`.
 
 ## Configure the Access-Token Seed (Optional)
 
@@ -115,12 +110,12 @@ The default overlay is `deploy/k8s/overlays/default`, targeting the `agentenv-sy
 
 The make targets build a temporary Kustomize context so runtime Pods mount the repository's `config/default.toml` rather than a separate checked-in copy.
 
-The runtime DaemonSet injects scheduler-report wiring for each node Pod:
+The runtime DaemonSet injects heartbeat-report wiring for each node Pod:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon` so the Pod uses the `uvm-ublk-daemon` binary included in the runtime image
 - `AENV_NODE_ID` from the node the Pod is on (`fieldRef: spec.nodeName`), not the Pod's own name — a paused sandbox's registry row records it as the holder, and it has to survive the Pod being replaced
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true`
-- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-scheduler:9090`
+- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002`
 - `AENV_SANDBOX_PROXY_DOMAINS` from the shared sandbox proxy ConfigMap
 
 The P2P listen address must be reachable Pod-to-Pod; use a concrete container port or a Pod-reachable address if your cluster policy does not allow dialing ephemeral ports.
@@ -352,6 +347,13 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 
 ## Service Discovery
 
-The scheduler watches EndpointSlices for the headless `agentenv-nodes` Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching `scheduler.discovery.kubernetes.no_schedule_pod_selector` stay discoverable as lingering/no-schedule nodes, while Pods matching `scheduler.discovery.kubernetes.ignore_pod_selector` are excluded. Both IPv4 and IPv6 endpoint addresses are supported.
-
-> Sandbox bindings remain in-memory, so the scheduler should run as a single replica. Bindings are lost on restart.
+Under `node_placement_source = "native"`, `agentenv-api`'s own
+`src/node_registry/kubernetes_discovery.rs` watches EndpointSlices for the
+headless `agentenv-nodes` Service and watches Pods for optional label-based
+discovery policy — a port of the same mechanism the deleted Go scheduler
+used, configured via `AENV_CLUSTER_KUBERNETES_DISCOVERY_*` (see
+`config/default.toml`'s `[cluster]` section) rather than
+`scheduler.discovery.kubernetes.*` JSON keys. See that module's own doc
+comment for the current state of `ignore_pod_selector`/
+`no_schedule_pod_selector` support. Both IPv4 and IPv6 endpoint addresses are
+supported.

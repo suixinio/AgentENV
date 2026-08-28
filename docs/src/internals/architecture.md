@@ -199,42 +199,50 @@ flowchart LR
     api -.->|node selection /<br/> lookup result| gateway
 ```
 
-This is `deploy/k8s/base`'s default as of 阶段四 E1-E3: `agentenv-scheduler`'s Deployment/Service/PDB are commented out of `kustomization.yaml`'s `resources:` (not deleted), and node heartbeats plus the gateway's `scheduler_addr` target `agentenv-api:8002` instead of a standalone scheduler. The code-level default is still `node_placement_source = "scheduler"` (`config/default.toml`), which is what `make deploy-up`'s docker-compose stack and local-dev `make -C services run-scheduler` still run: a standalone Go `scheduler` process on `:9090` answering the same contract, the shape this diagram used to show.
+This is `deploy/k8s/base`'s default as of 阶段四 E1-E3, and — since this
+change — the only implementation left: `services/scheduler` (the original
+standalone Go implementation of this contract) has been deleted, and node
+heartbeats plus the gateway's `scheduler_addr` target `agentenv-api:8002` on
+every current deployment (Kubernetes, Docker Compose). The code-level default
+of `[cluster].node_placement_source` is still `"scheduler"`
+(`config/default.toml`) — that setting controls whether `aenv-api` dials
+`[cluster].scheduler_endpoint` for placement decisions or answers them
+in-process, and the name is retained regardless of which process is on the
+other end of that dial (see `config/default.toml`'s own comment on
+`[cluster]`) — but there is no standalone Go process left to dial: every
+current deployment sets `node_placement_source = "native"` so `aenv-api`
+answers in-process instead.
 
-**Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via `gateway.scheduler_addr` before proxying to the resolved node — whichever process that address currently names.
+**Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via `gateway.scheduler_addr` before proxying to the resolved node — `agentenv-api` on every current deployment.
 
-**aenv-api native registry** (`src/node_registry/`, the Kubernetes default): the same RPC surface answered in-process inside the Rust `aenv-api` binary instead of a separate service. `NodeRegistryGrpcService` (`src/node_registry/grpc_service.rs`) is a port of the Go scheduler's handlers — `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat` (including the cluster-wide CPU-template intersection, `src/node_registry/cpu_template.rs`), `ListObservedNodes`, `ListP2pPeers` plus the P2P artifact record/forget/lookup RPCs, `GetNode`, `UnregisterNode`, and `ListRegistrySandboxes` (against `PausedSandboxRegistry::list_all`, backed on Kubernetes by the Postgres paused-registry under `crates/aenv-api/src/orchestrator/paused_registry/postgres/` — the same `[pg]` pool the snapshot catalog uses). Node discovery (static or Kubernetes EndpointSlice, `src/node_registry/kubernetes_discovery.rs`) and sandbox-to-node bindings (`src/binding_store/`, in-memory or Redis) are its own Rust implementations of the same contract, switched on via `[cluster].node_placement_source = "native"`.
+**aenv-api native registry** (`src/node_registry/`): the same RPC surface answered in-process inside the Rust `aenv-api` binary. `NodeRegistryGrpcService` (`src/node_registry/grpc_service.rs`) is a port of the deleted Go scheduler's handlers — `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat` (including the cluster-wide CPU-template intersection, `src/node_registry/cpu_template.rs`), `ListObservedNodes`, `ListP2pPeers` plus the P2P artifact record/forget/lookup RPCs, `GetNode`, `UnregisterNode`, and `ListRegistrySandboxes` (against `PausedSandboxRegistry::list_all`, backed on Kubernetes by the Postgres paused-registry under `crates/aenv-api/src/orchestrator/paused_registry/postgres/` — the same `[pg]` pool the snapshot catalog uses). Node discovery (static or Kubernetes EndpointSlice, `src/node_registry/kubernetes_discovery.rs`) and sandbox-to-node bindings (`src/binding_store/`, in-memory or Redis) are its own Rust implementations of the same contract, switched on via `[cluster].node_placement_source = "native"`.
 
-**Scheduler** (`services/scheduler/`, the non-Kubernetes default and the Kubernetes rollback target): gRPC service with pluggable node discovery and sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node. This Go source stays on tree and is still exercised by `make -C services test` / `test-with-postgres`; see `services/README.md` for how a Kubernetes deployment rolls back onto it.
-
-Binding lifecycle (the same on both implementations — `NodeRegistryGrpcService` is a port of the Go handlers, not a reinterpretation of them):
+Binding lifecycle:
 
 - `RecordAssignment` creates the initial binding immediately after sandbox creation succeeds.
 - Runtime heartbeats include the node's full sandbox ID roster. The binding store treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.
 - `binding_ttl` is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, the next lookup or roster reconcile drops it.
 - `UnregisterNode` removes the observed node record and proactively clears bindings owned by that node.
 
-Discovery modes (both implementations):
+Discovery modes:
 
-- `static`: explicit `scheduler.nodes` list from config
+- `static`: explicit static node list from config (`src/node_registry/static_discovery.rs`)
 - `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
 
-**Limitations**: bindings default to in-memory on both implementations and are lost when the process holding them restarts; either can be backed by Redis instead (`scheduler.redis_addr` for the standalone scheduler, `[binding_store].backend = "redis"` for the native registry). The standalone scheduler additionally supports read-only `--query-only` replicas that serve data-plane `LookupNode` off that Redis during a primary restart (`gateway.query_only_scheduler_addr` — see `services/README.md`), but that HA path is data-plane only: scheduling, sandbox creation, assignment writes, node APIs, and P2P scheduler APIs still need the primary. Kubernetes discovery updates the schedulable node set dynamically, but the P2P key-to-node artifact index stays in-memory-only on both implementations regardless of binding persistence.
+**Limitations**: bindings default to in-memory and are lost when the process holding them restarts; `[binding_store].backend = "redis"` backs them with Redis instead — required once `aenv-api` runs more than one replica. Kubernetes discovery updates the schedulable node set dynamically, but the P2P key-to-node artifact index stays in-memory-only regardless of binding persistence.
 
 **Deployment**:
 
 ```bash
 # local dev (single node)
-make start-server && make -C services run-scheduler && make -C services run-gateway
+make start-server && make -C services run-gateway
 
-# docker compose (multi-node) -- standalone scheduler, unchanged by 阶段四
-make deploy-up     # gateway + scheduler + 2 backend nodes
+# docker compose (multi-node) -- gateway + agentenv-api (native placement) + 2 backend nodes
+make deploy-up
 make deploy-down   # teardown
 
 # kubernetes (gateway + daemonset runtime nodes; aenv-api's native registry
-# answers placement/heartbeat/registry by default -- see above, and
-# services/README.md's "Deploy on Kubernetes" section to bring the
-# standalone scheduler back)
+# answers placement/heartbeat/registry -- see above)
 make k8s-render
 make k8s-apply
 ```
@@ -303,7 +311,6 @@ src/
 
 services/                       # distributed control plane (Go)
 ├── gateway/                    # HTTP reverse proxy
-├── scheduler/                  # gRPC node selection + binding
-├── api/proto/                  # protobuf contracts
+├── api/proto/                  # protobuf contracts (Scheduler/PausedRegistry/SnapshotCatalog RPCs, now answered by aenv-api)
 └── shared/                     # config, logging
 ```

@@ -1,5 +1,23 @@
 # Static Multi-Node (Without Kubernetes)
 
+🔴 **This guide is out of date and not currently actionable.** Every step
+below installs and runs `services/scheduler` — the Go Scheduler binary — via
+systemd (`make -C services build` producing `services/bin/scheduler`, the
+`agentenv-scheduler.service` unit, the `scheduler.*` JSON config block). That
+package has been deleted: `Scheduler`/`PausedRegistry` RPC handling now lives
+in the Rust `aenv-api` binary (`src/node_registry/`,
+`crates/aenv-api/src/orchestrator/paused_registry/postgres/`), which requires
+a reachable PostgreSQL (`[pg]`) and today ships as a container image
+(`deploy/docker/Dockerfile.aenv-api`), not as a bare systemd-friendly binary
+with a config story equivalent to what this page describes. Rewriting this
+guide to a native-mode, no-Kubernetes topology is tracked as follow-up work,
+not done here — see `services/README.md` for the current architecture status.
+Kubernetes ([Kubernetes (Multi-Node)](./kubernetes.md)) is the only
+currently-documented and current multi-node deployment path; Docker Compose
+([Docker Compose](./docker-compose.md)) is the only currently-documented
+single-host multi-node simulation. Everything past this point is preserved
+for historical reference only.
+
 Run AgentENV across multiple physical or virtual machines without Kubernetes.
 This deployment uses the Go Gateway and Scheduler with a statically configured
 runtime-node list.

@@ -94,19 +94,18 @@ export E2B_ACCESS_TOKEN=dummy
 
 > For local development, any non-empty value works for `E2B_API_KEY` and `E2B_ACCESS_TOKEN` because the server only checks that the auth header is present.
 
-## Gateway and Scheduler
+## Gateway
 
-These variables apply to both the gateway and scheduler processes.
+These variables apply to the gateway process (`services/gateway`, the only
+Go binary this module ships — the standalone `services/scheduler` process
+`LOG_LEVEL`/`LOG_FORMAT` used to also apply to has been deleted; its RPC
+surface is now answered by `aenv-api`, see the `AENV_NODE_PLACEMENT_SOURCE`
+row above).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
 | `LOG_FORMAT` | `auto` | Log output format: `auto`, `console`, or `json` |
-
-## Gateway
-
-| Variable | Default | Description |
-|----------|---------|-------------|
 | `GATEWAY_HTTP_LISTEN_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_METRICS_LISTEN_ADDR` | `:9102` | Prometheus metrics listen address |
 | `GATEWAY_SCHEDULER_ADDR` | `127.0.0.1:9090` | Scheduler gRPC address for routing and node lookup |
@@ -117,14 +116,3 @@ These variables apply to both the gateway and scheduler processes.
 | `GATEWAY_REST_UPSTREAM_ADDR` | from config | Where user-facing REST — the sandbox, snapshot and template routes — is sent: `http://agentenv-api:8000` (a bare `host:port` is read as http) sends those calls to the api half. Never carries data-plane traffic, which always goes to the node holding the sandbox. 🔴 **Required, not optional.** Nodes run `aenv-node`, which answers 404 on every user-facing REST route under any configuration, so `gateway.rest_upstream_addr` empty is refused at startup rather than falling back to a node — the empty value used to mean "the scheduler places each call and a node serves it," and that position no longer exists. An address that cannot be used, or an empty one, stops the gateway at startup. Setting this variable to the empty string does not clear it — an empty value is *ignored* and the config file's value stands, and that file ships empty on purpose, as a fail-fast if this variable's ConfigMap is ever lost. |
 | `GATEWAY_RESUME_ADDR` | from config | The api half's gRPC wake-up surface, asked when the routing projection cannot place a sandbox: `agentenv-api:8002` asks the api half. An api half that cannot be reached delays the request rather than failing it: the gateway falls back to the scheduler. 🔴 **Required, not optional**, for the same reason as `GATEWAY_REST_UPSTREAM_ADDR` above — `aenv-node` has no wake-up surface of its own under any configuration, so `gateway.resume_addr` empty is refused at startup. The same note above about an empty value being ignored, and why, applies here too. |
 
-## Scheduler
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SCHEDULER_GRPC_LISTEN_ADDR` | `:9090` | gRPC listen address |
-| `SCHEDULER_METRICS_LISTEN_ADDR` | `:9101` | Prometheus metrics listen address |
-| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
-| `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
-| `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
-| `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |
-| `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT` | `0` | Maximum number of nodes checked per P2P artifact lookup. `0` means no limit. |

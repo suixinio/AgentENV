@@ -11,7 +11,7 @@ REGISTRY_TEST_PG    ?= agentenv-registry-test-pg
 REGISTRY_TEST_PORT  ?= 15499
 REGISTRY_TEST_DSN   ?= postgres://postgres:verify@127.0.0.1:$(REGISTRY_TEST_PORT)/aenv_registry
 
-.PHONY: services proto tidy build test test-with-postgres report-skipped-suites fmt fmt-check vet run-scheduler run-gateway
+.PHONY: services proto tidy build test test-with-postgres report-skipped-suites fmt fmt-check vet run-gateway
 
 proto:
 	PATH="$(GOBIN_DIR):$$PATH" $(PROTOC) \
@@ -24,11 +24,9 @@ tidy:
 
 build:
 	$(MAKE) -C gateway build
-	$(MAKE) -C scheduler build
 
 test:
 	$(MAKE) -C gateway test
-	$(MAKE) -C scheduler test
 	@$(MAKE) --no-print-directory report-skipped-suites
 
 # 🔴 What a skipped suite looks like is `ok`.
@@ -100,18 +98,12 @@ test-with-postgres:
 
 fmt:
 	$(MAKE) -C gateway fmt
-	$(MAKE) -C scheduler fmt
 
 fmt-check:
 	$(MAKE) -C gateway fmt-check
-	$(MAKE) -C scheduler fmt-check
 
 vet:
 	$(MAKE) -C gateway vet
-	$(MAKE) -C scheduler vet
-
-run-scheduler:
-	$(GO) run ./scheduler/cmd -config ./config/local.json
 
 run-gateway:
 	$(GO) run ./gateway/cmd -config ./config/local.json

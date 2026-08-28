@@ -35,7 +35,6 @@ func TestMetricsListenersAreDeclaredAndExposed(t *testing.T) {
 	// value is ignored by overrideWithEnv, which is what makes this a clear
 	// rather than a set.
 	t.Setenv("GATEWAY_METRICS_LISTEN_ADDR", "")
-	t.Setenv("SCHEDULER_METRICS_LISTEN_ADDR", "")
 
 	for _, tc := range []struct {
 		service    string
@@ -51,13 +50,11 @@ func TestMetricsListenersAreDeclaredAndExposed(t *testing.T) {
 			svc:        "gateway-service.yaml",
 			metricsOf:  func(c Config) string { return c.Gateway.MetricsListenAddr },
 		},
-		{
-			service:    "scheduler",
-			configFile: "config/scheduler.json",
-			deployment: "scheduler-deployment.yaml",
-			svc:        "scheduler-service.yaml",
-			metricsOf:  func(c Config) string { return c.Scheduler.MetricsListenAddr },
-		},
+		// 🔴 阶段四/Stage E: the "scheduler" case that used to run here
+		// (config/scheduler.json against scheduler-deployment.yaml /
+		// scheduler-service.yaml) was deleted along with those files —
+		// services/scheduler has been decommissioned. See
+		// services/README.md for the current architecture.
 	} {
 		t.Run(tc.service, func(t *testing.T) {
 			cfg, err := Load(filepath.Join(manifestDir, tc.configFile), tc.service)
@@ -127,80 +124,6 @@ func decodeManifest(t *testing.T, path string, into any) {
 	if err := k8syaml.Unmarshal(raw, into); err != nil {
 		t.Fatalf("decoding %s failed: %v", path, err)
 	}
-}
-
-// 🔴 The node and the scheduler have to agree on which cluster they are, and
-// neither can tell that they do not.
-//
-// The node stamps this id on every paused-sandbox row it writes; the scheduler
-// scopes every registry read, every registry write and the reclamation timer to
-// it. Two different values produce no error anywhere: the rows are written, the
-// RPCs succeed, and the scheduler simply serves a cluster that has no rows in
-// it while nobody reclaims the ones the nodes are leaving behind.
-//
-// It was worse than that before this test existed. The scheduler read the id
-// from a key on the `agentenv-postgres` Secret that no manifest, script or
-// helper ever created, so on a fresh cluster the write surface came up
-// permanently cold — every registry RPC answered UNAVAILABLE, which from a
-// node looks exactly like a scheduler that is down, while the process is
-// healthy by every other measure and the only trace is one error line at
-// startup. Somebody had to `kubectl patch secret` by hand to make it work.
-//
-// So: one value, in the base layer, read by both — and a cluster id is a name
-// rather than a credential, so a Secret was never the right place for it.
-func TestOneClusterIdentityReachesBothSidesOfTheRegistry(t *testing.T) {
-	var node appsv1.DaemonSet
-	decodeManifest(t, filepath.Join(manifestDir, "agentenv-daemonset.yaml"), &node)
-	var scheduler appsv1.Deployment
-	decodeManifest(t, filepath.Join(manifestDir, "scheduler-deployment.yaml"), &scheduler)
-
-	nodeRef := clusterIDSource(t, "the node DaemonSet", node.Spec.Template.Spec.Containers, "AENV_CLUSTER_ID")
-	schedulerRef := clusterIDSource(t, "the scheduler Deployment", scheduler.Spec.Template.Spec.Containers, "SCHEDULER_REGISTRY_CLUSTER_ID")
-
-	if nodeRef.Name != schedulerRef.Name || nodeRef.Key != schedulerRef.Key {
-		t.Fatalf("the two sides read their cluster id from different places: node %s/%s, scheduler %s/%s — "+
-			"two places is two values to keep in step, and nothing reports it when they part",
-			nodeRef.Name, nodeRef.Key, schedulerRef.Name, schedulerRef.Key)
-	}
-
-	value := generatedLiteral(t, nodeRef.Name, nodeRef.Key)
-	if value == "" {
-		t.Fatalf("%s/%s is generated empty; an empty cluster id leaves the scheduler's write surface "+
-			"registered and cold, answering every registry RPC UNAVAILABLE", nodeRef.Name, nodeRef.Key)
-	}
-
-	// The file the node falls back to when the ConfigMap is absent. A fallback
-	// that disagrees with the ConfigMap is the same split as above, reached by
-	// deleting an object instead of by editing one.
-	if fallback := nodeIdentityClusterID(t); fallback != value {
-		t.Fatalf("%s/%s is %q but config/default.toml's [node_identity].cluster_id is %q; "+
-			"a node that loses the ConfigMap would start writing rows into another cluster",
-			nodeRef.Name, nodeRef.Key, value, fallback)
-	}
-}
-
-// clusterIDSource returns the ConfigMap key an env var is read from, and fails
-// if it is read from anywhere else. A Secret is the specific "anywhere else"
-// this guards: that is where the scheduler's copy used to live, and putting a
-// name behind a credential is what made it something no manifest supplied.
-func clusterIDSource(t *testing.T, where string, containers []corev1.Container, env string) *corev1.ConfigMapKeySelector {
-	t.Helper()
-
-	if len(containers) != 1 {
-		t.Fatalf("%s: expected one container, got %d", where, len(containers))
-	}
-	for _, candidate := range containers[0].Env {
-		if candidate.Name != env {
-			continue
-		}
-		if candidate.ValueFrom == nil || candidate.ValueFrom.ConfigMapKeyRef == nil {
-			t.Fatalf("%s reads %s from something other than a ConfigMap key (%+v); the cluster id is a name, "+
-				"not a credential, and both sides have to read the same one", where, env, candidate)
-		}
-		return candidate.ValueFrom.ConfigMapKeyRef
-	}
-	t.Fatalf("%s does not set %s at all; the side that does not get one does not agree with the side that does", where, env)
-	return nil
 }
 
 // generatedLiteral reads a literal out of the base layer's configMapGenerator.

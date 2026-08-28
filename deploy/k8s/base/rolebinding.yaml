@@ -1,21 +1,10 @@
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: agentenv-scheduler-discovery
-subjects:
-  - kind: ServiceAccount
-    name: agentenv-scheduler
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: agentenv-scheduler-discovery
----
-# Same rules as above (`role.yaml`'s `agentenv-scheduler-discovery` Role —
-# endpointslices/pods get/list/watch), bound to `agentenv-api` instead of
-# `agentenv-scheduler`. Reusing the Role rather than declaring a second,
-# identical one is deliberate: the two processes need exactly the same read
-# access during the Stage A rollout, and a second Role that happened to match
-# is a second thing to keep matching by hand.
+# 阶段 4/Stage E: the `agentenv-scheduler-discovery` RoleBinding this file
+# used to also declare (binding `role.yaml`'s `agentenv-scheduler-discovery`
+# Role to the now-deleted `agentenv-scheduler` ServiceAccount) is removed
+# along with the Go scheduler. The Role itself stays — reused below by
+# `agentenv-api`'s own binding, and its name outlived the workload it was
+# originally written for the same way `agentenv-nodes` (the headless
+# Service) did.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

@@ -1,6 +1,6 @@
 # Docker Compose (Multi-Node Simulation)
 
-Run a full multi-node stack on a single host using Docker Compose. This simulates a production-like topology with a gateway, scheduler, and multiple AgentENV backend nodes.
+Run a full multi-node stack on a single host using Docker Compose. This simulates a production-like topology with a gateway, `aenv-api` (serving the `Scheduler`/`PausedRegistry` RPCs), and multiple AgentENV backend nodes.
 
 For a real multi-machine deployment without Kubernetes, see
 [Static Multi-Node](./static-multi-node.md).
@@ -70,14 +70,14 @@ make deploy-down    # Tear down the cluster
 
 ## Configuration
 
-Container deployments use `deploy/docker/config/default.json`. Scheduler and backend node endpoints are configured for the Docker network.
+Container deployments use `deploy/docker/config/default.json`. Static node discovery and backend node endpoints are configured for the Docker network.
 
 The runtime image includes `uvm-ublk` at `/usr/local/bin/uvm-ublk`. Compose uses that path instead of a host-built `env/ublk/uvm-ublk` binary.
 
-The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:
+The compose manifest also wires node heartbeat reporting from runtime nodes to `agentenv-api`:
 
 - `AENV_NODE_ID` is set explicitly per node container (`node-a`, `node-b`).
-- `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables scheduler heartbeat reporting.
-- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://scheduler:9090`.
+- `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables heartbeat reporting.
+- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-api:8002`.
 - `SANDBOX_PROXY_DOMAINS`, when set, is passed through as both
   `GATEWAY_SANDBOX_PROXY_DOMAINS` and `AENV_SANDBOX_PROXY_DOMAINS`.

@@ -99,16 +99,6 @@ jobs:
           tags: agentenv-gateway:latest
           cache-from: type=gha,scope=agentenv-gateway
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-gateway,mode=max' || '' }}
-      - name: Build scheduler image
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.scheduler
-          load: true
-          tags: agentenv-scheduler:latest
-          cache-from: type=gha,scope=agentenv-scheduler
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-scheduler,mode=max' || '' }}
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:

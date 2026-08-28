@@ -1,30 +1,25 @@
 # services
 
-Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
+Go implementation of the AgentENV Gateway.
 
-🔴 **阶段四 status**: the Scheduler half of this module is **not deployed by
-default** on `deploy/k8s/base` any more — `docs/proposals/2026-08-20-service-decomposition.md`'s
-phase four has folded node discovery, heartbeat receipt (including the
-cluster CPU-config intersection), placement, P2P peer lookup, and the
-cluster-wide paused-sandbox registry into the Rust `aenv-api` binary
-(`src/node_registry/`, `crates/aenv-api/src/orchestrator/paused_registry/postgres/`),
-reachable over the same `services/api/proto/scheduler.proto` contract this
-package still generates from. `agentenv-scheduler`'s Deployment/Service/PDB
-are commented out of `deploy/k8s/base/kustomization.yaml`'s `resources:`
-(not deleted — see "Deploy on Kubernetes" below for how to bring them back),
-and the Gateway's own `scheduler_addr` now points at `agentenv-api` instead
-of `agentenv-scheduler`.
-
-This Go source is **kept, not deleted**, as the rollback target: everything
-below still describes real, working, tested code, and `make -C services
-test` / `test-with-postgres` still exercise it. What has changed is only
-which process answers the RPCs on a deployed cluster. `ListRegistrySandboxes`
-(`internal/registry_list.go`'s gateway-facing debug endpoint) was the last RPC
-group the Rust side had not ported; `src/node_registry/grpc_service.rs`'s
-`list_registry_sandboxes` now answers it too, against
-`PausedSandboxRegistry::list_all` (`src/orchestrator/paused_registry/mod.rs`),
-so no RPC on this contract still requires a real scheduler process reachable
-at `gateway.scheduler_addr` on the default deploy.
+🔴 **阶段四 status**: `services/scheduler` — the Go implementation of the
+`Scheduler`/`PausedRegistry`/`SnapshotCatalog` RPCs — has been deleted.
+`docs/proposals/2026-08-20-service-decomposition.md`'s phase four folded node
+discovery, heartbeat receipt (including the cluster CPU-config intersection),
+placement, P2P peer/artifact lookup, and the cluster-wide paused-sandbox
+registry into the Rust `aenv-api` binary (`src/node_registry/`,
+`crates/aenv-api/src/orchestrator/paused_registry/postgres/`) before this
+deletion, so the deletion changes no deployed behaviour: every RPC on
+`services/api/proto/scheduler.proto` was already answered by `aenv-api` on
+every current deployment (`ListRegistrySandboxes` — `src/node_registry/grpc_service.rs`'s
+`list_registry_sandboxes`, against `PausedSandboxRegistry::list_all`
+(`src/orchestrator/paused_registry/mod.rs`) — was the last RPC group ported).
+`services/gateway` is the only Go binary this module ships now; it still
+dials `gateway.scheduler_addr` — which points at `agentenv-api` on every
+current deployment — through the same generated `schedulerv1.SchedulerClient`
+it always has, so nothing about the gateway itself changed. The `.proto`
+contract and its generated Go/Rust bindings are unaffected by the deletion —
+see CLAUDE.md's "Distributed Control Plane" section for the full picture.
 
 ## Features
 
@@ -74,61 +69,40 @@ Commands (from `services/`):
 ```bash
 make tidy
 make proto
-make build              # builds both gateway and scheduler
-make test               # tests the whole module: gateway, scheduler, shared, api
-make test-with-postgres # the same, against a throwaway PostgreSQL: nothing skips
+make build              # builds gateway
+make test               # tests the whole module: gateway, shared, api
+make test-with-postgres # same, plus fails instead of silently skipping when redis-server is missing
 ```
 
-The paused-sandbox registry's behaviour is its SQL — which rows a predicate
-matches and which it deliberately does not — so none of it can be checked
-without a real database. `make test` on its own therefore skips 125 tests in
-`scheduler/internal/registry`, and a skip reports as a pass.
+`services/scheduler`'s PostgreSQL-gated paused-registry suite was deleted
+along with the package, so nothing left under `services/` needs a real
+PostgreSQL to run its tests. `make test-with-postgres` still starts a
+throwaway PostgreSQL in Docker for parity with the CI step it mirrors, but the
+only tests it changes the outcome of today are Redis-gated: `REDIS_SERVER_BIN`
+and `SCHEDULER_REDIS_TEST_REQUIRED=1` turn a missing `redis-server` into a
+failure instead of a silent skip for the `RedisBindingStore` and
+`shared/routing` reader tests.
 
-`make test-with-postgres` is the coverage CI has. It starts a throwaway
-PostgreSQL in Docker, points `SCHEDULER_REGISTRY_TEST_DSN` at it, and sets
-`SCHEDULER_REGISTRY_TEST_REQUIRED=1` so that a database which fails to come up
-fails the run instead of quietly restoring the skips. `REDIS_SERVER_BIN` and
-`SCHEDULER_REDIS_TEST_REQUIRED=1` do the same for the `RedisBindingStore`
-tests, which otherwise skip when `redis-server` is not installed. Override
-`REGISTRY_TEST_PORT` if 15499 is taken.
+🔴 That skip matters more than it looks. Those are the only tests that
+exercise the Redis implementation of sandbox-to-node bindings, and that
+implementation is what every HA deployment runs. A change made to the
+in-memory store and forgotten for Redis passes every other test in the
+module, on any machine, and shows up only in production — as routing that
+quietly stops arbitrating. A skip reports as a pass, so without
+`SCHEDULER_REDIS_TEST_REQUIRED` a missing `redis-server` and a healthy run
+look identical.
 
-🔴 Both redis variables matter, and the second one more than it looks. The
-binding-store tests are the only ones that exercise the Redis implementation of
-sandbox-to-node bindings, and that implementation is what every HA deployment
-runs. A change made to the in-memory store and forgotten for Redis passes every
-other test in the module, on any machine, and shows up only in production — as
-routing that quietly stops arbitrating. A skip reports as a pass, so without
-`SCHEDULER_REDIS_TEST_REQUIRED` a missing `redis-server` and a healthy run look
-identical.
-
-To point the suite at a database you already have, set the same two variables
-by hand:
-
-```bash
-SCHEDULER_REGISTRY_TEST_DSN=postgres://postgres:verify@127.0.0.1:15499/aenv_registry \
-SCHEDULER_REGISTRY_TEST_REQUIRED=1 \
-SCHEDULER_REDIS_TEST_REQUIRED=1 \
-REDIS_SERVER_BIN="$(command -v redis-server)" \
-  go test ./scheduler/internal/registry/ ./scheduler/internal/
-```
-
-Per-service (from `services/gateway/` or `services/scheduler/`):
+Per-service (from `services/gateway/`):
 
 ```bash
 make build
 make test
 ```
 
-Each per-service `test` covers `shared/` and `api/` as well as its own tree,
-which is the package set its `vet` and `fmt-check` already check.
+`gateway`'s `test` covers `shared/` and `api/` as well as its own tree, which
+is the package set its `vet` and `fmt-check` already check.
 
 ## Run locally
-
-Start scheduler:
-
-```bash
-make run-scheduler
-```
 
 Start gateway:
 
@@ -136,74 +110,10 @@ Start gateway:
 make run-gateway
 ```
 
-The default local config uses `127.0.0.1:9090` for the scheduler.
-
-## Scheduler configuration
-
-Scheduler discovery modes:
-
-- `static` (default): use `scheduler.nodes` from config.
-- `kubernetes`: watch EndpointSlices for a headless Service and build the node list from serving Pod endpoints. Terminating endpoints, or Pods matching `no_schedule_pod_selector`, are kept as lingering/no-schedule nodes; Pods matching `ignore_pod_selector` are excluded.
-
-General config notes:
-
-- `scheduler.report_ttl` must be a duration string such as `"30s"` in JSON config files.
-- `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
-- `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
-- `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
-- `scheduler.warmup_timeout` bounds how long a freshly started scheduler withholds `NotFound` for an unknown sandbox while its bindings are still being seeded by node heartbeats; defaults to `"15s"`. During that window a miss is reported as `Unavailable` (the gateway turns it into a 503) instead of `NotFound`, so traffic to live sandboxes does not 404. A sandbox that has never been paused has no paused-registry row by design, so it can only ever be found through a binding or a roster, which is what makes this window matter. The window ends early as soon as every discovered node has delivered a heartbeat.
-- `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
-- `--query-only` starts a read-only scheduler that serves `LookupNode` and `ListRegistrySandboxes`; it requires `scheduler.redis_addr` and does not need node discovery config. It runs no discovery and receives no heartbeats, so it answers from bindings and reports `Unavailable` for a sandbox that only the paused registry knows about — never `NotFound`.
-- `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
-- `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
-- `SCHEDULER_BINDING_TTL=<duration>` overrides `scheduler.binding_ttl` from the environment.
-- `SCHEDULER_WARMUP_TIMEOUT=<duration>` overrides `scheduler.warmup_timeout` from the environment.
-- `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
-- `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
-- `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
-
-### Scheduling strategy
-
-`scheduler.strategy` selects the algorithm used to pick a node from the eligible candidate list. Built-in strategies:
-
-| Strategy | Behaviour |
-|---|---|
-| `round_robin` (default) | Cycles through eligible nodes in stable order |
-| `random` | Picks a uniformly random eligible node |
-
-The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
-
-### Node resource limit
-
-`scheduler.node_resource_limit` defines per-node resource thresholds that are evaluated **before** the strategy runs. Any node whose heartbeat snapshot exceeds a configured limit is removed from the candidate list, regardless of which strategy is in use. This is a generic guard-rail that sits above the strategy layer — strategies only see nodes that already passed the resource filter.
-
-Nodes that have not yet sent a heartbeat (no snapshot available) are always kept in the candidate list, since there are no metrics to evaluate.
-
-All fields are optional. Omitting a field (or setting the whole block to `null`) disables that particular check.
-
-| Field | Type | Description |
-|---|---|---|
-| `max_sandbox_count` | uint32 | Maximum total sandbox count |
-| `max_sandbox_starting_count` | uint32 | Maximum concurrently starting sandboxes |
-| `max_cpu_used_percent` | uint32 | Maximum observed CPU usage (0–100) |
-| `max_cpu_allocated_percent` | uint32 | Maximum allocated-CPU-to-physical-CPU ratio; can exceed 100 when overcommit is allowed |
-| `max_memory_used_percent` | uint32 | Maximum observed memory usage (0–100) |
-| `max_memory_allocated_percent` | uint32 | Maximum allocated-memory-to-physical-memory ratio; can exceed 100 when overcommit is allowed |
-
-Example:
-
-```json
-"node_resource_limit": {
-  "max_sandbox_count": 50,
-  "max_sandbox_starting_count": 10,
-  "max_cpu_used_percent": 90,
-  "max_cpu_allocated_percent": 150,
-  "max_memory_used_percent": 85,
-  "max_memory_allocated_percent": 150
-}
-```
-
-When all nodes are filtered out, the scheduler returns `Unavailable` to the caller.
+Point `gateway.scheduler_addr` in `services/config/local.json` at whichever
+process answers `services/api/proto/scheduler.proto` — `aenv-api`'s gRPC
+listener on every current deployment, not a local Go scheduler process
+(`make run-scheduler` no longer exists; there is no Go binary left to run it).
 
 ## Gateway configuration
 
@@ -230,13 +140,12 @@ Logging format defaults to `auto`:
 Examples:
 
 ```bash
-LOG_FORMAT=console make run-scheduler
 LOG_FORMAT=json make run-gateway
 ```
 
 ## Deploy with Docker Compose
 
-From **repository root**, start gateway + scheduler + two backend nodes:
+From **repository root**, start gateway + two backend nodes (`agentenv-api` serves the `Scheduler`/`PausedRegistry` RPCs; there is no separate scheduler container):
 
 ```bash
 make deploy-up
@@ -260,30 +169,24 @@ make deploy-logs
 make deploy-down
 ```
 
-Container deployments use `deploy/docker/config/default.json`, where scheduler service-discovery and backend node endpoints are set for the Docker network.
+Container deployments use `deploy/docker/config/default.json`, where static node discovery and backend node endpoints are set for the Docker network.
 
-The compose stack also wires each runtime node for scheduler heartbeat reporting:
+The compose stack also wires each runtime node for heartbeat reporting:
 
 - `AENV_NODE_ID` is set per runtime container (`node-a`, `node-b`).
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables heartbeat reporting.
-- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` points runtime nodes at `http://scheduler:9090`.
+- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` points runtime nodes at `http://agentenv-api:8002`.
 - `SANDBOX_PROXY_DOMAINS`, when set, is passed through as both `GATEWAY_SANDBOX_PROXY_DOMAINS` and `AENV_SANDBOX_PROXY_DOMAINS`.
 
 ## Deploy on Kubernetes
 
-🔴 **The Scheduler workload is not part of this apply by default** (阶段四 —
-see the status note at the top of this file). `make k8s-render`/`k8s-apply`
-render `deploy/k8s/base/kustomization.yaml`, whose `resources:` list has
-`scheduler-service.yaml`/`scheduler-deployment.yaml`/`scheduler-pdb.yaml`
-commented out rather than removed. To roll back to a standalone scheduler,
-uncomment those three lines (and the matching `scheduler-k8s-config`
-`configMapGenerator` entry just above `gateway-k8s-config`), point
-`agentenv-api-deployment.yaml`'s `AENV_NODE_PLACEMENT_SOURCE` back to
-`"scheduler"` and `AENV_PAUSED_REGISTRY_BACKEND` back to `"central"`, and
-point `deploy/k8s/base/config/gateway.json`'s `scheduler_addr` back at
-`agentenv-scheduler:9090` — then re-render and apply. The Deployment's own
-image tag stays pinned in this file's `images:` transformer the whole time,
-so nothing needs rebuilding to bring it back.
+🔴 **There is no Scheduler workload to deploy.** `deploy/k8s/base` renders
+`gateway` and the `agentenv-node`/`agentenv-api` workloads only;
+`scheduler-service.yaml`/`scheduler-deployment.yaml`/`scheduler-pdb.yaml` and
+the Go source that backed them are deleted (see the status note at the top of
+this file). The gateway's `scheduler_addr` points at `agentenv-api` and the
+DaemonSet's heartbeat target does too — see CLAUDE.md's "Distributed Control
+Plane" section for the current architecture.
 
 ### 🔴 Rolling the *node* half back is an image tag, not a flag
 
@@ -341,11 +244,11 @@ SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply
 The default overlay is `deploy/k8s/overlays/default`.
 The make targets materialize a temporary Kustomize build context so Kubernetes runtime nodes always consume the repository's single AgentENV runtime config source: `config/default.toml`.
 
-The DaemonSet injects scheduler-report identity and endpoint wiring for runtime nodes:
+The DaemonSet injects heartbeat identity and endpoint wiring for runtime nodes:
 
 - `AENV_NODE_ID` comes from Pod metadata name.
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables heartbeat reporting.
-- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-scheduler:9090`.
+- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-api:8002` — `aenv-api`'s own gRPC listener, which answers the `Scheduler.Heartbeat` RPC (`src/node_registry/grpc_service.rs`).
 - `AENV_SANDBOX_PROXY_DOMAINS` comes from the shared sandbox proxy ConfigMap.
 
 Shared Kubernetes helpers:
@@ -372,37 +275,19 @@ make k8s-refresh-dev
 Deployment model:
 
 - `gateway`: Deployment + ClusterIP Service
-- `scheduler`: single-replica Deployment + ClusterIP Service
 - `agentenv-node`: privileged DaemonSet with `/dev/kvm` and hostPath `/var/lib/agentenv`
-- `agentenv-nodes`: headless Service used by scheduler EndpointSlice discovery
-
-Kubernetes config keys:
-
-- `scheduler.discovery.mode`
-- `scheduler.discovery.kubernetes.namespace`
-- `scheduler.discovery.kubernetes.service_name`
-- `scheduler.discovery.kubernetes.port`
-- `scheduler.discovery.kubernetes.scheme` (defaults to `http`)
-- `scheduler.discovery.kubernetes.ignore_pod_selector` (optional Kubernetes label selector; matching Pods are excluded from discovery)
-- `scheduler.discovery.kubernetes.no_schedule_pod_selector` (optional Kubernetes label selector; matching Pods are kept as lingering/no-schedule nodes)
-
-Kubernetes endpoint address handling:
-
-- Scheduler only accepts EndpointSlice addresses that parse as valid IPs.
-- Both IPv4 and IPv6 endpoint addresses are supported.
-- IPv6 endpoints are emitted using bracketed host:port form (for example, `http://[2001:db8::10]:8000`).
+- `agentenv-api`: Deployment answering the `Scheduler`/`PausedRegistry` RPCs — see CLAUDE.md's "Distributed Control Plane" section for `[cluster].node_placement_source = "native"` and the rest of that fold
+- `agentenv-nodes`: headless Service used by Kubernetes-mode node discovery
 
 Operational notes:
 
-- The scheduler uses in-cluster Kubernetes config and watches EndpointSlices plus Pods for service discovery.
-- Only serving, non-terminating DaemonSet Pods are schedulable. Use `no_schedule_pod_selector` for drain/no-new-work labels and `ignore_pod_selector` for Pods that should be completely hidden from discovery.
-- For the default `memory` binding store, `scheduler` should stay single-replica because sandbox bindings are process-local.
-- For high availability, run one primary scheduler with `scheduler.redis_addr` set and multiple query-only scheduler replicas started with `--query-only` against the same Redis. Point gateways at the primary with `gateway.scheduler_addr` and at the query-only service with `gateway.query_only_scheduler_addr`. The primary writes sandbox bindings to Redis while query-only replicas continue to serve data-plane `LookupNode` during primary restarts or upgrades. This HA mode is intentionally data-plane only: requests that proxy to existing sandboxes can keep routing, but control-plane operations that need the primary scheduler, such as creating new sandboxes, scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs, still fail while the primary scheduler is unavailable. Artifact store state is still in-memory and is not covered by this HA mode.
 - The gateway is intentionally left as ClusterIP by default; attach an Ingress or LoadBalancer based on your environment.
 
 ## gRPC API
 
-Proto contract: api/proto/scheduler.proto
+Proto contract: `api/proto/scheduler.proto`. `services/gateway` is a client of
+this contract, not a server for it — `aenv-api` (`src/node_registry/grpc_service.rs`)
+is the only production implementation left.
 
 Methods:
 

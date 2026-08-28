@@ -9,43 +9,6 @@ resources:
   - role.yaml
   - rolebinding.yaml
   - redis.yaml
-  # 🔴 阶段四 E4 (task's own label): the scheduler workload is commented out
-  # of the render, not deleted. `scheduler-service.yaml`,
-  # `scheduler-deployment.yaml` and `scheduler-pdb.yaml` still exist on disk
-  # byte for byte, but `images:` below still points `agentenv-scheduler` at
-  # `newTag: latest` — the same unpinned placeholder every other image here
-  # uses, not a build known to be compatible with the `paused_sandboxes`
-  # schema the currently-running `aenv-api` maintains, and the pve-mf
-  # registry this cluster deploys against carries no `agentenv-scheduler`
-  # repository at all (nothing has built/pushed that image since the
-  # scheduler was decommissioned). The wire format has moved on too: `6fb0594`
-  # reserves `HeartbeatRequest` field 8 (`sandbox_ids`) in
-  # `services/api/proto/scheduler.proto` and nodes stopped populating it, so a
-  # pre-`6fb0594` scheduler binary that still reads `sandbox_ids` for its
-  # roster will see every heartbeat as an empty roster — rolling the scheduler
-  # back is not only a `paused_sandboxes` schema question, the heartbeat
-  # protocol itself is no longer backward compatible either. Before
-  # uncommenting the workload below for an actual rollback, build and push a
-  # verified-compatible image and
-  # pin this reference to that specific tag or digest — do not rely on
-  # whatever `latest` resolves to at incident time, and do not assume
-  # uncommenting alone restores anything. `services/scheduler`'s Go source
-  # is untouched (task's own instruction: do not delete it).
-  #
-  # Nothing in this base layer still needs the scheduler process reachable:
-  # every node's primary heartbeat now targets `agentenv-api`
-  # (`node-heartbeat-config` above), `agentenv-api-deployment.yaml` runs
-  # `AENV_NODE_PLACEMENT_SOURCE=native` with
-  # `AENV_PAUSED_REGISTRY_BACKEND=postgres`, and `gateway-k8s-config`'s
-  # `config/gateway.json` now dials `agentenv-api:8002` instead of this
-  # Service, including `ListRegistrySandboxes` (gateway-k8s-config's own
-  # comment above) -- `src/node_registry/grpc_service.rs`'s
-  # `list_registry_sandboxes` now answers it for real, so every RPC the
-  # gateway sends this way is covered. See CLAUDE.md's "Distributed Control
-  # Plane" section and `services/README.md` for the current deploy status.
-  # - scheduler-service.yaml
-  # - scheduler-deployment.yaml
-  # - scheduler-pdb.yaml
   - gateway-service.yaml
   - gateway-deployment.yaml
   - agentenv-headless-service.yaml
@@ -116,15 +79,6 @@ configMapGenerator:
       # it is configured — and that binary cannot link a PostgreSQL client
       # anyway).
       - config/pg-overlay.toml
-  # 🔴 阶段四 E4: no longer generated from the Deployment — `scheduler-deployment.yaml`
-  # is out of `resources:` below (see the note there), so this ConfigMap has
-  # no reader left. Kept, not deleted, the same rollback discipline as the
-  # Deployment/Service/PDB files themselves: re-adding the Deployment to
-  # `resources:` needs this to already exist rather than also reconstructing
-  # it. `config/scheduler.json` itself is untouched.
-  # - name: scheduler-k8s-config
-  #   files:
-  #     - config/scheduler.json
   - name: gateway-k8s-config
     files:
       # 🔴 阶段四 E4: `gateway.scheduler_addr` inside this file is
@@ -701,11 +655,6 @@ configMapGenerator:
 images:
   - name: agentenv-gateway
     newName: agentenv-gateway
-    newTag: latest
-  # 🔴 Unpinned — see the rollback note in resources: above before using
-  # this as a rollback target.
-  - name: agentenv-scheduler
-    newName: agentenv-scheduler
     newTag: latest
   # 🔴 Two images, one tag. The node half and the api half are separate
   # binaries now (`aenv-node` links overlaybd/ublk/Firecracker; `aenv-api`

@@ -21,28 +21,6 @@ jobs:
     defaults:
       run:
         working-directory: services
-    # The scheduler reads the paused-sandbox registry out of PostgreSQL, and
-    # those tests were skipping in CI because nothing here provided one. They
-    # are the semantic baseline the control plane is measured against, so a
-    # baseline nobody runs is worse than none.
-    #
-    # Since PostgreSQL came off the node, that baseline lives here and nowhere
-    # else: the node's own `tests/paused_registry.rs` was deleted with it, and
-    # its thirty tests were ported into the registry package (each one named in
-    # a `Ported from` comment). This job is the only thing that runs them.
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: verify
-          POSTGRES_DB: aenv_registry
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -53,27 +31,23 @@ jobs:
             services/go.mod
       - name: Build services
         run: make build
-      - name: Install Redis server for scheduler tests
+      - name: Install Redis server for the routing-reader tests
         run: |
           sudo apt-get update
           sudo apt-get install -y redis-server
       - name: Test services
         env:
-          SCHEDULER_REGISTRY_TEST_DSN: postgres://postgres:verify@127.0.0.1:5432/aenv_registry
-          # A DSN that goes missing must fail this job rather than turn the
-          # registry tests into green skips.
-          SCHEDULER_REGISTRY_TEST_REQUIRED: "1"
-          # Same reason for the binding-store tests: they fall back to looking
-          # `redis-server` up on PATH and skip when it is absent, so naming the
-          # binary is what makes a failed install fail the job instead.
+          # shared/routing's reader tests fall back to looking `redis-server`
+          # up on PATH and skip when it is absent, so naming the binary is
+          # what makes a failed install fail the job instead of reporting a
+          # green skip.
           REDIS_SERVER_BIN: /usr/bin/redis-server
           # And the belt to that brace. Naming the binary only helps while the
           # path is right; this turns a skip inside the suite into a failure
-          # however it was reached. It matters here more than the registry's
-          # equivalent does: the binding-store tests are the only ones that
-          # exercise the Redis implementation, which is what every HA
-          # deployment runs, and a change made to the in-memory store and
-          # forgotten for Redis passes every other test in the module.
+          # however it was reached. The routing-reader tests are the only
+          # coverage the Redis-backed binding store has, and a change made to
+          # the in-memory store and forgotten for Redis passes every other
+          # test in the module.
           SCHEDULER_REDIS_TEST_REQUIRED: "1"
         run: make test
       - name: Go format check

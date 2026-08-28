@@ -20,6 +20,8 @@
   "gateway": {
     "http_listen_addr": ":8080",
     "scheduler_addr": "scheduler:9090",
+    "resume_addr": "agentenv-api:8002",
+    "rest_upstream_addr": "http://agentenv-api:8000",
     "request_timeout": "90s",
     "forward_response_size": 4194304,
     "sandbox_proxy_domains": []

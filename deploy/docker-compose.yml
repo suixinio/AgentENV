@@ -96,13 +96,26 @@ services:
       RUST_LOG: ${RUST_LOG:-aenv_core=info,aenv_api=info,agentenv=info}
     volumes:
       - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
-    # 🔴 Published directly, and the gateway is not yet in front of it. The
-    # gateway (`GATEWAY_SCHEDULER_ADDR`) routes sandbox *data-plane* traffic to
-    # whichever node holds the sandbox, which is unchanged; what used to also
-    # arrive on a node — the user-facing REST surface — now lives here. Point a
-    # client at http://localhost:8010 for `/sandboxes`, `/snapshots` and
-    # `/templates`. Wiring the gateway's control path to this service is a
-    # gateway-config change and is not part of this commit.
+    # 🔴 Also published directly on 8010 for convenience, but the gateway
+    # (`GATEWAY_REST_UPSTREAM_ADDR`/`GATEWAY_RESUME_ADDR` below, matching
+    # `deploy/k8s/base`'s `api-upstream-config`) now sends user-facing REST
+    # and paused-sandbox wake-ups here too — point a client at the gateway's
+    # own port (8000) for `/sandboxes`, `/snapshots` and `/templates` the same
+    # way a k8s deployment would.
+    #
+    # 🔴 This container will not actually come up healthy on a plain
+    # `make deploy-up`: `aenv-api` requires `[pg]` unconditionally
+    # (`build_snapshot_backend`, see CLAUDE.md's snapshot-catalog section) and
+    # this compose stack has no PostgreSQL service. That gap predates and is
+    # independent of the gateway wiring above — it is not fixed here. The
+    # gateway itself still starts fine regardless (`grpc.NewClient` dials
+    # lazily), so a crash-looping `agentenv-api` degrades REST/resume traffic
+    # rather than blocking gateway startup. Node placement/heartbeats still go
+    # through `scheduler` below, unmigrated — the `services/scheduler`
+    # service stays in this stack until a PostgreSQL service is added here
+    # and the native-topology migration (`AENV_NODE_PLACEMENT_SOURCE=native`,
+    # dropping `scheduler` the way `deploy/k8s/base/kustomization.yaml`
+    # comments out the scheduler workload) is done as its own change.
     ports:
       - "8010:8000"
     healthcheck:
@@ -151,6 +164,12 @@ services:
     environment:
       GATEWAY_HTTP_LISTEN_ADDR: :8080
       GATEWAY_SCHEDULER_ADDR: scheduler:9090
+      # 🔴 No longer optional (R9, `services/shared/config`'s `Config.Validate`):
+      # `aenv-node` answers 404 on user-facing REST and has no wake-up surface
+      # of its own, so both addresses must name the api half. Same values
+      # `deploy/k8s/base/kustomization.yaml`'s `api-upstream-config` uses.
+      GATEWAY_REST_UPSTREAM_ADDR: http://agentenv-api:8000
+      GATEWAY_RESUME_ADDR: agentenv-api:8002
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     ports:
       - "8000:8080"

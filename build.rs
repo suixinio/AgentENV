@@ -5,6 +5,7 @@ fn main() {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
     println!("cargo:rerun-if-changed=services/api/proto/node.proto");
     println!("cargo:rerun-if-changed=services/api/proto/apiproxy/apiproxy.proto");
+    println!("cargo:rerun-if-env-changed=AENV_GIT_COMMIT");
     emit_git_rerun_inputs();
 
     // The server stubs exist for the in-process fake controller the registry
@@ -33,8 +34,27 @@ fn main() {
         )
         .expect("failed to compile the scheduler, node and apiproxy protos for Rust gRPC");
 
-    let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());
+    let commit = resolve_build_commit();
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");
+}
+
+/// Resolves the commit embedded in the binary via `AENV_GIT_COMMIT`
+/// (`src/identity.rs::build_commit` reads it back with `option_env!`).
+///
+/// `.dockerignore` excludes `.git` from the Docker build context to keep it
+/// small, so `resolve_git_commit()`'s `git rev-parse` has nothing to read
+/// from inside a container build — every image build must instead pass the
+/// commit in explicitly as `AENV_GIT_COMMIT` (Docker `ARG`/`ENV`, threaded
+/// through by `deploy/docker/Dockerfile.aenv-node` /
+/// `Dockerfile.aenv-api` and `Makefile`'s `k8s-build`), which we prefer here
+/// when present. Plain local `cargo build` runs still resolve the commit
+/// from `.git` since it is actually present on disk there.
+fn resolve_build_commit() -> String {
+    std::env::var("AENV_GIT_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(resolve_git_commit)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn emit_git_rerun_inputs() {

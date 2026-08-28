@@ -55,6 +55,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM build-deps AS builder
 
 COPY . .
+# `.dockerignore` excludes `.git` to keep the build context small, so
+# `build.rs`'s `git rev-parse` has nothing to read in here. Pass the commit
+# in explicitly instead; `build.rs` prefers this env var over shelling out to
+# git. A missing `--build-arg` falls back to the literal "unknown" rather
+# than failing the build, and that literal is what shows up in `/nodes`'
+# `commit` field when it happens.
+ARG AENV_GIT_COMMIT=unknown
+ENV AENV_GIT_COMMIT=${AENV_GIT_COMMIT}
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release -p aenv-node --bin aenv-node -p uvm-ublk-daemon --bin uvm-ublk-daemon \

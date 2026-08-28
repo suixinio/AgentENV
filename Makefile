@@ -8,6 +8,12 @@ DOCKER ?= docker
 DOCKER_COMPOSE ?= docker compose
 DEPLOY_COMPOSE_FILE ?= deploy/docker-compose.yml
 APT_MIRROR_BASE ?=
+# Commit baked into aenv-node/aenv-api at build time (see build.rs and
+# deploy/docker/Dockerfile.aenv-{node,api}); `.git` is excluded from the
+# Docker build context, so this has to be passed in as a build-arg rather
+# than resolved inside the container. Falls back to "unknown" rather than
+# failing the build when git resolution isn't possible either.
+AENV_GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 KUBECTL ?= kubectl
 K8S_NAMESPACE ?= agentenv-system
 K8S_RUNTIME_IMAGE ?= agentenv-runtime:latest
@@ -363,8 +369,8 @@ deploy-ps:
 	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) ps
 
 k8s-build:
-	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.aenv-node -t $(K8S_RUNTIME_IMAGE) .
-	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.aenv-api -t $(K8S_API_IMAGE) .
+	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-node -t $(K8S_RUNTIME_IMAGE) .
+	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-api -t $(K8S_API_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
 

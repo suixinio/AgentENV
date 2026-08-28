@@ -307,6 +307,7 @@ jobs:
           push: true
           build-args: |
             AENV_VIRTUALIZATION_MODE=kvm
+            AENV_GIT_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}-${{ matrix.arch }}
 
@@ -317,6 +318,8 @@ jobs:
           file: deploy/docker/Dockerfile.aenv-api
           platforms: ${{ matrix.platform }}
           push: true
+          build-args: |
+            AENV_GIT_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-api:${{ github.ref_name }}-${{ matrix.arch }}
 
@@ -392,6 +395,7 @@ jobs:
           cache-from: type=gha,scope=agentenv-runtime
           build-args: |
             AENV_VIRTUALIZATION_MODE=pvm
+            AENV_GIT_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}-pvm
             ghcr.io/${{ env.OWNER }}/aenv-server:latest-pvm

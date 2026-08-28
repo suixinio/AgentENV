@@ -9,35 +9,45 @@ import (
 
 // This file is the gateway's half of 阶段 3a: where user-facing REST goes.
 //
-// # The two positions
+// # There is one position, not two
 //
-// Off — no `rest_upstream_addr` — is what has always run. A REST call with no
-// sandbox in it (a create, a template build) is placed by the scheduler and
-// forwarded to whichever node it named; a REST call about one sandbox
-// (`POST /sandboxes/{id}/pause`) is resolved to the node holding it and
-// forwarded there. Every node in the fleet answers those routes because every
-// node was the pre-split single process.
+// Every user-facing REST call — a create or a template build with no sandbox
+// in it, or a sandbox-scoped call like `POST /sandboxes/{id}/pause` — goes to
+// one address: the api half, which owns sandboxes and drives the machines
+// itself over the node service. The gateway asks the scheduler nothing for
+// these requests — placement is the api half's decision, and calling Schedule
+// only to discard the answer would consume a placement and move the
+// strategy's cursor for a request that never went there.
 //
-// 🔴 That premise is retired. Nodes run `aenv-node` now and never serve
-// user-facing REST under any configuration, so this upstream is not optional —
-// see `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
+// 🔴 An empty `rest_upstream_addr` used to be a second, supported position:
+// the scheduler placed the call and forwarded it to whichever node it named,
+// because every node was still the pre-split single process and answered
+// those routes itself. That premise is retired — nodes run `aenv-node` now
+// and never serve user-facing REST under any configuration — so an empty
+// value would only ever produce a 404 from every node in the fleet, never a
+// working rollback. `services/shared/config`'s `Config.Validate` refuses to
+// load a gateway config with `rest_upstream_addr` (or `resume_addr`) empty
+// for exactly that reason: see
+// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`. By the time a
+// `*Server` exists in this process, `s.restUpstream` is always a real
+// address; the package-level `ServerOptions` type still *accepts* an empty
+// one, purely so the test suite in this package can keep using an
+// unconfigured server as a fixture for exercising the pre-3a scheduler
+// routing paths that share this handler — no code reachable from a validated
+// deployment can construct one.
 //
-// On, the same calls go to one address instead: the api half, which owns
-// sandboxes and drives the machines itself over the node service. The gateway
-// asks the scheduler nothing for these requests — placement is the api half's
-// decision, and calling Schedule only to discard the answer would consume a
-// placement and move the strategy's cursor for a request that never went there.
+// # 🔴 Why this was a value and not a manifest, while it was still a switch
 //
-// # 🔴 Why this is a value and not a manifest
-//
-// 3a's whole value was the shape of its rollback. The nodes stayed pre-split
-// for the whole of it, so they never stopped being able to serve REST, so
-// putting the traffic back was emptying this one value and rolling the gateway —
-// seconds, and nothing touches the DaemonSet. 3b, where the DaemonSet moves to
-// `aenv-node`, is the step whose rollback is a serial roll with an hour of
-// grace per machine. Anything that makes enabling or disabling 3a a manifest
-// change spends 3b's cost to buy 3a's, which is the one trade this staging
-// exists to refuse (`_sd-impl-phase3-role.md` §11.1, §11.2).
+// 3a's whole value, while it had two positions, was the shape of its
+// rollback. The nodes stayed pre-split for the whole of it, so they never
+// stopped being able to serve REST, so putting the traffic back was emptying
+// this one value and rolling the gateway — seconds, and nothing touched the
+// DaemonSet. 3b, where the DaemonSet moved to `aenv-node`, was the step whose
+// rollback is a serial roll with an hour of grace per machine
+// (`_sd-impl-phase3-role.md` §11.1, §11.2). Now that 3b has shipped and the
+// nodes no longer serve REST in any configuration, that rollback shape no
+// longer exists either way — see `services/README.md` for the rollback this
+// value now has instead.
 //
 // # 🔴 What this switch never carries
 //
@@ -58,21 +68,27 @@ import (
 //     🔴 `GET /sandboxes` and `GET /v2/sandboxes` are *not* in that list, and
 //     used not to be in this one either. They are aggregations over the nodes
 //     rather than over the scheduler, and the api half owns the cluster ledger
-//     they aggregate, so they move with this value: off, the fan-out in
-//     cluster_list.go answers them out of every node; on, they are forwarded
-//     here like any other REST call. They have to move with it rather than on
-//     a switch of their own — 阶段 3b answers both of those routes with 404 on
-//     a node, and the fan-out is all-or-nothing.
+//     they aggregate, so — back when this switch still had two positions —
+//     they moved with it: unset, the fan-out in cluster_list.go answered them
+//     out of every node; set, they were forwarded here like any other REST
+//     call. They had to move with it rather than on a switch of their own,
+//     because 阶段 3b answers both of those routes with 404 on a node and the
+//     fan-out is all-or-nothing — see cluster_list.go for what that fan-out
+//     is now that the position it existed for is retired.
 
 // restUpstreamTarget labels which upstream served a REST call.
 //
-// 🔴 Both positions are counted, and that is the point of the series rather
-// than an accident of its shape. 3a's acceptance criterion is "no user-facing
-// REST is served by a node any more", and a counter that only counted the api
-// side could not tell that apart from a gateway that had stopped receiving REST
-// at all. With both, one scrape carries its own control: `{upstream="node"}`
-// flat at zero is evidence exactly when `{upstream="api"}` in the same scrape is
-// not.
+// 🔴 Both arms are still counted, and that is the point of the series rather
+// than an accident of its shape. 3a's acceptance criterion was "no
+// user-facing REST is served by a node any more", and a counter that only
+// counted the api side could not tell that apart from a gateway that had
+// stopped receiving REST at all. With both, one scrape carries its own
+// control: `{upstream="node"}` flat at zero is evidence exactly when
+// `{upstream="api"}` in the same scrape is not — and now that
+// `rest_upstream_addr` cannot be empty in a validated deployment,
+// `{upstream="node"}` is expected to read a permanent flat zero on every real
+// gateway; a nonzero reading there is not a rollback, it means something
+// constructed a `*Server` without going through `services/shared/config`.
 const (
 	restUpstreamAPI  = "api"
 	restUpstreamNode = "node"

@@ -90,23 +90,32 @@ type ServerOptions struct {
 	ProjectionAuthoritative bool
 
 	// ResumeClient asks the API half to wake a paused sandbox when the routing
-	// projection has no answer. Nil is the switch off, and off means the
-	// gateway behaves exactly as it did before the wake-up decision moved:
-	// every projection miss falls through to the scheduler.
+	// projection has no answer. Nil makes the gateway fall through to the
+	// scheduler on every projection miss, exactly as it did before the
+	// wake-up decision moved.
 	//
-	// 🔴 That nil is 3a's rollback lever. `_sd-impl-phase3-role.md` §11.2 buys
-	// 3a's "seconds, and does not touch the DaemonSet" rollback by making this
-	// a ConfigMap change, so it has to be a configuration switch and never a
-	// deploy-time one.
+	// 🔴 阶段 3a used to be able to leave this nil in production: nodes were
+	// still the pre-split single process and could wake a sandbox themselves,
+	// so nil was a supported rollback lever (`_sd-impl-phase3-role.md` §11.2).
+	// That premise is retired — `aenv-node` has no wake-up surface of its own —
+	// and `services/shared/config`'s `Config.Validate` now refuses to load a
+	// gateway config with `resume_addr` empty, so `cmd/main.go` can no longer
+	// construct a `*Server` with this nil. It stays nil-able here purely
+	// because this package's own tests use an unconfigured `*Server` as their
+	// baseline fixture for exercising the scheduler-routed paths this shares
+	// with the REST upstream switch below — see rest_upstream.go.
 	ResumeClient *resume.Client
 
 	// RestUpstreamAddr sends user-facing REST to the api half instead of
-	// fanning it out to the nodes. The empty string is the switch off and is
-	// today's behaviour exactly. Parsed in NewServer, so an address that cannot
-	// be used stops the process rather than becoming a 502 per request.
+	// fanning it out to the nodes. Parsed in NewServer, so an address that
+	// cannot be used stops the process rather than becoming a 502 per request.
 	//
-	// 🔴 3a's other rollback lever, and the same rule applies: it has to be a
-	// configuration switch, never a deploy-time one. See rest_upstream.go.
+	// 🔴 The empty string is still accepted here — see rest_upstream.go for
+	// why — but it is no longer a supported deployment position.
+	// `services/shared/config`'s `Config.Validate` refuses to load a gateway
+	// config with `rest_upstream_addr` empty, so no code reachable from a
+	// validated deployment can leave this empty; only this package's tests
+	// still construct a `*Server` that way, as a fixture.
 	RestUpstreamAddr string
 
 	// SchedulerFallbackDisabled turns off the query-only-scheduler LookupNode
@@ -166,9 +175,12 @@ type Server struct {
 	// switch is off" is a state a reader of this code can see.
 	projectionReader        projectionReader
 	projectionAuthoritative bool
-	// Nil when no wake-up endpoint is configured. See ServerOptions.
+	// Nil when no wake-up endpoint is configured — no longer reachable from a
+	// validated deployment, see ServerOptions.ResumeClient.
 	resumeClient *resume.Client
-	// Empty when user-facing REST still fans out to the nodes. Normalised to a
+	// Empty means user-facing REST fans out to the nodes, a position
+	// `services/shared/config` no longer lets a deployed gateway reach; see
+	// ServerOptions.RestUpstreamAddr and rest_upstream.go. Normalised to a
 	// base URL once, at construction, for the reason executionFencing is: a
 	// string re-read and re-interpreted at each call site is how one switch
 	// ends up meaning two things.
@@ -375,9 +387,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// The cluster listing is counted the same way from its own branch above,
 	// which is the one user-facing REST route this process can serve out of the
 	// nodes without forwarding anything. Counted there rather than left out, so
-	// that a fleet on `aenv-node` with this switch rolled back — where the
-	// listing is fanned out to nodes and 404s — cannot read as "no node serves
-	// REST any more".
+	// that `{upstream="node"}` reading nonzero — which should not happen from
+	// any validated deployment any more, see rest_upstream.go — cannot be
+	// mistaken for "no node serves REST any more" just because the listing's
+	// own fan-out went uncounted.
 	if isUserFacingRestRequest(r, hostRoute, routeSource) {
 		if s.restUpstream != "" {
 			recordRestUpstream(restUpstreamAPI)

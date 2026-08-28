@@ -78,23 +78,33 @@ func isClusterListRequest(r *http.Request) bool {
 // 🔴 One value decides it, and it is the same value that decides every other
 // user-facing REST call: `rest_upstream_addr`. Unset, this fan-out is the only
 // thing in the cluster that can answer `GET /sandboxes` — no single process
-// holds every node's sandboxes — so it stays exactly as it was, down to the
-// merge, the deduplication and the pagination below. Set, the api half owns the
-// cluster ledger and answers the same list from one read, so a cluster-list
-// request is claimed by nothing here and falls through to
-// `forwardToRestUpstream` with the rest of the REST surface.
+// holds every node's sandboxes — so it falls back to the merge, the
+// deduplication and the pagination below. Set, the api half owns the cluster
+// ledger and answers the same list from one read, so a cluster-list request is
+// claimed by nothing here and falls through to `forwardToRestUpstream` with
+// the rest of the REST surface.
 //
-// 🔴 Why the listing moves with that value rather than getting a switch of its
-// own. 阶段 3b flips the DaemonSet to `aenv-node`, and the role gate answers
-// `GET /sandboxes` and `GET /v2/sandboxes` with 404 there — those are exactly
-// the two routes this fan-out calls. The fan-out is all-or-nothing
+// 🔴 `rest_upstream_addr` can no longer be unset in a validated deployment —
+// `services/shared/config`'s `Config.Validate` refuses to load a gateway
+// config with it empty, because 阶段 3b already flipped the DaemonSet to
+// `aenv-node`, and the role gate answers `GET /sandboxes` and
+// `GET /v2/sandboxes` with 404 there, which are exactly the two routes this
+// fan-out would call. So this function is expected to always return false on
+// a real gateway; the fan-out below survives only because this package's own
+// tests still construct an unconfigured `*Server` to exercise it, and because
+// deleting it here would mean deleting the belt-and-braces coverage those
+// tests give the merge/dedup/pagination logic — see rest_upstream.go for why
+// an empty value is kept constructible at all.
+//
+// 🔴 Why the listing moved with that value rather than getting a switch of its
+// own, while both still existed: the fan-out is all-or-nothing
 // (`fetchClusterList` cancels the rest on the first failure) and
 // `handleClusterList` passes a 4xx through verbatim, so a node fleet on
 // `aenv-node` turns the user's `GET /sandboxes` into a bare 404 rather than
-// into a degraded list. A separate switch would mean 3b's correctness depended
-// on two values being flipped in the right order; with one, the position that
-// takes REST off the nodes is the position that stops asking nodes for this
-// list, and emptying it puts both back together.
+// into a degraded list. A separate switch would have meant 3b's correctness
+// depending on two values being flipped in the right order; with one, the
+// position that took REST off the nodes was the position that stopped asking
+// nodes for this list.
 func (s *Server) fansOutClusterList(r *http.Request) bool {
 	return isClusterListRequest(r) && s.restUpstream == ""
 }

@@ -303,8 +303,8 @@ To go back to the single-process shape, deploy the **pre-split image tag** on
 `agentenv-daemonset.yaml` (the last tag built before the crate split; that
 binary still accepts `--role all`) and point the gateway's
 `GATEWAY_REST_UPSTREAM_ADDR` and
-`GATEWAY_RESUME_ADDR` back at the nodes in the same apply. Two things to know
-before starting:
+`GATEWAY_RESUME_ADDR` back at the nodes in the same apply. Three things to
+know before starting:
 
 - it is a **serial DaemonSet roll with a drain per machine**, not a value
   change — budget the grace period times the node count;
@@ -313,7 +313,17 @@ before starting:
   keys while the nodes still run `aenv-node` 404s every REST call in the
   cluster. `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`
   (`shared/config/execution_switches_manifest_test.go`) is what refuses the
-  second of those in the tree.
+  second of those in the tree;
+- 🔴 **a current-generation gateway can no longer be pointed at empty
+  addresses at all.** `services/shared/config`'s `Config.Validate` refuses to
+  load a "gateway" config with `GATEWAY_REST_UPSTREAM_ADDR` or
+  `GATEWAY_RESUME_ADDR` empty, from either the ConfigMap or
+  `config/gateway.json`'s file fallback — the gateway now fails to start
+  rather than serving the outage those two keys used to produce when emptied.
+  So this rollback needs the **gateway's own image tag pinned back too**, to a
+  build from before that refusal existed, in the same apply as the DaemonSet's
+  pre-split tag and the two emptied keys — the DaemonSet image tag alone is
+  not enough any more.
 
 From the repository root:
 

@@ -78,44 +78,31 @@ func main() {
 		defer projectionReader.Close()
 	}
 
-	// 🔴 Built only when an address is configured, following the projection
-	// reader above: "the switch is off" has to be a nil client rather than a
-	// live connection nothing uses. Unlike the projection reader this does not
-	// dial here — grpc.NewClient is lazy — because an api half that is briefly
-	// down must delay a wake-up, not stop the gateway from starting.
-	var resumeClient *resume.Client
-	if cfg.Gateway.ResumeAddr != "" {
-		resumeConn, err := newSchedulerConn(cfg.Gateway.ResumeAddr)
-		if err != nil {
-			logger.Fatal("connect api resume surface failed", zap.Error(err), zap.String("addr", cfg.Gateway.ResumeAddr))
-		}
-		defer resumeConn.Close()
-		resumeClient = resume.New(resumeConn, cfg.Gateway.RequestTimeout)
-		logger.Info("waking paused sandboxes through the api half",
-			zap.String("addr", cfg.Gateway.ResumeAddr),
-		)
-	} else {
-		// 🔴 Said out loud, because the alternative is a capability that is
-		// silently absent. With no address the gateway never asks anyone to
-		// wake a sandbox: every projection miss goes to the scheduler and
-		// whichever node the request lands on wakes it itself. That is correct
-		// before 阶段 3a and wrong after it, and the difference is invisible
-		// from the outside — the requests still succeed.
-		logger.Info("no api resume surface configured; paused sandboxes are woken by the node the request lands on")
+	// 🔴 阶段 3a's two addresses are no longer optional. `services/shared/config`
+	// refuses to load a "gateway" config with either one empty
+	// (`Config.Validate`), so by the time this line runs both are real
+	// addresses — there is no "off" branch left to hold open here. See
+	// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest:
+	// aenv-node answers 404 on every user-facing REST route and has no
+	// wake-up surface of its own, so an empty value here would only ever have
+	// meant an outage, never a legitimate position.
+	//
+	// This does not dial here — grpc.NewClient is lazy — because an api half
+	// that is briefly down must delay a wake-up, not stop the gateway from
+	// starting.
+	resumeConn, err := newSchedulerConn(cfg.Gateway.ResumeAddr)
+	if err != nil {
+		logger.Fatal("connect api resume surface failed", zap.Error(err), zap.String("addr", cfg.Gateway.ResumeAddr))
 	}
+	defer resumeConn.Close()
+	resumeClient := resume.New(resumeConn, cfg.Gateway.RequestTimeout)
+	logger.Info("waking paused sandboxes through the api half",
+		zap.String("addr", cfg.Gateway.ResumeAddr),
+	)
 
-	// 🔴 Said out loud in both positions, following the resume surface above and
-	// for the same reason: with no address configured every user-facing REST
-	// call is placed by the scheduler and served by a node, which is correct
-	// before 阶段 3a and wrong after it, and the difference is invisible from
-	// the outside because the calls succeed either way.
-	if cfg.Gateway.RestUpstreamAddr != "" {
-		logger.Info("sending user-facing rest to the api half",
-			zap.String("addr", cfg.Gateway.RestUpstreamAddr),
-		)
-	} else {
-		logger.Info("no api rest upstream configured; user-facing rest is served by the node the scheduler names")
-	}
+	logger.Info("sending user-facing rest to the api half",
+		zap.String("addr", cfg.Gateway.RestUpstreamAddr),
+	)
 
 	serverOptions := gateway.ServerOptions{
 		RequestTimeout:            cfg.Gateway.RequestTimeout,

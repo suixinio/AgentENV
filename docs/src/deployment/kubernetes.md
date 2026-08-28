@@ -182,14 +182,21 @@ process starts, which is deliberate: an un-migrated manifest fails loudly instea
 of being ignored. Going back to a single process that serves REST on every node
 means deploying the pre-split image tag on the DaemonSet, a serial roll with a
 drain per machine; see `services/README.md`. Emptying the two gateway switches
-below alone does **not** do it any more, because an `aenv-node` fleet has no
-configuration in which it answers user-facing REST.
+below alone does **not** do it any more, and — since this change — cannot even
+be attempted any more: `services/shared/config`'s `Config.Validate` refuses to
+load a gateway config with either one empty, so a current-generation gateway
+CrashLoopBackOffs rather than starting up with them cleared. Getting this
+rollback's gateway half working again means also pinning the **gateway's own
+image tag** back to a build from before that refusal existed, in the same
+apply — see `services/README.md`'s "Rolling the node half back" section.
 
 🔴 **Do not turn a gateway switch on by editing `config/gateway.json`.** An
 environment variable set to the empty string is ignored by the loader, so a
-value that lives in the file cannot be cleared from the environment — and the
-rollback above would stop working. Keep the file's values empty and drive both
-switches from `api-upstream-config` or `kubectl set env`.
+value that lives in the file cannot be cleared from the environment — and
+losing `api-upstream-config` would then fall back to a real address in the
+file instead of the fail-fast refusal that emptying it is meant to produce.
+Keep the file's values empty and drive both switches from `api-upstream-config`
+or `kubectl set env`.
 
 The API half reaches a node's gRPC service by substituting
 `AENV_NODE_SERVICE_PORT` into the address the scheduler gives it, which is the

@@ -962,29 +962,32 @@ type GatewayConfig struct {
 	// ResumeAddr is the api half's wake-up surface, asked when the routing
 	// projection has no answer for a sandbox.
 	//
-	// 🔴 Empty is the switch off, and off is today's behaviour exactly: every
-	// projection miss falls through to the scheduler, and the node the request
-	// lands on wakes the sandbox itself. That is what makes 阶段 3a's rollback a
-	// ConfigMap change and a gateway restart — seconds — rather than a
-	// DaemonSet roll, which is an hour multiplied by the node count
-	// (`_sd-impl-phase3-role.md` §11.1, §11.2).
+	// 🔴 No longer optional. Empty used to be the switch off — every
+	// projection miss fell through to the scheduler, and the node the request
+	// landed on woke the sandbox itself — while 阶段 3a's rollback was a
+	// ConfigMap change and a gateway restart rather than a DaemonSet roll
+	// (`_sd-impl-phase3-role.md` §11.1, §11.2). That premise is retired: nodes
+	// run `aenv-node` now and have no wake-up surface of their own under any
+	// configuration, so `Validate` refuses a config with this empty rather
+	// than letting a cluster discover it as every resume attempt silently
+	// falling back to the scheduler. See rest_upstream.go and
+	// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
 	ResumeAddr string `json:"resume_addr"`
 	// RestUpstreamAddr is where user-facing REST goes: sandbox, snapshot and
 	// template calls, the routes `aenv-node` answers 404 on.
 	//
-	// 🔴 Empty is the switch off, and off is today's behaviour exactly: the
-	// gateway asks the scheduler which node should serve the call and forwards
-	// it there. Set — `http://agentenv-api:8000`, or a bare `agentenv-api:8000`
-	// which is read as http — the same calls go to the api half instead, which
-	// owns sandboxes and drives the machines itself.
-	//
-	// 🔴 This is the half of 阶段 3a whose rollback has to stay cheap. Emptying
-	// this value puts every REST call back on the nodes, which are still
-	// the pre-split single process for the whole of 3a and never stopped being able to
-	// serve it. Nothing about that rollback touches the DaemonSet, and that is
-	// the entire reason 3a is a separate step from 3b, where the same rollback
-	// is a serial roll with an hour of grace per machine
-	// (`_sd-impl-phase3-role.md` §11.1, §11.2).
+	// 🔴 No longer optional, for the same reason as ResumeAddr above. Empty
+	// used to be the switch off — the gateway asked the scheduler which node
+	// should serve the call and forwarded it there, because the nodes were
+	// still the pre-split single process and never stopped being able to
+	// serve it (`_sd-impl-phase3-role.md` §11.1, §11.2). That premise is
+	// retired: nodes run `aenv-node` now and answer 404 on every user-facing
+	// REST route under any configuration, so `Validate` refuses a config with
+	// this empty rather than letting a cluster discover it as REST 404s. Set —
+	// `http://agentenv-api:8000`, or a bare `agentenv-api:8000` which is read
+	// as http — the calls go to the api half, which owns sandboxes and drives
+	// the machines itself. See rest_upstream.go and
+	// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
 	//
 	// 🔴 Never carries data-plane traffic. A request routed by proxy headers or
 	// by a sandbox proxy domain goes to the node holding the sandbox whatever
@@ -1820,6 +1823,21 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		// stops the process here rather than turning into a 502 per request.
 		if _, err := ParseRestUpstream(c.Gateway.RestUpstreamAddr); err != nil {
 			return err
+		}
+		// 🔴 阶段 3a no longer has an "off" position for either of its two
+		// addresses. Nodes run aenv-node now and answer 404 on every
+		// user-facing REST route and have no wake-up surface of their own, so
+		// an empty rest_upstream_addr or resume_addr is not a rollback — it is
+		// an outage with no matching half, and refusing it here turns that into
+		// a startup failure instead of a 404/502 discovered per request. See
+		// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest.
+		if strings.TrimSpace(c.Gateway.RestUpstreamAddr) == "" {
+			return errors.New("gateway.rest_upstream_addr is required: aenv-node answers 404 on " +
+				"user-facing REST, so the gateway has nowhere else to send it")
+		}
+		if strings.TrimSpace(c.Gateway.ResumeAddr) == "" {
+			return errors.New("gateway.resume_addr is required: aenv-node has no wake-up surface " +
+				"of its own, so the gateway has nowhere else to ask a paused sandbox to be woken")
 		}
 	}
 	return nil

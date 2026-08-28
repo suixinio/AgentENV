@@ -310,30 +310,32 @@ configMapGenerator:
   # 阶段 3a, in two keys: which upstream the gateway sends user-facing REST to,
   # and who wakes a paused sandbox the routing projection has no answer for.
   #
-  # 🔴 This ConfigMap *is* 3a's switch, and its rollback — and 3a is **on**.
-  # Both keys carry real addresses because the cluster has been running them
-  # since 08-24: the gateway sends user-facing REST to the api half and wakes
-  # paused sandboxes through it, rather than fanning out to whichever node the
-  # scheduler names. Rolling 3a back is emptying them again and rolling the
-  # gateway — seconds, and **the DaemonSet is not touched**.
+  # 🔴 This ConfigMap *is* 3a's switch, and 3a is **on**, permanently now. Both
+  # keys carry real addresses because the cluster has been running them since
+  # 08-24: the gateway sends user-facing REST to the api half and wakes paused
+  # sandboxes through it, rather than fanning out to whichever node the
+  # scheduler names.
   #
-  # 🔴 That last sentence stopped being true of this cluster, and it is why
-  # these two values must not be left `off` here. The DaemonSet has since moved
-  # to `aenv-node` (3b, see agentenv-daemonset.yaml), so the nodes answer 404
-  # on the sandboxes routes. An `apply -k` that emptied these two keys would
-  # point the gateway back at nodes that no longer serve REST — not a rollback
-  # to the old behaviour but a REST outage, and one that only shows up as 404s
-  # from the gateway.
+  # 🔴 Emptying either key is no longer a rollback, and no longer possible at
+  # all. The DaemonSet has since moved to `aenv-node` (3b, see
+  # agentenv-daemonset.yaml), so the nodes answer 404 on the sandboxes routes
+  # and have no wake-up surface of their own — the shape of rollback this
+  # ConfigMap used to offer (empty the two keys, roll the gateway, leave the
+  # DaemonSet alone) would point the gateway at a target that cannot serve
+  # either call. `services/shared/config`'s `Config.Validate` now refuses to
+  # load a gateway config with either key empty, from the file or the
+  # environment, so an `apply -k` that emptied one is a CrashLoopBackOff at
+  # the next gateway restart rather than the silent REST/wake-up outage —
+  # discoverable only as 404s — that it used to be. The only rollback left for
+  # this half is the image-tag rollback in `services/README.md`'s "Rolling the
+  # node half back" section: a pre-阶段3a gateway image tag alongside the
+  # pre-split DaemonSet image tag, in the same apply, because a current
+  # gateway image can no longer run with these two empty at all.
   #
-  # 🔴 The empty values in `config/gateway.json` are load-bearing, not
-  # decoration. An environment variable set to the empty string is *ignored* by
-  # the config loader — that is what makes `kubectl set env FOO=` a clear rather
-  # than a set — so the off position always comes from the mounted file. Turn 3a
-  # on here or with `set env`; never by editing `resume_addr` /
-  # `rest_upstream_addr` in gateway.json to a real address, because then no
-  # environment value can turn it off again and the rollback becomes a manifest
-  # edit under incident pressure. `services/shared/config` has a test that
-  # pins both halves of this.
+  # `config/gateway.json` still mounts both keys empty, and that stays
+  # deliberate: it is what makes losing this ConfigMap a loud, fail-fast
+  # refusal to start rather than a fallback to a value nobody meant.
+  # `services/shared/config` has tests that pin both halves of this.
   - name: api-upstream-config
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000

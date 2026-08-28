@@ -29,7 +29,7 @@ import (
 const (
 	nodeHeartbeatConfigMap  = "node-heartbeat-config"
 	nodeHeartbeatEndpoint   = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT"
-	nodeHeartbeatFileEnv    = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE"
+	nodeHeartbeatFileEnv    = "AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE"
 	nodeHeartbeatMountPath  = "/etc/agentenv/heartbeat"
 	nodeHeartbeatFilePath   = nodeHeartbeatMountPath + "/scheduler-endpoint"
 	nodeHeartbeatVolumeName = "heartbeat-config"

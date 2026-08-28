@@ -273,8 +273,8 @@ impl ResumeWiring {
     /// 🔴 Lazy connect. [`SchedulerEndpointSource::spawn_from_config`] does not
     /// touch the network to build the channel, so a scheduler that is down at
     /// startup delays a resume rather than a process. The endpoint can also be
-    /// hot-reloaded afterward from `[cluster].scheduler_endpoint_file` (or its
-    /// deprecated fallback), with no restart.
+    /// hot-reloaded afterward from `[cluster].scheduler_endpoint_file`, with
+    /// no restart.
     pub fn from_config(node_id: impl Into<String>) -> anyhow::Result<Self> {
         let node_id = node_id.into();
         let config = ConfigManager::global_config();

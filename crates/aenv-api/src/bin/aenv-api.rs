@@ -93,6 +93,11 @@ async fn async_main() -> anyhow::Result<()> {
     // `aenv-node`'s own `async_main`, and `refuse_removed_catalog_env_vars`'s
     // doc for why an ignored environment variable is the dangerous shape here.
     aenv_api::cfg::refuse_removed_catalog_env_vars()?;
+    // 🔴 Same reasoning, for the deprecated
+    // AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE fallback: an un-migrated
+    // manifest would otherwise start with the heartbeat's hot-reload silently
+    // dead rather than refuse to start.
+    aenv_api::cfg::refuse_removed_scheduler_endpoint_file_env_var()?;
 
     let cli = ApiCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
@@ -1710,6 +1715,34 @@ mod tests {
         // that returned the whole file would satisfy the assertion above for
         // the wrong reason, and `async fn async_main` sits before the body's
         // opening brace, so a correct extraction never contains it.
+        assert!(
+            !async_main.contains("async fn async_main"),
+            "the scan is reading more than async_main's body, so the assertion above proves \
+             nothing about where the call actually is"
+        );
+    }
+
+    /// 🔴 This binary actually refuses a manifest that still sets the removed
+    /// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` fallback.
+    ///
+    /// `refuse_removed_scheduler_endpoint_file_env_var` has its own
+    /// two-direction test in `src/cfg.rs`, and that test stays green with the
+    /// call site deleted — which is the whole failure mode: confique ignores
+    /// an undeclared environment variable, so a manifest that kept setting
+    /// the old name would start a process that looks entirely healthy while
+    /// its heartbeat's hot-reload silently never fires. Nothing else would
+    /// say so.
+    #[test]
+    fn async_main_actually_refuses_the_removed_scheduler_endpoint_file_env_var() {
+        let source = include_str!("aenv-api.rs");
+        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
+        assert!(
+            async_main.contains("cfg::refuse_removed_scheduler_endpoint_file_env_var()"),
+            "async_main no longer refuses AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE; an \
+             un-migrated manifest would then start in silence, and src/cfg.rs's own test of the \
+             pure function would still report green"
+        );
+        // 🔴 The mutation control, same reasoning as the catalog scan above.
         assert!(
             !async_main.contains("async fn async_main"),
             "the scan is reading more than async_main's body, so the assertion above proves \

@@ -973,50 +973,6 @@ pub struct ObservabilitySchedulerReportConfig {
     pub enabled: bool,
     #[config(default = 5u64, env = "AENV_OBSERVABILITY_REPORT_INTERVAL_SECS")]
     pub interval_secs: u64,
-    /// A file holding the same endpoint as `[cluster].scheduler_endpoint`,
-    /// re-read once per heartbeat tick while the process runs.
-    ///
-    /// 🔴 This is what makes changing the heartbeat target free of a
-    /// DaemonSet roll. `[cluster].scheduler_endpoint` is read once at process
-    /// startup and baked into one gRPC channel that lives for the rest of the
-    /// process; today, changing it means editing the DaemonSet's
-    /// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` and rolling every node — the
-    /// serial, hour-long-grace-period roll that
-    /// `docs/proposals/2026-08-20-service-decomposition.md`'s phase four
-    /// section warns a rollback must not depend on. Point this at a file
-    /// mounted from a ConfigMap **without** `subPath` — kubelet only
-    /// refreshes non-`subPath` volumes, so a `subPath` mount would silently
-    /// never update — and the reporter notices an edit within one heartbeat
-    /// interval, with no pod restart.
-    ///
-    /// 🔴 **Deprecated** in favour of [`ClusterConfig::scheduler_endpoint_file`].
-    /// That field is the primary location now — Step 0.5 of the phase-4 fold
-    /// gave every `[cluster].scheduler_endpoint` consumer (P2P discovery, the
-    /// paused registry's `central` backend, the snapshot catalog client,
-    /// scheduler-backed node placement, resume placement) the same hot-reload
-    /// capability this field originally gave only
-    /// [`crate::observability::reporter`], which made "only the heartbeat can
-    /// hot-reload" no longer true. This field still works — existing
-    /// deployments that set only this one keep working unchanged — but is
-    /// read as a fallback: [`ClusterConfig::scheduler_endpoint_file`] wins
-    /// when both are set, logging a `warn!`. New deployments should set the
-    /// `[cluster]` field instead.
-    ///
-    /// 🔴 Not a union with the static value, unlike
-    /// `ApiConfig::control_plane_token_file`'s relationship to
-    /// `control_plane_tokens`: a heartbeat can only go to one place, so when
-    /// this is set and has been read successfully at least once, it
-    /// *overrides* `[cluster].scheduler_endpoint` outright rather than adding
-    /// to it. Unset — or set but never yet read successfully (not mounted
-    /// yet, briefly unreadable) — falls back to the static value, which is
-    /// today's behavior, byte-for-byte, for every deployment that has not
-    /// opted into this.
-    #[config(
-        default = "",
-        env = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE",
-        parse_env = parse_trimmed_string
-    )]
-    pub scheduler_endpoint_file: String,
 }
 
 /// Where `aenv-api` resolves a known node's current address for
@@ -1204,17 +1160,14 @@ pub struct ClusterConfig {
     /// cadence, so this does not need a second timing knob) while the
     /// process runs — no restart required to move traffic.
     ///
-    /// This is the Step 0.5 generalization of what
-    /// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`]
-    /// originally gave only the heartbeat reporter: every consumer that dials
-    /// the scheduler — P2P peer discovery, the paused registry's `central`
-    /// backend, the snapshot catalog client, scheduler-backed node placement,
-    /// resume placement, and the heartbeat reporter itself — now watches this
-    /// file through the same [`crate::scheduler_endpoint::SchedulerEndpointSource`]
-    /// and picks up an edit within one interval, with no pod restart. Point
-    /// it at a file mounted from a ConfigMap **without** `subPath` — kubelet
-    /// only refreshes non-`subPath` volumes, so a `subPath` mount would
-    /// silently never update.
+    /// Every consumer that dials the scheduler — P2P peer discovery,
+    /// scheduler-backed node placement, resume placement, and the heartbeat
+    /// reporter — watches this file through
+    /// [`crate::scheduler_endpoint::SchedulerEndpointSource`] and picks up an
+    /// edit within one interval, with no pod restart. Point it at a file
+    /// mounted from a ConfigMap **without** `subPath` — kubelet only
+    /// refreshes non-`subPath` volumes, so a `subPath` mount would silently
+    /// never update.
     ///
     /// 🔴 Not a union with the static value: once this has been read
     /// successfully at least once, it *overrides* `scheduler_endpoint`
@@ -1223,10 +1176,13 @@ pub struct ClusterConfig {
     /// the static value, which is today's behavior, byte-for-byte, for every
     /// deployment that has not opted into this.
     ///
-    /// When both this field and the deprecated
-    /// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`] are
-    /// set, this one wins and a `warn!` is logged once per resolution — see
-    /// [`crate::scheduler_endpoint::resolve_endpoint_file`].
+    /// 🔴 This field used to have a deprecated twin,
+    /// `[observability.scheduler_report].scheduler_endpoint_file`
+    /// (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE`), read as a fallback
+    /// when this one was unset. That field is gone: every deployment moved
+    /// onto this one, and [`crate::cfg::refuse_removed_scheduler_endpoint_file_env_var`]
+    /// now refuses to start a process that still has the old name set,
+    /// rather than let it silently stop hot-reloading.
     ///
     /// [`scheduler_endpoint`]: ClusterConfig::scheduler_endpoint
     #[config(
@@ -2698,6 +2654,65 @@ pub fn refuse_removed_catalog_env_vars_from(lookup: impl Fn(&str) -> Option<Stri
          it is where the rows are",
         present.join(", "),
         if present.len() == 1 { "it" } else { "them" }
+    )
+}
+
+/// The environment variable that used to set the heartbeat reporter's own
+/// hot-reload file directly
+/// (`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`), and is
+/// now removed.
+///
+/// 🔴 Named here and refused — rather than simply deleted from
+/// [`ObservabilitySchedulerReportConfig`]. confique **silently ignores** an
+/// environment variable no field declares, so a manifest that still sets
+/// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` would start a perfectly
+/// healthy-looking process while its operator believes the heartbeat target
+/// still hot-reloads from that file. It does not: every consumer that dials
+/// the scheduler moved onto [`ClusterConfig::scheduler_endpoint_file`]
+/// (`AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE`) instead, and the deprecated
+/// fallback that used to read this name is gone with it — a node that kept
+/// this set would silently stop hot-reloading its heartbeat target with no
+/// error anywhere.
+///
+/// Same decision `--role`/`AENV_ROLE` and [`REMOVED_CATALOG_ENV_VARS`] got:
+/// an un-migrated manifest fails loudly instead of being ignored.
+pub const REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR: &str =
+    "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE";
+
+/// Refuses to start when [`REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR`] is set.
+///
+/// Called from both binaries' entrypoints, before the configuration is
+/// loaded — same placement and reasoning as
+/// [`refuse_removed_catalog_env_vars`]: the point is to stop a process whose
+/// *manifest* still describes an arrangement this build does not have,
+/// knowable before anything is read.
+pub fn refuse_removed_scheduler_endpoint_file_env_var() -> Result<()> {
+    refuse_removed_scheduler_endpoint_file_env_var_from(|name| std::env::var(name).ok())
+}
+
+/// [`refuse_removed_scheduler_endpoint_file_env_var`] with the environment
+/// injected, so the decision is testable without mutating a process-global
+/// the rest of the test binary is reading concurrently.
+///
+/// 🔴 An empty value counts as set, same reasoning as
+/// [`refuse_removed_catalog_env_vars_from`]: a manifest that sets
+/// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE=` has still not been migrated.
+pub fn refuse_removed_scheduler_endpoint_file_env_var_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    if lookup(REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR).is_none() {
+        return Ok(());
+    }
+
+    bail!(
+        "{name} is set, and this build no longer has the setting it names. Every consumer that \
+         dials the scheduler moved onto [cluster].scheduler_endpoint_file \
+         (AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE), and the deprecated fallback that used to read \
+         {name} is gone. Remove {name} from this workload's manifest and set \
+         AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE to the same file instead; leaving {name} set would \
+         otherwise be ignored in silence, and the heartbeat's hot-reload would quietly stop \
+         working the moment an operator next needed to move it",
+        name = REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR
     )
 }
 
@@ -4220,6 +4235,61 @@ endpoint = "http://second:9000"
                 "{name} is refused at startup and still bound to a config field"
             );
         }
+    }
+
+    /// 🔴 The direction that matters: a manifest still carrying the removed
+    /// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` stops the process rather
+    /// than starting it with a heartbeat hot-reload that silently never
+    /// fires.
+    #[test]
+    fn a_manifest_still_setting_the_removed_scheduler_endpoint_file_env_var_is_refused() {
+        let error = refuse_removed_scheduler_endpoint_file_env_var_from(|probed| {
+            (probed == REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR)
+                .then(|| "/etc/agentenv/heartbeat/scheduler-endpoint".to_string())
+        })
+        .expect_err("the removed env var must stop the process, not be ignored");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR),
+            "the refusal must name the variable an operator has to delete: {rendered}"
+        );
+        assert!(
+            rendered.contains("AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE"),
+            "the refusal must name the replacement: {rendered}"
+        );
+    }
+
+    /// An empty value is still a manifest that has not been migrated.
+    #[test]
+    fn the_removed_scheduler_endpoint_file_env_var_set_to_nothing_is_still_refused() {
+        refuse_removed_scheduler_endpoint_file_env_var_from(|probed| {
+            (probed == REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR).then(String::new)
+        })
+        .expect_err("an empty value is set");
+    }
+
+    /// The control, and the half that makes the tests above mean something:
+    /// with the variable unset the check passes, so a green run is "the
+    /// environment is clean" rather than "this function never fires".
+    #[test]
+    fn an_environment_without_the_removed_scheduler_endpoint_file_env_var_starts() {
+        refuse_removed_scheduler_endpoint_file_env_var_from(|_| None)
+            .expect("a migrated manifest does not set it and must start");
+    }
+
+    /// The refused name must not still be a declared binding — a name that is
+    /// both refused here and read by confique would be refused before it
+    /// could be read, which is a contradiction somebody should hear about.
+    #[test]
+    fn the_removed_scheduler_endpoint_file_env_var_is_not_still_a_declared_binding() {
+        let source = include_str!("cfg.rs");
+        assert!(
+            !source.contains(&format!(
+                "env = \"{REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR}\""
+            )),
+            "{REMOVED_SCHEDULER_ENDPOINT_FILE_ENV_VAR} is refused at startup and still bound to \
+             a config field"
+        );
     }
 
     #[test]

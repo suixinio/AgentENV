@@ -31,8 +31,7 @@ pub struct SchedulerPeerDiscovery {
 
 impl SchedulerPeerDiscovery {
     /// Starts P2P peer discovery against the scheduler, hot-reloadable from
-    /// `[cluster].scheduler_endpoint_file` (or its deprecated fallback)
-    /// while the process runs — see
+    /// `[cluster].scheduler_endpoint_file` while the process runs — see
     /// [`SchedulerEndpointSource::spawn_from_config`]. An invalid *static*
     /// endpoint degrades to [`crate::p2p::discovery::NoopP2pPeerDiscovery`]
     /// rather than failing this process's startup: unlike the paused

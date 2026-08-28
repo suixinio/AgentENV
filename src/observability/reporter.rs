@@ -33,9 +33,8 @@ struct HeartbeatNodeNotConfigured;
 #[derive(Clone)]
 struct ReporterConfig {
     scheduler_endpoint: String,
-    /// Resolved from `[cluster].scheduler_endpoint_file` (falling back to
-    /// the deprecated `[observability.scheduler_report].scheduler_endpoint_file`)
-    /// by [`crate::scheduler_endpoint::resolve_endpoint_file`] — see that
+    /// Resolved from `[cluster].scheduler_endpoint_file` by
+    /// [`crate::scheduler_endpoint::resolve_endpoint_file`] — see that
     /// function, and [`crate::scheduler_endpoint::SchedulerEndpointSource`]
     /// for what re-reading it while the process runs actually does. Never a
     /// union with `scheduler_endpoint`: once read successfully at least
@@ -552,7 +551,7 @@ impl ReporterConfig {
         };
 
         let scheduler_endpoint_file =
-            crate::scheduler_endpoint::resolve_endpoint_file(cluster_config, config);
+            crate::scheduler_endpoint::resolve_endpoint_file(cluster_config);
 
         Some(ReporterConfig {
             scheduler_endpoint,
@@ -593,22 +592,13 @@ mod tests {
         }
     }
 
-    fn make_report_config(
+    pub fn make_report_config(
         enabled: Option<bool>,
         interval_secs: Option<u64>,
-    ) -> ObservabilitySchedulerReportConfig {
-        make_report_config_with_file(enabled, interval_secs, None)
-    }
-
-    pub fn make_report_config_with_file(
-        enabled: Option<bool>,
-        interval_secs: Option<u64>,
-        scheduler_endpoint_file: Option<&str>,
     ) -> ObservabilitySchedulerReportConfig {
         ObservabilitySchedulerReportConfig {
             enabled: enabled.unwrap_or_default(),
             interval_secs: interval_secs.unwrap_or(5),
-            scheduler_endpoint_file: scheduler_endpoint_file.unwrap_or_default().to_string(),
         }
     }
 
@@ -808,14 +798,16 @@ mod tests {
         );
     }
 
+    /// 🔴 Exercised through the actual integration point rather than only
+    /// against `scheduler_endpoint::resolve_endpoint_file` directly: the
+    /// reporter must wire `[cluster].scheduler_endpoint_file` through.
     #[test]
     fn resolve_trims_and_picks_up_a_configured_endpoint_file() {
-        let cluster = make_cluster_config(Some("http://scheduler:9090"));
-        let cfg = make_report_config_with_file(
-            Some(true),
-            None,
+        let cluster = make_cluster_config_with_file(
+            Some("http://scheduler:9090"),
             Some("  /etc/agentenv/heartbeat/scheduler-endpoint  "),
         );
+        let cfg = make_report_config(Some(true), None);
         let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
         assert_eq!(
             result.scheduler_endpoint_file,
@@ -825,35 +817,10 @@ mod tests {
 
     #[test]
     fn resolve_treats_a_blank_endpoint_file_as_unset() {
-        let cluster = make_cluster_config(Some("http://scheduler:9090"));
-        let cfg = make_report_config_with_file(Some(true), None, Some("   "));
+        let cluster = make_cluster_config_with_file(Some("http://scheduler:9090"), Some("   "));
+        let cfg = make_report_config(Some(true), None);
         let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
         assert_eq!(result.scheduler_endpoint_file, None);
-    }
-
-    /// 🔴 Step 0.5's D1 precedence, exercised through the actual integration
-    /// point rather than only against
-    /// `scheduler_endpoint::resolve_endpoint_file` directly: the reporter
-    /// must wire `[cluster].scheduler_endpoint_file` through, and prefer it
-    /// over the deprecated `[observability.scheduler_report]` field when
-    /// both are set.
-    #[test]
-    fn resolve_prefers_the_cluster_endpoint_file_over_the_deprecated_one() {
-        let cluster = make_cluster_config_with_file(
-            Some("http://scheduler:9090"),
-            Some("/etc/cluster/scheduler-endpoint"),
-        );
-        let cfg = make_report_config_with_file(
-            Some(true),
-            None,
-            Some("/etc/deprecated/scheduler-endpoint"),
-        );
-        let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
-        assert_eq!(
-            result.scheduler_endpoint_file,
-            Some(PathBuf::from("/etc/cluster/scheduler-endpoint")),
-            "[cluster].scheduler_endpoint_file must win when both are set"
-        );
     }
 }
 
@@ -881,7 +848,7 @@ mod against_a_scheduler {
     use tokio::sync::oneshot;
     use tonic::{Request, Response, Status};
 
-    use super::tests::{make_cluster_config, make_report_config_with_file};
+    use super::tests::{make_cluster_config_with_file, make_report_config};
     use super::*;
     use crate::identity::NodeIdentity;
     use crate::orchestrator::{Orchestrator, SandboxOrchestration};
@@ -1081,12 +1048,11 @@ mod against_a_scheduler {
         std::fs::write(&file_path, format!("http://{addr_a}")).expect("seed the file with A");
 
         let service = test_service().await;
-        let cluster = make_cluster_config(Some(&format!("http://{addr_a}")));
-        let report_config = make_report_config_with_file(
-            Some(true),
-            Some(1),
+        let cluster = make_cluster_config_with_file(
+            Some(&format!("http://{addr_a}")),
             Some(file_path.to_str().expect("temp paths are valid utf-8")),
         );
+        let report_config = make_report_config(Some(true), Some(1));
 
         let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
             .expect("a valid endpoint builds a reporter")

@@ -14,11 +14,10 @@
 //!
 //! That capability lived entirely inside `src/observability/reporter.rs` as a
 //! private `SchedulerChannelSource`, reachable only by the heartbeat loop.
-//! Five other places in this process dial the scheduler the same way — the
-//! paused registry's `central` backend, the snapshot catalog client,
+//! Three other places in this process dial the scheduler the same way —
 //! scheduler-backed node placement, resume placement, and P2P peer discovery
 //! — and none of them could hot-reload; changing their target still meant a
-//! restart. This module is that type, promoted and generalized so all six
+//! restart. This module is that type, promoted and generalized so all four
 //! consumers share one implementation and one behavior.
 //!
 //! # Two lifecycles kept apart
@@ -114,15 +113,14 @@ impl SchedulerEndpointSource {
         file_watch: Option<(PathBuf, Duration)>,
         component: &'static str,
     ) -> Result<Self> {
-        // 🔴 `build_channel` is the only place this qualifies its input
-        // (see [`qualified`] and `build_channel`'s own doc comment): three of
-        // this type's six consumers (`central.rs`'s paused registry, the
-        // snapshot catalog client, and the P2P discovery backend) pass their
-        // configured endpoint straight through with no scheme handling of
-        // their own, and `http::Uri` happily parses a bare `host:port` as an
-        // *authority-form* URI (`Endpoint::from_shared` returns `Ok`,
-        // `scheme() == None`) — so without that, those three would build a
-        // channel that fails every RPC with "invalid URL, scheme is
+        // 🔴 `build_channel` is the only place this qualifies its input (see
+        // [`qualified`] and `build_channel`'s own doc comment): some of this
+        // type's consumers (for example the P2P discovery backend) pass
+        // their configured endpoint straight through with no scheme handling
+        // of their own, and `http::Uri` happily parses a bare `host:port` as
+        // an *authority-form* URI (`Endpoint::from_shared` returns `Ok`,
+        // `scheme() == None`) — so without that, those consumers would build
+        // a channel that fails every RPC with "invalid URL, scheme is
         // missing" instead of refusing to start. The qualified string comes
         // back out of `build_channel` rather than being recomputed here, so
         // what gets published through `current()` is provably the same
@@ -137,9 +135,8 @@ impl SchedulerEndpointSource {
         Ok(Self { rx })
     }
 
-    /// [`spawn`](Self::spawn), resolving `file_watch` from configuration per
-    /// the precedence [`resolve_endpoint_file`] documents, and the watch
-    /// interval from
+    /// [`spawn`](Self::spawn), resolving `file_watch` from
+    /// [`resolve_endpoint_file`], and the watch interval from
     /// [`ObservabilitySchedulerReportConfig::interval_secs`] — the heartbeat
     /// cadence, reused rather than given every consumer its own timing knob
     /// to configure and reason about.
@@ -149,7 +146,7 @@ impl SchedulerEndpointSource {
         scheduler_report: &ObservabilitySchedulerReportConfig,
         component: &'static str,
     ) -> Result<Self> {
-        let file = resolve_endpoint_file(cluster, scheduler_report);
+        let file = resolve_endpoint_file(cluster);
         let interval = Duration::from_secs(scheduler_report.interval_secs.max(1));
         Self::spawn(
             static_endpoint,
@@ -228,38 +225,20 @@ fn build_channel(endpoint: &str) -> Result<(Channel, String)> {
     Ok((built.connect_lazy(), raw_endpoint))
 }
 
-/// Resolves the hot-reload file location per the `[cluster]` /
-/// `[observability.scheduler_report]` precedence: [`ClusterConfig`]'s own
-/// `scheduler_endpoint_file` wins when set, falling back to the deprecated
-/// [`ObservabilitySchedulerReportConfig::scheduler_endpoint_file`] otherwise.
-/// When both are set, the `[cluster]` value wins and this logs a `warn!` —
-/// the deployment almost certainly meant to set (or is mid-migration away
-/// from) only one of them.
+/// Resolves the hot-reload file location from [`ClusterConfig`]'s own
+/// `scheduler_endpoint_file`.
 ///
-/// Blank is the same as absent, for both fields, matching every other
-/// optional-endpoint field in this configuration (`scheduler_endpoint`
-/// itself, `control_plane_token_file`, ...).
-pub fn resolve_endpoint_file(
-    cluster: &ClusterConfig,
-    scheduler_report: &ObservabilitySchedulerReportConfig,
-) -> Option<PathBuf> {
-    let primary = non_blank(&cluster.scheduler_endpoint_file);
-    let deprecated = non_blank(&scheduler_report.scheduler_endpoint_file);
-
-    match (primary, deprecated) {
-        (Some(primary), Some(_deprecated)) => {
-            warn!(
-                "both [cluster].scheduler_endpoint_file and the deprecated \
-                 [observability.scheduler_report].scheduler_endpoint_file are set; using \
-                 [cluster].scheduler_endpoint_file and ignoring the deprecated one. Remove the \
-                 deprecated field once every deployment has migrated"
-            );
-            Some(PathBuf::from(primary))
-        }
-        (Some(primary), None) => Some(PathBuf::from(primary)),
-        (None, Some(deprecated)) => Some(PathBuf::from(deprecated)),
-        (None, None) => None,
-    }
+/// Blank is the same as absent, matching every other optional-endpoint field
+/// in this configuration (`scheduler_endpoint` itself,
+/// `control_plane_token_file`, ...).
+///
+/// 🔴 This used to also fall back to a deprecated
+/// `[observability.scheduler_report].scheduler_endpoint_file` field, removed
+/// once every deployment moved onto this one — see
+/// [`crate::cfg::refuse_removed_scheduler_endpoint_file_env_var`] for the
+/// startup guard that replaced the silent fallback.
+pub fn resolve_endpoint_file(cluster: &ClusterConfig) -> Option<PathBuf> {
+    non_blank(&cluster.scheduler_endpoint_file).map(PathBuf::from)
 }
 
 fn non_blank(raw: &str) -> Option<&str> {
@@ -452,14 +431,6 @@ mod tests {
         }
     }
 
-    fn scheduler_report_config(endpoint_file: &str) -> ObservabilitySchedulerReportConfig {
-        ObservabilitySchedulerReportConfig {
-            enabled: true,
-            interval_secs: 5,
-            scheduler_endpoint_file: endpoint_file.to_string(),
-        }
-    }
-
     /// A bare `host:port` is what `[cluster].scheduler_endpoint` and this
     /// source's own hot-reload file usually hold, and `http::Uri` parses it
     /// without complaint as an authority-form URI with no scheme —
@@ -478,50 +449,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_endpoint_file_is_none_when_neither_is_set() {
-        assert_eq!(
-            resolve_endpoint_file(&cluster_config(""), &scheduler_report_config("")),
-            None
-        );
+    fn resolve_endpoint_file_is_none_when_unset() {
+        assert_eq!(resolve_endpoint_file(&cluster_config("")), None);
     }
 
     #[test]
-    fn resolve_endpoint_file_treats_blank_as_absent_on_both_sides() {
-        assert_eq!(
-            resolve_endpoint_file(&cluster_config("   "), &scheduler_report_config("  \t ")),
-            None
-        );
+    fn resolve_endpoint_file_treats_blank_as_absent() {
+        assert_eq!(resolve_endpoint_file(&cluster_config("   ")), None);
     }
 
     #[test]
-    fn resolve_endpoint_file_uses_the_cluster_field_alone() {
+    fn resolve_endpoint_file_uses_the_cluster_field() {
         assert_eq!(
-            resolve_endpoint_file(&cluster_config("  /etc/a  "), &scheduler_report_config("")),
-            Some(PathBuf::from("/etc/a"))
-        );
-    }
-
-    /// The deprecated field must keep working for every deployment that has
-    /// not migrated — that is the entire point of keeping it as a fallback
-    /// rather than deleting it outright.
-    #[test]
-    fn resolve_endpoint_file_falls_back_to_the_deprecated_field_alone() {
-        assert_eq!(
-            resolve_endpoint_file(&cluster_config(""), &scheduler_report_config("  /etc/b  ")),
-            Some(PathBuf::from("/etc/b"))
-        );
-    }
-
-    /// 🔴 The precedence this whole function exists to state: when both are
-    /// configured, `[cluster]` wins, never a merge and never the deprecated
-    /// one.
-    #[test]
-    fn resolve_endpoint_file_prefers_the_cluster_field_when_both_are_set() {
-        assert_eq!(
-            resolve_endpoint_file(
-                &cluster_config("/etc/a"),
-                &scheduler_report_config("/etc/b")
-            ),
+            resolve_endpoint_file(&cluster_config("  /etc/a  ")),
             Some(PathBuf::from("/etc/a"))
         );
     }

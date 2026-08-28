@@ -188,7 +188,7 @@ spec:
             # same as before this ConfigMap existed, byte for byte. See
             # `node-heartbeat-config` in kustomization.yaml for why it moved
             # out of a literal and what changing it now costs (nothing, if
-            # AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE below is also set).
+            # AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE below is also set).
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
               valueFrom:
                 configMapKeyRef:
@@ -207,7 +207,18 @@ spec:
             # is enough to move every future heartbeat to the new address.
             # Unset, or the file briefly unreadable, falls back to the static
             # value above, which is exactly today's behaviour.
-            - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE
+            #
+            # 🔴 `[cluster].scheduler_endpoint_file`, not the deleted
+            # `[observability.scheduler_report]` field of the same name: the
+            # latter's deprecated fallback was removed once every consumer
+            # that dials the scheduler moved onto this hot-reloadable
+            # `[cluster]` copy (see CLAUDE.md's cfg.rs note). Setting the old
+            # `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` name here again
+            # would not error — confique silently ignores undeclared
+            # environment variables — it would just stop reloading, which is
+            # exactly why both binaries now refuse to start if that name is
+            # set at all.
+            - name: AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE
               value: /etc/agentenv/heartbeat/scheduler-endpoint
             # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no
             # ConfigMap generating one. It was a seam for a design that was not
@@ -495,7 +506,7 @@ spec:
             # this one *is* refreshed (kubelet's periodic sync, typically
             # within about a minute), which is what lets an edit to
             # `node-heartbeat-config` reach this file without a Pod restart.
-            # See `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` above and the
+            # See `AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE` above and the
             # `heartbeat-config` volume below.
             - name: heartbeat-config
               mountPath: /etc/agentenv/heartbeat

@@ -47,8 +47,7 @@ configMapGenerator:
   # writes it there from config/default.toml (run.sh:30) before invoking
   # kustomize, so the node's TOML and the repo's own default can never be two
   # different files. That is also why editing this ConfigMap in a live cluster
-  # is undone by the next apply — see the note on AENV_PAUSED_REGISTRY_BACKEND
-  # in agentenv-daemonset.yaml, and the one on [orchestrator.paused_registry]
+  # is undone by the next apply — see the note on [orchestrator.paused_registry]
   # in config/default.toml.
   #
   # Consequence: `kubectl kustomize deploy/k8s/base` fails on a clean checkout,
@@ -174,58 +173,45 @@ configMapGenerator:
   - name: node-heartbeat-config
     literals:
       - AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002
-  # The three switches of the incarnation work, in one place because the
-  # release sequence flips them one at a time and an operator has to be able to
-  # see all three at once.
+  # The incarnation work's gateway-side switch.
   #
-  # 🔴 They are three settings, not one. "Is fencing off" has no single answer:
-  #   · SCHEDULER_REGISTRY_WRITE_FENCING guards the registry's SQL predicates
-  #     — the half whose failure loses a workspace;
-  #   · SCHEDULER_ROUTING_EXECUTION_ARBITRATION guards binding arbitration
-  #     — the half whose failure routes to whichever node reported last;
-  #   · GATEWAY_ROUTING_EXECUTION_FENCING guards the gateway's refusal.
-  # Merging any two would let one panicked flip switch off a half nobody meant
-  # to, and two of the three failures are silent.
+  # 🔴 This ConfigMap used to carry three settings, not one:
+  # SCHEDULER_REGISTRY_WRITE_FENCING (the registry's SQL predicates) and
+  # SCHEDULER_ROUTING_EXECUTION_ARBITRATION (binding arbitration) were the
+  # scheduler's own half. Both are gone along with `services/scheduler` —
+  # deleted in full, not merely commented out of `resources:` — and neither
+  # has a reader left anywhere to protect: `55b8411` confirmed
+  # SCHEDULER_ROUTING_EXECUTION_ARBITRATION parsed into a field the gateway
+  # never read even before that, and the Go registry it guarded is gone with
+  # the scheduler. Only GATEWAY_ROUTING_EXECUTION_FENCING still has a reader.
   #
-  # 🔴 These values are the release's *end* state, because the release has
-  # finished. They were the starting state — `observe` and `off` — and the
-  # cluster was walked forward through them by hand (`kubectl patch`, 08-20);
-  # the manifest was never caught up, so every `apply -k` since has been a
-  # silent rollback of both flips. Neither direction reports anything: an
-  # arbitration that stops judging simply routes to whichever node reported
-  # last, and a gateway that stops refusing simply forwards.
+  # 🔴 This value is the release's *end* state, because the release has
+  # finished. It started at `off`, and the cluster was walked forward through
+  # it by hand (`kubectl patch`, 08-20); the manifest was never caught up, so
+  # every `apply -k` since had been a silent rollback of the flip — a gateway
+  # that stops refusing simply forwards, and reports nothing when it does.
   #
-  # All three now agree with the code defaults in `services/shared/config`.
-  # That is not redundancy — it is what makes losing this ConfigMap safe rather
-  # than a quiet downgrade, and the three literals stay named here because
-  # naming them is what keeps a rollback a value change instead of a manifest
-  # edit under incident pressure. `execution_switches_manifest_test.go` fails
-  # if any of them is put back to its starting value.
+  # It now agrees with the code default in `services/shared/config`. That is
+  # not redundancy — it is what makes losing this ConfigMap safe rather than a
+  # quiet downgrade, and the literal stays named here because naming it is
+  # what keeps a rollback a value change instead of a manifest edit under
+  # incident pressure. `execution_switches_manifest_test.go` fails if it is
+  # put back to `off`.
   #
   # 🔴 `observe` is no longer merely an old *value* to avoid going back to —
   # the release having finished was judged proof enough of that to delete the
-  # mode from the code on both sides of the wire (R10, task's own numbering).
-  # `SCHEDULER_ROUTING_EXECUTION_ARBITRATION=observe` or
-  # `GATEWAY_ROUTING_EXECUTION_FENCING=observe` now fail the process outright
-  # at start-up (`ParseSchedulerExecutionArbitration`/
-  # `ParseGatewayExecutionFencing` in `services/shared/config/config.go`, and
-  # `AppConfig::validate` on the Rust side) rather than being silently read as
+  # mode from the code (R10, task's own numbering).
+  # `GATEWAY_ROUTING_EXECUTION_FENCING=observe` now fails the process outright
+  # at start-up (`ParseGatewayExecutionFencing` in
+  # `services/shared/config/config.go`) rather than being silently read as
   # `enforce` or falling back to anything else — so a stale manifest that
   # still names `observe` is a startup crash, not a quiet downgrade, which is
   # the loudest failure mode available and therefore the intended one. `off`
-  # is unaffected: it remains a fully supported value on both processes, kept
-  # deliberately as the rollback target (`execution_fencing.go`'s own "the
-  # rollback is this line and nothing else" comment).
+  # is unaffected: it remains a fully supported value, kept deliberately as
+  # the rollback target (`execution_fencing.go`'s own "the rollback is this
+  # line and nothing else" comment).
   - name: execution-fencing-config
     literals:
-      # A3 is on from the moment the scheduler carrying it starts: it is the
-      # reason the release exists, and the rows it protects are the ones that
-      # cannot be reconstructed.
-      - SCHEDULER_REGISTRY_WRITE_FENCING=true
-      # Flipped once heartbeat_legacy_roster_total reached zero — with no node
-      # left too old to report incarnations, arbitration is no longer being
-      # asked to judge writes it cannot.
-      - SCHEDULER_ROUTING_EXECUTION_ARBITRATION=enforce
       # Flipped after the node-side gate was switched on and verified. The
       # gateway injects the control-plane token and refuses what fails it.
       - GATEWAY_ROUTING_EXECUTION_FENCING=enforce
@@ -245,8 +231,8 @@ configMapGenerator:
   # 08-20) and left out of this file, which made every `apply -k` a silent
   # rollback to `off`: the gateway would go back to reading routes it no longer
   # writes, and nothing would report the change. Written at the running state
-  # for the same reason `paused-registry-config` is — `off` here would not be
-  # the cautious choice, it would perform the regression.
+  # for the same reason `execution-fencing-config` is — `off` here would not
+  # be the cautious choice, it would perform the regression.
   #
   # Order to flip them in: the two write-side switches first, in either order,
   # then the read switch. Rolling back is `kubectl set env` on the Deployment,
@@ -255,8 +241,11 @@ configMapGenerator:
   #
   # 🔴 GATEWAY_ROUTING_PROJECTION_READ additionally requires
   # GATEWAY_REDIS_ADDR to be set on the gateway Deployment (it is, from the
-  # start) and requires SCHEDULER_ROUTING_EXECUTION_ARBITRATION above to be
-  # anything other than `off`.
+  # start). It used to also require the scheduler's own
+  # SCHEDULER_ROUTING_EXECUTION_ARBITRATION to be anything other than `off` —
+  # that pairing is moot now that `services/scheduler` and the switch it
+  # guarded are both deleted; see the note on `execution-fencing-config`
+  # above.
   - name: routing-projection-config
     literals:
       - SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE=on
@@ -362,41 +351,26 @@ configMapGenerator:
   # form of why. Giving the api half a machine to drive is a `aenv-node`
   # DaemonSet, not a ConfigMap key.
 
-  # Which paused-sandbox registry the node keeps: node-local, or the shared one
-  # the scheduler owns.
+  # 🔴 `paused-registry-config` is GONE. It carried one key,
+  # AENV_PAUSED_REGISTRY_BACKEND=central, read only by the node DaemonSet —
+  # and reading it there never did anything. `assemble_node`
+  # (`crates/aenv-node/src/bin/aenv-node.rs`) treats any backend other than
+  # `local` the same way: it logs a `warn!` naming the configured value
+  # ("aenv-node ignores the configured paused-sandbox registry: cluster-wide
+  # records belong to the API half") and wires in
+  # `DisabledPausedSandboxRegistry` regardless, because cluster-wide
+  # paused-sandbox state belongs to the api half alone now (see
+  # AENV_PAUSED_REGISTRY_BACKEND=postgres, a literal on
+  # `agentenv-api-deployment.yaml` rather than a reference to this
+  # ConfigMap — that asymmetry is what `snapshot_catalog_manifest_test.go`
+  # leans on as a control).
   #
-  # 🔴 This ConfigMap was referenced and never generated. `agentenv-daemonset.yaml`
-  # has read AENV_PAUSED_REGISTRY_BACKEND from `paused-registry-config` all
-  # along, but nothing in this file created it, so the reference resolved to
-  # nothing on every cluster. `optional: true` meant that was silent: the node
-  # fell back to `[orchestrator.paused_registry].backend = "local"` in
-  # config/default.toml and pauses stayed on the machine that made them. The
-  # live cluster papered over it with a `central` literal set by hand, which no
-  # manifest produced and the next apply would have dropped — back to `local`,
-  # with nothing reporting it until a node was lost and its sandboxes turned out
-  # to have gone with it.
-  #
-  # So the reference now has something to resolve to, at the value the cluster
-  # runs. `central` publishes each pause to the shared repository and records it
-  # cluster-wide, so any node can resume it under its original ID.
-  #
-  # 🔴 Environment, not `config/agentenv.toml`, for the reason the note in that
-  # file gives: `deploy/k8s/run.sh` overwrites it from config/default.toml on
-  # every apply, so a cluster that expressed this choice there would lose it —
-  # quietly, and in the direction that loses cross-node recovery.
-  #
-  # `central` requires a scheduler endpoint and fails startup without one rather
-  # than falling back; the node supplies it through
-  # AENV_OBSERVABILITY_SCHEDULER_ENDPOINT, which `src/cfg.rs` binds to
-  # `[cluster].scheduler_endpoint`.
-  #
-  # 🔴 Only the node reads this key from here. The api half hard-codes
-  # `central` in its own manifest on purpose — a node-local paused registry on
-  # a replica would be a registry only that replica can see — and
-  # `snapshot_catalog_manifest_test.go` leans on that asymmetry as a control.
-  - name: paused-registry-config
-    literals:
-      - AENV_PAUSED_REGISTRY_BACKEND=central
+  # Deleting the ConfigMap and the DaemonSet's reference to it is not a
+  # behaviour change: the node already ignored `central` and fell through to
+  # the same `DisabledPausedSandboxRegistry` wiring it uses with nothing set
+  # at all — the code default in config/default.toml (`local`) produces the
+  # identical outcome. What changes is that the node no longer logs a startup
+  # warning about a value it was always going to ignore.
   # 🔴 `snapshot-catalog-config` is GONE, and so are the two keys it carried.
   #
   # 阶段 2c / Stage B moved the snapshot catalog out of object storage and into

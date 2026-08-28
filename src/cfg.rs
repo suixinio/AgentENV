@@ -1345,7 +1345,8 @@ pub struct ClusterConfig {
 /// is required`) — but neither carries a default, unlike Go, because there is
 /// no single namespace/Service name every deployment of this process shares
 /// the way `agentenv-system`/`agentenv-nodes` happens to be what
-/// `deploy/k8s/base/config/scheduler.json` picks for the scheduler today.
+/// `deploy/k8s/base/config/scheduler.json` (deleted along with
+/// `services/scheduler`) used to pick for the Go scheduler.
 /// `Scheduler` mode (the default) never reads this struct at all, so an
 /// unconfigured cluster with the default placement source is unaffected by
 /// the missing defaults.
@@ -1361,8 +1362,9 @@ pub struct ClusterKubernetesDiscoveryConfig {
     /// The node's user-facing HTTP port, as named on the watched
     /// `EndpointSlice` — discovery's `Node.endpoint` is built from the
     /// slice's address and this port, the same value
-    /// `deploy/k8s/base/config/scheduler.json`'s scheduler discovery config
-    /// carries as `port` (`8000` in that deployment).
+    /// `deploy/k8s/base/config/scheduler.json` (deleted along with
+    /// `services/scheduler`) used to carry as `port` (`8000` in that
+    /// deployment).
     #[config(default = 8000u16, env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_PORT")]
     pub port: u16,
     /// The scheme discovered node endpoints are built with (`"http"` or

@@ -118,9 +118,18 @@ func TestNoAgentenvWorkloadDeclaresTheRemovedSnapshotCatalogSwitches(t *testing.
 
 // 🔴 The mutation control for the walk above. A scan for absence passes on a
 // tree it cannot read, so this proves the same walk *does* find an environment
-// variable that is genuinely there — AENV_PAUSED_REGISTRY_BACKEND, which both
-// halves still declare — using the same decode, the same population and the
-// same lookup.
+// variable that is genuinely there — AENV_PAUSED_REGISTRY_BACKEND, which the
+// api half still declares — using the same decode, the same population and
+// the same lookup.
+//
+// 🔴 Used to require both halves: the node DaemonSet carried this key too,
+// pointed at a `paused-registry-config` ConfigMap the node ignored regardless
+// of what it named (`assemble_node` warns and wires a no-op registry for any
+// backend other than `local`). That reference and the ConfigMap it read from
+// are both deleted now — the node's copy bought nothing but a startup
+// warning — so only the api half's literal (`AENV_PAUSED_REGISTRY_BACKEND=
+// postgres` on `agentenv-api-deployment.yaml`) remains for this control to
+// find.
 func TestTheRemovedSwitchWalkCanStillFindAnEnvironmentVariable(t *testing.T) {
 	const stillDeclared = "AENV_PAUSED_REGISTRY_BACKEND"
 
@@ -151,10 +160,10 @@ func TestTheRemovedSwitchWalkCanStillFindAnEnvironmentVariable(t *testing.T) {
 		}
 	}
 
-	if found < 2 {
-		t.Fatalf("the walk found %s on %d AgentENV containers, want both halves; the absence "+
-			"assertion in this file therefore proves nothing — it would pass on a tree this "+
-			"walk cannot read", stillDeclared, found)
+	if found < 1 {
+		t.Fatalf("the walk found %s on %d AgentENV containers, want at least the api half; the "+
+			"absence assertion in this file therefore proves nothing — it would pass on a tree "+
+			"this walk cannot read", stillDeclared, found)
 	}
 }
 

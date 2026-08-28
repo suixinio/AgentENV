@@ -478,17 +478,18 @@ spec:
               value: "redis"
             - name: AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_URL
               value: redis://agentenv-redis:6379
-            # The same namespace/Service/port/scheme
-            # `deploy/k8s/base/config/scheduler.json`'s
-            # `scheduler.discovery.kubernetes` already discovers nodes from
-            # (mounted there as a file, not env — confirmed against that file
-            # rather than assumed). `aenv-api` refuses to start under
+            # The same namespace/Service/port/scheme the Go scheduler's own
+            # `scheduler.discovery.kubernetes` config discovered nodes from
+            # (mounted there as a file, not env — `deploy/k8s/base/config/
+            # scheduler.json`, deleted along with `services/scheduler`; this
+            # port carries forward the values it used to name rather than a
+            # fresh guess). `aenv-api` refuses to start under
             # `node_placement_source = "native"` with the namespace/service
             # name unset (`crates/aenv-node/src/bin/aenv-node.rs`), so these three have no
             # default of their own; port/scheme are written out explicitly
             # even though they already match `cfg.rs`'s defaults, so a reader
-            # comparing this file against scheduler.json does not have to
-            # know that.
+            # does not have to know that to see what this Deployment
+            # discovers.
             - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE
               value: "agentenv-system"
             - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME
@@ -498,8 +499,8 @@ spec:
             - name: AENV_CLUSTER_KUBERNETES_DISCOVERY_SCHEME
               value: "http"
             # 🔴 No AENV_CLUSTER_KUBERNETES_DISCOVERY_IGNORE_POD_SELECTOR /
-            # ..._NO_SCHEDULE_POD_SELECTOR here, matching
-            # scheduler.json today: neither is set there either, and the
+            # ..._NO_SCHEDULE_POD_SELECTOR here, matching the Go scheduler's
+            # former discovery config: neither was set there either, and the
             # Rust port's cache-sync gate across the three watchers
             # (EndpointSlice, and one Pod watch per selector) is not wired
             # yet — see `src/node_registry/kubernetes_discovery.rs`'s module

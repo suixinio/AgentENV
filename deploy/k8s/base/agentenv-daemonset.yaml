@@ -67,25 +67,19 @@ spec:
                   name: agentenv-runtime-secrets
                   key: sandbox-access-token-hash-seed
                   optional: true
-            # Both halves of the cluster-wide paused-sandbox registry are
-            # optional so a cluster that has not set it up still starts: with
-            # neither of them the node keeps the `local` backend from
-            # config/default.toml and pauses stay node-local.
-            #
-            # 🔴 The backend is selected here rather than in the ConfigMap.
-            # `deploy/k8s/run.sh` overwrites config/agentenv.toml from
-            # config/default.toml on every apply, so a ConfigMap edit would be
-            # undone by the next `make k8s-apply` — silently, and in the
-            # direction that loses cross-node recovery. Set this key to
-            # "central" in an overlay patch; the scheduler endpoint below is the
-            # only other thing that backend needs, and the node carries no
-            # database credentials of its own.
-            - name: AENV_PAUSED_REGISTRY_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: paused-registry-config
-                  key: AENV_PAUSED_REGISTRY_BACKEND
-                  optional: true
+            # 🔴 No AENV_PAUSED_REGISTRY_BACKEND here any more, and no
+            # `paused-registry-config` ConfigMap for it to read from. This
+            # process ignored that key regardless of what it named:
+            # `assemble_node` (`crates/aenv-node/src/bin/aenv-node.rs`) treats
+            # any backend other than `local` the same way — it logs a `warn!`
+            # naming the configured value and wires in
+            # `DisabledPausedSandboxRegistry` regardless, because cluster-wide
+            # paused-sandbox state belongs to the api half alone (see
+            # AENV_PAUSED_REGISTRY_BACKEND=postgres on
+            # `agentenv-api-deployment.yaml`). Leaving the key here only
+            # bought this Pod a startup warning about a value it was always
+            # going to ignore; the code default (`local`, from
+            # config/default.toml) produces the identical outcome without one.
             # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
             # setting them would now stop this Pod at startup
             # (`refuse_removed_catalog_env_vars`, src/cfg.rs). 阶段 2c / Stage B

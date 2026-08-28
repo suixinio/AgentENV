@@ -56,13 +56,14 @@
 //!
 //! Left unfixed here per the task's own D2 discipline (port faithfully in
 //! this change; known gaps are tracked, not silently patched alongside
-//! unrelated work) — and currently latent regardless: neither
-//! `deploy/k8s/base/agentenv-api-deployment.yaml` nor
-//! `deploy/k8s/base/config/scheduler.json` configures
-//! `ignore_pod_selector`/`no_schedule_pod_selector` today, so every sync in
-//! this deployment already has all the pod-selector data there is (none) by
-//! construction. Whoever configures a selector for the first time should
-//! close this gap before relying on it.
+//! unrelated work) — and currently latent regardless:
+//! `deploy/k8s/base/agentenv-api-deployment.yaml` configures neither
+//! `ignore_pod_selector` nor `no_schedule_pod_selector` today (the Go
+//! scheduler's own former discovery config, `deploy/k8s/base/config/
+//! scheduler.json`, deleted along with `services/scheduler`, did not set
+//! either one either), so every sync in this deployment already has all the
+//! pod-selector data there is (none) by construction. Whoever configures a
+//! selector for the first time should close this gap before relying on it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;

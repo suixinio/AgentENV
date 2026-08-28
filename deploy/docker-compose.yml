@@ -139,27 +139,22 @@ services:
       # `agentenv-api:8002` answers both LookupNode (in-process,
       # NodeRegistryGrpcService) and ResumeSandbox on the same listener.
       AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://agentenv-api:8002
-      # `[cluster].node_placement_source = "native"` refuses to start
-      # without both of these (`start_native_node_registry`) — they name the
-      # Kubernetes EndpointSlice this process would watch to discover nodes.
-      #
-      # 🔴 There is no Kubernetes API in this compose stack, so discovery
-      # itself never succeeds here: `KubernetesDiscovery::connect` fails to
-      # build a client (no in-cluster config, no kubeconfig) and
-      # `run_kubernetes_discovery_with_retry` just retries forever in the
-      # background with capped backoff — logged as `warn!`, never fatal to
-      # this process. These two values exist only to satisfy the startup
-      # guard; the node registry they would feed stays empty in compose, so
-      # `agentenv-a`/`agentenv-b`'s heartbeats are rejected as
-      # `NodeNotInRegistry` under this topology (discovery is the registry's
-      # only source of truth for which node ids are real — see
-      # `src/node_registry/registry.rs`'s module doc). There is no
-      # static/env-based node registration on the Rust side the way the Go
-      # scheduler's `scheduler.nodes` list was — replicating that is out of
-      # scope for this change, which only removes the stack's dependency on
-      # the scheduler process.
-      AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE: compose
-      AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME: agentenv-node
+      # 🔴 Static discovery (ported from Go's own `scheduler.discovery.mode
+      # = "static"` branch, `services/scheduler/cmd/main.go`): there is no
+      # Kubernetes API in this compose stack, so `node_discovery_mode =
+      # "kubernetes"` (the Rust-side default) would leave
+      # `KubernetesDiscovery::connect` retrying forever against a client it
+      # can never build. Static mode seeds the registry once, at startup,
+      # from `[cluster].static_discovery_nodes` below instead — no
+      # Kubernetes client, no `[cluster.kubernetes_discovery]` namespace/
+      # service_name needed at all.
+      AENV_CLUSTER_NODE_DISCOVERY_MODE: static
+      # `static_discovery_nodes` has no `env =` binding (same as Go's own
+      # `scheduler.nodes` — see `crate::cfg::ClusterConfig::static_discovery_nodes`'s
+      # doc comment), so the node list itself comes from the tracked overlay
+      # file below (`AENV_CONFIG_OVERLAY_PATH`), not from an environment
+      # variable — it names `node-a`/`node-b`, the two `aenv-node` services
+      # this stack runs.
       # The shared-roster fix: `wire_shared_node_observed_store` refuses
       # `in_memory` (the default) unconditionally under native placement —
       # not gated on replica count — so this is not optional even for this
@@ -167,14 +162,26 @@ services:
       # subsystem here already uses, under its own key prefix.
       AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND: redis
       AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_URL: redis://redis:6379
-      # Where the entrypoint wrapper below writes `[pg]`'s overlay file.
-      AENV_CONFIG_OVERLAY_PATH: /tmp/agentenv-pg/pg-dsn.toml
+      # Two overlay files, `:`-joined (`AENV_CONFIG_OVERLAY_PATH` is a
+      # `:`-separated list, deep-merged table by table, later entries
+      # winning — see `src/cfg.rs`'s doc on `AppConfig`): the tracked,
+      # credential-free static-discovery node list (bind-mounted below, see
+      # its own comment on the `volumes:` key) and the runtime-generated
+      # `[pg]` overlay the entrypoint wrapper writes further down. Order
+      # does not matter here — the two touch disjoint tables (`[cluster]`
+      # vs `[pg]`) — but is kept the same as the two `volumes:`/`command:`
+      # entries below for readability.
+      AENV_CONFIG_OVERLAY_PATH: /workspace/config/cluster-static-discovery-overlay.toml:/tmp/agentenv-pg/pg-dsn.toml
       AENV_NODE_ID: api-0
       # This half runs no sandboxes, so no `envd`/`uvm_ublk`; the rest matches
       # `aenv_core::logging::DEFAULT_FILTER`.
       RUST_LOG: ${RUST_LOG:-aenv_core=info,aenv_api=info,agentenv=info}
     volumes:
       - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+      # Credential-free, so — unlike the `[pg]` overlay below — this one is
+      # simply a tracked file, bind-mounted directly rather than assembled
+      # at container start. See `AENV_CONFIG_OVERLAY_PATH` above.
+      - ./docker/config/cluster-static-discovery-overlay.toml:/workspace/config/cluster-static-discovery-overlay.toml:ro
     # 🔴 `[pg]` cannot be set from the environment at all: `PgConfig` is
     # reached only through `AppConfig.pg: Option<PgConfig>`, and confique
     # only descends into a struct via `#[config(nested)]`, which `Option<_>`

@@ -881,38 +881,6 @@ async fn start_native_node_registry(
     config: &aenv_api::cfg::ClusterConfig,
 ) -> anyhow::Result<NativeNodeRegistryBits> {
     let discovery = &config.kubernetes_discovery;
-    let namespace = discovery.namespace.trim();
-    let service_name = discovery.service_name.trim();
-    // 🔴 Refused here, before anything is connected — the same discipline
-    // `cluster_placement`'s own doc comment names: a misconfigured replica
-    // should be told about the setting it can see from its own config,
-    // rather than have a retry loop fail silently in the background forever
-    // for a reason a startup log line would have caught immediately.
-    if namespace.is_empty() || service_name.is_empty() {
-        anyhow::bail!(
-            "aenv-api needs [cluster.kubernetes_discovery].namespace and .service_name \
-             (AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE / \
-             AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when \
-             [cluster].node_placement_source = \"native\": Stage A's node registry has nothing \
-             to discover nodes from otherwise"
-        );
-    }
-    let kube_config = KubernetesDiscoveryConfig {
-        namespace: namespace.to_string(),
-        service_name: service_name.to_string(),
-        port: i32::from(discovery.port),
-        scheme: discovery.scheme.clone(),
-        ignore_pod_selector: discovery.ignore_pod_selector.clone(),
-        no_schedule_pod_selector: discovery.no_schedule_pod_selector.clone(),
-    };
-    // Same validation `KubernetesDiscovery::new` runs internally, run once
-    // here so a bad selector fails startup instead of failing the same way,
-    // silently, on every iteration of the retry loop below forever.
-    validate_optional_pod_selector(&kube_config.ignore_pod_selector, "ignore_pod_selector")?;
-    validate_optional_pod_selector(
-        &kube_config.no_schedule_pod_selector,
-        "no_schedule_pod_selector",
-    )?;
 
     let registry = Arc::new(AtomicNodeRegistry::with_empty_sync_guard(
         Vec::new(),
@@ -936,10 +904,85 @@ async fn start_native_node_registry(
     ));
     let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));
 
-    let discovery_task = {
-        let registry = Arc::clone(&registry);
-        tokio::spawn(run_kubernetes_discovery_with_retry(kube_config, registry))
-    };
+    // Mirrors `services/scheduler/cmd/main.go`'s own
+    // `switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))`:
+    // Kubernetes gets a background watch task; static is a one-shot seed
+    // with none.
+    let mut tasks = Vec::new();
+    match config.node_discovery_mode {
+        aenv_api::cfg::ClusterNodeDiscoveryMode::Kubernetes => {
+            let namespace = discovery.namespace.trim();
+            let service_name = discovery.service_name.trim();
+            // 🔴 Refused here, before anything is connected — the same
+            // discipline `cluster_placement`'s own doc comment names: a
+            // misconfigured replica should be told about the setting it can
+            // see from its own config, rather than have a retry loop fail
+            // silently in the background forever for a reason a startup log
+            // line would have caught immediately.
+            if namespace.is_empty() || service_name.is_empty() {
+                anyhow::bail!(
+                    "aenv-api needs [cluster.kubernetes_discovery].namespace and .service_name \
+                     (AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE / \
+                     AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when \
+                     [cluster].node_placement_source = \"native\" and (the default) \
+                     [cluster].node_discovery_mode = \"kubernetes\": Stage A's node registry has \
+                     nothing to discover nodes from otherwise. Set \
+                     AENV_CLUSTER_NODE_DISCOVERY_MODE=static and \
+                     [cluster].static_discovery_nodes for a non-Kubernetes deployment."
+                );
+            }
+            let kube_config = KubernetesDiscoveryConfig {
+                namespace: namespace.to_string(),
+                service_name: service_name.to_string(),
+                port: i32::from(discovery.port),
+                scheme: discovery.scheme.clone(),
+                ignore_pod_selector: discovery.ignore_pod_selector.clone(),
+                no_schedule_pod_selector: discovery.no_schedule_pod_selector.clone(),
+            };
+            // Same validation `KubernetesDiscovery::new` runs internally, run
+            // once here so a bad selector fails startup instead of failing
+            // the same way, silently, on every iteration of the retry loop
+            // below forever.
+            validate_optional_pod_selector(
+                &kube_config.ignore_pod_selector,
+                "ignore_pod_selector",
+            )?;
+            validate_optional_pod_selector(
+                &kube_config.no_schedule_pod_selector,
+                "no_schedule_pod_selector",
+            )?;
+
+            let discovery_task = {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(run_kubernetes_discovery_with_retry(kube_config, registry))
+            };
+            tasks.push(discovery_task);
+        }
+        aenv_api::cfg::ClusterNodeDiscoveryMode::Static => {
+            aenv_api::node_registry::static_discovery::validate_static_discovery_nodes(
+                &config.static_discovery_nodes,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "aenv-api needs a valid [[cluster.static_discovery_nodes]] list (set via \
+                     AENV_CONFIG_OVERLAY_PATH — see ClusterConfig::static_discovery_nodes's own \
+                     doc comment) when [cluster].node_placement_source = \"native\" and \
+                     [cluster].node_discovery_mode = \"static\": {err}"
+                )
+            })?;
+            let nodes = aenv_api::node_registry::static_discovery::nodes_from_static_config(
+                &config.static_discovery_nodes,
+            );
+            // 🔴 One-shot seed, not a background task: unlike Kubernetes
+            // discovery, a statically-configured node list never changes at
+            // runtime, so there is nothing to watch — mirrors
+            // `services/scheduler/cmd/main.go`'s own static branch, which
+            // calls `registry.Set(nodes, nil)` exactly once and spawns no
+            // goroutine.
+            registry.set(nodes, Vec::new(), std::time::SystemTime::now());
+        }
+    }
+
     let metrics_task = {
         let metrics_service = grpc_service.clone();
         tokio::spawn(async move {
@@ -950,12 +993,13 @@ async fn start_native_node_registry(
             }
         })
     };
+    tasks.push(metrics_task);
 
     Ok(NativeNodeRegistryBits {
         registry,
         warmup,
         grpc_service,
-        tasks: vec![discovery_task, metrics_task],
+        tasks,
     })
 }
 
@@ -1534,6 +1578,87 @@ mod tests {
         assert!(
             err.contains("kubernetes_discovery"),
             "an empty namespace/service_name must be refused: {err}"
+        );
+    }
+
+    /// Static discovery's own success path — the control for
+    /// `native_placement_refuses_an_unconfigured_kubernetes_discovery` above:
+    /// the same function, under `[cluster].node_discovery_mode = "static"`,
+    /// must succeed with `[cluster.kubernetes_discovery]` left completely
+    /// unconfigured, seed the registry from `static_discovery_nodes`, and
+    /// spawn no background discovery task — mirrors
+    /// `services/scheduler/cmd/main.go`'s static branch
+    /// (`registry.Set(nodes, nil)`, called once, no goroutine).
+    #[tokio::test]
+    async fn native_placement_seeds_the_registry_from_static_discovery() {
+        let config = aenv_api::cfg::ClusterConfig {
+            node_placement_source: NodePlacementSource::Native,
+            node_discovery_mode: aenv_api::cfg::ClusterNodeDiscoveryMode::Static,
+            static_discovery_nodes: vec![
+                aenv_api::cfg::ClusterStaticDiscoveryNode {
+                    id: "node-a".to_string(),
+                    endpoint: "http://agentenv-a:8000".to_string(),
+                },
+                aenv_api::cfg::ClusterStaticDiscoveryNode {
+                    id: "node-b".to_string(),
+                    endpoint: "http://agentenv-b:8000".to_string(),
+                },
+            ],
+            // Deliberately left unconfigured: static mode must never need it.
+            kubernetes_discovery: Default::default(),
+            ..AppConfig::default().cluster
+        };
+
+        let bits = start_native_node_registry(&config)
+            .await
+            .expect("a valid static node list must not be refused");
+
+        assert_eq!(
+            bits.tasks.len(),
+            1,
+            "static discovery is a one-shot seed; only the metrics task should be running, no \
+             discovery watch task"
+        );
+
+        let mut ids: Vec<String> = bits
+            .registry
+            .snapshot(true)
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["node-a".to_string(), "node-b".to_string()]);
+        assert_eq!(
+            bits.registry.resolve("node-a").map(|n| n.endpoint),
+            Some("http://agentenv-a:8000".to_string())
+        );
+
+        for task in bits.tasks {
+            task.abort();
+        }
+    }
+
+    /// The static branch's own validation
+    /// (`services/shared/config/config.go`'s `scheduler.nodes must not be
+    /// empty`): an empty `[cluster].static_discovery_nodes` under
+    /// `node_discovery_mode = "static"` is refused the same way an
+    /// unconfigured `[cluster.kubernetes_discovery]` is refused under the
+    /// default Kubernetes mode.
+    #[tokio::test]
+    async fn native_placement_refuses_an_empty_static_discovery_node_list() {
+        let config = aenv_api::cfg::ClusterConfig {
+            node_placement_source: NodePlacementSource::Native,
+            node_discovery_mode: aenv_api::cfg::ClusterNodeDiscoveryMode::Static,
+            static_discovery_nodes: Vec::new(),
+            ..AppConfig::default().cluster
+        };
+        let err = match start_native_node_registry(&config).await {
+            Ok(_) => panic!("an empty static_discovery_nodes list must still be refused"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("static_discovery_nodes"),
+            "an empty node list must be refused: {err}"
         );
     }
 

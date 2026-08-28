@@ -61,6 +61,7 @@ pub mod grpc_service;
 pub mod kubernetes_discovery;
 pub mod redis;
 pub mod registry;
+pub mod static_discovery;
 pub mod strategy;
 pub mod types;
 pub mod warmup;

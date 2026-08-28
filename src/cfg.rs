@@ -1151,6 +1151,49 @@ pub struct ClusterNodeRegistryStoreConfig {
     pub redis_connect_timeout_ms: u64,
 }
 
+/// Which discovery strategy seeds [`NodePlacementSource::Native`]'s node
+/// registry. Mirrors `services/shared/config.SchedulerDiscoveryConfig.Mode`
+/// (`"static"` or `"kubernetes"`, validated in `services/shared/config/config.go`'s
+/// `Config.validate` and dispatched in `services/scheduler/cmd/main.go`'s
+/// `switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))`).
+///
+/// 🔴 The default here (`Kubernetes`) deliberately does not match Go's
+/// (`static`, `applyDefaults`'s `if ... Mode == "" { Mode = "static" }`).
+/// Go's default is safe *because* its default `Nodes` list is a real,
+/// usable single-node fallback (`defaultConfig`'s
+/// `Nodes: []Node{{ID: "local-node", Endpoint: "http://127.0.0.1:8000"}}`).
+/// This process ships no such fallback list — [`ClusterConfig::static_discovery_nodes`]
+/// defaults to empty — so defaulting the *mode* to `Static` here would make
+/// every already-deployed `[cluster].node_placement_source = "native"`
+/// cluster (`deploy/k8s/base`, configured only with
+/// `[cluster.kubernetes_discovery]`, never with a static node list) refuse
+/// to start the moment this switch shipped. Defaulting to `Kubernetes`
+/// keeps that fleet's dependency footprint and behavior byte-for-byte
+/// unchanged; a deployment that wants static discovery (e.g.
+/// `deploy/docker-compose.yml`, which has no Kubernetes API to discover
+/// against) sets `AENV_CLUSTER_NODE_DISCOVERY_MODE=static` explicitly.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterNodeDiscoveryMode {
+    #[default]
+    Kubernetes,
+    Static,
+}
+
+/// One entry of [`ClusterConfig::static_discovery_nodes`]. Mirrors Go's
+/// `services/shared/config.Node` (`json:"id"`/`json:"endpoint"`) — the wire
+/// shape `services/scheduler/cmd/main.go`'s static branch reads directly
+/// into `scheduler.Node{ID: n.ID, Endpoint: n.Endpoint}`, leaving
+/// `PodName`/[`crate::node_registry::types::Node::pod_name`] at its zero
+/// value on both sides (see `crate::node_registry::static_discovery`'s own
+/// module doc for the full mapping and its golden test against this exact
+/// shape).
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct ClusterStaticDiscoveryNode {
+    pub id: String,
+    pub endpoint: String,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
     /// Which backend `resolve_node` reads a known node's address from. See
@@ -1231,12 +1274,39 @@ pub struct ClusterConfig {
     /// [`node_service_addr`]: ClusterConfig::node_service_addr
     #[config(default = 8001u16, env = "AENV_NODE_SERVICE_PORT")]
     pub node_service_port: u16,
+    /// Which discovery strategy [`NodePlacementSource::Native`]'s node
+    /// registry is seeded from. See [`ClusterNodeDiscoveryMode`]. Only read
+    /// under `Native` — see [`NodePlacementSource`]'s doc comment.
+    #[config(default = "kubernetes", env = "AENV_CLUSTER_NODE_DISCOVERY_MODE")]
+    pub node_discovery_mode: ClusterNodeDiscoveryMode,
     /// Kubernetes EndpointSlice/Pod discovery for
     /// [`NodePlacementSource::Native`]'s node registry. Read, and a kube
-    /// client built, only when `node_placement_source = "native"` — see
-    /// [`NodePlacementSource`]'s doc comment.
+    /// client built, only when `node_placement_source = "native"` and
+    /// [`Self::node_discovery_mode`] is [`ClusterNodeDiscoveryMode::Kubernetes`]
+    /// (the default) — see [`NodePlacementSource`]'s doc comment.
     #[config(nested)]
     pub kubernetes_discovery: ClusterKubernetesDiscoveryConfig,
+    /// Statically-configured node list, read only when
+    /// [`Self::node_discovery_mode`] is [`ClusterNodeDiscoveryMode::Static`].
+    /// Mirrors Go's `services/shared/config.SchedulerConfig.Nodes`
+    /// (`json:"nodes"`) — seeded into the registry once at startup
+    /// (`start_native_node_registry`, `crates/aenv-api/src/bin/aenv-api.rs`)
+    /// with no ongoing watch, exactly like Go's own static branch
+    /// (`services/scheduler/cmd/main.go`'s `registry.Set(nodes, nil)`,
+    /// called once, never again).
+    ///
+    /// 🔴 TOML-file only, deliberately with no `env =` binding — not a
+    /// confique nested-`Option` limitation (this field is not `#[config(nested)]`
+    /// at all, so that limitation does not even apply here), but the same
+    /// choice Go itself already made: `services/shared/config`'s
+    /// `overrideWithEnv` never touches `Scheduler.Nodes` either, so a
+    /// structured node list has only ever been a config-file concept on
+    /// either side of this port. Set it via `AENV_CONFIG_OVERLAY_PATH` when
+    /// the file named by `AENV_CONFIG_PATH` is not itself editable (e.g.
+    /// `deploy/docker-compose.yml`, which bind-mounts a single read-only
+    /// `config/default.toml`).
+    #[config(default = [])]
+    pub static_discovery_nodes: Vec<ClusterStaticDiscoveryNode>,
     /// How long [`crate::node_registry::warmup::WarmupGate`] withholds a
     /// binding-store "not found" answer while waiting for every node
     /// discovery currently knows about to report at least one heartbeat.
@@ -4703,7 +4773,9 @@ endpoint = "http://second:9000"
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
+            node_discovery_mode: Default::default(),
             kubernetes_discovery: Default::default(),
+            static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
             node_registry_store: Default::default(),
         };
@@ -4717,7 +4789,9 @@ endpoint = "http://second:9000"
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
+            node_discovery_mode: Default::default(),
             kubernetes_discovery: Default::default(),
+            static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
             node_registry_store: Default::default(),
         };

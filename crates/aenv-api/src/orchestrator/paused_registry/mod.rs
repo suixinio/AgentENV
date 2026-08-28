@@ -41,7 +41,9 @@ mod pg {
             node_service_addr: "0.0.0.0:8001".to_string(),
             api_grpc_addr: "0.0.0.0:8002".to_string(),
             node_service_port: 8001,
+            node_discovery_mode: Default::default(),
             kubernetes_discovery: Default::default(),
+            static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
             node_registry_store: Default::default(),
         }

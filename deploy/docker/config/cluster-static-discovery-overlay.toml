@@ -1,0 +1,18 @@
+# [cluster].static_discovery_nodes has no `env =` binding (same as Go's own
+# `scheduler.nodes`, which `overrideWithEnv` never touches either — see
+# `crate::cfg::ClusterConfig::static_discovery_nodes`'s doc comment), so a
+# structured node list can only reach the process through the config file or
+# an AENV_CONFIG_OVERLAY_PATH overlay like this one. Credential-free, so
+# (unlike the runtime-generated `[pg]` overlay) this one is tracked and
+# bind-mounted straight into the container rather than assembled at
+# container start.
+#
+# Matches `agentenv-a`/`agentenv-b` in `deploy/docker-compose.yml` — keep the
+# ids and endpoints in step with those two service definitions.
+[[cluster.static_discovery_nodes]]
+id = "node-a"
+endpoint = "http://agentenv-a:8000"
+
+[[cluster.static_discovery_nodes]]
+id = "node-b"
+endpoint = "http://agentenv-b:8000"

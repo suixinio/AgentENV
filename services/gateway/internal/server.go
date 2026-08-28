@@ -397,6 +397,32 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
 			return
 		}
+		// 🔴 Unreachable from any validated deployment: `51f83bd`
+		// ("drop the rest-upstream off switch that only produces 404s") made
+		// `services/shared/config`'s Config.Validate refuse to load a gateway
+		// config with rest_upstream_addr empty, so a real *Server never takes
+		// this branch. Do not delete it for that reason.
+		//
+		// It is the gateway half of the 阶段四 scheduler rollback.
+		// `services/scheduler`'s Go source stays in the tree as that
+		// rollback's target (services/README.md), and this fallthrough is
+		// what still gives the gateway somewhere to send a request once it
+		// falls through — together with the `hasSandbox` scheduler routing
+		// below, `assignmentRouteFor`, `isForkRequest`/`isResumeEntryPoint`/
+		// `shouldRecordCreateAssignment`, PLACED/PINNED resume's node
+		// routing, and the `s.scheduler.Schedule` call for a fresh
+		// placement, it is the whole gateway-decides-and-forwards-to-node
+		// path that predates 阶段 3a. Delete this and the scheduler source
+		// becomes a rollback target nothing in the gateway can drive.
+		//
+		// Deleting it also takes ~35-40 tests down with it:
+		// cluster_list_test.go (the whole file), ≥16 in server_test.go,
+		// ≥5 in execution_fencing_test.go, the 6 write-switch tests in
+		// projection_test.go, one in reroute_test.go, and rest_upstream_test.go's
+		// off half. `newTestServer`'s empty-restUpstream default is a
+		// consequence of this branch existing, not a justification for
+		// removing it — rewriting the fixture does not make the code it
+		// exercises dead.
 		recordRestUpstream(restUpstreamNode)
 	}
 

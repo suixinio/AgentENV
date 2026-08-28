@@ -96,6 +96,14 @@ func isClusterListRequest(r *http.Request) bool {
 // tests give the merge/dedup/pagination logic — see rest_upstream.go for why
 // an empty value is kept constructible at all.
 //
+// 🔴 It is also part of the same 阶段四 scheduler rollback that keeps
+// `services/scheduler`'s Go source in the tree (services/README.md): a
+// gateway rolled back to the pre-split, restUpstream-empty world needs some
+// way to answer `GET /sandboxes` out of the nodes directly, not just a
+// scheduler process to route individual sandboxes to. server.go's
+// `handleProxy` — right where this function is called — carries the fuller
+// account of what else that rollback needs kept and which tests go with it.
+//
 // 🔴 Why the listing moved with that value rather than getting a switch of its
 // own, while both still existed: the fan-out is all-or-nothing
 // (`fetchClusterList` cancels the rest on the first failure) and

@@ -167,6 +167,7 @@ impl ObservabilityReporter {
                     }
                     Err(err) => {
                         warn!(
+                            node_id = %service.node_id(),
                             error = %err,
                             retry_after_secs = backoff.as_secs(),
                             "observability heartbeat failed"
@@ -216,6 +217,7 @@ impl ObservabilityReporter {
         self.event_join = Some(event_join);
 
         info!(
+            node_id = %self.service.node_id(),
             scheduler_endpoint = %self.config.scheduler_endpoint,
             scheduler_endpoint_file = ?self.config.scheduler_endpoint_file.as_deref(),
             interval_secs = self.config.interval.as_secs(),
@@ -313,7 +315,10 @@ impl ObservabilityReporter {
 
         if !response.cpu_config_json.is_empty() {
             service.store_cluster_cpu_config(response.cpu_config_json);
-            info!("received cluster cpu config intersection from scheduler");
+            info!(
+                node_id = %node_id,
+                "received cluster cpu config intersection from scheduler"
+            );
         }
 
         trace!(

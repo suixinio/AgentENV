@@ -14,11 +14,19 @@
 //!
 //! That capability lived entirely inside `src/observability/reporter.rs` as a
 //! private `SchedulerChannelSource`, reachable only by the heartbeat loop.
-//! Three other places in this process dial the scheduler the same way —
-//! scheduler-backed node placement, resume placement, and P2P peer discovery
-//! — and none of them could hot-reload; changing their target still meant a
-//! restart. This module is that type, promoted and generalized so all four
-//! consumers share one implementation and one behavior.
+//! Two other places in this process dial the scheduler the same way — resume
+//! placement and P2P peer discovery — and neither could hot-reload; changing
+//! their target still meant a restart. This module is that type, promoted
+//! and generalized so all three consumers share one implementation and one
+//! behavior.
+//!
+//! 🔴 A fourth consumer, scheduler-backed node placement
+//! (`SchedulerNodePlacement::connect_hot_reloadable`), used to share this
+//! too. It dialled a Go scheduler process that is deleted from the tree (see
+//! "Distributed Control Plane" in the repo's top-level `CLAUDE.md`), and
+//! `SchedulerNodePlacement` went with it — placement is answered entirely
+//! in-process now (`crate::node_client::NativeNodePlacement`) and no longer
+//! dials anything this module would hot-reload.
 //!
 //! # Two lifecycles kept apart
 //!

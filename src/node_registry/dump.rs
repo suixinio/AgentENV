@@ -1,41 +1,32 @@
 //! Task 4's equivalence-dump debug endpoint: a read-only view of what api's
-//! node registry currently believes, in a shape directly comparable to the
-//! real scheduler's `ListNodes`/`ListObservedNodes` answers — the
-//! cluster-verification tool the Stage A placement switch (task's own "D7")
-//! needs to be checked against something.
+//! own node registry currently believes.
 //!
-//! # Works under both `[cluster].node_placement_source` values, on purpose
+//! # 🔴 One source now, not two
 //!
-//! - `Native`: reads api's own [`AtomicNodeRegistry`] directly — the same
-//!   data [`crate::node_client::NativeNodePlacement`] uses to answer
-//!   `resolve_node`/`node_membership`.
-//! - `Scheduler` (the default): `assemble_api` builds no local registry at
-//!   all under this mode (Task 1's "connect nothing under Scheduler"
-//!   constraint — see `src/bin/aenv-api.rs`'s `start_native_node_registry`),
-//!   so there is nothing local to read. This mode instead makes a live
-//!   `ListNodes` + `ListObservedNodes` RPC pair against the real scheduler,
-//!   over api's already-configured `[cluster].scheduler_endpoint`, and
-//!   reshapes the answer into the identical output format
-//!   [`dump_native`] produces.
-//!
-//! Both branches emit the exact same JSON shape ([`NodeRegistryDump`]), so a
-//! caller comparing this endpoint's output against a direct `grpcurl` at the
-//! scheduler's `ListNodes`/`ListObservedNodes` is diffing apples to apples
-//! either way — the only thing that changes between the two modes is *where*
-//! the answer came from, which the `source` field on the response names.
+//! This used to run under either of `[cluster].node_placement_source`'s two
+//! values — reading api's own [`AtomicNodeRegistry`] directly under `Native`,
+//! or making a live `ListNodes` + `ListObservedNodes` RPC pair against a
+//! real Go scheduler process under `Scheduler` (the former default) — and
+//! reshaping both into the identical [`NodeRegistryDump`] JSON shape so a
+//! caller could diff this endpoint's output against the scheduler's own
+//! `ListNodes`/`ListObservedNodes` and see the two agree. That scheduler
+//! process is deleted from the tree (see "Distributed Control Plane" in the
+//! repo's top-level `CLAUDE.md`), so there is nothing left to proxy to or to
+//! diff against: [`dump`] now only ever reads the local registry, and
+//! `source` on [`NodeRegistryDump`] is always `"native"`.
 //!
 //! # 🔴 D6: the CPU intersection is *recomputed here*, not read from a cache
 //!
 //! [`compute_intersections`] runs
 //! [`crate::node_registry::cpu_template::intersect_cpu_configs`] — the same
 //! algorithm [`AtomicNodeRegistry::heartbeat`] uses internally — fresh, over
-//! whatever `machine_info.cpu_config_json` values the dump just fetched
-//! (from the local registry or from a live `ListObservedNodes`), rather than
-//! reading a cached value out of the registry. This makes the dump a second,
-//! independent invocation of the same algorithm on live data, on top of
-//! `cpu_template`'s own byte-for-byte golden-output test against the real Go
-//! implementation and `grpc_service`'s own end-to-end wire test — three
-//! different angles on the same "must keep working" chain CLAUDE.md names.
+//! whatever `machine_info.cpu_config_json` values the dump just fetched from
+//! the local registry, rather than reading a cached value out of it. This
+//! makes the dump a second, independent invocation of the same algorithm on
+//! live data, on top of `cpu_template`'s own byte-for-byte golden-output test
+//! against the real Go implementation and `grpc_service`'s own end-to-end
+//! wire test — three different angles on the same "must keep working" chain
+//! CLAUDE.md names.
 //!
 //! 🔴 P4 correction to the paragraph above: that recompute
 //! (`cpu_intersection_recomputed_by_cluster` below) does **not** check
@@ -49,64 +40,42 @@
 //! fooled. `cpu_intersection_applied_by_cluster` is the other half of the
 //! fix: the *gated* value [`NodeRegistry::applied_cpu_intersection`] actually
 //! cached and would hand a node on its next heartbeat. Both are emitted side
-//! by side so a diff shows the gap instead of hiding it — and, under
-//! `Scheduler` mode, the applied map is always empty: no RPC exposes the real
-//! scheduler's internal cache, so there is nothing honest to put there (see
-//! [`dump_scheduler_proxy`]'s own note).
+//! by side so a diff shows the gap instead of hiding it.
 //!
-//! # 🔴 P4: `sandbox_ids` is Native-only, for the same reason
+//! # `sandbox_ids`
 //!
 //! The heartbeat roster (which sandboxes a node reported holding) never
 //! travels on `ObservedNode` — neither `ListObservedNodes` nor any other RPC
-//! exposes it — so [`dump_native`] can enrich its own output from
+//! exposes it — so [`dump`] enriches its own output from
 //! [`NodeRegistry::roster_of`], the same call `AtomicNodeRegistry` itself
-//! serves scheduling from, but [`dump_scheduler_proxy`] has nothing to ask
-//! the real scheduler for and leaves every `sandbox_ids` empty. This matters
-//! more than it looks: two dumps can report identical `sandbox_count`s while
-//! disagreeing about *which* sandboxes those are — the exact shape of
-//! inconsistency the binding reconcile in a real scheduler's `LookupNode`
-//! would silently act on — and a count alone cannot show that.
+//! serves scheduling from. This matters more than it looks: two dumps can
+//! report identical `sandbox_count`s while disagreeing about *which*
+//! sandboxes those are, which a count alone cannot show.
 //!
 //! # Determinism
 //!
-//! `nodes` and `observed` are sorted by `node_id` in both branches. The
-//! underlying sources are a `HashMap` (`dump_native`, via
-//! `AtomicNodeRegistry`'s own internal storage) and whatever order a gRPC
-//! response happens to arrive in (`dump_scheduler_proxy`) — neither is
+//! `nodes` and `observed` are sorted by `node_id` — the underlying source is
+//! a `HashMap` (`AtomicNodeRegistry`'s own internal storage), which is not
 //! stable across two calls, and an acceptance diff comparing this endpoint's
-//! output against itself (or against the real scheduler's) needs identical
-//! input to read as identical, not a reorder read as a difference.
+//! output against itself needs identical input to read as identical, not a
+//! reorder read as a difference.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::Serialize;
-use tonic::transport::Channel;
 
 use crate::node_registry::cpu_template::intersect_cpu_configs;
 use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
-use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
-
-/// Where [`dump`] reads from — built once at `assemble_api` time (see
-/// `src/bin/aenv-api.rs`) from whichever of the two the placement switch and
-/// configuration make available.
-#[derive(Clone)]
-pub enum NodeRegistryDumpSource {
-    /// `[cluster].node_placement_source = "native"`: api's own registry.
-    Native(Arc<AtomicNodeRegistry>),
-    /// `[cluster].node_placement_source = "scheduler"` (or `Native` without
-    /// a registry, which should not happen given `assemble_api`'s own
-    /// wiring, but this variant is also the safe fallback for that case): a
-    /// lazily connected channel to the real scheduler, dialled fresh on
-    /// every request via `ListNodes`/`ListObservedNodes`.
-    SchedulerProxy(Channel),
-}
+use crate::proto::scheduler;
 
 #[derive(Debug, Serialize)]
 pub struct NodeRegistryDump {
-    /// `"native"` or `"scheduler-proxy"` — which of the two branches above
-    /// actually answered this request.
+    /// Always `"native"` now — kept as a field (rather than dropped) because
+    /// it is a stable part of this debug endpoint's JSON shape, from the
+    /// window when a `"scheduler-proxy"` source also existed. See the
+    /// module doc.
     pub source: &'static str,
     /// Discovery-only view — mirrors `ListNodes`. Sorted by `node_id`.
     pub nodes: Vec<DumpNode>,
@@ -122,13 +91,12 @@ pub struct NodeRegistryDump {
     /// [`cpu_intersection_applied_by_cluster`]: NodeRegistryDump::cpu_intersection_applied_by_cluster
     pub cpu_intersection_recomputed_by_cluster: BTreeMap<String, String>,
     /// The gated value production actually cached and would hand a node on
-    /// its next heartbeat — see the module doc's "D6" section. Always empty
-    /// under `Scheduler` mode: no RPC exposes the real scheduler's internal
-    /// cache to reconstruct this from.
+    /// its next heartbeat — see the module doc's "D6" section.
     pub cpu_intersection_applied_by_cluster: BTreeMap<String, String>,
-    /// Set when a `SchedulerProxy` RPC failed; the corresponding list above
-    /// is then empty rather than partially populated, so a caller cannot
-    /// mistake "the scheduler answered with nothing" for "the RPC failed".
+    /// Always `None` now that [`dump`] has one source that cannot itself
+    /// fail (a registry read is infallible). Kept for the same JSON-shape
+    /// reason as `source` above, from the window when a failed
+    /// scheduler-proxy RPC used this to say so.
     pub error: Option<String>,
 }
 
@@ -152,11 +120,10 @@ pub struct DumpObservedNode {
     pub commit: String,
     pub status: &'static str,
     pub sandbox_count: u32,
-    /// The heartbeat roster itself, sorted — not just its count. Native-only;
-    /// see the module doc's own note on why `Scheduler` mode cannot fill
-    /// this in. Two nodes can report the same `sandbox_count` while holding
-    /// entirely different sandboxes, which a count alone cannot show and a
-    /// binding reconcile would act on regardless.
+    /// The heartbeat roster itself, sorted — not just its count. Two nodes
+    /// can report the same `sandbox_count` while holding entirely different
+    /// sandboxes, which a count alone cannot show and a binding reconcile
+    /// would act on regardless.
     pub sandbox_ids: Vec<String>,
     pub allocated_cpu: u32,
     pub allocated_memory_bytes: u64,
@@ -165,9 +132,9 @@ pub struct DumpObservedNode {
 
 impl From<scheduler::ObservedNode> for DumpObservedNode {
     /// `sandbox_ids` is always empty here — `ObservedNode` carries no
-    /// roster on the wire in either implementation (see the module doc) —
-    /// so [`dump_native`] fills it in separately, from
-    /// [`NodeRegistry::roster_of`], after this conversion runs.
+    /// roster on the wire (see the module doc) — so [`dump`] fills it in
+    /// separately, from [`NodeRegistry::roster_of`], after this conversion
+    /// runs.
     fn from(node: scheduler::ObservedNode) -> Self {
         let status = node
             .snapshot
@@ -207,14 +174,10 @@ fn status_label(status: scheduler::NodeStatus) -> &'static str {
     }
 }
 
-pub async fn dump(source: &NodeRegistryDumpSource) -> NodeRegistryDump {
-    match source {
-        NodeRegistryDumpSource::Native(registry) => dump_native(registry),
-        NodeRegistryDumpSource::SchedulerProxy(channel) => dump_scheduler_proxy(channel).await,
-    }
-}
-
-fn dump_native(registry: &Arc<AtomicNodeRegistry>) -> NodeRegistryDump {
+/// Reads a snapshot of `registry`'s current state — see the module doc.
+/// Infallible: a registry read cannot itself fail, so `error` on the result
+/// is always `None`.
+pub fn dump(registry: &Arc<AtomicNodeRegistry>) -> NodeRegistryDump {
     let now = SystemTime::now();
     let mut nodes: Vec<DumpNode> = registry
         .snapshot(true)
@@ -258,63 +221,6 @@ fn dump_native(registry: &Arc<AtomicNodeRegistry>) -> NodeRegistryDump {
         cpu_intersection_recomputed_by_cluster,
         cpu_intersection_applied_by_cluster,
         error: None,
-    }
-}
-
-async fn dump_scheduler_proxy(channel: &Channel) -> NodeRegistryDump {
-    let mut client = SchedulerClient::new(channel.clone());
-    let mut error: Option<String> = None;
-
-    let mut nodes: Vec<DumpNode> = match client.list_nodes(scheduler::ListNodesRequest {}).await {
-        Ok(response) => response
-            .into_inner()
-            .nodes
-            .into_iter()
-            .map(|n| DumpNode {
-                node_id: n.node_id,
-                endpoint: n.endpoint,
-            })
-            .collect(),
-        Err(status) => {
-            error = Some(format!("ListNodes: {status}"));
-            Vec::new()
-        }
-    };
-    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-
-    let observed_raw = match client
-        .list_observed_nodes(scheduler::ListObservedNodesRequest {
-            cluster_id: String::new(),
-        })
-        .await
-    {
-        Ok(response) => response.into_inner().nodes,
-        Err(status) => {
-            let message = format!("ListObservedNodes: {status}");
-            error = Some(match error {
-                Some(existing) => format!("{existing}; {message}"),
-                None => message,
-            });
-            Vec::new()
-        }
-    };
-    let cpu_intersection_recomputed_by_cluster = compute_intersections(&observed_raw);
-    let mut observed: Vec<DumpObservedNode> = observed_raw
-        .into_iter()
-        .map(DumpObservedNode::from)
-        .collect();
-    observed.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-
-    NodeRegistryDump {
-        source: "scheduler-proxy",
-        nodes,
-        observed,
-        cpu_intersection_recomputed_by_cluster,
-        // 🔴 Always empty here — see the module doc's own note: no RPC
-        // exposes the real scheduler's internal, gated intersection cache
-        // to reconstruct this field from over the wire.
-        cpu_intersection_applied_by_cluster: BTreeMap::new(),
-        error,
     }
 }
 
@@ -430,8 +336,7 @@ mod tests {
             )
             .expect("node-a is in discovery");
 
-        let source = NodeRegistryDumpSource::Native(Arc::clone(&registry));
-        let result = dump(&source).await;
+        let result = dump(&registry);
 
         assert_eq!(result.source, "native");
         assert_eq!(result.nodes.len(), 1);
@@ -515,8 +420,7 @@ mod tests {
             )
             .expect("node-b is in discovery");
 
-        let source = NodeRegistryDumpSource::Native(Arc::clone(&registry));
-        let result = dump(&source).await;
+        let result = dump(&registry);
 
         // Sorted output (P4's determinism guarantee) makes the indices
         // below meaningful without a lookup helper.
@@ -589,8 +493,7 @@ mod tests {
             )
             .expect("node-b is in discovery");
 
-        let source = NodeRegistryDumpSource::Native(Arc::clone(&registry));
-        let result = dump(&source).await;
+        let result = dump(&registry);
 
         let expected_recompute =
             intersect_cpu_configs(&[cfg_a.to_string()]).expect("golden algorithm");
@@ -605,165 +508,6 @@ mod tests {
             result.cpu_intersection_applied_by_cluster.get("cluster-a"),
             None,
             "the gated, actually-applied value must stay withheld until node-b reports too"
-        );
-    }
-
-    /// 🔴 Scheduler-proxy mode: same output shape, sourced from a live RPC
-    /// instead of a local registry — the property task 4 is about (the
-    /// endpoint stays usable, in the same shape, under the default switch
-    /// position too).
-    #[tokio::test]
-    async fn scheduler_proxy_dump_has_the_same_shape_as_native() {
-        use std::net::SocketAddr;
-
-        use tokio::sync::oneshot;
-        use tonic::{Request, Response, Status};
-
-        use crate::proto::scheduler::scheduler_server::{Scheduler, SchedulerServer};
-
-        struct FakeScheduler;
-
-        #[tonic::async_trait]
-        impl Scheduler for FakeScheduler {
-            async fn list_nodes(
-                &self,
-                _r: Request<scheduler::ListNodesRequest>,
-            ) -> Result<Response<scheduler::ListNodesResponse>, Status> {
-                Ok(Response::new(scheduler::ListNodesResponse {
-                    nodes: vec![scheduler::Node {
-                        node_id: "node-a".to_string(),
-                        endpoint: "http://10.0.0.7:8000".to_string(),
-                    }],
-                }))
-            }
-            async fn list_observed_nodes(
-                &self,
-                _r: Request<scheduler::ListObservedNodesRequest>,
-            ) -> Result<Response<scheduler::ListObservedNodesResponse>, Status> {
-                Ok(Response::new(scheduler::ListObservedNodesResponse {
-                    nodes: vec![scheduler::ObservedNode {
-                        node_id: "node-a".to_string(),
-                        endpoint: "http://10.0.0.7:8000".to_string(),
-                        cluster_id: "cluster-a".to_string(),
-                        ..Default::default()
-                    }],
-                }))
-            }
-            async fn heartbeat(
-                &self,
-                _r: Request<scheduler::HeartbeatRequest>,
-            ) -> Result<Response<scheduler::HeartbeatResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn schedule(
-                &self,
-                _r: Request<scheduler::ScheduleRequest>,
-            ) -> Result<Response<scheduler::ScheduleResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn lookup_node(
-                &self,
-                _r: Request<scheduler::LookupNodeRequest>,
-            ) -> Result<Response<scheduler::LookupNodeResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn record_assignment(
-                &self,
-                _r: Request<scheduler::RecordAssignmentRequest>,
-            ) -> Result<Response<scheduler::RecordAssignmentResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn report_sandbox_event(
-                &self,
-                _r: Request<scheduler::ReportSandboxEventRequest>,
-            ) -> Result<Response<scheduler::ReportSandboxEventResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn list_p2p_peers(
-                &self,
-                _r: Request<scheduler::ListP2pPeersRequest>,
-            ) -> Result<Response<scheduler::ListP2pPeersResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn record_p2p_artifact(
-                &self,
-                _r: Request<scheduler::RecordP2pArtifactRequest>,
-            ) -> Result<Response<scheduler::RecordP2pArtifactResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn forget_p2p_artifact(
-                &self,
-                _r: Request<scheduler::ForgetP2pArtifactRequest>,
-            ) -> Result<Response<scheduler::ForgetP2pArtifactResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn lookup_p2p_artifact(
-                &self,
-                _r: Request<scheduler::LookupP2pArtifactRequest>,
-            ) -> Result<Response<scheduler::LookupP2pArtifactResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn get_node(
-                &self,
-                _r: Request<scheduler::GetNodeRequest>,
-            ) -> Result<Response<scheduler::GetNodeResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn unregister_node(
-                &self,
-                _r: Request<scheduler::UnregisterNodeRequest>,
-            ) -> Result<Response<scheduler::UnregisterNodeResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-            async fn list_registry_sandboxes(
-                &self,
-                _r: Request<scheduler::ListRegistrySandboxesRequest>,
-            ) -> Result<Response<scheduler::ListRegistrySandboxesResponse>, Status> {
-                Err(Status::unimplemented("not used by this test"))
-            }
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port");
-        let addr: SocketAddr = listener.local_addr().expect("bound address");
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(SchedulerServer::new(FakeScheduler))
-                .serve_with_incoming_shutdown(
-                    tonic::transport::server::TcpIncoming::from(listener),
-                    async {
-                        let _ = rx.await;
-                    },
-                )
-                .await;
-        });
-        for _ in 0..200 {
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .expect("valid endpoint")
-            .connect()
-            .await
-            .expect("connect");
-
-        let source = NodeRegistryDumpSource::SchedulerProxy(channel);
-        let result = dump(&source).await;
-        let _ = tx.send(());
-
-        assert_eq!(result.source, "scheduler-proxy");
-        assert_eq!(result.nodes.len(), 1);
-        assert_eq!(result.nodes[0].node_id, "node-a");
-        assert_eq!(result.observed.len(), 1);
-        assert_eq!(result.observed[0].node_id, "node-a");
-        assert!(
-            result.error.is_none(),
-            "unexpected error: {:?}",
-            result.error
         );
     }
 }

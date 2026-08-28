@@ -161,8 +161,8 @@ mod pg {
             );
         };
         assert!(
-            failure.to_string().contains("node_placement_source"),
-            "the refusal has to name the missing setting, got {failure}"
+            failure.to_string().contains("heartbeat roster"),
+            "the refusal has to name what is missing, got {failure}"
         );
     }
 

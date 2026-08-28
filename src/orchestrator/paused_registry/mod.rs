@@ -623,10 +623,10 @@ pub trait PostgresPausedRegistryFactory: Send + Sync {
 /// either). `postgres` is the database half's own constructor --
 /// see [`PostgresPausedRegistryFactory`] for why this arrives as a trait
 /// object rather than as the `sqlx::PgPool` it used to be. `node_registry` is
-/// `Some` only when `aenv-api` built a
-/// real `crate::node_registry::registry::AtomicNodeRegistry`
-/// (`[cluster].node_placement_source = "native"`, `src/bin/aenv-api.rs`'s
-/// `assemble_api`) -- the pre-split single process never builds one at all.
+/// `Some` whenever `aenv-api` built a real
+/// `crate::node_registry::registry::AtomicNodeRegistry` (`src/bin/aenv-api.rs`'s
+/// `assemble_api`, which now always does) -- the pre-split single process
+/// never built one at all.
 ///
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
@@ -659,12 +659,11 @@ pub async fn build_paused_registry(
             // now-deleted central/gRPC backend.
             node_registry.as_ref().context(
                 "paused_registry.backend = \"postgres\" requires a heartbeat roster \
-                 source, which only exists under \
-                 [cluster].node_placement_source = \"native\" -- without it, running \
-                 sandboxes' registry leases have no renewal path and will eventually be \
-                 wrongly reclaimed even while healthy (this is the exact failure Fix A, \
-                 commit 151d00b, closed for the now-deleted central/gRPC backend). Set \
-                 AENV_NODE_PLACEMENT_SOURCE=native",
+                 source (aenv-api's own node registry, which assemble_api always builds) \
+                 -- without it, running sandboxes' registry leases have no renewal path \
+                 and will eventually be wrongly reclaimed even while healthy (this is the \
+                 exact failure Fix A, commit 151d00b, closed for the now-deleted \
+                 central/gRPC backend)",
             )?;
 
             // 🔴 `node_registry` is not consumed here -- it is only

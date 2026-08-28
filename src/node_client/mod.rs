@@ -37,7 +37,6 @@ pub mod factory;
 mod native_placement;
 pub mod paused_state;
 pub mod placement;
-mod scheduler_placement;
 pub mod stub;
 pub mod wire;
 
@@ -46,5 +45,4 @@ pub use factory::RemoteSandboxBackendFactory;
 pub use native_placement::NativeNodePlacement;
 pub use paused_state::RemotePausedState;
 pub use placement::{FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement};
-pub use scheduler_placement::SchedulerNodePlacement;
 pub use stub::RemoteSandboxStub;

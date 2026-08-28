@@ -1,4 +1,10 @@
-//! [`NativeNodePlacement`]: the `Native` half of `[cluster].node_placement_source`
+//! [`NativeNodePlacement`]: `aenv-api`'s only [`NodePlacement`] implementation.
+//! It used to be one of two — the `Native` half of
+//! `[cluster].node_placement_source`, alongside a `Scheduler` half
+//! (`SchedulerNodePlacement`) that dialled a Go scheduler process over gRPC —
+//! but that process is deleted from the tree (see "Distributed Control
+//! Plane" in the repo's top-level `CLAUDE.md`) and `SchedulerNodePlacement`
+//! went with it, so this is what every `aenv-api` replica runs now, always.
 //! (`docs/proposals/_sd-phase4-stageA-node-inventory.md` §5 — task's own "D7").
 //!
 //! # 🔴 P1 (task's own "phase4-close"): all five methods now go local
@@ -39,14 +45,15 @@
 //! scheduler scaled to zero left every create failing even though the
 //! exact logic needed to place it was already running, unreached, in the
 //! same process. See `cluster_placement`'s own doc comment in
-//! `src/bin/aenv-api.rs` for why `[cluster].scheduler_endpoint` is no longer
-//! required at all once `[cluster].node_placement_source = "native"`.
+//! `src/bin/aenv-api.rs`: placement no longer touches
+//! `[cluster].scheduler_endpoint` at all, now that `SchedulerNodePlacement`
+//! is deleted and this is the only implementation there is to construct.
 //!
 //! # Why `resolve_node` and `node_membership` share one registry call
 //!
 //! Both call [`AtomicNodeRegistry::get_observed`] with an empty cluster id
-//! (matching [`SchedulerNodePlacement`]'s own "blank means do not filter"
-//! convention on the same two methods) — mirroring the real Go `GetNode` RPC
+//! (matching the deleted `SchedulerNodePlacement`'s own "blank means do not
+//! filter" convention on the same two methods) — mirroring the real Go `GetNode` RPC
 //! handler, which both `resolve_node` and `node_membership` dial on the
 //! scheduler side. A node discovery knows about but that has never sent a
 //! heartbeat has no `observed` record yet — but whether that reads as
@@ -66,10 +73,9 @@
 //! port of `GetObserved`. Independent review of Stage A caught it: a
 //! process's own registry starts *empty*, and every node is `Gone` by that
 //! definition until the first heartbeat round finishes, however long that
-//! takes on a large or slow-starting cluster — which is a state the real
-//! scheduler-backed `SchedulerNodePlacement` never has (a scheduler that
-//! cannot answer the question errors instead, `Err`, never `Gone`; see
-//! `SchedulerNodePlacement::node_membership`'s own doc). `stub.rs`'s
+//! takes on a large or slow-starting cluster — which is a state the deleted
+//! scheduler-backed `SchedulerNodePlacement` never had (a scheduler that
+//! cannot answer the question errors instead, `Err`, never `Gone`). `stub.rs`'s
 //! contract for `node_membership` acts on `Gone` alone and treats it as
 //! proof a sandbox's runtime is gone for good — so an api replica that had
 //! just restarted would confirm every live sandbox as gone the moment
@@ -91,7 +97,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::Code;
 
@@ -100,10 +106,64 @@ use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::node_registry::warmup::WarmupGate;
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{self, ObservedNode};
+use crate::scheduler_endpoint::qualified;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
-use super::scheduler_placement::rewrite_port;
+
+/// Replaces the port in a `scheme://host:port` address, keeping everything
+/// else the local registry said.
+///
+/// 🔴 Parsed rather than string-spliced, because an IPv6 literal is written
+/// `http://[::1]:8000` and the last colon in it is not the one before the
+/// port on any naive reading that also has to cope with `http://[::1]`.
+///
+/// 🔴 Formerly `SchedulerNodePlacement::rewrite_port` — moved here rather
+/// than deleted when that type was, because this is its one remaining
+/// caller: both [`NativeNodePlacement::node_service_endpoint`] and
+/// [`NativeNodePlacement::node_service_endpoint_from_wire`] still need to
+/// substitute the node service's own port into whatever address the
+/// registry (or the local scheduler surface) answered with.
+pub fn rewrite_port(endpoint: &str, port: u16) -> Result<String> {
+    let mut url = url::Url::parse(&qualified(endpoint))
+        .with_context(|| format!("node address {endpoint:?} is not a valid URI"))?;
+    url.set_port(Some(port))
+        .map_err(|()| anyhow!("node address {endpoint:?} has no host to put a port on"))?;
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod rewrite_port_tests {
+    use super::rewrite_port;
+
+    #[test]
+    fn the_scheduler_names_a_http_port_and_the_node_service_is_on_another() {
+        assert_eq!(
+            rewrite_port("http://10.0.0.7:8000", 8001).unwrap(),
+            "http://10.0.0.7:8001/"
+        );
+        // A bare host:port is what a static discovery list carries.
+        assert_eq!(
+            rewrite_port("10.0.0.7:8000", 8001).unwrap(),
+            "http://10.0.0.7:8001/"
+        );
+        // 🔴 The control for the two above: an IPv6 literal, where the last
+        // colon in the string is inside the address rather than before the
+        // port. A splice on the last colon passes both cases above and turns
+        // this one into an address that does not resolve.
+        assert_eq!(
+            rewrite_port("http://[fd00::7]:8000", 8001).unwrap(),
+            "http://[fd00::7]:8001/"
+        );
+    }
+
+    #[test]
+    fn an_address_with_no_host_is_refused_rather_than_carrying_a_port() {
+        let err = rewrite_port("unix:///var/run/agentenv.sock", 8001)
+            .expect_err("a socket path is not somewhere to put a port");
+        assert!(err.to_string().contains("no host"), "{err}");
+    }
+}
 
 /// Placement backed entirely by api's own process — see the module doc for
 /// why the split that used to exist here between "answers locally" and
@@ -111,7 +171,7 @@ use super::scheduler_placement::rewrite_port;
 pub struct NativeNodePlacement {
     registry: Arc<AtomicNodeRegistry>,
     /// The port the node sandbox service listens on — same role as
-    /// [`SchedulerNodePlacement`]'s own field of the same name, applied to
+    /// the deleted `SchedulerNodePlacement`'s own field of the same name, applied to
     /// the address the local registry (or the local scheduler surface)
     /// answers with.
     node_service_port: u16,
@@ -146,7 +206,7 @@ impl NativeNodePlacement {
     }
 
     /// Turns an [`ObservedNode`] into the node service's address — the same
-    /// two refusals [`SchedulerNodePlacement::node_service_endpoint`] makes
+    /// two refusals the deleted `SchedulerNodePlacement::node_service_endpoint` made
     /// (no id, no address), against the local registry's answer instead of
     /// the scheduler's.
     fn node_service_endpoint(&self, observed: ObservedNode) -> Result<NodeEndpoint> {
@@ -169,7 +229,7 @@ impl NativeNodePlacement {
     /// [`Self::node_service_endpoint`]'s counterpart for the wire
     /// [`scheduler::Node`] shape `schedule`/`lookup_node` answer with,
     /// rather than the [`ObservedNode`] `get_observed` answers with —
-    /// mirrors [`SchedulerNodePlacement::node_service_endpoint`] exactly,
+    /// mirrored the deleted `SchedulerNodePlacement::node_service_endpoint` exactly,
     /// including its two refusals, worded to name the local scheduler
     /// surface rather than a remote one so an operator reading logs can
     /// tell the two apart.

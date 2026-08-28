@@ -299,12 +299,13 @@ pub struct BackgroundTasks {
 /// [`NodeRegistry::rosters_in_cluster`] answer -- without one, there is
 /// nothing for it to renew from, so [`replica_renewal::spawn`] is simply not
 /// started. This is **not** the same gap Fix A originally closed: under the
-/// split node/api identity model (`aenv-api`, `[cluster]
-/// .node_placement_source = "scheduler"`, the default), a missing roster
-/// really would leave `running` rows with no renewal path at all, and
+/// split node/api identity model, a missing roster really would leave
+/// `running` rows with no renewal path at all, and
 /// `crate::orchestrator::paused_registry::build_paused_registry` still
-/// refuses to select this backend in that configuration for exactly that
-/// reason (see that function's own doc). The case this function *does* have
+/// refuses to select this backend without one (see that function's own
+/// doc) — `aenv-api` always builds one now, so this case is no longer
+/// reachable from production, only from a test calling this function
+/// directly. The case this function *does* have
 /// to accept a missing roster for is the pre-split single process, which never builds a
 /// [`crate::node_registry::registry::AtomicNodeRegistry`] at all: there,
 /// this process's own identity coincides with `origin_node_id` for

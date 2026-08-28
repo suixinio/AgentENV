@@ -672,8 +672,9 @@ pub enum PausedRegistryBackendKind {
     /// connection pool, schema and credentials themselves instead of the
     /// scheduler owning them. Requires `[pg].dsn` and, for the background
     /// reconcile/reclaim loops' D2 Fix A safety net, a heartbeat roster —
-    /// `[cluster].node_placement_source = "native"` — or startup refuses; see
-    /// `orchestrator::paused_registry::build_paused_registry`'s own doc.
+    /// `aenv-api`'s node registry, which it always builds now — or startup
+    /// refuses; see `orchestrator::paused_registry::build_paused_registry`'s
+    /// own doc.
     ///
     /// 🔴 This name was briefly retired between D11 (which removed
     /// `aenv-node`'s own direct connection to this database — an unsafe
@@ -975,27 +976,22 @@ pub struct ObservabilitySchedulerReportConfig {
     pub interval_secs: u64,
 }
 
-/// Where `aenv-api` resolves a known node's current address for
+/// 🔴 Vestigial: nothing reads this any more. It used to choose where
+/// `aenv-api` resolved a known node's current address for
 /// [`crate::node_client::placement::NodePlacement::resolve_node`] and
-/// [`crate::node_client::placement::NodePlacement::node_membership`].
-///
-/// 🔴 Stage A of the scheduler fold
-/// (`docs/proposals/_sd-phase4-stageA-node-inventory.md`): `Scheduler` (the
-/// default) asks `[cluster].scheduler_endpoint` over gRPC, byte-for-byte
-/// today's behavior — `cluster_placement` in `src/bin/aenv-api.rs` builds no
-/// registry, no kube client, nothing. `Native` answers every
-/// `NodePlacement` method from api's own process instead
-/// (`crate::node_client::NativeNodePlacement`): `resolve_node`/
-/// `node_membership` from `src/node_registry`'s node registry, and
-/// `place_new`/`place_existing`/`record_placement` (task's own "phase4-close"
-/// P1) from the same in-process `Schedule`/`LookupNode`/`RecordAssignment`
-/// surface Stage D built (`crate::node_registry::grpc_service`) — no
-/// `[cluster].scheduler_endpoint` is required under `Native` at all. `Native`
-/// also gates whether `assemble_api` starts Kubernetes discovery
-/// (`[cluster.kubernetes_discovery]`) and the heartbeat-receiving gRPC
-/// service at all: under `Scheduler`, nothing in this module runs, no kube
-/// client is built, and the process's dependency footprint is unchanged from
-/// before this switch existed.
+/// [`crate::node_client::placement::NodePlacement::node_membership`] —
+/// `Scheduler` (the code default) asked `[cluster].scheduler_endpoint` over
+/// gRPC, through the now-deleted `SchedulerNodePlacement`; `Native` answered
+/// every `NodePlacement` method from api's own process instead
+/// (`crate::node_client::NativeNodePlacement`). That Go scheduler process is
+/// deleted from the tree (see "Distributed Control Plane" in the repo's
+/// top-level `CLAUDE.md`), so `Native` is what `src/bin/aenv-api.rs`'s
+/// `cluster_placement`/`start_native_node_registry` always build now,
+/// unconditionally — Kubernetes discovery (`[cluster.kubernetes_discovery]`)
+/// and the heartbeat-receiving gRPC service both start regardless of what
+/// this field is set to. The field and this enum are kept only for one more
+/// commit's worth of config-surface stability; see
+/// [`ClusterConfig::node_placement_source`]'s own doc comment.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodePlacementSource {
@@ -1024,9 +1020,9 @@ pub enum NodeRegistryObservedBackendKind {
     /// to every other replica. Correct only for a single-node
     /// deployment — the pre-split single process never even constructs
     /// `AtomicNodeRegistry`'s native-placement wiring, so this default
-    /// never matters there; under `aenv-api` with
-    /// `[cluster].node_placement_source = "native"`, it is the exact split
-    /// roster this fix exists to close, and `wire_shared_node_observed_store`
+    /// never matters there; under `aenv-api`, which always builds that
+    /// wiring now, it is the exact split roster this fix exists to close,
+    /// and `wire_shared_node_observed_store`
     /// (`src/bin/aenv-api.rs`) refuses to start on it unconditionally — the
     /// same discipline `build_binding_store` already applies to
     /// [`BindingStoreBackendKind::InMemory`], for the same reason: nothing
@@ -1144,8 +1140,10 @@ pub struct ClusterStaticDiscoveryNode {
 
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
-    /// Which backend `resolve_node` reads a known node's address from. See
-    /// [`NodePlacementSource`].
+    /// 🔴 Vestigial — see [`NodePlacementSource`]'s own doc comment. Setting
+    /// this to anything no longer changes `aenv-api`'s behavior; kept for one
+    /// more commit's worth of config-surface stability before the field, the
+    /// enum, and `AENV_NODE_PLACEMENT_SOURCE` are all deleted.
     #[config(default = "scheduler", env = "AENV_NODE_PLACEMENT_SOURCE")]
     pub node_placement_source: NodePlacementSource,
     /// Shared gRPC scheduler endpoint for cluster-level services.
@@ -1160,9 +1158,8 @@ pub struct ClusterConfig {
     /// cadence, so this does not need a second timing knob) while the
     /// process runs — no restart required to move traffic.
     ///
-    /// Every consumer that dials the scheduler — P2P peer discovery,
-    /// scheduler-backed node placement, resume placement, and the heartbeat
-    /// reporter — watches this file through
+    /// Every consumer that dials the scheduler — P2P peer discovery, resume
+    /// placement, and the heartbeat reporter — watches this file through
     /// [`crate::scheduler_endpoint::SchedulerEndpointSource`] and picks up an
     /// edit within one interval, with no pod restart. Point it at a file
     /// mounted from a ConfigMap **without** `subPath` — kubelet only
@@ -1287,7 +1284,7 @@ pub struct ClusterConfig {
 /// [`crate::node_registry::kubernetes_discovery::KubernetesDiscovery`].
 ///
 /// 🔴 Every field here is required in the sense that
-/// [`NodePlacementSource::Native`] refuses to start without `namespace` and
+/// `start_native_node_registry` refuses to start without `namespace` and
 /// `service_name` — mirroring Go's own `SchedulerDiscoveryConfig` validation
 /// (`scheduler.discovery.kubernetes.namespace is required`, `...service_name
 /// is required`) — but neither carries a default, unlike Go, because there is

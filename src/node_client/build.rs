@@ -85,7 +85,7 @@ pub async fn build_template_on_a_node(
 ) -> Result<StagedSnapshot, TemplateBuildErrorReason> {
     // 🔴 A synthetic id: `place_new` takes one because a sandbox create has
     // one to give, and every implementation in this tree
-    // (`SchedulerNodePlacement`, `FixedNodePlacement`) ignores it. A build has
+    // (`NativeNodePlacement`, `FixedNodePlacement`) ignores it. A build has
     // no sandbox to name; this exists only to satisfy the signature.
     let sandbox_id = SandboxId::new();
     let node = placement

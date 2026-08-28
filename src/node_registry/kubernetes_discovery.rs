@@ -32,10 +32,9 @@
 //! - 🔴 P6-d correction: the line that used to stand here — "nothing in
 //!   this file is wired into any assembly path" — stopped being true the
 //!   moment `src/bin/aenv-api.rs`'s `start_native_node_registry` started
-//!   calling [`KubernetesDiscovery::connect`] under
-//!   `[cluster].node_placement_source = "native"`. It is wired in now; what
-//!   is still true from the paragraph above is that none of that wiring has
-//!   been exercised against a real apiserver.
+//!   calling [`KubernetesDiscovery::connect`]. It is wired in now,
+//!   unconditionally; what is still true from the paragraph above is that
+//!   none of that wiring has been exercised against a real apiserver.
 //!
 //! # 🔴 P6-a: no cache-sync gate across the three watchers (tracked, not fixed)
 //!

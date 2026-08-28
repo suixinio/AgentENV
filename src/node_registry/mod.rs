@@ -3,13 +3,16 @@
 //! inventory (`node_registry.go`, `kubernetes_discovery.go`, `filter.go`,
 //! `strategy.go`, `warmup.go`, `cpu_template.go`).
 //!
-//! `[cluster].node_placement_source = "native"` is what flips `aenv-api`
-//! onto this module's answers instead of the scheduler's — see
+//! `aenv-api`'s `assemble_api` builds this module's registry unconditionally
+//! now and answers every placement question from it — see
 //! [`crate::node_client::NativeNodePlacement`] (the placement-side consumer)
-//! and [`grpc_service`] (the heartbeat-receiving plane that feeds it). Under
-//! the default `"scheduler"`, `assemble_api` builds none of this — no
-//! registry, no kube client, no gRPC service — so this tree stays exactly as
-//! inert as it was before the switch existed.
+//! and [`grpc_service`] (the heartbeat-receiving plane that feeds it). It
+//! used to be conditional on `[cluster].node_placement_source = "native"`,
+//! with a `"scheduler"` alternative under which `assemble_api` built none of
+//! this at all — no registry, no kube client, no gRPC service — but that
+//! alternative dialled a Go scheduler process that is deleted from the tree
+//! (see "Distributed Control Plane" in the repo's top-level `CLAUDE.md`), so
+//! this tree is what every `aenv-api` replica runs now, always.
 //!
 //! # 🔴 P6-e: the Go test-parity count, precisely
 //!

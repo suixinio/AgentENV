@@ -19,14 +19,11 @@ use aenv_api::binding_store::{
 };
 use aenv_api::cfg::{
     AppConfig, BindingStoreBackendKind, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
-    MetadataStoreBackendKind, NodePlacementSource, NodeRegistryObservedBackendKind,
+    MetadataStoreBackendKind, NodeRegistryObservedBackendKind,
 };
 use aenv_api::identity::NodeIdentity;
 use aenv_api::image::RefusingImageResolver;
-use aenv_api::node_client::{
-    NativeNodePlacement, RemoteSandboxBackendFactory, SchedulerNodePlacement,
-};
-use aenv_api::node_registry::dump::NodeRegistryDumpSource;
+use aenv_api::node_client::{NativeNodePlacement, RemoteSandboxBackendFactory};
 use aenv_api::node_registry::grpc_service::NodeRegistryGrpcService;
 use aenv_api::node_registry::kubernetes_discovery::{
     validate_optional_pod_selector, KubernetesDiscovery, KubernetesDiscoveryConfig,
@@ -321,73 +318,46 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // and an untested refusal branch is the shape this programme has already
     // paid for twice.
     let store_config = cluster_store_config(&config.orchestrator.store)?;
-    // 🔴 Stage A's placement switch (`[cluster].node_placement_source`, task's
-    // own "D7"): under `Native`, this builds api's own node registry — kube
-    // discovery, the heartbeat-receiving gRPC service, and the warm-up gate —
-    // *before* `cluster_placement` runs, so `cluster_placement` can hand a
-    // `NativeNodePlacement` a handle on it. Under `Scheduler` (the default),
-    // this constructs nothing: no registry, no kube client, no gRPC service —
-    // see `start_native_node_registry`'s own doc comment.
-    let native_node_registry = match config.cluster.node_placement_source {
-        NodePlacementSource::Native => Some(start_native_node_registry(&config.cluster).await?),
-        NodePlacementSource::Scheduler => None,
-    };
-    let (
-        native_registry_handle,
-        native_warmup_handle,
-        node_registry_grpc_service,
-        mut node_registry_upkeep,
-    ) = match native_node_registry {
-        Some(bits) => (
-            Some(bits.registry),
-            Some(bits.warmup),
-            Some(bits.grpc_service),
-            bits.tasks,
-        ),
-        None => (None, None, None, Vec::new()),
-    };
+    // `aenv-api` runs its own node registry unconditionally: kube discovery
+    // (or a one-shot static seed), the heartbeat-receiving gRPC service, and
+    // the warm-up gate that guards it. Built here, before `cluster_placement`
+    // runs, so that function can hand `NativeNodePlacement` a handle on each
+    // — see `start_native_node_registry`'s own doc comment.
+    let NativeNodeRegistryBits {
+        registry: native_registry_handle,
+        warmup: native_warmup_handle,
+        grpc_service: node_registry_grpc_service,
+        tasks: mut node_registry_upkeep,
+    } = start_native_node_registry(&config.cluster).await?;
     // Task's own "D3": wires the binding store into the Scheduler-compatible
-    // gRPC surface this replica serves natively. Gated the same way the
-    // service itself is — `node_registry_grpc_service` is only `Some` under
-    // `[cluster].node_placement_source = "native"` — because without that
-    // surface there is nowhere for `report_sandbox_event`/`heartbeat`/
-    // `record_assignment` to run at all.
-    let mut binding_store_handle: Option<Arc<dyn BindingStore>> = None;
-    let node_registry_grpc_service = match node_registry_grpc_service {
-        Some(service) => {
-            let binding_store = build_binding_store(&config.binding_store).await?;
-            binding_store_handle = Some(Arc::clone(&binding_store));
-            let max_projection_ttl =
-                Duration::from_secs(config.binding_store.max_projection_ttl_secs);
-            let artifact_store: Arc<dyn aenv_api::binding_store::artifact_index::ArtifactStore> =
-                Arc::new(
-                    aenv_api::binding_store::artifact_index::InMemoryArtifactStore::new(
-                        config.binding_store.artifact_index_capacity as usize,
-                    ),
-                );
-            Some(
-                service
-                    .with_binding_store(
-                        binding_store,
-                        config.binding_store.projection_authoritative,
-                        max_projection_ttl,
-                    )
-                    .with_artifact_store(artifact_store),
-            )
-        }
-        None => None,
-    };
-    // The shared-roster fix: only under `[cluster].node_placement_source =
-    // "native"` (`native_registry_handle` is `Some`), the same gate
-    // `binding_store` above is wired under. Its background task is folded
-    // into this role's own upkeep the same way the kube-discovery/metrics
-    // tasks already are, via `node_registry_upkeep`.
-    if let Some(registry) = native_registry_handle.as_ref() {
-        if let Some(task) =
-            wire_shared_node_observed_store(&config.cluster.node_registry_store, registry).await?
-        {
-            node_registry_upkeep.push(task);
-        }
+    // gRPC surface this replica serves natively — the surface
+    // `report_sandbox_event`/`heartbeat`/`record_assignment` run on.
+    let binding_store = build_binding_store(&config.binding_store).await?;
+    let binding_store_handle = Arc::clone(&binding_store);
+    let max_projection_ttl = Duration::from_secs(config.binding_store.max_projection_ttl_secs);
+    let artifact_store: Arc<dyn aenv_api::binding_store::artifact_index::ArtifactStore> = Arc::new(
+        aenv_api::binding_store::artifact_index::InMemoryArtifactStore::new(
+            config.binding_store.artifact_index_capacity as usize,
+        ),
+    );
+    let node_registry_grpc_service = node_registry_grpc_service
+        .with_binding_store(
+            binding_store,
+            config.binding_store.projection_authoritative,
+            max_projection_ttl,
+        )
+        .with_artifact_store(artifact_store);
+    // The shared-roster fix: mirrors this replica's heartbeat-derived state
+    // into the shared backend so every `aenv-api` replica sees the whole
+    // cluster's roster. Its background task is folded into this role's own
+    // upkeep the same way the kube-discovery/metrics tasks already are.
+    if let Some(task) = wire_shared_node_observed_store(
+        &config.cluster.node_registry_store,
+        &native_registry_handle,
+    )
+    .await?
+    {
+        node_registry_upkeep.push(task);
     }
     // 🔴 P1 (task's own "phase4-close"): moved up from after
     // `Orchestrator::new` (see the historical comments still attached to
@@ -412,10 +382,12 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
     // coerced to `Arc<dyn NodeRegistry>`, cloned rather than moved --
     // `native_registry_handle` itself is still needed below by
-    // `node_registry_dump_source`.
-    let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> = native_registry_handle
-        .clone()
-        .map(|registry| registry as Arc<dyn NodeRegistry>);
+    // `node_registry_dump_source`. `build_paused_registry`/
+    // `spawn_paused_registry_background_tasks` both still take this as an
+    // `Option` — a `Local` paused-registry backend has no use for a node
+    // registry at all — even though `aenv-api` always has one to hand them.
+    let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> =
+        Some(Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>);
     // The `postgres` arm's own constructor, when this replica has a pool at
     // all. `build_paused_registry` keeps the arm, its refusal message and its
     // roster guard; the pool, the schema bootstrap and the restart-grace entry
@@ -432,27 +404,22 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     .await?;
     // Task's own "Stage D remainder": `lookup_node`'s stage 3. Wired onto
     // the same service `cluster_placement` is about to hand
-    // `NativeNodePlacement` a clone of -- a no-op under
-    // `[cluster].node_placement_source = "scheduler"`
-    // (`node_registry_grpc_service` is `None` there).
-    let node_registry_grpc_service = node_registry_grpc_service
-        .map(|service| service.with_paused_registry(Arc::clone(&paused_registry)));
+    // `NativeNodePlacement` a clone of.
+    let node_registry_grpc_service =
+        node_registry_grpc_service.with_paused_registry(Arc::clone(&paused_registry));
 
-    // 🔴 P1: under `[cluster].node_placement_source = "native"`,
     // `NativeNodePlacement` answers `place_new`/`place_existing`/
     // `record_placement` from this same in-process
     // `node_registry_grpc_service` (a clone -- `spawn_grpc_surface` below
-    // still gets the original, moved in) instead of dialling a scheduler
-    // this deployment no longer has to run at all. See `cluster_placement`'s
-    // own doc comment for why `[cluster].scheduler_endpoint` is no longer
-    // required in that mode.
+    // still gets the original, moved in). See `cluster_placement`'s own doc
+    // comment for why placement needs no `[cluster].scheduler_endpoint` at
+    // all any more.
     let placement = cluster_placement(
-        &config.cluster,
-        &config.observability.scheduler_report,
-        native_registry_handle.as_ref(),
-        native_warmup_handle.as_ref(),
-        node_registry_grpc_service.as_ref(),
-    )?;
+        &native_registry_handle,
+        config.cluster.node_service_port,
+        &native_warmup_handle,
+        &node_registry_grpc_service,
+    );
     let store = RedisMetadataStore::connect(store_config)
         .await
         .context("connect the cluster metadata store")?;
@@ -607,59 +574,28 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // this role's upkeep — see `spawn_paused_record_upkeep`'s callers for why
     // that point is "before the shutdown pauses start" and not later.
     paused_upkeep.append(&mut node_registry_upkeep);
-    // Task's own "D4": the heartbeat-timeout binding sweep. Only meaningful
-    // alongside a wired binding store, which only exists alongside the
-    // native node registry -- both `Option`s are `Some` or `None` together.
+    // Task's own "D4": the heartbeat-timeout binding sweep.
     if config.binding_store.sweep_enabled {
-        if let (Some(registry), Some(store)) =
-            (native_registry_handle.clone(), binding_store_handle.clone())
-        {
-            let cluster_id = config.node_identity.cluster_id.clone().unwrap_or_default();
-            let sweeper = Arc::new(aenv_api::binding_store::sweep::BindingSweeper::new(
-                cluster_id,
-                Duration::from_secs(config.binding_store.sweep_silence_secs),
-            ));
-            let registry: Arc<dyn NodeRegistry> = registry;
-            let interval = Duration::from_secs(config.binding_store.sweep_interval_secs);
-            paused_upkeep.push(tokio::spawn(async move {
-                sweeper.run(registry, store, interval).await;
-            }));
-        }
+        let cluster_id = config.node_identity.cluster_id.clone().unwrap_or_default();
+        let sweeper = Arc::new(aenv_api::binding_store::sweep::BindingSweeper::new(
+            cluster_id,
+            Duration::from_secs(config.binding_store.sweep_silence_secs),
+        ));
+        let registry: Arc<dyn NodeRegistry> =
+            Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>;
+        let store = Arc::clone(&binding_store_handle);
+        let interval = Duration::from_secs(config.binding_store.sweep_interval_secs);
+        paused_upkeep.push(tokio::spawn(async move {
+            sweeper.run(registry, store, interval).await;
+        }));
     }
-    // B1: the postgres backend's per-replica renewal loop, present only
-    // under `[cluster].node_placement_source = "native"` (empty otherwise --
-    // see `spawn_paused_registry_background_tasks`'s own doc).
+    // B1: the postgres backend's per-replica renewal loop.
     paused_upkeep.append(&mut paused_registry_upkeep);
 
-    // 🔴 Task 4's equivalence-dump debug endpoint: built and mounted
-    // regardless of `node_placement_source`, per the task's own instruction
-    // that the comparison hook has to work under the default (`Scheduler`)
-    // switch position too — see `node_registry::dump`'s own module doc for
-    // why the two modes converge on the same output shape. Native mode reads
-    // the registry `start_native_node_registry` already built above;
-    // scheduler mode reuses the same, already-validated
-    // `[cluster].scheduler_endpoint` `cluster_placement` required, over a
-    // second lazily connected channel (never the same `Channel` as
-    // `cluster_placement`'s own `SchedulerNodePlacement`, so a slow or wedged
-    // debug request can never contend with real placement traffic).
-    let node_registry_dump_source = match &native_registry_handle {
-        Some(registry) => NodeRegistryDumpSource::Native(Arc::clone(registry)),
-        None => {
-            let endpoint = config
-                .cluster
-                .scheduler_endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|endpoint| !endpoint.is_empty())
-                .expect("cluster_placement already required a non-empty scheduler_endpoint");
-            let channel = tonic::transport::Endpoint::from_shared(
-                aenv_api::scheduler_endpoint::qualified(endpoint),
-            )
-            .context("build the node-registry dump's scheduler-proxy channel")?
-            .connect_lazy();
-            NodeRegistryDumpSource::SchedulerProxy(channel)
-        }
-    };
+    // 🔴 Task 4's equivalence-dump debug endpoint — see `node_registry::dump`'s
+    // own module doc: it reads the same registry `start_native_node_registry`
+    // already built above.
+    let node_registry_dump_source = Arc::clone(&native_registry_handle);
 
     let grpc = {
         let served = Arc::clone(&api_impl);
@@ -683,18 +619,14 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // gate to `NodeRegistryGrpcService`, which the closure above serves) —
     // see that construction's own comment. Now that the listener has
     // actually bound and can receive a `Heartbeat` RPC, rebase the deadline
-    // to start counting from here, not from wherever assembly happened to
-    // be earlier. A no-op under `[cluster].node_placement_source =
-    // "scheduler"` (`native_warmup_handle` is `None`) and cheap even when it
-    // is not — see `WarmupGate::rebase_deadline`'s own doc comment for why
+    // to start counting from here, not from wherever assembly happened to be
+    // earlier. See `WarmupGate::rebase_deadline`'s own doc comment for why
     // this is safe to call unconditionally, including on a gate that has
     // already gone warm.
-    if let Some(warmup) = native_warmup_handle.as_ref() {
-        warmup.rebase_deadline(
-            std::time::SystemTime::now(),
-            Duration::from_secs(config.cluster.native_warmup_timeout_secs),
-        );
-    }
+    native_warmup_handle.rebase_deadline(
+        std::time::SystemTime::now(),
+        Duration::from_secs(config.cluster.native_warmup_timeout_secs),
+    );
 
     // 🔴 P5: built as its own `Router` and merged into the *generated*
     // control-plane router by `server::new_with_control_plane_routes`,
@@ -712,8 +644,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let node_registry_debug_routes = axum::Router::new().route(
         "/debug/node-registry",
         axum::routing::get(move || {
-            let source = node_registry_dump_source.clone();
-            async move { axum::Json(aenv_api::node_registry::dump::dump(&source).await) }
+            let source = Arc::clone(&node_registry_dump_source);
+            async move { axum::Json(aenv_api::node_registry::dump::dump(&source)) }
         }),
     );
 
@@ -780,85 +712,46 @@ fn cluster_store_config(
     })
 }
 
-/// Where this half asks where sandboxes go. Under `Native`, every method
-/// answers from api's own process — [`NativeNodePlacement`] wraps the local
-/// node registry (`resolve_node`/`node_membership`) and a clone of the same
-/// `node_registry_grpc_service` `assemble_api` serves `Schedule`/
-/// `LookupNode`/`RecordAssignment` from over the wire (`place_new`/
-/// `place_existing`/`record_placement`) — see that type's own module doc
-/// for the P1 fix this replaced ("all five forward to the scheduler" ->
-/// "all five answer locally"). Under `Scheduler` (the default), this is
-/// unchanged from before P1: a `SchedulerNodePlacement` dialling
-/// `[cluster].scheduler_endpoint`, byte-for-byte.
+/// Where this half asks where sandboxes go: always [`NativeNodePlacement`],
+/// which wraps the local node registry (`resolve_node`/`node_membership`)
+/// and a clone of the same `node_registry_grpc_service` `assemble_api`
+/// serves `Schedule`/`LookupNode`/`RecordAssignment` from over the wire
+/// (`place_new`/`place_existing`/`record_placement`) — see that type's own
+/// module doc for the P1 fix this replaced ("all five forward to the
+/// scheduler" -> "all five answer locally").
 ///
-/// 🔴 P1 (task's own "phase4-close"): `[cluster].scheduler_endpoint` is now
-/// required *only* under `Scheduler` — the doc comment this replaced said
+/// 🔴 P1 (task's own "phase4-close"): the doc comment this replaced said
 /// "`Native` is not a way to run `aenv-api` without a scheduler," and
 /// that was the bug: three of `NativeNodePlacement`'s five methods used to
 /// forward to a `SchedulerNodePlacement` regardless, so `aenv-api` under
 /// `Native` was simultaneously the gRPC server for `Schedule`/`LookupNode`/
 /// `RecordAssignment` (Stage D) and a client of the Go scheduler for those
 /// same three calls, never reaching its own answers. Scaling that scheduler
-/// to zero left every create failing. `Native` now needs no scheduler
-/// endpoint at all.
+/// to zero left every create failing. `SchedulerNodePlacement` — and the
+/// `Scheduler` alternative this function used to choose between — are gone
+/// now, along with the Go scheduler process itself; this always builds a
+/// `NativeNodePlacement`, and infallibly, because there is nothing left for
+/// it to fail to connect to.
 fn cluster_placement(
-    config: &aenv_api::cfg::ClusterConfig,
-    scheduler_report: &aenv_api::cfg::ObservabilitySchedulerReportConfig,
-    native_registry: Option<&Arc<AtomicNodeRegistry>>,
-    native_warmup: Option<&Arc<WarmupGate>>,
-    native_grpc_service: Option<&NodeRegistryGrpcService>,
-) -> anyhow::Result<Arc<dyn aenv_api::node_client::NodePlacement>> {
-    match (
-        config.node_placement_source,
-        native_registry,
-        native_warmup,
-        native_grpc_service,
-    ) {
-        (NodePlacementSource::Native, Some(registry), Some(warmup), Some(local)) => {
-            Ok(Arc::new(NativeNodePlacement::new(
-                Arc::clone(registry),
-                config.node_service_port,
-                Arc::clone(warmup),
-                local.clone(),
-            )))
-        }
-        _ => {
-            let endpoint = config
-                .scheduler_endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|endpoint| !endpoint.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "aenv-api needs [cluster].scheduler_endpoint \
-                         (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not \
-                         run, so every create has to be placed by the scheduler and there is no \
-                         machine here to fall back to"
-                    )
-                })?;
-            let scheduler = SchedulerNodePlacement::connect_hot_reloadable(
-                endpoint,
-                config,
-                scheduler_report,
-                config.node_service_port,
-            )?;
-            Ok(Arc::new(scheduler))
-        }
-    }
+    registry: &Arc<AtomicNodeRegistry>,
+    node_service_port: u16,
+    warmup: &Arc<WarmupGate>,
+    grpc_service: &NodeRegistryGrpcService,
+) -> Arc<dyn aenv_api::node_client::NodePlacement> {
+    Arc::new(NativeNodePlacement::new(
+        Arc::clone(registry),
+        node_service_port,
+        Arc::clone(warmup),
+        grpc_service.clone(),
+    ))
 }
 
-/// Bundles what `[cluster].node_placement_source = "native"` needs running
-/// before `cluster_placement` can hand a [`NativeNodePlacement`] a registry
-/// to read: the registry itself, the heartbeat-receiving gRPC service that
-/// feeds it (task's own "D5"), and the background tasks that keep both
-/// current (kube discovery, the observed-nodes metrics gauge). Callers merge
-/// `tasks` into the role's own `upkeep` and pass `grpc_service` to
-/// `aenv_api::api::grpc::serve_on`.
-///
-/// 🔴 Under `[cluster].node_placement_source = "scheduler"` (the default),
-/// nothing in `assemble_api` calls this at all — no registry, no kube
-/// client, no gRPC service, matching the task's own instruction that the
-/// default path's dependency footprint must be unchanged.
+/// Bundles what `assemble_api` needs running before `cluster_placement` can
+/// hand a [`NativeNodePlacement`] a registry to read: the registry itself,
+/// the heartbeat-receiving gRPC service that feeds it (task's own "D5"), and
+/// the background tasks that keep both current (kube discovery, the
+/// observed-nodes metrics gauge). Callers merge `tasks` into the role's own
+/// `upkeep` and pass `grpc_service` to `aenv_api::api::grpc::serve_on`.
 struct NativeNodeRegistryBits {
     registry: Arc<AtomicNodeRegistry>,
     /// The same `Arc` handed to `grpc_service` below — cloned out here too
@@ -926,8 +819,7 @@ async fn start_native_node_registry(
                 anyhow::bail!(
                     "aenv-api needs [cluster.kubernetes_discovery].namespace and .service_name \
                      (AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE / \
-                     AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when \
-                     [cluster].node_placement_source = \"native\" and (the default) \
+                     AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when (the default) \
                      [cluster].node_discovery_mode = \"kubernetes\": Stage A's node registry has \
                      nothing to discover nodes from otherwise. Set \
                      AENV_CLUSTER_NODE_DISCOVERY_MODE=static and \
@@ -969,8 +861,7 @@ async fn start_native_node_registry(
                 anyhow::anyhow!(
                     "aenv-api needs a valid [[cluster.static_discovery_nodes]] list (set via \
                      AENV_CONFIG_OVERLAY_PATH — see ClusterConfig::static_discovery_nodes's own \
-                     doc comment) when [cluster].node_placement_source = \"native\" and \
-                     [cluster].node_discovery_mode = \"static\": {err}"
+                     doc comment) when [cluster].node_discovery_mode = \"static\": {err}"
                 )
             })?;
             let nodes = aenv_api::node_registry::static_discovery::nodes_from_static_config(
@@ -1007,8 +898,7 @@ async fn start_native_node_registry(
 }
 
 /// Task's own "D3": constructs the binding store `assemble_api` wires into
-/// `NodeRegistryGrpcService` (`with_binding_store`) under
-/// `[cluster].node_placement_source = "native"`. Mirrors
+/// `NodeRegistryGrpcService` (`with_binding_store`) unconditionally. Mirrors
 /// `RedisMetadataStore::connect`'s own error-wrapping style — a connection
 /// failure here is a startup refusal, not a background retry, the same
 /// discipline `cluster_placement`'s own comment names for every other
@@ -1044,11 +934,10 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
         // actually running.
         BindingStoreBackendKind::InMemory => {
             anyhow::bail!(
-                "[cluster].node_placement_source = \"native\" needs [binding_store].backend = \
-                 \"redis\" (AENV_BINDING_STORE_BACKEND): the in-memory binding store is one \
+                "aenv-api needs [binding_store].backend = \"redis\" \
+                 (AENV_BINDING_STORE_BACKEND): the in-memory binding store is one \
                  replica's private routing table, and aenv-api runs as more than one \
-                 replica. Set AENV_BINDING_STORE_BACKEND=redis, or keep \
-                 [cluster].node_placement_source = \"scheduler\""
+                 replica. Set AENV_BINDING_STORE_BACKEND=redis"
             );
         }
         BindingStoreBackendKind::Redis => {
@@ -1075,12 +964,9 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
 ///
 /// Mirrors `build_binding_store`'s own multi-replica guardrail exactly, for
 /// the same reason: nothing at this layer can distinguish "one replica,
-/// alone, safe" from "one of several, silently split," and this is only
-/// ever called from `assemble_api`, only when `native_registry_handle` is
-/// `Some` — i.e. only under `[cluster].node_placement_source = "native"`,
-/// the same trigger `build_binding_store` refuses
-/// `BindingStoreBackendKind::InMemory` under. So
-/// `NodeRegistryObservedBackendKind::InMemory` is refused here
+/// alone, safe" from "one of several, silently split," and this is called
+/// unconditionally from `assemble_api`, the same as `build_binding_store`
+/// is. So `NodeRegistryObservedBackendKind::InMemory` is refused here
 /// unconditionally too, regardless of how many replicas are actually
 /// running.
 ///
@@ -1097,13 +983,11 @@ async fn wire_shared_node_observed_store(
     match config.backend {
         NodeRegistryObservedBackendKind::InMemory => {
             anyhow::bail!(
-                "[cluster].node_placement_source = \"native\" needs \
-                 [cluster.node_registry_store].backend = \"redis\" \
+                "aenv-api needs [cluster.node_registry_store].backend = \"redis\" \
                  (AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND): the in-memory node registry only \
                  sees the nodes whose heartbeat happens to be pinned to this replica, and \
                  aenv-api runs as more than one replica. Set \
-                 AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND=redis, or keep \
-                 [cluster].node_placement_source = \"scheduler\""
+                 AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND=redis"
             );
         }
         NodeRegistryObservedBackendKind::Redis => {
@@ -1371,79 +1255,20 @@ mod tests {
             .expect("the defaults this function leans on must be a valid combination");
     }
 
-    #[tokio::test]
-    async fn the_api_half_refuses_to_place_sandboxes_with_nothing_to_ask() {
-        let mut config = AppConfig::default();
-        assert_eq!(
-            config.cluster.scheduler_endpoint, None,
-            "the default is no endpoint, which is what makes this refusal necessary"
-        );
-
-        let err = match cluster_placement(
-            &config.cluster,
-            &config.observability.scheduler_report,
-            None,
-            None,
-            None,
-        ) {
-            Ok(_) => panic!("there is no machine here to fall back to"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("scheduler_endpoint"), "{err}");
-        assert!(
-            err.contains("AENV_OBSERVABILITY_SCHEDULER_ENDPOINT"),
-            "{err}"
-        );
-
-        // 🔴 Blank is the same answer as absent, and separately so: a
-        // ConfigMap that carries the key with an empty value is not naming an
-        // endpoint, and treating it as one would produce a placement source
-        // that fails on every call instead of a process that refuses to start.
-        config.cluster.scheduler_endpoint = Some("   ".to_string());
-        assert!(
-            cluster_placement(
-                &config.cluster,
-                &config.observability.scheduler_report,
-                None,
-                None,
-                None
-            )
-            .is_err(),
-            "a blank endpoint is not an endpoint"
-        );
-
-        // 🔴 The control, again: a real endpoint resolves, so the two refusals
-        // above are about what was missing.
-        config.cluster.scheduler_endpoint = Some("http://scheduler:9090".to_string());
-        assert!(
-            cluster_placement(
-                &config.cluster,
-                &config.observability.scheduler_report,
-                None,
-                None,
-                None
-            )
-            .is_ok(),
-            "a configured endpoint is what this role runs on"
-        );
-    }
-
-    /// 🔴 P1 (task's own "phase4-close"): the other half of the same claim —
-    /// under `Native`, with a real local registry/warmup/gRPC service handed
-    /// in, `cluster_placement` must succeed with **no**
-    /// `[cluster].scheduler_endpoint` configured at all. Before P1,
-    /// `cluster_placement` read and refused on a missing endpoint
-    /// unconditionally, before it ever looked at `node_placement_source` —
-    /// so this exact call would have failed with "needs
-    /// [cluster].scheduler_endpoint", even though nothing in this test's
-    /// setup ever needs to dial one.
+    /// 🔴 P1 (task's own "phase4-close"): `cluster_placement` needs no
+    /// `[cluster].scheduler_endpoint` at all — the doc comment this test
+    /// guards against regressing said "`Native` is not a way to run
+    /// `aenv-api` without a scheduler," and that was the bug this fixed.
+    /// Now that `SchedulerNodePlacement` is deleted along with the
+    /// `Scheduler` alternative this function used to choose between, the
+    /// signature itself enforces it: there is no scheduler-endpoint
+    /// parameter left to require one from, and construction cannot fail.
     #[test]
-    fn native_placement_needs_no_scheduler_endpoint() {
-        let mut config = AppConfig::default();
-        config.cluster.node_placement_source = NodePlacementSource::Native;
+    fn cluster_placement_builds_a_native_placement_with_no_scheduler_endpoint() {
+        let config = AppConfig::default();
         assert_eq!(
             config.cluster.scheduler_endpoint, None,
-            "the whole point of this test is that native mode does not need one"
+            "the whole point of this test is that placement does not need one"
         );
 
         let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
@@ -1454,18 +1279,14 @@ mod tests {
         ));
         let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));
 
-        let placement = cluster_placement(
-            &config.cluster,
-            &config.observability.scheduler_report,
-            Some(&registry),
-            Some(&warmup),
-            Some(&grpc_service),
-        );
-        assert!(
-            placement.is_ok(),
-            "[cluster].node_placement_source = \"native\" must not require \
-             [cluster].scheduler_endpoint: {:?}",
-            placement.err()
+        // Infallible now — this is a construction smoke test, not a
+        // refusal/success pair, because there is no longer a failure mode
+        // to pair it against.
+        let _placement = cluster_placement(
+            &registry,
+            config.cluster.node_service_port,
+            &warmup,
+            &grpc_service,
         );
     }
 
@@ -1571,7 +1392,6 @@ mod tests {
     #[tokio::test]
     async fn native_placement_refuses_an_unconfigured_kubernetes_discovery() {
         let unconfigured_discovery = aenv_api::cfg::ClusterConfig {
-            node_placement_source: NodePlacementSource::Native,
             ..AppConfig::default().cluster
         };
         let err = match start_native_node_registry(&unconfigured_discovery).await {
@@ -1595,7 +1415,6 @@ mod tests {
     #[tokio::test]
     async fn native_placement_seeds_the_registry_from_static_discovery() {
         let config = aenv_api::cfg::ClusterConfig {
-            node_placement_source: NodePlacementSource::Native,
             node_discovery_mode: aenv_api::cfg::ClusterNodeDiscoveryMode::Static,
             static_discovery_nodes: vec![
                 aenv_api::cfg::ClusterStaticDiscoveryNode {
@@ -1650,7 +1469,6 @@ mod tests {
     #[tokio::test]
     async fn native_placement_refuses_an_empty_static_discovery_node_list() {
         let config = aenv_api::cfg::ClusterConfig {
-            node_placement_source: NodePlacementSource::Native,
             node_discovery_mode: aenv_api::cfg::ClusterNodeDiscoveryMode::Static,
             static_discovery_nodes: Vec::new(),
             ..AppConfig::default().cluster

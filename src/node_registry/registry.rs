@@ -8,12 +8,12 @@
 //! same name), so a future consumer can be tested against a fake without
 //! reaching for the concrete type.
 //!
-//! 🔴 Both are wired into a live runtime path from Stage A on:
+//! 🔴 Both are wired into a live runtime path from Stage A on, unconditionally:
 //! `start_native_node_registry` (`src/bin/aenv-api.rs`) builds an
 //! [`AtomicNodeRegistry`] and hands it to `NodeRegistryGrpcService`, whose
 //! `Heartbeat` RPC is the process's real, network-reachable heartbeat
-//! surface under `[cluster].node_placement_source = "native"`. This matters
-//! below: a bug here is not a bug in a data structure nothing calls yet.
+//! surface. This matters below: a bug here is not a bug in a data structure
+//! nothing calls yet.
 //!
 //! Two data structures, kept in step under one lock:
 //!
@@ -702,8 +702,7 @@ pub struct AtomicNodeRegistry {
     empty_sync_guard: EmptySyncGuard,
     /// Set at most once, by [`Self::enable_shared_observed_publishing`] —
     /// `Some` for exactly as long as `super::redis`'s shared observed store
-    /// is wired up (`[cluster].node_placement_source = "native"` with
-    /// `[cluster.node_registry_store].backend = "redis"`; see
+    /// is wired up (`[cluster.node_registry_store].backend = "redis"`; see
     /// `src/bin/aenv-api.rs`'s `wire_shared_node_observed_store`). `None`
     /// (the default for every other caller, including every test in this
     /// module) makes [`Self::publish_upsert`]/[`Self::publish_remove`]

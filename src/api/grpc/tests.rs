@@ -37,6 +37,9 @@ use crate::api::{ApiImpl, PausedSandboxWiring, ResumeWiring};
 use crate::cfg::ConfigManager;
 use crate::identity::NodeIdentity;
 use crate::image::RefusingImageResolver;
+use crate::node_registry::grpc_service::NodeRegistryGrpcService;
+use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
+use crate::node_registry::warmup::WarmupGate;
 use crate::orchestrator::{
     DisabledPausedSandboxRegistry, DisabledSandboxPersister, InMemoryMetadataStore, Orchestrator,
     ProxyTarget, SandboxState,
@@ -164,6 +167,23 @@ impl RunningApi {
     }
 }
 
+/// A minimal, otherwise-unused [`NodeRegistryGrpcService`] — `serve_on` now
+/// always mounts one alongside the resume surface, and these tests are about
+/// the resume surface alone, not the node-registry plane, so what they need
+/// is just something to hand it.
+fn dummy_node_registry_service() -> NodeRegistryGrpcService {
+    let registry = Arc::new(AtomicNodeRegistry::new(
+        Vec::new(),
+        std::time::Duration::from_secs(30),
+    ));
+    let warmup = Arc::new(WarmupGate::new(
+        Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+        std::time::Duration::from_secs(15),
+        std::time::SystemTime::now(),
+    ));
+    NodeRegistryGrpcService::new(registry, warmup)
+}
+
 async fn serve_api(resume_wiring: ResumeWiring) -> RunningApi {
     crate::logging::init_for_tests();
     let api = build_api(resume_wiring).await;
@@ -180,7 +200,7 @@ async fn serve_api(resume_wiring: ResumeWiring) -> RunningApi {
 
     let served = Arc::clone(&api);
     tokio::spawn(async move {
-        let _ = super::serve_on(listener, served, None, async {
+        let _ = super::serve_on(listener, served, dummy_node_registry_service(), async {
             let _ = rx.await;
         })
         .await;
@@ -1197,7 +1217,7 @@ async fn serve_api_with_registry(
     let (tx, rx) = oneshot::channel();
     let served = Arc::clone(&api);
     tokio::spawn(async move {
-        let _ = super::serve_on(listener, served, None, async {
+        let _ = super::serve_on(listener, served, dummy_node_registry_service(), async {
             let _ = rx.await;
         })
         .await;

@@ -49,7 +49,7 @@ LSMT (Log Structured Merge Tree) based layered image format.
 
 **Compression**: zstd (level 3) with random-access jump tables and CRC32C checksums.
 
-**Snapshot**: `ImageFile::create_snapshot_and_restack()` is the primary pause path. It seals the live upper layer via `LSMTFile::close_seal_and_reopen()` so the upper becomes the newest lower layer, then reopens a fresh writable upper in place. `image/snapshot.rs::export_upper_as_snapshot_layer()` retains the explicit upper-export path used by packaging and export flows.
+**Snapshot**: `ImageFile::create_snapshot_and_restack()` is the primary pause path. It seals the live upper layer via `LSMTFile::close_seal_and_reopen()` so the upper becomes the newest lower layer, then reopens a fresh writable upper in place. `export_upper_as_sealed()` (`image/image_file.rs` / `lsmt/file/readwrite.rs`) retains the explicit upper-export path used by packaging and export flows.
 
 **Key files**: `image/image_file.rs` (high-level image), `lsmt/file/` (LSMT stacking: `readonly.rs` for `LSMTReadOnlyFile`, `readwrite.rs` for `LSMTFile`, `stack.rs` for open/merge/stack helpers), `lsmt/format.rs` (binary format), `lsmt/index.rs` (segment mapping), `compression/zfile.rs` (compression), `image/snapshot.rs`.
 
@@ -102,8 +102,6 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 **Sharing**: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.
 
 **Memory snapshot creation**: On pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker's dirty/present memory ranges, reads the selected memory with `process_vm_readv`, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.
-
-> **Note**: `storage/uffd-core/` contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.
 
 ## Per-Node Subsystems
 
@@ -285,15 +283,9 @@ storage/
 │   ├── client.rs               # daemon client used by node runtime
 │   ├── server.rs               # daemon server + request loop
 │   └── protocol.rs             # RPC message types
-├── util/src/                   # shared io_uring abstractions
-│   ├── io_ring/                # AsyncIoRing, IoRingWorker
-│   └── id_allocator.rs         # bitmap-based ID allocation
-└── uffd-core/src/              # userfaultfd memory restore (excluded from workspace, retained for reference)
-    ├── handler.rs              # UffdHandle, page fault event loop
-    ├── backend.rs              # MemoryImageBackend trait
-    ├── overlaybd.rs            # OverlaybdMemoryImage backend
-    ├── process_vm_reader.rs    # ProcessVmReader (process_vm_readv)
-    └── scm.rs                  # SCM_RIGHTS fd passing
+└── util/src/                   # shared io_uring abstractions
+    ├── io_ring/                # AsyncIoRing, IoRingWorker
+    └── id_allocator.rs         # bitmap-based ID allocation
 
 src/
 ├── bin/aenv-node.rs            # node binary entrypoint (crates/aenv-node/src/)

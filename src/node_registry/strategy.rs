@@ -1,12 +1,7 @@
-//! Port of `services/scheduler/internal/strategy.go` (60 lines) — the two
-//! placement strategies `Schedule` chooses among: round-robin (the default)
-//! and random.
-//!
-//! Not wired into any scheduling path yet — see `src/node_registry/mod.rs`.
+//! Port of `services/scheduler/internal/strategy.go` (60 lines) — the
+//! round-robin placement strategy `Schedule` uses to pick a node.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use rand::RngExt;
 
 use crate::node_registry::types::RichNode;
 use crate::proto::scheduler::ScheduleRequestHint;
@@ -20,7 +15,7 @@ pub struct NoNodesAvailable;
 pub trait Strategy: Send + Sync {
     /// Picks one node from `nodes`. `hint` carries the same
     /// `ScheduleRequestHint` `Schedule` received, for a strategy that wants
-    /// to weigh it — neither strategy ported here reads it, matching Go.
+    /// to weigh it — the strategy ported here does not read it, matching Go.
     fn select(
         &self,
         nodes: &[RichNode],
@@ -64,43 +59,6 @@ impl Strategy for RoundRobinStrategy {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct RandomStrategy;
-
-impl RandomStrategy {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Strategy for RandomStrategy {
-    fn select(
-        &self,
-        nodes: &[RichNode],
-        _hint: Option<&ScheduleRequestHint>,
-    ) -> Result<RichNode, NoNodesAvailable> {
-        if nodes.is_empty() {
-            return Err(NoNodesAvailable);
-        }
-        let idx = rand::rng().random_range(0..nodes.len());
-        Ok(nodes[idx].clone())
-    }
-
-    fn name(&self) -> &'static str {
-        "random"
-    }
-}
-
-/// Mirrors Go's `NewStrategy`: `"random"` selects [`RandomStrategy`];
-/// anything else — including `"round_robin"` and an unrecognised name —
-/// falls back to [`RoundRobinStrategy`], the default.
-pub fn new_strategy(name: &str) -> Box<dyn Strategy> {
-    match name {
-        "random" => Box::new(RandomStrategy::new()),
-        _ => Box::new(RoundRobinStrategy::new()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,21 +89,8 @@ mod tests {
     }
 
     #[test]
-    fn random_no_nodes_errors() {
-        let s = RandomStrategy::new();
-        assert!(s.select(&[], None).is_err());
-    }
-
-    #[test]
     fn round_robin_no_nodes_errors() {
         let s = RoundRobinStrategy::new();
         assert!(s.select(&[], None).is_err());
-    }
-
-    #[test]
-    fn new_strategy_defaults_to_round_robin() {
-        assert_eq!(new_strategy("round_robin").name(), "round_robin");
-        assert_eq!(new_strategy("unrecognised").name(), "round_robin");
-        assert_eq!(new_strategy("random").name(), "random");
     }
 }

@@ -34,10 +34,6 @@ pub mod helper {
 }
 mod metrics;
 pub mod prefetch;
-pub mod snapshot {
-    #[cfg(feature = "full")]
-    pub use crate::image::snapshot::*;
-}
 pub mod tools;
 pub mod transient_io_ring {
     pub use crate::io::transient_io_ring::*;
@@ -60,8 +56,6 @@ pub use image_file::{ImageFile, RestackSnapshotTerminalFailure};
 #[cfg(feature = "full")]
 pub use image_service::ImageService;
 pub use index_file::LayerDescriptor;
-#[cfg(feature = "full")]
-pub use snapshot::export_upper_as_snapshot_layer;
 
 // Re-export the compact_writer
 pub use storage_util::compact_writer;

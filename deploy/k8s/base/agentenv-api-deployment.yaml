@@ -385,13 +385,23 @@ spec:
             #      catalog or refuses to assemble, and nothing in the snapshot
             #      layer reads this key at all.
             #
-            # Rollback: change this back to `http://agentenv-scheduler:9090`
-            # and roll this Deployment — unlike the DaemonSet's copy of this
-            # key, this one has no mounted hot-reload file
+            # Rollback: there is no `agentenv-scheduler:9090` left to point
+            # this at — the Go scheduler's Deployment/Service/PDB and its
+            # source under `services/scheduler` were deleted outright
+            # (`e2734fd`), not commented out. Changing this value back and
+            # rolling this Deployment would only trade a working
+            # `LookupNode` target for one that fails DNS resolution. The
+            # real rollback is checking out a commit from before `e2734fd`
+            # (or restoring the scheduler manifests and a compatible
+            # scheduler image from git history) alongside
+            # kustomization.yaml's heartbeat key and this Deployment's
+            # `AENV_NODE_PLACEMENT_SOURCE` / `AENV_PAUSED_REGISTRY_BACKEND`
+            # — a genuine restart either way, since this key has no mounted
+            # hot-reload file the way the DaemonSet's copy does
             # (`ResumeWiring::cluster_from_config` builds its
-            # `SchedulerEndpointSource` from `[cluster].scheduler_endpoint_file`
-            # too, but nothing here sets that file up), so this is a genuine
-            # restart, not a live reload.
+            # `SchedulerEndpointSource` from
+            # `[cluster].scheduler_endpoint_file` too, but nothing here sets
+            # that file up).
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
               value: http://agentenv-api:8002
             # 🔴 阶段四 E3 (task's own label): `native`, no longer the

@@ -72,41 +72,47 @@ Dependency downloads, generated OverlayBD runtime configs, and OverlayBD packagi
 
 All registry access goes through `regctl`: userImage manifest fetch, config blob fetch, layer download, tools drive image download (`crates/aenv-node/src/setup/deps.rs::extract_ext4_from_ghcr`, unpacked with `umoci`), and OCI referrers lookup when `[image_resolver].try_referrers_overlaybd_prefixes` is non-empty (referrers lookup failures fall back to the source image). Server setup provisions both automatically: `regctl` is downloaded from the `[regclient]` entry in `config/deps_manifest.toml` to `/usr/local/bin/regctl`, and `umoci` is installed as a `[packages.runtime]` system package. `crates/aenv-node/src/image/oci_image.rs` fetches the manifest via `regctl manifest get` and classifies it — standard OCI tar images trigger a full `regctl image copy` + per-layer conversion into local `.commit` files, while overlaybd-native images skip blob download entirely and emit a remote-ref `image.json` that the overlaybd runtime's `registryfs_v2` backend reads directly from the registry. User-facing image references are normalized by `ImageResolver` from template API `userImage` fields and CLI image arguments. For private registries referenced by `userImage`, run `docker login <registry>` before starting the server; `write_generated_overlaybd_global_config` auto-detects `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) and wires the overlaybd runtime's `credentialConfig.mode=file` so the runtime can authenticate too.
 
-P2P artifact transport (`src/p2p/`) is a project-wide, optional node-to-node artifact layer. Consumers depend on `P2pTransport` rather than a concrete backend. `DisabledP2pTransport` is the default no-op implementation; `IrohBlobsP2pTransport` embeds an `iroh` endpoint and `iroh-blobs` `FsStore`, serving bytes, byte ranges, and a small AgentENV catalog protocol from the AgentENV server process. Configure it with `[p2p]`. When enabled for overlaybd, the server also starts a localhost HTTP facade: `/p2p-http/{*origin}` is patched into overlaybd registryfs for foreground range reads, while `/p2p-control/publish-layer` accepts by-reference publication of fully downloaded layers as full-layer artifacts. Overlaybd layer artifact identity is owned by `crates/aenv-node/src/overlaybd/p2p/artifact.rs` (`overlaybd-layer/v1/sha256:<digest>` plus `LayerMetadata`); snapshot publishing must reuse that helper instead of inventing snapshot-specific layer keys. Snapshot publishing also advertises fixed artifacts under `snapshot/v1/artifacts/{snapshot_id}/...` after repository commit; OSS runtime resolution tries P2P before object storage for those fixed artifacts, while POSIX resolution does not consume P2P. Scheduler-protocol integration covers endpoint discovery and a lightweight in-memory artifact-to-node index: heartbeats advertise the local `P2pEndpoint`, `ListP2pPeers` returns ready peers for a backend, `RecordP2pArtifact`/`ForgetP2pArtifact`/`LookupP2pArtifact` maintain a key-to-node hint index that accelerates artifact lookup before falling back to broad peer polling. Only key-to-node mappings are stored, never artifact locators, metadata, or proxied bytes; node unregister removes all artifact mappings for that node. Both the Go scheduler (`services/scheduler/internal/node_registry.go`) and, since 阶段四, `aenv-api`'s own in-process registry (`src/node_registry/`, `[cluster].node_placement_source = "native"`) implement this same protocol — `src/p2p/discovery/scheduler.rs`'s peer discovery dials whichever one `[cluster].scheduler_endpoint` currently names. See `docs/src/internals/p2p-design.md`.
+P2P artifact transport (`src/p2p/`) is a project-wide, optional node-to-node artifact layer. Consumers depend on `P2pTransport` rather than a concrete backend. `DisabledP2pTransport` is the default no-op implementation; `IrohBlobsP2pTransport` embeds an `iroh` endpoint and `iroh-blobs` `FsStore`, serving bytes, byte ranges, and a small AgentENV catalog protocol from the AgentENV server process. Configure it with `[p2p]`. When enabled for overlaybd, the server also starts a localhost HTTP facade: `/p2p-http/{*origin}` is patched into overlaybd registryfs for foreground range reads, while `/p2p-control/publish-layer` accepts by-reference publication of fully downloaded layers as full-layer artifacts. Overlaybd layer artifact identity is owned by `crates/aenv-node/src/overlaybd/p2p/artifact.rs` (`overlaybd-layer/v1/sha256:<digest>` plus `LayerMetadata`); snapshot publishing must reuse that helper instead of inventing snapshot-specific layer keys. Snapshot publishing also advertises fixed artifacts under `snapshot/v1/artifacts/{snapshot_id}/...` after repository commit; OSS runtime resolution tries P2P before object storage for those fixed artifacts, while POSIX resolution does not consume P2P. Scheduler-protocol integration covers endpoint discovery and a lightweight in-memory artifact-to-node index: heartbeats advertise the local `P2pEndpoint`, `ListP2pPeers` returns ready peers for a backend, `RecordP2pArtifact`/`ForgetP2pArtifact`/`LookupP2pArtifact` maintain a key-to-node hint index that accelerates artifact lookup before falling back to broad peer polling. Only key-to-node mappings are stored, never artifact locators, metadata, or proxied bytes; node unregister removes all artifact mappings for that node. `aenv-api`'s own in-process registry (`src/node_registry/`, `[cluster].node_placement_source = "native"`) is the only production implementation of this protocol left — `services/scheduler`, the Go implementation the protocol was originally written against, has been deleted (see "Distributed Control Plane" below) — and `src/p2p/discovery/scheduler.rs`'s peer discovery dials whichever process `[cluster].scheduler_endpoint` currently names. See `docs/src/internals/p2p-design.md`.
 
 Local RocksDB helper (`src/local_store.rs`) is the shared async-friendly wrapper for small node-local key/value metadata stores. Use `LocalKvStore` with an explicit `LocalStoreDurability` (`Memory`, `Wal`, or `Sync`) for new local record/catalog persistence instead of hand-maintaining per-record JSON files. It runs RocksDB operations through `spawn_blocking`; keep values compact (for example compact JSON or other binary encodings) and let callers choose durability in code rather than config unless a user-facing knob is explicitly required.
 
-Go control-plane services (`services/` module):
+The `aenv-node`/`aenv-api` Docker images embed the commit they were built from rather than always reporting `unknown`: `.dockerignore` excludes `.git`, so `deploy/docker/Dockerfile.aenv-node`/`Dockerfile.aenv-api` each take an `AENV_GIT_COMMIT` build arg (`ARG AENV_GIT_COMMIT=unknown`) and set it as an `ENV` for `build.rs` to bake in via `cargo:rustc-env`; `src/identity.rs` reads it back through `option_env!("AENV_GIT_COMMIT")`. `make k8s-build` and `make deploy-up`/`make deploy-build` resolve it themselves (`AENV_GIT_COMMIT ?= $(shell git rev-parse --short HEAD ...)`) and pass it as `--build-arg`, so a normal `make` invocation needs nothing extra; only a manual `docker build` has to remember the flag.
+
+Config note: `docker-compose.yml`'s `agentenv-api` service requires a reachable PostgreSQL — a `postgres:17-alpine` container is defined in `deploy/docker-compose.yml` alongside `redis` and depended on by `agentenv-api`'s `depends_on`, mirroring `[pg]`'s mandatory status everywhere else (see the snapshot-catalog section below).
+
+🔴 **The Go scheduler is deleted, not merely disabled.** `services/scheduler`
+— the Go implementation of the `Scheduler`/`PausedRegistry` RPCs — and the
+`agentenv-scheduler` Deployment/Service/PDB that ran it are gone from the
+tree. `services/` now ships one Go binary, `gateway`; the `Scheduler` gRPC
+contract (`services/api/proto/scheduler.proto`) it still speaks as a client is
+answered by `aenv-api`'s own in-process registry (`src/node_registry/`) on
+every current deployment. See "Distributed Control Plane" below and
+`services/README.md` for the full picture.
+
+Go control-plane services (`services/` module — gateway only):
 ```bash
-make -C services build               # build gateway + scheduler
-make -C services test                # test the whole module (gateway, scheduler, shared, api)
-make -C services test-with-postgres  # the same, against a throwaway PostgreSQL: nothing skips
-make -C services run-scheduler
+make -C services build               # build gateway
+make -C services test                # test the whole module (gateway, shared, api)
+make -C services test-with-postgres  # same, plus fails instead of silently skipping when redis-server is missing
 make -C services run-gateway
 
 # from services/ directly
 go test ./...
 ```
 
-`make test` runs the paused-sandbox registry suite without a database, and every
-test in it that touches SQL skips — as measured 2026-08-25 at `56de492`, **257
-top-level tests (271 counting subtests), all reported as passes**, spread
-across `scheduler/internal/registry` (166), `scheduler/internal/catalog` (83),
-`catalog_service_test.go` (7), and `cmd/catalog_gate_test.go` (1). This number
-drifts with the commit — it was ~125, covering only the `registry` package,
-when `4f9c70b` first wrote it down; the `catalog` tests were added later and
-are DSN-gated the same way. See
-`docs/proposals/_sd-phase4-go-test-baseline.md` for the full recount and
-methodology before quoting a specific figure.
-`test-with-postgres` reproduces the coverage CI has: it starts a throwaway
-PostgreSQL, points `SCHEDULER_REGISTRY_TEST_DSN` at it, and sets
-`SCHEDULER_REGISTRY_TEST_REQUIRED=1`, which turns a missing database into a
-failure rather than back into green skips. It sets `REDIS_SERVER_BIN` and
-`SCHEDULER_REDIS_TEST_REQUIRED=1` for the same reason, on behalf of the
-binding-store tests — those are the only ones that exercise the Redis binding
-store, which is what every HA deployment runs, and a change made to the
-in-memory store and forgotten for Redis is invisible everywhere else. It needs
-Docker and a local `redis-server` binary.
+`make -C services test` runs `gateway`/`shared`/`api`; no package left under
+`services/` opens a real database connection any more —
+`scheduler/internal/registry` and `scheduler/internal/catalog`, the only ones
+that ever did, were deleted with `services/scheduler`. Without a
+`redis-server` on `PATH`, the `RedisBindingStore`/routing-reader suites call
+`t.Skip` and the package still reports `ok`, so `make -C services test` prints
+a warning naming exactly that after the run. `make -C services test-with-postgres`
+still starts a throwaway PostgreSQL in Docker for parity with the CI step it
+mirrors, but the only tests it changes the outcome of today are Redis-gated:
+`REDIS_SERVER_BIN` and `SCHEDULER_REDIS_TEST_REQUIRED=1` turn a missing
+`redis-server` into a failure instead of a silent skip for those same
+binding-store tests — the only ones that exercise the Redis implementation of
+sandbox-to-node bindings, which is what every HA deployment runs.
 
 Run a single test:
 ```bash
@@ -150,15 +156,68 @@ OverlayBD write-path optimizations use in-memory append cursors (`rw_data_append
 
 **uffd-core** (`storage/uffd-core/`): Retained for reference but excluded from the workspace build. Contains an alternative userfaultfd-based memory restore implementation.
 
-### Distributed Control Plane (`services/`)
+### Distributed Control Plane (`services/` + `src/node_registry/`)
 
-Gateway (`services/gateway/`) is an HTTP reverse proxy that routes client traffic to backend nodes and exposes `GET /nodes` / `GET /nodes/{id}` for aggregated node views. Scheduler (`services/scheduler/`) is a gRPC service managing static node discovery (`static` or `kubernetes`), sandbox-to-node bindings, observed-node heartbeat state, and the lightweight P2P artifact index. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `ListNodes`, `Heartbeat`, `ListObservedNodes`, `ReportSandboxEvent`, `GetNode`, `UnregisterNode`, `ListRegistrySandboxes`, and P2P peer/artifact lookup/update methods. Strategies: round_robin, random. Bindings are seeded by `RecordAssignment`, refreshed and reconciled from heartbeat `sandbox_ids` rosters, expired by `scheduler.binding_ttl`, and cleared for a node on `UnregisterNode`. Runtime nodes also send best-effort `ReportSandboxEvent` updates for create/delete/pause/resume/fork (fork is reported once per child sandbox with the child's ID/resources); the scheduler currently accepts/logs these events without mutating binding or resource state. By default bindings are in-memory and lost on scheduler restart; setting `scheduler.redis_addr` switches bindings to Redis so a primary scheduler can share them with query-only scheduler replicas started with `--query-only`. Gateways can send sandbox data-plane `LookupNode` traffic to those replicas via `gateway.query_only_scheduler_addr`, keeping proxy-to-existing-sandbox requests available during primary scheduler restarts. This HA mode is intentionally data-plane only: scheduling, sandbox creation, assignment writes, node APIs, P2P scheduler APIs, and other control-plane operations still depend on the primary scheduler.
+🔴 **The Go scheduler is deleted.** `services/scheduler` — the standalone Go
+implementation of the `Scheduler`/`PausedRegistry` RPCs — and the
+`agentenv-scheduler` Deployment/Service/PDB that ran it are gone from the
+repository outright, not commented out or kept as a rollback target.
+`services/api/proto/scheduler.proto` (RPCs: `Schedule`, `ListNodes`,
+`LookupNode`, `RecordAssignment`, `Heartbeat`, `ReportSandboxEvent`,
+`ListObservedNodes`, `ListP2pPeers`, `RecordP2pArtifact`,
+`ForgetP2pArtifact`, `LookupP2pArtifact`, `GetNode`, `UnregisterNode`,
+`ListRegistrySandboxes`) and its generated Go/Rust bindings are unaffected by
+the deletion — they are the contract, and `aenv-api`'s own in-process
+registry (`src/node_registry/grpc_service.rs::NodeRegistryGrpcService`) is now
+the only production implementation of it, on every current deployment
+(`deploy/k8s/base`, `deploy/docker-compose.yml`). `[cluster].node_placement_source
+= "native"` (env `AENV_NODE_PLACEMENT_SOURCE`, default `"scheduler"` in code
+but overridden to `"native"` on both shipped topologies) is what switches
+`aenv-api` onto that in-process registry instead of dialling out over gRPC for
+placement/heartbeat/paused-registry RPCs; `Schedule` always places with
+round-robin (`src/node_registry/strategy.rs` also ports Go's `random`
+strategy, but nothing wires it to a config knob yet). Node discovery for that
+registry is `[cluster].node_discovery_mode` — `"kubernetes"` (the default;
+watches EndpointSlices for `[cluster.kubernetes_discovery]`'s namespace/Service)
+or `"static"` (seeds once at startup, no watch, from
+`[cluster].static_discovery_nodes`, a `{id, endpoint}` list that is
+**TOML-file-only with no `env =` binding** — set it via the config file
+`AENV_CONFIG_PATH` names or an `AENV_CONFIG_OVERLAY_PATH` overlay, the way
+`deploy/docker/config/cluster-static-discovery-overlay.toml` does for
+`deploy/docker-compose.yml`, which has no Kubernetes API to discover
+against). `crates/aenv-api/src/orchestrator/paused_registry/postgres/`
+similarly ports the paused-sandbox registry onto the same shared `[pg]` pool
+the snapshot catalog uses (`[orchestrator.paused_registry].backend =
+"postgres"`, requires `node_placement_source = "native"`); `aenv-node` never
+holds this configuration meaningfully — it warns and wires a
+no-op registry for any `[orchestrator.paused_registry].backend` other than
+`"local"`, because cluster-wide paused-sandbox state belongs to the API half
+alone.
 
-🔴 阶段四 folds this Go control plane into the Rust `aenv-api` binary one RPC group at a time (`docs/proposals/2026-08-20-service-decomposition.md`'s phase four section): `src/node_registry/` ports node discovery, heartbeat receipt (including the CPU-config intersection, `src/node_registry/cpu_template.rs`), and P2P peer/artifact lookup; `crates/aenv-api/src/orchestrator/paused_registry/postgres/` ports the paused-sandbox registry onto the same shared `[pg]` pool the snapshot catalog uses. `[cluster].node_placement_source = "native"` switches `aenv-api` onto its own in-process registry instead of dialling the scheduler for placement/heartbeat/paused-registry RPCs, and `deploy/k8s/`'s base layer runs that way by default as of 阶段四 E1-E3 — the scheduler Deployment/Service/PDB are commented out of `kustomization.yaml`'s `resources:` (not deleted: `services/scheduler`'s Go source, and one release image tag, stay in the tree as the rollback target) and every runtime reference that used to dial `agentenv-scheduler` (node heartbeats, api's own resume placement, the gateway's `scheduler_addr`) now dials `agentenv-api` instead. `NodeRegistryGrpcService::list_registry_sandboxes` in `src/node_registry/grpc_service.rs` now answers `ListRegistrySandboxes` for real too, against `PausedSandboxRegistry::list_all` (`src/orchestrator/paused_registry/mod.rs`) — the gateway's registry-listing debug endpoint (`services/gateway/internal/registry_list.go`) is covered the same as every other RPC this fold ported. See `services/README.md` for the current deploy status and rollback steps.
+Gateway (`services/gateway/`, the only Go binary `services/` ships now) is an
+HTTP reverse proxy. Every user-facing REST call (`sandboxes`/`snapshots`/`templates`,
+including `GET /sandboxes` and `GET /v2/sandboxes`) is forwarded unconditionally
+to `gateway.rest_upstream_addr` — the api half — which `services/shared/config`'s
+`Config.Validate` refuses to load empty; there is no more per-node fan-out
+(`cluster_list.go`, which used to aggregate `GET /sandboxes` across every node
+when no api half was configured, is deleted along with the position it existed
+for). `GET /nodes` / `GET /nodes/{id}` and `GET /registry/sandboxes` are still
+the gateway's own aggregations, answered from the `Scheduler` protocol's
+`ListObservedNodes`/`GetNode`/`ListRegistrySandboxes` RPCs — today always
+against `aenv-api`. Sandbox data-plane traffic (proxy headers or a sandbox
+proxy domain) is routed by a `LookupNode` call through `gateway.scheduler_addr`
+(now `agentenv-api:8002` on every shipped deployment) or, if configured,
+`gateway.query_only_scheduler_addr` for HA read traffic — see
+`services/README.md` for what that HA knob still means now that there is no
+Go scheduler binary with a `--query-only` mode behind it.
 
-`services/` is a separate Go module containing the distributed control plane (gateway + scheduler). See `services/README.md` for build/run/deploy instructions, and for its current (阶段四) deployment status.
+`services/` is a separate Go module. See `services/README.md` for build/run/deploy
+instructions and the current architecture in full.
 
-When changing code under `services/`, validate via `make -C services test` (or `go test ./...` inside `services/`) in addition to Rust workspace checks. Anything touching `scheduler/internal/registry` needs `make -C services test-with-postgres` instead: without a database that package's tests skip rather than run.
+When changing code under `services/`, validate via `make -C services test` (or
+`go test ./...` inside `services/`) in addition to Rust workspace checks.
+Nothing left in the module needs a database to run its tests — see the build
+command block above.
 
 ### Per-Node Subsystems
 
@@ -168,7 +227,7 @@ Each node is an AgentENV server binary (`crates/aenv-node/src/bin/aenv-node.rs`)
 
 **Orchestrator** (`src/orchestrator/`): Manages sandbox lifecycle (create, fork, pause, resume, snapshot, delete) with state machine transitions (Creating -> Running -> Forking | Snapshotting | Pausing -> Paused, Resuming, Killing). `service.rs` is the core logic. `fork_sandbox` forks one running source sandbox into multiple running children on the same node, records child create successes/failures in `OrchestratorCounters`, and publishes one `SandboxLifecycleEventType::Fork` event per child with the child sandbox ID/resources. `capture_snapshot` drives the `Running -> Snapshotting -> Running` flow used by the user-facing snapshot API: it delegates the actual capture to the sandbox backend, rolls back to `Running` on recoverable failure, and tears the sandbox down on `SandboxCaptureError::Terminal` (when the runtime was mutated past the point of safe resume). Uses an in-memory metadata store and a proxy route table for fast sandbox discovery. Maintains incremental `OrchestratorCounters` for create success/failure totals, while running/starting sandbox counts and allocated CPU/memory are derived on demand from sandbox metadata via `aggregate_resource_metrics`. Publishes non-blocking broadcast lifecycle events for successful create/delete/pause/resume/fork; these are best-effort and dropped if there are no subscribers. Runs an auto-eviction task for expired sandboxes. On graceful shutdown, running sandboxes are paused and persisted rather than deleted; on next startup they are restored as `Paused` and can be resumed. The `SandboxPersister` trait abstracts durable storage of paused sandbox state across server restarts. On startup, `Orchestrator::new` restore persisted `Paused` sandboxes into the in-memory store.
 
-**Observability** (`src/observability/`): Builds node-level snapshots for the admin/node APIs by combining static node identity (node ID, cluster ID, service instance ID, build version/commit), machine information detected from `/proc/cpuinfo`, request-time host metrics collection (CPU, memory, disks), orchestrator runtime metrics sampled on request via `metrics_snapshot()`, and the current sandbox ID roster from orchestrator. `reporter.rs` runs a background task that periodically sends gRPC `Heartbeat` RPCs to `[cluster].scheduler_endpoint` — the Go scheduler, or (阶段四, `deploy/k8s`'s current default) `aenv-api`'s own `NodeRegistryGrpcService` under `node_placement_source = "native"`, hot-reloadable without a Pod restart via `src/scheduler_endpoint.rs::SchedulerEndpointSource` — so the control plane can track live node state, reconcile sandbox bindings, and advertise the node's optional P2P endpoint; the same loop also drains orchestrator lifecycle events and sends `ReportSandboxEvent` RPCs for create/delete/pause/resume/fork (fork events use child sandbox IDs/resources). The event receiver handles lagged receivers and disables the event branch when the broadcast channel closes to avoid busy loops. The reporter is created via `ObservabilityReporter::new` and started explicitly with `start()` before shutdown via `shutdown()`. `observability.enabled` controls whether this subsystem is exposed by the node/admin APIs. At startup, `machine.rs` optionally runs `cpu-template-helper template dump` (resolved from `{deps_path}/firecracker/{version}/cpu-template-helper`) and includes the output in each heartbeat's `MachineInfo.cpu_config_json`; whichever side answers `Heartbeat` computes a cluster-wide bitwise AND intersection of all node configs and returns it in the heartbeat response — the Go scheduler's algorithm and `src/node_registry/cpu_template.rs`'s port are byte-for-byte golden-tested against each other — where it is stored in a shared `Arc<RwLock<Option<String>>>` and applied to new VMs via Firecracker's pre-boot `PUT /cpu-config` API.
+**Observability** (`src/observability/`): Builds node-level snapshots for the admin/node APIs by combining static node identity (node ID, cluster ID, service instance ID, build version/commit), machine information detected from `/proc/cpuinfo`, request-time host metrics collection (CPU, memory, disks), orchestrator runtime metrics sampled on request via `metrics_snapshot()`, and the current sandbox ID roster from orchestrator. `reporter.rs` runs a background task that periodically sends gRPC `Heartbeat` RPCs to `[cluster].scheduler_endpoint` — `aenv-api`'s own `NodeRegistryGrpcService` under `node_placement_source = "native"` on every current deployment (the Go scheduler this endpoint used to name has been deleted; see "Distributed Control Plane" below), hot-reloadable without a Pod restart via `src/scheduler_endpoint.rs::SchedulerEndpointSource` — so the control plane can track live node state, reconcile sandbox bindings, and advertise the node's optional P2P endpoint; the same loop also drains orchestrator lifecycle events and sends `ReportSandboxEvent` RPCs for create/delete/pause/resume/fork (fork events use child sandbox IDs/resources). The event receiver handles lagged receivers and disables the event branch when the broadcast channel closes to avoid busy loops. The reporter is created via `ObservabilityReporter::new` and started explicitly with `start()` before shutdown via `shutdown()`. `observability.enabled` controls whether this subsystem is exposed by the node/admin APIs. At startup, `machine.rs` optionally runs `cpu-template-helper template dump` (resolved from `{deps_path}/firecracker/{version}/cpu-template-helper`) and includes the output in each heartbeat's `MachineInfo.cpu_config_json`; whichever side answers `Heartbeat` computes a cluster-wide bitwise AND intersection of all node configs and returns it in the heartbeat response — `src/node_registry/cpu_template.rs`'s port is golden-tested against fixed values recorded from the (now-deleted) Go scheduler's own algorithm — where it is stored in a shared `Arc<RwLock<Option<String>>>` and applied to new VMs via Firecracker's pre-boot `PUT /cpu-config` API.
 
 **Sandbox** (`src/sandbox/`): Manages Firecracker VMs, network namespaces (veth pairs, iptables isolation), rootfs mounting/file injection via debugfs, envd init system communication, MMDS metadata service, and ublk block devices. `firecracker/sandbox.rs` is the main wrapper coordinating all subsystems, and now owns a stable `SandboxId` passed in by the orchestrator so that Firecracker serial logs live under `{serial_output_base_dir}/{SandboxId}/firecracker-*.log`. The `SandboxBackend` trait exposes `snapshot()` and `fork()` alongside `pause`/`resume`/`stop`; capture/fork paths return typed errors where recoverable failures roll back to `Running` and terminal failures mean the live runtime was mutated and must be torn down. Captured state travels as an opaque `CapturedSandboxSnapshot` handle (backed by `FirecrackerCapturedSnapshot` in the Firecracker impl) that keeps the temp artifact dir alive until the repository publishes it. `firecracker/mmds.rs` defines the metadata structure exposed to VMs via Firecracker's MMDS V2 interface, providing sandbox and snapshot identity information to envd at the standard 169.254.169.254 address.
 
@@ -244,7 +303,7 @@ answer is a constant of the binary and the branch is simply gone.
 - `crates/test-support`: shared test fixtures and helpers used across workspace integration tests
 - `crates/shell-util`: shared `shell_quote` helper used by `aenv-node` and `aenv` to single-quote shell arguments
 - `crates/warm-pool`: generic watermark-based resource pool shared by the network slot manager and overlaybd ublk device pooling
-- `services` (Go module): control-plane services (`gateway`, `scheduler`) with independent `go.mod` and `services/Makefile`
+- `services` (Go module): the gateway control-plane service (`gateway`) with independent `go.mod` and `services/Makefile` — the Go scheduler this module used to also ship has been deleted; see "Distributed Control Plane"
 - `src/api/generated`: OpenAPI-generated Axum server; regenerate with `make agentenv-server`
 - `src/custom_extension_api/generated` (`custom_extension_client`): generated custom extension hook client from `src/custom_extension_api/openapi.yml`; regenerate with `make custom-extension-client`
 - `thirdparty/firecracker-client`: generated Firecracker API client; regenerate with `make firecracker-client`

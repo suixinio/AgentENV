@@ -23,17 +23,38 @@ see CLAUDE.md's "Distributed Control Plane" section for the full picture.
 
 ## Features
 
-- Gateway routes control-plane requests by real-time scheduling.
-- Gateway aggregates `GET /sandboxes` and `GET /v2/sandboxes` across all scheduler nodes.
-- Gateway aggregates `GET /nodes` across all observed nodes in the scheduler.
-- Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
-- Gateway routes sandbox requests to whichever node the scheduler names, in a single `LookupNode` call. The scheduler answers from the sandbox-to-node binding, from the heartbeat roster that seeded it, or — when neither knows the sandbox — from the paused registry the nodes maintain among themselves, and says which of the three it used.
-- Scheduler exposes gRPC API and supports pluggable strategy providers.
-- Built-in strategies in v1: round_robin and random.
-- Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
-- Scheduler sandbox binding store can be in-memory or Redis-backed.
-- Scheduler can run as a primary read/write service or as query-only replicas that serve sandbox data-plane lookups from Redis.
-- Scheduler observes node health and sandbox roster from heartbeats, and drops expired sandbox-to-node bindings on heartbeat, node unregistration, or lookup.
+- Every user-facing REST call (`sandboxes`/`snapshots`/`templates`, including
+  `GET /sandboxes` and `GET /v2/sandboxes`) is forwarded unconditionally to
+  `gateway.rest_upstream_addr` — the `aenv-api` half. 🔴 There is no more
+  per-node fan-out: `cluster_list.go`, which used to aggregate those two
+  routes across every runtime node when no api half was configured, is
+  deleted along with the position it existed for (`services/shared/config`'s
+  `Config.Validate` now refuses to load a gateway config with
+  `rest_upstream_addr` empty).
+- Gateway aggregates `GET /nodes` and resolves `GET /nodes/{id}` from the
+  Scheduler protocol's `ListObservedNodes`/`GetNode` RPCs — today always
+  answered by `aenv-api`.
+- Gateway routes sandbox data-plane requests to whichever node the Scheduler
+  protocol names, in a single `LookupNode` call. The answer comes from the
+  sandbox-to-node binding, from the heartbeat roster that seeded it, or —
+  when neither knows the sandbox — from the paused-sandbox registry, and says
+  which of the three it used.
+- The Scheduler protocol (`api/proto/scheduler.proto`) supports pluggable
+  placement strategies; `aenv-api`'s implementation (`src/node_registry/`)
+  always places with round-robin today (a `random` strategy is ported in
+  `src/node_registry/strategy.rs` but not wired to any config knob yet).
+- Node discovery for that registry is static configuration or Kubernetes
+  EndpointSlice watching (`[cluster].node_discovery_mode`).
+- The sandbox-to-node binding store can be in-memory or Redis-backed
+  (`[binding_store]` on `aenv-api`; `gateway`'s own routing-projection reader
+  reads the same Redis keys for its fast path).
+- `gateway.query_only_scheduler_addr` still exists as a second `LookupNode`
+  target for HA read traffic — see "Gateway configuration" below for what it
+  means now that there is no Go scheduler binary with a `--query-only` mode
+  behind it.
+- Node health and sandbox roster are observed from heartbeats, and expired
+  sandbox-to-node bindings are dropped on heartbeat, node unregistration, or
+  lookup.
 - HTTP and WebSocket forwarding.
 
 ## Header compatibility
@@ -117,15 +138,14 @@ listener on every current deployment, not a local Go scheduler process
 
 ## Gateway configuration
 
-- `gateway.scheduler_addr` points to the primary scheduler. The gateway uses it for scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs.
-- `gateway.query_only_scheduler_addr` optionally points to a query-only scheduler. When set, sandbox `LookupNode` routing uses this client; when unset, gateway falls back to `gateway.scheduler_addr`.
+- `gateway.scheduler_addr` points to whichever process answers the Scheduler protocol — `agentenv-api` on every current deployment. The gateway uses it for scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs.
+- `gateway.query_only_scheduler_addr` optionally points `LookupNode` at a second Scheduler-protocol endpoint for read traffic; when unset, the gateway falls back to `gateway.scheduler_addr`. 🔴 This dates from when `services/scheduler` had a `--query-only` replica mode reading bindings from Redis; that Go binary is deleted, and nothing in this repository documents an equivalent "query-only `aenv-api`" deployment mode today. The config knob and its client code path are unchanged and still exercised by this package's test suite, but confirm any specific HA topology against current `aenv-api`/Redis behavior rather than this historical description.
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
 - `gateway.request_timeout` applies to regular proxied HTTP requests. Streaming requests and WebSocket connections reuse the client context and are not cut off by this timeout.
 - `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
-- Cluster list requests (`GET /sandboxes`, `GET /v2/sandboxes`) fan out to every scheduler node and merge results in the gateway. Direct requests to a backend node remain node-scoped.
-- Cluster list requests are strict all-or-nothing: if any node times out, returns a non-2xx response, or cannot be reached, the gateway fails the whole list request rather than returning partial data.
-- `GET /nodes` returns scheduler-observed node snapshots (including runtime/resource counters), with optional `clusterID` filtering.
-- `GET /nodes/{id}` resolves node endpoint via scheduler and then proxies to the runtime node's admin endpoint.
+- `GET /sandboxes` and `GET /v2/sandboxes` are forwarded unconditionally to `gateway.rest_upstream_addr` (the api half) like any other user-facing REST call. 🔴 There is no more per-node fan-out or cluster-wide merge for these two routes: `cluster_list.go`, which used to aggregate them across every scheduler-known node when no api half was configured, is deleted (`rest_upstream.go` now claims both routes unconditionally).
+- `GET /nodes` returns Scheduler-protocol observed node snapshots (including runtime/resource counters), with optional `clusterID` filtering.
+- `GET /nodes/{id}` resolves the node endpoint via the Scheduler protocol and then proxies to the runtime node's admin endpoint.
 - `GATEWAY_REQUEST_TIMEOUT=<duration>` overrides `gateway.request_timeout` from the environment (for example, `1m30s`).
 - `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR=<addr>` overrides `gateway.query_only_scheduler_addr` from the environment.
 - `gateway.sandbox_proxy_domains` enables host-based sandbox data-plane routing for `{port}-{sandboxID}.{domain}` URLs. Domains are normalized to lowercase, deduplicated, and must be valid DNS names. Sandbox IDs used in host routes must be lowercase RFC 952/1123 DNS labels, and the full `{port}-{sandboxID}` label must be at most 63 characters.
@@ -145,7 +165,7 @@ LOG_FORMAT=json make run-gateway
 
 ## Deploy with Docker Compose
 
-From **repository root**, start gateway + two backend nodes (`agentenv-api` serves the `Scheduler`/`PausedRegistry` RPCs; there is no separate scheduler container):
+From **repository root**, start gateway + `agentenv-api` + two backend nodes (`agentenv-api` serves the `Scheduler`/`PausedRegistry` RPCs; there is no separate scheduler container). `deploy/docker-compose.yml` also runs `redis` and `postgres` (`postgres:17-alpine`) containers that `agentenv-api` depends on — it requires a reachable `[pg]` unconditionally, the same as every other deployment of it:
 
 ```bash
 make deploy-up
@@ -296,8 +316,12 @@ Methods:
 - LookupNode
 - RecordAssignment
 - Heartbeat
-- ListObservedNodes
 - ReportSandboxEvent
+- ListObservedNodes
+- ListP2pPeers
+- RecordP2pArtifact
+- ForgetP2pArtifact
+- LookupP2pArtifact
 - GetNode
 - UnregisterNode
 - ListRegistrySandboxes

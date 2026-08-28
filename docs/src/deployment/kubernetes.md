@@ -14,10 +14,10 @@ instead of `agentenv-scheduler:9090` for the same reason, including for
 `ListRegistrySandboxes` (`services/gateway/internal/registry_list.go`'s
 debug endpoint), which `aenv-api` now answers too — see `services/README.md`
 for the current status. The rest of this page describes the architecture as
-it runs today; where it still names "the scheduler" generically (the
-paused-registry migration history below, in particular) that is describing
-what the *node* half still needs from the `services/api/proto/scheduler.proto`
-gRPC contract, answered by `aenv-api` and not by a separate process.
+it runs today; where it still names "the scheduler" or "the Scheduler
+protocol" generically, that is describing the `services/api/proto/scheduler.proto`
+gRPC contract itself, which `aenv-api` answers in-process rather than a
+separate Go process.
 
 ## Architecture
 
@@ -201,98 +201,18 @@ load-balance them across the fleet.
 
 ## Cluster-wide Paused Sandboxes
 
-By default a paused sandbox is resumable only on the node that paused it. Pointing the nodes at the cluster-wide registry makes a pause publish its snapshot to the shared repository as well, so any node can resume the sandbox under its original ID.
+By default a paused sandbox is resumable only on the node that paused it — the `"local"` backend. Cluster-wide resume publishes a pause's snapshot to the shared repository and records the sandbox cluster-wide, so any node can resume it under its original ID.
 
-The registry lives in PostgreSQL and the **scheduler** owns it. Nodes reach it over gRPC; no node holds database credentials, a connection, or any say over the schema. Enabling it takes one object:
+🔴 **This is now entirely an `aenv-api`-side setting; there is no per-node opt-in step.** Through 阶段三 this was a *node*-side choice (`AENV_PAUSED_REGISTRY_BACKEND=central` via a `paused-registry-config` ConfigMap, each node dialling the standalone Go scheduler's own registry service over gRPC). 阶段四 replaced that with a `"postgres"` backend that lives entirely on `aenv-api`, and the node-side switch stopped doing anything:
 
-```bash
-kubectl -n agentenv-system create configmap paused-registry-config \
-  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=central
-```
+- The `paused-registry-config` ConfigMap and the `AENV_PAUSED_REGISTRY_BACKEND` key on the DaemonSet are gone from `deploy/k8s/base` (`02117b9`).
+- `aenv-node`'s `assemble_node` (`crates/aenv-node/src/bin/aenv-node.rs`) ignores `[orchestrator.paused_registry].backend` whenever it is anything other than `"local"`: it logs one `warn!` naming the configured value and wires in a registry that claims and records nothing, because cluster-wide paused-sandbox state belongs to the API half alone now. A node never refuses to start over this setting — only over a configured `[pg].dsn` (`refuse_configured_pg_dsn`), which a node must never hold regardless of this backend.
+- Cluster-wide resume is controlled entirely by `aenv-api`'s own `[orchestrator.paused_registry].backend = "postgres"`. `deploy/k8s/base/agentenv-api-deployment.yaml` sets `AENV_PAUSED_REGISTRY_BACKEND=postgres` unconditionally, alongside `AENV_NODE_PLACEMENT_SOURCE=native`, which that backend requires (`build_paused_registry` needs a heartbeat-roster `NodeRegistry` handle, which only `native` builds — the two env vars move together in one apply, never independently).
+- `aenv-api` reaches PostgreSQL directly over the shared `[pg]` pool — the same pool the snapshot catalog uses — instead of dialling a separate scheduler process. No node ever holds a `[pg]` DSN, a database connection, or any say over the schema.
 
-The setting reaches the DaemonSet through an optional reference, so a cluster without it starts normally on the node-local default.
+In short: on the `deploy/k8s/base` overlay, cluster-wide paused-sandbox resume is on by default and there is no ConfigMap toggle or kubectl step left to run to enable it. See `config/default.toml`'s `[orchestrator.paused_registry]` comment block (the authoritative description of `"local"`/`"central"`/`"postgres"`) and CLAUDE.md's "Distributed Control Plane" section.
 
-🔴 **Do not select the backend by editing the `agentenv-k8s-config` ConfigMap.** The make targets rebuild that ConfigMap from `config/default.toml` on every apply, so an edit there is undone by the next `make k8s-apply` — quietly, and in the direction that loses cross-node recovery: pauses go back to being node-local and nothing reports an error until a node is lost and its sandboxes turn out to have gone with it. `AENV_PAUSED_REGISTRY_BACKEND` exists so the choice lives somewhere the file cannot overwrite it.
-
-`central` needs `[cluster].scheduler_endpoint` (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, already set on the DaemonSet) and refuses to start without one rather than falling back. Reclaiming holdings from nodes that never came back is the scheduler's own timer, not something a node asks for.
-
-Each node reports the backend it assembled, once, at startup:
-
-```
-INFO paused sandbox registry ready backend=central cluster_id=… lease_ttl_secs=90 scheduler_endpoint=http://agentenv-api:8002
-```
-
-That line is how a rollout is confirmed. A value `AENV_PAUSED_REGISTRY_BACKEND` does not recognise stops the node rather than falling back, but a value that never reached the Pod at all — a ConfigMap that was not created, a key spelled differently — leaves it on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
-
-### Cluster identity
-
-Both sides of the registry are scoped to one cluster id, and both read it from the same generated key, `cluster-identity-config/CLUSTER_ID`: the node as `AENV_CLUSTER_ID`, the scheduler as `SCHEDULER_REGISTRY_CLUSTER_ID`. Change it in the one place it is written, the `configMapGenerator` literal in `deploy/k8s/base/kustomization.yaml`, and keep `[node_identity].cluster_id` in `config/default.toml` in step with it — that is what a node falls back to if the ConfigMap is ever absent.
-
-Two different values are not an error anywhere: rows are written, RPCs succeed, and the scheduler serves a cluster that has no rows while nobody reclaims the ones the nodes leave behind. A cluster id is a name rather than a credential, which is why it is not in a Secret — it used to be, on a key nothing ever created, and the result was a scheduler whose registry write surface was permanently cold on every fresh cluster while `/healthz` and the gRPC probe both said it was fine.
-
-The scheduler reports the scope it is running with on its metrics listener:
-
-```bash
-curl -s localhost:9101/healthz | jq .registry_write
-# { "phase": "serving", "ready": true, "serving": true, "cluster_id": "…", … }
-```
-
-An empty `cluster_id` there means the write surface is registered and cold, answering every registry RPC `UNAVAILABLE` until one is supplied.
-
-### Migrating from the removed `postgres` backend (nodes only)
-
-🔴 This subsection is about `aenv-node` specifically — a node never holds a
-`[pg]` DSN and never will: it does not link a PostgreSQL client at all, and it
-refuses to start outright if one is configured (`refuse_configured_pg_dsn`, in
-`crates/aenv-node/src/bin/aenv-node.rs`). It does **not** describe `aenv-api`:
-阶段四 gave that half a *different*, still-live `postgres` paused-registry
-backend that connects to the shared `[pg]` pool directly and folds the
-scheduler's own registry service into the process —
-`deploy/k8s/base/agentenv-api-deployment.yaml` runs it by default. See
-CLAUDE.md's paused-registry note and `[orchestrator.paused_registry]` in
-`config/default.toml` for that backend; nothing below applies to it.
-
-Nodes used to connect to the registry database themselves, under `AENV_PAUSED_REGISTRY_BACKEND=postgres`. That backend has been **removed for nodes**, and a node still configured with it refuses to start rather than guessing:
-
-```
-paused_registry.backend = "postgres" has been removed: the node no longer connects to the
-registry database. Set AENV_PAUSED_REGISTRY_BACKEND=central and point
-AENV_OBSERVABILITY_SCHEDULER_ENDPOINT at the scheduler, which owns the database now;
-the node's own DSN secret can then be dropped
-```
-
-Refusing is deliberate. Reading it as `local` would put the fleet back to node-local pauses — the silent failure this setting exists to prevent — and reading it as `central` would point the node at whatever endpoint happened to be configured, including none.
-
-To migrate:
-
-```bash
-# 1. The scheduler must already own the table: SCHEDULER_REGISTRY_DSN set,
-#    SCHEDULER_REGISTRY_WRITE_ENABLED=true, and a cluster id supplied.
-curl -s localhost:9101/healthz | jq .registry_write   # phase must be "serving"
-
-# 2. Switch the nodes.
-kubectl -n agentenv-system create configmap paused-registry-config \
-  --from-literal=AENV_PAUSED_REGISTRY_BACKEND=central \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n agentenv-system rollout restart daemonset/agentenv-node
-
-# 3. Drop the credentials the nodes no longer need.
-kubectl -n agentenv-system patch secret agentenv-runtime-secrets \
-  --type=json -p '[{"op":"remove","path":"/data/paused-registry-dsn"}]'
-```
-
-The table itself does not change: both backends wrote the same schema and arbitrate through the same generation column, so the rows a `postgres` fleet left behind are the rows a `central` fleet reads. What changes is who may write them.
-
-🔴 **The nodes and the scheduler in this release go out together.** Deleting a
-registry row is a conditional write now, and the two sides disagree about it in
-both directions: a node from before this release asks for the unconditional
-delete, which the scheduler refuses outright, and a node from after it asks for
-a kind an older scheduler does not serve. Neither direction corrupts anything —
-a refused delete leaves the row and its snapshot in place, which is the safe
-side — but during a mixed window `DELETE /sandboxes/{id}` will not clear the
-cluster record. Roll the DaemonSet and the Deployment in the same change.
-
-🔴 **Verify the switch on each node** with the assembly line above — `backend=central` with a non-empty `scheduler_endpoint`. A value that never reached the Pod at all (a ConfigMap that was not created, a key spelled differently) leaves the node on `local` with nothing else to say so, and node-local pauses only reveal themselves when a node is lost.
+🔴 **What is not verified and therefore not written here:** how to confirm the switch is live (the old node-startup log line `paused sandbox registry ready backend=central …` no longer applies, and no equivalent has been confirmed against current `aenv-api` logs for this doc), and what the `"central"` backend and its scheduler-owned cluster-identity story (`SCHEDULER_REGISTRY_CLUSTER_ID`, the scheduler's own `/healthz`) become on a deployment that is not `deploy/k8s/base` — the Go scheduler that backend dialed no longer exists in this repository. Both node and api Deployments read the same `cluster-identity-config/CLUSTER_ID` key as `AENV_CLUSTER_ID` today (`[node_identity].cluster_id` in `config/default.toml` is what a node falls back to if that ConfigMap is absent); there is no longer a second, scheduler-specific cluster-id variable.
 
 ## The node API is protected by the network, not by its headers
 
@@ -312,7 +232,7 @@ So the check belongs on the boundary:
 ```bash
 # Nothing should expose the node API beyond the cluster.
 kubectl -n agentenv-system get svc -o wide | grep -i nodeport
-# And the node's port should be reachable only from the gateway and scheduler.
+# And the node's port should be reachable only from the gateway and the api half.
 kubectl -n agentenv-system get networkpolicy
 ```
 

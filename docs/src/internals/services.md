@@ -39,10 +39,11 @@ current deployment.
 
 ## Discovery Modes
 
-`aenv-api`'s native registry supports two node discovery modes:
+`aenv-api`'s native registry supports two node discovery modes
+(`[cluster].node_discovery_mode`):
 
-- **static** (default): explicit node list from config
-- **kubernetes**: watches EndpointSlices for a headless Service, using ready Pod IPs as backends
+- **kubernetes** (default): watches EndpointSlices for a headless Service, using ready Pod IPs as backends
+- **static**: explicit node list from `[cluster].static_discovery_nodes` (config-file/overlay only — no environment-variable binding), seeded once at startup with no ongoing watch. `deploy/docker-compose.yml` sets this explicitly, since it has no Kubernetes API to discover against.
 
 ## Deployment
 
@@ -73,7 +74,7 @@ Deployment model:
 
 Proto contract: `services/api/proto/scheduler.proto`
 
-RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, `UnregisterNode`
+RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ReportSandboxEvent`, `ListObservedNodes`, `ListP2pPeers`, `RecordP2pArtifact`, `ForgetP2pArtifact`, `LookupP2pArtifact`, `GetNode`, `UnregisterNode`, `ListRegistrySandboxes`
 
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. `aenv-api`'s native registry stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. It does not query artifact catalogs and never forwards artifact data.
 

@@ -1,26 +1,12 @@
 {
   "log_level": "info",
   "log_format": "auto",
-  "scheduler": {
-    "grpc_listen_addr": ":9090",
-    "metrics_listen_addr": ":9101",
-    "strategy": "round_robin",
-    "report_ttl": "30s",
-    "binding_ttl": "30s",
-    "warmup_timeout": "15s",
-    "redis_addr": "",
-    "nodes": [
-      {
-        "id": "local-node",
-        "endpoint": "http://127.0.0.1:8000"
-      }
-    ]
-  },
   "gateway": {
     "http_listen_addr": ":8080",
     "metrics_listen_addr": ":9102",
-    "scheduler_addr": "127.0.0.1:9090",
-    "query_only_scheduler_addr": "",
+    "scheduler_addr": "127.0.0.1:8002",
+    "resume_addr": "127.0.0.1:8002",
+    "rest_upstream_addr": "http://127.0.0.1:8000",
     "request_timeout": "90s",
     "forward_response_size": 4194304,
     "sandbox_proxy_domains": []

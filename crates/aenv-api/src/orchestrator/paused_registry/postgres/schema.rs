@@ -480,3 +480,110 @@ mod pg {
         );
     }
 }
+
+/// R6: [`SCHEMA_DDL`]'s own doc comment claims byte-identity with
+/// `services/scheduler/internal/registry/migrate.go`'s `SchemaDDL` -- "a Rust
+/// port... verbatim" -- but nothing before this module checked that in code.
+/// A drift here is invisible everywhere else: both sides apply their own copy
+/// independently (`crate::pg::GO_SCHEMA_LOCK_KEY` only serialises *which*
+/// process gets to run its DDL, not whether the two DDLs agree), so a column
+/// added to one and forgotten on the other would only surface as a runtime
+/// constraint-violation on whichever replica happened to run second, in
+/// production, against a real database.
+///
+/// 🔴 Deliberately **not** nested inside `mod pg` above and **not** gated by
+/// `isolated_schema_pool_or_skip!`: this test needs no PostgreSQL at all, it
+/// only reads two source files. Gating it behind the pg-skip macro would make
+/// it silently skip in `make test-unit` on a machine with no `postgres`
+/// binary on `PATH` -- exactly the "looks green everywhere, checks nothing"
+/// failure mode this test exists to close.
+#[cfg(test)]
+mod ddl_drift {
+    /// Path from this crate's manifest dir to the Go DDL source, the same
+    /// `../../services/...` shape `crates/aenv-api/src/snapshot/image_export/
+    /// regctl.rs` and `crates/aenv-node/src/tests/api_cold_start.rs` already
+    /// use to reach `tests/fixtures/` from a nested crate.
+    const GO_MIGRATE_GO: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../services/scheduler/internal/registry/migrate.go"
+    );
+
+    const GO_ANCHOR: &str = "const SchemaDDL = `";
+
+    /// Pulls the backtick-delimited Go string literal's contents out of
+    /// `migrate.go` by anchor rather than by parsing Go, mirroring
+    /// `services/shared/config/regctl_config_manifest_test.go`'s precedent of
+    /// reading a tracked file as plain text instead of through its own
+    /// language's tooling.
+    fn extract_go_schema_ddl() -> String {
+        let src = std::fs::read_to_string(GO_MIGRATE_GO).unwrap_or_else(|err| {
+            panic!(
+                "could not read {GO_MIGRATE_GO} ({err}) -- has the Go registry package moved? \
+                 update GO_MIGRATE_GO above to match"
+            )
+        });
+        let start = src.find(GO_ANCHOR).unwrap_or_else(|| {
+            panic!(
+                "could not find `{GO_ANCHOR}` in {GO_MIGRATE_GO} -- SchemaDDL's declaration has \
+                 changed shape; update GO_ANCHOR above to match before trusting this test again"
+            )
+        }) + GO_ANCHOR.len();
+        let rest = &src[start..];
+        let end = rest.find('`').unwrap_or_else(|| {
+            panic!("no closing backtick found for SchemaDDL's string literal in {GO_MIGRATE_GO}")
+        });
+        rest[..end].to_string()
+    }
+
+    /// Strips what is safe to differ between the two copies and nothing else.
+    ///
+    /// Two things are dropped, both cosmetic:
+    /// - full-line-tail `--` SQL comments (the Go copy carries prose doc
+    ///   comments inline in the DDL string that the Rust copy, documented in
+    ///   ordinary `///` comments instead, does not repeat);
+    /// - whitespace, collapsed to single spaces between tokens and to one
+    ///   `\n` between statements (the two copies hand-align columns
+    ///   differently -- e.g. `updated_at` has a different number of trailing
+    ///   spaces on each side before `TIMESTAMPTZ`).
+    ///
+    /// Everything else -- every keyword, identifier, type, `NOT NULL`,
+    /// default, `CHECK` expression, and index definition -- is compared
+    /// exactly. A `--` is never split out of the *middle* of a token in this
+    /// DDL (no identifier or literal in either copy contains one), so a
+    /// naive "everything after `--` on a line is a comment" rule is safe
+    /// here without a full SQL tokenizer.
+    fn normalize(ddl: &str) -> String {
+        ddl.lines()
+            .map(|line| match line.find("--") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .map(|code| code.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn go_and_rust_paused_sandboxes_ddl_agree() {
+        let go_raw = extract_go_schema_ddl();
+        assert!(
+            !go_raw.trim().is_empty(),
+            "extracted an empty SchemaDDL body from {GO_MIGRATE_GO} -- the anchor probably \
+             matched the wrong spot"
+        );
+
+        let go_normalized = normalize(&go_raw);
+        let rust_normalized = normalize(super::SCHEMA_DDL);
+
+        assert_eq!(
+            go_normalized, rust_normalized,
+            "\n\n`services/scheduler/internal/registry/migrate.go`'s SchemaDDL and \
+             `crates/aenv-api/src/orchestrator/paused_registry/postgres/schema.rs`'s \
+             SCHEMA_DDL have drifted (compared with `--` comments and whitespace stripped, so \
+             this is a real difference in a column, type, constraint, default, or index -- not \
+             formatting). Port whichever side changed into the other; they must describe the \
+             same table."
+        );
+    }
+}

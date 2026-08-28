@@ -84,7 +84,3 @@ path = "tests/integration.rs"
 [[test]]
 name = "orchestrator_integration"
 path = "tests/orchestrator_integration.rs"
-
-[[test]]
-name = "snapshot_catalog"
-path = "tests/snapshot_catalog.rs"

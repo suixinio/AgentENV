@@ -279,9 +279,9 @@ async fn async_main() -> anyhow::Result<()> {
 /// already `None` for blank — so this only ever sees a value here when one is
 /// genuinely configured.
 ///
-/// A hard startup failure rather than a warning, for the same reason
-/// `crates/aenv-api/src/snapshot/repository/backends/central/mod.rs` gives for
-/// the snapshot catalog and `PausedRegistryBackendKind::Postgres`
+/// A hard startup failure rather than a warning, for the same reason the
+/// snapshot catalog only ever runs against PostgreSQL from `aenv-api`'s
+/// `PostgresSnapshotCatalog` and `PausedRegistryBackendKind::Postgres`
 /// (`src/cfg.rs`) already enforces for the paused registry: database
 /// credentials, the connection budget and the schema are the deciding half's
 /// business, never the machines that run user code.

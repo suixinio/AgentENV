@@ -100,9 +100,13 @@ pub async fn build_template_on_a_node(
     //
     // 🔴 This pair is the only place a template build's dispatch is logged on
     // the success path: `builds.node_id` (the catalog row `try_start_build`
-    // opened before this function was even called) names this replica, not
-    // `node.node_id` below — see `CentralSnapshotCatalog::node_id`'s doc for
-    // why that column cannot say this instead.
+    // opened before this function was even called) names this replica — the
+    // one administering the build's lease — never `node.node_id` below, which
+    // is the node a placement decision chose to run the build sandbox on.
+    // `start_build`/`renew_build_lease` (the catalog's Postgres backend,
+    // `crates/aenv-api/src/snapshot/repository/backends/postgres/writes.rs`)
+    // are never told the executor's identity at all, so that column cannot
+    // say this instead.
     let build_id = request.build_snapshot_id.clone();
     info!(
         %build_id,

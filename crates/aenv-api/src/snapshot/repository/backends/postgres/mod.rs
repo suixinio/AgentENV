@@ -1,7 +1,6 @@
 //! `PostgresSnapshotCatalog`: a `SnapshotCatalog` implementation that talks to
-//! PostgreSQL directly, in-process — the Stage B replacement for
-//! [`super::central::CentralSnapshotCatalog`]'s gRPC hop to
-//! `services/scheduler`.
+//! PostgreSQL directly, in-process — the Stage B replacement for the gRPC hop
+//! to `services/scheduler` that a now-deleted client used to make.
 //!
 //! 🔴 `aenv-node` must never hold one of these, and cannot: it does not link
 //! this crate. See `crate::pg`'s own module doc, and that binary's
@@ -59,8 +58,8 @@ impl PostgresSnapshotCatalog {
     /// built by `src/pg::connect` and migrated by
     /// `crate::snapshot::repository::backends::postgres::migrate::migrate` —
     /// this type never dials PostgreSQL or applies schema changes on its
-    /// own, the same division `CentralSnapshotCatalog` draws between "how to
-    /// reach the database" and "what to do once connected".
+    /// own; "how to reach the database" and "what to do once connected"
+    /// stay two separate concerns.
     pub fn new(pool: PgPool, cluster_id: Uuid, node_id: String) -> Self {
         Self {
             pool,

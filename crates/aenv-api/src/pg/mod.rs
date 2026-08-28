@@ -13,10 +13,10 @@
 //! # 🔴 `aenv-node` never reaches this module
 //!
 //! Database credentials, the connection budget and the schema are the
-//! deciding half's business, not the machines that run user code —
-//! `src/snapshot/repository/backends/central/mod.rs` states the same
-//! invariant for the snapshot catalog's own central backend, and
-//! `PausedRegistryBackendKind::Postgres` (`src/cfg.rs`) already refuses a
+//! deciding half's business, not the machines that run user code — the
+//! snapshot catalog only ever runs against PostgreSQL from `aenv-api`'s
+//! `PostgresSnapshotCatalog`, and `PausedRegistryBackendKind::Postgres`
+//! (`src/cfg.rs`) already refuses a
 //! node that tries to connect to the registry database directly. This module
 //! is the same invariant generalized to *any* `[pg]` DSN: `aenv-node` refuses
 //! to start with one configured at all, checked by `refuse_configured_pg_dsn`

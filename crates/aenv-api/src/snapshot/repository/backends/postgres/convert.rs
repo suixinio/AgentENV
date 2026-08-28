@@ -1,7 +1,5 @@
 //! The row and the domain, and the one place either is turned into the
-//! other — the direct-PG analogue of
-//! `backends/central/convert.rs`, reading a `sqlx` row instead of a proto
-//! message.
+//! other.
 //!
 //! 🔴 Same contract as the proto version: a row this build cannot make sense
 //! of must reach the caller as an error, never as a plausible-looking record

@@ -487,6 +487,24 @@ impl CatalogReadScope {
     }
 }
 
+#[cfg(test)]
+mod catalog_read_scope_tests {
+    use super::*;
+
+    /// 🔴 The inversion, in the one place it happens.
+    ///
+    /// The wire field is `allow_any_status` so that its zero value — what a
+    /// caller that never heard of it sends — keeps the predicate that stops a
+    /// half-uploaded snapshot from starting a VM. This side keeps the positive
+    /// reading, and this is the seam between them. A `Resolvable` scope that
+    /// sent `true` would resolve exactly the rows the field exists to hide.
+    #[test]
+    fn the_resolvable_scope_never_asks_for_any_status() {
+        assert!(!CatalogReadScope::Resolvable.allow_any_status());
+        assert!(CatalogReadScope::AnyStatus.allow_any_status());
+    }
+}
+
 /// Whether "no such snapshot" is the last word on one snapshot.
 ///
 /// 🔴 This exists for the one caller in the tree that *destroys* something on

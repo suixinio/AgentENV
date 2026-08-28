@@ -33,41 +33,6 @@ permissions:
   packages: read
 
 jobs:
-  # The central snapshot catalog client and the double write over it, against a
-  # real Go scheduler on a real PostgreSQL.
-  #
-  # 🔴 This job is the only thing that runs `tests/snapshot_catalog.rs`. Without
-  # it those tests are reachable only from a developer's shell: `make test` does
-  # not include them, `test-unit` is `--lib`, and every test in the file returns
-  # before it does anything when the endpoint is unset — so `cargo test` prints
-  # `ok` over a file in which nothing ran. `make test-snapshot-catalog` sets
-  # AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1, which turns a missing dependency into
-  # a failure instead of back into green skips, for the same reason and in the
-  # same shape as SCHEDULER_REGISTRY_TEST_REQUIRED in services-ci.yml.
-  #
-  # PostgreSQL is started by the make target rather than by a `services:` block
-  # so the command CI runs is the command a developer runs, character for
-  # character. Nothing here needs KVM, firecracker or a kernel image; the tests
-  # only load `config/default.toml`, so ci-deps is skipped.
-  snapshot-catalog-tests:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/rust-ci-setup
-        with:
-          install_ci_deps: "false"
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: services/go.mod
-          cache-dependency-path: |
-            services/go.sum
-            services/go.mod
-      - name: Snapshot catalog tests
-        run: make test-snapshot-catalog
-      - name: Scheduler log
-        if: failure()
-        run: cat target/catalog-test/scheduler.log || true
-
   agentenv-tests:
     # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
     runs-on: ubuntu-22.04

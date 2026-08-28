@@ -10,7 +10,7 @@ use anyhow::anyhow;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::snapshot::repository::backends::central::{
+use crate::snapshot::repository::backends::catalog_write::{
     alias_conflict, commit_opening_record, CatalogRefusal, CatalogWrite,
 };
 use crate::snapshot::repository::interfaces::StartedBuild;
@@ -654,7 +654,8 @@ async fn renew_build_lease(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Trait-facing composition — matches `impl SnapshotCatalog for CentralSnapshotCatalog`
+// Trait-facing composition — what `impl SnapshotCatalog for
+// PostgresSnapshotCatalog` (`mod.rs`) delegates to
 // ─────────────────────────────────────────────────────────────────────────
 
 pub async fn create(

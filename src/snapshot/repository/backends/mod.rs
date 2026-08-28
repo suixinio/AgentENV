@@ -1,4 +1,4 @@
-pub mod central;
+pub mod catalog_write;
 pub mod common;
 pub mod oss;
 pub mod posixfs;
@@ -11,7 +11,7 @@ use crate::cfg::{AppConfig, SnapshotImageStoragePolicy, SnapshotRepositoryBacken
 use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::SnapshotRepository;
-pub use central::{CatalogRefusal, CatalogWrite, CentralSnapshotCatalog};
+pub use catalog_write::{CatalogRefusal, CatalogWrite};
 use posixfs::posixfs_artifacts_only_repository;
 
 /// Whether this process holds a snapshot catalog at all.

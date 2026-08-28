@@ -55,7 +55,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-ublk install-ublk \
 	fmt clippy check-crate-boundaries \
 	mutants coverage \
-	test test-unit test-integration test-with-redis test-with-postgres test-snapshot-catalog prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
+	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
@@ -247,82 +247,6 @@ test-with-postgres:
 	  exit $$status
 
 test-integration: test-agent-integration test-envd test-ublk
-
-# Throwaway PostgreSQL and scheduler for `test-snapshot-catalog`.
-CATALOG_TEST_PG      ?= agentenv-catalog-test-pg
-CATALOG_TEST_PG_PORT ?= 15501
-CATALOG_TEST_GRPC    ?= 127.0.0.1:19090
-CATALOG_TEST_CLUSTER ?= 0198f0a1-0000-7000-8000-0000000c0ffe
-CATALOG_TEST_DIR     ?= $(CURDIR)/target/catalog-test
-
-# The central snapshot catalog client, against a real SnapshotCatalog server.
-#
-# 🔴 Without this, `cargo test --test snapshot_catalog` reports `ok` over a file
-# in which every test returned before it did anything. Which refusal a duplicate
-# alias produces, whether a `building` row is visible to a caller that never
-# mentioned allow_any_status, whether a bytea round-trips a CommittedSnapshot —
-# all of them are properties of the *server*, and a stub written from the same
-# reading of the proto as the client agrees with the client by construction.
-#
-# AENV_SNAPSHOT_CATALOG_TEST_REQUIRED turns a missing endpoint into a failure
-# rather than back into green skips, for the same reason
-# SCHEDULER_REGISTRY_TEST_REQUIRED does on the Go side.
-#
-# 🔴 Two waits, not one, and the second one fails rather than gives up. The gRPC
-# listener comes up *before* the catalog migration has run — the migration is a
-# retrying goroutine behind it — so a run that only waited for the socket raced
-# it. Waiting on the tables themselves is the check with no gap in it: the thing
-# the tests need is the thing being waited for.
-#
-# Giving up quietly was worse than not waiting. A scheduler left listening by an
-# earlier run makes this one exit with "address already in use", the tests then
-# talk to the *old* process against a database it never migrated, and the
-# result is thirty tests failing with `relation "snapshots" does not exist` —
-# which reads as a broken change rather than as a stale process.
-test-snapshot-catalog:
-	@command -v docker >/dev/null 2>&1 || { echo "docker not found: the catalog tests need a throwaway PostgreSQL"; exit 1; }
-	@command -v go >/dev/null 2>&1 || { echo "go not found: the catalog tests need the scheduler built from services/"; exit 1; }
-	mkdir -p $(CATALOG_TEST_DIR)
-	cd services && go build -o $(CATALOG_TEST_DIR)/scheduler ./scheduler/cmd
-	printf '%s\n' '{"log_level":"info","log_format":"json","scheduler":{"grpc_listen_addr":"$(CATALOG_TEST_GRPC)","metrics_listen_addr":"127.0.0.1:19101","strategy":"round_robin","report_ttl":"30s","binding_ttl":"30s","warmup_timeout":"15s","redis_addr":"","nodes":[{"id":"test-node-a","endpoint":"http://127.0.0.1:8000"}]},"gateway":{"http_listen_addr":"127.0.0.1:18080","metrics_listen_addr":"127.0.0.1:19102","scheduler_addr":"$(CATALOG_TEST_GRPC)","request_timeout":"90s","forward_response_size":4194304}}' > $(CATALOG_TEST_DIR)/config.json
-	docker run -d --rm --name $(CATALOG_TEST_PG) \
-		-e POSTGRES_PASSWORD=verify -e POSTGRES_DB=aenv_registry \
-		-p $(CATALOG_TEST_PG_PORT):5432 postgres:16-alpine >/dev/null
-	@for i in $$(seq 1 60); do \
-		docker exec $(CATALOG_TEST_PG) pg_isready -U postgres >/dev/null 2>&1 && break; \
-		sleep 1; \
-	done; \
-	SCHEDULER_REGISTRY_DSN="postgres://postgres:verify@127.0.0.1:$(CATALOG_TEST_PG_PORT)/aenv_registry" \
-	SCHEDULER_REGISTRY_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
-	SCHEDULER_REGISTRY_WRITE_ENABLED=true \
-	$(CATALOG_TEST_DIR)/scheduler -config $(CATALOG_TEST_DIR)/config.json > $(CATALOG_TEST_DIR)/scheduler.log 2>&1 & \
-	scheduler_pid=$$!; \
-	for i in $$(seq 1 60); do \
-		grep -q "scheduler gRPC server listening" $(CATALOG_TEST_DIR)/scheduler.log 2>/dev/null && break; \
-		sleep 1; \
-	done; \
-	migrated=0; \
-	for i in $$(seq 1 60); do \
-		docker exec $(CATALOG_TEST_PG) psql -U postgres -d aenv_registry -tAc \
-			"select to_regclass('public.snapshots') is not null and to_regclass('public.builds') is not null" \
-			2>/dev/null | grep -q '^t$$' && { migrated=1; break; }; \
-		sleep 1; \
-	done; \
-	if [ "$$migrated" != "1" ]; then \
-		echo "the catalog migration never ran; see $(CATALOG_TEST_DIR)/scheduler.log"; \
-		echo "(a scheduler left listening on $(CATALOG_TEST_GRPC) by an earlier run makes this one exit with 'address already in use')"; \
-		kill $$scheduler_pid 2>/dev/null; \
-		docker rm -f $(CATALOG_TEST_PG) >/dev/null 2>&1; \
-		exit 1; \
-	fi; \
-	AENV_SNAPSHOT_CATALOG_TEST_ENDPOINT="http://$(CATALOG_TEST_GRPC)" \
-	AENV_SNAPSHOT_CATALOG_TEST_CLUSTER_ID="$(CATALOG_TEST_CLUSTER)" \
-	AENV_SNAPSHOT_CATALOG_TEST_REQUIRED=1 \
-	$(CARGO) test -p aenv-node --test snapshot_catalog; \
-	status=$$?; \
-	kill $$scheduler_pid 2>/dev/null; \
-	docker rm -f $(CATALOG_TEST_PG) >/dev/null 2>&1; \
-	exit $$status
 
 prepare-agent-test-state:
 	$(CAPABILITY_TEST_ENV) $(CARGO) run -p aenv-node --bin aenv-node -- --setup-only

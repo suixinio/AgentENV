@@ -103,6 +103,7 @@ pub fn shared_runtime_cache_root() -> PathBuf {
 mod tests {
     use super::*;
     use crate::cfg::SnapshotRepositoryBackendKind;
+    use crate::snapshot::mock::InMemorySnapshotCatalog;
     use crate::snapshot::repository::backends::build_catalog_only_storage;
     use crate::snapshot::repository::interfaces::CatalogReadScope;
     use crate::snapshot::types::SnapshotId;
@@ -126,6 +127,14 @@ mod tests {
     /// that is where staging happens and because this half now refuses it —
     /// see the third claim below.
     ///
+    /// 🔴 One catalog, shared by both halves, and supplied by the test. Neither
+    /// assembly carries one: the snapshot catalog is PostgreSQL and both of
+    /// these byte halves are built over `NoSnapshotCatalog`. In a real cluster
+    /// the shared catalog is the `[pg]` pool `aenv-api` puts in front of its own
+    /// byte half; here it is `InMemorySnapshotCatalog`, and it has to be shared
+    /// or the delete below would be deleting out of a catalog the publish never
+    /// reached.
+    ///
     /// 3. `publish` through the api-assembled repository is refused rather
     ///    than silently doing nothing. `aenv-api` never stages: every capture
     ///    that reaches it arrived already staged by the node holding the bytes
@@ -140,8 +149,14 @@ mod tests {
             snapshot_store: dir.path().join("store"),
         });
 
-        let (repository, runtime_resolver) = build_catalog_only_storage(&config)
+        let (api_bytes, runtime_resolver) = build_catalog_only_storage(&config)
             .expect("the api half should assemble a storage backend");
+
+        let catalog = Arc::new(InMemorySnapshotCatalog::default());
+        let repository = Arc::new(SnapshotRepository::new(
+            Arc::clone(&catalog) as Arc<dyn crate::snapshot::repository::SnapshotCatalog>,
+            api_bytes.artifacts(),
+        ));
 
         assert!(
             runtime_resolver.is_none(),
@@ -175,6 +190,10 @@ mod tests {
         )
         .into_parts()
         .0;
+        let node_repository = Arc::new(SnapshotRepository::new(
+            Arc::clone(&catalog) as Arc<dyn crate::snapshot::repository::SnapshotCatalog>,
+            node_repository.artifacts(),
+        ));
         node_repository
             .publish(metadata.clone(), manifest.clone())
             .await

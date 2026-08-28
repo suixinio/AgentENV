@@ -12,6 +12,15 @@ path = "src/lib.rs"
 name = "aenv-api"
 path = "src/bin/aenv-api.rs"
 
+# 🔴 The operator tool, in this crate because the snapshot catalog is
+# PostgreSQL and this is the half that holds the only `[pg]` pool. It used to
+# live in `aenv-node` and read the object-storage catalog directly; there is no
+# object-storage catalog any more. Excluded from the Docker image and the
+# install packages — `make build-snapshot-image` is how it is built.
+[[bin]]
+name = "aenv-snapshot-image"
+path = "src/bin/aenv-snapshot-image.rs"
+
 [dependencies]
 aenv-core = { path = "../.." }
 agentenv-observability = { path = "../observability" }
@@ -31,15 +40,18 @@ serde_json = { version = "1", features = ["raw_value"] }
 # build time, which would leak into CI and Docker builds. See `src/pg/mod.rs`
 # and the root manifest's own note, which this entry was moved from.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "uuid", "json", "chrono", "derive"] }
+# 🔴 A normal dependency, not a dev one: `aenv-snapshot-image` materializes the
+# blobs it hands `regctl` under a temporary directory.
+tempfile = "3.22.0"
+thiserror = "2.0.18"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.14.2"
 tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 aenv-core = { path = "../..", features = ["test-support"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
-tempfile = "3.22.0"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

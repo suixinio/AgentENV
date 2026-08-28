@@ -20,10 +20,10 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::artifacts::OssSnapshotArtifactStore;
-use super::catalog::OssSnapshotCatalog;
 use super::client::OssClient;
 use super::config::NormalizedOssConfig;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
+use crate::snapshot::repository::no_catalog::NoSnapshotCatalog;
 use crate::snapshot::repository::SnapshotRepository;
 
 /// What [`oss_durable_parts`] hands back: the durable repository, plus the two
@@ -43,8 +43,9 @@ impl OssDurableParts {
     }
 }
 
-/// The durable halves on their own: the catalog and the delete-only artifact
-/// store, already composed into a [`SnapshotRepository`].
+/// The durable byte half on its own: the delete-only artifact store, composed
+/// into a [`SnapshotRepository`] whose catalog refuses — `build_snapshot_backend`
+/// is what puts PostgreSQL in front of it.
 pub fn oss_durable_parts(
     config: &OssBackendConfig,
     snapshot_image_storage: SnapshotImageStoragePolicy,
@@ -60,7 +61,7 @@ pub fn oss_durable_parts(
     )?);
 
     let repository = Arc::new(SnapshotRepository::new(
-        Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
+        Arc::new(NoSnapshotCatalog),
         Arc::new(OssSnapshotArtifactStore::new(Arc::clone(&client))),
     ));
 

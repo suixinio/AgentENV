@@ -3,7 +3,7 @@ pub mod composite;
 pub mod errors;
 pub mod interfaces;
 pub mod metrics;
-pub mod mirror;
+pub mod no_catalog;
 
 pub use composite::SnapshotRepository;
 pub use errors::{RepositoryError, RepositoryResult};

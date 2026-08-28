@@ -8,16 +8,13 @@
 //! `refuse_configured_pg_dsn`, which refuses startup outright if `[pg].dsn` is
 //! configured at all.
 //!
-//! Wired into `build_snapshot_backend` (`backends/mod.rs::build_central_catalog`):
-//! whenever a `[pg]` pool is available, this type stands in for
-//! [`super::central::CentralSnapshotCatalog`] as the "central" side of
-//! `write = "both"` and `write = "postgres"`, via the [`CentralCatalogWrites`]
-//! impl below.
+//! Wired into `build_snapshot_backend` by [`pg_snapshot_catalog`] below: this
+//! is the snapshot catalog, and since the object-storage catalog was removed it
+//! is the only one. Object storage holds byte artifacts and no rows.
 
 pub mod convert;
 pub mod metrics;
 pub mod migrate;
-pub mod migration_state;
 pub mod reads;
 pub mod reaper;
 pub mod writes;
@@ -30,24 +27,19 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::cfg::AppConfig;
-use crate::snapshot::repository::backends::central::CatalogWrite;
-use crate::snapshot::repository::backends::{CentralCatalogHandle, PgCatalogParts};
 use crate::snapshot::repository::interfaces::{
     CatalogReadScope, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
     StartedBuild,
 };
-use crate::snapshot::repository::mirror::{CatalogCensus, CentralCatalogWrites};
-
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
-use migration_state::PgReadSideConfirmation;
 
 /// Cluster-wide concurrent-build ceiling `PostgresSnapshotCatalog::new`
 /// starts at, and what an explicit `0` passed to
 /// [`PostgresSnapshotCatalog::with_max_concurrent_builds`] resolves to —
 /// mirrors Go's own default (`defaultMaxConcurrentBuilds`,
 /// `store_postgres.go:27`, re-read from `config.snapshot.catalog` at
-/// `build_central_catalog`'s call site). A *negative* value removes the
+/// [`pg_snapshot_catalog`]'s call site). A *negative* value removes the
 /// ceiling entirely (see `with_max_concurrent_builds`'s own doc); `0` is
 /// never unlimited on either side.
 pub const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 20;
@@ -79,8 +71,8 @@ impl PostgresSnapshotCatalog {
     }
 
     /// Overrides the cluster-wide build ceiling `new` started at — the
-    /// production caller is `build_central_catalog`
-    /// (`backends/mod.rs`), which passes
+    /// production caller is [`pg_snapshot_catalog`]
+    /// below, which passes
     /// `config.snapshot.catalog.max_concurrent_builds` here on every
     /// `PostgresSnapshotCatalog` it builds; tests call it directly to drive
     /// admission at a ceiling other than the default.
@@ -151,17 +143,9 @@ impl PostgresSnapshotCatalog {
 }
 
 // 🔴 P6: `metrics::record_catalog_outcome` is wired here, on the
-// `SnapshotCatalog` trait surface only — this is the *sole* path a
-// `write = "postgres"` deployment ever calls (`assemble_postgres_only_backend`
-// wires `Arc<dyn SnapshotCatalog>` straight into the repository, with no
-// mirror in front of it) and the read half of every `write = "both"`
-// deployment too. `CentralCatalogWrites` below — the double write's own
-// surface, live during the `write = "both"` observation window — is left
-// unwired: its methods answer `RepositoryResult<CatalogWrite<T>>`, so a
-// refusal is `Ok(CatalogWrite::Refused(_))`, not `Err(_)`, and
-// `record_catalog_outcome`'s `Result`-shaped wrapper cannot see it as a
-// rejection without unwrapping that enum too — left for whoever wires that
-// surface next rather than guessed at here.
+// `SnapshotCatalog` trait surface — which is now the *only* path any
+// deployment calls. `build_snapshot_backend` wires this `Arc<dyn
+// SnapshotCatalog>` straight into the repository, with nothing in front of it.
 #[async_trait]
 impl SnapshotCatalog for PostgresSnapshotCatalog {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
@@ -261,135 +245,25 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
     }
 }
 
-/// The central catalog's census asks at the *any status* scope — see
-/// [`CatalogCensus`]'s own doc on [`super::central::CentralSnapshotCatalog`],
-/// which this mirrors exactly: a `waiting` template must be counted here the
-/// same as it is counted in object storage, or the population comparison
-/// that guards the read-side switch refuses every cluster that has ever
-/// built one.
-#[async_trait]
-impl CatalogCensus for PostgresSnapshotCatalog {
-    async fn every_snapshot_id(&self) -> RepositoryResult<Vec<SnapshotId>> {
-        Ok(self
-            .list_scoped(
-                SnapshotListFilter::matches_all(),
-                CatalogReadScope::AnyStatus,
-            )
-            .await?
-            .into_iter()
-            .map(|record| record.id)
-            .collect())
-    }
-}
-
-/// What the double write needs from the central catalog — see
-/// [`CentralCatalogWrites`]'s own doc and
-/// `crate::snapshot::repository::mirror::central`'s identical impl for
-/// [`super::central::CentralSnapshotCatalog`], which this mirrors call for
-/// call. The difference is only how each call reaches PostgreSQL: a direct
-/// query here, a gRPC hop to `services/scheduler` there.
-#[async_trait]
-impl CentralCatalogWrites for PostgresSnapshotCatalog {
-    async fn begin(
-        &self,
-        record: &SnapshotRecord,
-        status: &str,
-        published: bool,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
-        writes::begin_snapshot(
-            &self.pool,
-            self.cluster_id,
-            &self.node_id,
-            record,
-            status,
-            published,
-        )
-        .await
-    }
-
-    async fn commit(
-        &self,
-        commit: &SnapshotCommit,
-        published: bool,
-        updated_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
-        writes::commit(
-            &self.pool,
-            self.cluster_id,
-            &self.node_id,
-            commit,
-            published,
-            updated_at_unix_ms,
-        )
-        .await
-    }
-
-    async fn start_build(
-        &self,
-        id: &SnapshotId,
-        build_id: &SnapshotId,
-        started_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<StartedBuild>> {
-        writes::start_build(
-            &self.pool,
-            self.cluster_id,
-            &self.node_id,
-            id,
-            build_id,
-            self.max_concurrent_builds,
-            started_at_unix_ms,
-        )
-        .await
-    }
-
-    async fn renew_build_lease(&self, build_id: &SnapshotId) -> RepositoryResult<bool> {
-        writes::renew_lease(&self.pool, self.cluster_id, &self.node_id, build_id).await
-    }
-
-    async fn fail(
-        &self,
-        id: &SnapshotId,
-        reason: &TemplateBuildErrorReason,
-        updated_at_unix_ms: i64,
-    ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
-        writes::fail(&self.pool, self.cluster_id, id, reason, updated_at_unix_ms).await
-    }
-
-    async fn delete(&self, id_or_alias: &str, deleted_at_unix_ms: i64) -> RepositoryResult<bool> {
-        writes::delete(&self.pool, self.cluster_id, id_or_alias, deleted_at_unix_ms).await
-    }
-
-    async fn get_any_status(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.get_scoped(id_or_alias, CatalogReadScope::AnyStatus)
-            .await
-    }
-
-    async fn get_resolvable(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.get_scoped(id_or_alias, CatalogReadScope::Resolvable)
-            .await
-    }
-}
-
-/// The PostgreSQL half of what [`build_snapshot_backend`][super::build_snapshot_backend]
-/// needs: the central catalog's three faces plus the shared read-side
-/// confirmation record, both over the one `[pg]` pool this process built.
+/// The snapshot catalog, over the one `[pg]` pool this process built — what
+/// [`build_snapshot_backend`][super::build_snapshot_backend] takes, and the
+/// only catalog there is.
 ///
 /// # 🔴 The `PostgresSnapshotCatalog` construction lives here, not in the
 /// shared assembly
 ///
-/// [`build_central_catalog`][super::build_central_catalog] used to take an
-/// `Option<&sqlx::PgPool>` and build this itself, which put `sqlx` — and with
-/// it a database credential — inside code every role links. Everything that
-/// touches the pool is on this side of the seam now; the shared assembly
-/// takes the result.
+/// The shared assembly used to take an `Option<&sqlx::PgPool>` and build this
+/// itself, which put `sqlx` — and with it a database credential — inside code
+/// every role links. Everything that touches the pool is on this side of the
+/// seam now; the shared assembly takes the result.
 ///
 /// `max_concurrent_builds` is read from `config` here, and it is the only
 /// place it is read on the production path — see
 /// `max_concurrent_builds_from_config_reaches_admission`.
-pub fn pg_catalog_parts(config: &AppConfig, pool: &PgPool) -> PgCatalogParts {
+pub fn pg_snapshot_catalog(config: &AppConfig, pool: &PgPool) -> Arc<dyn SnapshotCatalog> {
     let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
     let catalog = Arc::new(
-        PostgresSnapshotCatalog::new(pool.clone(), identity.cluster_id, identity.id.clone())
+        PostgresSnapshotCatalog::new(pool.clone(), identity.cluster_id, identity.id)
             .with_max_concurrent_builds(config.snapshot.catalog.max_concurrent_builds),
     );
     if config.snapshot.catalog.max_concurrent_builds < 0 {
@@ -408,18 +282,7 @@ pub fn pg_catalog_parts(config: &AppConfig, pool: &PgPool) -> PgCatalogParts {
         );
     }
 
-    PgCatalogParts {
-        central: CentralCatalogHandle {
-            writes: Arc::clone(&catalog) as Arc<dyn CentralCatalogWrites>,
-            census: Arc::clone(&catalog) as Arc<dyn CatalogCensus>,
-            reads: catalog as Arc<dyn SnapshotCatalog>,
-        },
-        read_side_confirmation: Arc::new(PgReadSideConfirmation::new(
-            pool,
-            identity.cluster_id,
-            &identity.id,
-        )),
-    }
+    catalog as Arc<dyn SnapshotCatalog>
 }
 
 /// Starts the catalog build reaper for this process, when `pool` is `Some`

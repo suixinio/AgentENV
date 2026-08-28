@@ -262,8 +262,8 @@ configMapGenerator:
   # 08-20) and left out of this file, which made every `apply -k` a silent
   # rollback to `off`: the gateway would go back to reading routes it no longer
   # writes, and nothing would report the change. Written at the running state
-  # for the same reason `snapshot-catalog-config` is (see below) — `off` here
-  # would not be the cautious choice, it would perform the regression.
+  # for the same reason `paused-registry-config` is — `off` here would not be
+  # the cautious choice, it would perform the regression.
   #
   # Order to flip them in: the two write-side switches first, in either order,
   # then the read switch. Rolling back is `kubectl set env` on the Deployment,
@@ -412,113 +412,42 @@ configMapGenerator:
   - name: paused-registry-config
     literals:
       - AENV_PAUSED_REGISTRY_BACKEND=central
-  # 阶段 2c / Stage B's two knobs: which catalog each half writes, and which one
-  # it reads. This cluster has finished the migration — both keys say
-  # `postgres`, and PostgreSQL is the only snapshot catalog there is.
+  # 🔴 `snapshot-catalog-config` is GONE, and so are the two keys it carried.
   #
-  # 🔴 These values are the cluster's *current, verified* state, not an off
-  # position waiting to be flipped. The route here is forced to be three steps
-  # by the code and cannot be short-cut:
+  # 阶段 2c / Stage B moved the snapshot catalog out of object storage and into
+  # PostgreSQL in three steps, steered by AENV_SNAPSHOT_CATALOG_WRITE and
+  # AENV_SNAPSHOT_CATALOG_READ:
   #
   #     object_store/object_store → both/object_store → both/postgres
   #                               → postgres/postgres
   #
-  # The last arrow is gated on a fact in the database rather than on an
-  # operator's promise: `build_snapshot_backend`'s `write = "postgres"` branch
-  # (src/snapshot/repository/backends/mod.rs) calls
-  # `require_read_side_confirmed`, which refuses to *start* unless
-  # `catalog_migration_state.read_side_confirmed` is already true for this
-  # cluster. Only a `both`/`postgres` run writes that row, and only after
-  # `admit_read_side_with_confirmation`'s population comparison has found both
-  # catalogs holding the same snapshot ids. Jumping straight from
-  # object_store/object_store to postgres/postgres CrashLoops every replica.
+  # This cluster reached the last of those and stayed there. The switches, the
+  # double write behind them, the mirror backlog, the read-side confirmation
+  # table and the object-storage catalog itself have all been deleted from the
+  # code: PostgreSQL is the catalog, `[pg]` is where it is configured, and
+  # object storage holds byte artifacts and no rows.
   #
-  # 🔴 What moving `write` off `both` changed: object storage is no longer a
-  # catalog, it is a frozen copy of what the catalog held at the cutover.
-  # `assemble_postgres_only_backend` builds no mirror, no backlog and no
-  # compensator, because — quoting the branch above — "object storage never
-  # receives a catalog write in this mode, ever". Byte artifacts are untouched
-  # and still land in the same bucket; only `catalog/records/*.json` and
-  # `catalog/aliases/*.json` stopped growing.
+  # 🔴 Both binaries now REFUSE TO START if either variable is set — see
+  # `refuse_removed_catalog_env_vars` (src/cfg.rs), called from both
+  # entrypoints before the configuration is read. That is deliberate and it is
+  # the reason this ConfigMap is deleted rather than left behind harmlessly:
+  # confique ignores an environment variable no field declares, so a manifest
+  # that kept them would have started a process that looked entirely healthy
+  # while its operator believed the catalog was double-written.
   #
-  # 🔴 Which turns the fallback from stale into destructive. Losing this
-  # ConfigMap still drops both keys onto `[snapshot.catalog]`'s
-  # object_store/object_store default (src/cfg.rs), and that pair is still
-  # *legal* — but it now aims every read at a catalog missing every snapshot
-  # published since the cutover, and absence is an instruction downstream:
-  # callers delete artifacts and refuse resumes on it. Under `both` the same
-  # fallback read an older but complete copy. So `optional: true` on the two
-  # references is no longer a safety property, only a syntax convenience, and
-  # writing `off` here would not be the cautious choice — it would be the
-  # outage.
+  # 🔴 One-time cost on a cluster that still has this ConfigMap and these
+  # references: apply the new manifests and roll BOTH workloads. A Pod that
+  # keeps the old environment exits at startup with an error naming the
+  # variable — loud, and recoverable by rolling. Deleting the ConfigMap alone
+  # is not enough while the Deployment/DaemonSet still reference it, but it is
+  # also not harmful: `optional: true` meant an absent ConfigMap already left
+  # the variables unset, which is exactly what the new build wants.
   #
-  # The consolation is that losing *one* key is now loud in both directions
-  # where it used to be loud in only one:
-  # `AppConfig::validate_snapshot_catalog` refuses object_store+postgres
-  # ("reads a table nothing writes") and postgres+object_store ("reads a store
-  # nothing writes any more"), so a half-applied ConfigMap fails at startup
-  # instead of guessing.
-  #
-  # 🔴 Environment, not `config/agentenv.toml`, for the reason
-  # AENV_PAUSED_REGISTRY_BACKEND is: `deploy/k8s/run.sh` overwrites that file
-  # from config/default.toml on every apply (run.sh:30), so a cluster that said
-  # this in the ConfigMap would lose it on the next one. `src/cfg.rs` carries the
-  # same note on the two `env =` attributes.
-  #
-  # 🔴 ROLLING BACK — and the order is the *reverse* of what this note said
-  # while the pair was `both`/`postgres`. Back then it was `read` first, then
-  # `write`, because object storage stayed a complete copy for as long as
-  # `write` said `both`. It is not a complete copy any more, so:
-  #
-  #   · `write` back to `both` is safe, and it is the only leg that is. The
-  #     process starts: `admit_read_side_with_confirmation` asks
-  #     `read_side_confirmed` *before* it compares populations, that row is
-  #     already true, and `confirm_read_side` is monotonic — no code path in
-  #     this repository ever sets it back to false. So the "central has rows
-  #     object storage does not" difference this rollback creates is never
-  #     even looked at, and no replica CrashLoops. Dual writing resumes, for
-  #     new rows only.
-  #   · `read` back to `object_store` is NOT reversible, and nothing warns.
-  #     Rows written while `write` was `postgres` live in PostgreSQL alone and
-  #     no code moves them the other way: `queue_history_toward_central`
-  #     enumerates object storage only *toward* PostgreSQL, and
-  #     `repair_toward_central` replays only `MirrorDirection::Central`. There
-  #     is no reverse backfill here or as an operator tool, and
-  #     `guard_read_side` does not refuse the move either (nothing was ever
-  #     queued for it to count). Every snapshot taken after the cutover simply
-  #     reads as absent.
-  #
-  # So this switch is one-way for the *data* while staying reversible for the
-  # *process*: a rolled-back cluster starts fine, it just has to keep reading
-  # PostgreSQL indefinitely, and the only route back to an
-  # object-store-authoritative cluster is a PostgreSQL→object-store backfill
-  # somebody still has to write.
-  #
-  # 🔴 Deliberate downstream consequence, not a defect: `aenv-snapshot-image`
-  # reads the object-storage catalog directly (aenv-node links no sqlx, so it
-  # has no PostgreSQL edge to fall back to), which under this pair means
-  # exporting from a catalog frozen at the cutover.
-  # `ensure_object_store_catalog_is_current`
-  # (crates/aenv-node/src/snapshot/image_export/service.rs, commit 3109149)
-  # therefore bails under `write = "postgres"` while still letting
-  # `object_store` and `both` through. The tool is unavailable on this cluster
-  # until it learns to read PostgreSQL.
-  #
-  # 🔴 One-time cost on any cluster still carrying these as `value:` literals
-  # set out of band: the next `apply -k` there does not merge, it is
-  # **rejected**. No `last-applied-configuration` mentions those literals, so
-  # the three-way merge keeps them and adds the reference, and an env var
-  # holding both `value` and `valueFrom` fails API validation. That is the loud
-  # direction and it costs nothing to be in, but it does not clear itself.
-  # Clear it with one in-place patch per workload, replacing each literal entry
-  # with the reference below, and then apply — do **not** reach for
-  # `kubectl set env …-` to delete the literals first, because that rolls both
-  # halves onto the object_store defaults for the length of the roll, which is
-  # now the destructive fallback described above rather than merely a stale one.
-  - name: snapshot-catalog-config
-    literals:
-      - AENV_SNAPSHOT_CATALOG_WRITE=postgres
-      - AENV_SNAPSHOT_CATALOG_READ=postgres
+  # 🔴 There is no way back to an object-storage catalog. Rows written since the
+  # cutover live in PostgreSQL alone; no code has ever replayed them the other
+  # way, and the code that could have has been deleted. Rolling back is an image
+  # tag on both workloads plus restoring this ConfigMap — and it lands on a
+  # cluster whose object-storage catalog is still frozen at the cutover.
   # Which durable snapshot repository this cluster keeps, and where the half of
   # its configuration that cannot be in this repository is read from.
   #

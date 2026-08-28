@@ -447,7 +447,7 @@ Snapshot storage/build configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
-| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
+| `repository_backend` | string | `"posix_fs"` | Snapshot repository backend — where snapshot **bytes** live. Supported values: `"posix_fs"` and `"oss"`. Neither holds catalog rows: the catalog is PostgreSQL (`[pg]`). |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:
@@ -466,6 +466,12 @@ Source-registry image publication. Only takes effect when `snapshot.repository_b
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.
 
+🔴 A **byte** repository, not a catalog. It stores the memory image, rootfs and
+attached-drive layers and `vm_state.bin`; the rows that name them are in
+PostgreSQL (`[pg]`), which `aenv-api` requires. Object storage and this backend
+both held a catalog until the Stage B cutover and neither does now, so there is
+no PostgreSQL-free deployment.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `snapshot_store` | string | `"$AENV_HOME/snapshot-store"` | Root directory for durable committed snapshot repository state. Relative explicit paths are resolved against the config file directory. |
@@ -480,6 +486,12 @@ outside `AENV_CONFIG_PATH`.
 ## `[backend.oss]`
 
 OSS-backed snapshot repository configuration. This section is required when `snapshot.repository_backend = "oss"`.
+
+🔴 A **byte** repository, not a catalog — the same note as `[backend.posix_fs]`
+above. The bucket held `catalog/records/*.json` and `catalog/aliases/*.json`
+until the Stage B cutover; it holds byte artifacts alone now, and the rows are
+in PostgreSQL (`[pg]`). Objects left under those prefixes on an existing bucket
+are a frozen copy nothing reads.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -510,14 +522,21 @@ Notes:
 
 Shared PostgreSQL connection settings for the control plane (`aenv-api`),
 consumed by `crates/aenv-api/src/pg/mod.rs`: a per-replica connection pool and
-a cluster-leadership primitive built on session-scoped advisory locks. Empty
-by default — set it and the pool backs the committed-snapshot catalog
-(`[snapshot.catalog]` `write`/`read` = `both`/`postgres` or `postgres`) and,
-since 阶段四, the `postgres` cluster-wide paused-sandbox registry backend
+a cluster-leadership primitive built on session-scoped advisory locks.
+
+**Required for `aenv-api`.** The pool backs the committed-snapshot catalog,
+which is PostgreSQL and nothing else — object storage held a catalog until the
+Stage B cutover and holds byte artifacts alone now — so an api replica with no
+`dsn` has no catalog and refuses to start rather than answering "no such
+snapshot" to everything. It also backs the `postgres` cluster-wide
+paused-sandbox registry backend
 (`[orchestrator.paused_registry].backend = "postgres"`, `aenv-api` also
-needs `[cluster].node_placement_source = "native"`) — see
-`deploy/k8s/base/agentenv-api-deployment.yaml` for the deployed shape of
-both.
+needs `[cluster].node_placement_source = "native"`) and the
+`aenv-snapshot-image` operator tool. See
+`deploy/k8s/base/agentenv-api-deployment.yaml` for the deployed shape.
+
+🔴 `aenv-node` must never hold it: that binary links no PostgreSQL client and
+refuses to start if `dsn` is configured.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

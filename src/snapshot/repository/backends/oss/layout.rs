@@ -1,6 +1,11 @@
 use crate::snapshot::SnapshotId;
 
 /// Committed object layout for the OSS snapshot backend.
+///
+/// 🔴 Artifacts only — see `posixfs::layout`'s counterpart note. The
+/// `catalog/records/` and `catalog/aliases/` keys this also produced are gone
+/// with the object-storage catalog; existing buckets still hold those objects,
+/// frozen at the cutover and read by nothing.
 pub struct OssSnapshotArtifactLayout<'a> {
     snapshot_id: &'a SnapshotId,
 }
@@ -8,14 +13,6 @@ pub struct OssSnapshotArtifactLayout<'a> {
 impl<'a> OssSnapshotArtifactLayout<'a> {
     pub fn new(snapshot_id: &'a SnapshotId) -> Self {
         Self { snapshot_id }
-    }
-
-    pub fn alias_key(alias: &str) -> String {
-        format!("catalog/aliases/{alias}.json")
-    }
-
-    pub fn record_key(id: &SnapshotId) -> String {
-        format!("catalog/records/{id}.json")
     }
 
     pub fn managed_layer_key(digest: &str) -> String {

@@ -12,10 +12,6 @@ path = "src/lib.rs"
 name = "aenv-node"
 path = "src/bin/aenv-node.rs"
 
-[[bin]]
-name = "aenv-snapshot-image"
-path = "src/bin/aenv-snapshot-image.rs"
-
 [features]
 vendored-openssl = ["aenv-core/vendored-openssl"]
 

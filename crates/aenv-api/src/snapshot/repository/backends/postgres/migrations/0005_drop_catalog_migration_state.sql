@@ -1,0 +1,27 @@
+-- Removes `catalog_migration_state`, the table
+-- `0004_catalog_migration_state.sql` creates.
+--
+-- 🔴 That table held one fact: whether this cluster's snapshot-catalog *read*
+-- side had ever been confirmed onto PostgreSQL, so `require_read_side_confirmed`
+-- could refuse to start a replica that would drop the object-storage copy
+-- before anything had checked the two agreed. The move it gated is finished —
+-- PostgreSQL is the only catalog, object storage holds byte artifacts and no
+-- rows — so both the gate and the fact it recorded are gone, and a table
+-- nothing reads is a table an operator will eventually wonder about.
+--
+-- 🔴 Version 4 is deliberately still applied rather than deleted from
+-- `MIGRATIONS`: `apply` trusts that array's order instead of sorting it, and
+-- `migrations_are_ordered_and_versions_are_dense` holds it to a gapless
+-- sequence, so removing 4 would break the invariant that makes trusting the
+-- order safe in the first place. The consequence is worth stating plainly
+-- rather than leaving for someone to discover in a psql session: a database
+-- created by this build *does* create this table in 4 and drop it again in 5,
+-- inside a single `migrate()`. A wasted pair of statements on a fresh cluster
+-- is the price of one code path that is correct both there and on a cluster
+-- already sitting at version 4, which has the table and needs this drop.
+-- `IF EXISTS` is what makes the statement safe in both directions.
+--
+-- `RELATIONS_BY_VERSION` in `migrate.rs` no longer claims version 4 owns any
+-- relation, which is what keeps `verify_applied` from reading the drop as a
+-- half-finished rollback.
+DROP TABLE IF EXISTS catalog_migration_state;

@@ -466,7 +466,7 @@ mod advertisement_tests {
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
     use crate::p2p::P2pTransport as _;
-    use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::mock::{write_mock_built_artifacts, InMemorySnapshotCatalog};
     use crate::snapshot::p2p::fixed_artifact_key;
     use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{
@@ -498,6 +498,9 @@ mod advertisement_tests {
         })
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
+        // The POSIX byte half under a catalog these tests can publish through:
+        // a node's own repository refuses every catalog call by construction.
+        let repository = InMemorySnapshotCatalog::in_front_of(&repository);
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
             repository,
@@ -580,6 +583,9 @@ mod advertisement_tests {
         })
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
+        // The POSIX byte half under a catalog these tests can publish through:
+        // a node's own repository refuses every catalog call by construction.
+        let repository = InMemorySnapshotCatalog::in_front_of(&repository);
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
             repository,

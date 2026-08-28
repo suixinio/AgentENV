@@ -2,4 +2,5 @@
 
 pub use aenv_core::snapshot::*;
 
+pub mod image_export;
 pub mod repository;

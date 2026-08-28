@@ -1,15 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use crate::snapshot::{SnapshotAlias, SnapshotId};
-
-pub const POSIXFS_SNAPSHOT_COMMIT_MARKER: &str = "commit";
-const LOCK_SUFFIX: &str = ".lock";
+use crate::snapshot::SnapshotId;
 
 pub fn managed_layer_file_name(digest: &str) -> String {
     format!("{}.overlaybd.commit", digest.replace([':', '/'], "_"))
 }
 
 /// Committed artifact layout for the POSIX-backed snapshot repository.
+///
+/// 🔴 Artifacts only. This carried the `catalog/records/` and
+/// `catalog/aliases/` paths too, plus their lock files and the per-snapshot
+/// `commit` marker, until the object-storage catalog was removed; the rows are
+/// PostgreSQL's now and this backend stores bytes alone. Existing repositories
+/// still have a `catalog/` directory on disk — frozen at the cutover, and read
+/// by nothing.
 pub struct PosixFsSnapshotArtifactLayout {
     root: PathBuf,
     snapshot_id: SnapshotId,
@@ -21,34 +25,6 @@ impl PosixFsSnapshotArtifactLayout {
             root: root.into(),
             snapshot_id: snapshot_id.clone(),
         }
-    }
-
-    pub fn catalog_dir(root: &Path) -> PathBuf {
-        root.join("catalog")
-    }
-
-    pub fn aliases_dir(root: &Path) -> PathBuf {
-        Self::catalog_dir(root).join("aliases")
-    }
-
-    pub fn records_dir(root: &Path) -> PathBuf {
-        Self::catalog_dir(root).join("records")
-    }
-
-    pub fn alias_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
-        Self::aliases_dir(root).join(alias.to_string())
-    }
-
-    pub fn alias_lock_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
-        Self::aliases_dir(root).join(format!("{alias}{LOCK_SUFFIX}"))
-    }
-
-    pub fn record_path(root: &Path, id: &SnapshotId) -> PathBuf {
-        Self::records_dir(root).join(format!("{id}.json"))
-    }
-
-    pub fn record_lock_path(root: &Path, id: &SnapshotId) -> PathBuf {
-        Self::records_dir(root).join(format!("{id}{LOCK_SUFFIX}"))
     }
 
     pub fn snapshots_dir(root: &Path) -> PathBuf {

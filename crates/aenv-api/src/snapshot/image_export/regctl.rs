@@ -10,7 +10,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
-use crate::image::oci_image::{
+use crate::image::regctl::{
     regctl_command, regctl_stderr_is_not_found, run_regctl, REGCTL_RETRY_ATTEMPTS,
     REGCTL_RETRY_BASE_DELAY,
 };

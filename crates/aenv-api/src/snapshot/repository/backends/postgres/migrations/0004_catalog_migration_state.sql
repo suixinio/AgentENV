@@ -1,3 +1,15 @@
+-- 🔴 HISTORY ONLY. `0005_drop_catalog_migration_state.sql` drops what this
+-- creates, and nothing between the two reads it: the read-side confirmation
+-- gate this table existed for is gone with the object-storage catalog it was
+-- gating the move away from.
+--
+-- Kept, and kept applying, rather than deleted, because the migration ledger is
+-- checked for density (`migrations_are_ordered_and_versions_are_dense`) and a
+-- cluster already at version 4 has both the row and the table — 5 is what
+-- removes the table there. A database created by this build creates it and
+-- drops it again in the same `migrate()` call, which costs one DDL statement
+-- and keeps the ledger the same shape everywhere.
+
 -- Stage B addition (not ported from services/scheduler/internal/catalog):
 -- where "has the PostgreSQL read side ever caught up with object storage"
 -- is recorded, so that fact is a cluster fact rather than a node-local one.

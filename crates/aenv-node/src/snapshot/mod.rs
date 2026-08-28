@@ -4,7 +4,6 @@
 pub use aenv_core::snapshot::*;
 
 pub mod artifact_cache;
-pub mod image_export;
 pub mod p2p;
 pub mod repository;
 pub mod runtime_support;

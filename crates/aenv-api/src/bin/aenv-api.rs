@@ -73,8 +73,8 @@ struct ApiCli {
 }
 
 /// 🔴 Not `#[tokio::main]` — see `aenv-node`'s `main` for the whole argument.
-/// This half opens fewer RocksDB stores than the node one does, but it opens
-/// the snapshot catalog's mirror backlog, so the same bound applies.
+/// This half opens fewer RocksDB stores than the node one does, but it still
+/// opens some, so the same bound applies.
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -88,6 +88,11 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     aenv_api::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
+
+    // 🔴 Before the configuration is read — see the identical call in
+    // `aenv-node`'s own `async_main`, and `refuse_removed_catalog_env_vars`'s
+    // doc for why an ignored environment variable is the dangerous shape here.
+    aenv_api::cfg::refuse_removed_catalog_env_vars()?;
 
     let cli = ApiCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
@@ -486,19 +491,21 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
 
-    // The central catalog's three faces and Stage B step 4's shared read-side
-    // confirmation record, both over the one pool this replica built — the
-    // only things `build_snapshot_backend` needs from PostgreSQL, and the
-    // reason it no longer takes the pool itself.
+    // The snapshot catalog, over the one pool this replica built — the only
+    // thing `build_snapshot_backend` needs from PostgreSQL, and the reason it
+    // no longer takes the pool itself.
+    //
+    // 🔴 `None` here is not a mode any more. Object storage stopped being a
+    // catalog at the Stage B cutover, so a replica with no `[pg]` has no
+    // catalog at all and `build_snapshot_backend` refuses to assemble.
     let pg_catalog = pg_pool
         .as_ref()
-        .map(|pool| aenv_api::snapshot::repository::backends::pg_catalog_parts(config, pool));
+        .map(|pool| aenv_api::snapshot::repository::backends::pg_snapshot_catalog(config, pool));
     let snapshot_backend = aenv_api::snapshot::repository::backends::build_snapshot_backend(
         aenv_api::snapshot::repository::backends::build_catalog_only_storage(config)?,
         pg_catalog,
         aenv_api::snapshot::repository::backends::CentralCatalogUse::AsConfigured,
-    )
-    .await?;
+    )?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
     // 🔴 Both halves refuse rather than resolve, and that is what this
     // process is: the resolving `ImageResolver` and the `TemplateBuilder` that
@@ -1633,6 +1640,63 @@ mod tests {
             err.contains("kubernetes_discovery"),
             "an empty namespace/service_name must be refused before the dual-report check \
              is ever reached: {err}"
+        );
+    }
+
+    /// The body of the named item in this file's own source text.
+    ///
+    /// Shared by the call-site guards below, which scan rather than execute:
+    /// deleting a call site is a change no unit test of the called function
+    /// can see.
+    fn body_of(source: &str, name: &str) -> String {
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+        let open = source[start..].find('{').expect("a body") + start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[open..open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} has no closing brace");
+    }
+
+    /// 🔴 This binary actually refuses a manifest that still sets one of the
+    /// removed snapshot-catalog switches.
+    ///
+    /// `refuse_removed_catalog_env_vars` has its own two-direction test in
+    /// `src/cfg.rs`, and that test stays green with the call site deleted —
+    /// which is the whole failure mode: confique ignores an undeclared
+    /// environment variable, so a `AENV_SNAPSHOT_CATALOG_WRITE=both` left in a
+    /// manifest would start a process that looks entirely healthy while its
+    /// operator believes the catalog is double-written. It is not, and nothing
+    /// would say so.
+    #[test]
+    fn async_main_actually_refuses_the_removed_catalog_switches() {
+        let source = include_str!("aenv-api.rs");
+        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
+        assert!(
+            async_main.contains("cfg::refuse_removed_catalog_env_vars()"),
+            "async_main no longer refuses AENV_SNAPSHOT_CATALOG_WRITE / _READ; an un-migrated \
+             manifest would then start in silence, and src/cfg.rs's own test of the pure \
+             function would still report green"
+        );
+        // 🔴 The mutation control: the scan has to be able to fail. A `body_of`
+        // that returned the whole file would satisfy the assertion above for
+        // the wrong reason, and `async fn async_main` sits before the body's
+        // opening brace, so a correct extraction never contains it.
+        assert!(
+            !async_main.contains("async fn async_main"),
+            "the scan is reading more than async_main's body, so the assertion above proves \
+             nothing about where the call actually is"
         );
     }
 }

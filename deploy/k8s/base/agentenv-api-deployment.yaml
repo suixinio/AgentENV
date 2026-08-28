@@ -201,49 +201,25 @@ spec:
             # paused registry would arbitrate a registry only it can see.
             - name: AENV_PAUSED_REGISTRY_BACKEND
               value: "postgres"
-            # 阶段 2c / Stage B, the same two keys and the same ConfigMap the
-            # DaemonSet reads. Now `postgres`/`postgres` — see the note on
-            # snapshot-catalog-config in kustomization.yaml for the values, the
-            # three-step route that reached them, and why the way back is not
-            # symmetric.
+            # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
+            # setting them would now stop this Pod at startup
+            # (`refuse_removed_catalog_env_vars`, src/cfg.rs). 阶段 2c / Stage B
+            # finished: PostgreSQL is the snapshot catalog, object storage holds
+            # byte artifacts and no rows, and the object-storage catalog, the
+            # double write and the read-side confirmation table are all deleted
+            # from the code. See the note where `snapshot-catalog-config` used
+            # to be, in kustomization.yaml.
             #
-            # 🔴 This half is now the *only* writer of the snapshot catalog.
-            # A node stages the bytes and tells the catalog nothing
-            # (`SnapshotRepository::stage`); the row is written here, by
+            # 🔴 This half is the *only* half that holds a catalog at all. A node
+            # stages the bytes and tells the catalog nothing
+            # (`SnapshotRepository::stage`) — its repository carries
+            # `NoSnapshotCatalog`, which refuses; the row is written here, by
             # `commit_staged` → `catalog.publish_commit`, straight into the
-            # shared `[pg]` pool. `build_snapshot_backend`'s
-            # `write = "postgres"` branch refuses to start this replica unless
-            # `catalog_migration_state.read_side_confirmed` is already true for
-            # this cluster, and logs `catalog_write=postgres
-            # catalog_read=postgres` when it is — that log line, not Pod
-            # readiness, is what says the assembly actually took this path.
-            #
-            # 🔴 A configMapKeyRef here rather than the literals this half uses
-            # for AENV_ORCHESTRATOR_STORE_BACKEND and
-            # AENV_PAUSED_REGISTRY_BACKEND above, and the difference is real:
-            # those two are settings where the api half's correct value differs
-            # from the node's, so writing them out here says so. This pair is
-            # the opposite — the two halves must hold the *same* value, and the
-            # moment they can be edited apart somebody will edit one. The whole
-            # cluster answers snapshot lookups from one catalog or it has a
-            # split nothing reports.
-            #
-            # These were added to the live Deployment with `kubectl set env` when
-            # 3a went out, which is why they are being written down now: until
-            # they were in this file, the api half's copy of 2c's end state
-            # survived exactly until the next `apply -k`.
-            - name: AENV_SNAPSHOT_CATALOG_WRITE
-              valueFrom:
-                configMapKeyRef:
-                  name: snapshot-catalog-config
-                  key: AENV_SNAPSHOT_CATALOG_WRITE
-                  optional: true
-            - name: AENV_SNAPSHOT_CATALOG_READ
-              valueFrom:
-                configMapKeyRef:
-                  name: snapshot-catalog-config
-                  key: AENV_SNAPSHOT_CATALOG_READ
-                  optional: true
+            # shared `[pg]` pool. That makes AENV_PG_DSN below load-bearing in a
+            # way it was not before: `build_snapshot_backend` refuses to
+            # assemble this replica without it, and logs "snapshot catalog is
+            # served solely by PostgreSQL" when it succeeds — that log line, not
+            # Pod readiness, is what says the assembly took this path.
             # Which durable snapshot repository this half reads and writes, and
             # where the half of its configuration that cannot be in this
             # repository comes from. Both keys, both workloads, one ConfigMap —
@@ -402,14 +378,12 @@ spec:
             #      by `lookup_node_answers_bound_from_the_binding_store` and
             #      its siblings) instead of the scheduler's Go port of the
             #      same query.
-            #   2. The `central` paused registry's gRPC fallback in
-            #      `build_central_catalog`
-            #      (`src/snapshot/repository/backends/mod.rs`) — moot here
-            #      since `[pg]` is always configured on this Deployment, so
-            #      that function picks `PostgresSnapshotCatalog` directly and
-            #      never reaches the branch that reads this value at all; it
-            #      is listed only so a reader auditing every consumer of this
-            #      key does not have to rediscover that for themselves.
+            #   2. There used to be a second consumer here: the snapshot
+            #      catalog's gRPC fallback, which dialled this endpoint when
+            #      `[pg]` was absent. It is gone with the object-storage
+            #      catalog — `build_snapshot_backend` now takes the PostgreSQL
+            #      catalog or refuses to assemble, and nothing in the snapshot
+            #      layer reads this key at all.
             #
             # Rollback: change this back to `http://agentenv-scheduler:9090`
             # and roll this Deployment — unlike the DaemonSet's copy of this
@@ -740,33 +714,15 @@ spec:
         # its durable state belongs in the shared store — and not a missing
         # volume.
         #
-        # 🔴 One thing under here is not a cache, and a reader deciding what to
-        # put in this volume has to know which: `snapshot-catalog-mirror`, the
-        # double write's queue of owed catalog writes. Its own configuration
-        # calls it "node-local and durable" (`src/cfg.rs`), and on this half it
-        # is neither — every replica opens an empty one.
-        #
-        # What that costs at startup is handled in code and must stay handled:
-        # a mirror with no recorded read side reads `read = "postgres"` as the
-        # switch, so every replica runs the two-catalog population comparison
-        # on every start rather than once, and the comparison replays what the
-        # history backfill just queued before it refuses
-        # (`mirror/population.rs::admit_read_side`). Without that replay a
-        # difference of any size stops every *new* api Pod while the ones older
-        # than the difference keep serving — measured on the dev cluster at five
-        # snapshots — and it cannot clear itself, because the compensator that
-        # would close it is spawned after the refusal.
-        #
-        # 🔴 What it still costs, and what no code here fixes: a write this
-        # replica owes one of the two catalogs is queued in this directory, so a
-        # replica that dies holding one leaves a difference that no gauge counts.
-        # The next replica's comparison is what finds it. A difference where
-        # object storage is ahead is closed by the replay above; one where
-        # PostgreSQL is ahead is closed by nothing automatic and takes an
-        # operator. Giving this half a durable mirror is the fix for that, and
-        # it is a decision about the api half's persistence model — per-replica
-        # volume or none at all, never one shared between replicas — rather than
-        # a line to add here.
+        # 🔴 Everything under here is a cache now, and that is a change: it used
+        # to also hold `snapshot-catalog-mirror`, the double write's queue of
+        # owed catalog writes — durable state on a volume with the Pod's
+        # lifetime, which cost this half a two-catalog population comparison on
+        # every replica start and left an uncounted difference behind whenever a
+        # replica died holding a queued write. The double write is gone and so
+        # is the directory. If anything this half writes here ever needs to
+        # survive a restart again, that is a bug in the api half — its durable
+        # state belongs in the shared store — and not a missing volume.
         - name: scratch
           emptyDir: {}
         # optional: an absent Secret, or a Secret without this key, mounts

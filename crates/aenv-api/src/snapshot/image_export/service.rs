@@ -12,9 +12,7 @@ use super::regctl::Regctl;
 use super::target::{
     resolve_snapshot_image_target, snapshot_managed_publication_for_target, SnapshotImageTarget,
 };
-use crate::cfg::{
-    ConfigManager, SnapshotCatalogWrite, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind,
-};
+use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
 use crate::digest;
 use crate::snapshot::repository::backends::common::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
@@ -40,31 +38,6 @@ enum ManagedLayerLocator {
     Oss { client: Arc<oss::OssClient> },
 }
 
-/// Refuses to export from an object-storage catalog that is no longer written.
-///
-/// [`SnapshotImageService::from_global_config`] builds its catalog straight
-/// out of `snapshot.repository_backend` and never consults
-/// `[snapshot.catalog]`'s write/read modes. That is correct exactly while
-/// object storage is still *one of* the catalogs (`write = "object_store"` or
-/// `"both"`), and silently wrong the moment it stops being one:
-/// `write = "postgres"` freezes the object-storage catalog at the cutover, so
-/// every snapshot committed afterwards reads back here as "not found" from a
-/// tool that otherwise looks entirely healthy -- an answer an operator cannot
-/// tell apart from a wrong snapshot id. Refusing is the whole point.
-fn ensure_object_store_catalog_is_current(write: SnapshotCatalogWrite) -> anyhow::Result<()> {
-    match write {
-        SnapshotCatalogWrite::ObjectStore | SnapshotCatalogWrite::Both => Ok(()),
-        SnapshotCatalogWrite::Postgres => anyhow::bail!(
-            "snapshot.catalog.write = \"postgres\": object storage is no longer a catalog, and \
-             aenv-snapshot-image reads the object-storage catalog directly -- this binary has no \
-             PostgreSQL edge (aenv-node links no sqlx, by design). Every snapshot committed since \
-             that cutover would read back here as not found, which is indistinguishable from a \
-             wrong snapshot id, so this refuses rather than export from a frozen catalog. \
-             Exporting under this mode needs a catalog read path this binary does not have."
-        ),
-    }
-}
-
 fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
     match layer {
         OverlaybdLayerRef::External(external) => (&external.digest, external.size),
@@ -85,43 +58,58 @@ pub struct SnapshotImageService {
 }
 
 impl SnapshotImageService {
-    /// Builds the service from the global config, intentionally skipping the
-    /// node-runtime resolver, artifact cache, layer store, and P2P machinery.
-    pub fn from_global_config(regctl_binary: impl Into<PathBuf>) -> anyhow::Result<Self> {
+    /// Builds the service from the global config and an already-connected
+    /// `[pg]` pool, intentionally skipping the node-runtime resolver, artifact
+    /// cache, layer store, and P2P machinery.
+    ///
+    /// 🔴 The catalog is PostgreSQL and nothing else. This tool used to build
+    /// the object-storage catalog straight out of `snapshot.repository_backend`
+    /// and read a row from it; object storage stopped receiving catalog rows at
+    /// the Stage B cutover, so that read answered "not found" for every
+    /// snapshot published since — an answer an operator cannot tell apart from
+    /// a wrong snapshot id. It reads the real catalog now, which is why this
+    /// binary moved into `aenv-api`: that is the half that holds the pool.
+    ///
+    /// `repository_backend` still decides where the *bytes* are, and that is
+    /// all it decides here.
+    pub async fn from_global_config(
+        pool: &sqlx::PgPool,
+        regctl_binary: impl Into<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
-        ensure_object_store_catalog_is_current(config.snapshot.catalog.write)?;
-        let (catalog, layers): (Arc<dyn SnapshotCatalog>, ManagedLayerLocator) =
-            match config.snapshot.repository_backend {
-                SnapshotRepositoryBackendKind::PosixFs => {
-                    let posix = config.backend.posix_fs.as_ref().context(
-                        "backend.posix_fs config is required when repository_backend = posix_fs",
-                    )?;
-                    let root = posix.snapshot_store.join("repository");
-                    let catalog = Arc::new(posixfs::PosixFsCatalogStore::new(root.clone()));
-                    (catalog, ManagedLayerLocator::PosixFs { root })
+        let catalog = crate::snapshot::repository::backends::pg_snapshot_catalog(config, pool);
+        let layers = match config.snapshot.repository_backend {
+            SnapshotRepositoryBackendKind::PosixFs => {
+                let posix = config.backend.posix_fs.as_ref().context(
+                    "backend.posix_fs config is required when repository_backend = posix_fs",
+                )?;
+                ManagedLayerLocator::PosixFs {
+                    root: posix.snapshot_store.join("repository"),
                 }
-                SnapshotRepositoryBackendKind::Oss => {
-                    let oss_config =
-                        config.backend.oss.as_ref().context(
-                            "backend.oss config is required when repository_backend = oss",
-                        )?;
-                    let policy = if config.snapshot.image_publish.enabled {
-                        SnapshotImageStoragePolicy::SourceRegistry
-                    } else {
-                        SnapshotImageStoragePolicy::ObjectStorage
-                    };
-                    let config = oss::NormalizedOssConfig::new(oss_config, policy)?;
-                    let client = Arc::new(oss::OssClient::new(
+            }
+            SnapshotRepositoryBackendKind::Oss => {
+                let oss_config = config
+                    .backend
+                    .oss
+                    .as_ref()
+                    .context("backend.oss config is required when repository_backend = oss")?;
+                let policy = if config.snapshot.image_publish.enabled {
+                    SnapshotImageStoragePolicy::SourceRegistry
+                } else {
+                    SnapshotImageStoragePolicy::ObjectStorage
+                };
+                let config = oss::NormalizedOssConfig::new(oss_config, policy)?;
+                ManagedLayerLocator::Oss {
+                    client: Arc::new(oss::OssClient::new(
                         config.bucket().to_string(),
                         config.endpoint().to_string(),
                         config.region().to_string(),
                         config.prefix().to_string(),
                         config.credential_source(),
-                    )?);
-                    let catalog = Arc::new(oss::OssSnapshotCatalog::new(Arc::clone(&client)));
-                    (catalog, ManagedLayerLocator::Oss { client })
+                    )?),
                 }
-            };
+            }
+        };
         Ok(Self {
             catalog,
             layers,
@@ -473,17 +461,60 @@ mod tests {
             .await
     }
 
+    /// One row, by id, and nothing else — the only catalog surface this tool
+    /// touches (`catalog.get`).
+    struct SeededCatalog(SnapshotRecord);
+
+    #[async_trait::async_trait]
+    impl SnapshotCatalog for SeededCatalog {
+        async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+            unreachable!("the export tool never writes")
+        }
+        async fn publish_commit(
+            &self,
+            _commit: crate::snapshot::repository::interfaces::SnapshotCommit,
+        ) -> RepositoryResult<SnapshotRecord> {
+            unreachable!("the export tool never writes")
+        }
+        async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+            Ok((id_or_alias == self.0.id.to_string()).then(|| self.0.clone()))
+        }
+        async fn list(
+            &self,
+            _filter: crate::snapshot::repository::SnapshotListFilter,
+        ) -> RepositoryResult<Vec<SnapshotRecord>> {
+            unreachable!("the export tool never lists")
+        }
+        async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
+            unreachable!("the export tool never deletes")
+        }
+        async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+            Ok(None)
+        }
+        async fn try_start_build(
+            &self,
+            _id: &SnapshotId,
+        ) -> RepositoryResult<crate::snapshot::repository::StartedBuild> {
+            unreachable!("the export tool never builds")
+        }
+        async fn mark_build_error(
+            &self,
+            _id: &SnapshotId,
+            _reason: crate::snapshot::TemplateBuildErrorReason,
+        ) -> RepositoryResult<()> {
+            unreachable!("the export tool never builds")
+        }
+    }
+
     #[tokio::test]
     async fn unknown_or_uncommitted_snapshot_is_rejected() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repository");
-        let catalog = posixfs::PosixFsCatalogStore::new(root.clone());
         let uncommitted =
             SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
         let lookup = uncommitted.id.to_string();
-        catalog.create(uncommitted).await.unwrap();
         let service = SnapshotImageService {
-            catalog: Arc::new(catalog),
+            catalog: Arc::new(SeededCatalog(uncommitted)),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new("/nonexistent/regctl"),
         };
@@ -755,31 +786,5 @@ mod tests {
                 Err(SnapshotImageTargetError::CannotInfer { .. })
             ));
         }
-    }
-
-    /// The cutover this guards is a config change on a running cluster, not a
-    /// code change here, so the polarity is what matters: `both` must stay
-    /// allowed (object storage is still written) and `postgres` must be
-    /// refused (it is not). Asserting only the refusal would still pass if the
-    /// guard rejected every mode.
-    #[test]
-    fn export_is_refused_once_object_storage_stops_being_a_catalog() {
-        for still_written in [
-            SnapshotCatalogWrite::ObjectStore,
-            SnapshotCatalogWrite::Both,
-        ] {
-            assert!(
-                ensure_object_store_catalog_is_current(still_written).is_ok(),
-                "{still_written:?} still writes the object-storage catalog this tool reads"
-            );
-        }
-
-        let refused = ensure_object_store_catalog_is_current(SnapshotCatalogWrite::Postgres)
-            .expect_err("a frozen object-storage catalog must not be exported from silently");
-        let message = refused.to_string();
-        assert!(
-            message.contains("no longer a catalog"),
-            "the refusal has to say why, not just that: {message}"
-        );
     }
 }

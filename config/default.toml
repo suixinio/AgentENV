@@ -477,9 +477,10 @@ reclaim_interval_secs = 30
 # Node-local cache for snapshot artifacts.
 # local_cache_path = "$AENV_HOME/snapshot-local-cache"
 
-# Durable repository backend:
-# - "posix_fs" stores snapshots on a local or shared filesystem.
-# - "oss" stores snapshots in S3-compatible object storage.
+# Durable repository backend — where snapshot *bytes* live. The catalog (the
+# rows) is PostgreSQL either way; see [snapshot.catalog] below.
+# - "posix_fs" stores snapshot artifacts on a local or shared filesystem.
+# - "oss" stores snapshot artifacts in S3-compatible object storage.
 repository_backend = "posix_fs"
 
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
@@ -496,76 +497,33 @@ p2p_enabled = true
 # [snapshot.image_publish]
 # enabled = true
 
-# Where the snapshot catalog lives while it is moving out of object storage and
-# into the control plane's PostgreSQL.
+# The snapshot catalog is PostgreSQL, and there is no other.
 #
-# Two knobs, rolled separately, because adding the second copy and starting to
-# trust it are different decisions with different ways back. Both are settable
-# from the environment (AENV_SNAPSHOT_CATALOG_WRITE / _READ) because run.sh
-# copies this file over the cluster's ConfigMap on every apply.
+# 🔴 [pg] is therefore required by aenv-api, and aenv-api is the only half that
+# may hold it (aenv-node refuses to start with [pg].dsn configured, and does not
+# link a PostgreSQL client at all). An api replica assembled without [pg] has no
+# catalog and refuses to start rather than answering "no such snapshot" to every
+# request:
 #
-#   write = "object_store"  object storage is the catalog
-#   write = "both"          both catalogs are written; the central one gets a
-#                           second, checkable copy. Requires
-#                           [cluster].scheduler_endpoint.
-#   write = "postgres"      PostgreSQL is the only catalog; object storage
-#                           receives no more catalog writes. No gRPC fallback
-#                           and no scheduler dependency — [pg] alone. Refused
-#                           at startup unless the read side was already
-#                           confirmed onto PostgreSQL first (see below).
-#                           aenv-node never builds a catalog of any kind
-#                           under this backend or any other: its two
-#                           request-time catalog reads are pre-resolved by
-#                           api and sent down with the request (task's own
-#                           "phase4-close" P2).
-#   read  = "object_store"  object storage answers reads. Always available, and
-#                           the way back from the line below.
-#   read  = "postgres"      the central catalog answers reads. Requires
-#                           write = "both" or write = "postgres" (the latter
-#                           forces it: there is no object-store copy left to
-#                           read), so object storage stays a complete copy
-#                           under "both" and the rollback there is a config
-#                           change.
+#     no snapshot catalog is configured: [pg].dsn is unset and PostgreSQL is
+#     the only snapshot catalog there is
 #
-# Moving `read` onto PostgreSQL is refused unless PostgreSQL actually holds what
-# object storage does, and the node checks four separate things before serving:
-# writes still owed to it, disagreements no replay can settle, whether the
-# snapshots that predate double writing were ever queued for it, and — because
-# all three of those describe the queue rather than the catalogs — a direct
-# comparison of what each one holds. The last is the only one that needs no
-# marker and no counter to be right.
+# 🔴 A deployment with no PostgreSQL is therefore no longer a deployment. Object
+# storage and posix_fs are still repository backends — they hold the *bytes*
+# (memory image, rootfs and attached-drive layers, vm_state.bin) and are chosen
+# with snapshot.repository_backend below — but object storage stopped receiving
+# catalog rows at the Stage B cutover and holds none now. There is no
+# single-machine mode that keeps rows on local disk.
 #
-# 🔴 If you are clearing state before turning double writing on, clear
-# PostgreSQL **and** every node's mirror_backlog_path, in that order. Clearing
-# one alone has produced two different silent failures:
-#
-#   PostgreSQL cleared, mirror stores kept: the "history already queued" marker
-#     survives, the backfill returns immediately, nothing is queued, and both
-#     gauges report agreement over a database with no rows in it. The direct
-#     comparison catches this one; nothing else did.
-#   Mirror stores cleared, PostgreSQL kept: the backfill re-runs and replays
-#     into rows that already exist, so every replay is answered "already there"
-#     and rows written by an older build keep whatever creation instant they
-#     were given. The comparison does **not** catch this: it compares which
-#     snapshots each catalog holds, not what the rows say.
-#
-# 🔴 ROLLING `read` BACK. Moving read from "postgres" to "object_store" is
-# refused while object storage still owes writes, because those are snapshots it
-# would answer as absent — and callers delete artifacts and refuse resumes on
-# absence. A node in that state now drains what it owes before the refusal is
-# decided, so the ordinary rollback just works. If it still refuses, the drain
-# could not finish, and the move that looks obvious — start the node so the
-# compensator runs — is the one that does not work: the compensator starts after
-# the refusal, so a node that will not start never drains.
-#
-# The way out, in order:
-#   1. put `read` back to the side the node was last serving ("postgres") and
-#      start it. The compensator runs once it is up.
-#   2. wait for agentenv_snapshot_catalog_mirror_lag{direction="object_store"}
-#      and ..._diverged{direction="object_store"} to reach 0.
-#   3. set read = "object_store" and restart.
-# A recorded divergence is not debt and no replay clears it; it takes deleting
-# the snapshot it names, or an operator.
+# 🔴 AENV_SNAPSHOT_CATALOG_WRITE and AENV_SNAPSHOT_CATALOG_READ are REMOVED, and
+# a process that finds either of them set exits at startup with an error naming
+# it. They chose between the two catalogs while the catalog was moving; there is
+# one catalog now, so a manifest that still carries them describes an
+# arrangement this build does not have. The refusal is deliberate: confique
+# ignores an environment variable no field declares, so leaving them set would
+# otherwise be silent, and an operator would go on believing the catalog is
+# where the variable says it is. AENV_SNAPSHOT_CATALOG_MIRROR_PATH is refused
+# the same way — the double write's queue is gone with the double write.
 #
 # 🔴 build_heartbeat_interval_secs must stay comfortably below the scheduler's
 # scheduler.catalog.build_heartbeat_ttl (5 minutes by default). A build that
@@ -577,11 +535,8 @@ p2p_enabled = true
 # interval, which its TTL floor is computed from — change one, change both.
 #
 # [snapshot.catalog]
-# write = "object_store"
-# read = "object_store"
-# mirror_compensator_interval_secs = 30
+# max_concurrent_builds = 20
 # build_heartbeat_interval_secs = 100
-# mirror_backlog_path = "$AENV_HOME/snapshot-catalog-mirror"
 
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.

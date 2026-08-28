@@ -229,8 +229,13 @@ impl CentralSnapshotCatalog {
     /// [`connect_lazy`](Self::connect_lazy), but the endpoint can be
     /// hot-reloaded from `[cluster].scheduler_endpoint_file` (or its
     /// deprecated fallback) while the process runs — see
-    /// [`SchedulerEndpointSource::spawn_from_config`]. This is what
-    /// `build_central_catalog` uses.
+    /// [`SchedulerEndpointSource::spawn_from_config`].
+    ///
+    /// 🔴 No production caller since the snapshot catalog became PostgreSQL
+    /// alone: `build_snapshot_backend` takes the catalog `aenv-api` builds over
+    /// `[pg]` and there is no gRPC arm left to choose. What still exercises
+    /// this client is `crates/aenv-node/tests/snapshot_catalog.rs` against a
+    /// real `services/scheduler`.
     pub fn connect_hot_reloadable(
         endpoint: &str,
         cluster: &crate::cfg::ClusterConfig,

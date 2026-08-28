@@ -427,3 +427,362 @@ pub fn write_mock_built_artifacts(
 
     Ok((rootfs_lower, memory_lower, manifest))
 }
+
+/// A whole snapshot catalog, in memory.
+///
+/// # 🔴 Why this exists
+///
+/// PostgreSQL is the only snapshot catalog there is, and it lives in
+/// `aenv-api`. A test that wants to exercise the *byte* half — the POSIX and
+/// OSS artifact stores, the runtime resolver, `SnapshotManager`'s
+/// stage/commit/delete flow — still needs a catalog behind it to publish
+/// through, and it cannot use the real one: `aenv-node` links no `sqlx`, and
+/// half of these tests live in that crate.
+///
+/// Until the object-storage catalog was deleted those tests used
+/// `PosixFsCatalogStore` as their catalog, incidentally, because it happened to
+/// sit in the same backend. This is the deliberate replacement, and its
+/// semantics are that store's: the alias rules, the `AliasConflict` a rebind
+/// over a live row produces, the build-status transitions, and
+/// `retains_artifacts_on_publish_failure` returning true for an id that is
+/// already committed — which is what stops a failed re-publish from deleting a
+/// live snapshot's bytes.
+///
+/// Not a production type and not a substitute for one: no durability, no
+/// locking beyond one `Mutex`, no cluster.
+#[derive(Debug, Default)]
+pub struct InMemorySnapshotCatalog {
+    rows: std::sync::Mutex<std::collections::HashMap<String, SnapshotRecord>>,
+    aliases: std::sync::Mutex<std::collections::HashMap<String, SnapshotId>>,
+}
+
+impl InMemorySnapshotCatalog {
+    /// The byte half the caller built, under a catalog a test can publish
+    /// through. `repository.artifacts()` is kept; its catalog is replaced.
+    pub fn in_front_of(repository: &SnapshotRepository) -> Arc<SnapshotRepository> {
+        Arc::new(SnapshotRepository::new(
+            Arc::new(Self::default()),
+            repository.artifacts(),
+        ))
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// The alias rule both writes share: rebinding a name a *live* row holds is
+    /// a conflict; rebinding one whose row is gone is a stale entry to clear.
+    fn claim_alias(
+        &self,
+        alias: &super::SnapshotAlias,
+        new_id: &SnapshotId,
+    ) -> RepositoryResult<()> {
+        let rows = self.rows.lock().expect("rows");
+        let mut aliases = self.aliases.lock().expect("aliases");
+        if let Some(existing) = aliases.get(&alias.to_string()).cloned() {
+            if &existing == new_id {
+                return Ok(());
+            }
+            if rows.contains_key(&existing.to_string()) {
+                return Err(RepositoryError::AliasConflict {
+                    alias: alias.to_string(),
+                    existing,
+                    new_id: new_id.clone(),
+                });
+            }
+            aliases.remove(&alias.to_string());
+        }
+        aliases.insert(alias.to_string(), new_id.clone());
+        Ok(())
+    }
+
+    fn matches(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
+        use super::{SnapshotSource, SnapshotSourceKind};
+
+        if let Some(prefix) = filter.alias_prefix.as_deref() {
+            match record.alias.as_ref() {
+                Some(alias) if alias.to_string().starts_with(prefix) => {}
+                _ => return false,
+            }
+        }
+        if let Some(ids) = filter.snapshot_ids.as_ref() {
+            if !ids.iter().any(|id| id == &record.id) {
+                return false;
+            }
+        }
+        if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
+            if record.id.to_string() != id_or_alias
+                && record
+                    .alias
+                    .as_ref()
+                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
+            {
+                return false;
+            }
+        }
+        if let Some(sandbox) = filter.source_sandbox_id.as_deref() {
+            match &record.source {
+                SnapshotSource::Sandbox { source_sandbox_id } if source_sandbox_id == sandbox => {}
+                _ => return false,
+            }
+        }
+        if let Some(sources) = filter.sources.as_ref() {
+            let kind = match &record.source {
+                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
+                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
+            };
+            if !sources.contains(&kind) {
+                return false;
+            }
+        }
+        if let Some(statuses) = filter.template_statuses.as_ref() {
+            let SnapshotSource::Template { build } = &record.source else {
+                return false;
+            };
+            if !statuses.contains(&build.status) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[async_trait]
+impl SnapshotCatalog for InMemorySnapshotCatalog {
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        use super::SnapshotSource;
+
+        if !matches!(record.source, SnapshotSource::Template { .. }) {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "only template snapshots can be pre-created".to_string(),
+            });
+        }
+        if record.committed.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "pre-created template snapshots must not already be committed".to_string(),
+            });
+        }
+        if self
+            .rows
+            .lock()
+            .expect("rows")
+            .contains_key(&record.id.to_string())
+        {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' already exists", record.id),
+            });
+        }
+        if let Some(alias) = record.alias.as_ref() {
+            self.claim_alias(alias, &record.id)?;
+        }
+        self.rows
+            .lock()
+            .expect("rows")
+            .insert(record.id.to_string(), record.clone());
+        Ok(record)
+    }
+
+    async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+        use super::{
+            SnapshotPublishSource, SnapshotSource, TemplateBuildInfo, TemplateBuildStatus,
+        };
+
+        let now = Self::now_ms();
+        if let Some(alias) = commit.alias.as_ref() {
+            self.claim_alias(alias, &commit.id)?;
+        }
+
+        let existing = self
+            .rows
+            .lock()
+            .expect("rows")
+            .get(&commit.id.to_string())
+            .cloned();
+        let record = match existing {
+            Some(mut record) => {
+                record.mark_committed(
+                    commit.alias.clone(),
+                    commit.resources,
+                    commit.committed.clone(),
+                    commit.source.clone(),
+                    now,
+                );
+                record
+            }
+            None => {
+                let source = match commit.source.clone() {
+                    SnapshotPublishSource::Template => SnapshotSource::Template {
+                        build: TemplateBuildInfo {
+                            status: TemplateBuildStatus::Ready,
+                            started_at_unix_ms: None,
+                            finished_at_unix_ms: Some(now),
+                            error_reason: None,
+                        },
+                    },
+                    SnapshotPublishSource::Sandbox { source_sandbox_id } => {
+                        SnapshotSource::Sandbox { source_sandbox_id }
+                    }
+                };
+                SnapshotRecord {
+                    id: commit.id.clone(),
+                    alias: commit.alias.clone(),
+                    source,
+                    resources: commit.resources,
+                    created_at_unix_ms: commit.created_at_unix_ms.unwrap_or(now),
+                    updated_at_unix_ms: now,
+                    committed: Some(commit.committed.clone()),
+                }
+            }
+        };
+        self.rows
+            .lock()
+            .expect("rows")
+            .insert(record.id.to_string(), record.clone());
+        Ok(record)
+    }
+
+    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        if let Some(record) = self.rows.lock().expect("rows").get(id_or_alias).cloned() {
+            return Ok(Some(record));
+        }
+        let Some(id) = self
+            .aliases
+            .lock()
+            .expect("aliases")
+            .get(id_or_alias)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .rows
+            .lock()
+            .expect("rows")
+            .get(&id.to_string())
+            .cloned())
+    }
+
+    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+        let mut records: Vec<SnapshotRecord> = self
+            .rows
+            .lock()
+            .expect("rows")
+            .values()
+            .filter(|record| Self::matches(record, &filter))
+            .cloned()
+            .collect();
+        records.sort_by(|left, right| {
+            right
+                .created_at_unix_ms
+                .cmp(&left.created_at_unix_ms)
+                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+        });
+        Ok(records)
+    }
+
+    async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+        self.rows
+            .lock()
+            .expect("rows")
+            .remove(&record.id.to_string());
+        if let Some(alias) = record.alias.as_ref() {
+            let mut aliases = self.aliases.lock().expect("aliases");
+            if aliases.get(&alias.to_string()) == Some(&record.id) {
+                aliases.remove(&alias.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        let Some(id) = self.aliases.lock().expect("aliases").get(alias).cloned() else {
+            return Ok(None);
+        };
+        if self
+            .rows
+            .lock()
+            .expect("rows")
+            .contains_key(&id.to_string())
+        {
+            return Ok(Some(id));
+        }
+        self.aliases.lock().expect("aliases").remove(alias);
+        Ok(None)
+    }
+
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<StartedBuild> {
+        use super::repository::interfaces::build_may_start_from;
+        use super::{SnapshotSource, TemplateBuildStatus};
+
+        let mut rows = self.rows.lock().expect("rows");
+        let record =
+            rows.get_mut(&id.to_string())
+                .ok_or_else(|| RepositoryError::SnapshotNotFound {
+                    lookup: id.to_string(),
+                })?;
+        let now = Self::now_ms();
+        let SnapshotSource::Template { build } = &mut record.source else {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{id}' is not a template build"),
+            });
+        };
+        if !build_may_start_from(build.status) {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!(
+                    "template build '{id}' cannot start from {:?}: only a template that has \
+                     never been built or whose last build failed may be built",
+                    build.status
+                ),
+            });
+        }
+        build.status = TemplateBuildStatus::Building;
+        build.started_at_unix_ms = Some(now);
+        build.error_reason = None;
+        record.updated_at_unix_ms = now;
+        Ok(StartedBuild::untracked(record.clone()))
+    }
+
+    async fn mark_build_error(
+        &self,
+        id: &SnapshotId,
+        reason: super::TemplateBuildErrorReason,
+    ) -> RepositoryResult<()> {
+        use super::{SnapshotSource, TemplateBuildStatus};
+
+        let mut rows = self.rows.lock().expect("rows");
+        let record =
+            rows.get_mut(&id.to_string())
+                .ok_or_else(|| RepositoryError::SnapshotNotFound {
+                    lookup: id.to_string(),
+                })?;
+        let now = Self::now_ms();
+        let SnapshotSource::Template { build } = &mut record.source else {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{id}' is not a template build"),
+            });
+        };
+        build.status = TemplateBuildStatus::Error;
+        build.finished_at_unix_ms = Some(now);
+        build.error_reason = Some(reason);
+        record.updated_at_unix_ms = now;
+        Ok(())
+    }
+
+    /// 🔴 True for an id that is already committed, matching the POSIX catalog
+    /// this replaced: a failed re-publish over a live snapshot must not take
+    /// that snapshot's bytes with it.
+    async fn retains_artifacts_on_publish_failure(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<bool> {
+        Ok(self
+            .rows
+            .lock()
+            .expect("rows")
+            .get(&id.to_string())
+            .is_some_and(|record| record.committed.is_some()))
+    }
+}

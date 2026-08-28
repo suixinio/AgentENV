@@ -3,12 +3,12 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::super::storage::shared_runtime_cache_root;
-use super::catalog::PosixFsCatalogStore;
 use super::import::PosixFsArtifactImporter;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::no_catalog::NoSnapshotCatalog;
 use crate::snapshot::repository::SnapshotRepository;
 
 #[derive(Clone, Debug)]
@@ -90,10 +90,16 @@ impl PosixFsBackend {
     }
 }
 
-/// Composes a POSIX repository out of its two halves, both rooted at `root`.
+/// Composes a POSIX repository out of the importing byte half rooted at
+/// `root`, and no catalog.
+///
+/// 🔴 `NoSnapshotCatalog`, and this is the whole of what a node holds. Rows
+/// are PostgreSQL's and PostgreSQL is `aenv-api`'s; a node stages bytes and
+/// hands a `StagedSnapshot` back for the deciding half to commit. See
+/// `no_catalog`'s own module doc.
 pub fn posixfs_repository(root: &std::path::Path) -> SnapshotRepository {
     SnapshotRepository::new(
-        Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
+        Arc::new(NoSnapshotCatalog),
         Arc::new(PosixFsArtifactImporter::new(root.to_path_buf())),
     )
 }
@@ -112,13 +118,14 @@ mod tests {
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::mock::InMemorySnapshotCatalog;
     use crate::snapshot::repository::{
         RepositoryError, SnapshotRepository, SnapshotRuntimeResolver,
     };
     use crate::snapshot::{
         CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId,
         SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-        TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
+        SNAPSHOT_ARTIFACT_LAYOUT,
     };
     use crate::types::{ExtraDrive, FirecrackerSnapshotManifest};
 
@@ -176,6 +183,15 @@ mod tests {
         PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
     }
 
+    /// 🔴 The byte half `posixfs_repository` builds, under a catalog a test
+    /// can publish through. That function carries `NoSnapshotCatalog` — the
+    /// node holds no catalog — so a test that only wants to exercise the POSIX
+    /// *artifact* store has to supply one; see
+    /// `InMemorySnapshotCatalog`'s own doc for why it is this one.
+    fn catalogued(repository: &SnapshotRepository) -> Arc<SnapshotRepository> {
+        InMemorySnapshotCatalog::in_front_of(repository)
+    }
+
     fn test_repository(root: &Path) -> SnapshotRepository {
         posixfs_repository(root)
     }
@@ -217,7 +233,7 @@ mod tests {
     async fn publishes_gets_and_resolves_snapshot() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let backend = test_backend(tempdir.path());
-        let repository = backend.repository();
+        let repository = catalogued(&backend.repository());
         let resolver = backend.runtime_resolver();
         let snapshot_id = SnapshotId::generate();
         let local_artifacts = seed_built_snapshot(tempdir.path());
@@ -255,7 +271,7 @@ mod tests {
     async fn failed_commit_cleans_uncommitted_snapshot_directory() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let repository_root = tempdir.path().to_path_buf();
-        let repository = test_backend(tempdir.path()).repository();
+        let repository = catalogued(&test_backend(tempdir.path()).repository());
 
         let first_id = SnapshotId::generate();
         let local_artifacts = seed_built_snapshot(tempdir.path());
@@ -294,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn failed_republish_keeps_the_committed_snapshot_it_was_overwriting() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_backend(tempdir.path()).repository();
+        let repository = catalogued(&test_backend(tempdir.path()).repository());
 
         let committed_id = SnapshotId::generate();
         repository
@@ -348,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_committed_snapshot_directory() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_backend(tempdir.path()).repository();
+        let repository = catalogued(&test_backend(tempdir.path()).repository());
         let snapshot_id = SnapshotId::generate();
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let metadata = sample_metadata(snapshot_id.clone(), Some("cleanup"));
@@ -383,46 +399,6 @@ mod tests {
                 .expect("get after delete should work")
                 .is_none(),
             "deleted snapshot should no longer be visible"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_removes_failed_template_build_record() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_backend(tempdir.path()).repository();
-        let snapshot_id = SnapshotId::generate();
-        let record =
-            SnapshotRecord::template_waiting(snapshot_id.clone(), None, Default::default());
-
-        repository.create(record).await.expect("create should work");
-        repository
-            .mark_build_error(&snapshot_id, TemplateBuildErrorReason::new("boom"))
-            .await
-            .expect("mark error should work");
-
-        let record_path = tempdir
-            .path()
-            .join("catalog")
-            .join("records")
-            .join(format!("{snapshot_id}.json"));
-        assert!(record_path.exists(), "failed build record should exist");
-
-        repository
-            .delete(&snapshot_id.to_string())
-            .await
-            .expect("delete should work");
-
-        assert!(
-            !record_path.exists(),
-            "delete should remove failed build record"
-        );
-        assert!(
-            repository
-                .get(&snapshot_id.to_string())
-                .await
-                .expect("get after delete should work")
-                .is_none(),
-            "deleted failed build should no longer be visible"
         );
     }
 

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::catalog::OssSnapshotCatalog;
 use super::config::NormalizedOssConfig;
 use super::durable::{oss_durable_parts, OssDurableParts};
 use super::import;
@@ -17,6 +16,7 @@ use crate::image::cache::{local_image_services_from_global_config, OverlaybdLaye
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::no_catalog::NoSnapshotCatalog;
 use crate::snapshot::repository::SnapshotRepository;
 
 /// OSS-backed snapshot backend.
@@ -62,10 +62,10 @@ impl OssBackend {
         } = oss_durable_parts(config, snapshot_image_storage)?;
         // 🔴 Not `oss_durable_parts`' repository. That one carries the
         // delete-only artifact half; this process holds bytes and has to be
-        // able to import them, so it composes the same catalog with the
-        // importing half.
+        // able to import them, so it composes the importing half instead.
+        // Neither carries a catalog — see `no_catalog`'s own module doc.
         let repository = Arc::new(SnapshotRepository::new(
-            Arc::new(OssSnapshotCatalog::new(Arc::clone(&client))),
+            Arc::new(NoSnapshotCatalog),
             Arc::new(import::OssSnapshotArtifactImporter::new(
                 Arc::clone(&client),
                 NormalizedOssConfig::new(config, snapshot_image_storage)?.snapshot_image_storage(),

@@ -86,60 +86,24 @@ spec:
                   name: paused-registry-config
                   key: AENV_PAUSED_REGISTRY_BACKEND
                   optional: true
-            # 阶段 2c / Stage B: which catalog this node writes, and which one
-            # it reads. Now `postgres`/`postgres` — see the note on
-            # snapshot-catalog-config in kustomization.yaml for the values, the
-            # three-step route that reached them, and why the way back is not
-            # symmetric.
+            # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
+            # setting them would now stop this Pod at startup
+            # (`refuse_removed_catalog_env_vars`, src/cfg.rs). 阶段 2c / Stage B
+            # finished: PostgreSQL is the snapshot catalog, and the section that
+            # configures it belongs to the api half alone — this half links no
+            # PostgreSQL client at all and refuses to start if that section is
+            # configured for it (see TestDaemonSetNeverReadsPg, which is why
+            # this note may not spell the section's name).
             #
-            # 🔴 Under `write = "postgres"` this half builds no central catalog
-            # at all: `build_snapshot_backend` takes
-            # `CentralCatalogUse::Never`'s early return (aenv-node links no
-            # sqlx and never queries a central catalog — api pre-resolves both
-            # of its request-time reads and sends them down with the request).
-            # What the pair still decides here is that this node's fallback
-            # read side matches api's, and that `aenv-snapshot-image` refuses
-            # to export from the now-frozen object-storage catalog
-            # (`ensure_object_store_catalog_is_current`).
-            #
-            # 🔴 Both halves of the cluster read the same two keys from the same
-            # ConfigMap, and a test in `services/shared/config` fails if they
-            # stop doing so. The node and the api Deployment answering
-            # snapshot lookups out of two different catalogs is the split this
-            # is here to prevent, and neither process can detect it: a read of
-            # the catalog that lacks a row does not fail, it answers "no such
-            # snapshot", and callers delete artifacts and refuse resumes on
-            # absence.
-            #
-            # 🔴 These were `kubectl set env` on the live DaemonSet before they
-            # were here, so the drift ran in the quiet direction: an `apply -k`
-            # dropped them, this node fell back to object_store/object_store
-            # (src/cfg.rs), and the scheduler went on treating PostgreSQL as
-            # authoritative. `optional: true` survives on both because losing
-            # *either* key alone now produces a pair
-            # `AppConfig::validate_snapshot_catalog` refuses at startup
-            # (object_store+postgres and postgres+object_store are both
-            # illegal), so the half-applied case is loud in either direction.
-            #
-            # 🔴 What is no longer true is that the both-keys-together fallback
-            # is harmless. It lands on object_store/object_store, which is
-            # still legal, but object storage stopped receiving catalog writes
-            # at the cutover — so that fallback now reads a catalog missing
-            # every snapshot published since, and absence is what callers act
-            # on. Under `write = "both"` the same fallback read a complete
-            # copy. Do not treat `optional` here as a safety net any more.
-            - name: AENV_SNAPSHOT_CATALOG_WRITE
-              valueFrom:
-                configMapKeyRef:
-                  name: snapshot-catalog-config
-                  key: AENV_SNAPSHOT_CATALOG_WRITE
-                  optional: true
-            - name: AENV_SNAPSHOT_CATALOG_READ
-              valueFrom:
-                configMapKeyRef:
-                  name: snapshot-catalog-config
-                  key: AENV_SNAPSHOT_CATALOG_READ
-                  optional: true
+            # 🔴 So this node holds no catalog at all. Its repository carries
+            # `NoSnapshotCatalog` (src/snapshot/repository/no_catalog.rs), which
+            # *refuses* every catalog call rather than answering it. That is the
+            # point: until this change the node carried the object-storage
+            # catalog, and after the cutover that catalog answered "no such
+            # snapshot" for everything published since — absence, which callers
+            # act on by deleting artifacts and refusing resumes. A node's two
+            # request-time reads are pre-resolved by api and sent down with the
+            # request, and the row for a snapshot it captures is written by api.
             # Which durable snapshot repository this node keeps, and where the
             # half of its configuration that cannot be in this repository comes
             # from. See the note on snapshot-storage-config in

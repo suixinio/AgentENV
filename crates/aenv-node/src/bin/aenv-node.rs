@@ -87,19 +87,20 @@ const NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The machine-local runtime this binary owns: the two P2P pieces it
 /// holds by value, the process-wide Firecracker pool and ublk daemon it
-/// reaches through their globals, and a handle onto the snapshot manager kept
-/// only so shutdown can close its durable mirror-backlog store.
+/// reaches through their globals.
 ///
 /// 🔴 Held as a whole rather than as independent handles so that the teardown
-/// order — pool, ublk, overlaybd P2P, transport, then the two RocksDB stores
-/// this bundle can reach — stays in one place.
+/// order — pool, ublk, overlaybd P2P, transport, then the RocksDB store this
+/// bundle can reach — stays in one place.
+///
+/// 🔴 It used to also hold the snapshot manager, for one call: closing the
+/// double write's durable mirror backlog. That store is gone with the double
+/// write — the snapshot catalog is PostgreSQL, which owns no node-local
+/// RocksDB — so the handle and the call went with it rather than being kept as
+/// a no-op somebody's shutdown guard would go on asserting.
 struct NodeRuntime {
     overlaybd_p2p: OverlaybdP2pRuntime,
     p2p_transport: Arc<dyn P2pTransport>,
-    /// Not otherwise used here: every operational use of the manager goes
-    /// through the `Arc` clone `assemble_node_core`'s caller wires into
-    /// `ApiImpl`. This clone exists only for `close_stores` below.
-    snapshot_manager: Arc<SnapshotManager>,
 }
 
 #[async_trait::async_trait]
@@ -164,18 +165,14 @@ impl ProcessRuntime for NodeRuntime {
             }
         }
 
-        // 🔴 The two RocksDB stores this bundle can still reach. Neither call
-        // drops the underlying store — both only stop its background
+        // 🔴 The RocksDB store this bundle can still reach. The call does not
+        // drop the underlying store — it only stops its background
         // compaction/flush ahead of time (see `LocalKvStore::close`) — so this
         // is safe even while other clones of the same store (the image cache's
         // shared-instance registry, in particular) are still live elsewhere in
         // the process.
         info!(target: "agentenv", "closing image cache metadata store");
         aenv_node::image::close_image_cache_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT).await;
-        info!(target: "agentenv", "closing snapshot catalog mirror backlog store");
-        self.snapshot_manager
-            .close_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT)
-            .await;
     }
 }
 
@@ -234,6 +231,14 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     aenv_node::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
+
+    // 🔴 Before the configuration is read, because what this refuses is a
+    // *manifest* that has not been migrated rather than a value in a file.
+    // confique silently ignores an environment variable no field declares, so
+    // an un-migrated workload would otherwise start looking perfectly healthy
+    // while its operator believes the snapshot catalog is somewhere it is not.
+    // Same decision `--role`/`AENV_ROLE` got when one binary became two.
+    aenv_node::cfg::refuse_removed_catalog_env_vars()?;
 
     let cli = NodeCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
@@ -354,10 +359,12 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
         Arc::new(aenv_node::snapshot::P2pSnapshotAdvertiser::new(transport))
             as Arc<dyn aenv_node::snapshot::SnapshotArtifactAdvertiser>
     });
-    // 🔴 `None` for the PostgreSQL parts, unconditionally and by construction:
-    // this half never holds a `[pg]` pool (see `refuse_configured_pg_dsn`
-    // above, and the dependency graph it is a belt over), so there is nothing
-    // for it to build a central catalog out of.
+    // 🔴 `None` for the PostgreSQL catalog, unconditionally and by
+    // construction: this half never holds a `[pg]` pool (see
+    // `refuse_configured_pg_dsn` above, and the dependency graph it is a belt
+    // over), so there is nothing for it to build a catalog out of — and under
+    // `CentralCatalogUse::Never` it needs none. A node stages bytes; the row is
+    // api's to write.
     let snapshot_backend = aenv_node::snapshot::repository::backends::build_snapshot_backend(
         aenv_node::snapshot::repository::backends::storage::build_node_storage(
             config,
@@ -365,8 +372,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
         )?,
         None,
         aenv_node::snapshot::repository::backends::CentralCatalogUse::Never,
-    )
-    .await?;
+    )?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(
         snapshot_backend,
         snapshot_advertiser,
@@ -446,14 +452,9 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
         None
     };
 
-    // Cloned before `snapshot_manager` moves into `NodeCore` below: the
-    // shutdown path needs its own handle to close the manager's stores, kept
-    // separately from whatever the caller does with the `NodeCore` field (move
-    // it into `ApiImpl`, which is what its one caller does).
     let runtime = NodeRuntime {
         overlaybd_p2p,
         p2p_transport,
-        snapshot_manager: Arc::clone(&snapshot_manager),
     };
 
     Ok(NodeCore {
@@ -700,7 +701,7 @@ mod tests {
     }
 
     /// 🔴 Guards the shutdown bounds `NodeRuntime::shutdown` and `main` are
-    /// each responsible for. Every one of the three calls this asserts on can
+    /// each responsible for. Either of the two calls this asserts on can
     /// be deleted without a single one of this binary's other tests noticing
     /// — nothing exercises the real graceful-shutdown path under test — so
     /// this scans the source text directly.
@@ -718,8 +719,14 @@ mod tests {
     /// without it a stuck `spawn_blocking` closure (RocksDB background
     /// compaction/flush, observed on nodes that had actually run a VM) hangs
     /// the process well past `terminationGracePeriodSeconds` — and
-    /// [`NodeRuntime::shutdown`]'s own doc for why the two store closes come
+    /// [`NodeRuntime::shutdown`]'s own doc for why the store close comes
     /// before that backstop rather than relying on it.
+    ///
+    /// 🔴 This asserted on three calls until the snapshot catalog moved wholly
+    /// into PostgreSQL. The third was `SnapshotManager::close_stores`, whose
+    /// only real work was closing the double write's mirror backlog; with that
+    /// store gone the call was a no-op, and an assertion pinning a no-op is a
+    /// guard that reports green whatever happens. Both were deleted together.
     #[test]
     fn the_shutdown_bounds_are_still_wired() {
         let source = include_str!("aenv-node.rs");
@@ -750,12 +757,6 @@ mod tests {
             "NodeRuntime::shutdown no longer closes the image cache metadata store's RocksDB \
              handle before process exit"
         );
-        assert!(
-            shutdown.contains("close_stores"),
-            "NodeRuntime::shutdown no longer closes the snapshot manager's RocksDB stores \
-             before process exit"
-        );
-
         let main = body("fn main() -> anyhow::Result<()>");
         assert!(
             main.contains("shutdown_timeout"),
@@ -828,6 +829,63 @@ mod tests {
             "the scan is reading something other than async_main's body — \
              `refuse_configured_pg_dsn(dsn` is the definition's own parameter list, which is \
              outside it"
+        );
+    }
+
+    /// The body of the named item in this file's own source text.
+    ///
+    /// Shared by the call-site guards below, which scan rather than execute:
+    /// deleting a call site is a change no unit test of the called function
+    /// can see.
+    fn body_of(source: &str, name: &str) -> String {
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} is no longer in this file"));
+        let open = source[start..].find('{').expect("a body") + start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[open..open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{name} has no closing brace");
+    }
+
+    /// 🔴 This binary actually refuses a manifest that still sets one of the
+    /// removed snapshot-catalog switches.
+    ///
+    /// `refuse_removed_catalog_env_vars` has its own two-direction test in
+    /// `src/cfg.rs`, and that test stays green with the call site deleted —
+    /// which is the whole failure mode: confique ignores an undeclared
+    /// environment variable, so a `AENV_SNAPSHOT_CATALOG_WRITE=both` left in a
+    /// manifest would start a process that looks entirely healthy while its
+    /// operator believes the catalog is double-written. It is not, and nothing
+    /// would say so.
+    #[test]
+    fn async_main_actually_refuses_the_removed_catalog_switches() {
+        let source = include_str!("aenv-node.rs");
+        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
+        assert!(
+            async_main.contains("cfg::refuse_removed_catalog_env_vars()"),
+            "async_main no longer refuses AENV_SNAPSHOT_CATALOG_WRITE / _READ; an un-migrated \
+             manifest would then start in silence, and src/cfg.rs's own test of the pure \
+             function would still report green"
+        );
+        // 🔴 The mutation control: the scan has to be able to fail. A `body_of`
+        // that returned the whole file would satisfy the assertion above for
+        // the wrong reason, and `async fn async_main` sits before the body's
+        // opening brace, so a correct extraction never contains it.
+        assert!(
+            !async_main.contains("async fn async_main"),
+            "the scan is reading more than async_main's body, so the assertion above proves \
+             nothing about where the call actually is"
         );
     }
 }

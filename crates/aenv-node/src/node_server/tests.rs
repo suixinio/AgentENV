@@ -3097,8 +3097,14 @@ async fn a_built_templates_metadata_survives_stage_encode_decode_and_commit() {
     })
     .expect("posix backend");
     let (repository, runtime_resolver) = backend.into_parts();
-    let snapshot_manager =
-        crate::snapshot::SnapshotManager::from_parts(repository, Some(runtime_resolver), None);
+    // 🔴 The catalog is the test's, standing in for `aenv-api`. This test spans
+    // both halves on purpose — a node stages and encodes, the committer decodes
+    // and commits — and a node's own repository refuses every catalog call.
+    let snapshot_manager = crate::snapshot::SnapshotManager::from_parts(
+        crate::snapshot::mock::InMemorySnapshotCatalog::in_front_of(&repository),
+        Some(runtime_resolver),
+        None,
+    );
 
     let artifacts_workspace = tempfile::tempdir().expect("tempdir");
     let (_, _, manifest): (_, _, FirecrackerSnapshotManifest) =

@@ -80,9 +80,11 @@ aenv-snapshot-image <snapshot-id-or-alias> \
   [--target-repository registry.example.com/team/app] [--tag release-1]
 ```
 
-It reads the server config (`AENV_CONFIG_PATH` or `--config`) for the
-`posix_fs`/`oss` snapshot repository and does all registry I/O through
-`regctl` (`docker login` provides credentials). An explicit
+It reads the server config (`AENV_CONFIG_PATH` or `--config`) for two things:
+`[pg]`, where the snapshot catalog is, and the `posix_fs`/`oss` snapshot
+repository, where the rootfs layer bytes are. `[pg]` is required — the catalog
+is PostgreSQL and there is no other — and the tool refuses to run without it.
+All registry I/O goes through `regctl` (`docker login` provides credentials). An explicit
 `--target-repository` defaults to the `latest` tag. When the target is omitted,
 the tool resolves the original repository from the snapshot's rootfs
 publication metadata, or from its unique external source, and defaults to
@@ -134,16 +136,14 @@ says what it is:
 curl -X DELETE -H "X-Admin-Token: $TOKEN" "$API/snapshots/<snapshot-id-or-name>"
 ```
 
-It removes the catalog row from **every** catalog — under `write = "both"` that
-is PostgreSQL and object storage, one of them from the mirror queue if it cannot
-be reached now — then the alias bound to the snapshot, then the artifacts. Rows
-at every status, so a template that never built (`waiting`) or whose build
-failed (`error`) can be removed too. A snapshot no catalog holds answers 404
-rather than 204, so a mistyped id says so.
+It removes the catalog row from PostgreSQL, then the alias bound to the
+snapshot, then the artifacts. Rows at every status, so a template that never
+built (`waiting`) or whose build failed (`error`) can be removed too. A snapshot
+the catalog does not hold answers 404 rather than 204, so a mistyped id says so.
 
 Deleting a row straight out of PostgreSQL is not the same operation: it leaves
-object storage holding a snapshot the database does not, which is the population
-divergence the read-side switch refuses to move over. Use the API.
+the artifacts behind in object storage with nothing naming them, and no route
+back to finding them. Use the API.
 
 Nothing calls this automatically, and it does not ask what depends on the
 snapshot. A paused sandbox's snapshot is that sandbox's only durable copy, and

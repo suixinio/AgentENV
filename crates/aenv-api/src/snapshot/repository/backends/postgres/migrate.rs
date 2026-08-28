@@ -15,7 +15,7 @@
 //! There is no down migration. A rollback is dropping what was created:
 //!
 //! ```text
-//! DROP TABLE IF EXISTS aliases, builds, templates, snapshots, catalog_migration_state CASCADE;
+//! DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;
 //! DROP TABLE IF EXISTS catalog_schema_migrations;
 //! ```
 //!
@@ -44,7 +44,7 @@
 //! the two ledgers agree because the SQL is identical. What neither
 //! `preflight` nor `verifyApplied` in Go was written to catch is a version
 //! number the *two* migration sets disagree about (a future Go migration and
-//! this build's `0004_catalog_migration_state.sql` both claiming version 4
+//! this build's `0005_drop_catalog_migration_state.sql` both claiming version 5
 //! but creating different things) — `verify_applied` below still catches
 //! that, generalised rather than narrowed to rollbacks: it checks every
 //! recorded version's *own* relations exist, not only versions this build
@@ -86,10 +86,22 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_disk_size_known_at_ready.sql",
         body: include_str!("migrations/0003_disk_size_known_at_ready.sql"),
     },
+    // 🔴 4 creates `catalog_migration_state` and 5 drops it again. 4 is history
+    // — the read-side confirmation gate it recorded for is gone with the
+    // object-storage catalog — but it is kept applying rather than deleted
+    // because this array is checked for density
+    // (`migrations_are_ordered_and_versions_are_dense`, and `apply` trusts the
+    // order instead of sorting), and because a cluster already at version 4 has
+    // the table: 5 is what removes it there.
     Migration {
         version: 4,
         name: "0004_catalog_migration_state.sql",
         body: include_str!("migrations/0004_catalog_migration_state.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "0005_drop_catalog_migration_state.sql",
+        body: include_str!("migrations/0005_drop_catalog_migration_state.sql"),
     },
 ];
 
@@ -201,7 +213,12 @@ const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
     (1, &["snapshots"]),
     (2, &["templates", "builds", "aliases", "active_templates"]),
     (3, &[]),
-    (4, &["catalog_migration_state"]),
+    // 🔴 Version 4 created `catalog_migration_state` and 5 drops it again, so
+    // neither owns a relation `verify_applied` may demand: a database that
+    // applied both has the ledger rows and no table, and that is correct rather
+    // than the half-finished rollback that check exists to catch.
+    (4, &[]),
+    (5, &[]),
 ];
 
 fn owned_relations() -> Vec<&'static str> {
@@ -296,7 +313,7 @@ async fn verify_applied(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -
          catalog_schema_migrations itself: the next start is then told every version is applied, \
          creates nothing, and every catalog query then fails on a missing relation, permanently. \
          Refusing to continue in this state. Finish the rollback, then restart:\n\
-         \x20   DROP TABLE IF EXISTS aliases, builds, templates, snapshots, catalog_migration_state CASCADE;\n\
+         \x20   DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;\n\
          \x20   DROP TABLE IF EXISTS catalog_schema_migrations;",
         claimed.join(", "),
         missing.join(", ")
@@ -387,12 +404,11 @@ mod pg {
         .expect("querying information_schema should succeed")
     }
 
-    const OWNED_TABLES: [&str; 6] = [
+    const OWNED_TABLES: [&str; 5] = [
         "snapshots",
         "templates",
         "builds",
         "aliases",
-        "catalog_migration_state",
         "catalog_schema_migrations",
     ];
 
@@ -413,7 +429,7 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1, 2, 3, 4]);
+        assert_eq!(recorded, vec![1, 2, 3, 4, 5]);
     }
 
     #[tokio::test]
@@ -443,7 +459,7 @@ mod pg {
         migrate(&pool).await.expect("migration should succeed");
 
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots, catalog_migration_state CASCADE;\
+            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;\
              DROP TABLE IF EXISTS catalog_schema_migrations;",
         )
         .execute(&pool)
@@ -488,7 +504,7 @@ mod pg {
                 .expect("reading the ledger should succeed");
         assert_eq!(
             recorded,
-            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5],
             "no duplicate or missing ledger rows"
         );
     }
@@ -545,12 +561,10 @@ mod pg {
 
         // The rollback command's first line, without its second — the exact
         // mistake this guard exists to catch.
-        sqlx::raw_sql(
-            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots, catalog_migration_state CASCADE;",
-        )
-        .execute(&pool)
-        .await
-        .expect("dropping the four owned tables should succeed");
+        sqlx::raw_sql("DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;")
+            .execute(&pool)
+            .await
+            .expect("dropping the four owned tables should succeed");
 
         let error = migrate(&pool)
             .await

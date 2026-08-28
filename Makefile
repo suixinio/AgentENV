@@ -82,7 +82,7 @@ build-server-release:
 	$(CARGO) build --release -p aenv-node -p aenv-api --bin aenv-node --bin aenv-api
 
 build-snapshot-image:
-	$(CARGO) build -p aenv-node --bin aenv-snapshot-image
+	$(CARGO) build -p aenv-api --bin aenv-snapshot-image
 
 build-aenv:
 	$(CARGO) build -p aenv

@@ -4,11 +4,19 @@
 //! non-zero with a credential-free context chain. It never starts
 //! node-runtime machinery (KVM, ublk, network); registry authentication
 //! stays with the Docker config that `regctl` reads itself.
+//!
+//! 🔴 In `aenv-api` and not `aenv-node`, because the snapshot catalog is
+//! PostgreSQL and `[pg]` is this half's alone. It used to read the
+//! object-storage catalog directly from a node; object storage stopped holding
+//! catalog rows at the Stage B cutover, so that read would now answer "not
+//! found" for every snapshot published since — indistinguishable from a wrong
+//! snapshot id.
 
 use std::path::PathBuf;
 
-use aenv_node::cfg::ConfigManager;
-use aenv_node::snapshot::image_export::SnapshotImageService;
+use aenv_api::cfg::ConfigManager;
+use aenv_api::pg::{self, PgPoolSettings};
+use aenv_api::snapshot::image_export::SnapshotImageService;
 use anyhow::Context as _;
 use clap::Parser;
 
@@ -51,9 +59,26 @@ async fn main() -> anyhow::Result<()> {
         None => ConfigManager::init_global()
             .context("load AgentENV config (AENV_CONFIG_PATH or the default config path)")?,
     };
-    let service =
-        SnapshotImageService::from_global_config(config_manager.config().resolved_regctl_binary())
-            .context("initialize the snapshot repository export backend")?;
+    // 🔴 The snapshot catalog is PostgreSQL, so this tool needs `[pg]` — the
+    // same section `aenv-api` itself reads, and the reason this binary lives in
+    // that crate. Nothing here migrates the schema: the tool is read-only, and
+    // a schema this cluster's api replicas have not already created is a
+    // cluster with no snapshots to export.
+    let settings = PgPoolSettings::from_config(config_manager.config().pg.as_ref())?.context(
+        "[pg] is not configured, and the snapshot catalog is PostgreSQL: this tool reads one \
+         catalog row and then reaches the rootfs layer bytes, and it has nowhere to read that \
+         row from. Point [pg].dsn (or AENV_PG_DSN) at the same database the api replicas use",
+    )?;
+    let pool = pg::connect(&settings)
+        .await
+        .context("connect to the snapshot catalog database")?;
+
+    let service = SnapshotImageService::from_global_config(
+        &pool,
+        config_manager.config().resolved_regctl_binary(),
+    )
+    .await
+    .context("initialize the snapshot repository export backend")?;
 
     let lookup = cli.snapshot.clone();
     let result = service

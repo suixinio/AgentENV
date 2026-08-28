@@ -251,12 +251,10 @@ impl Admin<()> for ApiImpl {
     /// consequence — a sandbox being deleted, a pause superseding the snapshot
     /// it replaces — and nothing reaches a snapshot whose sandbox is already
     /// gone. Those accumulate, and until now the only way to remove one was a
-    /// `psql` prompt: a row deleted straight out of PostgreSQL leaves object
-    /// storage holding a snapshot the database does not, which is precisely the
-    /// population divergence `admit_read_side` and `guard_read_side` exist to
-    /// refuse a read-side switch over. This goes through the catalog, so under
-    /// `write = "both"` both stores lose the row — one of them from the mirror
-    /// queue, if it cannot be reached now.
+    /// `psql` prompt: a row deleted straight out of PostgreSQL leaves the
+    /// artifacts sitting in object storage with nothing naming them, and no
+    /// route left to find them. This goes through the catalog and then removes
+    /// the alias and the bytes.
     ///
     /// 🔴 Not wired into anything automatic, and it must not be. The one
     /// caller in the tree that deletes on its own judgement is a cross-node

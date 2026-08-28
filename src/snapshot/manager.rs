@@ -128,9 +128,6 @@ pub struct SnapshotManager {
     /// than unwrapping.
     runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
     advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
-    /// Held, not used. The replay of owed object-store writes stops when the
-    /// last handle is dropped, so it lives as long as the manager does.
-    _mirror_compensator: Option<Arc<crate::snapshot::repository::mirror::MirrorCompensator>>,
 }
 
 impl SnapshotManager {
@@ -143,9 +140,8 @@ impl SnapshotManager {
     /// function needs — including an `Option<sqlx::PgPool>` threaded through
     /// a type that has no business holding one. Each binary now assembles the
     /// backend its own half is allowed to build and hands the result here:
-    /// `aenv-node` supplies the byte half and no central catalog, `aenv-api`
-    /// supplies the catalog-only repository and, when `[pg]` is configured,
-    /// the PostgreSQL parts.
+    /// `aenv-node` supplies the byte half and no catalog at all, `aenv-api`
+    /// supplies the byte half plus the PostgreSQL catalog it alone can build.
     pub fn from_assembled(
         assembled: AssembledSnapshotBackend,
         advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
@@ -154,7 +150,6 @@ impl SnapshotManager {
             repository: assembled.repository,
             runtime_resolver: assembled.runtime_resolver,
             advertiser,
-            _mirror_compensator: assembled.mirror_compensator,
         }
     }
 
@@ -174,7 +169,6 @@ impl SnapshotManager {
             repository,
             runtime_resolver,
             advertiser,
-            _mirror_compensator: None,
         }
     }
 
@@ -183,19 +177,6 @@ impl SnapshotManager {
         record: SnapshotRecord,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         self.repository.create(record).await
-    }
-
-    /// Boundedly closes any durable local store this manager's repository
-    /// owns, ahead of process shutdown.
-    ///
-    /// 🔴 A no-op for every repository configuration except the dual-write
-    /// catalog's durable mirror backlog (`SnapshotCatalog::close`'s default is
-    /// a no-op; only `DualWriteCatalog` overrides it) — most deployments have
-    /// nothing here to close, and this call is safe and cheap regardless. See
-    /// `crate::local_store::LocalKvStore::close` for the mechanism this
-    /// exists to bound.
-    pub async fn close_stores(&self, timeout: std::time::Duration) {
-        self.repository.catalog().close(timeout).await;
     }
 
     #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]

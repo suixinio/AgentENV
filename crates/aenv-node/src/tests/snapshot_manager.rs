@@ -3,12 +3,21 @@
 //! 🔴 In `aenv-node`: every one of these builds a `PosixFsBackend`, whose
 //! importing half reads overlaybd layers and so lives in this crate. The
 //! manager itself is `aenv-core`'s and is driven through its public API.
+//!
+//! 🔴 And every one of them supplies its own catalog. A node's repository
+//! carries `NoSnapshotCatalog` and refuses every catalog call, because the
+//! catalog is PostgreSQL and lives in `aenv-api`. What these tests exercise —
+//! stage, commit, resolve, delete — spans both halves, so they put
+//! `InMemorySnapshotCatalog` in front of the POSIX byte half and stand in for
+//! the committer. That is a fair stand-in for the flow and *not* a claim that a
+//! node can commit: `a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere`
+//! is the test that says what staging alone does.
 
 use std::sync::Arc;
 
 use aenv_core::snapshot::SnapshotManager;
 
-use crate::snapshot::mock::write_mock_built_artifacts;
+use crate::snapshot::mock::{write_mock_built_artifacts, InMemorySnapshotCatalog};
 use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
 use crate::snapshot::repository::StagedSnapshot;
 use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
@@ -27,7 +36,11 @@ fn test_manager(root: &Path) -> SnapshotManager {
     })
     .expect("posix backend");
     let (repository, runtime_resolver) = backend.into_parts();
-    SnapshotManager::from_parts(repository, Some(runtime_resolver), None)
+    SnapshotManager::from_parts(
+        InMemorySnapshotCatalog::in_front_of(&repository),
+        Some(runtime_resolver),
+        None,
+    )
 }
 
 /// 🔴 A manager assembled without a runtime resolver — which is what

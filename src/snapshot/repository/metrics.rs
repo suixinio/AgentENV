@@ -170,12 +170,15 @@ pub fn record_object_store_request(
     .increment(1);
 }
 
-/// Test-only readout of [`OBJECT_STORE_REQUESTS_TOTAL`], shared by the backend
-/// test modules so they all assert against the same series naming.
+/// Test-only counter readouts, shared by the backend test modules so they all
+/// assert against the same series naming.
+///
+/// 🔴 `object_store_requests` — the per-`{op,surface,outcome}` readout of
+/// [`OBJECT_STORE_REQUESTS_TOTAL`] — lived here too, and its only callers were
+/// the POSIX and OSS *catalog* test modules. Both stores are byte repositories
+/// now and neither has a catalog test module, so the helper went with them.
 #[cfg(test)]
 pub mod test_support {
-    use std::collections::BTreeMap;
-
     use metrics_util::debugging::{DebugValue, Snapshotter};
 
     /// The total of every sample of one unlabelled counter.
@@ -190,35 +193,6 @@ pub mod test_support {
             }
         }
         total
-    }
-
-    /// Collects every [`super::OBJECT_STORE_REQUESTS_TOTAL`] sample seen by
-    /// `snapshotter`, keyed by `"{op}/{surface}/{outcome}"`. Series that were
-    /// never touched are absent rather than zero, so a missing key and a zero
-    /// count are distinguishable.
-    pub fn object_store_requests(snapshotter: &Snapshotter) -> BTreeMap<String, u64> {
-        let mut counters: BTreeMap<String, u64> = BTreeMap::new();
-        for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
-            let key = composite.key();
-            if key.name() != super::OBJECT_STORE_REQUESTS_TOTAL {
-                continue;
-            }
-            let labels: BTreeMap<String, String> = key
-                .labels()
-                .map(|label| (label.key().to_owned(), label.value().to_owned()))
-                .collect();
-            let field = |name: &str| {
-                labels
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| "<missing>".to_owned())
-            };
-            let series = format!("{}/{}/{}", field("op"), field("surface"), field("outcome"));
-            if let DebugValue::Counter(count) = value {
-                *counters.entry(series).or_default() += count;
-            }
-        }
-        counters
     }
 }
 

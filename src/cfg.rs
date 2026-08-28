@@ -482,7 +482,7 @@ pub struct SnapshotConfig {
     )]
     pub local_cache_path: PathBuf,
     /// 🔴 Settable from the environment for the reason `paused_registry.backend`
-    /// and `catalog.write`/`catalog.read` are: `deploy/k8s/run.sh` copies
+    /// is: `deploy/k8s/run.sh` copies
     /// `config/default.toml` over the cluster's `agentenv-k8s-config` ConfigMap
     /// on every apply (run.sh:30), so a cluster that said `oss` only in that
     /// ConfigMap loses it on the next `make k8s-apply`.
@@ -515,25 +515,17 @@ pub struct SnapshotConfig {
     pub catalog: SnapshotCatalogConfig,
 }
 
-/// Which store holds the snapshot catalog, while it is moving between two.
+/// The snapshot catalog's tuning knobs.
 ///
-/// 🔴 Two knobs, not one, and they roll separately. Adding the second copy and
-/// starting to trust it are different decisions with different ways back — one
-/// is "stop writing there", the other is "stop reading there" — and the
-/// combination that is legal at any moment is the one the matrix in
-/// [`AppConfig::validate_snapshot_catalog`] allows.
+/// 🔴 *Which* store holds the catalog is no longer one of them. PostgreSQL is
+/// the catalog; object storage held one until the Stage B cutover and holds
+/// byte artifacts alone now. The two switches that expressed the move —
+/// `write` and `read`, `AENV_SNAPSHOT_CATALOG_WRITE` /
+/// `AENV_SNAPSHOT_CATALOG_READ` — are gone, and a process handed either is
+/// stopped at startup rather than started on a setting nothing reads; see
+/// [`refuse_removed_catalog_env_vars`].
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotCatalogConfig {
-    /// 🔴 Settable from the environment for the reason
-    /// `paused_registry.backend` is: `deploy/k8s/run.sh` copies
-    /// `config/default.toml` over the cluster's ConfigMap on every apply, so a
-    /// cluster that expressed this by editing the ConfigMap would lose it
-    /// silently, and lose it in the quiet direction — back to writing one store
-    /// while believing it writes two.
-    #[config(default = "object_store", env = "AENV_SNAPSHOT_CATALOG_WRITE")]
-    pub write: SnapshotCatalogWrite,
-    #[config(default = "object_store", env = "AENV_SNAPSHOT_CATALOG_READ")]
-    pub read: SnapshotCatalogRead,
     /// The cluster-wide ceiling on builds that are `pending`/`in_progress` at
     /// once, enforced by [`crate::snapshot::repository::backends::postgres::PostgresSnapshotCatalog`]
     /// — mirrors `scheduler.catalog.max_concurrent_builds`
@@ -556,16 +548,13 @@ pub struct SnapshotCatalogConfig {
     /// zero-value, hence negative rather than zero disables it — matching
     /// `SchedulerCatalogConfig.MaxConcurrentBuilds`'s own doc.
     ///
-    /// Settable from the environment for the same reason `write`/`read` are:
-    /// this is one of the two knobs `SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS`
-    /// lets a Go operator reach for during an incident, and a value edited
-    /// directly into `config/default.toml` is rolled back by the next
-    /// `deploy/k8s/run.sh` apply.
+    /// Settable from the environment because `deploy/k8s/run.sh` copies
+    /// `config/default.toml` over the cluster's ConfigMap on every apply: this
+    /// is one of the knobs `SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS` lets a Go
+    /// operator reach for during an incident, and a value edited directly into
+    /// `config/default.toml` is rolled back by the next apply.
     #[config(default = 20i32, env = "AENV_SNAPSHOT_CATALOG_MAX_CONCURRENT_BUILDS")]
     pub max_concurrent_builds: i32,
-    /// How often owed object-store writes are replayed.
-    #[config(default = 30u64)]
-    pub mirror_compensator_interval_secs: u64,
     /// How often a running build tells the catalog it is still alive.
     ///
     /// 🔴 Must stay comfortably below the scheduler's
@@ -584,38 +573,6 @@ pub struct SnapshotCatalogConfig {
     /// uses; the two must move together.
     #[config(default = 100u64)]
     pub build_heartbeat_interval_secs: u64,
-    /// Where the owed writes are kept.
-    ///
-    /// Node-local and durable: what it holds is the difference between "the two
-    /// catalogs agree" and "they do not", and a process that crashed holding
-    /// the answer must not come back believing they agreed.
-    #[config(
-        default = "$AENV_HOME/snapshot-catalog-mirror",
-        env = "AENV_SNAPSHOT_CATALOG_MIRROR_PATH",
-        parse_env = parse_required_path
-    )]
-    pub mirror_backlog_path: PathBuf,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotCatalogWrite {
-    /// Today: object storage is the catalog.
-    ObjectStore,
-    /// Both, object storage still answering reads. The central catalog gets a
-    /// second copy that can be checked against the first.
-    Both,
-    /// The central catalog alone. Only after the read side has been served from
-    /// it for an observation period — until then, dropping the object-store
-    /// copy removes the way back.
-    Postgres,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotCatalogRead {
-    ObjectStore,
-    Postgres,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -2052,11 +2009,6 @@ impl AppConfig {
 
         self.snapshot.local_cache_path =
             resolve_path(&self.home_path, config_dir, &self.snapshot.local_cache_path);
-        self.snapshot.catalog.mirror_backlog_path = resolve_path(
-            &self.home_path,
-            config_dir,
-            &self.snapshot.catalog.mirror_backlog_path,
-        );
 
         if self.snapshot.repository_backend == SnapshotRepositoryBackendKind::PosixFs {
             let posix_fs = self
@@ -2127,7 +2079,6 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
-        self.validate_snapshot_catalog()?;
         if self.snapshot.catalog.build_heartbeat_interval_secs == 0 {
             bail!(
                 "snapshot.catalog.build_heartbeat_interval_secs must be > 0; a build that never \
@@ -2135,72 +2086,6 @@ impl AppConfig {
             );
         }
         Ok(())
-    }
-
-    /// The legal (write, read) pairs, and why the rest are not.
-    ///
-    /// 🔴 An illegal pair fails startup rather than being corrected. Both
-    /// mistakes it rules out are quiet ones: reading a store nobody writes
-    /// answers "no such snapshot" for everything written since the switch, and
-    /// reading an empty table answers it for everything, full stop. Neither
-    /// reports an error — they report absence, and callers delete artifacts and
-    /// refuse resumes on absence.
-    fn validate_snapshot_catalog(&self) -> Result<()> {
-        let catalog = &self.snapshot.catalog;
-        match (catalog.write, catalog.read) {
-            (SnapshotCatalogWrite::ObjectStore, SnapshotCatalogRead::ObjectStore) => Ok(()),
-            (SnapshotCatalogWrite::Both, SnapshotCatalogRead::ObjectStore) => Ok(()),
-            (SnapshotCatalogWrite::ObjectStore, SnapshotCatalogRead::Postgres) => bail!(
-                "snapshot.catalog: write = \"object_store\" with read = \"postgres\" reads a table \
-                 nothing writes. Set write = \"both\" first and let the mirror catch up."
-            ),
-            (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::ObjectStore) => bail!(
-                "snapshot.catalog: write = \"postgres\" with read = \"object_store\" reads a store \
-                 nothing writes any more, so every snapshot published since the switch reads as \
-                 absent. Set read = \"postgres\" in the same change."
-            ),
-            // 🔴 The read switch, and passing here is not the switch being
-            // allowed — it is only this layer having nothing left to say about
-            // it. Four more refusals sit below, and every one of them is about
-            // whether PostgreSQL actually holds what object storage does:
-            //
-            //   1. Owed writes — `mirror_lag{direction="central"}`.
-            //   2. Disagreements no replay can settle —
-            //      `mirror_diverged{direction="central"}`. Until build
-            //      admission is wired that is every template, because
-            //      `try_start_build` writes object storage alone. A cluster
-            //      holding templates reads a mirror lag of zero and would
-            //      otherwise be waved through into making all of them vanish
-            //      from the API.
-            //   3. The snapshots that predate the double write. Neither number
-            //      says anything about those — both count writes the mirror
-            //      *saw* — so on the cluster this was measured on, the instant
-            //      `write = "both"` was switched on read `lag = 0, diverged =
-            //      0` over thirty-two snapshots PostgreSQL had never heard of.
-            //      `MirrorBacklog::queue_history_toward_central` puts them into
-            //      the queue at startup and `guard_read_side` refuses the
-            //      switch until it has run.
-            //   4. 🔴 And because all three of those describe the *queue*
-            //      rather than the two catalogs, a direct comparison of what
-            //      each one holds runs beside them —
-            //      `compare_catalog_populations`. It is the only one of the
-            //      four that needs no marker and no gauge to be right.
-            (SnapshotCatalogWrite::Both, SnapshotCatalogRead::Postgres) => Ok(()),
-            // 🔴 Legal now that `PostgresSnapshotCatalog` is wired into
-            // `build_central_catalog` (Stage B step 8/9): this pair is no
-            // longer refused for being unserved by this build. It drops the
-            // object-store copy, which is the only way back from the central
-            // catalog, so this layer having nothing left to say about it is
-            // still not the switch being safe on its own — see
-            // `build_snapshot_backend`'s own `write = "postgres"` branch,
-            // which refuses to *start* under this pair unless
-            // `PgReadSideConfirmation` already says the read side was
-            // confirmed onto PostgreSQL first (the "observation period and
-            // zero mirror lag throughout" this error used to describe,
-            // turned into something a start can actually check rather than
-            // an operator's promise).
-            (SnapshotCatalogWrite::Postgres, SnapshotCatalogRead::Postgres) => Ok(()),
-        }
     }
 
     /// Reject internally inconsistent or out-of-range disk rate limit configs so
@@ -2693,6 +2578,67 @@ fn resolve_relative_to(base_dir: &Path, path: &Path) -> PathBuf {
 
 const HOME_PATH_PLACEHOLDER: &str = "$AENV_HOME";
 const RUNTIME_PATH_PLACEHOLDER: &str = "$AENV_RUNTIME";
+
+/// The environment variables that used to choose which store held the snapshot
+/// catalog, and are now removed.
+///
+/// 🔴 Named here, in a list, and refused — rather than simply deleted from
+/// [`SnapshotCatalogConfig`]. confique **silently ignores** an environment
+/// variable no field declares, so a manifest that still carries
+/// `AENV_SNAPSHOT_CATALOG_WRITE=both` would start a perfectly healthy-looking
+/// process while the operator who set it believes the catalog is being
+/// double-written. It is not: PostgreSQL is the only catalog, object storage
+/// receives no rows, and nothing anywhere would say so.
+///
+/// This is the same decision `--role`/`AENV_ROLE` got when the single binary
+/// became two — an un-migrated manifest fails loudly instead of being ignored.
+pub const REMOVED_CATALOG_ENV_VARS: &[&str] = &[
+    "AENV_SNAPSHOT_CATALOG_WRITE",
+    "AENV_SNAPSHOT_CATALOG_READ",
+    "AENV_SNAPSHOT_CATALOG_MIRROR_PATH",
+];
+
+/// Refuses to start when any of [`REMOVED_CATALOG_ENV_VARS`] is set.
+///
+/// Called from both binaries' entrypoints, before the configuration is loaded:
+/// the point is to stop a process whose *manifest* still describes an
+/// arrangement this build does not have, and that is knowable before anything
+/// is read.
+///
+/// 🔴 An empty value counts as set. `AENV_SNAPSHOT_CATALOG_WRITE=` in a
+/// manifest is still a manifest that has not been migrated, and confique would
+/// have rejected it as an unparseable enum rather than ignoring it — so
+/// treating it as absent here would be *more* permissive than the code this
+/// replaces.
+pub fn refuse_removed_catalog_env_vars() -> Result<()> {
+    refuse_removed_catalog_env_vars_from(|name| std::env::var(name).ok())
+}
+
+/// [`refuse_removed_catalog_env_vars`] with the environment injected, so the
+/// decision is testable without mutating a process-global the rest of the test
+/// binary is reading concurrently.
+pub fn refuse_removed_catalog_env_vars_from(lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
+    let present: Vec<&str> = REMOVED_CATALOG_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| lookup(name).is_some())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} is set, and this build no longer has the setting it names. The snapshot catalog is \
+         PostgreSQL and nothing else: object storage stopped receiving catalog rows at the Stage \
+         B cutover and now holds byte artifacts alone, so there is no second store to write, no \
+         read side to choose, and no mirror between them. Remove {} from this workload's \
+         manifest; leaving it set would otherwise be ignored in silence, and an operator would \
+         go on believing the catalog is where the variable says it is. Configure [pg] instead — \
+         it is where the rows are",
+        present.join(", "),
+        if present.len() == 1 { "it" } else { "them" }
+    )
+}
 
 fn resolve_path(home_path: &Path, config_dir: &Path, raw: &Path) -> PathBuf {
     let expanded = match raw.to_str() {
@@ -4146,203 +4092,74 @@ endpoint = "http://second:9000"
         }
     }
 
-    /// 🔴 The legal pairs, and the two illegal ones by name.
+    /// 🔴 The direction that matters: a manifest still carrying one of the
+    /// removed switches stops the process.
     ///
-    /// Every rejected combination fails the same quiet way if it is allowed
-    /// through — a read that answers "no such snapshot" rather than an error —
-    /// and absence is what callers delete artifacts and refuse resumes on.
-    /// `(Postgres, Postgres)` used to be a third refusal here (unserved by
-    /// this build); it is legal now that `PostgresSnapshotCatalog` is wired
-    /// into `build_central_catalog` — see `validate_snapshot_catalog`'s own
-    /// comment on that arm for what still gates it at runtime.
+    /// confique ignores an environment variable no field declares, so deleting
+    /// `[snapshot.catalog].write`/`.read` on its own would have left
+    /// `AENV_SNAPSHOT_CATALOG_WRITE=both` starting a healthy-looking process
+    /// that writes exactly one catalog while its operator believes it writes
+    /// two. Nothing else in the system would say otherwise.
     #[test]
-    fn the_snapshot_catalog_matrix_allows_only_the_pairs_that_are_served() {
-        let cases: [(SnapshotCatalogWrite, SnapshotCatalogRead, Option<&str>); 6] = [
-            (
-                SnapshotCatalogWrite::ObjectStore,
-                SnapshotCatalogRead::ObjectStore,
-                None,
-            ),
-            (
-                SnapshotCatalogWrite::Both,
-                SnapshotCatalogRead::ObjectStore,
-                None,
-            ),
-            (
-                SnapshotCatalogWrite::ObjectStore,
-                SnapshotCatalogRead::Postgres,
-                Some("reads a table nothing writes"),
-            ),
-            (
-                SnapshotCatalogWrite::Postgres,
-                SnapshotCatalogRead::ObjectStore,
-                Some("reads a store nothing writes any more"),
-            ),
-            // 🔴 Legal as of the read switch, and this layer having nothing to
-            // say about it is not the switch being safe: `guard_read_side` and
-            // the population comparison run below it, on a store this function
-            // cannot see.
-            (
-                SnapshotCatalogWrite::Both,
-                SnapshotCatalogRead::Postgres,
-                None,
-            ),
-            // 🔴 Legal now that `PostgresSnapshotCatalog` is wired into
-            // `build_central_catalog` — see `validate_snapshot_catalog`'s own
-            // comment on this arm. This layer having nothing to say about it
-            // is, again, not the switch being safe on its own:
-            // `build_snapshot_backend`'s `write = "postgres"` branch is what
-            // actually refuses to start unless `PgReadSideConfirmation` says
-            // this cluster's read side was already confirmed onto PostgreSQL.
-            (
-                SnapshotCatalogWrite::Postgres,
-                SnapshotCatalogRead::Postgres,
-                None,
-            ),
-        ];
-
-        for (write, read, expected) in cases {
-            let mut config = AppConfig::default();
-            config.snapshot.catalog.write = write;
-            config.snapshot.catalog.read = read;
-
-            match expected {
-                None => config
-                    .validate_snapshot_catalog()
-                    .unwrap_or_else(|error| panic!("{write:?}/{read:?} should be legal: {error}")),
-                Some(expected) => {
-                    let error = config
-                        .validate_snapshot_catalog()
-                        .expect_err(&format!("{write:?}/{read:?} should be refused"));
-                    assert!(
-                        error.to_string().contains(expected),
-                        "{write:?}/{read:?}: expected {expected:?}, got: {error}"
-                    );
-                }
-            }
+    fn a_manifest_still_setting_a_removed_catalog_switch_is_refused() {
+        for name in REMOVED_CATALOG_ENV_VARS {
+            let error = refuse_removed_catalog_env_vars_from(|probed| {
+                (probed == *name).then(|| "both".to_string())
+            })
+            .expect_err("a removed switch must stop the process, not be ignored");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(name),
+                "the refusal must name the variable an operator has to delete: {rendered}"
+            );
+            assert!(
+                rendered.contains("[pg]"),
+                "the refusal must name where the catalog actually is: {rendered}"
+            );
         }
     }
 
-    /// 🔴 This layer no longer answers for the one below it.
-    ///
-    /// `read = "postgres"` used to be refused here, one layer *above*
-    /// `MirrorBacklog::guard_read_side` — so everything that guard refuses on
-    /// had never executed anywhere but a unit test of the guard itself. Opening
-    /// the arm is not the same as those refusals working, and this test is the
-    /// seam: the configuration that now passes here goes straight on to meet
-    /// them, and is refused by them.
-    ///
-    /// The control is the second half: with the same configuration and two
-    /// catalogs that agree, the same call is allowed.
-    #[tokio::test]
-    async fn a_legal_postgres_read_still_has_to_get_past_the_mirror() {
-        use crate::snapshot::repository::mirror::{
-            admit_read_side, CatalogCensus, CatalogReadSide, MirrorBacklog, MirrorDirection,
-            MirrorTargets,
-        };
-        use crate::snapshot::repository::RepositoryResult;
-        use crate::snapshot::SnapshotId;
-
-        struct Census(Vec<SnapshotId>);
-
-        // Targets with no central half, so the replay the admission now runs
-        // before it refuses can land nothing. What this test is a seam for is
-        // the refusals, and a refusal proven against a target that could have
-        // repaired proves less than it looks.
-        fn no_repair_possible() -> MirrorTargets {
-            MirrorTargets::object_store(std::sync::Arc::new(
-                crate::snapshot::repository::mirror::test_doubles::ScriptedCatalog::default(),
-            )
-                as std::sync::Arc<dyn crate::snapshot::repository::interfaces::SnapshotCatalog>)
-        }
-
-        #[async_trait::async_trait]
-        impl CatalogCensus for Census {
-            async fn every_snapshot_id(&self) -> RepositoryResult<Vec<SnapshotId>> {
-                Ok(self.0.clone())
-            }
-        }
-
-        let mut config = AppConfig::default();
-        config.snapshot.catalog.write = SnapshotCatalogWrite::Both;
-        config.snapshot.catalog.read = SnapshotCatalogRead::Postgres;
-        config
-            .validate_snapshot_catalog()
-            .expect("the read switch is a legal configuration now");
-
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let backlog = MirrorBacklog::open(dir.path().join("mirror"))
-            .await
-            .expect("the backlog should open");
-
-        // 1. The history the double write never saw. Refused before either
-        //    catalog is even asked.
-        let error = admit_read_side(
-            CatalogReadSide::Postgres,
-            &backlog,
-            &no_repair_possible(),
-            &Census(Vec::new()),
-            &Census(Vec::new()),
-        )
-        .await
-        .expect_err("a mirror that never enumerated the object store's history refuses");
-        assert!(error.to_string().contains("never been queued"), "{error}");
-
-        backlog
-            .queue_history_toward_central(
-                &crate::snapshot::repository::mirror::test_doubles::ScriptedCatalog::default(),
-            )
-            .await
-            .expect("an empty object store has no history to queue");
-        backlog
-            .record_read_side(CatalogReadSide::ObjectStore)
-            .await
-            .expect("the node starts out reading object storage");
-
-        // 2. The two catalogs holding different snapshots — the refusal no
-        //    gauge can express, and the one this batch added.
-        let held: Vec<SnapshotId> = (0..3).map(|_| SnapshotId::generate()).collect();
-        let error = admit_read_side(
-            CatalogReadSide::Postgres,
-            &backlog,
-            &no_repair_possible(),
-            &Census(held.clone()),
-            &Census(Vec::new()),
-        )
-        .await
-        .expect_err("object storage holds snapshots the central catalog has never heard of");
-        assert!(error.to_string().contains("3 row(s)"), "{error}");
-        assert_eq!(backlog.lag_toward(MirrorDirection::Central), 0);
-        assert_eq!(backlog.diverged_toward(MirrorDirection::Central), 0);
-
-        // The control.
-        admit_read_side(
-            CatalogReadSide::Postgres,
-            &backlog,
-            &no_repair_possible(),
-            &Census(held.clone()),
-            &Census(held),
-        )
-        .await
-        .expect("two catalogs holding the same snapshots may switch");
+    /// An empty value is still a manifest that has not been migrated.
+    #[test]
+    fn a_removed_catalog_switch_set_to_nothing_is_still_refused() {
+        refuse_removed_catalog_env_vars_from(|probed| {
+            (probed == "AENV_SNAPSHOT_CATALOG_READ").then(String::new)
+        })
+        .expect_err("an empty value is set");
     }
 
-    /// The default is the arrangement that exists today: one catalog, in
-    /// object storage. Anything else has to be asked for.
+    /// The control, and the half that makes the test above mean something: with
+    /// none of them set the check passes, so a green run is "the environment is
+    /// clean" rather than "this function always/never fires".
     #[test]
-    fn the_snapshot_catalog_defaults_to_the_single_store_it_has_always_had() {
-        let config = AppConfig::default();
+    fn an_environment_without_the_removed_switches_starts() {
+        refuse_removed_catalog_env_vars_from(|_| None)
+            .expect("a migrated manifest sets none of them and must start");
+    }
+
+    /// 🔴 The list is a list, and each entry is checked on its own — a guard
+    /// that only ever looked at the first would pass the test above and let the
+    /// other two through. This pins the membership rather than the mechanism.
+    #[test]
+    fn every_removed_catalog_switch_is_covered() {
         assert_eq!(
-            config.snapshot.catalog.write,
-            SnapshotCatalogWrite::ObjectStore
+            REMOVED_CATALOG_ENV_VARS,
+            [
+                "AENV_SNAPSHOT_CATALOG_WRITE",
+                "AENV_SNAPSHOT_CATALOG_READ",
+                "AENV_SNAPSHOT_CATALOG_MIRROR_PATH",
+            ]
         );
-        assert_eq!(
-            config.snapshot.catalog.read,
-            SnapshotCatalogRead::ObjectStore
-        );
-        config
-            .validate()
-            .expect("the default configuration must be valid");
+        // And none of them is still a declared binding: a name that is both
+        // refused here and read by confique would be refused before it could be
+        // read, which is a contradiction somebody should hear about.
+        let source = include_str!("cfg.rs");
+        for name in REMOVED_CATALOG_ENV_VARS {
+            assert!(
+                !source.contains(&format!("env = \"{name}\"")),
+                "{name} is refused at startup and still bound to a config field"
+            );
+        }
     }
 
     #[test]

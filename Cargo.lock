@@ -87,6 +87,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tempfile",
+ "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
  "tonic",

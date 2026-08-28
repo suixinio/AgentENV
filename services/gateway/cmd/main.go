@@ -36,6 +36,14 @@ func main() {
 	configPath := flag.String("config", "", "path to JSON config file")
 	flag.Parse()
 
+	// Checked before the config is loaded: the point is to stop a process
+	// whose manifest still describes an arrangement this build does not have
+	// (the deleted query-only-scheduler fallback), which is knowable before
+	// anything else is read. See RefuseRemovedGatewayEnvVars's own doc.
+	if err := config.RefuseRemovedGatewayEnvVars(); err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	cfg, err := config.Load(*configPath, "gateway")
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
@@ -54,16 +62,6 @@ func main() {
 	defer conn.Close()
 
 	schedulerClient := schedulerv1.NewSchedulerClient(conn)
-	queryOnlySchedulerClient := schedulerClient
-	var queryOnlyConn *grpc.ClientConn
-	if cfg.Gateway.QueryOnlySchedulerAddr != "" {
-		queryOnlyConn, err = newSchedulerConn(cfg.Gateway.QueryOnlySchedulerAddr)
-		if err != nil {
-			logger.Fatal("connect query-only scheduler failed", zap.Error(err), zap.String("addr", cfg.Gateway.QueryOnlySchedulerAddr))
-		}
-		defer queryOnlyConn.Close()
-		queryOnlySchedulerClient = schedulerv1.NewSchedulerClient(queryOnlyConn)
-	}
 
 	// 🔴 Built here and only when the read switch is on, so "the switch is off"
 	// is a nil reader rather than a live connection nothing uses. NewReader
@@ -105,21 +103,15 @@ func main() {
 	)
 
 	serverOptions := gateway.ServerOptions{
-		RequestTimeout:            cfg.Gateway.RequestTimeout,
-		MaxResponseSize:           cfg.Gateway.ForwardResponseSize,
-		DebugMode:                 cfg.Gateway.DebugMode,
-		SandboxProxyDomains:       cfg.Gateway.SandboxProxyDomains,
-		QueryOnlySchedulerClient:  queryOnlySchedulerClient,
-		ExecutionFencing:          string(cfg.Gateway.Routing.ExecutionFencing),
-		ControlPlaneToken:         cfg.Gateway.ControlPlaneToken,
-		ProjectionAuthoritative:   cfg.Gateway.Routing.ProjectionAuthoritative,
-		RestUpstreamAddr:          cfg.Gateway.RestUpstreamAddr,
-		SchedulerFallbackDisabled: cfg.Gateway.SchedulerFallbackDisabled,
-		SchedulerFallbackTimeout:  cfg.Gateway.SchedulerFallbackTimeout,
-	}
-	if cfg.Gateway.SchedulerFallbackDisabled {
-		logger.Info("query-only scheduler fallback is disabled; a projection miss or an " +
-			"undecided wake-up answers unavailable instead of asking the scheduler")
+		RequestTimeout:          cfg.Gateway.RequestTimeout,
+		MaxResponseSize:         cfg.Gateway.ForwardResponseSize,
+		DebugMode:               cfg.Gateway.DebugMode,
+		SandboxProxyDomains:     cfg.Gateway.SandboxProxyDomains,
+		ExecutionFencing:        string(cfg.Gateway.Routing.ExecutionFencing),
+		ControlPlaneToken:       cfg.Gateway.ControlPlaneToken,
+		ProjectionAuthoritative: cfg.Gateway.Routing.ProjectionAuthoritative,
+		RestUpstreamAddr:        cfg.Gateway.RestUpstreamAddr,
+		ColdLookupTimeout:       cfg.Gateway.ColdLookupTimeout,
 	}
 	// 🔴 Assigned through the branch rather than passed inline: a typed nil
 	// pointer stored in an interface field is not a nil interface, and the read
@@ -139,7 +131,6 @@ func main() {
 		zap.String("addr", cfg.Gateway.HTTPListenAddr),
 		zap.String("metrics_addr", cfg.Gateway.MetricsListenAddr),
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
-		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
 		zap.String("rest_upstream", cfg.Gateway.RestUpstreamAddr),
 		zap.String("resume_addr", cfg.Gateway.ResumeAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),

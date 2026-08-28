@@ -261,13 +261,15 @@ func TestTheGatewaysSchedulerAggregationsAreNotSentToTheApiHalf(t *testing.T) {
 // once: an "off" server (restUpstream=="") against the same scheduler stub,
 // asserting the node arm moved instead. Off no longer forwards anything to a
 // node — see rest_upstream.go — so there is no second server left to compare
-// against, and gatewayRestUpstream.WithLabelValues(restUpstreamNode) is
-// asserted never to move by any test in this package any more: see
-// gatewayRestUpstream's own doc comment in metrics.go for why the label is
-// still declared.
+// against, and gatewayRestUpstream.WithLabelValues("node") is asserted never
+// to move by any test in this package any more. "node" is a literal, not the
+// constant restUpstreamNode: that constant is deleted along with the
+// node-routing fallback it named, but the label value it stood for is still
+// a real value the label set `{"upstream"}` could take, so this sentinel
+// keeps asserting against it directly.
 func TestBothArmsOfTheRestUpstreamCounterMove(t *testing.T) {
 	apiBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamAPI))
-	nodeBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamNode))
+	nodeBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues("node"))
 
 	api := newRecordingUpstream(t)
 	scheduler := refusingScheduler(t, "the api half places its own sandboxes")
@@ -281,9 +283,9 @@ func TestBothArmsOfTheRestUpstreamCounterMove(t *testing.T) {
 	}
 	// 🔴 The regression guard this test still owns even without a second
 	// server to contrast against: nothing in this package may ever record
-	// against restUpstreamNode again. If a future change reintroduces a
+	// against `{upstream="node"}` again. If a future change reintroduces a
 	// node-routing fallback for user-facing REST, this is what catches it.
-	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamNode)) - nodeBefore; got != 0 {
+	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues("node")) - nodeBefore; got != 0 {
 		t.Fatalf("node arm moved by %v, want 0: there is no node-routing fallback left to record against", got)
 	}
 }

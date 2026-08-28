@@ -56,11 +56,10 @@ const (
 )
 
 type ServerOptions struct {
-	RequestTimeout           time.Duration
-	MaxResponseSize          int64
-	DebugMode                bool
-	SandboxProxyDomains      []string
-	QueryOnlySchedulerClient schedulerv1.SchedulerClient
+	RequestTimeout      time.Duration
+	MaxResponseSize     int64
+	DebugMode           bool
+	SandboxProxyDomains []string
 	// ExecutionFencing is the raw configured mode. It is parsed in NewServer so
 	// an unrecognised value stops the process rather than becoming a silently
 	// chosen behaviour; the empty string is the absence of a setting and takes
@@ -94,7 +93,7 @@ type ServerOptions struct {
 	// construct a `*Server` with this nil. It stays nil-able here purely
 	// because this package's own tests use an unconfigured `*Server` as their
 	// baseline fixture for exercising the data-plane routing paths — the
-	// projection, this wake-up client, and the scheduler LookupNode fallback
+	// projection, this wake-up client, and the cold-path LookupNode call
 	// below — none of which has ever depended on RestUpstreamAddr.
 	ResumeClient *resume.Client
 
@@ -114,30 +113,15 @@ type ServerOptions struct {
 	// exercising anything.
 	RestUpstreamAddr string
 
-	// SchedulerFallbackDisabled turns off the query-only-scheduler LookupNode
-	// call a projection miss and an undecided wake-up both fall through to
-	// (see the "if resp == nil" block below the wake-up attempt in
-	// handleProxy). False — the default — is today's behaviour exactly: every
-	// path that reaches this point still asks the scheduler.
-	//
-	// 🔴 This is phase 4's rollback-free decommissioning lever for that one
-	// call. Once nothing user-facing depends on it any more (§ the phase 4
-	// design doc), flipping this to true removes the gateway's last
-	// dependency on a live scheduler for data-plane traffic without a code
-	// change or a redeploy — a ConfigMap edit and a restart, the same shape
-	// as ResumeAddr and RestUpstreamAddr above. Set while a scheduler is
-	// still the system of record and every one of those requests fails
-	// closed at this line instead of proxying anywhere.
-	SchedulerFallbackDisabled bool
-
-	// SchedulerFallbackTimeout bounds the query-only-scheduler LookupNode call
-	// on its own, separately from RequestTimeout. Zero (the default when unset
-	// by the caller) is resolved to defaultSchedulerFallbackTimeout in
-	// NewServer, never left as "no timeout" — a scheduler that is merely
-	// unreachable (a Service with no ready endpoints, or a black-holed route)
-	// must not be allowed to hold this call open for whatever of
-	// RequestTimeout happens to be left, let alone for gRPC's own connection
-	// backoff.
+	// ColdLookupTimeout bounds the LookupNode call a projection miss and an
+	// undecided wake-up both fall through to (see the "if resp == nil" block
+	// below the wake-up attempt in handleProxy), separately from
+	// RequestTimeout. Zero (the default when unset by the caller) is resolved
+	// to defaultColdLookupTimeout in NewServer, never left as "no timeout" —
+	// a target that is merely unreachable (a Service with no ready endpoints,
+	// or a black-holed route) must not be allowed to hold this call open for
+	// whatever of RequestTimeout happens to be left, let alone for gRPC's own
+	// connection backoff.
 	//
 	// 🔴 Deliberately its own setting rather than a fraction of
 	// RequestTimeout: the two bound different things. RequestTimeout is a
@@ -146,16 +130,26 @@ type ServerOptions struct {
 	// the scenario this exists for, is not answering at all. Tying it to
 	// RequestTimeout would mean nobody could tighten one without retuning the
 	// other.
-	SchedulerFallbackTimeout time.Duration
+	//
+	// 🔴 This used to be SchedulerFallbackTimeout, with a sibling
+	// (SchedulerFallbackDisabled) that could skip the call entirely and a
+	// client-selection field (QueryOnlySchedulerClient) that could point it at
+	// a different scheduler than every other RPC in this package. Both are
+	// deleted along with the Go scheduler they existed to decommission — the
+	// call now always goes to the client NewServer was given, unconditionally
+	// — but this timeout is not decommissioning-only scaffolding: it is the
+	// ordinary protection every outbound RPC with a budget shorter than its
+	// caller's needs, and removing it would silently widen this call's
+	// failure window from a few seconds to RequestTimeout's 30-90s.
+	ColdLookupTimeout time.Duration
 }
 
 type Server struct {
-	logger             *zap.Logger
-	scheduler          schedulerv1.SchedulerClient
-	queryOnlyScheduler schedulerv1.SchedulerClient
-	httpClient         *http.Client
-	requestTimeout     time.Duration
-	maxRespSize        int64
+	logger         *zap.Logger
+	scheduler      schedulerv1.SchedulerClient
+	httpClient     *http.Client
+	requestTimeout time.Duration
+	maxRespSize    int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
@@ -181,24 +175,21 @@ type Server struct {
 	// string re-read and re-interpreted at each call site is how one switch
 	// ends up meaning two things.
 	restUpstream string
-	// See ServerOptions.SchedulerFallbackDisabled and
-	// .SchedulerFallbackTimeout. The timeout is never zero past NewServer —
-	// see defaultSchedulerFallbackTimeout.
-	schedulerFallbackDisabled bool
-	schedulerFallbackTimeout  time.Duration
+	// See ServerOptions.ColdLookupTimeout. Never zero past NewServer — see
+	// defaultColdLookupTimeout.
+	coldLookupTimeout time.Duration
 }
 
-// defaultSchedulerFallbackTimeout is used when ServerOptions.
-// SchedulerFallbackTimeout is zero, which includes every test and config that
-// predates this setting.
+// defaultColdLookupTimeout is used when ServerOptions.ColdLookupTimeout is
+// zero, which includes every test and config that predates this setting.
 //
 // 🔴 Picked to be well clear of a healthy LookupNode's latency (a single
 // registry read, normally milliseconds) while being nowhere near
 // RequestTimeout's default 30s or a TCP handshake's own retry ceiling
 // (`tcp_syn_retries`'s default of 6 costs on the order of two minutes) — the
-// two failure shapes this whole change exists to stop this call from being
+// two failure shapes this setting exists to stop this call from being
 // exposed to.
-const defaultSchedulerFallbackTimeout = 3 * time.Second
+const defaultColdLookupTimeout = 3 * time.Second
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
@@ -216,37 +207,30 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		return nil, err
 	}
 
-	queryOnlyScheduler := options.QueryOnlySchedulerClient
-	if queryOnlyScheduler == nil {
-		queryOnlyScheduler = schedulerClient
-	}
-
-	// 🔴 Never left at zero: a zero timeout would make every fallback call
+	// 🔴 Never left at zero: a zero timeout would make every cold-path call
 	// fail before it started, which for every test and config written before
 	// this setting existed silently changes today's behaviour instead of
 	// preserving it.
-	schedulerFallbackTimeout := options.SchedulerFallbackTimeout
-	if schedulerFallbackTimeout <= 0 {
-		schedulerFallbackTimeout = defaultSchedulerFallbackTimeout
+	coldLookupTimeout := options.ColdLookupTimeout
+	if coldLookupTimeout <= 0 {
+		coldLookupTimeout = defaultColdLookupTimeout
 	}
 
 	return &Server{
-		logger:                    logger,
-		scheduler:                 schedulerClient,
-		queryOnlyScheduler:        queryOnlyScheduler,
-		httpClient:                &http.Client{},
-		requestTimeout:            options.RequestTimeout,
-		maxRespSize:               options.MaxResponseSize,
-		debugMode:                 options.DebugMode,
-		sandboxProxyDomains:       sandboxProxyDomains,
-		executionFencing:          executionFencing,
-		controlPlaneToken:         strings.TrimSpace(options.ControlPlaneToken),
-		projectionReader:          options.ProjectionReader,
-		projectionAuthoritative:   options.ProjectionAuthoritative,
-		resumeClient:              options.ResumeClient,
-		restUpstream:              restUpstream,
-		schedulerFallbackDisabled: options.SchedulerFallbackDisabled,
-		schedulerFallbackTimeout:  schedulerFallbackTimeout,
+		logger:                  logger,
+		scheduler:               schedulerClient,
+		httpClient:              &http.Client{},
+		requestTimeout:          options.RequestTimeout,
+		maxRespSize:             options.MaxResponseSize,
+		debugMode:               options.DebugMode,
+		sandboxProxyDomains:     sandboxProxyDomains,
+		executionFencing:        executionFencing,
+		controlPlaneToken:       strings.TrimSpace(options.ControlPlaneToken),
+		projectionReader:        options.ProjectionReader,
+		projectionAuthoritative: options.ProjectionAuthoritative,
+		resumeClient:            options.ResumeClient,
+		restUpstream:            restUpstream,
+		coldLookupTimeout:       coldLookupTimeout,
 	}, nil
 }
 
@@ -469,7 +453,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		if resp == nil {
 			var err error
-			resp, err = s.lookupNodeFallback(routingCtx, sandboxID)
+			resp, err = s.lookupNodeColdPath(routingCtx, sandboxID)
 			if err != nil {
 				// 🔴 Still the only source of a 404 or a 503 on the scheduler
 				// path in this package.
@@ -571,52 +555,34 @@ func locationNeedsAssignment(location schedulerv1.SandboxLocation) bool {
 	}
 }
 
-// lookupNodeFallback is the cold path a projection miss and an undecided
-// wake-up both fall through to: the last resort that asks the query-only
-// scheduler directly instead of answering from a projection or from the api
+// lookupNodeColdPath is the cold path a projection miss and an undecided
+// wake-up both fall through to: the last resort that asks the scheduler
+// client directly instead of answering from a projection or from the api
 // half's own wake-up decision.
 //
-// 🔴 Phase 4 makes this call's normal target — a live scheduler — optional.
-// Everything below exists so that "the scheduler is gone" fails in a way an
-// operator can tell apart from "this sandbox has a problem", instead of
-// either hanging on gRPC's own connection backoff (which, for a Service with
-// no ready endpoints, can run for as long as the kernel's own SYN retry
-// ceiling — minutes, not seconds) or answering with a generic scheduler
-// error indistinguishable from every other reason this RPC can fail.
+// 🔴 This used to also carry a disable switch (schedulerFallbackDisabled) and
+// a separate client (queryOnlyScheduler) that could point this one call at a
+// different address than every other Scheduler RPC in this package. Both are
+// deleted along with the Go scheduler they existed to let this call stop
+// depending on independently of `gateway.scheduler_addr` itself — the call is
+// unconditional again and always goes to s.scheduler, exactly as every other
+// RPC in this file does.
 //
-// Two switches, checked in order, and each is a no-op when the scheduler is
-// healthy and reachable — the reachable path below is byte-for-byte what
-// `s.queryOnlyScheduler.LookupNode(routingCtx, ...)` plus
-// `recordGatewaySchedulerRPC` already did before either switch existed:
-//
-//   - schedulerFallbackDisabled skips the call entirely. This is the
-//     decommissioning lever — see ServerOptions.SchedulerFallbackDisabled —
-//     and it is the only branch here that makes zero network calls.
-//   - schedulerFallbackTimeout bounds the call on its own, tighter than
-//     RequestTimeout, so an unreachable-but-not-yet-failed scheduler cannot
-//     hold this call open for whatever of the request's overall budget
-//     happens to be left. Firing this cap is distinguished from routingCtx's
-//     own (pre-existing) deadline firing by checking ctx's own error first —
-//     if the caller's context is already done, this cap did not decide
-//     anything, and the error it returns is left exactly as it would have
-//     been before this method existed.
-func (s *Server) lookupNodeFallback(ctx context.Context, sandboxID string) (*schedulerv1.LookupNodeResponse, error) {
-	if s.schedulerFallbackDisabled {
-		recordSchedulerFallbackOutcome(schedulerFallbackOutcomeDisabled)
-		s.logger.Warn("query-only scheduler fallback is disabled; not asking the scheduler",
-			zap.String("sandbox_id", sandboxID),
-		)
-
-		return nil, status.Error(codes.Unavailable,
-			"query-only scheduler fallback is disabled by configuration; no scheduler lookup was "+
-				"attempted (this is a deliberate phase 4 setting, not a sandbox problem)")
-	}
-
-	fallbackCtx, cancel := context.WithTimeout(ctx, s.schedulerFallbackTimeout)
+// What is left, and stays, is the timeout: an unreachable-but-not-yet-failed
+// target must not be allowed to hold this call open for whatever of the
+// request's overall budget happens to be left, or for gRPC's own connection
+// backoff, so it runs under its own deadline (coldLookupTimeout) rather than
+// only routingCtx's. Firing this cap is distinguished from routingCtx's own
+// (pre-existing) deadline firing by checking ctx's own error first — if the
+// caller's context is already done, this cap did not decide anything, and the
+// error it returns is left exactly as it would have been before this method
+// existed.
+func (s *Server) lookupNodeColdPath(ctx context.Context, sandboxID string) (*schedulerv1.LookupNodeResponse, error) {
+	coldCtx, cancel := context.WithTimeout(ctx, s.coldLookupTimeout)
 	defer cancel()
 
 	rpcStart := time.Now()
-	resp, err := s.queryOnlyScheduler.LookupNode(fallbackCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
+	resp, err := s.scheduler.LookupNode(coldCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 	recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
 	if err == nil {
 		return resp, nil
@@ -625,18 +591,18 @@ func (s *Server) lookupNodeFallback(ctx context.Context, sandboxID string) (*sch
 	// Only our own cap firing is reclassified. If ctx (routingCtx) is also
 	// done, this timeout did not decide anything — some larger, pre-existing
 	// deadline did, and that keeps behaving exactly as it always has.
-	if ctx.Err() == nil && fallbackCtx.Err() != nil {
-		recordSchedulerFallbackOutcome(schedulerFallbackOutcomeTimeout)
-		s.logger.Warn("query-only scheduler fallback timed out",
+	if ctx.Err() == nil && coldCtx.Err() != nil {
+		recordGatewayColdLookupTimeout()
+		s.logger.Warn("cold-path LookupNode timed out",
 			zap.String("sandbox_id", sandboxID),
-			zap.Duration("timeout", s.schedulerFallbackTimeout),
+			zap.Duration("timeout", s.coldLookupTimeout),
 			zap.Error(err),
 		)
 
 		return nil, status.Error(codes.Unavailable, fmt.Sprintf(
-			"query-only scheduler fallback did not answer within %s; the scheduler may be scaled "+
-				"down or unreachable (this is not the sandbox's fault)",
-			s.schedulerFallbackTimeout,
+			"cold-path LookupNode did not answer within %s; the api half may be scaled down or "+
+				"unreachable (this is not the sandbox's fault)",
+			s.coldLookupTimeout,
 		))
 	}
 

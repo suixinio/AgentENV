@@ -12,18 +12,108 @@ import (
 	"time"
 )
 
-// defaultGatewaySchedulerFallbackTimeout bounds the query-only-scheduler
-// LookupNode call a projection miss and an undecided wake-up both fall
-// through to (services/gateway/internal/server.go's lookupNodeFallback).
+// defaultColdLookupTimeout bounds the LookupNode call a projection miss and
+// an undecided wake-up both fall through to
+// (services/gateway/internal/server.go's lookupNodeColdPath).
 //
-// 🔴 Mirrors gateway.defaultSchedulerFallbackTimeout, the value NewServer
-// falls back to when a caller constructs ServerOptions directly (every test,
-// and any embedder that does not go through config.Load). This package
-// cannot import the gateway package to share one constant, so the two are
-// declared independently and must be kept equal by hand — if they drift,
-// config.Load's callers see one value and a caller building ServerOptions
-// directly sees the other.
-const defaultGatewaySchedulerFallbackTimeout = 3 * time.Second
+// 🔴 This is an ordinary timeout on a cold-path RPC, not a decommissioning
+// lever — it protects the call from a target that is merely slow or
+// unreachable (a bad rollout, a brief outage on whichever api replica
+// answers), which is a real failure mode independent of whether that target
+// is a Go scheduler or aenv-api's own in-process registry. It used to be
+// named defaultGatewaySchedulerFallbackTimeout and to have a sibling,
+// SchedulerFallbackDisabled, that could skip the call entirely; that sibling
+// (and the query-only-scheduler client selection it disabled) is deleted
+// outright along with the Go scheduler it was written to decommission, but
+// this cap stays — removing it would silently widen the call's failure
+// window from this value (3s) to whatever of gateway.request_timeout happens
+// to be left (30-90s), which is a real behavioural regression, not a cleanup.
+//
+// 🔴 Mirrors gateway.defaultColdLookupTimeout, the value NewServer falls back
+// to when a caller constructs ServerOptions directly (every test, and any
+// embedder that does not go through config.Load). This package cannot import
+// the gateway package to share one constant, so the two are declared
+// independently and must be kept equal by hand — if they drift, config.Load's
+// callers see one value and a caller building ServerOptions directly sees the
+// other.
+const defaultColdLookupTimeout = 3 * time.Second
+
+// RemovedGatewayEnvVars lists the environment variables that used to
+// configure the gateway's now-deleted query-only-scheduler fallback: which
+// address to dial for the cold-path LookupNode call, and whether to skip that
+// call entirely. See RefuseRemovedGatewayEnvVars.
+//
+// 🔴 GATEWAY_SCHEDULER_FALLBACK_TIMEOUT is in this list even though the
+// *capability* it configured is not gone — it is GATEWAY_COLD_LOOKUP_TIMEOUT
+// now (GatewayConfig.ColdLookupTimeout). The old name specifically described a
+// fallback to a process that may not exist, which stopped being accurate the
+// moment gateway.scheduler_addr started naming aenv-api instead of a Go
+// scheduler; the setting itself — a cap on this one RPC, separate from
+// gateway.request_timeout — is unchanged and still load-bearing.
+var RemovedGatewayEnvVars = []string{
+	"GATEWAY_QUERY_ONLY_SCHEDULER_ADDR",
+	"GATEWAY_SCHEDULER_FALLBACK_DISABLED",
+	"GATEWAY_SCHEDULER_FALLBACK_TIMEOUT",
+}
+
+// removedGatewayEnvVarReplacements says, for each entry in
+// RemovedGatewayEnvVars, what an operator who still sets it should do instead
+// — the three do not share one answer, unlike aenv-core's
+// REMOVED_CATALOG_ENV_VARS (src/cfg.rs) where every removed switch has the
+// same replacement ([pg]).
+var removedGatewayEnvVarReplacements = map[string]string{
+	"GATEWAY_QUERY_ONLY_SCHEDULER_ADDR":   "there is no replacement: the client-selection logic it configured is deleted outright, and every LookupNode call now goes to gateway.scheduler_addr (GATEWAY_SCHEDULER_ADDR), the same address every other Scheduler RPC this process makes already used",
+	"GATEWAY_SCHEDULER_FALLBACK_DISABLED": "there is no replacement: the switch it flipped is deleted outright, not merely defaulted off, so the cold-path LookupNode call it could skip is unconditional again, the same as every RPC this process makes to gateway.scheduler_addr",
+	"GATEWAY_SCHEDULER_FALLBACK_TIMEOUT":  "set GATEWAY_COLD_LOOKUP_TIMEOUT instead — same setting (a cap on the cold-path LookupNode call, separate from GATEWAY_REQUEST_TIMEOUT), renamed once it stopped being a fallback to a process that might not be running",
+}
+
+// RefuseRemovedGatewayEnvVars refuses to start when any of
+// RemovedGatewayEnvVars is set.
+//
+// Called from cmd/main.go before config.Load: the point is to stop a process
+// whose *manifest* still describes an arrangement this build does not have,
+// and that is knowable before anything is read.
+//
+// 🔴 This exists for the same reason aenv-core's
+// refuse_removed_catalog_env_vars (src/cfg.rs) does: this package's own
+// JSON/env parsing silently ignores an unknown key, so a manifest that still
+// sets GATEWAY_SCHEDULER_FALLBACK_DISABLED would go on looking healthy while
+// its operator believed a projection miss could still be short-circuited to a
+// hard 503 on demand — and one that still sets
+// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT would go on believing the cold-path
+// LookupNode call has a 3s cap when, silently, it no longer does: the call
+// falls through to GATEWAY_REQUEST_TIMEOUT's much longer budget instead. An
+// empty value counts as set, matching the Rust guard's own reasoning: a
+// manifest that writes GATEWAY_SCHEDULER_FALLBACK_TIMEOUT= has not been
+// migrated any more than one that writes a real duration into it.
+func RefuseRemovedGatewayEnvVars() error {
+	return refuseRemovedGatewayEnvVarsFrom(os.LookupEnv)
+}
+
+// refuseRemovedGatewayEnvVarsFrom is RefuseRemovedGatewayEnvVars with the
+// lookup injected, so the decision is testable without mutating the real
+// process environment.
+func refuseRemovedGatewayEnvVarsFrom(lookup func(string) (string, bool)) error {
+	var present []string
+	for _, name := range RemovedGatewayEnvVars {
+		if _, ok := lookup(name); ok {
+			present = append(present, name)
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s set, and this build no longer has the setting it names:\n", strings.Join(present, ", "))
+	for _, name := range present {
+		fmt.Fprintf(&b, "  - %s: %s\n", name, removedGatewayEnvVarReplacements[name])
+	}
+	b.WriteString("Remove the ones with no replacement from this workload's manifest, and rename the others; " +
+		"leaving any of them set would otherwise be ignored in silence, which for the timeout means losing its " +
+		"3s cap without anything saying so.")
+	return errors.New(b.String())
+}
 
 // GatewayExecutionFencing is the two-state switch over the gateway's routing
 // layer refusal: whether it stamps the incarnation it routed against onto the
@@ -186,10 +276,9 @@ type GatewayRoutingConfig struct {
 }
 
 type GatewayConfig struct {
-	HTTPListenAddr         string `json:"http_listen_addr"`
-	MetricsListenAddr      string `json:"metrics_listen_addr"`
-	SchedulerAddr          string `json:"scheduler_addr"`
-	QueryOnlySchedulerAddr string `json:"query_only_scheduler_addr"`
+	HTTPListenAddr    string `json:"http_listen_addr"`
+	MetricsListenAddr string `json:"metrics_listen_addr"`
+	SchedulerAddr     string `json:"scheduler_addr"`
 	// ResumeAddr is the api half's wake-up surface, asked when the routing
 	// projection has no answer for a sandbox.
 	//
@@ -246,37 +335,35 @@ type GatewayConfig struct {
 	// gateway stamps nothing and the node's gate stays open, which is what makes
 	// the rollout config-driven instead of deploy-driven.
 	ControlPlaneToken string `json:"-"`
-	// SchedulerFallbackDisabled turns off the query-only-scheduler LookupNode
-	// call that a projection miss and an undecided wake-up both fall through
-	// to. False — the default, and today's behaviour exactly — still asks the
-	// scheduler on that cold path.
+	// ColdLookupTimeout bounds the LookupNode call a projection miss and an
+	// undecided wake-up both fall through to, separately from RequestTimeout,
+	// so a target that is merely unreachable cannot hold it open for whatever
+	// of the request's overall budget is left. Zero (the default when unset)
+	// is resolved to a fixed default inside gateway.NewServer, never left as
+	// "no timeout".
 	//
-	// 🔴 Phase 4's decommissioning lever for that one call, in the same shape
-	// as ResumeAddr and RestUpstreamAddr above: a ConfigMap edit and a
-	// restart, not a code change. See gateway/internal/server.go's
-	// ServerOptions.SchedulerFallbackDisabled.
-	SchedulerFallbackDisabled bool `json:"scheduler_fallback_disabled"`
-	// SchedulerFallbackTimeout bounds that same call on its own, separately
-	// from RequestTimeout, so a scheduler that is merely unreachable cannot
-	// hold it open for whatever of the request's overall budget is left. Zero
-	// (the default when unset) is resolved to a fixed fallback inside
-	// gateway.NewServer, never left as "no timeout".
-	SchedulerFallbackTimeout time.Duration `json:"scheduler_fallback_timeout"`
+	// 🔴 Named for what it protects rather than for the process it used to
+	// name: this was SchedulerFallbackTimeout, and the call it bounds used to
+	// be a fallback to a query-only scheduler that could be a different
+	// process from gateway.scheduler_addr. That client-selection logic (and
+	// its own disable switch, SchedulerFallbackDisabled) is deleted along
+	// with the Go scheduler; this cap is not — it is an ordinary timeout on an
+	// ordinary RPC now, same as it protected before either switch existed.
+	ColdLookupTimeout time.Duration `json:"cold_lookup_timeout"`
 }
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		HTTPListenAddr         *string         `json:"http_listen_addr"`
-		MetricsListenAddr      *string         `json:"metrics_listen_addr"`
-		SchedulerAddr          *string         `json:"scheduler_addr"`
-		QueryOnlySchedulerAddr *string         `json:"query_only_scheduler_addr"`
-		ResumeAddr             *string         `json:"resume_addr"`
-		RestUpstreamAddr       *string         `json:"rest_upstream_addr"`
-		RedisAddr              *string         `json:"redis_addr"`
-		RequestTimeout         json.RawMessage `json:"request_timeout"`
-		ForwardResponseSize    *int64          `json:"forward_response_size"`
-		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
-		DebugMode              *bool           `json:"debug_mode"`
+		HTTPListenAddr      *string         `json:"http_listen_addr"`
+		MetricsListenAddr   *string         `json:"metrics_listen_addr"`
+		SchedulerAddr       *string         `json:"scheduler_addr"`
+		ResumeAddr          *string         `json:"resume_addr"`
+		RestUpstreamAddr    *string         `json:"rest_upstream_addr"`
+		RedisAddr           *string         `json:"redis_addr"`
+		RequestTimeout      json.RawMessage `json:"request_timeout"`
+		ForwardResponseSize *int64          `json:"forward_response_size"`
+		SandboxProxyDomains *[]string       `json:"sandbox_proxy_domains"`
+		DebugMode           *bool           `json:"debug_mode"`
 		// Nested one pointer deep on each side, so a config file that names the
 		// block without naming the key inside it leaves the default alone rather
 		// than blanking it.
@@ -285,8 +372,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			ProjectionRead          *bool   `json:"projection_read"`
 			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
 		} `json:"routing"`
-		SchedulerFallbackDisabled *bool           `json:"scheduler_fallback_disabled"`
-		SchedulerFallbackTimeout  json.RawMessage `json:"scheduler_fallback_timeout"`
+		ColdLookupTimeout json.RawMessage `json:"cold_lookup_timeout"`
 	}
 
 	parsed := wire{}
@@ -302,9 +388,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.SchedulerAddr != nil {
 		g.SchedulerAddr = *parsed.SchedulerAddr
-	}
-	if parsed.QueryOnlySchedulerAddr != nil {
-		g.QueryOnlySchedulerAddr = *parsed.QueryOnlySchedulerAddr
 	}
 	if parsed.ResumeAddr != nil {
 		g.ResumeAddr = *parsed.ResumeAddr
@@ -345,15 +428,12 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		}
 		g.RequestTimeout = d
 	}
-	if parsed.SchedulerFallbackDisabled != nil {
-		g.SchedulerFallbackDisabled = *parsed.SchedulerFallbackDisabled
-	}
-	if len(bytes.TrimSpace(parsed.SchedulerFallbackTimeout)) > 0 {
-		d, err := parseGatewayDuration("gateway.scheduler_fallback_timeout", parsed.SchedulerFallbackTimeout)
+	if len(bytes.TrimSpace(parsed.ColdLookupTimeout)) > 0 {
+		d, err := parseGatewayDuration("gateway.cold_lookup_timeout", parsed.ColdLookupTimeout)
 		if err != nil {
 			return err
 		}
-		g.SchedulerFallbackTimeout = d
+		g.ColdLookupTimeout = d
 	}
 
 	return nil
@@ -424,13 +504,13 @@ func defaultConfig(service string) Config {
 		LogLevel:  "info",
 		LogFormat: "auto",
 		Gateway: GatewayConfig{
-			HTTPListenAddr:           ":8080",
-			MetricsListenAddr:        ":9102",
-			SchedulerAddr:            "127.0.0.1:9090",
-			RequestTimeout:           30 * time.Second,
-			ForwardResponseSize:      4 << 20,
-			SandboxProxyDomains:      []string{},
-			SchedulerFallbackTimeout: defaultGatewaySchedulerFallbackTimeout,
+			HTTPListenAddr:      ":8080",
+			MetricsListenAddr:   ":9102",
+			SchedulerAddr:       "127.0.0.1:9090",
+			RequestTimeout:      30 * time.Second,
+			ForwardResponseSize: 4 << 20,
+			SandboxProxyDomains: []string{},
+			ColdLookupTimeout:   defaultColdLookupTimeout,
 			// The default points at the end state rather than at the cautious
 			// first step. Starting a release on observe is release discipline,
 			// which belongs in the runbook; putting it in the default leaves
@@ -451,7 +531,6 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
-	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
 	set("GATEWAY_RESUME_ADDR", &cfg.Gateway.ResumeAddr)
 	set("GATEWAY_REST_UPSTREAM_ADDR", &cfg.Gateway.RestUpstreamAddr)
 	set("GATEWAY_REDIS_ADDR", &cfg.Gateway.RedisAddr)
@@ -478,25 +557,19 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Gateway.DebugMode = b
 	}
 
-	// 🔴 Phase 4's decommissioning lever — see GatewayConfig.
-	// SchedulerFallbackDisabled — so it follows GATEWAY_DEBUG_MODE's shape
-	// rather than the mounted-file pattern the projection switches use below:
-	// this one is meant to be flipped by `kubectl set env` and a restart, the
-	// same way ResumeAddr and RestUpstreamAddr are.
-	if v := strings.TrimSpace(os.Getenv("GATEWAY_SCHEDULER_FALLBACK_DISABLED")); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid GATEWAY_SCHEDULER_FALLBACK_DISABLED %q: %w", v, err)
-		}
-		cfg.Gateway.SchedulerFallbackDisabled = b
-	}
-
-	if v := strings.TrimSpace(os.Getenv("GATEWAY_SCHEDULER_FALLBACK_TIMEOUT")); v != "" {
+	// 🔴 Follows GATEWAY_DEBUG_MODE's shape rather than the mounted-file
+	// pattern the projection switches use below: this one is meant to be
+	// flipped by `kubectl set env` and a restart, the same way ResumeAddr and
+	// RestUpstreamAddr are. Named GATEWAY_COLD_LOOKUP_TIMEOUT, not
+	// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — see ColdLookupTimeout's own doc for
+	// why the rename, and RefuseRemovedGatewayEnvVars for what happens when a
+	// manifest still sets the old name.
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_COLD_LOOKUP_TIMEOUT")); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return fmt.Errorf("invalid GATEWAY_SCHEDULER_FALLBACK_TIMEOUT %q: %w", v, err)
+			return fmt.Errorf("invalid GATEWAY_COLD_LOOKUP_TIMEOUT %q: %w", v, err)
 		}
-		cfg.Gateway.SchedulerFallbackTimeout = d
+		cfg.Gateway.ColdLookupTimeout = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_ROUTING_EXECUTION_FENCING")); v != "" {

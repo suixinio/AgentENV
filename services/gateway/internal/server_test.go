@@ -207,12 +207,6 @@ func withDebugMode(enabled bool) testServerOption {
 	}
 }
 
-func withQueryOnlyScheduler(client schedulerv1.SchedulerClient) testServerOption {
-	return func(options *ServerOptions) {
-		options.QueryOnlySchedulerClient = client
-	}
-}
-
 func TestSandboxIDFromHeadersPrimary(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-agentenv-sandbox-id", "abc123")
@@ -490,20 +484,24 @@ func TestHandleProxyDirectForwardsNodeDetail(t *testing.T) {
 	}
 }
 
-func TestLookupNodeUsesQueryOnlySchedulerClient(t *testing.T) {
+// TestLookupNodeGoesToTheConfiguredScheduler pins the cold path's client
+// selection now that there is only one client to select: lookupNodeColdPath
+// calls LookupNode on the scheduler client NewServer was given (s.scheduler)
+// and forwards its answer, the same client every other Scheduler RPC in this
+// package uses. This replaces
+// TestLookupNodeUsesQueryOnlySchedulerClient, which pinned the opposite
+// behaviour — that LookupNode went to a second, separately configured
+// client (QueryOnlySchedulerClient) instead of s.scheduler — back when that
+// field existed. It does not any more: the query-only-scheduler client
+// selection is deleted along with the Go scheduler it existed to
+// decommission.
+func TestLookupNodeGoesToTheConfiguredScheduler(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
 
-	mainLookupCalled := make(chan struct{}, 1)
-	mainScheduler := stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			mainLookupCalled <- struct{}{}
-			return nil, fmt.Errorf("main scheduler lookup should not be used")
-		},
-	}
-	queryScheduler := stubSchedulerClient{
+	scheduler := stubSchedulerClient{
 		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
 			if req.GetSandboxId() != "sbx-1" {
 				return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-1")
@@ -511,7 +509,7 @@ func TestLookupNodeUsesQueryOnlySchedulerClient(t *testing.T) {
 			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-1", Endpoint: upstream.URL}}, nil
 		},
 	}
-	server := newTestServer(t, mainScheduler, time.Second, 1024, withQueryOnlyScheduler(queryScheduler))
+	server := newTestServer(t, scheduler, time.Second, 1024)
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -528,11 +526,6 @@ func TestLookupNodeUsesQueryOnlySchedulerClient(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-	select {
-	case <-mainLookupCalled:
-		t.Fatal("main scheduler handled LookupNode; want query-only scheduler")
-	default:
 	}
 }
 

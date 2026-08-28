@@ -115,33 +115,35 @@ var (
 		},
 		[]string{"result"},
 	)
-	// Cold-path query-only-scheduler fallback outcomes that never reached a
-	// normal LookupNode answer — recorded in addition to, not instead of,
-	// gatewaySchedulerRPCDuration.
+	// Cold-path LookupNode calls (a projection miss and an undecided wake-up
+	// both fall through to lookupNodeColdPath) that hit their own timeout
+	// before the RPC returned — recorded in addition to, not instead of,
+	// gatewaySchedulerRPCDuration, which already counts the RPC by status
+	// including this one's eventual DeadlineExceeded. This series exists only
+	// to answer "did the cold-path cap fire", which the RPC-status series
+	// cannot answer on its own since a caller-side deadline firing looks
+	// identical to it there.
 	//
-	// 🔴 Only two outcomes are ever recorded here: "disabled" (the fallback is
-	// switched off by configuration, so no RPC was attempted at all — this is
-	// phase 4's decommissioning lever) and "timeout" (the fallback-specific cap
-	// fired before the RPC returned, distinct from the RPC simply failing with
-	// an ordinary gRPC error, which gatewaySchedulerRPCDuration already counts
-	// by status). A success or an ordinary RPC failure is not double-counted
-	// here — this series exists only to answer "did the short-circuit fire",
-	// which the RPC-status series cannot answer on its own.
-	gatewaySchedulerFallback = promauto.NewCounterVec(
+	// 🔴 Used to be a CounterVec named agentenv_gateway_scheduler_fallback_total
+	// with an "outcome" label taking "disabled" or "timeout" — "disabled" was
+	// the now-deleted query-only-scheduler fallback's decommissioning lever,
+	// which made zero RPCs and so needed its own outcome to distinguish from a
+	// timeout. With that switch gone, "timeout" is the only outcome this
+	// series could ever record, so the label was dropped along with it rather
+	// than kept as a single-value vocabulary.
+	gatewayColdLookupTimeout = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "agentenv_gateway_scheduler_fallback_total",
-			Help: "Cold-path query-only-scheduler LookupNode fallback attempts that never reached the scheduler: by configuration (disabled) or by the fallback-specific timeout (timeout).",
+			Name: "agentenv_gateway_cold_lookup_timeout_total",
+			Help: "Cold-path LookupNode calls (a projection miss or an undecided wake-up) that hit their own timeout before the RPC returned.",
 		},
-		[]string{"outcome"},
 	)
 	// Which upstream served a user-facing REST call.
 	//
-	// 🔴 The label set is still `{"upstream"}`, and `restUpstreamNode` is still
-	// declared, purely for dashboard and alert compatibility with 阶段 3a — but
-	// nothing increments it any more. handleProxy's node-routing fallback for
-	// user-facing REST is gone outright, not merely unreachable behind a
-	// switch: `{upstream="node"}` will never be exported again by any build of
-	// this package, not just by any validated deployment. See rest_upstream.go.
+	// 🔴 The label set is `{"upstream"}`, but only `restUpstreamAPI` is ever
+	// recorded: handleProxy's node-routing fallback for user-facing REST is
+	// gone outright, not merely unreachable behind a switch, so
+	// `{upstream="node"}` will never be exported by any build of this package.
+	// See rest_upstream.go.
 	gatewayRestUpstream = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_rest_upstream_total",
@@ -358,14 +360,8 @@ func recordResumeAttempt(result resume.Result) {
 	gatewayResumeAttempts.WithLabelValues(resumeResultLabel(result)).Inc()
 }
 
-// The closed set of gatewaySchedulerFallback outcomes.
-const (
-	schedulerFallbackOutcomeDisabled = "disabled"
-	schedulerFallbackOutcomeTimeout  = "timeout"
-)
-
-func recordSchedulerFallbackOutcome(outcome string) {
-	gatewaySchedulerFallback.WithLabelValues(outcome).Inc()
+func recordGatewayColdLookupTimeout() {
+	gatewayColdLookupTimeout.Inc()
 }
 
 func recordRouteResolution(source string) {
@@ -373,10 +369,9 @@ func recordRouteResolution(source string) {
 }
 
 // recordRestUpstream counts one user-facing REST exchange against the upstream
-// about to serve it. Its one remaining call site, handleProxy's
-// isUserFacingRestRequest branch, only ever passes restUpstreamAPI now — see
-// gatewayRestUpstream's own doc comment for why restUpstreamNode is still
-// declared.
+// about to serve it. Its one call site, handleProxy's isUserFacingRestRequest
+// branch, only ever passes restUpstreamAPI — see gatewayRestUpstream's own
+// doc comment.
 func recordRestUpstream(upstream string) {
 	gatewayRestUpstream.WithLabelValues(upstream).Inc()
 }

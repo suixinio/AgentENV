@@ -116,11 +116,6 @@ func fencingCounter(t *testing.T, plane fencingPlane, decision string) float64 {
 	return scrapeCounter(t, fmt.Sprintf(`agentenv_gateway_execution_fencing_total{decision=%q,plane=%q}`, decision, plane))
 }
 
-func duplicateCounter(t *testing.T, resolution string) float64 {
-	t.Helper()
-	return scrapeCounter(t, fmt.Sprintf(`agentenv_gateway_cluster_list_duplicate_total{resolution=%q}`, resolution))
-}
-
 // 🔴 The probe before the assertions that lean on it.
 //
 // Every count in this file is a delta read through scrapeCounter, so a reader
@@ -324,47 +319,18 @@ func TestHostRoutedDataPlaneIsFencedLikeHeaderRouted(t *testing.T) {
 	}
 }
 
-// 🔴 The control plane is never refused and never stamped.
-//
-// resume is the operation that mints a new incarnation, so a gate in front of it
-// that compares against the old one would refuse the very thing it is waiting
-// for. pause is here for the same reason in reverse: the registry's own
-// transaction is the authoritative check, and a second one here, built from a
-// lookup that may be a heartbeat behind, can only disagree with it.
-func TestControlPlaneRequestIsNeverRefusedOnExecutionMismatch(t *testing.T) {
-	for _, path := range []string{"/sandboxes/sbx-1/pause", "/sandboxes/sbx-1/resume"} {
-		t.Run(path, func(t *testing.T) {
-			stamped := make(chan string, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				stamped <- r.Header.Get(headerExpectExecutionID)
-				// The node answers with an incarnation older than the one the
-				// scheduler named — the exact shape the data plane refuses.
-				w.Header().Set(headerExecutionID, executionOlder)
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer upstream.Close()
-
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-			}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
-
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}")))
-
-			if response.Code != http.StatusOK {
-				t.Fatalf("control-plane %s was answered %d (body %q); it must pass through", path, response.Code, response.Body.String())
-			}
-			select {
-			case got := <-stamped:
-				if got != "" {
-					t.Fatalf("control-plane %s carried expect header %q; it must carry none", path, got)
-				}
-			default:
-				t.Fatalf("control-plane %s never reached the node", path)
-			}
-		})
-	}
-}
+// 🔴 TestControlPlaneRequestIsNeverRefusedOnExecutionMismatch used to live
+// here: pause and resume routed straight to a node by this gateway (via
+// `newTestServer`'s unconfigured, restUpstream=="" fixture) and asserted that
+// neither was ever stamped or refused. That routing no longer exists —
+// handleProxy's isUserFacingRestRequest branch forwards every control-plane
+// call to the api half before decideFencing is ever reached for it, so the
+// property "the control plane is never refused" is enforced structurally now
+// (no fencing plan is ever computed for it — see forwardToRestUpstream's own
+// doc comment) rather than by a decision this test needed to pin. Deleted
+// rather than rewritten: there is no live call site left that resolves a
+// fencingPlaneControl plan through a real request the way this test drove
+// one.
 
 // 🔴 PLACED and PINNED both mean the node is about to mint a new incarnation, so
 // any incarnation on the answer names the previous one. Stamping it would refuse
@@ -860,24 +826,16 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T) {
 	})
 }
 
-// 🔴 The reverse control for the test above. A scheduler NotFound still has to
-// arrive as a 404: it is the signal the platform is entitled to act on, and the
-// blanket "no more 404s here" change that would satisfy the previous test must
-// fail this one.
-func TestSchedulerNotFoundStillMapsToFourOhFour(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return nil, status.Error(codes.NotFound, "sandbox assignment not found")
-		},
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
-
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader("{}")))
-
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("a scheduler NotFound arrived as %d, want 404", response.Code)
-	}
-}
+// 🔴 TestSchedulerNotFoundStillMapsToFourOhFour used to live here, driving a
+// scheduler NotFound through `POST /sandboxes/sbx-1/resume` against an
+// unconfigured (restUpstream=="") fixture to pin that writeSchedulerError's
+// NotFound branch still answers 404. Resume is a routeSourcePath call and is
+// now always forwarded to the api half before that branch is reached, so the
+// specific request this test sent no longer exercises writeSchedulerError at
+// all. The mapping itself is not uncovered: it is the same NotFound→404
+// branch `TestProjectionMissOnAnUnknownSandboxStillAnswers404`
+// (projection_test.go) exercises through a genuine, still-live data-plane
+// LookupNode failure.
 
 // 🔴 The Scheduler service may never answer PermissionDenied.
 //
@@ -1009,6 +967,21 @@ func TestFencingOffMatchesLegacyBehaviour(t *testing.T) {
 // it overwrites whatever the client sent under that name. "Add it if it is
 // missing" would not be a weaker version of this — it would hand any caller the
 // ability to present itself as the control plane by setting one header.
+//
+// 🔴 Converted to a data-plane request. This used to drive a pause (POST
+// /sandboxes/sbx-1/pause) against an unconfigured (restUpstream=="")
+// fixture, which is dead for the reason given throughout this file: pause is
+// a routeSourcePath call and is now always forwarded to the api half before
+// any node is resolved. stampOutboundGatewayHeaders is unconditional and
+// shared by every forwarding path in this package (proxyRequest.Rewrite,
+// used by both data-plane proxying and forwardToRestUpstream), so this table
+// still pins the same three-way behaviour through the one call site left that
+// exercises it via a real LookupNode/proxy round trip.
+// TestASandboxControlPlaneCallGoesToTheApiHalfWithoutResolvingANode
+// (rest_upstream_test.go) additionally pins that the api-bound forward is
+// stamped too, but only for the "configured, no client value" case; this
+// table is what still exercises the forged-value overwrite and the
+// no-token-configured deletion.
 func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -1035,7 +1008,7 @@ func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 				lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
 			}, 5*time.Second, 4<<20, withControlPlaneToken(tc.token))
 
-			request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", strings.NewReader("{}"))
+			request := dataPlaneRequest("sbx-1")
 			if tc.clientSet != "" {
 				request.Header.Set(headerControlPlane, tc.clientSet)
 			}
@@ -1053,225 +1026,17 @@ func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 	}
 }
 
-// 🔴 The cluster listing fans out to every node with the gateway's own HTTP
-// client, not through the reverse proxy, so it does not inherit the Rewrite
-// hook's headers. It is also all-or-nothing: one node refusing takes the whole
-// listing with it. Missing this means the listing returns 502 for the fleet the
-// moment the node-side gate is switched on, and nothing in the proxy path would
-// have shown it.
-func TestClusterListFanOutCarriesTheControlPlaneToken(t *testing.T) {
-	seen := make(chan http.Header, 1)
-	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Header.Clone()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[]`))
-	}))
-	defer node.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		listNodesFunc: func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-			return &schedulerv1.ListNodesResponse{Nodes: []*schedulerv1.Node{{NodeId: "node-a", Endpoint: node.URL}}}, nil
-		},
-	}, 5*time.Second, 4<<20, withControlPlaneToken("the-real-token"))
-
-	request := httptest.NewRequest(http.MethodGet, "/sandboxes", nil)
-	request.Header.Set(headerControlPlane, "a-forged-token")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d (body %q)", response.Code, response.Body.String())
-	}
-	select {
-	case header := <-seen:
-		if got := header.Get(headerControlPlane); got != "the-real-token" {
-			t.Fatalf("the fan-out carried control-plane header %q, want the gateway's own token", got)
-		}
-	default:
-		t.Fatal("the fan-out never reached the node")
-	}
-}
-
-func clusterListNode(t *testing.T, rows ...listedSandbox) *httptest.Server {
-	t.Helper()
-	payload, err := json.Marshal(rows)
-	if err != nil {
-		t.Fatalf("encode node rows: %v", err)
-	}
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(payload)
-	}))
-}
-
-func fetchClusterListRows(t *testing.T, server *Server, path string) []listedSandbox {
-	t.Helper()
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d (body %q)", response.Code, response.Body.String())
-	}
-	var rows []listedSandbox
-	if err := json.Unmarshal(response.Body.Bytes(), &rows); err != nil {
-		t.Fatalf("decode listing: %v (body %q)", err, response.Body.String())
-	}
-	return rows
-}
-
-// 🔴 The two rows a split brain produces are identical in everything the sort
-// orders on: the same sandbox id, and the same startedAt, because startedAt is
-// the sandbox's creation time and only a fork resets it. sort.Slice is not
-// stable, so which one survived was whichever the sort happened to leave first,
-// and two calls against the same cluster could disagree — with the state, the
-// end time and the metadata all read off a run that is over.
-//
-// Twenty rounds, because a single round passes half the time by luck.
-func TestClusterListPrefersTheCurrentExecutionOnDuplicates(t *testing.T) {
-	startedAt := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	stale := listedSandbox{
-		SandboxID:   "11111111-2222-3333-4444-555555555555",
-		StartedAt:   startedAt,
-		State:       "running-on-the-superseded-node",
-		ExecutionID: executionOlder,
-	}
-	current := listedSandbox{
-		SandboxID: "11111111-2222-3333-4444-555555555555",
-		StartedAt: startedAt,
-		State:     "running-on-the-current-node",
-		// 🔴 Upper-cased on purpose. The registry's own id validator accepts
-		// either case, so a node may report either, and the ordering is
-		// lexicographic: 'A' (0x41) sorts before 'a' (0x61), so a newer
-		// incarnation that arrived upper-cased loses to an older lower-cased one
-		// unless both are put into one case first. The row that is upper-cased
-		// here is the one that has to win.
-		ExecutionID: strings.ToUpper(executionNewer),
-	}
-
-	for round := 0; round < 20; round++ {
-		// The order the two nodes answer in is swapped between rounds, so a
-		// keep-first implementation cannot be right by accident.
-		first, second := stale, current
-		if round%2 == 1 {
-			first, second = current, stale
-		}
-
-		nodeA := clusterListNode(t, first)
-		nodeB := clusterListNode(t, second)
-
-		server := newTestServer(t, stubSchedulerClient{
-			listNodesFunc: func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-				return &schedulerv1.ListNodesResponse{Nodes: []*schedulerv1.Node{
-					{NodeId: "node-a", Endpoint: nodeA.URL},
-					{NodeId: "node-b", Endpoint: nodeB.URL},
-				}}, nil
-			},
-		}, 5*time.Second, 4<<20)
-
-		rows := fetchClusterListRows(t, server, "/v2/sandboxes")
-		nodeA.Close()
-		nodeB.Close()
-
-		if len(rows) != 1 {
-			t.Fatalf("round %d returned %d rows, want 1", round, len(rows))
-		}
-		if rows[0].State != current.State {
-			t.Fatalf("round %d kept the row from %q; the newer incarnation has to win every time", round, rows[0].State)
-		}
-	}
-}
-
-// The duplicate itself is the interesting fact. It used to be swallowed by the
-// deduplication, which made the endpoint most likely to be used to find a split
-// brain the one endpoint that hid it.
-func TestClusterListCountsDuplicates(t *testing.T) {
-	startedAt := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	row := func(execution string) listedSandbox {
-		return listedSandbox{
-			SandboxID:   "11111111-2222-3333-4444-555555555555",
-			StartedAt:   startedAt,
-			ExecutionID: execution,
-		}
-	}
-
-	for _, tc := range []struct {
-		name       string
-		second     listedSandbox
-		resolution string
-	}{
-		{name: "resolved by incarnation", second: row(executionOlder), resolution: clusterListDuplicateByExecution},
-		// Two nodes that cannot name an incarnation. The old fallback stands,
-		// and it is still counted — an uncountable duplicate would be the same
-		// silent swallow in a new place.
-		{name: "resolved by keeping the first", second: row(""), resolution: clusterListDuplicateKeepFirst},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			first := row(executionNewer)
-			if tc.resolution == clusterListDuplicateKeepFirst {
-				first = row("")
-			}
-
-			nodeA := clusterListNode(t, first)
-			defer nodeA.Close()
-			nodeB := clusterListNode(t, tc.second)
-			defer nodeB.Close()
-
-			before := duplicateCounter(t, tc.resolution)
-			other := clusterListDuplicateByExecution
-			if tc.resolution == clusterListDuplicateByExecution {
-				other = clusterListDuplicateKeepFirst
-			}
-			otherBefore := duplicateCounter(t, other)
-
-			server := newTestServer(t, stubSchedulerClient{
-				listNodesFunc: func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-					return &schedulerv1.ListNodesResponse{Nodes: []*schedulerv1.Node{
-						{NodeId: "node-a", Endpoint: nodeA.URL},
-						{NodeId: "node-b", Endpoint: nodeB.URL},
-					}}, nil
-				},
-			}, 5*time.Second, 4<<20)
-
-			if rows := fetchClusterListRows(t, server, "/sandboxes"); len(rows) != 1 {
-				t.Fatalf("returned %d rows, want 1", len(rows))
-			}
-			if got := duplicateCounter(t, tc.resolution) - before; got != 1 {
-				t.Fatalf("the %q series moved by %v, want 1", tc.resolution, got)
-			}
-			if got := duplicateCounter(t, other) - otherBefore; got != 0 {
-				t.Fatalf("the %q series also moved, by %v; the two resolutions have to stay distinguishable", other, got)
-			}
-		})
-	}
-}
-
-// 🔴 The listing is decoded into a struct of the gateway's own, and a field the
-// struct does not name is discarded without a word. A node reporting the
-// incarnation and a gateway dropping it look exactly like a node that never
-// reported one: the field is empty, and nothing fails.
-func TestClusterListExposesExecutionID(t *testing.T) {
-	node := clusterListNode(t, listedSandbox{
-		SandboxID:   "11111111-2222-3333-4444-555555555555",
-		StartedAt:   time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC),
-		ExecutionID: executionNewer,
-	})
-	defer node.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		listNodesFunc: func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-			return &schedulerv1.ListNodesResponse{Nodes: []*schedulerv1.Node{{NodeId: "node-a", Endpoint: node.URL}}}, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	for _, path := range []string{"/sandboxes", "/v2/sandboxes"} {
-		rows := fetchClusterListRows(t, server, path)
-		if len(rows) != 1 {
-			t.Fatalf("%s returned %d rows, want 1", path, len(rows))
-		}
-		if rows[0].ExecutionID != executionNewer {
-			t.Fatalf("%s reported executionID %q, want %q", path, rows[0].ExecutionID, executionNewer)
-		}
-	}
-}
+// 🔴 Four tests used to live here — TestClusterListFanOutCarriesTheControlPlaneToken,
+// TestClusterListPrefersTheCurrentExecutionOnDuplicates, TestClusterListCountsDuplicates,
+// and TestClusterListExposesExecutionID, together with their clusterListNode and
+// fetchClusterListRows helpers — driving the cluster-list fan-out (GET /sandboxes
+// and GET /v2/sandboxes against an unconfigured, restUpstream=="" fixture) to pin
+// the control-plane token stamp, the incarnation-based dedup, the duplicate
+// counter, and executionID exposure on the merged rows. The fan-out itself is
+// deleted (cluster_list.go is gone; see rest_upstream.go) along with the
+// restUpstream=="" position that was its only trigger, so none of these four
+// requests reaches a fan-out at all any more — both routes are unconditionally
+// forwarded to the api half now, like any other user-facing REST call.
 
 // The registry listing is the one place a row's incarnation can be read
 // directly, which is what makes it the surface a split brain is reconciled
@@ -1326,43 +1091,19 @@ func TestRegistryListDoesNotAcceptAnExecutionFilter(t *testing.T) {
 	}
 }
 
-// The incarnation the node reports on a fresh create is carried into the
-// assignment, so the binding is authoritative from the first request rather than
-// from the first heartbeat.
-func TestRecordedAssignmentCarriesTheNodesExecution(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerSandboxID, "sbx-1")
-		w.Header().Set(headerExecutionID, executionNewer)
-		w.WriteHeader(http.StatusCreated)
-	}))
-	defer upstream.Close()
-
-	assignments := make(chan *schedulerv1.RecordAssignmentRequest, 1)
-	server := newTestServer(t, stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			assignments <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader("{}")))
-	if response.Code != http.StatusCreated {
-		t.Fatalf("expected status 201, got %d (body %q)", response.Code, response.Body.String())
-	}
-
-	select {
-	case assignment := <-assignments:
-		if assignment.GetExecutionId() != executionNewer {
-			t.Fatalf("assignment recorded incarnation %q, want %q", assignment.GetExecutionId(), executionNewer)
-		}
-	default:
-		t.Fatal("no assignment was recorded")
-	}
-}
+// 🔴 TestRecordedAssignmentCarriesTheNodesExecution used to live here: a
+// `POST /sandboxes` create, scheduled by this gateway against an
+// unconfigured (restUpstream=="") fixture, whose recorded assignment had to
+// carry the node's reported incarnation. Create is a routeSourceSchedule
+// call and is now always forwarded to the api half — which records its own
+// placements — before the gateway ever schedules or records anything for
+// it, so this specific request no longer reaches recordAssignmentFromResponse
+// at all. The property this pinned — a recorded assignment carries whatever
+// incarnation the response named, not a placeholder — survives for the one
+// case that still writes an assignment from this package: a data-plane
+// request to a PLACED/PINNED sandbox. See
+// TestPlacedSandboxDataPlaneRequestRecordsTheAssignment in server_test.go,
+// which asserts the recorded execution id the same way this test did.
 
 // 🔴 An unrecognised mode stops the process. Falling back to a default would let
 // one mistyped letter switch fencing off with nothing to say it happened, and

@@ -81,143 +81,80 @@ func serve(t *testing.T, server *Server, req *http.Request) *http.Response {
 	return rec.Result()
 }
 
-// 🔴 The pair, and neither half is evidence without the other.
-//
-// "The api half was asked" passes against a gateway that sends it everything,
-// including the data plane. "A node was asked" passes against a gateway that
-// ignores the switch entirely. The same request, through the same handler,
-// differing only in whether an address is configured, is what says the switch
-// is live and that it switches.
+// 🔴 This used to be a pair with an "off" subtest: the scheduler placed the
+// call and a node served it, against an unconfigured (restUpstream=="")
+// fixture. Off is gone — handleProxy no longer has a node-routing fallback
+// for user-facing REST to fall through to, so a create against an
+// unconfigured server now just 502s rather than exercising anything (see
+// rest_upstream.go) — so only the "on" case is left to pin, and unwrapped
+// from its subtest since it no longer has a sibling to be paired against.
 func TestTheRestUpstreamSwitchDecidesWhoServesAUserFacingRestCall(t *testing.T) {
-	t.Run("off: the scheduler places the call and a node serves it", func(t *testing.T) {
-		node := newRecordingUpstream(t)
-		api := newRecordingUpstream(t)
-		schedules := 0
-		scheduler := stubSchedulerClient{
-			scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-				schedules++
-				return &schedulerv1.ScheduleResponse{
-					Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: node.server.URL},
-				}, nil
-			},
-			recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-				return &schedulerv1.RecordAssignmentResponse{}, nil
-			},
-		}
+	node := newRecordingUpstream(t)
+	api := newRecordingUpstream(t)
+	// 🔴 Every scheduler method fails the test. Placement is the api half's
+	// decision, and a Schedule call whose answer is discarded is not
+	// harmless: it consumes a placement and moves the strategy's cursor for
+	// a request that never went there.
+	scheduler := stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			t.Fatal("the api half places its own sandboxes; the gateway must not schedule one")
+			return nil, nil
+		},
+		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			t.Fatal("the gateway has no node to record: writing this address into a binding " +
+				"would route the next data-plane request to a process with no sandbox on it")
+			return nil, nil
+		},
+	}
 
-		server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-		resp := serve(t, server, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
-		defer resp.Body.Close()
+	server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withRestUpstream(api.server.URL))
+	resp := serve(t, server, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
+	defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
-		}
-		if schedules != 1 {
-			t.Fatalf("Schedule calls = %d, want 1: with no upstream configured the scheduler still places creates", schedules)
-		}
-		if node.hits() != 1 {
-			t.Fatalf("node hits = %d, want 1", node.hits())
-		}
-		if api.hits() != 0 {
-			t.Fatalf("api hits = %d, want 0: nothing is configured to send it anything", api.hits())
-		}
-	})
-
-	t.Run("on: the api half serves it and the scheduler is not consulted", func(t *testing.T) {
-		node := newRecordingUpstream(t)
-		api := newRecordingUpstream(t)
-		// 🔴 Every scheduler method fails the test. Placement is the api half's
-		// decision once this switch is on, and a Schedule call whose answer is
-		// discarded is not harmless: it consumes a placement and moves the
-		// strategy's cursor for a request that never went there.
-		scheduler := stubSchedulerClient{
-			scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-				t.Fatal("the api half places its own sandboxes; the gateway must not schedule one")
-				return nil, nil
-			},
-			recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-				t.Fatal("the gateway has no node to record: writing this address into a binding " +
-					"would route the next data-plane request to a process with no sandbox on it")
-				return nil, nil
-			},
-		}
-
-		server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withRestUpstream(api.server.URL))
-		resp := serve(t, server, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
-		}
-		if api.hits() != 1 {
-			t.Fatalf("api hits = %d, want 1", api.hits())
-		}
-		if got := api.lastPath(t); got != "/sandboxes" {
-			t.Fatalf("the api half was asked for %q, want /sandboxes: a REST path must arrive unrewritten", got)
-		}
-		if node.hits() != 0 {
-			t.Fatalf("node hits = %d, want 0", node.hits())
-		}
-	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if api.hits() != 1 {
+		t.Fatalf("api hits = %d, want 1", api.hits())
+	}
+	if got := api.lastPath(t); got != "/sandboxes" {
+		t.Fatalf("the api half was asked for %q, want /sandboxes: a REST path must arrive unrewritten", got)
+	}
+	if node.hits() != 0 {
+		t.Fatalf("node hits = %d, want 0", node.hits())
+	}
 }
 
 // A sandbox-scoped control-plane call is the other half of the REST surface,
 // and it takes a different route through handleProxy — it resolves a sandbox
-// before it forwards. With the switch on it must not resolve one at all.
+// before it forwards. It must not resolve one at all.
+//
+// 🔴 Also unwrapped from an "off"/"on" pair for the same reason as the test
+// above: off no longer has any behaviour of its own to contrast this against.
 func TestASandboxControlPlaneCallGoesToTheApiHalfWithoutResolvingANode(t *testing.T) {
-	t.Run("off: the sandbox is resolved and the holding node serves it", func(t *testing.T) {
-		node := newRecordingUpstream(t)
-		lookups := 0
-		scheduler := stubSchedulerClient{
-			lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-				lookups++
-				return &schedulerv1.LookupNodeResponse{
-					Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: node.server.URL},
-					Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-				}, nil
-			},
-		}
+	api := newRecordingUpstream(t)
+	scheduler := refusingScheduler(t, "the api half knows which machine holds the sandbox")
 
-		server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-		resp := serve(t, server, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
-		defer resp.Body.Close()
+	server := newTestServer(t, scheduler, 5*time.Second, 1<<20,
+		withRestUpstream(api.server.URL),
+		withControlPlaneToken("shared-secret"),
+	)
+	resp := serve(t, server, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
+	defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
-		}
-		if lookups != 1 {
-			t.Fatalf("LookupNode calls = %d, want 1", lookups)
-		}
-		if node.hits() != 1 {
-			t.Fatalf("node hits = %d, want 1", node.hits())
-		}
-	})
-
-	t.Run("on: the api half is asked directly", func(t *testing.T) {
-		api := newRecordingUpstream(t)
-		scheduler := refusingScheduler(t, "the api half knows which machine holds the sandbox")
-
-		server := newTestServer(t, scheduler, 5*time.Second, 1<<20,
-			withRestUpstream(api.server.URL),
-			withControlPlaneToken("shared-secret"),
-		)
-		resp := serve(t, server, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
-		}
-		if got := api.lastPath(t); got != "/sandboxes/sbx-1/pause" {
-			t.Fatalf("the api half was asked for %q", got)
-		}
-		// 🔴 The api half sits behind the same control-plane gate the nodes do.
-		// A forward that dropped the stamp would be refused by every gated api
-		// replica, and the symptom — 403 on every REST call — arrives at the
-		// moment the switch is flipped and looks like the switch being wrong.
-		if got := api.lastHeader(t, headerControlPlane); got != "shared-secret" {
-			t.Fatalf("control-plane stamp on the api-bound request = %q, want the configured token", got)
-		}
-	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := api.lastPath(t); got != "/sandboxes/sbx-1/pause" {
+		t.Fatalf("the api half was asked for %q", got)
+	}
+	// 🔴 The api half sits behind the same control-plane gate the nodes do.
+	// A forward that dropped the stamp would be refused by every gated api
+	// replica, and the symptom — 403 on every REST call — arrives at the
+	// moment the switch is flipped and looks like the switch being wrong.
+	if got := api.lastHeader(t, headerControlPlane); got != "shared-secret" {
+		t.Fatalf("control-plane stamp on the api-bound request = %q, want the configured token", got)
+	}
 }
 
 // 🔴 The switch is about REST and only REST. Data-plane traffic is addressed to
@@ -319,40 +256,35 @@ func TestTheGatewaysSchedulerAggregationsAreNotSentToTheApiHalf(t *testing.T) {
 	}
 }
 
-// 🔴 Both arms move, and that is what makes either one readable on a cluster.
-// 阶段 3a's acceptance criterion is "no node serves user REST any more"; a
-// counter with only an api arm could not tell that from a gateway receiving no
-// REST at all.
+// 🔴 Only one arm moves now. 阶段 3a's acceptance criterion was "no node
+// serves user REST any more", and this test used to prove it two ways at
+// once: an "off" server (restUpstream=="") against the same scheduler stub,
+// asserting the node arm moved instead. Off no longer forwards anything to a
+// node — see rest_upstream.go — so there is no second server left to compare
+// against, and gatewayRestUpstream.WithLabelValues(restUpstreamNode) is
+// asserted never to move by any test in this package any more: see
+// gatewayRestUpstream's own doc comment in metrics.go for why the label is
+// still declared.
 func TestBothArmsOfTheRestUpstreamCounterMove(t *testing.T) {
 	apiBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamAPI))
 	nodeBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamNode))
 
-	node := newRecordingUpstream(t)
 	api := newRecordingUpstream(t)
-	scheduler := stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return &schedulerv1.ScheduleResponse{
-				Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: node.server.URL},
-			}, nil
-		},
-		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	off := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-	resp := serve(t, off, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
-	_ = resp.Body.Close()
+	scheduler := refusingScheduler(t, "the api half places its own sandboxes")
 
 	on := newTestServer(t, scheduler, 5*time.Second, 1<<20, withRestUpstream(api.server.URL))
-	resp = serve(t, on, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
+	resp := serve(t, on, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
 	_ = resp.Body.Close()
 
-	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamNode)) - nodeBefore; got != 1 {
-		t.Fatalf("node arm moved by %v, want 1", got)
-	}
 	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamAPI)) - apiBefore; got != 1 {
 		t.Fatalf("api arm moved by %v, want 1", got)
+	}
+	// 🔴 The regression guard this test still owns even without a second
+	// server to contrast against: nothing in this package may ever record
+	// against restUpstreamNode again. If a future change reintroduces a
+	// node-routing fallback for user-facing REST, this is what catches it.
+	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamNode)) - nodeBefore; got != 0 {
+		t.Fatalf("node arm moved by %v, want 0: there is no node-routing fallback left to record against", got)
 	}
 }
 

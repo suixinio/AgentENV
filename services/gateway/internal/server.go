@@ -43,15 +43,6 @@ const (
 	// of them may ever become "no expiry".
 	headerProjectionTTLSecs    = "x-agentenv-projection-ttl-secs"
 	maxRecordAssignmentTimeout = 5 * time.Second
-
-	// headerReroute is how an isolated node asks for a request to be handed to
-	// somebody else instead. The gateway does not act on it: since the
-	// scheduler resolves a sandbox against the paused registry before anything
-	// is forwarded, an isolated node is either excluded from the decision or is
-	// the only node that could have served the request at all. The marker is
-	// forwarded verbatim, so an operator still sees why a node refused.
-	headerReroute         = "x-agentenv-reroute"
-	rerouteReasonSchedule = "schedule"
 )
 
 type routeSource string
@@ -102,20 +93,25 @@ type ServerOptions struct {
 	// gateway config with `resume_addr` empty, so `cmd/main.go` can no longer
 	// construct a `*Server` with this nil. It stays nil-able here purely
 	// because this package's own tests use an unconfigured `*Server` as their
-	// baseline fixture for exercising the scheduler-routed paths this shares
-	// with the REST upstream switch below — see rest_upstream.go.
+	// baseline fixture for exercising the data-plane routing paths — the
+	// projection, this wake-up client, and the scheduler LookupNode fallback
+	// below — none of which has ever depended on RestUpstreamAddr.
 	ResumeClient *resume.Client
 
-	// RestUpstreamAddr sends user-facing REST to the api half instead of
-	// fanning it out to the nodes. Parsed in NewServer, so an address that
-	// cannot be used stops the process rather than becoming a 502 per request.
+	// RestUpstreamAddr sends every user-facing REST call to the api half.
+	// Parsed in NewServer, so an address that cannot be used stops the
+	// process rather than becoming a 502 per request.
 	//
 	// 🔴 The empty string is still accepted here — see rest_upstream.go for
-	// why — but it is no longer a supported deployment position.
-	// `services/shared/config`'s `Config.Validate` refuses to load a gateway
-	// config with `rest_upstream_addr` empty, so no code reachable from a
-	// validated deployment can leave this empty; only this package's tests
-	// still construct a `*Server` that way, as a fixture.
+	// why — but it is no longer a supported deployment position, and unlike
+	// 阶段 3a it is not a rollback lever either: there is no longer a
+	// node-routing fallback in handleProxy for an empty value to fall through
+	// to. `services/shared/config`'s `Config.Validate` refuses to load a
+	// gateway config with `rest_upstream_addr` empty, so no code reachable
+	// from a validated deployment can leave this empty; only this package's
+	// tests still construct a `*Server` that way, purely as a data-plane
+	// fixture — a REST call against one now answers 502 rather than
+	// exercising anything.
 	RestUpstreamAddr string
 
 	// SchedulerFallbackDisabled turns off the query-only-scheduler LookupNode
@@ -178,7 +174,7 @@ type Server struct {
 	// Nil when no wake-up endpoint is configured — no longer reachable from a
 	// validated deployment, see ServerOptions.ResumeClient.
 	resumeClient *resume.Client
-	// Empty means user-facing REST fans out to the nodes, a position
+	// Empty is a data-plane-only test fixture, a position
 	// `services/shared/config` no longer lets a deployed gateway reach; see
 	// ServerOptions.RestUpstreamAddr and rest_upstream.go. Normalised to a
 	// base URL once, at construction, for the reason executionFencing is: a
@@ -335,17 +331,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
-		if s.fansOutClusterList(r) {
-			// The other position of this same predicate claims nothing: a
-			// cluster-list request with an api half configured falls out of
-			// this block and is forwarded — and counted — by the REST upstream
-			// decision below, exactly as `POST /sandboxes` is. See
-			// cluster_list.go.
-			recordRestUpstream(restUpstreamNode)
-			setGatewayRouteSource(w, routeSourceGateway)
-			s.handleClusterList(w, r, routingCtx)
-			return
-		} else if isNodeListRequest(r) {
+		if isNodeListRequest(r) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleNodeList(w, r, routingCtx)
 			return
@@ -378,26 +364,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 
-	// 阶段 3a. The two calls are adjacent so that the counter and the decision
-	// cannot drift: every user-facing REST exchange is counted exactly once,
-	// against the upstream that is about to serve it, and the "node" arm is
-	// what makes a flat zero on the "api" arm — or the other way round — mean
-	// anything at all. See rest_upstream.go.
-	//
-	// The cluster listing is counted the same way from its own branch above,
-	// which is the one user-facing REST route this process can serve out of the
-	// nodes without forwarding anything. Counted there rather than left out, so
-	// that `{upstream="node"}` reading nonzero — which should not happen from
-	// any validated deployment any more, see rest_upstream.go — cannot be
-	// mistaken for "no node serves REST any more" just because the listing's
-	// own fan-out went uncounted.
+	// 阶段 3a, and since 阶段 4/R9 the only position left: every user-facing
+	// REST exchange — including `GET /sandboxes` and `GET /v2/sandboxes`,
+	// which used to fan out to every node when no api half was configured, see
+	// cluster_list.go's history — goes to the api half. There is no longer a
+	// node-routing fallback to fall through to: `services/shared/config`'s
+	// `Config.Validate` has refused to load a gateway config with
+	// `rest_upstream_addr` empty since 阶段 3b, so the branch that used to run
+	// when it was empty was dead in every validated deployment and has been
+	// deleted outright rather than kept as an unreachable option.
 	if isUserFacingRestRequest(r, hostRoute, routeSource) {
-		if s.restUpstream != "" {
-			recordRestUpstream(restUpstreamAPI)
-			s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
-			return
-		}
-		recordRestUpstream(restUpstreamNode)
+		recordRestUpstream(restUpstreamAPI)
+		s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
+		return
 	}
 
 	var node *schedulerv1.Node
@@ -514,29 +493,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				zap.String("origin_node_id", resp.GetOriginNodeId()),
 			)
 		}
-	} else {
-		hint, err := buildScheduleHint(r)
-		if err != nil {
-			// this only happens it cannot read request body, so the request cannot continue
-			s.logger.Warn("Fatal error when building schedule hint",
-				zap.String("method", r.Method),
-				zap.String("path", r.URL.Path),
-				zap.Error(err),
-			)
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
-			return
-		}
-		rpcStart := time.Now()
-		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
-			Hint: hint,
-		})
-		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
-		if err != nil {
-			s.writeSchedulerError(w, err)
-			return
-		}
-		node = resp.GetNode()
 	}
+	// 🔴 No else. Every request that resolves no sandbox — a create, a cold
+	// create, a template build — is a user-facing REST call, and the
+	// isUserFacingRestRequest branch above has already forwarded it (and
+	// returned) before this point is reached. The gateway used to build a
+	// scheduling hint and call Schedule itself here, then proxy straight to
+	// whichever node it named; placement is the api half's decision now
+	// (`NodePlacement::record_placement`, called from the stub that has just
+	// had a create or a resume acknowledged), and calling Schedule only to
+	// discard the answer would consume a placement and move the strategy's
+	// cursor for a request that never went there.
+	//
+	// What is left of this branch at runtime is a defensive no-op: `node`
+	// stays nil for the one shape of request that can still reach here
+	// without a sandbox — proxy routing headers present, but none of them
+	// naming a sandbox id — and the upstream-URL build below fails closed
+	// with a 502 rather than proxying anywhere.
 
 	s.logger.Debug("gateway routed request",
 		zap.String("method", r.Method),
@@ -572,7 +545,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upstreamURL,
 		node,
 		proxyRequestOptions{
-			assignment:       s.assignmentRouteFor(r, routeSource, hasSandbox, location),
+			assignment:       assignmentRouteFor(hasSandbox, location),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 			sandboxID:        sandboxID,
@@ -948,18 +921,6 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	executionID := executionIDFromResponse(resp.Header)
 	projectionTTLSecs := s.projectionTTLToRecord(resp.Header)
 
-	// 🔴 The routed sandbox is the answer for resume and connect, and it costs
-	// nothing to find: it came off the request path. Falling through to the
-	// body would buffer the whole response to rediscover an id already in hand,
-	// and — worse — resume's 201 carries no sandbox-id header at all, so the
-	// buffering would not be optional.
-	if options.assignment == assignmentRoutePath {
-		if sandboxID := strings.TrimSpace(options.sandboxID); sandboxID != "" {
-			s.recordAssignment(recordCtx, sandboxID, node, executionID, projectionTTLSecs, "routed_path")
-			return nil
-		}
-	}
-
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
 		s.recordAssignment(recordCtx, sandboxID, node, executionID, projectionTTLSecs, "response_header")
 		return nil
@@ -1087,95 +1048,47 @@ func flushInterval(flushImmediately bool) time.Duration {
 	return 0
 }
 
-// assignmentRoute says how the sandbox an assignment is for should be found.
+// assignmentRoute says whether this exchange writes a routing projection.
 //
-// 🔴 Not a bool, because the two ways are genuinely different work. One reads
-// the response — a header if the node put one there, otherwise the whole body,
-// buffered. The other already knows: the request was routed for that sandbox
-// and the id came out of the path. Collapsing them would mean either buffering
-// a body to rediscover an id we are holding, or using the routed id on the one
-// route where it is the wrong answer.
+// 🔴 Only two states remain. A third, assignmentRoutePath — the assignment is
+// for the sandbox this request was already routed for, used by resume,
+// connect and any other control-plane call the scheduler resolved off the
+// paused registry — existed for as long as those calls could be routed
+// straight to a node by this gateway. They cannot be any more:
+// isUserFacingRestRequest forwards every one of them to the api half before
+// assignmentRouteFor is ever reached, and the api half records its own
+// placements (`NodePlacement::record_placement`). Reintroducing a
+// path-routed control-plane call here would mean this predicate has stopped
+// being true.
 type assignmentRoute int
 
 const (
 	// assignmentRouteNone: this exchange writes no assignment.
 	assignmentRouteNone assignmentRoute = iota
-	// assignmentRouteResponse: the sandboxes are named in the response.
-	// Creates, cold creates, and forks — a fork answers with several sandboxes
-	// and none of them is the one the request was routed for.
+	// assignmentRouteResponse: the sandbox is named in the response, read from
+	// a header if the node put one there, otherwise from the body.
 	assignmentRouteResponse
-	// assignmentRoutePath: the assignment is for the sandbox this request was
-	// already routed for. Resume and connect, and any control-plane request the
-	// scheduler resolved off the paused registry.
-	assignmentRoutePath
 )
 
-// assignmentRouteFor decides whether this exchange writes a routing projection,
-// and how the sandbox is named.
-func (s *Server) assignmentRouteFor(r *http.Request, routeSource routeSource, hasSandbox bool, location schedulerv1.SandboxLocation) assignmentRoute {
-	if isForkRequest(r, routeSource, hasSandbox) {
-		return assignmentRouteResponse
-	}
-	if shouldRecordCreateAssignment(r, hasSandbox) {
-		return assignmentRouteResponse
-	}
-	// 🔴 resume and connect both, never resume alone. Connect is a resume
-	// entry point — the node routes both into the same resume path — so
-	// recording one and not the other leaves the identical hole under a
-	// different name.
-	if s.projectionAuthoritative && isResumeEntryPoint(r, routeSource, hasSandbox) {
-		return assignmentRoutePath
-	}
-	// A sandbox the scheduler resolved off the paused registry is about to be
-	// held by a node nothing has recorded against. That was already true before
-	// any of this and is unrelated to the switch.
+// assignmentRouteFor decides whether this exchange writes a routing
+// projection.
+//
+// 🔴 Only ever called for data-plane traffic — routed by a proxy header or by
+// a sandbox proxy host name. Every user-facing REST call (create, fork,
+// resume, connect, and the rest of the sandbox control surface) is forwarded
+// to the api half by handleProxy's isUserFacingRestRequest branch before this
+// is reached, so there is no create or control-plane path left to
+// distinguish here; see the assignmentRoute doc comment. What remains is the
+// one case that predates the REST switch entirely and is unrelated to it: a
+// sandbox the scheduler resolved off the paused registry (PLACED or PINNED)
+// is about to be held by a node nothing has recorded against, and that
+// binding still has to be written from the data-plane response that reaches
+// it first.
+func assignmentRouteFor(hasSandbox bool, location schedulerv1.SandboxLocation) assignmentRoute {
 	if hasSandbox && locationNeedsAssignment(location) {
-		if routeSource == routeSourcePath {
-			return assignmentRoutePath
-		}
 		return assignmentRouteResponse
 	}
 	return assignmentRouteNone
-}
-
-func shouldRecordCreateAssignment(r *http.Request, hasSandbox bool) bool {
-	if r.Method != http.MethodPost || hasSandbox {
-		return false
-	}
-	path := strings.TrimRight(r.URL.Path, "/")
-	return path == "/sandboxes" || path == "/sandboxes-cold"
-}
-
-// isForkRequest: routed by the source sandbox, but it creates child sandbox
-// assignments, so the routed id is not the one to record.
-func isForkRequest(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
-	parts, ok := sandboxSubResourcePath(r, routeSource, hasSandbox)
-	return ok && parts[2] == "fork"
-}
-
-func isResumeEntryPoint(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
-	parts, ok := sandboxSubResourcePath(r, routeSource, hasSandbox)
-	if !ok {
-		return false
-	}
-	switch parts[2] {
-	case "resume", "connect":
-		return true
-	default:
-		return false
-	}
-}
-
-func sandboxSubResourcePath(r *http.Request, routeSource routeSource, hasSandbox bool) ([]string, bool) {
-	if r.Method != http.MethodPost || !hasSandbox || routeSource != routeSourcePath {
-		return nil, false
-	}
-	path := strings.Trim(strings.TrimRight(r.URL.Path, "/"), "/")
-	parts := strings.Split(path, "/")
-	if len(parts) != 3 || parts[0] != "sandboxes" || strings.TrimSpace(parts[1]) == "" {
-		return nil, false
-	}
-	return parts, true
 }
 
 func sandboxIDFromHeaders(h http.Header) (string, bool) {

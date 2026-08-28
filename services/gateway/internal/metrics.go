@@ -134,35 +134,20 @@ var (
 		},
 		[]string{"outcome"},
 	)
-	// Which upstream served a user-facing REST call: the api half, or a node
-	// the scheduler named.
+	// Which upstream served a user-facing REST call.
 	//
-	// 🔴 Two arms, always, and the second one is why this series is worth
-	// having. 阶段 3a's acceptance criterion is that no node serves user REST
-	// any more, and "a counter that stays at zero" is not evidence of that on
-	// its own — an idle gateway produces the same picture. One scrape carrying
-	// both arms carries its own control: node flat at zero means something
-	// precisely when api in the same scrape is climbing.
+	// 🔴 The label set is still `{"upstream"}`, and `restUpstreamNode` is still
+	// declared, purely for dashboard and alert compatibility with 阶段 3a — but
+	// nothing increments it any more. handleProxy's node-routing fallback for
+	// user-facing REST is gone outright, not merely unreachable behind a
+	// switch: `{upstream="node"}` will never be exported again by any build of
+	// this package, not just by any validated deployment. See rest_upstream.go.
 	gatewayRestUpstream = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_rest_upstream_total",
 			Help: "User-facing REST exchanges by which upstream served them: the api half, or a node the scheduler named.",
 		},
 		[]string{"upstream"},
-	)
-	// Duplicate sandbox rows seen while merging the cluster listing, by how the
-	// winner was chosen.
-	//
-	// A duplicate means one sandbox answered from two nodes, which is the most
-	// direct signal there is that a sandbox is live in two places. It used to be
-	// swallowed by the deduplication, so the endpoint most likely to be used to
-	// find a split brain was the one that hid it.
-	gatewayClusterListDuplicates = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "agentenv_gateway_cluster_list_duplicate_total",
-			Help: "Duplicate sandbox rows merged in the cluster listing, by how the surviving row was chosen.",
-		},
-		[]string{"resolution"},
 	)
 )
 
@@ -283,10 +268,6 @@ func recordExecutionFencing(plane fencingPlane, decision string) {
 	gatewayExecutionFencing.WithLabelValues(string(plane), decision).Inc()
 }
 
-func recordClusterListDuplicate(resolution string) {
-	gatewayClusterListDuplicates.WithLabelValues(resolution).Inc()
-}
-
 // The four ways a sandbox route gets answered. Closed set, and every path
 // through the read block lands on exactly one.
 const (
@@ -392,8 +373,10 @@ func recordRouteResolution(source string) {
 }
 
 // recordRestUpstream counts one user-facing REST exchange against the upstream
-// about to serve it. The label set is closed by its two callers, both of which
-// live in the same branch of handleProxy.
+// about to serve it. Its one remaining call site, handleProxy's
+// isUserFacingRestRequest branch, only ever passes restUpstreamAPI now — see
+// gatewayRestUpstream's own doc comment for why restUpstreamNode is still
+// declared.
 func recordRestUpstream(upstream string) {
 	gatewayRestUpstream.WithLabelValues(upstream).Inc()
 }

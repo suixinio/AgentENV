@@ -16,66 +16,29 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 )
 
-// An isolated node still marks the resumes it refuses, and the gateway
-// forwards that answer to the client untouched.
+// 🔴 TestDeclinedResumeIsForwardedToTheClient used to live here: a resume
+// (POST /sandboxes/sbx-1/resume) routed straight to a node by this gateway
+// against an unconfigured (restUpstream=="") fixture, asserting that an
+// isolated node's 503-with-marker response passed through untouched — and,
+// deliberately, that the gateway never picked a second node itself. Resume is
+// a routeSourcePath call and is now always forwarded to the api half before
+// this gateway ever resolves or proxies to a node for it, so there is no
+// longer a live call site here that could reroute in the first place: this
+// package does not route resume to a node at all any more, isolated or not.
 //
-// 🔴 This replaces a reroute the gateway used to perform on its own: buffer the
-// body, drop the first node's response, pick a second node, replay. That only
-// existed because nothing else could decide where a paused sandbox belonged.
-// The scheduler decides now — it excludes isolated nodes from a placement, and
-// refuses up front when an isolated node is the only one that could serve the
-// sandbox — so a marker arriving here means the node refused work that was
-// legitimately its own, and hiding it would hide a real fault.
-func TestDeclinedResumeIsForwardedToTheClient(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		marker bool
-	}{
-		{name: "with the reroute marker", marker: true},
-		// The control: a plain 503 was never rerouted, and must still not be.
-		{name: "without the reroute marker", marker: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			served := 0
-			isolated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				served++
-				if tc.marker {
-					w.Header().Set(headerReroute, rerouteReasonSchedule)
-				}
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write([]byte("node is isolated"))
-			}))
-			defer isolated.Close()
-
-			// scheduleFunc is unset: the stub fails the test if the gateway
-			// tries to pick a second node.
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: lookupNodeReturning(
-					&schedulerv1.Node{NodeId: "node-a", Endpoint: isolated.URL},
-					schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-					"",
-				),
-			}, 5*time.Second, 4<<20)
-
-			request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/resume", strings.NewReader(`{"timeout":600}`))
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, request)
-
-			if response.Code != http.StatusServiceUnavailable {
-				t.Fatalf("expected the upstream 503 to pass through, got %d", response.Code)
-			}
-			if !strings.Contains(response.Body.String(), "isolated") {
-				t.Fatalf("upstream body did not pass through: %q", response.Body.String())
-			}
-			if got := response.Header().Get(headerReroute); tc.marker && got != rerouteReasonSchedule {
-				t.Fatalf("the node's reroute marker was swallowed, got %q", got)
-			}
-			if served != 1 {
-				t.Fatalf("expected the bound node to be tried exactly once, got %d", served)
-			}
-		})
-	}
-}
+// The `headerReroute`/`rerouteReasonSchedule` constants this test pinned went
+// with it — they named a header the gateway only ever read back off a
+// response it had itself proxied to a node, and no code path in this package
+// does that for resume any more. Whether — and how — an isolated origin's
+// refusal reaches a resume caller is now entirely the api half's concern; see
+// `resume_route_test.go` for the wake-up refusals this package still routes
+// and answers (`TestAPinRefusalIs503AndNeverReachesTheScheduler`,
+// `TestATransitionInProgressCarriesRetryAfter`).
+//
+// The generic "an upstream's response headers and body pass through
+// untouched" property this test also incidentally covered is not
+// resume-specific: it is ordinary reverse-proxy behaviour, exercised by every
+// other test in this package that inspects a forwarded response.
 
 // Changing a node's status is owned by the node; the gateway resolves the id
 // and proxies the call through unchanged, body and all.

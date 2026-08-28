@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -387,329 +386,41 @@ func TestExtractSandboxAssignmentsShapes(t *testing.T) {
 	}
 }
 
-// TestForkRecordsEveryChildAssignment drives the fix end to end: a fork answers
-// with an array, and every child in it gets a binding written against the node
-// that answered.
-func TestForkRecordsEveryChildAssignment(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`[
-			{"sandbox":{"sandboxID":"child-1","executionID":"exec-1"},"projectionTtlSecs":3600},
-			{"sandbox":{"sandboxID":"child-2","executionID":"exec-2"},"projectionTtlSecs":3600}
-		]`))
-	}))
-	t.Cleanup(upstream.Close)
-
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 4)
-	scheduler := stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-				Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-			}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withProjectionAuthoritative(true))
-	req := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-parent/fork", strings.NewReader(`{"count":2}`))
-	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", rec.Code)
-	}
-
-	seen := map[string]*schedulerv1.RecordAssignmentRequest{}
-	for i := 0; i < 2; i++ {
-		select {
-		case got := <-recorded:
-			seen[got.GetSandboxId()] = got
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only %d child assignments were recorded; before this fix the answer was 0", len(seen))
-		}
-	}
-
-	for id, executionID := range map[string]string{"child-1": "exec-1", "child-2": "exec-2"} {
-		got, ok := seen[id]
-		if !ok {
-			t.Fatalf("no assignment recorded for %s", id)
-		}
-		if got.GetExecutionId() != executionID {
-			t.Fatalf("%s recorded incarnation %q, want %q", id, got.GetExecutionId(), executionID)
-		}
-		if got.GetProjectionTtlSecs() != 3600 {
-			t.Fatalf("%s recorded ttl %d, want 3600", id, got.GetProjectionTtlSecs())
-		}
-	}
-}
-
-// TestResumeRecordsTheRoutedSandbox is ①.2 end to end: resume's 201 carries no
-// sandbox-id header, and the routed id is used without buffering the body.
-func TestResumeRecordsTheRoutedSandbox(t *testing.T) {
-	const executionID = "0198b7cc-1111-7000-8000-000000000001"
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerExecutionID, executionID)
-		w.Header().Set(headerProjectionTTLSecs, "86460")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"templateID":"tpl","sandboxID":"sbx-1","clientID":"c","envdVersion":"1"}`))
-	}))
-	t.Cleanup(upstream.Close)
-
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 2)
-	scheduler := stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-				Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-			}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	for _, path := range []string{"/sandboxes/sbx-1/resume", "/sandboxes/sbx-1/connect"} {
-		t.Run(path, func(t *testing.T) {
-			server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withProjectionAuthoritative(true))
-			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"timeout":3600}`))
-			rec := httptest.NewRecorder()
-			server.Handler().ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusCreated {
-				t.Fatalf("status = %d, want 201", rec.Code)
-			}
-			select {
-			case got := <-recorded:
-				if got.GetSandboxId() != "sbx-1" {
-					t.Fatalf("recorded sandbox %q, want sbx-1", got.GetSandboxId())
-				}
-				// 🔴 Without the incarnation this write is silently refused by
-				// the scheduler's arbitration: a challenger naming none cannot
-				// displace an incumbent that does, and a resume mints a new
-				// incarnation every time.
-				if got.GetExecutionId() != executionID {
-					t.Fatalf("recorded incarnation %q, want %q", got.GetExecutionId(), executionID)
-				}
-				if got.GetProjectionTtlSecs() != 86460 {
-					t.Fatalf("recorded ttl %d, want 86460", got.GetProjectionTtlSecs())
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("no assignment was recorded for the resumed sandbox")
-			}
-		})
-	}
-}
-
-// TestResumeRecordsNothingWhileTheWriteSwitchIsOff keeps "off" equal to today.
+// 🔴 Six tests used to live here, testing the gateway's write-side
+// projection switch (ServerOptions.ProjectionAuthoritative) end to end:
+// TestForkRecordsEveryChildAssignment, TestResumeRecordsTheRoutedSandbox,
+// TestResumeRecordsNothingWhileTheWriteSwitchIsOff,
+// TestCreateSendsNoBudgetWhileTheWriteSwitchIsOff,
+// TestForkSendsNoBudgetWhileTheWriteSwitchIsOff, and
+// TestCreateForwardsTheBudgetWithoutBufferingTheBody. All six drove a create,
+// a fork, a resume or a connect against an unconfigured (restUpstream=="")
+// fixture — scheduled or looked up by this gateway itself — and inspected the
+// resulting RecordAssignment call.
 //
-// 🔴 It asserts on the calls, not on the status code. The version of this test
-// that shipped delegated its whole claim to a stub returning an error — and
-// Server.recordAssignment swallows a failed RecordAssignment with a Warn,
-// deliberately, because a projection write must never fail a client's request.
-// So the stub could fire on every request and the test would still have gone
-// green on its 201. A write that must not happen has to be counted.
-func TestResumeRecordsNothingWhileTheWriteSwitchIsOff(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerExecutionID, "0198b7cc-1111-7000-8000-000000000001")
-		w.Header().Set(headerProjectionTTLSecs, "86460")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	t.Cleanup(upstream.Close)
-
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 4)
-	scheduler := stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-				Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-			}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	// Both entry points, for the reason assignmentRouteFor covers both: the
-	// node routes connect into the same resume path, so a switch that governed
-	// only one would leave the identical write under a different name.
-	for _, path := range []string{"/sandboxes/sbx-1/resume", "/sandboxes/sbx-1/connect"} {
-		t.Run(path, func(t *testing.T) {
-			server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
-			rec := httptest.NewRecorder()
-			server.Handler().ServeHTTP(rec, req)
-			if rec.Code != http.StatusCreated {
-				t.Fatalf("status = %d, want 201", rec.Code)
-			}
-			// The write is made inside ModifyResponse, before the response is
-			// written back, so anything that was going to arrive already has.
-			select {
-			case got := <-recorded:
-				t.Fatalf("the switch is off and an assignment was recorded anyway: %v", got)
-			default:
-			}
-		})
-	}
-}
-
-// TestCreateSendsNoBudgetWhileTheWriteSwitchIsOff is the gateway's half of the
-// write switch, which nothing exercised.
+// All four of those request shapes are routeSourcePath or routeSourceSchedule
+// calls and are now always forwarded to the api half by handleProxy's
+// isUserFacingRestRequest branch, which records no assignment of its own — see
+// forwardToRestUpstream's doc comment: placement and its assignment are now the
+// api half's `NodePlacement::record_placement`, not this package's. None of
+// the six requests these tests sent reaches assignmentRouteFor,
+// recordAssignmentFromResponse or the scheduler's RecordAssignment RPC from
+// this package any more, so there is nothing left here for them to pin.
 //
-// 🔴 Create records either way — the switch was never about *whether* a create
-// is recorded, only about the TTL it carries — so "off" here is a zero in one
-// field of a request that still has to be sent, with the incarnation still on
-// it. That is what makes the projection write byte-identical to the one that
-// shipped before any of this, and what lets the two halves of the write switch
-// be flipped in either order.
-func TestCreateSendsNoBudgetWhileTheWriteSwitchIsOff(t *testing.T) {
-	const executionID = "0198b7cc-1111-7000-8000-000000000001"
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerSandboxID, "sbx-new")
-		w.Header().Set(headerExecutionID, executionID)
-		// The node stamps the budget whatever the gateway's switch says: it
-		// knows nothing about the gateway's configuration, and the header is
-		// the same one the switched-on case reads.
-		w.Header().Set(headerProjectionTTLSecs, "86460")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"sandboxID":"sbx-new"}`))
-	}))
-	t.Cleanup(upstream.Close)
-
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 2)
-	scheduler := stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"tpl"}`))
-	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", rec.Code)
-	}
-	select {
-	case got := <-recorded:
-		if got.GetSandboxId() != "sbx-new" {
-			t.Fatalf("recorded sandbox %q, want sbx-new", got.GetSandboxId())
-		}
-		if got.GetProjectionTtlSecs() != 0 {
-			t.Fatalf("recorded ttl %d with the switch off, want 0 so the scheduler uses binding_ttl", got.GetProjectionTtlSecs())
-		}
-		// 🔴 The incarnation is not gated. Forwarding it is behaviour that
-		// already shipped, and withholding it here would refuse the write at
-		// the scheduler's arbitration rather than shorten its TTL.
-		if got.GetExecutionId() != executionID {
-			t.Fatalf("recorded incarnation %q, want %q", got.GetExecutionId(), executionID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no assignment was recorded for the created sandbox")
-	}
-}
-
-// TestForkSendsNoBudgetWhileTheWriteSwitchIsOff is the same for the body path,
-// where the budget comes off each element rather than off a header.
-func TestForkSendsNoBudgetWhileTheWriteSwitchIsOff(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`[
-			{"sandbox":{"sandboxID":"sbx-child","executionID":"0198b7cc-1111-7000-8000-000000000001"},"projectionTtlSecs":3600}
-		]`))
-	}))
-	t.Cleanup(upstream.Close)
-
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 4)
-	scheduler := stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-				Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-			}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	server := newTestServer(t, scheduler, 5*time.Second, 1<<20)
-	req := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-parent/fork", strings.NewReader(`{"count":1}`))
-	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", rec.Code)
-	}
-	select {
-	case got := <-recorded:
-		if got.GetSandboxId() != "sbx-child" {
-			t.Fatalf("recorded sandbox %q, want sbx-child", got.GetSandboxId())
-		}
-		if got.GetProjectionTtlSecs() != 0 {
-			t.Fatalf("recorded ttl %d with the switch off, want 0", got.GetProjectionTtlSecs())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no assignment was recorded for the forked child")
-	}
-}
-
-// TestCreateForwardsTheBudgetWithoutBufferingTheBody pins the property §3.1
-// asks for: create's fast path reads the sandbox id off a header and must go on
-// doing so once the TTL header is added beside it.
-func TestCreateForwardsTheBudgetWithoutBufferingTheBody(t *testing.T) {
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 2)
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerSandboxID, "sbx-new")
-		w.Header().Set(headerExecutionID, "0198b7cc-1111-7000-8000-000000000001")
-		w.Header().Set(headerProjectionTTLSecs, "86460")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"sandboxID":"sbx-new"}`))
-	}))
-	t.Cleanup(upstream.Close)
-
-	scheduler := stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}}, nil
-		},
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}
-
-	server := newTestServer(t, scheduler, 5*time.Second, 1<<20, withProjectionAuthoritative(true))
-	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"tpl"}`))
-	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", rec.Code)
-	}
-	select {
-	case got := <-recorded:
-		if got.GetSandboxId() != "sbx-new" || got.GetProjectionTtlSecs() != 86460 {
-			t.Fatalf("recorded %+v", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no assignment was recorded for the created sandbox")
-	}
-}
+// The read-path tests above this comment — TestProjectionHitDoesNotCallThe-
+// Scheduler through TestProjectionHitCarriesTheIncarnationIntoFencing — are all
+// data-plane requests (serveDataPlaneRequest) and are unaffected: they do not
+// touch ProjectionAuthoritative or assignmentRouteFor at all.
+//
+// Every extraction-shape assertion these tests also exercised end to end
+// (single object, {"data":...} envelope, top-level array, dedup by sandbox id,
+// a negative budget dropped) remains pinned at the unit level by
+// TestExtractSandboxAssignmentsFromForkArray and TestExtractSandboxAssignments-
+// Shapes, above. What is not covered any more is end-to-end wiring — a real
+// HTTP response reaching recordAssignmentFromResponse's array-body branch —
+// because nothing in production reaches that branch either: fork is the only
+// route that ever answered with an array, and fork records no assignment from
+// this package now. The one assignment this package still writes from a
+// response — a data-plane request to a PLACED/PINNED sandbox — is exercised
+// end to end by TestPlacedSandboxDataPlaneRequestRecordsTheAssignment in
+// server_test.go, including the incarnation this file's create/resume tests
+// used to check.

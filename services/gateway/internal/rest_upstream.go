@@ -32,9 +32,13 @@ import (
 // `*Server` exists in this process, `s.restUpstream` is always a real
 // address; the package-level `ServerOptions` type still *accepts* an empty
 // one, purely so the test suite in this package can keep using an
-// unconfigured server as a fixture for exercising the pre-3a scheduler
-// routing paths that share this handler — no code reachable from a validated
-// deployment can construct one.
+// unconfigured server as a fixture for the data-plane routing paths —
+// unrelated to this switch — that a bare `*Server` also exercises. There is
+// no longer a second, node-routing position of `handleProxy` for that
+// fixture to reach for a REST call: the fallback was deleted outright once
+// nothing reachable from a validated deployment could take it, so a REST
+// call against an unconfigured `*Server` now answers 502 rather than
+// exercising anything.
 //
 // # 🔴 Why this was a value and not a manifest, while it was still a switch
 //
@@ -68,27 +72,25 @@ import (
 //     🔴 `GET /sandboxes` and `GET /v2/sandboxes` are *not* in that list, and
 //     used not to be in this one either. They are aggregations over the nodes
 //     rather than over the scheduler, and the api half owns the cluster ledger
-//     they aggregate, so — back when this switch still had two positions —
-//     they moved with it: unset, the fan-out in cluster_list.go answered them
-//     out of every node; set, they were forwarded here like any other REST
-//     call. They had to move with it rather than on a switch of their own,
-//     because 阶段 3b answers both of those routes with 404 on a node and the
-//     fan-out is all-or-nothing — see cluster_list.go for what that fan-out
-//     is now that the position it existed for is retired.
+//     they aggregate. While this switch still had two positions they moved
+//     with it: unset, a fan-out that lived in cluster_list.go asked every node
+//     for its own rows and merged them; set, the two routes were forwarded
+//     here like any other REST call. That fan-out — and the position of the
+//     switch it existed for — is gone: `isUserFacingRestRequest` claims both
+//     routes unconditionally now, so they are always forwarded here, and there
+//     is no longer a second code path in this package that builds a
+//     cluster-wide listing out of the nodes at all.
 
 // restUpstreamTarget labels which upstream served a REST call.
 //
-// 🔴 Both arms are still counted, and that is the point of the series rather
-// than an accident of its shape. 3a's acceptance criterion was "no
-// user-facing REST is served by a node any more", and a counter that only
-// counted the api side could not tell that apart from a gateway that had
-// stopped receiving REST at all. With both, one scrape carries its own
-// control: `{upstream="node"}` flat at zero is evidence exactly when
-// `{upstream="api"}` in the same scrape is not — and now that
-// `rest_upstream_addr` cannot be empty in a validated deployment,
-// `{upstream="node"}` is expected to read a permanent flat zero on every real
-// gateway; a nonzero reading there is not a rollback, it means something
-// constructed a `*Server` without going through `services/shared/config`.
+// 🔴 Only `restUpstreamAPI` is ever recorded now. `restUpstreamNode` is kept
+// declared for dashboard and alert label-set compatibility with 阶段 3a, when
+// both arms moved and a scrape's own control was `{upstream="node"}` flat at
+// zero while `{upstream="api"}` climbed. That control no longer applies:
+// handleProxy's node-routing fallback for user-facing REST is deleted, not
+// merely unreachable behind a switch, so `{upstream="node"}` will not be
+// exported by any build of this package — its absence is not itself evidence
+// of anything any more, the way its presence would have been.
 const (
 	restUpstreamAPI  = "api"
 	restUpstreamNode = "node"

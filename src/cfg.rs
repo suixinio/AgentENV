@@ -1025,47 +1025,6 @@ pub struct ObservabilitySchedulerReportConfig {
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint_file: String,
-    /// A second heartbeat target, dialled and sent to concurrently with
-    /// `[cluster].scheduler_endpoint` on every tick. Empty (the default)
-    /// disables it outright — no second connection is made, no second RPC is
-    /// sent, and the heartbeat loop is byte-for-byte what it was before this
-    /// field existed.
-    ///
-    /// 🔴 Stage A/D5 (`docs/proposals/_sd-phase4-stageA-node-inventory.md`
-    /// §5, "方案一"): api's own `src/node_registry` node registry only has
-    /// something to answer `resolve_node`/`node_membership`/the equivalence
-    /// dump endpoint with once heartbeats actually reach it — discovery
-    /// alone tells api *that* a node exists, not what it last reported.
-    /// Pointing this at `[cluster].api_grpc_addr` (or a Service in front of
-    /// several `aenv-api` replicas) lets a node report to both scheduler
-    /// (still authoritative — this is additive, not a replacement) and api's
-    /// registry, without a second copy of the reporter's retry/backoff/
-    /// hot-reload machinery: this target is dialled once, lazily, and is
-    /// **not** hot-reloadable the way `scheduler_endpoint_file`/
-    /// `[cluster].scheduler_endpoint_file` are — it is a Stage A/D5-only
-    /// bridge, not a permanent second heartbeat destination, so it does not
-    /// inherit that machinery's cost.
-    ///
-    /// 🔴 Best-effort, one-way, and dispatched *concurrently* with the
-    /// primary send via `tokio::join!` — not awaited serially ahead of it. A
-    /// serial await would add up to `GRPC_CALL_TIMEOUT` (10s) to every
-    /// heartbeat tick whenever this target is unreachable, more than the
-    /// default 5s heartbeat interval itself, turning the primary heartbeat's
-    /// own cadence into a function of this target's health.
-    ///
-    /// A failure here is logged and dropped, never affects the primary
-    /// send's success/failure, backoff, or the `HeartbeatNodeNotConfigured`
-    /// handling above — this heartbeat's authoritative destination is still,
-    /// and only, `scheduler_endpoint`. The response is checked only for
-    /// success/failure to log which one happened; its body — including any
-    /// `cpu_config_json` — is never read at all, and never overwrites what
-    /// the primary response already stored via `store_cluster_cpu_config`.
-    #[config(
-        default = "",
-        env = "AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT",
-        parse_env = parse_trimmed_string
-    )]
-    pub dual_report_api_endpoint: String,
 }
 
 /// Where `aenv-api` resolves a known node's current address for

@@ -72,9 +72,7 @@
 //! `SchedulerNodePlacement::node_membership`'s own doc). `stub.rs`'s
 //! contract for `node_membership` acts on `Gone` alone and treats it as
 //! proof a sandbox's runtime is gone for good — so an api replica that had
-//! just restarted, or a `Native` deployment missing
-//! `dual_report_api_endpoint` outright (see `start_native_node_registry`'s
-//! own refusal), would confirm every live sandbox as gone the moment
+//! just restarted would confirm every live sandbox as gone the moment
 //! anything dialled it. [`WarmupGate`] is what closes that: not a Stage A
 //! quirk to fix later, but the exact reason `warmup.rs` exists.
 //!

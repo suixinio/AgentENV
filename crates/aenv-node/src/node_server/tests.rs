@@ -18,11 +18,12 @@ use crate::orchestrator::{
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::mock::{MockAction, MockBackendFactory, MockBehavior, MockOperation};
 use crate::sandbox::{
     PausedSandboxState, RuntimeArtifactSet, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
-use crate::snapshot::{mock::mock_snapshot_manager, RunnableSnapshot};
+use crate::snapshot::mock::mock_snapshot_manager;
 use crate::types::{ExecutionId, SandboxId};
 
 use super::service::NodeSandboxService;

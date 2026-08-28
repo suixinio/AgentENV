@@ -13,13 +13,13 @@ use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::runtime_versions::probe_runtime_versions;
 use super::step_executor::TemplateStepExecutor;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::{
     FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
     ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
 };
 use crate::snapshot::{
-    CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
-    StartupCommand,
+    CommandContext, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions, StartupCommand,
 };
 use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;

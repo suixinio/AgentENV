@@ -966,7 +966,6 @@ mod build_tests {
             enabled: false,
             interval_secs: 5,
             scheduler_endpoint_file: String::new(),
-            dual_report_api_endpoint: String::new(),
         }
     }
 

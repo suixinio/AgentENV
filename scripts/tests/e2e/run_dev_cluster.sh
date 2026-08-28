@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Run the e2e suites against an already-running, long-lived k3s cluster
-# (currently pve-sg: aenv-master-01 10.10.10.203 + aenv-worker-01 10.10.10.204,
+# (currently pve-mf: k3s on 10.1.0.200 + 10.1.0.201,
 # namespace agentenv-system) without touching its deployment state.
+#
+# The previous dev cluster, pve-sg (aenv-master-01 10.10.10.203 +
+# aenv-worker-01 10.10.10.204), has been decommissioned; nothing there is
+# reachable any more.
 #
 # ---------------------------------------------------------------------------
 # Why not `make test-e2e-k8s`
@@ -12,9 +16,9 @@
 #     (deletes every resource the kustomize overlay manages), then
 #   - runs `make k8s-apply-dev` (reapplies the whole overlay).
 # Against a disposable kind/minikube cluster that is exactly what you want.
-# Pointed at pve-sg it deletes and reapplies a shared deployment other
-# people/sessions rely on. This script never calls k8s-apply-dev,
-# k8s-delete-dev, k8s-load-dev, or any image build target -- it only reads
+# Pointed at pve-mf (or any other shared cluster) it deletes and reapplies a
+# shared deployment other people/sessions rely on. This script never calls
+# k8s-apply-dev, k8s-delete-dev, k8s-load-dev, or any image build target -- it only reads
 # from the cluster (kubectl get/describe, port-forward, curl) and assumes
 # whatever is already running there is the version you want to test.
 #
@@ -48,9 +52,9 @@
 #   AENV_TEMPLATE_ID=my-template ./scripts/tests/e2e/run_dev_cluster.sh
 #
 # Environment variables:
-#   KUBECONFIG                            - default: ~/.kube/config-aenv-sg
+#   KUBECONFIG                            - default: ~/.kube/config-aenv-mf
 #   E2E_K8S_NAMESPACE                     - default: agentenv-system
-#   E2E_DEV_CLUSTER_GATEWAY_NODEPORT_URL  - default: http://10.10.10.203:30800
+#   E2E_DEV_CLUSTER_GATEWAY_NODEPORT_URL  - default: http://10.1.0.200:30800
 #   E2E_DEV_CLUSTER_GATEWAY_MODE          - auto (default) | nodeport | port-forward
 #   E2E_K8S_GATEWAY_LOCAL_PORT            - local port-forward port if the
 #                                            NodePort path isn't used/reachable
@@ -70,11 +74,11 @@ REPO_ROOT="${SCRIPT_DIR}/../../.."
 COMMON_SH="${REPO_ROOT}/scripts/lib/common.sh"
 [[ -f "$COMMON_SH" ]] || { echo "Missing ${COMMON_SH}" >&2; exit 1; }
 
-: "${KUBECONFIG:=$HOME/.kube/config-aenv-sg}"
+: "${KUBECONFIG:=$HOME/.kube/config-aenv-mf}"
 export KUBECONFIG
 : "${E2E_K8S_NAMESPACE:=agentenv-system}"
 export E2E_K8S_NAMESPACE
-: "${E2E_DEV_CLUSTER_GATEWAY_NODEPORT_URL:=http://10.10.10.203:30800}"
+: "${E2E_DEV_CLUSTER_GATEWAY_NODEPORT_URL:=http://10.1.0.200:30800}"
 : "${E2E_DEV_CLUSTER_GATEWAY_MODE:=auto}"
 : "${E2E_DEV_CLUSTER_HEALTH_TIMEOUT:=30}"
 

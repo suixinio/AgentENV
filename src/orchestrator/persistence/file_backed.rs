@@ -553,12 +553,12 @@ impl SandboxPersister for FileBackedSandboxPersister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_snapshot::RunnableSnapshot;
     use crate::sandbox::{
         mock::{MockBackendFactory, MockSnapshot},
         FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
         SandboxLaunchConfig,
     };
-    use crate::snapshot::RunnableSnapshot;
     use anyhow::Result;
     use std::sync::Arc;
     use std::time::Duration;

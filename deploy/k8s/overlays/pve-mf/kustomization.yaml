@@ -4,17 +4,21 @@ kind: Kustomization
 # The pve-mf cluster (PVE host `pve-mf`, k3s on 10.1.0.200/10.1.0.201).
 #
 # It differs from `overlays/default` in exactly one respect: the registry this
-# cluster's images and user images come from. `base` hardcodes the pve-sg
-# cluster's `10.10.10.204:5000` in two places that `deploy/k8s/run.sh`'s
+# cluster's images and user images come from. `base` ships neutral,
+# do-nothing-safe defaults in two places that `deploy/k8s/run.sh`'s
 # IMAGE_REGISTRY rewrite deliberately does not touch — that rewrite only
-# retags the three `agentenv-*` images built from this tree:
+# retags the three `agentenv-*` images built from this tree — and this
+# overlay supplies this cluster's real, plain-HTTP registry
+# (`10.1.0.201:5000`) for both:
 #
-#   * base/redis.yaml's `image:`, an upstream image mirrored into the builder's
-#     registry rather than built here, so it carries a full registry-qualified
-#     name that the `images:` transformer below re-points instead.
-#   * base/config/regctl.json, which is what tells `regctl` that this one
-#     registry speaks plain HTTP. It is a configMapGenerator *file*, so an
-#     overlay replaces the whole generator rather than patching a field.
+#   * base/redis.yaml's `image:`, an upstream image (`redis:7.4.10-alpine`,
+#     unqualified — pulled straight from docker.io in base) that this
+#     cluster instead needs mirrored into its own registry; the `images:`
+#     transformer below re-points it.
+#   * base/config/regctl.json, which base ships with an empty `hosts` map,
+#     and which is what tells `regctl` that this one registry speaks plain
+#     HTTP. It is a configMapGenerator *file*, so an overlay replaces the
+#     whole generator rather than patching a field.
 #
 # Everything else, including the /var/lib/aenv hostPath, matches
 # `overlays/default`. The `agentenv-runtime-secrets` Secret is likewise NOT
@@ -37,7 +41,7 @@ generatorOptions:
   disableNameSuffixHash: true
 
 images:
-  - name: 10.10.10.204:5000/redis
+  - name: redis
     newName: 10.1.0.201:5000/redis
 
 patches:

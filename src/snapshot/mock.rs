@@ -10,9 +10,10 @@ use super::repository::{
     SnapshotRuntimeResolver, StartedBuild,
 };
 use super::{
-    PersistedDiskImagePublication, RunnableSnapshot, SnapshotId, SnapshotManager,
-    SnapshotPublishMetadata, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
+    PersistedDiskImagePublication, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
+    SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::types::FirecrackerSnapshotManifest;
 
 /// Test double for catalog interactions that should stay unreachable.

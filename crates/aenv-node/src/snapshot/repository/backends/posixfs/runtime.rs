@@ -7,6 +7,7 @@ use overlaybd::config::{DownloadConfig, LayerConfig};
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
 use crate::runtime_snapshot::RuntimeArtifactLease;
+use crate::runtime_snapshot::{ResolvedAttachedDrive, RunnableSnapshot};
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::runtime_support::{
@@ -15,8 +16,7 @@ use crate::snapshot::runtime_support::{
 };
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, RepositoryError,
-    RepositoryResult, ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    RepositoryResult, SnapshotId, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Resolves committed snapshot artifacts into node-local runnable paths on a POSIX filesystem.

@@ -12,11 +12,18 @@ resources:
   # 🔴 阶段四 E4 (task's own label): the scheduler workload is commented out
   # of the render, not deleted. `scheduler-service.yaml`,
   # `scheduler-deployment.yaml` and `scheduler-pdb.yaml` still exist on disk
-  # byte for byte, and `images:` below still carries a real, pinned tag for
-  # `agentenv-scheduler` — see its own note — so restoring the workload for a
-  # rollback is uncommenting these three lines, not reconstructing anything.
-  # `services/scheduler`'s Go source is untouched (task's own instruction:
-  # do not delete it).
+  # byte for byte, but `images:` below still points `agentenv-scheduler` at
+  # `newTag: latest` — the same unpinned placeholder every other image here
+  # uses, not a build known to be compatible with the `paused_sandboxes`
+  # schema the currently-running `aenv-api` maintains, and the pve-mf
+  # registry this cluster deploys against carries no `agentenv-scheduler`
+  # repository at all (nothing has built/pushed that image since the
+  # scheduler was decommissioned). Before uncommenting the workload below
+  # for an actual rollback, build and push a verified-compatible image and
+  # pin this reference to that specific tag or digest — do not rely on
+  # whatever `latest` resolves to at incident time, and do not assume
+  # uncommenting alone restores anything. `services/scheduler`'s Go source
+  # is untouched (task's own instruction: do not delete it).
   #
   # Nothing in this base layer still needs the scheduler process reachable:
   # every node's primary heartbeat now targets `agentenv-api`
@@ -611,10 +618,11 @@ configMapGenerator:
   # `src/image/oci_image.rs::fetch_oci_manifest`), and AgentENV's own code
   # passes it no `--tls-insecure` or equivalent flag. The only place `regctl`
   # itself looks for "this host speaks plain HTTP" is `$HOME/.regctl/config.json`
-  # — absent that file, it defaults to TLS for every registry, including this
-  # cluster's own `10.10.10.204:5000`, and every manifest fetch, blob/layer
-  # download and tools-drive pull fails at the TLS handshake before anything
-  # else runs.
+  # — absent that file entirely, it defaults to TLS for every registry,
+  # including whichever plain-HTTP registry an overlay's own `regctl-config`
+  # override names, and every manifest fetch, blob/layer download and
+  # tools-drive pull against that registry fails at the TLS handshake before
+  # anything else runs.
   #
   # 🔴 This ConfigMap, the volume mounting it at `/root/.regctl/config.json`
   # (`subPath: config.json`) and the `HOME=/root` env var that makes `regctl`
@@ -630,15 +638,21 @@ configMapGenerator:
   # survive as an orphan while the volume and env var vanished from the
   # DaemonSet on the same apply — silently reintroducing the TLS failure above.
   #
-  # `10.10.10.204:5000` is the value this cluster actually runs, not a
-  # placeholder — tracked in `config/regctl.json` the same way
-  # `oss-overlay.toml`'s endpoint is, and for the same reason: both
-  # `agentenv-runtime`'s own images (the `IMAGE_REGISTRY` `run.sh` injects into
-  # the `images:` block below) and every `userImage` template this cluster
-  # resolves live behind it. A deployment whose registries all speak real TLS
-  # needs none of this; an empty `hosts` map is the do-nothing-safe shape to
-  # ship instead, and is what a fork of this tree pointed at a different
-  # registry should replace this file's contents with.
+  # `config/regctl.json` here in base carries an empty `hosts` map — the
+  # do-nothing-safe default this same reasoning already argued for: a
+  # deployment whose registries all speak real TLS needs none of this, so
+  # base should not force one specific cluster's plain-HTTP registry on every
+  # overlay. There is no longer a single "the" live cluster's registry to
+  # hardcode at this layer anyway: the pve-sg cluster this value used to name
+  # (`10.10.10.204:5000`) was decommissioned, and `deploy/k8s/overlays/pve-mf`
+  # is where the current live cluster's real, plain-HTTP registry
+  # (`10.1.0.201:5000`) is tracked instead, via its own `regctl-config`
+  # `configMapGenerator` override (`behavior: replace`, sourcing
+  # `overlays/pve-mf/regctl.json`) — the same file-tracked-not-secret
+  # reasoning as `oss-overlay.toml`'s endpoint, just scoped to the overlay
+  # that actually needs it. A cluster that needs a plain-HTTP registry should
+  # add its own overlay following `overlays/pve-mf`'s pattern rather than
+  # editing this file.
   #
   # 🔴 Only the node reads it. `assemble_api` in `src/bin/aenv-api.rs` states
   # outright that `aenv-api` "installs no regctl — by design, that is a
@@ -664,6 +678,8 @@ images:
   - name: agentenv-gateway
     newName: agentenv-gateway
     newTag: latest
+  # 🔴 Unpinned — see the rollback note in resources: above before using
+  # this as a rollback target.
   - name: agentenv-scheduler
     newName: agentenv-scheduler
     newTag: latest

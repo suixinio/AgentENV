@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 
@@ -48,15 +48,6 @@ pub struct ObservabilityReporter {
     config: ReporterConfig,
     service: Arc<ObservabilityService>,
     channel_source: SchedulerEndpointSource,
-    /// The second heartbeat target from
-    /// [`ObservabilitySchedulerReportConfig::dual_report_api_endpoint`] —
-    /// task's own "D5". `None` (the default: the field is unset) means dual
-    /// reporting is off and the heartbeat loop is exactly what it was before
-    /// this existed. Unlike `channel_source`, this is a single lazily
-    /// connected `Channel` rather than a hot-reloadable
-    /// [`SchedulerEndpointSource`]: see the config field's own doc comment
-    /// for why that asymmetry is deliberate.
-    dual_report_channel: Option<Channel>,
     p2p_endpoint: Option<P2pEndpoint>,
     shutdown_tx: Option<watch::Sender<bool>>,
     heartbeat_join: Option<JoinHandle<()>>,
@@ -65,12 +56,6 @@ pub struct ObservabilityReporter {
     /// [`shutdown`] to skip `UnregisterNode` when the reporter never managed
     /// to reach the scheduler at all.
     ever_heartbeat_succeeded: Arc<AtomicBool>,
-    /// Same idea, for `dual_report_channel`: set to `true` on its first
-    /// successful heartbeat, independent of `ever_heartbeat_succeeded`
-    /// above. `shutdown` reads this to decide whether the dual target has
-    /// anything of this node's registered to unregister — see P6-c's own
-    /// note there.
-    ever_dual_heartbeat_succeeded: Arc<AtomicBool>,
 }
 
 impl ObservabilityReporter {
@@ -80,7 +65,6 @@ impl ObservabilityReporter {
         cluster_config: &ClusterConfig,
         p2p_endpoint: Option<P2pEndpoint>,
     ) -> Result<Option<Self>> {
-        let dual_report_api_endpoint = config.dual_report_api_endpoint.trim().to_string();
         let Some(config) = ReporterConfig::resolve(config, cluster_config) else {
             return Ok(None);
         };
@@ -92,33 +76,16 @@ impl ObservabilityReporter {
                 .map(|path| (path, config.interval)),
             "heartbeat",
         )?;
-        let dual_report_channel = if dual_report_api_endpoint.is_empty() {
-            None
-        } else {
-            Some(
-                Endpoint::from_shared(crate::scheduler_endpoint::qualified(
-                    &dual_report_api_endpoint,
-                ))
-                .with_context(|| {
-                    format!(
-                        "dual report api endpoint {dual_report_api_endpoint:?} is not a valid URI"
-                    )
-                })?
-                .connect_lazy(),
-            )
-        };
 
         Ok(Some(Self {
             config,
             service,
             channel_source,
-            dual_report_channel,
             p2p_endpoint,
             shutdown_tx: None,
             heartbeat_join: None,
             event_join: None,
             ever_heartbeat_succeeded: Arc::new(AtomicBool::new(false)),
-            ever_dual_heartbeat_succeeded: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -139,9 +106,7 @@ impl ObservabilityReporter {
         let event_service = Arc::clone(&self.service);
         let channel_source = self.channel_source.clone();
         let event_channel_source = self.channel_source.clone();
-        let dual_report_channel = self.dual_report_channel.clone();
         let ever_heartbeat_succeeded = Arc::clone(&self.ever_heartbeat_succeeded);
-        let ever_dual_heartbeat_succeeded = Arc::clone(&self.ever_dual_heartbeat_succeeded);
         let p2p_endpoint = self.p2p_endpoint.clone();
         let mut heartbeat_shutdown_rx = shutdown_rx.clone();
         let mut event_shutdown_rx = shutdown_rx;
@@ -177,8 +142,6 @@ impl ObservabilityReporter {
                     &service,
                     &scheduler_channel,
                     &current_endpoint,
-                    dual_report_channel.as_ref(),
-                    &ever_dual_heartbeat_succeeded,
                     &mut pending_cpu_config_json,
                     p2p_endpoint.as_ref(),
                 )
@@ -260,17 +223,6 @@ impl ObservabilityReporter {
         );
     }
 
-    /// Whether [`ObservabilityReporter::new`] built a second heartbeat
-    /// target. Test-only: production code never needs to ask this, since
-    /// `send_heartbeat` already branches on the `Option` directly — this
-    /// exists purely so a test can assert on construction-time state without
-    /// standing up a live socket for a channel that, being lazy, would never
-    /// actually dial one anyway.
-    #[cfg(test)]
-    fn dual_report_channel_is_some(&self) -> bool {
-        self.dual_report_channel.is_some()
-    }
-
     pub async fn shutdown(&mut self) -> Result<()> {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
@@ -285,34 +237,6 @@ impl ObservabilityReporter {
         if let Some(join) = self.event_join.take() {
             if let Err(err) = join.await {
                 warn!(error = %err, "observability sandbox event reporter task join failed");
-            }
-        }
-
-        // 🔴 P6-c: the dual-report target (D5's best-effort bridge to api's
-        // own node registry) gets its own single-attempt UnregisterNode
-        // here, gated on its own success flag and independent of the
-        // primary's gate/retry loop below. Without this, a node's graceful
-        // shutdown deletes it from the real scheduler immediately but
-        // leaves it in api's registry until `observed_ttl` (30s) ages it
-        // out — during a rolling DaemonSet update, that is exactly the
-        // window the two registries are compared in, and they would
-        // disagree on every node mid-roll for no reason a healthy node did
-        // anything to deserve.
-        if self.ever_dual_heartbeat_succeeded.load(Ordering::Relaxed) {
-            if let Some(channel) = self.dual_report_channel.clone() {
-                match self.unregister_node_on(channel).await {
-                    Ok(()) => info!(
-                        node_id = %self.service.node_id(),
-                        service_instance_id = %self.service.service_instance_id(),
-                        "observability node unregistered from the dual-report target"
-                    ),
-                    Err(err) => warn!(
-                        node_id = %self.service.node_id(),
-                        service_instance_id = %self.service.service_instance_id(),
-                        error = %err,
-                        "failed to unregister node from the dual-report target during shutdown"
-                    ),
-                }
             }
         }
 
@@ -355,8 +279,6 @@ impl ObservabilityReporter {
         service: &ObservabilityService,
         scheduler_channel: &Channel,
         scheduler_endpoint: &str,
-        dual_report_channel: Option<&Channel>,
-        dual_report_ever_succeeded: &AtomicBool,
         cpu_config_json: &mut Option<String>,
         p2p_endpoint: Option<&P2pEndpoint>,
     ) -> Result<()> {
@@ -369,53 +291,13 @@ impl ObservabilityReporter {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint);
 
-        let mut primary_request = Request::new(req.clone());
+        let mut primary_request = Request::new(req);
         primary_request.set_timeout(GRPC_CALL_TIMEOUT);
         let mut primary_client = SchedulerClient::new(scheduler_channel.clone());
         let primary_send = primary_client.heartbeat(primary_request);
 
-        // 🔴 D5 (task's own label): best-effort, and run *concurrently* with
-        // the primary send above — not awaited serially ahead of it — see
-        // `ObservabilitySchedulerReportConfig::dual_report_api_endpoint`'s
-        // doc comment. A serial await here would add up to
-        // `GRPC_CALL_TIMEOUT` (10s) to every heartbeat tick whenever the
-        // dual target is unreachable, which is more than the default 5s
-        // heartbeat interval itself — turning the primary heartbeat's own
-        // cadence, the one the real scheduler ages a node's liveness against,
-        // into a function of a *second* target's health. `tokio::join!`
-        // below bounds this function's total latency by whichever send is
-        // slower, not by their sum. A primary failure never suppresses this,
-        // and this future's own success/failure never surfaces through this
-        // function's `Result` — `[cluster].scheduler_endpoint` stays the only
-        // heartbeat this loop's success/failure, backoff, and
-        // `HeartbeatNodeNotConfigured` handling below are about.
-        // `dual_report_ever_succeeded` is the one side channel: `shutdown`
-        // reads it to decide whether the dual target has anything of this
-        // node's to unregister.
-        let dual_send = async {
-            let Some(dual_channel) = dual_report_channel else {
-                return;
-            };
-            let mut dual_request = Request::new(req);
-            dual_request.set_timeout(GRPC_CALL_TIMEOUT);
-            match SchedulerClient::new(dual_channel.clone())
-                .heartbeat(dual_request)
-                .await
-            {
-                Ok(_) => {
-                    trace!(node_id = %node_id, "dual heartbeat report to api succeeded");
-                    dual_report_ever_succeeded.store(true, Ordering::Relaxed);
-                }
-                Err(err) => warn!(
-                    node_id = %node_id,
-                    error = %err,
-                    "dual heartbeat report to api failed"
-                ),
-            }
-        };
-
-        let (primary_result, ()) = tokio::join!(primary_send, dual_send);
-        let response = primary_result
+        let response = primary_send
+            .await
             .map_err(|s| {
                 if s.code() == tonic::Code::InvalidArgument
                     && s.message().contains("node is not in scheduler node list")
@@ -637,12 +519,9 @@ impl ObservabilityReporter {
         self.unregister_node_on(channel).await
     }
 
-    /// The `UnregisterNode` call itself, against an explicit channel — shared
+    /// The `UnregisterNode` call itself, against an explicit channel — used
     /// by [`unregister_node`](Self::unregister_node) (the primary target,
-    /// retried up to three times by [`shutdown`](Self::shutdown)) and
-    /// `shutdown`'s own best-effort call against `dual_report_channel`
-    /// (P6-c, one attempt, no retry — matching the dual heartbeat's own
-    /// best-effort contract).
+    /// retried up to three times by [`shutdown`](Self::shutdown)).
     async fn unregister_node_on(&self, channel: Channel) -> Result<()> {
         let mut request = Request::new(scheduler::UnregisterNodeRequest {
             node_id: self.service.node_id().to_string(),
@@ -735,7 +614,6 @@ mod tests {
             enabled: enabled.unwrap_or_default(),
             interval_secs: interval_secs.unwrap_or(5),
             scheduler_endpoint_file: scheduler_endpoint_file.unwrap_or_default().to_string(),
-            dual_report_api_endpoint: String::new(),
         }
     }
 
@@ -1003,7 +881,7 @@ mod tests {
 #[cfg(test)]
 mod against_a_scheduler {
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration as StdDuration, Instant};
 
     use tokio::sync::oneshot;
@@ -1016,31 +894,17 @@ mod against_a_scheduler {
     use crate::proto::scheduler::scheduler_server::{Scheduler, SchedulerServer};
 
     /// A scheduler that does nothing but answer `Heartbeat` and
-    /// `UnregisterNode`, counting each. Enough to tell "traffic reached this
-    /// address" from "traffic did not" — which is the only thing this test
-    /// is about.
+    /// `UnregisterNode`, counting heartbeats. Enough to tell "traffic
+    /// reached this address" from "traffic did not" — which is the only
+    /// thing this test is about.
     #[derive(Default)]
     struct CountingScheduler {
         heartbeats: AtomicUsize,
-        unregisters: AtomicUsize,
-        /// 🔴 P6-b timing test only: an artificial delay `heartbeat` sleeps
-        /// before answering, milliseconds. Zero (the default) answers
-        /// immediately, same as every other test using this fixture.
-        heartbeat_delay_millis: AtomicU64,
     }
 
     impl CountingScheduler {
         fn heartbeat_count(&self) -> usize {
             self.heartbeats.load(AtomicOrdering::SeqCst)
-        }
-
-        fn unregister_count(&self) -> usize {
-            self.unregisters.load(AtomicOrdering::SeqCst)
-        }
-
-        fn set_heartbeat_delay(&self, delay: StdDuration) {
-            self.heartbeat_delay_millis
-                .store(delay.as_millis() as u64, AtomicOrdering::SeqCst);
         }
     }
 
@@ -1050,10 +914,6 @@ mod against_a_scheduler {
             &self,
             _request: Request<scheduler::HeartbeatRequest>,
         ) -> Result<Response<scheduler::HeartbeatResponse>, Status> {
-            let delay = self.heartbeat_delay_millis.load(AtomicOrdering::SeqCst);
-            if delay > 0 {
-                sleep(StdDuration::from_millis(delay)).await;
-            }
             self.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(Response::new(scheduler::HeartbeatResponse::default()))
         }
@@ -1061,7 +921,6 @@ mod against_a_scheduler {
             &self,
             _request: Request<scheduler::UnregisterNodeRequest>,
         ) -> Result<Response<scheduler::UnregisterNodeResponse>, Status> {
-            self.unregisters.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(Response::new(scheduler::UnregisterNodeResponse::default()))
         }
         async fn record_assignment(
@@ -1263,237 +1122,5 @@ mod against_a_scheduler {
             .shutdown()
             .await
             .expect("both schedulers answer UnregisterNode");
-    }
-
-    /// 🔴 D5 (task's own label): with `dual_report_api_endpoint` configured,
-    /// every heartbeat lands on *both* the primary scheduler and the second
-    /// target — the same request, sent twice, not a failover where one
-    /// replaces the other.
-    #[tokio::test]
-    async fn dual_report_sends_every_heartbeat_to_both_targets() {
-        let (primary, primary_addr, _shutdown_primary) = scheduler_on_a_socket().await;
-        let (dual, dual_addr, _shutdown_dual) = scheduler_on_a_socket().await;
-
-        let service = test_service().await;
-        let cluster = make_cluster_config(Some(&format!("http://{primary_addr}")));
-        let mut report_config = make_report_config_with_file(Some(true), Some(1), None);
-        report_config.dual_report_api_endpoint = format!("http://{dual_addr}");
-
-        let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
-            .expect("a valid endpoint builds a reporter")
-            .expect("reporting is enabled and the endpoint is non-empty");
-        reporter.start();
-
-        wait_until(StdDuration::from_secs(5), || {
-            primary.heartbeat_count() >= 2 && dual.heartbeat_count() >= 2
-        })
-        .await;
-
-        reporter
-            .shutdown()
-            .await
-            .expect("both schedulers answer UnregisterNode");
-    }
-
-    /// 🔴 P6-b: the dual send must run *concurrently* with the primary send,
-    /// not serially ahead of it. A slow dual target must not delay the
-    /// primary heartbeat actually reaching the wire: `send_heartbeat`
-    /// dispatches both RPCs before awaiting either (`tokio::join!`), so the
-    /// primary request is in flight — and, against a fast primary scheduler
-    /// like this one, already answered — within a few milliseconds
-    /// regardless of how long the dual target takes.
-    ///
-    /// Serial-ahead-of-primary is the exact regression this guards: with the
-    /// dual send `.await`-ed to completion before the primary request is
-    /// even built, the primary scheduler could not see its first heartbeat
-    /// until the dual target's own delay had already elapsed, and this
-    /// assertion's tight bound (dual's own delay minus a comfortable margin)
-    /// would fail.
-    #[tokio::test]
-    async fn dual_report_does_not_delay_the_primary_heartbeat() {
-        let (primary, primary_addr, _shutdown_primary) = scheduler_on_a_socket().await;
-        let (dual, dual_addr, _shutdown_dual) = scheduler_on_a_socket().await;
-        dual.set_heartbeat_delay(StdDuration::from_secs(2));
-
-        let service = test_service().await;
-        let cluster = make_cluster_config(Some(&format!("http://{primary_addr}")));
-        // A long interval: this test wants exactly one heartbeat tick in
-        // flight, not a steady stream that could mask a slow first one.
-        let mut report_config = make_report_config_with_file(Some(true), Some(60), None);
-        report_config.dual_report_api_endpoint = format!("http://{dual_addr}");
-
-        let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
-            .expect("a valid endpoint builds a reporter")
-            .expect("reporting is enabled and the endpoint is non-empty");
-        reporter.start();
-
-        // Well under the dual target's 2s delay — wide margin for scheduling
-        // jitter under a loaded test run — and only reachable at all if the
-        // primary request went out without waiting for the dual one first.
-        wait_until(StdDuration::from_millis(800), || {
-            primary.heartbeat_count() >= 1
-        })
-        .await;
-        assert_eq!(
-            primary.heartbeat_count(),
-            1,
-            "the primary scheduler must receive its heartbeat well before the dual target's own \
-             2s delay elapses"
-        );
-        // The control: the dual target genuinely is slow and has not
-        // answered yet at this point, so the bound above was not met simply
-        // because the dual send never happened at all.
-        assert_eq!(
-            dual.heartbeat_count(),
-            0,
-            "the dual target's delay must still be in flight at this point, or the assertion \
-             above is not proving concurrency"
-        );
-
-        reporter
-            .shutdown()
-            .await
-            .expect("the primary scheduler answers UnregisterNode");
-    }
-
-    /// 🔴 P6-c: `shutdown` unregisters from the dual-report target too, not
-    /// only the primary. Without this, a node's graceful shutdown deletes it
-    /// from the real scheduler immediately but leaves it in api's own
-    /// registry until `observed_ttl` (30s) ages it out — exactly the window
-    /// a rolling DaemonSet update is compared in, so the two registries
-    /// would disagree about every node mid-roll for no reason a healthy node
-    /// did anything to deserve.
-    #[tokio::test]
-    async fn shutdown_unregisters_from_the_dual_report_target_too() {
-        let (primary, primary_addr, _shutdown_primary) = scheduler_on_a_socket().await;
-        let (dual, dual_addr, _shutdown_dual) = scheduler_on_a_socket().await;
-
-        let service = test_service().await;
-        let cluster = make_cluster_config(Some(&format!("http://{primary_addr}")));
-        let mut report_config = make_report_config_with_file(Some(true), Some(1), None);
-        report_config.dual_report_api_endpoint = format!("http://{dual_addr}");
-
-        let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
-            .expect("a valid endpoint builds a reporter")
-            .expect("reporting is enabled and the endpoint is non-empty");
-        reporter.start();
-
-        wait_until(StdDuration::from_secs(5), || {
-            primary.heartbeat_count() >= 1 && dual.heartbeat_count() >= 1
-        })
-        .await;
-
-        reporter
-            .shutdown()
-            .await
-            .expect("the primary scheduler answers UnregisterNode");
-
-        assert_eq!(primary.unregister_count(), 1);
-        assert_eq!(
-            dual.unregister_count(),
-            1,
-            "the dual-report target must also be unregistered, or api's own registry keeps a \
-             stale entry for observed_ttl after a graceful shutdown"
-        );
-    }
-
-    /// The control for the test above: a dual target that is *configured*
-    /// but never actually heartbeated successfully must not be sent an
-    /// `UnregisterNode` either — there is nothing there to unregister, and
-    /// this reporter never earned the right to assert otherwise. Also
-    /// proves the unreachable dual endpoint does not hang or fail the
-    /// primary's own shutdown.
-    #[tokio::test]
-    async fn shutdown_does_not_unregister_a_dual_target_that_never_heartbeated_successfully() {
-        let (primary, primary_addr, _shutdown_primary) = scheduler_on_a_socket().await;
-
-        let service = test_service().await;
-        let cluster = make_cluster_config(Some(&format!("http://{primary_addr}")));
-        let mut report_config = make_report_config_with_file(Some(true), Some(1), None);
-        // Configured, but a closed port: the dual heartbeat can never
-        // succeed.
-        report_config.dual_report_api_endpoint = "http://127.0.0.1:1".to_string();
-
-        let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
-            .expect("a valid endpoint builds a reporter")
-            .expect("reporting is enabled and the endpoint is non-empty");
-        reporter.start();
-
-        wait_until(StdDuration::from_secs(5), || primary.heartbeat_count() >= 1).await;
-
-        reporter
-            .shutdown()
-            .await
-            .expect("the primary scheduler answers UnregisterNode regardless of the dual target");
-
-        assert_eq!(primary.unregister_count(), 1);
-    }
-
-    /// The control for the test above: with `dual_report_api_endpoint` left
-    /// at its default (empty), a second listener never sees any traffic at
-    /// all, however long the reporter runs — dual reporting is additive and
-    /// off unless configured, not merely "off by default and easy to enable
-    /// by accident".
-    #[tokio::test]
-    async fn dual_report_off_by_default_never_reaches_a_second_address() {
-        let (primary, primary_addr, _shutdown_primary) = scheduler_on_a_socket().await;
-        let (unused, _unused_addr, _shutdown_unused) = scheduler_on_a_socket().await;
-
-        let service = test_service().await;
-        let cluster = make_cluster_config(Some(&format!("http://{primary_addr}")));
-        let report_config = make_report_config_with_file(Some(true), Some(1), None);
-        assert_eq!(
-            report_config.dual_report_api_endpoint, "",
-            "this test's premise is the field's own default"
-        );
-
-        let mut reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
-            .expect("a valid endpoint builds a reporter")
-            .expect("reporting is enabled and the endpoint is non-empty");
-        reporter.start();
-
-        wait_until(StdDuration::from_secs(5), || primary.heartbeat_count() >= 2).await;
-        assert_eq!(
-            unused.heartbeat_count(),
-            0,
-            "an unconfigured dual report target must never receive a heartbeat"
-        );
-
-        reporter
-            .shutdown()
-            .await
-            .expect("the primary scheduler answers UnregisterNode");
-    }
-
-    /// 🔴 The direct guard behind the network-behaviour test above: with
-    /// `dual_report_api_endpoint` at its default (empty), `new` must build
-    /// no second channel at all — not "a channel that happens never to be
-    /// dialled". Checked at construction time via a test-only accessor
-    /// rather than through network side effects, because a network
-    /// assertion like the one above cannot distinguish "the gate correctly
-    /// stayed off" from "the gate broke in a way that dials an address
-    /// nothing in this test happens to be listening on" — the mutation this
-    /// test is written to catch (inverting or dropping the `is_empty()`
-    /// check in `ObservabilityReporter::new`) does not, by itself, route
-    /// traffic to any *particular* bystander address, so only a
-    /// construction-time assertion can see it fail.
-    #[tokio::test]
-    async fn dual_report_channel_is_none_when_the_endpoint_is_unset() {
-        let service = test_service().await;
-        let cluster = make_cluster_config(Some("http://127.0.0.1:1"));
-        let report_config = make_report_config_with_file(Some(true), Some(60), None);
-        assert_eq!(
-            report_config.dual_report_api_endpoint, "",
-            "this test's premise is the field's own default"
-        );
-
-        let reporter = ObservabilityReporter::new(service, &report_config, &cluster, None)
-            .expect("an unset dual endpoint must not be refused as an invalid URI")
-            .expect("reporting is enabled and the primary endpoint is non-empty");
-
-        assert!(
-            !reporter.dual_report_channel_is_some(),
-            "an unset dual_report_api_endpoint must not build a second channel at all"
-        );
     }
 }

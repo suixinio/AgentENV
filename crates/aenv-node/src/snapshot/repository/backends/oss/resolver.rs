@@ -12,6 +12,7 @@ use super::layout::OssSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
 use crate::runtime_snapshot::RuntimeArtifactLease;
+use crate::runtime_snapshot::{ResolvedAttachedDrive, RunnableSnapshot};
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
 use crate::snapshot::p2p;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
@@ -20,8 +21,8 @@ use crate::snapshot::runtime_support::{
     runtime_image_cache_key, RuntimeImageMaterializer,
 };
 use crate::snapshot::{
-    CommittedAttachedDrive, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, OverlaybdLayerRef, RepositoryError, RepositoryResult, SnapshotId,
+    SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 const MANAGED_LAYER_EXISTS_CONCURRENCY: usize = 16;

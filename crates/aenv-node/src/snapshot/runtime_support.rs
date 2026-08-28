@@ -5,9 +5,10 @@ use std::sync::Arc;
 use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
 
 use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
+use crate::runtime_snapshot::ResolvedAttachedDrive;
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult, ResolvedAttachedDrive,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult, SnapshotId,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::types::FirecrackerSnapshotManifest;
 

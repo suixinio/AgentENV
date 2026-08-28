@@ -2,14 +2,13 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::snapshot::captured::{CapturedSandboxSnapshot, SnapshotArtifactAdvertiser};
 use crate::snapshot::repository::backends::AssembledSnapshotBackend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
 use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
-use crate::snapshot::{
-    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-};
+use crate::snapshot::{SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord};
 use crate::types::{ExecutionId, FirecrackerSnapshotManifest};
 
 /// The sandbox a publication says it came from, or `None` for a template

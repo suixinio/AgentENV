@@ -18,6 +18,7 @@ use super::super::persistence::{
 use super::super::types::SandboxLaunchSource;
 use super::*;
 use crate::image::{RecordingRuntimeImageRefs, RuntimeImageOwner, RuntimeImageRefs};
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
@@ -25,7 +26,6 @@ use crate::sandbox::{
     BaseSandboxNetworkPolicy, PausedSandboxState, RuntimeArtifactSet, SandboxLaunchConfig,
     SandboxNetworkEgressPolicy, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
-use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);

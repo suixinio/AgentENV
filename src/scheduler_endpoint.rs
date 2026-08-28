@@ -455,7 +455,6 @@ mod tests {
             enabled: true,
             interval_secs: 5,
             scheduler_endpoint_file: endpoint_file.to_string(),
-            dual_report_api_endpoint: String::new(),
         }
     }
 

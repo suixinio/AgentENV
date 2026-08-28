@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use super::store::{NewTimeout, SandboxMetadata};
 use super::types::SandboxState;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
     UnresolvedImageBuildSpec,
 };
-use crate::snapshot::{RunnableSnapshot, SnapshotRecord};
+use crate::snapshot::SnapshotRecord;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 /// A resume claim that has been granted, carrying the incarnation the claim

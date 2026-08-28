@@ -100,14 +100,21 @@ spec:
       # cluster.
       containers:
         - name: redis
-          # Mirrored into the dev cluster's registry from
-          # docker.io/library/redis:7-alpine
+          # The neutral, do-nothing-safe default: the public
+          # docker.io/library/redis image, unqualified by any
+          # cluster-specific registry host. Pinned to an immutable version
+          # tag rather than `:7-alpine` or `:latest` — the node containerd
+          # caches by tag with `IfNotPresent`, so a moving tag is how a
+          # cluster ends up silently running something other than what this
+          # file says. Redis 7.4.10, matching upstream
+          #   docker.io/library/redis:7-alpine
           #   @sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
-          # (Redis 7.4.10). Pinned to an immutable version tag rather than
-          # `:7-alpine` or `:latest` — the node containerd caches by tag with
-          # `IfNotPresent`, so a moving tag is how a cluster ends up silently
-          # running something other than what this file says.
-          image: 10.10.10.204:5000/redis:7.4.10-alpine
+          #
+          # A cluster whose nodes cannot reach docker.io directly needs this
+          # mirrored into its own registry first; `deploy/k8s/overlays/pve-mf`'s
+          # own `images:` transformer is the example of retagging this
+          # reference to that cluster's mirror rather than editing this file.
+          image: redis:7.4.10-alpine
           imagePullPolicy: IfNotPresent
           args:
             - --dir

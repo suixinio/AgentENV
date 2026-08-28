@@ -11,7 +11,7 @@ use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 
 #[derive(Clone)]
 pub enum SandboxLaunchSource {
-    Snapshot(Box<crate::snapshot::RunnableSnapshot>),
+    Snapshot(Box<crate::runtime_snapshot::RunnableSnapshot>),
     Image {
         image_ref: String,
         overlaybd_config_path: PathBuf,
@@ -72,7 +72,7 @@ pub enum SandboxLaunchSource {
     /// [`SandboxBackendFactory::build_from_snapshot_record`], whose only real
     /// implementation ships it to a node that can resolve it.
     ///
-    /// [`RunnableSnapshot`]: crate::snapshot::RunnableSnapshot
+    /// [`RunnableSnapshot`]: crate::runtime_snapshot::RunnableSnapshot
     /// [`SandboxBackendFactory::build_from_snapshot_record`]: crate::sandbox::SandboxBackendFactory::build_from_snapshot_record
     SnapshotRecord(Box<crate::snapshot::SnapshotRecord>),
 }

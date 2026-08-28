@@ -28,6 +28,7 @@ use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
     NodeSandboxService, NodeSandboxServiceServer,
 };
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
 use crate::sandbox::{
     CustomExtensionParams, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
@@ -39,9 +40,7 @@ use crate::snapshot::repository::{
     SnapshotRuntimeResolver, StagedSnapshot, StartedBuild,
 };
 use crate::snapshot::CapturedSandboxSnapshot;
-use crate::snapshot::{
-    CommittedSnapshot, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotRecord,
-};
+use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
 use crate::types::ExecutionId;
 
 use crate::node_client::factory::RemoteSandboxBackendFactory;

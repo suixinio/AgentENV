@@ -215,26 +215,6 @@ spec:
             # value above, which is exactly today's behaviour.
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE
               value: /etc/agentenv/heartbeat/scheduler-endpoint
-            # 🔴 阶段四 E1: there used to be a second env var here,
-            # `AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT`
-            # (`[observability.scheduler_report].dual_report_api_endpoint`),
-            # a best-effort *second* heartbeat target that fed api's own node
-            # registry while `node-heartbeat-config` above still pointed the
-            # *primary* channel at the real scheduler — see
-            # `src/observability/reporter.rs`'s own doc comment on that field
-            # for why a serial fallback there would have been unsafe and a
-            # concurrent second send was the only safe shape. It is gone now
-            # because it is redundant, not because dual reporting stopped
-            # working: `node-heartbeat-config` above **is** `agentenv-api`,
-            # so the primary heartbeat already reaches api's registry
-            # directly — a second, concurrent send to the same target would
-            # only double the request rate for no new coverage. If a future
-            # migration needs a real second target again (an api replica set
-            # a heartbeat should warm up *before* the primary channel moves),
-            # reintroduce this var pointed at that target rather than
-            # assuming it is still wired: `assemble_api`
-            # (`crates/aenv-api/src/bin/aenv-api.rs`) never starts a reporter,
-            # so nothing on that Deployment's own side needs a matching change.
             # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no
             # ConfigMap generating one. It was a seam for a design that was not
             # taken: letting the pre-split single process serve the node

@@ -7,11 +7,12 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
 use crate::proto::node as pb;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxLaunchConfig, UnresolvedImageBuildSpec,
 };
-use crate::snapshot::{RunnableSnapshot, SnapshotRecord};
+use crate::snapshot::SnapshotRecord;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::paused_state::RemotePausedState;

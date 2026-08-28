@@ -21,16 +21,26 @@ import (
 // deletes. `regctl` takes no `--tls-insecure` flag from AgentENV's own code
 // (`src/setup/deps.rs`, `src/image/oci_image.rs`) — its only source of truth
 // for "this host speaks plain HTTP" is that file — so losing it silently turns
-// every manifest fetch, blob/layer download and tools-drive pull against this
-// cluster's own plain-HTTP registry into a TLS handshake failure.
+// every manifest fetch, blob/layer download and tools-drive pull against a
+// plain-HTTP registry into a TLS handshake failure.
+//
+// 🔴 `config/regctl.json` in base itself carries an empty `hosts` map: the
+// pve-sg cluster this file used to name directly (`10.10.10.204:5000`) was
+// decommissioned, and there is no longer a single "the" live cluster's
+// registry to hardcode at the base layer. `deploy/k8s/overlays/pve-mf` is
+// where the current live cluster's real, plain-HTTP registry
+// (`10.1.0.201:5000`) is tracked instead, via its own `regctl-config`
+// `configMapGenerator` override (`behavior: replace`). This file has no test
+// reading that overlay — it only ever reads `manifestDir` (base) — so it
+// checks base ships the do-nothing-safe empty default, not any one cluster's
+// value.
 const (
-	regctlConfigMap       = "regctl-config"
-	regctlTrackedFile     = "config/regctl.json"
-	regctlMountPath       = "/root/.regctl/config.json"
-	regctlSubPath         = "config.json"
-	regctlHomeEnv         = "HOME"
-	regctlHomeValue       = "/root"
-	regctlClusterRegistry = "10.10.10.204:5000"
+	regctlConfigMap   = "regctl-config"
+	regctlTrackedFile = "config/regctl.json"
+	regctlMountPath   = "/root/.regctl/config.json"
+	regctlSubPath     = "config.json"
+	regctlHomeEnv     = "HOME"
+	regctlHomeValue   = "/root"
 )
 
 // 🔴 The generator, and that it is sourced from a tracked file rather than an
@@ -64,12 +74,18 @@ func TestRegctlConfigIsGeneratedFromTheTrackedFile(t *testing.T) {
 	}
 }
 
-// 🔴 The value, not just the key's presence. A ConfigMap generated from an
-// empty `{"hosts": {}}` would satisfy every other test in this file while
-// leaving `regctl` back on TLS for this cluster's registry — which is exactly
-// the failure mode this file exists to catch, so the running value is pinned
-// directly rather than inferred from the key existing.
-func TestTheTrackedRegctlConfigNamesThisClustersRegistry(t *testing.T) {
+// 🔴 The value, not just the key's presence — but for base, the value this
+// test expects is emptiness. base is a shared layer with no one cluster's
+// registry to bake in; the moment it names a real plain-HTTP host again, that
+// host silently becomes every overlay's default unless the overlay also
+// overrides this generator, which is exactly the kind of drift
+// `deploy/k8s/overlays/pve-mf`'s own `behavior: replace` override exists to
+// own instead. This test's predecessor pinned a live cluster's registry
+// (pve-sg, `10.10.10.204:5000`) directly in base; once that cluster was
+// decommissioned, base moved to this empty, do-nothing-safe default and this
+// test's job flipped from "assert the real value is here" to "assert base
+// never silently regains one."
+func TestTheTrackedRegctlConfigShipsNoClusterSpecificRegistry(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(manifestDir, regctlTrackedFile))
 	if err != nil {
 		t.Fatalf("reading the tracked regctl config failed: %v", err)
@@ -85,18 +101,11 @@ func TestTheTrackedRegctlConfigNamesThisClustersRegistry(t *testing.T) {
 		t.Fatalf("%s is not valid JSON: %v", regctlTrackedFile, err)
 	}
 
-	host, ok := parsed.Hosts[regctlClusterRegistry]
-	if !ok {
-		t.Fatalf("%s carries hosts %v, want an entry for %q — the registry this cluster's "+
-			"`agentenv-runtime` images and every `userImage` template it resolves both live "+
-			"behind", regctlTrackedFile, parsed.Hosts, regctlClusterRegistry)
-	}
-	if host.TLS != "disabled" {
-		t.Fatalf("%s/%s has tls=%q, want \"disabled\"; anything else sends `regctl` back to a TLS "+
-			"handshake against a registry that does not speak it", regctlTrackedFile, regctlClusterRegistry, host.TLS)
-	}
-	if host.Hostname != regctlClusterRegistry {
-		t.Fatalf("%s/%s has hostname=%q, want %q", regctlTrackedFile, regctlClusterRegistry, host.Hostname, regctlClusterRegistry)
+	if len(parsed.Hosts) != 0 {
+		t.Fatalf("%s carries hosts %v, want none — base ships the do-nothing-safe empty default; "+
+			"a cluster-specific plain-HTTP registry belongs in that cluster's own overlay "+
+			"(configMapGenerator behavior: replace), not in the shared base layer",
+			regctlTrackedFile, parsed.Hosts)
 	}
 }
 

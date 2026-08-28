@@ -12,10 +12,11 @@ use super::errors::{
 use super::runner::{TemplateBuildBase, TemplateBuildContext, TemplateBuildRunner};
 use super::TemplateBuildDriver as _;
 use crate::cfg::ConfigManager;
+use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::UblkConfig;
 use crate::snapshot::{
-    CommandContext, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
+    CommandContext, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
 };
 use crate::types::SandboxResources;
 
@@ -366,8 +367,9 @@ impl TemplateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_snapshot::RunnableSnapshot;
     use crate::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotManager, SnapshotRecord};
+    use crate::snapshot::{CommittedSnapshot, SnapshotManager, SnapshotRecord};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -387,7 +389,7 @@ mod tests {
     fn sample_runnable_snapshot_with_attached_drive() -> RunnableSnapshot {
         RunnableSnapshot::from_test_manifest(
             SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
-            vec![crate::snapshot::ResolvedAttachedDrive::Overlaybd {
+            vec![crate::runtime_snapshot::ResolvedAttachedDrive::Overlaybd {
                 drive_id: "data".to_string(),
                 image_config_path: PathBuf::from("/tmp/drive-image.json"),
                 read_only: true,

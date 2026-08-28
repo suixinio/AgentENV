@@ -713,7 +713,7 @@ func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, e
 	return 0, fmt.Errorf("%s must be a duration string like \"30s\"", field)
 }
 
-// SchedulerExecutionArbitration is the three-state switch over what the
+// SchedulerExecutionArbitration is the two-state switch over what the
 // scheduler's routing half does with an incarnation: whether a binding written
 // by an older one may displace a newer one, and whether LookupNode answers with
 // an incarnation at all.
@@ -724,6 +724,18 @@ func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, e
 // their scope in their names. Merging any two would let one panicked flip
 // switch off a half nobody meant to — and the half that goes quiet is not the
 // one whose failure is visible.
+//
+// 🔴 A third state, Observe, lived here through the rollout that proved
+// Enforce was safe to turn on everywhere: it worked out what arbitration would
+// have decided and counted it, but wrote the way Off does. That rollout is
+// over — the deploy manifest's execution-fencing-config comment records the
+// cluster reaching enforce — and the state was deleted from the type, from
+// ParseSchedulerExecutionArbitration, and from both Go arbiters
+// (arbitrateObserving/redisArbitrationObserving in
+// scheduler/internal/store.go and redis_store.go). The literal string
+// "observe" is not silently remapped to either remaining value: it now falls
+// into this parser's own default case below and is refused, the same as any
+// other unrecognised value.
 type SchedulerExecutionArbitration string
 
 const (
@@ -731,9 +743,6 @@ const (
 	// reported last, exactly as before, and the two new LookupNode fields stay
 	// at their zero values.
 	SchedulerExecutionArbitrationOff SchedulerExecutionArbitration = "off"
-	// Observe works out what arbitration would have decided and counts it, but
-	// writes the way Off does. The release runs a round of this first.
-	SchedulerExecutionArbitrationObserve SchedulerExecutionArbitration = "observe"
 	// Enforce is the default: an older incarnation cannot take a binding back.
 	SchedulerExecutionArbitrationEnforce SchedulerExecutionArbitration = "enforce"
 )
@@ -745,20 +754,22 @@ const (
 // mistyped letter switch arbitration off without saying so, and the resulting
 // behaviour is indistinguishable from the value having been meant. The empty
 // string is not a mistyped value: it is the absence of a setting, and it
-// resolves to the documented default.
+// resolves to the documented default. This is also, deliberately, what now
+// happens to the literal "observe": it used to be a recognised third state and
+// is not any more, so it is refused here rather than silently landing on
+// Enforce or Off — a manifest that still names it fails loudly instead of
+// starting in a mode the operator did not choose.
 func ParseSchedulerExecutionArbitration(raw string) (SchedulerExecutionArbitration, error) {
 	switch SchedulerExecutionArbitration(strings.ToLower(strings.TrimSpace(raw))) {
 	case "":
 		return SchedulerExecutionArbitrationEnforce, nil
 	case SchedulerExecutionArbitrationOff:
 		return SchedulerExecutionArbitrationOff, nil
-	case SchedulerExecutionArbitrationObserve:
-		return SchedulerExecutionArbitrationObserve, nil
 	case SchedulerExecutionArbitrationEnforce:
 		return SchedulerExecutionArbitrationEnforce, nil
 	default:
-		return "", fmt.Errorf("scheduler.routing.execution_arbitration must be one of %s, %s, %s, got %q",
-			SchedulerExecutionArbitrationOff, SchedulerExecutionArbitrationObserve, SchedulerExecutionArbitrationEnforce, raw)
+		return "", fmt.Errorf("scheduler.routing.execution_arbitration must be one of %s, %s, got %q",
+			SchedulerExecutionArbitrationOff, SchedulerExecutionArbitrationEnforce, raw)
 	}
 }
 
@@ -799,7 +810,7 @@ type SchedulerRoutingConfig struct {
 	BindingSweep bool `json:"binding_sweep"`
 }
 
-// GatewayExecutionFencing is the three-state switch over the gateway's routing
+// GatewayExecutionFencing is the two-state switch over the gateway's routing
 // layer refusal: whether it stamps the incarnation it routed against onto the
 // request, and whether a mismatch is refused or only counted.
 //
@@ -809,24 +820,22 @@ type SchedulerRoutingConfig struct {
 // guards binding arbitration — so "is fencing off" has no single answer and
 // each has to be named. They are deliberately not merged: sharing one would let
 // a single panic-flip switch off a half nobody meant to, silently.
+//
+// 🔴 A third state, Observe, lived here through the rollout that proved
+// Enforce was safe to turn on everywhere: it compared and counted, and stamped
+// nothing, so a 412 the node might otherwise have produced was never armed.
+// That rollout is over — the deploy manifest's execution-fencing-config
+// comment records the cluster reaching enforce — and the state was deleted
+// from the type, from ParseGatewayExecutionFencing, and from decideFencing in
+// execution_fencing.go. The literal string "observe" is not silently remapped
+// to either remaining value: it now falls into this parser's own default case
+// below and is refused, the same as any other unrecognised value.
 type GatewayExecutionFencing string
 
 const (
 	// Off is the complete rollback: the gateway behaves byte for byte as it did
 	// before execution fencing existed.
 	GatewayExecutionFencingOff GatewayExecutionFencing = "off"
-	// Observe compares and counts, and stamps nothing.
-	//
-	// 🔴 The "stamps nothing" is the load-bearing half, not a detail: stamping
-	// the expect header is what arms the node's own refusal, and a 412 the node
-	// has already produced cannot be withdrawn by a gateway that was only meant
-	// to be watching — it can only be translated into a 409 the client did not
-	// get before. So observe delegates nothing, and takes its whole reading off
-	// the echo the node sends regardless of what was expected of it, which costs
-	// it no observability at all. (This comment previously read "stamps and
-	// compares and counts"; corrected 2026-08-20 — observe never stamped after
-	// the adjudication that made it a real dry run.)
-	GatewayExecutionFencingObserve GatewayExecutionFencing = "observe"
 	// Enforce is the default. Both gates are live.
 	GatewayExecutionFencingEnforce GatewayExecutionFencing = "enforce"
 )
@@ -837,20 +846,22 @@ const (
 // one mistyped letter switch fencing off — or on — without saying so, and the
 // resulting behaviour is indistinguishable from the value having been meant.
 // The empty string is not a mistyped value: it is the absence of a setting, and
-// it resolves to the documented default.
+// it resolves to the documented default. This is also, deliberately, what now
+// happens to the literal "observe": it used to be a recognised third state and
+// is not any more, so it is refused here rather than silently landing on
+// enforce or off — a manifest that still names it fails loudly instead of
+// starting in a mode the operator did not choose.
 func ParseGatewayExecutionFencing(raw string) (GatewayExecutionFencing, error) {
 	switch GatewayExecutionFencing(strings.ToLower(strings.TrimSpace(raw))) {
 	case "":
 		return GatewayExecutionFencingEnforce, nil
 	case GatewayExecutionFencingOff:
 		return GatewayExecutionFencingOff, nil
-	case GatewayExecutionFencingObserve:
-		return GatewayExecutionFencingObserve, nil
 	case GatewayExecutionFencingEnforce:
 		return GatewayExecutionFencingEnforce, nil
 	default:
-		return "", fmt.Errorf("gateway.routing.execution_fencing must be one of %s, %s, %s, got %q",
-			GatewayExecutionFencingOff, GatewayExecutionFencingObserve, GatewayExecutionFencingEnforce, raw)
+		return "", fmt.Errorf("gateway.routing.execution_fencing must be one of %s, %s, got %q",
+			GatewayExecutionFencingOff, GatewayExecutionFencingEnforce, raw)
 	}
 }
 

@@ -169,9 +169,12 @@ func TestTheFencingCounterProbeCanTellSeriesApart(t *testing.T) {
 // node can compare it against what it is actually running.
 //
 // 🔴 Only enforce does this, and this test is one half of a pair. Without
-// TestObserveModeCountsTheMismatchWithoutRefusing, a gateway that stamped in
-// every mode would pass here; without this one, a gateway that stamped in no mode
-// would pass there. Neither is worth anything alone.
+// TestGatewayStripsClientSuppliedExecutionHeaders's "off" case, a gateway that
+// stamped in every mode would pass here; without this one, a gateway that
+// stamped in no mode would pass there. Neither is worth anything alone. (A
+// third mode, observe, used to occupy the middle of that pair — compares but
+// never stamps — until the rollout it existed for finished; see
+// arbitration.rs's own note on the Rust twin of this deletion.)
 func TestDataPlaneRequestCarriesTheExpectedExecutionHeader(t *testing.T) {
 	stamped := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -206,13 +209,14 @@ func TestDataPlaneRequestCarriesTheExpectedExecutionHeader(t *testing.T) {
 // there is nothing authoritative to stamp, deleted rather than left in place.
 // Without this the header is a fencing token any caller can forge.
 //
-// 🔴 The mode axis is load-bearing, not thoroughness. The two modes that stamp
-// nothing are exactly the two that make a forged header dangerous: in off it
-// would let a caller reach past a rolled-back gateway into whatever gate the
-// nodes still carry, and in observe it would let a caller manufacture the one
-// thing observe promises cannot happen — a 409, produced by a node the gateway
-// never armed. Stripping is what makes "this mode refuses nothing" a property of
-// the gateway rather than a hope about its clients.
+// 🔴 The mode axis is load-bearing, not thoroughness. Off is the one mode left
+// that stamps nothing, which is exactly what makes a forged header dangerous
+// there: it would let a caller reach past a rolled-back gateway into whatever
+// gate the nodes still carry. Stripping is what makes "this mode refuses
+// nothing" a property of the gateway rather than a hope about its clients. (A
+// second such mode, observe, used to sit here too — authoritative but never
+// stamping — until the rollout it existed for finished and the mode was
+// deleted; its case in the table below went with it.)
 func TestGatewayStripsClientSuppliedExecutionHeaders(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -232,16 +236,6 @@ func TestGatewayStripsClientSuppliedExecutionHeaders(t *testing.T) {
 			name:      "no authority deletes the forged value rather than forwarding it",
 			mode:      config.GatewayExecutionFencingEnforce,
 			authority: schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN,
-		},
-		{
-			// Authoritative, and still deleted: observe resolves the incarnation
-			// and compares against it, but delegates nothing to the node — so the
-			// forged value has no legitimate value to be overwritten by, and
-			// forwarding it would hand the caller the refusal observe withheld.
-			name:      "observe deletes the forged value rather than forwarding it",
-			mode:      config.GatewayExecutionFencingObserve,
-			authority: schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
-			execution: executionNewer,
 		},
 		{
 			// The rollback rolls back this gateway, not the fleet's nodes. Off
@@ -686,204 +680,47 @@ func TestNodeWithoutEchoHeaderIsCountedAsUnfenced(t *testing.T) {
 	}
 }
 
-// newFencingNode is a node that behaves the way a node carrying the A5 receiving
-// end behaves (node design §3.7): it echoes the incarnation it is running on
-// every response, pass or refuse, and it answers 412 plus the internal refusal
-// header — before doing anything — when it was handed an expect header naming an
-// incarnation newer than its own.
+// 🔴 Three tests used to live here, all exercised through a real request under
+// GatewayExecutionFencingObserve:
+// TestObserveModeCountsTheMismatchWithoutRefusing (the dry run measures a
+// mismatch without touching the response), TestObserveModeStillTranslatesA
+// RogueNodeRefusal (the preflight-translation branch stays correct even in
+// the one mode that cannot arm it), and part of the table below. Observe is
+// retired — the rollout it existed for finished
+// (deploy/k8s/base/kustomization.yaml's execution-fencing-config comment
+// records the cluster reaching enforce) — and all three went with it, not
+// merely edited: the mode they exercised can no longer be configured, so
+// there is no request to send that reaches their assertions.
 //
-// 🔴 The second half is what makes the observe tests below mean something. A stub
-// that ignored the expect header would answer 200 whether or not the gateway
-// stamped one, so every assertion about observe not stamping would hold just as
-// well against a gateway that stamps.
-func newFencingNode(live string, body string) (*httptest.Server, <-chan http.Header) {
-	seen := make(chan http.Header, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case seen <- r.Header.Clone():
-		default:
-		}
-		w.Header().Set(headerExecutionID, live)
-		if expect := normalizeExecutionID(r.Header.Get(headerExpectExecutionID)); expect != "" && live < expect {
-			w.Header().Set(headerRefusal, refusalCodeExecutionSuperseded)
-			w.WriteHeader(http.StatusPreconditionFailed)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(body))
-	}))
-	return server, seen
-}
+// Two of the three lost no coverage: TestDataPlaneRequestTranslatesNodePrecon
+// ditionRefusal already exercises the preflight-translation branch under
+// enforce (the mode that can actually arm it — observe's own version of that
+// test existed only to prove the branch survives in a mode that can never
+// reach it, a defensive test with no primary-path counterpart to lose), and
+// TestGatewayStripsClientSuppliedExecutionHeaders/TestDataPlaneRequestCarries
+// TheExpectedExecutionHeader together still pin "off and enforce, and only
+// those two, decide what gets stamped." The third — the log message split —
+// is replaced below, at the function level rather than the HTTP level, since
+// logExecutionMismatch still exists and still switches on an explicit
+// argument.
 
-// 🔴 observe is the dry run, and a dry run that can still hand a client a 409 is
-// not one.
+// TestLogExecutionMismatchPicksTheMessageForWhatHappened pins the one thing
+// the log line says that the field set does not: refused vs. observed, never
+// both.
 //
-// The mode exists for one step of the rollout — prove the wiring end to end while
-// user traffic is untouched — and the gateway's own refusal is the easy half to
-// withhold. The node's is not: it is delegated the moment an expect header goes
-// out, and a 412 the node has already produced can only be translated, never
-// withdrawn. So observe delegates nothing. It stamps no expect header, and takes
-// its entire reading off the echo the node sends regardless of what was expected
-// of it, which costs it no observability at all.
-//
-// The node here is the real gate rather than a passthrough, so the mutation this
-// test is aimed at — observe stamping again — fails it the way a user would see
-// it, as a 409, and not merely as a missing header.
-func TestObserveModeCountsTheMismatchWithoutRefusing(t *testing.T) {
-	const nodeBody = "served by a superseded incarnation, and delivered anyway"
-	// The node is running the older incarnation; the scheduler names the newer
-	// one. This is precisely the input enforce refuses.
-	upstream, seen := newFencingNode(executionOlder, nodeBody)
-	defer upstream.Close()
-
-	echoBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedEcho)
-	preflightBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedPreflight)
-
-	logs, logged := observer.New(zap.WarnLevel)
-	server := newTestServerWithLogger(t, zap.New(logs), stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingObserve))
-
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
-
-	// 1. The client is untouched. Not "refused with a friendlier code" — served.
-	if response.Code != http.StatusOK {
-		t.Fatalf("observe answered %d (body %q); the dry run may not cost a single client a request",
-			response.Code, response.Body.String())
-	}
-	if response.Body.String() != nodeBody {
-		t.Fatalf("body is %q, want the node's own %q", response.Body.String(), nodeBody)
-	}
-
-	// 2. And it is untouched because nothing was ever delegated. A gateway that
-	// stamped would already have failed above, on the 409; this says why.
-	var header http.Header
-	select {
-	case header = <-seen:
-	default:
-		t.Fatal("the request never reached the node")
-	}
-	if got := header.Get(headerExpectExecutionID); got != "" {
-		t.Fatalf("observe stamped expect header %q; stamping is handing the node a refusal the gateway cannot take back", got)
-	}
-
-	// 3. The whole point of the round: the mismatch was seen and written down.
-	if got := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedEcho) - echoBefore; got != 1 {
-		t.Fatalf("the echo series moved by %v, want 1 — observe measures exactly what enforce would refuse", got)
-	}
-	// The control: no preflight refusal can exist in observe, because none was
-	// armed. If this moves, the 200 above came from somewhere other than the node.
-	if got := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedPreflight) - preflightBefore; got != 0 {
-		t.Fatalf("the preflight series moved by %v in observe; nothing was stamped, so nothing could have been refused up front", got)
-	}
-
-	// 4. The log trail, by field rather than by message. During the observe round
-	// the response is identical to a healthy one, so the counter and this line are
-	// the only two artifacts an operator has — and the counter alone cannot say
-	// which sandbox, which node or which pair of incarnations disagreed.
-	entries := logged.FilterField(zap.String("fencing_stage", fencingStageGatewayRoute)).All()
-	if len(entries) != 1 {
-		t.Fatalf("observe wrote %d gateway_route fencing lines, want exactly 1", len(entries))
-	}
-	fields := entries[0].ContextMap()
-	for name, want := range map[string]any{
-		"sandbox_id":            "sbx-1",
-		"node_id":               "node-a",
-		"expected_execution_id": executionNewer,
-		"observed_execution_id": executionOlder,
-		"refusal_code":          refusalCodeExecutionSuperseded,
-		"refused_by":            refusedByGateway,
-	} {
-		if got := fields[name]; got != want {
-			t.Fatalf("the observe log line carries %s=%v, want %v", name, got, want)
-		}
-	}
-}
-
-// 🔴 The one branch the observe decision leaves unreachable, and why it stays.
-//
-// observe stamps nothing, so a node that implements the gate has nothing to
-// compare against and cannot answer 412: in the fleet as it is wired, this case
-// does not arise. It is translated anyway because the two failure costs are not
-// symmetric. An unreachable translation costs one comparison. A missing one hands
-// a client the internal 412 and the internal x-agentenv-refusal header the first
-// time anything else in the fleet produces them — a second gateway on enforce, a
-// mode flipped under a request already in flight, a middlebox replaying a
-// refusal — and an internal signal on the outside is the one thing §6's code
-// table forbids outright.
-//
-// This test is what stops the branch from being deleted as dead code, and it is
-// not in tension with the test above: there, observe produces no refusal because
-// none was armed; here, the refusal arrives from outside observe's control and
-// the only remaining question is what shape it reaches the client in.
-func TestObserveModeStillTranslatesARogueNodeRefusal(t *testing.T) {
-	const nodeBody = `{"error":"an internal refusal shape"}`
-	// A node refusing without having been asked to — the shape observe cannot
-	// cause but also cannot rule out.
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerExecutionID, executionOlder)
-		w.Header().Set(headerRefusal, refusalCodeExecutionSuperseded)
-		w.WriteHeader(http.StatusPreconditionFailed)
-		_, _ = w.Write([]byte(nodeBody))
-	}))
-	defer upstream.Close()
-
-	before := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedPreflight)
-
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingObserve))
-
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
-
-	if response.Code == http.StatusPreconditionFailed {
-		t.Fatal("a node's 412 reached the client in observe; 412 and x-agentenv-refusal are internal signals in every mode")
-	}
-	if response.Code != http.StatusConflict {
-		t.Fatalf("the node's 412 arrived as %d, want the one external shape 409", response.Code)
-	}
-	if strings.Contains(response.Body.String(), "an internal refusal shape") {
-		t.Fatalf("the node's own refusal body reached the client: %q", response.Body.String())
-	}
-
-	var body executionRefusalBody
-	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
-		t.Fatalf("refusal body is not JSON: %v (body %q)", err, response.Body.String())
-	}
-	if body.RefusedBy != refusedByNode {
-		t.Fatalf("refusedBy is %q, want %q — observe did not refuse this, the node did", body.RefusedBy, refusedByNode)
-	}
-	if got := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedPreflight) - before; got != 1 {
-		t.Fatalf("the preflight series moved by %v, want 1 — a refusal observe cannot explain is the one it most has to record", got)
-	}
-}
-
-// TestTheObserveLineDoesNotClaimToHaveRefused pins the one thing the log line
-// says that the field set does not.
-//
-// 🔴 Both live modes reach the same line with the same fields, and under observe
-// the request is answered 200. A single message saying "refused" therefore turns
-// the entire observe round into a log full of refusals that never happened —
-// and the observe round is precisely when somebody greps for them, because the
-// response is identical to a healthy one and the log is half of what is left.
-//
-// The upstream here does not implement the node-side gate: it always answers 200
-// with an older incarnation. That is deliberate — it forces both modes through
-// the *echo* branch, the one whose outcome differs between them, rather than
-// through the node's 412, which is refused in either mode.
-func TestTheObserveLineDoesNotClaimToHaveRefused(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerExecutionID, executionOlder)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
+// 🔴 This used to run end to end, across both live modes, because observe was
+// the only way to produce the "observed and let it through" message from a
+// real request. Observe is retired, but logExecutionMismatch's own refused
+// parameter still selects between the two messages — kept deliberately,
+// rather than collapsed to always-refused, because the echo call site in
+// fenceProxyResponse still passes plan.refuse rather than a literal true; a
+// future mode that compares without refusing again gets the right message
+// for free. That selection is what this test pins, directly, without needing
+// a mode that can no longer be configured.
+func TestLogExecutionMismatchPicksTheMessageForWhatHappened(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
-		mode        config.GatewayExecutionFencing
-		wantStatus  int
+		refused     bool
 		wantMessage string
 		// wantSaysRefused is asserted against the message text rather than
 		// against the constant, so collapsing the two constants onto either of
@@ -891,34 +728,26 @@ func TestTheObserveLineDoesNotClaimToHaveRefused(t *testing.T) {
 		wantSaysRefused bool
 	}{
 		{
-			name:            "observe measured it and served it",
-			mode:            config.GatewayExecutionFencingObserve,
-			wantStatus:      http.StatusOK,
+			name:            "observed and let through",
+			refused:         false,
 			wantMessage:     logMsgExecutionObserved,
 			wantSaysRefused: false,
 		},
 		{
-			name:            "enforce ended the request",
-			mode:            config.GatewayExecutionFencingEnforce,
-			wantStatus:      http.StatusConflict,
+			name:            "refused",
+			refused:         true,
 			wantMessage:     logMsgExecutionRefused,
 			wantSaysRefused: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs, logged := observer.New(zap.WarnLevel)
-			server := newTestServerWithLogger(t, zap.New(logs), stubSchedulerClient{
-				lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-			}, 5*time.Second, 4<<20, withExecutionFencing(tc.mode))
+			server := newTestServerWithLogger(t, zap.New(logs), stubSchedulerClient{}, 5*time.Second, 4<<20)
 
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
-
-			// The control: without it, a build that refused nothing at all would
-			// pass the "observe does not say refused" row for the wrong reason.
-			if response.Code != tc.wantStatus {
-				t.Fatalf("answered %d, want %d (body %q)", response.Code, tc.wantStatus, response.Body.String())
-			}
+			server.logExecutionMismatch(
+				"sbx-1", &schedulerv1.Node{NodeId: "node-a"},
+				executionNewer, executionOlder, refusedByGateway, tc.refused,
+			)
 
 			entries := logged.FilterField(zap.String("fencing_stage", fencingStageGatewayRoute)).All()
 			if len(entries) != 1 {
@@ -928,14 +757,14 @@ func TestTheObserveLineDoesNotClaimToHaveRefused(t *testing.T) {
 				t.Fatalf("the log line reads %q, want %q", entries[0].Message, tc.wantMessage)
 			}
 			if saysRefused := strings.Contains(entries[0].Message, "refused"); saysRefused != tc.wantSaysRefused {
-				t.Fatalf("the log line %q says refused=%v, want %v — a request answered %d must not be written down as the opposite",
-					entries[0].Message, saysRefused, tc.wantSaysRefused, response.Code)
+				t.Fatalf("the log line %q says refused=%v, want %v",
+					entries[0].Message, saysRefused, tc.wantSaysRefused)
 			}
 
 			// 🔴 The field set is the frozen half of this contract (the
 			// three-stage trail, impl plan §11.1(g)): the message text was split
-			// precisely because
-			// the fields could not be. Both messages must still carry all six.
+			// precisely because the fields could not be. Both messages must
+			// still carry all six.
 			fields := entries[0].ContextMap()
 			for _, name := range []string{
 				"sandbox_id", "node_id", "expected_execution_id",
@@ -1538,13 +1367,25 @@ func TestRecordedAssignmentCarriesTheNodesExecution(t *testing.T) {
 // 🔴 An unrecognised mode stops the process. Falling back to a default would let
 // one mistyped letter switch fencing off with nothing to say it happened, and
 // the result would be indistinguishable from the value having been meant.
+//
+// 🔴 "observe" is in the refused list, not the accepted one, deliberately. It
+// used to be a recognised third mode and is not any more — the rollout it
+// existed for finished (deploy/k8s/base/kustomization.yaml's
+// execution-fencing-config comment records the cluster reaching enforce) —
+// so a manifest that still names it must stop the process the same way a
+// typo does, rather than being silently accepted as enforce or off. This is
+// the regression guard for that: without it, deleting
+// GatewayExecutionFencingObserve from config.go but leaving some fallback
+// path in place would go unnoticed here.
 func TestAnUnrecognisedFencingModeRefusesToStart(t *testing.T) {
-	if _, err := newServerWithFencing("enfroce"); err == nil {
-		t.Fatal("a mistyped mode was accepted; it has to stop the process")
+	for _, mode := range []string{"enfroce", "observe"} {
+		if _, err := newServerWithFencing(mode); err == nil {
+			t.Fatalf("mode %q was accepted; it has to stop the process", mode)
+		}
 	}
 
-	// The control: the three real values, and the absent one, are all accepted.
-	for _, mode := range []string{"", "off", "observe", "enforce"} {
+	// The control: the two real values, and the absent one, are all accepted.
+	for _, mode := range []string{"", "off", "enforce"} {
 		if _, err := newServerWithFencing(mode); err != nil {
 			t.Fatalf("mode %q was rejected: %v", mode, err)
 		}

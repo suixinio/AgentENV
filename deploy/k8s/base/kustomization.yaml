@@ -247,6 +247,21 @@ configMapGenerator:
   # naming them is what keeps a rollback a value change instead of a manifest
   # edit under incident pressure. `execution_switches_manifest_test.go` fails
   # if any of them is put back to its starting value.
+  #
+  # 🔴 `observe` is no longer merely an old *value* to avoid going back to —
+  # the release having finished was judged proof enough of that to delete the
+  # mode from the code on both sides of the wire (R10, task's own numbering).
+  # `SCHEDULER_ROUTING_EXECUTION_ARBITRATION=observe` or
+  # `GATEWAY_ROUTING_EXECUTION_FENCING=observe` now fail the process outright
+  # at start-up (`ParseSchedulerExecutionArbitration`/
+  # `ParseGatewayExecutionFencing` in `services/shared/config/config.go`, and
+  # `AppConfig::validate` on the Rust side) rather than being silently read as
+  # `enforce` or falling back to anything else — so a stale manifest that
+  # still names `observe` is a startup crash, not a quiet downgrade, which is
+  # the loudest failure mode available and therefore the intended one. `off`
+  # is unaffected: it remains a fully supported value on both processes, kept
+  # deliberately as the rollback target (`execution_fencing.go`'s own "the
+  # rollback is this line and nothing else" comment).
   - name: execution-fencing-config
     literals:
       # A3 is on from the moment the scheduler carrying it starts: it is the

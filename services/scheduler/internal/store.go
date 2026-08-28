@@ -127,11 +127,20 @@ const (
 // arbiter decides whether a challenger may take a binding, and says what it
 // decided.
 //
-// 🔴 Three of them exist and exactly one is chosen when a store is built. Not
+// 🔴 Two of them exist and exactly one is chosen when a store is built. Not
 // one function with a mode argument: the "off" behaviour has to be the
 // behaviour this had before arbitration existed, testable on its own terms,
 // and a shared function with a branch in it can never be tested in either mode
 // without also testing the branch.
+//
+// 🔴 A third, arbitrateObserving, existed here through the rollout that
+// proved arbitrateFenced was safe to turn on everywhere: it worked out what
+// arbitrateFenced would have decided and wrote anyway, so the decisions
+// became visible in metrics before any of them changed what was routed
+// where. That rollout is over (deploy/k8s/base/kustomization.yaml's
+// execution-fencing-config comment records the cluster reaching enforce) and
+// the function was deleted along with its Redis twin,
+// redisArbitrationObserving, and the config states that selected them.
 type arbiter func(incumbent string, held bool, challenger string) (accept bool, decision bindingDecision)
 
 // arbitrateFenced is the rule. Six cases, in the order they are reached.
@@ -163,14 +172,6 @@ func arbitrateFenced(incumbent string, held bool, challenger string) (bool, bind
 	default:
 		return false, bindingRejectedOlder
 	}
-}
-
-// arbitrateObserving works out what arbitrateFenced would have decided and then
-// writes anyway. It is the release's first step: the decisions become visible
-// in metrics before any of them starts changing what is routed where.
-func arbitrateObserving(incumbent string, held bool, challenger string) (bool, bindingDecision) {
-	_, decision := arbitrateFenced(incumbent, held, challenger)
-	return true, decision
 }
 
 // arbitrateOff is the rollback: whoever reported last wins, and nothing is
@@ -670,8 +671,6 @@ func InMemoryArbitrationFor(mode string) arbiter {
 	switch mode {
 	case "off":
 		return arbitrateOff
-	case "observe":
-		return arbitrateObserving
 	default:
 		return arbitrateFenced
 	}
@@ -681,8 +680,6 @@ func RedisArbitrationFor(mode string) string {
 	switch mode {
 	case "off":
 		return redisArbitrationOff
-	case "observe":
-		return redisArbitrationObserving
 	default:
 		return redisArbitrationFenced
 	}

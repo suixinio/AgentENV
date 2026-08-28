@@ -112,13 +112,13 @@ func TestProjectionSwitchesReadBothTheFileAndTheEnvironment(t *testing.T) {
 // the routing block but not this key must not blank it.
 func TestProjectionSwitchNamingTheBlockWithoutTheKeyLeavesTheDefault(t *testing.T) {
 	clearProjectionEnv(t)
-	path := writeProjectionConfig(t, "gateway.json", `{"gateway":{"routing":{"execution_fencing":"observe"}}}`)
+	path := writeProjectionConfig(t, "gateway.json", `{"gateway":{"routing":{"execution_fencing":"off"}}}`)
 
 	cfg, err := Load(path, "gateway")
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Gateway.Routing.ExecutionFencing != GatewayExecutionFencingObserve {
+	if cfg.Gateway.Routing.ExecutionFencing != GatewayExecutionFencingOff {
 		t.Fatalf("execution_fencing = %q", cfg.Gateway.Routing.ExecutionFencing)
 	}
 	if cfg.Gateway.Routing.ProjectionRead {

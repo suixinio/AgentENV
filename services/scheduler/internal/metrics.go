@@ -529,13 +529,21 @@ func SetBindingSweep(enabled bool, silence time.Duration) {
 }
 
 // SetRoutingExecutionArbitration publishes the mode. Called once at start-up.
+//
+// 🔴 The scale keeps its historical gap at 1. Enforce publishes 2 and Off
+// publishes 0; a third value, Observe, used to publish 1 through the rollout
+// that proved Enforce was safe to turn on everywhere. That rollout is over
+// and the mode this function receives has already passed
+// ParseSchedulerExecutionArbitration, which refuses the literal string
+// "observe" rather than letting it reach here — so 1 can no longer be
+// produced. The scale is not renumbered to close the gap: a dashboard or
+// alert built against "1 meant observe, 2 means fully enforcing" during that
+// rollout keeps reading this gauge the same way, it will simply never see 1
+// again.
 func SetRoutingExecutionArbitration(mode string) {
 	value := 2.0
-	switch mode {
-	case "off":
+	if mode == "off" {
 		value = 0
-	case "observe":
-		value = 1
 	}
 	schedulerRoutingExecutionArbitration.Set(value)
 }

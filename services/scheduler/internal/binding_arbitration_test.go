@@ -340,44 +340,40 @@ func TestExecutionArbitrationOffMatchesLegacyBehaviour(t *testing.T) {
 	})
 }
 
-// TestExecutionArbitrationObserveKeepsRoutingButCounts: the release's first
-// step. Same routing as off, so nothing moves; the decisions become visible.
-func TestExecutionArbitrationObserveKeepsRoutingButCounts(t *testing.T) {
-	t.Run("in-memory", func(t *testing.T) {
-		store := NewInMemoryBindingStoreWithModes(time.Minute, InMemoryArbitrationFor("observe"), false)
-		now := time.Now()
-		mustReconcile(t, store, arbNodeB, []RosterEntry{{SandboxID: "sbx", ExecutionID: execNew}}, now)
+// TestArbitrationForNoLongerRecognizesObserve replaces
+// TestExecutionArbitrationObserveKeepsRoutingButCounts, which used to pin the
+// release's first step: same routing as off, so nothing moved, but the
+// decisions became visible. That mode is retired — the rollout it existed
+// for finished (deploy/k8s/base/kustomization.yaml's
+// execution-fencing-config comment records the cluster reaching enforce) —
+// so there is no longer a routing behaviour to pin for it. What replaces it:
+// InMemoryArbitrationFor/RedisArbitrationFor fold the literal "observe" into
+// the same unrecognised-value fallback (arbitrateFenced/
+// redisArbitrationFenced) as any other unrecognised string, rather than
+// granting it special recognition.
+//
+// 🔴 This alone is not the "explicit error" guard for a user-supplied
+// "observe" — that lives in ParseSchedulerExecutionArbitration, which refuses
+// the string outright before it ever reaches these functions (see
+// TestAnUnrecognisedArbitrationModeStopsTheProcess in
+// shared/config/scheduler_execution_test.go, and its "observe is retired"
+// sibling in TestABadValueInTheEnvironmentIsRefused). This test only pins
+// that these lower-level mappings stopped granting "observe" special
+// recognition, so nobody re-adds the case here without also reading why it
+// moved.
+func TestArbitrationForNoLongerRecognizesObserve(t *testing.T) {
+	store := NewInMemoryBindingStoreWithModes(time.Minute, InMemoryArbitrationFor("observe"), false)
+	now := time.Now()
+	mustReconcile(t, store, arbNodeB, []RosterEntry{{SandboxID: "sbx", ExecutionID: execNew}}, now)
+	mustReconcile(t, store, arbNodeA, []RosterEntry{{SandboxID: "sbx", ExecutionID: execOld}}, now)
+	// Fenced, not the old observe behaviour: the older incarnation is
+	// rejected outright rather than accepted-but-counted, and the binding
+	// stays with the node that reported the newer one.
+	assertBinding(t, store, "sbx", arbNodeB.ID, execNew)
 
-		before := bindingDecisionCount(t, string(bindingRejectedOlder), bindingSourceHeartbeat)
-		mustReconcile(t, store, arbNodeA, []RosterEntry{{SandboxID: "sbx", ExecutionID: execOld}}, now)
-		after := bindingDecisionCount(t, string(bindingRejectedOlder), bindingSourceHeartbeat)
-
-		assertBinding(t, store, "sbx", arbNodeA.ID, execOld)
-		if after <= before {
-			t.Fatalf("observe mode wrote the binding but counted nothing: %v -> %v", before, after)
-		}
-	})
-
-	t.Run("redis", func(t *testing.T) {
-		addr := startRedisServerForTest(t)
-		store, err := NewRedisBindingStoreWithModes(addr, time.Minute, RedisArbitrationFor("observe"), false)
-		if err != nil {
-			t.Fatalf("create redis binding store: %v", err)
-		}
-		t.Cleanup(func() { _ = store.Close() })
-
-		now := time.Now()
-		mustReconcile(t, store, arbNodeB, []RosterEntry{{SandboxID: "sbx", ExecutionID: execNew}}, now)
-
-		before := bindingDecisionCount(t, string(bindingRejectedOlder), bindingSourceHeartbeat)
-		mustReconcile(t, store, arbNodeA, []RosterEntry{{SandboxID: "sbx", ExecutionID: execOld}}, now)
-		after := bindingDecisionCount(t, string(bindingRejectedOlder), bindingSourceHeartbeat)
-
-		assertBinding(t, store, "sbx", arbNodeA.ID, execOld)
-		if after <= before {
-			t.Fatalf("observe mode wrote the binding but counted nothing: %v -> %v", before, after)
-		}
-	})
+	if got := RedisArbitrationFor("observe"); got != redisArbitrationFenced {
+		t.Fatal("RedisArbitrationFor(\"observe\") no longer returns the fenced prelude")
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -372,13 +372,22 @@ local function parse_binding(raw)
 end
 `
 
-// The three arbitration preludes. Each defines `accepts`, and one of them is
+// The two arbitration preludes. Each defines `accepts`, and one of them is
 // prepended to a script body when a store is built.
 //
-// 🔴 Three separate constants rather than one with a mode argument. A script
-// carrying all three behaviours can never be exercised in any one of them, and
-// the mode is a deployment decision that changes once — at construction — not a
+// 🔴 Two separate constants rather than one with a mode argument. A script
+// carrying both behaviours can never be exercised in either of them, and the
+// mode is a deployment decision that changes once — at construction — not a
 // per-call one.
+//
+// 🔴 A third constant, redisArbitrationObserving, lived here through the
+// rollout that proved redisArbitrationFenced was safe to turn on everywhere:
+// it worked the decision out and wrote anyway, so a release could see what
+// enforcing would do before it did it. That rollout is over
+// (deploy/k8s/base/kustomization.yaml's execution-fencing-config comment
+// records the cluster reaching enforce) and the prelude was deleted along
+// with its in-memory twin, arbitrateObserving, and the config states that
+// selected them.
 const (
 	// redisArbitrationFenced is the rule, in the same six cases as
 	// arbitrateFenced. Redis compares strings byte by byte, which for
@@ -394,22 +403,6 @@ local function accepts(raw, challenger)
   if challenger == incumbent then return true, "refreshed" end
   if challenger > incumbent then return true, "superseded" end
   return false, "rejected_older"
-end
-`
-
-	// redisArbitrationObserving works the decision out and writes anyway, so a
-	// release can see what enforcing would do before it does it.
-	redisArbitrationObserving = redisLuaHelpers + `
-local function accepts(raw, challenger)
-  local _, incumbent = parse_binding(raw)
-  if not raw then return true, (challenger ~= "" and "installed" or "installed_unknown") end
-  if not incumbent or incumbent == "" then
-    return true, (challenger ~= "" and "installed" or "installed_unknown")
-  end
-  if challenger == "" then return true, "rejected_unknown" end
-  if challenger == incumbent then return true, "refreshed" end
-  if challenger > incumbent then return true, "superseded" end
-  return true, "rejected_older"
 end
 `
 

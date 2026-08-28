@@ -1,9 +1,13 @@
 //! Task's own "D3": the Lua scripts `RedisBindingStore` runs, ported
 //! verbatim from `services/scheduler/internal/redis_store.go`'s own
-//! constants (`redisArbitrationFenced`/`Observing`/`Off`,
+//! constants (`redisArbitrationFenced`/`Off`,
 //! `redisKeepsDeadlineAuthoritative`/`Ephemeral`,
 //! `redisRecordBindingScriptBody`, `redisReconcileNodeScriptBody`,
-//! `redisDeleteBindingScriptBody`). Predicates live in Lua for the same
+//! `redisDeleteBindingScriptBody`). A third prelude,
+//! `redisArbitrationObserving`, existed through the rollout that proved
+//! `Fenced` was safe to turn on everywhere; it and its Rust twin
+//! (`ARBITRATION_OBSERVING`) were deleted together once that rollout
+//! finished. Predicates live in Lua for the same
 //! reason `src/orchestrator/store/redis/scripts.rs` gives for its own
 //! scripts: a lockless Rust-side read-modify-write would race a concurrent
 //! write between the read and the write.
@@ -66,20 +70,6 @@ local function accepts(raw, challenger)
 end
 "#;
 
-const ARBITRATION_OBSERVING: &str = r#"
-local function accepts(raw, challenger)
-  local _, incumbent = parse_binding(raw)
-  if not raw then return true, (challenger ~= "" and "installed" or "installed_unknown") end
-  if not incumbent or incumbent == "" then
-    return true, (challenger ~= "" and "installed" or "installed_unknown")
-  end
-  if challenger == "" then return true, "rejected_unknown" end
-  if challenger == incumbent then return true, "refreshed" end
-  if challenger > incumbent then return true, "superseded" end
-  return true, "rejected_older"
-end
-"#;
-
 const ARBITRATION_OFF: &str = r#"
 local function accepts(raw, challenger)
   return true, ""
@@ -89,7 +79,6 @@ end
 fn arbitration_prelude(mode: ArbitrationMode) -> &'static str {
     match mode {
         ArbitrationMode::Fenced => ARBITRATION_FENCED,
-        ArbitrationMode::Observing => ARBITRATION_OBSERVING,
         ArbitrationMode::Off => ARBITRATION_OFF,
     }
 }
@@ -166,10 +155,6 @@ fn build_record(mode: ArbitrationMode) -> Script {
 pub fn record_script(mode: ArbitrationMode) -> &'static Script {
     match mode {
         ArbitrationMode::Fenced => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_record(mode))
-        }
-        ArbitrationMode::Observing => {
             static S: OnceLock<Script> = OnceLock::new();
             S.get_or_init(|| build_record(mode))
         }
@@ -287,14 +272,6 @@ pub fn reconcile_script(mode: ArbitrationMode, projection_authoritative: bool) -
             static S: OnceLock<Script> = OnceLock::new();
             S.get_or_init(|| build_reconcile(mode, projection_authoritative))
         }
-        (ArbitrationMode::Observing, false) => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_reconcile(mode, projection_authoritative))
-        }
-        (ArbitrationMode::Observing, true) => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_reconcile(mode, projection_authoritative))
-        }
         (ArbitrationMode::Off, false) => {
             static S: OnceLock<Script> = OnceLock::new();
             S.get_or_init(|| build_reconcile(mode, projection_authoritative))
@@ -355,11 +332,8 @@ mod tests {
     #[test]
     fn record_scripts_differ_by_arbitration_mode() {
         let fenced = record_script(ArbitrationMode::Fenced);
-        let observing = record_script(ArbitrationMode::Observing);
         let off = record_script(ArbitrationMode::Off);
-        assert_ne!(fenced.get_hash(), observing.get_hash());
         assert_ne!(fenced.get_hash(), off.get_hash());
-        assert_ne!(observing.get_hash(), off.get_hash());
     }
 
     #[test]

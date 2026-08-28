@@ -138,7 +138,7 @@ func TestBindingSweepNamingTheRoutingBlockWithoutTheKeyLeavesTheDefault(t *testi
 	}}
 
 	// A file that names the routing block for one of the other keys in it.
-	if err := json.Unmarshal([]byte(`{"routing":{"execution_arbitration":"observe"}}`), &seeded); err != nil {
+	if err := json.Unmarshal([]byte(`{"routing":{"execution_arbitration":"off"}}`), &seeded); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if !seeded.Routing.BindingSweep {
@@ -149,7 +149,7 @@ func TestBindingSweepNamingTheRoutingBlockWithoutTheKeyLeavesTheDefault(t *testi
 	if !seeded.Routing.ProjectionAuthoritative {
 		t.Fatal("naming the routing block without projection_authoritative blanked it")
 	}
-	if seeded.Routing.ExecutionArbitration != SchedulerExecutionArbitrationObserve {
+	if seeded.Routing.ExecutionArbitration != SchedulerExecutionArbitrationOff {
 		t.Fatalf("execution_arbitration = %q", seeded.Routing.ExecutionArbitration)
 	}
 

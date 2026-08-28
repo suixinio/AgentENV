@@ -37,8 +37,8 @@ func TestTheTwoSchedulerSwitchesDefaultToOn(t *testing.T) {
 // nobody meant to, and two of those failures are silent.
 func TestTheThreeSwitchesAreSeparateSettings(t *testing.T) {
 	raw := `{
-        "scheduler": {"registry": {"write_fencing": false}, "routing": {"execution_arbitration": "observe"}},
-        "gateway": {"routing": {"execution_fencing": "off"}}
+        "scheduler": {"registry": {"write_fencing": false}, "routing": {"execution_arbitration": "off"}},
+        "gateway": {"routing": {"execution_fencing": "enforce"}}
     }`
 
 	cfg := defaultConfig("scheduler")
@@ -49,11 +49,11 @@ func TestTheThreeSwitchesAreSeparateSettings(t *testing.T) {
 	if cfg.Scheduler.Registry.WriteFencing {
 		t.Fatal("scheduler.registry.write_fencing did not follow its own key")
 	}
-	if got := cfg.Scheduler.Routing.ExecutionArbitration; got != SchedulerExecutionArbitrationObserve {
-		t.Fatalf("scheduler.routing.execution_arbitration: got %q, want observe", got)
+	if got := cfg.Scheduler.Routing.ExecutionArbitration; got != SchedulerExecutionArbitrationOff {
+		t.Fatalf("scheduler.routing.execution_arbitration: got %q, want off", got)
 	}
-	if got := cfg.Gateway.Routing.ExecutionFencing; got != GatewayExecutionFencingOff {
-		t.Fatalf("gateway.routing.execution_fencing: got %q, want off", got)
+	if got := cfg.Gateway.Routing.ExecutionFencing; got != GatewayExecutionFencingEnforce {
+		t.Fatalf("gateway.routing.execution_fencing: got %q, want enforce", got)
 	}
 }
 
@@ -89,8 +89,14 @@ func TestNamingOneSwitchLeavesTheOthersAlone(t *testing.T) {
 // off without saying so, and the resulting behaviour is indistinguishable from
 // the value having been meant. The empty string is not a mistyped value — it is
 // the absence of a setting — so it resolves to the documented default.
+//
+// 🔴 "observe" is in this list on purpose, not as a typo but as the retired
+// third mode itself. It used to be a recognised value and is not any more —
+// the rollout it existed for finished — so it must stop the process the same
+// way any other unrecognised string does, rather than being silently accepted
+// or coerced onto enforce/off.
 func TestAnUnrecognisedArbitrationModeStopsTheProcess(t *testing.T) {
-	for _, value := range []string{"enforced", "on", "true", "observed", "0", " off "} {
+	for _, value := range []string{"enforced", "on", "true", "observed", "observe", "0", " off "} {
 		mode, err := ParseSchedulerExecutionArbitration(value)
 		if strings.TrimSpace(value) == "off" {
 			// Surrounding whitespace is trimmed, so " off " is the setting
@@ -138,7 +144,7 @@ func TestValidateRefusesAnUnrecognisedArbitrationMode(t *testing.T) {
 	// build that refuses every configuration.
 	cfg := defaultConfig("scheduler")
 	cfg.Scheduler.RedisAddr = "127.0.0.1:6379"
-	cfg.Scheduler.Routing.ExecutionArbitration = SchedulerExecutionArbitrationObserve
+	cfg.Scheduler.Routing.ExecutionArbitration = SchedulerExecutionArbitrationOff
 	if err := cfg.validate(true); err != nil {
 		t.Fatalf("a valid mode was refused: %v", err)
 	}
@@ -148,7 +154,7 @@ func TestValidateRefusesAnUnrecognisedArbitrationMode(t *testing.T) {
 // the runbook flips them.
 func TestTheSchedulerSwitchesReadTheirEnvironmentVariables(t *testing.T) {
 	t.Setenv("SCHEDULER_REGISTRY_WRITE_FENCING", "false")
-	t.Setenv("SCHEDULER_ROUTING_EXECUTION_ARBITRATION", "observe")
+	t.Setenv("SCHEDULER_ROUTING_EXECUTION_ARBITRATION", "off")
 
 	cfg := defaultConfig("scheduler")
 	if err := overrideWithEnv(&cfg); err != nil {
@@ -157,8 +163,8 @@ func TestTheSchedulerSwitchesReadTheirEnvironmentVariables(t *testing.T) {
 	if cfg.Scheduler.Registry.WriteFencing {
 		t.Fatal("SCHEDULER_REGISTRY_WRITE_FENCING was ignored")
 	}
-	if got := cfg.Scheduler.Routing.ExecutionArbitration; got != SchedulerExecutionArbitrationObserve {
-		t.Fatalf("SCHEDULER_ROUTING_EXECUTION_ARBITRATION: got %q, want observe", got)
+	if got := cfg.Scheduler.Routing.ExecutionArbitration; got != SchedulerExecutionArbitrationOff {
+		t.Fatalf("SCHEDULER_ROUTING_EXECUTION_ARBITRATION: got %q, want off", got)
 	}
 }
 
@@ -179,6 +185,20 @@ func TestABadValueInTheEnvironmentIsRefused(t *testing.T) {
 		cfg := defaultConfig("scheduler")
 		if err := overrideWithEnv(&cfg); err == nil {
 			t.Fatal("an unrecognised mode was accepted from the environment")
+		}
+	})
+
+	// 🔴 "observe" specifically, not just a typo: it used to be a recognised
+	// mode read straight off the environment during the rollout that proved
+	// enforce was safe to turn on everywhere, and an operator's runbook or
+	// muscle memory from that period is exactly the kind of "value having
+	// been meant" a fallback would hide. It must refuse here the same as any
+	// other retired or misspelled value.
+	t.Run("observe is retired", func(t *testing.T) {
+		t.Setenv("SCHEDULER_ROUTING_EXECUTION_ARBITRATION", "observe")
+		cfg := defaultConfig("scheduler")
+		if err := overrideWithEnv(&cfg); err == nil {
+			t.Fatal("the retired \"observe\" mode was accepted from the environment")
 		}
 	})
 }

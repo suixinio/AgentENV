@@ -406,15 +406,10 @@ func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.Bindin
 	// of the moment will say.
 	scheduler.SetRoutingExecutionArbitration(string(mode))
 	scheduler.SetBindingArbitrationLogger(logger)
-	switch mode {
-	case config.SchedulerExecutionArbitrationOff:
+	if mode == config.SchedulerExecutionArbitrationOff {
 		logger.Warn("scheduler binding arbitration is OFF: whichever node reports last owns a sandbox's binding, so a superseded incarnation takes it back on every heartbeat",
 			zap.String("setting", "scheduler.routing.execution_arbitration"),
 			zap.String("env", "SCHEDULER_ROUTING_EXECUTION_ARBITRATION"),
-		)
-	case config.SchedulerExecutionArbitrationObserve:
-		logger.Warn("scheduler binding arbitration is OBSERVING: decisions are counted but not applied",
-			zap.String("setting", "scheduler.routing.execution_arbitration"),
 		)
 	}
 

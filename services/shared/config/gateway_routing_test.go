@@ -33,24 +33,24 @@ func TestGatewayExecutionFencingDefaultsToEnforce(t *testing.T) {
 // Both paths have to work: the config file is a ConfigMap and the environment is
 // how an operator flips one gateway without editing it.
 func TestGatewayExecutionFencingReadsBothTheFileAndTheEnvironment(t *testing.T) {
-	path := writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"observe"}}}`)
+	path := writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"off"}}}`)
 
 	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
 	cfg, err := Load(path, "gateway")
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Gateway.Routing.ExecutionFencing != GatewayExecutionFencingObserve {
-		t.Fatalf("file value came out as %q, want observe", cfg.Gateway.Routing.ExecutionFencing)
+	if cfg.Gateway.Routing.ExecutionFencing != GatewayExecutionFencingOff {
+		t.Fatalf("file value came out as %q, want off", cfg.Gateway.Routing.ExecutionFencing)
 	}
 
-	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "off")
+	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "enforce")
 	cfg, err = Load(path, "gateway")
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Gateway.Routing.ExecutionFencing != GatewayExecutionFencingOff {
-		t.Fatalf("the environment did not override the file: got %q, want off", cfg.Gateway.Routing.ExecutionFencing)
+	if cfg.Gateway.Routing.ExecutionFencing != GatewayExecutionFencingEnforce {
+		t.Fatalf("the environment did not override the file: got %q, want enforce", cfg.Gateway.Routing.ExecutionFencing)
 	}
 }
 
@@ -90,9 +90,27 @@ func TestAnUnrecognisedGatewayExecutionFencingRefusesToLoad(t *testing.T) {
 		}
 	})
 
-	// The control: the three real values load, so the refusal above is about the
+	// 🔴 "observe" gets its own subtest rather than joining the mistyped-mode
+	// cases above: it is not a typo, it is the retired third mode, and a
+	// manifest that still names it is exactly the case this whole file exists
+	// to catch. Both paths, the same as the two subtests above.
+	t.Run("observe in the config file", func(t *testing.T) {
+		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
+		if _, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"observe"}}}`), "gateway"); err == nil {
+			t.Fatal("the retired \"observe\" mode in the config file was accepted")
+		}
+	})
+
+	t.Run("observe in the environment", func(t *testing.T) {
+		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "observe")
+		if _, err := Load("", "gateway"); err == nil {
+			t.Fatal("the retired \"observe\" mode in the environment was accepted")
+		}
+	})
+
+	// The control: the two real values load, so the refusal above is about the
 	// value and not about the plumbing.
-	for _, mode := range []string{"off", "observe", "enforce"} {
+	for _, mode := range []string{"off", "enforce"} {
 		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", mode)
 		cfg, err := Load("", "gateway")
 		if err != nil {
@@ -131,12 +149,11 @@ func TestTheControlPlaneTokenComesOnlyFromTheEnvironment(t *testing.T) {
 
 func TestParseGatewayExecutionFencing(t *testing.T) {
 	for raw, want := range map[string]GatewayExecutionFencing{
-		"":         GatewayExecutionFencingEnforce,
-		"  ":       GatewayExecutionFencingEnforce,
-		"off":      GatewayExecutionFencingOff,
-		"OFF":      GatewayExecutionFencingOff,
-		" observe": GatewayExecutionFencingObserve,
-		"enforce":  GatewayExecutionFencingEnforce,
+		"":        GatewayExecutionFencingEnforce,
+		"  ":      GatewayExecutionFencingEnforce,
+		"off":     GatewayExecutionFencingOff,
+		"OFF":     GatewayExecutionFencingOff,
+		"enforce": GatewayExecutionFencingEnforce,
 	} {
 		got, err := ParseGatewayExecutionFencing(raw)
 		if err != nil {
@@ -147,7 +164,13 @@ func TestParseGatewayExecutionFencing(t *testing.T) {
 		}
 	}
 
-	for _, raw := range []string{"enfroce", "on", "true", "observe-only"} {
+	// 🔴 "observe" and " observe" (with the whitespace this parser trims) are
+	// in the refusal list on purpose: the mode used to be recognised here,
+	// with exactly this leading-space spelling accepted in the table above,
+	// and is not any more. A fallback to enforce or off would be silent about
+	// exactly the value an old runbook or a stale ConfigMap is most likely to
+	// still name.
+	for _, raw := range []string{"enfroce", "on", "true", "observe-only", "observe", " observe"} {
 		if _, err := ParseGatewayExecutionFencing(raw); err == nil {
 			t.Fatalf("ParseGatewayExecutionFencing(%q) was accepted", raw)
 		}

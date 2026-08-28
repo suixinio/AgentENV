@@ -687,13 +687,6 @@ pub enum PausedRegistryBackendKind {
     /// refusal message. Today the value is live again and means what it
     /// says.
     Postgres,
-    /// Same registry, reached over gRPC through whoever owns the database
-    /// instead of by connecting to it. Identical semantics to `postgres` — the
-    /// difference is that the database credentials, the connection budget and
-    /// the schema stop being every node's business.
-    ///
-    /// Requires `[cluster].scheduler_endpoint`.
-    Central,
 }
 
 impl PausedRegistryBackendKind {
@@ -707,7 +700,6 @@ impl PausedRegistryBackendKind {
         match self {
             Self::Local => "local",
             Self::Postgres => "postgres",
-            Self::Central => "central",
         }
     }
 }
@@ -808,7 +800,7 @@ mod paused_registry_config_tests {
 
     fn config(reconcile_interval_secs: u64, lease_ttl_secs: u64) -> PausedRegistryConfig {
         PausedRegistryConfig {
-            backend: PausedRegistryBackendKind::Central,
+            backend: PausedRegistryBackendKind::Postgres,
             reconcile_interval_secs,
             lease_ttl_secs,
             reclaim_interval_secs: 30,
@@ -2916,7 +2908,6 @@ mod tests {
         // overwrites — which is the failure this override exists to remove.
         for (value, expected) in [
             ("postgres", PausedRegistryBackendKind::Postgres),
-            ("central", PausedRegistryBackendKind::Central),
             ("local", PausedRegistryBackendKind::Local),
         ] {
             std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", value);
@@ -2951,7 +2942,7 @@ mod tests {
         // error at all. Startup is where the mistake is still cheap; past it,
         // it surfaces when a node is lost and its sandboxes turn out to have
         // gone with it.
-        for typo in ["postgress", "Central", "postgres ", "node-local"] {
+        for typo in ["postgress", "Postgres", "postgres ", "node-local"] {
             std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", typo);
             let loaded = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
             std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");

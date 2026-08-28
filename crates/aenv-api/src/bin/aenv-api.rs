@@ -418,8 +418,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let paused_registry_factory = pg_pool.clone().map(PgPausedRegistryFactory::new);
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
-        &config.cluster,
-        &config.observability.scheduler_report,
         &identity_for_registry,
         paused_registry_factory
             .as_ref()

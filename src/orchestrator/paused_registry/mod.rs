@@ -17,7 +17,6 @@
 //! makes every operation a no-op, which leaves pause/resume behaving exactly as
 //! it did before this module existed.
 
-pub mod central;
 pub mod disabled;
 pub mod types;
 
@@ -29,17 +28,13 @@ use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
-use crate::cfg::{
-    ClusterConfig, ObservabilitySchedulerReportConfig, PausedRegistryBackendKind,
-    PausedRegistryConfig,
-};
+use crate::cfg::{PausedRegistryBackendKind, PausedRegistryConfig};
 use crate::identity::NodeIdentity;
 use crate::node_registry::registry::NodeRegistry;
 use crate::orchestrator::PauseOutcome;
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
-pub use central::CentralPausedSandboxRegistry;
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use types::{
     BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
@@ -583,8 +578,8 @@ pub fn log_claim_outcome(
 /// # 🔴 A trait, and not the `sqlx::PgPool` this used to take
 ///
 /// [`build_paused_registry`] is the shared assembly: every role calls it, and
-/// two of its three arms (`local`, `central`) need no database at all. The
-/// third one does, and the pool, the schema bootstrap and the restart-grace
+/// one of its two arms (`local`) needs no database at all. The other one
+/// does, and the pool, the schema bootstrap and the restart-grace
 /// entry that go with it belong to the deciding half alone — the half that is
 /// allowed to hold database credentials (`src/pg/mod.rs`'s own module doc:
 /// "`aenv-node` never reaches this module"). Taking the constructor as a
@@ -624,8 +619,8 @@ pub trait PostgresPausedRegistryFactory: Send + Sync {
 /// never arrived — are told apart by the one info line at the end.
 ///
 /// `postgres`/`node_registry` are Stage C's own additions, both `None` for
-/// every caller not selecting `postgres` (the `Local`/`Central` arms never
-/// touch either). `postgres` is the database half's own constructor --
+/// every caller not selecting `postgres` (the `local` arm never touches
+/// either). `postgres` is the database half's own constructor --
 /// see [`PostgresPausedRegistryFactory`] for why this arrives as a trait
 /// object rather than as the `sqlx::PgPool` it used to be. `node_registry` is
 /// `Some` only when `aenv-api` built a
@@ -635,118 +630,76 @@ pub trait PostgresPausedRegistryFactory: Send + Sync {
 ///
 pub async fn build_paused_registry(
     config: &PausedRegistryConfig,
-    cluster: &ClusterConfig,
-    scheduler_report: &ObservabilitySchedulerReportConfig,
     identity: &NodeIdentity,
     postgres: Option<&dyn PostgresPausedRegistryFactory>,
     node_registry: Option<Arc<dyn NodeRegistry>>,
 ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
-    let (registry, scheduler_endpoint): (Arc<dyn PausedSandboxRegistry>, &str) =
-        match config.backend {
-            PausedRegistryBackendKind::Local => (Arc::new(DisabledPausedSandboxRegistry), ""),
-            PausedRegistryBackendKind::Postgres => {
-                let factory = postgres.context(
-                    "paused_registry.backend = \"postgres\" requires [pg].dsn to be configured \
-                     (the shared PostgreSQL pool this process already builds for Stage B's \
-                     catalog, if [pg] is set)",
-                )?;
+    let registry: Arc<dyn PausedSandboxRegistry> = match config.backend {
+        PausedRegistryBackendKind::Local => Arc::new(DisabledPausedSandboxRegistry),
+        PausedRegistryBackendKind::Postgres => {
+            let factory = postgres.context(
+                "paused_registry.backend = \"postgres\" requires [pg].dsn to be configured \
+                 (the shared PostgreSQL pool this process already builds for Stage B's \
+                 catalog, if [pg] is set)",
+            )?;
 
-                // 🔴 M1: the roster requirement, and it is unconditional now.
-                // It used to be guarded by the now-deleted `ServerRole`'s
-                // `runs_sandbox_runtime`, because a the pre-split single
-                // process process's own identity already
-                // coincided with `origin_node_id` for everything it ran, so
-                // the ordinary `renew_lease` trait method (its own periodic
-                // self-renewal) already covered what D2 Fix A exists to cover
-                // -- see `postgres::replica_renewal`'s own module doc for the
-                // full argument. `aenv-api` is the only caller of this
-                // function that has ever existed, no process links both
-                // halves, and that identity never coincides here: a missing
-                // roster leaves `running` rows with no renewal path at all --
-                // the exact failure Fix A (commit `151d00b`) closed for the
-                // central/gRPC backend.
-                node_registry.as_ref().context(
-                    "paused_registry.backend = \"postgres\" requires a heartbeat roster \
-                     source, which only exists under \
-                     [cluster].node_placement_source = \"native\" -- without it, running \
-                     sandboxes' registry leases have no renewal path and will eventually be \
-                     wrongly reclaimed even while healthy (this is the exact failure Fix A, \
-                     commit 151d00b, closed for the central/gRPC backend). Set \
-                     AENV_NODE_PLACEMENT_SOURCE=native, or keep this backend on \
-                     \"central\"",
-                )?;
+            // 🔴 M1: the roster requirement, and it is unconditional now.
+            // It used to be guarded by the now-deleted `ServerRole`'s
+            // `runs_sandbox_runtime`, because a the pre-split single
+            // process process's own identity already
+            // coincided with `origin_node_id` for everything it ran, so
+            // the ordinary `renew_lease` trait method (its own periodic
+            // self-renewal) already covered what D2 Fix A exists to cover
+            // -- see `postgres::replica_renewal`'s own module doc for the
+            // full argument. `aenv-api` is the only caller of this
+            // function that has ever existed, no process links both
+            // halves, and that identity never coincides here: a missing
+            // roster leaves `running` rows with no renewal path at all --
+            // the exact failure Fix A (commit `151d00b`) closed for the
+            // now-deleted central/gRPC backend.
+            node_registry.as_ref().context(
+                "paused_registry.backend = \"postgres\" requires a heartbeat roster \
+                 source, which only exists under \
+                 [cluster].node_placement_source = \"native\" -- without it, running \
+                 sandboxes' registry leases have no renewal path and will eventually be \
+                 wrongly reclaimed even while healthy (this is the exact failure Fix A, \
+                 commit 151d00b, closed for the now-deleted central/gRPC backend). Set \
+                 AENV_NODE_PLACEMENT_SOURCE=native",
+            )?;
 
-                // 🔴 `node_registry` is not consumed here -- it is only
-                // needed by the background reconcile/reclaim/renewal loops
-                // [`spawn_paused_registry_background_tasks`] starts, which
-                // this function's caller must invoke separately (mirroring
-                // `spawn_pg_singleton_tasks` alongside `build_pg_pool` in
-                // `src/bin/aenv-api.rs`) so their task handles land in the
-                // same buckets every other PostgreSQL-backed background task
-                // already shuts down through. Validated present here anyway,
-                // so a `postgres` backend that will fail to start its safety
-                // net a few lines later in the caller is a startup failure
-                // discovered too late to matter, not one avoided.
-                drop(node_registry);
+            // 🔴 `node_registry` is not consumed here -- it is only
+            // needed by the background reconcile/reclaim/renewal loops
+            // [`spawn_paused_registry_background_tasks`] starts, which
+            // this function's caller must invoke separately (mirroring
+            // `spawn_pg_singleton_tasks` alongside `build_pg_pool` in
+            // `src/bin/aenv-api.rs`) so their task handles land in the
+            // same buckets every other PostgreSQL-backed background task
+            // already shuts down through. Validated present here anyway,
+            // so a `postgres` backend that will fail to start its safety
+            // net a few lines later in the caller is a startup failure
+            // discovered too late to matter, not one avoided.
+            drop(node_registry);
 
-                let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
+            let lease_ttl = std::time::Duration::from_secs(config.lease_ttl_secs());
 
-                // 🔴 The schema bootstrap and B2(1)'s synchronous
-                // restart-grace entry both live behind this call, in the
-                // half that holds the pool -- see
-                // [`PgPausedRegistryFactory::build`]. They are not optional
-                // and not deferred: `build` performs both before it hands
-                // back a registry, exactly as this arm used to inline.
-                let registry = factory.build(identity, lease_ttl).await?;
-
-                (registry, "")
-            }
-            PausedRegistryBackendKind::Central => {
-                let endpoint = cluster
-                    .scheduler_endpoint
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|endpoint| !endpoint.is_empty())
-                    .context(
-                        "paused_registry.backend = \"central\" requires a scheduler endpoint; \
-                         set AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
-                    )?;
-
-                (
-                    Arc::new(CentralPausedSandboxRegistry::connect_hot_reloadable(
-                        endpoint,
-                        cluster,
-                        scheduler_report,
-                        identity.cluster_id,
-                        identity.id.clone(),
-                        config.lease_ttl_secs(),
-                        // The raw configured value, not the clamped one:
-                        // reporting `lease_ttl_secs()`'s own input back to the
-                        // controller is what lets it see the two knobs
-                        // disagreeing. Clamping first would make every node
-                        // look correctly configured by construction.
-                        config.reconcile_interval_secs,
-                    )?),
-                    endpoint,
-                )
-            }
-        };
+            // 🔴 The schema bootstrap and B2(1)'s synchronous
+            // restart-grace entry both live behind this call, in the
+            // half that holds the pool -- see
+            // [`PgPausedRegistryFactory::build`]. They are not optional
+            // and not deferred: `build` performs both before it hands
+            // back a registry, exactly as this arm used to inline.
+            factory.build(identity, lease_ttl).await?
+        }
+    };
 
     // 🔴 One statement for both backends, after the match rather than inside
-    // each arm. A per-arm line is a line an arm can be missing, and the arm
-    // that was missing it was `central`: a node switched over to it said
-    // nothing at all, so "the switch took" and "the value never reached the
-    // node and it stayed on `local`" read identically in the log — while the
-    // difference between them only surfaces later, when a node is lost and its
-    // sandboxes turn out to have gone with it. Which backend this node ended
-    // up on is the one fact this path has to state out loud.
-    //
-    // `scheduler_endpoint` is empty for `local`, which does not have one.
+    // each arm. A per-arm line is a line an arm can be missing. Which
+    // backend this node ended up on is the one fact this path has to state
+    // out loud.
     info!(
         backend = config.backend.as_str(),
         cluster_id = %identity.cluster_id,
         lease_ttl_secs = config.lease_ttl_secs(),
-        scheduler_endpoint,
         "paused sandbox registry ready"
     );
 
@@ -844,7 +797,7 @@ mod claim_outcome_tests {
 #[cfg(test)]
 mod build_tests {
     use super::*;
-    use crate::cfg::{ObservabilitySchedulerReportConfig, PausedRegistryConfig};
+    use crate::cfg::PausedRegistryConfig;
     use crate::logging::capture::Recorder;
 
     /// A `NodeRegistry` that answers every question with "nothing" -- only
@@ -947,30 +900,6 @@ mod build_tests {
         }
     }
 
-    pub fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
-        ClusterConfig {
-            node_placement_source: crate::cfg::NodePlacementSource::Scheduler,
-            scheduler_endpoint: scheduler_endpoint.map(str::to_string),
-            scheduler_endpoint_file: String::new(),
-            node_service_addr: "0.0.0.0:8001".to_string(),
-            api_grpc_addr: "0.0.0.0:8002".to_string(),
-            node_service_port: 8001,
-            node_discovery_mode: Default::default(),
-            kubernetes_discovery: Default::default(),
-            static_discovery_nodes: Vec::new(),
-            native_warmup_timeout_secs: 15,
-            node_registry_store: Default::default(),
-        }
-    }
-
-    pub fn scheduler_report() -> ObservabilitySchedulerReportConfig {
-        ObservabilitySchedulerReportConfig {
-            enabled: false,
-            interval_secs: 5,
-            scheduler_endpoint_file: String::new(),
-        }
-    }
-
     pub fn identity() -> NodeIdentity {
         NodeIdentity::from_config(&Default::default())
     }
@@ -979,8 +908,6 @@ mod build_tests {
     async fn the_default_backend_is_node_local() {
         let registry = build_paused_registry(
             &config(PausedRegistryBackendKind::Local),
-            &cluster(None),
-            &scheduler_report(),
             &identity(),
             None,
             None,
@@ -991,45 +918,6 @@ mod build_tests {
         assert!(!registry.is_cluster_backed());
     }
 
-    #[tokio::test]
-    async fn the_central_backend_comes_up_against_an_endpoint() {
-        let registry = build_paused_registry(
-            &config(PausedRegistryBackendKind::Central),
-            &cluster(Some("http://scheduler.invalid:9090")),
-            &scheduler_report(),
-            &identity(),
-            None,
-            None,
-        )
-        .await
-        .expect("the endpoint is dialled on first use, not here");
-
-        assert!(registry.is_cluster_backed());
-    }
-
-    /// 🔴 A cluster backend that cannot reach the cluster must stop the node,
-    /// not quietly serve node-local semantics. The difference between the two
-    /// only shows up when a node is lost and its sandboxes turn out to have
-    /// gone with it.
-    #[tokio::test]
-    async fn the_central_backend_without_an_endpoint_is_a_startup_failure() {
-        for endpoint in [None, Some(""), Some("   ")] {
-            assert!(
-                build_paused_registry(
-                    &config(PausedRegistryBackendKind::Central),
-                    &cluster(endpoint),
-                    &scheduler_report(),
-                    &identity(),
-                    None,
-                    None,
-                )
-                .await
-                .is_err(),
-                "endpoint {endpoint:?} must not build a registry"
-            );
-        }
-    }
-
     /// 🔴 D1 (Stage C report): the `postgres` backend refuses to start
     /// without a PostgreSQL pool -- never silently falls back to `local`,
     /// which would drop cluster-wide recovery with no error at all.
@@ -1037,8 +925,6 @@ mod build_tests {
     async fn the_postgres_backend_without_a_pool_is_a_startup_failure() {
         let failure = build_paused_registry(
             &config(PausedRegistryBackendKind::Postgres),
-            &cluster(None),
-            &scheduler_report(),
             &identity(),
             None,
             Some(std::sync::Arc::new(NoopNodeRegistry) as std::sync::Arc<dyn NodeRegistry>),
@@ -1061,36 +947,20 @@ mod build_tests {
     // suite's `the_postgres_backend_without_a_node_registry_is_a_startup_failure`
     // below, alongside the rest of this backend's real-database coverage.
 
-    /// 🔴 Every backend says which one it is, out loud, at assembly.
-    ///
-    /// The one that did not was `central`, and the cost was that a node
-    /// switched over to it produced no line at all — indistinguishable in the
-    /// log from a node whose override never arrived and that quietly stayed on
-    /// `local`, which is the failure `AENV_PAUSED_REGISTRY_BACKEND` was
-    /// introduced to prevent in the first place. The two arms reachable
-    /// without a database are checked here; the third shares the single
-    /// statement they all reach.
+    /// 🔴 Every backend says which one it is, out loud, at assembly. A
+    /// backend a node switched over to that produced no line at all would be
+    /// indistinguishable in the log from a node whose override never arrived
+    /// and that quietly stayed on `local`, which is the failure
+    /// `AENV_PAUSED_REGISTRY_BACKEND` was introduced to prevent in the first
+    /// place.
     #[tokio::test]
     async fn every_backend_reports_which_one_it_is() {
-        for (backend, endpoint) in [
-            (PausedRegistryBackendKind::Local, None),
-            (
-                PausedRegistryBackendKind::Central,
-                Some("http://scheduler.invalid:9090"),
-            ),
-        ] {
+        for backend in [PausedRegistryBackendKind::Local] {
             let recorder = Recorder::default();
             let guard = recorder.install();
-            build_paused_registry(
-                &config(backend),
-                &cluster(endpoint),
-                &scheduler_report(),
-                &identity(),
-                None,
-                None,
-            )
-            .await
-            .expect("neither backend dials anything here");
+            build_paused_registry(&config(backend), &identity(), None, None)
+                .await
+                .expect("the local backend dials nothing here");
             drop(guard);
 
             // The backend, so "the switch took" is readable on its own; the
@@ -1109,19 +979,6 @@ mod build_tests {
                     recorder.events()
                 );
             }
-
-            // And where it is reaching, for the backend that reaches anywhere:
-            // an endpoint pointing at the wrong scheduler is the other way a
-            // node can be configured on and useless.
-            assert_eq!(
-                recorder.saw(
-                    tracing::Level::INFO,
-                    "scheduler_endpoint=http://scheduler.invalid:9090"
-                ),
-                endpoint.is_some(),
-                "{backend:?} reported the wrong endpoint: {:?}",
-                recorder.events()
-            );
         }
     }
 }

@@ -1,7 +1,7 @@
 //! `aenv-core`'s paused-sandbox registry, plus the PostgreSQL backend.
 //!
 //! The shared half — the trait, the error type, `build_paused_registry` and
-//! its `local`/`central` arms — is `aenv-core`'s and is re-exported here
+//! its `local` arm — is `aenv-core`'s and is re-exported here
 //! unchanged. What this crate adds is the `postgres` arm's implementation:
 //! the schema bootstrap, the SQL, the leader-elected reconcile/reclaim loops
 //! and the per-replica lease renewal.
@@ -21,42 +21,15 @@ mod pg {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::cfg::{
-        ClusterConfig, ObservabilitySchedulerReportConfig, PausedRegistryBackendKind,
-        PausedRegistryConfig,
-    };
+    use crate::cfg::{PausedRegistryBackendKind, PausedRegistryConfig};
     use crate::identity::NodeIdentity;
     use crate::node_registry::registry::NodeRegistry;
     use crate::pg::harness::isolated_schema_pool_or_skip;
 
-    // 🔴 Copies of `aenv-core`'s own `build_tests` helpers rather than imports
-    // of them: those live in a `#[cfg(test)]` module, which is not compiled
-    // when `aenv-core` is a dependency. Kept identical in shape so the two
-    // suites still describe the same cluster.
-    fn cluster(scheduler_endpoint: Option<&str>) -> ClusterConfig {
-        ClusterConfig {
-            node_placement_source: crate::cfg::NodePlacementSource::Scheduler,
-            scheduler_endpoint: scheduler_endpoint.map(str::to_string),
-            scheduler_endpoint_file: String::new(),
-            node_service_addr: "0.0.0.0:8001".to_string(),
-            api_grpc_addr: "0.0.0.0:8002".to_string(),
-            node_service_port: 8001,
-            node_discovery_mode: Default::default(),
-            kubernetes_discovery: Default::default(),
-            static_discovery_nodes: Vec::new(),
-            native_warmup_timeout_secs: 15,
-            node_registry_store: Default::default(),
-        }
-    }
-
-    fn scheduler_report() -> ObservabilitySchedulerReportConfig {
-        ObservabilitySchedulerReportConfig {
-            enabled: false,
-            interval_secs: 5,
-            scheduler_endpoint_file: String::new(),
-        }
-    }
-
+    // 🔴 Copy of `aenv-core`'s own `build_tests::identity` helper rather than
+    // an import of it: that lives in a `#[cfg(test)]` module, which is not
+    // compiled when `aenv-core` is a dependency. Kept identical in shape so
+    // the two suites still describe the same identity.
     fn identity() -> NodeIdentity {
         NodeIdentity::from_config(&Default::default())
     }
@@ -179,15 +152,8 @@ mod pg {
             "the_postgres_backend_without_a_node_registry_is_a_startup_failure"
         );
 
-        let failure = build_paused_registry(
-            &config(),
-            &cluster(None),
-            &scheduler_report(),
-            &identity(),
-            Some(&factory(&pool)),
-            None,
-        )
-        .await;
+        let failure =
+            build_paused_registry(&config(), &identity(), Some(&factory(&pool)), None).await;
 
         let Err(failure) = failure else {
             panic!(
@@ -211,8 +177,6 @@ mod pg {
 
         let registry = build_paused_registry(
             &config(),
-            &cluster(None),
-            &scheduler_report(),
             &identity(),
             Some(&factory(&pool)),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),
@@ -250,8 +214,6 @@ mod pg {
         let node_identity = identity();
         let registry = build_paused_registry(
             &config(),
-            &cluster(None),
-            &scheduler_report(),
             &node_identity,
             Some(&factory(&pool)),
             Some(Arc::new(NoopNodeRegistry) as Arc<dyn NodeRegistry>),

@@ -416,13 +416,24 @@ spec:
             # only `native` builds). The two switches move together in one
             # apply, not two `kubectl set env` steps across a rollout window.
             #
-            # Rollback is a Pod restart on this Deployment with this value
-            # (and `AENV_PAUSED_REGISTRY_BACKEND`) set back to
-            # `"scheduler"`/`"central"` — `node_placement_source` is read
-            # once at startup (`start_native_node_registry`,
-            # `crates/aenv-node/src/bin/aenv-node.rs`), unlike the DaemonSet's hot-reloadable
-            # heartbeat target, so there is no live-reload path for this one
-            # value alone.
+            # Rollback is a Pod restart on this Deployment with this value set
+            # back to `"scheduler"` — `node_placement_source` is read once at
+            # startup (`start_native_node_registry`,
+            # `crates/aenv-node/src/bin/aenv-node.rs`), unlike the DaemonSet's
+            # hot-reloadable heartbeat target, so there is no live-reload path
+            # for this value alone.
+            #
+            # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` does not roll back alongside
+            # it any more. `"central"` — the backend that used to pair with
+            # `"scheduler"` here — is gone, not merely unused:
+            # `PausedRegistryBackendKind::Central` and
+            # `CentralPausedSandboxRegistry` were deleted along with the Go
+            # scheduler they dialled, so setting `AENV_PAUSED_REGISTRY_BACKEND
+            # =central` now refuses to start rather than rolling back. A
+            # genuine rollback of the paused-registry backend is the same
+            # "restore the scheduler manifests from git history" step named
+            # above for `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, not a value
+            # this Deployment can still express.
             - name: AENV_NODE_PLACEMENT_SOURCE
               value: "native"
             # 🔴 P4 (task's own "phase4-close"): carried here now, ahead of

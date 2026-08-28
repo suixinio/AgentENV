@@ -438,11 +438,6 @@ redis_connect_timeout_ms = 2500
 # sandboxes turn out to have gone with it.
 [orchestrator.paused_registry]
 # - "local": a paused sandbox is resumable only on the node that paused it.
-# - "central": the pause also publishes its snapshot to the shared repository
-#   and records the sandbox cluster-wide, so any node can resume it under its
-#   original ID. The registry is reached over gRPC through the scheduler, which
-#   owns the database. Requires [cluster].scheduler_endpoint; a "central"
-#   backend with no endpoint fails startup rather than falling back.
 # - "postgres": aenv-api connects directly to the registry database over the
 #   shared [pg] pool, folding the scheduler's registry service into that
 #   process. It requires a heartbeat roster source

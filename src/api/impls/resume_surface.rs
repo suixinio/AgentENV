@@ -369,11 +369,11 @@ fn configured_placement_endpoint(raw: Option<&str>) -> Option<&str> {
 /// at 0 that reads the same whether nothing happened or nothing was watching —
 /// so it gets a log line rather than a silence.
 ///
-/// The level carries the judgement. A `central` paused registry only exists in
-/// a clustered deployment, so it is the one signal available here that
+/// The level carries the judgement. A `postgres` paused registry only exists
+/// in a clustered deployment, so it is the one signal available here that
 /// distinguishes "correctly unconstrained" from "quietly unenforced".
 fn announce_unenforced_placement(backend: crate::cfg::PausedRegistryBackendKind) {
-    let clustered = matches!(backend, crate::cfg::PausedRegistryBackendKind::Central);
+    let clustered = matches!(backend, crate::cfg::PausedRegistryBackendKind::Postgres);
     if clustered {
         warn!(
             paused_registry_backend = backend.as_str(),

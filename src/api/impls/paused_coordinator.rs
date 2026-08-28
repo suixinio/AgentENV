@@ -203,8 +203,9 @@ enum Unrecorded {
     /// 🔴 Corrected. This variant used to say that the row could not be
     /// written because `begin_pause` "names the machine whose disk holds the
     /// artifacts" and this half is not that machine. Both halves of that were
-    /// wrong. `CentralPausedSandboxRegistry::begin_pause` names whatever the
-    /// caller put in `PausedSandboxEntry::origin_node_id` — it states the
+    /// wrong. The cluster-backed registry's `begin_pause` (today the
+    /// `postgres` backend's) names whatever the caller put in
+    /// `PausedSandboxEntry::origin_node_id` — it states the
     /// identity, it does not discover it — so the constraint was never "cannot
     /// write", it was "would write the wrong name". And it did: the moment a
     /// node started staging captures the early return here stopped being

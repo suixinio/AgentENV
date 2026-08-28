@@ -221,10 +221,11 @@ services:
     # instead of crash-looping for want of `[pg]` — see git history on this
     # comment block for the prior gap and the note on `AENV_CONFIG_OVERLAY_PATH`
     # above for how `[pg]` reaches this process without ever landing in a
-    # tracked file. `services/scheduler` is no longer part of this stack;
-    # its source and `Dockerfile.scheduler` stay in the tree as the
-    # decommission's own rollback target (see CLAUDE.md's "Distributed
-    # Control Plane" section) but nothing here builds or runs it any more.
+    # tracked file. `services/scheduler` and `deploy/docker/Dockerfile.scheduler`
+    # are deleted from this tree, not merely unused by this stack (see
+    # `services/README.md`'s 阶段四 status note and CLAUDE.md's "Distributed
+    # Control Plane" section) — the rollback target for that decommission is a
+    # prior commit/image tag, not source kept around in the working tree.
     ports:
       - "8010:8000"
     healthcheck:

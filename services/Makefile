@@ -3,14 +3,6 @@ GO        ?= go
 GOBIN_DIR := $(shell $(GO) env GOPATH)/bin
 PROTO_SRC := api/proto/scheduler.proto api/proto/apiproxy/apiproxy.proto
 
-# Throwaway PostgreSQL for `test-with-postgres`. The port matches the one the
-# registry suite's own documentation uses, and is overridable so the target can
-# run alongside a database somebody is already holding that port with.
-DOCKER              ?= docker
-REGISTRY_TEST_PG    ?= agentenv-registry-test-pg
-REGISTRY_TEST_PORT  ?= 15499
-REGISTRY_TEST_DSN   ?= postgres://postgres:verify@127.0.0.1:$(REGISTRY_TEST_PORT)/aenv_registry
-
 .PHONY: services proto tidy build test test-with-postgres report-skipped-suites fmt fmt-check vet run-gateway
 
 proto:
@@ -31,21 +23,25 @@ test:
 
 # 🔴 What a skipped suite looks like is `ok`.
 #
-# Without a DSN, every test that touches SQL calls t.Skip, and `go test` in its
-# default mode prints neither the skip nor a count — the package line is the
-# same `ok  agentenv/services/…` it prints when all of them ran. So the run
-# above can report a clean pass over a suite that opened no connection, and the
-# only way to tell is to know which variables were set. This says so, out loud,
-# after the output somebody is actually looking at.
+# Without `redis-server` on PATH, the RedisBindingStore/routing-reader tests
+# call t.Skip, and `go test` in its default mode prints neither the skip nor a
+# count — the package line is the same `ok  agentenv/services/…` it prints when
+# they ran. So the run above can report a clean pass over a suite that opened
+# no connection, and the only way to tell is to know which variable was set.
+# This says so, out loud, after the output somebody is actually looking at.
 #
-# It does not fail: running the module's tests without a database is a supported
-# workflow and this target is the one that supports it. `test-with-postgres`
-# provides all three, so nothing is printed there.
+# It does not fail: running the module's tests without redis-server is a
+# supported workflow and this target is the one that supports it.
+# `test-with-postgres` provides it, so nothing is printed there.
+#
+# 🔴 No PostgreSQL-gated suite is listed here any more. `scheduler/internal/registry`
+# and `scheduler/internal/catalog` — the only packages in this module that ever
+# touched a real database — were deleted with `services/scheduler` (阶段四's Go
+# scheduler decommission); `services/gateway` and `services/shared` open no SQL
+# connection. If a future package in this module needs PostgreSQL again, add its
+# skip-detection here rather than assuming this list is exhaustive.
 report-skipped-suites:
 	@skipped=''; \
-	 if [ -z "$$SCHEDULER_REGISTRY_TEST_DSN" ]; then \
-	   skipped="$$skipped  - SCHEDULER_REGISTRY_TEST_DSN unset: the paused-registry and snapshot-catalog suites\n    (scheduler/internal/registry, scheduler/internal/catalog, and the catalog service's\n    end-to-end tests) skipped every test that needs PostgreSQL.\n"; \
-	 fi; \
 	 if [ -z "$$REDIS_SERVER_BIN" ] && ! command -v redis-server >/dev/null 2>&1; then \
 	   skipped="$$skipped  - no redis-server on PATH and REDIS_SERVER_BIN unset: the RedisBindingStore and\n    routing-reader suites skipped — the only coverage the HA deployment's binding\n    store has.\n"; \
 	 fi; \
@@ -54,14 +50,19 @@ report-skipped-suites:
 	   printf 'Run \033[1mmake -C services test-with-postgres\033[0m for the coverage CI has.\n\n'; \
 	 fi
 
-# `make test` on its own runs the registry suite with no database, and every
-# test in it that touches SQL then skips — which reports as a pass. This target
-# is the coverage CI has: a throwaway PostgreSQL, plus the two variables that
-# turn a missing dependency into a failure instead of a file of green skips.
-#
-# SCHEDULER_REGISTRY_TEST_REQUIRED does that for the DSN. REDIS_SERVER_BIN and
-# SCHEDULER_REDIS_TEST_REQUIRED do it for the binding-store tests, which
-# otherwise skip when `redis-server` is not on PATH.
+# 🔴 Despite the name, this no longer touches PostgreSQL. It used to start a
+# throwaway PostgreSQL container and set SCHEDULER_REGISTRY_TEST_DSN /
+# SCHEDULER_REGISTRY_TEST_REQUIRED for `scheduler/internal/registry`'s and
+# `scheduler/internal/catalog`'s suites — the only packages in this module that
+# ever opened a real database connection. Both were deleted with
+# `services/scheduler` (阶段四's Go scheduler decommission; confirmed via a
+# repository-wide grep that nothing in this module still reads either
+# variable), so there is nothing left in this module for a database to gate.
+# The name stays because it is what CLAUDE.md, services/README.md and this
+# module's docs already call it, and this target's remaining, real job —
+# turning a missing `redis-server` into a failure instead of a green skip, for
+# the RedisBindingStore/routing-reader suites `make test` alone would silently
+# skip — is exactly the same job `report-skipped-suites` above warns about.
 #
 # 🔴 The -count=1 that makes this target mean anything lives in the two
 # sub-Makefiles, so it covers `make test` in CI as well. Without it a second run
@@ -80,21 +81,9 @@ test-with-postgres:
 	@command -v redis-server >/dev/null 2>&1 || { \
 		echo "redis-server not found: install it, or the RedisBindingStore tests silently skip"; \
 		exit 1; }
-	$(DOCKER) run -d --rm --name $(REGISTRY_TEST_PG) \
-		-e POSTGRES_PASSWORD=verify -e POSTGRES_DB=aenv_registry \
-		-p $(REGISTRY_TEST_PORT):5432 postgres:16-alpine >/dev/null
-	@for i in $$(seq 1 60); do \
-		$(DOCKER) exec $(REGISTRY_TEST_PG) pg_isready -U postgres >/dev/null 2>&1 && break; \
-		sleep 1; \
-	done; \
-	SCHEDULER_REGISTRY_TEST_DSN="$(REGISTRY_TEST_DSN)" \
-	SCHEDULER_REGISTRY_TEST_REQUIRED=1 \
 	SCHEDULER_REDIS_TEST_REQUIRED=1 \
 	REDIS_SERVER_BIN="$$(command -v redis-server)" \
-	$(MAKE) test; \
-	status=$$?; \
-	$(DOCKER) rm -f $(REGISTRY_TEST_PG) >/dev/null; \
-	exit $$status
+	$(MAKE) test
 
 fmt:
 	$(MAKE) -C gateway fmt

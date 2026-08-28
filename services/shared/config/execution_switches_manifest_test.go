@@ -11,19 +11,28 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// The incarnation work's switches — routing projection, execution fencing, and
-// 阶段 3a's REST upstream — as manifest assertions.
+// The incarnation work's switches still owned by a running process — the
+// gateway's execution fencing and routing projection — plus 阶段 3a's REST
+// upstream, as manifest assertions.
 //
-// 🔴 Every one of these was flipped on the live cluster with `kubectl patch`
-// and left out of this repository, which is the same shape of hole
-// `snapshot_catalog_manifest_test.go` was written to close and the same reason:
-// an `apply -k` would have put all five back to the release's *starting*
-// values, and not one of the five reports anything when it moves in that
-// direction. Arbitration that stops enforcing routes to whichever node reported
-// last. A gateway that stops refusing forwards what it should have rejected. A
-// projection switched off is a gateway reading a routing table nobody is
-// writing. And the REST upstream emptied while the DaemonSet holds `--role
-// node` is not a rollback at all — it is 404 from every node in the fleet.
+// 🔴 The scheduler's own half of this work (SCHEDULER_ROUTING_EXECUTION_ARBITRATION,
+// SCHEDULER_REGISTRY_WRITE_FENCING, SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE) is
+// gone from this file along with services/scheduler: those settings have no
+// reader left to protect, and asserting a ConfigMap literal nothing consumes is
+// not a regression test, it is archaeology. The literals may still sit in
+// deploy/k8s/base's ConfigMaps (untouched by this pass, out of its scope) but
+// this file only asserts what a live process still reads.
+//
+// 🔴 Every one of the surviving switches was flipped on the live cluster with
+// `kubectl patch` and left out of this repository at the time, which is the
+// same shape of hole `snapshot_catalog_manifest_test.go` was written to close
+// and the same reason: an `apply -k` would have put them back to the release's
+// *starting* values, and none of them reports anything when it moves in that
+// direction. A gateway that stops refusing forwards what it should have
+// rejected. A projection switched off is a gateway reading a routing table
+// nobody is writing. And the REST upstream emptied while the DaemonSet holds
+// `--role node` is not a rollback at all — it is 404 from every node in the
+// fleet.
 //
 // So these tests pin the values, and each pin carries a control, because the
 // easy version of this file — "the ConfigMap has these keys" — would pass just
@@ -35,20 +44,15 @@ const (
 	upstreamConfigMap   = "api-upstream-config"
 	pausedConfigMap     = "paused-registry-config"
 
-	arbitrationEnv  = "SCHEDULER_ROUTING_EXECUTION_ARBITRATION"
 	gatewayFenceEnv = "GATEWAY_ROUTING_EXECUTION_FENCING"
-	writeFencingEnv = "SCHEDULER_REGISTRY_WRITE_FENCING"
 
 	restUpstreamEnv = "GATEWAY_REST_UPSTREAM_ADDR"
 	resumeAddrEnv   = "GATEWAY_RESUME_ADDR"
 )
 
-// projectionEnvs are the three environment variables the routing projection is
-// carried by: two write-side switches in two different processes, and one read
-// switch. Three and not one, because they are flipped in an order and a merged
-// switch could not express it.
+// projectionEnvs are the two environment variables the gateway's half of the
+// routing projection is carried by: one write-side switch and one read switch.
 var projectionEnvs = []string{
-	"SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE",
 	"GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE",
 	"GATEWAY_ROUTING_PROJECTION_READ",
 }
@@ -66,25 +70,18 @@ func TestTheExecutionSwitchesShipTheStateTheClusterRuns(t *testing.T) {
 		want      string
 		starting  string
 	}{
-		// Flipped once heartbeat_legacy_roster_total reached zero.
-		{configMap: fencingConfigMap, key: arbitrationEnv, want: "enforce", starting: "observe"},
 		// Flipped after the node-side gate was verified.
 		{configMap: fencingConfigMap, key: gatewayFenceEnv, want: "enforce", starting: "off"},
-		// On from the moment the scheduler carrying it starts; it protects the
-		// rows that cannot be reconstructed, so it never had a starting value
-		// other than its end one.
-		{configMap: fencingConfigMap, key: writeFencingEnv, want: "true", starting: "false"},
 		{configMap: projectionConfigMap, key: projectionEnvs[0], want: "on", starting: "off"},
 		{configMap: projectionConfigMap, key: projectionEnvs[1], want: "on", starting: "off"},
-		{configMap: projectionConfigMap, key: projectionEnvs[2], want: "on", starting: "off"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			got := generatedLiteral(t, tc.configMap, tc.key)
 			if got == tc.starting {
 				t.Fatalf("%s/%s is back at %q, the value this release *started* from. That is what "+
 					"an `apply -k` produced for months while the cluster ran %q, and nothing "+
-					"reports the difference — arbitration simply stops judging, the gateway simply "+
-					"stops refusing, the projection simply stops being written",
+					"reports the difference — the gateway simply stops refusing, the projection "+
+					"simply stops being written",
 					tc.configMap, tc.key, got, tc.want)
 			}
 			if got != tc.want {
@@ -98,7 +95,7 @@ func TestTheExecutionSwitchesShipTheStateTheClusterRuns(t *testing.T) {
 // accepts, checked through the same parser the process uses.
 //
 // 🔴 A typo here does not fall back to a default. `ParseRoutingProjectionSwitch`
-// and `ParseSchedulerExecutionArbitration` both refuse an unrecognised value and
+// and `ParseGatewayExecutionFencing` both refuse an unrecognised value and
 // stop the process — deliberately, because guessing would produce a rollout that
 // reports success while the switch it was for never moved. So the failure is
 // loud, but it is loud on every pod in the fleet at once and at whatever hour
@@ -112,14 +109,6 @@ func TestTheExecutionSwitchValuesAreSpellingsTheLoaderAccepts(t *testing.T) {
 		if !on {
 			t.Fatalf("%s/%s parses as off", projectionConfigMap, env)
 		}
-	}
-
-	arbitration, err := ParseSchedulerExecutionArbitration(generatedLiteral(t, fencingConfigMap, arbitrationEnv))
-	if err != nil {
-		t.Fatalf("%s/%s: %v", fencingConfigMap, arbitrationEnv, err)
-	}
-	if arbitration != SchedulerExecutionArbitrationEnforce {
-		t.Fatalf("%s parses as %q, want enforce", arbitrationEnv, arbitration)
 	}
 
 	fencing, err := ParseGatewayExecutionFencing(generatedLiteral(t, fencingConfigMap, gatewayFenceEnv))
@@ -145,7 +134,7 @@ func TestTheExecutionSwitchValuesAreSpellingsTheLoaderAccepts(t *testing.T) {
 // only safe code default, because turning the write side on gives
 // ReportSandboxEvent — which every node already sends — the power to delete
 // routing records, and a cluster that merely rolled an image must not acquire
-// that. So these three literals are load-bearing: delete the ConfigMap and the
+// that. So these literals are load-bearing: delete the ConfigMap and the
 // projection is off.
 //
 // Execution fencing defaults **enforce** in code and is set to enforce here:
@@ -160,24 +149,18 @@ func TestTheExecutionSwitchValuesAreSpellingsTheLoaderAccepts(t *testing.T) {
 // the same time, and cannot.
 func TestTheTwoSwitchConfigMapsStandInOppositeRelationsToTheCode(t *testing.T) {
 	clearProjectionEnv(t)
-	t.Setenv(arbitrationEnv, "")
 	t.Setenv(gatewayFenceEnv, "")
 
 	gateway, err := Load("", "gateway")
 	if err != nil {
 		t.Fatalf("load gateway defaults: %v", err)
 	}
-	scheduler, err := Load("", "scheduler")
-	if err != nil {
-		t.Fatalf("load scheduler defaults: %v", err)
-	}
 
 	// Load("") is the code's own opinion, with no file and no environment.
-	if gateway.Gateway.Routing.ProjectionRead || gateway.Gateway.Routing.ProjectionAuthoritative ||
-		scheduler.Scheduler.Routing.ProjectionAuthoritative {
+	if gateway.Gateway.Routing.ProjectionRead || gateway.Gateway.Routing.ProjectionAuthoritative {
 		t.Fatal("the routing projection no longer defaults off in code. That default is what stops " +
 			"a cluster acquiring record-deleting powers by rolling an image; if it has moved " +
-			"deliberately, this test and the three literals it guards need deciding on together")
+			"deliberately, this test and the literals it guards need deciding on together")
 	}
 	for _, env := range projectionEnvs {
 		if value := generatedLiteral(t, projectionConfigMap, env); value == "off" {
@@ -187,65 +170,28 @@ func TestTheTwoSwitchConfigMapsStandInOppositeRelationsToTheCode(t *testing.T) {
 		}
 	}
 
-	if got := scheduler.Scheduler.Routing.ExecutionArbitration; got != SchedulerExecutionArbitrationEnforce {
-		t.Fatalf("scheduler arbitration defaults to %q, want enforce; the ConfigMap literal was set "+
+	if got := gateway.Gateway.Routing.ExecutionFencing; got != GatewayExecutionFencingEnforce {
+		t.Fatalf("gateway fencing defaults to %q, want enforce; the ConfigMap literal was set "+
 			"to enforce precisely because the code arrives there on its own, and if that has "+
 			"changed then losing %s is now a silent downgrade", got, fencingConfigMap)
 	}
-	if got := gateway.Gateway.Routing.ExecutionFencing; got != GatewayExecutionFencingEnforce {
-		t.Fatalf("gateway fencing defaults to %q, want enforce; same as above", got)
-	}
-	if got := generatedLiteral(t, fencingConfigMap, arbitrationEnv); got != string(SchedulerExecutionArbitrationEnforce) {
+	if got := generatedLiteral(t, fencingConfigMap, gatewayFenceEnv); got != string(GatewayExecutionFencingEnforce) {
 		t.Fatalf("%s/%s is %q while the code default is enforce; the ConfigMap is now weaker than "+
 			"the code, so losing it would *strengthen* the cluster and keeping it holds the "+
-			"cluster back — decide which was meant", fencingConfigMap, arbitrationEnv, got)
-	}
-	if got := generatedLiteral(t, fencingConfigMap, gatewayFenceEnv); got != string(GatewayExecutionFencingEnforce) {
-		t.Fatalf("%s/%s is %q while the code default is enforce; same as above",
-			fencingConfigMap, gatewayFenceEnv, got)
+			"cluster back — decide which was meant", fencingConfigMap, gatewayFenceEnv, got)
 	}
 }
 
-// 🔴 The mounted files must not be weaker than the ConfigMap.
+// 🔴 The mounted file must not be weaker than the ConfigMap.
 //
-// Every one of these switches is read from a ConfigMap key with `optional:
-// true`, so a cluster that lost the ConfigMap falls through to the file the
-// Deployment mounts. If that file names the *starting* value, losing the
-// ConfigMap is a silent downgrade rather than a fall back to the code's own
-// end-state default — the file beats the default, and only the environment
-// beats the file.
-//
-// `write_enabled` is here for a sharper reason: it defaults **off** in code and
-// is deliberately kept that way, because switching it on makes the scheduler the
-// owner of a table the nodes are still writing. The live cluster ran it on
-// through an environment literal that no manifest produced, so an apply would
-// have taken the write surface — the migration, the PausedRegistry service and
-// the reclamation timer — down without a word.
+// This switch is read from a ConfigMap key with `optional: true`, so a cluster
+// that lost the ConfigMap falls through to the file the Deployment mounts. If
+// that file names the *starting* value, losing the ConfigMap is a silent
+// downgrade rather than a fall back to the code's own end-state default — the
+// file beats the default, and only the environment beats the file.
 func TestTheMountedFilesDoNotUndoTheSwitches(t *testing.T) {
 	clearProjectionEnv(t)
-	t.Setenv(arbitrationEnv, "")
 	t.Setenv(gatewayFenceEnv, "")
-	t.Setenv("SCHEDULER_REGISTRY_WRITE_ENABLED", "")
-	t.Setenv(writeFencingEnv, "")
-
-	scheduler, err := Load(filepath.Join(manifestDir, "config", "scheduler.json"), "scheduler")
-	if err != nil {
-		t.Fatalf("loading the mounted scheduler config failed: %v", err)
-	}
-	if got := scheduler.Scheduler.Routing.ExecutionArbitration; got != SchedulerExecutionArbitrationEnforce {
-		t.Fatalf("the mounted scheduler config arbitrates %q; a cluster that lost %s would fall to "+
-			"this file, and this file would hold it back", got, fencingConfigMap)
-	}
-	if !scheduler.Scheduler.Registry.WriteFencing {
-		t.Fatal("the mounted scheduler config turns registry write fencing off")
-	}
-	if !scheduler.Scheduler.Registry.WriteEnabled {
-		t.Fatal("the mounted scheduler config does not enable the registry write surface. It " +
-			"defaults off in code and this cluster has run it on since the changeover, through an " +
-			"environment literal no manifest produced — which is exactly how it would come back " +
-			"off on the next apply, taking the migration, the PausedRegistry service and the " +
-			"reclamation timer with it and reporting nothing")
-	}
 
 	gateway, err := Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway")
 	if err != nil {

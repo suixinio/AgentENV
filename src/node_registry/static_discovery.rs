@@ -97,52 +97,57 @@ mod tests {
         }
     }
 
-    /// 🔴 The golden-test contract this module's own module doc promises:
-    /// parses the exact `scheduler.nodes` array Go's own compose config
-    /// carries (`deploy/docker/config/default.json`, the JSON
-    /// `services/scheduler`/`services/gateway` read), through the identical
-    /// `{"id": ..., "endpoint": ...}` wire shape
-    /// [`ClusterStaticDiscoveryNode`] deserializes from TOML, and asserts
-    /// [`nodes_from_static_config`]'s output against the byte-for-byte set
-    /// Go's own static branch would build from the same file:
-    /// `scheduler.Node{ID: n.ID, Endpoint: n.Endpoint}` for each entry, in
-    /// order, with `PodName` left empty.
+    /// 🔴 What this asserts, and why it changed: this used to be a golden
+    /// test pinning this port against `services/scheduler`'s own compose
+    /// config (`deploy/docker/config/default.json`'s `scheduler.nodes`),
+    /// proving byte-for-byte reproduction of the Go scheduler's static
+    /// branch. `services/scheduler` is deleted (阶段四's decommission), so
+    /// "matches Go" stopped being a thing this test could mean — there is no
+    /// Go process left reading that file's `scheduler` block at all.
     ///
-    /// A single point of contact with the real file, not a copy-pasted
-    /// literal: if `deploy/docker/config/default.json`'s `scheduler.nodes`
-    /// ever drifts from what this test expects, this test is what notices.
+    /// What is still real and worth pinning: `deploy/docker-compose.yml` runs
+    /// `aenv-api` with `AENV_CLUSTER_NODE_DISCOVERY_MODE=static`
+    /// (`[cluster].node_placement_source = "native"`) and
+    /// `AENV_CONFIG_OVERLAY_PATH` naming
+    /// `deploy/docker/config/cluster-static-discovery-overlay.toml` — the
+    /// tracked, credential-free overlay that is the *only* way
+    /// `[cluster].static_discovery_nodes` reaches the process (see that
+    /// overlay's own header comment: the field has no `env =` binding). This
+    /// test parses that exact file — the one the compose deployment actually
+    /// loads — and asserts [`nodes_from_static_config`] turns its two entries
+    /// into the precise `Node`s the native registry will serve, so a change
+    /// to the overlay's shape or values is caught here instead of at
+    /// container start-up.
     #[test]
-    fn matches_the_go_compose_config_nodes_array() {
-        let raw = include_str!("../../deploy/docker/config/default.json");
-        let parsed: serde_json::Value =
-            serde_json::from_str(raw).expect("deploy/docker/config/default.json is valid JSON");
-        let go_nodes = parsed
-            .get("scheduler")
-            .and_then(|s| s.get("nodes"))
-            .and_then(|n| n.as_array())
-            .expect("deploy/docker/config/default.json carries scheduler.nodes");
+    fn parses_the_compose_static_discovery_overlay_into_the_expected_nodes() {
+        #[derive(serde::Deserialize)]
+        struct Overlay {
+            cluster: OverlayCluster,
+        }
+        #[derive(serde::Deserialize)]
+        struct OverlayCluster {
+            static_discovery_nodes: Vec<ClusterStaticDiscoveryNode>,
+        }
+
+        let raw = include_str!("../../deploy/docker/config/cluster-static-discovery-overlay.toml");
+        let overlay: Overlay =
+            toml::from_str(raw).expect("cluster-static-discovery-overlay.toml is valid TOML");
+        let configured = overlay.cluster.static_discovery_nodes;
+
         assert!(
-            !go_nodes.is_empty(),
+            !configured.is_empty(),
             "the fixture this test exists to pin down must actually carry nodes"
         );
 
-        let configured: Vec<ClusterStaticDiscoveryNode> = go_nodes
-            .iter()
-            .map(|entry| ClusterStaticDiscoveryNode {
-                id: entry["id"].as_str().expect("id").to_string(),
-                endpoint: entry["endpoint"].as_str().expect("endpoint").to_string(),
-            })
-            .collect();
-
         validate_static_discovery_nodes(&configured)
-            .expect("the compose fixture's node list must be valid");
+            .expect("the compose overlay's node list must be valid");
 
         let got = nodes_from_static_config(&configured);
 
-        // Go's own `defaultConfig`/compose fixture, spelled out by hand as
-        // the independent expectation — this is what makes the mutation
-        // check below meaningful: change either side and only one of the
-        // two literal sources moves.
+        // The overlay's own literal values, spelled out by hand as the
+        // independent expectation — this is what makes the mutation check
+        // meaningful: change either the overlay file or this literal and
+        // only one of the two moves.
         let expected = vec![
             Node {
                 id: "node-a".to_string(),
@@ -158,10 +163,10 @@ mod tests {
 
         assert_eq!(
             got, expected,
-            "nodes_from_static_config must reproduce Go's static branch \
-             (scheduler.Node{{ID: n.ID, Endpoint: n.Endpoint}}) field-for-field, \
-             including pod_name staying empty and endpoint being carried through \
-             without rewriting"
+            "nodes_from_static_config must turn \
+             cluster-static-discovery-overlay.toml's entries into these Nodes \
+             field-for-field, including pod_name staying empty and endpoint \
+             being carried through without rewriting"
         );
     }
 

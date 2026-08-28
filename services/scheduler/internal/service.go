@@ -529,18 +529,7 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
-	roster, legacy := rosterFromHeartbeat(req)
-	if legacy {
-		// 🔴 Counted per node, not merely logged: this is the number that has
-		// to reach zero before the gateway starts refusing on incarnations,
-		// and "how many nodes are still on the old build" is not a question a
-		// log line answers.
-		recordLegacyRoster(nodeID)
-		s.logger.Warn("scheduler heartbeat used the legacy sandbox_ids roster",
-			zap.String("node_id", nodeID),
-			zap.Int("sandboxes", len(roster)),
-		)
-	}
+	roster := rosterFromHeartbeat(req)
 	roster = s.resolveRosterProjectionTTLs(roster)
 	if err := s.store.ReconcileNode(node, roster, now); err != nil {
 		s.logger.Warn("scheduler heartbeat binding reconcile failed",

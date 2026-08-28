@@ -163,37 +163,6 @@ func TestTwoPrimariesSharingOneRedisConvergeOnTheNewerExecution(t *testing.T) {
 	}
 }
 
-// TestTheReplicaSeesALegacyRosterAsBindingsRatherThanAsNone: the rolling
-// window, seen from the side that serves traffic.
-//
-// A node still on the old field must keep its bindings in Redis, or every
-// sandbox it holds that has never been paused answers nothing at all for as
-// long as the rollout takes.
-func TestTheReplicaSeesALegacyRosterAsBindingsRatherThanAsNone(t *testing.T) {
-	primary, replica, _, _ := newHAPair(t)
-
-	if _, err := primary.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
-		NodeId:            haNodeAID,
-		ClusterId:         "cluster-1",
-		ServiceInstanceId: "node-a-1",
-		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
-		SandboxIds:        []string{"sbx"},
-	}); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
-
-	resp := haLookup(t, replica, "sbx")
-	if got := resp.GetNode().GetNodeId(); got != haNodeAID {
-		t.Fatalf("node: got %q, want %q", got, haNodeAID)
-	}
-	// It routes, and it says it cannot be fenced. Both halves matter: the route
-	// is what keeps the sandbox reachable, and UNKNOWN is what stops a caller
-	// from refusing traffic on the strength of an incarnation nobody reported.
-	if got := resp.GetExecutionAuthority(); got != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN {
-		t.Fatalf("authority: got %v, want UNKNOWN", got)
-	}
-}
-
 func haLookup(t *testing.T, replica *QueryOnlyService, sandboxID string) *schedulerv1.LookupNodeResponse {
 	t.Helper()
 

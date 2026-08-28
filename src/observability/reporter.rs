@@ -388,13 +388,6 @@ impl ObservabilityReporter {
         Ok(())
     }
 
-    // `sandbox_ids` is deprecated on the wire and still sent on purpose: the
-    // controller deletes every binding a node owns when it receives an empty
-    // roster, so a node that stopped sending the old field before the whole
-    // fleet reads the new one would have its sandboxes answer 404 on the data
-    // plane for the length of the rolling window. Both fields travel until the
-    // controller reports it has seen no legacy roster.
-    #[allow(deprecated)]
     fn build_heartbeat_request(
         snapshot: super::NodeSnapshot,
         now_ms: i64,
@@ -449,11 +442,6 @@ impl ObservabilityReporter {
                 paused_allocated_cpu: snapshot.metrics.paused_allocated_cpu,
                 paused_allocated_memory_bytes: snapshot.metrics.paused_allocated_memory_bytes,
             }),
-            sandbox_ids: snapshot
-                .sandbox_ids
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect(),
             p2p_endpoint: p2p_endpoint.map(|endpoint| scheduler::P2pEndpoint {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
@@ -673,7 +661,6 @@ mod tests {
                 cpu_config_json: None,
             },
             sandbox_count: roster.len() as u32,
-            sandbox_ids: roster.iter().map(|entry| entry.sandbox_id).collect(),
             sandbox_roster: roster,
             metrics: NodeMetricsSnapshot {
                 allocated_cpu: 0,

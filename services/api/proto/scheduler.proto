@@ -282,27 +282,15 @@ message HeartbeatRequest {
   string commit = 5;
   MachineInfo machine_info = 6;
   NodeSnapshot snapshot = 7;
-  // Deprecated: the roster without incarnations, superseded by `roster` below.
-  //
-  // 🔴 Kept rather than reserved, for one release cycle. Nodes and the
-  // controller roll independently, so mixed versions are certain inside the
-  // window, and an empty roster does not read as a degraded report here — it
-  // reads as "this node holds no sandboxes at all" and deletes every binding
-  // the node owns. A new controller against an old node would therefore have
-  // the data plane answer 404 for every sandbox that has never been paused,
-  // for the whole rolling window.
-  //
-  // Removable once heartbeat_legacy_roster_total has been zero across the
-  // fleet — not before.
-  repeated string sandbox_ids = 8 [deprecated = true];
+  // Was the roster without incarnations, superseded by `roster` below and
+  // removed once heartbeat_legacy_roster_total reached zero fleet-wide.
+  reserved 8;
+  reserved "sandbox_ids";
   P2pEndpoint p2p_endpoint = 9;
   // The sandboxes alive on this node, and the incarnation each is running
-  // under. Supersedes sandbox_ids.
+  // under.
   //
-  // A node that reports this reports it in full: empty still means "nothing
-  // here", exactly as it does above. The receiver distinguishes "this node
-  // sent an empty roster" from "this node is too old to send one" by the
-  // presence of sandbox_ids, not by this field being empty.
+  // A node that reports this reports it in full: empty means "nothing here".
   repeated SandboxRosterEntry roster = 10;
 }
 
@@ -337,9 +325,9 @@ message SandboxRosterEntry {
   // instead of waking the sandbox. So the receiver keeps this entry in the
   // registry and withholds it from binding reconciliation.
   //
-  // 🔴 Absent (an older node, or the `sandbox_ids` fallback) is false, which
-  // is byte-for-byte the behaviour that shipped before this field existed:
-  // every entry reconciled, paused ones included.
+  // 🔴 Absent (an older node) is false, which is byte-for-byte the behaviour
+  // that shipped before this field existed: every entry reconciled, paused
+  // ones included.
   bool paused = 4;
 }
 

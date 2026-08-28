@@ -593,70 +593,20 @@ func (r *AtomicNodeRegistry) removeHolderLocked(sandboxID string, nodeID string)
 }
 
 // normalizeHeartbeatRoster is the one place a heartbeat's roster becomes the
-// scheduler's, and the only place the two generations of the field are
-// reconciled.
-//
-// 🔴 It does not count anything. The service layer counts, once, on the same
-// answer — this is called from the node registry as well, and a metric
-// incremented in both would report twice as many old nodes as there are.
+// scheduler's.
 func normalizeHeartbeatRoster(req *schedulerv1.HeartbeatRequest) []RosterEntry {
-	entries, _ := rosterFromHeartbeat(req)
-	return entries
+	return rosterFromHeartbeat(req)
 }
 
-// rosterFromHeartbeat collapses the two generations of the roster field into
-// one shape, and says which one it used.
-//
-//	roster present                  → use it
-//	roster empty, sandbox_ids present → use those, with no incarnations
-//	both empty                        → a genuinely empty roster
-//
-// 🔴 The fallback is not politeness towards old builds, it is the difference
-// between a rolling upgrade and an outage. Nodes are a DaemonSet and roll one
-// at a time, so a scheduler that only read the new field would see an empty
-// roster from every node it has not reached yet — and an empty roster is not a
-// degraded report here, it is "this node holds nothing", which deletes every
-// binding that node owns. The sandboxes that then answer nothing are the ones
-// that have never been paused, because those have no registry row to fall back
-// to. The field goes when heartbeat_legacy_roster_total has been zero across a
-// release, not before.
-func rosterFromHeartbeat(req *schedulerv1.HeartbeatRequest) (entries []RosterEntry, legacy bool) {
-	if roster := req.GetRoster(); len(roster) > 0 {
-		out := make([]RosterEntry, 0, len(roster))
-		seen := make(map[string]struct{}, len(roster))
-		for _, item := range roster {
-			sandboxID := strings.TrimSpace(item.GetSandboxId())
-			if sandboxID == "" {
-				continue
-			}
-			if _, ok := seen[sandboxID]; ok {
-				continue
-			}
-			seen[sandboxID] = struct{}{}
-			out = append(out, RosterEntry{
-				SandboxID:   sandboxID,
-				ExecutionID: normalizeExecutionID(item.GetExecutionId()),
-				// Raw as reported. The clamp and the switch are the service's
-				// to apply, not this decoder's — a node's budget and a
-				// scheduler's ceiling on it are two different facts and the
-				// place they meet has to be the place both are visible.
-				ProjectionTTL: projectionTTLFromSecs(item.GetProjectionTtlSecs()),
-			})
-		}
-		if len(out) == 0 {
-			return nil, false
-		}
-		return out, false
-	}
-
-	legacyIDs := req.GetSandboxIds() //nolint:staticcheck // the deprecated field is the rollout fallback; see the note above.
-	if len(legacyIDs) == 0 {
-		return nil, false
-	}
-	out := make([]RosterEntry, 0, len(legacyIDs))
-	seen := make(map[string]struct{}, len(legacyIDs))
-	for _, sandboxID := range legacyIDs {
-		sandboxID = strings.TrimSpace(sandboxID)
+// rosterFromHeartbeat normalizes a heartbeat's roster into the scheduler's
+// shape: trimmed, deduplicated ids, each carrying whatever incarnation the
+// node reported.
+func rosterFromHeartbeat(req *schedulerv1.HeartbeatRequest) []RosterEntry {
+	roster := req.GetRoster()
+	out := make([]RosterEntry, 0, len(roster))
+	seen := make(map[string]struct{}, len(roster))
+	for _, item := range roster {
+		sandboxID := strings.TrimSpace(item.GetSandboxId())
 		if sandboxID == "" {
 			continue
 		}
@@ -664,12 +614,20 @@ func rosterFromHeartbeat(req *schedulerv1.HeartbeatRequest) (entries []RosterEnt
 			continue
 		}
 		seen[sandboxID] = struct{}{}
-		out = append(out, RosterEntry{SandboxID: sandboxID})
+		out = append(out, RosterEntry{
+			SandboxID:   sandboxID,
+			ExecutionID: normalizeExecutionID(item.GetExecutionId()),
+			// Raw as reported. The clamp and the switch are the service's
+			// to apply, not this decoder's — a node's budget and a
+			// scheduler's ceiling on it are two different facts and the
+			// place they meet has to be the place both are visible.
+			ProjectionTTL: projectionTTLFromSecs(item.GetProjectionTtlSecs()),
+		})
 	}
 	if len(out) == 0 {
-		return nil, false
+		return nil
 	}
-	return out, true
+	return out
 }
 
 // normalizeExecutionID trims, checks the shape, and lower-cases.

@@ -91,7 +91,7 @@ func lookupHeartbeat(t *testing.T, svc *Service, nodeID string, nodeStatus sched
 		ClusterId:         "cluster-1",
 		ServiceInstanceId: nodeID + "-1",
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: nodeStatus},
-		SandboxIds:        sandboxIDs,
+		Roster:            sandboxRosterFromIDs(sandboxIDs),
 	})
 	if err != nil {
 		t.Fatalf("heartbeat for %s failed: %v", nodeID, err)

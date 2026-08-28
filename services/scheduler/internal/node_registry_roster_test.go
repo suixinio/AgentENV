@@ -22,11 +22,24 @@ func heartbeatWithClusterRoster(t *testing.T, nodes *AtomicNodeRegistry, nodeID 
 		ClusterId:         clusterID,
 		ServiceInstanceId: "svc-" + nodeID,
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
-		SandboxIds:        sandboxIDs,
+		Roster:            sandboxRosterFromIDs(sandboxIDs),
 	}, now)
 	if err != nil {
 		t.Fatalf("heartbeat for %s failed: %v", nodeID, err)
 	}
+}
+
+// sandboxRosterFromIDs builds a roster with only the sandbox id set on each
+// entry, one entry per id. This is the roster-shaped equivalent of the
+// removed `SandboxIds` wire field: every other field lands on its zero
+// value, which is byte-for-byte what the deleted legacy decode path used to
+// produce (`RosterEntry{SandboxID: sandboxID}`).
+func sandboxRosterFromIDs(sandboxIDs []string) []*schedulerv1.SandboxRosterEntry {
+	roster := make([]*schedulerv1.SandboxRosterEntry, 0, len(sandboxIDs))
+	for _, id := range sandboxIDs {
+		roster = append(roster, &schedulerv1.SandboxRosterEntry{SandboxId: id})
+	}
+	return roster
 }
 
 // rosterIDs is the sandbox ids of a roster, for the assertions that predate

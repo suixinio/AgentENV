@@ -310,7 +310,7 @@ func TestHeartbeatRebuildsSandboxBindings(t *testing.T) {
 		NodeId:            "node-a",
 		ClusterId:         "cluster-1",
 		ServiceInstanceId: "svc-a",
-		SandboxIds:        []string{"sbx-1", "sbx-2"},
+		Roster:            sandboxRosterFromIDs([]string{"sbx-1", "sbx-2"}),
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
 	})
 	if err != nil {
@@ -355,7 +355,7 @@ func TestHeartbeatRemovesBindingsMissingFromRoster(t *testing.T) {
 		NodeId:            "node-a",
 		ClusterId:         "cluster-1",
 		ServiceInstanceId: "svc-a",
-		SandboxIds:        []string{"sbx-1"},
+		Roster:            sandboxRosterFromIDs([]string{"sbx-1"}),
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
 	})
 	if err != nil {

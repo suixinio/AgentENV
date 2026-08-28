@@ -374,48 +374,6 @@ func TestArbitrationOffLeavesTheLookupAnswerUnchanged(t *testing.T) {
 	}
 }
 
-// TestLegacyRosterFallbackIsCountedNotSilent — S2.2.
-//
-// 🔴 A node that only sends the old field must keep its bindings. Reading its
-// heartbeat as an empty roster deletes every binding it owns, and the sandboxes
-// that then have nothing to fall back on are the ones that have never been
-// paused — which have no registry row by design.
-func TestLegacyRosterFallbackIsCountedNotSilent(t *testing.T) {
-	store := NewInMemoryBindingStore(time.Minute)
-	svc := newLookupTestService(t, store, forbiddenRegistryReader{t: t}, testReportTTL)
-
-	before := legacyRosterCount(t, "node-a")
-
-	// A node too old to know about the new field.
-	if _, err := svc.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
-		NodeId:            "node-a",
-		ClusterId:         "cluster-1",
-		ServiceInstanceId: "node-a-1",
-		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
-		SandboxIds:        []string{"sbx-1"},
-	}); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
-
-	binding, ok, err := store.Get("sbx-1", time.Now())
-	if err != nil || !ok {
-		t.Fatalf("the legacy roster was read as an empty one and the binding was deleted: ok=%v err=%v", ok, err)
-	}
-	if binding.Node.ID != "node-a" {
-		t.Fatalf("binding: got %q, want node-a", binding.Node.ID)
-	}
-	if after := legacyRosterCount(t, "node-a"); after <= before {
-		t.Fatalf("the fallback was taken silently: %v -> %v. This number is what says whether the field may be removed yet", before, after)
-	}
-
-	// 🟢 The control: a node on the new field does not count as legacy.
-	beforeB := legacyRosterCount(t, "node-b")
-	heartbeatWithExecutions(t, svc, "node-b", RosterEntry{SandboxID: "sbx-2", ExecutionID: lookupExecution})
-	if after := legacyRosterCount(t, "node-b"); after != beforeB {
-		t.Fatalf("a node reporting the new roster was counted as legacy: %v -> %v", beforeB, after)
-	}
-}
-
 // TestARosterEntryWithABadExecutionKeepsItsRoute: narrowing is counted, and
 // the route survives.
 //
@@ -456,14 +414,7 @@ func registryReaderOver(sandbox pausedregistry.Sandbox) *stubRegistryReader {
 	}}
 }
 
-// legacyRosterCount and rosterDroppedCount read one series each of the two
-// counters that make a silent narrowing visible.
-func legacyRosterCount(t *testing.T, nodeID string) float64 {
-	t.Helper()
-	return counterSeriesValue(t, schedulerHeartbeatLegacyRoster,
-		"agentenv_scheduler_heartbeat_legacy_roster_total", map[string]string{"node": nodeID})
-}
-
+// rosterDroppedCount reads the counter that makes a silent narrowing visible.
 func rosterDroppedCount(t *testing.T, reason string) float64 {
 	t.Helper()
 	return counterSeriesValue(t, schedulerHeartbeatRosterDropped,

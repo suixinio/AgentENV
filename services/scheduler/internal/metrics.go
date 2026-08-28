@@ -267,16 +267,6 @@ var (
 		},
 		[]string{"authority"},
 	)
-	// 🔴 How many nodes are still too old to report incarnations. It has to
-	// read zero before the gateway is switched to enforcing: while it does not,
-	// some node's sandboxes are being routed on arrival order.
-	schedulerHeartbeatLegacyRoster = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "agentenv_scheduler_heartbeat_legacy_roster_total",
-			Help: "Heartbeats that carried only the pre-incarnation sandbox_ids roster, by node. Must be zero before the gateway is switched to enforcing.",
-		},
-		[]string{"node"},
-	)
 	// Roster entries this build could not use as reported. Narrowing something
 	// silently is how a fleet ends up with fencing that is not running.
 	schedulerHeartbeatRosterDropped = promauto.NewCounterVec(
@@ -431,10 +421,6 @@ func executionAuthorityLabel(authority schedulerv1.ExecutionAuthority) string {
 		// fact across two series for the length of a rollout.
 		return "unknown"
 	}
-}
-
-func recordLegacyRoster(nodeID string) {
-	schedulerHeartbeatLegacyRoster.WithLabelValues(nodeID).Inc()
 }
 
 func recordRosterDropped(reason string) {

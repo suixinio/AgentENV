@@ -157,7 +157,7 @@ func metricsHeartbeat(t *testing.T, svc *Service, nodeID string, sandboxIDs ...s
 		ClusterId:         "cluster-a",
 		ServiceInstanceId: "svc-" + nodeID,
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
-		SandboxIds:        sandboxIDs,
+		Roster:            sandboxRosterFromIDs(sandboxIDs),
 	})
 	if err != nil {
 		t.Fatalf("heartbeat for %s failed: %v", nodeID, err)

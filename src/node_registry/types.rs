@@ -87,9 +87,9 @@ pub struct RosterEntry {
     /// a routing projection means "there is a VM at the other end", which is
     /// precisely what a parked sandbox does not have.
     ///
-    /// False where the node did not say — an older build, or the deprecated
-    /// `sandbox_ids` fallback — which is byte-for-byte the behaviour that
-    /// shipped before the flag existed.
+    /// False where the node did not say — an older build that predates this
+    /// field — which is byte-for-byte the behaviour that shipped before the
+    /// flag existed.
     pub paused: bool,
 }
 

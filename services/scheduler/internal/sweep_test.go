@@ -84,17 +84,17 @@ func (f *sweepFixture) report(t *testing.T, node Node, at time.Time, entries ...
 	mustReconcile(t, f.store, canonical, withLongBudget(entries), at)
 }
 
-// reportLegacy is the same, through the pre-incarnation sandbox_ids field: no
-// roster entries, so no incarnations, which is the input the "nothing to guard
-// with" branch exists for.
-func (f *sweepFixture) reportLegacy(t *testing.T, node Node, at time.Time, sandboxIDs ...string) {
+// reportWithNoIncarnation is the same, through a roster entry that carries
+// only a sandbox id: no incarnation, which is the input the "nothing to
+// guard with" branch exists for.
+func (f *sweepFixture) reportWithNoIncarnation(t *testing.T, node Node, at time.Time, sandboxIDs ...string) {
 	t.Helper()
 
 	req := &schedulerv1.HeartbeatRequest{
 		NodeId:            node.ID,
 		ClusterId:         sweepCluster,
 		ServiceInstanceId: node.ID + "-instance",
-		SandboxIds:        sandboxIDs,
+		Roster:            sandboxRosterFromIDs(sandboxIDs),
 	}
 	canonical, _, err := f.registry.Heartbeat(req, at)
 	if err != nil {
@@ -277,7 +277,7 @@ func TestBindingSweepSkipsARosterEntryWithNoIncarnation(t *testing.T) {
 		f := newSweepFixture(t, store, sweepNodeA())
 		start := time.Now()
 
-		f.reportLegacy(t, sweepNodeA(), start, "sbx-legacy")
+		f.reportWithNoIncarnation(t, sweepNodeA(), start, "sbx-legacy")
 		assertBinding(t, store, "sbx-legacy", "node-a", "")
 
 		before := sweepCounts(t)

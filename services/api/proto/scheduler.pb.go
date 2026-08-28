@@ -1833,29 +1833,11 @@ type HeartbeatRequest struct {
 	Commit            string                 `protobuf:"bytes,5,opt,name=commit,proto3" json:"commit,omitempty"`
 	MachineInfo       *MachineInfo           `protobuf:"bytes,6,opt,name=machine_info,json=machineInfo,proto3" json:"machine_info,omitempty"`
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,7,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	// Deprecated: the roster without incarnations, superseded by `roster` below.
-	//
-	// 🔴 Kept rather than reserved, for one release cycle. Nodes and the
-	// controller roll independently, so mixed versions are certain inside the
-	// window, and an empty roster does not read as a degraded report here — it
-	// reads as "this node holds no sandboxes at all" and deletes every binding
-	// the node owns. A new controller against an old node would therefore have
-	// the data plane answer 404 for every sandbox that has never been paused,
-	// for the whole rolling window.
-	//
-	// Removable once heartbeat_legacy_roster_total has been zero across the
-	// fleet — not before.
-	//
-	// Deprecated: Marked as deprecated in api/proto/scheduler.proto.
-	SandboxIds  []string     `protobuf:"bytes,8,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
-	P2PEndpoint *P2PEndpoint `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
+	P2PEndpoint       *P2PEndpoint           `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
 	// The sandboxes alive on this node, and the incarnation each is running
-	// under. Supersedes sandbox_ids.
+	// under.
 	//
-	// A node that reports this reports it in full: empty still means "nothing
-	// here", exactly as it does above. The receiver distinguishes "this node
-	// sent an empty roster" from "this node is too old to send one" by the
-	// presence of sandbox_ids, not by this field being empty.
+	// A node that reports this reports it in full: empty means "nothing here".
 	Roster        []*SandboxRosterEntry `protobuf:"bytes,10,rep,name=roster,proto3" json:"roster,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1940,14 +1922,6 @@ func (x *HeartbeatRequest) GetSnapshot() *NodeSnapshot {
 	return nil
 }
 
-// Deprecated: Marked as deprecated in api/proto/scheduler.proto.
-func (x *HeartbeatRequest) GetSandboxIds() []string {
-	if x != nil {
-		return x.SandboxIds
-	}
-	return nil
-}
-
 func (x *HeartbeatRequest) GetP2PEndpoint() *P2PEndpoint {
 	if x != nil {
 		return x.P2PEndpoint
@@ -1994,9 +1968,9 @@ type SandboxRosterEntry struct {
 	// instead of waking the sandbox. So the receiver keeps this entry in the
 	// registry and withholds it from binding reconciliation.
 	//
-	// 🔴 Absent (an older node, or the `sandbox_ids` fallback) is false, which
-	// is byte-for-byte the behaviour that shipped before this field existed:
-	// every entry reconciled, paused ones included.
+	// 🔴 Absent (an older node) is false, which is byte-for-byte the behaviour
+	// that shipped before this field existed: every entry reconciled, paused
+	// ones included.
 	Paused        bool `protobuf:"varint,4,opt,name=paused,proto3" json:"paused,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -7141,7 +7115,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xbf\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xad\x03\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -7150,12 +7124,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\aversion\x18\x04 \x01(\tR\aversion\x12\x16\n" +
 	"\x06commit\x18\x05 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\x06 \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
-	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12#\n" +
-	"\vsandbox_ids\x18\b \x03(\tB\x02\x18\x01R\n" +
-	"sandboxIds\x12<\n" +
+	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12<\n" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x128\n" +
 	"\x06roster\x18\n" +
-	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06roster\"\x9e\x01\n" +
+	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06rosterJ\x04\b\b\x10\tR\vsandbox_ids\"\x9e\x01\n" +
 	"\x12SandboxRosterEntry\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +

@@ -1,6 +1,5 @@
 use super::DiskMetric;
 use crate::orchestrator::SandboxRosterEntry;
-use crate::types::SandboxId;
 
 /// Static machine descriptors reported as part of node observability.
 #[derive(Clone, Debug)]
@@ -42,15 +41,8 @@ pub struct NodeSnapshot {
     pub cluster_id: uuid::Uuid,
     pub machine_info: MachineInfo,
     pub sandbox_count: u32,
-    pub sandbox_ids: Vec<SandboxId>,
-    /// The same sandboxes as `sandbox_ids`, each with the incarnation it is
+    /// The sandboxes alive on this node, each with the incarnation it is
     /// running under and the TTL its routing projection should carry.
-    ///
-    /// 🔴 Sent alongside the older field rather than instead of it. The
-    /// controller deletes every binding a node owns when it receives an empty
-    /// roster, so dropping `sandbox_ids` before the whole fleet reads this one
-    /// would make every sandbox that has never been paused answer 404 on the
-    /// data plane for the length of the rolling window.
     pub sandbox_roster: Vec<SandboxRosterEntry>,
     pub metrics: NodeMetricsSnapshot,
     /// Whether this node is isolated: still serving what it holds, refusing new

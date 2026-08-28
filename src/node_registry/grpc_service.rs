@@ -484,9 +484,6 @@ const OBSERVED_NODES_METRIC: &str = "agentenv_api_node_registry_observed_nodes";
 /// `agentenv_scheduler_observed_nodes` -> `OBSERVED_NODES_METRIC` above for
 /// the precedent).
 const SANDBOX_EVENT_METRIC: &str = "agentenv_api_sandbox_event_total";
-/// Ports `agentenv_scheduler_heartbeat_legacy_roster_total`, renamed per
-/// this module's own `scheduler` -> `api` convention.
-const HEARTBEAT_LEGACY_ROSTER_METRIC: &str = "agentenv_api_heartbeat_legacy_roster_total";
 /// Ports `agentenv_scheduler_projection_ttl_source_total`.
 const PROJECTION_TTL_SOURCE_METRIC: &str = "agentenv_api_projection_ttl_source_total";
 /// Ports `agentenv_scheduler_lookup_node_total`.
@@ -583,7 +580,7 @@ impl Scheduler for NodeRegistryGrpcService {
         // default path today) falls back to the pre-D3 behavior: warm-up
         // means "the registry accepted a heartbeat," nothing more.
         if let Some(binding_store) = &self.binding_store {
-            let (roster, legacy) = super::registry::roster_from_heartbeat(&req);
+            let roster = super::registry::roster_from_heartbeat(&req);
             // 🔴 The routing half of the roster, and only the routing half.
             //
             // The full roster already went into `self.registry.heartbeat`
@@ -621,15 +618,6 @@ impl Scheduler for NodeRegistryGrpcService {
                     withheld,
                     "withholding paused sandboxes from binding reconciliation"
                 );
-            }
-            if legacy {
-                // 🔴 Counted per node, not merely logged — mirrors Go's own
-                // comment on `recordLegacyRoster`: this is the number that
-                // has to reach zero before any consumer can refuse an
-                // incarnation-less roster, and a log line does not answer
-                // "how many nodes are still on the old build."
-                metrics::counter!(HEARTBEAT_LEGACY_ROSTER_METRIC, "node" => node.id.clone())
-                    .increment(1);
             }
             match binding_store.reconcile_node(node, routable, now).await {
                 Err(err) => {

@@ -79,7 +79,6 @@ impl ObservabilityService {
             cluster_id: self.identity.cluster_id,
             machine_info: self.machine_info.clone(),
             sandbox_count: runtime.running_sandbox_count,
-            sandbox_ids: self.orchestrator.list_sandbox_ids().await?,
             sandbox_roster: self.orchestrator.list_sandbox_roster().await?,
             draining: self.orchestrator.scheduling_disabled(),
             metrics: NodeMetricsSnapshot {

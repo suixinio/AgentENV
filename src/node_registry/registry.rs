@@ -1383,58 +1383,17 @@ fn normalize_cluster_id(cluster_id: &str) -> String {
 
 /// The one place a heartbeat's roster becomes the registry's.
 fn normalize_heartbeat_roster(req: &HeartbeatRequest) -> Vec<RosterEntry> {
-    roster_from_heartbeat(req).0
+    roster_from_heartbeat(req)
 }
 
-/// Collapses the two generations of the roster field into one shape, and
-/// says which one it used.
-///
-/// ```text
-/// roster present                    -> use it
-/// roster empty, sandbox_ids present -> use those, with no incarnations
-/// both empty                        -> a genuinely empty roster
-/// ```
-///
-/// The fallback is not politeness towards old builds, it is the difference
-/// between a rolling upgrade and an outage — see `node_registry.go`'s
-/// `rosterFromHeartbeat` doc comment for the full argument.
-///
-/// 🔴 `sandbox_ids` is read deliberately, mirroring Go's
-/// `//nolint:staticcheck` on the same line: the deprecated field is the
-/// rollout fallback, not dead code to warn about.
-#[allow(deprecated)]
-pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool) {
-    if !req.roster.is_empty() {
-        let mut out = Vec::with_capacity(req.roster.len());
-        let mut seen: HashSet<String> = HashSet::with_capacity(req.roster.len());
-        for item in &req.roster {
-            let sandbox_id = item.sandbox_id.trim().to_string();
-            if sandbox_id.is_empty() {
-                continue;
-            }
-            if !seen.insert(sandbox_id.clone()) {
-                continue;
-            }
-            out.push(RosterEntry {
-                sandbox_id,
-                execution_id: normalize_execution_id(&item.execution_id),
-                projection_ttl: projection_ttl_from_secs(item.projection_ttl_secs),
-                paused: item.paused,
-            });
-        }
-        if out.is_empty() {
-            return (Vec::new(), false);
-        }
-        return (out, false);
-    }
-
-    if req.sandbox_ids.is_empty() {
-        return (Vec::new(), false);
-    }
-    let mut out = Vec::with_capacity(req.sandbox_ids.len());
-    let mut seen: HashSet<String> = HashSet::with_capacity(req.sandbox_ids.len());
-    for sandbox_id in &req.sandbox_ids {
-        let sandbox_id = sandbox_id.trim().to_string();
+/// Normalizes a heartbeat's roster into the registry's shape: trimmed,
+/// deduplicated ids, each carrying whatever incarnation and pause state the
+/// node reported.
+pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> Vec<RosterEntry> {
+    let mut out = Vec::with_capacity(req.roster.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(req.roster.len());
+    for item in &req.roster {
+        let sandbox_id = item.sandbox_id.trim().to_string();
         if sandbox_id.is_empty() {
             continue;
         }
@@ -1443,23 +1402,12 @@ pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> (Vec<RosterEntry>, bool)
         }
         out.push(RosterEntry {
             sandbox_id,
-            execution_id: String::new(),
-            projection_ttl: Duration::ZERO,
-            // 🔴 False, and only false. `sandbox_ids` is a flat list of ids
-            // with no room to say anything about state, so a node old enough
-            // to be on this path has told us nothing about which of its
-            // sandboxes are parked. False is the answer that reproduces that
-            // node's pre-flag behaviour exactly — every entry reconciled —
-            // rather than guessing, which on this path could only ever guess
-            // wrong in the direction of dropping a live sandbox's route.
-            paused: false,
+            execution_id: normalize_execution_id(&item.execution_id),
+            projection_ttl: projection_ttl_from_secs(item.projection_ttl_secs),
+            paused: item.paused,
         });
     }
-    if out.is_empty() {
-        (Vec::new(), false)
-    } else {
-        (out, true)
-    }
+    out
 }
 
 /// The one conversion from the wire's whole seconds. A zero value becomes
@@ -1605,9 +1553,6 @@ mod tests {
         intersection
     }
 
-    // Mirrors the legacy `sandbox_ids` roster path deliberately — see
-    // `roster_from_heartbeat`'s doc comment.
-    #[allow(deprecated)]
     fn heartbeat_with_roster(
         registry: &AtomicNodeRegistry,
         node_id: &str,
@@ -1625,7 +1570,13 @@ mod tests {
                         status: NodeStatus::Ready as i32,
                         ..Default::default()
                     }),
-                    sandbox_ids: sandbox_ids.iter().map(|s| s.to_string()).collect(),
+                    roster: sandbox_ids
+                        .iter()
+                        .map(|s| SandboxRosterEntry {
+                            sandbox_id: s.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
                     ..Default::default()
                 },
                 now,
@@ -2177,40 +2128,9 @@ mod tests {
 
     // ---- node_registry_roster_test.go ----
 
-    /// The `paused` flag's two wire generations, in one place.
-    ///
-    /// The fallback half is the one that matters for a rolling upgrade: a node
-    /// old enough to be on the deprecated `sandbox_ids` path has said nothing
-    /// about which of its sandboxes are parked, and `false` is the only answer
-    /// that reproduces that node's pre-flag behaviour — every entry reconciled,
-    /// which is what it got before the field existed. Anything else would let a
-    /// silent field decide whether a live sandbox keeps its route.
-    #[test]
-    #[allow(deprecated)]
-    fn roster_from_heartbeat_defaults_paused_to_false_on_the_legacy_sandbox_ids_path() {
-        let (entries, legacy) = roster_from_heartbeat(&HeartbeatRequest {
-            node_id: "node-a".to_string(),
-            cluster_id: "cluster-a".to_string(),
-            service_instance_id: "svc-node-a".to_string(),
-            sandbox_ids: vec!["s1".to_string(), "s2".to_string()],
-            ..Default::default()
-        });
-
-        assert!(
-            legacy,
-            "precondition: this is the sandbox_ids fallback path"
-        );
-        assert_eq!(roster_ids(&entries), vec!["s1", "s2"]);
-        assert!(
-            entries.iter().all(|entry| !entry.paused),
-            "a node too old to send the flag must land on false, which is exactly the \
-             behaviour it had before the flag existed: every entry reconciled"
-        );
-    }
-
     #[test]
     fn roster_from_heartbeat_carries_the_paused_flag_both_ways() {
-        let (entries, legacy) = roster_from_heartbeat(&HeartbeatRequest {
+        let entries = roster_from_heartbeat(&HeartbeatRequest {
             node_id: "node-a".to_string(),
             cluster_id: "cluster-a".to_string(),
             service_instance_id: "svc-node-a".to_string(),
@@ -2229,7 +2149,6 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!legacy);
         assert_eq!(
             entries
                 .iter()

@@ -18,8 +18,15 @@ resources:
   # schema the currently-running `aenv-api` maintains, and the pve-mf
   # registry this cluster deploys against carries no `agentenv-scheduler`
   # repository at all (nothing has built/pushed that image since the
-  # scheduler was decommissioned). Before uncommenting the workload below
-  # for an actual rollback, build and push a verified-compatible image and
+  # scheduler was decommissioned). The wire format has moved on too: `6fb0594`
+  # reserves `HeartbeatRequest` field 8 (`sandbox_ids`) in
+  # `services/api/proto/scheduler.proto` and nodes stopped populating it, so a
+  # pre-`6fb0594` scheduler binary that still reads `sandbox_ids` for its
+  # roster will see every heartbeat as an empty roster — rolling the scheduler
+  # back is not only a `paused_sandboxes` schema question, the heartbeat
+  # protocol itself is no longer backward compatible either. Before
+  # uncommenting the workload below for an actual rollback, build and push a
+  # verified-compatible image and
   # pin this reference to that specific tag or digest — do not rely on
   # whatever `latest` resolves to at incident time, and do not assume
   # uncommenting alone restores anything. `services/scheduler`'s Go source

@@ -386,6 +386,10 @@ async fn a_capture_staged_elsewhere_is_committed_rather_than_staged_again() {
         Some("the-name-the-user-asked-for"),
         "the alias is the committer's and staging never had it"
     );
+    assert_eq!(
+        adopted.created_at_unix_ms, 1_700_000_000_000,
+        "the row must keep the staging node's created_at_unix_ms, not the committing node's own clock"
+    );
 
     // 🔴 The pair that carries the whole claim: no *artifact* was written
     // here for the adopted snapshot, and the identical look at the locally

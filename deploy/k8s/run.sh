@@ -62,7 +62,7 @@ if [[ -n "${IMAGE_TAG:-}" ]]; then
   ESCAPED_IMAGE_TAG="${IMAGE_TAG//\\/\\\\}"
   ESCAPED_IMAGE_TAG="${ESCAPED_IMAGE_TAG//&/\\&}"
   sed_in_place "s#^\( *\)newTag: .*\$#\1newTag: ${ESCAPED_IMAGE_TAG}#" "${TEMP_DIR}/k8s/base/kustomization.yaml"
-  if [[ "${IMAGE_TAG}" != "latest" ]] && grep -q "newTag: latest" "${TEMP_DIR}/k8s/base/kustomization.yaml"; then
+  if [[ "${IMAGE_TAG}" != "latest" ]] && grep -Eq '^[[:space:]]*newTag:[[:space:]]*latest[[:space:]]*$' "${TEMP_DIR}/k8s/base/kustomization.yaml"; then
     echo "failed to apply IMAGE_TAG=${IMAGE_TAG}; some image is still on latest" >&2
     exit 1
   fi

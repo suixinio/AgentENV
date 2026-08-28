@@ -841,9 +841,9 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T) {
 //
 // writeSchedulerError has no branch for it, so it falls through to the default
 // and becomes a 502 — "the upstream is broken", which is a wrong diagnosis of a
-// precise refusal. The code is spoken by PausedRegistry, where it means a
-// superseded incarnation tried to write, and nodes reach that service directly
-// without passing through here.
+// precise refusal. The code means a superseded incarnation tried to write;
+// aenv-api's own in-process paused registry enforces that fencing directly,
+// never through a gRPC service the gateway calls.
 //
 // The method list is frozen deliberately. Moving a refusing method onto this
 // service, or adding one, is exactly the change that would turn a fencing
@@ -864,9 +864,9 @@ func TestSchedulerServiceNeverReturnsPermissionDenied(t *testing.T) {
 		"LookupP2pArtifact":  {},
 		"GetNode":            {},
 		"UnregisterNode":     {},
-		// Read-only listing of the registry. It is on this service rather than
-		// on PausedRegistry because it is answered for operators through the
-		// gateway, and it cannot refuse a write because it performs none.
+		// Read-only listing of the registry. It cannot refuse a write because
+		// it performs none, so it belongs on this service, answered for
+		// operators through the gateway.
 		"ListRegistrySandboxes": {},
 	}
 

@@ -19,7 +19,7 @@
   },
   "gateway": {
     "http_listen_addr": ":8080",
-    "scheduler_addr": "scheduler:9090",
+    "scheduler_addr": "agentenv-api:8002",
     "resume_addr": "agentenv-api:8002",
     "rest_upstream_addr": "http://agentenv-api:8000",
     "request_timeout": "90s",

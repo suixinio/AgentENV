@@ -8,7 +8,11 @@ x-agentenv-base: &agentenv-base
     API_ADDR: 0.0.0.0:8000
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
     AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED: "true"
-    AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
+    # 🔴 Native topology: nodes heartbeat straight to `agentenv-api`'s own
+    # gRPC surface (AENV_API_GRPC_ADDR, 8002) instead of the (now removed)
+    # `scheduler` service — same value `deploy/k8s/base`'s
+    # `node-heartbeat-config` ConfigMap uses.
+    AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://agentenv-api:8002
     AENV_SNAPSHOT_LOCAL_CACHE_PATH: /var/cache/agentenv/snapshot-local-cache
     AENV_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     # Keep in step with `aenv_core::logging::DEFAULT_FILTER`: these are target
@@ -36,6 +40,18 @@ x-agentenv-base: &agentenv-base
 x-control-plane-config-volume: &control-plane-config-volume
   - ./docker/config/default.json:/config/default.json:ro
 
+# Fixed, committed dev-only PostgreSQL credentials for this compose stack —
+# same convention as AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED below: this is a
+# local dev stack, so a shared literal here is fine; never reuse it anywhere
+# real. Referenced by both `postgres` (to create the role/database) and
+# `agentenv-api` (merged into its own `environment:`, then assembled into a
+# `[pg].dsn` overlay file at container start — see that service's own
+# comment for why `[pg]` cannot just be a plain environment variable).
+x-postgres-credentials: &postgres-credentials
+  POSTGRES_USER: agentenv
+  POSTGRES_PASSWORD: agentenv-compose-dev-postgres-password
+  POSTGRES_DB: agentenv
+
 services:
   # 🔴 New in the crate split, and the stack does not serve the user-facing
   # REST API without it. `agentenv-a`/`agentenv-b` used to run the pre-split
@@ -60,6 +76,26 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # 🔴 阶段四 E4 in compose: `aenv-api` requires `[pg]` unconditionally
+  # (`build_snapshot_backend` in `src/snapshot/repository/backends/mod.rs`
+  # refuses to assemble without a PostgreSQL catalog — see CLAUDE.md's
+  # snapshot-catalog section). This stack had no PostgreSQL service until
+  # this commit, which is why `agentenv-api` used to crash-loop here. Plain
+  # public image, matching the `postgres:17-alpine` build the pve-mf cluster
+  # runs (`10.1.0.201:5000/postgres:17-alpine`) — no persistent volume, same
+  # ephemeral-by-design choice `redis` above makes for this dev stack.
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    environment:
+      <<: *postgres-credentials
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   agentenv-api:
     build:
       context: ..
@@ -72,9 +108,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      scheduler:
+      postgres:
         condition: service_healthy
     environment:
+      <<: *postgres-credentials
       AENV_CONFIG_PATH: /workspace/config/default.toml
       API_ADDR: 0.0.0.0:8000
       AENV_API_GRPC_ADDR: 0.0.0.0:8002
@@ -88,14 +125,83 @@ services:
       # so a seed invented per replica hands out tokens the others cannot
       # verify. Fixed here because this is a local dev stack; never reuse it.
       AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED: agentenv-compose-dev-access-token-hash-seed
-      AENV_NODE_PLACEMENT_SOURCE: scheduler
-      AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
+      # 🔴 Native topology (阶段四 E4 in compose): this replica answers its own
+      # Schedule/LookupNode/RecordAssignment and node heartbeats in-process
+      # instead of dialling `services/scheduler` — same switch
+      # `deploy/k8s/base/agentenv-api-deployment.yaml` runs, with the same
+      # paired requirements (see the keys below).
+      AENV_NODE_PLACEMENT_SOURCE: native
+      # Mandatory even under native: `ResumeWiring::cluster_from_config`
+      # (the `WakeSite::Remote` placement source) always dials
+      # `[cluster].scheduler_endpoint` for LookupNode and refuses to start on
+      # an empty one, regardless of AENV_NODE_PLACEMENT_SOURCE. Self-pointing,
+      # same as `agentenv-api-deployment.yaml`'s own copy of this key:
+      # `agentenv-api:8002` answers both LookupNode (in-process,
+      # NodeRegistryGrpcService) and ResumeSandbox on the same listener.
+      AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://agentenv-api:8002
+      # `[cluster].node_placement_source = "native"` refuses to start
+      # without both of these (`start_native_node_registry`) — they name the
+      # Kubernetes EndpointSlice this process would watch to discover nodes.
+      #
+      # 🔴 There is no Kubernetes API in this compose stack, so discovery
+      # itself never succeeds here: `KubernetesDiscovery::connect` fails to
+      # build a client (no in-cluster config, no kubeconfig) and
+      # `run_kubernetes_discovery_with_retry` just retries forever in the
+      # background with capped backoff — logged as `warn!`, never fatal to
+      # this process. These two values exist only to satisfy the startup
+      # guard; the node registry they would feed stays empty in compose, so
+      # `agentenv-a`/`agentenv-b`'s heartbeats are rejected as
+      # `NodeNotInRegistry` under this topology (discovery is the registry's
+      # only source of truth for which node ids are real — see
+      # `src/node_registry/registry.rs`'s module doc). There is no
+      # static/env-based node registration on the Rust side the way the Go
+      # scheduler's `scheduler.nodes` list was — replicating that is out of
+      # scope for this change, which only removes the stack's dependency on
+      # the scheduler process.
+      AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE: compose
+      AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME: agentenv-node
+      # The shared-roster fix: `wire_shared_node_observed_store` refuses
+      # `in_memory` (the default) unconditionally under native placement —
+      # not gated on replica count — so this is not optional even for this
+      # single-replica compose stack. Same Redis every other shared-state
+      # subsystem here already uses, under its own key prefix.
+      AENV_CLUSTER_NODE_REGISTRY_STORE_BACKEND: redis
+      AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_URL: redis://redis:6379
+      # Where the entrypoint wrapper below writes `[pg]`'s overlay file.
+      AENV_CONFIG_OVERLAY_PATH: /tmp/agentenv-pg/pg-dsn.toml
       AENV_NODE_ID: api-0
       # This half runs no sandboxes, so no `envd`/`uvm_ublk`; the rest matches
       # `aenv_core::logging::DEFAULT_FILTER`.
       RUST_LOG: ${RUST_LOG:-aenv_core=info,aenv_api=info,agentenv=info}
     volumes:
       - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+    # 🔴 `[pg]` cannot be set from the environment at all: `PgConfig` is
+    # reached only through `AppConfig.pg: Option<PgConfig>`, and confique
+    # only descends into a struct via `#[config(nested)]`, which `Option<_>`
+    # may never carry — so no field of `PgConfig`, including `dsn`, is ever
+    # bound to an `env =` attribute (see `src/cfg.rs`'s doc on
+    # `AppConfig::pg`). The only way in is a TOML file named by
+    # `AENV_CONFIG_OVERLAY_PATH` — the same mechanism `deploy/k8s/base` uses,
+    # via its tracked `config/pg-overlay.toml` plus a Secret-projected
+    # `pg-dsn.toml`.
+    #
+    # Compose has no Secret store, and `TestNoPgDsnIsCommittedToTheRepository`
+    # (`services/shared/config`) refuses a real `dsn = "..."` assignment
+    # anywhere under `config/` or `deploy/` in this repository — so the
+    # overlay file is assembled here, at container start, from the
+    # `postgres-credentials` anchor above, rather than ever being written to
+    # a tracked file. This replaces the image's plain `ENTRYPOINT
+    # ["/aenv-api"]` with a wrapper that writes `/tmp/agentenv-pg/pg-dsn.toml`
+    # and then `exec`s the real binary.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /tmp/agentenv-pg
+        printf '[pg]\ndsn = "postgres://%s:%s@postgres:5432/%s"\n' \
+          "$$POSTGRES_USER" "$$POSTGRES_PASSWORD" "$$POSTGRES_DB" \
+          > /tmp/agentenv-pg/pg-dsn.toml
+        exec /aenv-api
     # 🔴 Also published directly on 8010 for convenience, but the gateway
     # (`GATEWAY_REST_UPSTREAM_ADDR`/`GATEWAY_RESUME_ADDR` below, matching
     # `deploy/k8s/base`'s `api-upstream-config`) now sends user-facing REST
@@ -103,19 +209,15 @@ services:
     # own port (8000) for `/sandboxes`, `/snapshots` and `/templates` the same
     # way a k8s deployment would.
     #
-    # 🔴 This container will not actually come up healthy on a plain
-    # `make deploy-up`: `aenv-api` requires `[pg]` unconditionally
-    # (`build_snapshot_backend`, see CLAUDE.md's snapshot-catalog section) and
-    # this compose stack has no PostgreSQL service. That gap predates and is
-    # independent of the gateway wiring above — it is not fixed here. The
-    # gateway itself still starts fine regardless (`grpc.NewClient` dials
-    # lazily), so a crash-looping `agentenv-api` degrades REST/resume traffic
-    # rather than blocking gateway startup. Node placement/heartbeats still go
-    # through `scheduler` below, unmigrated — the `services/scheduler`
-    # service stays in this stack until a PostgreSQL service is added here
-    # and the native-topology migration (`AENV_NODE_PLACEMENT_SOURCE=native`,
-    # dropping `scheduler` the way `deploy/k8s/base/kustomization.yaml`
-    # comments out the scheduler workload) is done as its own change.
+    # 🔴 阶段四 E4 in compose: this stack now runs PostgreSQL (`postgres`
+    # above) and native node placement, so `agentenv-api` actually comes up
+    # instead of crash-looping for want of `[pg]` — see git history on this
+    # comment block for the prior gap and the note on `AENV_CONFIG_OVERLAY_PATH`
+    # above for how `[pg]` reaches this process without ever landing in a
+    # tracked file. `services/scheduler` is no longer part of this stack;
+    # its source and `Dockerfile.scheduler` stay in the tree as the
+    # decommission's own rollback target (see CLAUDE.md's "Distributed
+    # Control Plane" section) but nothing here builds or runs it any more.
     ports:
       - "8010:8000"
     healthcheck:
@@ -126,30 +228,6 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  scheduler:
-    build:
-      context: ..
-      dockerfile: deploy/docker/Dockerfile.scheduler
-    image: agentenv-scheduler:latest
-    container_name: scheduler
-    command: ["-config", "/config/default.json"]
-    depends_on:
-      agentenv-a:
-        condition: service_healthy
-      agentenv-b:
-        condition: service_healthy
-    volumes: *control-plane-config-volume
-    environment:
-      SCHEDULER_GRPC_LISTEN_ADDR: :9090
-      SCHEDULER_STRATEGY: round_robin
-    healthcheck:
-      test: ["CMD", "/grpc_health_probe", "-addr=127.0.0.1:9090"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 3s
-    restart: unless-stopped
-
   gateway:
     build:
       context: ..
@@ -158,12 +236,17 @@ services:
     container_name: gateway
     command: ["-config", "/config/default.json"]
     depends_on:
-      scheduler:
+      agentenv-api:
         condition: service_healthy
     volumes: *control-plane-config-volume
     environment:
       GATEWAY_HTTP_LISTEN_ADDR: :8080
-      GATEWAY_SCHEDULER_ADDR: scheduler:9090
+      # 🔴 阶段四 E4: `agentenv-api:8002`, not the (now removed) `scheduler`
+      # service — Schedule/LookupNode/RecordAssignment and node heartbeats are
+      # all answered in-process by `aenv-api`'s own `NodeRegistryGrpcService`
+      # now that it runs `AENV_NODE_PLACEMENT_SOURCE=native`. Same value
+      # `deploy/k8s/base/config/gateway.json`'s `gateway.scheduler_addr` uses.
+      GATEWAY_SCHEDULER_ADDR: agentenv-api:8002
       # 🔴 No longer optional (R9, `services/shared/config`'s `Config.Validate`):
       # `aenv-node` answers 404 on user-facing REST and has no wake-up surface
       # of its own, so both addresses must name the api half. Same values

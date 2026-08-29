@@ -18,8 +18,8 @@ use aenv_api::binding_store::{
     ArbitrationMode, BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
 use aenv_api::cfg::{
-    AppConfig, BindingStoreBackendKind, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
-    MetadataStoreBackendKind, NodeRegistryObservedBackendKind,
+    AppConfig, BindingStoreConfig, ClusterNodeRegistryStoreConfig, MetadataStoreBackendKind,
+    NodeRegistryObservedBackendKind,
 };
 use aenv_api::identity::NodeIdentity;
 use aenv_api::node_client::{NativeNodePlacement, RemoteSandboxBackendFactory};
@@ -917,56 +917,43 @@ async fn start_native_node_registry(
 /// discipline `cluster_placement`'s own comment names for every other
 /// config-driven refusal in this function.
 ///
-/// 🔴 P4 (task's own "phase4-close"): also mirrors `cluster_store_config`'s
-/// own refusal of the in-memory metadata store — `BindingStoreBackendKind::InMemory`
-/// is refused here the same way, for the same reason (one replica's private
-/// state, `aenv-api` runs as more than one replica), and unconditionally
-/// for the same reason: nothing at this layer can distinguish "one replica,
-/// alone, safe" from "one of several, silently wrong."
+/// 🔴 There is no backend to select. `[binding_store].backend`
+/// (`AENV_BINDING_STORE_BACKEND`, `"in_memory"` | `"redis"`) used to choose,
+/// and this function refused `"in_memory"` unconditionally — `aenv-api` is a
+/// multi-replica Deployment (`deploy/k8s/base/agentenv-api-deployment.yaml`'s
+/// `replicas: 2`), an in-memory binding store is one replica's private
+/// routing table, and every symptom of two replicas disagreeing about a
+/// sandbox's node is silent (a gateway routing-projection read, or
+/// `NativeNodePlacement::place_existing` on *this* replica, simply missing a
+/// binding another replica wrote). Nothing at this layer could tell "one
+/// replica, alone, safe" from "one of several, silently wrong," so the
+/// refusal never had a case it did not apply to. A setting with one legal
+/// value is not a setting: the field, its enum and the refusal arm are
+/// deleted, and this constructs Redis.
+///
+/// 🔴 `InMemoryBindingStore` itself is not deleted — the binding-store
+/// contract suite (`aenv_core::binding_store::contract`) runs the same
+/// assertions against both backends, which is what keeps a fix made to one
+/// and forgotten for the other from being invisible. It is gated behind
+/// `#[cfg(any(test, feature = "test-support"))]` instead, so it cannot be
+/// reached from a production build at all.
 async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<dyn BindingStore>> {
     let settings = BindingStoreSettings {
         binding_ttl: Duration::from_secs(config.binding_ttl_secs),
         arbitration: ArbitrationMode::from_str_relaxed(&config.arbitration),
         projection_authoritative: config.projection_authoritative,
     };
-    match config.backend {
-        // 🔴 P4 (task's own "phase4-close"): refused unconditionally, the
-        // same discipline `cluster_store_config` already applies to
-        // `[orchestrator.store].backend` above -- `aenv-api` is a
-        // multi-replica Deployment (`deploy/k8s/base/agentenv-api-deployment.yaml`'s
-        // `replicas: 2`), and an in-memory binding store is one replica's
-        // private routing table: `Schedule`/`LookupNode`/`RecordAssignment`
-        // answers from it, and nothing propagates a write on one replica to
-        // any other. Two replicas each holding a different, invisible
-        // answer for the same sandbox is not a degraded mode this process
-        // may run in — every symptom is silent (a gateway routing-projection
-        // read, or `NativeNodePlacement::place_existing` on *this* replica,
-        // simply missing a binding another replica wrote) — and nothing
-        // here can tell whether this process is one replica of many or
-        // genuinely alone, so this refuses regardless of how many are
-        // actually running.
-        BindingStoreBackendKind::InMemory => {
-            anyhow::bail!(
-                "aenv-api needs [binding_store].backend = \"redis\" \
-                 (AENV_BINDING_STORE_BACKEND): the in-memory binding store is one \
-                 replica's private routing table, and aenv-api runs as more than one \
-                 replica. Set AENV_BINDING_STORE_BACKEND=redis"
-            );
-        }
-        BindingStoreBackendKind::Redis => {
-            let redis_config = RedisBindingStoreConfig {
-                url: config.redis_url.clone(),
-                key_prefix: config.redis_key_prefix.clone(),
-                node_index_ttl: Duration::from_secs(config.redis_node_index_ttl_secs),
-                response_timeout: Duration::from_millis(config.redis_response_timeout_ms),
-                connect_timeout: Duration::from_millis(config.redis_connect_timeout_ms),
-            };
-            let store = RedisBindingStore::connect(redis_config, settings)
-                .await
-                .map_err(|err| anyhow::anyhow!("connecting the binding store to redis: {err}"))?;
-            Ok(Arc::new(store) as Arc<dyn BindingStore>)
-        }
-    }
+    let redis_config = RedisBindingStoreConfig {
+        url: config.redis_url.clone(),
+        key_prefix: config.redis_key_prefix.clone(),
+        node_index_ttl: Duration::from_secs(config.redis_node_index_ttl_secs),
+        response_timeout: Duration::from_millis(config.redis_response_timeout_ms),
+        connect_timeout: Duration::from_millis(config.redis_connect_timeout_ms),
+    };
+    let store = RedisBindingStore::connect(redis_config, settings)
+        .await
+        .map_err(|err| anyhow::anyhow!("connecting the binding store to redis: {err}"))?;
+    Ok(Arc::new(store) as Arc<dyn BindingStore>)
 }
 
 /// The shared-roster fix: wires `aenv-api`'s Stage A node registry's
@@ -1344,52 +1331,40 @@ mod tests {
         );
     }
 
-    /// 🔴 P4 (task's own "phase4-close"): the binding store's own copy of
-    /// `the_api_half_refuses_a_ledger_no_other_replica_can_see` above —
-    /// same shape, same reasoning, a different multi-replica ledger.
-    /// `[binding_store]`'s own doc comment on `backend` already named this
-    /// exact risk ("every replica answers LookupNode ... out of its own,
-    /// mutually invisible table") with nothing enforcing it; before this
-    /// guard existed, `build_binding_store` happily built an
-    /// `InMemoryBindingStore` for `aenv-api` regardless of how many
-    /// replicas were actually running.
+    /// 🔴 The binding store is Redis, and only Redis.
+    ///
+    /// This used to be a refusal/control pair: `[binding_store].backend`
+    /// defaulted to `"in_memory"`, `build_binding_store` refused that value
+    /// unconditionally, and the control below proved the refusal was about
+    /// the backend rather than about the function failing for any reason at
+    /// all. The field and its enum are deleted — a setting whose only legal
+    /// value was `"redis"` is not a setting — so only the control survives,
+    /// and it now carries the whole claim on its own: `AppConfig::default()`,
+    /// with nothing selecting anything, still reaches Redis.
+    ///
+    /// The URL is one nothing listens on, so what this asserts is *which
+    /// store was constructed*, read off the failure: a connection attempt to
+    /// the configured Redis. A regression that reintroduced an in-memory
+    /// fallback would return `Ok` here instead.
     #[tokio::test]
-    async fn the_api_half_refuses_a_binding_ledger_no_other_replica_can_see() {
-        let config = AppConfig::default().binding_store;
-        assert_eq!(
-            config.backend,
-            BindingStoreBackendKind::InMemory,
-            "the default is the per-replica table, which is what makes this refusal necessary"
-        );
+    async fn the_api_half_binds_sandboxes_through_redis_with_nothing_selecting_it() {
+        let mut config = AppConfig::default().binding_store;
+        config.redis_url = "redis://127.0.0.1:1/0".to_string();
 
         let err = match build_binding_store(&config).await {
-            Ok(_) => panic!("the in-memory binding store is one replica's private routing table"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("binding_store"), "{err}");
-        assert!(err.contains("AENV_BINDING_STORE_BACKEND"), "{err}");
-        assert!(err.contains("redis"), "{err}");
-
-        // 🔴 The control, again: the redis backend at least attempts to
-        // connect rather than being refused outright — proven by getting a
-        // *different* error (a connection failure, not the multi-replica
-        // refusal) against a URL nothing is listening on.
-        let mut redis_config = AppConfig::default().binding_store;
-        redis_config.backend = BindingStoreBackendKind::Redis;
-        redis_config.redis_url = "redis://127.0.0.1:1/0".to_string();
-        let connect_err = match build_binding_store(&redis_config).await {
-            Ok(_) => panic!("nothing is listening on this port"),
-            Err(err) => err.to_string(),
+            Ok(_) => panic!(
+                "nothing is listening on this port — an Ok here means this replica built some                  store other than the configured Redis one"
+            ),
+            Err(err) => format!("{err:#}"),
         };
         assert!(
-            !connect_err.contains("more than one replica"),
-            "a redis backend must fail on the connection, not on the multi-replica refusal: \
-             {connect_err}"
+            err.contains("connecting the binding store to redis"),
+            "the failure has to be the Redis connection, which is what says Redis is what got              built: {err}"
         );
     }
 
     /// The shared-roster fix's own copy of
-    /// `the_api_half_refuses_a_binding_ledger_no_other_replica_can_see` above
+    /// `the_api_half_refuses_a_ledger_no_other_replica_can_see` above
     /// — same shape, same reasoning, a third multi-replica ledger
     /// (`Inner.observed`, `src/node_registry/registry.rs`). Before this
     /// guard existed, `AtomicNodeRegistry`'s heartbeat-derived state had no

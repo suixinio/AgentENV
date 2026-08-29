@@ -248,19 +248,14 @@ redis_connect_timeout_ms = 3000
 # the same key space gateway's routing-projection read path already speaks
 # to.
 #
-#   backend = "in_memory"  (the code default) one replica's own table, lost
-#                           when it exits. Correct only for a single-replica
-#                           deployment.
-#   backend = "redis"      the shared table every `aenv-api` replica reads
-#                           and writes. `aenv-api` runs more than one
-#                           replica (`agentenv-api-deployment.yaml`'s
-#                           `replicas: 2`), so this is the only backend that
-#                           deployment may run — `build_binding_store`
-#                           (`crates/aenv-api/src/bin/aenv-api.rs`) refuses to
-#                           start on "in_memory" unconditionally, the same
-#                           guard [orchestrator.store] already has for the
-#                           sandbox ledger.
-# backend = "redis"
+# 🔴 There is no `backend` key. It existed (`AENV_BINDING_STORE_BACKEND`,
+# "in_memory" | "redis") and had exactly one legal value: `build_binding_store`
+# (crates/aenv-api/src/bin/aenv-api.rs) refused "in_memory" unconditionally,
+# because a routing table one replica cannot see misroutes silently and nothing
+# at that layer can tell a lone replica from one of several. The field and its
+# enum are deleted; aenv-api always constructs the Redis store, and the
+# in-memory implementation is now compiled only under `cfg(test)` /
+# `feature = "test-support"`, where the shared contract suite runs it.
 #
 # redis_url = "redis://127.0.0.1:6379"
 #

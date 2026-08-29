@@ -45,9 +45,10 @@ see CLAUDE.md's "Distributed Control Plane" section for the full picture.
   `src/node_registry/strategy.rs` but not wired to any config knob yet).
 - Node discovery for that registry is static configuration or Kubernetes
   EndpointSlice watching (`[cluster].node_discovery_mode`).
-- The sandbox-to-node binding store can be in-memory or Redis-backed
-  (`[binding_store]` on `aenv-api`; `gateway`'s own routing-projection reader
-  reads the same Redis keys for its fast path).
+- The sandbox-to-node binding store is Redis, always (`[binding_store]` on
+  `aenv-api` — the `backend` switch and its in-memory arm are deleted, so
+  `AENV_BINDING_STORE_REDIS_URL` is the whole configuration; `gateway`'s own
+  routing-projection reader reads the same Redis keys for its fast path).
 - Node health and sandbox roster are observed from heartbeats, and expired
   sandbox-to-node bindings are dropped on heartbeat, node unregistration, or
   lookup.

@@ -33,6 +33,24 @@
 
 pub mod arbitration;
 pub mod artifact_index;
+/// 🔴 Test-only, and `cfg(any(test, feature = "test-support"))` rather than a
+/// plain `cfg(test)`.
+///
+/// Production has one binding store: `aenv-api` is a multi-replica Deployment
+/// and a routing table one replica cannot see is a silent misroute, so
+/// `build_binding_store` constructs [`redis::RedisBindingStore`]
+/// unconditionally — there is no `[binding_store].backend` to select anything
+/// else with any more. What keeps this implementation alive is [`contract`],
+/// which runs the same assertions against both backends so a fix made to one
+/// and forgotten for the other turns red instead of invisible; that needs a
+/// second implementation to compare against, not a second deployable one.
+///
+/// `cfg(test)` alone would not do: it is per-crate, so `aenv-node`'s and
+/// `aenv-api`'s own test suites — which depend on `aenv-core` as an ordinary
+/// dependency, compiled without *its* `cfg(test)` — would lose the symbol.
+/// The `test-support` feature exists for exactly this, and both crates
+/// already take `aenv-core` with it enabled.
+#[cfg(any(test, feature = "test-support"))]
 pub mod in_memory;
 pub mod lookup;
 pub mod record;
@@ -50,6 +68,7 @@ use thiserror::Error;
 use crate::node_registry::types::{Node, RosterEntry};
 
 pub use arbitration::{ArbitrationMode, BindingDecision};
+#[cfg(any(test, feature = "test-support"))]
 pub use in_memory::InMemoryBindingStore;
 pub use redis::{RedisBindingStore, RedisBindingStoreConfig};
 

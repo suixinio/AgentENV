@@ -986,10 +986,11 @@ pub struct ObservabilitySchedulerReportConfig {
 /// sticks to one replica for its whole life). See
 /// [`crate::node_registry::redis`]'s own module doc for the full design.
 ///
-/// Mirrors [`BindingStoreBackendKind`]/[`MetadataStoreBackendKind`]'s
-/// two-value shape deliberately kept as its own type rather than reused —
-/// this codebase's established choice (see [`BindingStoreConfig`]'s own doc
-/// comment) for one enum per shared-state subsystem.
+/// Mirrors [`MetadataStoreBackendKind`]'s two-value shape, deliberately kept
+/// as its own type rather than reused — this codebase's established choice
+/// for one enum per shared-state subsystem. `[binding_store]` used to carry
+/// a third such enum; it was deleted once Redis became its only legal
+/// value.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRegistryObservedBackendKind {
@@ -1000,11 +1001,10 @@ pub enum NodeRegistryObservedBackendKind {
     /// never matters there; under `aenv-api`, which always builds that
     /// wiring now, it is the exact split roster this fix exists to close,
     /// and `wire_shared_node_observed_store`
-    /// (`src/bin/aenv-api.rs`) refuses to start on it unconditionally — the
-    /// same discipline `build_binding_store` already applies to
-    /// [`BindingStoreBackendKind::InMemory`], for the same reason: nothing
-    /// at this layer can distinguish "one replica, alone, safe" from "one
-    /// of several, silently split."
+    /// (`src/bin/aenv-api.rs`) refuses to start on it unconditionally, for
+    /// the same reason `[binding_store]` no longer has an in-memory backend
+    /// to choose at all: nothing at this layer can distinguish "one replica,
+    /// alone, safe" from "one of several, silently split."
     InMemory,
     /// A single Redis hash (`{redis_key_prefix}:observed`, one field per
     /// node id) every replica publishes its own heartbeats to and
@@ -1426,37 +1426,22 @@ impl MetadataStoreBackendKind {
     }
 }
 
-/// Task's own "D3": which [`crate::binding_store::BindingStore`]
-/// implementation `aenv-api` constructs. Mirrors
-/// [`MetadataStoreBackendKind`]'s two-value shape, but the two are not
-/// interchangeable — see [`BindingStoreConfig`]'s own doc comment.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BindingStoreBackendKind {
-    /// A single replica's own routing table, lost when it exits. Correct
-    /// only for a single-node deployment — the whole point of
-    /// the Redis backend is letting gateway read bindings without asking
-    /// any particular api replica, which an in-memory table cannot do.
-    InMemory,
-    /// `services/shared/routing`'s key space
-    /// (`agentenv:scheduler:bindings:*`) — gateway's read path
-    /// (`GATEWAY_ROUTING_PROJECTION_READ=on`) already speaks to this
-    /// exact keyspace.
-    Redis,
-}
-
 /// Task's own "D3": tuning for `src/binding_store/`. A top-level TOML
 /// section (`[binding_store]`), not nested under `[orchestrator]` — see
 /// [`AppConfig::binding_store`]'s own doc comment.
 #[derive(Debug, Config, Clone)]
 pub struct BindingStoreConfig {
-    /// The default matches a single-node deployment; a
-    /// multi-replica `aenv-api` deployment must set this to `"redis"` or
-    /// every replica answers `LookupNode`/reconciles heartbeats out of its
-    /// own, mutually invisible table.
-    #[config(default = "in_memory", env = "AENV_BINDING_STORE_BACKEND")]
-    pub backend: BindingStoreBackendKind,
-    /// `redis://host:port[/db]`, read only when `backend = "redis"`.
+    /// `redis://host:port[/db]`.
+    ///
+    /// 🔴 Not optional, and there is no backend switch above it any more.
+    /// `[binding_store]` had a `backend` field (`AENV_BINDING_STORE_BACKEND`,
+    /// defaulting to `"in_memory"`) whose only other value, `"redis"`, was
+    /// the only one `build_binding_store` would accept — the in-memory arm
+    /// was refused unconditionally, because a binding table one replica
+    /// cannot see is a silent routing failure and nothing here can tell
+    /// whether this process is one replica of many. A switch with one
+    /// legal position is not a switch; both it and the enum behind it are
+    /// deleted, and production always constructs the Redis store.
     #[config(
         default = "redis://127.0.0.1:6379",
         env = "AENV_BINDING_STORE_REDIS_URL",
@@ -3003,34 +2988,6 @@ mod tests {
                 .backend,
             PausedRegistryBackendKind::Local,
             "the file's value must stand when the environment says nothing"
-        );
-    }
-
-    #[test]
-    fn the_binding_store_backend_is_settable_from_the_environment_and_defaults_to_in_memory() {
-        let _env = env_guard();
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-        assert_eq!(
-            ConfigManager::new_from_path(&workspace.join("config/default.toml"))
-                .expect("load without the override")
-                .config()
-                .binding_store
-                .backend,
-            BindingStoreBackendKind::InMemory,
-            "the safe, single-process-compatible default must stand when nothing overrides it"
-        );
-
-        std::env::set_var("AENV_BINDING_STORE_BACKEND", "redis");
-        let overridden = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
-        std::env::remove_var("AENV_BINDING_STORE_BACKEND");
-        assert_eq!(
-            overridden
-                .expect("load with backend=redis")
-                .config()
-                .binding_store
-                .backend,
-            BindingStoreBackendKind::Redis
         );
     }
 

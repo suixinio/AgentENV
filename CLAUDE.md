@@ -188,7 +188,35 @@ namespace/Service) or `"static"` (seeds once at startup, no watch, from
 `AENV_CONFIG_PATH` names or an `AENV_CONFIG_OVERLAY_PATH` overlay, the way
 `deploy/docker/config/cluster-static-discovery-overlay.toml` does for
 `deploy/docker-compose.yml`, which has no Kubernetes API to discover
-against). `crates/aenv-api/src/orchestrator/paused_registry/postgres/`
+against).
+
+🔴 **The sandbox-to-node binding store is Redis, and there is no other.**
+`src/binding_store/` still holds two implementations, but only one is
+deployable: `build_binding_store` (`crates/aenv-api/src/bin/aenv-api.rs`)
+constructs `RedisBindingStore` unconditionally. There used to be a
+`[binding_store].backend` switch (`AENV_BINDING_STORE_BACKEND`, `"in_memory"`
+| `"redis"`, defaulting to `"in_memory"`) whose in-memory arm that same
+function refused *unconditionally* — `aenv-api` is a multi-replica Deployment,
+a routing table one replica cannot see misroutes silently, and nothing at that
+layer can tell a lone replica from one of several — so the field, its
+`BindingStoreBackendKind` enum, the refusal arm and the deployment values that
+set it (`deploy/docker-compose.yml`, `deploy/k8s/base/agentenv-api-deployment.yaml`)
+are all deleted; `AENV_BINDING_STORE_REDIS_URL` is now the whole
+configuration. `InMemoryBindingStore` is **not** deleted: it is gated behind
+`#[cfg(any(test, feature = "test-support"))]` (`src/binding_store/mod.rs`, on
+both `pub mod in_memory` and the re-export), because the shared contract suite
+(`src/binding_store/contract.rs`) runs the same assertions against both
+backends and that is what keeps a fix made to one and forgotten for the other
+from being invisible. `cfg(test)` alone would not do — it is per-crate, and
+`aenv-node`'s and `aenv-api`'s own suites would lose the symbol; both already
+take `aenv-core` with `features = ["test-support"]`, so no `Cargo.toml`
+change was needed. There is deliberately **no** startup refusal for a
+leftover `AENV_BINDING_STORE_BACKEND` (unlike `AENV_NODE_PLACEMENT_SOURCE` or
+the removed catalog variables): the only value a working deployment could
+have carried was `redis`, which is exactly what happens with the variable
+absent, so an un-migrated manifest cannot degrade.
+
+`crates/aenv-api/src/orchestrator/paused_registry/postgres/`
 similarly ports the paused-sandbox registry onto the same shared `[pg]` pool
 the snapshot catalog uses (`[orchestrator.paused_registry].backend =
 "postgres"`, requires a heartbeat roster — `aenv-api`'s own node registry,

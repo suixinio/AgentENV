@@ -119,7 +119,9 @@ services:
       # each answer for sandboxes the others also answer for.
       AENV_ORCHESTRATOR_STORE_BACKEND: redis
       AENV_ORCHESTRATOR_STORE_REDIS_URL: redis://redis:6379
-      AENV_BINDING_STORE_BACKEND: redis
+      # 🔴 No AENV_BINDING_STORE_BACKEND: the switch is deleted. Its only
+      # legal value was `redis` (`build_binding_store` refused `in_memory`
+      # unconditionally), so the URL is now the whole configuration.
       AENV_BINDING_STORE_REDIS_URL: redis://redis:6379
       # 🔴 Mandatory on this half: envd access tokens are HMAC(seed, sandbox_id),
       # so a seed invented per replica hands out tokens the others cannot

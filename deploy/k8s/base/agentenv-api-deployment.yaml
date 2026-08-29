@@ -426,21 +426,28 @@ spec:
             # "restore the scheduler manifests from git history" step named
             # above for `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, not a value
             # this Deployment can still express.
-            # 🔴 P4 (task's own "phase4-close"): `[binding_store]` backs
-            # `Schedule`/`LookupNode`/`RecordAssignment`, which native
-            # placement always answers locally (`NativeNodePlacement`,
+            # 🔴 `[binding_store]` backs `Schedule`/`LookupNode`/
+            # `RecordAssignment`, which native placement always answers
+            # locally (`NativeNodePlacement`,
             # `src/node_client/native_placement.rs`), and this Deployment
-            # runs `replicas: 2`: the code default (`in_memory`) is one
-            # replica's private routing table, and `build_binding_store`
-            # (`crates/aenv-api/src/bin/aenv-api.rs`) refuses to start on it
-            # unconditionally — the same refusal
-            # `AENV_ORCHESTRATOR_STORE_BACKEND`'s own comment above
-            # describes for the sandbox ledger. The same Redis, the same
-            # key prefix the store defaults to (`agentenv:scheduler:bindings`)
-            # and gateway's routing-projection read path already speaks to
-            # — do not rename it here; nothing else knows to follow.
-            - name: AENV_BINDING_STORE_BACKEND
-              value: "redis"
+            # runs `replicas: 2`. There is no backend key here any more:
+            # `AENV_BINDING_STORE_BACKEND` (`in_memory` | `redis`) is deleted
+            # along with the enum behind it, because `build_binding_store`
+            # (`crates/aenv-api/src/bin/aenv-api.rs`) refused `in_memory`
+            # unconditionally and Redis was therefore its only legal value.
+            # This URL is now the whole configuration. The same Redis, the
+            # same key prefix the store defaults to
+            # (`agentenv:scheduler:bindings`) and gateway's
+            # routing-projection read path already speaks to — do not rename
+            # it here; nothing else knows to follow.
+            #
+            # 🔴 Setting `AENV_BINDING_STORE_BACKEND` again does nothing:
+            # confique silently ignores an undeclared variable. It is safe to
+            # leave behind only because the value it used to have to carry
+            # (`redis`) is now what happens with no key at all — losing it
+            # cannot degrade this Deployment, which is why there is no
+            # startup refusal for it the way there is for
+            # `AENV_NODE_PLACEMENT_SOURCE`.
             - name: AENV_BINDING_STORE_REDIS_URL
               value: redis://agentenv-redis:6379
             # 🔴 The scheduler's SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE,
@@ -478,9 +485,9 @@ spec:
             # nodes whose heartbeat happens to land on it — this is what
             # `gateway`'s own `/nodes` split in half under two replicas.
             # `wire_shared_node_observed_store` (`src/bin/aenv-api.rs`) now
-            # refuses to start unconditionally on the in-memory default, the
-            # same discipline
-            # `AENV_BINDING_STORE_BACKEND`'s own comment above describes.
+            # refuses to start unconditionally on the in-memory default —
+            # the same discipline `[binding_store]` above took to its
+            # conclusion by deleting the choice entirely.
             # The same Redis, a namespace of its own
             # (`agentenv:node-registry`, not `agentenv:scheduler:bindings`
             # or `agentenv:api`) — do not rename it here; nothing else knows

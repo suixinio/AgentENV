@@ -11,7 +11,7 @@
 //! this backend, trait-facing or internal, is built from the same query
 //! shape, so there is nothing left to drift.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tracing::warn;
 use uuid::Uuid;
@@ -20,8 +20,8 @@ use super::row::{decode_entry, decode_list_entry, decode_registry_row, EntryRow,
 use super::sql;
 use super::PostgresPausedSandboxRegistry;
 use crate::orchestrator::paused_registry::{
-    PausedRegistryError, PausedRegistryListEntry, PausedRegistryListing, PausedSandboxEntry,
-    RegistryResult,
+    PausedRegistryError, PausedRegistryListEntry, PausedRegistryListing, PausedRegistryRows,
+    PausedSandboxEntry, RegistryResult,
 };
 use crate::types::SandboxId;
 
@@ -68,9 +68,13 @@ where
 pub async fn get_many(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_ids: &[SandboxId],
-) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+) -> RegistryResult<PausedRegistryRows> {
     if sandbox_ids.is_empty() {
-        return Ok(HashMap::new());
+        // 🔴 Asked nothing, covers nothing. The caller compares `covered`
+        // against the ids it passed, so an empty request is satisfied by an
+        // empty coverage list -- not by a claim to have answered for ids that
+        // were never in the batch.
+        return Ok(PausedRegistryRows::default());
     }
 
     let ids: Vec<Uuid> = sandbox_ids.iter().map(|id| id.into_inner()).collect();
@@ -81,55 +85,84 @@ pub async fn get_many(
         .await
         .map_err(|e| backend_err("get_many", e))?;
 
-    // 🔴 B6 (stop-gap): one row this crate cannot decode must not fail the
-    // whole batch. `get_many` exists precisely so a reconciliation pass can
-    // compare a node's roster against every row it holds in one round trip
-    // (this function's own doc); a `?` here turns one unreadable row into
-    // "every sandbox on this node looks untracked", which is a strictly
-    // worse outcome than the one bad row alone. Skipped rows are counted and
-    // named at `warn` so an operator can find and fix the record instead of
-    // this silently losing sandboxes from every caller's view.
-    //
-    // Not the full fix -- see this crate's own module doc on `get_many`'s
-    // trait contract for why the correct shape is a `Covered`/`Now`-style
-    // result (mirroring Go's `GetManyResult`) rather than a plain map, which
-    // is deferred to a later stage; this only stops one bad row from taking
-    // down every other row in the same batch.
-    let (out, skipped) = skip_bad_entries(rows);
+    // 🔴 One row this crate cannot decode must not fail the whole batch,
+    // and must not be reported as an absence either. `get_many` exists so a
+    // reconciliation pass can compare a node's whole roster against the
+    // registry in one round trip (the trait's own doc); a `?` here turns one
+    // unreadable row into "every sandbox on this node looks untracked", while
+    // silently dropping it turns that one row into "this sandbox is gone" --
+    // and the caller destroys a paused record or a live VM on exactly that
+    // answer. Both are wrong in the destructive direction, so the row is
+    // dropped from `entries` *and* withheld from `covered`: the batch keeps
+    // answering for every other id and declines to answer for this one.
+    let (rows, skipped) = collect_entries(sandbox_ids, rows);
     if skipped > 0 {
         warn!(
             target: "agentenv",
             skipped,
             requested = sandbox_ids.len(),
-            "paused registry get_many: some rows were skipped rather than failing the whole batch"
+            covered = rows.covered.len(),
+            "paused registry get_many: undecodable rows were withheld from the batch's coverage"
         );
     }
-    Ok(out)
+    Ok(rows)
 }
 
-/// The pure skip-and-count loop [`get_many`] runs -- pulled out so it is
+/// The pure decode-and-account loop [`get_many`] runs -- pulled out so it is
 /// testable without a database (see `#[cfg(test)] mod tests` below).
-fn skip_bad_entries(rows: Vec<EntryRow>) -> (HashMap<SandboxId, PausedSandboxEntry>, u32) {
-    let mut out = HashMap::with_capacity(rows.len());
+///
+/// `covered` is built from `requested` rather than from the rows that came
+/// back, because absence is a real answer here: an id the cluster holds no row
+/// for is answered for, and the caller is entitled to act on it. What removes
+/// an id from `covered` is a row that exists and could not be read.
+///
+/// 🔴 A row whose own `sandbox_id` column will not parse cannot be
+/// attributed to any requested id, so there is no single id to withhold. The
+/// batch then covers nothing: with an unattributable row in the result set,
+/// *any* of the requested ids could be the one whose row was unreadable, and
+/// "some absence in here is a lie" is not a state a destructive caller can
+/// safely act on for the rest.
+fn collect_entries(requested: &[SandboxId], rows: Vec<EntryRow>) -> (PausedRegistryRows, u32) {
+    let mut entries = HashMap::with_capacity(rows.len());
+    let mut undecodable: HashSet<SandboxId> = HashSet::new();
+    let mut unattributable = 0u32;
     let mut skipped = 0u32;
+
     for row in rows {
-        let sandbox_id = row.sandbox_id.clone();
+        let raw_id = row.sandbox_id.clone();
         match decode_entry(row) {
             Ok(entry) => {
-                out.insert(entry.sandbox_id, entry);
+                entries.insert(entry.sandbox_id, entry);
             }
             Err(err) => {
                 skipped += 1;
+                match SandboxId::parse_str(&raw_id) {
+                    Ok(sandbox_id) => {
+                        undecodable.insert(sandbox_id);
+                    }
+                    Err(_) => unattributable += 1,
+                }
                 warn!(
                     target: "agentenv",
-                    sandbox_id,
+                    sandbox_id = raw_id,
                     error = %err,
-                    "paused registry get_many: skipping a row this build cannot decode"
+                    "paused registry get_many: withholding a row this build cannot decode"
                 );
             }
         }
     }
-    (out, skipped)
+
+    let covered = if unattributable > 0 {
+        Vec::new()
+    } else {
+        requested
+            .iter()
+            .copied()
+            .filter(|id| !undecodable.contains(id))
+            .collect()
+    };
+
+    (PausedRegistryRows { entries, covered }, skipped)
 }
 
 /// Every row in `cluster_id` -- the internal listing
@@ -139,14 +172,15 @@ fn skip_bad_entries(rows: Vec<EntryRow>) -> (HashMap<SandboxId, PausedSandboxEnt
 /// that to matter is a scaling question for a later stage, not a
 /// correctness one for this one.
 ///
-/// 🔴 B6 (stop-gap): same reasoning as [`get_many`] above, and higher
-/// stakes -- this is the reconcile leader's own per-tick read. Before this
-/// fix, one row this build could not decode failed the whole `Vec::collect`,
-/// which failed every tick's reconcile pass forever (the bad row never goes
-/// away on its own), which stops Fix A's lease renewal for the *entire*
-/// cluster -- precisely the "running row lease freeze" failure mode this
-/// backend already exists to avoid (see B1's own doc). A skipped row is
-/// counted and named at `warn` instead.
+/// 🔴 Skip-and-count, and unlike [`get_many`] that is the whole fix here rather
+/// than half of one. One row this build could not decode used to fail the whole
+/// `Vec::collect`, which failed every tick's reconcile pass forever (the bad row
+/// never goes away on its own), which stops Fix A's lease renewal for the
+/// *entire* cluster -- precisely the "running row lease freeze" failure mode
+/// this backend already exists to avoid (see B1's own doc). A skipped row is
+/// counted and named at `warn` instead, and needs no coverage list on top
+/// because this listing's only consumer counts rows rather than acting on their
+/// absence -- see [`skip_bad_registry_rows`].
 pub async fn list_registry_rows(
     registry: &PostgresPausedSandboxRegistry,
 ) -> RegistryResult<Vec<RegistryRow>> {
@@ -172,8 +206,13 @@ pub async fn list_registry_rows(
     Ok(out)
 }
 
-/// The pure skip-and-count loop [`list_registry_rows`] runs -- see
-/// [`skip_bad_entries`]'s identical shape and reasoning.
+/// The pure skip-and-count loop [`list_registry_rows`] runs.
+///
+/// Still a plain skip-and-count, unlike [`collect_entries`]: this listing's
+/// consumer is [`super::reconcile::compute_reconcile`], which counts metrics
+/// over the rows it is given and never acts on a row's *absence*. A skipped row
+/// costs this pass its contribution to those counters and nothing else, so
+/// there is no absence for a coverage list to protect here.
 fn skip_bad_registry_rows(rows: Vec<EntryRow>) -> (Vec<RegistryRow>, u32) {
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0u32;
@@ -255,9 +294,12 @@ pub async fn list_all(
     })
 }
 
-/// The pure skip-and-count loop [`list_all`] runs -- see [`skip_bad_entries`]'s
-/// identical shape and reasoning: one row this build cannot decode must not
-/// take an admin/debug listing of every other row down with it.
+/// The pure skip-and-count loop [`list_all`] runs: one row this build cannot
+/// decode must not take an admin/debug listing of every other row down with it.
+///
+/// No coverage list, for [`skip_bad_registry_rows`]'s reason -- this feeds
+/// `ListRegistrySandboxes`, a read-only listing whose callers report what they
+/// were shown rather than destroying what they were not.
 fn skip_bad_list_entries(rows: Vec<EntryRow>) -> (Vec<PausedRegistryListEntry>, u32) {
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0u32;
@@ -323,7 +365,7 @@ mod tests {
     /// unrecognised `state` string, which no CHECK constraint short of a
     /// direct hand-corruption (or a build mismatch reading a differently
     /// migrated table) should ever actually produce -- but exactly the
-    /// shape [`skip_bad_entries`]/[`skip_bad_registry_rows`] exist to
+    /// shape [`collect_entries`]/[`skip_bad_registry_rows`] exist to
     /// survive rather than propagate.
     fn unreadable_row(sandbox_id: Uuid, cluster_id: Uuid) -> EntryRow {
         let mut row = good_row(sandbox_id, cluster_id);
@@ -331,40 +373,118 @@ mod tests {
         row
     }
 
-    /// The core B6 claim for `get_many`: one bad row must not take the good
-    /// one down with it.
+    fn sid(raw: Uuid) -> SandboxId {
+        SandboxId::parse_str(&raw.to_string()).unwrap()
+    }
+
+    /// One bad row must not take the good one down with it.
     #[test]
-    fn skip_bad_entries_keeps_the_good_row_and_counts_the_bad_one() {
+    fn collect_entries_keeps_the_good_row_and_counts_the_bad_one() {
         let cluster_id = Uuid::new_v4();
         let good_id = Uuid::new_v4();
         let bad_id = Uuid::new_v4();
+        let requested = vec![sid(good_id), sid(bad_id)];
         let rows = vec![
             good_row(good_id, cluster_id),
             unreadable_row(bad_id, cluster_id),
         ];
 
-        let (out, skipped) = skip_bad_entries(rows);
+        let (rows, skipped) = collect_entries(&requested, rows);
         assert_eq!(skipped, 1, "exactly the one unreadable row must be skipped");
-        assert_eq!(out.len(), 1, "the good row must still be present");
+        assert_eq!(rows.entries.len(), 1, "the good row must still be present");
         assert!(
-            out.contains_key(&SandboxId::parse_str(&good_id.to_string()).unwrap()),
+            rows.entries.contains_key(&sid(good_id)),
             "the good row's own sandbox id must be the one that survived"
         );
     }
 
-    /// A batch with nothing wrong in it must report zero skipped -- this
-    /// fix must not turn a clean batch into a partially-reported one.
+    /// 🔴 The A1 claim itself: an unreadable row is withheld from `covered`, so
+    /// a caller that destroys on absence cannot read it as "this sandbox is
+    /// gone". Without this the row simply vanishes from the map and
+    /// `reap_superseded_running_sandboxes` tears down a live VM.
     #[test]
-    fn skip_bad_entries_reports_nothing_skipped_when_every_row_decodes() {
+    fn collect_entries_withholds_coverage_for_a_row_it_cannot_decode() {
         let cluster_id = Uuid::new_v4();
+        let good_id = Uuid::new_v4();
+        let bad_id = Uuid::new_v4();
+        let requested = vec![sid(good_id), sid(bad_id)];
         let rows = vec![
-            good_row(Uuid::new_v4(), cluster_id),
-            good_row(Uuid::new_v4(), cluster_id),
+            good_row(good_id, cluster_id),
+            unreadable_row(bad_id, cluster_id),
         ];
 
-        let (out, skipped) = skip_bad_entries(rows);
+        let (rows, _) = collect_entries(&requested, rows);
+        assert!(
+            !rows.covers(&requested),
+            "a batch holding an undecodable row must not claim to cover it"
+        );
+        assert_eq!(rows.covered, vec![sid(good_id)]);
+        assert!(
+            !rows.covered.contains(&sid(bad_id)),
+            "the undecodable row's id is exactly the one absence must not be trusted for"
+        );
+    }
+
+    /// An id the cluster holds no row for is still *answered for*: absence is a
+    /// real result, and reconciliation is entitled to act on it. Only a row
+    /// that exists and cannot be read costs coverage.
+    #[test]
+    fn collect_entries_covers_an_id_with_no_row_at_all() {
+        let cluster_id = Uuid::new_v4();
+        let present = Uuid::new_v4();
+        let absent = Uuid::new_v4();
+        let requested = vec![sid(present), sid(absent)];
+
+        let (rows, skipped) = collect_entries(&requested, vec![good_row(present, cluster_id)]);
         assert_eq!(skipped, 0);
-        assert_eq!(out.len(), 2);
+        assert!(rows.entries.contains_key(&sid(present)));
+        assert!(!rows.entries.contains_key(&sid(absent)));
+        assert!(
+            rows.covers(&requested),
+            "an absent row is an answer, not a gap in coverage"
+        );
+    }
+
+    /// 🔴 A row whose own id column will not parse cannot be attributed to a
+    /// requested id, so no single id can be withheld -- and any of them could
+    /// be the one. The batch then covers nothing rather than covering the rest
+    /// on a guess.
+    #[test]
+    fn collect_entries_covers_nothing_when_a_bad_row_cannot_be_attributed() {
+        let cluster_id = Uuid::new_v4();
+        let good_id = Uuid::new_v4();
+        let requested = vec![sid(good_id), sid(Uuid::new_v4())];
+        let mut orphan = good_row(Uuid::new_v4(), cluster_id);
+        orphan.sandbox_id = "not-a-uuid".to_string();
+
+        let (rows, skipped) =
+            collect_entries(&requested, vec![good_row(good_id, cluster_id), orphan]);
+        assert_eq!(skipped, 1);
+        assert!(
+            rows.covered.is_empty(),
+            "an unattributable bad row makes every absence in the batch untrustworthy"
+        );
+        assert!(
+            rows.entries.contains_key(&sid(good_id)),
+            "the rows that did decode are still returned; only coverage is withheld"
+        );
+    }
+
+    /// A batch with nothing wrong in it must report zero skipped and full
+    /// coverage -- this fix must not turn a clean batch into a partially
+    /// reported one.
+    #[test]
+    fn collect_entries_reports_nothing_skipped_when_every_row_decodes() {
+        let cluster_id = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let requested = vec![sid(first), sid(second)];
+        let rows = vec![good_row(first, cluster_id), good_row(second, cluster_id)];
+
+        let (rows, skipped) = collect_entries(&requested, rows);
+        assert_eq!(skipped, 0);
+        assert_eq!(rows.entries.len(), 2);
+        assert!(rows.covers(&requested));
     }
 
     /// The identical claim for [`list_registry_rows`]'s own loop -- the one
@@ -407,7 +527,7 @@ mod tests {
     }
 
     /// A clean batch must report zero skipped -- mirrors
-    /// `skip_bad_entries_reports_nothing_skipped_when_every_row_decodes`.
+    /// `collect_entries_reports_nothing_skipped_when_every_row_decodes`.
     #[test]
     fn skip_bad_list_entries_reports_nothing_skipped_when_every_row_decodes() {
         let cluster_id = Uuid::new_v4();

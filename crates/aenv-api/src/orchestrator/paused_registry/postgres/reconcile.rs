@@ -218,17 +218,15 @@ fn record_reconcile_metrics(
 ) {
     let cluster_label = cluster_id.to_string();
 
-    let mut by_state: std::collections::HashMap<&'static str, u64> = [
-        ("publishing", 0),
-        ("paused", 0),
-        ("resuming", 0),
-        ("local_only", 0),
-        ("running", 0),
-    ]
-    .into_iter()
-    .collect();
+    // Seeded from the enum rather than a literal list so a state that reports
+    // zero rows still publishes a zero gauge -- a series that disappears and a
+    // series that reads zero mean different things to an alert.
+    let mut by_state: std::collections::HashMap<&'static str, u64> = PausedRegistryState::ALL
+        .iter()
+        .map(|s| (s.as_str(), 0))
+        .collect();
     for row in rows {
-        *by_state.entry(row_state_label(row.state)).or_insert(0) += 1;
+        *by_state.entry(row.state.as_str()).or_insert(0) += 1;
     }
     for (state, count) in by_state {
         metrics::gauge!(
@@ -263,16 +261,6 @@ fn record_reconcile_metrics(
 
 fn record_reconcile_read_failure(cluster_id: Uuid) {
     metrics::counter!(READ_FAILURES_METRIC, "cluster_id" => cluster_id.to_string()).increment(1);
-}
-
-fn row_state_label(state: PausedRegistryState) -> &'static str {
-    match state {
-        PausedRegistryState::Publishing => "publishing",
-        PausedRegistryState::Paused => "paused",
-        PausedRegistryState::Resuming => "resuming",
-        PausedRegistryState::LocalOnly => "local_only",
-        PausedRegistryState::Running => "running",
-    }
 }
 
 /// Ports `agentenv_scheduler_registry_rows{state}`.

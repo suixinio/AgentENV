@@ -1101,8 +1101,8 @@ mod tests {
     use super::test_support::{CountingRegistry, GetAnswer};
     use super::*;
     use crate::orchestrator::{
-        BeganPause, HeldSandbox, PausedRegistryError, ReclaimedHoldings, RegistryResult,
-        ReleasedHoldings, ResumeClaim,
+        BeganPause, HeldSandbox, PausedRegistryError, PausedRegistryRows, ReclaimedHoldings,
+        RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::sandbox::CapturedSandboxSnapshot;
     use crate::snapshot::repository::{
@@ -1698,16 +1698,18 @@ mod tests {
             Ok(self.row(sandbox_id))
         }
 
-        async fn get_many(
-            &self,
-            sandbox_ids: &[SandboxId],
-        ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+        async fn get_many(&self, sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
             let rows = self.rows.lock().unwrap();
 
-            Ok(sandbox_ids
-                .iter()
-                .filter_map(|id| rows.get(id).map(|row| (*id, row.clone())))
-                .collect())
+            // A stub that always answers for everything it was asked: it reads
+            // an in-memory map, so there is no row it can fail to decode.
+            Ok(PausedRegistryRows::fully_covering(
+                sandbox_ids
+                    .iter()
+                    .filter_map(|id| rows.get(id).map(|row| (*id, row.clone())))
+                    .collect(),
+                sandbox_ids,
+            ))
         }
 
         async fn claim_for_resume(
@@ -2662,8 +2664,8 @@ pub mod test_support {
 
     use crate::orchestrator::{
         BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
-        PausedRegistryError, PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings,
-        RegistryResult, ReleasedHoldings, ResumeClaim,
+        PausedRegistryError, PausedRegistryRows, PausedSandboxEntry, PausedSandboxRegistry,
+        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::snapshot::SnapshotId;
     use crate::types::{ExecutionId, SandboxId};
@@ -2859,11 +2861,11 @@ pub mod test_support {
             }
         }
 
-        async fn get_many(
-            &self,
-            _sandbox_ids: &[SandboxId],
-        ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
-            Ok(HashMap::new())
+        async fn get_many(&self, sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
+            Ok(PausedRegistryRows::fully_covering(
+                HashMap::new(),
+                sandbox_ids,
+            ))
         }
 
         async fn claim_for_resume(

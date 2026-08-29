@@ -168,9 +168,12 @@ pub struct SandboxListFilter {
 /// a caller can assert `covered.len() == ids.len()` before treating absence as
 /// authorisation to destroy anything.
 ///
-/// This mirrors `registry.Rows.Covered` on the Go side
-/// (`services/scheduler/internal/registry/store.go`), which
-/// `paused_registry::central::require_full_coverage` already asserts against.
+/// [`PausedRegistryRows`](crate::orchestrator::PausedRegistryRows) is the same
+/// shape on the paused-registry side, for the same reason and with the same
+/// rule: a caller that destroys on absence checks coverage first. (Both
+/// descend from `registry.Rows.Covered` in the Go scheduler, which is
+/// deleted; this is now the older of the two copies, not a port of a live
+/// one.)
 #[derive(Debug, Default)]
 pub struct MetadataRows {
     pub entries: HashMap<SandboxId, SandboxMetadata>,

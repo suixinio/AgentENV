@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 
 use super::{
     BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedRegistryListing,
-    PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
-    ResumeClaim,
+    PausedRegistryRows, PausedSandboxEntry, PausedSandboxRegistry, ReclaimedHoldings,
+    RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
@@ -49,11 +47,17 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(None)
     }
 
-    async fn get_many(
-        &self,
-        _sandbox_ids: &[SandboxId],
-    ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
-        Ok(HashMap::new())
+    /// Covers nothing, rather than covering everything as absent.
+    ///
+    /// 🔴 The difference matters even though `reconcile_local_records` already
+    /// refuses to run against a registry that is not cluster-backed: "every
+    /// sandbox you asked about is gone" is the one answer that must never come
+    /// out of a registry that was never consulted, and saying it here would
+    /// leave that single gate as the only thing between a no-op backend and a
+    /// node tearing down its whole roster. An empty `covered` makes the same
+    /// guarantee structurally, at the type.
+    async fn get_many(&self, _sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
+        Ok(PausedRegistryRows::default())
     }
 
     async fn claim_for_resume(

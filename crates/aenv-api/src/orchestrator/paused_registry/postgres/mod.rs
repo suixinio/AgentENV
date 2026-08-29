@@ -62,7 +62,6 @@ pub mod schema;
 mod sql;
 mod writes;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -78,9 +77,9 @@ use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
 use super::{
-    BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedSandboxEntry,
-    PausedSandboxRegistry, PostgresPausedRegistryFactory, ReclaimedHoldings, RegistryResult,
-    ReleasedHoldings, ResumeClaim,
+    BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedRegistryRows,
+    PausedSandboxEntry, PausedSandboxRegistry, PostgresPausedRegistryFactory, ReclaimedHoldings,
+    RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 
 /// [`PostgresPausedRegistryFactory`] over one shared `[pg]` pool.
@@ -184,10 +183,7 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
         reads::get(self, sandbox_id).await
     }
 
-    async fn get_many(
-        &self,
-        sandbox_ids: &[SandboxId],
-    ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>> {
+    async fn get_many(&self, sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
         reads::get_many(self, sandbox_ids).await
     }
 

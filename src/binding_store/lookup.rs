@@ -342,16 +342,6 @@ fn lookup_absent(warm: bool) -> LookupOutcome {
     }
 }
 
-fn paused_state_label(state: PausedRegistryState) -> &'static str {
-    match state {
-        PausedRegistryState::Publishing => "publishing",
-        PausedRegistryState::Paused => "paused",
-        PausedRegistryState::Resuming => "resuming",
-        PausedRegistryState::LocalOnly => "local_only",
-        PausedRegistryState::Running => "running",
-    }
-}
-
 /// Ports `lookupNode` (`lookup.go:134-373`). `sandbox_id` must already be
 /// non-empty -- the caller's `InvalidArgument` check runs before this, the
 /// same layering `RecordAssignment`'s own validation already uses in
@@ -459,7 +449,7 @@ pub async fn lookup_node(
                     LookupResultLabel::OriginNotReporting,
                     format!(
                         "sandbox is {} on node {}, which is not reporting",
-                        paused_state_label(entry.state),
+                        entry.state.as_str(),
                         entry.origin_node_id
                     ),
                 ),
@@ -467,7 +457,7 @@ pub async fn lookup_node(
                     LookupResultLabel::OriginUnschedulable,
                     format!(
                         "sandbox is {} on node {}, which is not accepting work",
-                        paused_state_label(entry.state),
+                        entry.state.as_str(),
                         entry.origin_node_id
                     ),
                 ),
@@ -499,7 +489,7 @@ pub async fn lookup_node(
                     LookupResultLabel::HolderUnreachable,
                     format!(
                         "sandbox is {} on node {holder_id}, which is not reporting",
-                        paused_state_label(entry.state),
+                        entry.state.as_str(),
                     ),
                 ),
                 Some(node) => {

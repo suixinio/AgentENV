@@ -1148,34 +1148,6 @@ impl Scheduler for NodeRegistryGrpcService {
     }
 }
 
-/// The five values [`PausedRegistryState`]'s `state` column may hold, in
-/// the order Go's `KnownStates()` presents them (`registry.go:44-46`) --
-/// used both to encode a row's state onto the wire and to name the
-/// accepted set in a `ListRegistrySandboxes` "unknown state" error.
-const KNOWN_REGISTRY_STATES: [PausedRegistryState; 5] = [
-    PausedRegistryState::Publishing,
-    PausedRegistryState::Paused,
-    PausedRegistryState::Resuming,
-    PausedRegistryState::LocalOnly,
-    PausedRegistryState::Running,
-];
-
-/// The literal each state encodes as on the wire -- matches the column's own
-/// CHECK-constrained values (`sql::ENTRY_COLUMNS`' decode side,
-/// `PausedRegistryState::parse`), duplicated here rather than reused because
-/// that decode is private to `orchestrator::paused_registry` -- the same
-/// duplication `binding_store::lookup::paused_state_label` and
-/// `paused_registry::postgres::reconcile`'s own copy already carry.
-fn registry_state_str(state: PausedRegistryState) -> &'static str {
-    match state {
-        PausedRegistryState::Publishing => "publishing",
-        PausedRegistryState::Paused => "paused",
-        PausedRegistryState::Resuming => "resuming",
-        PausedRegistryState::LocalOnly => "local_only",
-        PausedRegistryState::Running => "running",
-    }
-}
-
 /// Ports `parseRegistryStateFilter` (`service.go:947-965`): an empty filter
 /// means every state; anything else is matched case-insensitively (Go's
 /// `ParseState` uses `strings.EqualFold`) against the five known values, and
@@ -1188,15 +1160,15 @@ fn parse_registry_state_filter(raw: &str) -> Result<Option<PausedRegistryState>,
     if trimmed.is_empty() {
         return Ok(None);
     }
-    for state in KNOWN_REGISTRY_STATES {
-        if registry_state_str(state).eq_ignore_ascii_case(trimmed) {
+    for state in PausedRegistryState::ALL {
+        if state.as_str().eq_ignore_ascii_case(trimmed) {
             return Ok(Some(state));
         }
     }
-    let known: Vec<&str> = KNOWN_REGISTRY_STATES
+    let known: Vec<&str> = PausedRegistryState::ALL
         .iter()
         .copied()
-        .map(registry_state_str)
+        .map(PausedRegistryState::as_str)
         .collect();
     Err(Status::invalid_argument(format!(
         "unknown state '{trimmed}', must be one of {}",
@@ -1213,7 +1185,7 @@ fn registry_sandbox_to_proto(entry: &PausedRegistryListEntry) -> scheduler::Regi
     scheduler::RegistrySandbox {
         sandbox_id: entry.sandbox_id.to_string(),
         cluster_id: entry.cluster_id.to_string(),
-        state: registry_state_str(entry.state).to_string(),
+        state: entry.state.as_str().to_string(),
         generation: entry.generation,
         origin_node_id: entry.origin_node_id.clone(),
         claimed_by_node_id: entry.claimed_by_node_id.clone().unwrap_or_default(),
@@ -2756,8 +2728,8 @@ mod tests {
     use crate::binding_store::{BindingStoreSettings, InMemoryBindingStore};
     use crate::orchestrator::{
         BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
-        PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState, PausedSandboxEntry,
-        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
+        PausedRegistryListEntry, PausedRegistryListing, PausedRegistryRows, PausedRegistryState,
+        PausedSandboxEntry, ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
     };
     use crate::types::{ExecutionId, SandboxId};
 
@@ -2826,10 +2798,7 @@ mod tests {
         ) -> RegistryResult<()> {
             unimplemented!("lookup_node never calls this")
         }
-        async fn get_many(
-            &self,
-            _sandbox_ids: &[SandboxId],
-        ) -> RegistryResult<StdHashMap<SandboxId, PausedSandboxEntry>> {
+        async fn get_many(&self, _sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
             unimplemented!("lookup_node never calls this")
         }
         async fn claim_for_resume(
@@ -3037,10 +3006,7 @@ mod tests {
         ) -> RegistryResult<()> {
             unimplemented!("list_registry_sandboxes never calls this")
         }
-        async fn get_many(
-            &self,
-            _sandbox_ids: &[SandboxId],
-        ) -> RegistryResult<StdHashMap<SandboxId, PausedSandboxEntry>> {
+        async fn get_many(&self, _sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
             unimplemented!("list_registry_sandboxes never calls this")
         }
         async fn claim_for_resume(

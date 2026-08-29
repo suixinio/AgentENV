@@ -854,10 +854,30 @@ impl ApiImpl {
                 return;
             }
         };
+        // 🔴 The same rule one level finer. The error arm above covers a batch
+        // that failed outright; this covers a batch that came back short — a
+        // row the backend read but could not decode is dropped from `entries`,
+        // and without this it would arrive here as an absence and be torn down
+        // as "held elsewhere". A sandbox whose row cannot be read is a sandbox
+        // nothing is known about, which is the one state that must not license
+        // destroying it.
+        let answered = rows.answered();
+        if !rows.covers(&ids) {
+            warn!(
+                requested = ids.len(),
+                covered = answered.len(),
+                "registry answered for only part of the roster; leaving the rest of the running sandboxes alone"
+            );
+        }
 
         for (sandbox_id, registered_as) in registered {
-            let Some(superseded) =
-                running_supersession(rows.get(&sandbox_id), &registered_as, self.paused.node_id())
+            // Not answered for: judge nothing. `AnsweredRows::get` is what
+            // makes this step impossible to skip -- there is no way to reach
+            // the row, or its absence, without it.
+            let Some(row) = answered.get(&sandbox_id) else {
+                continue;
+            };
+            let Some(superseded) = running_supersession(row, &registered_as, self.paused.node_id())
             else {
                 continue;
             };
@@ -945,10 +965,29 @@ impl ApiImpl {
             }
         };
 
+        // 🔴 See `reap_superseded_running_sandboxes` for the reasoning: an id the
+        // batch could not answer for must not reach the `None => Gone` arm
+        // below, which deletes the record *and* its artifacts — on this path
+        // the local copy is frequently the only copy.
+        let answered = rows.answered();
+        if !rows.covers(&ids) {
+            warn!(
+                requested = ids.len(),
+                covered = answered.len(),
+                "registry answered for only part of the roster; leaving the rest of the paused records alone"
+            );
+        }
+
         let mut discarded = 0usize;
         for (sandbox_id, registration) in registered {
-            // Registered once, no row now: resumed elsewhere, or deleted.
-            let superseded = match rows.get(&sandbox_id) {
+            // Outer `None`: the batch did not answer for this sandbox, so
+            // nothing is known about it and nothing may be deleted. Inner
+            // `None`: registered once, no row now -- resumed elsewhere, or
+            // deleted.
+            let Some(row) = answered.get(&sandbox_id) else {
+                continue;
+            };
+            let superseded = match row {
                 None => Superseded::Gone,
                 Some(entry) => match supersession(entry, &registration) {
                     Some(superseded) => superseded,

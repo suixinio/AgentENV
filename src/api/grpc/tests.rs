@@ -1110,9 +1110,7 @@ impl crate::orchestrator::PausedSandboxRegistry for GrantingRegistry {
     async fn get_many(
         &self,
         sandbox_ids: &[SandboxId],
-    ) -> crate::orchestrator::RegistryResult<
-        std::collections::HashMap<SandboxId, crate::orchestrator::PausedSandboxEntry>,
-    > {
+    ) -> crate::orchestrator::RegistryResult<crate::orchestrator::PausedRegistryRows> {
         self.inner.get_many(sandbox_ids).await
     }
     async fn renew_lease(

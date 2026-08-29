@@ -20,7 +20,6 @@
 pub mod disabled;
 pub mod types;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -38,8 +37,8 @@ use crate::types::{ExecutionId, SandboxId};
 pub use disabled::DisabledPausedSandboxRegistry;
 pub use types::{
     BeganPause, ConflictReason, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome,
-    PausedRegistryListEntry, PausedRegistryListing, PausedRegistryState, PausedSandboxEntry,
-    ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
+    PausedRegistryListEntry, PausedRegistryListing, PausedRegistryRows, PausedRegistryState,
+    PausedSandboxEntry, ReclaimedHoldings, ReleasedHoldings, ResumeClaim,
 };
 
 pub type RegistryResult<T> = std::result::Result<T, PausedRegistryError>;
@@ -135,12 +134,17 @@ pub trait PausedSandboxRegistry: Send + Sync {
     /// state that a sandbox read late already contradicts. One query answers
     /// both.
     ///
-    /// A sandbox missing from the returned map has no row — the same answer
-    /// `get` gives as `None`, and never "we did not look".
-    async fn get_many(
-        &self,
-        sandbox_ids: &[SandboxId],
-    ) -> RegistryResult<HashMap<SandboxId, PausedSandboxEntry>>;
+    /// 🔴 A sandbox missing from [`PausedRegistryRows::entries`] has no row —
+    /// the same answer `get` gives as `None` — **but only for the ids the batch
+    /// reports as covered**. That distinction is load-bearing rather than
+    /// pedantic: both callers of this method destroy something on the strength
+    /// of an absence (a paused record with its artifacts, or a running VM), so
+    /// an implementation that shortens the map when it cannot read a row
+    /// converts "unreadable" into "gone" and the caller acts on it. Backends
+    /// list an id in `covered` only when they can stand behind the answer;
+    /// callers check [`covers`](PausedRegistryRows::covers) before treating any
+    /// absence as authorisation.
+    async fn get_many(&self, sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows>;
 
     /// Takes ownership of a paused sandbox so this node can resume it.
     ///

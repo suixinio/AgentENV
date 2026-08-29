@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -33,6 +35,20 @@ pub enum PausedRegistryState {
 }
 
 impl PausedRegistryState {
+    /// The five values the `state` column may hold, in the order Go's
+    /// `KnownStates()` presented them (`registry.go:44-46`).
+    ///
+    /// Used to name the accepted set in a `ListRegistrySandboxes` "unknown
+    /// state" error and to seed the per-state row gauge, so that a state added
+    /// to the enum shows up in both without either being edited.
+    pub const ALL: [Self; 5] = [
+        Self::Publishing,
+        Self::Paused,
+        Self::Resuming,
+        Self::LocalOnly,
+        Self::Running,
+    ];
+
     /// Decodes the textual form stored in the registry. The encoded values are
     /// written literally by the backend's SQL and pinned there by a CHECK
     /// constraint, so this is the only place that has to know them.
@@ -44,6 +60,27 @@ impl PausedRegistryState {
             "local_only" => Some(Self::LocalOnly),
             "running" => Some(Self::Running),
             _ => None,
+        }
+    }
+
+    /// [`parse`](Self::parse)'s inverse, and the only place these literals are
+    /// produced.
+    ///
+    /// 🔴 The strings are wire and schema, not display text: the
+    /// `paused_sandboxes` CHECK constraint, the `Scheduler` proto's state
+    /// filter, and the gateway's own tests all pin these exact five values, so
+    /// a rename here is a migration rather than an edit. That is precisely why
+    /// there is one copy — three call sites used to carry a private `match`
+    /// each (`node_registry::grpc_service`, `binding_store::lookup`, and the
+    /// postgres backend's `reconcile`), byte-identical and free to drift apart
+    /// one at a time.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Publishing => "publishing",
+            Self::Paused => "paused",
+            Self::Resuming => "resuming",
+            Self::LocalOnly => "local_only",
+            Self::Running => "running",
         }
     }
 }
@@ -110,6 +147,111 @@ pub struct PausedSandboxEntry {
     pub execution_id: Option<ExecutionId>,
     pub paused_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A batched registry read, plus the ids it can actually answer for.
+///
+/// 🔴 The `covered` list is the whole point, and it exists because the two
+/// answers a plain map conflates have opposite consequences. Reconciliation
+/// destroys things on the strength of an absence — a paused record and its
+/// artifacts (`discard_paused_record`), or a *live VM*
+/// (`discard_superseded_sandbox`) — so "asked, and the cluster holds no row"
+/// must be distinguishable from "did not ask" and from "asked, and this build
+/// could not read the answer". In a bare `HashMap` all three are the same
+/// missing key.
+///
+/// A backend puts an id in `covered` only when it can stand behind the answer
+/// for it, present and absent alike. A row it read but could not decode is
+/// therefore *not* covered: the sandbox exists as far as the cluster is
+/// concerned, and treating it as gone is the exact inversion that turns one
+/// unreadable row into a torn-down sandbox.
+///
+/// This mirrors [`MetadataRows`](crate::orchestrator::store::MetadataRows) on
+/// the sandbox-metadata side, which already has this shape and a contract test
+/// (`store::contract::get_many_reports_what_it_covered`) pinning it.
+#[derive(Debug, Default)]
+pub struct PausedRegistryRows {
+    pub entries: HashMap<SandboxId, PausedSandboxEntry>,
+    pub covered: Vec<SandboxId>,
+}
+
+impl PausedRegistryRows {
+    /// Every id asked about, answered for.
+    ///
+    /// Callers that act destructively on absence must check this before reading
+    /// [`entries`](Self::entries) — see the type's own doc for why a shortened
+    /// batch is indistinguishable from a cluster that holds nothing.
+    pub fn covers(&self, ids: &[SandboxId]) -> bool {
+        self.covered.len() == ids.len()
+    }
+
+    /// This batch narrowed to the ids it can answer for.
+    ///
+    /// Built once per pass rather than scanned per id: reconciliation asks
+    /// about every sandbox on the node, so a linear membership test inside that
+    /// loop is quadratic in the roster.
+    pub fn answered(&self) -> AnsweredRows<'_> {
+        AnsweredRows {
+            entries: &self.entries,
+            covered: self.covered.iter().copied().collect(),
+        }
+    }
+
+    /// A batch that answered for every id it was given.
+    ///
+    /// The shape a backend with nothing to skip returns, and the only one a
+    /// caller acting on absence will accept.
+    pub fn fully_covering(
+        entries: HashMap<SandboxId, PausedSandboxEntry>,
+        ids: &[SandboxId],
+    ) -> Self {
+        Self {
+            entries,
+            covered: ids.to_vec(),
+        }
+    }
+}
+
+/// A [`PausedRegistryRows`] that will not hand out a row without first saying
+/// whether it answered for that id.
+///
+/// 🔴 This exists to make the fail-open shape unrepresentable at the call site
+/// rather than merely discouraged. The guard it replaces was a hand-written
+/// `if !covered.contains(&id) { continue; }` sitting above a plain map lookup:
+/// correct, invisible, and deletable without breaking a single test or type —
+/// which is exactly how the original defect arrived. Going through
+/// [`get`](Self::get) means a caller cannot reach an entry, or an absence,
+/// without having been handed the coverage answer in the same expression.
+pub struct AnsweredRows<'a> {
+    entries: &'a HashMap<SandboxId, PausedSandboxEntry>,
+    covered: HashSet<SandboxId>,
+}
+
+impl<'a> AnsweredRows<'a> {
+    /// The batch's answer for one id, or `None` when it has none.
+    ///
+    /// The two `None`s are different facts and the nesting is what keeps them
+    /// apart:
+    ///
+    /// - `None` — the batch did not answer for this id (a row it could not
+    ///   read, or an id it was never asked about). **Judge nothing.**
+    /// - `Some(None)` — asked, and the cluster holds no row. A real absence,
+    ///   and the one a caller may act on.
+    /// - `Some(Some(entry))` — asked, and here is the row.
+    pub fn get(&self, sandbox_id: &SandboxId) -> Option<Option<&'a PausedSandboxEntry>> {
+        self.covered
+            .contains(sandbox_id)
+            .then(|| self.entries.get(sandbox_id))
+    }
+
+    /// How many ids this batch answered for, for the caller's own log line.
+    pub fn len(&self) -> usize {
+        self.covered.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.covered.is_empty()
+    }
 }
 
 /// What [`PausedSandboxRegistry::begin_pause`](super::PausedSandboxRegistry::begin_pause) hands back.
@@ -335,4 +477,98 @@ impl PausedRegistryListEntry {
 pub struct PausedRegistryListing {
     pub sandboxes: Vec<PausedRegistryListEntry>,
     pub now: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(sandbox_id: SandboxId) -> PausedSandboxEntry {
+        PausedSandboxEntry {
+            sandbox_id,
+            cluster_id: Uuid::nil(),
+            state: PausedRegistryState::Paused,
+            generation: 1,
+            origin_node_id: "node-a".to_string(),
+            claimed_by_node_id: None,
+            snapshot_id: None,
+            metadata: None,
+            execution_id: None,
+            paused_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// 🔴 The three answers a destructive caller has to tell apart, and the one
+    /// assertion that says they are told apart: an id the batch did not cover
+    /// must not be reachable as an absence.
+    #[test]
+    fn answered_rows_separates_an_uncovered_id_from_a_real_absence() {
+        let present = SandboxId::new();
+        let absent = SandboxId::new();
+        let unreadable = SandboxId::new();
+
+        let rows = PausedRegistryRows {
+            entries: HashMap::from([(present, entry(present))]),
+            // `unreadable` was asked about and is deliberately not covered --
+            // the shape a backend returns for a row it could not decode.
+            covered: vec![present, absent],
+        };
+        let answered = rows.answered();
+
+        assert!(
+            matches!(answered.get(&present), Some(Some(_))),
+            "a covered id with a row answers with the row"
+        );
+        assert!(
+            matches!(answered.get(&absent), Some(None)),
+            "a covered id with no row is a real absence the caller may act on"
+        );
+        assert!(
+            answered.get(&unreadable).is_none(),
+            "🔴 an uncovered id must answer 'do not judge', never 'no row'. \
+             Collapsing this into Some(None) is what tore down live sandboxes"
+        );
+    }
+
+    #[test]
+    fn a_fully_covering_batch_covers_exactly_what_it_was_asked() {
+        let first = SandboxId::new();
+        let second = SandboxId::new();
+        let ids = [first, second];
+
+        let rows = PausedRegistryRows::fully_covering(HashMap::from([(first, entry(first))]), &ids);
+
+        assert!(rows.covers(&ids));
+        assert_eq!(rows.answered().len(), 2);
+        assert!(matches!(rows.answered().get(&second), Some(None)));
+    }
+
+    /// A default batch has looked at nothing, so it answers for nothing --
+    /// the `DisabledPausedSandboxRegistry` shape.
+    #[test]
+    fn a_default_batch_answers_for_nothing() {
+        let rows = PausedRegistryRows::default();
+        let id = SandboxId::new();
+
+        assert!(rows.answered().is_empty());
+        assert!(rows.answered().get(&id).is_none());
+        assert!(!rows.covers(&[id]));
+        assert!(rows.covers(&[]));
+    }
+
+    /// `as_str` and `parse` must stay inverses: these five strings are the
+    /// column's CHECK constraint and the proto's filter vocabulary, so a
+    /// one-sided edit is a silent schema mismatch.
+    #[test]
+    fn every_state_round_trips_through_its_wire_literal() {
+        for state in PausedRegistryState::ALL {
+            assert_eq!(
+                PausedRegistryState::parse(state.as_str()),
+                Some(state),
+                "{state:?} must decode from the literal it encodes to"
+            );
+        }
+        assert_eq!(PausedRegistryState::ALL.len(), 5);
+    }
 }

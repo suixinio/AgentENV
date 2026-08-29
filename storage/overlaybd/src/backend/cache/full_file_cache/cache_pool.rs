@@ -700,19 +700,6 @@ impl FileCacheBackend {
         self.file_stats(&store_key)
     }
 
-    pub(crate) fn contains_store_key(&self, store_key: &str) -> bool {
-        let cache_id = cache_key_digest(store_key);
-        self.state
-            .cache_entries
-            .get(&cache_id)
-            .is_some_and(|s| s.value().as_active().is_some())
-    }
-
-    pub(crate) fn contains_src_name(&self, src_name: &str) -> bool {
-        let store_key = self.transform_store_key(src_name);
-        self.contains_store_key(&store_key)
-    }
-
     pub(crate) fn cached_size_by_store_key(&self, store_key: &str) -> Option<u64> {
         let cache_id = cache_key_digest(store_key);
         self.state
@@ -720,11 +707,6 @@ impl FileCacheBackend {
             .get(&cache_id)
             .and_then(|s| s.value().as_active().cloned())
             .map(|e| e.source_size.load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn cached_size_by_src_name(&self, src_name: &str) -> Option<u64> {
-        let store_key = self.transform_store_key(src_name);
-        self.cached_size_by_store_key(&store_key)
     }
 
     pub fn stat_path(&self, pathname: Option<&str>) -> Result<CachePoolStat> {
@@ -953,12 +935,6 @@ impl FileCacheBackend {
         Ok(())
     }
 
-    pub async fn rename_src_name(&self, old_src: &str, new_src: &str) -> Result<()> {
-        let old_key = self.transform_store_key(old_src);
-        let new_key = self.transform_store_key(new_src);
-        self.rename_store_key(&old_key, &new_key).await
-    }
-
     // -------------------------------------------------------------------
     // Open
     // -------------------------------------------------------------------
@@ -1075,18 +1051,7 @@ impl FileCacheBackend {
         }))
     }
 
-    pub(crate) async fn open_cache_only_src_name_with_flags(
-        &self,
-        src_name: impl AsRef<str>,
-        initial_size: u64,
-        open_flags: u32,
-    ) -> Result<Arc<CachedFile>> {
-        let store_key = self.transform_store_key(src_name.as_ref());
-        self.open_cache_only_with_flags(store_key, initial_size, open_flags)
-            .await
-    }
-
-    pub(crate) async fn open_src_name_with_flags(
+    pub async fn open_src_name_with_flags(
         &self,
         src_name: impl AsRef<str>,
         source: Arc<dyn VirtualFile>,

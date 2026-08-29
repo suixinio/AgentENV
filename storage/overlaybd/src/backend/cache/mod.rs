@@ -1,5 +1,4 @@
 mod bk_download;
-mod cached_fs;
 mod full_file_cache;
 mod meta;
 #[cfg(test)]
@@ -11,7 +10,6 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use cached_fs::{CachedFs, CachedFsSource, LocalFsSource};
 pub use full_file_cache::cache_pool::{
     CacheListType, CachePoolStat, CacheStats, CachedFileStats, FileCacheBackend,
     FileCacheBackendOptions,

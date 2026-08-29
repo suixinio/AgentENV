@@ -921,6 +921,54 @@ mod build_tests {
         assert!(!registry.is_cluster_backed());
     }
 
+    /// 🔴 The converse of [`the_default_backend_is_node_local`], and the
+    /// guard for the hazard `[pg]` becoming mandatory for `aenv-api`
+    /// introduced: that binary now *always* has a pool, so it now always
+    /// hands this function a `Some(factory)`. Having a factory must not
+    /// select the PostgreSQL registry — `[orchestrator.paused_registry]
+    /// .backend` decides that and always did. Before the change, pg presence
+    /// could only ever veto the `postgres` arm; it could never select it, and
+    /// it still cannot.
+    ///
+    /// The fake counts calls rather than merely failing on one, so a
+    /// regression that reached the factory and then recovered would still be
+    /// red.
+    #[tokio::test]
+    async fn a_local_backend_ignores_a_postgres_factory_it_was_handed() {
+        struct CountingFactory(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait(?Send)]
+        impl PostgresPausedRegistryFactory for CountingFactory {
+            async fn build(
+                &self,
+                _identity: &NodeIdentity,
+                _lease_ttl: std::time::Duration,
+            ) -> anyhow::Result<Arc<dyn PausedSandboxRegistry>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("the local backend must never build a postgres registry");
+            }
+        }
+
+        let factory = CountingFactory(std::sync::atomic::AtomicUsize::new(0));
+        let registry = build_paused_registry(
+            &config(PausedRegistryBackendKind::Local),
+            &identity(),
+            Some(&factory as &dyn PostgresPausedRegistryFactory),
+            Some(std::sync::Arc::new(NoopNodeRegistry) as std::sync::Arc<dyn NodeRegistry>),
+        )
+        .await
+        .expect("the local backend needs nothing, and must ignore what it is given");
+
+        assert!(
+            !registry.is_cluster_backed(),
+            "a local backend handed a postgres factory must still be node-local"
+        );
+        assert_eq!(
+            factory.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the local arm must never touch the factory"
+        );
+    }
+
     /// 🔴 D1 (Stage C report): the `postgres` backend refuses to start
     /// without a PostgreSQL pool -- never silently falls back to `local`,
     /// which would drop cluster-wide recovery with no error at all.

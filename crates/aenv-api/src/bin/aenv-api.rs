@@ -114,19 +114,44 @@ async fn async_main() -> anyhow::Result<()> {
     server_main::serve(config, assembly).await
 }
 
-/// This replica's `[pg]` connection pool, or `None` when PostgreSQL is not
-/// configured for this process.
+/// This replica's `[pg]` connection pool. Required, not optional.
+///
+/// 🔴 `[pg]` is not a mode this half may run without. The snapshot catalog is
+/// PostgreSQL and there is no other — object storage stopped being one at the
+/// Stage B cutover — so a replica with no `[pg]` has no catalog at all. That
+/// used to be discovered *last*, by `build_snapshot_backend` at the far end of
+/// `assemble_api`, after the catalog build reaper, the paused-registry factory
+/// and the paused-registry background tasks had already been wired against a
+/// `None` pool and had all silently done nothing. Refusing here, at
+/// construction, is the same discipline every other unsafe-default in
+/// `assemble_api` already follows: fail before building the things that would
+/// quietly degrade.
+///
+/// 🔴 Requiring the pool is *not* the same as selecting the PostgreSQL paused
+/// registry. `[orchestrator.paused_registry].backend` still decides that, and
+/// `"local"` is still a supported value — see `assemble_api`'s own comment at
+/// the `PgPausedRegistryFactory` construction.
 ///
 /// 🔴 There is no node-side counterpart, and there cannot be: `aenv-node` does
 /// not link `sqlx` (`make check-crate-boundaries`), and it refuses to start at
 /// all if `[pg].dsn` is configured (`refuse_configured_pg_dsn`, in that
 /// binary's own `async_main`). This is the one process that may hold
 /// PostgreSQL credentials, the connection budget and the schema; see
-/// `src/pg/mod.rs`'s own module doc.
-async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool>> {
-    let Some(settings) = PgPoolSettings::from_config(config.pg.as_ref())? else {
-        return Ok(None);
-    };
+/// `src/pg/mod.rs`'s own module doc. `config.pg` therefore stays
+/// `Option<PgConfig>` in the shared `AppConfig` — it is this binary that has
+/// no optional case, not the config type.
+async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<sqlx::PgPool> {
+    let settings = PgPoolSettings::from_config(config.pg.as_ref())?.context(
+        "[pg] is required for aenv-api: [pg].dsn is unset or blank, and PostgreSQL is the only \
+         snapshot catalog there is (object storage held one until the Stage B cutover and holds \
+         byte artifacts alone now). Without it this replica would start with no catalog, and \
+         every snapshot, template and paused-sandbox request would have nowhere to read or write \
+         a row. Set [pg].dsn for this half — it is TOML-file-only, with no environment binding \
+         (confique cannot descend into AppConfig::pg's Option), so supply it through the file \
+         AENV_CONFIG_PATH names or an AENV_CONFIG_OVERLAY_PATH overlay, the way \
+         deploy/k8s/base's pg-dsn.toml and deploy/docker-compose.yml's /tmp/agentenv-pg/\
+         pg-dsn.toml both do",
+    )?;
     let pool = pg::connect(&settings).await?;
     // 🔴 Before this pool reaches anything that queries the catalog tables —
     // the build reaper (`spawn_pg_singleton_tasks`, started right after this
@@ -136,7 +161,7 @@ async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<Option<sqlx::PgPool
     // doc: idempotent, advisory-lock-guarded, safe on every start and across
     // a fleet of replicas racing to call it at once.
     aenv_api::snapshot::repository::backends::migrate_catalog_schema(&pool).await?;
-    Ok(Some(pool))
+    Ok(pool)
 }
 
 /// The catalog build reaper's own cadence: how often the cluster-elected
@@ -158,18 +183,22 @@ fn reaper_cadence(config: &AppConfig) -> (std::time::Duration, std::time::Durati
     (interval, ttl)
 }
 
-/// Starts the catalog build reaper for this process when `pg_pool` is
-/// `Some`. See `aenv_api::snapshot::repository::backends::spawn_catalog_build_reaper`'s
+/// Starts the catalog build reaper for this process. See
+/// `aenv_api::snapshot::repository::backends::spawn_catalog_build_reaper`'s
 /// own doc on why the handle must be shut down through its own `shutdown()`
 /// path rather than folded into `paused_upkeep`.
+///
+/// 🔴 That function keeps its `Option<sqlx::PgPool>` parameter — it is shared
+/// library code, and "no pool" is a state it must still be able to express.
+/// This bin-private wrapper has no such case: `build_pg_pool` refused already.
 fn spawn_pg_singleton_tasks(
     config: &AppConfig,
-    pg_pool: Option<sqlx::PgPool>,
+    pg_pool: sqlx::PgPool,
 ) -> Vec<aenv_api::pg::SingletonTaskHandle> {
     let (interval, ttl) = reaper_cadence(config);
     let identity = aenv_api::identity::NodeIdentity::from_config(&config.node_identity);
     aenv_api::snapshot::repository::backends::spawn_catalog_build_reaper(
-        pg_pool,
+        Some(pg_pool),
         identity.cluster_id,
         interval,
         ttl,
@@ -382,6 +411,12 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // passed there, and `[snapshot].p2p_enabled` is not consulted: P2P
     // moves bytes between machines that hold them, and this process holds
     // none.
+    //
+    // 🔴 This is where a missing `[pg]` now fails. It used to fail at
+    // `build_snapshot_backend`, at the very bottom of this function — after
+    // the reaper, the paused-registry factory and the paused-registry
+    // background tasks below had each been handed a `None` and quietly
+    // become no-ops. See `build_pg_pool`'s own doc.
     let pg_pool = build_pg_pool(config).await?;
     let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
     // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
@@ -393,17 +428,24 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // registry at all — even though `aenv-api` always has one to hand them.
     let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> =
         Some(Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>);
-    // The `postgres` arm's own constructor, when this replica has a pool at
-    // all. `build_paused_registry` keeps the arm, its refusal message and its
-    // roster guard; the pool, the schema bootstrap and the restart-grace entry
-    // live behind this.
-    let paused_registry_factory = pg_pool.clone().map(PgPausedRegistryFactory::new);
+    // The `postgres` arm's own constructor. `build_paused_registry` keeps the
+    // arm, its refusal message and its roster guard; the pool, the schema
+    // bootstrap and the restart-grace entry live behind this.
+    //
+    // 🔴 Constructing it is not selecting it. `PgPausedRegistryFactory::new`
+    // only holds the pool — the schema bootstrap and the restart-grace entry
+    // are in `build`, which `build_paused_registry` calls from its `Postgres`
+    // arm alone. `[orchestrator.paused_registry].backend = "local"` still
+    // builds `DisabledPausedSandboxRegistry` and never touches this factory,
+    // exactly as it did when the factory was `None` for want of a pool. The
+    // thing that decides whether the PostgreSQL paused registry is *used* is
+    // that setting, and it always was; before `[pg]` became mandatory, pg
+    // presence could only ever veto it, never select it.
+    let paused_registry_factory = PgPausedRegistryFactory::new(pg_pool.clone());
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
         &identity_for_registry,
-        paused_registry_factory
-            .as_ref()
-            .map(|factory| factory as &dyn PostgresPausedRegistryFactory),
+        Some(&paused_registry_factory as &dyn PostgresPausedRegistryFactory),
         node_registry_for_paused.clone(),
     )
     .await?;
@@ -461,12 +503,12 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // thing `build_snapshot_backend` needs from PostgreSQL, and the reason it
     // no longer takes the pool itself.
     //
-    // 🔴 `None` here is not a mode any more. Object storage stopped being a
-    // catalog at the Stage B cutover, so a replica with no `[pg]` has no
-    // catalog at all and `build_snapshot_backend` refuses to assemble.
-    let pg_catalog = pg_pool
-        .as_ref()
-        .map(|pool| aenv_api::snapshot::repository::backends::pg_snapshot_catalog(config, pool));
+    // 🔴 `None` here is not a mode any more, and it is no longer even
+    // reachable: `build_pg_pool` refused a missing `[pg]` at the top of this
+    // function. `build_snapshot_backend` keeps its own `Option` and its own
+    // refusal — it is shared with `aenv-node`, which always passes `None`.
+    let pg_catalog =
+        Some(aenv_api::snapshot::repository::backends::pg_snapshot_catalog(config, &pg_pool));
     let snapshot_backend = aenv_api::snapshot::repository::backends::build_snapshot_backend(
         aenv_api::snapshot::repository::backends::build_catalog_only_storage(config)?,
         pg_catalog,
@@ -496,10 +538,15 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         None
     };
 
+    // 🔴 `Some(...)`, not "postgres is selected". This function keeps its
+    // `Option<sqlx::PgPool>` parameter deliberately — the paused-registry
+    // backend is genuinely optional — and its *first* statement is
+    // `if config.backend != Postgres { return default }`. A `"local"` backend
+    // still starts no reconcile/reclaim/renewal loops with a pool in hand.
     let paused_registry_tasks = spawn_paused_registry_background_tasks(
         &config.orchestrator.paused_registry,
         &identity_for_registry,
-        pg_pool,
+        Some(pg_pool),
         node_registry_for_paused,
     );
     pg_singleton_tasks.extend(paused_registry_tasks.singleton);
@@ -1127,6 +1174,47 @@ mod tests {
             ApiCli::try_parse_from(["aenv-api", "--config", "/dev/null"]).is_ok(),
             "the control: an argument this binary does declare still parses, so the refusals \
              above are about the flags and not about parse_from being broken"
+        );
+    }
+
+    /// 🔴 `[pg]` is not optional for this half, and the refusal is at
+    /// construction rather than at the far end of `assemble_api`.
+    ///
+    /// `build_snapshot_backend` also refuses a missing catalog, but it runs
+    /// last — after the catalog build reaper, the paused-registry factory and
+    /// the paused-registry background tasks have each been handed a `None`
+    /// pool and quietly become no-ops. That ordering is what this guards: an
+    /// unconfigured `[pg]` must not get far enough to build any of them.
+    ///
+    /// `AppConfig::default()` has no `[pg]` at all, so this reaches the
+    /// refusal without dialling anything — the message is produced before
+    /// `pg::connect` is called.
+    #[tokio::test]
+    async fn the_api_half_refuses_to_assemble_without_a_postgres_catalog() {
+        let config = AppConfig::default();
+        assert!(
+            config.pg.is_none(),
+            "the default has no [pg], which is what makes this refusal reachable without a \
+             database"
+        );
+
+        let err = match build_pg_pool(&config).await {
+            Ok(_) => panic!("aenv-api has no catalog at all without [pg]"),
+            Err(err) => format!("{err:#}"),
+        };
+        // The setting, which binary is being talked about, and — because
+        // `[pg]` has no `env =` binding and cannot have one (confique will
+        // not descend into `AppConfig::pg`'s `Option`) — the mechanism that
+        // actually supplies it. A message naming `AENV_PG_DSN`, as
+        // `build_snapshot_backend`'s older one still does, sends an operator
+        // to set an environment variable nothing reads.
+        assert!(err.contains("[pg]"), "{err}");
+        assert!(err.contains("[pg].dsn"), "{err}");
+        assert!(err.contains("aenv-api"), "{err}");
+        assert!(err.contains("AENV_CONFIG_OVERLAY_PATH"), "{err}");
+        assert!(
+            !err.contains("AENV_PG_DSN"),
+            "there is no such environment variable: {err}"
         );
     }
 

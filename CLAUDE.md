@@ -247,9 +247,18 @@ none now. The switches that steered that move (`[snapshot.catalog].write`/`.read
 (`repository/mirror/`), the mirror backlog, the read-side confirmation gate and the `catalog_migration_state`
 table are all deleted. Consequences worth knowing before touching this code:
 
-- `aenv-api` **requires `[pg]`**. `build_snapshot_backend` refuses to assemble without it rather than starting a
-  replica whose first snapshot request is the one that discovers there is no catalog. There is no
-  PostgreSQL-free deployment any more — single-machine, compose or dev included.
+- `aenv-api` **requires `[pg]`**, and refuses at construction rather than at first use: `build_pg_pool`
+  (`crates/aenv-api/src/bin/aenv-api.rs`) returns a `PgPool`, not an `Option<PgPool>`, so an unconfigured
+  `[pg].dsn` stops `assemble_api` *before* the catalog build reaper, the paused-registry factory and the
+  paused-registry background tasks are wired — each of which used to be handed a `None` and silently become a
+  no-op while the replica went on assembling. `build_snapshot_backend` keeps its own `Option` and its own
+  refusal, because it is shared with `aenv-node`, which always passes `None`. Requiring the pool is **not** the
+  same as selecting the PostgreSQL paused registry: `[orchestrator.paused_registry].backend` still decides that
+  and `"local"` is still supported — `build_paused_registry`'s `Local` arm never touches the factory it is now
+  always handed (`a_local_backend_ignores_a_postgres_factory_it_was_handed`). There is no PostgreSQL-free
+  deployment any more — single-machine, compose or dev included. 🔴 There is **no `AENV_PG_DSN`**: `[pg]` is
+  `Option<PgConfig>`, confique cannot descend into it, so the section is TOML-file-only (a config file or an
+  `AENV_CONFIG_OVERLAY_PATH` overlay). Some older error strings still name that variable; they are wrong.
 - `aenv-node` holds **no catalog at all**. Its `SnapshotRepository` carries `NoSnapshotCatalog`
   (`src/snapshot/repository/no_catalog.rs`), which *refuses* every catalog call rather than reporting absence —
   absence is what callers act on by deleting artifacts and refusing resumes. A node stages bytes

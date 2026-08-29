@@ -534,12 +534,20 @@ a cluster-leadership primitive built on session-scoped advisory locks.
 which is PostgreSQL and nothing else — object storage held a catalog until the
 Stage B cutover and holds byte artifacts alone now — so an api replica with no
 `dsn` has no catalog and refuses to start rather than answering "no such
-snapshot" to everything. It also backs the `postgres` cluster-wide
-paused-sandbox registry backend
+snapshot" to everything. The refusal is at construction: `build_pg_pool`
+(`crates/aenv-api/src/bin/aenv-api.rs`) yields a pool or an error, never
+"no pool", so startup stops before the catalog build reaper and the
+paused-registry machinery are wired rather than after. It also backs the
+`postgres` cluster-wide paused-sandbox registry backend
 (`[orchestrator.paused_registry].backend = "postgres"`, which also needs a
 heartbeat roster — `aenv-api`'s own node registry, which it always builds)
 and the `aenv-snapshot-image` operator tool. See
 `deploy/k8s/base/agentenv-api-deployment.yaml` for the deployed shape.
+
+🔴 Configuring `[pg]` does not *select* the `postgres` paused registry.
+`[orchestrator.paused_registry].backend` alone decides that, and `"local"`
+remains a supported value on an api replica with a pool: the `local` arm builds
+the disabled registry and never touches the PostgreSQL factory it is handed.
 
 🔴 `aenv-node` must never hold it: that binary links no PostgreSQL client and
 refuses to start if `dsn` is configured.

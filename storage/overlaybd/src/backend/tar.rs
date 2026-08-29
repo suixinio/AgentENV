@@ -26,27 +26,6 @@ const REGTYPE: u8 = b'0';
 // only for overlaybd remote blob, which stores one blob file with tar header and trailer.
 // used to skip header for file I/O.
 
-#[derive(Debug, Clone, Default)]
-pub struct TarBackend;
-
-impl TarBackend {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub async fn open(&self, file: Arc<dyn VirtualFile>) -> Result<Arc<dyn VirtualFile>> {
-        new_tar_file_adaptor(file).await
-    }
-
-    pub async fn open_rw(&self, file: Arc<dyn VirtualFile>) -> Result<Arc<dyn VirtualFile>> {
-        open_tar_file_rw(file).await
-    }
-
-    pub async fn create(&self, file: Arc<dyn VirtualFile>) -> Result<Arc<TarFile>> {
-        new_tar_file_create(file).await
-    }
-}
-
 pub struct TarFile {
     file: Arc<dyn VirtualFile>,
     tar: TarCore,

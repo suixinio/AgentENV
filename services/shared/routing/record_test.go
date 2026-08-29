@@ -70,31 +70,13 @@ func TestParseRecordCases(t *testing.T) {
 	}
 }
 
-// TestMarshalRecordShape pins the stored bytes. 🔴 The scheduler's heartbeat
-// script splices a record together inside Lua rather than re-encoding the node,
-// and it splices against exactly this shape — so a change to the json tags that
-// only this side knew about would produce records the script writes one way and
-// this reads another.
-func TestMarshalRecordShape(t *testing.T) {
-	value, err := MarshalRecord(Node{ID: "node-a", Endpoint: "http://node-a"}, "exec-1")
-	if err != nil {
-		t.Fatalf("MarshalRecord failed: %v", err)
-	}
-	const want = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1"}`
-	if value != want {
-		t.Fatalf("stored shape drifted:\n got %s\nwant %s", value, want)
-	}
-
-	// An empty incarnation is omitted, so a record written now and one written
-	// before the field existed are byte-identical.
-	value, err = MarshalRecord(Node{ID: "node-a", Endpoint: "http://node-a"}, "")
-	if err != nil {
-		t.Fatalf("MarshalRecord failed: %v", err)
-	}
-	if value != `{"node":{"node_id":"node-a","endpoint":"http://node-a"}}` {
-		t.Fatalf("empty incarnation must be omitted, got %s", value)
-	}
-}
+// 🔴 TestMarshalRecordShape used to sit here, asserting MarshalRecord's output
+// against a literal. It went with the encoder: it was that function's only
+// remaining caller, and what it pinned — the field names and order, and
+// `execution_id` being omitted when empty — is pinned by
+// `marshal_record`'s own tests in `src/binding_store/record.rs`, against the
+// process that actually writes these bytes. The literals below are the same
+// shape, read from the decoding side.
 
 // The two shapes a live writer actually puts in Redis, written out.
 //
@@ -204,12 +186,13 @@ func TestTheStoredLiteralsAreTheOnesRustAssertsToo(t *testing.T) {
 	}
 }
 
-func TestBindingKeyAndNodeIndexKey(t *testing.T) {
+// TestBindingKey pins the one key this package derives. 🔴 It used to pin a
+// second, NodeIndexKey — the reverse index — which went with the function: only
+// a writer maintains that set and this module has none. `aenv-api`'s
+// `node_index_key` keeps the format, pinned by `keys_match_gos_format`.
+func TestBindingKey(t *testing.T) {
 	if got := BindingKey(DefaultKeyPrefix, "sbx-1"); got != "agentenv:scheduler:bindings:sandbox:sbx-1" {
 		t.Fatalf("binding key drifted: %s", got)
-	}
-	if got := NodeIndexKey(DefaultKeyPrefix, "node-a"); got != "agentenv:scheduler:bindings:node:node-a" {
-		t.Fatalf("node index key drifted: %s", got)
 	}
 }
 
@@ -265,16 +248,9 @@ func TestSynthesizeWithNoIncarnationClaimsNoAuthority(t *testing.T) {
 	}
 }
 
-func TestNodeProtoRoundTrip(t *testing.T) {
-	node := Node{ID: "node-a", Endpoint: "http://node-a", PodName: "pod-a"}
-	back := NodeFromProto(node.ToProto())
-	if back.ID != node.ID || back.Endpoint != node.Endpoint {
-		t.Fatalf("round trip lost the address: %+v", back)
-	}
-	if back.PodName != "" {
-		t.Fatalf("pod name must not travel on the wire node, got %q", back.PodName)
-	}
-	if got := NodeFromProto(nil); got != (Node{}) {
-		t.Fatalf("a nil message must decode to the zero node, got %+v", got)
-	}
-}
+// 🔴 TestNodeProtoRoundTrip used to close this file, and it was NodeFromProto's
+// only caller anywhere — a test of a function nothing else used, which is what
+// made both deletable. The one property in it that was about production code
+// rather than about the round trip — that a pod name never reaches the wire
+// node — is asserted by TestSynthesizeFillsEveryFieldTheReaderCannotSee above,
+// over the whole marshalled lookup answer, which is where it actually matters.

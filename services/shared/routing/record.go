@@ -1,14 +1,19 @@
-// Package routing owns the routing projection: the record a scheduler writes
-// when it learns where a sandbox is, and everything needed to read one back.
+// Package routing reads the routing projection: the record written when the
+// control plane learns where a sandbox is, and everything needed to turn one
+// back into a lookup answer.
 //
-// 🔴 It exists because two processes read the same bytes. The scheduler writes
-// the record and answers lookups from it; the gateway reads it directly and
-// synthesises the answer the scheduler would have given. Go's internal rule
-// keeps the gateway out of services/scheduler/internal, so without a shared
-// package the record's shape, its key, and the rule turning an incarnation into
-// an authority would each exist twice — and two copies of a wire format drift,
-// which here means the gateway routing on a field the scheduler stopped
-// writing.
+// 🔴 It reads, and it does not write. It used to do both, when
+// `services/scheduler` wrote these keys and answered lookups from them and
+// Go's internal rule kept the gateway out of that package's internals. That
+// process is deleted: `aenv-api` writes every record now
+// (`src/binding_store/record.rs`), and the gateway reads them directly and
+// synthesises the answer a lookup would have given.
+//
+// So the format lives in two languages rather than in two Go packages, which
+// changes what keeps the copies together. Nothing here can be exercised against
+// the writer by calling it; what holds instead is that the tests on both sides
+// assert the same literal bytes, and one of them reads the other language's
+// source to say so. See record_test.go's storedRecord* constants.
 package routing
 
 import (
@@ -51,18 +56,12 @@ func (n Node) ToProto() *schedulerv1.Node {
 	}
 }
 
-// NodeFromProto is the inverse, and tolerates a nil message the way every
-// generated getter does.
-func NodeFromProto(node *schedulerv1.Node) Node {
-	if node == nil {
-		return Node{}
-	}
-	return Node{
-		ID:       node.GetNodeId(),
-		Endpoint: node.GetEndpoint(),
-	}
-}
-
+// 🔴 There is no inverse. NodeFromProto used to sit here, and nothing outside
+// a test of itself ever called it: this package decodes a stored record and
+// converts it *towards* the wire, never back. A wire node has no pod name and
+// no stored form to return to, so the only thing the reverse could produce is a
+// half-populated Node that reads like a stored one.
+//
 // Record is one routing projection: where a sandbox is, and which incarnation
 // of it is there.
 type Record struct {
@@ -78,11 +77,13 @@ func BindingKey(prefix string, sandboxID string) string {
 	return prefix + ":sandbox:" + sandboxID
 }
 
-// NodeIndexKey is the reverse index: the set of sandboxes a node holds.
-func NodeIndexKey(prefix string, nodeID string) string {
-	return prefix + ":node:" + nodeID
-}
-
+// 🔴 The reverse index's key, NodeIndexKey, is not here. It names the set of
+// sandboxes a node holds, which only a writer maintains — and this module holds
+// no writer. `aenv-api` keeps its own (`src/binding_store/record.rs`'s
+// `node_index_key`, pinned to the same `{prefix}:node:{node_id}` format by
+// `keys_match_gos_format`), and a second unused copy here is a format free to
+// drift with nothing reading either one.
+//
 // DefaultKeyPrefix is the prefix both processes use unless told otherwise.
 const DefaultKeyPrefix = "agentenv:scheduler:bindings"
 
@@ -110,17 +111,21 @@ func ParseRecord(raw []byte) (Record, bool) {
 	return Record{Node: node, ExecutionID: strings.TrimSpace(record.ExecutionID)}, true
 }
 
-// MarshalRecord is the one encoder. The scheduler's Lua scripts splice a record
-// together in place for the heartbeat path, and they are held to producing
-// exactly what this emits — a golden test in the scheduler package asserts it.
-func MarshalRecord(node Node, executionID string) (string, error) {
-	data, err := json.Marshal(Record{Node: node, ExecutionID: executionID})
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
+// 🔴 There is no encoder here, and its absence is the point.
+//
+// MarshalRecord used to be "the one encoder", written when `services/scheduler`
+// wrote these keys and its Lua heartbeat script had to splice a record together
+// against a shape this file defined. That process is deleted; `aenv-api` writes
+// every one of these keys now (`src/binding_store/record.rs`'s
+// `marshal_record`), and Go only ever reads them.
+//
+// A leftover encoder is worse than none. Its only callers were tests, which
+// then encoded and decoded with the same package and so proved nothing about
+// the format the cluster actually stores; and the next writer to need one in Go
+// would reach for it rather than noticing that writing these keys from two
+// processes is the problem. The tests now feed literals, pinned against
+// `marshal_record`'s own output — see record_test.go's storedRecord* constants.
+//
 // Synthesize turns a record into the lookup answer the scheduler would have
 // given for it, so a gateway reading the projection directly returns the same
 // thing it would have been told.

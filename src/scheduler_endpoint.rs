@@ -248,10 +248,11 @@ fn build_channel(endpoint: &str) -> Result<(Channel, String)> {
 /// `control_plane_token_file`, ...).
 ///
 /// 🔴 This used to also fall back to a deprecated
-/// `[observability.scheduler_report].scheduler_endpoint_file` field, removed
-/// once every deployment moved onto this one — see
-/// [`crate::cfg::refuse_removed_scheduler_endpoint_file_env_var`] for the
-/// startup guard that replaced the silent fallback.
+/// `[observability.scheduler_report].scheduler_endpoint_file` field
+/// (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE`), removed once every
+/// deployment moved onto this one. The old name is ignored now — the startup
+/// refusal that carried un-migrated manifests through that move has itself
+/// been removed.
 pub fn resolve_endpoint_file(cluster: &ClusterConfig) -> Option<PathBuf> {
     non_blank(&cluster.scheduler_endpoint_file).map(PathBuf::from)
 }

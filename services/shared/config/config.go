@@ -28,6 +28,8 @@ import (
 // this cap stays — removing it would silently widen the call's failure
 // window from this value (3s) to whatever of gateway.request_timeout happens
 // to be left (30-90s), which is a real behavioural regression, not a cleanup.
+// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT, the old name, is neither read nor
+// refused now: set GATEWAY_COLD_LOOKUP_TIMEOUT.
 //
 // 🔴 Mirrors gateway.defaultColdLookupTimeout, the value NewServer falls back
 // to when a caller constructs ServerOptions directly (every test, and any
@@ -37,83 +39,6 @@ import (
 // callers see one value and a caller building ServerOptions directly sees the
 // other.
 const defaultColdLookupTimeout = 3 * time.Second
-
-// RemovedGatewayEnvVars lists the environment variables that used to
-// configure the gateway's now-deleted query-only-scheduler fallback: which
-// address to dial for the cold-path LookupNode call, and whether to skip that
-// call entirely. See RefuseRemovedGatewayEnvVars.
-//
-// 🔴 GATEWAY_SCHEDULER_FALLBACK_TIMEOUT is in this list even though the
-// *capability* it configured is not gone — it is GATEWAY_COLD_LOOKUP_TIMEOUT
-// now (GatewayConfig.ColdLookupTimeout). The old name specifically described a
-// fallback to a process that may not exist, which stopped being accurate the
-// moment gateway.scheduler_addr started naming aenv-api instead of a Go
-// scheduler; the setting itself — a cap on this one RPC, separate from
-// gateway.request_timeout — is unchanged and still load-bearing.
-var RemovedGatewayEnvVars = []string{
-	"GATEWAY_QUERY_ONLY_SCHEDULER_ADDR",
-	"GATEWAY_SCHEDULER_FALLBACK_DISABLED",
-	"GATEWAY_SCHEDULER_FALLBACK_TIMEOUT",
-}
-
-// removedGatewayEnvVarReplacements says, for each entry in
-// RemovedGatewayEnvVars, what an operator who still sets it should do instead
-// — the three do not share one answer, unlike aenv-core's
-// REMOVED_CATALOG_ENV_VARS (src/cfg.rs) where every removed switch has the
-// same replacement ([pg]).
-var removedGatewayEnvVarReplacements = map[string]string{
-	"GATEWAY_QUERY_ONLY_SCHEDULER_ADDR":   "there is no replacement: the client-selection logic it configured is deleted outright, and every LookupNode call now goes to gateway.scheduler_addr (GATEWAY_SCHEDULER_ADDR), the same address every other Scheduler RPC this process makes already used",
-	"GATEWAY_SCHEDULER_FALLBACK_DISABLED": "there is no replacement: the switch it flipped is deleted outright, not merely defaulted off, so the cold-path LookupNode call it could skip is unconditional again, the same as every RPC this process makes to gateway.scheduler_addr",
-	"GATEWAY_SCHEDULER_FALLBACK_TIMEOUT":  "set GATEWAY_COLD_LOOKUP_TIMEOUT instead — same setting (a cap on the cold-path LookupNode call, separate from GATEWAY_REQUEST_TIMEOUT), renamed once it stopped being a fallback to a process that might not be running",
-}
-
-// RefuseRemovedGatewayEnvVars refuses to start when any of
-// RemovedGatewayEnvVars is set.
-//
-// Called from cmd/main.go before config.Load: the point is to stop a process
-// whose *manifest* still describes an arrangement this build does not have,
-// and that is knowable before anything is read.
-//
-// 🔴 This exists for the same reason aenv-core's
-// refuse_removed_catalog_env_vars (src/cfg.rs) does: this package's own
-// JSON/env parsing silently ignores an unknown key, so a manifest that still
-// sets GATEWAY_SCHEDULER_FALLBACK_DISABLED would go on looking healthy while
-// its operator believed a projection miss could still be short-circuited to a
-// hard 503 on demand — and one that still sets
-// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT would go on believing the cold-path
-// LookupNode call has a 3s cap when, silently, it no longer does: the call
-// falls through to GATEWAY_REQUEST_TIMEOUT's much longer budget instead. An
-// empty value counts as set, matching the Rust guard's own reasoning: a
-// manifest that writes GATEWAY_SCHEDULER_FALLBACK_TIMEOUT= has not been
-// migrated any more than one that writes a real duration into it.
-func RefuseRemovedGatewayEnvVars() error {
-	return refuseRemovedGatewayEnvVarsFrom(os.LookupEnv)
-}
-
-// refuseRemovedGatewayEnvVarsFrom is RefuseRemovedGatewayEnvVars with the
-// lookup injected, so the decision is testable without mutating the real
-// process environment.
-func refuseRemovedGatewayEnvVarsFrom(lookup func(string) (string, bool)) error {
-	var present []string
-	for _, name := range RemovedGatewayEnvVars {
-		if _, ok := lookup(name); ok {
-			present = append(present, name)
-		}
-	}
-	if len(present) == 0 {
-		return nil
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s set, and this build no longer has the setting it names:\n", strings.Join(present, ", "))
-	for _, name := range present {
-		fmt.Fprintf(&b, "  - %s: %s\n", name, removedGatewayEnvVarReplacements[name])
-	}
-	b.WriteString("Remove the ones with no replacement from this workload's manifest, and rename the others; " +
-		"leaving any of them set would otherwise be ignored in silence, which for the timeout means losing its " +
-		"3s cap without anything saying so.")
-	return errors.New(b.String())
-}
 
 // GatewayExecutionFencing is the two-state switch over the gateway's routing
 // layer refusal: whether it stamps the incarnation it routed against onto the
@@ -562,8 +487,8 @@ func overrideWithEnv(cfg *Config) error {
 	// flipped by `kubectl set env` and a restart, the same way ResumeAddr and
 	// RestUpstreamAddr are. Named GATEWAY_COLD_LOOKUP_TIMEOUT, not
 	// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — see ColdLookupTimeout's own doc for
-	// why the rename, and RefuseRemovedGatewayEnvVars for what happens when a
-	// manifest still sets the old name.
+	// why the rename. The old name is neither read nor refused any more; a
+	// manifest that still sets it silently keeps the 3s default.
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_COLD_LOOKUP_TIMEOUT")); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {

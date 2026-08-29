@@ -36,14 +36,6 @@ func main() {
 	configPath := flag.String("config", "", "path to JSON config file")
 	flag.Parse()
 
-	// Checked before the config is loaded: the point is to stop a process
-	// whose manifest still describes an arrangement this build does not have
-	// (the deleted query-only-scheduler fallback), which is knowable before
-	// anything else is read. See RefuseRemovedGatewayEnvVars's own doc.
-	if err := config.RefuseRemovedGatewayEnvVars(); err != nil {
-		log.Fatalf("%v", err)
-	}
-
 	cfg, err := config.Load(*configPath, "gateway")
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)

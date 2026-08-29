@@ -175,9 +175,10 @@ to be a `[cluster].node_placement_source` switch (env
 (`"scheduler"`, the code default) for the same placement/heartbeat/
 paused-registry RPCs; that field, its `NodePlacementSource` enum, and the
 gRPC-dialling implementation (`SchedulerNodePlacement`) are all deleted along
-with the Go scheduler they dialled — `aenv-api` refuses to start if
-`AENV_NODE_PLACEMENT_SOURCE` is still set
-(`cfg::refuse_removed_node_placement_source_env_var`). `Schedule` always
+with the Go scheduler they dialled. `AENV_NODE_PLACEMENT_SOURCE` is inert
+now: no field declares it, so confique ignores it and nothing refuses it —
+the startup guard that carried un-migrated manifests through the cutover has
+itself been removed. `Schedule` always
 places with round-robin (`src/node_registry/strategy.rs` also ports Go's
 `random` strategy, but nothing wires it to a config knob yet). Node discovery
 for that registry is `[cluster].node_discovery_mode` — `"kubernetes"` (the
@@ -210,11 +211,12 @@ backends and that is what keeps a fix made to one and forgotten for the other
 from being invisible. `cfg(test)` alone would not do — it is per-crate, and
 `aenv-node`'s and `aenv-api`'s own suites would lose the symbol; both already
 take `aenv-core` with `features = ["test-support"]`, so no `Cargo.toml`
-change was needed. There is deliberately **no** startup refusal for a
-leftover `AENV_BINDING_STORE_BACKEND` (unlike `AENV_NODE_PLACEMENT_SOURCE` or
-the removed catalog variables): the only value a working deployment could
-have carried was `redis`, which is exactly what happens with the variable
-absent, so an un-migrated manifest cannot degrade.
+change was needed. There is **no** startup refusal for a leftover
+`AENV_BINDING_STORE_BACKEND`, and there is none for any other removed
+AgentENV variable either — the tombstone guards were a transition measure and
+are gone. The only value a working deployment could have carried was `redis`,
+which is exactly what happens with the variable absent, so an un-migrated
+manifest cannot degrade.
 
 `crates/aenv-api/src/orchestrator/paused_registry/postgres/`
 similarly ports the paused-sandbox registry onto the same shared `[pg]` pool
@@ -240,9 +242,11 @@ proxy domain) is routed by a `LookupNode` call through `gateway.scheduler_addr`
 (now `agentenv-api:8002` on every shipped deployment). 🔴 There is no second
 read endpoint any more: `gateway.query_only_scheduler_addr`, and the
 `QueryOnlySchedulerClient` it selected, are deleted along with the Go
-scheduler's `--query-only` replica mode, and `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR`
-is in `RemovedGatewayEnvVars` — a manifest that still sets it makes the gateway
-refuse to start.
+scheduler's `--query-only` replica mode. `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR`,
+`GATEWAY_SCHEDULER_FALLBACK_DISABLED` and `GATEWAY_SCHEDULER_FALLBACK_TIMEOUT`
+are all inert now — `services/shared/config` reads no such keys and refuses no
+such names, so a manifest that still sets one is simply ignored. The last of
+the three was renamed rather than dropped: use `GATEWAY_COLD_LOOKUP_TIMEOUT`.
 
 `services/` is a separate Go module. See `services/README.md` for build/run/deploy
 instructions and the current architecture in full.
@@ -286,17 +290,24 @@ table are all deleted. Consequences worth knowing before touching this code:
   always handed (`a_local_backend_ignores_a_postgres_factory_it_was_handed`). There is no PostgreSQL-free
   deployment any more — single-machine, compose or dev included. 🔴 There is **no `AENV_PG_DSN`**: `[pg]` is
   `Option<PgConfig>`, confique cannot descend into it, so the section is TOML-file-only (a config file or an
-  `AENV_CONFIG_OVERLAY_PATH` overlay). Some older error strings still name that variable; they are wrong.
+  `AENV_CONFIG_OVERLAY_PATH` overlay). Every operator-facing "no `[pg]`" message now says so, and each of the
+  three is pinned by a test that fails if `AENV_PG_DSN` reappears in it: `build_pg_pool`'s
+  (`the_api_half_refuses_to_assemble_without_a_postgres_catalog`), `build_snapshot_backend`'s
+  (`the_refusal_names_no_environment_variable_that_does_not_exist`) and `aenv-snapshot-image`'s
+  (`the_missing_pg_refusal_names_no_environment_variable_that_does_not_exist`).
 - `aenv-node` holds **no catalog at all**. Its `SnapshotRepository` carries `NoSnapshotCatalog`
   (`src/snapshot/repository/no_catalog.rs`), which *refuses* every catalog call rather than reporting absence —
   absence is what callers act on by deleting artifacts and refusing resumes. A node stages bytes
   (`SnapshotRepository::stage`) and hands a `StagedSnapshot` back over gRPC; `aenv-api`'s `commit_staged` writes
   the row.
-- Both binaries **refuse to start** if `AENV_SNAPSHOT_CATALOG_WRITE`, `AENV_SNAPSHOT_CATALOG_READ` or
-  `AENV_SNAPSHOT_CATALOG_MIRROR_PATH` is set (`cfg::refuse_removed_catalog_env_vars`, called from both
-  entrypoints before the config is read). confique silently ignores an undeclared environment variable, so an
-  un-migrated manifest would otherwise start looking healthy while its operator believed the catalog was
-  double-written — the same reasoning `--role`/`AENV_ROLE` got.
+- `AENV_SNAPSHOT_CATALOG_WRITE`, `AENV_SNAPSHOT_CATALOG_READ` and `AENV_SNAPSHOT_CATALOG_MIRROR_PATH` are
+  **inert**. Both binaries refused to start on them for one release; that guard is deleted along with the rest
+  of the transition's scaffolding, so confique now ignores the undeclared names in silence. The risk it covered
+  is real — an un-migrated manifest looks healthy while its operator believes the catalog is double-written —
+  and what covers it now is manifest hygiene, not runtime: `services/shared/config/snapshot_catalog_manifest_test.go`
+  walks every AgentENV workload under `deploy/k8s/base` and fails if one declares any of the three. **Keep it
+  working.** Note that this is the opposite call from `--role`/`AENV_ROLE`, which is argument parsing rather than
+  an ignored env var and still refuses.
 
 For the OSS repository backend, `snapshot_image_storage = "source_registry"` publishes compatible overlaybd-native rootfs and attached-drive snapshot deltas back to their source OCI registry via `src/snapshot/repository/backends/common/acr/`; `object_storage` keeps the conservative OSS managed-layer behavior.
 

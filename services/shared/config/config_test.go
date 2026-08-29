@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -251,82 +250,5 @@ func TestLoadRejectsInvalidGatewayColdLookupTimeoutEnv(t *testing.T) {
 
 	if _, err := Load("", "gateway"); err == nil {
 		t.Fatal("expected load to fail for invalid GATEWAY_COLD_LOOKUP_TIMEOUT")
-	}
-}
-
-// TestRefuseRemovedGatewayEnvVarsRefusesEachRemovedVariable mirrors
-// aenv-core's a_manifest_still_setting_a_removed_catalog_switch_is_refused
-// (src/cfg.rs): a manifest that still sets any one of RemovedGatewayEnvVars
-// must be refused, and the refusal must name the exact variable an operator
-// has to act on rather than a generic "invalid config" message — the three
-// have different remedies (two have none, one renames), so the message has
-// to distinguish them.
-func TestRefuseRemovedGatewayEnvVarsRefusesEachRemovedVariable(t *testing.T) {
-	for _, name := range RemovedGatewayEnvVars {
-		name := name
-		t.Run(name, func(t *testing.T) {
-			err := refuseRemovedGatewayEnvVarsFrom(func(probed string) (string, bool) {
-				if probed == name {
-					return "anything", true
-				}
-				return "", false
-			})
-			if err == nil {
-				t.Fatalf("expected %s to be refused", name)
-			}
-			if !strings.Contains(err.Error(), name) {
-				t.Fatalf("error %q does not name the variable an operator has to act on", err)
-			}
-		})
-	}
-}
-
-// TestRefuseRemovedGatewayEnvVarsTreatsEmptyAsSet matches the Rust guard's
-// own reasoning: GATEWAY_SCHEDULER_FALLBACK_TIMEOUT= in a manifest is still a
-// manifest that has not been migrated, the same as one that sets a real
-// duration into it, so an empty value must be refused rather than read as
-// absent.
-func TestRefuseRemovedGatewayEnvVarsTreatsEmptyAsSet(t *testing.T) {
-	err := refuseRemovedGatewayEnvVarsFrom(func(probed string) (string, bool) {
-		if probed == "GATEWAY_SCHEDULER_FALLBACK_TIMEOUT" {
-			return "", true
-		}
-		return "", false
-	})
-	if err == nil {
-		t.Fatal("expected an empty-but-set removed variable to be refused")
-	}
-}
-
-// TestRefuseRemovedGatewayEnvVarsAllowsAnUnsetEnvironment is
-// TestRefuseRemovedGatewayEnvVarsRefusesEachRemovedVariable's negative
-// control: a migrated manifest, which sets none of RemovedGatewayEnvVars,
-// must start.
-func TestRefuseRemovedGatewayEnvVarsAllowsAnUnsetEnvironment(t *testing.T) {
-	err := refuseRemovedGatewayEnvVarsFrom(func(string) (string, bool) { return "", false })
-	if err != nil {
-		t.Fatalf("expected a migrated manifest to be accepted, got %v", err)
-	}
-}
-
-// TestRemovedGatewayEnvVarsMembershipIsExact pins the three names by value
-// rather than by count, the same way aenv-core's own
-// removed_catalog_env_vars_are_exactly_these pins REMOVED_CATALOG_ENV_VARS: a
-// change that only ever checked len(RemovedGatewayEnvVars) == 3 would pass
-// this test's weaker sibling even if one entry were replaced by an unrelated
-// fourth variable.
-func TestRemovedGatewayEnvVarsMembershipIsExact(t *testing.T) {
-	want := []string{
-		"GATEWAY_QUERY_ONLY_SCHEDULER_ADDR",
-		"GATEWAY_SCHEDULER_FALLBACK_DISABLED",
-		"GATEWAY_SCHEDULER_FALLBACK_TIMEOUT",
-	}
-	if len(RemovedGatewayEnvVars) != len(want) {
-		t.Fatalf("RemovedGatewayEnvVars = %v, want %v", RemovedGatewayEnvVars, want)
-	}
-	for i, name := range want {
-		if RemovedGatewayEnvVars[i] != name {
-			t.Fatalf("RemovedGatewayEnvVars[%d] = %q, want %q", i, RemovedGatewayEnvVars[i], name)
-		}
 	}
 }

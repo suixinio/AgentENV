@@ -387,21 +387,24 @@ configMapGenerator:
   # code: PostgreSQL is the catalog, `[pg]` is where it is configured, and
   # object storage holds byte artifacts and no rows.
   #
-  # 🔴 Both binaries now REFUSE TO START if either variable is set — see
-  # `refuse_removed_catalog_env_vars` (src/cfg.rs), called from both
-  # entrypoints before the configuration is read. That is deliberate and it is
-  # the reason this ConfigMap is deleted rather than left behind harmlessly:
-  # confique ignores an environment variable no field declares, so a manifest
-  # that kept them would have started a process that looked entirely healthy
-  # while its operator believed the catalog was double-written.
+  # 🔴 Setting either variable now does NOTHING. There was a startup refusal
+  # here for one release — both binaries exited naming the variable — and it
+  # has been removed with the rest of this transition's scaffolding. No field
+  # declares these names, so confique ignores them silently, which is exactly
+  # why this ConfigMap is deleted rather than left behind: a manifest that
+  # kept them would start a process that looks entirely healthy while its
+  # operator believed the catalog was double-written, and nothing would say
+  # otherwise. `services/shared/config/snapshot_catalog_manifest_test.go`
+  # walks every AgentENV workload in this directory and fails if one declares
+  # them; that walk is now the only thing standing between an un-migrated
+  # manifest and a silent misbelief.
   #
   # 🔴 One-time cost on a cluster that still has this ConfigMap and these
-  # references: apply the new manifests and roll BOTH workloads. A Pod that
-  # keeps the old environment exits at startup with an error naming the
-  # variable — loud, and recoverable by rolling. Deleting the ConfigMap alone
-  # is not enough while the Deployment/DaemonSet still reference it, but it is
-  # also not harmful: `optional: true` meant an absent ConfigMap already left
-  # the variables unset, which is exactly what the new build wants.
+  # references: apply the new manifests and roll BOTH workloads. Deleting the
+  # ConfigMap alone is not enough while the Deployment/DaemonSet still
+  # reference it, but it is also not harmful: `optional: true` meant an absent
+  # ConfigMap already left the variables unset, which is exactly what the new
+  # build wants.
   #
   # 🔴 There is no way back to an object-storage catalog. Rows written since the
   # cutover live in PostgreSQL alone; no code has ever replayed them the other

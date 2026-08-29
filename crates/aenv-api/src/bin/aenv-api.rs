@@ -84,23 +84,6 @@ async fn async_main() -> anyhow::Result<()> {
     aenv_api::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
-    // 🔴 Before the configuration is read — see the identical call in
-    // `aenv-node`'s own `async_main`, and `refuse_removed_catalog_env_vars`'s
-    // doc for why an ignored environment variable is the dangerous shape here.
-    aenv_api::cfg::refuse_removed_catalog_env_vars()?;
-    // 🔴 Same reasoning, for the deprecated
-    // AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE fallback: an un-migrated
-    // manifest would otherwise start with the heartbeat's hot-reload silently
-    // dead rather than refuse to start.
-    aenv_api::cfg::refuse_removed_scheduler_endpoint_file_env_var()?;
-    // 🔴 Same reasoning again, for the deleted `[cluster].node_placement_source`
-    // switch: `aenv-api` now always answers placement/heartbeat/paused-registry
-    // from its own in-process node registry, unconditionally, so a manifest
-    // still setting AENV_NODE_PLACEMENT_SOURCE (to either value) would
-    // otherwise start looking healthy while an operator believes the setting
-    // still selects something.
-    aenv_api::cfg::refuse_removed_node_placement_source_env_var()?;
-
     let cli = ApiCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         aenv_api::cfg::ConfigManager::init_global_from_path(config_path)?
@@ -1208,9 +1191,10 @@ mod tests {
         // The setting, which binary is being talked about, and — because
         // `[pg]` has no `env =` binding and cannot have one (confique will
         // not descend into `AppConfig::pg`'s `Option`) — the mechanism that
-        // actually supplies it. A message naming `AENV_PG_DSN`, as
-        // `build_snapshot_backend`'s older one still does, sends an operator
-        // to set an environment variable nothing reads.
+        // actually supplies it. A message naming `AENV_PG_DSN` would send an
+        // operator to set an environment variable nothing reads;
+        // `build_snapshot_backend` and `aenv-snapshot-image` each carry the
+        // same guard over their own copy of this wording.
         assert!(err.contains("[pg]"), "{err}");
         assert!(err.contains("[pg].dsn"), "{err}");
         assert!(err.contains("aenv-api"), "{err}");
@@ -1622,94 +1606,6 @@ mod tests {
             !assemble.contains("async fn assemble_api"),
             "the scan is reading more than assemble_api's body, so the ordering above \
              proves nothing about where the builders actually run"
-        );
-    }
-
-    /// 🔴 This binary actually refuses a manifest that still sets one of the
-    /// removed snapshot-catalog switches.
-    ///
-    /// `refuse_removed_catalog_env_vars` has its own two-direction test in
-    /// `src/cfg.rs`, and that test stays green with the call site deleted —
-    /// which is the whole failure mode: confique ignores an undeclared
-    /// environment variable, so a `AENV_SNAPSHOT_CATALOG_WRITE=both` left in a
-    /// manifest would start a process that looks entirely healthy while its
-    /// operator believes the catalog is double-written. It is not, and nothing
-    /// would say so.
-    #[test]
-    fn async_main_actually_refuses_the_removed_catalog_switches() {
-        let source = include_str!("aenv-api.rs");
-        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
-        assert!(
-            async_main.contains("cfg::refuse_removed_catalog_env_vars()"),
-            "async_main no longer refuses AENV_SNAPSHOT_CATALOG_WRITE / _READ; an un-migrated \
-             manifest would then start in silence, and src/cfg.rs's own test of the pure \
-             function would still report green"
-        );
-        // 🔴 The mutation control: the scan has to be able to fail. A `body_of`
-        // that returned the whole file would satisfy the assertion above for
-        // the wrong reason, and `async fn async_main` sits before the body's
-        // opening brace, so a correct extraction never contains it.
-        assert!(
-            !async_main.contains("async fn async_main"),
-            "the scan is reading more than async_main's body, so the assertion above proves \
-             nothing about where the call actually is"
-        );
-    }
-
-    /// 🔴 This binary actually refuses a manifest that still sets the removed
-    /// `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` fallback.
-    ///
-    /// `refuse_removed_scheduler_endpoint_file_env_var` has its own
-    /// two-direction test in `src/cfg.rs`, and that test stays green with the
-    /// call site deleted — which is the whole failure mode: confique ignores
-    /// an undeclared environment variable, so a manifest that kept setting
-    /// the old name would start a process that looks entirely healthy while
-    /// its heartbeat's hot-reload silently never fires. Nothing else would
-    /// say so.
-    #[test]
-    fn async_main_actually_refuses_the_removed_scheduler_endpoint_file_env_var() {
-        let source = include_str!("aenv-api.rs");
-        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
-        assert!(
-            async_main.contains("cfg::refuse_removed_scheduler_endpoint_file_env_var()"),
-            "async_main no longer refuses AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE; an \
-             un-migrated manifest would then start in silence, and src/cfg.rs's own test of the \
-             pure function would still report green"
-        );
-        // 🔴 The mutation control, same reasoning as the catalog scan above.
-        assert!(
-            !async_main.contains("async fn async_main"),
-            "the scan is reading more than async_main's body, so the assertion above proves \
-             nothing about where the call actually is"
-        );
-    }
-
-    /// 🔴 This binary actually refuses a manifest that still sets the removed
-    /// `AENV_NODE_PLACEMENT_SOURCE` switch — the one that used to choose
-    /// between this in-process node registry and dialling a Go scheduler
-    /// process for the same placement/heartbeat/paused-registry answers.
-    ///
-    /// `refuse_removed_node_placement_source_env_var` has its own
-    /// two-direction test in `src/cfg.rs`, and that test stays green with the
-    /// call site deleted — which is the whole failure mode: confique ignores
-    /// an undeclared environment variable, so a manifest that kept setting it
-    /// would start a process that looks entirely healthy while an operator
-    /// believes the setting still selects something.
-    #[test]
-    fn async_main_actually_refuses_the_removed_node_placement_source_env_var() {
-        let source = include_str!("aenv-api.rs");
-        let async_main = body_of(source, "async fn async_main() -> anyhow::Result<()>");
-        assert!(
-            async_main.contains("cfg::refuse_removed_node_placement_source_env_var()"),
-            "async_main no longer refuses AENV_NODE_PLACEMENT_SOURCE; an un-migrated manifest \
-             would then start in silence, and src/cfg.rs's own test of the pure function would \
-             still report green"
-        );
-        // 🔴 The mutation control, same reasoning as the catalog scan above.
-        assert!(
-            !async_main.contains("async fn async_main"),
-            "the scan is reading more than async_main's body, so the assertion above proves \
-             nothing about where the call actually is"
         );
     }
 }

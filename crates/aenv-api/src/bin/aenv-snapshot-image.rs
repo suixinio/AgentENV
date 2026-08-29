@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use aenv_api::cfg::ConfigManager;
+use aenv_api::cfg::{AppConfig, ConfigManager};
 use aenv_api::pg::{self, PgPoolSettings};
 use aenv_api::snapshot::image_export::SnapshotImageService;
 use anyhow::Context as _;
@@ -64,11 +64,7 @@ async fn main() -> anyhow::Result<()> {
     // that crate. Nothing here migrates the schema: the tool is read-only, and
     // a schema this cluster's api replicas have not already created is a
     // cluster with no snapshots to export.
-    let settings = PgPoolSettings::from_config(config_manager.config().pg.as_ref())?.context(
-        "[pg] is not configured, and the snapshot catalog is PostgreSQL: this tool reads one \
-         catalog row and then reaches the rootfs layer bytes, and it has nowhere to read that \
-         row from. Point [pg].dsn (or AENV_PG_DSN) at the same database the api replicas use",
-    )?;
+    let settings = pg_settings(config_manager.config())?;
     let pool = pg::connect(&settings)
         .await
         .context("connect to the snapshot catalog database")?;
@@ -93,11 +89,73 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `[pg]` settings this tool cannot run without, or the refusal that says
+/// how to supply them.
+///
+/// 🔴 Extracted from `main` so the refusal is reachable from a test without a
+/// database. What it must not say is `AENV_PG_DSN`: there is no such
+/// environment variable and there cannot be one — `AppConfig::pg` is an
+/// `Option<PgConfig>`, and confique reaches a field from the environment only
+/// through `#[config(nested)]`, which may not be optional (see `src/cfg.rs`'s
+/// `[pg]` module doc). An operator sent to set it would export a name nothing
+/// reads and see the same refusal again. The wording therefore matches
+/// `build_pg_pool`'s (`crates/aenv-api/src/bin/aenv-api.rs`): the setting is
+/// `[pg].dsn`, it is TOML-file-only, and it arrives through
+/// `AENV_CONFIG_PATH` or an `AENV_CONFIG_OVERLAY_PATH` overlay.
+fn pg_settings(config: &AppConfig) -> anyhow::Result<PgPoolSettings> {
+    PgPoolSettings::from_config(config.pg.as_ref())?.context(
+        "[pg] is not configured, and the snapshot catalog is PostgreSQL: this tool reads one \
+         catalog row and then reaches the rootfs layer bytes, and it has nowhere to read that \
+         row from. Set [pg].dsn to the same database the api replicas use — it is \
+         TOML-file-only, with no environment binding (confique cannot descend into \
+         AppConfig::pg's Option), so supply it through the file AENV_CONFIG_PATH names or an \
+         AENV_CONFIG_OVERLAY_PATH overlay, the way deploy/k8s/base's pg-dsn.toml and \
+         deploy/docker-compose.yml's /tmp/agentenv-pg/pg-dsn.toml both do",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{pg_settings, AppConfig, Cli};
+
+    /// 🔴 The refusal must not send an operator to an environment variable
+    /// that does not exist.
+    ///
+    /// `AENV_PG_DSN` was named here for as long as this tool has existed, and
+    /// nothing reads it: `[pg]` is `Option<PgConfig>` in `AppConfig`, and
+    /// confique descends into a struct only through `#[config(nested)]`, which
+    /// may not be optional — so no field under `[pg]` can carry an `env =`
+    /// binding. An operator who followed the old message would export the
+    /// name, restart, and get the identical error with nothing to show for it.
+    ///
+    /// `AppConfig::default()` carries no `[pg]`, which is what makes this
+    /// refusal reachable without a database.
+    #[test]
+    fn the_missing_pg_refusal_names_no_environment_variable_that_does_not_exist() {
+        let config = AppConfig::default();
+        assert!(
+            config.pg.is_none(),
+            "the default has no [pg], which is what makes this refusal reachable"
+        );
+
+        let err = match pg_settings(&config) {
+            Ok(_) => panic!("this tool has no catalog to read without [pg]"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(
+            !err.contains("AENV_PG_DSN"),
+            "there is no such environment variable: {err}"
+        );
+        // And it still says what to do instead — the same three facts
+        // `build_pg_pool`'s message carries, so an operator reading either one
+        // is told the same thing.
+        assert!(err.contains("[pg].dsn"), "{err}");
+        assert!(err.contains("TOML-file-only"), "{err}");
+        assert!(err.contains("AENV_CONFIG_OVERLAY_PATH"), "{err}");
+        assert!(err.contains("pg-dsn.toml"), "{err}");
+    }
 
     #[test]
     fn cli_parses_options_and_requires_snapshot() {

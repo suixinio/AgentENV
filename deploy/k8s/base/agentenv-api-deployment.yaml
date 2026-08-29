@@ -200,8 +200,11 @@ spec:
             - name: AENV_PAUSED_REGISTRY_BACKEND
               value: "postgres"
             # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
-            # setting them would now stop this Pod at startup
-            # (`refuse_removed_catalog_env_vars`, src/cfg.rs). 阶段 2c / Stage B
+            # setting them would now do nothing at all — no field declares
+            # those names, so confique ignores them and no error is raised.
+            # The manifest walk in
+            # services/shared/config/snapshot_catalog_manifest_test.go is what
+            # keeps them out of this file. 阶段 2c / Stage B
             # finished: PostgreSQL is the snapshot catalog, object storage holds
             # byte artifacts and no rows, and the object-storage catalog, the
             # double write and the read-side confirmation table are all deleted
@@ -213,8 +216,14 @@ spec:
             # (`SnapshotRepository::stage`) — its repository carries
             # `NoSnapshotCatalog`, which refuses; the row is written here, by
             # `commit_staged` → `catalog.publish_commit`, straight into the
-            # shared `[pg]` pool. That makes AENV_PG_DSN below load-bearing in a
-            # way it was not before: `build_snapshot_backend` refuses to
+            # shared `[pg]` pool. That makes the `[pg].dsn` overlay below
+            # load-bearing in a way it was not before — and there is no
+            # AENV_PG_DSN to set instead: `[pg]` is `Option<PgConfig>`, and
+            # confique reaches a field from the environment only through
+            # `#[config(nested)]`, which may not be optional, so no key under
+            # `[pg]` can carry an `env =` binding. It arrives through
+            # `AENV_CONFIG_OVERLAY_PATH` and the `pg-dsn.toml` overlay key
+            # below, and nowhere else. `build_snapshot_backend` refuses to
             # assemble this replica without it, and logs "snapshot catalog is
             # served solely by PostgreSQL" when it succeeds — that log line, not
             # Pod readiness, is what says the assembly took this path.
@@ -302,8 +311,8 @@ spec:
             # separate scheduler. This is no longer the latency-not-availability
             # trade it was when that path could lead somewhere else; the switch
             # that used to be able to skip it entirely
-            # (GATEWAY_SCHEDULER_FALLBACK_DISABLED) is deleted, so the call is
-            # unconditional now — see the `cold-lookup-config` note in
+            # (`gateway.scheduler_fallback_disabled`) is deleted, so the call
+            # is unconditional now — see the `cold-lookup-config` note in
             # kustomization.yaml for the timeout that still bounds it.
             - name: AENV_API_GRPC_ADDR
               value: "0.0.0.0:8002"
@@ -398,8 +407,9 @@ spec:
             # `"scheduler"` alternative it selected between (dialling a Go
             # scheduler process for placement instead of answering from this
             # process's own registry) is gone along with that process, and
-            # the switch was deleted with it — `aenv-api` refuses to start if
-            # this env var is still set (`cfg::refuse_removed_node_placement_source_env_var`).
+            # the switch was deleted with it. Setting that env var again does
+            # nothing at all: no field declares it, so confique ignores it and
+            # nothing errors.
             #
             # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` does not roll back on its own
             # any more. `"central"` — the backend that used to pair with the
@@ -432,9 +442,10 @@ spec:
             # confique silently ignores an undeclared variable. It is safe to
             # leave behind only because the value it used to have to carry
             # (`redis`) is now what happens with no key at all — losing it
-            # cannot degrade this Deployment, which is why there is no
-            # startup refusal for it the way there is for
-            # `AENV_NODE_PLACEMENT_SOURCE`.
+            # cannot degrade this Deployment. That is now true of every
+            # removed AgentENV variable: the startup refusals that carried
+            # un-migrated manifests through 阶段 2c / 阶段四 have themselves
+            # been removed, so an old key is ignored rather than fatal.
             - name: AENV_BINDING_STORE_REDIS_URL
               value: redis://agentenv-redis:6379
             # 🔴 The scheduler's SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE,

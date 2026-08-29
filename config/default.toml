@@ -498,15 +498,16 @@ p2p_enabled = true
 # catalog rows at the Stage B cutover and holds none now. There is no
 # single-machine mode that keeps rows on local disk.
 #
-# 🔴 AENV_SNAPSHOT_CATALOG_WRITE and AENV_SNAPSHOT_CATALOG_READ are REMOVED, and
-# a process that finds either of them set exits at startup with an error naming
-# it. They chose between the two catalogs while the catalog was moving; there is
-# one catalog now, so a manifest that still carries them describes an
-# arrangement this build does not have. The refusal is deliberate: confique
-# ignores an environment variable no field declares, so leaving them set would
-# otherwise be silent, and an operator would go on believing the catalog is
-# where the variable says it is. AENV_SNAPSHOT_CATALOG_MIRROR_PATH is refused
-# the same way — the double write's queue is gone with the double write.
+# 🔴 AENV_SNAPSHOT_CATALOG_WRITE, AENV_SNAPSHOT_CATALOG_READ and
+# AENV_SNAPSHOT_CATALOG_MIRROR_PATH are REMOVED. They chose between the two
+# catalogs while the catalog was moving, and queued the double write between
+# them; there is one catalog now, so a manifest that still carries any of them
+# describes an arrangement this build does not have. The startup refusal that
+# carried un-migrated manifests through the move is gone too: no field declares
+# these names, so confique simply ignores them and nothing errors. What keeps
+# them out of this repository's own deployments is the manifest walk in
+# services/shared/config/snapshot_catalog_manifest_test.go, which fails if any
+# AgentENV workload under deploy/k8s/base declares one.
 #
 # 🔴 build_heartbeat_interval_secs is the only declaration of this cadence:
 # the catalog build reaper derives its TTL from it (ttl = 3 x this value, in

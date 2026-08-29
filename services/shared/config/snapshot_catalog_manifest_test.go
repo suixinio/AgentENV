@@ -23,10 +23,16 @@ import (
 // `SnapshotCatalogRead` do not exist, and object storage is not a catalog.
 //
 // What replaces them is the inverse assertion, because the risk inverted with
-// them: both binaries now REFUSE TO START when either variable is set
-// (`refuse_removed_catalog_env_vars`, src/cfg.rs), so a manifest that still
-// carries one does not quietly do nothing — it CrashLoops the workload. The
-// walk below is the manifest-side half of that guard.
+// them: a manifest that still carries one is describing an arrangement this
+// build does not have. Both binaries REFUSED TO START on those names for one
+// release; that startup guard has been deleted along with the rest of the
+// transition's scaffolding, so confique now ignores the undeclared names in
+// silence and an un-migrated workload comes up looking entirely healthy while
+// its operator believes the catalog is double-written.
+//
+// 🔴 The walk below is therefore no longer the manifest-side *half* of a
+// guard — it is the whole guard. Nothing else in the tree fails when one of
+// these names reappears in a manifest.
 
 const (
 	catalogWriteEnv = "AENV_SNAPSHOT_CATALOG_WRITE"

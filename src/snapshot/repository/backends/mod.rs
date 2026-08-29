@@ -97,8 +97,11 @@ pub fn build_snapshot_backend(
         "no snapshot catalog is configured: [pg].dsn is unset and PostgreSQL is the only \
          snapshot catalog there is. Object storage held one until the Stage B cutover and \
          holds byte artifacts alone now, so starting without [pg] would leave every snapshot \
-         and template request with nowhere to read or write a row. Configure [pg] (or \
-         AENV_PG_DSN) for this half",
+         and template request with nowhere to read or write a row. Set [pg].dsn for this half \
+         — it is TOML-file-only, with no environment binding (confique cannot descend into \
+         AppConfig::pg's Option), so supply it through the file AENV_CONFIG_PATH names or an \
+         AENV_CONFIG_OVERLAY_PATH overlay, the way deploy/k8s/base's pg-dsn.toml and \
+         deploy/docker-compose.yml's /tmp/agentenv-pg/pg-dsn.toml both do",
     )?;
 
     let node_id = crate::identity::local_node_id();
@@ -226,6 +229,38 @@ mod tests {
             rendered.contains("[pg]"),
             "the error must name the setting an operator has to add: {rendered}"
         );
+    }
+
+    /// 🔴 And it must not name an environment variable that does not exist.
+    ///
+    /// This message said "Configure [pg] (or AENV_PG_DSN)" for as long as the
+    /// refusal has existed, and nothing reads that name: `AppConfig::pg` is an
+    /// `Option<PgConfig>`, and confique reaches a field from the environment
+    /// only through `#[config(nested)]`, which may not be optional — so no
+    /// field under `[pg]` can carry an `env =` binding at all (see
+    /// `src/cfg.rs`'s own note). An operator who followed it would export the
+    /// variable, restart, and get the identical error back.
+    ///
+    /// The positive half is what makes the negative one actionable, and it is
+    /// deliberately the same three facts `build_pg_pool`'s message carries
+    /// (`crates/aenv-api/src/bin/aenv-api.rs`): the setting is `[pg].dsn`, it
+    /// is TOML-file-only, and it arrives through `AENV_CONFIG_PATH` or an
+    /// `AENV_CONFIG_OVERLAY_PATH` overlay.
+    #[test]
+    fn the_refusal_names_no_environment_variable_that_does_not_exist() {
+        let Err(error) = build_snapshot_backend(storage(), None, CentralCatalogUse::AsConfigured)
+        else {
+            panic!("an api half with no [pg] holds no catalog and must not start");
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("AENV_PG_DSN"),
+            "there is no such environment variable: {rendered}"
+        );
+        assert!(rendered.contains("[pg].dsn"), "{rendered}");
+        assert!(rendered.contains("TOML-file-only"), "{rendered}");
+        assert!(rendered.contains("AENV_CONFIG_OVERLAY_PATH"), "{rendered}");
+        assert!(rendered.contains("pg-dsn.toml"), "{rendered}");
     }
 
     /// The other direction: a catalog is handed over, and it is the one the

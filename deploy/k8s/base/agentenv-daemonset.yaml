@@ -81,8 +81,11 @@ spec:
             # going to ignore; the code default (`local`, from
             # config/default.toml) produces the identical outcome without one.
             # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
-            # setting them would now stop this Pod at startup
-            # (`refuse_removed_catalog_env_vars`, src/cfg.rs). 阶段 2c / Stage B
+            # setting them would now do nothing at all — no field declares
+            # those names, so confique ignores them and no error is raised.
+            # The manifest walk in
+            # services/shared/config/snapshot_catalog_manifest_test.go is what
+            # keeps them out of this file. 阶段 2c / Stage B
             # finished: PostgreSQL is the snapshot catalog, and the section that
             # configures it belongs to the api half alone — this half links no
             # PostgreSQL client at all and refuses to start if that section is
@@ -215,9 +218,8 @@ spec:
             # `[cluster]` copy (see CLAUDE.md's cfg.rs note). Setting the old
             # `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE` name here again
             # would not error — confique silently ignores undeclared
-            # environment variables — it would just stop reloading, which is
-            # exactly why both binaries now refuse to start if that name is
-            # set at all.
+            # environment variables — it would just stop reloading. Set the
+            # `AENV_CLUSTER_` name below and nothing else.
             - name: AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE
               value: /etc/agentenv/heartbeat/scheduler-endpoint
             # 🔴 There is deliberately no AENV_NODE_SERVICE_ENABLED here, and no

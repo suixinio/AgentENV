@@ -16,6 +16,12 @@ use tracing::info;
 use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
+// 🔴 Every `record_object_store_request` below passes
+// `ObjectStoreSurface::Artifact` literally, and that is not an oversight: this
+// backend's only key builders are `layout::managed_layer_key` and
+// `layout::artifact_key`, so every request it issues is byte traffic. The
+// classifier that used to derive the label from the key is gone with the
+// `catalog/` keys it looked for. See `metrics::ObjectStoreSurface`.
 use crate::snapshot::repository::metrics::{
     record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
@@ -125,7 +131,7 @@ impl OssClient {
         metric.finish(&result);
         record_object_store_request(
             ObjectStoreOp::Get,
-            ObjectStoreSurface::for_key(key),
+            ObjectStoreSurface::Artifact,
             read_outcome(&result),
         );
         result
@@ -153,7 +159,7 @@ impl OssClient {
         metric.finish(&result);
         record_object_store_request(
             ObjectStoreOp::Get,
-            ObjectStoreSurface::for_key(key),
+            ObjectStoreSurface::Artifact,
             read_outcome(&result),
         );
         result
@@ -175,7 +181,7 @@ impl OssClient {
         // question expecting "no" to be a routine answer.
         record_object_store_request(
             ObjectStoreOp::Head,
-            ObjectStoreSurface::for_key(key),
+            ObjectStoreSurface::Artifact,
             match &result {
                 Ok(present) => ObjectStoreOutcome::from_present(*present),
                 Err(_) => ObjectStoreOutcome::Error,
@@ -202,7 +208,7 @@ impl OssClient {
         // a miss.
         record_object_store_request(
             ObjectStoreOp::List,
-            ObjectStoreSurface::for_key(prefix),
+            ObjectStoreSurface::Artifact,
             ObjectStoreOutcome::from_success(listed.is_ok()),
         );
         let keys: Vec<String> = listed?;
@@ -217,7 +223,8 @@ impl OssClient {
             .collect())
     }
 
-    /// Write small data (catalog JSON, alias JSON, etc.).
+    /// Write small data — an `image.json`, a manifest, any per-snapshot
+    /// artifact small enough to hold in memory.
     pub async fn put_bytes(
         &self,
         key: &str,
@@ -240,7 +247,7 @@ impl OssClient {
         metric.finish(&result);
         record_object_store_request(
             ObjectStoreOp::Put,
-            ObjectStoreSurface::for_key(key),
+            ObjectStoreSurface::Artifact,
             ObjectStoreOutcome::from_success(result.is_ok()),
         );
         if result.is_ok() {
@@ -285,7 +292,7 @@ impl OssClient {
         metric.finish(&result);
         record_object_store_request(
             ObjectStoreOp::Put,
-            ObjectStoreSurface::for_key(key),
+            ObjectStoreSurface::Artifact,
             ObjectStoreOutcome::from_success(result.is_ok()),
         );
         match result {
@@ -326,7 +333,7 @@ impl OssClient {
             .with_context(|| format!("oss delete '{key}'"));
         record_object_store_request(
             ObjectStoreOp::Delete,
-            ObjectStoreSurface::for_key(key),
+            ObjectStoreSurface::Artifact,
             match &result {
                 Ok(deleted) => ObjectStoreOutcome::from_present(*deleted == Deleted::Removed),
                 Err(_) => ObjectStoreOutcome::Error,
@@ -352,7 +359,7 @@ impl OssClient {
         .await;
         record_object_store_request(
             ObjectStoreOp::DeletePrefix,
-            ObjectStoreSurface::for_key(prefix),
+            ObjectStoreSurface::Artifact,
             ObjectStoreOutcome::from_success(result.is_ok()),
         );
         result
@@ -439,9 +446,9 @@ enum Deleted {
 }
 
 /// Classifies a read: a `NotFound` from the store is an answer, not a failure.
-/// Every catalog read path in this backend (`read_record`, `load_alias_target`,
-/// `resolve_alias`) turns that same error into `Ok(None)`, so counting it as
-/// `outcome="error"` made routine lookups indistinguishable from real ones.
+/// A caller asking whether an artifact is already uploaded turns that same
+/// error into `Ok(None)` or `Ok(false)`, so counting it as `outcome="error"`
+/// makes routine lookups indistinguishable from real ones.
 fn read_outcome<T>(result: &Result<T>) -> ObjectStoreOutcome {
     match result {
         Ok(_) => ObjectStoreOutcome::Ok,

@@ -1,24 +1,28 @@
 //! Object-storage request accounting shared by the snapshot repository
 //! backends.
 //!
-//! The `surface` label is the reason this counter exists. Object storage keeps
-//! carrying every snapshot *byte* even once the catalog moves out of it, so
-//! `op="put"` stays permanently high and would drown out the thing we care
-//! about. Only the `surface="catalog"` series answers "how many object-storage
-//! requests does listing snapshots cost", which is what the catalog migration
-//! is measured against.
-
-/// Repository-relative key prefix that holds catalog rows: snapshot records
-/// under `catalog/records/` and alias bindings under `catalog/aliases/`.
-const CATALOG_PREFIX: &str = "catalog/";
+//! The `surface` label existed to separate two bodies of data that shared one
+//! bucket: rows under `catalog/`, and the snapshot bytes everything else. Only
+//! the `surface="catalog"` series answered "how many object-storage requests
+//! does listing snapshots cost", which is what the catalog migration was
+//! measured against. That migration is finished — PostgreSQL is the catalog,
+//! object storage holds no rows at all — so every request a backend issues
+//! today is byte traffic and the label is emitted as the constant
+//! `surface="artifact"`.
+//!
+//! 🔴 The label stays. `agentenv_snapshot_object_store_requests_total` is a
+//! published series with three labels, and dropping one because it currently
+//! has a single value silently rewrites every query and dashboard built on it
+//! — a PromQL selector naming `surface` matches nothing at all against a series
+//! that no longer carries it. See the test that pins the name and the three
+//! keys.
 
 /// One increment per request a repository backend issues against its durable
 /// store.
 ///
 /// Counts *backend operations*, not literal HTTP round-trips: opendal's retry
 /// layer and multipart uploads can turn one increment into several requests on
-/// the wire. Catalog objects are small single-shot JSON blobs, so on the
-/// catalog surface the two coincide unless a request is retried.
+/// the wire.
 pub const OBJECT_STORE_REQUESTS_TOTAL: &str = "agentenv_snapshot_object_store_requests_total";
 
 /// Publish rollbacks that deliberately left a snapshot's artifacts in place.
@@ -40,10 +44,17 @@ pub fn record_artifacts_retained() {
 }
 
 /// Which body of data a request touched.
+///
+/// 🔴 One variant, on purpose. A `Catalog` variant sat beside it, chosen by a
+/// `for_key` classifier that tested the key against a `catalog/` prefix; the
+/// only key builders left are `oss::layout`'s `managed-layers/{digest}` and
+/// `artifacts/{id}/…`, so every one of the eight call sites resolved to
+/// `Artifact` and the classifier was a branch that could not be taken. Kept as
+/// an enum rather than folded into the emission site because the label is part
+/// of the published series either way, and a second body of data arriving is
+/// then a variant and eight compiler errors instead of a silent mislabelling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectStoreSurface {
-    /// Snapshot records and alias bindings — the rows.
-    Catalog,
     /// Snapshot artifacts and managed layers — the bytes.
     Artifact,
 }
@@ -51,25 +62,7 @@ pub enum ObjectStoreSurface {
 impl ObjectStoreSurface {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Catalog => "catalog",
             Self::Artifact => "artifact",
-        }
-    }
-
-    /// Classifies a repository-relative key (the backend prefix is already
-    /// stripped by the time a key reaches here).
-    ///
-    /// Deriving the surface from the key instead of threading it through every
-    /// call site keeps composite callers labelled correctly without each of
-    /// them having to remember to say so: `list()`'s LIST plus one GET per
-    /// record, and `bind_alias()`'s read / write / read-back / delete, all land
-    /// on `catalog/` keys and are counted as catalog traffic for free.
-    pub fn for_key(key: &str) -> Self {
-        let key = key.trim_start_matches('/');
-        if key.starts_with(CATALOG_PREFIX) || key == CATALOG_PREFIX.trim_end_matches('/') {
-            Self::Catalog
-        } else {
-            Self::Artifact
         }
     }
 }
@@ -198,37 +191,92 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::ObjectStoreSurface;
+    use super::*;
+    use metrics_util::debugging::DebuggingRecorder;
 
+    /// The name and the full label set of the one sample
+    /// [`record_object_store_request`] emits.
+    fn emitted_series(
+        op: ObjectStoreOp,
+        surface: ObjectStoreSurface,
+        outcome: ObjectStoreOutcome,
+    ) -> (String, Vec<(String, String)>) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        record_object_store_request(op, surface, outcome);
+        drop(guard);
+
+        let samples = snapshotter.snapshot().into_vec();
+        assert_eq!(samples.len(), 1, "one request is one sample");
+        let key = samples[0].0.key().clone();
+        let mut labels: Vec<(String, String)> = key
+            .labels()
+            .map(|label| (label.key().to_owned(), label.value().to_owned()))
+            .collect();
+        labels.sort();
+        (key.name().to_owned(), labels)
+    }
+
+    /// 🔴 The published contract of
+    /// `agentenv_snapshot_object_store_requests_total`, pinned by value.
+    ///
+    /// The metric name and all three label keys are consumed from outside this
+    /// repository, so renaming the series or dropping a label is a breaking
+    /// change that compiles, passes every other test, and shows up as an empty
+    /// graph. `surface` in particular now has one possible value — which is
+    /// exactly the state in which somebody deletes it as redundant.
     #[test]
-    fn catalog_keys_are_separated_from_byte_keys() {
-        for catalog_key in [
-            "catalog/records/0198f0a1-0000-7000-8000-000000000000.json",
-            "catalog/aliases/my-template.json",
-            "catalog/records/",
-            "catalog/",
-            "catalog",
+    fn the_object_store_counter_keeps_its_name_and_all_three_labels() {
+        let (name, labels) = emitted_series(
+            ObjectStoreOp::Get,
+            ObjectStoreSurface::Artifact,
+            ObjectStoreOutcome::Ok,
+        );
+
+        assert_eq!(name, "agentenv_snapshot_object_store_requests_total");
+        assert_eq!(name, OBJECT_STORE_REQUESTS_TOTAL);
+        assert_eq!(
+            labels,
+            vec![
+                ("op".to_owned(), "get".to_owned()),
+                ("outcome".to_owned(), "ok".to_owned()),
+                ("surface".to_owned(), "artifact".to_owned()),
+            ],
+            "the series carries op/surface/outcome and nothing else"
+        );
+    }
+
+    /// The other label values a reader can select on, so a renamed variant
+    /// string is caught here rather than in a dashboard.
+    #[test]
+    fn every_op_and_outcome_keeps_its_label_value() {
+        for (op, expected) in [
+            (ObjectStoreOp::Get, "get"),
+            (ObjectStoreOp::Put, "put"),
+            (ObjectStoreOp::Head, "head"),
+            (ObjectStoreOp::List, "list"),
+            (ObjectStoreOp::Delete, "delete"),
+            (ObjectStoreOp::DeletePrefix, "delete_prefix"),
         ] {
-            assert_eq!(
-                ObjectStoreSurface::for_key(catalog_key),
-                ObjectStoreSurface::Catalog,
-                "'{catalog_key}' should be catalog traffic"
+            let (_, labels) =
+                emitted_series(op, ObjectStoreSurface::Artifact, ObjectStoreOutcome::Ok);
+            assert!(
+                labels.contains(&("op".to_owned(), expected.to_owned())),
+                "{op:?} must be labelled '{expected}', got {labels:?}"
             );
         }
 
-        // Everything that is not a catalog row is bytes: per-snapshot
-        // artifacts, managed overlaybd layers, and anything added later.
-        for artifact_key in [
-            "artifacts/0198f0a1-0000-7000-8000-000000000000/vm_state.bin",
-            "artifacts/0198f0a1-0000-7000-8000-000000000000/",
-            "managed-layers/sha256:deadbeef",
-            "catalogue/records/not-a-catalog-key.json",
-            "",
+        for (outcome, expected) in [
+            (ObjectStoreOutcome::Ok, "ok"),
+            (ObjectStoreOutcome::NotFound, "not_found"),
+            (ObjectStoreOutcome::Error, "error"),
         ] {
-            assert_eq!(
-                ObjectStoreSurface::for_key(artifact_key),
-                ObjectStoreSurface::Artifact,
-                "'{artifact_key}' should be byte traffic"
+            let (_, labels) =
+                emitted_series(ObjectStoreOp::Get, ObjectStoreSurface::Artifact, outcome);
+            assert!(
+                labels.contains(&("outcome".to_owned(), expected.to_owned())),
+                "{outcome:?} must be labelled '{expected}', got {labels:?}"
             );
         }
     }

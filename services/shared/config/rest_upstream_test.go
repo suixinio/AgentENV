@@ -79,7 +79,7 @@ func TestALoadedGatewayConfigRefusesARestUpstreamItCannotUse(t *testing.T) {
 	if err := os.WriteFile(bad, []byte(`{"gateway":{"rest_upstream_addr":"grpc://agentenv-api:8002"}}`), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	if _, err := Load(bad, "gateway"); err == nil {
+	if _, err := Load(bad); err == nil {
 		t.Fatal("a gateway config naming an unusable REST upstream loaded successfully")
 	}
 
@@ -89,7 +89,7 @@ func TestALoadedGatewayConfigRefusesARestUpstreamItCannotUse(t *testing.T) {
 	if err := os.WriteFile(good, []byte(`{"gateway":{"rest_upstream_addr":"agentenv-api:8000"}}`), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	cfg, err := Load(good, "gateway")
+	cfg, err := Load(good)
 	if err != nil {
 		t.Fatalf("a gateway config naming a usable REST upstream failed to load: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestALoadedGatewayConfigRefusesARestUpstreamItCannotUse(t *testing.T) {
 	// ...and the environment is refused on the same terms, which matters
 	// because the environment is how this switch is actually flipped.
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://agentenv-api:8000/v2")
-	if _, err := Load(good, "gateway"); err == nil {
+	if _, err := Load(good); err == nil {
 		t.Fatal("an unusable REST upstream from the environment loaded successfully")
 	}
 }

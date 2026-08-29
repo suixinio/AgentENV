@@ -152,7 +152,7 @@ func TestTheTwoSwitchConfigMapsStandInOppositeRelationsToTheCode(t *testing.T) {
 	clearProjectionEnv(t)
 	t.Setenv(gatewayFenceEnv, "")
 
-	gateway, err := Load("", "gateway")
+	gateway, err := Load("")
 	if err != nil {
 		t.Fatalf("load gateway defaults: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestTheMountedFilesDoNotUndoTheSwitches(t *testing.T) {
 	clearProjectionEnv(t)
 	t.Setenv(gatewayFenceEnv, "")
 
-	gateway, err := Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway")
+	gateway, err := Load(filepath.Join(manifestDir, "config", "gateway.json"))
 	if err != nil {
 		t.Fatalf("loading the mounted gateway config failed: %v", err)
 	}

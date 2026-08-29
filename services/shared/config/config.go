@@ -383,19 +383,32 @@ func parseGatewayDuration(field string, raw json.RawMessage) (time.Duration, err
 	return 0, fmt.Errorf("%s must be a duration string like \"30s\"", field)
 }
 
+// Config is one process's configuration, and that process is the gateway.
+//
+// 🔴 There used to be a `Service` field, set from a string every caller passed
+// as "gateway", and the whole gateway half of validate() was indented under
+// `if c.Service == "gateway"`. It existed while this module shipped two
+// binaries: `services/scheduler` loaded the same struct and skipped that block.
+// The scheduler is deleted, `services/gateway/cmd/main.go` is the only non-test
+// caller left, and a discriminator with one value is a branch that cannot be
+// exercised — so the field is gone and the gateway block runs unconditionally.
+//
+// Dropping the `service` JSON tag is not a breaking change for a deployed
+// manifest: `json.Unmarshal` ignores a key no field claims, so a ConfigMap that
+// still carries `"service": "gateway"` loads exactly as it did.
+// `TestAConfigStillNamingItsServiceLoads` pins that rather than trusting it.
 type Config struct {
-	Service   string        `json:"service"`
 	LogLevel  string        `json:"log_level"`
 	LogFormat string        `json:"log_format"`
 	Gateway   GatewayConfig `json:"gateway"`
 }
 
-func Load(path string, service string) (Config, error) {
-	return load(path, service)
+func Load(path string) (Config, error) {
+	return load(path)
 }
 
-func load(path string, service string) (Config, error) {
-	cfg := defaultConfig(service)
+func load(path string) (Config, error) {
+	cfg := defaultConfig()
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -408,7 +421,6 @@ func load(path string, service string) (Config, error) {
 	if err := overrideWithEnv(&cfg); err != nil {
 		return Config{}, err
 	}
-	cfg.Service = service
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -416,9 +428,8 @@ func load(path string, service string) (Config, error) {
 	return cfg, nil
 }
 
-func defaultConfig(service string) Config {
+func defaultConfig() Config {
 	return Config{
-		Service:   service,
 		LogLevel:  "info",
 		LogFormat: "auto",
 		Gateway: GatewayConfig{
@@ -555,10 +566,17 @@ func (c Config) Validate() error {
 	return c.validate()
 }
 
+// validate refuses a configuration this process cannot serve.
+//
+// 🔴 Everything below the log settings used to sit inside `if c.Service ==
+// "gateway"`, and there was a `c.Service == ""` refusal above it. Both are
+// gone with the field: this module ships one binary, so the gateway checks are
+// this loader's checks. Re-introducing a discriminator would silently switch
+// the whole block off for any value that is not the one string it compared
+// against — which is exactly the failure an un-migrated manifest would have
+// produced, had `service` ever been read back off the file rather than passed
+// in by the caller.
 func (c Config) validate() error {
-	if c.Service == "" {
-		return errors.New("service is required")
-	}
 	if c.LogLevel == "" {
 		return errors.New("log_level is required")
 	}
@@ -570,45 +588,43 @@ func (c Config) validate() error {
 	default:
 		return errors.New("log_format must be one of auto, console, json")
 	}
-	if c.Service == "gateway" {
-		if c.Gateway.HTTPListenAddr == "" {
-			return errors.New("gateway.http_listen_addr is required")
-		}
-		if c.Gateway.MetricsListenAddr == "" {
-			return errors.New("gateway.metrics_listen_addr is required")
-		}
-		if c.Gateway.SchedulerAddr == "" {
-			return errors.New("gateway.scheduler_addr is required")
-		}
-		if _, err := ParseGatewayExecutionFencing(string(c.Gateway.Routing.ExecutionFencing)); err != nil {
-			return err
-		}
-		// 🔴 Refused rather than quietly ignored. A read switch with nowhere to
-		// read from is a switch that reports as on and does nothing, and the
-		// symptom — every request still going to the scheduler — is exactly
-		// what the switch being off looks like.
-		if c.Gateway.Routing.ProjectionRead && strings.TrimSpace(c.Gateway.RedisAddr) == "" {
-			return errors.New("gateway.routing.projection_read requires gateway.redis_addr")
-		}
-		// Same reasoning, one step earlier: a REST upstream nobody can parse
-		// stops the process here rather than turning into a 502 per request.
-		if _, err := ParseRestUpstream(c.Gateway.RestUpstreamAddr); err != nil {
-			return err
-		}
-		// 🔴 阶段 3a no longer has an "off" position for its REST upstream.
-		// Nodes run aenv-node now and answer 404 on every user-facing REST
-		// route, so an empty rest_upstream_addr is not a rollback — it is an
-		// outage with no matching half, and refusing it here turns that into a
-		// startup failure instead of a 404/502 discovered per request. See
-		// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest.
-		//
-		// Its former sibling, resume_addr, needs no such check any more: the
-		// wake-up RPC rides scheduler_addr's connection, so there is no second
-		// address left to be emptied independently of it.
-		if strings.TrimSpace(c.Gateway.RestUpstreamAddr) == "" {
-			return errors.New("gateway.rest_upstream_addr is required: aenv-node answers 404 on " +
-				"user-facing REST, so the gateway has nowhere else to send it")
-		}
+	if c.Gateway.HTTPListenAddr == "" {
+		return errors.New("gateway.http_listen_addr is required")
+	}
+	if c.Gateway.MetricsListenAddr == "" {
+		return errors.New("gateway.metrics_listen_addr is required")
+	}
+	if c.Gateway.SchedulerAddr == "" {
+		return errors.New("gateway.scheduler_addr is required")
+	}
+	if _, err := ParseGatewayExecutionFencing(string(c.Gateway.Routing.ExecutionFencing)); err != nil {
+		return err
+	}
+	// 🔴 Refused rather than quietly ignored. A read switch with nowhere to
+	// read from is a switch that reports as on and does nothing, and the
+	// symptom — every request still going to the scheduler — is exactly
+	// what the switch being off looks like.
+	if c.Gateway.Routing.ProjectionRead && strings.TrimSpace(c.Gateway.RedisAddr) == "" {
+		return errors.New("gateway.routing.projection_read requires gateway.redis_addr")
+	}
+	// Same reasoning, one step earlier: a REST upstream nobody can parse
+	// stops the process here rather than turning into a 502 per request.
+	if _, err := ParseRestUpstream(c.Gateway.RestUpstreamAddr); err != nil {
+		return err
+	}
+	// 🔴 阶段 3a no longer has an "off" position for its REST upstream.
+	// Nodes run aenv-node now and answer 404 on every user-facing REST
+	// route, so an empty rest_upstream_addr is not a rollback — it is an
+	// outage with no matching half, and refusing it here turns that into a
+	// startup failure instead of a 404/502 discovered per request. See
+	// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest.
+	//
+	// Its former sibling, resume_addr, needs no such check any more: the
+	// wake-up RPC rides scheduler_addr's connection, so there is no second
+	// address left to be emptied independently of it.
+	if strings.TrimSpace(c.Gateway.RestUpstreamAddr) == "" {
+		return errors.New("gateway.rest_upstream_addr is required: aenv-node answers 404 on " +
+			"user-facing REST, so the gateway has nowhere else to send it")
 	}
 	return nil
 }

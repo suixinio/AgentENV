@@ -21,7 +21,7 @@ func writeGatewayConfig(t *testing.T, body string) string {
 func TestGatewayExecutionFencingDefaultsToEnforce(t *testing.T) {
 	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
 
-	cfg, err := Load("", "gateway")
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestGatewayExecutionFencingReadsBothTheFileAndTheEnvironment(t *testing.T) 
 	path := writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"off"}}}`)
 
 	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestGatewayExecutionFencingReadsBothTheFileAndTheEnvironment(t *testing.T) 
 	}
 
 	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "enforce")
-	cfg, err = Load(path, "gateway")
+	cfg, err = Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestGatewayExecutionFencingReadsBothTheFileAndTheEnvironment(t *testing.T) 
 func TestGatewayRoutingBlockWithoutTheKeyKeepsTheDefault(t *testing.T) {
 	t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
 
-	cfg, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{}}}`), "gateway")
+	cfg, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{}}}`))
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -78,14 +78,14 @@ func TestGatewayRoutingBlockWithoutTheKeyKeepsTheDefault(t *testing.T) {
 func TestAnUnrecognisedGatewayExecutionFencingRefusesToLoad(t *testing.T) {
 	t.Run("from the config file", func(t *testing.T) {
 		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
-		if _, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"enfroce"}}}`), "gateway"); err == nil {
+		if _, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"enfroce"}}}`)); err == nil {
 			t.Fatal("a mistyped mode in the config file was accepted")
 		}
 	})
 
 	t.Run("from the environment", func(t *testing.T) {
 		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "enfroce")
-		if _, err := Load("", "gateway"); err == nil {
+		if _, err := Load(""); err == nil {
 			t.Fatal("a mistyped mode in the environment was accepted")
 		}
 	})
@@ -96,14 +96,14 @@ func TestAnUnrecognisedGatewayExecutionFencingRefusesToLoad(t *testing.T) {
 	// to catch. Both paths, the same as the two subtests above.
 	t.Run("observe in the config file", func(t *testing.T) {
 		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "")
-		if _, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"observe"}}}`), "gateway"); err == nil {
+		if _, err := Load(writeGatewayConfig(t, `{"gateway":{"routing":{"execution_fencing":"observe"}}}`)); err == nil {
 			t.Fatal("the retired \"observe\" mode in the config file was accepted")
 		}
 	})
 
 	t.Run("observe in the environment", func(t *testing.T) {
 		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", "observe")
-		if _, err := Load("", "gateway"); err == nil {
+		if _, err := Load(""); err == nil {
 			t.Fatal("the retired \"observe\" mode in the environment was accepted")
 		}
 	})
@@ -112,7 +112,7 @@ func TestAnUnrecognisedGatewayExecutionFencingRefusesToLoad(t *testing.T) {
 	// value and not about the plumbing.
 	for _, mode := range []string{"off", "enforce"} {
 		t.Setenv("GATEWAY_ROUTING_EXECUTION_FENCING", mode)
-		cfg, err := Load("", "gateway")
+		cfg, err := Load("")
 		if err != nil {
 			t.Fatalf("mode %q was rejected: %v", mode, err)
 		}
@@ -129,7 +129,7 @@ func TestTheControlPlaneTokenComesOnlyFromTheEnvironment(t *testing.T) {
 	t.Setenv("GATEWAY_CONTROL_PLANE_TOKEN", "")
 
 	path := writeGatewayConfig(t, `{"gateway":{"control_plane_token":"a-token-in-a-configmap"}}`)
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestTheControlPlaneTokenComesOnlyFromTheEnvironment(t *testing.T) {
 	}
 
 	t.Setenv("GATEWAY_CONTROL_PLANE_TOKEN", "a-token-from-a-secret")
-	cfg, err = Load(path, "gateway")
+	cfg, err = Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}

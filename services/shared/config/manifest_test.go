@@ -57,7 +57,7 @@ func TestMetricsListenersAreDeclaredAndExposed(t *testing.T) {
 		// services/README.md for the current architecture.
 	} {
 		t.Run(tc.service, func(t *testing.T) {
-			cfg, err := Load(filepath.Join(manifestDir, tc.configFile), tc.service)
+			cfg, err := Load(filepath.Join(manifestDir, tc.configFile))
 			if err != nil {
 				t.Fatalf("loading the mounted %s config failed: %v", tc.service, err)
 			}
@@ -214,7 +214,7 @@ func TestGatewayRestUpstreamIsDeclaredAndRequired(t *testing.T) {
 	}
 
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "")
-	if _, err := Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway"); err == nil {
+	if _, err := Load(filepath.Join(manifestDir, "config", "gateway.json")); err == nil {
 		t.Fatal("the mounted gateway config loaded with no rest_upstream_addr from either the " +
 			"file or the environment; it must refuse, the same way a deployed gateway would if " +
 			"api-upstream-config were ever lost")
@@ -227,7 +227,7 @@ func TestGatewayRestUpstreamIsDeclaredAndRequired(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"gateway":{"rest_upstream_addr":"http://agentenv-api:8000"}}`), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestGatewayRestUpstreamIsDeclaredAndRequired(t *testing.T) {
 	}
 
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://agentenv-api-canary:8000")
-	cfg, err = Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway")
+	cfg, err = Load(filepath.Join(manifestDir, "config", "gateway.json"))
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestAnEmptyEnvironmentValueCannotTurnTheApiUpstreamSwitchOff(t *testing.T) 
 	}
 
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "")
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestAnEmptyEnvironmentValueCannotTurnTheApiUpstreamSwitchOff(t *testing.T) 
 	// ...whereas a non-empty one does take, which is how 3a is turned on and —
 	// given the file ships empty — turned back off.
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://elsewhere:8000")
-	cfg, err = Load(path, "gateway")
+	cfg, err = Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}

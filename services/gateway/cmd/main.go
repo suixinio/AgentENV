@@ -36,7 +36,7 @@ func main() {
 	configPath := flag.String("config", "", "path to JSON config file")
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath, "gateway")
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
 	}

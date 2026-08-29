@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,14 +28,14 @@ func TestMain(m *testing.M) {
 }
 
 func TestDefaultConfigUsesAutoLogFormat(t *testing.T) {
-	cfg := defaultConfig("gateway")
+	cfg := defaultConfig()
 	if cfg.LogFormat != "auto" {
 		t.Fatalf("expected default log format auto, got %q", cfg.LogFormat)
 	}
 }
 
 func TestValidateRejectsUnsupportedLogFormat(t *testing.T) {
-	cfg := defaultConfig("gateway")
+	cfg := defaultConfig()
 	cfg.LogFormat = "pretty"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected validate to reject unsupported log_format")
@@ -43,7 +45,7 @@ func TestValidateRejectsUnsupportedLogFormat(t *testing.T) {
 func TestValidateAcceptsSupportedLogFormats(t *testing.T) {
 	formats := []string{"auto", "console", "json"}
 	for _, format := range formats {
-		cfg := defaultConfig("gateway")
+		cfg := defaultConfig()
 		cfg.LogFormat = format
 		// defaultConfig deliberately gives this no value — see
 		// GatewayConfig.RestUpstreamAddr — so a Validate() call made directly
@@ -70,7 +72,7 @@ func TestValidateAcceptsSupportedLogFormats(t *testing.T) {
 // refuse.
 func TestValidateRefusesAnEmptyGatewayUpstream(t *testing.T) {
 	base := func() Config {
-		cfg := defaultConfig("gateway")
+		cfg := defaultConfig()
 		cfg.Gateway.RestUpstreamAddr = "http://agentenv-api:8000"
 		return cfg
 	}
@@ -109,7 +111,7 @@ func TestLoadParsesGatewayRequestTimeoutDurationString(t *testing.T) {
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
@@ -133,7 +135,7 @@ func TestLoadRejectsNumericGatewayRequestTimeout(t *testing.T) {
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	_, err := Load(path, "gateway")
+	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected load to fail for numeric request_timeout")
 	}
@@ -143,7 +145,7 @@ func TestLoadAppliesGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	t.Setenv("GATEWAY_REQUEST_TIMEOUT", "1m30s")
 	t.Setenv("GATEWAY_SANDBOX_PROXY_DOMAINS", " sandbox-proxy.example.invalid,sandbox-proxy-alt.example.invalid ,,")
 
-	cfg, err := Load("", "gateway")
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
@@ -158,7 +160,7 @@ func TestLoadAppliesGatewayRequestTimeoutEnvDuration(t *testing.T) {
 func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	t.Setenv("GATEWAY_REQUEST_TIMEOUT", "1m30")
 
-	_, err := Load("", "gateway")
+	_, err := Load("")
 	if err == nil {
 		t.Fatal("expected load to fail for invalid GATEWAY_REQUEST_TIMEOUT")
 	}
@@ -173,7 +175,7 @@ func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 // half of it that asserted SchedulerFallbackDisabled defaulted to false —
 // that field has no replacement; it is deleted outright, not renamed.
 func TestDefaultConfigLeavesTheColdLookupTimeoutAtDefault(t *testing.T) {
-	cfg := defaultConfig("gateway")
+	cfg := defaultConfig()
 	if cfg.Gateway.ColdLookupTimeout != defaultColdLookupTimeout {
 		t.Fatalf("expected cold lookup timeout %s, got %s",
 			defaultColdLookupTimeout, cfg.Gateway.ColdLookupTimeout)
@@ -195,7 +197,7 @@ func TestLoadParsesGatewayColdLookupTimeoutFromFile(t *testing.T) {
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
@@ -216,7 +218,7 @@ func TestLoadRejectsNumericGatewayColdLookupTimeout(t *testing.T) {
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	if _, err := Load(path, "gateway"); err == nil {
+	if _, err := Load(path); err == nil {
 		t.Fatal("expected load to fail for numeric cold_lookup_timeout")
 	}
 }
@@ -224,7 +226,7 @@ func TestLoadRejectsNumericGatewayColdLookupTimeout(t *testing.T) {
 func TestLoadAppliesGatewayColdLookupTimeoutEnv(t *testing.T) {
 	t.Setenv("GATEWAY_COLD_LOOKUP_TIMEOUT", "7s")
 
-	cfg, err := Load("", "gateway")
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
@@ -236,7 +238,74 @@ func TestLoadAppliesGatewayColdLookupTimeoutEnv(t *testing.T) {
 func TestLoadRejectsInvalidGatewayColdLookupTimeoutEnv(t *testing.T) {
 	t.Setenv("GATEWAY_COLD_LOOKUP_TIMEOUT", "5x")
 
-	if _, err := Load("", "gateway"); err == nil {
+	if _, err := Load(""); err == nil {
 		t.Fatal("expected load to fail for invalid GATEWAY_COLD_LOOKUP_TIMEOUT")
+	}
+}
+
+// 🔴 A deployed ConfigMap may still carry the key the deleted `Config.Service`
+// field used to claim.
+//
+// `Service` was a discriminator with one value: every caller passed "gateway",
+// `defaultConfig` used the parameter for nothing else, and the whole gateway
+// half of `validate` was indented under `c.Service == "gateway"`. It went with
+// `services/scheduler`, the second binary that made it a discriminator at all.
+//
+// Dropping the field drops the `service` JSON tag with it, and that is the half
+// worth pinning: `json.Unmarshal` ignores a key no field claims, so an
+// un-migrated gateway.json loads byte-identically to a migrated one. Trusting
+// that rather than testing it would be trusting it about a file that is mounted
+// into every gateway pod in the cluster at once — the failure, if it were ever
+// untrue, is every replica failing `unmarshal config json` on a manifest nobody
+// edited.
+//
+// Both values are covered, not only "gateway": the property is that the key is
+// *ignored*, and a loader that had quietly grown a second discriminator would
+// pass a test that only ever fed it the one value the old code accepted.
+func TestAConfigStillNamingItsServiceLoads(t *testing.T) {
+	const gatewayBody = `{
+		"log_level": "debug",
+		"gateway": {"http_listen_addr": ":8081", "rest_upstream_addr": "http://agentenv-api:8000"}
+	}`
+
+	want, err := Load(writeGatewayConfig(t, gatewayBody))
+	if err != nil {
+		t.Fatalf("the migrated config did not load: %v", err)
+	}
+
+	for _, stale := range []string{"gateway", "scheduler"} {
+		t.Run(stale, func(t *testing.T) {
+			body := `{
+				"service": "` + stale + `",
+				"log_level": "debug",
+				"gateway": {"http_listen_addr": ":8081", "rest_upstream_addr": "http://agentenv-api:8000"}
+			}`
+			got, err := Load(writeGatewayConfig(t, body))
+			if err != nil {
+				t.Fatalf("a config still naming %q as its service refused to load: %v", stale, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("the stale service key changed what loaded:\n got %+v\nwant %+v", got, want)
+			}
+		})
+	}
+}
+
+// 🔴 The gateway checks are no longer gated on anything.
+//
+// They used to run only when `c.Service == "gateway"`, which meant a
+// `Config` built any other way — the scheduler's, or a zero value — skipped
+// every one of them silently. Nothing selects them now, and this is the
+// mutation guard for that: if a discriminator is ever reintroduced and the
+// block goes back under it, a `Config` that does not satisfy it stops being
+// refused and this notices.
+func TestTheGatewayChecksRunForEveryConfig(t *testing.T) {
+	cfg := Config{LogLevel: "info", LogFormat: "auto"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a config with no gateway settings at all validated; the gateway checks are gated on something again")
+	}
+	if !strings.Contains(err.Error(), "gateway.") {
+		t.Fatalf("the refusal did not come from the gateway checks: %v", err)
 	}
 }

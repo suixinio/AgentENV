@@ -39,7 +39,7 @@ func clearProjectionEnv(t *testing.T) {
 func TestProjectionSwitchesDefaultOff(t *testing.T) {
 	clearProjectionEnv(t)
 
-	gateway, err := Load("", "gateway")
+	gateway, err := Load("")
 	if err != nil {
 		t.Fatalf("load gateway config: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestProjectionSwitchesReadBothTheFileAndTheEnvironment(t *testing.T) {
 	clearProjectionEnv(t)
 
 	path := writeProjectionConfig(t, "gateway.json", `{"gateway":{"redis_addr":"127.0.0.1:6379","routing":{"projection_read":true,"projection_authoritative":true}}}`)
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestProjectionSwitchesReadBothTheFileAndTheEnvironment(t *testing.T) {
 	// a ConfigMap — and it is the form the rollback instructions use, because
 	// `kubectl set env` rolls the deployment and is therefore loud.
 	t.Setenv("GATEWAY_ROUTING_PROJECTION_READ", "off")
-	cfg, err = Load(path, "gateway")
+	cfg, err = Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestProjectionSwitchNamingTheBlockWithoutTheKeyLeavesTheDefault(t *testing.
 	clearProjectionEnv(t)
 	path := writeProjectionConfig(t, "gateway.json", `{"gateway":{"routing":{"execution_fencing":"off"}}}`)
 
-	cfg, err := Load(path, "gateway")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestProjectionSwitchEnvironmentRejectsGarbage(t *testing.T) {
 		"GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE",
 	} {
 		t.Setenv(key, "observe")
-		if _, err := Load("", "gateway"); err == nil || !strings.Contains(err.Error(), key) {
+		if _, err := Load(""); err == nil || !strings.Contains(err.Error(), key) {
 			t.Fatalf("%s=observe was accepted or the error did not name it: %v", key, err)
 		}
 		t.Setenv(key, "")
@@ -147,12 +147,12 @@ func TestProjectionReadRequiresARedisAddress(t *testing.T) {
 	clearProjectionEnv(t)
 	t.Setenv("GATEWAY_ROUTING_PROJECTION_READ", "on")
 
-	if _, err := Load("", "gateway"); err == nil || !strings.Contains(err.Error(), "gateway.redis_addr") {
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "gateway.redis_addr") {
 		t.Fatalf("expected a refusal naming gateway.redis_addr, got %v", err)
 	}
 
 	t.Setenv("GATEWAY_REDIS_ADDR", "127.0.0.1:6379")
-	if _, err := Load("", "gateway"); err != nil {
+	if _, err := Load(""); err != nil {
 		t.Fatalf("a read switch with an address must load, got %v", err)
 	}
 }

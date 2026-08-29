@@ -626,29 +626,21 @@ mod tests {
         );
     }
 
-    /// 🔴 T-A4-11. What `aenv-node` costs the gateway's cluster listing, said
-    /// out loud in the one place that can say it.
+    /// 🔴 T-A4-11. The two listing routes are ordinary gated routes now.
     ///
-    /// `control_plane_gate::is_exempt` lets `GET /sandboxes` and
-    /// `GET /v2/sandboxes` through without a credential because the gateway
-    /// fans out to every node with its own HTTP client to build the cluster
-    /// -wide list. The role gate runs *first* and refuses both on a node, so on
-    /// a `aenv-node` fleet that fan-out gets the 404s below — and since the
-    /// listing is all-or-nothing and the gateway passes a 4xx through verbatim,
-    /// the user's `GET /sandboxes` is that same 404.
+    /// They were exempt from the control-plane gate for one caller — the
+    /// gateway's cluster-list fan-out, which used the gateway's own HTTP client
+    /// and so never carried the credential. That fan-out is deleted
+    /// (`cluster_list.go`), both routes are forwarded to the api half
+    /// unconditionally, and an empty `gateway.rest_upstream_addr` is refused at
+    /// config load, so nothing reaches these routes uncredentialed any more and
+    /// the exemption went with them.
     ///
-    /// That is intended (`_sd-impl-phase3-role.md` §7.4: after phase 2 the list
-    /// is one SQL query and the fan-out goes away), and the exemption is left in
-    /// place until the fan-out is deleted, in that order — deleting the
-    /// exemption first would 403 a fan-out that is still running. The gateway
-    /// now skips the fan-out whenever `rest_upstream_addr` is set, which is what
-    /// keeps a `aenv-node` fleet answering this route at all; the empty value
-    /// still fans out, so these 404s are what that rollback position costs. This
-    /// test is not a preference about either; it is here so that whoever flips a
-    /// DaemonSet to `aenv-node` learns this from a test name rather than from
-    /// a 404 on the first listing.
+    /// Asserted from both faces because either one alone is satisfiable by an
+    /// accident: a gate that 403s everything would pass the first half, and the
+    /// role gate 404ing everything would pass the second.
     #[tokio::test]
-    async fn a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts() {
+    async fn the_sandbox_listing_is_gated_like_any_other_route() {
         for path in ["/sandboxes", "/v2/sandboxes"] {
             assert_eq!(
                 status(
@@ -658,21 +650,30 @@ mod tests {
                     None
                 )
                 .await,
+                StatusCode::FORBIDDEN,
+                "the listing must not be reachable without the credential: {path}"
+            );
+            assert_eq!(
+                status(
+                    assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
+                    Method::GET,
+                    path,
+                    Some(TOKEN)
+                )
+                .await,
                 StatusCode::OK,
-                "under the pre-split single process the fan-out is exempt and reaches the handler: {path}"
+                "and must still be reachable with it: {path}"
             );
             assert_eq!(
                 status(
                     assemble_as(REFUSES_USER_REST, vec![TOKEN.to_string()], ""),
                     Method::GET,
                     path,
-                    None
+                    Some(TOKEN)
                 )
                 .await,
                 StatusCode::NOT_FOUND,
-                "under aenv-node the same fan-out is refused before the exemption \
-                 is ever consulted: {path}. Stop the gateway fan-out before rolling \
-                 a node to aenv-node."
+                "a node still answers the listing as absent, not as forbidden: {path}"
             );
         }
     }
@@ -742,21 +743,18 @@ mod tests {
         );
     }
 
-    /// T-A4-7. 🔴 The cluster listing is a fan-out the gateway makes with its
-    /// own client, so it never carries the credential — and it is
-    /// all-or-nothing, so one node's refusal is the whole cluster's answer: the
-    /// gateway passes a 4xx from any node through verbatim, so a 403 here would
-    /// be a 403 on the user's listing.
+    /// T-A4-7. 🔴 Nothing under `/sandboxes` is exempt from the gate — not
+    /// the reads either, since the fan-out that needed them to be is gone.
     ///
-    /// The second half is the control group: without it, exempting the entire
-    /// `/sandboxes` prefix would pass.
+    /// The `/health` half is the control group: without it, a gate that simply
+    /// forbade everything would pass the rest of this test.
     #[tokio::test]
-    async fn the_cluster_list_fanout_is_never_gated() {
+    async fn no_sandbox_route_is_exempt_from_the_gate() {
         for path in ["/sandboxes", "/v2/sandboxes"] {
-            assert_ne!(
+            assert_eq!(
                 status(gated(vec![TOKEN.to_string()], ""), Method::GET, path, None).await,
                 StatusCode::FORBIDDEN,
-                "the cluster listing fan-out must stay reachable: {path}"
+                "the cluster listing is gated like every other REST route: {path}"
             );
         }
 
@@ -770,6 +768,17 @@ mod tests {
             .await,
             StatusCode::FORBIDDEN,
             "creating a sandbox is not a read and is not exempt"
+        );
+        assert_ne!(
+            status(
+                gated(vec![TOKEN.to_string()], ""),
+                Method::GET,
+                "/health",
+                None
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "kubelet's probe is the one thing that stays ungated"
         );
     }
 

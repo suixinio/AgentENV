@@ -64,45 +64,23 @@ pub const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 /// * `/health` is what kubelet polls, three ways. kubelet does not go through
 ///   the gateway and has no credential, so gating it stops the pod from ever
 ///   becoming ready.
-/// * `GET /sandboxes` and `GET /v2/sandboxes` are what the gateway fans out to
-///   when it builds the cluster-wide list. That fan-out uses the gateway's own
-///   HTTP client, not the reverse proxy, so it never passes through the hook
-///   that stamps the credential — and the endpoint is all-or-nothing, so one
-///   refusal turns the whole cluster listing into that refusal's own status.
 ///
-/// ⚠️ Only the reads are exempt. `POST /sandboxes` creates a sandbox and stays
-/// behind the gate.
-///
-/// 🔴 **The `/sandboxes` half is dead code on a `aenv-node` process, and
-/// deleting it is still not this batch's job.** [`super::role_gate`] runs ahead
-/// of this gate and answers both listing routes with 404 there, so the fan-out
-/// this exemption exists for gets 404s from such a node — and because the
-/// listing is all-or-nothing and `handleClusterList` passes a 4xx through
-/// verbatim, the user's `GET /sandboxes` is that 404, not a 502. That is the
-/// intended end state (`_sd-impl-phase3-role.md` §7.4: after phase 2 the
-/// listing is one query against the catalog and the fan-out goes away), but the
-/// order is fixed and runs the other way: **stop the fan-out first, delete this
-/// exemption second**. Deleting it while
-/// `services/gateway/internal/cluster_list.go` can still call
-/// `fetchNodeClusterList` turns every one of those calls into a 403 on nodes
-/// that are still the pre-split single process, which is the same outage a release earlier.
-/// `a_node_refuses_the_cluster_list_fanout_that_the_control_plane_gate_exempts`
-/// holds both halves of that in one place.
-///
-/// 🔴 The gateway now *skips* that fan-out whenever `rest_upstream_addr` is set,
-/// forwarding both listing routes to the api half instead
-/// (`Server.fansOutClusterList`). That is not the same thing as the fan-out
-/// being gone, and it is not yet licence to delete this: the empty value is the
-/// documented rollback position, and in it the fan-out runs exactly as before
-/// and needs this exemption on every the pre-split single process node. What retires this
-/// exemption is deleting `fetchNodeClusterList` — the off position ceasing to
-/// exist — not any deployment happening to have the switch on.
-fn is_exempt(method: &Method, path: &str) -> bool {
-    if path == "/health" {
-        return true;
-    }
-
-    method == Method::GET && matches!(path, "/sandboxes" | "/v2/sandboxes")
+/// 🔴 `GET /sandboxes` and `GET /v2/sandboxes` used to be exempt too, and are
+/// not any more. The exemption existed for one caller: the gateway's
+/// cluster-list fan-out, which asked every node for its own rows using the
+/// gateway's own HTTP client rather than the reverse proxy, so it never passed
+/// through the hook that stamps the credential. Its own retirement condition
+/// was written here — *"what retires this exemption is deleting
+/// `fetchNodeClusterList`, the off position ceasing to exist"* — and that has
+/// happened: `services/gateway/internal/cluster_list.go` is deleted,
+/// `isUserFacingRestRequest` claims both routes unconditionally, and
+/// `Config.Validate` refuses an empty `gateway.rest_upstream_addr`, so there is
+/// no configuration left in which anything reaches a node's listing routes
+/// without the credential. Both routes are now gated exactly like every other
+/// user-facing REST call; `the_sandbox_listing_is_gated_like_any_other_route`
+/// is what fails if the exemption comes back.
+fn is_exempt(_method: &Method, path: &str) -> bool {
+    path == "/health"
 }
 
 /// The credentials this node accepts, and where they come from.
@@ -532,13 +510,19 @@ mod tests {
         );
     }
 
+    /// 🔴 The exemption list is `/health` and nothing else.
+    ///
+    /// The listing routes are named explicitly rather than left to the
+    /// catch-all below because they are the ones that *were* exempt: a revert
+    /// of that deletion is the realistic way this regresses, and it would
+    /// reopen two unauthenticated reads of every sandbox in the cluster.
     #[test]
-    fn only_the_read_half_of_the_sandbox_listing_is_exempt() {
+    fn only_the_health_probe_is_exempt() {
         assert!(is_exempt(&Method::GET, "/health"));
         assert!(is_exempt(&Method::POST, "/health"));
-        assert!(is_exempt(&Method::GET, "/sandboxes"));
-        assert!(is_exempt(&Method::GET, "/v2/sandboxes"));
 
+        assert!(!is_exempt(&Method::GET, "/sandboxes"));
+        assert!(!is_exempt(&Method::GET, "/v2/sandboxes"));
         assert!(!is_exempt(&Method::POST, "/sandboxes"));
         assert!(!is_exempt(&Method::DELETE, "/sandboxes"));
         assert!(!is_exempt(&Method::GET, "/sandboxes/some-id"));

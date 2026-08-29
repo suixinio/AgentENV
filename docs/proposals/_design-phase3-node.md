@@ -653,6 +653,8 @@ generated auth 层继续按 openapi 的 security 声明抽 claims，A4 的 gate 
 > 2. 🟢 **顺带解决了 preStop 的一半**：F20 那条 `curl … /sandboxes | jq 'length'` 因此不再需要 token；
 >    但 §3.4 的 `POST /nodes/${AENV_NODE_ID}` **仍然需要**，那条 header 一条都不能少。
 > 3. 🔴 **必须配一发测试**（✅ 2026-08-19 已在 §4.2 编号为 **`T-A4-7 the_cluster_list_fanout_is_never_gated`**，原先只在这里点名、编号表里没有）：
+
+> 🔴 **已被后续变更取代（2026-08-29）**：`GET /sandboxes` / `GET /v2/sandboxes` 的只读豁免已删除——它自述的退役条件（gateway 的 `fetchNodeClusterList` 扇出消失）已满足，`cluster_list.go` 不复存在，且 `Config.Validate` 拒绝空的 `gateway.rest_upstream_addr`，因此不再有任何无凭据到达该路由的调用方。T-A4-7 随之改名并反转为 `no_sandbox_route_is_exempt_from_the_gate`（无 token 的两条 listing ⇒ **403**；对照面 `/health` ⇒ 非 403），另有 `the_sandbox_listing_is_gated_like_any_other_route` 从 api/node 两面钉住。豁免表现在只剩 `/health`。
 >    无 token 的 `GET /sandboxes` ⇒ 非 403；无 token 的 `POST /sandboxes` ⇒ 403。
 >    后半句是对照面 —— 没有它，"把整个 `/sandboxes` 路径前缀豁免掉"这个变异会假绿。
 
@@ -958,6 +960,8 @@ gateway §11.6），并且在步骤 8 的验收里明写"此刻应当**看得见
 | T-A4-5 | `the_gateway_overwrites_a_client_supplied_control_plane_header`<br>`services/gateway/internal/server_test.go` | 客户端自带 `x-agentenv-control-plane: forged`：<br>① gateway 配了 token ⇒ 上游收到的是 gateway 的 token；<br>② gateway 未配 token ⇒ 上游收到的**没有**这个 header | ① 改成"没有才加"（`if Get()==""`）；② 改成"未配就不动" | **T-A4-5**（①②各自转 FAIL）—— 🔴 这是 §3.2 约束 1，漏了等于 A4 白做 |
 | T-A4-6 | `the_prestop_drain_carries_the_control_plane_credential`<br>清单校验（`make` 里的 lint 或 `deploy/` 下一个 shell 断言）| `agentenv-daemonset.yaml` 的 preStop 两条 curl 都带 `x-agentenv-control-plane` header | 删掉 header | **T-A4-6** —— 🔴 因为 preStop 的失败是静默的（`\|\| echo … continuing`，`:145`），运行时抓不到 |
 | 🔴 T-A4-7 | `the_cluster_list_fanout_is_never_gated`<br>同 `src/api/server.rs` 的 `mod tests`（**§3.3 裁决 D-6 早已点名要这一发，本表原先漏编号，2026-08-19 补**）| 无 token 的 `GET /sandboxes` ⇒ **非 403**，无 token 的 `GET /v2/sandboxes` ⇒ **非 403**；🔴 **对照面**：无 token 的 `POST /sandboxes` ⇒ **403** | ① 删掉 `GET /sandboxes` 豁免 ⇒ 前半 FAIL（= 集群列表整体 502 的早期信号）；② **把 `/sandboxes` 整条路径前缀豁免** ⇒ 后半 FAIL | **T-A4-7**（①②各自转 FAIL）—— 🔴 缺后半句，"前缀豁免"的变异会假绿 |
+
+> 🔴 **已被后续变更取代（2026-08-29）**：`GET /sandboxes` / `GET /v2/sandboxes` 的只读豁免已删除——它自述的退役条件（gateway 的 `fetchNodeClusterList` 扇出消失）已满足，`cluster_list.go` 不复存在，且 `Config.Validate` 拒绝空的 `gateway.rest_upstream_addr`，因此不再有任何无凭据到达该路由的调用方。T-A4-7 随之改名并反转为 `no_sandbox_route_is_exempt_from_the_gate`（无 token 的两条 listing ⇒ **403**；对照面 `/health` ⇒ 非 403），另有 `the_sandbox_listing_is_gated_like_any_other_route` 从 api/node 两面钉住。豁免表现在只剩 `/health`。
 | 🔴 T-A4-8 | `the_gate_picks_up_a_token_written_after_startup`（**§3.2 的热读**）| 启动时 token 文件为空 ⇒ 调用非 403；**运行期**把 token 写进该文件 ⇒ 同一个 gate 实例开始 403；再清空 ⇒ 又非 403 | 把文件读成"启动时一次性加载" | **T-A4-8** —— 🔴 这一发是"步骤 9 不用滚 DaemonSet"的**唯一机械保证**；退化成启动期读取的症状是运维改了 Secret 却毫无变化，而那与"Secret 卷还没刷新"外观完全一致 |
 | 🔴 T-A4-9 | `an_unreadable_token_file_keeps_the_last_known_value`（**§3.2 的三态**）| 先成功读到 token（gate 生效）→ 让文件读失败 ⇒ **仍然 403**（沿用上次成功值）+ `error_kept_previous` 计数 +1；而**文件存在且内容为空**才是显式关闭 ⇒ 非 403 | 把读失败降级成"视为空" | **T-A4-9** —— 🔴 变异后一次磁盘抖动就能把整个 A4 悄悄关掉 |
 

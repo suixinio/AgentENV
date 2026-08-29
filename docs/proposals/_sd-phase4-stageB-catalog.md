@@ -446,15 +446,23 @@ Stage A（`docs/proposals/_sd-phase4-stageA-node-inventory.md`）已经踩过几
   可查询的观测钩子」这一步——本次订正把这个缺口标注出来，但不代为决定要不要现在补：
   如果 Stage B 要补，应该新增一步，产出形状类似 `node_registry::dump`（同样两个数
   并排、同样没有诚实答案就留空），而不是塞进现有步骤里顺手做。
-- **挂载新调试路由必须用 `new_with_control_plane_routes`，不能 `.route()`**：这是本轮
+- **挂载新调试路由必须走 `extra_control_plane_routes`，不能 `.route()`**：这是本轮
   （F1）刚修过的坑，`/debug/node-registry` 曾经因为在 `server::new`
   返回的路由器上直接 `.route(...)` 而完全绕过控制面网关和角色网关。如果 Stage B
   要新增任何调试/观测端点（例如上面那条 `CatalogPopulations` 的查询钩子），必须走
-  `agentenv::api::server::new_with_control_plane_routes` 的 `extra_control_plane_routes`
+  `src/api/server.rs::compose` 的 `extra_control_plane_routes`
   参数，在 `assemble` 附加网关**之前**合并进生成的路由器——`src/api/server.rs`
   自己的模块文档和
   `extra_control_plane_routes_require_the_control_plane_credential` 测试记录了完整
   原因，不要重新踩一遍。
+
+  🔴 事后订正（batch 2a）：本条提到的两个符号都已删除。`node_registry::dump` 和
+  `/debug/node-registry` 整个端点连同 `new_with_control_plane_routes` 一起删掉了
+  （Go scheduler 没了，这个「两边对拍」的钩子已无对拍对象）。合并顺序这条纪律本身
+  没变，只是入口现在叫 `compose`，且是私有的：`new`（aenv-node）与
+  `new_control_plane_only`（aenv-api）都转发到它，两者今天传的都是
+  `Router::new()`。上一段里「产出形状类似 `node_registry::dump`」应读作
+  「产出形状类似当时的 `node_registry::dump`」，那份代码已不在树上。
 
 ---
 

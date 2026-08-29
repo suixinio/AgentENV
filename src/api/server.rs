@@ -34,69 +34,15 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
-    new_with_control_plane_routes::<I, A, E, C>(api_impl, Router::new())
-}
-
-/// Same as [`new`], plus `extra_control_plane_routes` merged into the
-/// *generated* control-plane router before the control-plane gate and role
-/// gate are attached — so anything registered on it is covered by both, the
-/// same as every generated route.
-///
-/// 🔴 P5: `src/bin/aenv-api.rs`'s `assemble_api` is the one caller that needs
-/// this — `/debug/node-registry`, Stage A's equivalence-dump debug endpoint
-/// (`node_registry::dump`'s own module doc), used to be `.route(...)`-ed onto
-/// the `Router` *this function itself returns*, i.e. after every layer
-/// `new`'s body below applies. axum's `Router::layer` — and, transitively,
-/// `require_control_plane`/the role gate wired through `assemble` — only
-/// ever covers routes registered before the `.layer` call that attaches it;
-/// a `.route` added to the router `new` hands back is a route the control
-/// -plane gate has never seen. `GET /sandboxes` needs a credential;
-/// `/debug/node-registry` — which answers every node's internal address, its
-/// resource allocation and the cluster's CPU-config intersection — did not.
-/// It is also reachable through the gateway: `hasSandbox=false` there routes
-/// unrecognized paths to the api half's REST surface exactly like a genuine
-/// user-facing route (`services/gateway/internal/server.go`), unlike
-/// `/metrics`, which the gateway 404s on its public listener explicitly.
-///
-/// 🔴 Describing this as zero-impact "by default" is not accurate and should
-/// not be repeated: `/debug/node-registry` did not exist before Stage A
-/// added it, so shipping it is one more reachable endpoint on this process's
-/// default HTTP surface regardless of gating, full stop. What moving it here
-/// changes is that a deployment that *has* configured a control-plane token
-/// (`ControlPlaneGate::from_global_config`) now actually needs it for this
-/// route too, matching every other control-plane route — a deployment
-/// running with the gate off (`an_empty_configured_token_lets_everything_through`'s
-/// own rollback state) answers it exactly as unauthenticated as it did
-/// before this change, because an off gate opens everything on this router,
-/// not merely this one route.
-pub fn new_with_control_plane_routes<I, A, E, C>(
-    api_impl: I,
-    extra_control_plane_routes: Router,
-) -> Router
-where
-    I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
-    A: apis::admin::Admin<E, Claims = C>
-        + apis::default::Default<E>
-        + apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::snapshots::Snapshots<E, Claims = C>
-        + apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync
-        + 'static,
-    E: std::fmt::Debug + Send + Sync + 'static,
-    C: Send + Sync + 'static,
-{
-    new_with_control_plane_routes_and_gate::<I, A, E, C>(
+    compose::<I, A, E, C>(
         api_impl,
-        extra_control_plane_routes,
+        Router::new(),
         Arc::new(ControlPlaneGate::from_global_config()),
     )
 }
 
-/// The actual body of [`new_with_control_plane_routes`], with the gate taken
-/// as a parameter rather than built from process-global config.
+/// The actual body of [`new`], with the gate
+/// taken as a parameter rather than built from process-global config.
 ///
 /// 🔴 P5 follow-up. `extra_control_plane_routes_are_merged_before_assemble_is_called`
 /// proves the merge call's byte offset falls between `assemble(`'s parens,
@@ -113,11 +59,20 @@ where
 ///
 /// Not `pub`: `ControlPlaneGate` does not cross the crate boundary (its
 /// defining module is private to `crate::api`), so a function taking one as a
-/// parameter cannot be `pub` either without exposing a type `src/bin/aenv-api.rs`
-/// — a separate crate — cannot name. `new_with_control_plane_routes` stays the
-/// only crate-external entry point, unchanged, and forwards here with the
-/// default gate.
-fn new_with_control_plane_routes_and_gate<I, A, E, C>(
+/// parameter cannot be `pub` either without exposing a type
+/// `crates/aenv-api/src/bin/aenv-api.rs` — a separate crate — cannot name.
+/// [`new`] stays the only crate-external entry point and forwards here with
+/// the default gate.
+///
+/// 🔴 `extra_control_plane_routes` is `Router::new()` from [`new`] today:
+/// `/debug/node-registry`, the one endpoint that ever used it, is deleted. The
+/// parameter stays because the *merge order* it exists to fix is a property of
+/// this function that outlives that endpoint — the next route someone adds
+/// must arrive through here, in `assemble`'s `generated` argument, and not by
+/// `.route()`-ing onto the router this function returns, where no layer
+/// covers it. `extra_control_plane_routes_require_the_control_plane_credential`
+/// keeps that provable with a real request instead of a comment.
+fn compose<I, A, E, C>(
     api_impl: I,
     extra_control_plane_routes: Router,
     gate: Arc<ControlPlaneGate>,
@@ -328,17 +283,17 @@ mod tests {
         );
     }
 
-    /// 🔴 P5. The mechanism [`new_with_control_plane_routes`] relies on to
-    /// fix `/debug/node-registry`'s original exposure: a route merged into
-    /// the *generated* router before `assemble` runs is covered by the
-    /// control-plane gate; the identical route `.route()`-ed onto
-    /// `assemble`'s own return value is not, because `Router::layer` only
-    /// ever covers routes registered before it runs. That asymmetry — not
-    /// any check this endpoint failed — is why `/debug/node-registry`
-    /// answered unauthenticated regardless of a configured control-plane
-    /// token before this fix. Proven here on a stand-in so a future
-    /// regression in the ordering shows up as a failing unit test rather
-    /// than only in a manual check of the real endpoint.
+    /// 🔴 P5. The mechanism [`compose`]'s `extra_control_plane_routes`
+    /// parameter relies on: a route merged into the *generated* router before
+    /// `assemble` runs is covered by the control-plane gate; the identical
+    /// route `.route()`-ed onto `assemble`'s own return value is not, because
+    /// `Router::layer` only ever covers routes registered before it runs. That
+    /// asymmetry — not any check it failed — is why the debug endpoint this
+    /// was originally written for answered unauthenticated regardless of a
+    /// configured control-plane token. That endpoint is deleted; the asymmetry
+    /// is not, and the next route added here inherits it. Proven on a stand-in
+    /// so a regression in the ordering shows up as a failing unit test rather
+    /// than only in a manual check of whatever route is mounted at the time.
     #[tokio::test]
     async fn a_route_merged_before_assemble_is_gated_and_the_same_route_added_after_is_not() {
         let debug_route = || Router::new().route("/debug/example", get(|| async { "debug" }));
@@ -377,15 +332,16 @@ mod tests {
 
     /// 🔴 P5, the other half of the guard: the test above proves the
     /// *mechanism* (`assemble` gates whatever `generated` already contains);
-    /// this proves `new_with_control_plane_routes_and_gate` — the function
-    /// that actually does the composing; `new_with_control_plane_routes` is
-    /// now a thin forwarder to it — still hands `assemble` the merged router
-    /// rather than merging `extra_control_plane_routes` onto `assemble`'s
-    /// return value. Getting that wrong would compile and pass every other
-    /// test in this file that predates
+    /// this proves `compose` — the function that actually does the composing,
+    /// which `new` and `new_control_plane_only` are both thin forwarders to —
+    /// still hands `assemble` the merged router rather than merging
+    /// `extra_control_plane_routes` onto `assemble`'s return value. Getting
+    /// that wrong would compile and pass every other test in this file that
+    /// predates
     /// `extra_control_plane_routes_require_the_control_plane_credential`
     /// below (none of them exercised a non-empty extra router), silently
-    /// reintroducing the exact bug `/debug/node-registry` originally had.
+    /// reintroducing the exact bug the deleted `/debug/node-registry`
+    /// originally had.
     ///
     /// 🔴 What this scan *cannot* see: `assemble` takes two router arguments,
     /// and a merge onto the wrong one (`data_plane`, deliberately never
@@ -399,8 +355,8 @@ mod tests {
     fn extra_control_plane_routes_are_merged_before_assemble_is_called() {
         let source = include_str!("server.rs");
         let start = source
-            .find("fn new_with_control_plane_routes_and_gate")
-            .expect("new_with_control_plane_routes_and_gate is no longer in this file");
+            .find("fn compose<")
+            .expect("compose is no longer in this file");
         let open = source[start..].find('{').expect("a body") + start;
         let mut depth = 0usize;
         let mut body = "";
@@ -417,10 +373,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(
-            !body.is_empty(),
-            "new_with_control_plane_routes has no closing brace"
-        );
+        assert!(!body.is_empty(), "compose has no closing brace");
 
         let assemble_call = body
             .find("assemble(")
@@ -460,8 +413,8 @@ mod tests {
             "extra_control_plane_routes must be merged *inside* the call to assemble — into the \
              `generated` router argument, before the control-plane gate and role gate are \
              attached — not chained onto assemble's return value. Chaining it after is exactly \
-             the bug /debug/node-registry originally had: a route added after every layer runs \
-             is a route no layer ever covers."
+             the bug the deleted /debug/node-registry originally had: a route added after every \
+             layer runs is a route no layer ever covers."
         );
     }
 
@@ -507,8 +460,14 @@ mod tests {
         ))
     }
 
-    /// A stand-in for `/debug/node-registry`, merged in exactly the way
-    /// `assemble_api` (`src/bin/aenv-api.rs`) merges the real one.
+    /// A stand-in for whatever route `compose`'s `extra_control_plane_routes`
+    /// carries next, merged exactly the way `compose` merges the real thing.
+    ///
+    /// It stood in for `/debug/node-registry` while that endpoint existed. The
+    /// endpoint is deleted and the parameter is `Router::new()` from both
+    /// production callers now — which is precisely why this stand-in has to
+    /// stay: with no real route left to notice a regression on, this test is
+    /// the only thing that would.
     fn stand_in_debug_route() -> Router {
         Router::new().route("/debug/example-registry", get(|| async { "debug" }))
     }
@@ -520,17 +479,17 @@ mod tests {
     /// a merge onto `data_plane` (the one `assemble`'s own doc says is
     /// deliberately never gated) still sits inside those parens and still
     /// passes the scan. A real request against the composed router does not
-    /// have that blind spot, which is why this exercises
-    /// `new_with_control_plane_routes_and_gate` — the function the bug would
-    /// actually live in — with an injected gate, rather than reading source
-    /// text or touching `ConfigManager`'s process-global config.
+    /// have that blind spot, which is why this exercises `compose` — the
+    /// function the bug would actually live in — with an injected gate, rather
+    /// than reading source text or touching `ConfigManager`'s process-global
+    /// config.
     ///
-    /// Four assertions, not one: a debug route wired the intended way must be
-    /// gated (this is the fix `/debug/node-registry` needed); an existing
-    /// gated route must *stay* gated (so this test cannot pass by the new
-    /// composition accidentally opening everything); the correct credential
-    /// must reach both; and `/health` must stay reachable regardless, so a
-    /// gate that refuses everything cannot pass this either.
+    /// Five assertions, not one: a debug route wired the intended way must be
+    /// gated (this is the fix `/debug/node-registry` needed before it was
+    /// deleted); an existing gated route must *stay* gated (so this test cannot
+    /// pass by the new composition accidentally opening everything); the
+    /// correct credential must reach both; and `/health` must stay reachable
+    /// regardless, so a gate that refuses everything cannot pass this either.
     #[tokio::test]
     async fn extra_control_plane_routes_require_the_control_plane_credential() {
         let api_impl = build_api_impl_for_gate_test().await;
@@ -538,7 +497,7 @@ mod tests {
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
 
         let router = || {
-            new_with_control_plane_routes_and_gate(
+            compose(
                 Arc::clone(&api_impl),
                 stand_in_debug_route(),
                 Arc::clone(&gate),
@@ -548,8 +507,8 @@ mod tests {
         assert_eq!(
             status(router(), Method::GET, "/debug/example-registry", None).await,
             StatusCode::FORBIDDEN,
-            "a route merged in through new_with_control_plane_routes must require the \
-             control-plane credential, same as /debug/node-registry"
+            "a route merged in through compose must require the control-plane credential, same \
+             as /debug/node-registry did"
         );
         assert_eq!(
             status(router(), Method::POST, sandbox_path, None).await,

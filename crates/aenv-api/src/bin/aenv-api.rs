@@ -388,8 +388,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
     // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
     // coerced to `Arc<dyn NodeRegistry>`, cloned rather than moved --
-    // `native_registry_handle` itself is still needed below by
-    // `node_registry_dump_source`. `build_paused_registry`/
+    // `native_registry_handle` itself is still needed below, by the binding
+    // sweeper. `build_paused_registry`/
     // `spawn_paused_registry_background_tasks` both still take this as an
     // `Option` — a `Local` paused-registry backend has no use for a node
     // registry at all — even though `aenv-api` always has one to hand them.
@@ -599,11 +599,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // B1: the postgres backend's per-replica renewal loop.
     paused_upkeep.append(&mut paused_registry_upkeep);
 
-    // 🔴 Task 4's equivalence-dump debug endpoint — see `node_registry::dump`'s
-    // own module doc: it reads the same registry `start_native_node_registry`
-    // already built above.
-    let node_registry_dump_source = Arc::clone(&native_registry_handle);
-
     let grpc = {
         let served = Arc::clone(&api_impl);
         spawn_grpc_surface(
@@ -635,32 +630,11 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         Duration::from_secs(config.cluster.native_warmup_timeout_secs),
     );
 
-    // 🔴 P5: built as its own `Router` and merged into the *generated*
-    // control-plane router by `server::new_with_control_plane_routes`,
-    // rather than `.route(..)`-ed onto the fully assembled `Router` `server::new`
-    // hands back. axum's `Router::layer` only covers routes registered
-    // before it runs, so a route added after `server::new` returns — after
-    // every layer, including `require_control_plane` and the role gate —
-    // was never behind either. This endpoint answers every node's internal
-    // address, its resource allocation and the cluster's CPU-config
-    // intersection, and is reachable through the gateway's REST fan-out the
-    // same as any other unrecognized path (`services/gateway/internal/server.go`).
-    // See `aenv_api::api::server::new_with_control_plane_routes`'s own doc
-    // comment for the full argument, including why "zero impact by default"
-    // is not an accurate description of adding this endpoint at all.
-    let node_registry_debug_routes = axum::Router::new().route(
-        "/debug/node-registry",
-        axum::routing::get(move || {
-            let source = Arc::clone(&node_registry_dump_source);
-            async move { axum::Json(aenv_api::node_registry::dump::dump(&source)) }
-        }),
-    );
-
     Ok(Assembly {
         // 🔴 No user-REST gate: this half serves the whole user-facing
-        // surface, and `server::new_with_control_plane_routes` reads that off
-        // the `ApiImpl` itself. The gate exists to stop a *node* answering it.
-        app: server::new_with_control_plane_routes(api_impl, node_registry_debug_routes),
+        // surface, and `server::new` reads that off the `ApiImpl` itself. The
+        // gate exists to stop a *node* answering it.
+        app: server::new(api_impl),
         orchestration,
         upkeep: paused_upkeep,
         pg_singleton_tasks,

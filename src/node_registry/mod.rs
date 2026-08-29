@@ -51,7 +51,7 @@
 //! **10 are net-new to the Rust port**, covering behavior the Go tests never
 //! isolated on their own (roster normalization edge cases, alias/identity
 //! collapse, and the like). None of this counts the tests added afterward,
-//! in `node_client::native_placement`, `dump`, `api::server`, or
+//! in `node_client::native_placement`, `api::server`, or
 //! `observability::reporter`, to guard the independent-review fixes
 //! (`node_registry_grpc_service`'s own test count is separate for the same
 //! reason: it has no Go file of its own, `Heartbeat`'s Go home being
@@ -59,7 +59,6 @@
 //! for bugs this review found rather than for port parity.
 
 pub mod cpu_template;
-pub mod dump;
 pub mod filter;
 pub mod grpc_service;
 pub mod kubernetes_discovery;

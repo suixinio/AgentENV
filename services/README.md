@@ -41,8 +41,11 @@ see CLAUDE.md's "Distributed Control Plane" section for the full picture.
   which of the three it used.
 - The Scheduler protocol (`api/proto/scheduler.proto`) supports pluggable
   placement strategies; `aenv-api`'s implementation (`src/node_registry/`)
-  always places with round-robin today (a `random` strategy is ported in
-  `src/node_registry/strategy.rs` but not wired to any config knob yet).
+  always places with round-robin. `RoundRobinStrategy`
+  (`src/node_registry/strategy.rs`) is the only strategy in that tree — Go's
+  `random` was never ported, there is no config knob to pick another, and the
+  one-implementation `Strategy` trait has been deleted. The `strategy` metric
+  label survives it, still valued `round_robin`.
 - Node discovery for that registry is static configuration or Kubernetes
   EndpointSlice watching (`[cluster].node_discovery_mode`).
 - The sandbox-to-node binding store is Redis, always (`[binding_store]` on

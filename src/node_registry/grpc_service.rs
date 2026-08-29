@@ -127,7 +127,7 @@ use crate::proto::scheduler::{
 use super::registry::{
     AtomicNodeRegistry, NodeNotInRegistry, NodeRegistry, ServiceInstanceMismatch,
 };
-use super::strategy::{RoundRobinStrategy, Strategy};
+use super::strategy::RoundRobinStrategy;
 use super::warmup::WarmupGate;
 
 const NOT_STAGE_A: &str = "not served by api's Stage A node-registry service — see \
@@ -173,8 +173,16 @@ pub struct NodeRegistryGrpcService {
     /// `Schedule`'s placement strategy, and `lookup_node`'s `Paused`
     /// branch's (`select_node`'s `hint = None` call). Round-robin, matching
     /// Go's own `NewStrategy` fallback, and not wired to `AppConfig` -- it
-    /// is the only strategy this build has.
-    strategy: Arc<dyn Strategy>,
+    /// is the only strategy this build has, so it is held concretely rather
+    /// than behind a one-implementation trait object.
+    ///
+    /// 🔴 One `Arc`, read by both call paths. The round-robin cursor lives
+    /// in this instance's atomic, so handing `schedule` and `lookup_node`
+    /// separate `RoundRobinStrategy` values would leave each rotating on
+    /// its own -- placement would stop alternating across the two paths
+    /// while every round-robin test kept passing. `Clone` on this service
+    /// clones the `Arc`, so a second handle shares the same cursor too.
+    strategy: Arc<RoundRobinStrategy>,
 }
 
 impl NodeRegistryGrpcService {
@@ -3130,6 +3138,140 @@ mod tests {
             seen,
             vec!["node-a".to_string(), "node-b".to_string()],
             "round-robin over two calls must visit both nodes exactly once"
+        );
+    }
+
+    /// 🔴 The round-robin cursor is `RoundRobinStrategy`'s own atomic, so
+    /// it is the *instance* that carries scheduling state, not the argument
+    /// list. `schedule` and `lookup_node`'s `Paused` branch each build
+    /// their own `ScheduleDeps`; if either borrowed a freshly constructed
+    /// strategy rather than this service's single `Arc<RoundRobinStrategy>`,
+    /// both paths would still round-robin perfectly *on their own* and
+    /// every other test in this file would still pass -- while placement
+    /// quietly stopped rotating *across* the two paths, so the create path
+    /// and the resume path kept landing on the same node forever.
+    ///
+    /// `AtomicNodeRegistry::snapshot` sorts by node id, so the candidate
+    /// list is `[node-a, node-b, node-c]` on every call and the interleaved
+    /// sequence below is exact: one shared cursor yields a, b, c, a. Two
+    /// independent cursors would yield a, a, b, b.
+    #[tokio::test]
+    async fn schedule_and_lookup_node_advance_one_shared_round_robin_cursor() {
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-b", "http://10.0.0.2:8000"),
+                node("node-c", "http://10.0.0.3:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        // Empty origin: no preference to short-circuit the strategy with,
+        // so the `Paused` branch reaches `RoundRobinStrategy::select` the
+        // same way `Schedule` does.
+        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
+            paused_entry(sandbox_id, PausedRegistryState::Paused, "", None),
+            true,
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_paused_registry(paused);
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let scheduled = service
+                .schedule(Request::new(ScheduleRequest { hint: None }))
+                .await
+                .expect("three discovered nodes")
+                .into_inner();
+            seen.push(scheduled.node.expect("a node was chosen").node_id);
+
+            let looked_up = service
+                .lookup_node(Request::new(LookupNodeRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }))
+                .await
+                .expect("a paused row with no origin preference")
+                .into_inner();
+            assert_eq!(looked_up.location(), scheduler::SandboxLocation::Placed);
+            seen.push(looked_up.node.expect("a node was placed").node_id);
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+                "node-a".to_string(),
+            ],
+            "Schedule and LookupNode must advance ONE cursor; a, a, b, b means              they were each handed their own RoundRobinStrategy"
+        );
+    }
+
+    /// 🔴 `agentenv_api_schedule_duration_seconds` and
+    /// `agentenv_api_schedule_assignments_total` are series a dashboard
+    /// already groups by, and the `strategy`/`status` label keys are part
+    /// of that identity. Round-robin being the only strategy this build has
+    /// is not a licence to drop the label or stop naming it: a series that
+    /// changes shape goes blank silently, with nothing failing anywhere.
+    ///
+    /// So this pins all three axes at the emission site -- both metric
+    /// names, both label keys, and the literal `round_robin` value.
+    #[tokio::test]
+    async fn schedule_metrics_are_named_and_labelled_exactly() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.1:8000")],
+            Duration::from_secs(30),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
+        service
+            .schedule(Request::new(ScheduleRequest { hint: None }))
+            .await
+            .expect("one discovered node");
+
+        drop(guard);
+
+        // (metric name, sorted (label key, label value) pairs) for every
+        // series the call emitted -- an exact shape, so an extra, missing,
+        // renamed or revalued label is a mismatch rather than a near miss.
+        let series: Vec<(String, Vec<(String, String)>)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _unit, _description, _value)| {
+                let key = composite.key();
+                let mut labels: Vec<(String, String)> = key
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                labels.sort();
+                (key.name().to_string(), labels)
+            })
+            .collect();
+
+        assert!(
+            series.contains(&(
+                "agentenv_api_schedule_duration_seconds".to_string(),
+                vec![
+                    ("status".to_string(), "ok".to_string()),
+                    ("strategy".to_string(), "round_robin".to_string()),
+                ],
+            )),
+            "the duration histogram must keep its name and both of its              strategy=round_robin / status=ok labels: {series:?}"
+        );
+        assert!(
+            series.contains(&(
+                "agentenv_api_schedule_assignments_total".to_string(),
+                vec![("strategy".to_string(), "round_robin".to_string())],
+            )),
+            "the assignments counter must keep its name and its              strategy=round_robin label: {series:?}"
         );
     }
 

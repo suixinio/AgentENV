@@ -34,8 +34,9 @@ pub struct Node {
 /// Discovery identity combined with the most recent heartbeat-reported
 /// runtime state. `snapshot` is `None` until the node's first heartbeat.
 ///
-/// `Clone` mirrors Go's by-value slice element: [`super::strategy::Strategy`]
-/// hands back an owned `RichNode` picked out of a borrowed candidate slice.
+/// `Clone` mirrors Go's by-value slice element:
+/// [`super::strategy::RoundRobinStrategy::select`] hands back an owned
+/// `RichNode` picked out of a borrowed candidate slice.
 #[derive(Debug, Clone, Default)]
 pub struct RichNode {
     pub node: Node,

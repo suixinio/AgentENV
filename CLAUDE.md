@@ -179,8 +179,13 @@ with the Go scheduler they dialled. `AENV_NODE_PLACEMENT_SOURCE` is inert
 now: no field declares it, so confique ignores it and nothing refuses it —
 the startup guard that carried un-migrated manifests through the cutover has
 itself been removed. `Schedule` always
-places with round-robin (`src/node_registry/strategy.rs` also ports Go's
-`random` strategy, but nothing wires it to a config knob yet). Node discovery
+places with round-robin: `RoundRobinStrategy` (`src/node_registry/strategy.rs`)
+is the only strategy in the tree — held concretely rather than behind a
+one-implementation trait, with no config knob to pick another, and Go's
+`random` strategy was never ported. Its `strategy` metric label is still
+emitted, and still valued `round_robin`, because
+`agentenv_api_schedule_duration_seconds` / `..._assignments_total` are
+series identities that must not change shape. Node discovery
 for that registry is `[cluster].node_discovery_mode` — `"kubernetes"` (the
 default; watches EndpointSlices for `[cluster.kubernetes_discovery]`'s
 namespace/Service) or `"static"` (seeds once at startup, no watch, from

@@ -46,7 +46,7 @@ use std::time::SystemTime;
 use crate::binding_store::BindingStore;
 use crate::node_registry::filter::filter_unschedulable;
 use crate::node_registry::registry::NodeRegistry;
-use crate::node_registry::strategy::{NoNodesAvailable, Strategy};
+use crate::node_registry::strategy::{NoNodesAvailable, RoundRobinStrategy};
 use crate::node_registry::types::{Node, RichNode};
 use crate::node_registry::warmup::WarmupGate;
 use crate::orchestrator::{PausedRegistryState, PausedSandboxRegistry};
@@ -64,10 +64,15 @@ pub use crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL as ROSTER_FR
 /// Everything [`select_node`] needs. Shared between `Schedule` (bare
 /// preference) and [`lookup_node`]'s `Paused` branch (origin-node
 /// preference) -- Go's `Service.place` is exactly this reuse.
+///
+/// 🔴 `strategy` is a borrow of one shared [`RoundRobinStrategy`], never a
+/// fresh one per call: the round-robin cursor is that instance's atomic,
+/// so two `ScheduleDeps` pointing at two instances would silently give
+/// `Schedule` and [`lookup_node`]'s `Paused` branch independent rotations.
 #[derive(Clone, Copy)]
 pub struct ScheduleDeps<'a> {
     pub node_registry: &'a dyn NodeRegistry,
-    pub strategy: &'a dyn Strategy,
+    pub strategy: &'a RoundRobinStrategy,
 }
 
 /// One selection, with the candidate counts it was taken over -- mirrors

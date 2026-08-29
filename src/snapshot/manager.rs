@@ -9,7 +9,7 @@ use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSna
 use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
 use crate::snapshot::{SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord};
-use crate::types::{ExecutionId, FirecrackerSnapshotManifest};
+use crate::types::FirecrackerSnapshotManifest;
 
 /// The sandbox a publication says it came from, or `None` for a template
 /// build.
@@ -184,7 +184,7 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let handle = self.stage(metadata, manifest, None).await?;
+        let handle = self.stage(metadata, manifest).await?;
         self.commit_and_advertise(handle).await
     }
 
@@ -194,9 +194,7 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let handle = self
-            .stage_captured(metadata, captured_snapshot, None)
-            .await?;
+        let handle = self.stage_captured(metadata, captured_snapshot).await?;
         self.commit_and_advertise(handle).await
     }
 
@@ -237,7 +235,6 @@ impl SnapshotManager {
         &self,
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
-        execution_id: Option<ExecutionId>,
     ) -> crate::snapshot::RepositoryResult<StagedSnapshotHandle> {
         let local_capture = match captured_snapshot {
             CapturedSandboxSnapshot::Staged(staged) => return self.adopt_staged(metadata, *staged),
@@ -251,10 +248,7 @@ impl SnapshotManager {
                 feature: "publishing captured snapshots for this sandbox backend".to_string(),
             })?;
 
-        let staged = self
-            .repository
-            .stage(metadata, manifest.clone(), execution_id)
-            .await?;
+        let staged = self.repository.stage(metadata, manifest.clone()).await?;
 
         Ok(StagedSnapshotHandle {
             staged,
@@ -305,12 +299,8 @@ impl SnapshotManager {
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
-        execution_id: Option<ExecutionId>,
     ) -> crate::snapshot::RepositoryResult<StagedSnapshotHandle> {
-        let staged = self
-            .repository
-            .stage(metadata, manifest.clone(), execution_id)
-            .await?;
+        let staged = self.repository.stage(metadata, manifest.clone()).await?;
 
         Ok(StagedSnapshotHandle {
             staged,

@@ -1600,7 +1600,7 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
 }
 
 /// A row a node might hand back, staged on the node under test.
-fn staged_snapshot(execution_id: ExecutionId) -> StagedSnapshot {
+fn staged_snapshot() -> StagedSnapshot {
     StagedSnapshot {
         commit: SnapshotCommit {
             id: SnapshotId::generate(),
@@ -1612,7 +1612,6 @@ fn staged_snapshot(execution_id: ExecutionId) -> StagedSnapshot {
         },
         staged_at_unix_ms: 1_700_000_000_000,
         origin_node_id: "node-under-test".to_string(),
-        execution_id: Some(execution_id),
     }
 }
 
@@ -1627,7 +1626,7 @@ async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
         ..Default::default()
     }));
 
-    let staged = staged_snapshot(execution_id);
+    let staged = staged_snapshot();
     *script.checkpoint.lock().expect("lock") = Some(Ok(pb::SandboxCheckpointResponse {
         staged: Some(pb::StagedSnapshot {
             value: Some(wire::serialize(&staged, "staged snapshot").expect("encode")),
@@ -1649,7 +1648,6 @@ async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
     };
     let decoded: StagedSnapshot = *decoded;
     assert_eq!(decoded.origin_node_id, "node-under-test");
-    assert_eq!(decoded.execution_id, Some(execution_id));
     assert_eq!(decoded.id(), staged.id());
 }
 
@@ -2690,7 +2688,7 @@ async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
 async fn a_pause_asks_for_a_row_only_when_its_caller_will_commit_one() {
     let (script, node) = scripted_node().await;
 
-    let staged = staged_snapshot(ExecutionId::new());
+    let staged = staged_snapshot();
     // 🔴 After `paused_stub`, which writes its own pause script on the way to
     // starting the sandbox. Setting it first would be overwritten and this test
     // would assert against a reply with no row in it.

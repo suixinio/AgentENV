@@ -516,7 +516,6 @@ mod advertisement_tests {
             .stage_captured(
                 capture_of(sandbox, SnapshotId::generate()),
                 CapturedSandboxSnapshot::staged(staged_elsewhere(staged_id.clone(), sandbox)),
-                None,
             )
             .await
             .expect("an adopted staging");
@@ -537,7 +536,6 @@ mod advertisement_tests {
             .stage_captured(
                 capture_of(sandbox, local_id.clone()),
                 CapturedSandboxSnapshot::local(CallerOwnedArtifacts::new(manifest)),
-                None,
             )
             .await
             .expect("a local staging");

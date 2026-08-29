@@ -194,7 +194,6 @@ impl NodeSandboxService {
     async fn stage_for_caller(
         &self,
         sandbox_id: SandboxId,
-        execution_id: ExecutionId,
         metadata: &SandboxMetadata,
         captured: crate::sandbox::CapturedSandboxSnapshot,
     ) -> Result<pb::StagedSnapshot, String> {
@@ -203,11 +202,6 @@ impl NodeSandboxService {
             .stage_captured(
                 crate::orchestrator::capture_publish_metadata(metadata, None),
                 captured,
-                // 🔴 The incarnation this call was fenced on, so the row records
-                // which run of the sandbox it is a snapshot of. Fencing already
-                // refused a caller naming a superseded run; this is what a later
-                // reader consults once the caller is long gone.
-                Some(execution_id),
             )
             .await
             .map_err(|err| format!("stage sandbox {sandbox_id}'s capture: {err}"))?
@@ -375,7 +369,7 @@ impl NodeSandboxService {
         // nothing, because there is no sandbox run for a later caller to name.
         let staged = self
             .snapshots
-            .stage(metadata, manifest, None)
+            .stage(metadata, manifest)
             .await
             .map_err(|err| {
                 Status::internal(format!("stage template build {build_snapshot_id}: {err:#}"))
@@ -1069,7 +1063,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 // that is what the reply says was lost. See
                 // `SandboxPauseResponse.staging_error`.
                 Some(publishable) => match self
-                    .stage_for_caller(sandbox_id, execution_id, &outcome.metadata, publishable)
+                    .stage_for_caller(sandbox_id, &outcome.metadata, publishable)
                     .await
                 {
                     Ok(staged) => (Some(staged), String::new()),
@@ -1239,12 +1233,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         // the caller tear down a sandbox that is running and serving requests
         // because a disk filled up.
         let staged = self
-            .stage_for_caller(
-                sandbox_id,
-                execution_id,
-                &capture.metadata,
-                capture.captured_snapshot,
-            )
+            .stage_for_caller(sandbox_id, &capture.metadata, capture.captured_snapshot)
             .await
             .map_err(|err| {
                 crate::proto::node::capture_failure_status(

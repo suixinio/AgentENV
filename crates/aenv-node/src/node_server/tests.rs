@@ -2593,11 +2593,6 @@ async fn a_published_pause_stages_the_bytes_here_and_leaves_the_row_to_the_calle
         staged.origin_node_id, "",
         "a row that names no machine cannot be resumed anywhere"
     );
-    assert_eq!(
-        staged.execution_id,
-        Some(published.execution_id),
-        "the row must name the run it is a snapshot of"
-    );
     assert!(
         matches!(
             &staged.commit.source,
@@ -2788,7 +2783,6 @@ async fn a_checkpoint_answers_with_a_row_nobody_has_announced() {
     );
     assert_eq!(staged.origin_node_id, crate::identity::local_node_id());
     assert_ne!(staged.origin_node_id, "");
-    assert_eq!(staged.execution_id, Some(sandbox.execution_id));
     assert!(
         matches!(
             &staged.commit.source,
@@ -3192,7 +3186,7 @@ async fn a_built_templates_metadata_survives_stage_encode_decode_and_commit() {
     );
 
     let staged = snapshot_manager
-        .stage(metadata, manifest, None)
+        .stage(metadata, manifest)
         .await
         .expect("a freshly built template's artifacts must stage")
         .into_staged();

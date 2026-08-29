@@ -188,7 +188,7 @@ async fn a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere() {
     };
 
     let handle = manager
-        .stage(metadata, manifest, None)
+        .stage(metadata, manifest)
         .await
         .expect("staging should work");
 
@@ -271,7 +271,7 @@ async fn a_manager_staged_snapshot_commits_after_a_serde_round_trip() {
     };
 
     let handle = manager
-        .stage(metadata, manifest, None)
+        .stage(metadata, manifest)
         .await
         .expect("staging should work");
     let encoded = serde_json::to_vec(handle.staged()).expect("staged value should serialize");
@@ -313,7 +313,6 @@ pub fn staged_elsewhere(id: SnapshotId, source_sandbox_id: &str) -> StagedSnapsh
         },
         staged_at_unix_ms: 1_700_000_000_000,
         origin_node_id: "the-node-holding-the-bytes".to_string(),
-        execution_id: None,
     }
 }
 

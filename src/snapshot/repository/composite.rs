@@ -37,7 +37,6 @@ use crate::snapshot::types::{
     PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
     TemplateBuildErrorReason,
 };
-use crate::types::ExecutionId;
 use crate::types::FirecrackerSnapshotManifest;
 
 /// Durable snapshot repository: a [`SnapshotCatalog`] and a
@@ -108,7 +107,7 @@ impl SnapshotRepository {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
-        let staged = self.stage(metadata, manifest, None).await?;
+        let staged = self.stage(metadata, manifest).await?;
         self.commit_staged(staged).await
     }
 
@@ -123,13 +122,10 @@ impl SnapshotRepository {
     /// On failure the artifacts are rolled back exactly as they were before the
     /// split, including the registry publications a partial import had already
     /// made.
-    ///
-    /// `execution_id` is recorded, never checked. See [`StagedSnapshot`].
     pub async fn stage(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
-        execution_id: Option<ExecutionId>,
     ) -> RepositoryResult<StagedSnapshot> {
         validate_attached_drives(&manifest)?;
 
@@ -152,7 +148,6 @@ impl SnapshotRepository {
                     commit: SnapshotCommit::new(&metadata, imported, staged_at_unix_ms),
                     staged_at_unix_ms,
                     origin_node_id: self.origin_node_id.clone(),
-                    execution_id,
                 })
             }
             Err(error) => {
@@ -377,7 +372,6 @@ mod tests {
         CommittedSnapshot, PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishSource,
         TemplateBuildStatus,
     };
-    use crate::types::ExecutionId;
     use crate::types::ExtraDrive;
 
     /// Every call either half receives, in order, so a test can assert that the
@@ -800,7 +794,7 @@ mod tests {
         );
 
         let staged = repository
-            .stage(metadata(), manifest(), None)
+            .stage(metadata(), manifest())
             .await
             .expect("staging should work");
 
@@ -826,7 +820,7 @@ mod tests {
         );
 
         let staged = repository
-            .stage(metadata(), manifest(), Some(ExecutionId::new()))
+            .stage(metadata(), manifest())
             .await
             .expect("staging should work");
         let encoded = serde_json::to_vec(&staged).expect("a staged snapshot must serialize");
@@ -835,7 +829,6 @@ mod tests {
 
         assert_eq!(decoded.commit.id, staged.commit.id);
         assert_eq!(decoded.origin_node_id, staged.origin_node_id);
-        assert_eq!(decoded.execution_id, staged.execution_id);
         assert_eq!(
             decoded.commit.committed.disk_publications.len(),
             staged.commit.committed.disk_publications.len(),
@@ -871,7 +864,7 @@ mod tests {
         );
 
         let staged = repository
-            .stage(metadata(), manifest(), None)
+            .stage(metadata(), manifest())
             .await
             .expect("staging should work");
         repository

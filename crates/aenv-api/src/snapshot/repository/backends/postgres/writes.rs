@@ -87,15 +87,13 @@ pub async fn begin_snapshot(
             cpu_count, memory_mib, disk_size_mib,
             status, status_group,
             published, origin_node_id,
-            sandbox_started_at_ms, created_at_ms, updated_at_ms,
-            publishing_execution_id
+            sandbox_started_at_ms, created_at_ms, updated_at_ms
          ) VALUES (
             $1, $2, $3, $4,
             $5, $6, $7,
             $8, 'pending',
             $9, $10,
-            NULL, $11, $11,
-            NULL
+            NULL, $11, $11
          )
          ON CONFLICT (id) DO NOTHING
          RETURNING id::text",

@@ -13,7 +13,7 @@ use crate::snapshot::types::{
     TemplateBuildStatus,
 };
 use crate::types::FirecrackerSnapshotManifest;
-use crate::types::{ExecutionId, SandboxResources};
+use crate::types::SandboxResources;
 
 /// How many rows a listing returns when the caller asks for no particular
 /// number.
@@ -373,14 +373,6 @@ pub struct StagedSnapshot {
     /// time a remote committer is looking at this value there is nothing left
     /// to ask.
     pub origin_node_id: String,
-    /// Which incarnation staged this.
-    ///
-    /// 🔴 Written and never checked in this phase. It is here so the phase
-    /// where several processes may commit can add the predicate without a
-    /// migration that backfills a column onto rows already in flight; the
-    /// catalog column it feeds (`snapshots.publishing_execution_id`) exists for
-    /// the same reason and is written the same way.
-    pub execution_id: Option<ExecutionId>,
 }
 
 impl StagedSnapshot {

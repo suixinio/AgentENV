@@ -32,7 +32,6 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 index-set = "0.2"
-io-uring = "0.7.9"
 ipnetwork = "0.21"
 libc = "0.2"
 metrics = "0.24"
@@ -47,7 +46,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 shell-util = { path = "../shell-util" }
-storage-util = { path = "../../storage/util" }
 tar = "0.4"
 tempfile = "3.22.0"
 thiserror = "2.0.18"
@@ -75,7 +73,13 @@ agentenv-test-support = { path = "../test-support" }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
 headers = "0.4"
 http = "1"
+# Test-only: `snapshot/p2p.rs`'s `#[cfg(test)]` module spins up an io_uring
+# worker to build a real overlaybd layer. Nothing in this crate's production
+# code touches either -- ublk and the io_uring rings live in the daemon
+# process, which `aenv-node` drives over its Unix socket.
+io-uring = "0.7.9"
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
+storage-util = { path = "../../storage/util" }
 
 [[test]]
 name = "integration"

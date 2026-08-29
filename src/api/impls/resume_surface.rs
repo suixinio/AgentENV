@@ -211,7 +211,7 @@ impl ResumeWiring {
     /// The general constructor, and the seam a test injects a placement source
     /// through.
     ///
-    /// Production builds this through [`Self::from_config`] or
+    /// Production builds this through [`Self::cluster_from_config`] or
     /// [`Self::node_local`]; this one exists for the two cases neither covers —
     /// a stub placement source, and the `WakeSite::Remote` that arrives with
     /// the remote backend factory.
@@ -267,52 +267,12 @@ impl ResumeWiring {
         }
     }
 
-    /// Builds the scheduler-backed wiring from configuration, or the node-local
-    /// one when no scheduler endpoint is configured.
-    ///
-    /// 🔴 Lazy connect. [`SchedulerEndpointSource::spawn_from_config`] does not
-    /// touch the network to build the channel, so a scheduler that is down at
-    /// startup delays a resume rather than a process. The endpoint can also be
-    /// hot-reloaded afterward from `[cluster].scheduler_endpoint_file`, with
-    /// no restart.
-    pub fn from_config(node_id: impl Into<String>) -> anyhow::Result<Self> {
-        let node_id = node_id.into();
-        let config = ConfigManager::global_config();
-        let Some(endpoint) =
-            configured_placement_endpoint(config.cluster.scheduler_endpoint.as_deref())
-        else {
-            announce_unenforced_placement(config.orchestrator.paused_registry.backend);
-            return Ok(Self::node_local(node_id));
-        };
-
-        // 🔴 A hard failure and not a degradation, deliberately. Falling back to
-        // `node_local` here would leave `placement` as `None`, every placement
-        // would answer `Unconstrained`, and `refuse_unhonourable_pin` would
-        // never fire for any sandbox in the fleet — so one typo in one config
-        // line would silently switch pin enforcement off. The failure that
-        // follows from that is not an error the operator sees: it is a
-        // sandbox whose only copy lived on another disk being rebuilt from an
-        // older snapshot and answering 200, with the user's last session gone.
-        // Refusing to start is loud; the alternative is silent and
-        // irreversible.
-        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
-            endpoint.to_string(),
-            &config.cluster,
-            &config.observability.scheduler_report,
-            "resume_placement",
-        )?;
-        Ok(Self {
-            placement: Some(Arc::new(SchedulerPlacementSource::new(endpoint_source))),
-            wake_site: WakeSite::Local(node_id),
-        })
-    }
-
     /// The wiring for a process that owns sandboxes it does not run: every
     /// wake-up is placed by the cluster, and this process performs it on
     /// whichever machine the placement named.
     ///
-    /// 🔴 Requires a scheduler endpoint, where [`from_config`](Self::from_config)
-    /// degrades to node-local without one. The degradation is right for a
+    /// 🔴 Requires a scheduler endpoint rather than degrading to node-local
+    /// without one. Degrading is right for a
     /// single-node deployment, which genuinely has nothing to ask; it is wrong
     /// here, because a process with no local machine and no placement source
     /// would answer `Unconstrained` for every sandbox and then have nowhere to
@@ -350,45 +310,12 @@ impl ResumeWiring {
 ///
 /// Blank and absent are the same answer, because a config file that carries the
 /// key with an empty value is not naming an endpoint. Split out from
-/// [`ResumeWiring::from_config`] because that function reads a global and this
-/// decision is worth being able to state a test about: inverting it would drop
-/// every configured endpoint on the floor and turn pin enforcement off exactly
-/// where it is needed.
+/// [`ResumeWiring::cluster_from_config`] because that function reads a global
+/// and this decision is worth being able to state a test about: inverting it
+/// would drop every configured endpoint on the floor and turn pin enforcement
+/// off exactly where it is needed.
 fn configured_placement_endpoint(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|endpoint| !endpoint.is_empty())
-}
-
-/// Says out loud that no placement source is configured, and therefore that
-/// nothing in this process will refuse a pin.
-///
-/// 🔴 Said rather than left implicit. With no endpoint every placement is
-/// `Unconstrained`, so this process will wake any sandbox anywhere it is asked
-/// to — which is correct for a single-node deployment and is a capability gap
-/// on a cluster. The gap is invisible from the outside: the resumes still
-/// succeed. That is the exact shape this programme keeps paying for — a metric
-/// at 0 that reads the same whether nothing happened or nothing was watching —
-/// so it gets a log line rather than a silence.
-///
-/// The level carries the judgement. A `postgres` paused registry only exists
-/// in a clustered deployment, so it is the one signal available here that
-/// distinguishes "correctly unconstrained" from "quietly unenforced".
-fn announce_unenforced_placement(backend: crate::cfg::PausedRegistryBackendKind) {
-    let clustered = matches!(backend, crate::cfg::PausedRegistryBackendKind::Postgres);
-    if clustered {
-        warn!(
-            paused_registry_backend = backend.as_str(),
-            "no [cluster].scheduler_endpoint is configured, so this process will not refuse \
-             to wake a sandbox pinned to another node; the scheduler's LookupNode is the only \
-             thing still enforcing that, and an unpublished pause woken here would be rebuilt \
-             from an older snapshot"
-        );
-    } else {
-        debug!(
-            paused_registry_backend = backend.as_str(),
-            "no [cluster].scheduler_endpoint is configured; placement is unconstrained, which \
-             is what a single-node deployment expects"
-        );
-    }
 }
 
 /// The scheduler's `LookupNode`, read as a placement answer.

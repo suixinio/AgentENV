@@ -35,12 +35,29 @@ log "Proxy (e2b headers) returned HTTP ${HTTP_STATUS}"
 assert_status "$HTTP_STATUS" "204" "proxy with e2b headers"
 
 # -- Proxy request without sandbox header returns 400 --
-# Use the explicit /proxy path so both single-node and compose reach the
-# node-local proxy entrypoint before header validation.
+# Address a runtime node's own /proxy entrypoint, not ${AENV_URL}.
+#
+# 🔴 The gateway cannot carry this request to a node, and no longer pretends
+# to. Routing a data-plane request needs a sandbox to look up; with no sandbox
+# header there is nothing to look up, so the gateway classifies /proxy/health
+# as an unrecognised REST path and forwards it to the api half -- which since
+# 2338993 mounts no /proxy at all, deliberately. Through the gateway this path
+# therefore only ever reaches aenv-api's generated router 404, which asserts
+# nothing about the proxy. Header validation lives in the node's proxy, so
+# that is what this assertion has to talk to.
+#
+# The node half's *user-facing REST* is gone in a split deployment (see
+# node_rest_is_served), but its *data plane* is exactly what it still serves,
+# so this needs no skip gate: in clustered modes the first runtime node
+# endpoint answers, and in single-node mode ${AENV_URL} is itself the node.
+# (`| head -n1` also keeps candidate_node_urls' empty-case exit status out of
+# `set -e`, the same way node_rest_is_served calls it.)
+proxy_entrypoint_url="$(candidate_node_urls | head -n 1)"
+[[ -n "$proxy_entrypoint_url" ]] || proxy_entrypoint_url="${AENV_URL}"
 _curl_do -s --max-time 5 \
   -H "X-API-Key: ${AENV_API_KEY}" \
-  "${AENV_URL}/proxy/health"
-log "Proxy (no sandbox header) returned HTTP ${HTTP_STATUS}"
+  "${proxy_entrypoint_url}/proxy/health"
+log "Proxy (no sandbox header) at ${proxy_entrypoint_url} returned HTTP ${HTTP_STATUS}: ${HTTP_BODY}"
 assert_status "$HTTP_STATUS" "400" "proxy without sandbox header"
 
 # -- Paused sandbox with auto-resume disabled returns 410 --

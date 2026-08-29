@@ -9,7 +9,41 @@ use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
 
-/// Builds the router this process serves.
+/// Whether the router carries the sandbox HTTP data plane: the `/proxy/*`
+/// entrypoints, the host-routed fallback they share, and the
+/// `sandbox_proxy_classifier` layer that turns a sandbox proxy domain into a
+/// call on them.
+///
+/// 🔴 Named by the caller, and deliberately *not* read off the `ApiImpl` — the
+/// opposite of the choice [`assemble`]'s `serves_user_facing_rest` makes, for a
+/// reason worth spelling out because the two look interchangeable.
+/// `ApiImpl::owns_sandboxes` is the exact complement of
+/// `ApiImpl::runs_sandbox_runtime` (see its own doc), so deriving the data
+/// plane from either one would compile, ship, and read as if the router had
+/// decided something it had not: it would have inherited a decision about
+/// *which REST route groups this half answers*. Whether a process mounts an
+/// HTTP forwarder is a different question — it is about whether there is a
+/// local VM at the other end of the socket — and a call site that has to write
+/// the answer down cannot pick it up by accident.
+///
+/// It is also what keeps `crate::api::proxy`'s own tests honest. They compose
+/// real routers through [`new`] against an api-half `ApiImpl` on purpose (the
+/// half whose handlers they are exercising); coupling the mount to the half
+/// would have deleted the data plane out from under them and made the fix
+/// "flip the fixture", not "fix the router".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataPlane {
+    /// `aenv-node`: sandboxes run in this process, so `/proxy/*` has somewhere
+    /// to forward to.
+    Served,
+    /// `aenv-api`: no sandbox runs here (the crate does not even link one —
+    /// `make check-crate-boundaries`), so the forwarder, its fallback and its
+    /// host classifier are absent rather than present-and-always-failing.
+    Absent,
+}
+
+/// Builds the full router `aenv-node` serves: the generated control plane plus
+/// the sandbox HTTP data plane ([`DataPlane::Served`]).
 ///
 /// 🔴 Which half this is comes off the `ApiImpl` itself
 /// ([`ApiImpl::owns_sandboxes`]) rather than from a parameter beside it. It was
@@ -18,6 +52,10 @@ use agentenv_observability::metrics_handler;
 /// `ApiImpl` believed otherwise would have refused user REST while going on
 /// waking sandboxes on its own initiative, and nothing else would have noticed.
 /// One carrier cannot disagree with itself.
+///
+/// The data plane is the one thing this function decides *for* the caller
+/// rather than reading off that carrier — see [`DataPlane`] for why, and
+/// [`new_control_plane_only`] for the caller that wants the other answer.
 pub fn new<I, A, E, C>(api_impl: I) -> Router
 where
     I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
@@ -36,12 +74,62 @@ where
 {
     compose::<I, A, E, C>(
         api_impl,
+        DataPlane::Served,
         Router::new(),
         Arc::new(ControlPlaneGate::from_global_config()),
     )
 }
 
-/// The actual body of [`new`], with the gate
+/// Builds the router `aenv-api` serves: the generated control plane, `/metrics`
+/// and the resume-isolation gate, and **no** sandbox data plane
+/// ([`DataPlane::Absent`]).
+///
+/// 🔴 What is gone here relative to [`new`], and why:
+///
+/// - `proxy::router` — `/proxy`, `/proxy/`, `/proxy/{*rest}` and the
+///   host-routed fallback behind them. Every one of those handlers ends in a
+///   forward to a sandbox's address on *this machine*; `aenv-api` runs no
+///   sandbox and links no runtime to run one, so mounting them buys a set of
+///   routes whose only possible answer is a failure invented one layer too
+///   late. Sandbox data-plane traffic is routed by the gateway's `LookupNode`
+///   straight at the node that holds the sandbox
+///   (`services/gateway/internal/`), never here.
+/// - `proxy::sandbox_proxy_classifier` — the layer that reads `Host` against
+///   `[api].sandbox_proxy_domains` and rewrites a matching request into the
+///   routes above. With those routes absent it can only rewrite a request into
+///   a 404, and it runs on *every* request to this process to do it.
+///
+/// 🔴 The fallback goes with them, and that is a visible change rather than a
+/// tidy-up: an unrecognized path on this half is now the generated router's own
+/// 404 instead of `proxy_via_fallback`'s attempt to read a sandbox out of the
+/// `Host` header. That is the intended answer — this half has no sandbox to
+/// name — and it is what stops a stray path being interpreted as data-plane
+/// traffic by the one process that cannot serve any.
+pub fn new_control_plane_only<I, A, E, C>(api_impl: I) -> Router
+where
+    I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+    A: apis::admin::Admin<E, Claims = C>
+        + apis::default::Default<E>
+        + apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::snapshots::Snapshots<E, Claims = C>
+        + apis::templates::Templates<E, Claims = C>
+        + apis::ApiKeyAuthHeader<Claims = C>
+        + apis::ApiAuthBasic<Claims = C>
+        + Send
+        + Sync
+        + 'static,
+    E: std::fmt::Debug + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+{
+    compose::<I, A, E, C>(
+        api_impl,
+        DataPlane::Absent,
+        Router::new(),
+        Arc::new(ControlPlaneGate::from_global_config()),
+    )
+}
+
+/// The actual body of [`new`] and [`new_control_plane_only`], with the gate
 /// taken as a parameter rather than built from process-global config.
 ///
 /// 🔴 P5 follow-up. `extra_control_plane_routes_are_merged_before_assemble_is_called`
@@ -61,10 +149,10 @@ where
 /// defining module is private to `crate::api`), so a function taking one as a
 /// parameter cannot be `pub` either without exposing a type
 /// `crates/aenv-api/src/bin/aenv-api.rs` — a separate crate — cannot name.
-/// [`new`] stays the only crate-external entry point and forwards here with
-/// the default gate.
+/// [`new`] and [`new_control_plane_only`] are the crate-external entry points
+/// and forward here with the default gate.
 ///
-/// 🔴 `extra_control_plane_routes` is `Router::new()` from [`new`] today:
+/// 🔴 `extra_control_plane_routes` is `Router::new()` from both of them today:
 /// `/debug/node-registry`, the one endpoint that ever used it, is deleted. The
 /// parameter stays because the *merge order* it exists to fix is a property of
 /// this function that outlives that endpoint — the next route someone adds
@@ -74,6 +162,7 @@ where
 /// keeps that provable with a real request instead of a comment.
 fn compose<I, A, E, C>(
     api_impl: I,
+    data_plane: DataPlane,
     extra_control_plane_routes: Router,
     gate: Arc<ControlPlaneGate>,
 ) -> Router
@@ -98,15 +187,25 @@ where
     // `debug_assert` here.
     let serves_user_facing_rest = AsRef::<ApiImpl>::as_ref(&api_impl).owns_sandboxes();
 
+    // 🔴 `Absent` merges an empty `Router`, which is not a stand-in for
+    // "skip the merge" — it *is* one: an empty router contributes no route and
+    // no custom fallback, so `assemble`'s result keeps the generated router's
+    // own 404. Writing it this way keeps `assemble` — and the merge-ordering
+    // property its own doc rests on — identical for both halves.
+    let mounted_data_plane = match data_plane {
+        DataPlane::Served => proxy::router(api_impl.clone()),
+        DataPlane::Absent => Router::new(),
+    };
+
     // Keep the generated control-plane API as the primary router, merge the
     // caller's extra gated routes into it *before* `assemble` attaches the
     // control-plane gate and the role gate — so both cover them — then merge
     // in the hand-written `/proxy/*` entrypoints needed for the temporary
     // reverse proxy contract.
-    assemble(
+    let router = assemble(
         agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
             .merge(extra_control_plane_routes),
-        proxy::router(api_impl.clone()),
+        mounted_data_plane,
         gate,
         serves_user_facing_rest,
     )
@@ -117,12 +216,20 @@ where
     .layer(middleware::from_fn_with_state(
         api_impl.clone(),
         isolation::resume_isolation_gate::<I>,
-    ))
-    .layer(middleware::from_fn_with_state(
-        api_impl,
-        proxy::sandbox_proxy_classifier::<I>,
-    ))
-    .layer(middleware::from_fn(prometheus::http_metrics_middleware))
+    ));
+
+    // 🔴 Attached only where the routes it rewrites into exist. A classifier on
+    // a router with no `/proxy` handlers runs on every request to turn some of
+    // them into a 404 that the router would have produced anyway.
+    let router = match data_plane {
+        DataPlane::Served => router.layer(middleware::from_fn_with_state(
+            api_impl,
+            proxy::sandbox_proxy_classifier::<I>,
+        )),
+        DataPlane::Absent => router,
+    };
+
+    router.layer(middleware::from_fn(prometheus::http_metrics_middleware))
 }
 
 /// Joins the control plane and the data plane, with the control-plane gate on
@@ -424,6 +531,13 @@ mod tests {
     /// than reusing `proxy`'s copy) because that one is `pub(super)` to
     /// `proxy` and not reachable from this sibling module.
     async fn build_api_impl_for_gate_test() -> Arc<ApiImpl> {
+        build_api_impl_with_proxy_domains(Vec::new()).await
+    }
+
+    /// The same `ApiImpl`, with `[api].sandbox_proxy_domains` populated so the
+    /// sandbox host classifier has something to classify — the only way to
+    /// observe whether that layer is attached at all.
+    async fn build_api_impl_with_proxy_domains(domains: Vec<String>) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().unwrap();
         let orchestrator = crate::orchestrator::Orchestrator::new(
             crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
@@ -451,7 +565,7 @@ mod tests {
                 snapshot_manager,
                 &identity,
             ),
-            Vec::new(),
+            domains,
             // 🔴 The half that serves the user-facing REST surface, because
             // that is what this module's gate tests are about: on the other
             // half every assertion below would read 404 from the user-REST
@@ -490,51 +604,186 @@ mod tests {
     /// pass by the new composition accidentally opening everything); the
     /// correct credential must reach both; and `/health` must stay reachable
     /// regardless, so a gate that refuses everything cannot pass this either.
+    ///
+    /// 🔴 Run against **both** [`DataPlane`] choices, because the data plane is
+    /// now the one thing that differs between the two production entry points
+    /// and it is merged into the same expression the gate is attached in. A
+    /// composition that gated extra routes on `aenv-node` and dropped the gate
+    /// on `aenv-api` — or the reverse — would pass a single-variant version of
+    /// this test.
     #[tokio::test]
     async fn extra_control_plane_routes_require_the_control_plane_credential() {
         let api_impl = build_api_impl_for_gate_test().await;
         let gate = Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], ""));
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
 
-        let router = || {
+        for data_plane in [DataPlane::Served, DataPlane::Absent] {
+            let router = || {
+                compose(
+                    Arc::clone(&api_impl),
+                    data_plane,
+                    stand_in_debug_route(),
+                    Arc::clone(&gate),
+                )
+            };
+
+            assert_eq!(
+                status(router(), Method::GET, "/debug/example-registry", None).await,
+                StatusCode::FORBIDDEN,
+                "a route merged in through compose must require the control-plane credential, \
+                 same as /debug/node-registry did ({data_plane:?})"
+            );
+            assert_eq!(
+                status(router(), Method::POST, sandbox_path, None).await,
+                StatusCode::FORBIDDEN,
+                "regression control: an existing gated route must still be gated ({data_plane:?})"
+            );
+            assert_ne!(
+                status(
+                    router(),
+                    Method::GET,
+                    "/debug/example-registry",
+                    Some(TOKEN)
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "the correct credential must reach the merged-in debug route ({data_plane:?})"
+            );
+            assert_ne!(
+                status(router(), Method::POST, sandbox_path, Some(TOKEN)).await,
+                StatusCode::FORBIDDEN,
+                "the correct credential must still reach the pre-existing gated route \
+                 ({data_plane:?})"
+            );
+            assert_ne!(
+                status(router(), Method::GET, "/health", None).await,
+                StatusCode::FORBIDDEN,
+                "/health must stay ungated regardless ({data_plane:?})"
+            );
+        }
+    }
+
+    /// 🔴 The sandbox data plane is mounted only where a sandbox actually runs.
+    ///
+    /// `aenv-node` keeps `/proxy/*`, the host-routed fallback and the sandbox
+    /// host classifier; `aenv-api` mounts none of the three. Every half of this
+    /// is asserted from both faces, because each one alone is satisfiable by an
+    /// accident: a router that answered 404 to *everything* would pass the
+    /// `Absent` assertions on its own, and one that mounted the data plane on
+    /// both halves would pass the `Served` ones.
+    ///
+    /// The classifier gets its own probe because it is invisible otherwise: it
+    /// is a layer, not a route, so a composition that dropped `/proxy` but kept
+    /// the layer — running on every request to this process to rewrite some of
+    /// them into a 404 — would pass a routes-only test.
+    #[tokio::test]
+    async fn the_sandbox_data_plane_is_mounted_only_where_sandboxes_run() {
+        const DOMAIN: &str = "sandbox.example.invalid";
+        let api_impl = build_api_impl_with_proxy_domains(vec![DOMAIN.to_string()]).await;
+        // An explicitly-off gate: what is under test here is which routes and
+        // layers the composition carries, and a credential check answering
+        // first would mask exactly that.
+        let router = |data_plane| {
             compose(
                 Arc::clone(&api_impl),
-                stand_in_debug_route(),
-                Arc::clone(&gate),
+                data_plane,
+                Router::new(),
+                Arc::new(ControlPlaneGate::new(Vec::new(), "")),
             )
         };
 
+        // 1. The `/proxy/*` entrypoints. 400 is the data plane's own handler
+        //    answering ("missing sandbox routing header"); 404 is the route not
+        //    being there at all.
         assert_eq!(
-            status(router(), Method::GET, "/debug/example-registry", None).await,
-            StatusCode::FORBIDDEN,
-            "a route merged in through compose must require the control-plane credential, same \
-             as /debug/node-registry did"
+            status(router(DataPlane::Served), Method::GET, "/proxy/hello", None).await,
+            StatusCode::BAD_REQUEST,
+            "aenv-node must keep serving /proxy/* from the data plane's own handler"
         );
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
-            StatusCode::FORBIDDEN,
-            "regression control: an existing gated route must still be gated"
+            status(router(DataPlane::Absent), Method::GET, "/proxy/hello", None).await,
+            StatusCode::NOT_FOUND,
+            "aenv-api must not carry a /proxy route at all"
+        );
+
+        // 2. The host classifier. A sandbox proxy domain carrying an
+        //    unparseable sandbox id is refused by the classifier itself (400,
+        //    "invalid sandbox data-plane host"), so a 400 here means the layer
+        //    ran. Without the layer the same request is just an unmatched path.
+        let via_host = |data_plane| {
+            let router = router(data_plane);
+            async move {
+                router
+                    .oneshot(
+                        HttpRequest::builder()
+                            .method(Method::GET)
+                            .uri("/not-a-control-plane-route")
+                            .header(
+                                axum::http::header::HOST,
+                                format!("8080-not-a-sandbox-id.{DOMAIN}"),
+                            )
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(
+            via_host(DataPlane::Served).await,
+            StatusCode::BAD_REQUEST,
+            "aenv-node must still classify a sandbox proxy domain into the data plane"
+        );
+        assert_eq!(
+            via_host(DataPlane::Absent).await,
+            StatusCode::NOT_FOUND,
+            "aenv-api must not run the sandbox host classifier: with no /proxy routes to \
+             rewrite into, the only thing it can produce is a 404 the router already had"
+        );
+
+        // 3. The control group: the port is not what was taken away. Asserted
+        //    as "the same answer on both halves" rather than against a fixed
+        //    status, because what matters is that dropping the data plane
+        //    changed nothing outside it — and a generated route answering the
+        //    same way on both is exactly that.
+        let health = |data_plane| status(router(data_plane), Method::GET, "/health", None);
+        let health_on_node = health(DataPlane::Served).await;
+        assert_ne!(
+            health_on_node,
+            StatusCode::NOT_FOUND,
+            "kubelet's probe must exist at all, or the comparison below is vacuous"
+        );
+        assert_eq!(
+            health(DataPlane::Absent).await,
+            health_on_node,
+            "the generated routes must answer identically with and without the data plane"
+        );
+
+        // 4. ...and the two public entry points actually pass those two values,
+        //    which is the only thing that makes any of the above a fact about
+        //    the two binaries rather than about `compose`'s parameter.
+        assert_eq!(
+            status(
+                new(Arc::clone(&api_impl)),
+                Method::GET,
+                "/proxy/hello",
+                None
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "server::new — what aenv-node calls — must carry the data plane"
         );
         assert_ne!(
             status(
-                router(),
+                new_control_plane_only(Arc::clone(&api_impl)),
                 Method::GET,
-                "/debug/example-registry",
-                Some(TOKEN)
+                "/proxy/hello",
+                None
             )
             .await,
-            StatusCode::FORBIDDEN,
-            "the correct credential must reach the merged-in debug route"
-        );
-        assert_ne!(
-            status(router(), Method::POST, sandbox_path, Some(TOKEN)).await,
-            StatusCode::FORBIDDEN,
-            "the correct credential must still reach the pre-existing gated route"
-        );
-        assert_ne!(
-            status(router(), Method::GET, "/health", None).await,
-            StatusCode::FORBIDDEN,
-            "/health must stay ungated regardless"
+            StatusCode::BAD_REQUEST,
+            "server::new_control_plane_only — what aenv-api calls — must not"
         );
     }
 

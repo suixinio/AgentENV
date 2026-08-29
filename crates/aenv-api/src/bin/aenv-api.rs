@@ -632,9 +632,15 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
 
     Ok(Assembly {
         // 🔴 No user-REST gate: this half serves the whole user-facing
-        // surface, and `server::new` reads that off the `ApiImpl` itself. The
-        // gate exists to stop a *node* answering it.
-        app: server::new(api_impl),
+        // surface, and `server::new_control_plane_only` reads that off the
+        // `ApiImpl` itself. The gate exists to stop a *node* answering it.
+        //
+        // 🔴 `_control_plane_only` is the other half of the same sentence, and
+        // it is *not* read off the `ApiImpl`: this replica mounts no `/proxy`
+        // routes, no host-routed fallback and no sandbox host classifier,
+        // because it runs no sandbox to forward a byte to. See
+        // `server::new_control_plane_only`'s own doc comment.
+        app: server::new_control_plane_only(api_impl),
         orchestration,
         upkeep: paused_upkeep,
         pg_singleton_tasks,

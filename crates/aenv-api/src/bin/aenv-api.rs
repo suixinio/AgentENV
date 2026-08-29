@@ -340,7 +340,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // link the code that would), no heartbeat (`reporter: None`, below), no
     // drain (`drains_on_shutdown: false`, below), sandbox ownership and the
     // user-facing REST surface and the wake-up decision (all three off
-    // `ResumeWiring::cluster_from_config`, below).
+    // `ResumeWiring::cluster_in_process`, below).
     let identity = NodeIdentity::from_config(&config.node_identity);
     let identity_for_registry = identity.clone();
 
@@ -396,10 +396,11 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // 🔴 P1 (task's own "phase4-close"): moved up from after
     // `Orchestrator::new` (see the historical comments still attached to
     // `pg_pool`/`node_registry_for_paused`/`build_paused_registry` below).
-    // `NativeNodePlacement`'s `place_existing` now answers `LookupNode`'s
-    // paused-registry stage in-process through the same
-    // `node_registry_grpc_service` `cluster_placement` is about to hand it
-    // a clone of, so that service has to be `.with_paused_registry(...)`
+    // `NativeNodePlacement`'s `place_existing` — and, since resume placement
+    // stopped dialling this process's own listener, `ResumeWiring`'s
+    // `NativePlacementSource` too — now answer `LookupNode`'s paused-registry
+    // stage in-process through the same `node_registry_grpc_service` both are
+    // handed a clone of, so that service has to be `.with_paused_registry(...)`
     // *before* `cluster_placement` runs rather than after — which means
     // `paused_registry`, and the `pg_pool` its `postgres` backend needs,
     // now have to exist this early too. Nothing between here and their old
@@ -568,11 +569,26 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             // 🔴 `WakeSite::Remote`, and it carries two facts rather than one.
             // The pin is honoured by the orchestration surface below, which
             // places the wake-up on the machine the paused state names, rather
-            // than by a same-machine check this process cannot make (it
-            // requires a scheduler endpoint and says so if it has none). And it
+            // than by a same-machine check this process cannot make. And it
             // is what `ApiImpl::runs_sandbox_runtime` reads to know it is in
             // this binary and not `aenv-node` — see its own doc.
-            ResumeWiring::cluster_from_config()?,
+            //
+            // 🔴 A clone of the *fully wired* `node_registry_grpc_service`, and
+            // that is the whole safety property of this line. Resume placement
+            // used to open a tonic channel to `[cluster].scheduler_endpoint` —
+            // `agentenv-api:8002`, this process's own listener — and make a
+            // network `LookupNode` call that arrived back at this same value.
+            // It now calls `lookup_node` on it directly, exactly as
+            // `NativeNodePlacement::place_existing` already does. The clone has
+            // to happen *after* `with_binding_store`/`with_artifact_store`
+            // (above) and `with_paused_registry` (above, moved up for
+            // `cluster_placement`): without the binding store `LookupNode` is
+            // `Unimplemented`, and without the paused registry it can never
+            // answer `PINNED`, so every unpublished pause would come back as a
+            // preference and be woken on a machine that does not have its
+            // bytes. `resume_placement_is_wired_after_every_builder` is the
+            // guard on that ordering.
+            ResumeWiring::cluster_in_process(node_registry_grpc_service.clone()),
         )
         // 🔴 What `!runs_sandbox_runtime()` names, and the one
         // `v2_templates_...`'s remote branch exists for: a template build has
@@ -1536,6 +1552,77 @@ mod tests {
             }
         }
         panic!("{name} has no closing brace");
+    }
+
+    /// 🔴 Resume placement is handed a `NodeRegistryGrpcService` that has
+    /// already been through *every* builder.
+    ///
+    /// `ResumeWiring::cluster_in_process` takes the service by value and
+    /// nothing about the type records which builders have been applied to it,
+    /// so the ordering inside `assemble_api` is the whole guarantee. Move the
+    /// `ResumeWiring` construction above `with_paused_registry` and every
+    /// unpublished pause — `local_only`, `publishing` — stops coming back
+    /// `PINNED`: stage 3 of `lookup_node` never runs, the answer is
+    /// `NotFound`, and the platform's contract for `NotFound` is "rebuild it
+    /// from its template", which resets the user's workspace. Move it above
+    /// `with_binding_store` and every wake-up fails with `Unimplemented`
+    /// instead. Neither shows up in a type error, and neither is visible in
+    /// this crate's other tests, which all build the service themselves.
+    ///
+    /// `src/api/impls/resume_surface.rs`'s
+    /// `a_partly_wired_service_cannot_answer_a_pin_and_says_so_differently`
+    /// proves those two answers really do differ; this proves *this* call site
+    /// is on the right side of them.
+    #[test]
+    fn resume_placement_is_wired_after_every_builder() {
+        let source = include_str!("aenv-api.rs");
+        // 🔴 Comment lines stripped first, and this is not tidiness: every one
+        // of these needles is also *named in a comment* in this function, and
+        // some of those comments sit above the code they describe. A scan over
+        // the raw body finds the comment, not the call, and then reports the
+        // ordering of prose — which does not move when the code does. That is
+        // exactly how this guard passed a mutation that moved the clone above
+        // `with_paused_registry` before this line existed.
+        let assemble: String = body_of(source, "async fn assemble_api(config: &AppConfig)")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let at = |needle: &str| {
+            assemble
+                .find(needle)
+                .unwrap_or_else(|| panic!("assemble_api no longer contains {needle}"))
+        };
+        // The strip has to actually remove something, or the filter above could
+        // silently become a no-op and take the guard back to scanning prose.
+        assert!(
+            !assemble.contains("🔴"),
+            "no comment line survived the strip, so this is scanning the raw body again"
+        );
+        let resume = at("ResumeWiring::cluster_in_process(node_registry_grpc_service.clone())");
+        for builder in [
+            ".with_binding_store(",
+            ".with_artifact_store(",
+            ".with_paused_registry(",
+        ] {
+            assert!(
+                at(builder) < resume,
+                "🔴 {builder} runs after the clone handed to resume placement, so the \
+                 wake-up path holds a service that cannot answer LookupNode the way \
+                 the served one does"
+            );
+        }
+
+        // 🔴 The mutation control, same reasoning as the scans below: a
+        // `body_of` that returned the whole file would satisfy the ordering
+        // above for the wrong reason, and `async fn assemble_api` sits before
+        // the body's opening brace, so a correct extraction never contains it.
+        assert!(
+            !assemble.contains("async fn assemble_api"),
+            "the scan is reading more than assemble_api's body, so the ordering above \
+             proves nothing about where the builders actually run"
+        );
     }
 
     /// 🔴 This binary actually refuses a manifest that still sets one of the

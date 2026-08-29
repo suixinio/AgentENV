@@ -138,13 +138,15 @@ services:
       # "Distributed Control Plane" section) — this is simply how it works
       # now, with no key to set.
       #
-      # `ResumeWiring::cluster_from_config` (the `WakeSite::Remote` placement
-      # source) separately, and always, dials `[cluster].scheduler_endpoint`
-      # for LookupNode and refuses to start on an empty one. Self-pointing,
-      # same as `agentenv-api-deployment.yaml`'s own copy of this key:
-      # `agentenv-api:8002` answers both LookupNode (in-process,
-      # NodeRegistryGrpcService) and ResumeSandbox on the same listener.
-      AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://agentenv-api:8002
+      # 🔴 No `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` on this half, and its
+      # absence is deliberate. `ResumeWiring::cluster_from_config` (the
+      # `WakeSite::Remote` placement source) used to dial that endpoint's
+      # `LookupNode` for every wake-up and refuse to start without it — and
+      # the value was `agentenv-api:8002`, this very container, so the call
+      # left the process and came back to the same `NodeRegistryGrpcService`.
+      # `ResumeWiring::cluster_in_process` calls that value's `lookup_node`
+      # directly now. The node services above still set the key (they
+      # heartbeat over it); nothing in this container reads it.
       # 🔴 Static discovery (ported from Go's own `scheduler.discovery.mode
       # = "static"` branch, `services/scheduler/cmd/main.go`): there is no
       # Kubernetes API in this compose stack, so `node_discovery_mode =

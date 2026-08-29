@@ -356,54 +356,40 @@ spec:
             # `true`, without noticing what it means here.
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "false"
-            # 🔴 阶段四 E1/E3 (task's own label): `agentenv-api` — itself, via
-            # its own Service — not `agentenv-scheduler`. Two independent
-            # consumers of this process's own `[cluster].scheduler_endpoint`
-            # still dial out over gRPC even under native placement, and both
-            # now resolve to this replica (or a sibling replica, load
-            # balanced by the Service, exactly like the DaemonSet's
-            # heartbeat) rather than the Go scheduler:
+            # 🔴 Nothing in this process reads `[cluster].scheduler_endpoint`
+            # any more, so this replica sets none. It is not an oversight and
+            # not a value waiting to be filled in.
+            #
+            # There were two consumers here and both are gone:
             #
             #   1. `ResumeWiring::cluster_from_config()`
             #      (`src/api/impls/resume_surface.rs`) — the wake-site
-            #      placement source for `WakeSite::Remote`. It hard-refuses
-            #      to start with an empty endpoint ("aenv-api needs
-            #      [cluster].scheduler_endpoint") and always dials this
-            #      endpoint's `LookupNode` RPC — unlike `placement`
-            #      (`cluster_placement`, driving create/build), which answers
-            #      from `aenv-api`'s own in-process node registry instead and
-            #      never dials this endpoint at all. Pointed at
-            #      `agentenv-api:8002`, that RPC is answered for real by this
-            #      same `NodeRegistryGrpcService.lookup_node`
-            #      (`src/node_registry/grpc_service.rs`, already exercised
-            #      by `lookup_node_answers_bound_from_the_binding_store` and
-            #      its siblings) instead of the scheduler's Go port of the
-            #      same query.
-            #   2. There used to be a second consumer here: the snapshot
-            #      catalog's gRPC fallback, which dialled this endpoint when
-            #      `[pg]` was absent. It is gone with the object-storage
-            #      catalog — `build_snapshot_backend` now takes the PostgreSQL
-            #      catalog or refuses to assemble, and nothing in the snapshot
-            #      layer reads this key at all.
+            #      placement source for `WakeSite::Remote`. It refused to
+            #      start without this key ("aenv-api needs
+            #      [cluster].scheduler_endpoint") and dialled its
+            #      `LookupNode` RPC for every resume. Pointed at
+            #      `agentenv-api:8002` — this Deployment's own Service — that
+            #      was a gRPC call from this process to this process, over
+            #      the Service network, answered by the very
+            #      `NodeRegistryGrpcService` value it had already built.
+            #      `ResumeWiring::cluster_in_process` now calls
+            #      `lookup_node` on that value directly: same RPC, same
+            #      `tonic::Status` values, same pin/prefer discrimination, no
+            #      socket. `resume_placement_is_wired_after_every_builder`
+            #      (`src/bin/aenv-api.rs`) guards the one thing that call
+            #      site can get wrong — handing over a service that has not
+            #      been through every builder.
+            #   2. The snapshot catalog's gRPC fallback, which dialled this
+            #      endpoint when `[pg]` was absent. It went with the
+            #      object-storage catalog — `build_snapshot_backend` now
+            #      takes the PostgreSQL catalog or refuses to assemble.
             #
-            # Rollback: there is no `agentenv-scheduler:9090` left to point
-            # this at — the Go scheduler's Deployment/Service/PDB and its
-            # source under `services/scheduler` were deleted outright
-            # (`e2734fd`), not commented out. Changing this value back and
-            # rolling this Deployment would only trade a working
-            # `LookupNode` target for one that fails DNS resolution. The
-            # real rollback is checking out a commit from before `e2734fd`
-            # (or restoring the scheduler manifests and a compatible
-            # scheduler image from git history) alongside
-            # kustomization.yaml's heartbeat key and this Deployment's
-            # `AENV_PAUSED_REGISTRY_BACKEND` — a genuine restart either way,
-            # since this key has no mounted hot-reload file the way the
-            # DaemonSet's copy does (`ResumeWiring::cluster_from_config`
-            # builds its `SchedulerEndpointSource` from
-            # `[cluster].scheduler_endpoint_file` too, but nothing here sets
-            # that file up).
-            - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT
-              value: http://agentenv-api:8002
+            # 🔴 The key itself is *not* deleted from the config: `aenv-node`
+            # still needs it for the heartbeat reporter and P2P peer
+            # discovery (see kustomization.yaml's `heartbeat-config`, which
+            # the DaemonSet reads), and the gateway still dials this
+            # Deployment's gRPC listener under its own `scheduler_addr`. What
+            # is gone is only this replica's own *client* of it.
             # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` requires a heartbeat-roster
             # `NodeRegistry` (see that key's own comment above) — `aenv-api`
             # always builds one, unconditionally, so there is no companion
@@ -422,10 +408,11 @@ spec:
             # `CentralPausedSandboxRegistry` were deleted along with the Go
             # scheduler they dialled, so setting `AENV_PAUSED_REGISTRY_BACKEND
             # =central` now refuses to start rather than rolling back. A
-            # genuine rollback of the paused-registry backend is the same
-            # "restore the scheduler manifests from git history" step named
-            # above for `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, not a value
-            # this Deployment can still express.
+            # genuine rollback of the paused-registry backend is restoring
+            # the scheduler Deployment/Service/PDB manifests and a compatible
+            # scheduler image from git history (`e2734fd` deleted them, along
+            # with `services/scheduler` itself), not a value this Deployment
+            # can still express.
             # 🔴 `[binding_store]` backs `Schedule`/`LookupNode`/
             # `RecordAssignment`, which native placement always answers
             # locally (`NativeNodePlacement`,

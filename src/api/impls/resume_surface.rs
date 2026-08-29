@@ -34,11 +34,33 @@
 //!
 //! Arbitration cannot tell those apart: `claim_for_resume` grants a lapsed
 //! `local_only` row to any node that asks, and logs the rewind. The two-tier
-//! decision lives in the scheduler's `LookupNode`
-//! (`services/scheduler/internal/lookup.go`), which answers `PINNED` for the
-//! unpublished states and `PLACED` for the published one — so this module
-//! consumes it rather than reimplementing it, and refuses a pin it cannot
-//! honour instead of falling back to "some node".
+//! decision lives in `LookupNode` — [`crate::binding_store::lookup::lookup_node`],
+//! reached through [`NodeRegistryGrpcService::lookup_node`] — which answers
+//! `PINNED` for the unpublished states and `PLACED` for the published one, so
+//! this module consumes it rather than reimplementing it, and refuses a pin it
+//! cannot honour instead of falling back to "some node".
+//!
+//! # 🔴 `LookupNode` is called in-process, not dialled
+//!
+//! It used to be dialled: `SchedulerPlacementSource` opened a tonic channel to
+//! `[cluster].scheduler_endpoint` and made a network `LookupNode` call for
+//! every wake-up. That endpoint names `agentenv-api:8002` on every shipped
+//! deployment — this process's own listener — so the call left the pod, went
+//! through the Service, and came back to the same `NodeRegistryGrpcService`
+//! value `aenv-api` had already built and wired. [`NativePlacementSource`]
+//! calls that value's [`lookup_node`](NodeRegistryGrpcService::lookup_node)
+//! directly instead, exactly as
+//! [`crate::node_client::NativeNodePlacement::place_existing`] already does for
+//! `place_existing`.
+//!
+//! 🔴 It is `lookup_node` and not the raw registry underneath it, and that is
+//! the whole point of routing through the service type: the pin/prefer
+//! discrimination, the three-stage binding → roster → registry ladder and the
+//! warm-up gate all live in there. Reading the binding store or the paused
+//! registry directly here would answer a *different* question and erase pin
+//! enforcement — the rewind this module exists to refuse. The `tonic::Status`
+//! values that come back are the same ones the wire carried, so
+//! [`refusal_from_status`] is unchanged.
 
 use std::sync::Arc;
 
@@ -48,12 +70,16 @@ use tracing::{debug, warn};
 use super::paused_recovery::{CrossNodeResume, MissingLocalResume};
 use super::{ApiImpl, ResumeArbitration};
 use crate::cfg::ConfigManager;
+use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::orchestrator::{
     ClaimedExecution, NewTimeout, OrchestratorError, PausedSandboxEntry, SandboxMetadata,
     SandboxState,
 };
-use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
-use crate::scheduler_endpoint::SchedulerEndpointSource;
+use crate::proto::scheduler;
+// The generated server trait, in scope so `NodeRegistryGrpcService`'s own
+// `lookup_node` can be called as a plain async method on the value rather than
+// dialled. Same import `NativeNodePlacement` takes for the same reason.
+use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::types::{ExecutionId, SandboxId};
 
 /// A node the placement source named.
@@ -120,7 +146,7 @@ pub(in crate::api) enum PinRefusalReason {
     /// recognise.
     ///
     /// 🔴 The classification is a match on the placement source's message —
-    /// the scheduler emits those two refusals with no structured field — so a
+    /// `LookupNode` emits those two refusals with no structured field — so a
     /// reworded message has to degrade to "do not try anywhere else" rather
     /// than to "this was not a pin refusal at all". This variant is that
     /// degradation, and a non-zero count of it is the signal that the two ends
@@ -196,7 +222,7 @@ pub(in crate::api) enum WakeSite {
     /// so the branch is wrong in a test rather than in production on the day
     /// the factory is wired.
     ///
-    /// 🔧 That day has come: `ResumeWiring::cluster_from_config` constructs it,
+    /// 🔧 That day has come: `ResumeWiring::cluster_in_process` constructs it,
     /// and `aenv-api` is the caller.
     Remote,
 }
@@ -212,7 +238,7 @@ impl ResumeWiring {
     /// The general constructor, and the seam a test injects a placement source
     /// through.
     ///
-    /// Production builds this through [`Self::cluster_from_config`] or
+    /// Production builds this through [`Self::cluster_in_process`] or
     /// [`Self::node_local`]; this one exists for the two cases neither covers —
     /// a stub placement source, and the `WakeSite::Remote` that arrives with
     /// the remote backend factory.
@@ -252,8 +278,9 @@ impl ResumeWiring {
         }
     }
 
-    /// The wiring an `aenv-api` process has, without the scheduler endpoint
-    /// [`cluster_from_config`](Self::cluster_from_config) insists on.
+    /// The wiring an `aenv-api` process has, without the wired
+    /// `NodeRegistryGrpcService` [`cluster_in_process`](Self::cluster_in_process)
+    /// insists on.
     ///
     /// 🔴 Test-only, and behind `test-support` rather than plain `cfg(test)` so
     /// `aenv-node`'s own suite can build the half it is asserting *about*:
@@ -272,72 +299,55 @@ impl ResumeWiring {
     /// wake-up is placed by the cluster, and this process performs it on
     /// whichever machine the placement named.
     ///
-    /// 🔴 Requires a scheduler endpoint rather than degrading to node-local
-    /// without one. Degrading is right for a
-    /// single-node deployment, which genuinely has nothing to ask; it is wrong
-    /// here, because a process with no local machine and no placement source
-    /// would answer `Unconstrained` for every sandbox and then have nowhere to
-    /// wake it. The failure would not look like a missing setting — it would
-    /// look like resumes that fail for no stated reason.
-    pub fn cluster_from_config() -> anyhow::Result<Self> {
-        let config = ConfigManager::global_config();
-        let endpoint = configured_placement_endpoint(config.cluster.scheduler_endpoint.as_deref())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "aenv-api needs [cluster].scheduler_endpoint \
-                     (AENV_OBSERVABILITY_SCHEDULER_ENDPOINT): it owns sandboxes it does not run, \
-                     so every wake-up and every create has to be placed by the scheduler, and \
-                     there is no machine here to fall back to"
-                )
-            })?;
-        let endpoint_source = SchedulerEndpointSource::spawn_from_config(
-            endpoint.to_string(),
-            &config.cluster,
-            &config.observability.scheduler_report,
-            "resume_placement",
-        )?;
-        Ok(Self {
-            placement: Some(Arc::new(SchedulerPlacementSource::new(endpoint_source))),
+    /// 🔴 Takes the **fully wired** `NodeRegistryGrpcService` — the same value
+    /// `assemble_api` serves `LookupNode` from over the wire, after
+    /// `with_binding_store`, `with_artifact_store` and `with_paused_registry`
+    /// have all been applied — rather than building its own. A freshly
+    /// constructed one answers `LookupNode` with `Unimplemented` (no binding
+    /// store) and, with a binding store but no paused registry, skips stage 3
+    /// entirely: it can never say `PINNED`, so every unpublished pause would
+    /// come back as a preference and be woken anywhere. That is the rewind this
+    /// module exists to refuse, arriving as a success.
+    ///
+    /// 🔴 No `[cluster].scheduler_endpoint` any more, and no failure mode left:
+    /// the placement source is a value this process already holds, so there is
+    /// nothing to configure and nothing to fail to connect to. The endpoint
+    /// setting still exists for the two consumers that genuinely dial across
+    /// the network — `aenv-node`'s heartbeat reporter and P2P peer discovery —
+    /// but this half no longer requires it.
+    pub fn cluster_in_process(local: NodeRegistryGrpcService) -> Self {
+        Self {
+            placement: Some(Arc::new(NativePlacementSource { local })),
             // 🔴 The pin is honoured by the orchestration surface below this
             // one — the remote backend factory places the wake-up on the node
             // the paused state names — rather than by a check here, which is
             // what `WakeSite::Local` means and what this process cannot do.
             wake_site: WakeSite::Remote,
-        })
+        }
     }
 }
 
-/// The placement endpoint a configuration names, if it names one.
+/// `LookupNode`, read as a placement answer — called in-process on the same
+/// service value this replica serves the RPC from.
 ///
-/// Blank and absent are the same answer, because a config file that carries the
-/// key with an empty value is not naming an endpoint. Split out from
-/// [`ResumeWiring::cluster_from_config`] because that function reads a global
-/// and this decision is worth being able to state a test about: inverting it
-/// would drop every configured endpoint on the floor and turn pin enforcement
-/// off exactly where it is needed.
-fn configured_placement_endpoint(raw: Option<&str>) -> Option<&str> {
-    raw.map(str::trim).filter(|endpoint| !endpoint.is_empty())
-}
-
-/// The scheduler's `LookupNode`, read as a placement answer.
-struct SchedulerPlacementSource {
-    endpoint_source: SchedulerEndpointSource,
-}
-
-impl SchedulerPlacementSource {
-    fn new(endpoint_source: SchedulerEndpointSource) -> Self {
-        Self { endpoint_source }
-    }
+/// 🔴 The type is `NodeRegistryGrpcService` and the call is `lookup_node`, not
+/// a read of the binding store or the paused registry underneath it. Those
+/// answer "where is this sandbox believed to be", which is a *hint*;
+/// `lookup_node` answers "where may this sandbox be woken", which is the
+/// pin/prefer discrimination [`placement_from_lookup`] consumes. Going around
+/// it would erase pin enforcement silently — see the module doc.
+struct NativePlacementSource {
+    local: NodeRegistryGrpcService,
 }
 
 #[async_trait]
-impl ResumePlacementSource for SchedulerPlacementSource {
+impl ResumePlacementSource for NativePlacementSource {
     async fn locate(&self, sandbox_id: SandboxId) -> Result<ResumePlacement, PlacementRefusal> {
-        let mut client = SchedulerClient::new(self.endpoint_source.channel());
-        match client
-            .lookup_node(scheduler::LookupNodeRequest {
+        match self
+            .local
+            .lookup_node(tonic::Request::new(scheduler::LookupNodeRequest {
                 sandbox_id: sandbox_id.to_string(),
-            })
+            }))
             .await
         {
             Ok(response) => placement_from_lookup(response.into_inner()),
@@ -381,16 +391,18 @@ fn placement_from_lookup(
     }
 }
 
-/// The message fragments the scheduler refuses a pin with.
+/// The message fragments a pin refusal is spelled with.
 ///
-/// 🔴 Fragments of a `status.Errorf` format string in another language's
-/// repository, matched here. That is as fragile as it looks, and it is the only
-/// channel available: `LookupNode` has no structured refusal field, adding one
-/// is the scheduler's change to make, and this half still has to tell "wait a
-/// moment" from "wait for a machine". The degradation is deliberate — an
-/// unmatched `FailedPrecondition` stays a pin refusal
-/// ([`PinRefusalReason::OriginUnclassified`]) and is therefore still never
-/// retried on another node.
+/// 🔴 Fragments of a `format!` string, matched here. Since the Go scheduler was
+/// deleted the producer is Rust and in this same crate
+/// (`crate::binding_store::lookup`, the two `NodeSchedulability` arms), but
+/// there is still no compiler edge between the two ends: `LookupNode`'s
+/// response has no structured refusal field, only a `FailedPrecondition`
+/// message, and this half still has to tell "wait a moment" from "wait for a
+/// machine". Nothing but a test notices when somebody rewords it. The
+/// degradation is deliberate — an unmatched `FailedPrecondition` stays a pin
+/// refusal ([`PinRefusalReason::OriginUnclassified`]) and is therefore still
+/// never retried on another node.
 const SCHEDULER_NOT_REPORTING: &str = "is not reporting";
 const SCHEDULER_NOT_ACCEPTING_WORK: &str = "is not accepting work";
 
@@ -988,6 +1000,8 @@ fn auto_resume_min_sandbox_timeout() -> std::time::Duration {
 mod tests {
     use super::*;
 
+    use crate::orchestrator::PausedRegistryState;
+
     /// 🔴 The scheduler's refusal format strings, reproduced verbatim from
     /// `services/scheduler/internal/lookup.go:294` and `:303`.
     ///
@@ -1240,39 +1254,505 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 🔴 The two decisions that switch enforcement off when inverted
+    // 🔴 The in-process `LookupNode` call
     // -----------------------------------------------------------------------
+    //
+    // Resume placement used to dial `[cluster].scheduler_endpoint` — which
+    // names this process's own listener on every shipped deployment — and read
+    // the `tonic::Status` off the wire. `NativePlacementSource` calls
+    // `NodeRegistryGrpcService::lookup_node` on the value directly. The tests
+    // below drive that call end to end against a service wired the way
+    // `assemble_api` wires it, and assert the answers this module's whole
+    // decision rests on: `PINNED` vs `BOUND`, and the pin refusals.
 
-    /// 🔴 A configured endpoint must survive, and a blank one must not become
-    /// one.
-    ///
-    /// Both directions matter and they fail differently. Dropping a real
-    /// endpoint leaves `placement` as `None`, every placement answers
-    /// `Unconstrained`, and no pin is ever refused — fleet-wide, silently.
-    /// Accepting a blank one sends `Endpoint::from_shared("http://")` a URI
-    /// with no authority and stops the process instead.
-    #[test]
-    fn a_configured_placement_endpoint_survives_and_a_blank_one_does_not_become_one() {
-        assert_eq!(
-            configured_placement_endpoint(Some("scheduler:9090")),
-            Some("scheduler:9090"),
-            "🔴 dropping a configured endpoint switches pin enforcement off for \
-             every sandbox in the fleet, and nothing reports it"
-        );
-        assert_eq!(
-            configured_placement_endpoint(Some("  scheduler:9090  ")),
-            Some("scheduler:9090"),
-            "a config file's whitespace is not part of the address"
-        );
+    /// A `PausedSandboxRegistry` test double for stage 3 of `lookup_node`:
+    /// `get`/`is_cluster_backed` answer from one fixed row, everything else
+    /// panics. `lookup_node` never calls the other twelve methods — a test
+    /// that (incorrectly) drove this into a write path fails loudly instead of
+    /// silently getting a made-up default. Same shape and same reasoning as
+    /// `src/node_registry/grpc_service.rs`'s own `FakePausedRegistry`.
+    struct OneRowRegistry {
+        entry: PausedSandboxEntry,
+    }
 
-        for blank in [None, Some(""), Some("   ")] {
-            assert_eq!(
-                configured_placement_endpoint(blank),
-                None,
-                "a key carrying no value is not naming an endpoint: {blank:?}"
-            );
+    #[async_trait]
+    impl crate::orchestrator::PausedSandboxRegistry for OneRowRegistry {
+        async fn get(
+            &self,
+            sandbox_id: &SandboxId,
+        ) -> crate::orchestrator::RegistryResult<Option<PausedSandboxEntry>> {
+            Ok((self.entry.sandbox_id == *sandbox_id).then(|| self.entry.clone()))
+        }
+
+        fn is_cluster_backed(&self) -> bool {
+            true
+        }
+
+        async fn begin_pause(
+            &self,
+            _entry: &PausedSandboxEntry,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::BeganPause> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn complete_pause(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+            _snapshot_id: &crate::snapshot::SnapshotId,
+        ) -> crate::orchestrator::RegistryResult<()> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn mark_local_only(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> crate::orchestrator::RegistryResult<()> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn get_many(
+            &self,
+            _sandbox_ids: &[SandboxId],
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::PausedRegistryRows> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn claim_for_resume(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _execution_id: ExecutionId,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ResumeClaim> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn release_claim(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> crate::orchestrator::RegistryResult<bool> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn renew_lease(
+            &self,
+            _node_id: &str,
+            _held: &[crate::orchestrator::HeldSandbox],
+        ) -> crate::orchestrator::RegistryResult<u64> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn reclaim_expired_holdings(
+            &self,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ReclaimedHoldings> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn mark_running(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _holder_node_id: &str,
+            _execution_id: ExecutionId,
+            _expires_at: Option<std::time::SystemTime>,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::MarkRunningOutcome> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn renew_sandbox_deadline(
+            &self,
+            _sandbox_id: &SandboxId,
+            _execution_id: ExecutionId,
+            _expires_at: Option<std::time::SystemTime>,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::DeadlineRenewalOutcome>
+        {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn release_node_holdings(
+            &self,
+            _node_id: &str,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ReleasedHoldings> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn remove(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> crate::orchestrator::RegistryResult<bool> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn list_all(
+            &self,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::PausedRegistryListing>
+        {
+            unimplemented!("lookup_node never calls this")
         }
     }
+
+    fn discovered(id: &str, endpoint: &str) -> crate::node_registry::types::Node {
+        crate::node_registry::types::Node {
+            id: id.to_string(),
+            endpoint: endpoint.to_string(),
+            pod_name: String::new(),
+        }
+    }
+
+    /// A gate that is already warm: its deadline sits at the Unix epoch and it
+    /// has been told a node reported, which is what `warmed_up` requires
+    /// besides the clock. Mirrors `grpc_service.rs`'s own `warm_gate`.
+    fn warm_gate(
+        registry: &Arc<crate::node_registry::registry::AtomicNodeRegistry>,
+    ) -> Arc<crate::node_registry::warmup::WarmupGate> {
+        let gate = Arc::new(crate::node_registry::warmup::WarmupGate::new(
+            Arc::clone(registry) as Arc<dyn crate::node_registry::registry::NodeRegistry>,
+            std::time::Duration::from_secs(1),
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        gate.reported_in(std::time::SystemTime::now());
+        gate
+    }
+
+    fn a_heartbeat(node_id: &str, status: scheduler::NodeStatus) -> scheduler::HeartbeatRequest {
+        scheduler::HeartbeatRequest {
+            node_id: node_id.to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: format!("{node_id}-instance"),
+            snapshot: Some(scheduler::NodeSnapshot {
+                status: status as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn registry_row(
+        sandbox_id: SandboxId,
+        state: PausedRegistryState,
+        origin_node_id: &str,
+        execution_id: Option<ExecutionId>,
+    ) -> PausedSandboxEntry {
+        let now = chrono::Utc::now();
+        PausedSandboxEntry {
+            sandbox_id,
+            cluster_id: uuid::Uuid::nil(),
+            state,
+            generation: 1,
+            origin_node_id: origin_node_id.to_string(),
+            claimed_by_node_id: None,
+            snapshot_id: None,
+            metadata: None,
+            execution_id,
+            paused_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn empty_binding_store() -> Arc<dyn crate::binding_store::BindingStore> {
+        Arc::new(crate::binding_store::InMemoryBindingStore::new(
+            crate::binding_store::BindingStoreSettings::default(),
+        ))
+    }
+
+    /// The service exactly as `assemble_api` builds it: every builder applied,
+    /// in the order that function applies them.
+    fn wired_service(
+        registry: &Arc<crate::node_registry::registry::AtomicNodeRegistry>,
+        binding_store: Arc<dyn crate::binding_store::BindingStore>,
+        paused: Arc<dyn crate::orchestrator::PausedSandboxRegistry>,
+    ) -> NodeRegistryGrpcService {
+        NodeRegistryGrpcService::new(Arc::clone(registry), warm_gate(registry))
+            .with_binding_store(binding_store, false, std::time::Duration::ZERO)
+            .with_artifact_store(Arc::new(
+                crate::binding_store::artifact_index::InMemoryArtifactStore::new(8),
+            ))
+            .with_paused_registry(paused)
+    }
+
+    fn source_over(service: NodeRegistryGrpcService) -> NativePlacementSource {
+        NativePlacementSource { local: service }
+    }
+
+    /// 🔴 The two answers the whole module turns on, taken through the
+    /// in-process call rather than a hand-built `LookupNodeResponse`.
+    ///
+    /// `local_only`/`publishing` rows come back `PINNED` and must stay a pin;
+    /// a live binding comes back `BOUND` and must stay a *preference*. Asserted
+    /// in one test because "everything is a pin" and "nothing is a pin" each
+    /// pass half of this alone — and the first strands every drained node's
+    /// sandboxes, while the second silently rewinds the unpublished ones.
+    #[tokio::test]
+    async fn the_in_process_lookup_pins_an_unpublished_row_and_prefers_a_binding() {
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(crate::node_registry::registry::AtomicNodeRegistry::new(
+            vec![discovered("node-a", "http://10.0.0.1:8000")],
+            std::time::Duration::from_secs(30),
+        ));
+        crate::node_registry::registry::NodeRegistry::heartbeat(
+            registry.as_ref(),
+            &a_heartbeat("node-a", scheduler::NodeStatus::Ready),
+            std::time::SystemTime::now(),
+        )
+        .expect("node-a is in discovery");
+
+        let pinned = source_over(wired_service(
+            &registry,
+            empty_binding_store(),
+            Arc::new(OneRowRegistry {
+                entry: registry_row(sandbox_id, PausedRegistryState::LocalOnly, "node-a", None),
+            }),
+        ))
+        .locate(sandbox_id)
+        .await
+        .expect("origin is live and schedulable, so the pin can be honoured");
+        assert_eq!(
+            pinned,
+            ResumePlacement::Pinned {
+                node: PlacedNode {
+                    node_id: "node-a".to_string(),
+                    address: "http://10.0.0.1:8000".to_string(),
+                },
+            },
+            "🔴 a local_only row has exactly one copy of the bytes; reading it as \
+             a preference wakes the sandbox somewhere else and silently rewinds it"
+        );
+
+        // The same sandbox id, now with a live binding — stage 1 of the same
+        // call, which answers BOUND.
+        let binding_store = empty_binding_store();
+        binding_store
+            .record(
+                &sandbox_id.to_string(),
+                crate::binding_store::Binding {
+                    node: discovered("node-a", "http://10.0.0.1:8000"),
+                    execution_id: ExecutionId::new().to_string(),
+                    projection_ttl: std::time::Duration::ZERO,
+                },
+                std::time::SystemTime::now(),
+            )
+            .await
+            .expect("install the binding");
+        let bound = source_over(wired_service(
+            &registry,
+            binding_store,
+            Arc::new(OneRowRegistry {
+                entry: registry_row(sandbox_id, PausedRegistryState::LocalOnly, "node-a", None),
+            }),
+        ))
+        .locate(sandbox_id)
+        .await
+        .expect("a binding names a node");
+        assert_eq!(
+            bound,
+            ResumePlacement::Preferred {
+                node: PlacedNode {
+                    node_id: "node-a".to_string(),
+                    address: "http://10.0.0.1:8000".to_string(),
+                },
+                origin_node_id: String::new(),
+            },
+            "🔴 BOUND is a hint about where the layers are, not a claim that the \
+             bytes exist nowhere else; reading it as a pin refuses ordinary \
+             resumes off a node that has since drained"
+        );
+    }
+
+    /// 🔴 The pin refusals, in-process, with the wording the producer actually
+    /// emits — `crate::binding_store::lookup`'s two `NodeSchedulability` arms,
+    /// which is the *only* place a `FailedPrecondition` can come from on this
+    /// path now that the Go scheduler is deleted.
+    ///
+    /// All three reasons stay `PlacementRefusal::Pinned`. That is the
+    /// load-bearing half: for an unpublished pause "retry somewhere else" does
+    /// not fail, it succeeds by rewinding the sandbox to an older snapshot.
+    #[tokio::test]
+    async fn the_in_process_lookup_classifies_every_pin_refusal_it_can_emit() {
+        for (status, expected, note) in [
+            (
+                scheduler::NodeStatus::Unspecified,
+                PinRefusalReason::OriginNotReporting,
+                "no heartbeat at all",
+            ),
+            (
+                scheduler::NodeStatus::Draining,
+                PinRefusalReason::OriginNotAcceptingWork,
+                "heartbeating, but refusing new work",
+            ),
+        ] {
+            let sandbox_id = SandboxId::new();
+            let registry = Arc::new(crate::node_registry::registry::AtomicNodeRegistry::new(
+                vec![discovered("node-a", "http://10.0.0.1:8000")],
+                std::time::Duration::from_secs(30),
+            ));
+            // `Unspecified` stands for "never reported": the node is in
+            // discovery but has no roster, which is what `live_node` misses on.
+            if status != scheduler::NodeStatus::Unspecified {
+                crate::node_registry::registry::NodeRegistry::heartbeat(
+                    registry.as_ref(),
+                    &a_heartbeat("node-a", status),
+                    std::time::SystemTime::now(),
+                )
+                .expect("node-a is in discovery");
+            }
+
+            let refusal = source_over(wired_service(
+                &registry,
+                empty_binding_store(),
+                Arc::new(OneRowRegistry {
+                    entry: registry_row(sandbox_id, PausedRegistryState::LocalOnly, "node-a", None),
+                }),
+            ))
+            .locate(sandbox_id)
+            .await
+            .expect_err("the only copy is on a node that cannot serve it");
+
+            let PlacementRefusal::Pinned { reason, detail, .. } = refusal else {
+                panic!(
+                    "🔴 every FailedPrecondition must stay a pin refusal, or an \
+                     unpublished sandbox gets woken on a machine without its \
+                     bytes: {note} became {refusal:?}"
+                );
+            };
+            assert_eq!(reason, expected, "classifying the refusal for: {note}");
+            assert!(
+                detail.contains("node-a"),
+                "the producer's own words reach the caller: {detail}"
+            );
+        }
+
+        // 🔴 The third spelling, and why it is asserted through the converter
+        // rather than end to end: `origin_unclassified` is the degradation for
+        // a *reworded* refusal, and by construction no wording the current
+        // producer emits reaches it — the loop above is the proof that both
+        // wordings it does emit are recognised. This is the same
+        // `refusal_from_status` call `NativePlacementSource::locate`'s `Err`
+        // arm makes, and it must still refuse rather than fall through to a
+        // retry somewhere else.
+        let reworded = refusal_from_status(&tonic::Status::failed_precondition(
+            "sandbox is local_only on node node-a, which has been eaten by a grue",
+        ));
+        assert!(
+            matches!(
+                reworded,
+                PlacementRefusal::Pinned {
+                    reason: PinRefusalReason::OriginUnclassified,
+                    ..
+                }
+            ),
+            "a reworded refusal must degrade to \"do not try anywhere else\", \
+             not to \"this was not a pin refusal\": {reworded:?}"
+        );
+    }
+
+    /// 🔴 An empty sandbox id is still `InvalidArgument` in-process, and still
+    /// becomes a plain failure rather than anything a caller retries elsewhere.
+    ///
+    /// Unreachable through [`NativePlacementSource::locate`] itself — that
+    /// takes a typed [`SandboxId`], which cannot be blank — so the RPC is
+    /// driven directly and its status put through the same converter `locate`
+    /// uses. The pair is the point: the transport change must not have moved
+    /// where the validation lives.
+    #[tokio::test]
+    async fn an_empty_sandbox_id_is_still_invalid_argument_in_process() {
+        let registry = Arc::new(crate::node_registry::registry::AtomicNodeRegistry::new(
+            Vec::new(),
+            std::time::Duration::from_secs(30),
+        ));
+        let service = wired_service(
+            &registry,
+            empty_binding_store(),
+            Arc::new(OneRowRegistry {
+                entry: registry_row(
+                    SandboxId::new(),
+                    PausedRegistryState::Paused,
+                    "node-a",
+                    None,
+                ),
+            }),
+        );
+
+        let status = service
+            .lookup_node(tonic::Request::new(scheduler::LookupNodeRequest {
+                sandbox_id: "   ".to_string(),
+            }))
+            .await
+            .expect_err("a blank sandbox id is not a lookup");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(matches!(
+            refusal_from_status(&status),
+            PlacementRefusal::Failed(_)
+        ));
+    }
+
+    /// 🔴 The control that gives every assertion above its meaning: a service
+    /// that is *not* fully wired answers differently, so those tests pass
+    /// because the wiring is right rather than because any service would do.
+    ///
+    /// This is the shape of the bug the in-process call could introduce.
+    /// `ResumeWiring::cluster_in_process` takes a `NodeRegistryGrpcService`
+    /// value, and nothing about the type says which builders have been applied
+    /// to it. A freshly constructed one answers `Unimplemented`; one with a
+    /// binding store but no paused registry never reaches stage 3, so it can
+    /// never say `PINNED` — and `NotFound` on this path means "rebuild it from
+    /// its template", which resets the user's workspace. Both are silent.
+    #[tokio::test]
+    async fn a_partly_wired_service_cannot_answer_a_pin_and_says_so_differently() {
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(crate::node_registry::registry::AtomicNodeRegistry::new(
+            vec![discovered("node-a", "http://10.0.0.1:8000")],
+            std::time::Duration::from_secs(30),
+        ));
+        crate::node_registry::registry::NodeRegistry::heartbeat(
+            registry.as_ref(),
+            &a_heartbeat("node-a", scheduler::NodeStatus::Ready),
+            std::time::SystemTime::now(),
+        )
+        .expect("node-a is in discovery");
+        let row = || {
+            Arc::new(OneRowRegistry {
+                entry: registry_row(sandbox_id, PausedRegistryState::LocalOnly, "node-a", None),
+            }) as Arc<dyn crate::orchestrator::PausedSandboxRegistry>
+        };
+
+        // No binding store: `LookupNode` is `Unimplemented` before it looks at
+        // anything.
+        let bare = source_over(NodeRegistryGrpcService::new(
+            Arc::clone(&registry),
+            warm_gate(&registry),
+        ))
+        .locate(sandbox_id)
+        .await
+        .expect_err("nothing is wired, so nothing can be answered");
+        assert!(
+            matches!(
+                bare,
+                PlacementRefusal::Failed(ref reason) if reason.contains("needs a binding store")
+            ),
+            "an unwired service must not look like an answer: {bare:?}"
+        );
+
+        // A binding store but no paused registry: stage 3 never runs, so the
+        // pinned row is invisible and the answer is `NotFound`.
+        let no_stage_three = source_over(
+            NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+                .with_binding_store(empty_binding_store(), false, std::time::Duration::ZERO),
+        )
+        .locate(sandbox_id)
+        .await
+        .expect_err("no registry leg, so the row cannot be seen");
+        assert_eq!(
+            no_stage_three,
+            PlacementRefusal::NotFound,
+            "🔴 without with_paused_registry the pin is invisible, and NotFound \
+             tells the platform to rebuild the sandbox from its template"
+        );
+
+        // Fully wired, same inputs: the pin appears.
+        let wired = source_over(wired_service(&registry, empty_binding_store(), row()))
+            .locate(sandbox_id)
+            .await
+            .expect("the fully wired service can see the row");
+        assert!(
+            matches!(wired, ResumePlacement::Pinned { .. }),
+            "the three assertions above are only about wiring if this one holds: {wired:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 🔴 The decision that switches enforcement off when inverted
+    // -----------------------------------------------------------------------
 
     /// 🔴 Which authorization outcome still needs the cluster's record.
     ///
@@ -1322,8 +1802,10 @@ mod tests {
     }
 
     // Endpoint scheme normalisation used to be tested here via a local
-    // `qualified_endpoint` duplicate. That duplicate is gone — both spawn
-    // paths below now route through `SchedulerEndpointSource::spawn_from_config`,
-    // which qualifies internally (see `crate::scheduler_endpoint::qualified`
-    // and its own `a_scheme_is_added_only_when_one_is_missing` test).
+    // `qualified_endpoint` duplicate, then via `SchedulerEndpointSource`'s own
+    // qualification once that duplicate was deleted. Neither applies any more:
+    // this module dials nothing, so it has no endpoint to normalise. Scheme
+    // handling is `crate::scheduler_endpoint::qualified`'s alone, tested there
+    // by `a_scheme_is_added_only_when_one_is_missing`, for the two consumers
+    // that still dial (`aenv-node`'s heartbeat reporter and P2P discovery).
 }

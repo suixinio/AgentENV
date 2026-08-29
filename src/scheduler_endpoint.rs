@@ -36,9 +36,9 @@
 //!   existed. What a construction failure *means* — hard-fail the process,
 //!   degrade to node-local, degrade to a no-op discovery backend — is each
 //!   consumer's own policy, argued for at its own call site (see
-//!   `src/api/impls/resume_surface.rs`'s comment on why `from_config` and
-//!   `cluster_from_config` disagree, for the sharpest example). This type
-//!   does not flatten those differences into one answer.
+//!   `src/p2p/discovery/scheduler.rs`'s `from_config`, which degrades to a
+//!   no-op discovery backend where the heartbeat reporter hard-fails). This
+//!   type does not flatten those differences into one answer.
 //! - **Runtime reload** (the background watcher, once running) never fails
 //!   outward. A missing, empty, or unparseable file is logged, metered under
 //!   `component` (see [`SCHEDULER_ENDPOINT_RELOAD_METRIC`]), and the
@@ -72,13 +72,20 @@ use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
 /// Metric name for a watcher's file re-read outcome.
 ///
 /// Carries two labels: `component` (which of this process's scheduler
-/// dialers this increment belongs to — `"heartbeat"`, `"p2p_discovery"`,
-/// `"paused_registry"`, `"snapshot_catalog"`, `"create_placement"`,
-/// `"resume_placement"`) and `result` (`switched` / `unchanged` /
+/// dialers this increment belongs to — `"heartbeat"` and `"p2p_discovery"`,
+/// both `aenv-node`'s) and `result` (`switched` / `unchanged` /
 /// `same_value` / `empty_kept_previous` / `invalid_kept_previous` /
-/// `error_kept_previous`). Six consumers sharing one counter with no
+/// `error_kept_previous`). Consumers sharing one counter with no
 /// `component` label would erase which of them reloaded; the extra
-/// cardinality is six values, which is cheap.
+/// cardinality is a couple of values, which is cheap.
+///
+/// 🔴 The label set used to also list `"paused_registry"`,
+/// `"snapshot_catalog"`, `"create_placement"` and `"resume_placement"`.
+/// Each of those dialers has since been deleted — the paused registry and
+/// the snapshot catalog moved onto `[pg]`, create placement onto
+/// `NativeNodePlacement`'s in-process calls, and resume placement onto
+/// `NativePlacementSource`'s (`src/api/impls/resume_surface.rs`) — which is
+/// why nothing in `aenv-api` builds one of these any more.
 pub const SCHEDULER_ENDPOINT_RELOAD_METRIC: &str = "agentenv_scheduler_endpoint_reload_total";
 
 /// A live `(Channel, endpoint)` pair, optionally kept fresh by a background

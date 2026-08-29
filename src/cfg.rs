@@ -1119,6 +1119,19 @@ pub struct ClusterStaticDiscoveryNode {
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
     /// Shared gRPC scheduler endpoint for cluster-level services.
+    ///
+    /// 🔴 Read by `aenv-node` only. Its two consumers are the observability
+    /// heartbeat reporter (`src/observability/reporter.rs`) and P2P peer
+    /// discovery (`src/p2p/mod.rs::peer_discovery_from_config`), and both run
+    /// in the node half. `aenv-api` reads this key nowhere: placement answers
+    /// from its own in-process node registry
+    /// (`src/node_client/native_placement.rs`) and resume placement calls
+    /// `NodeRegistryGrpcService::lookup_node` on the value it already holds
+    /// (`src/api/impls/resume_surface.rs`), rather than dialling the endpoint
+    /// — which on every shipped deployment names `aenv-api`'s own listener.
+    /// The field stays because the node half needs it, and because the
+    /// gateway still dials that same listener under its own
+    /// `gateway.scheduler_addr`.
     #[config(
         env = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
         parse_env = parse_trimmed_string
@@ -1130,8 +1143,8 @@ pub struct ClusterConfig {
     /// cadence, so this does not need a second timing knob) while the
     /// process runs — no restart required to move traffic.
     ///
-    /// Every consumer that dials the scheduler — P2P peer discovery, resume
-    /// placement, and the heartbeat reporter — watches this file through
+    /// Every consumer that dials the scheduler — P2P peer discovery and the
+    /// heartbeat reporter, both `aenv-node`'s — watches this file through
     /// [`crate::scheduler_endpoint::SchedulerEndpointSource`] and picks up an
     /// edit within one interval, with no pod restart. Point it at a file
     /// mounted from a ConfigMap **without** `subPath` — kubelet only

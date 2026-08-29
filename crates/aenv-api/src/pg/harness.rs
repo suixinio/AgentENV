@@ -14,6 +14,17 @@
 //!   stderr — greppable, the same convention the Redis harness uses, so a
 //!   skip that silently becomes permanent is something a make target can
 //!   still catch.
+//!
+//! 🔴 The Redis side has since hoisted its *process bootstrap* — free port,
+//! spawn under `PR_SET_PDEATHSIG`, readiness probe, the
+//! `AENV_REDIS_TEST_REQUIRED` predicate — into `aenv-core`'s
+//! `src/redis_test_server.rs`, shared by its three harnesses. That does not
+//! generalise to here and is not meant to: this one spawns a different server
+//! with `initdb` first, lives in a different crate, and hands out schemas
+//! rather than logical databases. What the Redis extraction kept separate is
+//! the same thing this file keeps separate — each subsystem's own server
+//! process and its own namespace allocator, so one suite's reset cannot reach
+//! into another's live state.
 
 use std::io;
 use std::net::TcpListener;

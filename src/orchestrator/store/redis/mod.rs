@@ -49,7 +49,7 @@ mod scripts;
 mod transition;
 
 #[cfg(test)]
-mod harness;
+pub(crate) mod harness;
 #[cfg(test)]
 mod tests;
 

@@ -75,7 +75,7 @@
 //! competing notion of "expired."
 
 #[cfg(test)]
-mod harness;
+pub(crate) mod harness;
 #[cfg(test)]
 mod tests;
 

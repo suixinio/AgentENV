@@ -14,20 +14,42 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// TestReaderGetHit reads back, through a real Redis, the exact bytes the live
+// writer puts there.
+//
+// 🔴 The value written is a literal — see record_test.go's
+// storedRecordWithPodName / storedRecordWithoutPodName and the note above them.
+// It used to be produced by this package's own MarshalRecord, which made this
+// the one test in the module that touches real Redis and still proved nothing
+// about the format: Go encoded it, Go decoded it, and any shape at all would
+// have passed while the process that actually writes these keys is `aenv-api`.
 func TestReaderGetHit(t *testing.T) {
-	reader, client := newReaderForTest(t)
-	value, err := MarshalRecord(Node{ID: "node-a", Endpoint: "http://node-a"}, "0198b7cc-1111-7000-8000-000000000001")
-	if err != nil {
-		t.Fatalf("MarshalRecord failed: %v", err)
-	}
-	writeKey(t, client, BindingKey(DefaultKeyPrefix, "sbx-1"), value)
+	for _, tc := range []struct {
+		name        string
+		stored      string
+		wantPodName string
+	}{
+		{name: "with a pod name", stored: storedRecordWithPodName, wantPodName: "agentenv-node-7f4c2"},
+		{name: "without one", stored: storedRecordWithoutPodName},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader, client := newReaderForTest(t)
+			writeKey(t, client, BindingKey(DefaultKeyPrefix, "sbx-1"), tc.stored)
 
-	got, ok, err := reader.Get(context.Background(), " sbx-1 ")
-	if err != nil || !ok {
-		t.Fatalf("expected a hit, got (%+v, %v, %v)", got, ok, err)
-	}
-	if got.Node.ID != "node-a" || got.ExecutionID != "0198b7cc-1111-7000-8000-000000000001" {
-		t.Fatalf("unexpected record: %+v", got)
+			got, ok, err := reader.Get(context.Background(), " sbx-1 ")
+			if err != nil || !ok {
+				t.Fatalf("expected a hit, got (%+v, %v, %v)", got, ok, err)
+			}
+			if got.Node.ID != "node-a" || got.Node.Endpoint != "http://node-a" {
+				t.Fatalf("unexpected node: %+v", got.Node)
+			}
+			if got.Node.PodName != tc.wantPodName {
+				t.Fatalf("pod name = %q, want %q", got.Node.PodName, tc.wantPodName)
+			}
+			if got.ExecutionID != storedRecordExecutionID {
+				t.Fatalf("execution id = %q, want %q", got.ExecutionID, storedRecordExecutionID)
+			}
+		})
 	}
 }
 

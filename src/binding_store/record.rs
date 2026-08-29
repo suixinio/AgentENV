@@ -149,6 +149,49 @@ mod tests {
         );
     }
 
+    /// 🔴 The cross-language pin. These two strings are byte-for-byte the
+    /// literals `services/shared/routing/record_test.go` declares as
+    /// `storedRecordWithPodName` / `storedRecordWithoutPodName` and feeds to
+    /// `ParseRecord` and to the Redis reader — including through a real
+    /// `redis-server` in `TestReaderGetHit`.
+    ///
+    /// Both sides assert against the same literal rather than against each
+    /// other's code, which is the whole point: this function is the only
+    /// writer of these bytes in the cluster, so a Go test that encoded and
+    /// decoded with Go functions of its own would have gone on passing for a
+    /// format nothing writes. Changing either string alone turns one of the
+    /// two suites red — `TestTheStoredLiteralsAreTheOnesRustAssertsToo` reads
+    /// this file and refuses a literal that moved on one side only.
+    ///
+    /// The two shapes are the two a live writer produces: `pod_name` is
+    /// omitted when empty and present otherwise, and nothing else varies.
+    #[test]
+    fn go_and_rust_agree_on_the_stored_record_bytes() {
+        const STORED_RECORD_WITH_POD_NAME: &str = r#"{"node":{"node_id":"node-a","endpoint":"http://node-a","pod_name":"agentenv-node-7f4c2"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}"#;
+        const STORED_RECORD_WITHOUT_POD_NAME: &str = r#"{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}"#;
+        const EXECUTION_ID: &str = "0198b7cc-1111-7000-8000-000000000001";
+
+        let with_pod_name = Node {
+            id: "node-a".to_string(),
+            endpoint: "http://node-a".to_string(),
+            pod_name: "agentenv-node-7f4c2".to_string(),
+        };
+        assert_eq!(
+            marshal_record(&with_pod_name, EXECUTION_ID),
+            STORED_RECORD_WITH_POD_NAME
+        );
+
+        let without_pod_name = Node {
+            id: "node-a".to_string(),
+            endpoint: "http://node-a".to_string(),
+            pod_name: String::new(),
+        };
+        assert_eq!(
+            marshal_record(&without_pod_name, EXECUTION_ID),
+            STORED_RECORD_WITHOUT_POD_NAME
+        );
+    }
+
     #[test]
     fn parse_round_trips_marshal() {
         let node = Node {

@@ -2,6 +2,7 @@ package routing
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -95,18 +96,111 @@ func TestMarshalRecordShape(t *testing.T) {
 	}
 }
 
-func TestMarshalRecordRoundTrips(t *testing.T) {
-	node := Node{ID: "node-a", Endpoint: "http://node-a", PodName: "pod-a"}
-	value, err := MarshalRecord(node, "exec-1")
+// The two shapes a live writer actually puts in Redis, written out.
+//
+// 🔴 Literals, and not calls to this package's own encoder. Go does not write
+// these bytes any more — `aenv-api` does, from `src/binding_store/record.rs`'s
+// `marshal_record` — so a test that encoded with a Go function and decoded with
+// a Go function would pass for any format the two agreed on, including one no
+// writer in the cluster produces. That is not a hypothetical: the format is the
+// only thing holding the gateway's routing projection and the api half's
+// binding store together, and every other test in this module is green whatever
+// it says.
+//
+// `binding_store/record.rs`'s `go_and_rust_agree_on_the_stored_record_bytes`
+// asserts `marshal_record` emits these same two strings, byte for byte. The two
+// languages are pinned to one string rather than to each other's code, so
+// neither side can move the format by agreeing with itself.
+//
+// Serde and encoding/json both emit declaration order, and both omit an empty
+// `pod_name` / `execution_id`, which is what makes the shape:
+//
+//	{"node":{"node_id":…,"endpoint":…[,"pod_name":…]}[,"execution_id":…]}
+const (
+	// With a pod name — what a node whose heartbeat still reports its pod
+	// identity produces.
+	storedRecordWithPodName = `{"node":{"node_id":"node-a","endpoint":"http://node-a","pod_name":"agentenv-node-7f4c2"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}`
+	// Without one — the ordinary shape, since `pod_name` is omitted when empty.
+	storedRecordWithoutPodName = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}`
+)
+
+// storedRecordExecutionID is the incarnation both literals above carry.
+const storedRecordExecutionID = "0198b7cc-1111-7000-8000-000000000001"
+
+// TestTheStoredRecordShapesParse decodes the exact bytes the live writer
+// produces, in both of the shapes it produces.
+//
+// It replaces TestMarshalRecordRoundTrips, which encoded with MarshalRecord and
+// decoded with ParseRecord and so asserted only that this package agreed with
+// itself. 🔴 The pod-name shape in particular had no literal anywhere on this
+// side: the encoder test pinned the form without one, and this side's only
+// pod-name literal lived in TestParseRecordCases under a made-up value
+// ("pod-a") that no writer emits.
+func TestTheStoredRecordShapesParse(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stored   string
+		wantNode Node
+	}{
+		{
+			name:     "with a pod name",
+			stored:   storedRecordWithPodName,
+			wantNode: Node{ID: "node-a", Endpoint: "http://node-a", PodName: "agentenv-node-7f4c2"},
+		},
+		{
+			name:     "without one",
+			stored:   storedRecordWithoutPodName,
+			wantNode: Node{ID: "node-a", Endpoint: "http://node-a"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseRecord([]byte(tc.stored))
+			if !ok {
+				t.Fatalf("the bytes the live writer produces did not parse: %s", tc.stored)
+			}
+			if got.Node != tc.wantNode {
+				t.Fatalf("node = %+v, want %+v", got.Node, tc.wantNode)
+			}
+			if got.ExecutionID != storedRecordExecutionID {
+				t.Fatalf("execution id = %q, want %q", got.ExecutionID, storedRecordExecutionID)
+			}
+		})
+	}
+}
+
+// rustWriterSource is the file holding the only writer of these bytes in the
+// cluster: `aenv-api`'s `marshal_record`.
+const rustWriterSource = "../../../src/binding_store/record.rs"
+
+// TestTheStoredLiteralsAreTheOnesRustAssertsToo closes the one gap the two
+// suites leave on their own.
+//
+// Rust asserting `marshal_record` emits a string, and Go asserting `ParseRecord`
+// accepts a string, are two true statements about two strings — and nothing so
+// far makes them the same string. `ParseRecord` is deliberately tolerant (a
+// missing `execution_id` is not a decode failure, whitespace is trimmed), so a
+// Go literal that drifted would keep passing here while no writer produced it,
+// and Go's decoder would then be verified against a format that exists nowhere.
+//
+// 🔴 This is a source scan, so its polarity is the whole safety argument: it
+// asserts the literals are *present* in the Rust writer's test, and an absent
+// file is a failure rather than a skip. Editing either language's copy of a
+// literal without the other turns this red — which is what "pinned to one
+// string" has to mean to be worth anything.
+func TestTheStoredLiteralsAreTheOnesRustAssertsToo(t *testing.T) {
+	source, err := os.ReadFile(rustWriterSource)
 	if err != nil {
-		t.Fatalf("MarshalRecord failed: %v", err)
+		t.Fatalf("cannot read %s, the writer these literals came from: %v", rustWriterSource, err)
 	}
-	got, ok := ParseRecord([]byte(value))
-	if !ok {
-		t.Fatal("a record this package wrote must parse back")
-	}
-	if got.Node != node || got.ExecutionID != "exec-1" {
-		t.Fatalf("round trip lost something: got %+v", got)
+	for name, literal := range map[string]string{
+		"storedRecordWithPodName":    storedRecordWithPodName,
+		"storedRecordWithoutPodName": storedRecordWithoutPodName,
+	} {
+		if !strings.Contains(string(source), literal) {
+			t.Fatalf("%s is not asserted in %s:\n\t%s\n"+
+				"Go decodes this shape and Rust writes it; if one side's literal moved, move both.",
+				name, rustWriterSource, literal)
+		}
 	}
 }
 

@@ -339,7 +339,6 @@ mod operator_snapshot_delete_tests {
 
     use super::ApiImpl;
     use crate::identity::NodeIdentity;
-    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
@@ -357,7 +356,6 @@ mod operator_snapshot_delete_tests {
         SnapshotManager, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason, TemplateBuildInfo,
     };
-    use crate::template::RefusingTemplateBuildDriver;
 
     /// One row, and a note of what was asked to be deleted.
     struct OneRowCatalog {
@@ -532,8 +530,6 @@ mod operator_snapshot_delete_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),

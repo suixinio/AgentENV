@@ -10,7 +10,6 @@ use aenv_node::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
     SnapshotRuntimeVersions,
 };
-use aenv_node::template::TemplateBuildDriver as _;
 use aenv_node::template::TemplateBuildSpec;
 use aenv_node::types::{ExecutionId, SandboxId, SandboxResources};
 use anyhow::{anyhow, bail, Context, Result};

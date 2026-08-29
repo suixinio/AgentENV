@@ -620,8 +620,6 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestration),
         core.snapshot_manager,
-        core.template_builder,
-        core.image_resolver,
         core.observability,
         paused_wiring,
         config.sandbox_proxy.domains.clone(),

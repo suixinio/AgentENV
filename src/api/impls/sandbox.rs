@@ -10,7 +10,6 @@ use http::Method;
 use tracing::{info, warn};
 
 use crate::cfg::ConfigManager;
-use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxExpiry,
@@ -18,13 +17,13 @@ use crate::orchestrator::{
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-use crate::snapshot::{CommandContext, SnapshotAlias};
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::snapshot::SnapshotAlias;
+use crate::types::{SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
-use super::attached_drives::{resolve_attached_drives, unresolved_attached_drives};
+use super::attached_drives::unresolved_attached_drives;
 use super::pagination::PaginationCursor;
 use super::paused_recovery::{CrossNodeResume, MissingLocalResume, ResumeArbitration};
 use super::ApiImpl;
@@ -347,27 +346,6 @@ fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResource
     })
 }
 
-/// Build source image configs from the resolved rootfs and attached drives.
-fn build_image_configs(
-    rootfs: &ResolvedBlockImage,
-    attached: &[super::attached_drives::ResolvedAttachedDrive],
-) -> ImageConfigs {
-    let mut image_configs = ImageConfigs::new();
-    if let Some(config) = &rootfs.raw_config {
-        image_configs.add(None::<String>, "/", config.clone());
-    }
-    for r in attached {
-        if let Some(config) = &r.raw_config {
-            image_configs.add(
-                Some(r.drive.drive_id()),
-                r.drive.mount_path().display().to_string(),
-                config.clone(),
-            );
-        }
-    }
-    image_configs
-}
-
 /// Convert a generated params model into the internal params map.
 fn params_model_to_map(
     model: &std::collections::HashMap<String, agentenv_http_server::types::Object>,
@@ -481,93 +459,31 @@ impl Sandboxes<()> for ApiImpl {
             ));
         }
 
-        // 🔴 The only place this route forks on role, and the fix for a real
-        // capability gap rather than a stylistic choice: a cold start's first
-        // act used to be resolving `body.image` unconditionally on the
-        // machine serving this call — `regctl` fetches the manifest, pulls
-        // the blobs and converts them into a local overlaybd image, which is
-        // then handed to a local Firecracker VM. `aenv-api` has no
-        // `regctl`, no `/dev/kvm` and no `ublk`, so that used to fail this
-        // route outright (formerly refused at the door here with a 500
-        // naming `aenv-api`; see `SandboxLaunchSource::UnresolvedImage`'s
-        // doc for the shape of that gap). What changed: this half now
-        // validates the request exactly as strictly as the half that
-        // resolves does (`unresolved_attached_drives` runs the same checks
-        // as `resolve_attached_drives`, minus the registry calls) and ships
-        // the raw reference to a node — the same node-dispatch a
-        // snapshot-source create already uses — which resolves it as part of
-        // the same `Create` call (`NodeSandboxService::create`'s
+        // 🔴 This half has no `regctl` of its own, and that is the whole of
+        // why the reference travels unresolved. A cold start's first act used
+        // to be resolving `body.image` on the machine serving this call —
+        // `regctl` fetches the manifest, pulls the blobs and converts them
+        // into a local overlaybd image for a local Firecracker VM. `aenv-api`
+        // has no `regctl`, no `/dev/kvm` and no `ublk`, so that used to fail
+        // this route outright (formerly refused at the door here with a 500
+        // naming `aenv-api`; see `SandboxLaunchSource::UnresolvedImage`'s doc
+        // for the shape of that gap). What it does instead: validate the
+        // request exactly as strictly as a resolving half would
+        // (`unresolved_attached_drives` runs the same checks, minus the
+        // registry calls) and ship the raw reference to a node — the same
+        // node-dispatch a snapshot-source create already uses — which resolves
+        // it as part of the same `Create` call (`NodeSandboxService::create`'s
         // `Source::Image` arm).
-        let source = if self.runs_sandbox_runtime() {
-            let image_resolver = self.image_resolver();
-            // TODO: Move cold-start image resolution into an async create
-            // operation once the API supports 202 Accepted + status polling.
-            let resolved_rootfs = match timer
-                .time("resolve_rootfs", image_resolver.resolve(&body.image))
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(err) if err.is_user_error() => {
-                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                        Self::error(400, err.to_string()),
-                    ));
-                }
-                Err(err) => {
-                    warn!(error = %format_args!("{err:#}"), image = %body.image, "failed to resolve sandbox rootfs image");
-                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::error(
-                            500,
-                            format!("resolve sandbox rootfs image '{}': {err:#}", body.image),
-                        ),
-                    ));
-                }
-            };
-            let resolved_attached = match timer
-                .time(
-                    "resolve_attached_drives",
-                    resolve_attached_drives(
-                        body.attached_drives.as_deref().unwrap_or_default(),
-                        image_resolver.as_ref(),
-                    ),
-                )
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(err) => {
-                    warn!(error = %err.message, "failed to resolve attached drives");
-                    return Ok(Self::client_or_server_response(
-                        err,
-                        SandboxesColdPostResponse::Status400_BadRequest,
-                        SandboxesColdPostResponse::Status500_ServerError,
-                    ));
-                }
-            };
-
-            let image_configs = build_image_configs(&resolved_rootfs, &resolved_attached);
-            let extra_drives = resolved_attached.into_iter().map(|r| r.drive).collect();
-
-            let base = resolved_rootfs.base_context;
-            SandboxLaunchSource::Image {
-                image_ref: resolved_rootfs.image_ref,
-                overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
-                context: Box::new(
-                    CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                        .with_user(base.user)
-                        .with_exposed_ports(base.exposed_ports)
-                        .with_entrypoint(base.entrypoint)
-                        .with_cmd(base.cmd)
-                        .with_volumes(base.volumes)
-                        .with_labels(base.labels),
-                ),
-                resources: Some(resources),
-                extra_drives,
-                extra_boot_args: body.extra_boot_args.clone(),
-                image_configs: Box::new(image_configs),
-            }
-        } else {
-            let attached_drives = match unresolved_attached_drives(
-                body.attached_drives.as_deref().unwrap_or_default(),
-            ) {
+        //
+        // 🔴 There was a second arm here, taken when
+        // `ApiImpl::runs_sandbox_runtime()`, that resolved the image and its
+        // attached drives in-process. It is deleted rather than disabled: on
+        // `aenv-api` it was never taken, and on `aenv-node` this route never
+        // runs at all — `crate::api::role_gate` answers the user-facing REST
+        // surface with 404 there, and a node's real create path is the gRPC
+        // `NodeSandboxService::create`, which does not go through `ApiImpl`.
+        let attached_drives =
+            match unresolved_attached_drives(body.attached_drives.as_deref().unwrap_or_default()) {
                 Ok(drives) => drives,
                 Err(err) => {
                     warn!(error = %err.message, "failed to validate attached drives");
@@ -578,17 +494,16 @@ impl Sandboxes<()> for ApiImpl {
                     ));
                 }
             };
-            info!(
-                image = %body.image,
-                "cold sandbox create: this role has no regctl of its own, dispatching the \
-                 unresolved image reference to a node to resolve"
-            );
-            SandboxLaunchSource::UnresolvedImage {
-                image_ref: body.image.clone(),
-                resources,
-                attached_drives,
-                extra_boot_args: body.extra_boot_args.clone(),
-            }
+        info!(
+            image = %body.image,
+            "cold sandbox create: this half has no regctl of its own, dispatching the \
+             unresolved image reference to a node to resolve"
+        );
+        let source = SandboxLaunchSource::UnresolvedImage {
+            image_ref: body.image.clone(),
+            resources,
+            attached_drives,
+            extra_boot_args: body.extra_boot_args.clone(),
         };
 
         let request = CreateSandboxRequest {
@@ -692,43 +607,34 @@ impl Sandboxes<()> for ApiImpl {
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
         let timer = SandboxStageTimer::new("create_warm");
-        // 🔴 The same fork, and the same one line, as `sandboxes_cold_post`
-        // above — one rung further in. A warm create's first act used to be
-        // `load_runnable`, which is not a catalog lookup: it downloads
-        // `vm_state.bin` onto this machine's disk, materializes the memory and
-        // rootfs overlaybd `image.json` files, and takes a lease pinning all of
-        // it in this process's local artifact cache. That is right for a
-        // process about to boot a Firecracker VM from those bytes.
+        // 🔴 A catalog read, and deliberately only that. A warm create's
+        // first act used to be `load_runnable`, which is not a lookup: it
+        // downloads `vm_state.bin` onto this machine's disk, materializes the
+        // memory and rootfs overlaybd `image.json` files, and takes a lease
+        // pinning all of it in this process's local artifact cache. That is
+        // right for a process about to boot a Firecracker VM from those bytes.
         //
         // `aenv-api` is not that process. It hands the create to a node, and
         // `RemoteSandboxBackendFactory` reads exactly one thing back out of the
         // `RunnableSnapshot` it is given: the catalog row. The manifest, the
         // lease and every downloaded byte are dropped unread, and the node
         // resolves the row itself against the cache its VM actually mmaps. So
-        // the api half asks the catalog for the row and stops there — the node
+        // this half asks the catalog for the row and stops there — the node
         // receives byte-for-byte the request it always did, because the row was
         // already the whole of what `SnapshotSource` carried.
-        let loaded: anyhow::Result<Option<SandboxLaunchSource>> = if self.runs_sandbox_runtime() {
-            timer
-                .time(
-                    "load_snapshot",
-                    self.snapshot_manager.load_runnable(&body.template_id),
-                )
-                .await
-                .map(|found| {
-                    found.map(|snapshot| SandboxLaunchSource::Snapshot(Box::new(snapshot)))
-                })
-        } else {
-            timer
-                .time(
-                    "load_snapshot",
-                    self.snapshot_manager.get(&body.template_id),
-                )
-                .await
-                .map(|found| {
-                    found.map(|record| SandboxLaunchSource::SnapshotRecord(Box::new(record)))
-                })
-        };
+        //
+        // 🔴 The `load_runnable` arm that used to sit opposite this one, taken
+        // when `ApiImpl::runs_sandbox_runtime()`, is deleted: `aenv-node`
+        // answers this route with 404 (`crate::api::role_gate`) and creates
+        // over gRPC instead, where `NodeSandboxService::create` does its own
+        // resolution.
+        let loaded: anyhow::Result<Option<SandboxLaunchSource>> = timer
+            .time(
+                "load_snapshot",
+                self.snapshot_manager.get(&body.template_id),
+            )
+            .await
+            .map(|found| found.map(|record| SandboxLaunchSource::SnapshotRecord(Box::new(record))));
         let source = match loaded {
             Ok(Some(source)) => source,
             Ok(None) => {
@@ -1927,45 +1833,6 @@ mod tests {
     }
 
     #[test]
-    fn build_image_configs_preserves_rootfs_and_attached_drives() {
-        let rootfs_config = serde_json::json!({
-            "Cmd": ["/bin/bash"],
-            "WorkingDir": "/workspace"
-        });
-        let rootfs = ResolvedBlockImage {
-            image_ref: "ubuntu:24.04".to_string(),
-            overlaybd_config_path: "/tmp/rootfs-image.json".into(),
-            base_context: crate::image::ImageBaseContext::default(),
-            raw_config: Some(rootfs_config.clone()),
-        };
-        let drive_config = serde_json::json!({
-            "Env": ["DATA=1"]
-        });
-        let attached = super::super::attached_drives::ResolvedAttachedDrive {
-            drive: crate::sandbox::ExtraDrive::try_new_overlaybd_with_mount_path(
-                "data",
-                "/tmp/data-image.json",
-                true,
-                "/data",
-                None::<std::path::PathBuf>,
-            )
-            .expect("valid test drive"),
-            raw_config: Some(drive_config.clone()),
-        };
-
-        let image_configs = build_image_configs(&rootfs, &[attached]);
-
-        assert_eq!(image_configs.len(), 2);
-        let entries = image_configs.entries();
-        assert_eq!(entries[0].drive_id, None);
-        assert_eq!(entries[0].mount_path, "/");
-        assert_eq!(entries[0].config, rootfs_config);
-        assert_eq!(entries[1].drive_id.as_deref(), Some("data"));
-        assert_eq!(entries[1].mount_path, "/data");
-        assert_eq!(entries[1].config, drive_config);
-    }
-
-    #[test]
     fn network_update_replaces_base_policy_and_egress() {
         let body = models::SandboxNetworkUpdateConfig {
             allow_out: Some(vec!["8.8.8.8".to_string()]),
@@ -2253,7 +2120,7 @@ mod execution_exposure_tests {
     }
 }
 
-/// 🔴 Whether `aenv-api` turns a snapshot into bytes on its own disk.
+/// 🔴 Whether a warm create turns a snapshot into bytes on its own disk.
 ///
 /// `POST /sandboxes` used to answer that with an unconditional
 /// `load_runnable`, which is not a catalog lookup: `SnapshotRuntimeResolver`
@@ -2268,16 +2135,19 @@ mod execution_exposure_tests {
 /// The resolver here is [`MockSnapshotRuntimeResolver`], which fails every
 /// call. So "did this create resolve" is not a string to match or a counter to
 /// read: a create that resolved *cannot* have succeeded, because the failure
-/// propagates and ends the request. `aenv-api` answering 201 over a resolver
+/// propagates and ends the request. This route answering 201 over a resolver
 /// that refuses is the whole proof, and it stays the proof if every error
 /// message in the tree is reworded.
 ///
-/// The the pre-split single process arm is the other half of it, and it is what stops this
-/// from passing on a tree where nothing resolves anywhere: the same fixture,
-/// the same catalog row, the same request, and it fails — because that half
-/// still resolves, and the resolver still refuses.
+/// 🔴 There used to be a second arm here, running the same request through a
+/// `ResumeWiring::node_local` surface and asserting it *did* resolve. It went
+/// with the `load_runnable` branch it covered: `aenv-node` never reaches this
+/// handler — `crate::api::role_gate` answers the user-facing REST surface with
+/// 404 there — and creates over gRPC instead, where
+/// `NodeSandboxService::create` does its own resolution and is covered by
+/// `crates/aenv-node/src/node_server/tests.rs`.
 #[cfg(test)]
-mod warm_start_role_tests {
+mod warm_start_source_tests {
     use std::sync::Arc;
 
     use axum_extra::extract::CookieJar;
@@ -2289,7 +2159,6 @@ mod warm_start_role_tests {
 
     use super::ApiImpl;
     use crate::identity::NodeIdentity;
-    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
         Orchestrator,
@@ -2297,24 +2166,23 @@ mod warm_start_role_tests {
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
-    use crate::template::RefusingTemplateBuildDriver;
 
     /// One API surface whose catalog holds a ready snapshot and whose runtime
     /// resolver refuses every call.
     ///
-    /// 🔴 The orchestrator takes the permissive seed policy in every case,
-    /// for the reason `crates/aenv-node/src/tests/api_cold_start.rs`'s own
-    /// fixture gives: the route under test asks `ApiImpl`, and an
-    /// `Orchestrator` built with [`AccessTokenSeedPolicy::MustBeConfigured`]
-    /// has construction-time demands that would make this fail on the fixture
-    /// rather than on the fork.
+    /// 🔴 The orchestrator takes the permissive seed policy, for the reason
+    /// `crates/aenv-node/src/tests/api_cold_start.rs`'s own fixture gives: the
+    /// route under test asks `ApiImpl`, and an `Orchestrator` built with
+    /// [`AccessTokenSeedPolicy::MustBeConfigured`] has construction-time
+    /// demands that would make this fail on the fixture rather than on the
+    /// path under test.
     ///
     /// 🔴 The factory is `MockBackendFactory` rather than
-    /// `FirecrackerSandboxFactory` because the question is what the api half
+    /// `FirecrackerSandboxFactory` because the question is what this half
     /// *sends*, not whether this machine can run a VM — and
     /// `MockBackendFactory` is the one factory in the tree that, like the real
     /// `RemoteSandboxBackendFactory`, accepts both snapshot launch sources.
-    async fn surface_as(wiring: crate::api::ResumeWiring, row: SnapshotRecord) -> Arc<ApiImpl> {
+    async fn surface(row: SnapshotRecord) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().expect("a temp dir");
 
         let orchestrator = Orchestrator::new(
@@ -2332,8 +2200,6 @@ mod warm_start_role_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),
@@ -2341,8 +2207,7 @@ mod warm_start_role_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 The one value this fixture varies.
-            wiring,
+            crate::api::ResumeWiring::api_half_for_test(),
         ));
 
         // Held for the process's lifetime: the persister above goes on reading it.
@@ -2370,8 +2235,8 @@ mod warm_start_role_tests {
     }
 
     #[tokio::test]
-    async fn a_warm_start_resolves_locally_or_ships_the_catalog_row_depending_on_half() {
-        let api = surface_as(crate::api::ResumeWiring::api_half_for_test(), ready_row()).await;
+    async fn a_warm_start_ships_the_catalog_row_without_resolving_it() {
+        let api = surface(ready_row()).await;
         let response = create_from_template(&api).await;
         assert!(
             matches!(
@@ -2379,35 +2244,8 @@ mod warm_start_role_tests {
                 SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully { .. }
             ),
             "🔴 the assertion. This manager's runtime resolver fails every call, so a create \
-             that touched it could not have got here — aenv-api answering 201 over it is the \
-             proof that it never turned the catalog row into local bytes, got {response:?}"
+             that touched it could not have got here — answering 201 over it is the proof that \
+             this route never turned the catalog row into local bytes, got {response:?}"
         );
-
-        {
-            let api = surface_as(
-                crate::api::ResumeWiring::node_local(
-                    NodeIdentity::from_config(&Default::default()).id,
-                ),
-                ready_row(),
-            )
-            .await;
-            let response = create_from_template(&api).await;
-            match &response {
-                SandboxesPostResponse::Status500_ServerError(error) => {
-                    assert!(
-                        error.message.contains("mock snapshot runtime resolver"),
-                        "aenv-node must still resolve the snapshot itself, so it must fail \
-                         exactly where this fixture's resolver refuses; failing anywhere else \
-                         would mean the fixture, not the fork, decided this test: got {:?}",
-                        error.message
-                    );
-                }
-                other => panic!(
-                    "aenv-node still resolves, and this fixture's resolver refuses every call, \
-                     so this create cannot succeed — if it did, nothing here would be resolving \
-                     anywhere and the api-half assertion above would be vacuous: got {other:?}"
-                ),
-            }
-        }
     }
 }

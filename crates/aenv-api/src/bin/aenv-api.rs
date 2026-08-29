@@ -22,7 +22,6 @@ use aenv_api::cfg::{
     MetadataStoreBackendKind, NodeRegistryObservedBackendKind,
 };
 use aenv_api::identity::NodeIdentity;
-use aenv_api::image::RefusingImageResolver;
 use aenv_api::node_client::{NativeNodePlacement, RemoteSandboxBackendFactory};
 use aenv_api::node_registry::grpc_service::NodeRegistryGrpcService;
 use aenv_api::node_registry::kubernetes_discovery::{
@@ -42,7 +41,6 @@ use aenv_api::orchestrator::{
 use aenv_api::pg::{self, PgPoolSettings};
 use aenv_api::server_main::{self, spawn_grpc_surface, Assembly};
 use aenv_api::snapshot::SnapshotManager;
-use aenv_api::template::RefusingTemplateBuildDriver;
 use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
@@ -475,23 +473,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         aenv_api::snapshot::repository::backends::CentralCatalogUse::AsConfigured,
     )?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
-    // 🔴 Both halves refuse rather than resolve, and that is what this
-    // process is: the resolving `ImageResolver` and the `TemplateBuilder` that
-    // drives a Firecracker sandbox are `aenv-node`'s, and this binary does not
-    // link that crate at all. Nothing here reaches either — `ApiImpl` takes
-    // both arms behind traits and only calls them when
-    // `ApiImpl::runs_sandbox_runtime()` says so, which is `false` for the
-    // `WakeSite::Remote` wiring below. What used to be constructed here was the
-    // concrete pair, unused; what is constructed now says so in the type.
-    //
-    // `default_image` still comes from config: the request shapes that only
-    // need the *name* — a template build that named no image, about to be
-    // dispatched to a machine that will resolve it — go on working.
-    let template_builder = Arc::new(RefusingTemplateBuildDriver);
-    let image_resolver = Arc::new(RefusingImageResolver::new(
-        config.image.resolver.default_image.clone(),
-    ));
-
     // 🔴 The receiving side only. `ObservabilityReporter` is not started: a
     // heartbeat reports a machine, and this replica is not one — reporting
     // itself would put a node in the scheduler's table that can never run
@@ -534,8 +515,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         ApiImpl::new(
             Arc::clone(&orchestration),
             snapshot_manager,
-            template_builder,
-            image_resolver,
             observability,
             paused_wiring,
             config.sandbox_proxy.domains.clone(),

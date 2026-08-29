@@ -13,5 +13,4 @@
 //! half that makes the test possible.
 
 mod api_cold_start;
-mod attached_drives;
 pub mod snapshot_manager;

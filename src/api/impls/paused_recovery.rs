@@ -492,30 +492,21 @@ impl ApiImpl {
             }
         };
 
-        // 🔴 The same fork as `sandboxes_post`'s, written on the same one line,
-        // and for the same reason: `resolve_runnable` is not a lookup. It
+        // 🔴 The row, and only the row. `resolve_runnable` is not a lookup: it
         // downloads `vm_state.bin` onto this machine's disk, materializes the
         // memory and rootfs overlaybd `image.json` files, and leases all of it
-        // in this process's local artifact cache. A restore driven from
-        // `aenv-api` boots nothing here — `RemoteSandboxBackendFactory` reads
-        // only the catalog row back out and sends it on, and the node resolves
-        // it against the cache its own VM mmaps. `record` is already in hand
-        // from the read above, so the unresolved half costs nothing at all.
-        let source = if self.runs_sandbox_runtime() {
-            match self.snapshot_manager.resolve_runnable(record).await {
-                Ok(snapshot) => SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-                Err(err) => {
-                    warn!(error = ?err, %sandbox_id, %snapshot_id, "failed to resolve paused snapshot");
-                    self.release_claim(&sandbox_id, entry.generation).await;
-
-                    return CrossNodeResume::Failed(format!(
-                        "failed to load paused snapshot: {err}"
-                    ));
-                }
-            }
-        } else {
-            SandboxLaunchSource::SnapshotRecord(Box::new(record))
-        };
+        // in this process's local artifact cache. A restore driven from the
+        // deciding half boots nothing here — `RemoteSandboxBackendFactory`
+        // reads only the catalog row back out and sends it on, and the node
+        // resolves it against the cache its own VM mmaps. `record` is already
+        // in hand from the read above, so this costs nothing at all.
+        //
+        // 🔴 The `resolve_runnable` arm that used to sit opposite this one,
+        // taken when `ApiImpl::runs_sandbox_runtime()`, is deleted for the same
+        // reason `sandboxes_post`'s was: `aenv-node` never reaches this surface
+        // (`crate::api::role_gate` answers it with 404 there) and does its
+        // resuming over gRPC instead.
+        let source = SandboxLaunchSource::SnapshotRecord(Box::new(record));
 
         let request = restore_request(&metadata, source, timeout);
 
@@ -1437,7 +1428,6 @@ mod tests {
     use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
     use crate::identity::NodeIdentity;
-    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, DisabledSandboxPersister, FileBackedSandboxPersister,
         InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
@@ -1445,7 +1435,6 @@ mod tests {
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::mock_snapshot_manager;
     use crate::snapshot::SnapshotId;
-    use crate::template::RefusingTemplateBuildDriver;
 
     const SELF: &str = "node-a";
     const OTHER: &str = "node-b";
@@ -1489,8 +1478,6 @@ mod tests {
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry,
@@ -1739,8 +1726,6 @@ mod tests {
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry,
@@ -2646,7 +2631,6 @@ mod cross_node_resume_scope_tests {
     use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
     use crate::identity::NodeIdentity;
-    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
@@ -2659,7 +2643,6 @@ mod cross_node_resume_scope_tests {
         SnapshotAbsence, SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason,
     };
-    use crate::template::RefusingTemplateBuildDriver;
 
     /// A catalog holding one row that has not been committed: present to a
     /// scoped read, absent to the resolvable one. That is a pause mid-publish,
@@ -2802,8 +2785,6 @@ mod cross_node_resume_scope_tests {
         let api = Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry as Arc<dyn PausedSandboxRegistry>,
@@ -2963,8 +2944,8 @@ mod cross_node_resume_scope_tests {
     }
 }
 
-/// 🔴 Whether `aenv-api` turns a paused sandbox's snapshot into bytes on its
-/// own disk before asking a node to bring the sandbox back.
+/// 🔴 Whether a cross-node resume turns a paused sandbox's snapshot into bytes
+/// on its own disk before asking a node to bring the sandbox back.
 ///
 /// A cross-node resume already has the catalog row in hand — it just read it,
 /// at `AnyStatus`, to decide whether the registry row was still worth keeping.
@@ -2978,14 +2959,18 @@ mod cross_node_resume_scope_tests {
 ///
 /// # 🔴 Why the fixture proves it rather than describing it
 ///
-/// Same construction as `sandbox::warm_start_role_tests`: the resolver is
+/// Same construction as `sandbox::warm_start_source_tests`: the resolver is
 /// `MockSnapshotRuntimeResolver`, which fails every call, so a restore that
-/// resolved could not have completed. `aenv-api` answering `Restored` over a
-/// resolver that refuses is the proof; the `aenv-node` arm, which still
-/// resolves and therefore still fails, is what keeps that proof from being
-/// vacuous.
+/// resolved could not have completed. Answering `Restored` over a resolver
+/// that refuses is the proof.
+///
+/// 🔴 There used to be a second arm here, running the same restore through a
+/// `ResumeWiring::node_local` surface and asserting it *did* resolve. It went
+/// with the `resolve_runnable` branch it covered: `aenv-node` never reaches
+/// this surface — `crate::api::role_gate` answers the user-facing REST routes
+/// with 404 there — and resumes over gRPC instead.
 #[cfg(test)]
-mod cross_node_resume_role_tests {
+mod cross_node_resume_source_tests {
     use std::sync::Arc;
 
     use chrono::Utc;
@@ -2993,24 +2978,21 @@ mod cross_node_resume_role_tests {
     use super::super::paused_coordinator::test_support::CountingRegistry;
     use super::*;
     use crate::identity::NodeIdentity;
-    use crate::image::RefusingImageResolver;
     use crate::orchestrator::{
         FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
     };
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
-    use crate::template::RefusingTemplateBuildDriver;
 
     /// One API surface whose catalog holds a ready snapshot and whose runtime
     /// resolver refuses every call.
     ///
-    /// 🔴 The orchestrator's seed policy is the permissive one in both cases
-    /// and only `ApiImpl`'s half varies, for the reason
-    /// `sandbox::warm_start_role_tests::surface_as` gives; and the factory is
-    /// `MockBackendFactory` because the question is what the api half *sends*,
+    /// 🔴 The orchestrator's seed policy is the permissive one, for the reason
+    /// `sandbox::warm_start_source_tests::surface` gives; and the factory is
+    /// `MockBackendFactory` because the question is what this half *sends*,
     /// not whether this machine can run a VM.
-    async fn api_as(wiring: crate::api::ResumeWiring, row: SnapshotRecord) -> Arc<ApiImpl> {
+    async fn api_with(row: SnapshotRecord) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
             crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
@@ -3029,8 +3011,6 @@ mod cross_node_resume_role_tests {
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 registry,
@@ -3038,8 +3018,7 @@ mod cross_node_resume_role_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 The one value this fixture varies.
-            wiring,
+            crate::api::ResumeWiring::api_half_for_test(),
         ))
     }
 
@@ -3066,53 +3045,19 @@ mod cross_node_resume_role_tests {
     }
 
     #[tokio::test]
-    async fn a_cross_node_resume_resolves_locally_or_ships_the_catalog_row_depending_on_half() {
+    async fn a_cross_node_resume_ships_the_catalog_row_without_resolving_it() {
         let row = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
         let snapshot_id = row.id.clone();
 
-        let api = api_as(crate::api::ResumeWiring::api_half_for_test(), row.clone()).await;
+        let api = api_with(row).await;
         let outcome = api
-            .restore_claimed_sandbox(claimed_entry(snapshot_id.clone()), NewTimeout::None)
+            .restore_claimed_sandbox(claimed_entry(snapshot_id), NewTimeout::None)
             .await;
         assert!(
             matches!(outcome, CrossNodeResume::Restored(_)),
             "🔴 the assertion. This manager's runtime resolver fails every call, so a restore \
-             that touched it could not have got here — aenv-api restoring over it is the proof \
-             that it never turned the catalog row into local bytes, got {outcome:?}"
+             that touched it could not have got here — restoring over it is the proof that this \
+             path never turned the catalog row into local bytes, got {outcome:?}"
         );
-
-        {
-            let api = api_as(
-                crate::api::ResumeWiring::node_local(
-                    NodeIdentity::from_config(&Default::default()).id,
-                ),
-                row.clone(),
-            )
-            .await;
-            let outcome = api
-                .restore_claimed_sandbox(claimed_entry(snapshot_id.clone()), NewTimeout::None)
-                .await;
-            match &outcome {
-                // 🔴 The context `SnapshotManager::resolve_runnable` and
-                // nothing else in the tree adds, so this says *the resolver
-                // was called* rather than merely *something failed*. The
-                // resolver's own wording does not survive to here — the
-                // failure is reported with `{err}`, which prints only the
-                // outermost context — and matching on "failed to load paused
-                // snapshot" would have matched three other branches of this
-                // same function.
-                CrossNodeResume::Failed(reason) => assert!(
-                    reason.contains("resolve committed snapshot into runnable runtime paths"),
-                    "aenv-node must still resolve the snapshot itself, so it must fail exactly \
-                     where this fixture's resolver refuses; failing anywhere else would mean the \
-                     fixture, not the fork, decided this test: got {reason:?}"
-                ),
-                other => panic!(
-                    "aenv-node still resolves, and this fixture's resolver refuses every call, \
-                     so this restore cannot succeed — if it did, nothing here would be resolving \
-                     anywhere and the api-half assertion above would be vacuous: got {other:?}"
-                ),
-            }
-        }
     }
 }

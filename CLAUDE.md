@@ -292,6 +292,30 @@ naming the one decision they need (`CentralCatalogUse`,
 `AccessTokenSeedPolicy`, `Assembly::drains_on_shutdown`). Everywhere else the
 answer is a constant of the binary and the branch is simply gone.
 
+🔴 **`runs_sandbox_runtime` no longer branches any user-facing REST handler.**
+Four of them used to keep a "resolve it locally" arm for the running half —
+cold create (`image_resolver.resolve` + `resolve_attached_drives`), warm create
+(`load_runnable`), the paused cross-node restore (`resolve_runnable`) and the
+template build (`run_the_build_locally`). Those arms were dead in production
+twice over: `aenv-api` never took them, and `aenv-node` answers the whole
+user-facing REST surface with 404 (`src/api/role_gate.rs`) before any handler
+runs — its real create/build path is gRPC
+(`crates/aenv-node/src/node_server/service.rs`), which does not go through
+`ApiImpl` at all. They are collapsed to the single surviving arm, and the
+abstractions that existed only to let the deciding half hold a stand-in went
+with them: the `TemplateBuildDriver` trait and `RefusingTemplateBuildDriver`
+(whose whole file, `src/template/driver.rs`, is gone), the
+`RootfsImageResolver` trait and `RefusingImageResolver` (formerly in
+`src/image/contract.rs`), `resolve_attached_drives`
+(`unresolved_attached_drives` and its shared `validate_attached_drives` stay),
+and `ApiImpl`'s `template_builder`/`image_resolver` fields with their two
+constructor parameters. `aenv-node`'s concrete `ImageResolver` and
+`TemplateBuilder` are untouched — the node gRPC service still holds and uses
+both, now through inherent methods. `runs_sandbox_runtime` itself survives
+through `owns_sandboxes`, which `src/api/server.rs` reads to attach the role
+gate. The template build's door refusal survives too, narrowed from "no local
+runtime *and* no node to send it to" to "no node to send it to".
+
 - `aenv-core` (root, lib `aenv_core`): everything both halves need — the HTTP
   API surface, the orchestrator, the snapshot catalog model, cfg, the node
   registry and binding store, the node client, p2p

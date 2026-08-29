@@ -1,19 +1,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::image::RootfsImageResolver;
 use crate::sandbox::{validate_drive_id, validate_mount_path, validate_sub_path, ExtraDrive};
 use agentenv_http_server::models;
 
 pub const MIB: u64 = 1024 * 1024;
-
-/// Resolved attached drive with its ExtraDrive definition and optional raw source image config.
-#[derive(Debug)]
-pub struct ResolvedAttachedDrive {
-    pub drive: ExtraDrive,
-    /// Raw image config JSON from the source image.
-    pub raw_config: Option<serde_json::Value>,
-}
 
 struct PendingAttachedDrive {
     drive_id: String,
@@ -27,16 +18,16 @@ struct PendingAttachedDrive {
 /// Validates and deduplicates attached drive declarations, without resolving
 /// any of their source images.
 ///
-/// # 🔴 Deliberately split out of [`resolve_attached_drives`]
+/// # 🔴 Validation without registry access, on purpose
 ///
 /// Everything here is pure input validation — drive id shape, mount path
 /// shape, sub-path shape, uniqueness, `diskSizeMB`'s bounds — and needs no
-/// registry access. `sandboxes_cold_post` on `aenv-api` cannot resolve an
-/// image (no `regctl`), but it can and must still run these same checks
+/// registry access. `sandboxes_cold_post` cannot resolve an image (no
+/// `regctl` on the deciding half), but it can and must still run these checks
 /// before it ever asks a node to: a caller sending a malformed drive should
 /// get a 400 from the machine it talked to, not a registry round trip on
 /// another machine followed by a refusal that says nothing about the request.
-/// See [`unresolved_attached_drives`], this function's other caller.
+/// See [`unresolved_attached_drives`], this function's caller.
 fn validate_attached_drives(
     drives: &[models::AttachedDrive],
 ) -> Result<Vec<PendingAttachedDrive>, models::Error> {
@@ -106,61 +97,16 @@ fn validate_attached_drives(
     Ok(pending)
 }
 
-/// Resolves attached drive declarations into `ResolvedAttachedDrive` values ready for sandbox launch.
-pub async fn resolve_attached_drives(
-    drives: &[models::AttachedDrive],
-    image_resolver: &dyn RootfsImageResolver,
-) -> Result<Vec<ResolvedAttachedDrive>, models::Error> {
-    let pending = validate_attached_drives(drives)?;
-
-    let resolved_images = futures::future::try_join_all(pending.iter().map(|drive| async move {
-        image_resolver
-            .resolve(&drive.image)
-            .await
-            .map(|resolved| (resolved.overlaybd_config_path, resolved.raw_config))
-            .map_err(|err| {
-                models::Error::new(
-                    if err.is_user_error() { 400 } else { 500 },
-                    format!(
-                        "resolve attached drive '{}' image '{}': {err:#}",
-                        drive.drive_id, drive.image
-                    ),
-                )
-            })
-    }))
-    .await?;
-
-    let mut resolved = Vec::with_capacity(pending.len());
-    for (drive, (image_config_path, raw_config)) in pending.into_iter().zip(resolved_images) {
-        let mut extra_drive = ExtraDrive::try_new_overlaybd_with_mount_path(
-            drive.drive_id,
-            image_config_path,
-            drive.read_only,
-            drive.mount_path,
-            drive.sub_path,
-        )
-        .map_err(bad_request)?;
-        if let Some(virtual_size) = drive.virtual_size {
-            extra_drive = extra_drive
-                .try_with_virtual_size(virtual_size)
-                .map_err(bad_request)?;
-        }
-        resolved.push(ResolvedAttachedDrive {
-            drive: extra_drive,
-            raw_config,
-        });
-    }
-
-    Ok(resolved)
-}
-
-/// The `aenv-api` counterpart of [`resolve_attached_drives`]: validates the
-/// same way, but leaves every drive's image reference unresolved for the node
-/// that will build the sandbox to resolve instead.
+/// Validates every attached drive declaration and leaves its image reference
+/// unresolved, for the node that will build the sandbox to resolve instead.
 ///
-/// 🔴 Used only when `ApiImpl::runs_sandbox_runtime` is false — see the branch
-/// it guards in `sandboxes_cold_post`. `aenv-node`, which can resolve images
-/// itself, always takes `resolve_attached_drives`, unchanged.
+/// 🔴 The only shape left. A `resolve_attached_drives` sibling used to sit
+/// here, resolving each drive's image through a `RootfsImageResolver` for the
+/// half that ran the sandbox in-process; `sandboxes_cold_post` chose between
+/// the two on `ApiImpl::runs_sandbox_runtime`. That arm is deleted — the
+/// deciding half never took it, and the running half answers this route with
+/// 404 (`crate::api::role_gate`) and creates over gRPC, where
+/// `NodeSandboxService::create` does its own resolution.
 pub fn unresolved_attached_drives(
     drives: &[models::AttachedDrive],
 ) -> Result<Vec<crate::sandbox::UnresolvedAttachedDrive>, models::Error> {
@@ -200,4 +146,184 @@ pub fn virtual_size_from_disk_size_mb(
         .ok_or_else(|| {
             models::Error::new(400, "attached drive diskSizeMB overflows bytes".to_string())
         })
+}
+
+/// The validation every attached-drive declaration goes through.
+///
+/// 🔴 These moved here from `crates/aenv-node/src/tests/`, where they lived
+/// because they drove a real `ImageResolver` over a fake `regctl` through
+/// `resolve_attached_drives`. That function is deleted with the cold-create
+/// arm that called it; what it and [`unresolved_attached_drives`] shared —
+/// [`validate_attached_drives`], the whole of what these tests ever asserted —
+/// is reached through the surviving one, and needs nothing from the running
+/// half.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn drive(
+        drive_id: &str,
+        source: models::AttachedDriveSource,
+        read_only: Option<bool>,
+        mount_path: Option<&str>,
+    ) -> models::AttachedDrive {
+        drive_with_sub_path(drive_id, source, read_only, mount_path, None)
+    }
+
+    fn drive_with_sub_path(
+        drive_id: &str,
+        source: models::AttachedDriveSource,
+        read_only: Option<bool>,
+        mount_path: Option<&str>,
+        sub_path: Option<&str>,
+    ) -> models::AttachedDrive {
+        drive_with_sub_path_and_disk_size(drive_id, source, read_only, mount_path, sub_path, None)
+    }
+
+    fn drive_with_sub_path_and_disk_size(
+        drive_id: &str,
+        source: models::AttachedDriveSource,
+        read_only: Option<bool>,
+        mount_path: Option<&str>,
+        sub_path: Option<&str>,
+        disk_size_mb: Option<u32>,
+    ) -> models::AttachedDrive {
+        models::AttachedDrive {
+            drive_id: drive_id.to_string(),
+            read_only,
+            mount_path: mount_path.map(ToString::to_string),
+            sub_path: sub_path.map(ToString::to_string),
+            disk_size_mb,
+            source,
+        }
+    }
+
+    fn source_image(image_ref: &str) -> models::AttachedDriveSource {
+        models::AttachedDriveSource::new(image_ref.to_string())
+    }
+
+    #[test]
+    fn rejects_missing_source() {
+        let err = unresolved_attached_drives(&[drive(
+            "data",
+            models::AttachedDriveSource::new("".to_string()),
+            None,
+            None,
+        )])
+        .expect_err("blank image should fail");
+
+        assert!(err.message.contains("requires exactly one"));
+    }
+
+    #[test]
+    fn rejects_duplicates_and_invalid_mount_paths() {
+        let duplicate_id = unresolved_attached_drives(&[
+            drive("data", source_image("img"), None, None),
+            drive("data", source_image("img"), None, Some("/mnt/other")),
+        ])
+        .expect_err("duplicate id should fail");
+        assert!(duplicate_id
+            .message
+            .contains("duplicate attached drive driveID"));
+
+        let duplicate_mount = unresolved_attached_drives(&[
+            drive("data", source_image("img"), None, Some("/mnt/shared")),
+            drive("logs", source_image("img"), None, Some("/mnt/shared")),
+        ])
+        .expect_err("duplicate mount should fail");
+        assert!(duplicate_mount
+            .message
+            .contains("duplicate attached drive mountPath"));
+
+        // mount_path validation fires before source validation.
+        let invalid_mount = unresolved_attached_drives(&[drive(
+            "data",
+            source_image("img"),
+            None,
+            Some("/proc/data"),
+        )])
+        .expect_err("reserved mount path should fail");
+        assert!(invalid_mount.message.contains("reserved path"));
+    }
+
+    #[test]
+    fn sub_path_validation() {
+        // Valid values pass through unchanged.
+        assert_eq!(
+            validate_sub_path("workspace/data").expect("valid sub_path"),
+            PathBuf::from("workspace/data"),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_sub_paths() {
+        // Strict mode: empty / whitespace-padded values are *not* normalised
+        // into "absent"; they are rejected with 400 unchanged.
+        let cases: &[(Option<&str>, &str)] = &[
+            (Some(""), "subPath must not be empty"),
+            (Some("   "), "whitespace"),
+            (Some(" workspace/data "), "whitespace"),
+            (Some("/workspace/data"), "relative"),
+            (Some("workspace/../etc"), "'..'"),
+            // ':' must be rejected: it is the cmdline separator in
+            // `agentenv_drives=vd<letter>:<mountPath>[:<subPath>]`.
+            (Some("workspace:data"), "colons"),
+        ];
+
+        for (input, needle) in cases {
+            let err = unresolved_attached_drives(&[drive_with_sub_path(
+                "data",
+                source_image("img"),
+                None,
+                None,
+                *input,
+            )])
+            .unwrap_err();
+            assert_eq!(err.code, 400, "sub_path {input:?}");
+            assert!(
+                err.message.contains(needle),
+                "sub_path {input:?}: expected message to contain {needle:?}, got {:?}",
+                err.message,
+            );
+        }
+    }
+
+    #[test]
+    fn disk_size_mb_validation() {
+        assert_eq!(
+            virtual_size_from_disk_size_mb(None).expect("omitted size should pass"),
+            None,
+        );
+        assert_eq!(
+            virtual_size_from_disk_size_mb(Some(2048)).expect("valid size should pass"),
+            Some(2048 * MIB),
+        );
+
+        for disk_size_mb in [0, 512, 1536] {
+            let err = virtual_size_from_disk_size_mb(Some(disk_size_mb))
+                .expect_err("invalid disk size should fail");
+            assert_eq!(err.code, 400);
+            assert!(err.message.contains("diskSizeMB"));
+        }
+    }
+
+    /// 🔴 `diskSizeMB` is checked in the same first pass as every other field,
+    /// before anything downstream is asked to resolve the drive's image.
+    #[test]
+    fn rejects_invalid_disk_size_mb_with_the_rest_of_validation() {
+        for disk_size_mb in [0, 512, 1536] {
+            let err = unresolved_attached_drives(&[drive_with_sub_path_and_disk_size(
+                "data",
+                source_image("img"),
+                None,
+                None,
+                None,
+                Some(disk_size_mb),
+            )])
+            .expect_err("invalid disk size should fail");
+            assert_eq!(err.code, 400);
+            assert!(err.message.contains("diskSizeMB"));
+        }
+    }
 }

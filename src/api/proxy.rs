@@ -1414,7 +1414,6 @@ mod tests {
 
     use crate::{
         api::server,
-        image::RefusingImageResolver,
         orchestrator::{FileBackedSandboxPersister, Orchestrator},
         snapshot::mock::mock_snapshot_manager,
     };
@@ -1845,13 +1844,9 @@ mod tests {
         .await
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
-        let template_builder = Arc::new(crate::template::RefusingTemplateBuildDriver);
-        let image_resolver = Arc::new(RefusingImageResolver::new(""));
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            template_builder,
-            image_resolver,
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),

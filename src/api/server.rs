@@ -553,14 +553,10 @@ mod tests {
         .await
         .unwrap();
         let snapshot_manager = Arc::new(crate::snapshot::mock::mock_snapshot_manager());
-        let template_builder = Arc::new(crate::template::RefusingTemplateBuildDriver);
-        let image_resolver = Arc::new(crate::image::RefusingImageResolver::new(""));
         let identity = crate::identity::NodeIdentity::from_config(&Default::default());
         Arc::new(ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            template_builder,
-            image_resolver,
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),

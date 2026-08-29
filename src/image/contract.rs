@@ -9,9 +9,8 @@
 //! them, names them, and hands them to a machine that can.
 //!
 //! So the two halves are stated apart. This module holds the request and answer
-//! types plus the traits the callers spell; the implementations that touch
-//! registries, the layer cache and overlaybd live beside them in the half that
-//! owns those things.
+//! types both halves name; the implementations that touch registries, the layer
+//! cache and overlaybd live beside them in the half that owns those things.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,7 +20,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{ImageError, ImageResult};
 use crate::sandbox::RuntimeArtifactSet;
 use crate::types::SandboxId;
 
@@ -88,49 +86,6 @@ pub struct ResolvedBlockImage {
     /// Raw source image config JSON, `None` when the image source has no config
     /// (e.g. bare overlaybd config path) or when loaded from a legacy cache entry.
     pub raw_config: Option<serde_json::Value>,
-}
-
-/// Turns a user-facing image reference into local overlaybd bytes.
-#[async_trait]
-pub trait RootfsImageResolver: Send + Sync + std::fmt::Debug {
-    /// The image a request that named none is asking for.
-    fn default_image(&self) -> &str;
-
-    async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage>;
-}
-
-/// A resolver for a process that resolves nothing.
-///
-/// 🔴 Refuses rather than panicking, and carries the configured default image
-/// so the request shapes that only need the *name* — a template build that
-/// named no image, and is about to be dispatched to a machine that will
-/// resolve it — still work here. Only `resolve` is the thing this half cannot
-/// do.
-#[derive(Debug)]
-pub struct RefusingImageResolver {
-    default_image: String,
-}
-
-impl RefusingImageResolver {
-    pub fn new(default_image: impl Into<String>) -> Self {
-        Self {
-            default_image: default_image.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl RootfsImageResolver for RefusingImageResolver {
-    fn default_image(&self) -> &str {
-        &self.default_image
-    }
-
-    async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
-        Err(ImageError::Other(anyhow::anyhow!(
-            "this process resolves no images: '{image_ref}' has to be resolved on a machine that \
-             runs sandboxes"
-        )))
-    }
 }
 
 /// Who is keeping a set of runtime artifacts from being reclaimed.

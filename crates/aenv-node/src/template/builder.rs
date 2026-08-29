@@ -10,7 +10,6 @@ use super::errors::{
     TemplateBuildError, TemplateBuildFailure, TemplateBuildResult, TemplatePipelineResult,
 };
 use super::runner::{TemplateBuildBase, TemplateBuildContext, TemplateBuildRunner};
-use super::TemplateBuildDriver as _;
 use crate::cfg::ConfigManager;
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::UblkConfig;
@@ -61,12 +60,9 @@ impl TemplateBuilder {
         self.build_and_publish_with_id(snapshot_manager, snapshot_id, spec)
             .await
     }
-}
 
-#[async_trait::async_trait]
-impl super::TemplateBuildDriver for TemplateBuilder {
     /// Builds and publishes a new snapshot using a caller-provided id.
-    async fn build_and_publish_with_id(
+    pub async fn build_and_publish_with_id(
         &self,
         snapshot_manager: &SnapshotManager,
         snapshot_id: SnapshotId,
@@ -82,7 +78,7 @@ impl super::TemplateBuildDriver for TemplateBuilder {
     }
 
     /// Builds a new snapshot from an existing committed snapshot and publishes it.
-    async fn build_from_snapshot_and_publish(
+    pub async fn build_from_snapshot_and_publish(
         &self,
         snapshot_manager: &SnapshotManager,
         spec: TemplateBuildSpec,
@@ -97,9 +93,7 @@ impl super::TemplateBuildDriver for TemplateBuilder {
         )
         .await
     }
-}
 
-impl TemplateBuilder {
     #[tracing::instrument(
         skip(self, snapshot_manager, context, operation),
         fields(build_id = %context.build_snapshot_id)

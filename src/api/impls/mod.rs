@@ -18,13 +18,11 @@ use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
 use crate::identity::NodeIdentity;
-use crate::image::RootfsImageResolver;
 use crate::node_client::NodePlacement;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
-use crate::template::TemplateBuildDriver;
 use agentenv_http_server::{apis, models};
 pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
 // The data-plane auto-resume takes the same decision the REST resume does; both
@@ -89,8 +87,6 @@ pub struct ApiImpl {
     /// Cluster-wide bookkeeping for paused sandboxes. With the default `local`
     /// registry backend every call is a no-op and pause/resume stay node-local.
     paused: Arc<PausedSandboxCoordinator>,
-    template_builder: Arc<dyn TemplateBuildDriver>,
-    image_resolver: Arc<dyn RootfsImageResolver>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -110,21 +106,24 @@ pub struct ApiImpl {
 }
 
 impl ApiImpl {
-    // Eight, and each one is a distinct subsystem this surface needs rather
+    // Six, and each one is a distinct subsystem this surface needs rather
     // than a parameter that could be folded into another.
     //
-    // 🔴 It was nine while a `role` sat beside `resume_wiring`. The two said
-    // the same thing — see [`ResumeWiring::runs_sandboxes_here`] — and a pair
-    // that must agree is a pair that can disagree.
+    // 🔴 It was nine while a `role` sat beside `resume_wiring` and a
+    // `TemplateBuildDriver`/`RootfsImageResolver` pair sat beside the snapshot
+    // manager. The `role` said the same thing as `resume_wiring` — see
+    // [`ResumeWiring::runs_sandboxes_here`] — and a pair that must agree is a
+    // pair that can disagree. The build driver and the image resolver were
+    // taken only by the arms this surface reached when it ran the sandboxes it
+    // answered for, and those arms are gone: `aenv-api` dispatches, and
+    // `aenv-node` answers these routes with 404 (`crate::api::role_gate`) and
+    // does its real work over gRPC instead.
     //
-    // 🔴 Not nine now either: `node_placement` is deliberately not a
+    // 🔴 Not seven either: `node_placement` is deliberately not a
     // constructor parameter — see `with_node_placement` below for why.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<dyn SandboxOrchestration>,
         snapshot_manager: Arc<SnapshotManager>,
-        template_builder: Arc<dyn TemplateBuildDriver>,
-        image_resolver: Arc<dyn RootfsImageResolver>,
         observability: Option<Arc<ObservabilityService>>,
         paused: PausedSandboxWiring,
         sandbox_proxy_domains: Vec<String>,
@@ -134,8 +133,6 @@ impl ApiImpl {
             orchestrator,
             snapshot_manager,
             paused: paused.coordinator,
-            template_builder,
-            image_resolver,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
@@ -206,10 +203,6 @@ impl ApiImpl {
 
     pub fn sandbox_proxy_domains(&self) -> &[String] {
         &self.sandbox_proxy_domains
-    }
-
-    pub fn image_resolver(&self) -> Arc<dyn RootfsImageResolver> {
-        Arc::clone(&self.image_resolver)
     }
 
     /// Returns the optional observability service backing node/admin

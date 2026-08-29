@@ -13,8 +13,8 @@ pub mod regctl;
 use thiserror::Error;
 
 pub use contract::{
-    DisabledRuntimeImageRefs, ImageBaseContext, RefusingImageResolver, ResolvedBlockImage,
-    RootfsImageResolver, RuntimeImageOwner, RuntimeImageRefs,
+    DisabledRuntimeImageRefs, ImageBaseContext, ResolvedBlockImage, RuntimeImageOwner,
+    RuntimeImageRefs,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use mock::RecordingRuntimeImageRefs;

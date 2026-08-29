@@ -1,21 +1,21 @@
-//! What `aenv-api` answers when it is asked to cold-start a sandbox.
+//! What `POST /sandboxes-cold` does with the image reference it is given.
+//!
+//! A cold start's first act used to be resolving an OCI image *in the process
+//! serving the call*: `regctl` fetches the manifest and converts the layers
+//! into a local overlaybd image for a local Firecracker VM. The `api` Pod
+//! installs no `regctl` — that is a node's tooling — so the call died on step
+//! one with `regctl is required for OCI registry access`, and the refusal that
+//! actually names the problem (`RemoteSandboxBackendFactory::build`) sat behind
+//! that resolve and was never reached. The operator was told a tool was
+//! missing; the truth was that this half cannot cold-start at all.
 //!
 //! 🔴 In `aenv-node` even though the surface under test is `aenv-core`'s
-//! `api::impls::sandbox`. These fixtures install a fake `regctl` and drive the
-//! real `ImageResolver` — the resolving half, which lives in this crate — so
-//! that "the api half never reaches the resolver" is proved against the thing
-//! that would have been reached. A test in `aenv-core` could not link it.
-//!
-//! 🔴 What `aenv-api` answers when it is asked to cold-start a sandbox.
-//!
-//! A cold start is the one create path whose first act is to resolve an OCI
-//! image *here*: `regctl` fetches the manifest and converts the layers into a
-//! local overlaybd image for a local Firecracker VM. The `api` Pod installs no
-//! `regctl` — that is a node's tooling — so the call died on step one with
-//! `regctl is required for OCI registry access`, and the refusal that actually
-//! names the problem (`RemoteSandboxBackendFactory::build`) sat behind that
-//! resolve and was never reached. The operator was told a tool was missing;
-//! the truth was that this half cannot cold-start at all.
+//! `api::impls::sandbox`. `ApiImpl::new` no longer takes an image resolver at
+//! all — the arm that resolved in-process is deleted — but the fixture still
+//! installs a fake `regctl` and points the process config at it, so "nothing
+//! on this path shells out to a registry" stays a fact this test can observe
+//! rather than one it asserts by construction. A test in `aenv-core` could not
+//! install that.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,13 +27,11 @@ use http::Method;
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 
-use crate::cfg::AppConfig;
 use crate::identity::NodeIdentity;
 use crate::orchestrator::{
     DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
 };
 use crate::sandbox::mock::MockBackendFactory;
-use crate::template::RefusingTemplateBuildDriver;
 use aenv_core::api::impls::ApiImpl;
 
 /// The image every fixture here asks for.
@@ -41,7 +39,7 @@ use aenv_core::api::impls::ApiImpl;
 /// Fully qualified on purpose: an unqualified name is expanded across
 /// `image.resolver.search_registries` into one candidate per registry, and
 /// the fake `regctl` below would then be run once per candidate. One
-/// candidate makes "was the resolver reached" a single, unambiguous fact.
+/// candidate makes "was a resolver reached" a single, unambiguous fact.
 /// `.invalid` is reserved by RFC 6761 and can never resolve, so a fixture
 /// that stopped installing the fake `regctl` would fail rather than reach
 /// a real registry.
@@ -55,29 +53,27 @@ struct Surface {
     regctl_dir: PathBuf,
 }
 
-/// A surface differing from every other one here in exactly one value:
-/// which half of the split the process serving it is.
+/// The surface this route is served by.
 ///
-/// 🔴 The orchestrator takes `AccessTokenSeedPolicy::MayGenerate` in every
-/// case: the cold-start route asks the `ApiImpl`, not the orchestrator, and an
+/// 🔴 The orchestrator takes `AccessTokenSeedPolicy::MayGenerate`: the
+/// cold-start route asks the `ApiImpl`, not the orchestrator, and an
 /// orchestrator built with `MustBeConfigured` has construction-time demands of
-/// its own that would make the refusing half of this test fail on the fixture
-/// instead of on the gate.
+/// its own that would make this test fail on the fixture instead of on the
+/// route.
 ///
-/// 🔴 `ResumeWiring` is the whole of the difference. `node_local` gives an
-/// `ApiImpl` that runs its sandboxes here; `api_half_for_test` gives one that
-/// does not — see `ApiImpl::runs_sandbox_runtime`, which is the branch under
-/// test. This crate can reach the second only because `aenv-core`'s
-/// `test-support` feature is on for its dev build.
-async fn surface_as(wiring: crate::api::ResumeWiring) -> Surface {
+/// 🔴 `ResumeWiring::api_half_for_test` because that is the half this route is
+/// answered on: `aenv-node` replies 404 to the whole user-facing REST surface
+/// (`aenv_core::api::role_gate`) and cold-creates over gRPC instead, in
+/// `NodeSandboxService::create`.
+async fn surface() -> Surface {
     let root = tempfile::tempdir().expect("a temp dir");
 
     // A fake `regctl` that answers every lookup with a registry 404. The
     // 404 matters twice over: `run_regctl` treats `[http 404]` as final and
-    // skips its five-attempt retry budget, so the test neither sleeps nor
-    // spawns more than once, and `ImageError::NotFound` is a *user* error,
-    // so the road not refused ends in a 400 that could never be mistaken
-    // for the 500 the refusal uses.
+    // skips its five-attempt retry budget, so a test that did reach it would
+    // neither sleep nor spawn more than once, and `ImageError::NotFound` is a
+    // *user* error, so the road not taken would end in a 400 rather than a
+    // 500.
     //
     // 🔴 Symlinked from the repository rather than written out here: while
     // any thread in this process holds a write fd on an executable, every
@@ -103,13 +99,6 @@ async fn surface_as(wiring: crate::api::ResumeWiring) -> Surface {
     )
     .expect("link the fake regctl");
 
-    // The only field that matters: `resolved_regctl_binary()` is derived
-    // from it, so this is what points the resolver at the fake.
-    let config = AppConfig {
-        deps_path,
-        ..Default::default()
-    };
-
     let orchestrator = Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
@@ -125,8 +114,6 @@ async fn surface_as(wiring: crate::api::ResumeWiring) -> Surface {
     let api = Arc::new(ApiImpl::new(
         orchestrator,
         Arc::clone(&snapshot_manager),
-        Arc::new(RefusingTemplateBuildDriver),
-        Arc::new(crate::image::ImageResolver::new(&config)),
         None,
         crate::api::PausedSandboxWiring::new(
             Arc::new(DisabledPausedSandboxRegistry),
@@ -134,8 +121,7 @@ async fn surface_as(wiring: crate::api::ResumeWiring) -> Surface {
             &NodeIdentity::from_config(&Default::default()),
         ),
         Vec::new(),
-        // 🔴 The one value this fixture varies.
-        wiring,
+        crate::api::ResumeWiring::api_half_for_test(),
     ));
 
     // Held for the process's lifetime: the persister above goes on reading
@@ -169,61 +155,60 @@ async fn cold_start(s: &Surface) -> SandboxesColdPostResponse {
 
 /// The argv of the fake `regctl`'s last run, or `None` if it never ran.
 ///
-/// 🔴 This is the discriminator. "Did this call reach the image resolver"
-/// is the question at stake here, and it is answerable only as a side
-/// effect: the resolver's first act is to shell out to `regctl`, and the
-/// fake records what it was asked for. A status code cannot answer it.
+/// 🔴 This is the discriminator. "Did this call resolve the image here" is
+/// answerable only as a side effect: resolution's first act is to shell out to
+/// `regctl`, and the fake records what it was asked for. A status code cannot
+/// answer it.
 fn regctl_argv(s: &Surface) -> Option<Vec<String>> {
     std::fs::read_to_string(s.regctl_dir.join("argv"))
         .ok()
         .map(|raw| raw.lines().map(ToString::to_string).collect())
 }
 
-/// `aenv-api` used to refuse a cold start outright — see the retired
-/// history on `SandboxLaunchSource::UnresolvedImage`. This pins the
-/// replacement: `aenv-api` no longer touches `regctl` (it cannot — no
-/// `/dev/kvm`, no `ublk` either) but *does* now build a launch source and
-/// hand it to the orchestrator, same as a node always has — just carrying a
-/// reference instead of an already-resolved path.
+/// This route used to be refused outright on the deciding half — see the
+/// retired history on `SandboxLaunchSource::UnresolvedImage`. This pins the
+/// replacement: it touches no `regctl` (it cannot — no `/dev/kvm`, no `ublk`
+/// either) but *does* build a launch source and hand it to the orchestrator,
+/// carrying a reference instead of an already-resolved path.
 ///
-/// # 🔴 Why the api-half assertion is a refusal from `build_from_image_ref`
+/// # 🔴 Why the assertion is a refusal from `build_from_image_ref`
 ///
-/// `surface_as`'s fixture orchestrator is deliberately the same
-/// `MockBackendFactory` the node arm uses (see its own note) rather
-/// than a `RemoteSandboxBackendFactory` dialling a real node, so an
-/// unresolved-image create on this fixture runs out of road at
-/// `SandboxBackendFactory::build_from_image_ref`'s *default* refusal.
-/// That refusal is exactly what proves the request got there at all —
-/// reaching it means `sandboxes_cold_post` built
-/// `SandboxLaunchSource::UnresolvedImage` from `body.image` verbatim and
-/// handed it to the orchestrator without ever calling `regctl`, which is
-/// the whole of what this route owes `aenv-api` now. A real remote
-/// dispatch — the node actually resolving the reference itself — is
+/// `surface`'s fixture orchestrator is a `MockBackendFactory` rather than a
+/// `RemoteSandboxBackendFactory` dialling a real node, so an unresolved-image
+/// create on this fixture runs out of road at
+/// `SandboxBackendFactory::build_from_image_ref`'s *default* refusal. That
+/// refusal is exactly what proves the request got there at all — reaching it
+/// means `sandboxes_cold_post` built `SandboxLaunchSource::UnresolvedImage`
+/// from `body.image` verbatim and handed it to the orchestrator without ever
+/// calling `regctl`, which is the whole of what this route owes now. A real
+/// remote dispatch — the node actually resolving the reference itself — is
 /// exercised end-to-end in `node_client::tests` and `node_server::tests`,
-/// which run a real node service over a real socket; this test's job is
-/// only the fork inside this one function.
+/// which run a real node service over a real socket.
 ///
-/// The node arm is asserted even though a node never reaches this handler in
-/// production — the user-REST gate answers `POST /sandboxes-cold` with 404
-/// there (`crate::api::role_gate`) — because the branch under test is
-/// `ApiImpl::runs_sandbox_runtime`, and a node answers `true` to it.
+/// 🔴 A second arm used to drive the same request through a
+/// `ResumeWiring::node_local` surface and assert that `regctl` *did* run,
+/// because `sandboxes_cold_post` forked on `ApiImpl::runs_sandbox_runtime` and
+/// resolved in-process on the running half. That fork is collapsed: a node
+/// answers this route with 404 (`aenv_core::api::role_gate`) and resolves
+/// inside `NodeSandboxService::create`'s `Source::Image` arm instead, which
+/// `crates/aenv-node/src/node_server/tests.rs` covers.
 #[tokio::test]
-async fn a_cold_start_resolves_locally_or_ships_the_reference_unresolved_depending_on_half() {
-    let s = surface_as(crate::api::ResumeWiring::api_half_for_test()).await;
+async fn a_cold_start_ships_the_reference_unresolved() {
+    let s = surface().await;
     let response = cold_start(&s).await;
     assert_eq!(
         regctl_argv(&s),
         None,
-        "🔴 aenv-api must never resolve the image itself — that capability gap is what \
-         this route now closes by dispatching instead of resolving — so regctl must not \
-         have run, got {response:?}"
+        "🔴 this route must never resolve the image itself — that capability gap is what it \
+         closes by dispatching instead of resolving — so regctl must not have run, got \
+         {response:?}"
     );
     match &response {
         SandboxesColdPostResponse::Status500_ServerError(error) => {
             assert!(
                 !error.message.contains("no sandbox runtime"),
                 "this must not be the old door refusal — the whole point of the fix is that \
-                 aenv-api no longer refuses this route outright — got {:?}",
+                 this route no longer refuses outright — got {:?}",
                 error.message
             );
             assert!(
@@ -242,30 +227,5 @@ async fn a_cold_start_resolves_locally_or_ships_the_reference_unresolved_dependi
              inherits SandboxBackendFactory::build_from_image_ref's default rather than \
              overriding it, unlike RemoteSandboxBackendFactory), got {other:?}"
         ),
-    }
-
-    {
-        let s = surface_as(crate::api::ResumeWiring::node_local(
-            NodeIdentity::from_config(&Default::default()).id,
-        ))
-        .await;
-        let response = cold_start(&s).await;
-        let argv = regctl_argv(&s).unwrap_or_else(|| {
-            panic!(
-                "aenv-node must still resolve the image itself, and the resolver's first act \
-                 is to run regctl; it never ran, so this create was cut short somewhere it \
-                 never used to be, got {response:?}"
-            )
-        });
-        assert!(
-            argv.iter().any(|arg| arg == IMAGE),
-            "the road being taken is the image resolver's, got argv {argv:?}"
-        );
-        assert!(
-            matches!(response, SandboxesColdPostResponse::Status400_BadRequest(_)),
-            "the fake registry answers 404, so this create ends where image resolution ends \
-             and the caller is told about the image rather than about the server, got \
-             {response:?}"
-        );
     }
 }

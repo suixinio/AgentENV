@@ -13,7 +13,7 @@ use aenv_node::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
 };
-use aenv_node::template::{TemplateBuildDriver as _, TemplateBuildSpec, TemplateBuilder};
+use aenv_node::template::{TemplateBuildSpec, TemplateBuilder};
 use aenv_node::types::{ExecutionId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;

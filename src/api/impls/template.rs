@@ -3,7 +3,7 @@ use axum_extra::extract::CookieJar;
 use chrono::TimeZone;
 use headers::Host;
 use http::Method;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use agentenv_http_server::apis::templates::*;
 use agentenv_http_server::models;
@@ -15,7 +15,6 @@ use super::template_helpers::{
     template_build_start_base_source, TemplateBuildStartBaseSource,
 };
 use super::ApiImpl;
-use crate::image::ResolvedBlockImage;
 use crate::proto::node as pb;
 use crate::sandbox::CapturedSandboxSnapshot;
 use crate::snapshot::{
@@ -23,124 +22,8 @@ use crate::snapshot::{
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
     SnapshotSource, TemplateBuildErrorReason, TemplateBuildStatus,
 };
-use crate::template::{TemplateBuildError, TemplateBuildFailure, TemplatePipelineError};
 use crate::types::{ImageConfigs, SandboxResources};
 use crate::virtualization::VirtualizationMode;
-
-fn pipeline_build_error(err: &TemplatePipelineError) -> models::Error {
-    match err {
-        TemplatePipelineError::Build(TemplateBuildError::InvalidInput { reason }) => {
-            models::Error::new(400, reason.clone())
-        }
-        TemplatePipelineError::Build(TemplateBuildError::System { reason, .. }) => {
-            models::Error::new(500, reason.message.clone())
-        }
-        TemplatePipelineError::Repository(repository) => {
-            ApiImpl::bad_request_for_repository_build_error(repository)
-                .unwrap_or_else(|| models::Error::new(500, repository.to_string()))
-        }
-    }
-}
-
-fn pipeline_error_reason(err: &TemplatePipelineError) -> TemplateBuildErrorReason {
-    match err {
-        TemplatePipelineError::Build(TemplateBuildError::InvalidInput { reason }) => {
-            TemplateBuildErrorReason::new(reason.clone())
-        }
-        TemplatePipelineError::Build(TemplateBuildError::System { reason, .. }) => reason.clone(),
-        TemplatePipelineError::Repository(repository) => {
-            TemplateBuildErrorReason::new(repository.to_string())
-        }
-    }
-}
-
-fn pipeline_error_chain(err: &TemplatePipelineError) -> Option<String> {
-    let client_message = pipeline_error_reason(err).message;
-    let outer_message = err.to_string();
-    let mut causes = Vec::new();
-    let mut current = std::error::Error::source(err);
-    while let Some(source) = current {
-        let cause = source.to_string();
-        if cause != outer_message
-            && cause != client_message
-            && !cause.starts_with("template build failed:")
-            && source.downcast_ref::<TemplateBuildFailure>().is_none()
-            && !causes.contains(&cause)
-        {
-            causes.push(cause);
-        }
-        current = source.source();
-    }
-    (!causes.is_empty()).then(|| causes.join(": "))
-}
-
-fn pipeline_error_is_internal(err: &TemplatePipelineError) -> bool {
-    if matches!(
-        err,
-        TemplatePipelineError::Build(TemplateBuildError::InvalidInput { .. })
-    ) {
-        return false;
-    }
-
-    let causes = std::iter::successors(std::error::Error::source(err), |cause| cause.source());
-    if causes
-        .into_iter()
-        .any(|cause| cause.downcast_ref::<TemplateBuildFailure>().is_some())
-    {
-        return false;
-    }
-
-    pipeline_build_error(err).code >= 500
-}
-
-fn handle_v2_pipeline_error(
-    build_id: &SnapshotId,
-    base_template: Option<&SnapshotAlias>,
-    err: &TemplatePipelineError,
-) -> TemplateBuildErrorReason {
-    let error = pipeline_build_error(err);
-    let reason = pipeline_error_reason(err);
-    if pipeline_error_is_internal(err) {
-        let internal_causes = pipeline_error_chain(err);
-        if let Some(base_template) = base_template {
-            warn!(
-                build_id = %build_id,
-                base_template = %base_template,
-                reason = %error.message,
-                failed_step = ?reason.step,
-                internal_causes = ?internal_causes,
-                "snapshot-based template build failed"
-            );
-        } else {
-            warn!(
-                build_id = %build_id,
-                reason = %error.message,
-                failed_step = ?reason.step,
-                internal_causes = ?internal_causes,
-                "template build failed"
-            );
-        }
-    }
-    reason
-}
-
-#[tracing::instrument(skip(api))]
-async fn resolve_template_rootfs_image(
-    api: &ApiImpl,
-    requested_image: Option<&str>,
-) -> Result<ResolvedBlockImage, models::Error> {
-    let image_resolver = api.image_resolver();
-    let image_ref = requested_image
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| image_resolver.default_image());
-    image_resolver.resolve(image_ref).await.map_err(|err| {
-        models::Error::new(
-            if err.is_user_error() { 400 } else { 500 },
-            format!("{err:#}"),
-        )
-    })
-}
 
 impl From<TemplateBuildStatus> for models::TemplateBuildStatus {
     fn from(status: TemplateBuildStatus) -> Self {
@@ -620,22 +503,29 @@ impl Templates<()> for ApiImpl {
         // everything else the split made remote — but unlike a cold create,
         // this one *can* be forwarded: `TemplateBuildRunner` is ordinary Rust
         // that runs wherever it is called, and a node has `/dev/kvm`, `regctl`
-        // and a Firecracker binary even when this process does not. So
-        // `aenv-api` does not refuse here — it dispatches to a node instead
+        // and a Firecracker binary even when this process does not. So this
+        // half does not refuse here — it dispatches to a node instead
         // (`run_the_build_on_a_node`, below). What is refused is the one
-        // configuration that can do neither: no local sandbox runtime *and* no
-        // node placement to send the build to, which today only happens if
-        // `assemble_api` is ever changed to construct an `ApiImpl` without one.
+        // configuration that can do nothing at all: no node placement to send
+        // the build to, which today only happens if `assemble_api` is ever
+        // changed to construct an `ApiImpl` without one.
+        //
+        // 🔴 This condition used to also spare a process that could run the
+        // build itself (`!self.runs_sandbox_runtime() && ...`). That half of it
+        // is gone with `run_the_build_locally`: there is no local arm left to
+        // spare, and a build with nowhere to dispatch is refused whichever
+        // binary is asked. The refusal itself is deliberately *not* dropped —
+        // see below for what it costs to admit a build nothing will run.
         //
         // Refusing here is not a smaller version of running it elsewhere. It is
         // the whole difference between an answer the caller gets and an answer
         // only a log has. Nothing has been mutated at this point, so the
         // template row is left exactly as it was found, in `waiting`.
-        if !self.runs_sandbox_runtime() && self.node_placement().is_none() {
+        if self.node_placement().is_none() {
             warn!(
                 template_id = %path_params.template_id,
-                "refused a template build: this process runs no sandbox runtime and has no node \
-                 placement source to forward the build to"
+                "refused a template build: this process has no node placement source to forward \
+                 the build to"
             );
             return Ok(v2_start_build_error(Self::error(
                 // 🔴 500 because it is the only code this operation declares
@@ -737,7 +627,7 @@ impl Templates<()> for ApiImpl {
             // no build rows to renew against.
             let lease_build_id = started.build_id;
             let lease_api = api.clone();
-            let build = run_the_build(api, build_id, base_source, spec);
+            let build = run_the_build_on_a_node(api, build_id, base_source, spec);
             hold_the_build_lease(&lease_api, &lease_build_id, build).await;
         });
 
@@ -851,160 +741,19 @@ async fn hold_a_lease<Renew, Answer>(
     }
 }
 
-/// Runs a template build wherever this process can run one — locally, in
-/// `aenv-node`, which has a sandbox runtime, or on a node it dials, in
-/// `aenv-api`, which has a placement source instead. Every failure either arm
-/// can raise ends the same way: `mark_v2_build_error` on `build_id`, and the
-/// template row stays `waiting` for the reaper to hand to another build if
-/// nothing else claims it first.
-async fn run_the_build(
-    api: ApiImpl,
-    build_id: SnapshotId,
-    base_source: TemplateBuildStartBaseSource,
-    spec: crate::template::TemplateBuildSpec,
-) {
-    if api.runs_sandbox_runtime() {
-        run_the_build_locally(api, build_id, base_source, spec).await
-    } else {
-        run_the_build_on_a_node(api, build_id, base_source, spec).await
-    }
-}
-
-/// `run_the_build`'s local arm: drives `TemplateBuildRunner` in this process,
-/// exactly as it did before the split.
-async fn run_the_build_locally(
-    api: ApiImpl,
-    build_id: SnapshotId,
-    base_source: TemplateBuildStartBaseSource,
-    spec: crate::template::TemplateBuildSpec,
-) {
-    match base_source {
-        source @ (TemplateBuildStartBaseSource::DefaultImage
-        | TemplateBuildStartBaseSource::Image(_)) => {
-            let requested_image = match source {
-                TemplateBuildStartBaseSource::Image(image) => Some(image),
-                _ => None,
-            };
-            let resolved_rootfs =
-                match resolve_template_rootfs_image(&api, requested_image.as_deref()).await {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        warn!(
-                            build_id = %build_id,
-                            reason = %err.message,
-                            "template build failed while resolving the base image"
-                        );
-                        mark_v2_build_error(
-                            &api,
-                            &build_id,
-                            TemplateBuildErrorReason::new(err.message),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            debug!(
-                build_id = %build_id,
-                requested_image,
-                "template build base image resolved"
-            );
-            let mut image_configs = ImageConfigs::new();
-            if let Some(config) = &resolved_rootfs.raw_config {
-                image_configs.add(None::<String>, "/", config.clone());
-            }
-            let base = resolved_rootfs.base_context;
-            let base_context = CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                .with_user(base.user)
-                .with_exposed_ports(base.exposed_ports)
-                .with_entrypoint(base.entrypoint)
-                .with_cmd(base.cmd)
-                .with_volumes(base.volumes)
-                .with_labels(base.labels);
-            let spec = spec
-                .with_resolved_overlaybd_image(resolved_rootfs.overlaybd_config_path, image_configs)
-                .with_base_context(base_context);
-            match api
-                .template_builder
-                .build_and_publish_with_id(api.snapshot_manager.as_ref(), build_id.clone(), spec)
-                .await
-            {
-                Ok(_) => {
-                    info!(build_id = %build_id, "template build completed");
-                }
-                Err(error) => {
-                    let reason = handle_v2_pipeline_error(&build_id, None, &error);
-                    mark_v2_build_error(&api, &build_id, reason).await;
-                }
-            }
-        }
-        TemplateBuildStartBaseSource::Template(alias) => {
-            let base_runnable = match api.snapshot_manager.load_runnable(alias.as_ref()).await {
-                Ok(Some(runnable)) => runnable,
-                Ok(None) => {
-                    warn!(
-                        build_id = %build_id,
-                        base_template = %alias,
-                        reason = "base template alias not found",
-                        "template build failed while resolving the base template"
-                    );
-                    mark_v2_build_error(
-                        &api,
-                        &build_id,
-                        TemplateBuildErrorReason::new(format!("template alias not found: {alias}")),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    warn!(
-                        build_id = %build_id,
-                        base_template = %alias,
-                        error = %format_args!("{err:#}"),
-                        "template build failed while loading the base template"
-                    );
-                    mark_v2_build_error(
-                        &api,
-                        &build_id,
-                        TemplateBuildErrorReason::new(
-                            ApiImpl::snapshot_manager_error(&err).message,
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            debug!(
-                build_id = %build_id,
-                base_template = %alias,
-                base_snapshot_id = %base_runnable.record().id,
-                "template build base template resolved"
-            );
-            match api
-                .template_builder
-                .build_from_snapshot_and_publish(
-                    api.snapshot_manager.as_ref(),
-                    spec,
-                    build_id.clone(),
-                    &base_runnable,
-                )
-                .await
-            {
-                Ok(_) => {
-                    info!(build_id = %build_id, "template build completed");
-                }
-                Err(error) => {
-                    let reason = handle_v2_pipeline_error(&build_id, Some(&alias), &error);
-                    mark_v2_build_error(&api, &build_id, reason).await;
-                }
-            }
-        }
-    }
-}
-
-/// `run_the_build`'s remote arm, for `aenv-api`: picks a node through
-/// `api.node_placement()`, asks it to run the build
-/// (`crate::node_client::build_template_on_a_node`), and commits what comes
-/// back.
+/// Runs a template build: picks a node through `api.node_placement()`, asks it
+/// to run the build (`crate::node_client::build_template_on_a_node`), and
+/// commits what comes back. Every failure ends the same way —
+/// `mark_v2_build_error` on `build_id`, and the template row stays `waiting`
+/// for the reaper to hand to another build if nothing else claims it first.
+///
+/// 🔴 The only arm. A `run_the_build_locally` sibling used to drive
+/// `TemplateBuildRunner` in this process, chosen by
+/// `ApiImpl::runs_sandbox_runtime`; it is deleted. `aenv-api` never took it,
+/// and `aenv-node` never reaches this route at all — `crate::api::role_gate`
+/// answers the user-facing REST surface with 404 there, and a node runs builds
+/// through the gRPC `NodeSandboxService::build_template`, which does not go
+/// through `ApiImpl`.
 ///
 /// # 🔴 Alias ownership
 ///
@@ -1028,8 +777,8 @@ async fn run_the_build_on_a_node(
     spec: crate::template::TemplateBuildSpec,
 ) {
     let Some(placement) = api.node_placement() else {
-        // 🔴 Loud rather than silently falling back to a local run this role
-        // cannot perform: see the door refusal in
+        // 🔴 Loud rather than silent: there is no local run to fall back to.
+        // See the door refusal in
         // `v2_templates_template_id_builds_build_id_post`, which is meant to
         // catch this before a build is ever admitted. Reaching here means that
         // refusal's premise changed without this arm changing with it.
@@ -1225,7 +974,6 @@ fn adopted_build_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::pipeline_build_error;
     use super::{hold_a_lease, SnapshotId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1390,30 +1138,6 @@ mod tests {
         assert_eq!(finished.load(Ordering::SeqCst), 1);
         assert_eq!(renewals.load(Ordering::SeqCst), 0);
     }
-
-    #[test]
-    fn pipeline_build_error_maps_invalid_input_to_bad_request() {
-        let error = pipeline_build_error(&crate::template::TemplatePipelineError::Build(
-            crate::template::TemplateBuildError::invalid_input("bad input"),
-        ));
-
-        assert_eq!(error.code, 400);
-        assert_eq!(error.message, "bad input");
-    }
-
-    #[test]
-    fn pipeline_build_error_maps_repository_conflict_to_bad_request() {
-        let error = pipeline_build_error(&crate::template::TemplatePipelineError::Repository(
-            crate::snapshot::RepositoryError::AliasConflict {
-                alias: "dup".to_string(),
-                existing: crate::snapshot::SnapshotId::generate(),
-                new_id: crate::snapshot::SnapshotId::generate(),
-            },
-        ));
-
-        assert_eq!(error.code, 400);
-        assert!(error.message.contains("dup"));
-    }
 }
 
 /// 🔴 The template surface, read through a catalog that hides what PostgreSQL
@@ -1446,7 +1170,6 @@ mod template_read_scope_tests {
 
     use super::{run_the_build_on_a_node, ApiImpl, TemplateBuildStartBaseSource};
     use crate::identity::NodeIdentity;
-    use crate::image::RefusingImageResolver;
     use crate::node_client::{FixedNodePlacement, NodeEndpoint, NodePlacement};
     use crate::orchestrator::{
         DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
@@ -1582,14 +1305,23 @@ mod template_read_scope_tests {
         build_starts: Arc<AtomicUsize>,
     }
 
-    /// The surface as the role every fixture here predates the split with.
+    /// The surface every read-scope fixture here uses: one that can dispatch a
+    /// build, so the build route's door refusal is not what they measure.
     async fn surface() -> Surface {
-        surface_as(node_half(), None).await
+        surface_as(Some(unreachable_placement())).await
     }
 
-    /// The same surface, differing in two values: which half of the split the
-    /// process serving it is, and — for a half that needs one to build a
-    /// template remotely — where that half sends the build.
+    /// The same surface, differing in one value: where this half sends a
+    /// template build, or `None` for the misconfiguration that has nowhere to
+    /// send one.
+    ///
+    /// 🔴 The `ApiImpl` is always the deciding half
+    /// (`ResumeWiring::api_half_for_test`). It used to be a parameter, because
+    /// four user-facing routes forked on `ApiImpl::runs_sandbox_runtime` and
+    /// these fixtures had to drive both arms; those forks are collapsed and
+    /// `aenv-node` answers this whole route group with 404
+    /// (`crate::api::role_gate`), so the running half never reaches any handler
+    /// under test here.
     ///
     /// 🔴 The orchestrator takes [`AccessTokenSeedPolicy::MayGenerate`] in
     /// every case. It is not what the build route reads — the handler asks
@@ -1597,20 +1329,7 @@ mod template_read_scope_tests {
     /// to construct without a configured envd access-token seed, which would
     /// make the refusing half of these tests fail on the fixture rather than
     /// on the thing under test.
-    /// The wiring that makes a `Surface`'s `ApiImpl` the `aenv-node` half.
-    fn node_half() -> crate::api::ResumeWiring {
-        crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id)
-    }
-
-    /// The wiring that makes a `Surface`'s `ApiImpl` the `aenv-api` half.
-    fn api_half() -> crate::api::ResumeWiring {
-        crate::api::ResumeWiring::api_half_for_test()
-    }
-
-    async fn surface_as(
-        wiring: crate::api::ResumeWiring,
-        node_placement: Option<Arc<dyn NodePlacement>>,
-    ) -> Surface {
+    async fn surface_as(node_placement: Option<Arc<dyn NodePlacement>>) -> Surface {
         let id = SnapshotId::generate();
         let alias = SnapshotAlias::parse("pending-template").expect("alias parses");
         let now = 1_700_000_000_000;
@@ -1661,8 +1380,6 @@ mod template_read_scope_tests {
         let api = ApiImpl::new(
             orchestrator,
             Arc::clone(&snapshot_manager),
-            Arc::new(crate::template::RefusingTemplateBuildDriver),
-            Arc::new(RefusingImageResolver::new("")),
             None,
             crate::api::PausedSandboxWiring::new(
                 Arc::new(DisabledPausedSandboxRegistry),
@@ -1670,10 +1387,7 @@ mod template_read_scope_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 The one value these fixtures vary. `surface()` passes the
-            // node half, because they predate the split and assert the
-            // behaviour of a process that runs the sandboxes it answers for.
-            wiring,
+            crate::api::ResumeWiring::api_half_for_test(),
         );
         // 🔴 A builder step, matching `assemble_api`'s own use of it — see
         // `ApiImpl::with_node_placement`.
@@ -1932,10 +1646,9 @@ mod template_read_scope_tests {
         )))
     }
 
-    /// 🔴 Only a process with **neither** a local sandbox runtime **nor** a
-    /// node to send the build to is refused at the door — and the point of
-    /// this test is that `aenv-api` is only in that set when it was not given
-    /// a placement source, which `assemble_api` always gives it in production.
+    /// 🔴 A process with no node to send the build to is refused at the door —
+    /// and the point of this test is that this is the *only* configuration
+    /// that is, which `assemble_api` never produces in production.
     ///
     /// Before `run_the_build_on_a_node` existed, `aenv-api` refused
     /// unconditionally: the 202 would otherwise have gone out, the build would
@@ -1945,12 +1658,19 @@ mod template_read_scope_tests {
     /// to prevent, restated as "still true when there is truly nowhere to
     /// send the build" rather than "true for `aenv-api` unconditionally".
     ///
+    /// 🔴 A second arm used to assert that a `ResumeWiring::node_local`
+    /// surface was admitted without a placement, because it could run the
+    /// build in-process. `run_the_build_locally` is deleted — there is no
+    /// in-process arm to be spared by — and its opposite,
+    /// [`an_api_replica_with_a_node_to_send_the_build_to_is_admitted`], is what
+    /// keeps this from passing on a tree that refuses every build.
+    ///
     /// The discriminator is the admission counter rather than the status
     /// code, because a refusal and a failed admission are both 500 — only one
     /// of them got as far as asking the catalog to start a build.
     #[tokio::test]
     async fn a_build_is_refused_only_when_it_can_run_nowhere_at_all() {
-        let s = surface_as(api_half(), None).await;
+        let s = surface_as(None).await;
         let response = start_a_build(&s).await;
         let refusal = role_refusal(&response).unwrap_or_else(|| {
             panic!(
@@ -1970,36 +1690,17 @@ mod template_read_scope_tests {
             "🔴 and it must refuse before the admission: a build the catalog has admitted is a \
              template moved out of `waiting` into a `building` state nothing will ever finish"
         );
-
-        {
-            let s = surface_as(node_half(), None).await;
-            let response = start_a_build(&s).await;
-            assert!(
-                role_refusal(&response).is_none(),
-                "aenv-node runs sandboxes, so this build takes the road it always took, got \
-                 {response:?}"
-            );
-            assert_eq!(
-                s.build_starts.load(Ordering::SeqCst),
-                1,
-                "and it reached the admission, which is the road being taken rather than merely \
-                 a status code that is not the refusal's"
-            );
-        }
     }
 
     /// 🔴 The regression guard for the gap this whole feature closes:
-    /// `aenv-api` given a node to send the build to is admitted exactly like
-    /// `aenv-node`, not refused the way it always was before
-    /// `run_the_build_on_a_node` existed. Deleting the `node_placement` half
-    /// of the door's refusal condition (leaving only
-    /// `!self.runs_sandbox_runtime()`, which is what this repository shipped
-    /// before this change) turns this assertion red — `aenv-api` would go back
-    /// to refusing every build regardless of whether it has somewhere to send
-    /// one.
+    /// a replica given a node to send the build to is admitted, not refused the
+    /// way `aenv-api` always was before `run_the_build_on_a_node` existed.
+    /// Turning the door's condition back into an unconditional refusal turns
+    /// this assertion red — every build would be refused regardless of whether
+    /// there is somewhere to send one.
     #[tokio::test]
     async fn an_api_replica_with_a_node_to_send_the_build_to_is_admitted() {
-        let s = surface_as(api_half(), Some(unreachable_placement())).await;
+        let s = surface_as(Some(unreachable_placement())).await;
         let response = start_a_build(&s).await;
         assert!(
             role_refusal(&response).is_none(),
@@ -2014,7 +1715,7 @@ mod template_read_scope_tests {
     }
 
     /// 🔴 The requirement this feature's build lease safety rests on: a node
-    /// this process cannot reach must not leave `run_the_build`'s future
+    /// this process cannot reach must not leave `run_the_build_on_a_node`'s future
     /// pending forever. `hold_the_build_lease` only stops renewing once that
     /// future resolves — see `hold_a_lease`'s tests above, which cover *that*
     /// half generically against a synthetic build future — so what has to be
@@ -2035,7 +1736,7 @@ mod template_read_scope_tests {
     /// quietly.
     #[tokio::test]
     async fn a_node_nobody_answers_does_not_hang_the_remote_build() {
-        let s = surface_as(api_half(), Some(unreachable_placement())).await;
+        let s = surface_as(Some(unreachable_placement())).await;
         let spec = TemplateBuildSpec::new().resources(1, 128);
 
         let outcome = tokio::time::timeout(

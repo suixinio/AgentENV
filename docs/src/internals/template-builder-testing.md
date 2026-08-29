@@ -29,8 +29,8 @@ repository/runtime boundary, and what the relevant tests validate.
   - Main methods:
     - `new()` / `with_cpu_config(arc)`
     - `build_and_publish(snapshot_manager, spec).await` — generates the id, then
-      delegates to the trait method below
-  - The two build entry points are `TemplateBuildDriver` trait methods:
+      delegates to the first entry point below
+  - The two build entry points:
     - `build_and_publish_with_id(snapshot_manager, snapshot_id, spec).await`
     - `build_from_snapshot_and_publish(snapshot_manager, spec, snapshot_id, base_snapshot).await`
 

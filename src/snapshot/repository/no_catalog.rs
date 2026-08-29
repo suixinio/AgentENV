@@ -11,9 +11,8 @@
 //!
 //! Making the repository's catalog optional would push that decision into every
 //! one of its ~15 delegating methods, at every call site, in a crate both
-//! binaries link. This is the same shape as `aenv-api`'s own
-//! `RefusingTemplateBuildDriver` / `RefusingImageResolver`: one type that says
-//! "not here" in the type system's stead, and says it loudly.
+//! binaries link. So one type says "not here" in the type system's stead, and
+//! says it loudly.
 //!
 //! 🔴 Loudly is the point. Until the catalog moved into PostgreSQL, `aenv-node`
 //! carried an object-storage catalog that answered these calls, and after the

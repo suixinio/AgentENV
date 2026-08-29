@@ -484,17 +484,6 @@ fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
     })
 }
 
-#[async_trait::async_trait]
-impl crate::image::RootfsImageResolver for ImageResolver {
-    fn default_image(&self) -> &str {
-        ImageResolver::default_image(self)
-    }
-
-    async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
-        ImageResolver::resolve(self, image_ref).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

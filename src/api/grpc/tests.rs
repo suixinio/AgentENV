@@ -36,7 +36,6 @@ use crate::api::impls::{
 use crate::api::{ApiImpl, PausedSandboxWiring, ResumeWiring};
 use crate::cfg::ConfigManager;
 use crate::identity::NodeIdentity;
-use crate::image::RefusingImageResolver;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::node_registry::warmup::WarmupGate;
@@ -49,7 +48,6 @@ use crate::proto::apiproxy::{
 };
 use crate::sandbox::mock::MockBackendFactory;
 use crate::snapshot::mock::mock_snapshot_manager;
-use crate::template::RefusingTemplateBuildDriver;
 use crate::types::SandboxId;
 
 /// The node the process under test wakes sandboxes on.
@@ -108,8 +106,6 @@ async fn build_api(resume_wiring: ResumeWiring) -> Arc<ApiImpl> {
     Arc::new(ApiImpl::new(
         orchestrator,
         Arc::clone(&snapshot_manager),
-        Arc::new(RefusingTemplateBuildDriver),
-        Arc::new(RefusingImageResolver::new("")),
         None,
         PausedSandboxWiring::new(
             Arc::new(DisabledPausedSandboxRegistry),
@@ -1192,8 +1188,6 @@ async fn serve_api_with_registry(
     let api = Arc::new(ApiImpl::new(
         orchestrator,
         Arc::clone(&snapshot_manager),
-        Arc::new(RefusingTemplateBuildDriver),
-        Arc::new(RefusingImageResolver::new("")),
         None,
         PausedSandboxWiring::new(
             Arc::new(GrantingRegistry {

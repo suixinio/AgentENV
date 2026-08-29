@@ -19,8 +19,9 @@
 #     for a process that never boots a VM.
 #   * no `uvm-ublk-daemon`, no `/dev/kvm`, no privileged runtime packages
 #     (`e2fsprogs`, `iptables`, `iproute2`, `umoci`, `zstd`).
-#   * no `regctl`. Resolving an image reference is the node's job
-#     (`RefusingImageResolver` is what this half holds).
+#   * no `regctl`. Resolving an image reference is the node's job — this half
+#     ships the reference unresolved and `NodeSandboxService::create` resolves
+#     it there.
 #
 # `cargo tree -p aenv-api -e normal` names none of overlaybd, uvm-ublk,
 # uvm-ublk-daemon or storage-util, which is the same statement one layer down.

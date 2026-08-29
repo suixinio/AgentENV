@@ -131,7 +131,7 @@ const (
 	// This is the only refusal that happens before the side effects.
 	//
 	// 🔴 Only enforce can produce it: it takes a stamp to arm the node's gate,
-	// and off never reaches decideFencing's compare/stamp branch at all. A
+	// and off never reaches decideFencing's fenced branch at all. A
 	// non-zero count while the fleet is on off means something other than this
 	// gateway put an expect header on the wire.
 	fencingDecisionRefusedPreflight = "refused_preflight"
@@ -154,33 +154,28 @@ const fencingStageGatewayRoute = "gateway_route"
 // fencingPlan is what one lookup answer licenses, decided once, before the
 // request goes out, and carried through to the response.
 type fencingPlan struct {
-	// stamp says whether the expect header goes on the outbound request — gate 1,
-	// which is a refusal delegated to the node.
+	// fenced says whether this request is fenced, which is all three gates at
+	// once: the expect header goes out on it (gate 1, a refusal delegated to the
+	// node), the node's echo is read back and measured (gate 2), and a mismatch
+	// gate 2 catches ends the request rather than only being counted.
 	//
-	// 🔴 Only enforce sets it. The delegation is one-way: once a node has answered
-	// 412 the gateway can translate that refusal but cannot undo it, so a mode
-	// that promises to refuse nothing cannot afford to hand it out.
-	stamp bool
-	// compare says whether the node's echo is read back and measured — gate 2.
-	//
-	// It is deliberately not the same field as stamp, even though the two
-	// states remaining today (off, enforce) always agree on it: off leaves
-	// both false by returning out of decideFencing before either is set, and
-	// enforce sets both true together. The node echoes the incarnation it is
-	// actually running on every response, whether or not anything was
-	// expected of it, so gate 2 needs nothing from gate 1 — that
-	// independence is what let a third mode, observe, measure every mismatch
-	// enforce would refuse while putting no refusal anywhere in reach,
-	// through the rollout that proved enforce was safe to turn on
-	// everywhere. That rollout is over and observe is gone, but the fields
-	// stay separate on the same reasoning: a mode that compares without
-	// refusing is one gate 2 alone should be able to express again.
-	compare bool
-	// refuse says whether a mismatch caught by gate 2 ends the request rather
-	// than just counting it.
-	refuse bool
+	// 🔴 One field, and it used to be three — stamp, compare and refuse, kept
+	// apart so that a mode could arm gate 2 alone. One did: observe compared
+	// every mismatch enforce would refuse while stamping nothing, so no refusal
+	// was ever in reach, through the rollout that proved enforce was safe to
+	// turn on everywhere. That mode is deleted, and with it every construction
+	// that set the three unequally. What is left cannot express the difference:
+	// decideFencing holds six composite literals and exactly one names any of
+	// the three, setting them together; off, the control plane and every
+	// unfenced answer return before reaching it; handleProxy's unresolved
+	// request starts from the zero value; and nothing anywhere assigns these
+	// fields after construction. Two of the eight states were reachable, so the
+	// type says two. A mode that compares without refusing would be a new
+	// state, and it should arrive with the code that produces it rather than
+	// being carried in advance by a shape nothing can put a value into.
+	fenced bool
 	// expect is the incarnation the scheduler named, whether or not it may be
-	// used. It is never empty when compare is true, and it is populated for the
+	// used. It is never empty when fenced is true, and it is populated for the
 	// control plane too, where it exists only to be logged.
 	//
 	// 🔴 Read it through stampedExecutionID for anything that goes on the wire.
@@ -201,8 +196,11 @@ type fencingPlan struct {
 // which compared against an incarnation but never delegated it either — used
 // to share this reasoning; the mode is retired, and off never resolves an
 // expect to withhold in the first place.)
+//
+// It reads `fenced` rather than a `stamp` of its own: the control plane is the
+// one case this guards, and it is unfenced, so one field answers it.
 func (p fencingPlan) stampedExecutionID() string {
-	if !p.stamp {
+	if !p.fenced {
 		return ""
 	}
 	return p.expect
@@ -258,17 +256,16 @@ func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.Looku
 		// 🔴 mode is guaranteed fencingEnforce here, not merely likely: off
 		// already returned at the top of this function, and no other value
 		// exists any more. A third value, observe, used to reach this same
-		// branch and arm only gate 2 (compare) while leaving gate 1 (stamp)
-		// and the refusal (refuse) off — gate 1 is a refusal carried out by
-		// the node, and the node cannot be asked to compare and then not act
-		// on the comparison, so that asymmetry is what made observe a dry run
-		// rather than a differently-worded enforce. That rollout is over and
-		// the mode is gone, so both gates now arm together, unconditionally,
-		// every time this branch is reached.
+		// branch and arm only gate 2 while leaving gate 1 and the refusal off
+		// — gate 1 is a refusal carried out by the node, and the node cannot
+		// be asked to compare and then not act on the comparison, so that
+		// asymmetry is what made observe a dry run rather than a
+		// differently-worded enforce. That rollout is over and the mode is
+		// gone, so both gates arm together, unconditionally, every time this
+		// branch is reached — which is why the plan carries one field and not
+		// three. This is the only literal in this file that sets it.
 		return fencingPlan{
-			stamp:     true,
-			compare:   true,
-			refuse:    true,
+			fenced:    true,
 			expect:    expect,
 			authority: authority,
 		}
@@ -351,19 +348,18 @@ func (s *Server) stampOutboundGatewayHeaders(h http.Header, expectExecutionID st
 // reaches the client — and it is the only way to refuse a 101 without racing the
 // upgrade path.
 func (s *Server) fenceProxyResponse(plan fencingPlan, sandboxID string, node *schedulerv1.Node, resp *http.Response) error {
-	if !plan.compare {
+	if !plan.fenced {
 		// No authoritative incarnation to compare against, so no response header
 		// is read at all. This is the branch off, the control plane and every
 		// unfenced answer take, and it is what keeps off at exactly one
 		// comparison, touching no header in either direction.
 		//
-		// 🔴 Gated on compare, not on stamp — a distinction that mattered while
-		// observe existed: it stamped nothing and still measured everything, so
-		// gating this on stamp instead would have produced no evidence, the
-		// only thing that dry run was for. Observe is retired, but compare and
-		// stamp are kept as separate fields (and this stays gated on compare)
-		// for the same reason: a future mode that measures without delegating
-		// should not have to re-derive this branch.
+		// 🔴 This used to be gated on a `compare` field distinct from `stamp`,
+		// a distinction that mattered while observe existed: it stamped nothing
+		// and still measured everything, so gating on stamp instead would have
+		// produced no evidence, the only thing that dry run was for. Observe is
+		// deleted and nothing can set the two differently any more, so there is
+		// one field and this reads it.
 		return nil
 	}
 
@@ -372,7 +368,7 @@ func (s *Server) fenceProxyResponse(plan fencingPlan, sandboxID string, node *sc
 	// The node refused before running anything. Its 412 and its refusal header
 	// are internal, so they are translated here and never forwarded.
 	//
-	// 🔴 Live in every mode that compares. While observe existed, this branch
+	// 🔴 Live in every fenced request. While observe existed, this branch
 	// was unreachable there by construction — observe stamped nothing and a
 	// node with nothing to compare against cannot refuse — and it was kept
 	// anyway because the two failure costs were not symmetric: an unreachable
@@ -392,9 +388,8 @@ func (s *Server) fenceProxyResponse(plan fencingPlan, sandboxID string, node *sc
 	// refuse.
 	if resp.StatusCode == refusalNodeStatusCode &&
 		resp.Header.Get(headerRefusal) == refusalCodeExecutionSuperseded {
-		// Refused unconditionally: the return below is unconditional, so this
-		// line says "refused" unconditionally too.
-		s.logExecutionMismatch(sandboxID, node, plan.expect, observed, refusedByNode, true)
+		// Refused unconditionally, which the return below is too.
+		s.logExecutionMismatch(sandboxID, node, plan.expect, observed, refusedByNode)
 		recordExecutionFencing(fencingPlaneData, fencingDecisionRefusedPreflight)
 		return executionSupersededRefusal(sandboxID, plan.expect, observed, refusedByNode)
 	}
@@ -420,28 +415,17 @@ func (s *Server) fenceProxyResponse(plan fencingPlan, sandboxID string, node *sc
 
 	// observed < expect: the node is running an incarnation the control plane
 	// has moved past.
-	// 🔴 plan.refuse, not a constant. While observe existed this was the record
-	// of a request that was measured and then served, and calling that
-	// "refused" would have made that round's log unreadable — the reason the
-	// two messages in logExecutionMismatch are still split rather than
-	// collapsed to one. Today plan.refuse is always true wherever plan.compare
-	// is (only enforce reaches this line; off never reaches fenceProxyResponse's
-	// compare branch at all), so this call always logs "refused" in practice —
-	// but it reads the field rather than a literal so a future mode that
-	// compares without refusing does not have to touch this line to get it
-	// right.
-	s.logExecutionMismatch(sandboxID, node, plan.expect, observed, refusedByGateway, plan.refuse)
+	//
+	// 🔴 Refused, unconditionally. This line used to read a `refuse` field and
+	// to be followed by a `if !plan.refuse { return nil }` dry-run exit, from
+	// when observe measured this exact mismatch and then served the response
+	// anyway. Nothing reaches here except a fenced plan, and a fenced plan
+	// refuses by definition — the exit was dead code guarding a state the type
+	// no longer has, and a dead branch that says "sometimes we let this
+	// through" is worse than none, because it is read as evidence that we
+	// sometimes do.
+	s.logExecutionMismatch(sandboxID, node, plan.expect, observed, refusedByGateway)
 	recordExecutionFencing(fencingPlaneData, fencingDecisionRefusedEcho)
-	if !plan.refuse {
-		// Unreachable today for the same reason as the comment above: nothing
-		// this build can configure sets compare true without also setting
-		// refuse true. Kept for the same "it cannot happen is a statement
-		// about today's wiring, not an invariant this function enforces"
-		// reasoning as the preflight branch above — if a mode ever compares
-		// without refusing again, this is where it stays a dry run rather
-		// than silently starting to refuse.
-		return nil
-	}
 	return executionSupersededRefusal(sandboxID, plan.expect, observed, refusedByGateway)
 }
 
@@ -513,46 +497,35 @@ func executionSupersededRefusal(sandboxID string, expected string, observed stri
 	}
 }
 
-// The two messages one mismatch can be written down under.
+// The message one mismatch is written down under.
 //
-// 🔴 Two, not one, and the field set is identical between them — the six fields
-// are the frozen half of this contract (the three-stage trail in
-// `_impl-plan-control-plane-phase3.md` §11.1(g), which the node and the registry
-// write out under the same names), the message text is not. So splitting here is
-// the change that costs nothing downstream, and the field set is what a test
-// pins. One message for both outcomes is what the observe round used to leave
-// an operator with: `grep refused` during that dry run returned a page of
-// requests that were all answered 200, because observe counted and logged
-// exactly what enforce refuses and then delivered the response anyway. A
-// refusal log that is right half the time is worse than no log, because it is
-// the one an incident is triaged with. Observe is retired, so in practice only
-// logMsgExecutionRefused is written today — see logExecutionMismatch's own
-// doc comment for why the split, and logMsgExecutionObserved, are kept anyway.
-const (
-	logMsgExecutionRefused  = "gateway refused a request against a superseded execution"
-	logMsgExecutionObserved = "gateway observed a request against a superseded execution and let it through"
-)
+// 🔴 There used to be a second, logMsgExecutionObserved ("...and let it through"),
+// picked by a `refused` parameter on logExecutionMismatch. It existed for
+// observe, the deleted third mode, which counted and logged exactly what
+// enforce refuses and then delivered the response anyway: one message for both
+// outcomes would have made `grep refused` during that dry run return a page of
+// requests that were all answered 200, and a refusal log that is right half the
+// time is worse than no log, because it is the one an incident is triaged with.
+// Both remaining call sites refuse — the preflight gate translates a refusal
+// the node has already produced, and the echo gate is reached only by a fenced
+// plan, which refuses by definition — so the second message named an outcome
+// this build cannot produce, and the parameter selecting it could only ever be
+// true.
+//
+// 🔴 The *field set* below, not the text, is the frozen half of this contract:
+// the six fields are the three-stage trail in
+// `_impl-plan-control-plane-phase3.md` §11.1(g), which the node and the
+// registry write out under the same names, and a test pins them.
+const logMsgExecutionRefused = "gateway refused a request against a superseded execution"
 
 // logExecutionMismatch writes the one line an operator has for a mismatch.
 //
-// refused says which of the two things happened, and it is a parameter rather
-// than a re-derivation from the mode because the two call sites still do not
-// derive it identically: the echo gate refuses only when plan.refuse is set,
-// while a refusal the node has already produced is translated and passed on
-// unconditionally. Both currently agree in practice — off never reaches
-// either call site, and enforce is the only mode left that does — but a third
-// mode, observe, used to make the two call sites disagree for real (comparing
-// without refusing, so the echo gate's refused was sometimes false while the
-// preflight gate's was always true), which is why the parameter is not simply
-// `mode == fencingEnforce`. Observe is retired; the parameter stays a
-// parameter so a future mode that reintroduces that disagreement does not
-// have to touch this function at all.
-func (s *Server) logExecutionMismatch(sandboxID string, node *schedulerv1.Node, expected string, observed string, refusedBy string, refused bool) {
-	message := logMsgExecutionObserved
-	if refused {
-		message = logMsgExecutionRefused
-	}
-	s.logger.Warn(message,
+// refusedBy stays a parameter and the two call sites still disagree on it: a
+// preflight refusal is the node's, caught before anything ran, and an echo
+// refusal is the gateway's, caught after. That distinction is what a client
+// reading the refusal body needs, and it is the one this function is told.
+func (s *Server) logExecutionMismatch(sandboxID string, node *schedulerv1.Node, expected string, observed string, refusedBy string) {
+	s.logger.Warn(logMsgExecutionRefused,
 		zap.String("sandbox_id", sandboxID),
 		zap.String("node_id", node.GetNodeId()),
 		zap.String("expected_execution_id", expected),

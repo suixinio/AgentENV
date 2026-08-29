@@ -666,85 +666,70 @@ func TestNodeWithoutEchoHeaderIsCountedAsUnfenced(t *testing.T) {
 // TestGatewayStripsClientSuppliedExecutionHeaders/TestDataPlaneRequestCarries
 // TheExpectedExecutionHeader together still pin "off and enforce, and only
 // those two, decide what gets stamped." The third — the log message split —
-// is replaced below, at the function level rather than the HTTP level, since
-// logExecutionMismatch still exists and still switches on an explicit
-// argument.
+// lost its subject: the second message and the parameter that picked it were
+// deleted with the last thing that could produce a non-refusing mismatch. What
+// replaces it below pins the half of that line that was never about the mode,
+// its frozen field set.
 
-// TestLogExecutionMismatchPicksTheMessageForWhatHappened pins the one thing
-// the log line says that the field set does not: refused vs. observed, never
-// both.
+// TestLogExecutionMismatchWritesTheFrozenFieldSet pins the half of the mismatch
+// log line that is a contract rather than prose: the six fields an operator
+// joins the three-stage trail on (impl plan §11.1(g)), which the node and the
+// registry write out under the same names.
 //
-// 🔴 This used to run end to end, across both live modes, because observe was
-// the only way to produce the "observed and let it through" message from a
-// real request. Observe is retired, but logExecutionMismatch's own refused
-// parameter still selects between the two messages — kept deliberately,
-// rather than collapsed to always-refused, because the echo call site in
-// fenceProxyResponse still passes plan.refuse rather than a literal true; a
-// future mode that compares without refusing again gets the right message
-// for free. That selection is what this test pins, directly, without needing
-// a mode that can no longer be configured.
-func TestLogExecutionMismatchPicksTheMessageForWhatHappened(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		refused     bool
-		wantMessage string
-		// wantSaysRefused is asserted against the message text rather than
-		// against the constant, so collapsing the two constants onto either of
-		// the two texts fails one of these rows.
-		wantSaysRefused bool
-	}{
-		{
-			name:            "observed and let through",
-			refused:         false,
-			wantMessage:     logMsgExecutionObserved,
-			wantSaysRefused: false,
-		},
-		{
-			name:            "refused",
-			refused:         true,
-			wantMessage:     logMsgExecutionRefused,
-			wantSaysRefused: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+// 🔴 This used to be a two-row table over a `refused` parameter that picked
+// between logMsgExecutionRefused and a second message, "…and let it through".
+// That parameter and that message existed for observe, which measured a
+// mismatch and then served the response; observe is deleted, both remaining
+// call sites refuse, and the type can no longer express a plan that compares
+// without refusing — so the selection this test pinned no longer exists to be
+// pinned. What survives is the part that was never about the mode: the fields,
+// and that the one message an operator greps for says "refused" because every
+// line it now writes describes a refusal.
+func TestLogExecutionMismatchWritesTheFrozenFieldSet(t *testing.T) {
+	for _, refusedBy := range []string{refusedByNode, refusedByGateway} {
+		t.Run(refusedBy, func(t *testing.T) {
 			logs, logged := observer.New(zap.WarnLevel)
 			server := newTestServerWithLogger(t, zap.New(logs), stubSchedulerClient{}, 5*time.Second, 4<<20)
 
 			server.logExecutionMismatch(
 				"sbx-1", &schedulerv1.Node{NodeId: "node-a"},
-				executionNewer, executionOlder, refusedByGateway, tc.refused,
+				executionNewer, executionOlder, refusedBy,
 			)
 
 			entries := logged.FilterField(zap.String("fencing_stage", fencingStageGatewayRoute)).All()
 			if len(entries) != 1 {
 				t.Fatalf("wrote %d gateway_route fencing lines, want exactly 1", len(entries))
 			}
-			if entries[0].Message != tc.wantMessage {
-				t.Fatalf("the log line reads %q, want %q", entries[0].Message, tc.wantMessage)
+			if entries[0].Message != logMsgExecutionRefused {
+				t.Fatalf("the log line reads %q, want %q", entries[0].Message, logMsgExecutionRefused)
 			}
-			if saysRefused := strings.Contains(entries[0].Message, "refused"); saysRefused != tc.wantSaysRefused {
-				t.Fatalf("the log line %q says refused=%v, want %v",
-					entries[0].Message, saysRefused, tc.wantSaysRefused)
+			// Asserted against the text, not the constant: every line this
+			// function writes now describes a refusal, and an operator finds
+			// them by grepping for that word. Rewording the constant to
+			// something that does not say it is the regression.
+			if !strings.Contains(entries[0].Message, "refused") {
+				t.Fatalf("the log line %q does not say refused; it is the line an incident is "+
+					"triaged with and every one of them is now a refusal", entries[0].Message)
 			}
 
 			// 🔴 The field set is the frozen half of this contract (the
 			// three-stage trail, impl plan §11.1(g)): the message text was split
-			// precisely because the fields could not be. Both messages must
-			// still carry all six.
+			// from it precisely because the fields could not be.
 			fields := entries[0].ContextMap()
 			for _, name := range []string{
 				"sandbox_id", "node_id", "expected_execution_id",
 				"observed_execution_id", "refusal_code", "refused_by",
 			} {
 				if _, present := fields[name]; !present {
-					t.Fatalf("the %q line dropped field %q; the fields are the part operators join on across the three stages", tc.name, name)
+					t.Fatalf("the %q line dropped field %q; the fields are the part operators join on across the three stages", refusedBy, name)
 				}
 			}
+			// refused_by is the one field the two call sites still disagree on,
+			// and the reason it stayed a parameter when `refused` did not.
+			if got := fields["refused_by"]; got != refusedBy {
+				t.Fatalf("refused_by came out as %v, want %q", got, refusedBy)
+			}
 		})
-	}
-
-	if logMsgExecutionObserved == logMsgExecutionRefused {
-		t.Fatal("the two messages are the same string again; one message for two outcomes is the defect this test exists for")
 	}
 }
 

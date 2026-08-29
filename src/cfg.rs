@@ -1487,21 +1487,6 @@ pub struct BindingStoreConfig {
     /// entry with no budget of its own).
     #[config(default = 30u64, env = "AENV_BINDING_STORE_BINDING_TTL_SECS")]
     pub binding_ttl_secs: u64,
-    /// `"fenced"` (the safe default) or `"off"` (always accepts, records no
-    /// decision — the rollback target). Anything else is treated as
-    /// `"fenced"`, matching
-    /// `crate::binding_store::ArbitrationMode::from_str_relaxed` — except the
-    /// literal `"observe"`, which [`AppConfig::validate`] refuses outright
-    /// rather than silently downgrading it. `"observe"` was a third,
-    /// intermediate mode (compares but always accepts, for measuring what
-    /// fencing would have refused before turning it on) that existed only
-    /// for the rollout that proved `"fenced"` was safe to enable everywhere;
-    /// that rollout is over (`deploy/k8s/base/kustomization.yaml`'s
-    /// `execution-fencing-config` comment records the cluster reaching
-    /// `enforce`) and the mode no longer exists in code on either side of
-    /// the wire.
-    #[config(default = "fenced", env = "AENV_BINDING_STORE_ARBITRATION")]
-    pub arbitration: String,
     /// Mirrors Go's `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE`. Off is
     /// the safe default (every write always re-arms a fresh deadline); on
     /// lets a heartbeat refresh of the same incarnation keep the existing
@@ -2037,36 +2022,6 @@ impl AppConfig {
             bail!(
                 "snapshot.catalog.build_heartbeat_interval_secs must be > 0; a build that never \
                  says it is alive is ended by the catalog's reaper while it is still running"
-            );
-        }
-        self.validate_binding_store_arbitration()?;
-        Ok(())
-    }
-
-    /// 🔴 Refuses the literal `"observe"` arbitration mode outright, rather
-    /// than letting it fall through `ArbitrationMode::from_str_relaxed`'s
-    /// generic unrecognized-value fallback to `Fenced`. That fallback exists
-    /// for genuine typos and is a silent one by design (matching this file's
-    /// own doc comment on `binding_store.arbitration`); `"observe"` is not a
-    /// typo, it is a value this codebase used to accept on purpose and no
-    /// longer does, so a manifest that still names it must fail loudly
-    /// instead of quietly starting in a stricter mode than the operator
-    /// believes they configured -- indistinguishable from `"fenced"`/enforce
-    /// unless they go looking. Mirrors the Go side's own posture: once
-    /// `ParseSchedulerExecutionArbitration`/`ParseGatewayExecutionFencing`
-    /// lose their `"observe"` case arms, that same string falls into their
-    /// existing `default:` branch, which was always a hard parse error there
-    /// -- so both languages refuse the same input for the same reason,
-    /// they just arrive at "refuse" from different starting postures.
-    fn validate_binding_store_arbitration(&self) -> Result<()> {
-        if self.binding_store.arbitration == "observe" {
-            bail!(
-                "binding_store.arbitration = \"observe\" is no longer a supported value. That \
-                 mode existed only for the rollout that proved \"fenced\" enforcement was safe to \
-                 turn on everywhere; the rollout finished and the mode was removed from the code \
-                 on both sides of the wire. Set AENV_BINDING_STORE_ARBITRATION (or \
-                 [binding_store].arbitration) to \"fenced\" (the default) or \"off\" instead -- it \
-                 will not be silently treated as either."
             );
         }
         Ok(())
@@ -3938,44 +3893,6 @@ endpoint = "http://second:9000"
                 .contains("memory_snapshot.background_download.concurrency must be > 0"),
             "unexpected error: {err}"
         );
-    }
-
-    /// 🔴 R10's own regression guard: a manifest that still names the retired
-    /// `"observe"` arbitration mode must fail loudly at start-up, not be
-    /// silently treated as `"fenced"`/enforce (the generic
-    /// unrecognized-value fallback every other typo gets) or `"off"`. See
-    /// `validate_binding_store_arbitration`'s own doc comment for why this
-    /// value gets a dedicated refusal instead of falling into that fallback.
-    #[test]
-    fn validate_rejects_the_literal_observe_arbitration_value() {
-        let mut config = AppConfig::default();
-        config.binding_store.arbitration = "observe".to_string();
-
-        let err = config.validate().unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("binding_store.arbitration"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("observe"),
-            "the refusal should name the retired value: {message}"
-        );
-    }
-
-    /// Control for the test above: the two values that remain
-    /// (`ArbitrationMode::Fenced`/`Off`) must still load cleanly, so the
-    /// refusal is about the specific retired string and not a validator that
-    /// rejects the whole section.
-    #[test]
-    fn validate_accepts_the_two_remaining_arbitration_values() {
-        for value in ["fenced", "off"] {
-            let mut config = AppConfig::default();
-            config.binding_store.arbitration = value.to_string();
-            config
-                .validate()
-                .unwrap_or_else(|err| panic!("{value:?} must still be accepted: {err}"));
-        }
     }
 
     #[test]

@@ -436,8 +436,10 @@ impl NodeRegistryGrpcService {
     }
 
     /// Ports `recordBindingArbitration` (`metrics.go:409-414`): a no-op for
-    /// `BindingDecision::NotArbitrated` (arbitration off, Go's `""`), which
-    /// carries nothing worth counting.
+    /// `BindingDecision::NotArbitrated` (Go's `""`), which carries nothing
+    /// worth counting. Since the `[binding_store].arbitration` switch was
+    /// deleted, the one thing that still produces it is a write naming no
+    /// sandbox, dropped by both backends before any comparison happens.
     fn record_binding_execution(source: &'static str, decision: BindingDecision) {
         let label = decision.as_str();
         if label.is_empty() {

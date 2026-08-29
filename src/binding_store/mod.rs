@@ -67,7 +67,7 @@ use thiserror::Error;
 
 use crate::node_registry::types::{Node, RosterEntry};
 
-pub use arbitration::{ArbitrationMode, BindingDecision};
+pub use arbitration::BindingDecision;
 #[cfg(any(test, feature = "test-support"))]
 pub use in_memory::InMemoryBindingStore;
 pub use redis::{RedisBindingStore, RedisBindingStoreConfig};
@@ -99,8 +99,8 @@ pub enum BindingDeleteOutcome {
     Absent,
     /// The record named the incarnation the caller supplied; removed.
     Deleted,
-    /// The record named no incarnation (an old writer, or a heartbeat-only
-    /// arbitration-off record); removed anyway — deliberately asymmetric
+    /// The record named no incarnation (an old writer, or a heartbeat that
+    /// had none to name); removed anyway — deliberately asymmetric
     /// with the write path's "unknown never displaces known" rule, because
     /// an event that supplies a *known* incarnation is stronger evidence
     /// than a record that never named one.
@@ -194,7 +194,6 @@ pub struct BindingStoreSettings {
     /// The TTL a binding gets when the caller does not supply its own
     /// (`Binding::projection_ttl <= Duration::ZERO`).
     pub binding_ttl: Duration,
-    pub arbitration: ArbitrationMode,
     /// Mirrors Go's `projectionAuthoritative`: whether a heartbeat refresh
     /// of the *same* incarnation may keep the record's existing deadline
     /// (`KEEPTTL`) instead of always re-arming it. `false` means every
@@ -208,7 +207,6 @@ impl Default for BindingStoreSettings {
     fn default() -> Self {
         Self {
             binding_ttl: Duration::from_secs(30),
-            arbitration: ArbitrationMode::Fenced,
             projection_authoritative: false,
         }
     }

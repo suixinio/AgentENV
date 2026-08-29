@@ -7,9 +7,7 @@ use std::time::Duration;
 use redis::AsyncCommands;
 
 use super::harness::store_or_skip;
-use crate::binding_store::{
-    arbitration::ArbitrationMode, Binding, BindingStore, BindingStoreSettings,
-};
+use crate::binding_store::{Binding, BindingStore, BindingStoreSettings};
 use crate::node_registry::types::{Node, RosterEntry};
 
 fn unix(secs: u64) -> std::time::SystemTime {
@@ -27,7 +25,6 @@ fn node(id: &str) -> Node {
 fn authoritative_settings() -> BindingStoreSettings {
     BindingStoreSettings {
         binding_ttl: Duration::from_secs(30),
-        arbitration: ArbitrationMode::Fenced,
         projection_authoritative: true,
     }
 }
@@ -35,7 +32,6 @@ fn authoritative_settings() -> BindingStoreSettings {
 fn ephemeral_settings() -> BindingStoreSettings {
     BindingStoreSettings {
         binding_ttl: Duration::from_secs(30),
-        arbitration: ArbitrationMode::Fenced,
         projection_authoritative: false,
     }
 }
@@ -265,22 +261,7 @@ mod contract {
         super::store_or_skip_option(test, BindingStoreSettings::default()).await
     }
 
-    async fn new_contract_store_with_mode(
-        test: &str,
-        mode: crate::binding_store::ArbitrationMode,
-    ) -> Option<RedisBindingStore> {
-        super::store_or_skip_option(
-            test,
-            BindingStoreSettings {
-                arbitration: mode,
-                ..BindingStoreSettings::default()
-            },
-        )
-        .await
-    }
-
     crate::binding_store::contract::binding_store_contract!();
-    crate::binding_store::contract::binding_store_arbitration_contract!();
 }
 
 /// A non-macro variant of `store_or_skip!` for `mod contract`, which needs

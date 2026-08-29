@@ -1,46 +1,39 @@
-//! Task's own "D3": the two arbitration rules a write may run under. Ports
-//! `services/scheduler/internal/store.go`'s `arbiter` type and its two
-//! remaining implementations (`arbitrateFenced`/`arbitrateOff`), and their
-//! Lua twins in `redis_store.go` (`redisArbitrationFenced`/`Off`, ported
-//! verbatim in `super::redis::scripts`).
+//! Task's own "D3": the arbitration rule every write runs under. Ports
+//! `services/scheduler/internal/store.go`'s `arbitrateFenced`, and its Lua
+//! twin in `redis_store.go` (`redisArbitrationFenced`, ported verbatim in
+//! `super::redis::scripts`).
 //!
-//! 🔴 A third rule, `Observing`/`"observe"`, existed here and on both Go
-//! twins through the rollout that proved enforcing was safe to turn on. That
-//! rollout finished (`deploy/k8s/base/kustomization.yaml`'s
-//! `execution-fencing-config` comment records the cluster reaching `enforce`)
-//! and the mode was deleted from all three implementations together. A caller
-//! that still passes the literal string `"observe"` is refused at config load
-//! (`crate::cfg::AppConfig::validate`), not silently downgraded — see that
-//! function's own doc comment.
-
-/// Which arbitration rule a write runs under. Mirrors
-/// `InMemoryArbitrationFor`/`RedisArbitrationFor`'s string-mode mapping:
-/// `"off"` -> [`ArbitrationMode::Off`], anything else (including
-/// unrecognized) -> [`ArbitrationMode::Fenced`], the safe default. The
-/// literal string `"observe"` is refused earlier, at config validation, so it
-/// never reaches this function in a process that loaded its config normally
-/// — see [`crate::cfg::AppConfig::validate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ArbitrationMode {
-    #[default]
-    Fenced,
-    Off,
-}
-
-impl ArbitrationMode {
-    pub fn from_str_relaxed(mode: &str) -> Self {
-        match mode {
-            "off" => ArbitrationMode::Off,
-            _ => ArbitrationMode::Fenced,
-        }
-    }
-}
+//! 🔴 There is one rule, and there is no switch. Two others existed here and
+//! on both Go twins: `Observing`/`"observe"` through the rollout that proved
+//! enforcing was safe to turn on, and `Off`/`"off"` as that rollout's
+//! rollback target. The rollout finished
+//! (`deploy/k8s/base/kustomization.yaml`'s `execution-fencing-config`
+//! comment records the cluster reaching `enforce`) and both modes are gone,
+//! together with the `ArbitrationMode` enum that selected between them, the
+//! `[binding_store].arbitration` config knob
+//! (`AENV_BINDING_STORE_ARBITRATION`), and the Redis `ARBITRATION_OFF`
+//! prelude. `aenv-api` builds one arbitration and there is no value a
+//! deployment can set to get another; a manifest that still names one is
+//! simply ignored, and the only value that ever worked in production is
+//! what it now gets unconditionally.
 
 /// Mirrors Go's `bindingDecision` enum (`store.go:99-125`) — the label
 /// [`super::BindingStore::record`]/[`super::BindingStore::reconcile_node`]
 /// hand back for the `agentenv_api_binding_execution_total{decision,source}`
-/// metric. `NotArbitrated` is arbitration-off's answer ("" in Go): nothing
-/// was compared, so nothing was decided.
+/// metric.
+///
+/// 🔴 [`BindingDecision::NotArbitrated`] survived the deletion of the
+/// arbitration switch, and it is **not** a leftover. It used to have two
+/// producers: `arbitrate_off`, which is gone with the mode that selected it,
+/// and the empty-sandbox-id no-op at the top of
+/// [`super::BindingStore::record`] in *both* backends
+/// (`super::in_memory::InMemoryBindingStore::record`,
+/// `super::redis::RedisBindingStore::record`) — a write naming no sandbox is
+/// dropped before any comparison happens, so there is nothing to report, and
+/// that is exactly what this variant says. Its wire spelling stays the empty
+/// string: it is the `decision` label on
+/// `agentenv_api_binding_execution_total`, so renaming it would silently
+/// re-partition an existing time series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingDecision {
     Installed,
@@ -96,25 +89,6 @@ pub fn arbitrate_fenced(incumbent: &str, held: bool, challenger: &str) -> (bool,
     }
 }
 
-/// Ports `arbitrateOff` (`store.go:176-180`): always accepts, reports no
-/// decision.
-pub fn arbitrate_off(_incumbent: &str, _held: bool, _challenger: &str) -> (bool, BindingDecision) {
-    (true, BindingDecision::NotArbitrated)
-}
-
-/// Dispatches to the rule [`ArbitrationMode`] selects.
-pub fn arbitrate(
-    mode: ArbitrationMode,
-    incumbent: &str,
-    held: bool,
-    challenger: &str,
-) -> (bool, BindingDecision) {
-    match mode {
-        ArbitrationMode::Fenced => arbitrate_fenced(incumbent, held, challenger),
-        ArbitrationMode::Off => arbitrate_off(incumbent, held, challenger),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,44 +137,14 @@ mod tests {
         );
     }
 
+    /// 🔴 The empty spelling is a metric contract, not a formatting
+    /// choice: `NotArbitrated` is what both backends report for a write that
+    /// named no sandbox, and it reaches Prometheus as the `decision` label on
+    /// `agentenv_api_binding_execution_total`. Giving it a word would
+    /// re-partition an existing series.
     #[test]
-    fn off_always_accepts_and_reports_nothing() {
-        assert_eq!(
-            arbitrate_off("exec-2", true, "exec-1"),
-            (true, BindingDecision::NotArbitrated)
-        );
+    fn not_arbitrated_still_spells_itself_as_the_empty_string() {
         assert_eq!(BindingDecision::NotArbitrated.as_str(), "");
-    }
-
-    #[test]
-    fn mode_from_str_defaults_to_fenced() {
-        assert_eq!(
-            ArbitrationMode::from_str_relaxed("off"),
-            ArbitrationMode::Off
-        );
-        assert_eq!(
-            ArbitrationMode::from_str_relaxed("anything-else"),
-            ArbitrationMode::Fenced
-        );
-        assert_eq!(
-            ArbitrationMode::from_str_relaxed(""),
-            ArbitrationMode::Fenced
-        );
-    }
-
-    /// 🔴 The removed mode's own regression guard: `from_str_relaxed` no
-    /// longer recognizes `"observe"` and folds it into the same safe-default
-    /// bucket as any other unrecognized string. This function alone cannot
-    /// enforce "explicit error" — it has no `Result` to return — so the real
-    /// guard is `crate::cfg::AppConfig::validate`'s dedicated refusal; this
-    /// test only pins that this lower-level function stopped granting
-    /// `"observe"` special recognition, so nobody re-adds the arm here
-    /// without also reading why it moved.
-    #[test]
-    fn from_str_relaxed_no_longer_recognizes_observe() {
-        assert_eq!(
-            ArbitrationMode::from_str_relaxed("observe"),
-            ArbitrationMode::Fenced
-        );
+        assert!(BindingDecision::NotArbitrated.accepted());
     }
 }

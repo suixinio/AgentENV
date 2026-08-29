@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use aenv_api::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
 use aenv_api::binding_store::{
-    ArbitrationMode, BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
+    BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
 use aenv_api::cfg::{
     AppConfig, BindingStoreConfig, ClusterNodeRegistryStoreConfig, MetadataStoreBackendKind,
@@ -939,7 +939,6 @@ async fn start_native_node_registry(
 async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<dyn BindingStore>> {
     let settings = BindingStoreSettings {
         binding_ttl: Duration::from_secs(config.binding_ttl_secs),
-        arbitration: ArbitrationMode::from_str_relaxed(&config.arbitration),
         projection_authoritative: config.projection_authoritative,
     };
     let redis_config = RedisBindingStoreConfig {

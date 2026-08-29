@@ -69,8 +69,8 @@ pub async fn record_with_no_execution_id_installs_unknown<S: BindingStore>(store
     assert_eq!(decision, BindingDecision::InstalledUnknown);
 }
 
-/// Fenced arbitration (both backends default to it): a lexicographically
-/// older challenger is refused and the existing record is left untouched.
+/// Fenced arbitration (the only rule there is): a lexicographically older
+/// challenger is refused and the existing record is left untouched.
 pub async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
     store
         .record(
@@ -330,10 +330,10 @@ pub async fn delete_with_a_stale_incarnation_is_refused_and_the_record_survives<
 pub async fn delete_of_a_record_with_no_known_incarnation_deletes_anyway<S: BindingStore>(
     store: &S,
 ) {
-    // A record that never named an incarnation (arbitration-off, or an old
-    // writer) -- an event carrying a known execution id is stronger
-    // evidence than a record that never named one, so this deletes rather
-    // than refusing -- deliberately asymmetric with the write path.
+    // A record that never named an incarnation (an old writer, or one that
+    // simply had none to name) -- an event carrying a known execution id is
+    // stronger evidence than a record that never named one, so this deletes
+    // rather than refusing -- deliberately asymmetric with the write path.
     store
         .record(
             "sbx-1",
@@ -375,92 +375,72 @@ pub async fn delete_with_an_empty_execution_id_is_a_noop_never_an_unguarded_dele
     );
 }
 
-// ---- Arbitration-mode contract: Off, run against both backends ----
-//
-// Every function above runs under `ArbitrationMode::Fenced` only (both
-// backends' `new_contract_store` build with `BindingStoreSettings::default()`,
-// whose `arbitration` field defaults to `Fenced`). `arbitration.rs`'s own
-// unit test (`off_always_accepts_and_reports_nothing`) already proves the
-// pure `arbitrate_off` function is correct in isolation — what neither
-// backend's store-level suite ever exercised is that
-// `BindingStore::record`/`reconcile_node` actually *thread* the configured
-// mode through to that function rather than hard-wiring `Fenced`'s
-// accept/reject behavior regardless of what `BindingStoreSettings` said.
-// A backend that ignored `settings.arbitration` entirely would still pass
-// every test above (they never construct a non-Fenced store) and would
-// still pass `arbitration.rs`'s pure unit test (it never touches a real
-// `BindingStore` at all) — this one closes exactly that gap, for both
-// backends, the same "one suite, run twice" discipline the rest of this
-// file already uses.
-//
-// 🔴 A second case lived here, `record_observing_mode_accepts_but_still_
-// labels_the_fenced_decision`, exercising `ArbitrationMode::Observing`. That
-// mode was deleted once the rollout it existed for finished (the deploy
-// manifest's `execution-fencing-config` comment records the cluster reaching
-// `enforce`), and the case was deleted with it rather than left asserting a
-// variant that no longer compiles.
+/// 🔴 A write naming no sandbox is dropped before any comparison happens,
+/// and it says so: [`BindingDecision::NotArbitrated`], whose wire spelling is
+/// the empty string.
+///
+/// This is the *surviving* producer of that variant. The other was
+/// `arbitrate_off`, the always-accept rule behind the deleted
+/// `[binding_store].arbitration = "off"` switch; deleting the variant along
+/// with the switch would have silently turned this no-op into something
+/// else. It has to be a contract function rather than a per-backend test
+/// because both backends carry their own copy of the guard
+/// (`InMemoryBindingStore::record`, `RedisBindingStore::record`) — the exact
+/// shape a fix made to one and forgotten for the other hides in.
+///
+/// The `"   "` case is the same guard one step earlier: both backends `trim`
+/// before testing for empty, so a whitespace-only id is an empty one.
+pub async fn record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrated<
+    S: BindingStore,
+>(
+    store: &S,
+) {
+    for sandbox_id in ["", "   "] {
+        let decision = store
+            .record(
+                sandbox_id,
+                Binding {
+                    node: node("node-a"),
+                    execution_id: "exec-1".to_string(),
+                    projection_ttl: Duration::ZERO,
+                },
+                unix(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            BindingDecision::NotArbitrated,
+            "a write naming no sandbox ({sandbox_id:?}) arbitrated something"
+        );
+        assert_eq!(
+            decision.as_str(),
+            "",
+            "NotArbitrated's metric label must stay the empty string"
+        );
+        assert!(
+            store.get(sandbox_id, unix(0)).await.unwrap().is_none(),
+            "a write naming no sandbox ({sandbox_id:?}) still stored a record"
+        );
+    }
 
-/// Off: always accepts, and reports no decision at all -- nothing for
-/// `agentenv_api_binding_execution_total` to count.
-pub async fn record_off_mode_accepts_anything_and_reports_no_decision<S: BindingStore>(store: &S) {
-    store
+    // 🔴 Control: the same call with a real id does write, so "nothing was
+    // stored" above is about the empty id and not about a store that
+    // refuses everything.
+    let decision = store
         .record(
             "sbx-1",
             Binding {
                 node: node("node-a"),
-                execution_id: "b-newer".to_string(),
+                execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::ZERO,
             },
             unix(0),
         )
         .await
         .unwrap();
-
-    let decision = store
-        .record(
-            "sbx-1",
-            Binding {
-                node: node("node-b"),
-                execution_id: "a-older".to_string(),
-                projection_ttl: Duration::ZERO,
-            },
-            unix(1),
-        )
-        .await
-        .unwrap();
-    assert_eq!(decision, BindingDecision::NotArbitrated);
-
-    let binding = store.get("sbx-1", unix(1)).await.unwrap().expect("bound");
-    assert_eq!(
-        binding.node.id, "node-b",
-        "Off must move the record unconditionally"
-    );
-}
-
-macro_rules! binding_store_arbitration_contract_suite {
-    ($($name:ident: $mode:expr),* $(,)?) => {
-        $(
-            #[tokio::test]
-            async fn $name() {
-                let Some(store) = new_contract_store_with_mode(stringify!($name), $mode).await else {
-                    return;
-                };
-                crate::binding_store::contract::$name(&store).await;
-            }
-        )*
-    };
-}
-
-/// Companion to [`binding_store_contract`]: each backend's `mod contract`
-/// calls this too, alongside a `new_contract_store_with_mode(test, mode)`
-/// (the same shape as `new_contract_store`, plus the mode to build under).
-macro_rules! binding_store_arbitration_contract {
-    () => {
-        crate::binding_store::contract::binding_store_arbitration_contract_suite!(
-            record_off_mode_accepts_anything_and_reports_no_decision:
-                crate::binding_store::ArbitrationMode::Off,
-        );
-    };
+    assert_eq!(decision, BindingDecision::Installed);
+    assert!(store.get("sbx-1", unix(0)).await.unwrap().is_some());
 }
 
 macro_rules! binding_store_contract_suite {
@@ -494,11 +474,9 @@ macro_rules! binding_store_contract {
             delete_with_a_stale_incarnation_is_refused_and_the_record_survives,
             delete_of_a_record_with_no_known_incarnation_deletes_anyway,
             delete_with_an_empty_execution_id_is_a_noop_never_an_unguarded_delete,
+            record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrated,
         );
     };
 }
 
-pub(crate) use {
-    binding_store_arbitration_contract, binding_store_arbitration_contract_suite,
-    binding_store_contract, binding_store_contract_suite,
-};
+pub(crate) use {binding_store_contract, binding_store_contract_suite};

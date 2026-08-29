@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use super::arbitration::{arbitrate, BindingDecision};
+use super::arbitration::{arbitrate_fenced, BindingDecision};
 use super::{Binding, BindingDeleteOutcome, BindingStore, BindingStoreError, BindingStoreSettings};
 use crate::node_registry::types::{Node, RosterEntry};
 
@@ -126,12 +126,7 @@ impl InMemoryBindingStore {
             ""
         };
 
-        let (accept, decision) = arbitrate(
-            self.settings.arbitration,
-            incumbent,
-            held,
-            &binding.execution_id,
-        );
+        let (accept, decision) = arbitrate_fenced(incumbent, held, &binding.execution_id);
         if !accept {
             return decision;
         }
@@ -319,7 +314,6 @@ impl BindingStore for InMemoryBindingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binding_store::arbitration::ArbitrationMode;
     use std::time::Duration;
 
     /// The shared contract, run against this backend. The Redis backend
@@ -333,18 +327,7 @@ mod tests {
             Some(InMemoryBindingStore::new(BindingStoreSettings::default()))
         }
 
-        async fn new_contract_store_with_mode(
-            _test: &str,
-            mode: crate::binding_store::ArbitrationMode,
-        ) -> Option<InMemoryBindingStore> {
-            Some(InMemoryBindingStore::new(BindingStoreSettings {
-                arbitration: mode,
-                ..BindingStoreSettings::default()
-            }))
-        }
-
         crate::binding_store::contract::binding_store_contract!();
-        crate::binding_store::contract::binding_store_arbitration_contract!();
     }
 
     fn unix(secs: u64) -> SystemTime {
@@ -362,7 +345,6 @@ mod tests {
     fn settings() -> BindingStoreSettings {
         BindingStoreSettings {
             binding_ttl: Duration::from_secs(30),
-            arbitration: ArbitrationMode::Fenced,
             projection_authoritative: false,
         }
     }

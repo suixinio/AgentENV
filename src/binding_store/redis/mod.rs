@@ -195,7 +195,7 @@ impl BindingStore for RedisBindingStore {
         }
         let value = marshal_record(&binding.node, &binding.execution_id);
         let mut connection = self.connection.clone();
-        let result: Vec<(String, String)> = scripts::record_script(self.settings.arbitration)
+        let result: Vec<(String, String)> = scripts::record_script()
             .key(self.binding_key(sandbox_id))
             .key(self.node_index_key(&binding.node.id))
             .arg(value)
@@ -256,10 +256,7 @@ impl BindingStore for RedisBindingStore {
             .collect();
 
         let mut connection = self.connection.clone();
-        let script = scripts::reconcile_script(
-            self.settings.arbitration,
-            self.settings.projection_authoritative,
-        );
+        let script = scripts::reconcile_script(self.settings.projection_authoritative);
         let mut invocation = script.key(self.node_index_key(&node.id));
         invocation
             .arg(&node.id)

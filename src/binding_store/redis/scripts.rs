@@ -1,23 +1,28 @@
 //! Task's own "D3": the Lua scripts `RedisBindingStore` runs, ported
 //! verbatim from `services/scheduler/internal/redis_store.go`'s own
-//! constants (`redisArbitrationFenced`/`Off`,
+//! constants (`redisArbitrationFenced`,
 //! `redisKeepsDeadlineAuthoritative`/`Ephemeral`,
 //! `redisRecordBindingScriptBody`, `redisReconcileNodeScriptBody`,
-//! `redisDeleteBindingScriptBody`). A third prelude,
-//! `redisArbitrationObserving`, existed through the rollout that proved
-//! `Fenced` was safe to turn on everywhere; it and its Rust twin
-//! (`ARBITRATION_OBSERVING`) were deleted together once that rollout
-//! finished. Predicates live in Lua for the same
+//! `redisDeleteBindingScriptBody`). Predicates live in Lua for the same
 //! reason `src/orchestrator/store/redis/scripts.rs` gives for its own
 //! scripts: a lockless Rust-side read-modify-write would race a concurrent
 //! write between the read and the write.
+//!
+//! 🔴 [`ARBITRATION_FENCED`] is the only arbitration prelude, and it is not
+//! selected — it is concatenated. Two others existed: `ARBITRATION_OBSERVING`
+//! through the rollout that proved `Fenced` was safe to turn on everywhere,
+//! and `ARBITRATION_OFF` (`accepts` returning `true, ""` unconditionally) as
+//! that rollout's rollback target. Both are gone, along with the
+//! `ArbitrationMode` enum that picked between them and the
+//! `[binding_store].arbitration` knob that set it — see
+//! `super::super::arbitration`'s module doc.
 //!
 //! # 🔴 The KEEPTTL fix ("阶段 1 第 5 点")
 //!
 //! [`reconcile_script`]'s deadline prelude is *not* unconditional `KEEPTTL`
 //! gated only by a Go-side TTL value, the way an earlier shipped version
-//! read. `keeps_deadline` is picked by [`super::super::ArbitrationMode`]'s
-//! sibling setting, `projection_authoritative`: when it is `false`
+//! read. `keeps_deadline` is picked by `projection_authoritative`, the one
+//! `BindingStoreSettings` switch these scripts still read: when it is `false`
 //! (ephemeral/rollback mode), every heartbeat write always re-arms a fresh
 //! deadline (`PX`), even for the same incarnation. Only when it is `true`
 //! does a same-incarnation refresh keep the existing deadline — and even
@@ -28,8 +33,6 @@
 use std::sync::OnceLock;
 
 use redis::Script;
-
-use super::super::arbitration::ArbitrationMode;
 
 // ---------------------------------------------------------------------------
 // Shared parse helper, prefixed onto every script below.
@@ -53,7 +56,7 @@ end
 "#;
 
 // ---------------------------------------------------------------------------
-// Arbitration preludes: each defines `accepts(raw, challenger)`.
+// Arbitration prelude: defines `accepts(raw, challenger)`.
 // ---------------------------------------------------------------------------
 
 const ARBITRATION_FENCED: &str = r#"
@@ -69,19 +72,6 @@ local function accepts(raw, challenger)
   return false, "rejected_older"
 end
 "#;
-
-const ARBITRATION_OFF: &str = r#"
-local function accepts(raw, challenger)
-  return true, ""
-end
-"#;
-
-fn arbitration_prelude(mode: ArbitrationMode) -> &'static str {
-    match mode {
-        ArbitrationMode::Fenced => ARBITRATION_FENCED,
-        ArbitrationMode::Off => ARBITRATION_OFF,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Deadline preludes: each defines `keeps_deadline(incumbent, challenger, budget_ms)`.
@@ -143,26 +133,9 @@ redis.call("PEXPIRE", KEYS[2], ARGV[6])
 return { { ARGV[3], decision } }
 "#;
 
-fn build_record(mode: ArbitrationMode) -> Script {
-    Script::new(&format!(
-        "{}{}{}",
-        PARSE_BINDING,
-        arbitration_prelude(mode),
-        RECORD_BODY
-    ))
-}
-
-pub fn record_script(mode: ArbitrationMode) -> &'static Script {
-    match mode {
-        ArbitrationMode::Fenced => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_record(mode))
-        }
-        ArbitrationMode::Off => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_record(mode))
-        }
-    }
+pub fn record_script() -> &'static Script {
+    static S: OnceLock<Script> = OnceLock::new();
+    S.get_or_init(|| Script::new(&format!("{PARSE_BINDING}{ARBITRATION_FENCED}{RECORD_BODY}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,33 +225,25 @@ end
 return decisions
 "#;
 
-fn build_reconcile(mode: ArbitrationMode, projection_authoritative: bool) -> Script {
+fn build_reconcile(projection_authoritative: bool) -> Script {
     Script::new(&format!(
         "{}{}{}{}",
         PARSE_BINDING,
-        arbitration_prelude(mode),
+        ARBITRATION_FENCED,
         deadline_prelude(projection_authoritative),
         RECONCILE_BODY
     ))
 }
 
-pub fn reconcile_script(mode: ArbitrationMode, projection_authoritative: bool) -> &'static Script {
-    match (mode, projection_authoritative) {
-        (ArbitrationMode::Fenced, false) => {
+pub fn reconcile_script(projection_authoritative: bool) -> &'static Script {
+    match projection_authoritative {
+        false => {
             static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_reconcile(mode, projection_authoritative))
+            S.get_or_init(|| build_reconcile(false))
         }
-        (ArbitrationMode::Fenced, true) => {
+        true => {
             static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_reconcile(mode, projection_authoritative))
-        }
-        (ArbitrationMode::Off, false) => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_reconcile(mode, projection_authoritative))
-        }
-        (ArbitrationMode::Off, true) => {
-            static S: OnceLock<Script> = OnceLock::new();
-            S.get_or_init(|| build_reconcile(mode, projection_authoritative))
+            S.get_or_init(|| build_reconcile(true))
         }
     }
 }
@@ -325,21 +290,20 @@ mod tests {
     use super::*;
 
     /// A minimal shape check that catches an unbalanced quote/concat error
-    /// without needing a live Redis: every script must at least produce a
-    /// non-empty SHA and must differ between arbitration modes (a copy-paste
-    /// that reused the same prelude for two modes would collapse them to
-    /// the same SHA).
+    /// without needing a live Redis: the script must produce a stable,
+    /// non-empty SHA and must be memoized rather than rebuilt per call.
     #[test]
-    fn record_scripts_differ_by_arbitration_mode() {
-        let fenced = record_script(ArbitrationMode::Fenced);
-        let off = record_script(ArbitrationMode::Off);
-        assert_ne!(fenced.get_hash(), off.get_hash());
+    fn the_record_script_is_stable_and_memoized() {
+        let a = record_script();
+        let b = record_script();
+        assert!(!a.get_hash().is_empty());
+        assert_eq!(a.get_hash(), b.get_hash(), "must be memoized");
     }
 
     #[test]
     fn reconcile_scripts_differ_by_projection_authoritative() {
-        let ephemeral = reconcile_script(ArbitrationMode::Fenced, false);
-        let authoritative = reconcile_script(ArbitrationMode::Fenced, true);
+        let ephemeral = reconcile_script(false);
+        let authoritative = reconcile_script(true);
         assert_ne!(
             ephemeral.get_hash(),
             authoritative.get_hash(),

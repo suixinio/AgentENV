@@ -35,10 +35,10 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::{impls::ResumeArbitration, ApiImpl},
+    api::ApiImpl,
     cfg::ConfigManager,
     observability::prometheus::HttpRouteSource,
-    orchestrator::{NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
+    orchestrator::{OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
     types::{ExecutionId, SandboxId},
 };
 
@@ -67,8 +67,6 @@ enum ProxyRequestError {
     InvalidHostRoute(&'static str),
     SandboxNotFound(SandboxId),
     SandboxUnavailable(SandboxId, SandboxState),
-    AutoResumeFailed(SandboxId),
-    AutoResumeTimedOut(SandboxId),
     MissingRuntimeRoute(SandboxId),
     InvalidUpstreamUri,
 }
@@ -83,7 +81,6 @@ const E2B_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
-const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
 /// Set by the gateway when the control plane can name the incarnation it is
 /// routing to. Absent whenever it cannot, which is an ordinary answer.
 const EXPECT_EXECUTION_HEADER: &str = "x-agentenv-expect-execution-id";
@@ -116,29 +113,22 @@ const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Every outcome `try_auto_resume` can record. A closed set: it is a metric
-/// label, and an unbounded label value is a memory leak.
-const AUTO_RESUME_RESULTS: &[&str] = &["ok", "refused", "failed", "timed_out"];
-
-fn record_auto_resume(result: &'static str) {
-    debug_assert!(AUTO_RESUME_RESULTS.contains(&result));
-    metrics::counter!("agentenv_proxy_auto_resume_total", "result" => result).increment(1);
-}
-
-#[cfg(test)]
-const PROXY_AUTO_RESUME_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
-const PROXY_AUTO_RESUME_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// How long a wake-up may take before the caller is told it did not happen.
 ///
-/// Shared with `crate::api::impls`'s data-plane wake-up rather than duplicated,
-/// for the same reason the timeout floor below is: a wake-up that arrived over
-/// the gateway's cold path and one that arrived through a node's own proxy must
-/// be bounded identically, or the pre-split single process stops being today's behaviour and
-/// the rollback story goes with it.
+/// 🔴 Declared in the file that no longer wakes anything, and read only by
+/// `crate::api::impls::resume_surface` — the gRPC surface the gateway's cold
+/// path calls. The local reverse proxy used to take the same decision on its
+/// own request path and shared this bound with it; the proxy half of that is
+/// deleted and the bound is not, because a wake-up driven by a request already
+/// in flight still must not run unbounded: it holds the gateway's request open
+/// and leaves the cluster row in `resuming` until the lease lapses.
 pub(in crate::api) fn auto_resume_deadline() -> Duration {
-    PROXY_AUTO_RESUME_TIMEOUT
+    #[cfg(test)]
+    const DEADLINE: Duration = Duration::from_millis(100);
+    #[cfg(not(test))]
+    const DEADLINE: Duration = Duration::from_secs(60);
+
+    DEADLINE
 }
 
 pub(in crate::api) fn auto_resume_min_sandbox_timeout() -> Duration {
@@ -171,17 +161,6 @@ pub fn router<I>(api_impl: I) -> Router
 where
     I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
 {
-    // 🔴 Published at zero before any request arrives, for every role and every
-    // outcome. The acceptance test for moving the wake-up decision off the node
-    // is "this counter stays at zero on a `aenv-node` fleet"
-    // (`_sd-impl-phase3-role.md` §12, P3 control A), and a counter that is
-    // absent until its first increment makes "zero" and "the probe is looking
-    // at a series that does not exist" the same scrape. Lifting it is then a
-    // real check: point traffic at a the pre-split single process node's own port and it moves.
-    for result in AUTO_RESUME_RESULTS {
-        metrics::counter!("agentenv_proxy_auto_resume_total", "result" => *result).increment(0);
-    }
-
     Router::new()
         .route(PROXY_ROUTE, any(proxy_via_prefix::<I>))
         // `/proxy/` has nothing left after the prefix, so the wildcard route
@@ -897,86 +876,42 @@ async fn resolve_proxy_request(
     let target_port =
         parse_target_port_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
 
-    let mut auto_resume_attempted = false;
-    let target = loop {
-        match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
-            Ok(ProxyLookupResult::Ready(target)) => break target,
-            Ok(ProxyLookupResult::NotFound) => {
-                return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
-                    sandbox_id,
-                )))
-            }
-            // 🔴 A branch on which half this is, and not a deletion.
-            // `aenv-node` must not start a sandbox on its own initiative — the
-            // wake-up decision belongs to the API half and reaches it over
-            // `crate::api::grpc::resume` — while `aenv-api` takes the four
-            // decision arms below. Both binaries link this function, so this is
-            // a runtime question here even though it is settled at build time
-            // for each of them; see [`ApiImpl::owns_sandboxes`].
-            Ok(ProxyLookupResult::Paused { auto_resume: true }) if api_impl.owns_sandboxes() => {
-                if auto_resume_attempted {
-                    return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                        sandbox_id,
-                    )));
-                }
-                authorize_secure_envd_auto_resume(
-                    api_impl,
-                    sandbox_id,
-                    target_port,
-                    &parts.headers,
-                )
-                .await?;
-                try_auto_resume(api_impl, sandbox_id).await?;
-                auto_resume_attempted = true;
-                continue;
-            }
-            // 🔴 The same answer a sandbox with `auto_resume: false` gets, and
-            // deliberately the same: from the caller's side "this node does not
-            // wake sandboxes" and "this sandbox does not wake on traffic" are
-            // one fact — the sandbox is paused and this request will not change
-            // that. The gateway is what turns a paused sandbox back into a
-            // running one, and it does that before it ever reaches a node.
-            Ok(ProxyLookupResult::Paused { .. }) => {
-                return Err(proxy_error_response(
-                    &ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
-                ))
-            }
-            Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
-                if auto_resume_attempted =>
-            {
-                return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                    sandbox_id,
-                )))
-            }
-            Ok(ProxyLookupResult::Unavailable(state)) => {
-                return Err(proxy_error_response(
-                    &ProxyRequestError::SandboxUnavailable(sandbox_id, state),
-                ))
-            }
-            Ok(ProxyLookupResult::RouteMissing) => {
-                return Err(proxy_error_response(
-                    &ProxyRequestError::MissingRuntimeRoute(sandbox_id),
-                ))
-            }
-            Err(OrchestratorError::SandboxNotFound(_)) => {
-                return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
-                    sandbox_id,
-                )))
-            }
-            Err(err) if auto_resume_attempted => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "failed to resolve proxy target after auto-resume"
-                );
-                return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                    sandbox_id,
-                )));
-            }
-            Err(err) => {
-                warn!(sandbox_id = %sandbox_id, error = %err, "failed to resolve proxy target");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-            }
+    let target = match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
+        Ok(ProxyLookupResult::Ready(target)) => target,
+        Ok(ProxyLookupResult::NotFound) => {
+            return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
+                sandbox_id,
+            )))
+        }
+        // 🔴 One answer for a paused sandbox, whatever its `auto_resume`
+        // says, and deliberately so: from the caller's side "this process does
+        // not wake sandboxes" and "this sandbox does not wake on traffic" are
+        // one fact — the sandbox is paused and this request will not change
+        // that. Waking it is the gateway's cold path, which asks
+        // `crate::api::grpc::resume` before traffic ever reaches a proxy.
+        Ok(ProxyLookupResult::Paused { .. }) => {
+            return Err(proxy_error_response(
+                &ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
+            ))
+        }
+        Ok(ProxyLookupResult::Unavailable(state)) => {
+            return Err(proxy_error_response(
+                &ProxyRequestError::SandboxUnavailable(sandbox_id, state),
+            ))
+        }
+        Ok(ProxyLookupResult::RouteMissing) => {
+            return Err(proxy_error_response(
+                &ProxyRequestError::MissingRuntimeRoute(sandbox_id),
+            ))
+        }
+        Err(OrchestratorError::SandboxNotFound(_)) => {
+            return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
+                sandbox_id,
+            )))
+        }
+        Err(err) => {
+            warn!(sandbox_id = %sandbox_id, error = %err, "failed to resolve proxy target");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
 
@@ -992,125 +927,6 @@ async fn resolve_proxy_request(
         upstream_uri,
         original_host: parts.headers.get(header::HOST).cloned(),
     })
-}
-
-async fn authorize_secure_envd_auto_resume(
-    api_impl: &ApiImpl,
-    sandbox_id: SandboxId,
-    target_port: u16,
-    headers: &HeaderMap,
-) -> Result<(), Response<Body>> {
-    if target_port != ConfigManager::global_config().tools.control_plane_port {
-        return Ok(());
-    }
-    let metadata = api_impl
-        .orchestrator()
-        .get_sandbox(&sandbox_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
-        .ok_or_else(|| proxy_error_response(&ProxyRequestError::SandboxNotFound(sandbox_id)))?;
-    if !metadata.secure {
-        return Ok(());
-    }
-    let candidate = headers
-        .get(ENVD_ACCESS_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if api_impl
-        .orchestrator()
-        .validate_envd_access_token(sandbox_id, candidate)
-    {
-        return Ok(());
-    }
-
-    Err(Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        )
-        .body(Body::from("invalid or missing envd access token"))
-        .expect("static unauthorized proxy response is valid"))
-}
-
-async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<(), Response<Body>> {
-    // 🔴 The data plane takes the same resume decision the REST route does.
-    // It used to go straight to the orchestrator, past both the supersession
-    // check and the claim — so a request arriving here could bring up a second
-    // copy of a sandbox that is live on another node, with nothing recorded
-    // anywhere. It cannot any more: the claim is the only source of the token
-    // `resume_sandbox` requires.
-    let (claimed, held) = match api_impl.arbitrate_resume(sandbox_id).await {
-        ResumeArbitration::Proceed(claimed) => (claimed, None),
-        ResumeArbitration::Held(entry, claimed) => (claimed, Some(entry.generation)),
-        // Somebody else holds it, or nobody could be asked. Either way this
-        // node must not start it. 🔴 Never 404 here: on this route a 404 says
-        // "no such sandbox", and the sandbox exists — it is just not ours.
-        ResumeArbitration::Blocked { origin_node_id }
-        | ResumeArbitration::NotReady { origin_node_id } => {
-            warn!(
-                sandbox_id = %sandbox_id,
-                node_id = %origin_node_id,
-                "refusing to auto-resume a sandbox the cluster holds elsewhere"
-            );
-            record_auto_resume("refused");
-            return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                sandbox_id,
-            )));
-        }
-        ResumeArbitration::Unavailable { reason } => {
-            warn!(
-                sandbox_id = %sandbox_id,
-                error = %reason,
-                "refusing to auto-resume a sandbox the cluster could not be asked about"
-            );
-            record_auto_resume("refused");
-            return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                sandbox_id,
-            )));
-        }
-    };
-
-    match timeout(
-        PROXY_AUTO_RESUME_TIMEOUT,
-        api_impl.orchestrator().resume_sandbox(
-            sandbox_id,
-            NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout()),
-            claimed,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
-            debug!(sandbox_id = %sandbox_id, "sandbox auto-resume completed");
-            record_auto_resume("ok");
-            Ok(())
-        }
-        Ok(Err(err)) => {
-            warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume failed");
-            record_auto_resume("failed");
-            if let Some(generation) = held {
-                api_impl.abandon_claim(sandbox_id, generation).await;
-            }
-            Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                sandbox_id,
-            )))
-        }
-        Err(_) => {
-            warn!(
-                sandbox_id = %sandbox_id,
-                timeout_ms = PROXY_AUTO_RESUME_TIMEOUT.as_millis(),
-                "sandbox auto-resume timed out"
-            );
-            record_auto_resume("timed_out");
-            if let Some(generation) = held {
-                api_impl.abandon_claim(sandbox_id, generation).await;
-            }
-            Err(proxy_error_response(
-                &ProxyRequestError::AutoResumeTimedOut(sandbox_id),
-            ))
-        }
-    }
 }
 
 fn parse_sandbox_id_header(headers: &HeaderMap) -> Result<SandboxId, ProxyRequestError> {
@@ -1153,12 +969,6 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
             StatusCode::GONE,
             "sandbox is not proxyable in its current state",
         ),
-        ProxyRequestError::AutoResumeFailed(_) => {
-            (StatusCode::BAD_GATEWAY, "sandbox auto-resume failed")
-        }
-        ProxyRequestError::AutoResumeTimedOut(_) => {
-            (StatusCode::GATEWAY_TIMEOUT, "sandbox auto-resume timed out")
-        }
         ProxyRequestError::MissingRuntimeRoute(_) => (
             StatusCode::BAD_GATEWAY,
             "sandbox route is temporarily unavailable",
@@ -1182,12 +992,6 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         }
         ProxyRequestError::SandboxUnavailable(sandbox_id, state) => {
             debug!(sandbox_id = %sandbox_id, state = ?state, status = %status, message, "proxy request rejected")
-        }
-        ProxyRequestError::AutoResumeFailed(sandbox_id) => {
-            warn!(sandbox_id = %sandbox_id, status = %status, message, "proxy auto-resume failed")
-        }
-        ProxyRequestError::AutoResumeTimedOut(sandbox_id) => {
-            warn!(sandbox_id = %sandbox_id, status = %status, message, "proxy auto-resume timed out")
         }
         ProxyRequestError::MissingRuntimeRoute(sandbox_id) => {
             warn!(sandbox_id = %sandbox_id, status = %status, message, "sandbox route missing for running sandbox")
@@ -1581,6 +1385,14 @@ fn tungstenite_message_to_axum(message: TungsteniteMessage) -> Option<WebSocketM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The envd access token header, named here and not beside the routing
+    /// constants because the proxy does not read it: it forwards every header
+    /// it is given untouched, and only these tests care that this particular
+    /// one arrives intact. Checking it was `authorize_secure_envd_auto_resume`'s
+    /// job, and waking a sandbox — with the token check that gates it — belongs
+    /// to `crate::api::impls::resume_surface` now.
+    const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
     use std::{
         convert::Infallible,
         net::{Ipv4Addr, SocketAddr},
@@ -2428,202 +2240,6 @@ mod tests {
             body,
             Bytes::from_static(b"sandbox is not proxyable in its current state")
         );
-    }
-
-    #[tokio::test]
-    async fn proxy_attempts_auto_resume_for_paused_sandbox_when_enabled() {
-        let upstream_addr = start_upstream_server().await;
-        let sandbox_id = SandboxId::new();
-        let app = proxy_app_for_sandbox_with_state_and_auto_resume(
-            &sandbox_id,
-            crate::orchestrator::SandboxState::Paused,
-            true,
-        )
-        .await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/proxy/health")
-                    .header("x-api-key", "test-key")
-                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
-                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body, Bytes::from_static(b"sandbox auto-resume failed"));
-    }
-
-    /// 🔴 The branch that is the whole of §6 on the node side, and the API
-    /// half's counterpart in the same test.
-    ///
-    /// Identical input — a paused sandbox with `autoResume: true`, the same
-    /// request — put to the two halves, and they must answer differently:
-    ///
-    /// - `aenv-api` runs the four decision arms, so the wake is attempted and
-    ///   fails on the missing VM: **502**. That is the requirement that
-    ///   `try_auto_resume` stay *reached*, not merely compiled; a
-    ///   `#[cfg]`-ed-out or dead-code version of it would fail here.
-    /// - `aenv-node` never takes the arm, so the sandbox is simply reported
-    ///   paused: **410**. That is §6.1's requirement that a node stop starting
-    ///   sandboxes on its own initiative.
-    ///
-    /// 🔴 Neither half is an assertion that nothing happened. "A node did not
-    /// wake the sandbox" is true of a build where the wake path is broken for
-    /// everyone, so it is worth nothing on its own — it is only evidence
-    /// standing next to the 502, which proves the path still fires on the half
-    /// that may take it.
-    #[tokio::test]
-    async fn only_the_half_that_owns_sandboxes_auto_resumes_a_paused_one() {
-        let upstream_addr = start_upstream_server().await;
-
-        async fn ask(
-            wiring: crate::api::ResumeWiring,
-            upstream_addr: SocketAddr,
-        ) -> (StatusCode, Bytes) {
-            let sandbox_id = SandboxId::new();
-            let app = proxy_app_for_sandbox_as_half(
-                &sandbox_id,
-                crate::orchestrator::SandboxState::Paused,
-                true,
-                wiring,
-            )
-            .await;
-
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method(Method::GET)
-                        .uri("/proxy/health")
-                        .header("x-api-key", "test-key")
-                        .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
-                        .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let status = response.status();
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            (status, body)
-        }
-
-        let (api_status, api_body) = ask(api_half(), upstream_addr).await;
-        assert_eq!(
-            api_status,
-            StatusCode::BAD_GATEWAY,
-            "🔴 aenv-api owns sandboxes: it must take the auto-resume arm"
-        );
-        assert_eq!(
-            api_body,
-            Bytes::from_static(b"sandbox auto-resume failed"),
-            "and it must reach try_auto_resume itself, not merely a half check"
-        );
-
-        let (node_status, node_body) = ask(node_half(), upstream_addr).await;
-        assert_eq!(
-            node_status,
-            StatusCode::GONE,
-            "🔴 a node forwards bytes; it does not decide that a sandbox should \
-             be alive. The gateway's cold path does that before traffic ever \
-             reaches a node"
-        );
-        assert_eq!(
-            node_body,
-            Bytes::from_static(b"sandbox is not proxyable in its current state"),
-            "and it answers exactly as it does for a sandbox that does not \
-             auto-resume at all: from the caller's side the two are one fact"
-        );
-
-        assert_ne!(
-            api_status, node_status,
-            "if these ever agree the branch on which half this is has stopped doing anything, \
-             and the topology change is a no-op that looks like it landed"
-        );
-    }
-
-    #[tokio::test]
-    async fn paused_secure_envd_auto_resume_requires_valid_access_token() {
-        let sandbox_id = SandboxId::new();
-        let api = build_api().await;
-        api.orchestrator()
-            .set_proxy_target_for_test(
-                sandbox_id,
-                ProxyTarget::new(Ipv4Addr::LOCALHOST),
-                crate::orchestrator::SandboxState::Paused,
-            )
-            .await;
-        api.orchestrator()
-            .set_auto_resume_for_test(&sandbox_id, true)
-            .await
-            .unwrap();
-        api.orchestrator()
-            .set_secure_for_test(&sandbox_id, true)
-            .await
-            .unwrap();
-        let metadata = api
-            .orchestrator()
-            .get_sandbox(&sandbox_id)
-            .await
-            .unwrap()
-            .expect("paused sandbox metadata");
-        let valid_token = api
-            .orchestrator()
-            .get_envd_access_token(&metadata)
-            .expect("secure paused sandbox token");
-        let app = server::new(api);
-
-        for token in [None, Some("incorrect")] {
-            let mut request = Request::builder()
-                .method(Method::GET)
-                .uri("/proxy/health")
-                .header("x-api-key", "test-key")
-                .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
-                .header(
-                    TARGET_PORT_HEADER,
-                    ConfigManager::global_config()
-                        .tools
-                        .control_plane_port
-                        .to_string(),
-                );
-            if let Some(token) = token {
-                request = request.header(ENVD_ACCESS_TOKEN_HEADER, token);
-            }
-            let response = app
-                .clone()
-                .oneshot(request.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/proxy/health")
-                    .header("x-api-key", "test-key")
-                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
-                    .header(
-                        TARGET_PORT_HEADER,
-                        ConfigManager::global_config()
-                            .tools
-                            .control_plane_port
-                            .to_string(),
-                    )
-                    .header(ENVD_ACCESS_TOKEN_HEADER, valid_token.expose())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

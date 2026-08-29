@@ -266,9 +266,9 @@ message PausedState {
 // 🔴 The id, and not a *resolved runtime*. Resolving a snapshot into runnable
 // state yields local artifact paths and an open image, and both belong to the
 // machine that will run the VM — the node still does that part, from
-// `resolved_record` when it is set or from `snapshot_id` through its own
-// catalog access when it is not. The API half decides *which* snapshot; the
-// node decides what running it means on its disk.
+// `resolved_record`, which is the only thing it can do it from. The API half
+// decides *which* snapshot; the node decides what running it means on its
+// disk.
 message SnapshotSource {
   string snapshot_id = 1;
   // The catalog row for `snapshot_id`, resolved by the API half at dispatch
@@ -298,13 +298,20 @@ message SnapshotSource {
   // the whole of what this message carried. The node resolves it on its own
   // disk, which is the disk its VM actually reads.
   //
-  // 🔴 Absent is not an error. A node built before this field existed ignores
-  // it (proto3 forward compatibility); a node built after it exists, talking
-  // to an API replica built before this field existed, sees it unset and
-  // falls back to resolving `snapshot_id` itself through its own
-  // `SnapshotManager` — the pre-existing path, kept for exactly this rolling
-  // upgrade window. See `NodeSandboxService::create`'s own fallback for the
-  // other half of that contract.
+  // 🔴 **Required.** Absent is refused — `InvalidArgument`, before the node
+  // touches a registry or opens a local artifact. There is nothing to fall
+  // back to: `aenv-node`'s `SnapshotRepository` carries `NoSnapshotCatalog`
+  // (`src/snapshot/repository/no_catalog.rs`), which *refuses* every catalog
+  // call rather than reporting absence, so the `load_runnable` fallback this
+  // field once documented — kept for the rolling-upgrade window in which an
+  // API replica predating the field could still be dispatching creates — can
+  // only produce an `Internal` naming a catalog this binary does not have.
+  // Every API replica sends the row (`RemoteSandboxBackendFactory::
+  // build_from_snapshot_record` sets it unconditionally), and that window is
+  // closed. The field number stays 2 and the wire type is unchanged; only
+  // the handler's tolerance of an unset value is gone. See
+  // `TemplateBuildRequest.base_snapshot_resolved` for the same contract on
+  // the build path.
   SerializedValue resolved_record = 2;
 }
 
@@ -813,11 +820,11 @@ message TemplateBuildRequest {
   // node and not the caller.
   oneof base {
     TemplateBuildImageBase image = 2;
-    // A committed snapshot to build on top of, by id or alias. Resolved
-    // node-side through the same `SnapshotManager::load_runnable` a `Create`
-    // with a `SnapshotSource` resolves its base through — unless
-    // `base_snapshot_resolved` below is set, in which case the node resolves
-    // the *row* it already has instead of asking its own catalog for it.
+    // A committed snapshot to build on top of, by id or alias. The node
+    // resolves the *row* `base_snapshot_resolved` below carries — which is
+    // required whenever this variant is set — and never asks its own
+    // catalog. This string is what that row is cross-checked against, by id
+    // or by alias.
     string base_snapshot_ref = 3;
   }
 
@@ -855,12 +862,14 @@ message TemplateBuildRequest {
   // this node wrote, so sending one here would be a value nobody reads.
 
   // The catalog row for `base_snapshot_ref`, resolved by the API half at
-  // dispatch time — meaningful only when `base` is `base_snapshot_ref`,
-  // ignored otherwise. Same shape, same reasoning and the same rolling-
-  // upgrade fallback contract as `SnapshotSource.resolved_record` above: see
-  // that field's doc. A field number of its own (not folded into the `base`
-  // oneof) because a oneof variant's shape cannot grow a second value without
-  // breaking every existing reader of `base_snapshot_ref` as a bare string.
+  // dispatch time — **required** when `base` is `base_snapshot_ref`, ignored
+  // otherwise. Same shape, same reasoning and the same required-field
+  // contract as `SnapshotSource.resolved_record` above: absent is refused
+  // with `InvalidArgument`, because this node holds no catalog to resolve
+  // `base_snapshot_ref` against. See that field's doc. A field number of its
+  // own (not folded into the `base` oneof) because a oneof variant's shape
+  // cannot grow a second value without breaking every existing reader of
+  // `base_snapshot_ref` as a bare string.
   SerializedValue base_snapshot_resolved = 8;
 }
 

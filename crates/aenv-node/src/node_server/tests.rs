@@ -58,7 +58,7 @@ async fn service_with(
 
 /// [`service`], but also hands back the concrete [`MockSnapshotCatalog`]
 /// instance wired into the service's snapshot manager — for the
-/// fallback/skip pairs below, which assert on
+/// never-touch-the-catalog tests below, which assert on
 /// [`crate::snapshot::mock::MockSnapshotCatalog::get_calls`] rather than on
 /// the wording of whatever the mock catalog and mock runtime resolver
 /// refused with. See those tests' own doc comments for why.
@@ -121,6 +121,24 @@ async fn listed(service: &NodeSandboxService) -> Vec<pb::NodeSandbox> {
         .expect("a node that looked can answer")
         .into_inner()
         .sandboxes
+}
+
+/// A well-formed `SnapshotSource`: an id and the catalog row that names it.
+///
+/// 🔴 `resolved_record` is required, and refused before anything else about
+/// the snapshot is looked at
+/// (`an_absent_resolved_record_is_refused_without_a_catalog_lookup`). A test
+/// that is about something *other* than snapshot resolution therefore has to
+/// send a source that gets past that refusal, or it would be proving its
+/// point against a refusal that fires first and would keep passing after the
+/// thing it is actually about had been broken.
+fn resolved_snapshot_source() -> pb::SnapshotSource {
+    let record =
+        crate::snapshot::SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
+    pb::SnapshotSource {
+        snapshot_id: record.id.to_string(),
+        resolved_record: Some(pb::encode_value(&record).expect("encode should succeed")),
+    }
 }
 
 /// The in-memory store, with a switch that makes single-record reads fail.
@@ -768,10 +786,7 @@ async fn a_create_carrying_an_empty_marker_produces_an_unowned_sandbox() {
         .create(Request::new(pb::SandboxCreateRequest {
             sandbox_id: SandboxId::new().to_string(),
             source: Some(pb::sandbox_create_request::Source::Snapshot(
-                pb::SnapshotSource {
-                    snapshot_id: "mock".to_string(),
-                    resolved_record: None,
-                },
+                resolved_snapshot_source(),
             )),
             expiry: Some(pb::sandbox_create_request::Expiry::NodeKeptTimeoutMs(
                 60_000,
@@ -825,14 +840,13 @@ async fn a_create_carrying_an_empty_marker_produces_an_unowned_sandbox() {
 #[tokio::test]
 async fn a_create_that_does_not_say_who_keeps_the_deadline_is_refused_before_the_resolver() {
     let (orchestration, service) = service().await;
+    // 🔴 A *well-formed* snapshot source, so the control face below reaches
+    // the resolver. With `resolved_record` absent both halves would be
+    // refused with `InvalidArgument` and the split would prove nothing.
+    let source = resolved_snapshot_source();
     let request = |expiry| pb::SandboxCreateRequest {
         sandbox_id: SandboxId::new().to_string(),
-        source: Some(pb::sandbox_create_request::Source::Snapshot(
-            pb::SnapshotSource {
-                snapshot_id: "no-such-snapshot".to_string(),
-                resolved_record: None,
-            },
-        )),
+        source: Some(pb::sandbox_create_request::Source::Snapshot(source.clone())),
         expiry,
         timeout_action: pb::TimeoutAction::Pause as i32,
         control_plane_config: b"owned".to_vec(),
@@ -882,10 +896,7 @@ async fn a_create_uses_the_id_the_caller_chose() {
         .create(Request::new(pb::SandboxCreateRequest {
             sandbox_id: sandbox_id.to_string(),
             source: Some(pb::sandbox_create_request::Source::Snapshot(
-                pb::SnapshotSource {
-                    snapshot_id: "no-such-snapshot".to_string(),
-                    resolved_record: None,
-                },
+                resolved_snapshot_source(),
             )),
             expiry: Some(pb::sandbox_create_request::Expiry::CallerKept(
                 pb::CallerKeptExpiry {},
@@ -895,7 +906,7 @@ async fn a_create_uses_the_id_the_caller_chose() {
             ..Default::default()
         }))
         .await
-        .expect_err("the mock catalog has no snapshots");
+        .expect_err("the mock runtime resolver fails every call");
     assert!(
         matches!(err.code(), Code::NotFound | Code::Internal),
         "{err}"
@@ -915,16 +926,16 @@ async fn a_create_uses_the_id_the_caller_chose() {
 ///
 /// The service's mock catalog (`MockSnapshotCatalog`) and runtime resolver
 /// (`MockSnapshotRuntimeResolver`) both fail every call. `load_runnable` (the
-/// pre-Stage-B path) would fail at the *catalog* step, before ever reaching
-/// the resolver; `resolve_runnable` (the path this test exercises) skips the
-/// catalog and fails at the *resolver* step instead.
+/// pre-Stage-B path, now deleted from this handler) would fail at the
+/// *catalog* step, before ever reaching the resolver; `resolve_runnable` (the
+/// path this test exercises) skips the catalog and fails at the *resolver*
+/// step instead.
 ///
 /// 🔴 Proven with `MockSnapshotCatalog::get_calls()`, not by matching on
 /// which of the two refusal messages came back. A string match cannot tell
 /// "the catalog was consulted and refused" from "the catalog was never asked
-/// in the first place" once the wording changes — and it will: Phase 4's own
-/// direction is `aenv-node` ending up with no catalog access at all, at
-/// which point this fallback is deleted outright and the refusal becomes
+/// in the first place" once the wording changes — and it did: `aenv-node`
+/// now holds no catalog at all, and a reintroduced lookup would refuse with
 /// something like "no catalog access on `aenv-node`", which still contains
 /// the substring "catalog" and would keep a string-matching assertion green
 /// over behaviour that no longer exists. A call count does not have that
@@ -967,21 +978,35 @@ async fn a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup() {
     );
 }
 
-/// The rolling-upgrade fallback `SnapshotSource.resolved_record`'s doc
-/// promises: absent, the node resolves `snapshot_id` itself, exactly the
-/// pre-Stage-B path — same shape of proof as the test above, mirrored. This
-/// is `a_create_uses_the_id_the_caller_chose` in miniature, named for what it
-/// specifically guards: an API replica built before this field existed (or a
-/// caller that simply has nothing resolved yet) must not be refused for
-/// omitting it.
+/// 🔴 The resolved row is **required**, at both sites that take one, and an
+/// absent one is refused without the node going to a catalog it does not
+/// have.
 ///
-/// 🔴 Proven with `MockSnapshotCatalog::get_calls()` — see the skip test
-/// above's doc for why a message match on "catalog" cannot be trusted to
-/// keep detecting this once `aenv-node` stops holding a catalog at all.
+/// This replaces the rolling-upgrade fallback the two fields used to
+/// document, one per site: absent used to mean "resolve `snapshot_id` /
+/// `base_snapshot_ref` yourself through `SnapshotManager::load_runnable`".
+/// That arm is dead on `aenv-node`, whose `SnapshotRepository` carries
+/// `NoSnapshotCatalog` — a catalog that *refuses* every call rather than
+/// reporting absence — so it could only ever turn a missing field into an
+/// `Internal` about a catalog this binary does not hold, which names neither
+/// the field that is missing nor the sender that owes it.
+///
+/// # 🔴 Why the call count is asserted and not just the code
+///
+/// `Code::InvalidArgument` alone is satisfied by a build that refuses for
+/// some *other* reason — and both of these requests are deliberately close to
+/// requests that are refused for other reasons (the id/ref cross-check is one
+/// line away, and it is `InvalidArgument` too). `get_calls() == 0` is what
+/// says the refusal happened *before* any resolution was attempted: restore
+/// either fallback and this reads at least 1 while the code becomes
+/// `Internal`, so neither half can be satisfied by accident. The message
+/// assertion pins which field the refusal is about, since the two sites are
+/// otherwise indistinguishable from the outside.
 #[tokio::test]
-async fn a_snapshot_source_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
-    let (_orchestration, service, catalog) = service_with_catalog().await;
+async fn an_absent_resolved_record_is_refused_without_a_catalog_lookup() {
+    let (orchestration, mut service, catalog) = service_with_catalog().await;
 
+    // Create: a `SnapshotSource` with no `resolved_record`.
     let err = service
         .create(Request::new(pb::SandboxCreateRequest {
             sandbox_id: SandboxId::new().to_string(),
@@ -999,11 +1024,60 @@ async fn a_snapshot_source_with_no_resolved_record_falls_back_to_the_nodes_own_c
             ..Default::default()
         }))
         .await
-        .expect_err("the mock catalog fails every call");
-    assert_eq!(err.code(), Code::Internal);
+        .expect_err("an absent resolved_record must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
     assert!(
-        catalog.get_calls() >= 1,
-        "an absent resolved_record must fall back to this node's own catalog lookup"
+        err.message().contains("resolved_record is required"),
+        "the refusal must name the field the sender owes: {err}"
+    );
+    assert_eq!(
+        catalog.get_calls(),
+        0,
+        "an absent resolved_record must be refused, never fall back to a catalog lookup"
+    );
+
+    // And nothing was started on the way to that refusal.
+    assert!(listed(&service).await.is_empty());
+    assert!(Arc::clone(&orchestration)
+        .list_sandboxes()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // BuildTemplate: a `base_snapshot_ref` with no `base_snapshot_resolved`.
+    service = service.with_template_build(
+        Arc::new(crate::image::ImageResolver::new(
+            &crate::cfg::AppConfig::default(),
+        )),
+        Arc::new(crate::template::TemplateBuilder::new()),
+    );
+    let err = service
+        .build_template(Request::new(pb::TemplateBuildRequest {
+            build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
+            base: Some(pb::template_build_request::Base::BaseSnapshotRef(
+                "no-such-alias".to_string(),
+            )),
+            base_snapshot_resolved: None,
+            steps: None,
+            resources: Some(pb::SandboxResources {
+                cpu_count: 1,
+                memory_mib: 512,
+                disk_size_mib: 1024,
+            }),
+            start_cmd: String::new(),
+            ready_cmd: String::new(),
+        }))
+        .await
+        .expect_err("an absent base_snapshot_resolved must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(
+        err.message().contains("base_snapshot_resolved is required"),
+        "the refusal must name the field the sender owes: {err}"
+    );
+    assert_eq!(
+        catalog.get_calls(),
+        0,
+        "an absent base_snapshot_resolved must be refused, never fall back to a catalog lookup"
     );
 }
 
@@ -1203,49 +1277,6 @@ async fn a_base_snapshot_ref_matching_the_records_alias_is_accepted() {
     );
 }
 
-/// The fallback half of the pair above: no `base_snapshot_resolved`, so the
-/// node resolves `base_snapshot_ref` itself, exactly the pre-Stage-B path.
-///
-/// 🔴 Proven with `MockSnapshotCatalog::get_calls()` — see
-/// `a_resolved_snapshot_source_skips_the_nodes_own_catalog_lookup`'s doc for
-/// why a message match on "catalog" cannot be trusted to keep detecting this
-/// once `aenv-node` stops holding a catalog at all.
-#[tokio::test]
-async fn a_base_snapshot_ref_with_no_resolved_record_falls_back_to_the_nodes_own_catalog_lookup() {
-    let (orchestration, mut service, catalog) = service_with_catalog().await;
-    service = service.with_template_build(
-        Arc::new(crate::image::ImageResolver::new(
-            &crate::cfg::AppConfig::default(),
-        )),
-        Arc::new(crate::template::TemplateBuilder::new()),
-    );
-    let _ = &orchestration;
-
-    let err = service
-        .build_template(Request::new(pb::TemplateBuildRequest {
-            build_snapshot_id: crate::snapshot::SnapshotId::generate().to_string(),
-            base: Some(pb::template_build_request::Base::BaseSnapshotRef(
-                "no-such-alias".to_string(),
-            )),
-            base_snapshot_resolved: None,
-            steps: None,
-            resources: Some(pb::SandboxResources {
-                cpu_count: 1,
-                memory_mib: 512,
-                disk_size_mib: 1024,
-            }),
-            start_cmd: String::new(),
-            ready_cmd: String::new(),
-        }))
-        .await
-        .expect_err("the mock catalog fails every call");
-    assert_eq!(err.code(), Code::Internal);
-    assert!(
-        catalog.get_calls() >= 1,
-        "an absent base_snapshot_resolved must fall back to this node's own catalog lookup"
-    );
-}
-
 /// A create with no source, or an unset timeout action, is refused rather than
 /// given a default.
 ///
@@ -1270,11 +1301,10 @@ async fn a_create_missing_what_it_needs_is_refused() {
     let err = service
         .create(Request::new(pb::SandboxCreateRequest {
             sandbox_id: SandboxId::new().to_string(),
+            // Well-formed, so the refusal below is about the timeout action
+            // and not about a missing `resolved_record`.
             source: Some(pb::sandbox_create_request::Source::Snapshot(
-                pb::SnapshotSource {
-                    snapshot_id: "mock".to_string(),
-                    resolved_record: None,
-                },
+                resolved_snapshot_source(),
             )),
             timeout_action: pb::TimeoutAction::Unspecified as i32,
             ..Default::default()
@@ -1282,6 +1312,10 @@ async fn a_create_missing_what_it_needs_is_refused() {
         .await
         .expect_err("a create that did not say what its timeout does");
     assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message().contains("timeout_action"),
+        "the refusal must name the timeout action, not something else: {err}"
+    );
 }
 
 /// A command naming a run this node is not running is refused, and the sandbox

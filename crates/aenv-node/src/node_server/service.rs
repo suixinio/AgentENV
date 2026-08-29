@@ -302,48 +302,43 @@ impl NodeSandboxService {
                 if base_ref.is_empty() {
                     return Err(Status::invalid_argument("base_snapshot_ref is required"));
                 }
-                // 🔴 `base_snapshot_resolved`, when the API half sent one, in
-                // place of this node's own catalog lookup — same contract as
-                // `SnapshotSource.resolved_record` in `create` above; see
-                // that field's doc in node.proto.
-                let resolved: Option<SnapshotRecord> = convert::serialized(
+                // 🔴 `base_snapshot_resolved` is **required** — same contract
+                // as `SnapshotSource.resolved_record` in `create` below; see
+                // that field's doc in node.proto. Absent is refused rather
+                // than resolved here: this node's `SnapshotRepository` carries
+                // `NoSnapshotCatalog`, which refuses every catalog call, so
+                // the fallback that used to sit in this arm could only ever
+                // produce a confusing `Internal` naming a catalog this binary
+                // does not have.
+                let record: SnapshotRecord = convert::serialized(
                     request.base_snapshot_resolved.as_ref(),
                     "base_snapshot_resolved",
-                )?;
-                let runnable = match resolved {
-                    Some(record) => {
-                        if !record_names(&record, &base_ref) {
-                            return Err(Status::invalid_argument(format!(
-                                "base_snapshot_resolved names snapshot {}{}, not \
-                                 base_snapshot_ref {base_ref}",
-                                record.id,
-                                record
-                                    .alias
-                                    .as_ref()
-                                    .map(|alias| format!(" (alias {alias})"))
-                                    .unwrap_or_default(),
-                            )));
-                        }
-                        self.snapshots
-                            .resolve_runnable(record)
-                            .await
-                            .map_err(|err| {
-                                Status::internal(format!(
-                                    "resolve base template {base_ref}: {err:#}"
-                                ))
-                            })?
-                    }
-                    None => self
-                        .snapshots
-                        .load_runnable(&base_ref)
-                        .await
-                        .map_err(|err| {
-                            Status::internal(format!("resolve base template {base_ref}: {err:#}"))
-                        })?
-                        .ok_or_else(|| {
-                            Status::not_found(format!("base template {base_ref} not found"))
-                        })?,
-                };
+                )?
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "base_snapshot_resolved is required: this node holds no snapshot \
+                         catalog to resolve base_snapshot_ref against",
+                    )
+                })?;
+                if !record_names(&record, &base_ref) {
+                    return Err(Status::invalid_argument(format!(
+                        "base_snapshot_resolved names snapshot {}{}, not \
+                         base_snapshot_ref {base_ref}",
+                        record.id,
+                        record
+                            .alias
+                            .as_ref()
+                            .map(|alias| format!(" (alias {alias})"))
+                            .unwrap_or_default(),
+                    )));
+                }
+                let runnable = self
+                    .snapshots
+                    .resolve_runnable(record)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!("resolve base template {base_ref}: {err:#}"))
+                    })?;
                 Some(runnable)
             }
             None => return Err(Status::invalid_argument("base is required")),
@@ -887,52 +882,41 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 if snapshot.snapshot_id.is_empty() {
                     return Err(Status::invalid_argument("snapshot.snapshot_id is required"));
                 }
-                // 🔴 `resolved_record`, when the API half sent one, in place
-                // of this node's own catalog lookup — see
+                // 🔴 `resolved_record` is **required** — see
                 // `SnapshotSource.resolved_record`'s own doc in node.proto
-                // and Q3 in `_sd-phase4-open-questions-resolved.md`. Absent
-                // (an API replica built before this field existed) falls
-                // back to `load_runnable`, the pre-existing path, unchanged.
-                let resolved: Option<SnapshotRecord> =
-                    convert::serialized(snapshot.resolved_record.as_ref(), "resolved_record")?;
-                let runnable = match resolved {
-                    Some(record) => {
-                        if record.id.to_string() != snapshot.snapshot_id {
-                            return Err(Status::invalid_argument(format!(
-                                "resolved_record names snapshot {}, not snapshot_id {}",
-                                record.id, snapshot.snapshot_id
-                            )));
-                        }
-                        self.snapshots
-                            .resolve_runnable(record)
-                            .await
-                            .map_err(|err| {
-                                Status::internal(format!(
-                                    "resolve snapshot {}: {err:#}",
-                                    snapshot.snapshot_id
-                                ))
-                            })?
-                    }
-                    None => self
-                        .snapshots
-                        .load_runnable(&snapshot.snapshot_id)
-                        .await
-                        // 🔴 A resolver that could not answer is an error. Reading
-                        // it as "no such snapshot" would turn a registry outage
-                        // into a permanent-looking refusal.
-                        .map_err(|err| {
-                            Status::internal(format!(
-                                "resolve snapshot {}: {err:#}",
-                                snapshot.snapshot_id
-                            ))
-                        })?
+                // and Q3 in `_sd-phase4-open-questions-resolved.md`. The API
+                // half read this row to route the create at all and forwards
+                // it; this node's `SnapshotRepository` carries
+                // `NoSnapshotCatalog` (`src/snapshot/repository/no_catalog.rs`),
+                // which *refuses* every catalog call rather than reporting
+                // absence, so the `load_runnable` fallback that used to sit
+                // in this arm could only ever turn a missing field into an
+                // `Internal` about a catalog this binary does not have.
+                // Refusing the message outright says what is actually wrong.
+                let record: SnapshotRecord =
+                    convert::serialized(snapshot.resolved_record.as_ref(), "resolved_record")?
                         .ok_or_else(|| {
-                            Status::not_found(format!(
-                                "snapshot {} not found",
-                                snapshot.snapshot_id
-                            ))
-                        })?,
-                };
+                            Status::invalid_argument(
+                                "resolved_record is required: this node holds no snapshot \
+                                 catalog to resolve snapshot_id against",
+                            )
+                        })?;
+                if record.id.to_string() != snapshot.snapshot_id {
+                    return Err(Status::invalid_argument(format!(
+                        "resolved_record names snapshot {}, not snapshot_id {}",
+                        record.id, snapshot.snapshot_id
+                    )));
+                }
+                let runnable = self
+                    .snapshots
+                    .resolve_runnable(record)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!(
+                            "resolve snapshot {}: {err:#}",
+                            snapshot.snapshot_id
+                        ))
+                    })?;
                 SandboxLaunchSource::Snapshot(Box::new(runnable))
             }
             Some(pb::sandbox_create_request::Source::Image(image)) => {

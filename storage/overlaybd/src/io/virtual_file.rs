@@ -202,11 +202,6 @@ impl VirtualFileWriter {
             buf_size: 32 * 1024,
         }
     }
-
-    /// Create a writer with a custom buffer size.
-    pub fn with_buffer_size(file: Arc<dyn VirtualFile>, buf_size: usize) -> Self {
-        Self { file, buf_size }
-    }
 }
 
 #[async_trait]

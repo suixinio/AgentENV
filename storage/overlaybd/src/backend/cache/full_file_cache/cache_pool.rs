@@ -1106,18 +1106,6 @@ impl FileCacheBackend {
         Ok(file)
     }
 
-    pub async fn open_with_flags(
-        &self,
-        cache_key: impl Into<String>,
-        source: Arc<dyn VirtualFile>,
-        open_flags: u32,
-    ) -> Result<Arc<dyn VirtualFile>> {
-        let file = self
-            .open_file_with_flags(cache_key, source, open_flags)
-            .await?;
-        Ok(file)
-    }
-
     fn contains_active_entry(&self, cache_id: &str) -> bool {
         self.state
             .cache_entries

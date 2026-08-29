@@ -10,7 +10,6 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use super::arbitration::{arbitrate, BindingDecision};
-use super::record::normalize_execution_id_reason;
 use super::{Binding, BindingDeleteOutcome, BindingStore, BindingStoreError, BindingStoreSettings};
 use crate::node_registry::types::{Node, RosterEntry};
 
@@ -315,14 +314,6 @@ impl BindingStore for InMemoryBindingStore {
         Self::delete_locked(&mut inner, sandbox_id);
         Ok(outcome)
     }
-}
-
-/// Ports `normalizeExecutionIDReason` being called from the event-delete
-/// path without recording the roster-drop metric — a thin re-export so
-/// callers outside this crate's `node_registry` module do not need to know
-/// where the shape check actually lives.
-pub fn normalize_delete_execution_id(raw: &str) -> (String, Option<&'static str>) {
-    normalize_execution_id_reason(raw)
 }
 
 #[cfg(test)]

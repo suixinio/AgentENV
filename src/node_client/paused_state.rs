@@ -70,12 +70,6 @@ impl RemotePausedState {
     pub fn paused_execution_id(&self) -> ExecutionId {
         self.paused_execution_id
     }
-
-    /// The backend's own encoding, to be handed back to that backend's factory
-    /// on the origin node.
-    pub fn backend_state(&self) -> &Value {
-        &self.state
-    }
 }
 
 impl PausedSandboxState for RemotePausedState {

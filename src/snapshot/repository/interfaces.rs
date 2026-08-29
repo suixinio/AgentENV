@@ -533,10 +533,6 @@ impl SnapshotAbsence {
             because: because.into(),
         }
     }
-
-    pub fn is_settled(&self) -> bool {
-        matches!(self, Self::Settled)
-    }
 }
 
 #[async_trait]

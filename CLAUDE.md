@@ -209,10 +209,12 @@ the gateway's own aggregations, answered from the `Scheduler` protocol's
 `ListObservedNodes`/`GetNode`/`ListRegistrySandboxes` RPCs — today always
 against `aenv-api`. Sandbox data-plane traffic (proxy headers or a sandbox
 proxy domain) is routed by a `LookupNode` call through `gateway.scheduler_addr`
-(now `agentenv-api:8002` on every shipped deployment) or, if configured,
-`gateway.query_only_scheduler_addr` for HA read traffic — see
-`services/README.md` for what that HA knob still means now that there is no
-Go scheduler binary with a `--query-only` mode behind it.
+(now `agentenv-api:8002` on every shipped deployment). 🔴 There is no second
+read endpoint any more: `gateway.query_only_scheduler_addr`, and the
+`QueryOnlySchedulerClient` it selected, are deleted along with the Go
+scheduler's `--query-only` replica mode, and `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR`
+is in `RemovedGatewayEnvVars` — a manifest that still sets it makes the gateway
+refuse to start.
 
 `services/` is a separate Go module. See `services/README.md` for build/run/deploy
 instructions and the current architecture in full.

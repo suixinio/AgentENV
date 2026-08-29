@@ -557,20 +557,20 @@ pub struct SnapshotCatalogConfig {
     pub max_concurrent_builds: i32,
     /// How often a running build tells the catalog it is still alive.
     ///
-    /// 🔴 Must stay comfortably below the scheduler's
-    /// `scheduler.catalog.build_heartbeat_ttl` (5 minutes by default), because
-    /// the reaper ends a build that has gone unheard from for that long and
-    /// hands its template to whoever asks next. A third of the TTL is the usual
-    /// margin: two renewals may be lost — to a scheduler rollout, a slow
-    /// network — before a build that is running perfectly well is taken away
-    /// from it.
+    /// 🔴 This is the *only* declaration of the cadence now, and the reaper's
+    /// TTL is derived from it rather than configured beside it:
+    /// `aenv-api.rs::reaper_cadence` computes `ttl = 3 ×` this value. The
+    /// reaper ends a build that has gone unheard from for the TTL and hands
+    /// its template to whoever asks next, so the factor of three is the margin
+    /// — two renewals may be lost, to a rollout or a slow network, before a
+    /// build that is running perfectly well is taken away from it.
     ///
-    /// 🔴 The scheduler cannot see this number — nothing on the wire carries
-    /// it — so it is declared to the scheduler a second time, as
-    /// `scheduler.catalog.node_build_heartbeat_interval`, which is what its
-    /// TTL floor is computed from. Changing this without changing that leaves
-    /// the scheduler enforcing a floor for a cadence this cluster no longer
-    /// uses; the two must move together.
+    /// It used to have to be kept in lockstep with a second declaration on the
+    /// Go scheduler (`scheduler.catalog.build_heartbeat_ttl` /
+    /// `node_build_heartbeat_interval`), because nothing on the wire carried
+    /// this number and the process enforcing the TTL could not see it. That
+    /// process is deleted; the reaper now runs in the same binary that reads
+    /// this field, so there is no second copy left to drift.
     #[config(default = 100u64)]
     pub build_heartbeat_interval_secs: u64,
 }

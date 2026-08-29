@@ -432,7 +432,7 @@ spec:
             # `src/node_client/native_placement.rs`), and this Deployment
             # runs `replicas: 2`: the code default (`in_memory`) is one
             # replica's private routing table, and `build_binding_store`
-            # (`crates/aenv-node/src/bin/aenv-node.rs`) refuses to start on it
+            # (`crates/aenv-api/src/bin/aenv-api.rs`) refuses to start on it
             # unconditionally — the same refusal
             # `AENV_ORCHESTRATOR_STORE_BACKEND`'s own comment above
             # describes for the sandbox ledger. The same Redis, the same

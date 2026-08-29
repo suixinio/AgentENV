@@ -23,14 +23,16 @@ repository/runtime boundary, and what the relevant tests validate.
     rebuilds from committed snapshots. Fresh ext4-rootfs builds are not wired
     through `TemplateBuilder`.
 
-- `TemplateBuilder` (`src/template/builder.rs`)
+- `TemplateBuilder` (`crates/aenv-node/src/template/builder.rs`)
   - Preserves the external template semantics for build / rebuild flows, while
     committed snapshot lifecycle operations live in `SnapshotManager`.
   - Main methods:
-    - `new()`
-    - `with_local_store_root(path)`
-    - `build_and_publish(snapshot_manager, config).await`
-    - `rebuild_and_publish(snapshot_manager, config, snapshot_id, base_snapshot).await`
+    - `new()` / `with_cpu_config(arc)`
+    - `build_and_publish(snapshot_manager, spec).await` — generates the id, then
+      delegates to the trait method below
+  - The two build entry points are `TemplateBuildDriver` trait methods:
+    - `build_and_publish_with_id(snapshot_manager, snapshot_id, spec).await`
+    - `build_from_snapshot_and_publish(snapshot_manager, spec, snapshot_id, base_snapshot).await`
 
 ### Snapshot-first internals
 
@@ -57,8 +59,10 @@ repository/runtime boundary, and what the relevant tests validate.
 `TemplateBuilder::build_and_publish(...)` does the following:
 
 1. Prepare the build base from either:
-   - a committed snapshot (`rebuild_and_publish`)
-   - overlaybd configs (`from_overlaybd_configs`)
+   - a committed snapshot (`build_from_snapshot_and_publish` →
+     `prepare_snapshot_base_context`)
+   - the requested base image (`build_and_publish_with_id` →
+     `prepare_fresh_context`)
 2. Start a temporary Firecracker sandbox with the requested CPU/memory.
 3. Execute template steps in order.
 4. Probe `envd`, kernel, and firecracker versions from the running guest and executable.

@@ -1,12 +1,17 @@
 # Redis for the control plane's shared binding store.
 #
-# Today this holds exactly one thing: the scheduler's sandbox-to-node bindings
-# (`agentenv:scheduler:bindings:*`, written by services/scheduler/internal/
-# redis_store.go). Without it those bindings live in one process's memory, so
-# every scheduler rollout drops them and the data plane pays a 503 window while
-# heartbeats rebuild the roster. Pointing `SCHEDULER_REDIS_ADDR` at this Service
-# is what closes that window, and it is also the hard prerequisite for the
-# query-only scheduler replicas (`--query-only` refuses to start without it).
+# Today this holds exactly one thing: the sandbox-to-node bindings
+# (`agentenv:scheduler:bindings:*`), written by `aenv-api`
+# (`src/binding_store/redis/`) and read by the gateway's routing projection
+# (`services/shared/routing`). Without it those bindings live in one replica's
+# memory, so every rollout drops them and the data plane pays a 503 window
+# while heartbeats rebuild the roster — and `aenv-api` runs `replicas: 2`, so
+# `build_binding_store` refuses the in-memory backend outright rather than
+# letting one replica route on a table the other cannot see. Pointing
+# `AENV_BINDING_STORE_REDIS_URL` at this Service is what closes that window.
+#
+# (The Go scheduler that used to write these keys, and its `--query-only`
+# replica mode that required this Service, are both deleted.)
 #
 # 🔴 It is provisioned as a *durable store*, not as a cache, because of what is
 # scheduled to land in it next: phase 3 of the service-decomposition proposal

@@ -13,7 +13,8 @@
 #   E2E_TEMPLATE_USER_IMAGE - Optional fromImage override for the base template build
 #   SKIP_BUILD            - Set to 1 to skip the build step
 #   SUITE_FILTER          - Run only suites matching this glob (e.g. "02*")
-#   E2E_MODE              - Runtime mode: single-node, compose, or k8s
+#   E2E_MODE              - Runtime mode: compose or k8s (single-node is refused;
+#                           see the check below for why)
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -77,11 +78,15 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
 fi
 
 if ! e2e_mode_is "compose" && ! e2e_mode_is "k8s"; then
-  _E2E_PHASE="build"
-  server_profile="debug"
-
-  SERVER_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/${server_profile}/server"
-  [[ -x "$SERVER_BIN" ]] || die "Server binary not found at ${SERVER_BIN}"
+  # 🔴 There is no single-process runtime to start any more. This branch looked
+  # for `target/debug/server`, which no build target has produced since the
+  # binary was split in two: `make build-server` builds `aenv-node` and
+  # `aenv-api`, and neither is a drop-in for the other here. `aenv-node` runs
+  # the sandboxes but answers 404 on every user-facing REST route the suites
+  # drive (the role gate), while `aenv-api` decides but runs no VMs and
+  # requires `[pg]`. Restoring this mode means starting both plus a
+  # PostgreSQL, which is what E2E_MODE=compose already does.
+  die "E2E_MODE=${E2E_MODE} is not supported: the single-process runtime it starts was split into aenv-node + aenv-api, and a single-node run now needs both plus PostgreSQL. Use E2E_MODE=compose (make test-e2e-compose) or E2E_MODE=k8s (make test-e2e-k8s)."
 fi
 
 # ---- Start server ------------------------------------------------------------

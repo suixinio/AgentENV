@@ -72,7 +72,7 @@ make deploy-down    # Tear down the cluster
 
 Container deployments use `deploy/docker/config/default.json`. Static node discovery and backend node endpoints are configured for the Docker network.
 
-The runtime image includes `uvm-ublk` at `/usr/local/bin/uvm-ublk`. Compose uses that path instead of a host-built `env/ublk/uvm-ublk` binary.
+The runtime image includes the ublk **daemon** at `/usr/local/bin/uvm-ublk-daemon`, and `AENV_UBLK_DAEMON_BINARY_PATH` points at it. The `uvm-ublk` CLI is *not* in the image — `Dockerfile.aenv-node` builds and copies `uvm-ublk-daemon` only — so it is available for hand troubleshooting from a source checkout (`storage/ublk/README.md`) rather than from inside a container.
 
 The compose manifest also wires node heartbeat reporting from runtime nodes to `agentenv-api`:
 

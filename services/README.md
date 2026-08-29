@@ -48,10 +48,6 @@ see CLAUDE.md's "Distributed Control Plane" section for the full picture.
 - The sandbox-to-node binding store can be in-memory or Redis-backed
   (`[binding_store]` on `aenv-api`; `gateway`'s own routing-projection reader
   reads the same Redis keys for its fast path).
-- `gateway.query_only_scheduler_addr` still exists as a second `LookupNode`
-  target for HA read traffic — see "Gateway configuration" below for what it
-  means now that there is no Go scheduler binary with a `--query-only` mode
-  behind it.
 - Node health and sandbox roster are observed from heartbeats, and expired
   sandbox-to-node bindings are dropped on heartbeat, node unregistration, or
   lookup.
@@ -101,13 +97,14 @@ PostgreSQL to run its tests. `make test-with-postgres` still starts a
 throwaway PostgreSQL in Docker for parity with the CI step it mirrors, but the
 only tests it changes the outcome of today are Redis-gated: `REDIS_SERVER_BIN`
 and `SCHEDULER_REDIS_TEST_REQUIRED=1` turn a missing `redis-server` into a
-failure instead of a silent skip for the `RedisBindingStore` and
-`shared/routing` reader tests.
+failure instead of a silent skip for `shared/routing`'s reader tests. (There is
+no Go `RedisBindingStore` suite any more — no type of that name is left in the
+module; `aenv-api` owns the binding store's write side, and Go reads those keys.)
 
-🔴 That skip matters more than it looks. Those are the only tests that
-exercise the Redis implementation of sandbox-to-node bindings, and that
-implementation is what every HA deployment runs. A change made to the
-in-memory store and forgotten for Redis passes every other test in the
+🔴 That skip matters more than it looks. Those reader tests are the only
+thing in this module that exercises the real Redis routing projection, and that
+projection is what every HA deployment's data plane reads. A change made to the
+key format on the Rust side and forgotten here passes every other test in the
 module, on any machine, and shows up only in production — as routing that
 quietly stops arbitrating. A skip reports as a pass, so without
 `SCHEDULER_REDIS_TEST_REQUIRED` a missing `redis-server` and a healthy run
@@ -139,7 +136,7 @@ listener on every current deployment, not a local Go scheduler process
 ## Gateway configuration
 
 - `gateway.scheduler_addr` points to whichever process answers the Scheduler protocol — `agentenv-api` on every current deployment. The gateway uses it for scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs.
-- `gateway.query_only_scheduler_addr` optionally points `LookupNode` at a second Scheduler-protocol endpoint for read traffic; when unset, the gateway falls back to `gateway.scheduler_addr`. 🔴 This dates from when `services/scheduler` had a `--query-only` replica mode reading bindings from Redis; that Go binary is deleted, and nothing in this repository documents an equivalent "query-only `aenv-api`" deployment mode today. The config knob and its client code path are unchanged and still exercised by this package's test suite, but confirm any specific HA topology against current `aenv-api`/Redis behavior rather than this historical description.
+- 🔴 `gateway.query_only_scheduler_addr` is **deleted**, knob and client path both. It named a second Scheduler-protocol endpoint that `LookupNode` alone would use, for HA read traffic served by `services/scheduler`'s `--query-only` replica mode; that Go binary is gone, and the client-selection field it configured (`QueryOnlySchedulerClient`) went with it. Every `LookupNode` call now goes to `gateway.scheduler_addr`, like every other Scheduler RPC this process makes. `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` is in `RemovedGatewayEnvVars`, so a manifest that still sets it makes the gateway **refuse to start** rather than silently ignoring it.
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
 - `gateway.request_timeout` applies to regular proxied HTTP requests. Streaming requests and WebSocket connections reuse the client context and are not cut off by this timeout.
 - `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
@@ -147,7 +144,6 @@ listener on every current deployment, not a local Go scheduler process
 - `GET /nodes` returns Scheduler-protocol observed node snapshots (including runtime/resource counters), with optional `clusterID` filtering.
 - `GET /nodes/{id}` resolves the node endpoint via the Scheduler protocol and then proxies to the runtime node's admin endpoint.
 - `GATEWAY_REQUEST_TIMEOUT=<duration>` overrides `gateway.request_timeout` from the environment (for example, `1m30s`).
-- `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR=<addr>` overrides `gateway.query_only_scheduler_addr` from the environment.
 - `gateway.sandbox_proxy_domains` enables host-based sandbox data-plane routing for `{port}-{sandboxID}.{domain}` URLs. Domains are normalized to lowercase, deduplicated, and must be valid DNS names. Sandbox IDs used in host routes must be lowercase RFC 952/1123 DNS labels, and the full `{port}-{sandboxID}` label must be at most 63 characters.
 - `GATEWAY_SANDBOX_PROXY_DOMAINS=<domain>[,<domain>...]` overrides `gateway.sandbox_proxy_domains` from the environment.
 

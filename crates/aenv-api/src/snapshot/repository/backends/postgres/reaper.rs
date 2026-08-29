@@ -1,9 +1,8 @@
 //! The catalog build reaper: ends builds whose builder stopped saying it was
-//! alive, as a cluster-wide singleton — a Rust port of
-//! `catalog_service.go`'s `RunBuildReaper`.
+//! alive, as a cluster-wide singleton.
 //!
 //! 🔴 Not optional wherever `builds_one_active_per_template` exists (see
-//! migration 0002's own comment on that index): a build stranded at
+//! `0001_initial_schema.sql`'s own comment on that index): a build stranded at
 //! `building`/`waiting` holds its template shut until something ends it, and
 //! this is that something.
 //!

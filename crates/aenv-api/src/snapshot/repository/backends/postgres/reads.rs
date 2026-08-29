@@ -47,8 +47,9 @@ const SNAPSHOT_COLUMNS: &str = "s.id::text                AS id,
        s.origin_node_id          AS origin_node_id";
 
 /// At most one alias names this snapshot — safe to join rather than subquery
-/// because `aliases_one_per_snapshot` (migration 0002) makes a second alias
-/// row for the same snapshot a schema violation rather than a possibility.
+/// because `aliases_one_per_snapshot` (`0001_initial_schema.sql`) makes a
+/// second alias row for the same snapshot a schema violation rather than a
+/// possibility.
 const ALIAS_JOIN: &str =
     "LEFT JOIN aliases a ON a.snapshot_id = s.id AND a.cluster_id = s.cluster_id";
 
@@ -283,12 +284,10 @@ fn list_sql(
     sql
 }
 
-/// Matches `queries_resolved.go`'s `appendFilters` field for field.
-///
 /// 🔴 No branch for `published`/`origin_node_id`, and there must never be
-/// one — see migration 0001's rule V5 and `pin.go`'s own comment: filtering a
-/// listing on them would tell a user a snapshot does not exist when it can
-/// only be started on one machine.
+/// one — see rule 5 of the origin-pinning block in
+/// `0001_initial_schema.sql`: filtering a listing on them would tell a user a
+/// snapshot does not exist when it can only be started on one machine.
 fn append_filters(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFilter) {
     if let Some(sources) = &filter.sources {
         if !sources.is_empty() {

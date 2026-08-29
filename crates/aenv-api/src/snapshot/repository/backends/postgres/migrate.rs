@@ -1,14 +1,26 @@
 //! Brings the catalog schema in a PostgreSQL database to the shape this build
-//! expects — a Rust port of `services/scheduler/internal/catalog/migrate.go`.
+//! expects.
 //!
-//! Follows the same two conventions Go's applier does, on purpose: a version
-//! table (`catalog_schema_migrations`) rather than a migration framework
-//! (Go's own file header explains why: four files that change roughly once a
-//! month do not earn a build-time tool), and a session-scoped PostgreSQL
-//! advisory lock so that two processes racing to migrate the same database —
-//! two `aenv-api` replicas starting at once, or this build racing a Go
-//! `scheduler` process during a rollout — serialize rather than corrupt the
-//! ledger.
+//! Two conventions, both deliberate: a version table
+//! (`catalog_schema_migrations`) rather than a migration framework — a
+//! directory that changes roughly once a release does not earn a build-time
+//! tool — and a session-scoped PostgreSQL advisory lock so that two processes
+//! racing to migrate the same database (two `aenv-api` replicas starting at
+//! once) serialize rather than corrupt the ledger.
+//!
+//! # One version today, and the machinery for the next one
+//!
+//! `MIGRATIONS` carries a single entry: `0001_initial_schema.sql`, the squash
+//! of the five incremental files this catalog was built up through. The
+//! database they migrated was never released, so there was nothing to preserve
+//! and no second migrator to agree with about version numbers.
+//!
+//! 🔴 That does **not** make this an "apply one file" script, and it must not
+//! become one. Everything a real version 2 needs is here and stays here: the
+//! ledger, the ordering/density check, `preflight`, `verify_applied`,
+//! `RELATIONS_BY_VERSION`, and `apply_one`'s per-migration transaction. Adding
+//! a version is appending to two `const` arrays and dropping a `.sql` file
+//! beside this one.
 //!
 //! # Rolling it back
 //!
@@ -25,30 +37,18 @@
 //! every catalog query then fails on a missing relation with no way forward
 //! short of re-running this file's `DROP` by hand.
 //!
-//! # `preflight` / `verify_applied`, ported after all
+//! # Why `preflight` and `verify_applied` both exist
 //!
-//! An earlier version of this module left Go's `preflight`/`verifyApplied`
-//! pair out, on the theory that Stage B's tables are new to whatever database
-//! this build touches. That theory does not hold on every cluster this build
-//! ships to: a cluster already running `services/scheduler` has these exact
-//! tables — `snapshots`/`templates`/`builds`/`aliases`, plus the
-//! `catalog_schema_migrations` ledger itself — created by *Go's* migrate.go,
-//! against the *same* PostgreSQL database this build's `[pg]` now points at.
-//! `migrate()` runs unconditionally at `aenv-api` startup
-//! whenever `[pg]` is configured (`build_pg_pool` in `src/bin/aenv-api.rs`), so
-//! this is not a hypothetical shared-database scenario to defend against —
-//! it is the ordinary shape of a cluster mid-migration off `services/scheduler`.
-//!
-//! Versions 1-3 are copied verbatim from Go's own migration files, so a
-//! database Go already migrated reads as "already applied" here for those —
-//! the two ledgers agree because the SQL is identical. What neither
-//! `preflight` nor `verifyApplied` in Go was written to catch is a version
-//! number the *two* migration sets disagree about (a future Go migration and
-//! this build's `0005_drop_catalog_migration_state.sql` both claiming version 5
-//! but creating different things) — `verify_applied` below still catches
-//! that, generalised rather than narrowed to rollbacks: it checks every
-//! recorded version's *own* relations exist, not only versions this build
-//! just tried to skip.
+//! `preflight` refuses to create a table that is already there under an *empty*
+//! ledger — somebody else's table, whoever they are — because every statement
+//! in a migration file is `IF NOT EXISTS`, so marching ahead would leave a
+//! schema that looks migrated and rejects writes on a column this ledger never
+//! added. `verify_applied` refuses the opposite shape: a ledger that claims
+//! work the database no longer has, which is what a rollback that dropped the
+//! tables and forgot the ledger looks like. It checks every recorded version's
+//! own relations rather than only the ones a rollback would touch, and skips
+//! versions it does not recognise so that a database some future migrator got
+//! ahead on does not fail every start here.
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPool;
@@ -66,61 +66,17 @@ struct Migration {
 ///
 /// 🔴 Order here is asserted by a test (`migrations_are_ordered_and_versions_are_dense`)
 /// rather than merely hoped for — `apply` trusts this order and does not sort
-/// it, unlike Go's applier, which reads a directory and sorts by parsed
-/// version. A `const` array read top to bottom is the whole directory in this
-/// build, so sorting it a second time at runtime would only hide a mistake in
-/// this list instead of catching it at compile-adjacent test time.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "0001_snapshots.sql",
-        body: include_str!("migrations/0001_snapshots.sql"),
-    },
-    Migration {
-        version: 2,
-        name: "0002_templates_builds_aliases.sql",
-        body: include_str!("migrations/0002_templates_builds_aliases.sql"),
-    },
-    Migration {
-        version: 3,
-        name: "0003_disk_size_known_at_ready.sql",
-        body: include_str!("migrations/0003_disk_size_known_at_ready.sql"),
-    },
-    // 🔴 4 creates `catalog_migration_state` and 5 drops it again. 4 is history
-    // — the read-side confirmation gate it recorded for is gone with the
-    // object-storage catalog — but it is kept applying rather than deleted
-    // because this array is checked for density
-    // (`migrations_are_ordered_and_versions_are_dense`, and `apply` trusts the
-    // order instead of sorting), and because a cluster already at version 4 has
-    // the table: 5 is what removes it there.
-    Migration {
-        version: 4,
-        name: "0004_catalog_migration_state.sql",
-        body: include_str!("migrations/0004_catalog_migration_state.sql"),
-    },
-    Migration {
-        version: 5,
-        name: "0005_drop_catalog_migration_state.sql",
-        body: include_str!("migrations/0005_drop_catalog_migration_state.sql"),
-    },
-];
-
-/// The highest version this build carries.
-///
-/// 🔴 Not called from production code yet — `migrate` itself walks
-/// `MIGRATIONS` directly and never needs to ask its own ceiling. Kept `pub`
-/// for whoever first needs a preflight check against it (see this module's
-/// own "Deliberately not ported from `migrate.go`" doc on the
-/// `preflight`/`verifyApplied` pair Go's applier runs and this one does
-/// not), and exercised today only by
-/// `migrations_are_ordered_and_versions_are_dense`.
-#[allow(dead_code)]
-pub fn latest_version() -> i32 {
-    MIGRATIONS
-        .last()
-        .expect("MIGRATIONS is never empty")
-        .version
-}
+/// it. A `const` array read top to bottom is the whole directory in this build,
+/// so sorting it a second time at runtime would only hide a mistake in this
+/// list instead of catching it at compile-adjacent test time. The check keeps
+/// meaning something the day a second entry lands: it is what makes appending
+/// a version 3 while a version 2 is still on a branch fail here rather than in
+/// a half-migrated database.
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "0001_initial_schema.sql",
+    body: include_str!("migrations/0001_initial_schema.sql"),
+}];
 
 const VERSION_TABLE_DDL: &str = "
 CREATE TABLE IF NOT EXISTS catalog_schema_migrations (
@@ -137,12 +93,10 @@ CREATE TABLE IF NOT EXISTS catalog_schema_migrations (
 ///
 /// 🔴 Callers should treat a failure here as a reason to refuse to serve the
 /// catalog rather than to crash the process outright wherever that choice is
-/// available to them — the same posture `catalog_service.go`'s `catalogGate`
-/// takes. Stage B's own caller (`PostgresSnapshotCatalog::connect`) runs this
-/// synchronously during backend assembly, before anything is wired to serve
-/// traffic, so there is no analogous "already serving, now the schema turns
-/// out to be broken" state to guard against the way Go's background goroutine
-/// has to.
+/// available to them. The only caller (`PostgresSnapshotCatalog::connect`)
+/// runs this synchronously during backend assembly, before anything is wired
+/// to serve traffic, so there is no "already serving, now the schema turns out
+/// to be broken" state to guard against.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     let mut conn = pool
         .acquire()
@@ -157,8 +111,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 
     let apply_result = apply(&mut conn).await;
 
-    // 🔴 Released before the outcome is reported, same as Go's applier —
-    // whatever failed above may have left the connection's server-side state
+    // 🔴 Released before the outcome is reported: whatever failed above may
+    // have left the connection's server-side state
     // in a way that makes even the unlock fail; if so, close the connection
     // outright rather than let a lock-holding session drift back into the
     // pool for some other borrower to inherit.
@@ -206,20 +160,22 @@ async fn apply(conn: &mut sqlx::PgConnection) -> Result<()> {
 }
 
 /// The relations each migration version is expected to have created, in
-/// version order — a Rust port of Go's `relationsByVersion`. Version 3
-/// creates no new relation (it only moves a CHECK constraint), matching Go
-/// exactly; version 4 is this build's own addition, absent from Go's set.
-const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
-    (1, &["snapshots"]),
-    (2, &["templates", "builds", "aliases", "active_templates"]),
-    (3, &[]),
-    // 🔴 Version 4 created `catalog_migration_state` and 5 drops it again, so
-    // neither owns a relation `verify_applied` may demand: a database that
-    // applied both has the ledger rows and no table, and that is correct rather
-    // than the half-finished rollback that check exists to catch.
-    (4, &[]),
-    (5, &[]),
-];
+/// version order — what `preflight` refuses to overwrite and what
+/// `verify_applied` demands still exists.
+///
+/// 🔴 `active_templates` is a view and is listed anyway: `to_regclass`
+/// resolves a view the same as a table, and a rollback that took the view
+/// without the ledger is the same broken state as one that took a table.
+const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[(
+    1,
+    &[
+        "snapshots",
+        "templates",
+        "builds",
+        "aliases",
+        "active_templates",
+    ],
+)];
 
 fn owned_relations() -> Vec<&'static str> {
     RELATIONS_BY_VERSION
@@ -228,8 +184,8 @@ fn owned_relations() -> Vec<&'static str> {
         .collect()
 }
 
-/// `to_regclass` resolves against the connection's `search_path`, same as
-/// Go's identical query — which is what keeps this consistent between a
+/// `to_regclass` resolves against the connection's `search_path`, which is
+/// what keeps this consistent between a
 /// production connection (the `public` schema) and this module's own
 /// `pg::` tests (each running in its own schema-scoped connection via
 /// `isolated_schema_pool`).
@@ -243,7 +199,7 @@ async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Resul
 }
 
 /// Refuses to create a table that already exists and was not created by this
-/// ledger — a Rust port of Go's `preflight`. Only fires on an empty ledger:
+/// ledger. Only fires on an empty ledger:
 /// once anything is recorded, these relations are this ledger's by
 /// construction and their existence is expected.
 async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
@@ -266,20 +222,17 @@ async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Res
          these tables were not created by this ledger. Refusing to continue: every migration \
          statement is IF NOT EXISTS, so continuing would silently leave a schema that looks \
          migrated but rejects every write on a column this ledger's migrations never added. \
-         Confirm what created these tables before proceeding (a `services/scheduler` deployment \
-         against the same database is one live possibility, not a hypothetical one); in dev/test, \
-         DROP them and restart this process.",
+         Confirm what created these tables before proceeding; in dev/test, DROP them and \
+         restart this process.",
         existing.join(", ")
     )
 }
 
-/// Refuses a ledger that claims work the database no longer has — a Rust
-/// port of Go's `verifyApplied`, generalised the same way that function's own
-/// doc already frames it: checked against every recorded version's relations,
-/// not only the ones a half-finished rollback would touch. Versions this
-/// build does not recognise are skipped, same as Go: that is a database a
-/// newer (or differently versioned) migrator touched, and this one has no
-/// idea what those files created.
+/// Refuses a ledger that claims work the database no longer has: checked
+/// against every recorded version's relations, not only the ones a
+/// half-finished rollback would touch. Versions this build does not recognise
+/// are skipped — that is a database a newer (or differently versioned)
+/// migrator touched, and this one has no idea what those files created.
 async fn verify_applied(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
     if applied.is_empty() {
         return Ok(());
@@ -331,10 +284,10 @@ async fn apply_one(conn: &mut sqlx::PgConnection, migration: &Migration) -> Resu
     // 🔴 `sqlx::raw_sql`, not `sqlx::query`. The extended (prepared-statement)
     // protocol `query()` uses accepts exactly one statement; these files are
     // several, some containing PL/pgSQL bodies with their own internal
-    // semicolons inside `$$ ... $$` dollar-quoting (0001's triggers, 0003's
-    // `DO` block). `raw_sql` sends the file as one simple-query message and
+    // semicolons inside `$$ ... $$` dollar-quoting (0001's two trigger
+    // functions). `raw_sql` sends the file as one simple-query message and
     // lets PostgreSQL's own parser split it, which is the same thing `psql`
-    // and Go's `pgx.Conn.Exec` do for a multi-statement body.
+    // does for a multi-statement body.
     sqlx::raw_sql(migration.body)
         .execute(&mut *tx)
         .await
@@ -383,11 +336,6 @@ mod pg {
         );
     }
 
-    #[test]
-    fn latest_version_is_the_last_entry() {
-        assert_eq!(latest_version(), MIGRATIONS.last().unwrap().version);
-    }
-
     /// `information_schema.tables` is not filtered by `search_path` on its
     /// own, so two isolated-schema tests both creating a `snapshots` table
     /// would each see the other's row here unless the query names its own
@@ -429,7 +377,7 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1, 2, 3, 4, 5]);
+        assert_eq!(recorded, vec![1]);
     }
 
     #[tokio::test]
@@ -502,19 +450,14 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(
-            recorded,
-            vec![1, 2, 3, 4, 5],
-            "no duplicate or missing ledger rows"
-        );
+        assert_eq!(recorded, vec![1], "no duplicate or missing ledger rows");
     }
 
-    /// The scenario this pair was reinstated for: a database already holding
-    /// these tables under an empty ledger — exactly what a cluster running
-    /// `services/scheduler`'s own `catalog.Migrate` looks like from this
-    /// build's side, before `catalog_schema_migrations` has a single row in
-    /// it that this build wrote. `migrate()` must refuse rather than march
-    /// ahead over somebody else's table.
+    /// A database already holding these tables under an empty ledger — some
+    /// other tool's `snapshots`, or a rollback that dropped the ledger and
+    /// nothing else. `migrate()` must refuse rather than march ahead over a
+    /// table it did not create, because every statement in the file is
+    /// `IF NOT EXISTS` and would quietly do nothing.
     #[tokio::test]
     async fn preflight_refuses_a_snapshots_table_that_predates_the_ledger() {
         let pool = isolated_schema_pool_or_skip!(
@@ -549,7 +492,7 @@ mod pg {
         );
     }
 
-    /// The half-finished-rollback shape `verifyApplied` exists for: the four
+    /// The half-finished-rollback shape `verify_applied` exists for: the four
     /// owned tables dropped, `catalog_schema_migrations` left behind. A
     /// second `migrate()` must refuse rather than believe the ledger and
     /// silently create nothing.
@@ -579,10 +522,9 @@ mod pg {
     /// A version this build's own `RELATIONS_BY_VERSION` has no entry for —
     /// standing in for a migration a *different* migrator applied under a
     /// version number this build has never heard of — must not be refused.
-    /// Refusing it would mean two independently-versioned migrators (this
-    /// build and a future Go or Rust one) could never share a database
-    /// without this build failing every start the moment the other one gets
-    /// ahead.
+    /// Refusing it would mean two independently-versioned migrators could
+    /// never share a database without this build failing every start the
+    /// moment the other one gets ahead.
     #[tokio::test]
     async fn an_unrecognized_version_in_the_ledger_is_skipped_not_refused() {
         let pool = isolated_schema_pool_or_skip!(
@@ -600,5 +542,202 @@ mod pg {
         migrate(&pool)
             .await
             .expect("a ledger row this build does not recognize must not block a start");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // What the schema actually is
+    //
+    // 🔴 These four lists are the reason a squashed migration is safe to edit.
+    // Every statement in `0001_initial_schema.sql` is `IF NOT EXISTS` /
+    // `OR REPLACE`, so *deleting* one is silent: the file still applies, the
+    // ledger still records version 1, every other test here still passes, and
+    // the constraint or index that was supposed to stop a bad row is simply
+    // gone. Nothing else in this crate reads `pg_constraint`. So these
+    // assertions are spelled as whole sorted sets rather than as `contains`
+    // checks — a set comparison fails on a deletion, which is the direction
+    // that matters, and a `contains` check does not.
+    //
+    // A deliberate change to the schema is meant to fail these and be updated
+    // here in the same commit. That is the point: the update is where somebody
+    // states, in the diff, which rule they are removing.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Everything in the test connection's own schema, so two isolated-schema
+    /// tests cannot see each other's tables.
+    async fn schema_facts(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
+        sqlx::query_scalar(sql)
+            .fetch_all(pool)
+            .await
+            .expect("inspecting the applied schema should succeed")
+    }
+
+    #[tokio::test]
+    async fn the_applied_schema_has_exactly_these_relations() {
+        let pool = isolated_schema_pool_or_skip!("the_applied_schema_has_exactly_these_relations");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let found = schema_facts(
+            &pool,
+            "SELECT relname || ' (' || relkind::text || ')' \
+               FROM pg_class \
+              WHERE relnamespace = current_schema()::regnamespace \
+                AND relkind IN ('r', 'v') \
+              ORDER BY 1",
+        )
+        .await;
+
+        assert_eq!(
+            found,
+            vec![
+                "active_templates (v)",
+                "aliases (r)",
+                "builds (r)",
+                "catalog_schema_migrations (r)",
+                "snapshots (r)",
+                "templates (r)",
+            ],
+            "the applied schema is not the set of relations this build expects"
+        );
+    }
+
+    /// 🔴 The auto-named column CHECKs (`snapshots_cpu_count_check`,
+    /// `snapshots_status_check`, …) are listed beside the hand-named ones on
+    /// purpose. PostgreSQL derives those names from the table and column, so
+    /// they are stable, and pinning them is what catches an inline `CHECK`
+    /// being dropped out of a `CREATE TABLE` — which no named-constraint list
+    /// would notice.
+    ///
+    /// 🔴 There is deliberately no `snapshots_disk_size_mib_check` here.
+    /// `disk_size_mib` carries no inline positivity CHECK: 0 means "not known
+    /// until the build produces a rootfs", and an insert-time `> 0` refused
+    /// every v3 template create. The two named rules below
+    /// (`snapshots_disk_size_floor`, `snapshots_ready_has_disk_size`) are what
+    /// replaced it, and this assertion fails if somebody puts the inline one
+    /// back.
+    #[tokio::test]
+    async fn the_applied_schema_has_exactly_these_constraints() {
+        let pool =
+            isolated_schema_pool_or_skip!("the_applied_schema_has_exactly_these_constraints");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let found = schema_facts(
+            &pool,
+            "SELECT t.relname || '.' || c.conname || ' (' || c.contype::text || ')' \
+               FROM pg_constraint c \
+               JOIN pg_class t ON t.oid = c.conrelid \
+              WHERE t.relnamespace = current_schema()::regnamespace \
+                AND c.contype IN ('c', 'f', 'p', 'u') \
+              ORDER BY 1",
+        )
+        .await;
+
+        assert_eq!(
+            found,
+            vec![
+                "aliases.aliases_pkey (p)",
+                "aliases.aliases_snapshot_fk (f)",
+                "builds.builds_finished_axis (c)",
+                "builds.builds_pkey (p)",
+                "builds.builds_started_axis (c)",
+                "builds.builds_status_check (c)",
+                "builds.builds_status_group_check (c)",
+                "builds.builds_template_fk (f)",
+                "catalog_schema_migrations.catalog_schema_migrations_pkey (p)",
+                "snapshots.snapshots_committed_axis (c)",
+                "snapshots.snapshots_cpu_count_check (c)",
+                "snapshots.snapshots_disk_size_floor (c)",
+                "snapshots.snapshots_error_axis (c)",
+                "snapshots.snapshots_memory_mib_check (c)",
+                "snapshots.snapshots_origin_axis (c)",
+                "snapshots.snapshots_pkey (p)",
+                "snapshots.snapshots_ready_has_disk_size (c)",
+                "snapshots.snapshots_ready_is_committed (c)",
+                "snapshots.snapshots_source_axis (c)",
+                "snapshots.snapshots_source_kind_check (c)",
+                "snapshots.snapshots_status_check (c)",
+                "snapshots.snapshots_status_group_check (c)",
+                "templates.templates_id_fk (f)",
+                "templates.templates_pkey (p)",
+            ],
+            "the applied schema is not the set of constraints this build expects"
+        );
+    }
+
+    /// 🔴 `unique` and `partial` are asserted, not just the names. Both carry
+    /// the rule rather than the performance: `builds_one_active_per_template`
+    /// is what makes "one live build per template" an impossibility instead of
+    /// a race two concurrent POSTs can lose, and it only means that while it is
+    /// UNIQUE *and* predicated on the active status groups. An index recreated
+    /// without either half still answers every query and enforces nothing.
+    #[tokio::test]
+    async fn the_applied_schema_has_exactly_these_indexes() {
+        let pool = isolated_schema_pool_or_skip!("the_applied_schema_has_exactly_these_indexes");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let found = schema_facts(
+            &pool,
+            "SELECT c.relname \
+                 || ' unique=' || i.indisunique::text \
+                 || ' partial=' || (i.indpred IS NOT NULL)::text \
+               FROM pg_index i \
+               JOIN pg_class c ON c.oid = i.indexrelid \
+               JOIN pg_class t ON t.oid = i.indrelid \
+              WHERE t.relnamespace = current_schema()::regnamespace \
+              ORDER BY 1",
+        )
+        .await;
+
+        assert_eq!(
+            found,
+            vec![
+                "aliases_one_per_snapshot unique=true partial=false",
+                "aliases_pkey unique=true partial=false",
+                "builds_active_idx unique=false partial=true",
+                "builds_one_active_per_template unique=true partial=true",
+                "builds_pkey unique=true partial=false",
+                "catalog_schema_migrations_pkey unique=true partial=false",
+                "snapshots_list_idx unique=false partial=true",
+                "snapshots_pkey unique=true partial=false",
+                "snapshots_source_sandbox_idx unique=false partial=true",
+                "snapshots_unpublished_idx unique=false partial=true",
+                "templates_cluster_live_idx unique=false partial=true",
+                "templates_pkey unique=true partial=false",
+            ],
+            "the applied schema is not the set of indexes this build expects"
+        );
+    }
+
+    /// 🔴 The function each trigger calls is part of the assertion. `status_group`
+    /// is never written by a caller — every read path's partial indexes are
+    /// predicated on it — so a trigger left pointing at the wrong function, or
+    /// dropped from one of the two tables that carry the column, produces rows
+    /// whose `status_group` disagrees with their `status` and which the listing
+    /// index therefore cannot see.
+    #[tokio::test]
+    async fn the_applied_schema_has_exactly_these_triggers() {
+        let pool = isolated_schema_pool_or_skip!("the_applied_schema_has_exactly_these_triggers");
+        migrate(&pool).await.expect("migration should succeed");
+
+        let found = schema_facts(
+            &pool,
+            "SELECT t.relname || '.' || g.tgname || ' -> ' || p.proname \
+               FROM pg_trigger g \
+               JOIN pg_class t ON t.oid = g.tgrelid \
+               JOIN pg_proc p ON p.oid = g.tgfoid \
+              WHERE t.relnamespace = current_schema()::regnamespace \
+                AND NOT g.tgisinternal \
+              ORDER BY 1",
+        )
+        .await;
+
+        assert_eq!(
+            found,
+            vec![
+                "builds.builds_status_group_trg -> catalog_status_group_trg",
+                "snapshots.snapshots_status_group_trg -> catalog_status_group_trg",
+                "snapshots.snapshots_updated_at_trg -> snapshots_touch_updated_at_trg",
+            ],
+            "the applied schema is not the set of triggers this build expects"
+        );
     }
 }

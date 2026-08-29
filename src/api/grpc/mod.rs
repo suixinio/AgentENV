@@ -10,12 +10,11 @@
 //!
 //! # 🔴 Served by `aenv-api`, and by nothing else
 //!
-//! `assemble_api` binds [`serve_on`] on `[cluster].api_grpc_addr`.
-//! the pre-split single process deliberately does not open a second listener: it is the
-//! rollback target and is defined as the process that ran before the split.
-//! Under the pre-split single process the wake-up decision is still taken where it always was —
-//! `try_auto_resume` on the local reverse proxy's request path — which is what
-//! makes rolling back to it a ConfigMap change rather than a code change.
+//! `assemble_api` binds [`serve_on`] on `[cluster].api_grpc_addr`. `aenv-node`
+//! opens no such listener, and there is no longer a second place the wake-up
+//! decision could be taken: `try_auto_resume`, which took it on the local
+//! reverse proxy's own request path before the split, is deleted. This service
+//! is how the data plane asks for a wake-up, and the only how.
 
 mod resume;
 

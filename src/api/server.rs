@@ -181,10 +181,12 @@ where
     E: std::fmt::Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
-    // 🔴 One carrier. The gate below and the data plane's auto-resume arm
-    // (`crate::api::proxy::resolve_proxy_request`) now read the same `ApiImpl`,
-    // so there is no longer a pair that has to be kept in step by a
-    // `debug_assert` here.
+    // 🔴 The one surviving reader of `owns_sandboxes`, and the reason that
+    // method is not the proxy's to take with it: this is the role gate that
+    // makes `aenv-node` answer 404 on the user-facing REST routes. The data
+    // plane read the same predicate to decide whether it might wake a paused
+    // sandbox; that arm is deleted, and waking is `crate::api::grpc::resume`'s
+    // alone. Two readers of one carrier became one, not a pair to keep in step.
     let serves_user_facing_rest = AsRef::<ApiImpl>::as_ref(&api_impl).owns_sandboxes();
 
     // 🔴 `Absent` merges an empty `Router`, which is not a stand-in for

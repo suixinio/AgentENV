@@ -31,9 +31,10 @@ pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
 // reach it through this one point.
 //
 // 🔴 Still true after the wake-up decision moved to `resume_surface`, and it is
-// what makes the move safe: the gRPC surface the gateway calls, the REST resume
-// route, and the local reverse proxy's `try_auto_resume` all arbitrate here.
-// Three callers, one place a resume can acquire the right to start.
+// what made the move safe: the gRPC surface the gateway calls and the REST
+// resume route both arbitrate here. The local reverse proxy's
+// `try_auto_resume` was the third caller and is deleted; the point survives it
+// — one place a resume can acquire the right to start.
 pub(in crate::api) use paused_recovery::ResumeArbitration;
 pub use resume_surface::ResumeWiring;
 pub(in crate::api) use resume_surface::{

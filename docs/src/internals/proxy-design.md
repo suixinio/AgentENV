@@ -71,25 +71,28 @@ Lookup behavior (`proxy_lookup_for`):
 
 This keeps hot-path reads lock-light and avoids reading sandbox instance internals in API request paths.
 
-## Paused Sandbox Auto-Resume
+## Paused Sandboxes
 
-`/proxy` can auto-resume paused sandboxes when lifecycle policy enables it.
-
-- Proxy never reads sandbox metadata directly.
-- Orchestrator lookup returns `Paused { auto_resume }`, and proxy decides behavior from that signal.
-- Auto-resume is attempted once per request.
-- Resume timeout update uses `EnsureMinimum(5 minutes)`:
-  - effective sandbox timeout is `max(existing_timeout, 5 minutes)`
-- Proxy waits up to:
-  - test builds: short unit-test timeout
-  - non-test runtime: `60s`
+🔴 **The proxy does not wake sandboxes.** It forwards bytes; deciding that a
+sandbox should be alive belongs to the half that owns sandboxes, and the data
+plane reaches that decision over the gateway's cold path
+(`SandboxResumeService`, `src/api/grpc/resume.rs`) before traffic ever arrives
+at a proxy. `try_auto_resume` used to take the same decision on the proxy's own
+request path and is deleted, along with the
+`agentenv_proxy_auto_resume_total` counter that measured it.
 
 Request outcomes for paused sandboxes:
 
-- `auto_resume = false`: `410 Gone`
-- `auto_resume = true` and resume succeeds, then route becomes ready: request is forwarded normally
-- `auto_resume = true` but resume/lookup fails: `502 Bad Gateway`
-- `auto_resume = true` but resume wait times out: `504 Gateway Timeout`
+- `410 Gone`, whatever `auto_resume` says. From the caller's side "this process
+  does not wake sandboxes" and "this sandbox does not wake on traffic" are one
+  fact: the sandbox is paused and this request will not change that.
+
+The lifetime a woken sandbox gets and the bound the wake-up runs under are
+still declared in `src/api/proxy.rs` — `auto_resume_min_sandbox_timeout()`
+(`EnsureMinimum`, `orchestrator.auto_resume_min_sandbox_timeout_secs`, 5
+minutes by default) and `auto_resume_deadline()` (`60s` outside test builds) —
+and read from there by `crate::api::impls::resume_surface`, so a wake-up over
+the gateway hands out exactly what the data plane's own wake-up used to.
 
 ## Lifecycle Hooks and Race Hardening
 
@@ -174,14 +177,12 @@ Handshake failure behavior:
 - `404 Not Found`
   - Sandbox not found
 - `410 Gone`
-  - Sandbox is paused and auto-resume is disabled
+  - Sandbox is paused (regardless of `auto_resume`)
   - Sandbox exists but is not proxyable in current state
 - `502 Bad Gateway`
   - Upstream transport/connect failure
   - Sandbox is `Running` but runtime route is missing (`RouteMissing`)
-  - Paused sandbox auto-resume failed
 - `504 Gateway Timeout`
-  - Paused sandbox auto-resume timed out
   - Upstream response header timeout
   - Upstream websocket handshake timeout
 
@@ -232,6 +233,6 @@ Relevant test coverage exists in:
 - `src/api/proxy.rs` unit tests (HTTP, SSE, large body, websocket, headers, path preservation, error mapping)
 - `src/orchestrator/service.rs` unit tests (route publication/removal behavior and stale-handle guard)
 - Integration lifecycle tests in `tests/integration/orchestrator.rs`
-- E2E proxy suite in `scripts/tests/e2e/suites/06_proxy.sh` (header compatibility and paused auto-resume behavior)
+- E2E proxy suite in `scripts/tests/e2e/suites/06_proxy.sh` (header compatibility, and paused-sandbox wake-up end to end — that suite drives `AENV_PROXY_URL`, so the wake it observes is the gateway's cold path, not the proxy's)
 
 For environment-backed integration validation, use repository-prescribed integration targets.

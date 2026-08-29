@@ -11,7 +11,7 @@
 //! It is not a remote form of the REST resume route. That route serves a user
 //! who asked for a resume and can be told "409, try again"; this one serves a
 //! request that is already in flight towards a sandbox. The difference shows up
-//! in two places, both inherited from the local reverse proxy's
+//! in two places, both inherited from the local reverse proxy's deleted
 //! `try_auto_resume` rather than from the REST route:
 //!
 //! - the lifetime the woken sandbox gets is the auto-resume floor, not a

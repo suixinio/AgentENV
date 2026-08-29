@@ -14,13 +14,14 @@
 //! reverse proxy keeps forwarding bytes and keeps its execution fencing; what
 //! it no longer does is start anything.
 //!
-//! # 🔴 What did *not* move
+//! # 🔴 There is no second copy of this decision
 //!
-//! `try_auto_resume` is still in `src/api/proxy.rs`, still compiled, still
-//! reached — under the pre-split single process, which is the rollback target and is defined as
-//! today's behaviour verbatim. The call site became a role branch rather than a
-//! deletion (`_sd-impl-phase3-role.md` §11.3). Deleting it belongs to a release
-//! after the switch, not to the switch.
+//! `try_auto_resume` is deleted, not switched off. It survived the move for a
+//! release as a branch gated on `ApiImpl::owns_sandboxes()`, which meant only
+//! `aenv-api` could take it; once `aenv-api` stopped mounting the proxy at all
+//! the branch was unreachable in both binaries, and an unreachable second
+//! implementation of "may this sandbox start" is worse than none. This module
+//! is the only one left.
 //!
 //! # 🔴 Pin and prefer are two different answers
 //!
@@ -487,10 +488,10 @@ pub(in crate::api) enum DataPlaneResume {
     /// The wake-up was attempted and did not finish in time.
     ///
     /// 🔴 Kept apart from [`Self::Failed`] for the metric and the log, not for
-    /// the wire: both answer the caller the same way, which is what
-    /// `try_auto_resume` did (`AutoResumeFailed` and `AutoResumeTimedOut` are
-    /// both a 502). A wedged wake-up and a wake-up that returned an error need
-    /// different investigations, and only the counter can tell them apart.
+    /// the wire: both answer the caller the same way, exactly as the deleted
+    /// `try_auto_resume` did — its `AutoResumeFailed` and `AutoResumeTimedOut`
+    /// were both a 502. A wedged wake-up and a wake-up that returned an error
+    /// need different investigations, and only the counter can tell them apart.
     TimedOut,
 }
 
@@ -710,9 +711,10 @@ impl ApiImpl {
         let timeout = NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout());
         // 🔴 A wall-clock bound, because the function this replaced had one.
         //
-        // `try_auto_resume` wrapped exactly this call in
-        // `PROXY_AUTO_RESUME_TIMEOUT` and, on expiry, handed the claim back
-        // before answering. Without it a wake-up that wedges holds the
+        // `try_auto_resume` wrapped exactly this call and, on expiry, handed
+        // the claim back before answering; `auto_resume_deadline` is that same
+        // bound, which is why it outlived it. Without it a wake-up that wedges
+        // holds the
         // gateway's request open and — the half that actually costs something —
         // leaves the cluster row sitting in `resuming` with this node's name on
         // it until the lease lapses, which blocks every later attempt to wake
@@ -973,10 +975,11 @@ impl From<PlacementRefusal> for DataPlaneResume {
 
 /// The floor a woken sandbox's timeout is raised to.
 ///
-/// Shared with the local reverse proxy's `try_auto_resume` rather than
-/// duplicated: a wake-up that came through the gateway and one that came
-/// through a node's own proxy must not leave the sandbox with different
-/// lifetimes.
+/// Declared in `crate::api::proxy` and read here rather than restated: the
+/// deleted `try_auto_resume` raised a woken sandbox's timeout to exactly this
+/// floor, and reading the same accessor is what keeps a wake-up over the
+/// gateway's cold path from handing out a different lifetime than the one the
+/// data plane used to hand out itself.
 fn auto_resume_min_sandbox_timeout() -> std::time::Duration {
     crate::api::proxy::auto_resume_min_sandbox_timeout()
 }
@@ -1300,15 +1303,15 @@ mod tests {
         );
     }
 
-    /// The woken sandbox's timeout floor is the local reverse proxy's, not zero.
+    /// The woken sandbox's timeout floor is the one `crate::api::proxy`
+    /// declares, not zero.
     ///
-    /// Shared rather than duplicated so a wake-up that came through the gateway
-    /// and one that came through a node's own proxy cannot leave the sandbox
-    /// with different lifetimes. A zero floor would hand every woken sandbox
-    /// whatever it had left, which for a sandbox that was paused past its
-    /// deadline is nothing.
+    /// Read rather than restated, so this wake-up cannot drift away from the
+    /// lifetime the data plane's own wake-up used to hand out. A zero floor
+    /// would hand every woken sandbox whatever it had left, which for a sandbox
+    /// that was paused past its deadline is nothing.
     #[test]
-    fn the_wake_up_timeout_floor_is_the_one_the_local_proxy_uses() {
+    fn the_wake_up_timeout_floor_is_the_one_the_proxy_module_declares() {
         let floor = auto_resume_min_sandbox_timeout();
         assert_eq!(floor, crate::api::proxy::auto_resume_min_sandbox_timeout());
         assert!(

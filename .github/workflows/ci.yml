@@ -81,8 +81,9 @@ jobs:
       # contract had never run in CI at all.
       #
       # Same shape as the `--lib`-only selection this target was already fixed
-      # for, and as the Go side's `SCHEDULER_REDIS_TEST_REQUIRED`: the tests
-      # were compiled on every PR and executed on none.
+      # for, and as the Go side's own AENV_REDIS_TEST_REQUIRED (services-ci.yml
+      # sets the same variable): the tests were compiled on every PR and
+      # executed on none.
       - name: Install Redis server for the metadata store tests
         run: |
           sudo apt-get update

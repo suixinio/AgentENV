@@ -93,7 +93,7 @@ Go control-plane services (`services/` module — gateway only):
 ```bash
 make -C services build               # build gateway
 make -C services test                # test the whole module (gateway, shared, api)
-make -C services test-with-postgres  # same, plus fails instead of silently skipping when redis-server is missing
+make -C services test-with-redis      # same, plus fails instead of silently skipping when redis-server is missing
 make -C services run-gateway
 
 # from services/ directly
@@ -103,16 +103,28 @@ go test ./...
 `make -C services test` runs `gateway`/`shared`/`api`; no package left under
 `services/` opens a real database connection any more —
 `scheduler/internal/registry` and `scheduler/internal/catalog`, the only ones
-that ever did, were deleted with `services/scheduler`. Without a
-`redis-server` on `PATH`, the `RedisBindingStore`/routing-reader suites call
-`t.Skip` and the package still reports `ok`, so `make -C services test` prints
-a warning naming exactly that after the run. `make -C services test-with-postgres`
-still starts a throwaway PostgreSQL in Docker for parity with the CI step it
-mirrors, but the only tests it changes the outcome of today are Redis-gated:
-`REDIS_SERVER_BIN` and `SCHEDULER_REDIS_TEST_REQUIRED=1` turn a missing
-`redis-server` into a failure instead of a silent skip for those same
-binding-store tests — the only ones that exercise the Redis implementation of
-sandbox-to-node bindings, which is what every HA deployment runs.
+that ever did, were deleted with `services/scheduler`, and nothing left in the
+module imports `database/sql`, `pgx` or `lib/pq`. Without a `redis-server` on
+`PATH`, `shared/routing`'s reader suite calls `t.Skip` and the package still
+reports `ok`, so `make -C services test` prints a warning naming exactly that
+after the run.
+
+🔴 **`make -C services test-with-postgres` is gone, and it started no
+PostgreSQL.** This file used to claim it "still starts a throwaway PostgreSQL in
+Docker for parity with the CI step it mirrors"; that was false — the recipe only
+ever checked for `redis-server` and set two Redis variables. It is renamed
+`make -C services test-with-redis`, with **no compatibility alias**, so the old
+name fails with "No rule to make target" instead of quietly doing something
+other than what it says. (The repository-root `make test-with-postgres`, which
+does run a real PostgreSQL for `crates/aenv-api/src/pg/`, is a different target
+and is unaffected.) `REDIS_SERVER_BIN` and `AENV_REDIS_TEST_REQUIRED=1` turn a
+missing `redis-server` into a failure instead of a silent skip for that reader
+suite — the only thing in this module that exercises the real Redis routing
+projection, which is what every HA deployment's data plane routes on.
+`AENV_REDIS_TEST_REQUIRED` is deliberately the same variable the Rust side's
+harness reads (it was `SCHEDULER_REDIS_TEST_REQUIRED`, from when
+`services/scheduler` owned the write side): one Redis key format read by two
+languages, one switch that arms both.
 
 Run a single test:
 ```bash

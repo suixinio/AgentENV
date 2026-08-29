@@ -161,8 +161,13 @@ func startRedisServerForTest(t *testing.T) string {
 		var err error
 		bin, err = exec.LookPath("redis-server")
 		if err != nil {
-			if os.Getenv("SCHEDULER_REDIS_TEST_REQUIRED") != "" {
-				t.Fatal("SCHEDULER_REDIS_TEST_REQUIRED is set but no redis-server was found: these routing-reader tests would have been skipped")
+			// 🔴 AENV_REDIS_TEST_REQUIRED, not SCHEDULER_REDIS_TEST_REQUIRED:
+			// the same name the Rust harness reads, deliberately. The two
+			// languages read one Redis key format, and a run that set one
+			// variable and not the other would arm half the contract while
+			// reporting green for all of it.
+			if os.Getenv("AENV_REDIS_TEST_REQUIRED") != "" {
+				t.Fatal("AENV_REDIS_TEST_REQUIRED is set but no redis-server was found: these routing-reader tests would have been skipped")
 			}
 			t.Skip("redis-server not found; set REDIS_SERVER_BIN or install redis-server to run the routing reader test")
 		}

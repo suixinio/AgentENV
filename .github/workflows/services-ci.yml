@@ -45,10 +45,17 @@ jobs:
           # And the belt to that brace. Naming the binary only helps while the
           # path is right; this turns a skip inside the suite into a failure
           # however it was reached. The routing-reader tests are the only
-          # coverage the Redis-backed binding store has, and a change made to
-          # the in-memory store and forgotten for Redis passes every other
+          # coverage the Redis routing projection has on this side, and a key
+          # or record-format change made on the Rust side — aenv-api writes
+          # every one of those keys — and forgotten here passes every other
           # test in the module.
-          SCHEDULER_REDIS_TEST_REQUIRED: "1"
+          #
+          # Named AENV_REDIS_TEST_REQUIRED, the same variable ci.yml sets for
+          # the Rust half: one contract, two languages, one switch. It was
+          # SCHEDULER_REDIS_TEST_REQUIRED, from when services/scheduler owned
+          # the write side; there is no alias, so a workflow still setting the
+          # old name arms nothing and this suite goes back to skipping green.
+          AENV_REDIS_TEST_REQUIRED: "1"
         run: make test
       - name: Go format check
         run: make fmt-check

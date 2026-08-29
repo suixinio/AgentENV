@@ -326,11 +326,19 @@ func TestHostRoutedDataPlaneIsFencedLikeHeaderRouted(t *testing.T) {
 // handleProxy's isUserFacingRestRequest branch forwards every control-plane
 // call to the api half before decideFencing is ever reached for it, so the
 // property "the control plane is never refused" is enforced structurally now
-// (no fencing plan is ever computed for it — see forwardToRestUpstream's own
-// doc comment) rather than by a decision this test needed to pin. Deleted
-// rather than rewritten: there is no live call site left that resolves a
-// fencingPlaneControl plan through a real request the way this test drove
-// one.
+// (no fencing plan is computed for a control-plane call that reaches the api
+// half — see forwardToRestUpstream's own doc comment) rather than by a decision
+// this test needed to pin.
+//
+// 🔴 The note that stood here added "there is no live call site left that
+// resolves a fencingPlaneControl plan through a real request", and that part
+// was wrong. isUserFacingRestRequest bails out on any request carrying a
+// routing header, so a control-plane path sent with x-agentenv-sandbox-id set
+// — which is what a client that stamps the header on everything produces —
+// still reaches decideFencing, with routeSourcePath and therefore
+// fencingPlaneControl. TestControlPlaneRequestsAreCountedUnderTheObservedLabel
+// at the bottom of this file drives exactly that request and reads the
+// resulting series off /metrics.
 
 // 🔴 PLACED and PINNED both mean the node is about to mint a new incarnation, so
 // any incarnation on the answer names the previous one. Stamping it would refuse
@@ -1185,5 +1193,91 @@ func TestWebSocketHandshakeAgainstASupersededExecutionIsRefused(t *testing.T) {
 	}
 	if strings.Contains(string(body), "frames from a superseded incarnation") {
 		t.Fatalf("the superseded incarnation's stream reached the client: %q", body)
+	}
+}
+
+// 🔴 fencingDecisionObserved is a live metric label and nothing pinned its
+// value.
+//
+// It is what the routing layer records for control-plane traffic: the plane
+// that resolves an incarnation, logs it, and deliberately never stamps it. A
+// mutation run changed the constant to fencingDecisionOff and the entire Go
+// suite stayed green — the series carried on counting control-plane requests,
+// under the one label that means "the switch is off and nothing was resolved".
+// Any alert or dashboard reading agentenv_gateway_execution_fencing_total would
+// have been reading a different fact, in the direction that hides a gap rather
+// than inventing one, and no test said a word.
+//
+// The name is the other half of the reason for this guard. It collides with
+// Observe, the deleted third fencing mode, so it reads like that mode's
+// leftover and invites deletion — but Observe was a *mode* the operator chose,
+// and this is a *plane's* decision that no configuration reaches. The pin is
+// what makes that difference visible to whoever reaches for the constant next.
+//
+// Pinned at both ends, against the literal string rather than against the
+// constant: what decideFencing puts in the plan, and what reaches /metrics.
+// recordExecutionFencing is the only emission — no log line carries a decision
+// label (logExecutionMismatch's frozen six-field set does not include one, and
+// it is reached only by refusals, which the control plane never produces).
+func TestControlPlaneRequestsAreCountedUnderTheObservedLabel(t *testing.T) {
+	// The plan half. Pure, so the whole decision is one call.
+	resolved := &schedulerv1.LookupNodeResponse{
+		Node:               &schedulerv1.Node{NodeId: "node-a", Endpoint: "http://node-a"},
+		Location:           schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
+		ExecutionId:        executionNewer,
+		ExecutionAuthority: schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
+	}
+	plan := decideFencing(fencingEnforce, fencingPlaneControl, resolved)
+	if plan.decision != "observed" {
+		t.Fatalf("the control plane's decision label is %q, want \"observed\"", plan.decision)
+	}
+	if plan.fenced {
+		t.Fatal("a control-plane plan came back fenced; the label would then be the least of it")
+	}
+
+	// The emission half, through the exporter Prometheus reads. A control-plane
+	// request reaches decideFencing when it carries a routing header as well as
+	// a control-plane path — the header is what keeps isUserFacingRestRequest
+	// from forwarding it to the api half first.
+	stamped := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stamped <- r.Header.Get(headerExpectExecutionID)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	observedBefore := fencingCounter(t, fencingPlaneControl, "observed")
+	offBefore := fencingCounter(t, fencingPlaneControl, "off")
+
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
+	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+
+	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil)
+	request.Header.Set(headerSandboxID, "sbx-1")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d (body %q)", response.Code, response.Body.String())
+	}
+
+	// Proves the request really took the control plane rather than the data
+	// plane: the expect header is the one thing only a fenced, data-plane
+	// request carries.
+	select {
+	case got := <-stamped:
+		if got != "" {
+			t.Fatalf("a control-plane request carried expect header %q; this exercised the data plane", got)
+		}
+	default:
+		t.Fatal("the request never reached the node")
+	}
+
+	if got := fencingCounter(t, fencingPlaneControl, "observed") - observedBefore; got != 1 {
+		t.Fatalf(`agentenv_gateway_execution_fencing_total{plane="control",decision="observed"} moved by %v, want 1`, got)
+	}
+	if got := fencingCounter(t, fencingPlaneControl, "off") - offBefore; got != 0 {
+		t.Fatalf(`the control plane was counted under "off" (moved by %v); that label means the switch is off `+
+			`and nothing was resolved, which is not what happened`, got)
 	}
 }

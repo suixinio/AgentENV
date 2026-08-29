@@ -90,20 +90,33 @@ Commands (from `services/`):
 ```bash
 make tidy
 make proto
-make build              # builds gateway
-make test               # tests the whole module: gateway, shared, api
-make test-with-postgres # same, plus fails instead of silently skipping when redis-server is missing
+make build           # builds gateway
+make test            # tests the whole module: gateway, shared, api
+make test-with-redis # same, plus fails instead of silently skipping when redis-server is missing
 ```
 
-`services/scheduler`'s PostgreSQL-gated paused-registry suite was deleted
-along with the package, so nothing left under `services/` needs a real
-PostgreSQL to run its tests. `make test-with-postgres` still starts a
-throwaway PostgreSQL in Docker for parity with the CI step it mirrors, but the
-only tests it changes the outcome of today are Redis-gated: `REDIS_SERVER_BIN`
-and `SCHEDULER_REDIS_TEST_REQUIRED=1` turn a missing `redis-server` into a
-failure instead of a silent skip for `shared/routing`'s reader tests. (There is
-no Go `RedisBindingStore` suite any more — no type of that name is left in the
-module; `aenv-api` owns the binding store's write side, and Go reads those keys.)
+🔴 **`make test-with-postgres` is gone, and it never started a PostgreSQL.**
+This file and CLAUDE.md both used to say it "starts a throwaway PostgreSQL in
+Docker for parity with the CI step it mirrors" — untrue since
+`services/scheduler` was deleted, and worth more than a corrected sentence: the
+recipe only ever checked for `redis-server` and set two Redis variables, so an
+operator debugging a red run had a container to go looking for that no target
+here has ever started. Nothing left under `services/` imports `database/sql`,
+`pgx` or `lib/pq`. The target is renamed to `test-with-redis` with **no
+compatibility alias**, so the old name now fails with "No rule to make target"
+rather than quietly doing something else than its name says.
+
+What it does: `REDIS_SERVER_BIN` and `AENV_REDIS_TEST_REQUIRED=1` turn a missing
+`redis-server` into a failure instead of a silent skip for `shared/routing`'s
+reader tests. (There is no Go `RedisBindingStore` suite any more — no type of
+that name is left in the module; `aenv-api` owns the binding store's write side,
+and Go reads those keys.)
+
+🔴 The variable is `AENV_REDIS_TEST_REQUIRED` — the same name the Rust half's
+harness reads, which is the point. One Redis key format is read by two
+languages; two names for the switch that arms it would let a run set one and
+report green for both halves. It was `SCHEDULER_REDIS_TEST_REQUIRED`, from when
+`services/scheduler` owned the write side, and that name is dead with no alias.
 
 🔴 That skip matters more than it looks. Those reader tests are the only
 thing in this module that exercises the real Redis routing projection, and that
@@ -111,7 +124,7 @@ projection is what every HA deployment's data plane reads. A change made to the
 key format on the Rust side and forgotten here passes every other test in the
 module, on any machine, and shows up only in production — as routing that
 quietly stops arbitrating. A skip reports as a pass, so without
-`SCHEDULER_REDIS_TEST_REQUIRED` a missing `redis-server` and a healthy run
+`AENV_REDIS_TEST_REQUIRED` a missing `redis-server` and a healthy run
 look identical.
 
 Per-service (from `services/gateway/`):

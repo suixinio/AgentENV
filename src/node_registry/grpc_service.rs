@@ -124,7 +124,6 @@ use crate::proto::scheduler::{
     UnregisterNodeResponse,
 };
 
-use super::filter::NodeResourceLimit;
 use super::registry::{
     AtomicNodeRegistry, NodeNotInRegistry, NodeRegistry, ServiceInstanceMismatch,
 };
@@ -172,15 +171,10 @@ pub struct NodeRegistryGrpcService {
     /// than refusing the RPC the way a missing `binding_store` does.
     paused_registry: Option<Arc<dyn PausedSandboxRegistry>>,
     /// `Schedule`'s placement strategy, and `lookup_node`'s `Paused`
-    /// branch's (`select_node`'s `hint = None` call). Defaults to
-    /// round-robin, matching Go's own `NewStrategy` fallback -- neither is
-    /// wired to `AppConfig` yet, mirroring `NodeResourceLimit`'s own
-    /// "deliberately deferred" stance (`src/node_registry/strategy.rs`,
-    /// `src/node_registry/filter.rs`).
+    /// branch's (`select_node`'s `hint = None` call). Round-robin, matching
+    /// Go's own `NewStrategy` fallback, and not wired to `AppConfig` -- it
+    /// is the only strategy this build has.
     strategy: Arc<dyn Strategy>,
-    /// `Schedule`'s resource ceiling. `None` (no limit) by default -- see
-    /// `strategy`'s own doc for why this is not yet configurable here.
-    resource_limit: Option<NodeResourceLimit>,
 }
 
 impl NodeRegistryGrpcService {
@@ -194,7 +188,6 @@ impl NodeRegistryGrpcService {
             artifact_store: None,
             paused_registry: None,
             strategy: Arc::new(RoundRobinStrategy::new()),
-            resource_limit: None,
         }
     }
 
@@ -766,7 +759,6 @@ impl Scheduler for NodeRegistryGrpcService {
         let deps = ScheduleDeps {
             node_registry: self.registry.as_ref(),
             strategy: self.strategy.as_ref(),
-            resource_limit: self.resource_limit.as_ref(),
         };
         let result = lookup_logic::select_node(&deps, req.hint.as_ref(), "");
         let strategy_name = self.strategy.name();
@@ -817,7 +809,6 @@ impl Scheduler for NodeRegistryGrpcService {
             place: ScheduleDeps {
                 node_registry: self.registry.as_ref(),
                 strategy: self.strategy.as_ref(),
-                resource_limit: self.resource_limit.as_ref(),
             },
             binding_store: binding_store.as_ref(),
             paused_registry: self.paused_registry.as_deref(),

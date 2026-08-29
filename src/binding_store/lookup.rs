@@ -44,9 +44,7 @@
 use std::time::SystemTime;
 
 use crate::binding_store::BindingStore;
-use crate::node_registry::filter::{
-    filter_by_resource_limit, filter_unschedulable, NodeResourceLimit,
-};
+use crate::node_registry::filter::filter_unschedulable;
 use crate::node_registry::registry::NodeRegistry;
 use crate::node_registry::strategy::{NoNodesAvailable, Strategy};
 use crate::node_registry::types::{Node, RichNode};
@@ -70,7 +68,6 @@ pub use crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL as ROSTER_FR
 pub struct ScheduleDeps<'a> {
     pub node_registry: &'a dyn NodeRegistry,
     pub strategy: &'a dyn Strategy,
-    pub resource_limit: Option<&'a NodeResourceLimit>,
 }
 
 /// One selection, with the candidate counts it was taken over -- mirrors
@@ -104,7 +101,7 @@ pub fn select_node(
             RichNode { node, snapshot }
         })
         .collect();
-    let eligible_nodes = filter_by_resource_limit(filter_unschedulable(rich), deps.resource_limit);
+    let eligible_nodes = filter_unschedulable(rich);
     let eligible = eligible_nodes.len();
 
     let prefer_node_id = prefer_node_id.trim();

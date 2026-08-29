@@ -101,8 +101,9 @@ const LABEL_SERVICE_NAME: &str = "kubernetes.io/service-name";
 const MAX_CONSECUTIVE_WATCH_ERRORS: u32 = 5;
 
 /// Stage A-local stand-in for `services/shared/config.SchedulerDiscoveryKubernetesConfig`.
-/// Not yet registered on [`crate::cfg::AppConfig`] — same deferral as
-/// [`super::filter::NodeResourceLimit`].
+/// Built by `aenv-api`'s startup wiring out of
+/// [`crate::cfg::ClusterKubernetesDiscoveryConfig`], which is what an
+/// operator actually sets under `[cluster.kubernetes_discovery]`.
 #[derive(Debug, Clone, Default)]
 pub struct KubernetesDiscoveryConfig {
     pub namespace: String,

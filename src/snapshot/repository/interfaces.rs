@@ -106,49 +106,6 @@ impl SnapshotListPage {
     }
 }
 
-/// Slices an already-materialised listing into one page.
-///
-/// This is what a catalog that cannot push the keyset into its storage does —
-/// both object-store backends read every row whatever the filter says, so their
-/// paging is a sort and a slice. It lives here rather than in the HTTP layer
-/// because the layer above must not be able to tell which backend it is talking
-/// to: the same `limit`, the same cursor and the same order have to mean the
-/// same thing whether the answer came from a SQL keyset or from this.
-pub fn paginate_records(
-    mut records: Vec<SnapshotRecord>,
-    limit: u32,
-    cursor: Option<&SnapshotCursor>,
-) -> SnapshotListPage {
-    // 🔴 An explicit request for no rows is answered with no rows and no
-    // cursor. Clamping it up to one would invent a row the caller did not ask
-    // for, and the arithmetic below would underflow on a zero page size — the
-    // panic the HTTP layer's early return used to be hiding.
-    if limit == 0 {
-        return SnapshotListPage {
-            items: Vec::new(),
-            next: None,
-        };
-    }
-
-    records.sort_by(SnapshotCursor::order);
-    if let Some(cursor) = cursor {
-        records.retain(|record| cursor.is_before(record));
-    }
-
-    let limit = limit as usize;
-    let next = if records.len() > limit {
-        records.get(limit - 1).map(SnapshotCursor::of)
-    } else {
-        None
-    };
-    records.truncate(limit);
-
-    SnapshotListPage {
-        items: records,
-        next,
-    }
-}
-
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
@@ -175,9 +132,9 @@ pub struct SnapshotListFilter {
     /// How many rows one page may hold. `None` means
     /// [`DEFAULT_LIST_PAGE_LIMIT`], not "all of them".
     ///
-    /// Read only by [`SnapshotCatalog::list_page`]; [`SnapshotCatalog::list`]
-    /// ignores it, because its callers want every row and take the cost
-    /// knowingly.
+    /// Every catalog read honours this: [`SnapshotCatalog::list_page`] is the
+    /// only listing there is, so there is no longer a way to ask a catalog for
+    /// every row at once.
     pub limit: Option<u32>,
     /// Where the page starts. `None` starts at the newest row.
     ///
@@ -206,18 +163,6 @@ impl SnapshotListFilter {
         self.limit
             .unwrap_or(DEFAULT_LIST_PAGE_LIMIT)
             .min(MAX_LIST_PAGE_LIMIT)
-    }
-
-    /// The same filter with the page bounds removed.
-    ///
-    /// What [`SnapshotCatalog::list`] is given, and what the default
-    /// [`SnapshotCatalog::list_page`] hands the full listing it slices: a
-    /// backend that ignores `limit` and one that honours it must not both act
-    /// on the same filter.
-    pub fn without_pagination(mut self) -> Self {
-        self.limit = None;
-        self.cursor = None;
-        self
     }
 
     pub fn templates() -> Self {
@@ -588,33 +533,26 @@ pub trait SnapshotCatalog: Send + Sync {
         self.get(id_or_alias).await
     }
 
-    /// Lists every snapshot record matching the provided filter.
-    ///
-    /// Ignores `filter.limit` and `filter.cursor`: this is the unbounded read,
-    /// for the callers that genuinely need every row — the mirror's history
-    /// backfill and the catalog comparison that guards the read-side switch.
-    /// Anything answering a user request wants [`Self::list_page`].
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
-
     /// Lists one page of snapshot records, newest first.
     ///
-    /// 🔴 The default reads every row and slices it, which is what both
-    /// object-store backends can do and no more: their catalog is one object
-    /// per record, so a page costs a LIST plus a GET per row however small the
-    /// page is. A backend whose storage can express the keyset — the central
-    /// catalog's SQL — overrides this, and that override is the whole point of
-    /// the method existing.
+    /// 🔴 The only catalog read that returns more than one row, and it is
+    /// required rather than defaulted. There used to be an unbounded `list`
+    /// beside it, with `list_page` defaulting to reading every row and slicing
+    /// the result; both of that default's justifications are gone — the
+    /// object-store catalogs it existed for hold no rows any more, and the
+    /// callers that genuinely wanted every row (the mirror's history backfill,
+    /// the population comparison behind the read-side switch) were deleted with
+    /// the migration they served. Leaving the default in place would leave a
+    /// way to pull an entire catalog into memory that nothing needs and no
+    /// review would catch.
     ///
-    /// What it must *not* change is the answer. The slice and the keyset order
-    /// rows the same way, cut the page at the same row and produce the same
-    /// cursor, because a read-side switch in either direction has to be
-    /// invisible to a client holding a token.
-    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
-        let limit = filter.effective_limit();
-        let cursor = filter.cursor.clone();
-        let records = self.list(filter.without_pagination()).await?;
-        Ok(paginate_records(records, limit, cursor.as_ref()))
-    }
+    /// Implementations must honour [`SnapshotListFilter::effective_limit`] and
+    /// [`SnapshotListFilter::cursor`], order rows by [`SnapshotCursor::order`],
+    /// and set [`SnapshotListPage::next`] to the *last row of this page* — so a
+    /// caller holding nothing but a token walks the listing exactly once. A
+    /// backend whose storage can express that keyset (PostgreSQL's SQL) pushes
+    /// it down; one that cannot sorts and slices in memory.
+    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage>;
 
     /// [`Self::list_page`] at an explicitly chosen scope.
     ///
@@ -793,13 +731,45 @@ pub trait SnapshotRuntimeResolver: Send + Sync {
     async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot>;
 }
 
+/// The paging contract, exercised end to end through the one implementation of
+/// it a unit test can reach.
+///
+/// 🔴 These used to call `paginate_records`, a free function that was the body
+/// of `SnapshotCatalog::list_page`'s trait default. The default is gone —
+/// `list_page` is required — so the assertions were moved onto
+/// [`InMemorySnapshotCatalog`], which is now the only non-SQL implementation of
+/// the contract. What they pin is unchanged: the listing order, the keyset
+/// cursor, where a page is cut, and what `next` names.
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+    use crate::snapshot::mock::InMemorySnapshotCatalog;
     use crate::snapshot::types::{SnapshotSource, TemplateBuildInfo, TemplateBuildStatus};
     use crate::types::SandboxResources;
     use std::collections::HashSet;
     use uuid::Uuid;
+
+    /// A catalog holding exactly `rows`, so a listing over it is a listing over
+    /// them.
+    fn catalog_of(rows: &[SnapshotRecord]) -> InMemorySnapshotCatalog {
+        let catalog = InMemorySnapshotCatalog::default();
+        for row in rows {
+            catalog.seed(row.clone());
+        }
+        catalog
+    }
+
+    /// One page of everything in `catalog`, at an explicit page size.
+    async fn page_of(
+        catalog: &InMemorySnapshotCatalog,
+        limit: u32,
+        cursor: Option<&SnapshotCursor>,
+    ) -> SnapshotListPage {
+        catalog
+            .list_page(SnapshotListFilter::matches_all().paginated(Some(limit), cursor.cloned()))
+            .await
+            .expect("the in-memory catalog answers every listing")
+    }
 
     fn record(created_at_unix_ms: i64, id: SnapshotId) -> SnapshotRecord {
         SnapshotRecord {
@@ -817,6 +787,17 @@ mod pagination_tests {
             created_at_unix_ms,
             updated_at_unix_ms: created_at_unix_ms,
             committed: None,
+        }
+    }
+
+    /// The same row with the other source kind, so a filter has something to
+    /// exclude.
+    fn sandbox_record(created_at_unix_ms: i64, id: SnapshotId) -> SnapshotRecord {
+        SnapshotRecord {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "sbx-1".to_string(),
+            },
+            ..record(created_at_unix_ms, id)
         }
     }
 
@@ -914,17 +895,18 @@ mod pagination_tests {
     /// The rows deliberately share timestamps in groups, so most page
     /// boundaries land *inside* a tie. A cursor that compared only the
     /// timestamp passes a test whose rows all differ and fails this one.
-    #[test]
-    fn paging_to_the_end_returns_every_row_exactly_once() {
+    #[tokio::test]
+    async fn paging_to_the_end_returns_every_row_exactly_once() {
         let rows: Vec<SnapshotRecord> = (0..40u8)
             .map(|n| record(1_000 - i64::from(n / 4), id(n)))
             .collect();
         let total = rows.len();
+        let catalog = catalog_of(&rows);
 
         let mut seen: Vec<SnapshotId> = Vec::new();
         let mut cursor: Option<SnapshotCursor> = None;
         for _ in 0..total + 1 {
-            let page = paginate_records(rows.clone(), 3, cursor.as_ref());
+            let page = page_of(&catalog, 3, cursor.as_ref()).await;
             seen.extend(page.items.iter().map(|row| row.id.clone()));
             match page.next {
                 None => break,
@@ -956,23 +938,23 @@ mod pagination_tests {
     /// ahead of the walk must not either. Offset paging fails one of these in
     /// each direction — it would skip a row on the first and repeat one on the
     /// second.
-    #[test]
-    fn rows_written_during_a_walk_do_not_shift_the_pages() {
+    #[tokio::test]
+    async fn rows_written_during_a_walk_do_not_shift_the_pages() {
         let rows: Vec<SnapshotRecord> = (0..10u8)
             .map(|n| record(1_000 - i64::from(n), id(n)))
             .collect();
+        let catalog = catalog_of(&rows);
 
-        let first = paginate_records(rows.clone(), 4, None);
+        let first = page_of(&catalog, 4, None).await;
         let cursor = first.next.clone().expect("there is a second page");
         let first_ids: Vec<SnapshotId> = first.items.iter().map(|row| row.id.clone()).collect();
 
-        let mut grown = rows.clone();
         // One row inside the range already returned…
-        grown.push(record(999, id(200)));
+        catalog.seed(record(999, id(200)));
         // …and one newer than anything the walk has seen.
-        grown.push(record(5_000, id(201)));
+        catalog.seed(record(5_000, id(201)));
 
-        let second = paginate_records(grown, 4, Some(&cursor));
+        let second = page_of(&catalog, 4, Some(&cursor)).await;
         let second_ids: Vec<SnapshotId> = second.items.iter().map(|row| row.id.clone()).collect();
 
         assert!(
@@ -992,13 +974,13 @@ mod pagination_tests {
     /// The cursor names the last row of the page, not the first row of the next
     /// one — that is what lets the next page be computed without the caller
     /// holding anything but the token.
-    #[test]
-    fn the_cursor_names_the_last_row_of_the_page() {
+    #[tokio::test]
+    async fn the_cursor_names_the_last_row_of_the_page() {
         let rows: Vec<SnapshotRecord> = (0..5u8)
             .map(|n| record(1_000 - i64::from(n), id(n)))
             .collect();
 
-        let page = paginate_records(rows, 2, None);
+        let page = page_of(&catalog_of(&rows), 2, None).await;
 
         assert_eq!(page.items.len(), 2);
         let next = page.next.expect("there is another page");
@@ -1008,13 +990,13 @@ mod pagination_tests {
 
     /// A page that exactly fits gets no cursor: one more row is the only
     /// evidence there is another page.
-    #[test]
-    fn a_page_that_exactly_fits_has_no_next_cursor() {
+    #[tokio::test]
+    async fn a_page_that_exactly_fits_has_no_next_cursor() {
         let rows: Vec<SnapshotRecord> = (0..3u8)
             .map(|n| record(1_000 - i64::from(n), id(n)))
             .collect();
 
-        let page = paginate_records(rows, 3, None);
+        let page = page_of(&catalog_of(&rows), 3, None).await;
 
         assert_eq!(page.items.len(), 3);
         assert!(page.next.is_none());
@@ -1023,13 +1005,13 @@ mod pagination_tests {
     /// 🔴 A page size of zero. The old HTTP-layer pager computed
     /// `items[limit - 1]` and was kept from underflowing only by an early
     /// return one function up; this is the case that used to reach it.
-    #[test]
-    fn a_page_of_no_rows_is_empty_and_ends_the_walk() {
+    #[tokio::test]
+    async fn a_page_of_no_rows_is_empty_and_ends_the_walk() {
         let rows: Vec<SnapshotRecord> = (0..3u8)
             .map(|n| record(1_000 - i64::from(n), id(n)))
             .collect();
 
-        let page = paginate_records(rows, 0, None);
+        let page = page_of(&catalog_of(&rows), 0, None).await;
 
         assert!(page.items.is_empty());
         assert!(
@@ -1068,18 +1050,43 @@ mod pagination_tests {
         );
     }
 
-    /// The page bounds have to come off before an unbounded listing is asked
-    /// for, or a backend that honours them and one that ignores them answer
-    /// different questions from the same filter.
-    #[test]
-    fn stripping_the_page_bounds_leaves_the_rest_of_the_filter_alone() {
-        let filter =
-            SnapshotListFilter::templates().paginated(Some(5), Some(SnapshotCursor::new(1, id(1))));
+    /// 🔴 One filter carries both the page bounds and what to match, and a
+    /// listing has to apply both. This replaces the test that pinned
+    /// `without_pagination`, the helper that stripped the bounds back off a
+    /// filter before handing it to the unbounded `list`: with `list_page` the
+    /// only read there is, nothing strips anything, and what is left to get
+    /// wrong is honouring one half of the filter and dropping the other.
+    #[tokio::test]
+    async fn the_page_bounds_and_the_match_are_both_applied() {
+        let mut rows: Vec<SnapshotRecord> = (0..3u8)
+            .map(|n| record(1_000 - i64::from(n), id(n)))
+            .collect();
+        rows.extend((10..13u8).map(|n| sandbox_record(1_000 - i64::from(n), id(n))));
+        let catalog = catalog_of(&rows);
 
-        let stripped = filter.clone().without_pagination();
+        let page = catalog
+            .list_page(SnapshotListFilter::templates().paginated(Some(2), None))
+            .await
+            .expect("the in-memory catalog answers every listing");
 
-        assert!(stripped.limit.is_none());
-        assert!(stripped.cursor.is_none());
-        assert_eq!(stripped.sources, filter.sources);
+        assert_eq!(
+            page.items.len(),
+            2,
+            "the limit is honoured even though the filter also matches"
+        );
+        assert!(
+            page.items
+                .iter()
+                .all(|row| matches!(row.source, SnapshotSource::Template { .. })),
+            "and the sandbox rows are excluded even though the page had room"
+        );
+
+        let cursor = page.next.expect("a third template row is left");
+        let rest = catalog
+            .list_page(SnapshotListFilter::templates().paginated(Some(2), Some(cursor)))
+            .await
+            .expect("the in-memory catalog answers every listing");
+        assert_eq!(rest.items.len(), 1, "the walk continues under the filter");
+        assert!(rest.next.is_none());
     }
 }

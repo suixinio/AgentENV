@@ -134,30 +134,12 @@ pub async fn resolve_alias_scoped(
     .transpose()
 }
 
-/// The unbounded read: every row matching `filter`, at `scope`, ignoring
-/// pagination — for the mirror's history backfill and the population
-/// comparison, both of which are counting *everything*.
-pub async fn list_scoped(
-    pool: &PgPool,
-    cluster_id: Uuid,
-    filter: &SnapshotListFilter,
-    scope: CatalogReadScope,
-) -> RepositoryResult<Vec<SnapshotRecord>> {
-    let mut binder = Binder::new(cluster_id);
-    let sql = list_sql(&mut binder, filter, scope, None);
-    let rows: Vec<CatalogRow> = binder
-        .apply(sqlx::query_as(&sql))
-        .fetch_all(pool)
-        .await
-        .map_err(backend_error("list_snapshots"))?;
-    rows.into_iter()
-        .map(|row| decode_row(row, cluster_id))
-        .collect()
-}
-
 /// One keyset page, pushed all the way into the `WHERE`/`ORDER BY`/`LIMIT` —
-/// the pushdown that is the whole point of this backend existing, unlike the
-/// object-store backends' "list everything and slice".
+/// the pushdown that is the whole point of this backend existing, and the only
+/// listing there is: the unbounded `list_scoped` beside it went with
+/// `SnapshotCatalog::list`, whose callers (the mirror's history backfill, the
+/// population comparison behind the read-side switch) were deleted with the
+/// migration they served.
 pub async fn list_page_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -174,7 +156,7 @@ pub async fn list_page_scoped(
     // is another one, matching `listSnapshotsSQL`'s own comment — comparing
     // the page size to the limit instead ends every listing whose total is a
     // multiple of the limit one page early, silently.
-    let sql = list_sql(&mut binder, filter, scope, Some(limit as i64 + 1));
+    let sql = list_sql(&mut binder, filter, scope, limit as i64 + 1);
     let rows: Vec<CatalogRow> = binder
         .apply(sqlx::query_as(&sql))
         .fetch_all(pool)
@@ -246,14 +228,14 @@ impl Binder {
     }
 }
 
-/// Builds one listing query. `limit` is `None` for the unbounded read
-/// ([`list_scoped`]) and `Some(limit + 1)` for a keyset page
-/// ([`list_page_scoped`]).
+/// Builds the listing query. `limit` is always the page size plus one — see
+/// [`list_page_scoped`] on why the extra row; there is no unbounded form of
+/// this query any more, and a caller cannot ask for one.
 fn list_sql(
     binder: &mut Binder,
     filter: &SnapshotListFilter,
     scope: CatalogReadScope,
-    limit: Option<i64>,
+    limit: i64,
 ) -> String {
     let scope_sql = scope_predicate(scope);
     let mut sql = format!(
@@ -277,10 +259,8 @@ fn list_sql(
     }
 
     sql.push_str("\n ORDER BY s.created_at_ms DESC, s.id ASC");
-    if let Some(limit) = limit {
-        let limit_placeholder = binder.add(Value::I64(limit));
-        sql.push_str(&format!("\n LIMIT {limit_placeholder}"));
-    }
+    let limit_placeholder = binder.add(Value::I64(limit));
+    sql.push_str(&format!("\n LIMIT {limit_placeholder}"));
     sql
 }
 

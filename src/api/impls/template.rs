@@ -1234,8 +1234,17 @@ mod template_read_scope_tests {
             Ok((self.visible_at(scope) && names_it).then(|| self.record.clone()))
         }
 
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            Ok(Vec::new())
+        /// 🔴 Not hard-coded empty: routed through the scoped listing below at
+        /// the scope an unscoped read means. A `waiting` template is invisible
+        /// at `Resolvable`, so this comes back empty — but it comes back empty
+        /// for the reason the production catalog would, and it starts returning
+        /// the row the moment `visible_at` says it should.
+        async fn list_page(
+            &self,
+            filter: SnapshotListFilter,
+        ) -> RepositoryResult<SnapshotListPage> {
+            self.list_page_scoped(filter, CatalogReadScope::Resolvable)
+                .await
         }
 
         async fn list_page_scoped(

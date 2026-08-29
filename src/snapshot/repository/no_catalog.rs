@@ -65,10 +65,6 @@ impl SnapshotCatalog for NoSnapshotCatalog {
         Self::refuse("get")
     }
 
-    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        Self::refuse("list")
-    }
-
     async fn list_page(&self, _filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
         Self::refuse("list_page")
     }

@@ -117,17 +117,6 @@ impl PostgresSnapshotCatalog {
         )
     }
 
-    pub async fn list_scoped(
-        &self,
-        filter: SnapshotListFilter,
-        scope: CatalogReadScope,
-    ) -> RepositoryResult<Vec<SnapshotRecord>> {
-        metrics::record_catalog_outcome(
-            "list_scoped",
-            reads::list_scoped(&self.pool, self.cluster_id, &filter, scope).await,
-        )
-    }
-
     pub async fn list_page_scoped(
         &self,
         filter: SnapshotListFilter,
@@ -173,10 +162,6 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
         scope: CatalogReadScope,
     ) -> RepositoryResult<Option<SnapshotRecord>> {
         PostgresSnapshotCatalog::get_scoped(self, id_or_alias, scope).await
-    }
-
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        PostgresSnapshotCatalog::list_scoped(self, filter, CatalogReadScope::Resolvable).await
     }
 
     async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
@@ -724,9 +709,14 @@ mod pg {
         assert_eq!(seen, expected);
     }
 
+    /// 🔴 A filter with no `limit` is not a filter asking for every row — it
+    /// asks for `DEFAULT_LIST_PAGE_LIMIT`, and this is the only place that is
+    /// asserted against real SQL. It replaces the test for the unbounded
+    /// `list`, deleted with that method: what mattered about it was that an
+    /// unspecified limit drops no rows, and that is what this still says.
     #[tokio::test]
-    async fn the_unbounded_list_ignores_the_limit_and_returns_everything() {
-        let catalog = catalog!("the_unbounded_list_ignores_the_limit_and_returns_everything");
+    async fn a_listing_with_no_limit_returns_the_default_page() {
+        let catalog = catalog!("a_listing_with_no_limit_returns_the_default_page");
         for _ in 0..3 {
             let commit = commit_for(SnapshotId::generate(), None);
             catalog
@@ -735,11 +725,16 @@ mod pg {
                 .expect("publish should succeed");
         }
 
-        let all = catalog
-            .list(SnapshotListFilter::default())
+        assert!(SnapshotListFilter::default().limit.is_none());
+        let page = catalog
+            .list_page(SnapshotListFilter::default())
             .await
             .expect("listing should succeed");
-        assert_eq!(all.len(), 3);
+        assert_eq!(page.items.len(), 3);
+        assert!(
+            page.next.is_none(),
+            "three rows fit inside the default page, so the walk ends here"
+        );
     }
 
     #[tokio::test]
@@ -767,12 +762,13 @@ mod pg {
             .expect("publishing the sandbox snapshot should succeed");
 
         let templates_only = catalog
-            .list(SnapshotListFilter {
+            .list_page(SnapshotListFilter {
                 sources: Some(vec![SnapshotSourceKind::Template]),
                 ..SnapshotListFilter::default()
             })
             .await
-            .expect("listing should succeed");
+            .expect("listing should succeed")
+            .items;
         assert_eq!(templates_only.len(), 1);
         assert!(matches!(
             templates_only[0].source,

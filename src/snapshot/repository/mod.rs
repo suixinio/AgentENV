@@ -8,8 +8,8 @@ pub mod no_catalog;
 pub use composite::SnapshotRepository;
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
-    paginate_records, CatalogReadScope, ImportedSnapshotArtifacts, SnapshotAbsence,
-    SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter,
-    SnapshotListPage, SnapshotRuntimeResolver, StagedSnapshot, StartedBuild,
-    DEFAULT_LIST_PAGE_LIMIT, MAX_LIST_PAGE_LIMIT,
+    CatalogReadScope, ImportedSnapshotArtifacts, SnapshotAbsence, SnapshotArtifactStore,
+    SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
+    SnapshotRuntimeResolver, StagedSnapshot, StartedBuild, DEFAULT_LIST_PAGE_LIMIT,
+    MAX_LIST_PAGE_LIMIT,
 };

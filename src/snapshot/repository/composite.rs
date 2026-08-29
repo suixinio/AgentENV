@@ -212,11 +212,6 @@ impl SnapshotRepository {
         self.catalog.absence_of(id).await
     }
 
-    /// Lists every snapshot record matching the provided filter.
-    pub async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.catalog.list(filter).await
-    }
-
     /// Lists one page of snapshot records, newest first.
     pub async fn list_page(
         &self,
@@ -446,9 +441,12 @@ mod tests {
             Ok(Some(record))
         }
 
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            self.journal.record("catalog.list");
-            Ok(Vec::new())
+        async fn list_page(
+            &self,
+            _filter: SnapshotListFilter,
+        ) -> RepositoryResult<SnapshotListPage> {
+            self.journal.record("catalog.list_page");
+            Ok(SnapshotListPage::single(Vec::new()))
         }
 
         async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {

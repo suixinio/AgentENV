@@ -1107,7 +1107,7 @@ mod tests {
     use crate::sandbox::CapturedSandboxSnapshot;
     use crate::snapshot::repository::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
-        SnapshotListFilter, SnapshotRepository, StartedBuild,
+        SnapshotListFilter, SnapshotListPage, SnapshotRepository, StartedBuild,
     };
     use crate::snapshot::{
         PersistedDiskImagePublication, RepositoryResult, SnapshotRecord, TemplateBuildErrorReason,
@@ -1993,8 +1993,13 @@ mod tests {
             Ok(None)
         }
 
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            Ok(Vec::new())
+        /// The journal's subject is the write path; this catalog holds no rows
+        /// at all, so every page of it is empty.
+        async fn list_page(
+            &self,
+            _filter: SnapshotListFilter,
+        ) -> RepositoryResult<SnapshotListPage> {
+            Ok(SnapshotListPage::single(Vec::new()))
         }
 
         async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {

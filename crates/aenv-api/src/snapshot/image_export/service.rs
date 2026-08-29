@@ -479,10 +479,10 @@ mod tests {
         async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
             Ok((id_or_alias == self.0.id.to_string()).then(|| self.0.clone()))
         }
-        async fn list(
+        async fn list_page(
             &self,
             _filter: crate::snapshot::repository::SnapshotListFilter,
-        ) -> RepositoryResult<Vec<SnapshotRecord>> {
+        ) -> RepositoryResult<crate::snapshot::repository::SnapshotListPage> {
             unreachable!("the export tool never lists")
         }
         async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {

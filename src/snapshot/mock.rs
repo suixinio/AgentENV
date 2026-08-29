@@ -6,8 +6,8 @@ use async_trait::async_trait;
 
 use super::repository::{
     ImportedSnapshotArtifacts, RepositoryError, RepositoryResult, SnapshotArtifactStore,
-    SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotRepository,
-    SnapshotRuntimeResolver, StartedBuild,
+    SnapshotCatalog, SnapshotCommit, SnapshotCursor, SnapshotListFilter, SnapshotListPage,
+    SnapshotRepository, SnapshotRuntimeResolver, StartedBuild,
 };
 use super::{
     PersistedDiskImagePublication, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
@@ -63,7 +63,7 @@ impl SnapshotCatalog for MockSnapshotCatalog {
         Err(Self::unsupported())
     }
 
-    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+    async fn list_page(&self, _filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
         Err(Self::unsupported())
     }
 
@@ -239,8 +239,11 @@ impl SnapshotCatalog for RecordingSnapshotRepository {
         Ok(None)
     }
 
-    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        Ok(Vec::new())
+    /// Holds no rows at all — it records commits and answers reads with
+    /// nothing — so every page of its listing is empty and there is never a
+    /// next one.
+    async fn list_page(&self, _filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
+        Ok(SnapshotListPage::single(Vec::new()))
     }
 
     async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
@@ -330,8 +333,14 @@ impl SnapshotCatalog for OneRowSnapshotCatalog {
         Ok(Some(self.row.clone()))
     }
 
-    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        Ok(vec![self.row.clone()])
+    /// The one row, paged like any other listing: an explicit `limit: 0` must
+    /// still answer with nothing rather than with the row.
+    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
+        Ok(paginate_records(
+            vec![self.row.clone()],
+            filter.effective_limit(),
+            filter.cursor.as_ref(),
+        ))
     }
 
     async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
@@ -457,7 +466,64 @@ pub struct InMemorySnapshotCatalog {
     aliases: std::sync::Mutex<std::collections::HashMap<String, SnapshotId>>,
 }
 
+/// Sorts an already-materialised listing and cuts one page out of it.
+///
+/// 🔴 The in-memory half of [`SnapshotCatalog::list_page`]'s contract, and the
+/// only one left: this used to be `repository::interfaces::paginate_records`,
+/// the body of a trait default that every object-store catalog inherited. Those
+/// catalogs are gone — PostgreSQL pushes the same keyset into SQL — so the
+/// slice survives only for the test doubles here, and it has to keep answering
+/// exactly what the SQL answers or a paging test proves nothing about
+/// production.
+fn paginate_records(
+    mut records: Vec<SnapshotRecord>,
+    limit: u32,
+    cursor: Option<&SnapshotCursor>,
+) -> SnapshotListPage {
+    // 🔴 An explicit request for no rows is answered with no rows and no
+    // cursor. Clamping it up to one would invent a row the caller did not ask
+    // for, and the arithmetic below would underflow on a zero page size.
+    if limit == 0 {
+        return SnapshotListPage {
+            items: Vec::new(),
+            next: None,
+        };
+    }
+
+    records.sort_by(SnapshotCursor::order);
+    if let Some(cursor) = cursor {
+        records.retain(|record| cursor.is_before(record));
+    }
+
+    let limit = limit as usize;
+    let next = if records.len() > limit {
+        records.get(limit - 1).map(SnapshotCursor::of)
+    } else {
+        None
+    };
+    records.truncate(limit);
+
+    SnapshotListPage {
+        items: records,
+        next,
+    }
+}
+
 impl InMemorySnapshotCatalog {
+    /// Inserts a row exactly as given, bypassing the write rules.
+    ///
+    /// 🔴 For paging tests only. `create`/`publish_commit` stamp
+    /// `created_at_unix_ms` themselves, and the listing order — and therefore
+    /// every page boundary and every cursor — is a function of that column, so
+    /// a test that cannot choose it cannot construct the tie a cursor has to
+    /// break.
+    pub fn seed(&self, record: SnapshotRecord) {
+        self.rows
+            .lock()
+            .expect("rows")
+            .insert(record.id.to_string(), record);
+    }
+
     /// The byte half the caller built, under a catalog a test can publish
     /// through. `repository.artifacts()` is kept; its catalog is replaced.
     pub fn in_front_of(repository: &SnapshotRepository) -> Arc<SnapshotRepository> {
@@ -666,8 +732,16 @@ impl SnapshotCatalog for InMemorySnapshotCatalog {
             .cloned())
     }
 
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let mut records: Vec<SnapshotRecord> = self
+    /// Matches, then sorts, then slices — the in-memory half of the paging
+    /// contract, opposite PostgreSQL's keyset pushdown.
+    ///
+    /// 🔴 This is the only implementation of that contract a unit test can
+    /// reach without a database, so `interfaces`'s paging tests drive it. The
+    /// sort is [`SnapshotCursor::order`] rather than a hand-written comparison
+    /// because a tie inside one millisecond has to break the same way here as
+    /// it does in SQL.
+    async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
+        let records: Vec<SnapshotRecord> = self
             .rows
             .lock()
             .expect("rows")
@@ -675,13 +749,11 @@ impl SnapshotCatalog for InMemorySnapshotCatalog {
             .filter(|record| Self::matches(record, &filter))
             .cloned()
             .collect();
-        records.sort_by(|left, right| {
-            right
-                .created_at_unix_ms
-                .cmp(&left.created_at_unix_ms)
-                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
-        });
-        Ok(records)
+        Ok(paginate_records(
+            records,
+            filter.effective_limit(),
+            filter.cursor.as_ref(),
+        ))
     }
 
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {

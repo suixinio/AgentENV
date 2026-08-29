@@ -349,7 +349,7 @@ mod operator_snapshot_delete_tests {
         StartedBuild,
     };
     use crate::snapshot::repository::{
-        RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
+        RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotListPage, SnapshotRepository,
     };
     use crate::snapshot::{
         CatalogReadScope, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,
@@ -398,8 +398,15 @@ mod operator_snapshot_delete_tests {
             self.get(id_or_alias).await
         }
 
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            Ok(Vec::new())
+        /// 🔴 Empty on purpose, and not because the catalog is: this double
+        /// holds one row and answers `get`/`get_scoped` with it. The admin
+        /// surfaces under test read snapshots by id and never list, so a
+        /// listing that started returning the row would be asserting nothing.
+        async fn list_page(
+            &self,
+            _filter: SnapshotListFilter,
+        ) -> RepositoryResult<SnapshotListPage> {
+            Ok(SnapshotListPage::single(Vec::new()))
         }
 
         async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {

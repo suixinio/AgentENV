@@ -138,10 +138,11 @@ async fn repository_management_methods_delegate_to_committed_store() {
     assert_eq!(loaded.id, snapshot_id);
 
     let listed = manager
-        .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+        .list_page(crate::snapshot::repository::SnapshotListFilter::matches_all())
         .await
         .expect("list should work");
-    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.items.len(), 1);
+    assert!(listed.next.is_none());
 
     manager.delete("managed").await.expect("delete should work");
     assert!(manager
@@ -218,9 +219,10 @@ async fn a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere() {
         "a staged snapshot must not be resolvable by alias"
     );
     assert!(manager
-        .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+        .list_page(crate::snapshot::repository::SnapshotListFilter::matches_all())
         .await
         .expect("list should work")
+        .items
         .is_empty());
 
     // The control: one more call flips all three answers.
@@ -245,9 +247,10 @@ async fn a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere() {
     );
     assert_eq!(
         manager
-            .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+            .list_page(crate::snapshot::repository::SnapshotListFilter::matches_all())
             .await
             .expect("list should work")
+            .items
             .len(),
         1
     );

@@ -2637,7 +2637,7 @@ mod cross_node_resume_scope_tests {
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{SnapshotCatalog, SnapshotCommit, StartedBuild};
     use crate::snapshot::repository::{
-        RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
+        RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotListPage, SnapshotRepository,
     };
     use crate::snapshot::{
         SnapshotAbsence, SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource,
@@ -2686,8 +2686,14 @@ mod cross_node_resume_scope_tests {
             Ok(None)
         }
 
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            Ok(Vec::new())
+        /// The one row this double holds is uncommitted, and a listing
+        /// answers at `Resolvable` scope, which an uncommitted row is not in —
+        /// so empty is the same answer the row would have produced anyway.
+        async fn list_page(
+            &self,
+            _filter: SnapshotListFilter,
+        ) -> RepositoryResult<SnapshotListPage> {
+            Ok(SnapshotListPage::single(Vec::new()))
         }
 
         async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {

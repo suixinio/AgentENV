@@ -416,14 +416,6 @@ impl SnapshotManager {
             .with_context(|| format!("settle whether snapshot '{id}' is really gone"))
     }
 
-    /// Lists every snapshot record that matches the given filter.
-    pub async fn list(&self, filter: SnapshotListFilter) -> anyhow::Result<Vec<SnapshotRecord>> {
-        self.repository
-            .list(filter)
-            .await
-            .context("list committed snapshots through repository")
-    }
-
     /// Lists one page of snapshot records, newest first.
     ///
     /// What every listing endpoint calls: the page bounds ride on the filter so

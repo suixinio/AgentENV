@@ -36,8 +36,8 @@ use crate::sandbox::{
 };
 use crate::snapshot::mock::MockSnapshotArtifactStore;
 use crate::snapshot::repository::{
-    RepositoryResult, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotRepository,
-    SnapshotRuntimeResolver, StagedSnapshot, StartedBuild,
+    RepositoryResult, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
+    SnapshotRepository, SnapshotRuntimeResolver, StagedSnapshot, StartedBuild,
 };
 use crate::snapshot::CapturedSandboxSnapshot;
 use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
@@ -233,8 +233,14 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
             Ok((id_or_alias != "no-such-snapshot")
                 .then(|| SnapshotRecord::mock_ready(CommittedSnapshot::mock())))
         }
-        async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-            Ok(Vec::new())
+        /// These tests resolve one snapshot by id to get a sandbox started;
+        /// nothing lists, and a row appearing in a listing would be a row this
+        /// double never had.
+        async fn list_page(
+            &self,
+            _filter: SnapshotListFilter,
+        ) -> RepositoryResult<SnapshotListPage> {
+            Ok(SnapshotListPage::single(Vec::new()))
         }
         async fn delete_record(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
             Ok(())

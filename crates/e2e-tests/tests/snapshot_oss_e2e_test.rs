@@ -401,8 +401,9 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     assert!(repository.get(alias.as_ref()).await?.is_none());
     assert_eq!(repository.resolve_alias(alias.as_ref()).await?, None);
     assert!(repository
-        .list(SnapshotListFilter::matches_all())
+        .list_page(SnapshotListFilter::matches_all())
         .await?
+        .items
         .is_empty());
     assert!(
         !fixture

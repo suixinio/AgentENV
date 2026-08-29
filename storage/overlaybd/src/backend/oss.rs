@@ -13,7 +13,6 @@ use object_store_operator::{
 use reqwest::Url;
 use std::cmp::min;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -113,13 +112,12 @@ impl OssBackend {
         Ok(file)
     }
 
-    pub async fn upload_path(&self, url: impl AsRef<str>, path: impl AsRef<Path>) -> Result<()> {
-        let body = tokio::fs::read(path.as_ref())
-            .await
-            .with_context(|| format!("read staged oss upload file {}", path.as_ref().display()))?;
-        self.upload_bytes(url, body).await
-    }
-
+    /// Upload `body` to an `oss://` / `s3://` URL.
+    ///
+    /// Retained deliberately, not live: the `upload_path` wrapper that fed it
+    /// from a staging file went with `ImageService::export_upper_as_oss_sealed`.
+    /// The only remaining exercise is `tests/oss_backend_minio.rs`, which is
+    /// `#[ignore = "requires docker"]`, so nothing covers this in a normal run.
     pub async fn upload_bytes(&self, url: impl AsRef<str>, body: Vec<u8>) -> Result<()> {
         let location = ParsedOssUrl::parse(
             url.as_ref(),

@@ -8,7 +8,6 @@ use std::time::Duration;
 use crate::backend::cache::{
     BkDownloadSubmitError, CacheFnTransFunc, CachedFile, FileCacheBackend, FileCacheBackendOptions,
 };
-use crate::backend::local::LocalFile;
 use crate::backend::oss::OssBackend;
 use crate::backend::registryfs_v2::RegistryFsV2;
 use crate::config::{
@@ -17,11 +16,9 @@ use crate::config::{
 };
 use crate::image::image_file::ImageFile;
 use crate::io::virtual_file::VirtualFile;
-use crate::lsmt::file::CommitArgs;
 use anyhow::{bail, Context, Result};
 use storage_util::io_ring::IoRingHandle;
 use tokio::sync::OnceCell;
-use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -472,45 +469,6 @@ impl ImageService {
                     .await
             }
         }
-    }
-
-    pub async fn export_upper_as_oss_sealed(
-        &self,
-        image: &ImageFile,
-        dest_url: &str,
-    ) -> Result<()> {
-        if !Self::is_oss_url(dest_url) {
-            bail!("destination url must use oss:// or s3://");
-        }
-        let remote_runtime = self.remote_runtime().await?;
-        let oss = remote_runtime
-            .oss_backend
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OSS backend not enabled in config"))?;
-
-        let stage_dir =
-            Path::new(&self.inner.global_config.cache_config.cache_dir).join("oss-stage");
-        std::fs::create_dir_all(&stage_dir)
-            .with_context(|| format!("create oss stage dir {}", stage_dir.display()))?;
-        let stage_path = stage_dir.join(format!("{}.lsmt", Uuid::new_v4()));
-        let stage_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(&stage_path, self.io_ring(dest_url)).await?);
-
-        let export_result = image
-            .export_upper_as_sealed(CommitArgs::new(stage_file.clone()))
-            .await;
-        if let Err(err) = export_result {
-            let _ = tokio::fs::remove_file(&stage_path).await;
-            return Err(err);
-        }
-
-        stage_file.sync().await?;
-        let upload_result = oss.upload_path(dest_url, &stage_path).await;
-        // Always clean up the staging file regardless of upload outcome.
-        // The staging file is a full copy of the sealed upper layer and can
-        // be large; leaving it on disk across failures would accumulate waste.
-        let _ = tokio::fs::remove_file(&stage_path).await;
-        upload_result
     }
 
     fn set_result_file(&self, filename: &str, data: &str) -> Result<()> {

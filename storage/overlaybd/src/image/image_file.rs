@@ -182,6 +182,14 @@ impl ImageFile {
         }
     }
 
+    /// Export the writable upper layer as a standalone sealed layer.
+    ///
+    /// Retained deliberately, not live: its last caller was
+    /// `ImageService::export_upper_as_oss_sealed`, deleted along with the OSS
+    /// staging wrapper that was its only user. The pause path uses
+    /// `close_seal` + `restack` instead. The `LSMTFile::export_upper_as_sealed`
+    /// this delegates to *is* live — three `lsmt/file/tests.rs` tests drive it
+    /// directly.
     pub async fn export_upper_as_sealed(&self, args: CommitArgs) -> Result<()> {
         let state = self.state.read().await;
         state
@@ -937,7 +945,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::{sleep, Duration};
 
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) -> Result<()> {
@@ -1144,35 +1151,6 @@ mod tests {
             .expect("service")
     }
 
-    async fn build_oss_service(tmp: &TempDir, endpoint: &str, region: &str) -> ImageService {
-        let global_path = tmp.path().join("overlaybd.json");
-        write_json(
-            &global_path,
-            &json!({
-                "registryFsVersion": "v2",
-                "ioEngine": 0,
-                "cacheConfig": {
-                    "cacheType": "file",
-                    "cacheDir": tmp.path().join("cache"),
-                    "cacheSizeGB": 1,
-                    "refillSize": 262144,
-                    "blockSize": 65536
-                },
-                "download": serde_json::to_value(DownloadConfig::default()).expect("download"),
-                "ossConfig": {
-                    "enable": true,
-                    "accessKeyId": "minioadmin",
-                    "secretAccessKey": "minioadmin",
-                    "defaultRegion": region,
-                    "defaultEndpoint": endpoint
-                }
-            }),
-        );
-        ImageService::from_config_path(global_path)
-            .await
-            .expect("service")
-    }
-
     #[derive(Clone, Debug)]
     struct P2pUuidLayerState {
         blob: Arc<Vec<u8>>,
@@ -1223,86 +1201,6 @@ mod tests {
             .header(reqwest::header::CONTENT_LENGTH, body.len().to_string())
             .body(Body::from(body))
             .expect("206 response")
-    }
-
-    #[derive(Clone, Debug, Default)]
-    struct UploadedObjectState {
-        blob: Arc<AsyncMutex<Option<Vec<u8>>>>,
-    }
-
-    async fn handle_uploaded_object(
-        State(state): State<UploadedObjectState>,
-        request: Request,
-    ) -> Response<Body> {
-        match *request.method() {
-            axum::http::Method::PUT => {
-                let headers = request.headers();
-                let auth = headers
-                    .get(reqwest::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default();
-                if !auth.starts_with("AWS4-HMAC-SHA256 ") {
-                    return Response::builder()
-                        .status(HttpStatusCode::FORBIDDEN)
-                        .body(Body::from("missing auth"))
-                        .expect("403 response");
-                }
-                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .expect("read put body");
-                *state.blob.lock().await = Some(body.to_vec());
-                Response::builder()
-                    .status(HttpStatusCode::OK)
-                    .body(Body::empty())
-                    .expect("200 response")
-            }
-            axum::http::Method::HEAD => {
-                let guard = state.blob.lock().await;
-                match guard.as_ref() {
-                    Some(blob) => Response::builder()
-                        .status(HttpStatusCode::OK)
-                        .header(reqwest::header::CONTENT_LENGTH, blob.len().to_string())
-                        .body(Body::empty())
-                        .expect("head response"),
-                    None => Response::builder()
-                        .status(HttpStatusCode::NOT_FOUND)
-                        .body(Body::empty())
-                        .expect("404 response"),
-                }
-            }
-            axum::http::Method::GET => {
-                let guard = state.blob.lock().await;
-                let Some(blob) = guard.as_ref() else {
-                    return Response::builder()
-                        .status(HttpStatusCode::NOT_FOUND)
-                        .body(Body::empty())
-                        .expect("404 response");
-                };
-                let len = blob.len() as u64;
-                let headers = request.headers().clone();
-                if let Some((start, end)) = parse_request_range(&headers) {
-                    let start = start.min(len.saturating_sub(1));
-                    let end = end.min(len.saturating_sub(1));
-                    let body = blob[start as usize..=end as usize].to_vec();
-                    Response::builder()
-                        .status(HttpStatusCode::PARTIAL_CONTENT)
-                        .header(CONTENT_RANGE_RAW, format!("bytes {start}-{end}/{len}"))
-                        .header(reqwest::header::CONTENT_LENGTH, body.len().to_string())
-                        .body(Body::from(body))
-                        .expect("206 response")
-                } else {
-                    Response::builder()
-                        .status(HttpStatusCode::OK)
-                        .header(reqwest::header::CONTENT_LENGTH, blob.len().to_string())
-                        .body(Body::from(blob.clone()))
-                        .expect("200 response")
-                }
-            }
-            _ => Response::builder()
-                .status(HttpStatusCode::METHOD_NOT_ALLOWED)
-                .body(Body::empty())
-                .expect("405 response"),
-        }
     }
 
     #[tokio::test]
@@ -1883,79 +1781,6 @@ mod tests {
             write_err.to_string().contains("File is sealed"),
             "expected sealed write failure, got: {write_err:#}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_export_upper_as_oss_sealed_roundtrip() {
-        let tmp = TempDir::new().expect("tempdir");
-        let lower_path = tmp.path().join("lower.data");
-        let lower_index = tmp.path().join("lower.index");
-        let lower_payload = vec![0x11; 4096];
-        create_sealed_lower(&lower_path, &lower_index, &lower_payload)
-            .await
-            .expect("build sealed lower");
-
-        let upper_data = tmp.path().join("upper.data");
-        let upper_index = tmp.path().join("upper.index");
-        create_initialized_upper(&upper_data, &upper_index, lower_payload.len() as u64)
-            .await
-            .expect("build initialized upper");
-
-        let app = Router::new()
-            .route(
-                "/export-bucket/snapshots/upper.lsmt",
-                any(handle_uploaded_object),
-            )
-            .with_state(UploadedObjectState::default());
-        let (endpoint, server_handle) = spawn_server(app).await;
-
-        let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
-            lowers: vec![LayerConfig {
-                file: lower_path.to_string_lossy().into_owned(),
-                ..LayerConfig::default()
-            }],
-            upper: UpperConfig {
-                mode: None,
-                index: upper_index.to_string_lossy().into_owned(),
-                data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
-            },
-            result_file: String::new(),
-            download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
-        };
-
-        let service = build_oss_service(&tmp, &endpoint, "us-east-1").await;
-        let image = ImageFile::open(image_cfg, service.clone(), None)
-            .await
-            .expect("open image");
-        let overlay = vec![0x22; 4096];
-        image.write_at(0, &overlay).await.expect("write overlay");
-
-        let dest_url =
-            format!("s3://export-bucket/snapshots/upper.lsmt?endpoint={endpoint}&region=us-east-1");
-        service
-            .export_upper_as_oss_sealed(&image, &dest_url)
-            .await
-            .expect("export upper to oss");
-
-        let exported = service
-            .open_remote_blob(&dest_url)
-            .await
-            .expect("open exported object");
-        let exported_ro = LSMTReadOnlyFile::open(exported)
-            .await
-            .expect("open exported lsmt");
-        let got = exported_ro
-            .read_at(0, overlay.len())
-            .await
-            .expect("read overlay");
-        assert_eq!(got.as_ref(), overlay.as_slice());
-
-        server_handle.abort();
     }
 
     #[tokio::test]
